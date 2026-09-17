@@ -114,10 +114,10 @@
 //!   (persisting `<base>/.tracker.bin`), `abort_block` drops everything staged.
 //! * the wasm `guest` (the production node): the core runs inside the
 //!   component, re-entering each block through the host state lane, while a
-//!   native [`ForgeOdbBacking`] on the host keeps the git substrate — the root,
-//!   the browse/diff reads, snapshot packing, and materialization at the block
-//!   boundary. the root is byte-identical across the two, so the cutover moves
-//!   no committed state.
+//!   native `forge_odb::ForgeOdbBacking` on the host keeps the git substrate —
+//!   the root, the browse/diff reads, snapshot packing, and materialization at
+//!   the block boundary. the root is byte-identical across the two, so the
+//!   cutover moves no committed state.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -149,10 +149,6 @@ pub use module::{
     COMPACT_PACK_LIMIT, Forge, PendingBranch, build_objects, compact_repos, install_objects,
     on_disk_heads, pending_branches,
 };
-#[cfg(feature = "native")]
-mod backing;
-#[cfg(feature = "native")]
-pub use backing::ForgeOdbBacking;
 #[cfg(feature = "guest")]
 mod guest;
 #[cfg(feature = "native")]

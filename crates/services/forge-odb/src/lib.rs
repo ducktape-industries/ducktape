@@ -2,10 +2,21 @@
 //! surface to: [`ForgeOdbBacking`] implements [`wasm_host::OdbBacking`] over
 //! the SAME native [`Forge`] the daemon lanes run. it is native forge with the
 //! `sdk::Module` trait peeled off: the guest owns `execute` (the pure
-//! [`ForgeState`](crate::state::ForgeState) core), the host owns everything
-//! that touches a git object database — `root`, bounded object/diff primitives,
-//! snapshot packing + install, materialization — and the block boundary is
-//! driven by the kernel through the backing hooks.
+//! `ForgeState` core), the host owns everything that touches a git object
+//! database — `root`, bounded object/diff primitives, snapshot packing +
+//! install, materialization — and the block boundary is driven by the kernel
+//! through the backing hooks.
+//!
+//! ## why this is not a fork of [`Forge`]
+//!
+//! the publish ordering is the load-bearing part, and it is SINGLE-SOURCED:
+//! [`OdbBacking::adopt_refs`] here calls [`Forge::adopt_refs`], which is the
+//! same fates-then-publish the native `Module::commit_block` runs. the only
+//! thing this file adds is the SHAPE the kernel drives — the kernel accumulates
+//! the block's staged objects itself and hands them back one
+//! [`HostOdb::stage_put`] at a time, then splits the flush
+//! ([`OdbBacking::publish_block`]) from the refs adopt. the bytes on disk, and
+//! the root, are identical either way.
 //!
 //! ## the block boundary, as the kernel drives it
 //!
@@ -18,22 +29,19 @@
 //! * calls [`OdbBacking::publish_block`] — a no-op: forge has no objects of
 //!   its own to make durable (packs arrive out of band through the blob
 //!   plane; the pending file is the durable record and lands at adopt);
-//! * calls [`OdbBacking::adopt_refs`] with the block's final image — the
-//!   substrate rebuilds the per-branch fates the guest staged (targets are
-//!   the packed publications, dropped committed branches are deletes) and
-//!   runs the native publish: the ref cache moves where the pack is present,
-//!   the catch-up map records where it is not, the tracker swaps in, and
-//!   both files persist — exactly `Forge::commit_block`.
+//! * calls [`OdbBacking::adopt_refs`] with the block's final image — the ref
+//!   cache moves where the pack is present, the catch-up map records where it
+//!   is not, the tracker swaps in, and both files persist.
 //!
 //! an aborted block drops the buffered targets ([`OdbBacking::discard_block`])
 //! and the kernel drops the staged image, so nothing here moved.
 
-use sdk::{Error, ModuleId, StateRoot, StateSyncHandle};
+use forge::state::{REF_TARGET_KIND, RefTarget, decode_ref_target};
+use forge::Forge;
+use git_primitives::{GitDiff, GitDiffError, GitObject};
+use sdk::{Error, Module as _, ModuleId, StateRoot, StateSyncHandle};
 use sha2::{Digest as _, Sha256};
 use wasm_host::{HostOdb, OdbBacking};
-
-use crate::module::Forge;
-use crate::state::{REF_TARGET_KIND, RefTarget, decode_image, decode_ref_target};
 
 /// the git substrate for a wasm forge tenant: the native [`Forge`] (repos,
 /// tracker, pending map, snapshot memo) plus the block's buffered ref targets.
@@ -98,7 +106,7 @@ impl OdbBacking for ForgeOdbBacking {
         repository: &str,
         oid: &[u8],
         max_bytes: u64,
-    ) -> Result<wasm_host::GitObject, Error> {
+    ) -> Result<GitObject, Error> {
         self.forge.git_object_read(repository, oid, max_bytes)
     }
     fn git_diff_read(
@@ -109,7 +117,7 @@ impl OdbBacking for ForgeOdbBacking {
         max_bytes: u64,
         max_files: u64,
         max_blob_bytes: u64,
-    ) -> Result<wasm_host::GitDiff, wasm_host::GitDiffError> {
+    ) -> Result<GitDiff, GitDiffError> {
         self.forge.git_diff_read(
             repository,
             target,
@@ -121,28 +129,22 @@ impl OdbBacking for ForgeOdbBacking {
     }
 
     fn refs_bytes(&self) -> Vec<u8> {
-        self.forge.state.committed_image()
+        self.forge.committed_image()
     }
 
     /// the domain-separated composition native forge computes — NOT
     /// `sha256(image)` — so the wasm tenant's root is byte-identical to the
     /// native module's at every height.
     fn root(&self) -> StateRoot {
-        self.forge.state.root()
+        self.forge.root()
     }
 
     /// adopt the block's final image: rebuild the per-branch fates from the
     /// image + the buffered targets, stage them onto the core, and run the
     /// native publish (ref cache / catch-up map / tracker / both files).
     fn adopt_refs(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        let image = decode_image(bytes)?;
         let targets = std::mem::take(&mut self.targets);
-        let fates = self.forge.state.fates_for_image(&image, targets)?;
-        for (name, staged) in fates {
-            self.forge.state.repos.entry(name).or_default().staged = staged;
-        }
-        self.forge.state.staged_tracker = Some(image.tracker);
-        self.forge.publish_block()
+        self.forge.adopt_refs(bytes, targets)
     }
 
     /// forge has no block-local objects to make durable: packs arrive out of
@@ -154,7 +156,7 @@ impl OdbBacking for ForgeOdbBacking {
 
     fn discard_block(&mut self) {
         self.targets.clear();
-        self.forge.state.abort();
+        self.forge.abort_staged();
     }
 
     /// the whole state ships as one self-contained container (image + packs

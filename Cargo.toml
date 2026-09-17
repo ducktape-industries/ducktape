@@ -16,6 +16,11 @@
 #                      git revision: the ducktape:module WIT world, the
 #                      bindings + adapter every port shares, `sdk` re-exported,
 #                      and the wasm32 patch crates (stubs/) a guest graph needs
+#   crates/git-primitives/ — the six git types of that WIT world as plain data,
+#                      dependency-free: the kernel host speaks them across
+#                      `OdbBacking` and converts at the import boundary, so a
+#                      module's read policy names the shape without naming the
+#                      host it must stay separable from
 #   crates/networking/ — the netstack: transport infra ONLY (wireguard,
 #                      nat-traversal, netstack-machine [the sans-I/O
 #                      reachability decision core, its ducktape:netstack
@@ -46,8 +51,9 @@
 #                      provider — the executor spec layer + CliProvider run loop;
 #                      agent — the pty session daemon; airlock — the lender;
 #                      media — the huddle voice/video planes + call-socket wire;
-#                      files-odb — the disk odb a wasm files tenant commits
-#                      through, so the `files` module names no kernel host)
+#                      files-odb / forge-odb — the disk odb a wasm files or
+#                      forge tenant commits through, so neither module names
+#                      a kernel host)
 #   crates/topology/ — the module composition catalog: the id universe, its
 #                      shape/config schema and the named genesis selections
 #                      every composer draws from (pure data, no deps)
@@ -150,6 +156,9 @@ members = [
     # reader links provider-host and with it the microVM sandbox, which a GUI
     # submitting a run must not.
     "crates/run-envelope",
+    # The six git types the host surface speaks, as plain data with no deps, so
+    # a module's read policy can name the shape without naming the kernel host.
+    "crates/git-primitives",
     # A workspace on disk (identity, network.toml, node.toml, the invite codec)
     # and the join ceremony that writes one. Split from bin/node because
     # joining is the one node operation with no running node to ask.
@@ -192,6 +201,7 @@ members = [
     "crates/services/broker",
     "crates/services/compute",
     "crates/services/files-odb",
+    "crates/services/forge-odb",
     "crates/services/mcp",
     "crates/services/media",
     "crates/services/provider",
@@ -420,6 +430,7 @@ airlock-service = { path = "crates/services/airlock" }
 broker-host = { path = "crates/services/broker" }
 compute-service = { path = "crates/services/compute" }
 files-odb = { path = "crates/services/files-odb" }
+forge-odb = { path = "crates/services/forge-odb" }
 mcp-host = { path = "crates/services/mcp" }
 media-service = { path = "crates/services/media" }
 provider-host = { path = "crates/services/provider" }
@@ -436,6 +447,9 @@ authpage = { path = "crates/authpage" }
 # the run envelope's magic + headless composer, linked by the CLI, the compute
 # service and the desktop app.
 run-envelope = { path = "crates/run-envelope" }
+# the plain git read types `wasm_host::OdbBacking` speaks and `forge`'s read
+# policy names — a zero-dep leaf on purpose, so naming it drags in nothing.
+git-primitives = { path = "crates/git-primitives" }
 # a ducktape workspace on disk + the join ceremony, linked by the CLI and the
 # desktop app.
 workspace-config = { path = "crates/workspace-config" }

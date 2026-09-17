@@ -102,6 +102,8 @@ mod bindings {
     });
 }
 
+mod git_wit;
+
 use bindings::Module as ModuleWorld;
 use bindings::ducktape::module::host::{
     self, Ack as WitAck, Backing as WitBacking, CallId as WitCallId, Cause as WitCause,
@@ -315,7 +317,17 @@ impl Default for GuestLimits {
 }
 
 /// Typed local Git storage results shared with native substrate implementations.
-pub use bindings::ducktape::module::host::{
+///
+/// These are `git_primitives`' plain types, NOT the ones [`bindings`] generates:
+/// a substrate lives outside the kernel (`crates/services/*-odb`) and a module's
+/// read policy names the same shapes, and neither may be made to name wasmtime
+/// to do it. [`git_wit`] converts to the generated twins at the import boundary.
+///
+/// The obvious alternative — `bindgen!`'s `with:` mapping, so there is literally
+/// one type — is not available: at wasmtime 46 `with` is consulted only by
+/// `name_interface` and `type_resource`, never by `type_record`, so a record key
+/// is never matched and the macro then fails the build for an unused key.
+pub use git_primitives::{
     GitCommit, GitDiff, GitDiffError, GitObject, GitObjectData, GitTreeEntry,
 };
 
@@ -887,7 +899,7 @@ impl host::Host for HostData {
         repository: String,
         oid: Vec<u8>,
         max_bytes: u64,
-    ) -> wasmtime::Result<Result<GitObject, WitError>> {
+    ) -> wasmtime::Result<Result<host::GitObject, WitError>> {
         if !self.local_reads {
             return Ok(Err(WitError::Unsupported));
         }
@@ -898,7 +910,7 @@ impl host::Host for HostData {
         }
         let key = (repository, oid, max_bytes);
         if let Some(answer) = self.memo.git_objects.get(&key) {
-            return Ok(answer.clone());
+            return Ok(answer.clone().map(git_wit::object));
         }
         let key_bytes = key.0.len() + key.1.len() + 8;
         self.admit_object_read(key_bytes)?;
@@ -910,7 +922,7 @@ impl host::Host for HostData {
             .map_err(to_wit_error);
         self.retain_object_read(key_bytes + git_object_bytes(&answer))?;
         self.memo.git_objects.insert(key, answer.clone());
-        Ok(answer)
+        Ok(answer.map(git_wit::object))
     }
     fn git_diff_read(
         &mut self,
@@ -920,9 +932,9 @@ impl host::Host for HostData {
         max_bytes: u64,
         max_files: u64,
         max_blob_bytes: u64,
-    ) -> wasmtime::Result<Result<GitDiff, GitDiffError>> {
+    ) -> wasmtime::Result<Result<host::GitDiff, host::GitDiffError>> {
         if !self.local_reads {
-            return Ok(Err(GitDiffError::Unsupported));
+            return Ok(Err(host::GitDiffError::Unsupported));
         }
         let valid = valid_git_repository(&repository)
             && target.len() == 20
@@ -931,7 +943,9 @@ impl host::Host for HostData {
             && max_files <= 4096
             && max_blob_bytes <= 16 * 1024 * 1024;
         if !valid {
-            return Ok(Err(GitDiffError::Limit("invalid_git_diff_read".into())));
+            return Ok(Err(host::GitDiffError::Limit(
+                "invalid_git_diff_read".into(),
+            )));
         }
         let key = (
             repository,
@@ -942,7 +956,7 @@ impl host::Host for HostData {
             max_blob_bytes,
         );
         if let Some(answer) = self.memo.git_diffs.get(&key) {
-            return Ok(answer.clone());
+            return Ok(git_wit::diff_result(answer.clone()));
         }
         let key_bytes = key.0.len() + key.1.len() + key.2.len() + 24;
         self.admit_object_read(key_bytes)?;
@@ -961,7 +975,7 @@ impl host::Host for HostData {
         };
         self.retain_object_read(key_bytes + answer_bytes)?;
         self.memo.git_diffs.insert(key, answer.clone());
-        Ok(answer)
+        Ok(git_wit::diff_result(answer))
     }
     /// overlay-over-backing full read: staged puts (the tagged body verbatim)
     /// first, then the memo, else the backing — inline, like `object-stat`.

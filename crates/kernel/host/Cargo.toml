@@ -99,6 +99,9 @@ files-odb = { workspace = true }
 # over the git substrate; `testkit` builds the real git history + packs the
 # push ops need.
 forge = { workspace = true, features = ["testkit"] }
+# and the wasm side of that proof stands on forge's substrate, a service crate
+# for the same reason files' is.
+forge-odb = { workspace = true }
 blobstore = { workspace = true }
 tempfile = "3"
 commonware-cryptography = { workspace = true }

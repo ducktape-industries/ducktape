@@ -1,6 +1,6 @@
 //! the NATIVE forge module: [`Forge`] is the block-spanning `sdk::Module` over
 //! the on-disk git substrate — the daemon, sim, and demo lanes compose it, and
-//! the wasm tenant's host-side [`ForgeOdbBacking`](crate::ForgeOdbBacking)
+//! the wasm tenant's host-side substrate (`forge_odb::ForgeOdbBacking`)
 //! wraps it for the substrate half (root, browse/diff reads, snapshot packing,
 //! materialization). the accept/reject logic is NOT here: `execute` delegates
 //! to the shared [`ForgeState`] core, so this file owns only what touches disk
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 
 use crate::refs::RepoState;
-use crate::state::ForgeState;
+use crate::state::{ForgeState, RefTarget};
 use crate::tracker::Tracker;
 use crate::*;
 #[cfg(test)]
@@ -664,15 +664,17 @@ impl Forge {
         .query(req)
     }
 
-    pub(crate) fn git_object_read(
+    /// the bounded object read the product policy makes, exposed because the
+    /// host-side substrate (`forge-odb`) answers the kernel's import with it.
+    pub fn git_object_read(
         &self,
         repository: &str,
         oid: &[u8],
         max_bytes: u64,
-    ) -> Result<wasm_host::GitObject, Error> {
+    ) -> Result<git_primitives::GitObject, Error> {
         crate::query::read_object(&self.base, repository, oid, max_bytes)
     }
-    pub(crate) fn git_diff_read(
+    pub fn git_diff_read(
         &self,
         repository: &str,
         target: &[u8],
@@ -680,7 +682,7 @@ impl Forge {
         max_bytes: u64,
         max_files: u64,
         max_blob_bytes: u64,
-    ) -> Result<wasm_host::GitDiff, wasm_host::GitDiffError> {
+    ) -> Result<git_primitives::GitDiff, git_primitives::GitDiffError> {
         crate::query::read_diff(
             &self.base,
             repository,
@@ -711,6 +713,37 @@ impl Forge {
             self.persist_tracker()?;
         }
         Ok(())
+    }
+
+    /// adopt a block's final refs image on behalf of the wasm tenant: rebuild
+    /// the per-branch fates from the image plus the packed-head records the
+    /// guest staged, put them on the core, and run the SAME publish
+    /// `Module::commit_block` runs.
+    ///
+    /// it lives here rather than in the substrate for the reason files' does:
+    /// the durability ordering is the load-bearing part, and one copy of it is
+    /// what makes a wasm tenant's disk and root byte-identical to native
+    /// forge's. the substrate owns only the shape the kernel drives — buffering
+    /// the records and splitting the flush from the adopt.
+    pub fn adopt_refs(&mut self, bytes: &[u8], targets: Vec<RefTarget>) -> Result<(), Error> {
+        let image = crate::state::decode_image(bytes)?;
+        let fates = self.state.fates_for_image(&image, targets)?;
+        for (name, staged) in fates {
+            self.state.repos.entry(name).or_default().staged = staged;
+        }
+        self.state.staged_tracker = Some(image.tracker);
+        self.publish_block()
+    }
+
+    /// the committed refs image — the `root()` preimage and the snapshot bytes.
+    pub fn committed_image(&self) -> Vec<u8> {
+        self.state.committed_image()
+    }
+
+    /// drop everything staged this block: the sync twin of
+    /// `Module::abort_block`, which is what the kernel's discard hook needs.
+    pub fn abort_staged(&mut self) {
+        self.state.abort();
     }
 }
 
