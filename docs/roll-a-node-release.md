@@ -89,18 +89,27 @@ executable path names its release directory, never `current/` — a scan looking
 for `current/` matches nothing at all and looks exactly like "nothing is
 running".
 
-## 1. Archive the binary
+## 1. Archive the release
 
-A node archive is a `.tar.zst` carrying one executable `ducktape` at its root.
-Nothing else is required, and symlinks, hard links, absolute paths and `..`
-are refused by the launcher rather than unpacked.
+A node archive is a `.tar.zst` carrying `ducktape`, `ducktape-node-launcher`
+and the founding set as `modules/`, all at its root. Symlinks, hard links,
+absolute paths and `..` are refused by the launcher rather than unpacked.
 
 ```
-mkdir -p stage && cp target/release/ducktape stage/ducktape && chmod 755 stage/ducktape
-tar --zstd -cf ducktape-linux-x86_64.tar.zst -C stage ducktape
+cargo build --release -p node-bin -p node-launcher
+ops/release/archive.sh --kind node --from target/release
 ```
 
-The file name is for the eye. The published name is derived from the
+`--from` is the profile directory that build wrote: it holds both binaries and
+the founding set the same build staged beside them, and the script packs that
+set under `modules/`, the one name `workspace_config::modules_dir()` resolves
+beside an executable. That is what lets a host with nothing but this archive
+run `ducktape node init` — a binary carries no wasm, so a release without the
+set founds nothing. The script refuses a set that holds no components, holds
+no `netstack.component.wasm`, carries a `.view.pending` marker, or carries no
+`.staged-by` record for the binary beside it to match.
+
+The printed file name is for the eye. The published name is derived from the
 archive's own sha256 by `app_update::layout`.
 
 ## 2. Publish it

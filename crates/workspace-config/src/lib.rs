@@ -105,15 +105,24 @@ pub fn modules_dir() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(dir));
     }
     let exe = std::env::current_exe().map_err(|e| format!("current executable: {e}"))?;
-    staged_modules_dir(&exe).ok_or_else(|| {
-        format!(
-            "no founding set beside {} — `cargo build` stages this checkout's own \
-             (target/<profile>/modules%<checkout>, named by its `{}`), `make install-node` \
-             installs one beside the binary as `modules`, or set $DUCKTAPE_MODULES_DIR",
-            exe.display(),
-            staged_key::STAGED_POINTER,
-        )
-    })
+    staged_modules_dir(&exe).ok_or_else(|| no_founding_set(&exe))
+}
+
+/// What a binary with no set beside it says. It names the ARTIFACT that is
+/// missing, because on a release-only host nothing else can put one there: a
+/// node release archive carries `modules/` next to `ducktape`, and a binary
+/// lifted out of the archive on its own is the one way to end up here.
+fn no_founding_set(exe: &Path) -> String {
+    format!(
+        "no founding set beside {} — a node release archive carries the set its binary was \
+         built with as `modules/` beside `ducktape`, so unpack the WHOLE archive (download it \
+         again if only the binary was copied); `ops/release/archive.sh --kind node` packs one \
+         and `ducktape-node-launcher` unpacks it into <workspace>/updates/releases/<sha>/. In a \
+         checkout, `cargo build` stages this checkout's own set beside the binaries it links \
+         (target/<profile>/modules%<checkout>, named by its `{}`).",
+        exe.display(),
+        staged_key::STAGED_POINTER,
+    )
 }
 
 /// The simulator's packaged preset also includes its small KV test module.
@@ -1449,6 +1458,34 @@ mod tests {
         assert_eq!(
             sim_twin(&profile.join(ours)),
             profile.join("sim-modules%home%someone%checkout")
+        );
+    }
+
+    /// A NODE RELEASE resolves its set exactly like an installed one, because
+    /// there is one layout: the archive unpacks `ducktape` and `modules/` side
+    /// by side into `<workspace>/updates/releases/<sha>/`, and `/proc/self/exe`
+    /// resolves through `current` to that directory.
+    #[test]
+    fn a_release_directory_resolves_the_set_its_archive_unpacked_beside_the_binary() {
+        let scratch = tempfile::tempdir().unwrap();
+        let release = scratch.path().join("updates/releases/deadbeef");
+        std::fs::create_dir_all(release.join("modules")).unwrap();
+        assert_eq!(
+            staged_modules_dir(&release.join("ducktape")).unwrap(),
+            release.join("modules")
+        );
+
+        // and a binary lifted out of the archive on its own — the one way to
+        // reach a release host with no set — is told which ARTIFACT is
+        // missing, never an environment variable it has no way to fill.
+        let alone = scratch.path().join("bin/ducktape");
+        assert!(staged_modules_dir(&alone).is_none());
+        let refusal = no_founding_set(&alone);
+        assert!(refusal.contains("release archive"), "{refusal}");
+        assert!(refusal.contains("modules/"), "{refusal}");
+        assert!(
+            !refusal.contains("DUCKTAPE_MODULES_DIR"),
+            "the fatal names the artifact to download, not an env var: {refusal}"
         );
     }
 
