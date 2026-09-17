@@ -6,7 +6,7 @@ mod common;
 use std::io::BufRead as _;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -110,7 +110,7 @@ impl NodeStderr {
 /// pubkey hex — the join code every targeted invite locks to. `join --dir <dir>`
 /// reuses this identity, so the join-side target self-check passes.
 fn keygen(dir: &Path) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let out = common::ducktape()
         .arg("node")
         .args(["key", "--dir"])
         .arg(dir)
@@ -184,7 +184,7 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
     let founder = dir.path().join("founder");
     let friend = dir.path().join("friend");
 
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let init = common::ducktape()
         .arg("node")
         .args([
             "init",
@@ -204,7 +204,7 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
     );
 
     keygen(&friend);
-    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let invite = common::ducktape()
         .arg("node")
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
@@ -217,7 +217,7 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
     );
     let blob = String::from_utf8_lossy(&invite.stdout).trim().to_string();
 
-    let join = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let join = common::ducktape()
         .arg("node")
         .args([
             "join",
@@ -266,7 +266,7 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
     let founder = dir.path().join("founder");
     let friend = dir.path().join("friend");
 
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let init = common::ducktape()
         .arg("node")
         .args([
             "init",
@@ -297,7 +297,7 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
         .expect("seed mesh-state.json");
 
     keygen(&friend);
-    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let invite = common::ducktape()
         .arg("node")
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
@@ -310,7 +310,7 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
     );
     let blob = String::from_utf8_lossy(&invite.stdout).trim().to_string();
 
-    let join = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let join = common::ducktape()
         .arg("node")
         .args([
             "join",
@@ -373,7 +373,7 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
     let ports = alloc_ports(5);
     let coord_addr = std::net::SocketAddr::from(([127, 0, 0, 1], ports[3]));
     let wg_port = ports[4];
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let init = common::ducktape()
         .arg("node")
         .args([
             "init",
@@ -408,7 +408,7 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
     // tracing writes — is piped to a reader thread for event-driven waits.
     let log_path = dir.path().join("founder-heal.log");
     let out = std::fs::File::create(&log_path).expect("create node log");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let mut child = common::ducktape()
         .arg("node")
         .arg("run")
         .arg("--config")
@@ -485,7 +485,7 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
     // `DEFAULT_*_LISTEN` ports) would collide with a real node on this host.
     let ports = alloc_ports(4);
     let wg_port = ports[3];
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let init = common::ducktape()
         .arg("node")
         .args([
             "init",
@@ -522,7 +522,7 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
     // then tear the node down. An early exit surfaces as stderr EOF.
     let log_path = dir.path().join("founder-run.log");
     let out = std::fs::File::create(&log_path).expect("create node log");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let mut child = common::ducktape()
         .arg("node")
         .arg("run")
         .arg("--config")
@@ -577,7 +577,7 @@ fn a_taken_wireguard_port_refuses_the_join_instead_of_blaming_the_invite() {
     // 8845/51820/51821, which is the very collision under test and would take
     // a real node on this host with it.
     let ports = alloc_ports(9);
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let init = common::ducktape()
         .arg("node")
         .args([
             "init",
@@ -619,7 +619,7 @@ fn a_taken_wireguard_port_refuses_the_join_instead_of_blaming_the_invite() {
         .expect("seed mesh-state.json");
 
     keygen(&friend);
-    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let invite = common::ducktape()
         .arg("node")
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
@@ -640,7 +640,7 @@ fn a_taken_wireguard_port_refuses_the_join_instead_of_blaming_the_invite() {
     let _squatter = std::net::UdpSocket::bind(("0.0.0.0", joiner_wireguard))
         .expect("hold the joiner's wireguard port");
 
-    let join = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let join = common::ducktape()
         .arg("node")
         .args([
             "join",
@@ -675,7 +675,7 @@ fn a_taken_wireguard_port_refuses_the_join_instead_of_blaming_the_invite() {
 
     let log_path = dir.path().join("joiner-run.log");
     let out = std::fs::File::create(&log_path).expect("create node log");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let mut child = common::ducktape()
         .arg("node")
         .arg("run")
         .arg("--config")

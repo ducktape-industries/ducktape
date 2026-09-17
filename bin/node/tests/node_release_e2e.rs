@@ -67,13 +67,14 @@ const BUDGET: Duration = Duration::from_secs(180);
 /// it reads the node's identity off `/v1/status` and exits loudly without one.
 const SERVICE_KIND: &str = "airlock";
 
-fn ducktape() -> &'static str {
-    env!("CARGO_BIN_EXE_ducktape")
+fn ducktape() -> &'static Path {
+    common::node_bin()
 }
 
-/// The launcher, built beside the binary under test.
+/// The launcher, built beside the binary under test — and pinned beside it too,
+/// so "beside" keeps meaning the same build for the whole run.
 fn launcher_exe() -> PathBuf {
-    let path = Path::new(ducktape()).with_file_name("ducktape-node-launcher");
+    let path = ducktape().with_file_name("ducktape-node-launcher");
     assert!(
         path.exists(),
         "{} is not built — run `cargo build -p node-launcher` first",
@@ -358,7 +359,7 @@ fn release_binary(mark: &str, qualify_refuses: bool) -> String {
          {refusal}  \"service run\") echo \"daemon on release {mark}\" >&2 ;;\n\
          esac\n\
          exec \"{real}\" \"$@\"\n",
-        real = ducktape()
+        real = ducktape().display()
     )
 }
 

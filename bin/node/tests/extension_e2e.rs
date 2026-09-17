@@ -49,7 +49,7 @@ fn install_command() -> Command {
     command
         .arg(root().join("ops/application-service/install.py"))
         .arg("--ducktape")
-        .arg(env!("CARGO_BIN_EXE_ducktape"));
+        .arg(common::node_bin());
     command
 }
 fn checked(mut command: Command) {
@@ -387,7 +387,7 @@ fn independent_service_module_and_view_replace_without_rebuilding_native_hosts()
         PathBuf::from(std::env::var("DUCK_EXTENSION_APP_TEST").expect("compiled app test binary"));
     let app_binary =
         PathBuf::from(std::env::var("DUCK_EXTENSION_APP_BIN").expect("compiled desktop binary"));
-    let node = Path::new(env!("CARGO_BIN_EXE_ducktape"));
+    let node = common::node_bin();
     let frozen = (hash(node), hash(&app_test), hash(&app_binary));
     let artifacts = root().join("crates/examples/extension-probe/artifacts");
     let mut cluster = spawn_founders(Cluster::new(&[1, 2, 3], &[1, 2, 3]));
