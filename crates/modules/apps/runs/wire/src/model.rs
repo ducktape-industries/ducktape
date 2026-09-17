@@ -396,27 +396,15 @@ pub enum ModelReply {
 
 // ---- codecs -------------------------------------------------------------------
 
-pub fn encode_model_msg(m: &ModelMsg) -> Vec<u8> {
-    sdk::wire::encode(m)
-}
-pub fn decode_model_msg(b: &[u8]) -> Result<ModelMsg, String> {
-    sdk::wire::decode(b)
-}
+// `ModelMsg`, `ModelQuery` and `ModelReply` have no codec of their own: each
+// rides INSIDE the module envelope (`RunsMsg::ConfigureModel { operation }`,
+// `RunsQuery::Model { query }`, `RunsReply::Model`), so the envelope's codec is
+// the only one on the path. `AgentResponse` is the exception below — it crosses
+// on its own.
+
 pub fn encode_response(r: &AgentResponse) -> Vec<u8> {
     sdk::wire::encode(r)
 }
 pub fn decode_response(b: &[u8]) -> Result<AgentResponse, String> {
-    sdk::wire::decode(b)
-}
-pub fn encode_model_query(q: &ModelQuery) -> Vec<u8> {
-    sdk::wire::encode(q)
-}
-pub fn decode_model_query(b: &[u8]) -> Result<ModelQuery, String> {
-    sdk::wire::decode(b)
-}
-pub fn encode_model_reply(r: &ModelReply) -> Vec<u8> {
-    sdk::wire::encode(r)
-}
-pub fn decode_model_reply(b: &[u8]) -> Result<ModelReply, String> {
     sdk::wire::decode(b)
 }
