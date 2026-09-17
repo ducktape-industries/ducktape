@@ -184,8 +184,8 @@ fn open_log_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
 }
 
 /// a panic in a spawned task kills THAT TASK ONLY: the node stays "up" while one
-/// plane goes dark forever. the reachability plane, the voice hub and the overlay
-/// stack each own a thread, so this is not hypothetical.
+/// plane goes dark forever. the reachability plane, the presence hub and the
+/// overlay stack each own a thread, so this is not hypothetical.
 ///
 /// chain, don't replace — the default hook keeps the backtrace on stderr.
 fn install_panic_hook() {

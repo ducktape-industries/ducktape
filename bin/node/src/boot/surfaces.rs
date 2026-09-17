@@ -10,7 +10,7 @@ pub(crate) struct Surfaces {
     pub(crate) status: noded::StatusCell,
     pub(crate) stream_hub: noded::StreamHub,
     pub(crate) index: std::sync::Arc<indexer::IndexStore>,
-    pub(crate) voice_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
+    pub(crate) presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
     pub(crate) code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     pub(crate) blobs: noded::blobs::BlobHandle,
     /// the volatile service-signaling catalog shared with the http surface —
@@ -173,7 +173,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // sessions here. created up front because the app-surface thread starts
     // before the mesh exists; validator and resident paths drain it, while a
     // sync-only or overlay-less path drops it so the routes refuse promptly.
-    let (voice_lane, voice_requests) =
+    let (presence_lane, presence_requests) =
         tokio::sync::mpsc::channel::<noded::PresenceSessionRequest>(8);
     // the module-code stage lane: POST /v1/admin/module-code/stage fans an
     // artifact out through the node's code plane. same shape as the realtime
@@ -190,7 +190,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         .with_blob_root(storage.join("blobstore"))?
         .with_forge_repo(storage.join("forge-repo"))
         .with_index_store(index.clone())
-        .with_presence(voice_lane)
+        .with_presence(presence_lane)
         .with_code_stage(code_stage_lane)
         .with_node_signer(signer)
         // the duckfs workspace RPC's managed-checkout root (disk state, separate
@@ -332,7 +332,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         status,
         stream_hub,
         index,
-        voice_requests,
+        presence_requests,
         code_stage_requests,
         blobs,
         services,

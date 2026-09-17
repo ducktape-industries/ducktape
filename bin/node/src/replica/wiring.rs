@@ -54,7 +54,7 @@ pub(super) struct ReplicaChannels {
     /// task the moment a member's doorbell answers the gate with the
     /// AUTHORITATIVE `Admitted` — the park loop reads it directly.
     pub(super) admitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub(super) voice_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
+    pub(super) presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
     /// the mesh window tracker, genesis already tracked — the park loop
     /// advances it as generations land, and promotion carries it on.
     pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
@@ -97,7 +97,7 @@ pub(super) async fn wire(
     // invite token deleted (the workspace dir — same one `park` gates reads
     // from).
     workspace: std::path::PathBuf,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
+    presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> ReplicaChannels {
     if manifest.is_none() && !recovery.journal_is_empty().await {
@@ -523,7 +523,7 @@ pub(super) async fn wire(
         relay_tx,
         relay_rx,
         admitted,
-        voice_requests,
+        presence_requests,
         mesh_window,
         mesh_book,
     }

@@ -107,7 +107,7 @@ pub(crate) async fn run(
     index: std::sync::Arc<indexer::IndexStore>,
     metrics: noded::NodeMetrics,
     status: noded::StatusCell,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
+    presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
     blobs: noded::blobs::BlobHandle,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
@@ -151,7 +151,7 @@ pub(crate) async fn run(
         invite_wireguard,
         invite_fronts,
         workspace.clone(),
-        voice_requests,
+        presence_requests,
         overlay_slot.clone(),
     )
     .await;
