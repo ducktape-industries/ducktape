@@ -318,7 +318,7 @@ impl BoardsView {
                     centered_caption("boards/hint", self.hint()),
                 ));
             }
-            layers.extend(self.empty_prompt(board));
+            layers.extend(self.empty_prompt(board, w, h));
         }
         // Last of the stage's layers, so the menu stands over everything drawn
         // on the board and its backdrop stands over everything but the menu.
@@ -792,10 +792,16 @@ impl BoardsView {
         }
     }
     /// The prompt an empty board shows, centred on the stage.
-    fn empty_prompt(&self, board: &Board) -> Option<Node> {
+    fn empty_prompt(&self, board: &Board, w: f32, h: f32) -> Option<Node> {
         if !board.shapes.is_empty() {
             return None;
         }
+        /// The card's width, and about what it stands to when the two lines of
+        /// prose wrap the way they do at that width. The height is only used to
+        /// centre it, so being a few pixels out moves the card a few pixels and
+        /// nothing else — which is why it is a number here rather than a
+        /// measurement the card would have to be laid out twice to get.
+        const CARD: [f32; 2] = [420., 172.];
         let empty = kit::spaced(
             kit::column(
                 "boards/empty-body",
@@ -840,18 +846,26 @@ impl BoardsView {
             ),
             0.,
         );
-        Some(float(
-            "boards/empty-float",
-            kit::space(Some(Length::Fill), Some(Length::Fill)),
-            kit::sized(
-                kit::card("boards/empty-card", empty),
-                Some(Length::Fixed(420.)),
-                None,
-            ),
-            AlignX::Center,
-            AlignY::Center,
-            24.,
-            None,
+        // A PIN and not an overlay, which every island on this board is. The
+        // host stops a press on an overlay's surface — right for an island,
+        // which is chrome you press, and wrong for this card, which is an
+        // invitation to draw standing in the middle of an empty board. As an
+        // overlay it was a dead zone 420 wide at the one moment a user has
+        // never drawn here before: click in the middle of a new board with the
+        // rectangle tool and nothing happened at all.
+        //
+        // The objection to a pin — a press falls through and the gesture it
+        // starts re-renders the card out from under the click — is exactly what
+        // this card wants. Draw on an empty board and the prompt SHOULD go,
+        // because the board is no longer empty. Its two buttons still answer:
+        // a button carries its own handler, so a press on one is the button's
+        // and a press on the card's body is the board's.
+        Some(pin(
+            "boards/empty-pin",
+            (w - CARD[0]) / 2.,
+            (h - CARD[1]) / 2.,
+            CARD[0],
+            kit::card("boards/empty-card", empty),
         ))
     }
     /// The colour the next shape will be drawn in, on its own, for when there

@@ -4034,6 +4034,45 @@ fn the_shortcuts_card_names_the_keys_a_hand_reaches_for() {
         );
     }
 }
+/// The prompt on an empty board invites you to draw; it must not be standing on
+/// the place you would draw. As an overlay it swallowed every press on its own
+/// 420-wide body — a dead zone in the middle of the canvas, present at exactly
+/// the moment a user is finding out whether the board works at all.
+#[test]
+fn the_empty_boards_prompt_does_not_stand_on_the_canvas() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    let tree = view.view();
+    assert!(
+        node_at(&tree, "boards/empty-card").is_some(),
+        "an empty board showed no prompt at all"
+    );
+    assert!(
+        node_at(&tree, "boards/empty-float").is_none(),
+        "the prompt is still an overlay, which stops every press on its body"
+    );
+
+    // And the middle of the board — where the card stands — draws.
+    let middle = [700., 450.];
+    view.on_tool(Tool::Rectangle);
+    view.cursor = middle;
+    view.on_press(middle[0], middle[1]);
+    view.on_release();
+    assert!(
+        matches!(view.gesture, Gesture::Idle),
+        "a press under the prompt left a gesture hanging"
+    );
+    let drawn = view
+        .drawn_shape(Kind::Rectangle, middle, middle)
+        .expect("a click with a shape tool leaves a shape");
+    assert_eq!(
+        drawn.kind,
+        Kind::Rectangle,
+        "the click under the prompt drew something else"
+    );
+}
 /// The sheet is read at a glance, so it is laid ACROSS and not down. One column
 /// grew taller than the window the moment six rows were added to it, and it
 /// cannot scroll — a shortcut list you have to scroll is one you close and go
