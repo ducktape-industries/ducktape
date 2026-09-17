@@ -670,6 +670,54 @@ impl BoardsView {
             edit
         }
     }
+    /// How far the board should slide this tick, or nothing at all. A gesture
+    /// with a point in hand, held near an edge of the stage, carries the board
+    /// under it — which is how a card goes further than one screen without
+    /// being put down, panned to, and picked up again.
+    ///
+    /// It is asked every tick rather than remembered, so letting go, moving out
+    /// of the margin and dropping the gesture all stop it by the same answer.
+    pub(super) fn drift(&self) -> Option<[f32; 2]> {
+        let carries_a_point = match &self.gesture {
+            Gesture::Move { .. }
+            | Gesture::Resize { .. }
+            | Gesture::Scale { .. }
+            | Gesture::Create { .. }
+            | Gesture::Marquee { .. }
+            | Gesture::Sketch { .. }
+            | Gesture::Erase { .. }
+            | Gesture::Endpoint { .. } => true,
+            // The hand tool is already moving the camera and a drift would move
+            // it twice; a nudge is a held key with no pointer in it; and idle
+            // is the board sitting still, which is most of the time.
+            Gesture::Idle | Gesture::Pan { .. } | Gesture::Nudge { .. } => false,
+        };
+        if !carries_a_point {
+            return None;
+        }
+        let step = [
+            edge_step(self.cursor[0], self.viewport[0]),
+            edge_step(self.cursor[1], self.viewport[1]),
+        ];
+        let clear_of_both_margins = step[0].abs() + step[1].abs() < f32::EPSILON;
+        match clear_of_both_margins {
+            true => None,
+            false => Some(step),
+        }
+    }
+    /// A tick of the drift: move the camera, then re-apply the gesture at the
+    /// same SCREEN point. The shape in hand stays under the cursor and the
+    /// world moves beneath it, which is what makes it read as carrying the card
+    /// off the edge rather than as the card sliding away from you. Re-applying
+    /// through `on_move` is also what keeps the guides, the snapping and the
+    /// eraser's sweep true while the board is moving.
+    pub(super) fn on_drift(&mut self) -> Task<Message> {
+        let Some(step) = self.drift() else {
+            return Task::none();
+        };
+        self.camera = [self.camera[0] + step[0], self.camera[1] + step[1]];
+        self.on_move(self.cursor[0], self.cursor[1])
+    }
     pub(super) fn on_move(&mut self, x: f32, y: f32) -> Task<Message> {
         self.cursor = [x, y];
         let mut point = self.world([x, y]);
@@ -2886,6 +2934,33 @@ pub(super) fn points_rect(a: [f32; 2], b: [f32; 2]) -> [f32; 4] {
         a[0].max(b[0]),
         a[1].max(b[1]),
     ]
+}
+/// How far the camera moves along one axis this tick, from where the pointer
+/// sits along it. Zero anywhere but the two margins at the ends.
+///
+/// The camera moves the OPPOSITE way to the reach: a pointer held at the right
+/// edge is asking for the board further right, and the board comes left to meet
+/// it.
+///
+/// Squared in the depth, not linear. Linear starts moving the moment the
+/// pointer enters the margin, which drags the board every time a card is placed
+/// near the edge on purpose; squared leaves the first third of the margin
+/// almost still and gets going only when the pointer is genuinely pressed
+/// against the edge. Both are a tuning, and this one was picked on a live
+/// board.
+pub(super) fn edge_step(at: f32, span: f32) -> f32 {
+    /// How wide the band at each end of the stage is, in screen pixels.
+    const MARGIN: f32 = 56.;
+    /// The fastest the board travels, in screen pixels per tick. At a tick
+    /// every 16ms that is about 750 a second — a 1280-wide stage crossed in
+    /// under two, which is quick enough to carry a card somewhere and slow
+    /// enough to stop where you meant to.
+    const FASTEST: f32 = 12.;
+    let into_the_near_edge = (MARGIN - at).clamp(0., MARGIN);
+    let into_the_far_edge = (at - (span - MARGIN)).clamp(0., MARGIN);
+    let depth = into_the_near_edge - into_the_far_edge;
+    let ramp = (depth / MARGIN).abs().powi(2);
+    FASTEST * ramp * depth.signum()
 }
 pub(super) fn contains(b: [f32; 4], p: [f32; 2]) -> bool {
     p[0] >= b[0] && p[1] >= b[1] && p[0] <= b[2] && p[1] <= b[3]
