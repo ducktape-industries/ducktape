@@ -63,7 +63,8 @@ enumerates it and the printed path is the only way back to it.
 | `--guest DIR` | a guest image (`vmlinux`, `rootfs.ext4`) installed as the workspace's own. |
 | `--mirror REPO` | a git checkout to import into the network's forge. |
 | `--port-offset N` | add N to every port. |
-| `--wallet-name`, `--wallet-password` | the workspace's active wallet and the account founded for it. |
+| `--wallet-name` | the workspace's active wallet and the account founded for it. |
+| `--wallet-password` | its password. No default — left out, one is generated and written `0600` to `<workspace>/wallet-<name>.password`. |
 | `--skip-app` | do not rebuild the desktop app. |
 | `--no-smoke` | do not seed an agent and mention it at the end. |
 | `--yes` | proceed past stopping and archiving an existing root. |
@@ -124,10 +125,15 @@ lost grant is visible.
 **A fresh workspace has no wallet, and a fresh chain has no account.** Every
 keyless verb signs with the active wallet and the service daemons refuse to
 boot without one. `wallet new` prints a mnemonic, so the script writes it to a
-`0600` file in the workspace and never to its own output. The key is minted
-before anything runs, because the install below pins its public key; the
-account is the on-chain identity that key belongs to, and `account create` is
-a submitted transaction, so that half runs against the serving founder.
+`0600` file in the workspace and never to its own output. Its password gets
+the same treatment: this key is what the network's node releases are signed
+with, so there is no default password to bake into the script — without
+`--wallet-password` one is generated and written `0600` beside the mnemonic,
+and the report names both paths. The release lane reads it straight back:
+`RELEASE_WALLET_PASSWORD=$(cat <workspace>/wallet-<name>.password)`. The key
+is minted before anything runs, because the install below pins its public key;
+the account is the on-chain identity that key belongs to, and `account create`
+is a submitted transaction, so that half runs against the serving founder.
 Without it a daemon does not stop at the grant: it enables, announces, and
 then exits `FATAL: the active wallet key is on no account`.
 
