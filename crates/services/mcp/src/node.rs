@@ -1,9 +1,10 @@
 //! the node client: the two read surfaces the tool plane needs, over the http
 //! routes `noded` already serves.
 //!
-//! - `POST /v1/query`  — every module read (chat, tasks, pages, forge, agent).
-//! - `GET  /v1/files/*` — the duckfs read verbs, which are their own routes
-//!   rather than module queries.
+//! - `POST /v1/query` — every module read (chat, tasks, pages, forge, agent,
+//!   and duckfs, which is the `files` module and answers its own query enum
+//!   like any other).
+//! - `POST /v1/index/{module}/view` — the index-tier read model.
 //!
 //! Writes use the separately injected run-scoped action endpoint. This client
 //! intentionally has no general submit method.
@@ -87,13 +88,6 @@ impl Node {
     pub fn view(&self, module: &str, query: Value) -> Result<Value> {
         let url = format!("{}/v1/index/{module}/view", self.base()?);
         self.send(self.client.post(url).json(&query))
-    }
-
-    /// one of the duckfs read routes (`ls`, `read`, `grep`, ...), with its
-    /// params as the query string.
-    pub fn files(&self, verb: &str, params: &[(&str, String)]) -> Result<Value> {
-        let url = format!("{}/v1/files/{verb}", self.base()?);
-        self.send(self.client.get(url).query(params))
     }
 
     /// the one place a response becomes a `Result`. a 400 carries the module's

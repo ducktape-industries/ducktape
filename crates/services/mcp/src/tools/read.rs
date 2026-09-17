@@ -28,6 +28,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 
+use duckfs_core::{FilesQuery, MAX_PAGE, MAX_READ_BYTES};
 use forge::ForgeQuery;
 use pages::PageQuery;
 use runs::{ModelQuery, RunsQuery};
@@ -41,6 +42,7 @@ const TARGET_CHAT: &str = "chat";
 const TARGET_TASKS: &str = "tasks";
 const TARGET_PAGES: &str = "pages";
 const TARGET_FORGE: &str = "forge";
+const TARGET_FILES: &str = "files";
 /// the generic read: any module's own query, verbatim.
 pub const OP_QUERY: &str = "query";
 
@@ -242,23 +244,23 @@ pub(super) fn read_operations() -> Vec<ReadOperation> {
         },
         ReadOperation {
             name: "files.ls",
-            description: "List a directory in the Ducktape filesystem (duckfs). This is the shared, replicated filesystem — NOT your local workspace, which you read with ordinary file tools.",
+            description: "List one bounded page of a directory in the Ducktape filesystem (duckfs), in ascending name order. This is the shared, replicated filesystem — NOT your local workspace, which you read with ordinary file tools. When the reply carries a next, pass it as after for the following page; when it does not, you have seen the whole directory.",
             target: Some(closed(json!({"path": {"type": "string"}}), &["path"])),
-            input: no_input(),
+            input: files_ls_schema(),
             handler: files_ls,
         },
         ReadOperation {
             name: "files.read",
-            description: "Read a file from the Ducktape filesystem (duckfs) as text.",
+            description: "Read one bounded byte range of a file in the Ducktape filesystem (duckfs) as text. Continue until eof is true by passing the reply's next_offset as the next offset. A range that would end inside a multibyte character stops before it, so next_offset is always a character boundary.",
             target: Some(closed(json!({"path": {"type": "string"}}), &["path"])),
-            input: no_input(),
+            input: files_read_schema(),
             handler: files_read,
         },
         ReadOperation {
             name: "files.grep",
-            description: "Search the Ducktape filesystem (duckfs) for matching lines under a path prefix.",
+            description: "Search the Ducktape filesystem (duckfs) for matching lines under a path prefix. When the reply carries a next, pass it as cursor for the following page.",
             target: Some(closed(json!({"prefix": {"type": "string"}}), &["prefix"])),
-            input: closed(json!({"pattern": {"type": "string"}}), &["pattern"]),
+            input: files_grep_schema(),
             handler: files_grep,
         },
         ReadOperation {
@@ -547,41 +549,143 @@ fn item_number(target: &Value) -> Result<u64> {
     })
 }
 
-fn files_ls(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
+/// duckfs answers with its own externally tagged reply (`{"ls": {…}}`); an
+/// agent wants the page, not the tag.
+fn files_reply(run: &Run, query: &FilesQuery, tag: &str) -> Result<Value> {
+    let reply = run.node.query(TARGET_FILES, encode(query)?)?;
+    reply
+        .get(tag)
+        .cloned()
+        .ok_or_else(|| NodeError::Transport(format!("duckfs answered no {tag} to a {tag} query")))
+}
+
+/// the snapshot a page was read at, stamped onto the page. every later call of
+/// a walk passes it back as `snapshot`, so the pages compose into one listing
+/// of one tree instead of drifting onto whatever commit landed between them.
+fn pinned(page: Value, snapshot: Option<String>) -> Result<Value> {
+    let Value::Object(mut fields) = page else {
+        return Err(NodeError::Transport(
+            "duckfs answered a page that is not an object".into(),
+        ));
+    };
+    fields.insert("snapshot".into(), json!(snapshot));
+    Ok(Value::Object(fields))
+}
+
+/// the snapshot to read at: the caller's if it named one, this filesystem's
+/// committed head otherwise. resolving the head HERE is what lets the first
+/// page of a walk hand back a pin the rest of the walk can hold — a reply that
+/// echoed nothing would leave every continuation reading the live tree.
+fn files_snapshot(run: &Run, input: &Value) -> Result<Option<String>> {
+    if let Some(named) = opt_string(input, "snapshot")? {
+        return Ok(Some(named));
+    }
+    let refs = files_reply(run, &FilesQuery::Refs {}, "refs")?;
+    // a filesystem with nothing committed yet has no head to pin to.
+    Ok(refs.get("head").and_then(Value::as_str).map(str::to_owned))
+}
+
+fn files_ls(run: &Run, target: &Value, input: &Value) -> Result<Value> {
     let path = arg_str(target, "path")?;
-    run.node.files("ls", &[("path", path)])
+    let after = opt_string(input, "after")?;
+    let limit = files_limit(input)?;
+    let snapshot = files_snapshot(run, input)?;
+    let query = FilesQuery::Ls {
+        path,
+        snapshot: snapshot.clone(),
+        after,
+        limit,
+    };
+    pinned(files_reply(run, &query, "ls")?, snapshot)
 }
 
 /// duckfs reads come back base64 in `b64`. an agent wants TEXT — hand it the
 /// decoded body and say plainly when the bytes are not text, rather than
 /// handing a model a base64 blob to decode in its head.
-fn files_read(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
+fn files_read(run: &Run, target: &Value, input: &Value) -> Result<Value> {
     let path = arg_str(target, "path")?;
-    let reply = run.node.files("read", &[("path", path.clone())])?;
-    let Some(b64) = reply.get("b64").and_then(Value::as_str) else {
-        return Ok(reply);
+    let offset = files_offset(input)?;
+    let len = files_len(input)?;
+    let snapshot = files_snapshot(run, input)?;
+    let query = FilesQuery::Read {
+        path: path.clone(),
+        snapshot: snapshot.clone(),
+        offset,
+        len,
     };
+    let page = files_reply(run, &query, "read")?;
+    let b64 = page
+        .get("b64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| NodeError::Transport("duckfs answered a read with no body".into()))?;
     let bytes = STANDARD
         .decode(b64)
         .map_err(|e| NodeError::Transport(format!("duckfs returned undecodable base64: {e}")))?;
-    match String::from_utf8(bytes) {
-        Ok(text) => Ok(json!({
-            "path": path,
-            "text": text,
-            "eof": reply.get("eof").cloned().unwrap_or(Value::Null),
-        })),
-        Err(e) => Err(NodeError::Rejected(format!(
-            "{path:?} is not utf-8 text ({} bytes); this operation reads text files only",
-            e.into_bytes().len()
-        ))),
+    let served = bytes.len() as u64;
+    let ends_the_file = page.get("eof").and_then(Value::as_bool).unwrap_or(false);
+    let text = utf8_prefix(&path, bytes, offset, ends_the_file)?;
+    let consumed = text.len() as u64;
+    Ok(json!({
+        "path": path,
+        "text": text,
+        "offset": offset,
+        // where the next range starts: a character boundary, and the size of
+        // the file exactly when eof is true.
+        "next_offset": offset + consumed,
+        // a range whose last character was left for the next one has not
+        // reached the end, whatever duckfs said about the bytes it served.
+        "eof": ends_the_file && consumed == served,
+        "snapshot": snapshot,
+    }))
+}
+
+/// the text of one read range. a range boundary can fall INSIDE a multibyte
+/// character: `from_utf8` then fails with no `error_len`, which means "the
+/// input ended mid-sequence", not "these bytes are not text". The valid prefix
+/// is returned and the character is left for the next range, which begins on
+/// its first byte. An invalid byte (`error_len` is `Some`) is a file that is
+/// not text — and so is a sequence cut short at the END of the file, where
+/// there is no next range to complete it.
+fn utf8_prefix(path: &str, bytes: Vec<u8>, offset: u64, ends_the_file: bool) -> Result<String> {
+    let cut = match String::from_utf8(bytes) {
+        Ok(text) => return Ok(text),
+        Err(cut) => cut,
+    };
+    let boundary = cut.utf8_error();
+    let ends_mid_character = boundary.error_len().is_none() && !ends_the_file;
+    if !ends_mid_character {
+        return Err(NodeError::Rejected(format!(
+            "{path:?} is not utf-8 text at byte {}; this operation reads text files only",
+            offset + boundary.valid_up_to() as u64
+        )));
     }
+    let valid = boundary.valid_up_to();
+    if valid == 0 {
+        return Err(NodeError::Rejected(format!(
+            "the character at byte {offset} of {path:?} is longer than this range, so the read \
+             would make no progress; raise \"len\""
+        )));
+    }
+    let mut bytes = cut.into_bytes();
+    bytes.truncate(valid);
+    String::from_utf8(bytes)
+        .map_err(|_| NodeError::Transport("a utf-8 prefix did not decode".into()))
 }
 
 fn files_grep(run: &Run, target: &Value, input: &Value) -> Result<Value> {
     let prefix = arg_str(target, "prefix")?;
     let pattern = arg_str(input, "pattern")?;
-    run.node
-        .files("grep", &[("pattern", pattern), ("prefix", prefix)])
+    let cursor = opt_string(input, "cursor")?;
+    let limit = files_limit(input)?;
+    let snapshot = files_snapshot(run, input)?;
+    let query = FilesQuery::Grep {
+        pattern,
+        prefix,
+        snapshot: snapshot.clone(),
+        cursor,
+        limit,
+    };
+    pinned(files_reply(run, &query, "grep")?, snapshot)
 }
 
 fn agent_calls(run: &Run, _target: &Value, _input: &Value) -> Result<Value> {
@@ -660,6 +764,127 @@ fn tasks_list_schema() -> Value {
     value
 }
 
+/// every duckfs read verb takes the same pin, and a model that cannot see it
+/// cannot hold a walk still.
+const SNAPSHOT_DOC: &str = "The snapshot to read at, as the reply's snapshot spells it. Omit on \
+                            the first call and pass it back on every later one, so the whole walk \
+                            reads one version of the filesystem.";
+
+/// the shared bounds of a duckfs page: `1..=MAX_PAGE`, defaulting to the whole
+/// page the module will serve.
+fn files_page_bounds(mut value: Value) -> Value {
+    value["properties"]["limit"]["minimum"] = json!(1);
+    value["properties"]["limit"]["maximum"] = json!(MAX_PAGE);
+    value["properties"]["limit"]["default"] = json!(MAX_PAGE);
+    value["additionalProperties"] = Value::Bool(false);
+    value
+}
+
+fn files_ls_schema() -> Value {
+    files_page_bounds(schema(&[
+        (
+            "after",
+            "string",
+            false,
+            "Exclusive cursor: the next the previous page returned.",
+        ),
+        (
+            "limit",
+            "integer",
+            false,
+            "Entries to return (default and maximum 256).",
+        ),
+        ("snapshot", "string", false, SNAPSHOT_DOC),
+    ]))
+}
+
+fn files_grep_schema() -> Value {
+    files_page_bounds(schema(&[
+        ("pattern", "string", true, "The text to search for."),
+        (
+            "cursor",
+            "string",
+            false,
+            "Exclusive cursor: the next the previous page returned.",
+        ),
+        (
+            "limit",
+            "integer",
+            false,
+            "Hits to return (default and maximum 256).",
+        ),
+        ("snapshot", "string", false, SNAPSHOT_DOC),
+    ]))
+}
+
+fn files_read_schema() -> Value {
+    let mut value = schema(&[
+        (
+            "offset",
+            "integer",
+            false,
+            "Byte offset to read from: the next_offset the previous range returned (default 0).",
+        ),
+        (
+            "len",
+            "integer",
+            false,
+            "Bytes to read (default and maximum 1048576).",
+        ),
+        ("snapshot", "string", false, SNAPSHOT_DOC),
+    ]);
+    value["properties"]["offset"]["minimum"] = json!(0);
+    value["properties"]["offset"]["default"] = json!(0);
+    value["properties"]["len"]["minimum"] = json!(1);
+    value["properties"]["len"]["maximum"] = json!(MAX_READ_BYTES);
+    value["properties"]["len"]["default"] = json!(MAX_READ_BYTES);
+    value["additionalProperties"] = Value::Bool(false);
+    value
+}
+
+fn files_limit(args: &Value) -> Result<u64> {
+    bounded_u64(args, "limit", MAX_PAGE, 1, MAX_PAGE)
+}
+
+fn files_len(args: &Value) -> Result<u64> {
+    bounded_u64(args, "len", MAX_READ_BYTES, 1, MAX_READ_BYTES)
+}
+
+fn files_offset(args: &Value) -> Result<u64> {
+    bounded_u64(args, "offset", 0, 0, u64::MAX)
+}
+
+/// an optional integer argument with a default and an inclusive range. out of
+/// range is a refusal naming the bound, never a silent clamp: a model that
+/// asked for 10_000 entries must learn the page holds 256, or it will believe
+/// its one call saw the whole directory.
+fn bounded_u64(args: &Value, name: &str, default: u64, low: u64, high: u64) -> Result<u64> {
+    let Some(value) = args.get(name) else {
+        return Ok(default);
+    };
+    let number = value.as_u64().ok_or_else(|| {
+        NodeError::Rejected(format!("this operation needs an integer {name:?} argument"))
+    })?;
+    if !(low..=high).contains(&number) {
+        return Err(NodeError::Rejected(format!(
+            "this operation needs {name:?} between {low} and {high}"
+        )));
+    }
+    Ok(number)
+}
+
+/// an optional string argument, refused rather than ignored when it is not a
+/// string: a cursor silently dropped repeats the first page forever.
+fn opt_string(args: &Value, name: &str) -> Result<Option<String>> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(NodeError::Rejected(format!(
+            "this operation needs a string {name:?} argument"
+        ))),
+    }
+}
+
 fn page_cursor_schema() -> Value {
     let mut value = schema(&[
         (
@@ -683,13 +908,7 @@ fn page_cursor_schema() -> Value {
 }
 
 fn page_cursor(args: &Value) -> Result<Option<String>> {
-    match args.get("after") {
-        None => Ok(None),
-        Some(Value::String(cursor)) => Ok(Some(cursor.clone())),
-        Some(_) => Err(NodeError::Rejected(
-            "this operation needs a string \"after\" argument".into(),
-        )),
-    }
+    opt_string(args, "after")
 }
 
 fn page_limit(args: &Value) -> Result<u16> {
@@ -813,6 +1032,131 @@ mod tests {
             .unwrap(),
             json!({"get_item": {"repo": "app", "number": 7}})
         );
+        assert_eq!(
+            encode(&FilesQuery::Ls {
+                path: "/shared".into(),
+                snapshot: Some("ab".into()),
+                after: Some("skills".into()),
+                limit: 8,
+            })
+            .unwrap(),
+            json!({"ls": {"path": "/shared", "snapshot": "ab", "after": "skills", "limit": 8}})
+        );
+        assert_eq!(
+            encode(&FilesQuery::Read {
+                path: "/shared/x".into(),
+                snapshot: None,
+                offset: 1024,
+                len: 64,
+            })
+            .unwrap(),
+            json!({"read": {"path": "/shared/x", "snapshot": null, "offset": 1024, "len": 64}})
+        );
+        assert_eq!(encode(&FilesQuery::Refs {}).unwrap(), json!({"refs": {}}));
+    }
+
+    #[test]
+    fn the_duckfs_operations_expose_every_continuation_input() {
+        let ls = find_read("files.ls").unwrap();
+        assert_eq!(ls.input["properties"]["after"]["type"], "string");
+        assert_eq!(ls.input["properties"]["limit"]["maximum"], MAX_PAGE);
+        assert_eq!(ls.input["properties"]["snapshot"]["type"], "string");
+        assert_eq!(ls.input["additionalProperties"], false);
+
+        let read = find_read("files.read").unwrap();
+        assert_eq!(read.input["properties"]["offset"]["type"], "integer");
+        assert_eq!(read.input["properties"]["len"]["maximum"], MAX_READ_BYTES);
+        assert_eq!(read.input["properties"]["snapshot"]["type"], "string");
+        assert_eq!(read.input["additionalProperties"], false);
+
+        let grep = find_read("files.grep").unwrap();
+        assert_eq!(grep.input["required"], json!(["pattern"]));
+        assert_eq!(grep.input["properties"]["cursor"]["type"], "string");
+        assert_eq!(grep.input["properties"]["snapshot"]["type"], "string");
+        assert_eq!(grep.input["additionalProperties"], false);
+    }
+
+    #[test]
+    fn the_duckfs_handlers_bound_their_page_arguments_before_reaching_the_node() {
+        let run = Run::from_env();
+        let target = json!({"path": "/shared", "prefix": "/shared"});
+        let refused = |handler: fn(&Run, &Value, &Value) -> Result<Value>, input: &Value| {
+            matches!(handler(&run, &target, input), Err(NodeError::Rejected(_)))
+        };
+        for input in [
+            json!({"limit": 0}),
+            json!({"limit": MAX_PAGE + 1}),
+            json!({"limit": "8"}),
+            json!({"after": 8}),
+            json!({"snapshot": 8}),
+        ] {
+            assert!(refused(files_ls, &input), "ls accepted {input}");
+        }
+        for input in [
+            json!({"len": 0}),
+            json!({"len": MAX_READ_BYTES + 1}),
+            json!({"offset": -1}),
+            json!({"offset": "8"}),
+        ] {
+            assert!(refused(files_read, &input), "read accepted {input}");
+        }
+        // grep's pattern is required, and its cursor is a string like any other.
+        assert!(refused(files_grep, &json!({})), "grep accepted no pattern");
+        assert!(
+            refused(files_grep, &json!({"pattern": "x", "cursor": 8})),
+            "grep accepted a numeric cursor"
+        );
+        // a well-formed page is the node's to answer — and this process is
+        // bound to no node, which is how far it gets.
+        assert!(matches!(
+            files_ls(&run, &target, &json!({"limit": 8, "after": "b"})),
+            Err(NodeError::Unbound)
+        ));
+    }
+
+    #[test]
+    fn a_range_that_ends_mid_character_keeps_the_valid_prefix() {
+        // "añ", cut between the two bytes of the ñ.
+        let cut = vec![b'a', 0xC3];
+        assert_eq!(utf8_prefix("/x", cut.clone(), 0, false).unwrap(), "a");
+        // at the end of the file the same bytes are a character cut short, and
+        // no later range can complete it: that file is not text.
+        assert!(matches!(
+            utf8_prefix("/x", cut, 0, true),
+            Err(NodeError::Rejected(_))
+        ));
+        // an invalid byte is not text at any offset, and the refusal says where
+        // in the FILE it sits, not where in the range.
+        let bad = utf8_prefix("/x", vec![b'a', 0xFF, b'b'], 1024, false).unwrap_err();
+        assert!(
+            matches!(&bad, NodeError::Rejected(m) if m.contains("byte 1025")),
+            "got {bad:?}"
+        );
+        // a range too small to hold the character it starts on would advance
+        // next_offset by nothing; it says so instead of looping the caller.
+        let stuck = utf8_prefix("/x", vec![0xC3], 8, false).unwrap_err();
+        assert!(
+            matches!(&stuck, NodeError::Rejected(m) if m.contains("len")),
+            "got {stuck:?}"
+        );
+        // reading at EOF is an empty range, not a failure.
+        assert_eq!(utf8_prefix("/x", Vec::new(), 8, true).unwrap(), "");
+    }
+
+    #[test]
+    fn a_page_carries_the_snapshot_it_was_read_at() {
+        let page = pinned(json!({"entries": [], "next": null}), Some("ab".into())).unwrap();
+        assert_eq!(page["snapshot"], json!("ab"));
+        // an uncommitted filesystem has no head, and the reply says so rather
+        // than omitting the field a caller is told to pass back.
+        assert_eq!(
+            pinned(json!({"entries": []}), None).unwrap()["snapshot"],
+            Value::Null
+        );
+        assert!(matches!(
+            pinned(json!([]), None),
+            Err(NodeError::Transport(_))
+        ));
     }
 
     #[test]
