@@ -19,6 +19,25 @@ fn node_ending(frame: &Frame, suffix: &str) -> Node {
     find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
 }
 
+/// Every button in the frame, by the name a press would find it under —
+/// its accessible label, else its key. A row that offers a control is in
+/// here; a row drawn as text is not.
+fn buttons(frame: &Frame) -> Vec<String> {
+    fn walk(node: &Node, found: &mut Vec<String>) {
+        if let Node::Button { key, label, .. } = node {
+            found.push(label.clone().unwrap_or_else(|| key.clone()));
+        }
+        for child in node.children() {
+            walk(child, found);
+        }
+    }
+    let mut found = Vec::new();
+    if let Some(root) = frame.root.as_ref() {
+        walk(root, &mut found);
+    }
+    found
+}
+
 fn kinds(requests: &[Request]) -> Vec<&str> {
     requests
         .iter()
@@ -201,6 +220,27 @@ fn pr_diff() -> Vec<u8> {
     .into_bytes()
 }
 
+/// A patch that changes one text file and one BINARY, as git writes one: a
+/// binary delta carries no `---`/`+++` pair and no hunks, only the line
+/// saying the two sides differ. Every pull request the closed loop opens
+/// looks like this — a rebuilt `component.wasm` beside its source.
+fn pr_diff_with_binary() -> Vec<u8> {
+    serde_json::json!({ "pr_diff": {
+        "source_oid": "aaaabbbbccccdddd", "target_oid": "1111222233334444",
+        "patch": concat!(
+            "diff --git a/main.rs b/main.rs\n",
+            "index 94c9d14..c2e5965 100644\n",
+            "--- a/main.rs\n+++ b/main.rs\n@@ -1 +1 @@\n-old\n+new\n",
+            "diff --git a/logo.png b/logo.png\n",
+            "index 22a565b..f34c953 100644\n",
+            "Binary files a/logo.png and b/logo.png differ\n",
+        ),
+        "truncated": false, "files_changed": 2, "additions": 1, "deletions": 1
+    }})
+    .to_string()
+    .into_bytes()
+}
+
 /// Boots, hands the view a connected session, and answers the repo-list
 /// read: the view with the namespace on screen, and the live id.
 fn namespace(link: &str) -> (Drive, u64) {
@@ -225,6 +265,19 @@ fn open_item(link: &str) -> Drive {
     drive.answer("get_item", &detail());
     drive.answer("pr_diff", &pr_diff());
     drive.answer("all", &accounts());
+    drive
+}
+
+/// The files screen of a pull request that carries a binary.
+fn open_files_with_binary(link: &str) -> Drive {
+    let (mut drive, _) = namespace(link);
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    drive.answer("get_item", &detail());
+    drive.answer("pr_diff", &pr_diff_with_binary());
+    drive.answer("all", &accounts());
+    drive.tick(press(&drive.frame, "forge/item-tab/files"));
     drive
 }
 
@@ -491,8 +544,85 @@ fn a_patch_opens_each_file_with_one_named_row() {
     );
 }
 
+/// A refusal reaches the view wrapped in the transport's own words. What the
+/// screen shows is the MODULE's sentence: no status line, no JSON, and not
+/// the object ids the module names for an operator — a reader cannot act on
+/// an oid, and the envelope is long enough to push the real ending off the
+/// end of the notice.
+#[test]
+fn a_refusal_is_shown_as_the_module_s_own_sentence() {
+    use forge_view::host::refusal_reason;
+    assert_eq!(
+        refusal_reason(concat!(
+            r#"RPC returned 400 Bad Request: {"error":"Module(forge: pull request #5 diff is "#,
+            r#"too large to serve (target 8b4ba7efd7caa4e4f3d8106ff11579d26df4c0ab, source "#,
+            r#"564ea02b5b094f225ebab8fcf09a1a782d24fffb): diff is too large: 1 changed files "#,
+            r#"/ 8388609 materialized blob bytes)"}"#,
+        )),
+        "forge: pull request #5 diff is too large to serve: diff is too large: \
+         1 changed files / 8388609 materialized blob bytes",
+    );
+    // a plain refusal passes through untouched
+    assert_eq!(refusal_reason("the pack is gone"), "the pack is gone");
+}
+
+/// A CHANGED BINARY IS A ROW, NOT A CONTROL. The patch says only that the
+/// two sides differ, so the row names the file, says it is not shown, and
+/// offers nothing to press: no fold (there are no hunks to put away) and no
+/// line to comment on. Git's own `diff --git` and `index` bookkeeping never
+/// reaches the screen either.
+#[test]
+fn a_changed_binary_is_named_and_offers_nothing_to_press() {
+    let drive = open_files_with_binary("duck://forge/core/7");
+    let shown = texts(&drive.frame);
+    assert!(
+        shown
+            .iter()
+            .any(|text| text == "logo.png (binary file, not shown)"),
+        "{shown:?}"
+    );
+    assert!(
+        !shown
+            .iter()
+            .any(|text| text.starts_with("diff --git") || text.starts_with("index ")),
+        "git's bookkeeping is not a row: {shown:?}"
+    );
+    let pressable = buttons(&drive.frame);
+    assert!(
+        pressable.iter().any(|name| name == "main.rs"),
+        "a text file's header still folds: {pressable:?}"
+    );
+    assert!(
+        !pressable.iter().any(|name| name.contains("logo.png")),
+        "nothing about the binary is pressable: {pressable:?}"
+    );
+}
+
+/// Folding the text file beside a binary puts ITS hunks away and leaves the
+/// binary's row where it was: each header opens its own block, so a binary
+/// cannot end up hidden inside the file above it.
+#[test]
+fn folding_a_text_file_leaves_the_binary_row_alone() {
+    let mut drive = open_files_with_binary("duck://forge/core/7");
+    assert!(has_text(&drive.frame, "@@ -1 +1 @@"));
+    drive.tick(press(&drive.frame, "main.rs"));
+    assert!(
+        !has_text(&drive.frame, "@@ -1 +1 @@"),
+        "the hunks are away: {:?}",
+        texts(&drive.frame)
+    );
+    assert!(
+        has_text(&drive.frame, "logo.png (binary file, not shown)"),
+        "the binary is still listed: {:?}",
+        texts(&drive.frame)
+    );
+}
+
 /// A refused patch read leaves the merge and review doors shut, and the
-/// Changes section says why instead of vanishing.
+/// Changes section says why IN THE MODULE'S OWN WORDS — a diff over a size
+/// ceiling never becomes readable, so a reader who is told to retry is being
+/// sent back for nothing. The tally is not drawn at all: the zeroes a
+/// missing reply decodes to would claim the pull request changes nothing.
 #[test]
 fn a_refused_patch_read_is_said_under_changes() {
     let (mut drive, _) = namespace("duck://forge/core/7");
@@ -501,16 +631,25 @@ fn a_refused_patch_read_is_said_under_changes() {
     drive.answer("all", &accounts());
     drive.answer("get_item", &detail());
     let diff = drive.take("pr_diff");
-    drive.tick(vec![refuse(diff, "the pack is gone")]);
+    drive.tick(vec![refuse(
+        diff,
+        "forge: pull request #7 diff is too large to serve",
+    )]);
     drive.answer("all", &accounts());
     drive.tick(press(&drive.frame, "forge/item-tab/files"));
+    let shown = texts(&drive.frame);
     assert!(
-        has_text(
-            &drive.frame,
-            "The changes could not be loaded. Open the pull request again to retry."
-        ),
-        "{:?}",
-        texts(&drive.frame)
+        shown.iter().any(|text| text
+            == "These changes cannot be shown: forge: pull request #7 diff is too large to serve"),
+        "{shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|text| text.starts_with("0 files")),
+        "a refused patch has no tally to draw: {shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|text| text.contains("retry")),
+        "nothing promises a retry that cannot succeed: {shown:?}"
     );
 }
 
