@@ -136,9 +136,18 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
   guests compile a crate in. A lock names only what a guest COMPILES, so it
   can never name the BUILDER: a change to `bin/guest-builder`, to the
   `[profile.release]` it synthesizes into the scratch workspace, to the
-  vendored registry seed or to the toolchain pin moves every guest at once and
-  that grep finds nothing at all. Scope by the grep only after ruling that
-  case out; in it, the scope is all of them. The
+  vendored registry seed, to the module WIT or to the toolchain pin moves every
+  guest at once and that grep finds nothing at all. Scope by the grep only after
+  ruling that case out; in it, the scope is all of them.
+  `make wasm-rebuild-check` is not the whole set either: it covers the guests
+  guest-builder builds and NOT the five standalone fixture guests under
+  `crates/guests/` (hello, hello-replacement, noop, sibling, object), which are
+  their own workspaces and which `make wasm-modules` builds in its explicit
+  tail. Nothing checks those for drift, so a WIT or toolchain move leaves
+  `object`/`sibling` stale in `crates/kernel/wasm-host/tests/fixtures/` while
+  the check reports clean and `wasm-host --test dispatch` reds. For anything
+  below a module's own source, BUILD with `make wasm-modules` and VERIFY with
+  `make wasm-rebuild-check`; the check alone is green on a stale fixture. The
   committed guest is what every composed genesis runs; a host that speaks a
   field the guest never learned fails closed on every network founded from
   that `dev`, and the failure surfaces as a stranger's red hours later.
