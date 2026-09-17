@@ -350,7 +350,7 @@ pub(super) async fn park(
         mut relay_tx,
         relay_rx,
         admitted,
-        voice_requests,
+        presence_requests,
         mut mesh_window,
         mesh_book,
     } = channels;
@@ -374,7 +374,7 @@ pub(super) async fn park(
             .try_into()
             .expect("ed25519 keys are 32 bytes");
         crate::presence::spawn_hub(
-            voice_requests,
+            presence_requests,
             crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
             std::sync::Arc::clone(&tracked),
             me,
@@ -398,7 +398,7 @@ pub(super) async fn park(
             reason = "overlay_unavailable",
             "page presence disabled"
         );
-        drop(voice_requests);
+        drop(presence_requests);
         None
     };
     // the announce pump re-reads the grant from this path per tick; the

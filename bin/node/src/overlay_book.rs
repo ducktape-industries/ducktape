@@ -135,11 +135,11 @@ impl OverlayPeers {
 /// WHICH lane a plane serves, by the pair the registry keys on: the module
 /// that declares the lane and the name it declares it under.
 ///
-/// The key is compile-time because a plane knows what it IS — the voice plane
-/// serves chat's voice lane whatever id that lane holds. Everything the id
-/// decides (the two overlay ports, the pacing, the accept backlog) comes from
-/// the lane table at bind, so a network can renumber a lane without a binary
-/// that knows about it.
+/// The key is compile-time because a plane knows what it IS — the presence
+/// plane serves chat's presence lane whatever id that lane holds. Everything
+/// the id decides (the two overlay ports, the pacing, the accept backlog) comes
+/// from the lane table at bind, so a network can renumber a lane without a
+/// binary that knows about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaneKey {
     pub module_id: &'static str,

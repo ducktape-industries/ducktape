@@ -40,7 +40,7 @@ pub(crate) async fn run(
     blobs: noded::blobs::BlobHandle,
     index: &indexer::IndexStore,
     genesis: &crate::config::GenesisModules,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
+    presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
 ) {
     metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Syncing);
     tracing::info!(
@@ -101,7 +101,7 @@ pub(crate) async fn run(
     // the mesh; a sync-only resident serves no huddle media, so drop
     // the session lane to make /v1/presence/ws refuse instead of hang
     // (this branch never reaches main.rs's validator path).
-    drop(voice_requests);
+    drop(presence_requests);
     network.start();
 
     if sync_sources.is_empty() {

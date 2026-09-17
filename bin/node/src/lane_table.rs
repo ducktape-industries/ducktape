@@ -4,7 +4,7 @@
 //! decides two overlay ports, so a plane cannot bind until the node can read
 //! the table. That read is LATE: a validator has a host before its planes
 //! spawn, but a resident awaiting redemption has no committed state at all
-//! while its voice and gateway planes are already coming up. So the table is
+//! while its presence and gateway planes are already coming up. So the table is
 //! a watch, not a boot constant — the node fills it from the registry
 //! whenever the committed table changes, and every plane waits for its own
 //! lane exactly as it already waits for its overlay `/128`.

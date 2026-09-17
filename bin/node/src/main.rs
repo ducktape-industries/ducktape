@@ -555,7 +555,7 @@ fn run_node(
         status,
         stream_hub,
         index,
-        voice_requests,
+        presence_requests,
         code_stage_requests,
         blobs,
         services,
@@ -787,7 +787,7 @@ fn run_node(
                 blobs,
                 &index,
                 &genesis,
-                voice_requests,
+                presence_requests,
             )
             .await;
             return;
@@ -882,7 +882,7 @@ fn run_node(
                 index.clone(),
                 metrics.clone(),
                 status.clone(),
-                voice_requests,
+                presence_requests,
                 blobs.clone(),
                 overlay_slot.clone(),
                 bulk_pacer.clone(),
@@ -972,7 +972,7 @@ fn run_node(
             node_api_ports,
             stream_hub,
             index,
-            voice_requests,
+            presence_requests,
             code_stage_requests,
             blobs,
             overlay_slot,

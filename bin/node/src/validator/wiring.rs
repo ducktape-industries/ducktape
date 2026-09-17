@@ -603,7 +603,7 @@ pub(super) async fn wire(
     wireguard_advertised: Option<Ingress>,
     invite_listen: Option<std::net::SocketAddr>,
     coord_cap: Option<nat_traversal::CoordCap>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
+    presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
     planes: data_plane::PlaneMonitor,
     netstack_backend: Result<reachability::NetstackBackend, String>,
@@ -713,7 +713,7 @@ pub(super) async fn wire(
                 .try_into()
                 .expect("ed25519 keys are 32 bytes");
             presence::spawn_hub(
-                voice_requests,
+                presence_requests,
                 crate::overlay_book::socket_factory(overlay_capable, &overlay_slot),
                 std::sync::Arc::clone(&peers),
                 me,
@@ -730,7 +730,7 @@ pub(super) async fn wire(
                 reason = "overlay_unavailable",
                 "page presence disabled; set wireguard_listen to enable the overlay"
             );
-            drop(voice_requests);
+            drop(presence_requests);
             None
         }
     };
