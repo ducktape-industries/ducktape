@@ -285,7 +285,7 @@ fn fails_closed_on_missing_or_tampered_bytes() {
     // refuses rather than forking).
     let missing = MapSource::with(&[HELLO_V1]);
     let err = realize(&mut host, H, &missing).expect_err("absent bytes fail closed");
-    assert!(matches!(err, Error::Module(m) if m.contains("absent")));
+    assert!(matches!(err, Error::Module { ref reason, .. } if reason == "code_bytes_absent"));
 
     // tampered bytes: active bytes filed under the replacement hash — sha mismatch.
     let tampered = MapSource(BTreeMap::from([(
@@ -293,7 +293,7 @@ fn fails_closed_on_missing_or_tampered_bytes() {
         HELLO_V1.to_vec(),
     )]));
     let err = realize(&mut host, H, &tampered).expect_err("mismatched bytes fail closed");
-    assert!(matches!(err, Error::Module(m) if m.contains("do not match")));
+    assert!(matches!(err, Error::Module { ref reason, .. } if reason == "code_hash_mismatch"));
 
     // neither attempt swapped anything: the module still runs v1.
     submit(&mut host, H, Origin::External(vec![7; 32]), inc_msg());
@@ -593,7 +593,7 @@ fn unservable_hash_fails_closed_with_the_reason_logged() {
     let err = tracing::subscriber::with_default(subscriber, || {
         realize(&mut host, H, &MeshSource::unservable()).expect_err("no peer serves it")
     });
-    assert!(matches!(err, Error::Module(m) if m.contains("absent")));
+    assert!(matches!(err, Error::Module { ref reason, .. } if reason == "code_bytes_absent"));
 
     let line = captured.text();
     assert!(
@@ -719,7 +719,7 @@ fn a_missing_second_module_realizes_neither() {
     let root0 = host.root_hash();
     let src = MapSource::with(&[HELLO_V1, HELLO_REPLACEMENT]);
     let err = realize(&mut host, H, &src).expect_err("the absent second entry fails closed");
-    assert!(matches!(err, Error::Module(m) if m.contains("absent")));
+    assert!(matches!(err, Error::Module { ref reason, .. } if reason == "code_bytes_absent"));
 
     assert_eq!(
         host.module_code_hash("hello"),

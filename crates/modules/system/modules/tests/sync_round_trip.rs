@@ -38,7 +38,7 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
         cause: sdk::Cause::Direct,
     })
     .on_query("valset", |req| {
-        match valset::decode_query(req).map_err(Error::Module)? {
+        match valset::decode_query(req).map_err(|e| Error::module("codec", e))? {
             ValsetQuery::Validators => Ok(valset_encode_reply(&ValsetReply::Validators(vec![
                 MEMBER.to_vec(),
             ]))),

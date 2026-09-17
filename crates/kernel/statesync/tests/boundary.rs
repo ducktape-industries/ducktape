@@ -49,7 +49,10 @@ impl sdk::Module for DegradedModule {
     }
 
     fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, sdk::Error> {
-        Err(sdk::Error::Module("no pack for committed head".into()))
+        Err(sdk::Error::module(
+            "no_pack_for_head",
+            "no pack for committed head",
+        ))
     }
 
     async fn execute(

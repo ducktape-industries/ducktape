@@ -1,7 +1,8 @@
 //! the native module glue: [`Files`] implements [`sdk::Module`] over the pure
-//! [`Fs`] core. origin/env map in here; core `String` errors map out as
-//! [`Error::Module`]; watch-notification emission (task 9) and the gc
-//! watermark trigger (task 13) land here too.
+//! [`Fs`] core. origin/env map in here; a core `String` error maps out as a
+//! module refusal whose token names the `files_*` step that failed;
+//! watch-notification emission (task 9) and the gc watermark trigger (task 13)
+//! land here too.
 
 use std::path::PathBuf;
 
@@ -52,16 +53,16 @@ impl Files {
     /// restart), height, and gc watermark from the refs-file envelope.
     pub fn open(id: impl Into<ModuleId>, dir: PathBuf) -> Result<Self, Error> {
         let refs_store = DiskRefs::open(dir.clone())
-            .map_err(|e| Error::Module(format!("files: refs open: {e}")))?;
+            .map_err(|e| Error::module("files_refs_open", format!("files: refs open: {e}")))?;
         let (refs, durable_height, gc_watermark) = match refs_store
             .load()
-            .map_err(|e| Error::Module(format!("files: refs load: {e}")))?
+            .map_err(|e| Error::module("files_refs_load", format!("files: refs load: {e}")))?
         {
             Some((refs, height, gc_watermark)) => (refs, Some(height), gc_watermark),
             None => (Refs::default(), None, 0),
         };
         let store = DiskStore::open(dir.join("objects"))
-            .map_err(|e| Error::Module(format!("files: odb open: {e}")))?;
+            .map_err(|e| Error::module("files_odb_open", format!("files: odb open: {e}")))?;
         Ok(Self {
             id: id.into(),
             fs: Fs::new(store, refs),
@@ -115,11 +116,11 @@ impl<S: ObjectStore, R: RefsStore> Files<S, R> {
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot, height: u64) -> Result<(), Error> {
         self.fs
             .install_refs(bytes, expected.0)
-            .map_err(Error::Module)?;
+            .map_err(|e| Error::module("files_install_refs", e))?;
         self.durable_height = Some(height);
         self.refs_store
             .save(self.fs.refs(), height, self.gc_watermark)
-            .map_err(|e| Error::Module(format!("files: refs save: {e}")))?;
+            .map_err(|e| Error::module("files_refs_save", format!("files: refs save: {e}")))?;
         Ok(())
     }
 
@@ -135,7 +136,9 @@ impl<S: ObjectStore, R: RefsStore> Files<S, R> {
     /// the ids of up to `limit` objects reachable from the committed refs but not
     /// yet in the odb — the fetch driver's worklist. see [`Fs::missing_objects`].
     pub fn missing_objects(&self, limit: usize) -> Result<Vec<ObjectId>, Error> {
-        self.fs.missing_objects(limit).map_err(Error::Module)
+        self.fs
+            .missing_objects(limit)
+            .map_err(|e| Error::module("files_missing_objects", e))
     }
 
     /// verify-then-store a batch of fetched objects, then fsync the odb dirs ONCE
@@ -148,12 +151,12 @@ impl<S: ObjectStore, R: RefsStore> Files<S, R> {
         for (id, kind, body) in batch {
             self.fs
                 .ingest_object(id, *kind, body)
-                .map_err(Error::Module)?;
+                .map_err(|e| Error::module("files_ingest_object", e))?;
         }
         self.fs
             .store_mut()
             .sync_dirs()
-            .map_err(|e| Error::Module(format!("files: odb sync: {e}")))?;
+            .map_err(|e| Error::module("files_odb_sync", format!("files: odb sync: {e}")))?;
         Ok(())
     }
 
@@ -164,7 +167,9 @@ impl<S: ObjectStore, R: RefsStore> Files<S, R> {
     /// cheap presence walk. running it here, once at the boundary, keeps the cost
     /// off the loop.
     pub fn possession_complete(&self) -> Result<bool, Error> {
-        self.fs.possession_complete().map_err(Error::Module)
+        self.fs
+            .possession_complete()
+            .map_err(|e| Error::module("files_possession", e))
     }
 
     /// `#[doc(hidden)]` test seam: stage a pending block directly so the real
@@ -305,8 +310,11 @@ impl<S: ObjectStore, R: RefsStore> Module for Files<S, R> {
     }
 
     async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let req = decode_sync_req(req).map_err(Error::Module)?;
-        let resp = self.fs.serve_sync(req).map_err(Error::Module)?;
+        let req = decode_sync_req(req).map_err(|e| Error::module("codec", e))?;
+        let resp = self
+            .fs
+            .serve_sync(req)
+            .map_err(|e| Error::module("files_serve_sync", e))?;
         Ok(encode_sync_resp(&resp))
     }
 
@@ -315,8 +323,11 @@ impl<S: ObjectStore, R: RefsStore> Module for Files<S, R> {
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let q = decode_query(req).map_err(Error::Module)?;
-        let reply = self.fs.query(q).map_err(Error::Module)?;
+        let q = decode_query(req).map_err(|e| Error::module("codec", e))?;
+        let reply = self
+            .fs
+            .query(q)
+            .map_err(|e| Error::module("files_query", e))?;
         Ok(encode_reply(&reply))
     }
 

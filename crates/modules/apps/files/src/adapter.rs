@@ -15,9 +15,13 @@ async fn identity_account(
     let bytes = ctx
         .query("identity", &identity::encode_query(&query))
         .await?;
-    let reply = identity::decode_reply(&bytes).map_err(Error::Module)?;
+    let reply =
+        identity::decode_reply(&bytes).map_err(|e| Error::module("identity_reply_decode", e))?;
     let identity::IdentityReply::Account(account) = reply else {
-        return Err(Error::Module("files: unexpected identity reply".into()));
+        return Err(Error::module(
+            "unexpected_identity_reply",
+            "files: unexpected identity reply",
+        ));
     };
     Ok(account)
 }
@@ -26,7 +30,10 @@ async fn authority(ctx: &dyn Ctx) -> Result<Authority, Error> {
     match &ctx.env().origin {
         Origin::External(key) => {
             if key.is_empty() {
-                return Err(Error::Module("files: external key is empty".into()));
+                return Err(Error::module(
+                    "empty_origin_key",
+                    "files: external key is empty",
+                ));
             }
             let account =
                 identity_account(ctx, identity::IdentityQuery::OfKey { key: key.clone() }).await?;
@@ -38,7 +45,9 @@ async fn authority(ctx: &dyn Ctx) -> Result<Authority, Error> {
         Origin::Program(number) => {
             let account = identity_account(ctx, identity::IdentityQuery::Get { number: *number })
                 .await?
-                .ok_or_else(|| Error::Module("files: program account does not exist".into()))?;
+                .ok_or_else(|| {
+                    Error::module("unknown_account", "files: program account does not exist")
+                })?;
             let active_program = matches!(
                 account.control,
                 identity::Control::Program {
@@ -47,7 +56,10 @@ async fn authority(ctx: &dyn Ctx) -> Result<Authority, Error> {
                 }
             );
             if !active_program {
-                return Err(Error::Module("files: program account is not active".into()));
+                return Err(Error::module(
+                    "not_an_active_program",
+                    "files: program account is not active",
+                ));
             }
             Ok(Authority::Program(account.number))
         }
@@ -151,12 +163,12 @@ pub(crate) async fn apply_op<S: ObjectStore>(
     let outcome = match payload.first() {
         Some(&PUTBLOB_FRAME_TAG) => {
             fs.putblob(&authority, env.height, &payload[1..])
-                .map_err(Error::Module)?;
+                .map_err(|e| Error::module("files_putblob", e))?;
             WriteOutcome::PutBlob {
                 chunk: to_hex(&duckfs_core::objects::object_id(Kind::Chunk, &payload[1..])),
             }
         }
-        _ => match decode_msg(payload).map_err(Error::Module)? {
+        _ => match decode_msg(payload).map_err(|e| Error::module("codec", e))? {
             FilesMsg::Commit {
                 base_snapshot,
                 message,
@@ -171,7 +183,7 @@ pub(crate) async fn apply_op<S: ObjectStore>(
                         message,
                         changes,
                     )
-                    .map_err(Error::Module)?;
+                    .map_err(|e| Error::module("files_commit", e))?;
                 for notification in notifications {
                     ctx.emit_msg(Msg {
                         target: notification.module_id.clone(),
@@ -185,7 +197,7 @@ pub(crate) async fn apply_op<S: ObjectStore>(
             FilesMsg::ProjectSnapshot { snapshot, path } => {
                 let snapshot = fs
                     .project_snapshot(&authority, env.height, env.consensus_time, snapshot, path)
-                    .map_err(Error::Module)?;
+                    .map_err(|e| Error::module("files_project_snapshot", e))?;
                 WriteOutcome::ProjectSnapshot { snapshot }
             }
             FilesMsg::CompareExchangeRetention {
@@ -200,7 +212,7 @@ pub(crate) async fn apply_op<S: ObjectStore>(
                     expected,
                     replacement.clone(),
                 )
-                .map_err(Error::Module)?;
+                .map_err(|e| Error::module("files_compare_exchange_retention", e))?;
                 WriteOutcome::CompareExchangeRetention {
                     key,
                     reference: replacement,
@@ -208,7 +220,7 @@ pub(crate) async fn apply_op<S: ObjectStore>(
             }
             FilesMsg::Pin { snapshot, name } => {
                 fs.pin(&authority, env.height, snapshot.clone(), name.clone())
-                    .map_err(Error::Module)?;
+                    .map_err(|e| Error::module("files_pin", e))?;
                 let pin = fs.pending_refs().pins.get(&name).expect("pin inserted");
                 WriteOutcome::Pin {
                     snapshot: to_hex(&pin.snapshot),
@@ -217,17 +229,17 @@ pub(crate) async fn apply_op<S: ObjectStore>(
             }
             FilesMsg::Unpin { name } => {
                 fs.unpin(&authority, env.height, name.clone())
-                    .map_err(Error::Module)?;
+                    .map_err(|e| Error::module("files_unpin", e))?;
                 WriteOutcome::Unpin { name }
             }
             FilesMsg::Watch { prefix, module_id } => {
                 fs.watch(&authority, env.height, prefix.clone(), module_id.clone())
-                    .map_err(Error::Module)?;
+                    .map_err(|e| Error::module("files_watch", e))?;
                 WriteOutcome::Watch { prefix, module_id }
             }
             FilesMsg::Unwatch { prefix, module_id } => {
                 fs.unwatch(&authority, env.height, prefix.clone(), module_id.clone())
-                    .map_err(Error::Module)?;
+                    .map_err(|e| Error::module("files_unwatch", e))?;
                 WriteOutcome::Unwatch { prefix, module_id }
             }
         },

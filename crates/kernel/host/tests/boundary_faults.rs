@@ -49,7 +49,7 @@ impl Module for BoundaryBomb {
     }
     async fn commit_block(&mut self) -> Result<(), Error> {
         if self.fail_commit {
-            return Err(Error::Module("disk died mid-commit".into()));
+            return Err(Error::module("injected_fault", "disk died mid-commit"));
         }
         if self.staged {
             self.committed = self.committed.wrapping_add(1);
@@ -59,7 +59,7 @@ impl Module for BoundaryBomb {
     }
     async fn abort_block(&mut self) -> Result<(), Error> {
         if self.fail_abort {
-            return Err(Error::Module("could not discard stage".into()));
+            return Err(Error::module("injected_fault", "could not discard stage"));
         }
         self.staged = false;
         Ok(())
@@ -77,7 +77,7 @@ impl Module for Boom {
         StateRoot::ZERO
     }
     async fn execute(&mut self, _c: &mut dyn Ctx, _m: &Msg) -> Result<(), Error> {
-        Err(Error::Module("boom".into()))
+        Err(Error::module("boom", "boom"))
     }
 }
 
@@ -202,7 +202,7 @@ fn clean_rejection_stays_rejected() {
             .await
             .expect_err("the boom follow-up must fail the block");
 
-        assert_eq!(err, SubmitError::Rejected(Error::Module("boom".into())));
+        assert_eq!(err, SubmitError::Rejected(Error::module("boom", "boom")));
         assert_eq!(host.root_hash(), app0, "a rejected block leaves no trace");
     });
 }

@@ -530,7 +530,7 @@ fn forge_push_is_cas_guarded_and_a_review_pins_its_commit() {
         None,
     );
     assert!(
-        error.contains("non-fast-forward: forge HEAD moved"),
+        error.contains("non_fast_forward: forge HEAD moved"),
         "a stale prev_oid must fail the CAS: {error}"
     );
 

@@ -432,13 +432,22 @@ async fn rejections_inner(context: &deterministic::Context) {
         // both reject DETERMINISTICALLY with the native module's reason. the
         // wasm runtime wraps the reason in its wit-error rendering, so the
         // parity claim is containment, not string equality.
-        let SubmitError::Rejected(Error::Module(n_msg)) = n_err else {
+        let SubmitError::Rejected(Error::Module {
+            reason: n_reason,
+            sentence: n_msg,
+        }) = n_err
+        else {
             panic!("native rejection shape: {n_err:?}");
         };
-        let SubmitError::Rejected(Error::Module(w_msg)) = w_err else {
+        let SubmitError::Rejected(Error::Module {
+            reason: w_reason,
+            sentence: w_msg,
+        }) = w_err
+        else {
             panic!("wasm rejection shape: {w_err:?}");
         };
         assert!(n_msg.contains(needle), "native reason: {n_msg}");
+        assert_eq!(n_reason, w_reason, "wasm token must match the native token");
         assert!(
             w_msg.contains(needle),
             "wasm reason must carry the native reason: {w_msg}"
@@ -717,13 +726,22 @@ async fn class_claim_rejections_inner(context: &deterministic::Context) {
             .await
             .expect_err("wasm must reject");
 
-        let SubmitError::Rejected(Error::Module(n_msg)) = n_err else {
+        let SubmitError::Rejected(Error::Module {
+            reason: n_reason,
+            sentence: n_msg,
+        }) = n_err
+        else {
             panic!("native rejection shape: {n_err:?}");
         };
-        let SubmitError::Rejected(Error::Module(w_msg)) = w_err else {
+        let SubmitError::Rejected(Error::Module {
+            reason: w_reason,
+            sentence: w_msg,
+        }) = w_err
+        else {
             panic!("wasm rejection shape: {w_err:?}");
         };
         assert!(n_msg.contains(needle), "native reason: {n_msg}");
+        assert_eq!(n_reason, w_reason, "wasm token must match the native token");
         assert!(
             w_msg.contains(needle),
             "wasm reason must carry the native reason: {w_msg}"

@@ -166,7 +166,7 @@ mod tests {
             match decode_query(req) {
                 Ok(ValsetQuery::Validators) => match &self.0 {
                     Ok(keys) => Ok(encode_reply(&ValsetReply::Validators(keys.clone()))),
-                    Err(reason) => Err(Error::Module(reason.clone())),
+                    Err(reason) => Err(Error::module("injected_fault", reason.clone())),
                 },
                 _ => Err(Error::QueryUnsupported),
             }

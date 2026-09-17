@@ -127,9 +127,10 @@ fn take_contract(cur: &mut codec::Cursor) -> Result<OutputContract, Error> {
     match cur.byte("record contract")? {
         0 => Ok(OutputContract::Text),
         1 => Ok(OutputContract::Json),
-        d => Err(Error::Module(format!(
-            "record has unknown contract discriminant {d}"
-        ))),
+        d => Err(Error::module(
+            "record_decode",
+            format!("record has unknown contract discriminant {d}"),
+        )),
     }
 }
 
@@ -165,9 +166,10 @@ fn decode_recipe(bytes: &[u8]) -> Result<Recipe, Error> {
         0 => Routing::Rendezvous,
         1 => Routing::Pinned(cur.bytes("recipe routing pin")?.to_vec()),
         d => {
-            return Err(Error::Module(format!(
-                "record has unknown routing discriminant {d}"
-            )));
+            return Err(Error::module(
+                "record_decode",
+                format!("record has unknown routing discriminant {d}"),
+            ));
         }
     };
     let output_contract = take_contract(&mut cur)?;
@@ -212,9 +214,10 @@ fn take_delivery(cur: &mut codec::Cursor) -> Result<DeliveryOutcome, Error> {
             reason: cur.string("delivery failure reason")?,
         }),
         2 => Ok(DeliveryOutcome::Unrepresentable),
-        d => Err(Error::Module(format!(
-            "record has unknown delivery discriminant {d}"
-        ))),
+        d => Err(Error::module(
+            "record_decode",
+            format!("record has unknown delivery discriminant {d}"),
+        )),
     }
 }
 
@@ -257,7 +260,7 @@ fn decode_dispatch(bytes: &[u8]) -> Result<DispatchState, Error> {
     let mut cur = codec::Cursor::new(bytes);
     let receiver = cur.string("dispatch receiver")?;
     let cause = borsh::from_slice(cur.bytes("dispatch cause")?)
-        .map_err(|e| Error::Module(format!("dispatch cause: {e}")))?;
+        .map_err(|e| Error::module("record_decode", format!("dispatch cause: {e}")))?;
     let dispatch_id = cur.string("dispatch id")?;
     let recipe_id = cur.string("dispatch recipe id")?;
     let contract = take_contract(&mut cur)?;
@@ -269,9 +272,10 @@ fn decode_dispatch(bytes: &[u8]) -> Result<DispatchState, Error> {
             delivery: take_delivery(&mut cur)?,
         },
         d => {
-            return Err(Error::Module(format!(
-                "record has unknown status discriminant {d}"
-            )));
+            return Err(Error::module(
+                "record_decode",
+                format!("record has unknown status discriminant {d}"),
+            ));
         }
     };
     let outcome = match cur.byte("dispatch outcome tag")? {
@@ -279,7 +283,10 @@ fn decode_dispatch(bytes: &[u8]) -> Result<DispatchState, Error> {
         1 => Some(Ok(cur.bytes("dispatch outcome")?.to_vec())),
         2 => Some(Err(cur.string("dispatch outcome error")?)),
         t => {
-            return Err(Error::Module(format!("record has unknown outcome tag {t}")));
+            return Err(Error::module(
+                "record_decode",
+                format!("record has unknown outcome tag {t}"),
+            ));
         }
     };
     let created_at = cur.u64("dispatch created_at")?;
@@ -339,7 +346,8 @@ pub(crate) fn encode_call(record: &CallRecord) -> Vec<u8> {
 }
 
 fn decode_call(bytes: &[u8]) -> Result<CallRecord, Error> {
-    borsh::from_slice(bytes).map_err(|e| Error::Module(format!("call record decode: {e}")))
+    borsh::from_slice(bytes)
+        .map_err(|e| Error::module("record_decode", format!("call record decode: {e}")))
 }
 
 pub(crate) fn encode_claim(enqueued: u64) -> Vec<u8> {
@@ -371,7 +379,8 @@ pub(crate) fn encode_mail_entry(entry: &MailEntry) -> Vec<u8> {
 }
 
 fn decode_mail_entry(bytes: &[u8]) -> Result<MailEntry, Error> {
-    borsh::from_slice(bytes).map_err(|e| Error::Module(format!("mailbox entry decode: {e}")))
+    borsh::from_slice(bytes)
+        .map_err(|e| Error::module("record_decode", format!("mailbox entry decode: {e}")))
 }
 
 // ---- the queue cursors -------------------------------------------------------

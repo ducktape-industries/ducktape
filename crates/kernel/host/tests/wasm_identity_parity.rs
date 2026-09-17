@@ -568,13 +568,22 @@ async fn same_ops_inner(context: &deterministic::Context) {
         .query("identity", &junk)
         .await
         .expect_err("wasm rejects");
-    let Error::Module(n_msg) = n_err else {
+    let Error::Module {
+        reason: n_reason,
+        sentence: n_msg,
+    } = n_err
+    else {
         panic!("native query error shape: {n_err:?}");
     };
-    let Error::Module(w_msg) = w_err else {
+    let Error::Module {
+        reason: w_reason,
+        sentence: w_msg,
+    } = w_err
+    else {
         panic!("wasm query error shape: {w_err:?}");
     };
     assert!(n_msg.contains("expected value"), "native reason: {n_msg}");
+    assert_eq!(n_reason, w_reason, "wasm token must match the native token");
     assert!(w_msg.contains("expected value"), "wasm reason: {w_msg}");
 
     // queries are read-only on the wasm side too.
@@ -741,13 +750,22 @@ async fn rejections_inner(context: &deterministic::Context) {
             .await
             .expect_err("wasm must reject");
 
-        let SubmitError::Rejected(Error::Module(n_msg)) = n_err else {
+        let SubmitError::Rejected(Error::Module {
+            reason: n_reason,
+            sentence: n_msg,
+        }) = n_err
+        else {
             panic!("native rejection shape: {n_err:?}");
         };
-        let SubmitError::Rejected(Error::Module(w_msg)) = w_err else {
+        let SubmitError::Rejected(Error::Module {
+            reason: w_reason,
+            sentence: w_msg,
+        }) = w_err
+        else {
             panic!("wasm rejection shape: {w_err:?}");
         };
         assert!(n_msg.contains(needle), "native reason: {n_msg}");
+        assert_eq!(n_reason, w_reason, "wasm token must match the native token");
         assert!(
             w_msg.contains(needle),
             "wasm reason must carry the native reason: {w_msg}"
@@ -897,11 +915,15 @@ async fn genesis_config_inner(context: &deterministic::Context) {
         .submit_at(block(2, joiner), m)
         .await
         .expect_err("a foreign chain id must refuse the consent");
-    let SubmitError::Rejected(Error::Module(reason)) = err else {
+    let SubmitError::Rejected(Error::Module { reason, sentence }) = err else {
         panic!("rejection shape: {err:?}");
     };
+    assert_eq!(
+        reason, "consent_unverified",
+        "the chain-scoped preimage is what refuses"
+    );
     assert!(
-        reason.contains("does not verify"),
-        "the chain-scoped preimage is what refuses: {reason}"
+        sentence.contains("does not verify"),
+        "the chain-scoped preimage is what refuses: {sentence}"
     );
 }

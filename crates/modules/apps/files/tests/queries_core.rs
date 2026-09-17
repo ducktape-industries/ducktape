@@ -316,7 +316,8 @@ fn ls_on_a_file_path_errors() {
 
     let reply = ls_query(&f, "/shared/other", None, None, 256);
     assert!(
-        matches!(&reply, Err(sdk::Error::Module(m)) if m.contains("not a directory")),
+        matches!(&reply, Err(sdk::Error::Module { reason, sentence })
+            if reason == "files_query" && sentence.contains("not a directory")),
         "got {reply:?}"
     );
 }
@@ -357,7 +358,8 @@ fn only_the_roots_themselves_list_empty_never_a_path_under_one() {
     ] {
         let reply = ls_query(&f, absent, None, None, 256);
         assert!(
-            matches!(&reply, Err(sdk::Error::Module(m)) if m.contains("path not found")),
+            matches!(&reply, Err(sdk::Error::Module { reason, sentence })
+                if reason == "files_query" && sentence.contains("path not found")),
             "{absent}: got {reply:?}"
         );
     }
@@ -401,7 +403,8 @@ fn ls_on_absent_path_errors() {
 
     let reply = ls_query(&f, "/shared/nope", None, None, 256);
     assert!(
-        matches!(&reply, Err(sdk::Error::Module(m)) if m.contains("path not found")),
+        matches!(&reply, Err(sdk::Error::Module { reason, sentence })
+            if reason == "files_query" && sentence.contains("path not found")),
         "got {reply:?}"
     );
 }
@@ -467,7 +470,8 @@ fn ls_unresolvable_snapshot_errors() {
     let bad = "cc".repeat(32);
     let reply = ls_query(&f, "/shared/bulk", Some(&bad), None, 256);
     assert!(
-        matches!(&reply, Err(sdk::Error::Module(m)) if m.contains("snapshot not resolvable")),
+        matches!(&reply, Err(sdk::Error::Module { reason, sentence })
+            if reason == "files_query" && sentence.contains("snapshot not resolvable")),
         "got {reply:?}"
     );
 }
@@ -630,7 +634,8 @@ fn read_on_a_dir_errors() {
 
     let reply = read_query(&f, "/shared/bulk", None, 0, 10);
     assert!(
-        matches!(&reply, Err(sdk::Error::Module(m)) if m.contains("not a file")),
+        matches!(&reply, Err(sdk::Error::Module { reason, sentence })
+            if reason == "files_query" && sentence.contains("not a file")),
         "got {reply:?}"
     );
 }
@@ -643,7 +648,8 @@ fn read_on_absent_path_errors() {
 
     let reply = read_query(&f, "/shared/nope", None, 0, 10);
     assert!(
-        matches!(&reply, Err(sdk::Error::Module(m)) if m.contains("path not found")),
+        matches!(&reply, Err(sdk::Error::Module { reason, sentence })
+            if reason == "files_query" && sentence.contains("path not found")),
         "got {reply:?}"
     );
 }
@@ -657,7 +663,8 @@ fn read_unresolvable_snapshot_errors() {
     let bad = "dd".repeat(32);
     let reply = read_query(&f, "/shared/other", Some(&bad), 0, 10);
     assert!(
-        matches!(&reply, Err(sdk::Error::Module(m)) if m.contains("snapshot not resolvable")),
+        matches!(&reply, Err(sdk::Error::Module { reason, sentence })
+            if reason == "files_query" && sentence.contains("snapshot not resolvable")),
         "got {reply:?}"
     );
 }
@@ -744,7 +751,8 @@ fn queries_never_see_a_staged_but_uncommitted_write() {
     );
     let reply = read_query(&f, "/shared/ghost", None, 0, 10);
     assert!(
-        matches!(&reply, Err(sdk::Error::Module(m)) if m.contains("path not found")),
+        matches!(&reply, Err(sdk::Error::Module { reason, sentence })
+            if reason == "files_query" && sentence.contains("path not found")),
         "Read does not see the pending write: {reply:?}"
     );
     abort_block(&mut f);
@@ -771,7 +779,10 @@ fn has_chunks(f: &files::Files, ids: &[String]) -> Vec<bool> {
 
 fn has_chunks_err(f: &files::Files, ids: &[String]) -> String {
     match block_on(f.query(&encode_query(&FilesQuery::HasChunks { ids: ids.to_vec() }))) {
-        Err(sdk::Error::Module(m)) => m,
+        Err(sdk::Error::Module { reason, sentence }) => {
+            assert_eq!(reason, "files_query");
+            sentence
+        }
         other => panic!("expected a Module error, got {other:?}"),
     }
 }

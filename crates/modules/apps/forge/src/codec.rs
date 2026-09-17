@@ -32,7 +32,7 @@ impl<'a> Reader<'a> {
     }
     pub fn u32(&mut self) -> Result<u32, Error> {
         if self.remaining() < 4 {
-            return Err(Error::Module("forge codec: truncated u32 field".into()));
+            return Err(Error::module("codec", "forge codec: truncated u32 field"));
         }
         let v = u32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap());
         self.pos += 4;
@@ -40,7 +40,7 @@ impl<'a> Reader<'a> {
     }
     pub fn u64(&mut self) -> Result<u64, Error> {
         if self.remaining() < 8 {
-            return Err(Error::Module("forge codec: truncated u64 field".into()));
+            return Err(Error::module("codec", "forge codec: truncated u64 field"));
         }
         let v = u64::from_le_bytes(self.buf[self.pos..self.pos + 8].try_into().unwrap());
         self.pos += 8;
@@ -48,10 +48,13 @@ impl<'a> Reader<'a> {
     }
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         if self.remaining() < n {
-            return Err(Error::Module(format!(
-                "forge codec: truncated field ({n} bytes needed, {} left)",
-                self.remaining()
-            )));
+            return Err(Error::module(
+                "codec",
+                format!(
+                    "forge codec: truncated field ({n} bytes needed, {} left)",
+                    self.remaining()
+                ),
+            ));
         }
         let s = &self.buf[self.pos..self.pos + n];
         self.pos += n;
@@ -63,7 +66,7 @@ impl<'a> Reader<'a> {
         let bytes = self.take(len)?;
         std::str::from_utf8(bytes)
             .map(str::to_owned)
-            .map_err(|_| Error::Module("forge codec: string field not utf-8".into()))
+            .map_err(|_| Error::module("codec", "forge codec: string field not utf-8"))
     }
 }
 

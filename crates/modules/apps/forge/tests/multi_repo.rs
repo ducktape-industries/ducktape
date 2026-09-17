@@ -13,7 +13,6 @@
 //!     to an identical composed root, and a node WITHOUT a push's pack still
 //!     composes the SAME root (the phase-1 determinism invariant, now per-repo).
 
-
 use std::path::{Path, PathBuf};
 
 use forge::Forge;
@@ -194,7 +193,7 @@ fn stale_push_on_one_repo_does_not_touch_another() {
     // a stale push to "a" (prev = None but "a" is born) — non-fast-forward. the
     // CAS is per-repo and fires BEFORE any IO, so a bogus digest is irrelevant.
     let err = try_push(&mut f, "a", None, &hc, &[0u8; 32]).unwrap_err();
-    assert!(matches!(err, Error::Module(m) if m.contains("non-fast-forward")));
+    assert!(matches!(err, Error::Module { ref reason, .. } if reason == "non_fast_forward"));
 
     // nothing moved: not "a", and — the isolation property — not "b" either.
     assert_eq!(f.root(), pinned, "a rejected push must not move any root");
@@ -264,7 +263,10 @@ fn head_of_reads_named_repos_and_bad_slugs_are_rejected() {
     for bad in ["BAD", "a/b", "..", "with space"] {
         let err =
             block_on(f.execute(&mut at(2), &push_msg(bad, None, &head, &digest))).unwrap_err();
-        assert!(matches!(err, Error::Module(_)), "{bad:?} must reject");
+        assert!(
+            matches!(err, Error::Module { ref reason, .. } if reason == "bad_repo_name"),
+            "{bad:?} must reject"
+        );
     }
     // a bad slug in a HeadOf query also errs (never a silent None).
     let q = encode_query(&ForgeQuery::HeadOf { repo: "..".into() });

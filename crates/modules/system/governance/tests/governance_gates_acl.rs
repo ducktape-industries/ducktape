@@ -176,7 +176,7 @@ fn a_user_standing_policy_on_governance_is_refused_at_propose_in_validator_mode(
         .await
         .expect_err("a policy the validator-mode electorate can never satisfy is refused");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("lock")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "electorate_lockout"),
             "got {err:?}"
         );
         assert_eq!(proposal_status(&host, "brick-it").await, None);
@@ -207,7 +207,7 @@ fn a_user_standing_wildcard_policy_is_also_refused_at_propose() {
         .await
         .expect_err("a wildcard policy that would brick governance is refused too");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("lock")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "electorate_lockout"),
             "got {err:?}"
         );
     });

@@ -45,7 +45,7 @@ impl Module for BytesModule {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let Some((&next, rest)) = msg.payload.split_first() else {
-            return Err(Error::Module("missing staged byte".into()));
+            return Err(Error::module("injected_fault", "missing staged byte"));
         };
         self.staged = Some(next);
         if rest == *b"!" {
@@ -86,7 +86,10 @@ impl Module for DegradedBytesModule {
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Err(Error::Module("missing pack for committed head".into()))
+        Err(Error::module(
+            "injected_fault",
+            "missing pack for committed head",
+        ))
     }
 
     async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
@@ -107,7 +110,7 @@ impl Module for SecondDegradedModule {
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Err(Error::Module("also broken".into()))
+        Err(Error::module("injected_fault", "also broken"))
     }
 
     async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
@@ -275,7 +278,7 @@ fn one_module_that_cannot_snapshot_does_not_abort_the_capture() {
         assert_eq!(degraded.root, StateRoot([3u8; sdk::ROOT_LEN]));
         assert_eq!(
             degraded.reason,
-            Error::Module("missing pack for committed head".into()),
+            Error::module("injected_fault", "missing pack for committed head"),
         );
 
         assert!(!snapshot.has_all_snapshot_bytes());

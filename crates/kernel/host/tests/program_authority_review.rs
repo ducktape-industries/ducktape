@@ -28,12 +28,15 @@ impl Module for Executor {
         let provisioning = matches!(&ctx.env().origin, Origin::Module(id) if id == "identity");
         if provisioning {
             identity::authenticate_event(&ctx.env().origin, "identity", &msg.payload)
-                .map_err(Error::Module)?;
+                .map_err(|e| Error::module("codec", e))?;
             return Ok(());
         }
         let queue_requested = msg.payload == b"queue";
         if !queue_requested {
-            return Err(Error::Module("unknown executor input".into()));
+            return Err(Error::module(
+                "unknown_executor_input",
+                "unknown executor input",
+            ));
         }
         ctx.emit_msg(Msg {
             target: "dispatch".into(),
@@ -255,7 +258,10 @@ impl Module for UnreadableIdentity {
     }
 
     async fn query(&self, _: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::Module("injected identity read failure".into()))
+        Err(Error::module(
+            "injected_fault",
+            "injected identity read failure",
+        ))
     }
 }
 

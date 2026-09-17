@@ -36,7 +36,7 @@ impl Module for Executor {
     }
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         identity::authenticate_event(&ctx.env().origin, "identity", &msg.payload)
-            .map_err(Error::Module)?;
+            .map_err(|e| Error::module("authenticate_event", e))?;
         Ok(())
     }
 }

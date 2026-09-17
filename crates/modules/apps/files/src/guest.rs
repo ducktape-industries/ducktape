@@ -125,7 +125,7 @@ pub async fn dispatch<S: ObjectStore>(
     let height = ctx.env().height;
     let index = match block_objects {
         None => BTreeMap::new(),
-        Some(bytes) => decode_block_objects(bytes).map_err(Error::Module)?,
+        Some(bytes) => decode_block_objects(bytes).map_err(|e| Error::module("codec", e))?,
     };
     fs.seed_block_objects(height, index);
     crate::adapter::apply_op(fs, ctx, payload).await?;
@@ -139,7 +139,9 @@ pub async fn dispatch<S: ObjectStore>(
     // boundary (`StateBacking::Odb::commit_block`).
     let store = fs.store_mut();
     for (kind, body) in &objects {
-        store.put(*kind, body).map_err(Error::Module)?;
+        store
+            .put(*kind, body)
+            .map_err(|e| Error::module("files_object_put", e))?;
     }
     Ok(Dispatched {
         refs_image: encode_refs(&refs),
@@ -603,7 +605,8 @@ mod tests {
             .dispatch(1, 1, &commit_chunks("/a", 12, &phantom))
             .expect_err("an unstaged chunk must reject");
         assert!(
-            matches!(&err, Error::Module(m) if m.contains("chunk not available")),
+            matches!(&err, Error::Module { reason, sentence }
+                if reason == "files_commit" && sentence.contains("chunk not available")),
             "expected the availability reject, got {err:?}"
         );
     }
@@ -674,7 +677,8 @@ mod tests {
             .dispatch(2, 2, &commit_chunks("/b", content.len() as u64, &chunk_hex))
             .expect_err("a prior-block inline chunk is not referenceable by hash");
         assert!(
-            matches!(&err, Error::Module(m) if m.contains("chunk not available")),
+            matches!(&err, Error::Module { reason, sentence }
+                if reason == "files_commit" && sentence.contains("chunk not available")),
             "expected the availability reject across the block boundary, got {err:?}"
         );
     }

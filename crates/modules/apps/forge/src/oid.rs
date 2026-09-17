@@ -21,10 +21,13 @@ impl Oid {
     /// refusal (the same input rejects identically on every validator).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let raw: [u8; OID_RAW_LEN] = bytes.try_into().map_err(|_| {
-            Error::Module(format!(
-                "forge: oid must be {OID_RAW_LEN} bytes, got {}",
-                bytes.len()
-            ))
+            Error::module(
+                "bad_oid",
+                format!(
+                    "forge: oid must be {OID_RAW_LEN} bytes, got {}",
+                    bytes.len()
+                ),
+            )
         })?;
         Ok(Self(raw))
     }
@@ -34,11 +37,14 @@ impl Oid {
         let well_formed =
             hex.len() == 2 * OID_RAW_LEN && hex.bytes().all(|b| b.is_ascii_hexdigit());
         if !well_formed {
-            return Err(Error::Module(format!(
-                "forge: oid must be {} hex chars, got {:?}",
-                2 * OID_RAW_LEN,
-                hex.len()
-            )));
+            return Err(Error::module(
+                "bad_oid",
+                format!(
+                    "forge: oid must be {} hex chars, got {:?}",
+                    2 * OID_RAW_LEN,
+                    hex.len()
+                ),
+            ));
         }
         let mut raw = [0u8; OID_RAW_LEN];
         for (byte, pair) in raw.iter_mut().zip(hex.as_bytes().chunks(2)) {

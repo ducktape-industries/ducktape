@@ -239,9 +239,10 @@ impl Module for Counting {
         self.executes.set(self.executes.get() + 1);
         self.inner.execute(ctx, msg).await?;
         match decode_msg(&msg.payload) {
-            Ok(DirMsg::Set { key, .. }) if key == "fail" => {
-                Err(sdk::Error::Module("staged, then rejected".into()))
-            }
+            Ok(DirMsg::Set { key, .. }) if key == "fail" => Err(sdk::Error::module(
+                "staged_then_rejected",
+                "staged, then rejected",
+            )),
             _ => Ok(()),
         }
     }

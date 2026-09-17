@@ -407,7 +407,10 @@ fn resolve_resident_hold(hold: ResidentHold, outcome: relay::RelayOutcome) {
         // courier lane's), and a caller that must tell them apart no longer has
         // to read the sentence to do it.
         (ResidentHold::Http(tx), relay::RelayOutcome::Rejected { detail }) => {
-            let _ = tx.send(Err(noded::Refused::new("module", detail)));
+            // the custodian relayed the refusal FRAMED: split it so this
+            // caller sees the refusing module's own token, not a stamp that
+            // only says a module was involved.
+            let _ = tx.send(Err(noded::Refused::framed(&detail)));
         }
         (ResidentHold::Http(tx), relay::RelayOutcome::Refused { detail }) => {
             let _ = tx.send(Err(noded::Refused::new("relay_refused", detail)));
@@ -817,8 +820,8 @@ impl ValidatorRelay {
         for (id, detail) in stalled {
             if let Some(fanout) = self.local_fanouts.remove(&id) {
                 let _ = fanout
-                        .reply
-                        .send(Err(noded::Refused::new("blob_fanout", detail)));
+                    .reply
+                    .send(Err(noded::Refused::new("blob_fanout", detail)));
             }
         }
 

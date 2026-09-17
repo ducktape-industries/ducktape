@@ -33,7 +33,7 @@ impl Module for CommitBomb {
     }
     async fn commit_block(&mut self) -> Result<(), Error> {
         if self.executes > self.armed_after {
-            return Err(Error::Module("disk died mid-commit".into()));
+            return Err(Error::module("injected_fault", "disk died mid-commit"));
         }
         self.committed = self.committed.wrapping_add(1);
         Ok(())
@@ -105,7 +105,7 @@ impl Module for RejectAll {
         StateRoot::ZERO
     }
     async fn execute(&mut self, _c: &mut dyn Ctx, _m: &Msg) -> Result<(), Error> {
-        Err(Error::Module("no".into()))
+        Err(Error::module("only_get_served", "no"))
     }
 }
 
@@ -135,7 +135,10 @@ fn a_deterministic_rejection_does_not_halt_the_drain() {
             .drain_delivered()
             .await
             .expect("rejections must not error the drain");
-        assert_eq!(applied, 2, "both rejected batches count as processed no-ops");
+        assert_eq!(
+            applied, 2,
+            "both rejected batches count as processed no-ops"
+        );
     });
 }
 

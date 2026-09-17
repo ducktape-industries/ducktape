@@ -632,10 +632,13 @@ fn terminal_evictions(terminal: &BTreeMap<String, TerminalEntry>) -> Vec<String>
 /// side and none on the other, and the two ports diverge on the root.
 fn check_record(value: &[u8], what: &str) -> Result<(), Error> {
     if value.len() > MAX_RECORD_BYTES {
-        return Err(Error::Module(format!(
-            "{what} is {} bytes, over the {MAX_RECORD_BYTES}-byte store record cap",
-            value.len()
-        )));
+        return Err(Error::module(
+            "record_too_large",
+            format!(
+                "{what} is {} bytes, over the {MAX_RECORD_BYTES}-byte store record cap",
+                value.len()
+            ),
+        ));
     }
     Ok(())
 }
@@ -647,9 +650,10 @@ fn saga_origin(origin: &Origin) -> Result<SagaOrigin, Error> {
     match origin {
         Origin::External(key) => Ok(SagaOrigin::External(key.clone())),
         Origin::Module(module) => Ok(SagaOrigin::Module(module.clone())),
-        Origin::Program(account) => Err(Error::Module(format!(
-            "saga: a program account has no saga standing: {account}"
-        ))),
+        Origin::Program(account) => Err(Error::module(
+            "program_origin_refused",
+            format!("saga: a program account has no saga standing: {account}"),
+        )),
         Origin::System => Ok(SagaOrigin::System),
     }
 }
@@ -769,7 +773,7 @@ impl SagaModule {
         };
         borsh::from_slice(&bytes)
             .map(Some)
-            .map_err(|e| Error::Module(format!("saga record decode: {e}")))
+            .map_err(|e| Error::module("record_decode", format!("saga record decode: {e}")))
     }
 
     /// reassemble one saga's spec from its chunks. only the surfaces that
@@ -778,10 +782,12 @@ impl SagaModule {
     async fn load_spec(&self, saga_id: &str, spec_len: u64) -> Result<Vec<u8>, Error> {
         let mut spec = Vec::with_capacity(spec_len as usize);
         for key in spec_chunk_keys(saga_id, spec_len) {
-            let chunk =
-                self.staged.get(&key).await?.ok_or_else(|| {
-                    Error::Module(format!("saga {saga_id} is missing a spec chunk"))
-                })?;
+            let chunk = self.staged.get(&key).await?.ok_or_else(|| {
+                Error::module(
+                    "missing_spec_chunk",
+                    format!("saga {saga_id} is missing a spec chunk"),
+                )
+            })?;
             spec.extend_from_slice(&chunk);
         }
         Ok(spec)
@@ -794,7 +800,8 @@ impl SagaModule {
         let Some(bytes) = self.staged.get(&pending_shard_key(shard)).await? else {
             return Ok(PendingIndex::new());
         };
-        borsh::from_slice(&bytes).map_err(|e| Error::Module(format!("pending index decode: {e}")))
+        borsh::from_slice(&bytes)
+            .map_err(|e| Error::module("record_decode", format!("pending index decode: {e}")))
     }
 
     /// every live id and its meta as ONE sorted sequence — the iteration order
@@ -818,7 +825,8 @@ impl SagaModule {
         let Some(bytes) = self.staged.get(&quota_key(origin)).await? else {
             return Ok(0);
         };
-        borsh::from_slice(&bytes).map_err(|e| Error::Module(format!("live saga count decode: {e}")))
+        borsh::from_slice(&bytes)
+            .map_err(|e| Error::module("record_decode", format!("live saga count decode: {e}")))
     }
 
     /// the terminal receipt index; absent reads as empty.
@@ -826,15 +834,19 @@ impl SagaModule {
         let Some(bytes) = self.staged.get(TERMINAL_INDEX_KEY).await? else {
             return Ok(BTreeMap::new());
         };
-        borsh::from_slice(&bytes).map_err(|e| Error::Module(format!("terminal index decode: {e}")))
+        borsh::from_slice(&bytes)
+            .map_err(|e| Error::module("record_decode", format!("terminal index decode: {e}")))
     }
 
     /// the live saga a projection promised, or a loud store bug — an index
     /// entry without its record must never be silently skipped.
     async fn require(&self, saga_id: &str) -> Result<Saga, Error> {
-        self.load(saga_id)
-            .await?
-            .ok_or_else(|| Error::Module(format!("saga index names a missing saga: {saga_id}")))
+        self.load(saga_id).await?.ok_or_else(|| {
+            Error::module(
+                "missing_saga_record",
+                format!("saga index names a missing saga: {saga_id}"),
+            )
+        })
     }
 
     // ---- the writers -------------------------------------------------------
@@ -884,9 +896,10 @@ impl SagaModule {
     async fn live_count_after_release(&self, origin: &SagaOrigin) -> Result<u32, Error> {
         let live = self.live_sagas(origin).await?;
         live.checked_sub(1).ok_or_else(|| {
-            Error::Module(format!(
-                "live_saga_count_underflow: {origin:?} ended a saga it never claimed"
-            ))
+            Error::module(
+                "live_saga_count_underflow",
+                format!("{origin:?} ended a saga it never claimed"),
+            )
         })
     }
 
@@ -1199,20 +1212,21 @@ impl SagaModule {
         let valset = self
             .valset
             .as_deref()
-            .ok_or_else(|| Error::Module("accept_no_standing: no valset is configured".into()))?;
+            .ok_or_else(|| Error::module("accept_no_standing", "no valset is configured"))?;
         let standing = valset::members_and_residents(ctx, valset).await?;
         if !standing.contains(key) {
-            return Err(Error::Module(
-                "accept_no_standing: submitter holds no current standing (validator or resident)"
-                    .into(),
+            return Err(Error::module(
+                "accept_no_standing",
+                "submitter holds no current standing (validator or resident)",
             ));
         }
         let Some(tag) = capability else {
             return Ok(());
         };
         let registry = self.capability_registry.as_deref().ok_or_else(|| {
-            Error::Module(
-                "accept_not_capability_provider: no capability registry is configured".into(),
+            Error::module(
+                "accept_not_capability_provider",
+                "no capability registry is configured",
             )
         })?;
         let reply = ctx
@@ -1224,24 +1238,26 @@ impl SagaModule {
             )
             .await
             .map_err(|_| {
-                Error::Module(
-                    "accept_not_capability_provider: capability registry query failed".into(),
+                Error::module(
+                    "accept_not_capability_provider",
+                    "capability registry query failed",
                 )
             })?;
-        let CapabilityReply::Providers(providers) =
-            capability_decode_reply(&reply).map_err(Error::Module)?
+        let CapabilityReply::Providers(providers) = capability_decode_reply(&reply)
+            .map_err(|e| Error::module("capability_reply_decode", e))?
         else {
-            return Err(Error::Module(
-                "accept_not_capability_provider: capability registry answered an unexpected reply"
-                    .into(),
+            return Err(Error::module(
+                "accept_not_capability_provider",
+                "capability registry answered an unexpected reply",
             ));
         };
         if providers.iter().any(|provider| provider.as_slice() == key) {
             Ok(())
         } else {
-            Err(Error::Module(format!(
-                "accept_not_capability_provider: submitter is not an announced provider of {tag:?}"
-            )))
+            Err(Error::module(
+                "accept_not_capability_provider",
+                format!("submitter is not an announced provider of {tag:?}"),
+            ))
         }
     }
 
@@ -1360,7 +1376,7 @@ impl SagaModule {
     /// the op handler — one arm per [`SagaMsg`] variant. every write it makes
     /// is STAGED; `execute` wraps it with the retention trim.
     async fn handle(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        match decode_msg(&msg.payload).map_err(Error::Module)? {
+        match decode_msg(&msg.payload).map_err(|e| Error::module("codec", e))? {
             SagaMsg::Trigger {
                 saga_id,
                 spec,
@@ -1381,18 +1397,24 @@ impl SagaModule {
                 // whose own trigger would then no-op, wedging the work at
                 // Pending forever under the squatter's Cancel/Prune.
                 if !owns_id(&ctx.env().origin, &saga_id) {
-                    return Err(Error::Module(format!(
-                        "trigger saga_id must be in the trigger's own namespace {:?}",
-                        ctx.env().origin.actor_string()
-                    )));
+                    return Err(Error::module(
+                        "bad_saga_id",
+                        format!(
+                            "trigger saga_id must be in the trigger's own namespace {:?}",
+                            ctx.env().origin.actor_string()
+                        ),
+                    ));
                 }
                 // the SHARED-record guard: every live id rides a `pending`
                 // index shard record (see [`MAX_SAGA_ID_BYTES`]).
                 if saga_id.len() > MAX_SAGA_ID_BYTES {
-                    return Err(Error::Module(format!(
-                        "trigger saga_id is {} bytes; the cap is {MAX_SAGA_ID_BYTES}",
-                        saga_id.len()
-                    )));
+                    return Err(Error::module(
+                        "bad_saga_id",
+                        format!(
+                            "trigger saga_id is {} bytes; the cap is {MAX_SAGA_ID_BYTES}",
+                            saga_id.len()
+                        ),
+                    ));
                 }
                 // a duplicate saga_id — staged this block or already committed
                 // — is a DETERMINISTIC NO-OP. (v1 silently reset the saga and
@@ -1402,22 +1424,32 @@ impl SagaModule {
                     return Ok(());
                 }
                 if max_attempts == 0 {
-                    return Err(Error::Module("trigger max_attempts must be >= 1".into()));
+                    return Err(Error::module(
+                        "bad_max_attempts",
+                        "trigger max_attempts must be >= 1",
+                    ));
                 }
                 // the same commit-into-the-root-preimage class as an oversized
                 // result: the spec is stored AND re-emitted per retry, the
                 // reply_payload is stored and echoed in the callback.
                 if spec.len() > MAX_SPEC_BYTES {
-                    return Err(Error::Module(format!(
-                        "trigger spec is {} bytes; the cap is {MAX_SPEC_BYTES}",
-                        spec.len()
-                    )));
+                    return Err(Error::module(
+                        "spec_too_large",
+                        format!(
+                            "trigger spec is {} bytes; the cap is {MAX_SPEC_BYTES}",
+                            spec.len()
+                        ),
+                    ));
                 }
                 if reply_payload.len() > MAX_REPLY_PAYLOAD_BYTES {
-                    return Err(Error::Module(format!(
-                        "trigger reply_payload is {} bytes; the cap is {MAX_REPLY_PAYLOAD_BYTES}",
-                        reply_payload.len()
-                    )));
+                    return Err(Error::module(
+                        "reply_payload_too_large",
+                        format!(
+                            "trigger reply_payload is {} bytes; \
+                             the cap is {MAX_REPLY_PAYLOAD_BYTES}",
+                            reply_payload.len()
+                        ),
+                    ));
                 }
                 // the tag is opaque here (no charset rules — an unannounced
                 // tag simply assigns nobody) but its SIZE is bounded like
@@ -1425,21 +1457,25 @@ impl SagaModule {
                 // rejected rather than silently read as "no capability".
                 if let Some(tag) = &capability {
                     if tag.is_empty() {
-                        return Err(Error::Module(
-                            "trigger capability must be non-empty when set".into(),
+                        return Err(Error::module(
+                            "bad_capability_tag",
+                            "trigger capability must be non-empty when set",
                         ));
                     }
                     if tag.len() > MAX_CAPABILITY_BYTES {
-                        return Err(Error::Module(format!(
-                            "trigger capability is {} bytes; the cap is {MAX_CAPABILITY_BYTES}",
-                            tag.len()
-                        )));
+                        return Err(Error::module(
+                            "bad_capability_tag",
+                            format!(
+                                "trigger capability is {} bytes; the cap is {MAX_CAPABILITY_BYTES}",
+                                tag.len()
+                            ),
+                        ));
                     }
                 }
                 // the same validate_resources invariant the capability
                 // registry itself enforces on an announce: bounded dimension
                 // count, non-empty tag-shaped keys, non-zero values.
-                validate_resources(&demands).map_err(Error::Module)?;
+                validate_resources(&demands).map_err(|e| Error::module("bad_resources", e))?;
                 // an empty pinned key is a caller bug, rejected rather than
                 // silently read as "no binding" (the same rule as an empty
                 // capability tag). its SIZE is the ONE wire-supplied field the
@@ -1447,15 +1483,20 @@ impl SagaModule {
                 // the store — see [`MAX_ASSIGNEE_BYTES`].
                 if let Some(key) = &pinned_assignee {
                     if key.is_empty() {
-                        return Err(Error::Module(
-                            "trigger pinned_assignee must be non-empty when set".into(),
+                        return Err(Error::module(
+                            "bad_pinned_key",
+                            "trigger pinned_assignee must be non-empty when set",
                         ));
                     }
                     if key.len() > MAX_ASSIGNEE_BYTES {
-                        return Err(Error::Module(format!(
-                            "trigger pinned_assignee is {} bytes; the cap is {MAX_ASSIGNEE_BYTES}",
-                            key.len()
-                        )));
+                        return Err(Error::module(
+                            "bad_pinned_key",
+                            format!(
+                                "trigger pinned_assignee is {} bytes; \
+                                 the cap is {MAX_ASSIGNEE_BYTES}",
+                                key.len()
+                            ),
+                        ));
                     }
                 }
                 // the callback-poison rule (design §4): a callback aimed at an
@@ -1465,14 +1506,16 @@ impl SagaModule {
                 // trigger time, while rejection is still cheap and local.
                 if let Some(target) = &reply_to {
                     if *target == ctx.env().me {
-                        return Err(Error::Module(
-                            "trigger reply_to must not target the saga module itself".into(),
+                        return Err(Error::module(
+                            "bad_reply_to",
+                            "trigger reply_to must not target the saga module itself",
                         ));
                     }
                     if ctx.module_root(target).is_none() {
-                        return Err(Error::Module(format!(
-                            "trigger reply_to targets unknown module {target}"
-                        )));
+                        return Err(Error::module(
+                            "bad_reply_to",
+                            format!("trigger reply_to targets unknown module {target}"),
+                        ));
                     }
                 }
                 // the LIVE quota, and the last check before anything is staged
@@ -1483,9 +1526,10 @@ impl SagaModule {
                 let cap = live_saga_cap(&origin);
                 let live = self.live_sagas(&origin).await?;
                 if live >= cap {
-                    return Err(Error::Module(format!(
-                        "origin_live_saga_cap: {live} live sagas is this origin's {cap} cap"
-                    )));
+                    return Err(Error::module(
+                        "origin_live_saga_cap",
+                        format!("{live} live sagas is this origin's {cap} cap"),
+                    ));
                 }
                 let now = ctx.env().consensus_time;
                 let saga = Saga {
@@ -1565,10 +1609,13 @@ impl SagaModule {
                 if let Err(error) = &outcome
                     && error.len() > MAX_ERROR_BYTES
                 {
-                    return Err(Error::Module(format!(
-                        "oracle error is {} bytes; the cap is {MAX_ERROR_BYTES}",
-                        error.len()
-                    )));
+                    return Err(Error::module(
+                        "error_too_large",
+                        format!(
+                            "oracle error is {} bytes; the cap is {MAX_ERROR_BYTES}",
+                            error.len()
+                        ),
+                    ));
                 }
                 let mut saga = current;
                 saga.updated_at = ctx.env().consensus_time;
@@ -1577,10 +1624,13 @@ impl SagaModule {
                         // a finalized oversized result must not commit: abort
                         // the block rather than bloat the record.
                         if result.len() > MAX_RESULT_BYTES {
-                            return Err(Error::Module(format!(
-                                "oracle result is {} bytes; the cap is {MAX_RESULT_BYTES}",
-                                result.len()
-                            )));
+                            return Err(Error::module(
+                                "result_too_large",
+                                format!(
+                                    "oracle result is {} bytes; the cap is {MAX_RESULT_BYTES}",
+                                    result.len()
+                                ),
+                            ));
                         }
                         saga.status = SagaStatus::Done;
                         saga.result = Some(result.clone());
@@ -1652,10 +1702,16 @@ impl SagaModule {
                 let mut saga = current;
                 saga.updated_at = ctx.env().consensus_time;
                 if saga.pinned_assignee.is_some() {
-                    return Err(Error::Module("pinned saga cannot be reassigned".into()));
+                    return Err(Error::module(
+                        "saga_is_pinned",
+                        "pinned saga cannot be reassigned",
+                    ));
                 }
                 if saga.attempt + 1 >= saga.max_attempts {
-                    return Err(Error::Module("reassignment attempts exhausted".into()));
+                    return Err(Error::module(
+                        "attempts_exhausted",
+                        "reassignment attempts exhausted",
+                    ));
                 }
 
                 let old_assignee = saga.assignee.clone();
@@ -1673,7 +1729,10 @@ impl SagaModule {
                     )
                     .await;
                 let Some(next) = next else {
-                    return Err(Error::Module("no alternate assignee is available".into()));
+                    return Err(Error::module(
+                        "no_alternate_assignee",
+                        "no alternate assignee is available",
+                    ));
                 };
                 let spec = self.load_spec(&saga_id, saga.spec_len).await?;
                 self.cancel_attempt(ctx, &saga_id, old_attempt, old_assignee.as_deref());
@@ -1688,13 +1747,15 @@ impl SagaModule {
                 // never an error (a finalized late accept must not abort
                 // the block).
                 let Origin::External(key) = &ctx.env().origin else {
-                    return Err(Error::Module(
-                        "Accept requires an external origin (the accepting node's key)".into(),
+                    return Err(Error::module(
+                        "external_origin_required",
+                        "Accept requires an external origin (the accepting node's key)",
                     ));
                 };
                 if key.is_empty() {
-                    return Err(Error::Module(
-                        "Accept requires a non-empty submitter id".into(),
+                    return Err(Error::module(
+                        "empty_origin_key",
+                        "Accept requires a non-empty submitter id",
                     ));
                 }
                 let Some(current) = self.load(&saga_id).await? else {
@@ -1825,8 +1886,7 @@ impl SagaModule {
                 let Some(current) = self.load(&saga_id).await? else {
                     return Ok(());
                 };
-                if current.status.is_terminal()
-                    || current.origin != saga_origin(&ctx.env().origin)?
+                if current.status.is_terminal() || current.origin != saga_origin(&ctx.env().origin)?
                 {
                     return Ok(());
                 }
@@ -1920,7 +1980,7 @@ impl Module for SagaModule {
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match decode_query(req).map_err(Error::Module)? {
+        match decode_query(req).map_err(|e| Error::module("codec", e))? {
             SagaQuery::Get { saga_id } => {
                 let view = match self.load(&saga_id).await? {
                     Some(saga) => {
@@ -2097,15 +2157,17 @@ mod tests {
                 // exercises resident-only standing) whenever validators are
                 // configured at all.
                 "valset" => match &self.validators {
-                    Some(v) => match valset::decode_query(req).map_err(Error::Module)? {
-                        ValsetQuery::Validators => {
-                            Ok(valset::encode_reply(&ValsetReply::Validators(v.clone())))
+                    Some(v) => {
+                        match valset::decode_query(req).map_err(|e| Error::module("codec", e))? {
+                            ValsetQuery::Validators => {
+                                Ok(valset::encode_reply(&ValsetReply::Validators(v.clone())))
+                            }
+                            ValsetQuery::Residents => {
+                                Ok(valset::encode_reply(&ValsetReply::Residents(Vec::new())))
+                            }
+                            ValsetQuery::MeshWindow => Err(Error::QueryUnsupported),
                         }
-                        ValsetQuery::Residents => {
-                            Ok(valset::encode_reply(&ValsetReply::Residents(Vec::new())))
-                        }
-                        ValsetQuery::MeshWindow => Err(Error::QueryUnsupported),
-                    },
+                    }
                     None => Err(Error::QueryUnsupported),
                 },
                 // key on the decoded query variant: CapableProviders answers
@@ -2113,7 +2175,8 @@ mod tests {
                 // from the full announced pool — mirrors the real registry's
                 // "empty demands degrade to Providers" contract.
                 "capability" => {
-                    let query = capability::decode_query(req).map_err(Error::Module)?;
+                    let query =
+                        capability::decode_query(req).map_err(|e| Error::module("codec", e))?;
                     let pool = match query {
                         CapabilityQuery::CapableProviders { .. } => &self.capable_providers,
                         _ => &self.providers,
@@ -2529,7 +2592,7 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Module(_)));
+        assert!(matches!(err, Error::Module { ref reason, .. } if reason == "bad_max_attempts"));
         assert!(ctx.events.is_empty(), "a rejected trigger fires no worker");
         assert_eq!(get(&m, &sid("s1")), None);
     }
@@ -2558,7 +2621,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, Error::Module(_)),
+            matches!(err, Error::Module { ref reason, .. } if reason == "bad_reply_to"),
             "unknown reply_to rejects at trigger"
         );
         assert_eq!(get(&m, &sid("s1")), None, "no saga was staged");
@@ -2582,7 +2645,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, Error::Module(_)),
+            matches!(err, Error::Module { ref reason, .. } if reason == "bad_reply_to"),
             "self reply_to rejects at trigger"
         );
 
@@ -2882,7 +2945,10 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Module(_)), "oversized spec errs");
+        assert!(
+            matches!(err, Error::Module { ref reason, .. } if reason == "spec_too_large"),
+            "oversized spec errs"
+        );
         assert!(
             ctx.events.is_empty(),
             "no WorkerRequest for a rejected trigger"
@@ -2907,7 +2973,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, Error::Module(_)),
+            matches!(err, Error::Module { ref reason, .. } if reason == "reply_payload_too_large"),
             "oversized reply_payload errs"
         );
 
@@ -2922,7 +2988,10 @@ mod tests {
         let mut ctx = CaptureCtx::new();
         let huge = "e".repeat(MAX_ERROR_BYTES + 1);
         let err = exec(&mut m, &mut ctx, &oracle(&sid("s1"), 0, Err(huge))).unwrap_err();
-        assert!(matches!(err, Error::Module(_)), "oversized error errs");
+        assert!(
+            matches!(err, Error::Module { ref reason, .. } if reason == "error_too_large"),
+            "oversized error errs"
+        );
         block_on(m.abort_block()).unwrap();
         assert_eq!(m.root(), pending_root, "the aborted block left no trace");
         assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Pending);
@@ -2960,7 +3029,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, Error::Module(_)),
+            matches!(err, Error::Module { ref reason, .. } if reason == "result_too_large"),
             "oversized result errs with Module"
         );
         block_on(m.abort_block()).unwrap();
@@ -4335,7 +4404,10 @@ mod tests {
                 }),
             )
             .unwrap_err();
-            assert!(matches!(err, Error::Module(_)), "got {err:?} for {bad:?}");
+            assert!(
+                matches!(err, Error::Module { ref reason, .. } if reason == "bad_capability_tag"),
+                "got {err:?} for {bad:?}"
+            );
         }
         assert!(ctx.events.is_empty(), "rejected triggers fire no worker");
         assert_eq!(get(&m, &sid("s1")), None, "nothing was staged");
@@ -4672,7 +4744,10 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Module(_)), "got {err:?}");
+        assert!(
+            matches!(err, Error::Module { ref reason, .. } if reason == "bad_resources"),
+            "got {err:?}"
+        );
 
         // ...and a zero value both reject.
         let err = exec(
@@ -4692,7 +4767,10 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Module(_)), "got {err:?}");
+        assert!(
+            matches!(err, Error::Module { ref reason, .. } if reason == "bad_resources"),
+            "got {err:?}"
+        );
 
         assert!(ctx.events.is_empty(), "rejected triggers fire no worker");
         assert_eq!(get(&m, &sid("s1")), None, "nothing was staged");

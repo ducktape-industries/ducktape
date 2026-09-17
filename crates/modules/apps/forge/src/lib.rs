@@ -139,10 +139,10 @@ pub use oid::Oid;
 #[cfg(feature = "native")]
 mod module;
 pub mod pushcert;
-pub mod refs;
-pub mod state;
 #[cfg(any(feature = "native", feature = "guest"))]
 mod query;
+pub mod refs;
+pub mod state;
 #[cfg(feature = "native")]
 pub use module::{
     COMPACT_PACK_LIMIT, Forge, PendingBranch, build_objects, compact_repos, install_objects,
@@ -189,23 +189,28 @@ pub fn norm_repo(repo: &str) -> Result<String, Error> {
         return Ok(DEFAULT_REPO.to_string());
     }
     if repo.len() > MAX_REPO_NAME_LEN {
-        return Err(Error::Module(format!(
-            "forge: repo name too long ({} bytes, max {MAX_REPO_NAME_LEN})",
-            repo.len()
-        )));
+        return Err(Error::module(
+            "bad_repo_name",
+            format!(
+                "forge: repo name too long ({} bytes, max {MAX_REPO_NAME_LEN})",
+                repo.len()
+            ),
+        ));
     }
     if repo.starts_with('.') {
-        return Err(Error::Module(
-            "forge: repo name may not start with '.'".into(),
+        return Err(Error::module(
+            "bad_repo_name",
+            "forge: repo name may not start with '.'",
         ));
     }
     if !repo
         .bytes()
         .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
     {
-        return Err(Error::Module(format!(
-            "forge: repo name {repo:?} must match [a-z0-9._-]"
-        )));
+        return Err(Error::module(
+            "bad_repo_name",
+            format!("forge: repo name {repo:?} must match [a-z0-9._-]"),
+        ));
     }
     Ok(repo.to_string())
 }

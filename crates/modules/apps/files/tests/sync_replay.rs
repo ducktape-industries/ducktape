@@ -347,7 +347,8 @@ fn install_rejects_wrong_root_tampered_object_and_never_livelocks() {
         .ingest_objects(&[(honest_id, Kind::Chunk.tag(), tampered)])
         .unwrap_err();
     assert!(
-        matches!(&err, sdk::Error::Module(m) if m.contains("object id mismatch")),
+        matches!(&err, sdk::Error::Module { reason, sentence }
+            if reason == "files_ingest_object" && sentence.contains("object id mismatch")),
         "got {err:?}"
     );
 

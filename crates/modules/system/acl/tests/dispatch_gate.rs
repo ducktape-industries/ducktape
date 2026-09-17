@@ -120,8 +120,8 @@ fn the_default_is_allow_all_and_the_target_module_still_gates_semantically() {
         .await
         .expect_err("valset's own origin gate still refuses");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m))
-                if m.contains("only via governance")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. })
+                if reason == "not_governance"),
             "the refusal is the TARGET's, not the dispatch gate's: {err:?}"
         );
     });
@@ -151,8 +151,9 @@ fn a_set_policy_refuses_no_standing_keys_at_dispatch_and_clears_back_to_open() {
         .await
         .expect_err("no validator standing");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m))
-                if m.contains("acl: target acl requires validator standing")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, ref sentence })
+                if reason == "acl_standing"
+                    && sentence.contains("acl: target acl requires validator standing")),
             "the refusal is the dispatch gate's: {err:?}"
         );
 
@@ -168,8 +169,8 @@ fn a_set_policy_refuses_no_standing_keys_at_dispatch_and_clears_back_to_open() {
         .await
         .expect_err("acl's own gate still refuses external writes");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m))
-                if m.contains("only via governance")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. })
+                if reason == "not_governance"),
             "got {err:?}"
         );
 
@@ -185,8 +186,8 @@ fn a_set_policy_refuses_no_standing_keys_at_dispatch_and_clears_back_to_open() {
         .await
         .expect_err("back to the module's own gate");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m))
-                if m.contains("only via governance")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. })
+                if reason == "not_governance"),
             "the dispatch gate is open again: {err:?}"
         );
     });
@@ -224,8 +225,8 @@ fn node_standing_admits_residents_and_the_wildcard_covers_unlisted_targets() {
         .await
         .expect_err("no node standing");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m))
-                if m.contains("requires node standing")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, ref sentence })
+                if reason == "acl_standing" && sentence.contains("requires node standing")),
             "got {err:?}"
         );
 
@@ -242,8 +243,8 @@ fn node_standing_admits_residents_and_the_wildcard_covers_unlisted_targets() {
             .await
             .expect_err("valset's own gate answers");
             assert!(
-                matches!(err, SubmitError::Rejected(Error::Module(ref m))
-                    if m.contains("only via governance")),
+                matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. })
+                    if reason == "not_governance"),
                 "got {err:?}"
             );
         }
@@ -300,8 +301,8 @@ fn user_standing_resolves_through_the_identity_account_plane() {
         .await
         .expect_err("a node key is not a user");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m))
-                if m.contains("requires user standing")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, ref sentence })
+                if reason == "acl_standing" && sentence.contains("requires user standing")),
             "got {err:?}"
         );
 
@@ -316,8 +317,8 @@ fn user_standing_resolves_through_the_identity_account_plane() {
         .await
         .expect_err("no account");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m))
-                if m.contains("requires user standing")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, ref sentence })
+                if reason == "acl_standing" && sentence.contains("requires user standing")),
             "got {err:?}"
         );
     });

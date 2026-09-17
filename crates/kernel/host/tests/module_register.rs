@@ -542,7 +542,10 @@ struct FlakyStore {
 impl sdk::MerkleStore for FlakyStore {
     async fn get(&self, key: &[u8; sdk::ROOT_LEN]) -> Result<Option<Vec<u8>>, Error> {
         if self.failing.get() {
-            return Err(Error::Module("injected registry read failure".into()));
+            return Err(Error::module(
+                "injected_fault",
+                "injected registry read failure",
+            ));
         }
         self.inner.get(key).await
     }

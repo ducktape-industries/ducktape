@@ -43,9 +43,12 @@ impl Module for Caller {
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         if matches!(&ctx.env().origin, Origin::Module(m) if m == "dispatch") {
             let dispatch::Delivery::Result(event) =
-                dispatch::decode_delivery(&msg.payload).map_err(Error::Module)?
+                dispatch::decode_delivery(&msg.payload).map_err(|e| Error::module("codec", e))?
             else {
-                return Err(Error::Module("expected recipe result".into()));
+                return Err(Error::module(
+                    "unexpected_delivery",
+                    "expected recipe result",
+                ));
             };
             self.received.borrow_mut().push(event);
             return Ok(());

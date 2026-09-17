@@ -41,9 +41,10 @@ fn mk_ctx(height: u64, origin: Origin) -> TestCtx {
 /// a ctx whose identity sibling answers `Get` from `accounts`.
 fn with_identity(ctx: TestCtx, accounts: Vec<AccountView>) -> TestCtx {
     ctx.on_query("identity", move |req| {
-        let IdentityQuery::Get { number } = identity_decode_query(req).map_err(Error::Module)?
+        let IdentityQuery::Get { number } =
+            identity_decode_query(req).map_err(|e| Error::module("codec", e))?
         else {
-            return Err(Error::Module("only Get is served here".into()));
+            return Err(Error::module("only_get_served", "only Get is served here"));
         };
         let account = accounts.iter().find(|a| a.number == number).cloned();
         Ok(identity_encode_reply(&IdentityReply::Account(account)))

@@ -5,10 +5,10 @@ use std::fmt;
 use std::time::Duration;
 
 use futures::{SinkExt as _, StreamExt as _};
-use reqwest::{Response, Url};
 /// Re-exported with [`refusal`], which takes one: a caller that reads a `/v1`
 /// route itself should not have to pin this client's reqwest to say so.
 pub use reqwest::StatusCode;
+use reqwest::{Response, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -34,7 +34,7 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(7_500);
 /// and then clip the whole thing, so every character of framing was a character
 /// cut off the END of the module's own sentence, which is the half that says
 /// what to do about it.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     reason: String,
     message: String,
@@ -137,7 +137,11 @@ pub enum SubmitFailure {
     /// The node answered, and its answer was no — a malformed frame, an
     /// unknown module, a module that refused the op. This is a verdict, and
     /// it is the only failure a caller may relay to a user as a refusal.
-    Refused(String),
+    ///
+    /// It carries the node's refusal WHOLE — the refusing module's own token
+    /// in [`Error::reason`] and its sentence in [`Error::message`] — so a
+    /// caller branches on the token instead of sniffing the prose.
+    Refused(Error),
     /// The exchange never completed: the connection failed, the budget ran
     /// out, or the receipt did not parse. The op's fate is UNKNOWN. Report it
     /// as an error, never as a refusal, and re-read before retrying.
@@ -147,7 +151,8 @@ pub enum SubmitFailure {
 impl fmt::Display for SubmitFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Refused(detail) | Self::Unresolved(detail) => formatter.write_str(detail),
+            Self::Refused(error) => formatter.write_str(error.message()),
+            Self::Unresolved(detail) => formatter.write_str(detail),
         }
     }
 }
@@ -619,7 +624,9 @@ impl Client {
         };
         let response = sign("POST", QUERY_READER_PATH, &digest)
             .into_iter()
-            .fold(request, |request, (name, value)| request.header(name, value))
+            .fold(request, |request, (name, value)| {
+                request.header(name, value)
+            })
             .send()
             .await
             .map_err(|error| Error::new(format!("{target} authenticated query failed: {error}")))?;
@@ -936,9 +943,7 @@ impl Client {
                 SubmitFailure::Unresolved(format!("transaction submission failed: {error}"))
             })?;
         if !response.status().is_success() {
-            return Err(SubmitFailure::Refused(
-                response_error(response).await.to_string(),
-            ));
+            return Err(SubmitFailure::Refused(response_error(response).await));
         }
         #[derive(Deserialize)]
         struct Receipt {
@@ -1532,10 +1537,18 @@ mod tests {
     /// may relay; `Unresolved` means nobody said no and the op may be landing.
     #[test]
     fn only_an_answered_submit_reads_as_a_refusal() {
-        let refused = SubmitFailure::Refused("forge: non-fast-forward".into());
+        let refused = SubmitFailure::Refused(Error::refused(
+            "non_fast_forward",
+            "forge: non-fast-forward",
+        ));
         let unresolved = SubmitFailure::Unresolved("transaction submission failed".into());
         assert_ne!(refused, unresolved);
-        assert!(matches!(refused, SubmitFailure::Refused(_)));
+        // the refusing module's own token survives the lane — a caller branches
+        // on it instead of reading the sentence.
+        let SubmitFailure::Refused(error) = &refused else {
+            panic!("a refusal is a refusal");
+        };
+        assert_eq!(error.reason(), "non_fast_forward");
         assert!(matches!(unresolved, SubmitFailure::Unresolved(_)));
         // both render as their detail — the distinction is the variant, so a
         // caller that only prints one cannot accidentally branch on prose.

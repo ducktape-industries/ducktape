@@ -93,10 +93,13 @@ impl EvmModule {
                 gas_limit,
             } => {
                 if init_code.len() > MAX_INIT_CODE_BYTES {
-                    return Err(Error::Module(format!(
-                        "EVM init code too large: {} bytes exceeds {MAX_INIT_CODE_BYTES}",
-                        init_code.len()
-                    )));
+                    return Err(Error::module(
+                        "init_code_too_large",
+                        format!(
+                            "EVM init code too large: {} bytes exceeds {MAX_INIT_CODE_BYTES}",
+                            init_code.len()
+                        ),
+                    ));
                 }
                 (TxKind::Create, init_code, gas_limit)
             }
@@ -106,18 +109,22 @@ impl EvmModule {
                 gas_limit,
             } => {
                 if input.len() > MAX_INPUT_BYTES {
-                    return Err(Error::Module(format!(
-                        "EVM input too large: {} bytes exceeds {MAX_INPUT_BYTES}",
-                        input.len()
-                    )));
+                    return Err(Error::module(
+                        "input_too_large",
+                        format!(
+                            "EVM input too large: {} bytes exceeds {MAX_INPUT_BYTES}",
+                            input.len()
+                        ),
+                    ));
                 }
                 (TxKind::Call(Address::from(to)), input, gas_limit)
             }
         };
         if !(21_000..=MAX_GAS_LIMIT).contains(&gas_limit) {
-            return Err(Error::Module(format!(
-                "EVM gas limit must be between 21000 and {MAX_GAS_LIMIT}"
-            )));
+            return Err(Error::module(
+                "bad_gas_limit",
+                format!("EVM gas limit must be between 21000 and {MAX_GAS_LIMIT}"),
+            ));
         }
 
         let caller = origin_address(origin);
@@ -153,11 +160,13 @@ impl EvmModule {
             .nonce(nonce)
             .chain_id(None)
             .build()
-            .map_err(|e| Error::Module(format!("invalid EVM transaction: {e}")))?;
+            .map_err(|e| {
+                Error::module("bad_transaction", format!("invalid EVM transaction: {e}"))
+            })?;
         let mut evm = context.build_mainnet();
-        let result = evm
-            .transact_commit(tx)
-            .map_err(|e| Error::Module(format!("EVM transaction rejected: {e}")))?;
+        let result = evm.transact_commit(tx).map_err(|e| {
+            Error::module("transact_commit", format!("EVM transaction rejected: {e}"))
+        })?;
         let db = evm.ctx.journaled_state.database;
         Ok((execution_result(result), db))
     }
@@ -186,7 +195,7 @@ impl Module for EvmModule {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        match decode_msg(&msg.payload).map_err(Error::Module)? {
+        match decode_msg(&msg.payload).map_err(|e| Error::module("codec", e))? {
             EvmMsg::Execute(transaction) => {
                 let env = ctx.env();
                 let caller = address_bytes(&origin_address(&env.origin));
@@ -215,8 +224,9 @@ impl Module for EvmModule {
             EvmMsg::Receipt { result, .. } => {
                 let env = ctx.env();
                 if env.origin != Origin::Module(self.id.clone()) {
-                    return Err(Error::Module(
-                        "EVM receipts may only be emitted by the EVM module".into(),
+                    return Err(Error::module(
+                        "module_origin_required",
+                        "EVM receipts may only be emitted by the EVM module",
                     ));
                 }
                 ctx.emit_event(Event {
@@ -229,13 +239,13 @@ impl Module for EvmModule {
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let EvmQuery::Simulate(tx) = decode_query(req).map_err(Error::Module)?;
+        let EvmQuery::Simulate(tx) = decode_query(req).map_err(|e| Error::module("codec", e))?;
         Self::run(self.active().clone(), tx, &Origin::System, 0, 0)
             .map(|(result, _)| encode_result(&result))
     }
 
     async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let EvmQuery::Simulate(tx) = decode_query(req).map_err(Error::Module)?;
+        let EvmQuery::Simulate(tx) = decode_query(req).map_err(|e| Error::module("codec", e))?;
         let env = ctx.env();
         Self::run(
             self.active().clone(),
@@ -348,7 +358,9 @@ fn encode_snapshot(db: &InMemoryDB) -> Result<Vec<u8>, Error> {
                 .or_else(|| db.cache.contracts.get(&account.info.code_hash))
                 .map(|code| code.original_byte_slice().to_vec())
                 .or_else(|| (account.info.code_hash == KECCAK_EMPTY).then(Vec::new))
-                .ok_or_else(|| Error::Module("EVM account code missing from cache".into()))?;
+                .ok_or_else(|| {
+                    Error::module("code_absent", "EVM account code missing from cache")
+                })?;
             let mut storage: Vec<_> = account
                 .storage
                 .iter()
@@ -368,18 +380,19 @@ fn encode_snapshot(db: &InMemoryDB) -> Result<Vec<u8>, Error> {
             })
         })
         .collect();
-    serde_json::to_vec(&accounts?).map_err(|e| Error::Module(e.to_string()))
+    serde_json::to_vec(&accounts?).map_err(|e| Error::module("snapshot_encode", e.to_string()))
 }
 
 fn decode_snapshot(bytes: &[u8]) -> Result<InMemoryDB, Error> {
-    let accounts: Vec<SnapshotAccount> =
-        serde_json::from_slice(bytes).map_err(|e| Error::Module(e.to_string()))?;
+    let accounts: Vec<SnapshotAccount> = serde_json::from_slice(bytes)
+        .map_err(|e| Error::module("snapshot_decode", e.to_string()))?;
     if accounts
         .windows(2)
         .any(|pair| pair[0].address >= pair[1].address)
     {
-        return Err(Error::Module(
-            "EVM snapshot accounts are not strictly sorted".into(),
+        return Err(Error::module(
+            "snapshot_decode",
+            "EVM snapshot accounts are not strictly sorted",
         ));
     }
 
@@ -390,13 +403,18 @@ fn decode_snapshot(bytes: &[u8]) -> Result<InMemoryDB, Error> {
             .windows(2)
             .any(|pair| pair[0].key >= pair[1].key)
         {
-            return Err(Error::Module(
-                "EVM snapshot storage is not strictly sorted".into(),
+            return Err(Error::module(
+                "snapshot_decode",
+                "EVM snapshot storage is not strictly sorted",
             ));
         }
         let address = Address::from(account.address);
-        let code = Bytecode::new_raw_checked(account.code.into())
-            .map_err(|e| Error::Module(format!("invalid EVM snapshot bytecode: {e}")))?;
+        let code = Bytecode::new_raw_checked(account.code.into()).map_err(|e| {
+            Error::module(
+                "snapshot_decode",
+                format!("invalid EVM snapshot bytecode: {e}"),
+            )
+        })?;
         db.insert_account_info(
             address,
             AccountInfo::default()

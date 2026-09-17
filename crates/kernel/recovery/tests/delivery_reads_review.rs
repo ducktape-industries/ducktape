@@ -86,7 +86,10 @@ impl Module for Source {
             SourceBehavior::EmitOnlyWhileReady => {
                 let retired = self.disk.borrow().queue == QueueState::Retired;
                 if retired {
-                    return Err(Error::Module("source action already consumed".into()));
+                    return Err(Error::module(
+                        "source_action_consumed",
+                        "source action already consumed",
+                    ));
                 }
                 ctx.emit_msg(Msg {
                     target: "receiver".into(),
@@ -218,7 +221,7 @@ impl Module for Receiver {
         let observed = match answer.first() {
             Some(1) => true,
             Some(0) => false,
-            _ => return Err(Error::Module("bad source reply".into())),
+            _ => return Err(Error::module("bad_source_reply", "bad source reply")),
         };
         let received = self
             .staged
@@ -359,7 +362,7 @@ impl Module for RegistryBoundary {
         })
     }
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match modules::decode_query(req).map_err(Error::Module)? {
+        match modules::decode_query(req).map_err(|e| Error::module("codec", e))? {
             modules::ModulesQuery::ModuleStatus => {
                 let pending = match *self.disk.borrow() {
                     true => None,
@@ -411,7 +414,10 @@ impl Module for RegistryBoundary {
         assert_eq!(ctx.env().origin, Origin::System);
         let already_advanced = *self.disk.borrow();
         if already_advanced {
-            return Err(Error::Module("boundary already advanced".into()));
+            return Err(Error::module(
+                "boundary_advanced",
+                "boundary already advanced",
+            ));
         }
         self.staged = Some(true);
         ctx.emit_msg(Msg {
