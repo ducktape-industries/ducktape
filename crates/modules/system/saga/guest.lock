@@ -67,7 +67,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "capability-wire"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "sdk",
  "serde",
@@ -117,7 +117,7 @@ dependencies = [
 [[package]]
 name = "ducktape-module-sdk"
 version = "0.0.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "async-trait",
  "sdk",
@@ -133,7 +133,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "fluent-guest"
 version = "0.1.0"
-source = "git+https://github.com/orthory/fluent31?rev=76ba1867bc0ba9c09bb8387149c07844f1d2395c#76ba1867bc0ba9c09bb8387149c07844f1d2395c"
+source = "git+https://github.com/ducktape-industries/fluent31?rev=76ba1867bc0ba9c09bb8387149c07844f1d2395c#76ba1867bc0ba9c09bb8387149c07844f1d2395c"
 dependencies = [
  "fluent-guest-macros",
 ]
@@ -141,7 +141,7 @@ dependencies = [
 [[package]]
 name = "fluent-guest-macros"
 version = "0.1.0"
-source = "git+https://github.com/orthory/fluent31?rev=76ba1867bc0ba9c09bb8387149c07844f1d2395c#76ba1867bc0ba9c09bb8387149c07844f1d2395c"
+source = "git+https://github.com/ducktape-industries/fluent31?rev=76ba1867bc0ba9c09bb8387149c07844f1d2395c#76ba1867bc0ba9c09bb8387149c07844f1d2395c"
 
 [[package]]
 name = "foldhash"
@@ -183,7 +183,7 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 [[package]]
 name = "index-guest"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "borsh",
  "fluent-guest",
@@ -289,7 +289,7 @@ dependencies = [
 [[package]]
 name = "saga"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#8c2c09cd20ff7b4284d22a10789e88512237f2e0"
+source = "git+https://github.com/ducktape-industries/ducktape#d91dbe32c9d6275383f4ae742acf7a3b94beac5b"
 dependencies = [
  "async-trait",
  "borsh",
@@ -321,7 +321,7 @@ dependencies = [
 [[package]]
 name = "saga-wire"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "borsh",
  "sdk",
@@ -331,7 +331,7 @@ dependencies = [
 [[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "async-trait",
  "borsh",
@@ -473,7 +473,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 [[package]]
 name = "valset-wire"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "sdk",
  "serde",
@@ -628,19 +628,19 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[patch.unused]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"

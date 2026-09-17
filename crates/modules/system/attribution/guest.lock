@@ -54,7 +54,7 @@ dependencies = [
 [[package]]
 name = "attribution"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#8c2c09cd20ff7b4284d22a10789e88512237f2e0"
+source = "git+https://github.com/ducktape-industries/ducktape#d91dbe32c9d6275383f4ae742acf7a3b94beac5b"
 dependencies = [
  "async-trait",
  "attribution-wire",
@@ -76,7 +76,7 @@ dependencies = [
 [[package]]
 name = "attribution-wire"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "borsh",
  "sdk",
@@ -178,7 +178,7 @@ dependencies = [
 [[package]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "cc",
  "glob",
@@ -701,7 +701,7 @@ dependencies = [
 [[package]]
 name = "ducktape-module-sdk"
 version = "0.0.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "async-trait",
  "sdk",
@@ -977,17 +977,17 @@ dependencies = [
 [[package]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 
 [[package]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 
 [[package]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "rand_core 0.10.1",
 ]
@@ -1085,7 +1085,7 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 [[package]]
 name = "identity-wire"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "borsh",
  "keyscheme",
@@ -1156,7 +1156,7 @@ dependencies = [
 [[package]]
 name = "keyscheme"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "base64",
  "borsh",
@@ -1640,7 +1640,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "async-trait",
  "borsh",
