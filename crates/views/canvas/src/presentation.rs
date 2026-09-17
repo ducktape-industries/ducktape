@@ -257,6 +257,11 @@ pub(super) struct Lettering {
 }
 /// The inset every island keeps from the stage's edge.
 const ISLAND: f32 = 12.;
+/// The width of the board's own menu. Fixed, because a menu whose width came
+/// from its longest row would change shape as rows come and go — and the rows
+/// come and go with what is under the cursor, so the same press in two places
+/// would put the same action in two different spots.
+const MENU_WIDTH: f32 = 200.;
 /// The side of an icon-only tool.
 const TOOL: f32 = 36.;
 /// The width of the zoom readout. Fixed on purpose — a readout that resized as
@@ -315,6 +320,9 @@ impl BoardsView {
             }
             layers.extend(self.empty_prompt(board));
         }
+        // Last of the stage's layers, so the menu stands over everything drawn
+        // on the board and its backdrop stands over everything but the menu.
+        layers.extend(self.menu_layers());
         let mut stage = Node::Stack {
             key: "boards/stage".into(),
             width: Some(Length::Fill),
@@ -411,6 +419,108 @@ impl BoardsView {
             stage = modal("boards/help-modal", stage, card, Message::Help);
         }
         stage
+    }
+    /// The board's own menu, where the secondary button opened it: a backdrop
+    /// that shuts it on any press, then the card floated at the cursor.
+    ///
+    /// A `Node::Float` and not the `float` overlay every island uses: the
+    /// overlay's wrapper paints its surface at the card's UN-translated
+    /// origin, which a floated card leaves behind as a grey rectangle in the
+    /// corner. The chat view learned this the same way. A `Float` carries its
+    /// own surface and stops a press inside it, which is the half of the
+    /// overlay that a menu actually needs.
+    fn menu_layers(&self) -> Vec<Node> {
+        let Some(press) = self.menu else {
+            return Vec::new();
+        };
+        let items = self.menu_items();
+        let (card, height) = self.board_menu(&items);
+        let at = menu_origin(press, [MENU_WIDTH, height], self.viewport);
+        vec![
+            Node::MouseArea {
+                key: "boards/menu-backdrop".into(),
+                on_press: Some(slots::message(Message::CloseMenu)),
+                on_release: None,
+                on_double_click: None,
+                // The second button shuts it too, rather than opening a second
+                // menu over the first — which is what a press outside a menu
+                // means everywhere else.
+                on_right_press: Some(slots::message(Message::CloseMenu)),
+                on_right_release: None,
+                on_middle_press: None,
+                on_middle_release: None,
+                on_enter: None,
+                on_exit: None,
+                on_move: None,
+                on_press_at: None,
+                on_scroll: None,
+                content: Box::new(kit::space(Some(Length::Fill), Some(Length::Fill))),
+            },
+            // The box around the float, not the card inside it: a float takes
+            // the width of the box it is laid out in, and the box a stage
+            // layer hands it is the whole stage — which paints its surface
+            // from the cursor to the right edge. Sizing the card within it
+            // does not help; the sheet is the float's own.
+            kit::sized(
+                kit::container(
+                    "boards/menu-box",
+                    Node::Float {
+                        key: "boards/menu-card".into(),
+                        x: at[0],
+                        y: at[1],
+                        scale: 1.,
+                        shadow: wire::Shadow {
+                            color: Some(Rgba([0., 0., 0., self.menu_shade()])),
+                            x: Some(0.),
+                            y: Some(4.),
+                            blur: Some(16.),
+                        },
+                        radius: Some([10.; 4]),
+                        content: Box::new(card),
+                    },
+                ),
+                Some(Length::Fixed(MENU_WIDTH)),
+                Some(Length::Fixed(height)),
+            ),
+        ]
+    }
+    /// A dropped shadow lifts the card off the board; deeper on a dark one,
+    /// where a soft grey under a card reads as part of the card.
+    fn menu_shade(&self) -> f32 {
+        match self.session.dark {
+            true => 0.5,
+            false => 0.16,
+        }
+    }
+    /// The menu's rows, and the height they add up to. The height is returned
+    /// and not measured, because the corner it opens from is chosen from it:
+    /// a menu pressed near the bottom of the stage opens upward, and it cannot
+    /// wait for a frame to find out how tall it is.
+    fn board_menu(&self, items: &[MenuItem]) -> (Node, f32) {
+        const ROW: f32 = 28.;
+        const GAP: f32 = 2.;
+        const RULE: f32 = 1.;
+        const PADDING: f32 = 8.;
+        let mut rows = Vec::new();
+        let mut height = 2. * PADDING;
+        for item in items {
+            // The one row that destroys something stands apart from the rows
+            // that copy and stack, so a hand aiming for Duplicate cannot land
+            // on Delete by being one row out. Nothing above it means nothing
+            // to stand apart from.
+            let opens_the_last_group = *item == MenuItem::Delete && !rows.is_empty();
+            if opens_the_last_group {
+                rows.push(kit::divider("boards/menu-rule"));
+                height += RULE + GAP;
+            }
+            rows.push(menu_button(*item));
+            height += ROW + GAP;
+        }
+        let card = kit::padded(
+            kit::spaced(kit::column("boards/menu-body", rows), GAP),
+            wire::Edges::all(PADDING),
+        );
+        (card, height - GAP)
     }
     /// Top-left: the board's name and its save state; open, the board list.
     fn menu_island(&self, board: &Option<Board>, open: bool) -> Node {
@@ -1091,7 +1201,7 @@ impl BoardsView {
                 Some(Message::Wheel(x, y, pixels))
             }))),
             on_double_click: Some(slots::message(Message::DoubleClick)),
-            on_right_press: None,
+            on_right_press: Some(slots::message(Message::OpenMenu)),
             on_right_release: None,
             on_middle_press: Some(slots::message(Message::MiddleDown)),
             on_middle_release: Some(slots::message(Message::Release)),
@@ -2437,6 +2547,96 @@ fn plate(id: &str, words: Node, letters: &Lettering, wash: [f32; 4], room: [f32;
     middle
 }
 /// An island: a card at a stage corner, its controls packed tight.
+/// Where a menu of this size stands when it was pressed there. It opens down
+/// and to the right of the cursor, the way a menu does everywhere — and flips
+/// to the other side of the press rather than hanging off the stage, because
+/// the edge of the board is exactly where you are when you right-click the last
+/// shape in a row.
+pub(super) fn menu_origin(press: [f32; 2], size: [f32; 2], viewport: [f32; 2]) -> [f32; 2] {
+    const GUTTER: f32 = 8.;
+    let fits_right = press[0] + size[0] + GUTTER <= viewport[0];
+    let fits_below = press[1] + size[1] + GUTTER <= viewport[1];
+    let x = match fits_right {
+        true => press[0],
+        false => press[0] - size[0],
+    };
+    let y = match fits_below {
+        true => press[1] + 4.,
+        false => press[1] - size[1] - 4.,
+    };
+    [x.max(GUTTER), y.max(GUTTER)]
+}
+/// One row of the menu. Its words start at the left edge and the button fills
+/// the card, because a menu is read down its left margin — a column of centred
+/// labels is a toolbar stood on its side, and the eye has to find each one.
+fn menu_button(item: MenuItem) -> Node {
+    let key = format!("boards/menu/{}", menu_key(item));
+    let (label, hint) = menu_row(item);
+    let mut words = kit::nowrap(kit::text(format!("{key}/label"), label));
+    if let Node::Text { align_x, .. } = &mut words {
+        *align_x = Some(AlignX::Left);
+    }
+    let mut node = kit::button_child(
+        &key,
+        kit::sized(words, Some(Length::Fill), None),
+        Some(slots::message(Message::Menu(item))),
+        ButtonPreset::Subtle,
+    );
+    if let Node::Button {
+        label: accessible,
+        description,
+        width,
+        height,
+        padding,
+        ..
+    } = &mut node
+    {
+        *accessible = Some(label.into());
+        *description = Some(hint.into());
+        *width = Some(Length::Fill);
+        *height = Some(Length::Fixed(28.));
+        *padding = Some(wire::Edges {
+            top: 0.,
+            right: 8.,
+            bottom: 0.,
+            left: 8.,
+        });
+    }
+    node
+}
+/// What a menu row says, and the keys that do the same thing. The shortcut is
+/// the row's description rather than a second column: a menu whose rows each
+/// carried two strings would be half again as wide for a hint you read once.
+fn menu_row(item: MenuItem) -> (&'static str, &'static str) {
+    match item {
+        MenuItem::Cut => ("Cut", "⌘ / Ctrl X"),
+        MenuItem::Copy => ("Copy", "⌘ / Ctrl C"),
+        MenuItem::Paste => ("Paste", "⌘ / Ctrl V"),
+        MenuItem::Duplicate => ("Duplicate", "⌘ / Ctrl D"),
+        MenuItem::Front => ("Bring to front", "⌘ / Ctrl ]"),
+        MenuItem::Back => ("Send to back", "⌘ / Ctrl ["),
+        MenuItem::Group => ("Group", "⌘ / Ctrl G"),
+        MenuItem::Ungroup => ("Ungroup", "⌘ / Ctrl ⇧ G"),
+        MenuItem::SelectAll => ("Select all", "⌘ / Ctrl A"),
+        MenuItem::Delete => ("Delete", "Delete / Backspace"),
+    }
+}
+/// The key a row is addressed by. Its own name and not its label, so a row a
+/// test reaches for keeps its address when the wording changes.
+fn menu_key(item: MenuItem) -> &'static str {
+    match item {
+        MenuItem::Cut => "cut",
+        MenuItem::Copy => "copy",
+        MenuItem::Paste => "paste",
+        MenuItem::Duplicate => "duplicate",
+        MenuItem::Front => "front",
+        MenuItem::Back => "back",
+        MenuItem::Group => "group",
+        MenuItem::Ungroup => "ungroup",
+        MenuItem::SelectAll => "select-all",
+        MenuItem::Delete => "delete",
+    }
+}
 fn island(key: &str, content: Node) -> Node {
     kit::padded(kit::card(key, content), wire::Edges::all(4.))
 }

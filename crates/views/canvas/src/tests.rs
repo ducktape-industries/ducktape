@@ -4008,6 +4008,185 @@ fn the_weight_row_is_offered_to_everything_that_draws_a_line() {
         "a text shape draws no line, so a weight row on it sets nothing"
     );
 }
+/// The rows the board's menu is showing, by their own keys.
+fn menu_rows(view: &BoardsView) -> Vec<String> {
+    let tree = view.view();
+    let mut keys = Vec::new();
+    fn walk(node: &wire::Node, keys: &mut Vec<String>) {
+        // The row itself, not the words inside it: a row's label is a child
+        // keyed under the row.
+        if let Some(key) = node.key().and_then(|key| key.strip_prefix("boards/menu/"))
+            && !key.contains('/')
+        {
+            keys.push(key.to_owned());
+        }
+        for child in node.children() {
+            walk(child, keys);
+        }
+    }
+    walk(&tree, &mut keys);
+    keys
+}
+/// Right-click takes what it landed on, opens where it landed, and offers what
+/// that thing can actually answer. Before this the secondary button was the one
+/// input on the canvas wired to nothing at all — not a menu, not even a pick.
+#[test]
+fn the_secondary_button_takes_what_it_landed_on_and_opens_over_it() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    for (id, x) in [("a", 100), ("b", 500)] {
+        view.edit(Change::Create {
+            id: id.into(),
+            shape: Shape {
+                kind: Kind::Rectangle,
+                x,
+                y: 100,
+                width: 200,
+                height: 140,
+                ..Default::default()
+            },
+        });
+    }
+
+    // Over a shape nothing had picked: it takes that shape alone, so the
+    // delete this menu is about to offer deletes what was pointed at.
+    view.cursor = view.screen(150., 150.);
+    view.on_open_menu();
+    assert_eq!(view.selected, ["a".to_owned()].into());
+    assert!(
+        view.menu.is_some(),
+        "a right-click on a shape opened nothing"
+    );
+    assert_eq!(
+        menu_rows(&view),
+        ["cut", "copy", "duplicate", "front", "back", "delete"],
+        "a lone shape was offered rows it cannot answer"
+    );
+
+    // Over a shape already in a selection of three: the selection stands, so
+    // "pick three, right-click one, group" is a thing you can do.
+    view.on_close_menu();
+    view.selected = ["a".to_owned(), "b".to_owned()].into();
+    view.cursor = view.screen(550., 150.);
+    view.on_open_menu();
+    assert_eq!(view.selected, ["a".to_owned(), "b".to_owned()].into());
+    assert!(
+        menu_rows(&view).contains(&"group".to_owned()),
+        "two loose shapes were offered no grouping: {:?}",
+        menu_rows(&view)
+    );
+
+    // Over bare canvas with nothing copied: what is left is the one thing bare
+    // canvas can answer.
+    view.on_close_menu();
+    view.selected = Default::default();
+    view.cursor = view.screen(900., 700.);
+    view.on_open_menu();
+    assert_eq!(menu_rows(&view), ["select-all"]);
+
+    // And with something copied, the paste that bare canvas is usually for.
+    view.on_close_menu();
+    view.selected = ["a".to_owned()].into();
+    view.on_copy();
+    view.selected = Default::default();
+    view.on_open_menu();
+    assert_eq!(menu_rows(&view), ["paste", "select-all"]);
+}
+/// A menu pressed near the edge of the stage opens back over the press rather
+/// than off the board. The edge is exactly where you are when you right-click
+/// the last shape in a row, so a menu that only works in the middle is a menu
+/// that fails when it is needed.
+#[test]
+fn a_menu_pressed_at_the_edge_opens_back_over_the_press() {
+    let viewport = [1400., 900.];
+    let size = [200., 240.];
+    let middle = super::presentation::menu_origin([400., 300.], size, viewport);
+    assert!(
+        middle[0] >= 400. && middle[1] >= 300.,
+        "a menu with room around it did not open down and to the right: {middle:?}"
+    );
+
+    let corner = super::presentation::menu_origin([1380., 880.], size, viewport);
+    assert!(
+        corner[0] + size[0] <= viewport[0] && corner[1] + size[1] <= viewport[1],
+        "a menu pressed in the bottom-right corner hung off the stage: {corner:?}"
+    );
+    assert!(
+        corner[0] >= 8. && corner[1] >= 8.,
+        "a menu flipped off the other edge instead: {corner:?}"
+    );
+}
+/// Escape shuts the menu and stops there. It is the same key that drops a
+/// selection, and a menu that dropped the selection on the way out would
+/// answer "not that one" with "none of them".
+#[test]
+fn escape_shuts_the_menu_without_dropping_what_it_was_about() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            kind: Kind::Rectangle,
+            x: 100,
+            y: 100,
+            width: 200,
+            height: 140,
+            ..Default::default()
+        },
+    });
+    view.cursor = view.screen(150., 150.);
+    view.on_open_menu();
+    assert!(view.menu.is_some());
+
+    view.on_cancel();
+    assert!(view.menu.is_none(), "Escape left the menu standing");
+    assert_eq!(
+        view.selected,
+        ["a".to_owned()].into(),
+        "Escape shut the menu and dropped the selection with it"
+    );
+
+    // A second Escape, with no menu in the way, drops the selection as it
+    // always did.
+    view.on_cancel();
+    assert!(view.selected.is_empty());
+}
+/// A row acts AND shuts the menu, in one press. A menu left standing over the
+/// thing it just changed is a menu you have to dismiss before you can see what
+/// it did.
+#[test]
+fn a_menu_row_does_its_work_and_shuts_the_menu_behind_it() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            kind: Kind::Rectangle,
+            x: 100,
+            y: 100,
+            width: 200,
+            height: 140,
+            ..Default::default()
+        },
+    });
+    view.cursor = view.screen(150., 150.);
+    view.on_open_menu();
+    view.on_menu_item(MenuItem::Delete);
+    assert!(
+        view.menu.is_none(),
+        "the menu outlived the row pressed on it"
+    );
+    assert!(
+        view.visible().unwrap().shapes.is_empty(),
+        "the row shut the menu and did nothing else"
+    );
+}
 /// Where this shape's arrowheads were drawn, one point per head: a head is two
 /// barbs and both start at the tip, so the tips are what the painter is asked
 /// about rather than the six numbers it worked them out of.
