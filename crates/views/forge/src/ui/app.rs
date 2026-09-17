@@ -54,6 +54,8 @@ pub struct ForgeView {
     /// one wears; a fold is the reader's, so it rides the snapshot.
     pub(crate) diff_folded: Vec<String>,
     pub(crate) forge_item_diff_truncated: bool,
+    /// Why this item's patch could not be read, in the module's own words.
+    pub(crate) forge_item_diff_error: String,
     pub(crate) forge_item_merge_oid: String,
     pub(crate) forge_item_source_branch: String,
     pub(crate) forge_item_source_oid: String,
@@ -207,6 +209,7 @@ impl ForgeView {
             diff_rows: Vec::new(),
             diff_folded: Vec::new(),
             forge_item_diff_truncated: false,
+            forge_item_diff_error: "".to_owned(),
             forge_item_merge_oid: "".to_owned(),
             forge_item_source_branch: "".to_owned(),
             forge_item_source_oid: "".to_owned(),
@@ -268,7 +271,7 @@ impl ForgeView {
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     /// This state's layout, digested — `snapshot_schema` holds it here.
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "33f740f13efc67ee77242c11be6709e3158e3312ca3512c2f2f68c60477a861d";
+        "acda532bbeaa620c5e0bbae32da192bf8166f845a74fa9cae5c76152f105ffed";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
