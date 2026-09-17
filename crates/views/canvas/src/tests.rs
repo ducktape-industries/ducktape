@@ -4034,6 +4034,60 @@ fn the_shortcuts_card_names_the_keys_a_hand_reaches_for() {
         );
     }
 }
+/// The brainstorm template lands where you are looking. It used to land at the
+/// world coordinates its columns were written at, whatever the camera was doing
+/// — so on a board panned anywhere at all, one of the two buttons a first-time
+/// user is offered put three notes off-screen and looked like it had done
+/// nothing.
+#[test]
+fn the_template_lands_in_the_middle_of_what_you_are_looking_at() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.zoom = 1.;
+    // The three columns as `on_template` writes them: 840 across, 200 down,
+    // with their top-left at the origin's x and 80 down from it.
+    let columns: Vec<(String, Shape)> = [0, 300, 600]
+        .into_iter()
+        .map(|x| {
+            (
+                format!("c{x}"),
+                Shape {
+                    kind: Kind::Note,
+                    x,
+                    y: 80,
+                    width: 240,
+                    height: 200,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    let landed = |view: &BoardsView| {
+        let offset = view
+            .centred_on_the_stage(&columns)
+            .expect("three notes have a box");
+        // The middle of the block, in world units, after the offset.
+        [420. + offset[0] as f32, 180. + offset[1] as f32]
+    };
+
+    // Standing at the origin, the block's middle is the middle of the stage.
+    view.camera = [0., 0.];
+    let expected = view.world([700., 450.]);
+    let at = landed(&view);
+    assert!(
+        (at[0] - expected[0]).abs() < 1. && (at[1] - expected[1]).abs() < 1.,
+        "the template landed at {at:?} rather than {expected:?}"
+    );
+
+    // And panned a long way off, it follows — which is the whole of the bug.
+    view.camera = [-4000., 2500.];
+    let expected = view.world([700., 450.]);
+    let at = landed(&view);
+    assert!(
+        (at[0] - expected[0]).abs() < 1. && (at[1] - expected[1]).abs() < 1.,
+        "after a pan the template landed at {at:?} rather than {expected:?}"
+    );
+}
 /// The prompt on an empty board invites you to draw; it must not be standing on
 /// the place you would draw. As an overlay it swallowed every press on its own
 /// 420-wide body — a dead zone in the middle of the canvas, present at exactly

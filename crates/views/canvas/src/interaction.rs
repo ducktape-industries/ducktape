@@ -2271,14 +2271,34 @@ impl BoardsView {
                 },
             )
         };
-        self.plant(
-            vec![
-                column("Ideas", "What could we try?", 0, 0),
-                column("Questions", "What do we need to learn?", 300, 1),
-                column("Next steps", "Choose one thing to move forward.", 600, 2),
-            ],
-            [0, 0],
-        )
+        let shapes = vec![
+            column("Ideas", "What could we try?", 0, 0),
+            column("Questions", "What do we need to learn?", 300, 1),
+            column("Next steps", "Choose one thing to move forward.", 600, 2),
+        ];
+        let Some(offset) = self.centred_on_the_stage(&shapes) else {
+            return Task::none();
+        };
+        self.plant(shapes, offset)
+    }
+    /// How far a set of shapes has to move to sit in the middle of what you are
+    /// looking at. Its own answer and not `plant`'s, because `plant` awaits the
+    /// host for a name per shape and nothing can be asserted about where they
+    /// landed until it comes back — where they were SENT is decided here.
+    ///
+    /// The template's columns are laid out in world coordinates, and planting
+    /// them AT those coordinates put the whole thing at a fixed spot on the
+    /// board however far you had panned. So the one button that is supposed to
+    /// show a first-time user what this is put three notes somewhere they were
+    /// not looking, and read as doing nothing at all. "Add a note", beside it on
+    /// the same card, has always placed in the middle of the stage.
+    pub(super) fn centred_on_the_stage(&self, shapes: &[(String, Shape)]) -> Option<[i32; 2]> {
+        let b = bounds(shapes.iter().map(|(_, s)| s))?;
+        let middle = self.world([self.viewport[0] / 2., self.viewport[1] / 2.]);
+        Some([
+            coordinate(middle[0] - (b[0] + b[2]) / 2.),
+            coordinate(middle[1] - (b[1] + b[3]) / 2.),
+        ])
     }
     /// Line a selection up, or spread it evenly. Every arrangement is a set
     /// of moves against the selection's own bounding box.
