@@ -129,7 +129,7 @@ async fn submit_test(
             payload,
         },
     );
-    rpc.submit_frame(frame).await.unwrap();
+    rpc.submit_frame(frame, 0).await.unwrap();
 }
 
 /// One function's body out of a backend module: from its declaration to the

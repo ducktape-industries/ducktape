@@ -81,7 +81,12 @@ pub(crate) async fn submit_raw_frame(
     target: &str,
     frame: Vec<u8>,
 ) -> Result<u64, String> {
-    let height = rpc.submit_frame(frame).await?;
+    // no blob: an app frame carries its payload inline, so the wait is an
+    // ordinary RPC's. Only a pack-bearing push needs a budget sized by bytes.
+    let height = rpc
+        .submit_frame(frame, 0)
+        .await
+        .map_err(|failure| failure.to_string())?;
     note_module_block(rpc, target, height);
     Ok(height)
 }
