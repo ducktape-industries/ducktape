@@ -110,18 +110,16 @@ fn stage_founding_set() {
 /// The owner record is the belt to that braces: a sibling's `cargo check -p
 /// noded` moves the pointer without relinking any binary, and only a stamp
 /// inside the set can catch that.
-fn name_the_staged_set(profile_dir: &Path, modules: &Path) {
+pub(crate) fn name_the_staged_set(profile_dir: &Path, modules: &Path) {
     let name = modules
         .file_name()
         .and_then(|name| name.to_str())
         .expect("a staged set has a utf-8 directory name");
     let pointer = profile_dir.join(staged_key::STAGED_POINTER);
-    std::fs::write(&pointer, name)
-        .unwrap_or_else(|e| panic!("name the staged set in {}: {e}", pointer.display()));
+    write_without_truncating(&pointer, name.as_bytes());
     let owner = modules.join(staged_key::STAGED_OWNER);
     let build = build_id().unwrap_or_else(|| staged_key::UNIDENTIFIED_BUILD.to_owned());
-    std::fs::write(&owner, &build)
-        .unwrap_or_else(|e| panic!("record the staging build in {}: {e}", owner.display()));
+    write_without_truncating(&owner, build.as_bytes());
 }
 
 /// Remove keyed sets whose checkout is gone.
@@ -314,14 +312,36 @@ fn stage(src: &Path, dest: &Path) {
     if already_staged {
         return;
     }
-    let tmp = dest.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", tmp.display()));
-    std::fs::rename(&tmp, dest)
-        .unwrap_or_else(|e| panic!("rename {} -> {}: {e}", tmp.display(), dest.display()));
+    write_without_truncating(dest, &bytes);
     let modified = std::fs::metadata(src).and_then(|m| m.modified());
     if let Ok(modified) = modified {
         let _ = std::fs::File::open(dest).and_then(|f| f.set_modified(modified));
     }
+}
+
+/// Put `bytes` at `path` by writing a temporary beside it and renaming over
+/// the name — never by opening `path` itself.
+///
+/// EVERY write into a staged set goes through here, because a staged file is
+/// not only this build's. The node e2e pin HARDLINKS the set it pins
+/// (`bin/node/tests/common/mod.rs`, "the link is the point — it pins the
+/// INODE"), so a plain `std::fs::write` reaches inside a running suite's
+/// pinned copy: it truncates the shared inode, and a node booting in that
+/// window reads a component of zero bytes and fails closed on it. A rename
+/// swings the directory entry onto a NEW inode instead, so the pin keeps the
+/// bytes it linked and a reader sees the old file or the new one, never a
+/// half-written one.
+///
+/// Same reason inside one build: `stage` is called for forty artifacts while
+/// another checkout may be reading the same directory.
+fn write_without_truncating(path: &Path, bytes: &[u8]) {
+    // `.staged-by` and `.staged-modules` carry no extension, so this appends
+    // rather than replaces — and the pid keeps two builds passing through one
+    // profile directory off each other's temporaries.
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, bytes).unwrap_or_else(|e| panic!("write {}: {e}", tmp.display()));
+    std::fs::rename(&tmp, path)
+        .unwrap_or_else(|e| panic!("rename {} -> {}: {e}", tmp.display(), path.display()));
 }
 
 /// `<short sha>`, or `<short sha>-<digest>` when the working tree differs from
