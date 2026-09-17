@@ -40,6 +40,23 @@ pub enum Arrange {
     SpreadX,
     SpreadY,
 }
+/// What a press on the board's own menu asks for. One tagged value and not ten
+/// messages, because every row of a menu has to close the menu as well as act,
+/// and a menu that closed in ten handlers is a menu that one day stays open in
+/// one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MenuItem {
+    Cut,
+    Copy,
+    Paste,
+    Duplicate,
+    Front,
+    Back,
+    Group,
+    Ungroup,
+    SelectAll,
+    Delete,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 enum Gesture {
     #[default]
@@ -244,6 +261,11 @@ pub struct BoardsView {
     /// The ids ride along because a connector in the set names its cards by
     /// id, and the paste remaps from exactly those.
     clipboard: Vec<(String, Shape)>,
+    /// Where the board's own menu stands, in screen coordinates, while it is
+    /// open. The point and not a flag: a menu that does not open where you
+    /// pressed is a menu you have to go and find, which is the complaint the
+    /// corner panel already answers to.
+    menu: Option<[f32; 2]>,
     cameras: BTreeMap<String, ([f32; 2], f32)>,
     tool: Tool,
     camera: [f32; 2],
@@ -289,6 +311,10 @@ pub enum Message {
     Copy,
     Cut,
     Paste,
+    /// The secondary button, over whatever the pointer is on.
+    OpenMenu,
+    CloseMenu,
+    Menu(MenuItem),
     Stack(bool),
     Planted(
         u64,
@@ -361,6 +387,7 @@ impl BoardsView {
                 held: [None, None],
                 hover: None,
                 clipboard: Vec::new(),
+                menu: None,
                 cameras: BTreeMap::new(),
                 tool: Tool::Select,
                 camera: [80., 80.],
@@ -425,6 +452,9 @@ impl BoardsView {
             Message::Copy => self.on_copy(),
             Message::Cut => self.on_cut(),
             Message::Paste => self.on_paste(),
+            Message::OpenMenu => self.on_open_menu(),
+            Message::CloseMenu => self.on_close_menu(),
+            Message::Menu(item) => self.on_menu_item(item),
             Message::Stack(front) => self.on_stack(front),
             Message::Planted(epoch, board, shapes, offset, ids) => {
                 self.on_planted(epoch, board, shapes, offset, ids)

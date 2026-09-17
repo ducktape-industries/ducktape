@@ -1310,6 +1310,12 @@ impl BoardsView {
         self.edit_many(swept.into_iter().map(|id| Change::Delete { id }).collect())
     }
     pub(super) fn on_cancel(&mut self) -> Task<Message> {
+        // A menu standing over the board is the first thing Escape answers,
+        // and the only one: shutting a menu is not also dropping what it was
+        // about to act on.
+        if self.menu.is_some() {
+            return self.on_close_menu();
+        }
         // Escape stops the writing. It does not throw it away: EVERY door out
         // of a card keeps what you wrote, which is the answer tldraw and
         // excalidraw both give and the only safe one here. What you type lives
@@ -1811,28 +1817,40 @@ impl BoardsView {
         let Some(board) = self.visible() else {
             return Task::none();
         };
-        // Whole groups, both ways. Picking a member already picks its group,
-        // so this is usually what the selection holds anyway — but a selection
-        // assembled some other way must not be able to bind or free HALF of a
-        // group, which would leave the rest carrying a name with nothing to
-        // share it with.
-        let ids: Vec<String> = with_group_mates(&board, self.selected.iter().cloned())
+        let ids = self.grouping_ids(&board);
+        if !self.grouping_would_hold(binding) {
+            return Task::none();
+        }
+        let group = binding.then(|| ids[0].clone());
+        self.edit(Change::Group { ids, group })
+    }
+    /// Whole groups, both ways. Picking a member already picks its group, so
+    /// this is usually what the selection holds anyway — but a selection
+    /// assembled some other way must not be able to bind or free HALF of a
+    /// group, which would leave the rest carrying a name with nothing to share
+    /// it with.
+    fn grouping_ids(&self, board: &Board) -> Vec<String> {
+        with_group_mates(board, self.selected.iter().cloned())
             .into_iter()
             .filter(|id| board.shapes.contains_key(id))
-            .collect();
-        let enough = match binding {
+            .collect()
+    }
+    /// Whether binding the selection — or freeing it — would do anything. The
+    /// menu asks so it can leave out a row that would do nothing, and
+    /// `on_group` asks so the board is never sent a change it would refuse.
+    pub(super) fn grouping_would_hold(&self, binding: bool) -> bool {
+        let Some(board) = self.visible() else {
+            return false;
+        };
+        let ids = self.grouping_ids(&board);
+        match binding {
             // A group of one never reads differently from no group at all, and
             // the board refuses one — so the board would print an error at a
             // writer who only pressed the chord on a single card.
             true => ids.len() >= 2,
             // Nothing to free unless something in the selection is held.
             false => ids.iter().any(|id| board.shapes[id].shape.group.is_some()),
-        };
-        if !enough {
-            return Task::none();
         }
-        let group = binding.then(|| ids[0].clone());
-        self.edit(Change::Group { ids, group })
     }
     fn nudge(&mut self, x: i32, y: i32) -> Task<Message> {
         if let Gesture::Nudge { offset, .. } = &mut self.gesture {
@@ -2053,6 +2071,93 @@ impl BoardsView {
         let at = self.world(self.cursor);
         let offset = [coordinate(at[0] - b[0]), coordinate(at[1] - b[1])];
         self.plant(shapes, offset)
+    }
+    /// The secondary button, over whatever it landed on. A right-click on a
+    /// shape OUTSIDE the selection takes that shape and nothing else, which is
+    /// what makes "right-click, delete" delete the thing you pointed at rather
+    /// than whatever was picked a minute ago. A right-click INSIDE the
+    /// selection leaves it alone, so "pick three, right-click one, group"
+    /// works. Both are what tldraw and excalidraw do.
+    ///
+    /// It asks the board what is under the cursor rather than reading `hover`:
+    /// hover is only kept while a press would TAKE something, and the secondary
+    /// button has an answer under every tool.
+    pub(super) fn on_open_menu(&mut self) -> Task<Message> {
+        // A card being written in owns the pointer; a menu over the words it
+        // is editing would offer a cut that means the shape, not the writing.
+        if self.inline.is_some() {
+            return Task::none();
+        }
+        let under = self.hit(self.world(self.cursor));
+        let points_somewhere_new = under.as_ref().is_some_and(|id| !self.selected.contains(id));
+        if points_somewhere_new {
+            self.selected = under.into_iter().collect();
+        }
+        // Nothing to offer is not a menu: an empty card under the cursor, and
+        // a backdrop that eats the next press, is worse than the nothing that
+        // happened before this existed.
+        if self.menu_items().is_empty() {
+            return Task::none();
+        }
+        self.menu = Some(self.cursor);
+        Task::none()
+    }
+    pub(super) fn on_close_menu(&mut self) -> Task<Message> {
+        self.menu = None;
+        Task::none()
+    }
+    /// A row of the menu: close, then do the thing. One handler and not ten,
+    /// so closing is written once.
+    pub(super) fn on_menu_item(&mut self, item: MenuItem) -> Task<Message> {
+        self.menu = None;
+        match item {
+            MenuItem::Cut => self.on_cut(),
+            MenuItem::Copy => self.on_copy(),
+            MenuItem::Paste => self.on_paste(),
+            MenuItem::Duplicate => self.on_duplicate(),
+            MenuItem::Front => self.on_stack(true),
+            MenuItem::Back => self.on_stack(false),
+            MenuItem::Group => self.on_group(true),
+            MenuItem::Ungroup => self.on_group(false),
+            MenuItem::SelectAll => self.on_select_all(),
+            MenuItem::Delete => self.on_delete(),
+        }
+    }
+    /// What the menu can offer over what is picked, in the order it lists them.
+    /// Built from what would actually happen: a row that cannot do anything is
+    /// left out rather than listed and dead, which is the rule the style panel
+    /// already follows for its fill row.
+    pub(super) fn menu_items(&self) -> Vec<MenuItem> {
+        let Some(board) = self.visible() else {
+            return Vec::new();
+        };
+        if self.selected.is_empty() {
+            let pasteable = !self.clipboard.is_empty();
+            let anything_to_take = !board.shapes.is_empty();
+            let mut items = Vec::new();
+            if pasteable {
+                items.push(MenuItem::Paste);
+            }
+            if anything_to_take {
+                items.push(MenuItem::SelectAll);
+            }
+            return items;
+        }
+        let mut items = vec![
+            MenuItem::Cut,
+            MenuItem::Copy,
+            MenuItem::Duplicate,
+            MenuItem::Front,
+            MenuItem::Back,
+        ];
+        if self.grouping_would_hold(true) {
+            items.push(MenuItem::Group);
+        }
+        if self.grouping_would_hold(false) {
+            items.push(MenuItem::Ungroup);
+        }
+        items.push(MenuItem::Delete);
+        items
     }
     /// Stacking: raising the selection puts it on top, and sinking it is
     /// raising everything else — one primitive, both directions.
