@@ -179,8 +179,11 @@ reqwest = { workspace = true }
 # WebSocket bridge to a route's loopback upstream (ws://127.0.0.1, no TLS).
 tokio-tungstenite = "0.24"
 sha2 = { workspace = true }
-# Validate standalone executor archives before extracting their runtime assets.
+# Validate standalone executor archives before extracting their runtime assets;
+# `release schedule` also unpacks the node archive it is about to designate, to
+# ask its executable whether it links this network's modules.
 tar = "0.4"
+zstd = { workspace = true }
 # `release sign-bundle` unpacks the bundle it sends and the one it receives
 # into a scratch dir that goes away on every exit path.
 tempfile = "3"
@@ -238,9 +241,6 @@ verify = ["airlock/verify", "airlock/testkit", "provider-host/verify"]
 [dev-dependencies]
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 ducktape-forge-service = { path = "../forge-service" }
-# the node release e2e packs its own `.tar.zst` releases (tar is already a
-# runtime dep above); the launcher under test unpacks them.
-zstd = { workspace = true }
 # the shared raw-http/port/poll harness helpers (was: a per-suite copy each).
 nettest = { path = "../../crates/testing/nettest" }
 # a scripted fixture lifts its guest shell out of the rootfs with the same

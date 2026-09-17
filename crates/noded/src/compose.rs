@@ -354,6 +354,22 @@ pub async fn fetch_code(
     Ok(bytes)
 }
 
+/// can THIS build load `id`'s deployment at all? `compile_artifact`
+/// instantiates the bytes against this binary's real `ducktape:module/host`
+/// world, so a component whose imports that world no longer provides is
+/// refused right here — which is the ONLY refusal the whole wasm path can
+/// reach without a store, a substrate or a byte of state. that is what makes
+/// it askable of a STAGED binary beside a running node: the roster comes off
+/// the node's rpc and the bytes off the blobstore's immutable files, and the
+/// sentence a refusal carries is the very one the next boot would print.
+pub fn load(id: &str, bytes: &[u8]) -> Result<CompiledModule, String> {
+    workspace_config::validate_module_id(id)?;
+    let compiled = CompiledModule::compile_artifact(bytes)
+        .map_err(|e| format!("{id} component loads: {e}"))?;
+    check_realizable(id, compiled.shape())?;
+    Ok(compiled)
+}
+
 /// the ONE wasm path: wrap `bytes` for `id` over the substrate its declared
 /// shape names. a store-backed module opens its store through the source; an
 /// odb-backed one opens the host substrate for its id and carries its
@@ -369,11 +385,8 @@ pub async fn wasm_module(
     bindings: &Bindings<'_>,
     start: Start<'_, '_>,
 ) -> Result<WasmModule, String> {
-    workspace_config::validate_module_id(id)?;
-    let compiled = CompiledModule::compile_artifact(bytes)
-        .map_err(|e| format!("{id} component loads: {e}"))?;
+    let compiled = load(id, bytes)?;
     let shape = compiled.shape().clone();
-    check_realizable(id, &shape)?;
     let is_fresh = matches!(start, Start::Fresh { .. });
     let wrapped = match shape.backing {
         Backing::Map => compiled.over_map(id),
