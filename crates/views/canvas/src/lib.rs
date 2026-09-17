@@ -238,6 +238,10 @@ pub struct BoardsView {
     delivery: Delivery,
     error: String,
     title: String,
+    /// The open board's name while it is being edited in the picker. Seeded
+    /// from the board every time the picker opens, so what you see in the box
+    /// is the name the board actually has and not a name you abandoned.
+    rename: String,
     selected: BTreeSet<String>,
     inline: Option<Inline>,
     modifiers: wire::keyboard::Modifiers,
@@ -335,6 +339,9 @@ pub enum Message {
     Template,
 
     Title(String),
+    RenameTitle(String),
+    RenameBoard,
+    RemoveBoard,
     Open(String),
     Tool(Tool),
     Press(f32, f32),
@@ -376,6 +383,7 @@ impl BoardsView {
                 delivery: Delivery::Idle,
                 error: String::new(),
                 title: String::new(),
+                rename: String::new(),
                 selected: BTreeSet::new(),
                 inline: None,
                 modifiers: Default::default(),
@@ -482,6 +490,9 @@ impl BoardsView {
             Message::QuickNote => self.on_quick_note(),
             Message::Template => self.on_template(),
             Message::Title(title) => self.on_title(title),
+            Message::RenameTitle(title) => self.on_rename_title(title),
+            Message::RenameBoard => self.on_rename_board(),
+            Message::RemoveBoard => self.on_remove_board(),
             Message::Open(id) => self.on_open(id),
             Message::Tool(tool) => self.on_tool(tool),
             Message::Press(x, y) => self.on_press(x, y),
@@ -860,6 +871,75 @@ impl BoardsView {
         self.pending.push_back(Operation::Create { id, title });
         Task::batch([self.pump(), self.take_the_keyboard()])
     }
+    /// Whether the name in the rename box is one the board could be given. The
+    /// same rule the module holds, asked here so the button is dark before the
+    /// press rather than an error message after it.
+    fn rename_would_hold(&self) -> bool {
+        let Some(board) = self.confirmed.as_ref() else {
+            return false;
+        };
+        let wanted = self.rename.trim();
+        self.session.connected
+            && self.pending.is_empty()
+            && boards_wire::valid_title(&self.rename).is_ok()
+            && wanted != board.title
+    }
+    fn on_rename_board(&mut self) -> Task<Message> {
+        if !self.rename_would_hold() {
+            return Task::none();
+        }
+        let title = self.rename.trim().to_owned();
+        let Some(board) = self.confirmed.as_ref() else {
+            return Task::none();
+        };
+        let renamed = match board.renamed(title.clone()) {
+            Ok(renamed) => renamed,
+            Err(error) => {
+                self.error = error;
+                return Task::none();
+            }
+        };
+        // The box keeps the trimmed name it just sent, so the field agrees with
+        // the board the moment the press lands instead of a round-trip later.
+        self.rename = title.clone();
+        self.confirmed = Some(renamed);
+        self.catalog.insert(self.current.clone(), title.clone());
+        self.pending.push_back(Operation::Rename {
+            board: self.current.clone(),
+            title,
+        });
+        self.pump()
+    }
+    /// Whether the open board is one this view may ask to have removed. The
+    /// module's rule, asked here for the same reason the rename's is: only a
+    /// board with nothing on it, because a board nobody has drawn on holds
+    /// nobody's work.
+    fn removal_would_hold(&self) -> bool {
+        let Some(board) = self.confirmed.as_ref() else {
+            return false;
+        };
+        self.session.connected && self.pending.is_empty() && board.shapes.is_empty()
+    }
+    fn on_remove_board(&mut self) -> Task<Message> {
+        if !self.removal_would_hold() {
+            return Task::none();
+        }
+        let board = std::mem::take(&mut self.current);
+        self.catalog.remove(&board);
+        self.cameras.remove(&board);
+        self.confirmed = None;
+        self.selected.clear();
+        self.rename.clear();
+        self.undo.clear();
+        self.redo.clear();
+        self.board_picker = false;
+        self.pending.push_back(Operation::Remove { board });
+        self.pump()
+    }
+    fn on_rename_title(&mut self, title: String) -> Task<Message> {
+        self.rename = title;
+        Task::none()
+    }
     fn on_title(&mut self, title: String) -> Task<Message> {
         self.title = title;
         Task::none()
@@ -1082,6 +1162,11 @@ fn apply_operation(board: &Board, operation: &Operation) -> Result<Board, String
     match operation {
         Operation::Edit { change, .. } => board.changed(change),
         Operation::Batch { changes, .. } => board.changed_many(changes),
-        Operation::Create { .. } => Ok(board.clone()),
+        Operation::Rename { title, .. } => board.renamed(title.clone()),
+        // Neither says anything about the board on screen. A create is about a
+        // board you are not looking at yet, and a remove is about one the view
+        // has already let go of — `on_remove_board` clears it before the
+        // operation is ever sent, so there is nothing here left to take away.
+        Operation::Create { .. } | Operation::Remove { .. } => Ok(board.clone()),
     }
 }
