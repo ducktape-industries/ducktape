@@ -179,6 +179,14 @@ members = [
 # the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
 exclude = ["crates/labs"]
 
+# how this workspace names itself to `guest-builder` (ducktape-sdk). A guest is
+# built out of the PLATFORM REPOSITORY at a revision, never out of the working
+# tree: the builder synthesizes a scratch workspace whose module dependency is
+# this git url pinned to a commit, so the url has to come from the platform
+# itself rather than from whoever runs the build.
+[workspace.metadata.guest-builder]
+platform = "https://github.com/ducktape-industries/ducktape"
+
 [workspace.package]
 edition = "2024"
 version = "0.1.0"

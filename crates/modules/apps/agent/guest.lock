@@ -15,15 +15,15 @@ dependencies = [
 [[package]]
 name = "agent"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-modules#3a1bdadd6a4d93f8c1b017382887ff2c79ce7967"
 dependencies = [
  "agent-wire",
  "async-trait",
- "attribution",
+ "attribution-wire",
  "borsh",
- "dispatch",
+ "dispatch-wire",
  "ducktape-module-sdk",
- "identity",
+ "identity-wire",
  "sdk",
  "serde",
  "serde_json",
@@ -40,12 +40,12 @@ dependencies = [
 [[package]]
 name = "agent-wire"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
 dependencies = [
- "attribution",
+ "attribution-wire",
  "borsh",
- "dispatch",
- "identity",
+ "dispatch-wire",
+ "identity-wire",
  "sdk",
  "serde",
  "serde_json",
@@ -91,16 +91,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "attribution"
+name = "attribution-wire"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
 dependencies = [
- "async-trait",
  "borsh",
- "identity",
  "sdk",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -198,7 +195,7 @@ dependencies = [
 [[package]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
 dependencies = [
  "cc",
  "glob",
@@ -235,18 +232,6 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
-
-[[package]]
-name = "capability"
-version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
-dependencies = [
- "async-trait",
- "borsh",
- "sdk",
- "serde",
- "valset",
-]
 
 [[package]]
 name = "cc"
@@ -731,25 +716,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "dispatch"
+name = "dispatch-wire"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
 dependencies = [
- "async-trait",
  "borsh",
- "capability",
- "identity",
- "saga",
+ "saga-wire",
  "sdk",
  "serde",
- "serde_json",
  "sha2 0.10.9",
 ]
 
 [[package]]
 name = "ducktape-module-sdk"
 version = "0.0.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
 dependencies = [
  "async-trait",
  "sdk",
@@ -1025,17 +1006,17 @@ dependencies = [
 [[package]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
 
 [[package]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
 
 [[package]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
 dependencies = [
  "rand_core 0.10.1",
 ]
@@ -1131,25 +1112,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
-name = "identity"
+name = "identity-wire"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
 dependencies = [
- "async-trait",
  "borsh",
- "commonware-cryptography",
  "keyscheme",
  "sdk",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "index-guest"
-version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
-dependencies = [
- "borsh",
  "serde",
 ]
 
@@ -1216,7 +1185,7 @@ dependencies = [
 [[package]]
 name = "keyscheme"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
 dependencies = [
  "base64",
  "borsh",
@@ -1692,19 +1661,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "saga"
+name = "saga-wire"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
 dependencies = [
- "async-trait",
  "borsh",
- "capability",
- "index-guest",
  "sdk",
  "serde",
- "serde_json",
- "sha2 0.10.9",
- "valset",
 ]
 
 [[package]]
@@ -1716,7 +1679,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b1de6b0bcab9e2a6406ab789388ca262eebf220b"
 dependencies = [
  "async-trait",
  "borsh",
@@ -2116,20 +2079,6 @@ name = "untrusted"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
-
-[[package]]
-name = "valset"
-version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
-dependencies = [
- "async-trait",
- "borsh",
- "commonware-codec",
- "commonware-cryptography",
- "sdk",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "version_check"

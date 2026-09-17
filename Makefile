@@ -19,7 +19,7 @@ LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all airlock-gateway-image rcodesign dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install-node install-coordinator test clean wasm-embed-check labs-gate audit
+.PHONY: all airlock-gateway-image rcodesign dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install-node install-coordinator test clean wasm-modules wasm-modules-check modules-sync wasm-embed-check labs-gate audit
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -237,10 +237,131 @@ test: wasm-embed-check
 # That is not hypothetical — it shipped and sat on dev for 81 commits.
 	$(CARGO) build $(LOCKED) -p noded-bin -p simnode
 
-# The wasm guest builder, the module SDK, and the wasm-modules /
-# wasm-modules-check / wasm-repro-check / wasm-rebuild-check /
-# wasm-rebuild-refresh targets that drove them all ship in ducktape-sdk now;
-# no replacement machinery lives here.
+# The guest builder ships in ducktape-sdk; core runs the built binary rather
+# than compiling one, so point this at wherever that checkout put it.
+GUEST_BUILDER ?= ../ducktape-sdk/target/release/guest-builder
+
+# Every guest core OWNS: the eleven system modules plus the two product modules
+# it still builds from source. Each carries its own guest port (src/guest.rs
+# behind the `guest` feature); guest-builder builds it out of the platform
+# repository at HEAD — so HEAD must be pushed first — and writes the canonical
+# component.wasm and guest.lock into the module directory itself.
+BUILDER_MODULES := \
+  crates/modules/system/acl crates/modules/system/kv \
+  crates/modules/system/valset crates/modules/system/governance \
+  crates/modules/system/identity crates/modules/system/modules \
+  crates/modules/system/saga crates/modules/system/capability \
+  crates/modules/system/dispatch crates/modules/system/attribution \
+  crates/modules/system/gateway \
+  crates/modules/apps/forge crates/modules/apps/files
+
+# Modules that additionally ship an INDEX guest (src/index_guest.rs behind the
+# `index-guest` feature). The committed index.wasm IS the declaration:
+# crates/noded/build.rs stages an index guest for exactly the modules that have
+# one beside their component.
+INDEX_MODULES := crates/modules/system/saga
+
+# The netstack guest: the reachability machine as a `ducktape:netstack`
+# component. Not a consensus module, so no kernel fixture copy and no place in
+# a genesis — the build stages it into the founding set as
+# `netstack.component.wasm` and bin/node reads it from there at boot.
+NETSTACK_GUEST := crates/networking/netstack-machine
+
+## rebuild every guest core owns in place and refresh the kernel host fixture
+## beside each component, so the two copies can never drift apart. Component
+## bytes are toolchain-dependent: a rebuild on a different rustc may
+## legitimately differ from the committed bytes — move the channel and the
+## whole set together.
+wasm-modules:
+	@for m in $(BUILDER_MODULES); do \
+	  id=$$(basename $$m) && \
+	  $(GUEST_BUILDER) $$m && \
+	  cp $$m/component.wasm \
+	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
+	done
+	@for m in $(INDEX_MODULES); do $(GUEST_BUILDER) --index $$m || exit 1; done
+	$(GUEST_BUILDER) $(NETSTACK_GUEST)
+
+WASM_CHECK_DIR := $(CURDIR)/target/wasm-modules-check
+
+## the drift gate: rebuild every guest core owns into a scratch directory and
+## compare it with the committed bytes (and each component with its kernel host
+## fixture). A `--out` build leaves the module directory — guest.lock included —
+## untouched, so the tree stays clean under the check. Needs the wasm32 target
+## and a pushed HEAD, so it is not part of the offline `test` gate.
+##
+## Every guest is rebuilt before this reports, so ONE run names every stale
+## artifact. Scope it by overriding the lists on the command line, e.g.
+##   make wasm-modules-check BUILDER_MODULES=crates/modules/system/kv \
+##     INDEX_MODULES= NETSTACK_GUEST=
+wasm-modules-check:
+	@mkdir -p "$(WASM_CHECK_DIR)"
+	@stale=""; checked=0; \
+	for m in $(BUILDER_MODULES) $(NETSTACK_GUEST); do \
+	  id=$$(basename $$m); \
+	  $(GUEST_BUILDER) $$m --out "$(WASM_CHECK_DIR)/$$id.component.wasm" >/dev/null || exit 1; \
+	  checked=$$((checked + 1)); \
+	  cmp -s $$m/component.wasm "$(WASM_CHECK_DIR)/$$id.component.wasm" || stale="$$stale $$m"; \
+	done; \
+	for m in $(INDEX_MODULES); do \
+	  id=$$(basename $$m); \
+	  $(GUEST_BUILDER) --index $$m --out "$(WASM_CHECK_DIR)/$$id.index.wasm" >/dev/null || exit 1; \
+	  checked=$$((checked + 1)); \
+	  cmp -s $$m/index.wasm "$(WASM_CHECK_DIR)/$$id.index.wasm" || stale="$$stale --index $$m"; \
+	done; \
+	for m in $(BUILDER_MODULES); do \
+	  id=$$(basename $$m); \
+	  cmp -s $$m/component.wasm crates/kernel/host/tests/fixtures/$$id.component.wasm \
+	    || stale="$$stale $$id.component.wasm(fixture)"; \
+	done; \
+	test -z "$$stale" || { \
+	  echo "stale committed guests:$$stale"; \
+	  echo "  refresh with: make wasm-modules"; exit 1; }; \
+	echo "$$checked guest artifacts match their source at HEAD"
+
+# where the app modules and the standalone fixture guests are built: core holds
+# their committed artifacts but not their source.
+MODULES_DIR ?= ../ducktape-modules
+SDK_DIR ?= ../ducktape-sdk
+
+# the app modules core ships the bytes of, and the two example modules beside
+# them — all built in ducktape-modules. `greeter` is listed because it is one
+# of the two examples, but it ships no guest: core's cross_module test links it
+# NATIVELY (a git dependency), so the loop below skips an example with no
+# component.wasm rather than inventing a fixture for it.
+SYNC_MODULES := chat pages agent runs tasks boards automations inbox collaboration
+SYNC_EXAMPLES := directory greeter
+# the standalone kernel test guests, built in ducktape-sdk under crates/guests.
+SYNC_FIXTURE_GUESTS := hello:hello-wasm hello-replacement:hello-wasm-replacement noop:noop-wasm
+
+## copy the guests core does not build from the repositories that do: each app
+## module's component.wasm / index.wasm / guest.lock into
+## crates/modules/apps/<id>/ and its component into the kernel host fixture of
+## the same id, the examples' components into the same fixture directory, and
+## the three standalone fixture guests out of the SDK's crates/guests.
+modules-sync:
+	@for id in $(SYNC_MODULES); do \
+	  src="$(MODULES_DIR)/crates/modules/apps/$$id"; \
+	  test -d "$$src" || { echo "modules-sync: no $$src (set MODULES_DIR)"; exit 1; }; \
+	  cp "$$src/component.wasm" "$$src/guest.lock" crates/modules/apps/$$id/ || exit 1; \
+	  ! test -f "$$src/index.wasm" || cp "$$src/index.wasm" crates/modules/apps/$$id/ || exit 1; \
+	  cp "$$src/component.wasm" \
+	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
+	done
+	@for id in $(SYNC_EXAMPLES); do \
+	  src="$(MODULES_DIR)/crates/examples/$$id"; \
+	  test -d "$$src" || { echo "modules-sync: no $$src (set MODULES_DIR)"; exit 1; }; \
+	  test -f "$$src/component.wasm" || continue; \
+	  cp "$$src/component.wasm" \
+	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
+	done
+	@for rec in $(SYNC_FIXTURE_GUESTS); do \
+	  id=$${rec%%:*}; dir=$${rec##*:}; \
+	  src="$(SDK_DIR)/crates/guests/$$dir/component.wasm"; \
+	  test -f "$$src" || { echo "modules-sync: no $$src (set SDK_DIR)"; exit 1; }; \
+	  cp "$$src" crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
+	done
+	@echo "synced the guests core does not build"
 
 ## the binary embeds no wasm (AGENTS.md, "No Embedded Wasm"): an
 ## include_bytes!/include_str! of a `.wasm` is allowed only in a test — a file
