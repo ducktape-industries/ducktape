@@ -1196,7 +1196,12 @@ impl Cluster {
     /// the bootstrapper), `validator_ids` the consensus subset.
     pub fn new(peer_ids: &[u64], validator_ids: &[u64]) -> Self {
         let seq = CLUSTER_SEQ.fetch_add(1, Ordering::Relaxed);
-        let namespace = format!("ducktape-e2e-{}-{seq}", std::process::id());
+        // SHAPED LIKE A MINTED ONE: `node init` writes `<name>#<8 hex>`, and a
+        // cluster named without the `#` is a cluster that cannot reproduce
+        // anything keyed on a chain id's real shape — forge's push-certificate
+        // nonce went unsignable on every real network while these tests, whose
+        // ids happened to be alphanumeric, signed happily.
+        let namespace = format!("ducktape-e2e-{}-{seq}#{:08x}", std::process::id(), seq);
         let dir = e2e_tempdir("cluster");
         let ports = alloc_ports(peer_ids.len() * 4);
         let (p2p_ports, rest) = ports.split_at(peer_ids.len());
