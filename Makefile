@@ -352,6 +352,23 @@ test: wasm-modules-check wasm-embed-check
 # Skips with a notice where there is no node, like the bun line below.
 	@if command -v node >/dev/null; then node ops/auth-page/test.mjs; \
 	else echo "[test] skipped ops/auth-page/test.mjs — node (nodejs) is not installed" >&2; fi
+# the ops/ scripts' own tests. Every one is offline — a real temporary git
+# repository, a mocked systemd socket, a recorded cluster inventory — and none
+# reaches a node, a network or a Proxmox host. They run here because a test no
+# target runs is a false guarantee, not a spare one: `worktree-clean.sh`'s
+# refusal to remove a worktree that is dirty, unmerged or in use is precisely
+# what its test covers, and a regression there destroys unmerged work.
+	@if command -v node >/dev/null; then node ops/proxmox-view-observe-test.mjs; \
+	else echo "[test] skipped ops/proxmox-view-observe-test.mjs — node (nodejs) is not installed" >&2; fi
+# One guard for all three: `tomllib` is 3.11, which the lane test reads its
+# fixtures with, so a box that fails this check cannot run any of them.
+# PYTHONDONTWRITEBYTECODE because `__pycache__` beside a tracked script is
+# untracked litter the gate would leave in everyone's `git status`.
+	@if python3 -c 'import tomllib' >/dev/null 2>&1; then \
+	  PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s ops/application-service && \
+	  PYTHONDONTWRITEBYTECODE=1 python3 ops/proxmox-view-lane-test.py && \
+	  PYTHONDONTWRITEBYTECODE=1 python3 ops/worktree-clean-test.py; \
+	else echo "[test] skipped the ops/ script tests — they need python 3.11 (tomllib)" >&2; fi
 # demo-clear's refusal line against a stub admin surface (the reason token it
 # prints has to be the node's own, not one invented in the script) and its
 # process sweep (only the workspace's ducktape node and services, never a
