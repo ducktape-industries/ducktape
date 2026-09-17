@@ -1005,6 +1005,10 @@ struct View {
     rows: Vec<ServiceRow>,
     node_build: Option<String>,
     unread: Option<String>,
+    /// where the node writes its own reason. Carried because the refusal
+    /// points at it, and a path the reader has to reconstruct is one they will
+    /// not open.
+    launcher_log: std::path::PathBuf,
 }
 
 fn view(args: &ReadArgs) -> Result<View, Box<dyn std::error::Error>> {
@@ -1023,6 +1027,7 @@ fn view(args: &ReadArgs) -> Result<View, Box<dyn std::error::Error>> {
         rows: only_kind(all, args.kind.as_deref())?,
         node_build: catalog.node_build,
         unread,
+        launcher_log: workspace.join("launcher.log"),
     })
 }
 
@@ -1068,7 +1073,7 @@ fn list(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     match view.unread {
         None => Ok(()),
-        Some(reason) => Err(unread_refusal(&reason, has_rows).into()),
+        Some(reason) => Err(unread_refusal(&reason, has_rows, &view.launcher_log).into()),
     }
 }
 
@@ -1088,7 +1093,7 @@ fn status(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> {
     // verb that could not ask must not exit as though it had.
     match view.unread {
         None => Ok(()),
-        Some(reason) => Err(unread_refusal(&reason, has_rows).into()),
+        Some(reason) => Err(unread_refusal(&reason, has_rows, &view.launcher_log).into()),
     }
 }
 
@@ -1096,7 +1101,7 @@ fn status(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// is still true (whatever is on disk), what is not known (what is signaling
 /// right now), and where the node's own reason lives — it writes an exact one,
 /// into a file rather than in front of anyone.
-fn unread_refusal(reason: &str, printed_grants: bool) -> String {
+fn unread_refusal(reason: &str, printed_grants: bool, launcher_log: &std::path::Path) -> String {
     let disk = match printed_grants {
         true => "the grants above are what this workspace holds on disk",
         false => "this workspace holds no grants on disk",
@@ -1104,7 +1109,8 @@ fn unread_refusal(reason: &str, printed_grants: bool) -> String {
     format!(
         "{disk}; what is SIGNALING could not be read — {reason}.\n\
          if a launcher is supervising this node, its own reason is the last \
-         FATAL line in <workspace>/launcher.log"
+         FATAL line in {}",
+        launcher_log.display()
     )
 }
 
@@ -3542,13 +3548,18 @@ mod tests {
     #[test]
     fn the_unread_refusal_never_claims_the_catalog_was_empty() {
         let reason = "the node is not running";
+        let log = std::path::Path::new("/home/duck/.ducktape/dognet/launcher.log");
         for (printed_grants, expected) in [
             (true, "the grants above are what this workspace holds on disk"),
             (false, "this workspace holds no grants on disk"),
         ] {
-            let said = unread_refusal(reason, printed_grants);
+            let said = unread_refusal(reason, printed_grants, log);
             assert!(said.starts_with(expected), "{said}");
             assert!(said.contains(reason), "the reason must survive: {said}");
+            assert!(
+                said.contains("/home/duck/.ducktape/dognet/launcher.log"),
+                "the log it points at must be a path the reader can open: {said}"
+            );
             assert!(
                 said.contains("could not be read"),
                 "it must say the catalog went UNREAD, never that it was empty: {said}"
