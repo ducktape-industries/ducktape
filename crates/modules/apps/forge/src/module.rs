@@ -1658,6 +1658,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// the substrate hands over git's own bytes and nothing else: what a commit
+    /// MEANS is decided over `raw` by `git_primitives::parse_commit`, and a read
+    /// the ceiling refused answers with the size alone.
+    #[test]
+    fn a_commit_object_crosses_raw_and_a_refused_read_keeps_its_size() {
+        let base = tmp_base("object-raw");
+        let forge = five_commits(&base);
+        let head = git_head_oid(&base, "demo");
+
+        let object = forge
+            .git_object_read("demo", head.as_bytes(), 256 * 1024)
+            .expect("the head commit object");
+        assert_eq!(object.kind, git_primitives::KIND_COMMIT);
+        assert_eq!(
+            object.raw.len() as u64,
+            object.size,
+            "a body inside the ceiling crosses whole"
+        );
+
+        let commit = git_primitives::parse_commit(&object.raw).expect("a commit body");
+        assert_eq!(commit.message, "commit 5\n\nthe body of 5");
+        assert_eq!(commit.author, "ducktape <ducktape@localhost>");
+        // the COMMITTER's epoch seconds, which `seed_materialized_commit` set
+        // to the commit's own number.
+        assert_eq!(commit.committed_at, 5);
+        assert_eq!(commit.parents.len(), 1, "a linear history");
+        assert_eq!(commit.tree.len(), 20, "an oid is 20 stored bytes");
+
+        // one byte short of the body: the size is still the truth, and the body
+        // is simply not there.
+        let refused = forge
+            .git_object_read("demo", head.as_bytes(), object.size - 1)
+            .expect("a refused read is an answer, not an error");
+        assert_eq!(refused.kind, object.kind);
+        assert_eq!(refused.size, object.size);
+        assert!(refused.raw.is_empty(), "a refused body crosses empty");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A root commit has no parent to diff against, and diffing it against
     /// ITSELF answers an empty diff -- which tells a reader the first commit
     /// changed nothing, while it in fact introduced every file in the tree.
