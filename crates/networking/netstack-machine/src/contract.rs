@@ -168,8 +168,8 @@ pub enum StepError {
     Protocol(#[from] UpgradeError),
     /// The backend itself failed to run the step — a guest trap, an
     /// exhausted fuel budget, an undecodable wire value. The machine's state
-    /// is unknown from here on; the executor fails over to the native
-    /// backend.
+    /// is unknown from here on; the executor stops the plane. It never
+    /// selects a different implementation after a fault.
     #[error("backend fault: {0}")]
     Fault(String),
 }

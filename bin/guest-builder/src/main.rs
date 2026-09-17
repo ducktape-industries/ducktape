@@ -41,8 +41,15 @@
 //! * the shell lock is the module's `guest.lock`, committed beside its
 //!   artifacts: the record of the revision and the registry versions an
 //!   artifact came from, and the seed of the next build, so a crates.io
-//!   publish between two rebuilds does not move the bytes. a canonical build
-//!   writes artifact and lock together; `--out` writes the artifact alone.
+//!   publish between two rebuilds does not move the bytes. artifact and lock
+//!   are ALWAYS written together: a canonical build puts them in the module
+//!   directory, an `--out` build puts them side by side at the out path
+//!   (`<out>` and `<out>.lock`, so `runs.component.wasm` is joined by
+//!   `runs.component.lock`). the module directory stays untouched either way,
+//!   which is what lets the drift check rebuild every guest without dirtying
+//!   the tree — and what lets it hand the result back without a second build,
+//!   since a lock that does not describe the bytes beside it is worse than no
+//!   lock at all.
 //!
 //! the revision defaults to the checkout's HEAD and must be reachable at
 //! [`PLATFORM_GIT`]: push before building. uncommitted inputs anywhere in the
@@ -74,7 +81,8 @@ const PLATFORM_GIT: &str = "https://github.com/orthory/ducktape";
 
 const USAGE: &str = "usage: guest-builder <module-dir> [--index] [--rev <sha>] \
      [--out <artifact.wasm>] [--scratch <dir>]\n       \
-     guest-builder componentize <core.wasm> --out <component.wasm>";
+     guest-builder componentize <core.wasm> --out <component.wasm>\n       \
+     guest-builder vendor --out <dir> [--directory <path the config names>]";
 
 /// which of a module's two guests to build. the consensus component and the
 /// index mapper share the shell; everything guest-specific — contract
@@ -140,6 +148,7 @@ fn run() -> Result<(), String> {
     match parse_args()? {
         Args::Build(args) => build_guest(args),
         Args::Componentize { core, out } => componentize(&core, &out),
+        Args::Vendor { out, directory } => vendor(&out, directory.as_deref()),
     }
 }
 
@@ -185,19 +194,22 @@ fn build_guest(args: BuildArgs) -> Result<(), String> {
     )?;
 
     let cdylib = cdylib_path(&scratch, &module.name, kind);
-    // the canonical artifact and its lock are written together: the lock is
-    // the record of THOSE bytes. a one-off `--out` build leaves the module
-    // directory untouched, so a check that rebuilds every guest keeps the
-    // tree clean.
+    // artifact and lock travel together, wherever they land: the lock is the
+    // record of THOSE bytes, and one without the other is a half-answer. a
+    // one-off `--out` build still leaves the MODULE DIRECTORY untouched — it
+    // writes the pair at the out path instead — so a check that rebuilds every
+    // guest keeps the tree clean AND can hand its result back without paying
+    // for the same build twice.
     let out = match args.out {
         Some(path) => {
             write_artifact(kind, &cdylib, &path)?;
+            write_lock(&scratch, &path.with_extension("lock"))?;
             path
         }
         None => {
             let canonical = module_dir.join(kind.artifact());
             write_artifact(kind, &cdylib, &canonical)?;
-            record_lock(&scratch, &module_dir)?;
+            write_lock(&scratch, &module_dir.join("guest.lock"))?;
             canonical
         }
     };
@@ -220,7 +232,17 @@ fn write_artifact(kind: GuestKind, cdylib: &Path, out: &Path) -> Result<(), Stri
 /// repository, or wrap one already-built core module as a component.
 enum Args {
     Build(BuildArgs),
-    Componentize { core: PathBuf, out: PathBuf },
+    Componentize {
+        core: PathBuf,
+        out: PathBuf,
+    },
+    Vendor {
+        out: PathBuf,
+        /// what the emitted config names as the vendor directory, when that is
+        /// not where this run writes it — a guest image builds the set on the
+        /// host and mounts it somewhere else entirely.
+        directory: Option<String>,
+    },
 }
 
 struct BuildArgs {
@@ -233,12 +255,40 @@ struct BuildArgs {
 
 fn parse_args() -> Result<Args, String> {
     let mut argv = env::args().skip(1).peekable();
-    let is_the_componentize_verb = argv.peek().is_some_and(|arg| arg == "componentize");
-    if is_the_componentize_verb {
-        argv.next();
-        return parse_componentize_args(argv);
+    // step: the verb ladder became a match when the third verb arrived. ONE
+    // discriminant — the leading word — and the build verb is the unnamed one,
+    // which is why it is the fallthrough rather than an arm.
+    let verb = argv.peek().cloned().unwrap_or_default();
+    match verb.as_str() {
+        "componentize" => {
+            argv.next();
+            parse_componentize_args(argv)
+        }
+        "vendor" => {
+            argv.next();
+            parse_vendor_args(argv)
+        }
+        _ => parse_build_args(argv).map(Args::Build),
     }
-    parse_build_args(argv).map(Args::Build)
+}
+
+fn parse_vendor_args(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
+    let mut out = None;
+    let mut directory = None;
+    while let Some(arg) = argv.next() {
+        let value = argv
+            .next()
+            .ok_or_else(|| format!("{arg} needs a value\n{USAGE}"))?;
+        match arg.as_str() {
+            "--out" => out = Some(PathBuf::from(value)),
+            "--directory" => directory = Some(value),
+            other => return Err(format!("unknown argument {other}\n{USAGE}")),
+        }
+    }
+    let Some(out) = out else {
+        return Err(format!("vendor needs --out <dir>\n{USAGE}"));
+    };
+    Ok(Args::Vendor { out, directory })
 }
 
 fn parse_componentize_args(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -556,6 +606,19 @@ fn workspace_manifest(guests: &[GuestKind], source: &str) -> String {
 members = [{members}]
 resolver = "2"
 
+# a guest is optimized as ONE unit. without this the shell inherits cargo's
+# release defaults — lto = false, codegen-units = 16 — and every crate boundary
+# inside a module's own graph becomes an optimization barrier, so splitting a
+# module's wire types into their own crate costs the component real bytes for
+# no change in behaviour. the module set is shipped, hashed and consensus-
+# pinned, so it is compiled like something shipped rather than something built
+# in a loop. panic and debug settings are deliberately NOT set here: a trap's
+# function name is what makes a guest failure readable in a host log.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
 # the uniform wasm32 patch set (crates/module-sdk/stubs in the platform
 # repository, at the module's own revision): applied to every guest; cargo's
 # "unused patch" warning on a module whose graph never pulls one of these
@@ -779,13 +842,14 @@ fn copy_cdylib(cdylib: &Path, out: &Path) -> Result<(), String> {
         .map_err(|e| format!("copying {} to {}: {e}", cdylib.display(), out.display()))
 }
 
-/// the shell lock, written back beside the module as its `guest.lock`: the
-/// record of what the artifact was built from, and the seed of the next build.
-fn record_lock(scratch: &Path, module_dir: &Path) -> Result<(), String> {
-    let lock = module_dir.join("guest.lock");
-    fs::copy(scratch.join("Cargo.lock"), &lock)
+/// the shell lock, written beside the artifact it describes: the record of what
+/// that artifact was built from, and the seed of the next build. `dest` is the
+/// module's `guest.lock` for a canonical build and `<out>.lock` for an `--out`
+/// one — the same bytes either way, since the shell workspace is the same.
+fn write_lock(scratch: &Path, dest: &Path) -> Result<(), String> {
+    fs::copy(scratch.join("Cargo.lock"), dest)
         .map(|_| ())
-        .map_err(|e| format!("recording the shell lock as {}: {e}", lock.display()))
+        .map_err(|e| format!("recording the shell lock as {}: {e}", dest.display()))
 }
 
 fn cdylib_path(scratch: &Path, name: &str, kind: GuestKind) -> PathBuf {
@@ -805,6 +869,14 @@ fn cargo() -> String {
 
 /// the ducktape checkout this binary was built from: the source of the
 /// default revision, and the tree a module directory must sit in.
+///
+/// Baked in at COMPILE time, which matters whenever worktrees share one cargo
+/// target directory: the binary sitting in it belongs to whichever worktree
+/// built it last, so `cargo run -p guest-builder` from yours can hand you a
+/// sibling's — one that reads a sibling's modules, vendors a sibling's
+/// dependency set, and refuses your own module with "is outside the platform
+/// checkout". Build it into a private `CARGO_TARGET_DIR` when the answer has
+/// to come from THIS tree.
 fn default_platform_root() -> Result<PathBuf, String> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let Some(root) = manifest_dir.parent().and_then(Path::parent) else {
@@ -829,6 +901,224 @@ fn write(path: &Path, content: &str) -> Result<(), String> {
 // ============================================================================
 // tests
 // ============================================================================
+
+// ---- vendor: the registry a run builds a module against, with no network ----
+
+/// `guest-builder vendor --out <dir> [--directory <path>]`: every crates.io
+/// package a module guest build resolves, as a directory plus the cargo config
+/// that points at it.
+///
+/// A run inside a microVM reaches the network through vsock tunnels and
+/// nothing else, so a module build there resolves against vendored sources or
+/// it does not resolve at all. The set is DERIVED, never listed: one
+/// synthesized workspace depending on every crate that declares a `guest`
+/// feature, seeded with the checkout's own lockfile, has a lockfile that IS
+/// the union of what the modules need — and a crate nobody depends on is
+/// simply never in it.
+///
+/// **The set is the LOCKFILE graph, not the compile graph, and that is not an
+/// oversight.** Cargo's resolution is target-independent even though
+/// compilation is not: a replaced source must hold every package in the
+/// lockfile so the resolver can read its manifest, including ones no wasm32
+/// build ever compiles. Filtering by `cargo tree --target
+/// wasm32-unknown-unknown` removes `sha2`'s `cpufeatures` — declared under
+/// `[target.'cfg(any(target_arch = "x86_64", …))'.dependencies]` — and every
+/// build then fails with "no matching package named `cpufeatures` found". It
+/// is the same reason `cargo vendor` has no `--target`: it could not honour
+/// one. So `aws-lc-sys` rides along at 69 MB, unreachable and required.
+///
+/// The tree it reads is [`default_platform_root`], baked in at compile time —
+/// so on a shared cargo target directory this can vendor a SIBLING worktree's
+/// dependency set without saying so. Read that function's note first.
+fn vendor(out: &Path, directory: Option<&str>) -> Result<(), String> {
+    let root = default_platform_root()?;
+    let scratch = root.join("target/guest-builder/vendor-shell");
+    let _ = fs::remove_dir_all(&scratch);
+    synthesize_vendor_shell(&scratch, &root)?;
+    // the checkout's OWN pins: a run clones this tree, so the versions it asks
+    // for are the versions that have to be on disk. Without the seed cargo
+    // resolves to latest-compatible and vendors crates the clone never wants.
+    fs::copy(root.join("Cargo.lock"), scratch.join("Cargo.lock"))
+        .map_err(|e| format!("seeding the vendor lock: {e}"))?;
+
+    let vendor_dir = out.join("vendor");
+    fs::create_dir_all(out).map_err(|e| format!("creating {}: {e}", out.display()))?;
+    let output = Command::new(cargo())
+        .arg("vendor")
+        .arg("--versioned-dirs")
+        .arg(&vendor_dir)
+        .current_dir(&scratch)
+        .output()
+        .map_err(|e| format!("running cargo vendor: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo vendor: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    // cargo writes the config with the directory it just filled; an image build
+    // fills it on the host and mounts it elsewhere, so `--directory` renames it
+    // without touching the git-source stanzas, which carry exact revisions and
+    // are nobody's to hand-write.
+    let config = String::from_utf8_lossy(&output.stdout).into_owned();
+    let named = match directory {
+        None => config,
+        Some(path) => config.replace(
+            &format!("directory = \"{}\"", vendor_dir.display()),
+            &format!("directory = \"{path}\""),
+        ),
+    };
+    write(&out.join("config.toml"), &named)?;
+    eprintln!(
+        "guest-builder: vendored {} crates for {} guests",
+        fs::read_dir(&vendor_dir).map(Iterator::count).unwrap_or(0),
+        guest_packages(&root)?.len()
+    );
+    Ok(())
+}
+
+/// one workspace whose sole member depends on EVERY guest crate in the
+/// checkout, carrying the same wasm32 patch set a build shell gets.
+fn synthesize_vendor_shell(scratch: &Path, root: &Path) -> Result<(), String> {
+    let shell = scratch.join("shell");
+    let src = shell.join("src");
+    fs::create_dir_all(&src).map_err(|e| format!("creating {}: {e}", src.display()))?;
+    let deps: Vec<String> = guest_packages(root)?
+        .into_iter()
+        .map(|(name, dir)| {
+            format!(
+                "{name} = {{ path = {:?}, features = [\"guest\"], default-features = false }}",
+                dir.display().to_string()
+            )
+        })
+        .collect();
+    write(
+        &shell.join("Cargo.toml"),
+        &format!(
+            "# synthesized by `guest-builder vendor` — do not edit.\n\
+             [package]\nname = \"guest-vendor-shell\"\nversion = \"0.0.0\"\n\
+             edition = \"2021\"\npublish = false\n\n[lib]\npath = \"src/lib.rs\"\n\n\
+             [dependencies]\n{}\n",
+            deps.join("\n")
+        ),
+    )?;
+    write(&src.join("lib.rs"), "")?;
+    write(
+        &scratch.join("Cargo.toml"),
+        &format!(
+            "# synthesized by `guest-builder vendor` — do not edit.\n\
+             [workspace]\nmembers = [\"shell\"]\nresolver = \"2\"\n{}",
+            wasm32_patch_section(root)?
+        ),
+    )
+}
+
+/// every package in the checkout that declares a `guest` feature — the same
+/// question [`read_module`] asks of one directory, asked of the whole tree, so
+/// a module added tomorrow is vendored for without anyone editing a list.
+fn guest_packages(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    let output = Command::new(cargo())
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("running cargo metadata: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo metadata: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let meta: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("parsing cargo metadata output: {e}"))?;
+    let mut found: Vec<(String, PathBuf)> = meta["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|pkg| {
+            pkg["features"]
+                .get(GuestKind::Component.feature())
+                .is_some()
+        })
+        .filter_map(|pkg| {
+            let name = pkg["name"].as_str()?.to_string();
+            let dir = Path::new(pkg["manifest_path"].as_str()?)
+                .parent()?
+                .to_path_buf();
+            Some((name, dir))
+        })
+        .collect();
+    found.sort();
+    if found.is_empty() {
+        return Err(format!("no guest crates under {}", root.display()));
+    }
+    Ok(found)
+}
+
+/// the uniform wasm32 patch set, read out of `crates/module-sdk/stubs` rather
+/// than written down again: a build shell spells these as one git source and
+/// finds them by package name, which a path source cannot do, so the two
+/// renderings differ — but the SET does not, because both come from that
+/// directory. A stub added there is patched here without an edit.
+fn wasm32_patch_section(root: &Path) -> Result<String, String> {
+    let stubs = root.join("crates/module-sdk/stubs");
+    let mut entries: Vec<PathBuf> = fs::read_dir(&stubs)
+        .map_err(|e| format!("reading {}: {e}", stubs.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.is_dir())
+        .collect();
+    entries.sort();
+    let mut lines = String::from(
+        "\n# the uniform wasm32 patch set (crates/module-sdk/stubs): the crates a\n\
+         # guest substitutes because they cannot compile to wasm32. Read from that\n\
+         # directory, so this set cannot drift from the one a build shell applies.\n\
+         [patch.crates-io]\n",
+    );
+    for dir in entries {
+        let alias = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("unreadable stub name in {}", stubs.display()))?;
+        let (package, version) = stub_identity(&dir)?;
+        lines.push_str(&format!(
+            "{alias} = {{ package = \"{package}\", version = \"{version}\", path = {:?} }}\n",
+            dir.display().to_string()
+        ));
+    }
+    Ok(lines)
+}
+
+/// a stub's real package name and the `major.minor` requirement it stands in
+/// for, from its own manifest — the first `name` and `version` under
+/// `[package]`, which cargo's normalized manifests put first.
+fn stub_identity(dir: &Path) -> Result<(String, String), String> {
+    let manifest = dir.join("Cargo.toml");
+    let text = fs::read_to_string(&manifest)
+        .map_err(|e| format!("reading {}: {e}", manifest.display()))?;
+    let field = |key: &str| {
+        text.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix(&format!("{key} = "))?
+                .strip_prefix('"')?
+                .strip_suffix('"')
+                .map(str::to_string)
+        })
+    };
+    let (Some(name), Some(version)) = (field("name"), field("version")) else {
+        return Err(format!(
+            "{}: no package name and version",
+            manifest.display()
+        ));
+    };
+    let mut parts = version.split('.');
+    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+        return Err(format!(
+            "{}: version {version} is not major.minor",
+            manifest.display()
+        ));
+    };
+    Ok((name, format!("{major}.{minor}")))
+}
 
 #[cfg(test)]
 mod tests {
@@ -927,6 +1217,132 @@ mod tests {
                 target.join("wasm32-unknown-unknown/release/collaboration_component.wasm"),
                 "componentization must read the artifact just compiled"
             );
+        }
+    }
+
+    /// where a round of the redirection test sends cargo's output when the
+    /// explicit selection is dropped.
+    #[derive(Clone, Copy)]
+    enum Redirect {
+        Environment,
+        Configuration,
+    }
+
+    /// An inherited `CARGO_TARGET_DIR` or a `build.target-dir` in
+    /// configuration must not move the compiler's output away from the path
+    /// the artifact lookup reads: a redirected build either cannot be found at
+    /// all, or leaves an EARLIER build's bytes there to be packaged under this
+    /// build's lock. Each round compiles a real cdylib through the production
+    /// seam and reads back what would be packaged.
+    #[test]
+    fn a_redirected_cargo_output_cannot_package_an_earlier_build() {
+        let work = scratch();
+        let shell = work.path().join("shell");
+        fixture_file(
+            &shell,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"component\", \"index\"]\nresolver = \"2\"\n",
+        );
+        for kind in GuestKind::ALL {
+            fixture_file(
+                &shell,
+                &format!("{}/Cargo.toml", kind.member()),
+                &format!(
+                    "[package]\nname = \"probe-{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"cdylib\"]\n",
+                    kind.member()
+                ),
+            );
+            fixture_file(&shell, &format!("{}/src/lib.rs", kind.member()), "");
+        }
+        run_command(
+            Command::new(cargo())
+                .current_dir(&shell)
+                .arg("generate-lockfile"),
+        );
+
+        let decoy = |redirect: Redirect| match redirect {
+            Redirect::Environment => work.path().join("decoy-environment"),
+            Redirect::Configuration => work.path().join("decoy-configuration"),
+        };
+        let redirect_output = |redirect: Redirect, command: &mut Command| match redirect {
+            Redirect::Environment => {
+                command.env("CARGO_TARGET_DIR", decoy(redirect));
+            }
+            Redirect::Configuration => {
+                fixture_file(
+                    &shell,
+                    ".cargo/config.toml",
+                    &format!(
+                        "[build]\ntarget-dir = {:?}\n",
+                        decoy(redirect).display().to_string()
+                    ),
+                );
+            }
+        };
+        // the same build minus the explicit selection: what the redirection
+        // does when nothing overrides it, so a round that redirects nothing
+        // cannot pass for one that does.
+        let unselected = |kind: GuestKind| {
+            let reference = build_command(&shell, "probe", kind, "");
+            let mut args: Vec<std::ffi::OsString> =
+                reference.get_args().map(ToOwned::to_owned).collect();
+            let selection = args
+                .iter()
+                .position(|arg| arg == "--target-dir")
+                .expect("the build must select its target directory explicitly");
+            args.drain(selection..selection + 2);
+            let mut command = Command::new(cargo());
+            command
+                .args(args)
+                .env("CARGO_ENCODED_RUSTFLAGS", "")
+                .env_remove("RUSTFLAGS")
+                // "nothing overrides it" has to mean nothing THE OPERATOR
+                // brought either. The configuration round redirects with a
+                // config file, and cargo ranks the environment above one — so
+                // a `CARGO_TARGET_DIR` in the shell running the test wins,
+                // the reference build lands in the operator's directory, and
+                // the round fails claiming the redirection moved nothing.
+                .env_remove("CARGO_TARGET_DIR")
+                .current_dir(&shell);
+            command
+        };
+
+        let mut packaged: std::collections::HashMap<&str, Vec<u8>> = Default::default();
+        // round 1 builds a clean scratch; round 2 finds round 1's bytes
+        // sitting at the lookup path.
+        for (value, redirect) in [(1u32, Redirect::Environment), (2, Redirect::Configuration)] {
+            for kind in GuestKind::ALL {
+                fixture_file(
+                    &shell,
+                    &format!("{}/src/lib.rs", kind.member()),
+                    &format!("#[no_mangle]\npub extern \"C\" fn value() -> u32 {{ {value} }}\n"),
+                );
+            }
+            let mut without_selection = unselected(GuestKind::Component);
+            redirect_output(redirect, &mut without_selection);
+            run_command(&mut without_selection);
+            assert!(
+                decoy(redirect)
+                    .join("wasm32-unknown-unknown/release/probe_component.wasm")
+                    .is_file(),
+                "the redirection under test moved nothing"
+            );
+
+            for kind in GuestKind::ALL {
+                let mut command = build_command(&shell, "probe", kind, "");
+                redirect_output(redirect, &mut command);
+                run_command(&mut command);
+                let artifact = cdylib_path(&shell, "probe", kind);
+                let bytes =
+                    fs::read(&artifact).unwrap_or_else(|e| panic!("{}: {e}", artifact.display()));
+                assert_ne!(
+                    packaged.get(kind.member()),
+                    Some(&bytes),
+                    "{}: the lookup still holds the earlier build's bytes",
+                    kind.member()
+                );
+                packaged.insert(kind.member(), bytes);
+            }
         }
     }
 
@@ -1095,11 +1511,9 @@ mod tests {
         let lock = fs::read_to_string(shell.join("Cargo.lock")).unwrap();
         assert!(lock.contains(&format!("git+{url}#{rev}")));
         assert!(!lock.contains("?rev="));
-        assert!(
-            !fs::read_to_string(shell.join("component/Cargo.toml"))
-                .unwrap()
-                .contains("rev =")
-        );
+        assert!(!fs::read_to_string(shell.join("component/Cargo.toml"))
+            .unwrap()
+            .contains("rev ="));
         run_command(Command::new(cargo()).current_dir(&shell).args([
             "check",
             "--locked",
@@ -1131,17 +1545,13 @@ mod tests {
         }
         refuse_modified_sources(&repo, &inputs).unwrap();
         fixture_file(&repo, "shared/src/lib.rs", "pub fn value() -> u32 { 2 }\n");
-        assert!(
-            refuse_modified_sources(&repo, &inputs)
-                .unwrap_err()
-                .contains("shared/src/lib.rs")
-        );
+        assert!(refuse_modified_sources(&repo, &inputs)
+            .unwrap_err()
+            .contains("shared/src/lib.rs"));
         git(&repo, &["add", "shared/src/lib.rs"]);
-        assert!(
-            refuse_modified_sources(&repo, &inputs)
-                .unwrap_err()
-                .contains("shared/src/lib.rs")
-        );
+        assert!(refuse_modified_sources(&repo, &inputs)
+            .unwrap_err()
+            .contains("shared/src/lib.rs"));
         git(
             &repo,
             &[
@@ -1153,22 +1563,18 @@ mod tests {
             ],
         );
         fixture_file(&repo, "shared/src/new.rs", "pub const VALUE: u32 = 3;\n");
-        assert!(
-            refuse_modified_sources(&repo, &inputs)
-                .unwrap_err()
-                .contains("shared/src/new.rs")
-        );
+        assert!(refuse_modified_sources(&repo, &inputs)
+            .unwrap_err()
+            .contains("shared/src/new.rs"));
         fs::remove_file(repo.join("shared/src/new.rs")).unwrap();
         fixture_file(
             &repo,
             ".cargo/config.toml",
             "[build]\nincremental = false\n",
         );
-        assert!(
-            refuse_modified_sources(&repo, &inputs)
-                .unwrap_err()
-                .contains(".cargo/config.toml")
-        );
+        assert!(refuse_modified_sources(&repo, &inputs)
+            .unwrap_err()
+            .contains(".cargo/config.toml"));
     }
 
     #[test]

@@ -94,7 +94,17 @@ impl ValidatorRuntime<'_> {
             .with_roles(&validators, &residents)
     }
 
-    pub(super) async fn on_rpc(&mut self, (req, reply): RpcJob) {
+    pub(super) async fn on_rpc(
+        &mut self,
+        RpcJob {
+            req,
+            reply,
+            written,
+        }: RpcJob,
+    ) {
+        // read before the destructure borrows the rest of `self`: a parked
+        // submit needs the same wall clock the drain expires it against.
+        let now = self.context.current();
         let Self {
             node,
             orchestrator,
@@ -103,6 +113,7 @@ impl ValidatorRuntime<'_> {
             label,
             join_requests,
             metrics,
+            pending_rpc_submits,
             ..
         } = self;
 
@@ -115,7 +126,19 @@ impl ValidatorRuntime<'_> {
                     let seq = *next_seq;
                     *next_seq += 1;
                     match node.submit(signer, seq, Msg { target, payload }).await {
-                        Ok(_) => RpcReply::ok(),
+                        // ACCEPTED, not applied: the module that will refuse
+                        // this op has not run yet. Answering `ok` here is what
+                        // made every consensus refusal silent — park the caller
+                        // against the frame's own id and let `on_drain` answer
+                        // with its fate (#2533).
+                        Ok(frame_id) => {
+                            pending_rpc_submits
+                                .entry(frame_id)
+                                .or_insert_with(|| (Vec::new(), now + crate::constants::SUBMIT_HOLD))
+                                .0
+                                .push(reply);
+                            return;
+                        }
                         Err(e) => RpcReply::err(format!("submit failed: {e}")),
                     }
                 }
@@ -138,7 +161,7 @@ impl ValidatorRuntime<'_> {
                         height: node.finalized().map(|f| f.height),
                         root_hash: hex(&node.root_hash()),
                         modules,
-                        netstack: metrics.operational_status().netstack,
+                        operations: metrics.operational_status(),
                     }),
                     ..RpcReply::ok()
                 }
@@ -189,6 +212,10 @@ impl ValidatorRuntime<'_> {
                 // SAME sequence as the signal arm (shared macro).
                 graceful_checkpoint(node, orchestrator, *next_seq).await;
                 let _ = reply.send(RpcReply::ok());
+                // the send only queues the reply on the rpc thread; exiting
+                // here would race its write and close the socket on a caller
+                // that never saw a reply line.
+                let _ = written.await;
                 tracing::info!(
                     target: "ducktape::node",
                     node = %label,
@@ -477,13 +504,15 @@ impl ValidatorRuntime<'_> {
                         .push(reply);
                 }
                 Err(e) => {
-                    let _ = reply.send(Err(format!("submit failed: {e}")));
+                    // the "submit failed" framing IS the token now, so the
+                    // sentence carries the cause and nothing else.
+                    let _ = reply.send(Err(noded::Refused::new("submit_failed", e.to_string())));
                 }
             },
         }
     }
 
-    /// take custody of an already-framed op on THIS validator: fan a forge pack
+    /// take custody of an already-framed op on THIS validator: fan a required blob
     /// out to the peers that need it, then pin + propose the frame and hold the
     /// caller's reply against the frame id until the drain answers it.
     ///
@@ -496,7 +525,7 @@ impl ValidatorRuntime<'_> {
     async fn submit_local_frame(
         &mut self,
         frame: Vec<u8>,
-        reply: futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
+        reply: futures::channel::oneshot::Sender<Result<noded::BlockSummary, noded::Refused>>,
     ) {
         let Self {
             context,
@@ -538,7 +567,9 @@ impl ValidatorRuntime<'_> {
                         .push(reply);
                 }
                 Err(e) => {
-                    let _ = reply.send(Err(format!("submit failed: {e}")));
+                    // the "submit failed" framing IS the token now, so the
+                    // sentence carries the cause and nothing else.
+                    let _ = reply.send(Err(noded::Refused::new("submit_failed", e.to_string())));
                 }
             },
             Ok(Some(relay_runtime::ValidatorAction::SubmitResident { .. })) => {
@@ -546,7 +577,7 @@ impl ValidatorRuntime<'_> {
             }
             Ok(None) => {}
             Err((reply, detail)) => {
-                let _ = reply.send(Err(detail));
+                let _ = reply.send(Err(noded::Refused::new("blob_fanout", detail)));
             }
         }
     }
@@ -565,12 +596,18 @@ impl ValidatorRuntime<'_> {
             noded::NodeCommand::Submit {
                 target,
                 payload,
+                required_blob,
                 origin: _,
                 reply,
             } => {
                 let seq = self.next_seq;
                 self.next_seq += 1;
-                let frame = node::encode_frame(&self.signer, seq, &Msg { target, payload });
+                let frame = node::encode_frame_with_blob(
+                    &self.signer,
+                    seq,
+                    &Msg { target, payload },
+                    required_blob,
+                );
                 self.submit_local_frame(frame, reply).await;
             }
             // an ALREADY-SIGNED frame: submitted VERBATIM, never re-signed and
@@ -588,7 +625,7 @@ impl ValidatorRuntime<'_> {
                     .host()
                     .query(&target, &req)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|error| noded::Refused::of(&error));
                 let _ = reply.send(result);
             }
             noded::NodeCommand::QueryAs {
@@ -602,7 +639,7 @@ impl ValidatorRuntime<'_> {
                     .host()
                     .query_as(&target, &req, sdk::Origin::External(reader))
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|error| noded::Refused::of(&error));
                 let _ = reply.send(result);
             }
         }

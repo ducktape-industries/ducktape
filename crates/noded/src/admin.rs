@@ -677,10 +677,9 @@ async fn ping() -> Response {
 /// POST /v1/admin/netstack/swap — move the reachability plane onto another
 /// netstack backend, mid-life, without a retarget or a tunnel flap.
 ///
-/// The OPERATOR's trigger: one node rolled forward onto a component, or back
-/// onto native, without waiting for governance. Body is
-/// `{"backend": "native"}` or `{"backend": {"component": "<path on the node's
-/// disk>"}}` — the path is read by the NODE, so a caller off-box never ships
+/// The operator can select a component without waiting for governance. Body
+/// is `{"backend": {"component": "<path on the node disk>"}}`.
+/// The path is read by the NODE, so a caller off-box never ships
 /// bytes through this route.
 ///
 /// A refused swap is a 409 and the running machine CONTINUES untouched (the

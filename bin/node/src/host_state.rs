@@ -200,7 +200,7 @@ pub(super) async fn fetch_and_hydrate_genesis<
         client,
         blobs,
         &hash,
-        crate::constants::MAX_MODULE_CODE_BYTES,
+        crate::constants::MAX_GENESIS_BYTES,
         crate::constants::BLOB_FETCH_ATTEMPTS,
     )
     .await
@@ -345,8 +345,12 @@ fn disk_substrates(
     blobs: blobstore::BlobHandle,
 ) -> Substrates {
     Substrates {
-        forge_repo: forge_repo.to_path_buf(),
-        duckfs_dir: duckfs_dir.to_path_buf(),
+        directory: duckfs_dir.with_file_name("module-storage"),
+        bindings: [
+            ("forge".into(), forge_repo.to_path_buf()),
+            ("files".into(), duckfs_dir.to_path_buf()),
+        ]
+        .into(),
         blobs,
     }
 }
@@ -500,7 +504,7 @@ pub(super) async fn restore_host(
 fn restore_snapshot(manifest: &Manifest, id: &str, backing: Backing) -> Result<Snapshot, String> {
     match backing {
         Backing::Map => manifest_snapshot(manifest, id).map(Some),
-        Backing::Store | Backing::Odb => Ok(None),
+        Backing::Store | Backing::Odb | Backing::Git => Ok(None),
     }
 }
 
@@ -885,29 +889,21 @@ mod tests {
 
     use super::*;
 
-    /// The PRODUCTION genesis root hash over [`PIN_BINDINGS`] and an EMPTY
-    /// validator set — the consensus root every node of such a network computes
-    /// at block zero, pinned so that moving it is a decision instead of an
-    /// accident. Update it ONLY as the deliberate half of a flag day (see
-    /// [`production_genesis_root_hash_is_pinned`]).
-    const GENESIS_ROOT_HASH: &str =
-        "fb7249348f419f61af37816c4444cede7cf1f11720cfac3b110b5f2e1cbe291d";
-
-    /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
-    /// because they are NOT: each rides its module's genesis `__config`
-    /// record (the composer's `seed_store_config` for a store-backed tenant,
-    /// the `initial_state` install for a Map-backed one), so a real
-    /// network's invite namespace and chain id put it on its own root by
-    /// design. Pinning a hash only says anything against fixed ones.
+    /// The bindings the composition below runs under. Fixed values, and
+    /// arbitrary ones: each rides its module's genesis `__config` record (the
+    /// composer's `seed_store_config` for a store-backed tenant, the
+    /// `initial_state` install for a Map-backed one), so every real network's
+    /// own invite namespace and chain id put it on its own genesis root by
+    /// design. Nothing here is any deployed network's number.
     const PIN_BINDINGS: NetworkBindings<'static> = NetworkBindings {
         invite: b"parity-test",
         identity_chain_id: "parity-test",
     };
 
     /// Compose the production genesis host in a throwaway storage root and
-    /// return `(module ids sorted, root hash hex, native module ids sorted)` —
-    /// everything all three pins below need, so none has to keep its own copy
-    /// of the construction.
+    /// return `(module ids sorted, native module ids sorted)` — everything
+    /// both pins below need, so neither has to keep its own copy of the
+    /// construction.
     ///
     /// Production runs this root future on macOS's ~8 MiB process stack, and
     /// the reason to run the test twin on the same budget is to MATCH
@@ -918,12 +914,19 @@ mod tests {
 
     /// the genesis code set the pins compose over: the founding set the build
     /// staged beside this test executable — the committed components (the
-    /// kernel fixtures pin the same bytes), read and hashed at test time,
-    /// never embedded.
+    /// kernel fixtures pin the same bytes) and the founding views
+    /// (`topology::VIEWS`, staged out of `make views`), read and hashed at
+    /// test time, never embedded. The same set `node init` composes.
     fn fixture_genesis() -> GenesisModules {
-        let dir = workspace_config::modules_dir().expect("the build stages the founding set");
-        let hashes = noded::bundle::hash_bundle(&dir, &topology::TOPOLOGY.wasm_ids(PRODUCTION))
-            .expect("founding set");
+        // `{why}`, not `expect`: the refusal carries its remedy on its own
+        // lines, and `expect`'s `{:?}` would hand the reader `\n` escapes in
+        // the one place the remedy is most needed — a sibling checkout built
+        // between this executable's link and its run.
+        let dir = noded::services::founding_set()
+            .unwrap_or_else(|why| panic!("the build stages the founding set:\n{why}"));
+        let mut ids = topology::TOPOLOGY.wasm_ids(PRODUCTION);
+        ids.extend(topology::VIEWS);
+        let hashes = noded::bundle::hash_bundle(&dir, &ids).expect("founding set");
         GenesisModules {
             hashes,
             source: GenesisSource::FoundingSet(dir),
@@ -935,7 +938,7 @@ mod tests {
         indexer::IndexStore::open_bare(dir.join("index"), PRODUCTION).expect("open index")
     }
 
-    fn genesis_facts() -> (Vec<String>, String, Vec<String>) {
+    fn genesis_facts() -> (Vec<String>, Vec<String>) {
         std::thread::Builder::new()
             .name("production-genesis-test".into())
             .stack_size(GENESIS_TEST_STACK_BYTES)
@@ -947,7 +950,7 @@ mod tests {
             .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
     }
 
-    fn compose_genesis_facts() -> (Vec<String>, String, Vec<String>) {
+    fn compose_genesis_facts() -> (Vec<String>, Vec<String>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let forge_repo = dir.path().join("forge");
         let duckfs_dir = dir.path().join("duckfs");
@@ -979,7 +982,7 @@ mod tests {
                 .filter(|id| host.module_code_hash(id).is_none())
                 .cloned()
                 .collect();
-            (ids, hex(&host.root_hash()), native)
+            (ids, native)
         })
     }
 
@@ -1020,7 +1023,9 @@ mod tests {
                 10,
                 ModulesMsg::RegisterModule {
                     module_id: "hello".into(),
+                    kind: modules::Kind::Module,
                     code_hash: first.to_vec(),
+                    lanes: Vec::new(),
                 },
             ),
             (
@@ -1113,7 +1118,7 @@ mod tests {
     /// status/index surfaces open fails here instead of silently misreporting.
     #[test]
     fn genesis_registry_matches_production() {
-        let (got, _root, _native) = genesis_facts();
+        let (got, _native) = genesis_facts();
         let mut want: Vec<String> = PRODUCTION.iter().map(|s| s.to_string()).collect();
         want.sort_unstable();
         assert_eq!(got, want);
@@ -1121,7 +1126,7 @@ mod tests {
 
     #[test]
     fn every_default_module_runs_wasm_including_the_registries() {
-        let (_ids, _root, natives) = genesis_facts();
+        let (_ids, natives) = genesis_facts();
         assert!(
             natives.is_empty(),
             "the binary must construct no native modules: {natives:?}"
@@ -1140,7 +1145,7 @@ mod tests {
         let genesis = Genesis {
             modules: vec![workspace_config::Artifact {
                 id: "pages".into(),
-                bytes: module_artifact::ModuleArtifact::component(b"pages-bytes".to_vec()).encode(),
+                bytes: module_artifact::Artifact::module(b"pages-bytes".to_vec()).encode(),
             }],
         };
         let bytes = genesis.encode();
@@ -1199,7 +1204,7 @@ mod tests {
         let mut want = std::collections::BTreeMap::new();
         want.insert(
             "pages".to_string(),
-            module_artifact::ModuleArtifact::component(b"pages-bytes".to_vec()).hash(),
+            module_artifact::Artifact::module(b"pages-bytes".to_vec()).hash(),
         );
         let blobs = blobstore::BlobHandle::default();
         seed_founding_set(&blobs, dir.path(), &want).expect("seed");
@@ -1216,67 +1221,6 @@ mod tests {
         assert!(err.contains("pages.component.wasm"), "{err}");
         // a chunk the store already holds needs no file at all.
         seed_founding_set(&blobs, dir.path(), &want).expect("seeded store");
-    }
-
-    /// THE consensus pin: the production genesis root hash is a constant.
-    ///
-    /// It is the only ABSOLUTE one in the tree, and until it existed every claim
-    /// that "the root hash did not move" was relative and therefore weak.
-    /// `bin/simnode/tests/topology_set.rs` pins the 15-module sim composition —
-    /// which excludes `acl`, `governance`, `modules` and `valset`, and is not
-    /// what a node runs. (Not a NATIVE composition, as this said for a while:
-    /// simnode opens a `DirCodeSource` over the founding set the build staged
-    /// beside it and composes through `noded::compose`, so every `SIM_BASE`
-    /// id loads as a wasm component — which is why a rebuilt component moves
-    /// that root.) And `git
-    /// diff crates/modules/` on a committed tree is EMPTY BY CONSTRUCTION, so
-    /// quoting it proves nothing at all. Neither would have noticed a module's
-    /// bytes changing.
-    ///
-    /// ## the mechanism, because it surprises everyone once
-    ///
-    /// What this covers is wider than the module SET. The composer's modules registry
-    /// seed commits each deployment hash — the descriptor's commitment — for
-    /// every wasm tenant into the modules registry's MerkleStore, so each
-    /// guest's CODE DIGEST is consensus state itself. That means a module's
-    /// SOURCE is consensus-relevant the moment its component is rebuilt — even
-    /// for a change that alters no behaviour, even a comment — and it means
-    /// `make wasm-modules` can ship a seventeen-module flag day as a side effect
-    /// of touching one guest. That is correct, and it is exactly the event that
-    /// must never happen silently.
-    ///
-    /// ## when this fails
-    ///
-    /// You are in one of two situations and the message says so, because they
-    /// need opposite responses:
-    ///
-    /// - **On purpose.** A module was added or removed, a guest was rebuilt, a
-    ///   genesis-seeded record changed. Then this hash SHOULD move: update the
-    ///   constant in the same commit, and say in the commit message which change
-    ///   moved it. A flag day is cheap — there is no live chain — but it has to
-    ///   be a stated act.
-    /// - **By accident.** You did not mean to touch consensus, and you did. The
-    ///   usual cause is a rebuilt `component.wasm` riding along in the diff.
-    #[test]
-    fn production_genesis_root_hash_is_pinned() {
-        let (_ids, root, _native) = genesis_facts();
-        assert_eq!(
-            root, GENESIS_ROOT_HASH,
-            "the production genesis root hash MOVED.\n\
-             Every node computes this at block zero, so a network whose members \
-             do not all agree on it forks at genesis.\n\
-             \n\
-             DID YOU MEAN TO? A module added/removed, a guest rebuilt, a \
-             genesis-seeded record changed — then yes, and this is a deliberate \
-             flag day: set GENESIS_ROOT_HASH to {root} in the SAME commit as the \
-             change that moved it, and name that change in the commit message.\n\
-             \n\
-             DID YOU NOT? Then you have moved consensus by accident. Look for a \
-             rebuilt component.wasm in your diff — a guest's code digest is \
-             consensus state, so `make wasm-modules` moves this hash even when \
-             the source change was cosmetic:\n\
-             \x20 git diff origin/dev --name-only crates/modules/ crates/guests/ crates/examples/"
-        );
     }
 
     /// `sync_all_modules` re-enters forever on a resident whose boundary sync

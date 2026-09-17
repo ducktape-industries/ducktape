@@ -205,6 +205,7 @@ async fn boot_gateway_and_upstream() -> (String, u16, Arc<MockUpstream>) {
             oauth_client_id: "test-client".into(),
             session_ttl_secs: 3600,
             max_requests: 100,
+            sign: None,
         },
         "snp",
         test_enclave().quoter(),
@@ -294,7 +295,7 @@ fn signed_airlock_route(
             policy: RoutePolicy {
                 audience: RouteAudience::Network,
                 methods: vec![RouteMethod::Get, RouteMethod::Head, RouteMethod::Post],
-                max_request_bytes: 1024 * 1024,
+                max_request_bytes: Some(1024 * 1024),
                 max_response_bytes: 4 * 1024 * 1024,
                 allow_authorization: true,
                 allow_upgrade: false,
@@ -775,6 +776,7 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     let (ok, output) = cluster.run_verb(&[
         "gateway",
         "bind",
+        "--trusted-loopback",
         "--workspace",
         workspace.to_str().unwrap(),
         "--label",

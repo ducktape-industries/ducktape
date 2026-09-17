@@ -2,9 +2,11 @@
 //! off the register it reads for itself.
 //!
 //! The kernel pushes only session facts (`governance.props`: connected,
-//! admin, dark). The register is the view's own: it asks the node through
-//! `rpc.query` and `rpc.blocks`, re-reads on every `rpc.live` hit for the
-//! governance plane, and folds the proposals into rows here. A vote or a
+//! dark, the taste set). The register is the view's own, and so is this
+//! node's authority over it: it asks the node through `rpc.query` and
+//! `rpc.blocks`, re-reads on every `rpc.live` hit for the governance plane,
+//! folds the proposals into rows here, and reads its own quorum seat off
+//! `rpc.status` and the valset. A vote or a
 //! settle leaves as `op.submit` carrying the governance message the kernel
 //! signs with the seated key — the view never sees the key, the endpoint or
 //! the password.
@@ -16,9 +18,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
 
 /// How far back the op feed is scanned for a settled proposal's execute
 /// height.
@@ -29,8 +31,10 @@ const SETTLE_SCAN_BLOCKS: usize = 400;
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ProposalRow {
     pub id: String,
+    /// What kind of change, in words: `Add validator`, `Update module`.
     pub action: String,
-    pub detail: String,
+    /// The action's payload as labelled fields, in the order they read.
+    pub fields: Vec<Field>,
     pub proposer: String,
     pub status: String,
     pub deadline: i64,
@@ -41,6 +45,101 @@ pub struct ProposalRow {
     pub electorate: i64,
     pub open: bool,
     pub settled_height: i64,
+    /// For a code ballot (`update_module` / `register_module`): the module
+    /// it names and the full hex of the hash it would install — the pair
+    /// the taste set is keyed by. Empty for every other action.
+    pub module_id: String,
+    pub code_hash: String,
+}
+
+/// One row of the taste set the kernel pushes with the session: a
+/// `(module, hash)` an open code ballot or a scheduled swap names, whether
+/// this app tastes it, and why it cannot be tasted if it cannot (`reason`
+/// empty when it can).
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct TasteRow {
+    pub module: String,
+    /// The module's tab name.
+    pub name: String,
+    pub proposal: String,
+    pub hash: String,
+    /// `open` or `scheduled`.
+    pub status: String,
+    pub activation_height: i64,
+    pub tasting: bool,
+    pub reason: String,
+}
+
+/// The taste row a proposal's `(module, hash)` names, if the taste set
+/// lists it.
+pub fn taste_of<'a>(tasting: &'a [TasteRow], proposal: &ProposalRow) -> Option<&'a TasteRow> {
+    let names_code = !proposal.code_hash.is_empty();
+    if !names_code {
+        return None;
+    }
+    tasting
+        .iter()
+        .find(|row| row.module == proposal.module_id && row.hash == proposal.code_hash)
+}
+
+/// Why a proposed view cannot be tried here, for the reader.
+pub fn refusal_words(reason: &str) -> String {
+    match reason {
+        "not_registered" => "Its module is not registered here yet".into(),
+        "not_held" => "Your node has not received these bytes yet".into(),
+        "hash_mismatch" => "The bytes your node holds do not match the proposal".into(),
+        "invalid_artifact" => "The proposed artifact cannot be read".into(),
+        "kind_mismatch" => "The proposed artifact is not this entry's kind".into(),
+        "core_changes_too" => {
+            "Changes the module's code too — it becomes current when it activates".into()
+        }
+        "wire_protocol" => "Built for another version of this app".into(),
+        "no_view" => "Removes the view".into(),
+        other => sentence_case(other),
+    }
+}
+
+/// The line under a tasteable row: where the ballot stands, and whether
+/// this app is on it.
+pub fn taste_status(row: &TasteRow) -> String {
+    let stage = match row.status.as_str() {
+        "scheduled" => format!(
+            "Scheduled for {}",
+            height_label_short(row.activation_height)
+        ),
+        _ => "On the ballot".into(),
+    };
+    match row.tasting {
+        true => format!("{stage} · you are trying it"),
+        false => stage,
+    }
+}
+
+/// One labelled field of a proposal's action: `Key` / `8c4fa211…`. `code`
+/// marks a value that is an identifier (a key, a hash, a module id) and
+/// reads in mono; the rest is prose.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct Field {
+    pub name: String,
+    pub value: String,
+    pub code: bool,
+}
+
+impl Field {
+    fn prose(name: &str, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            code: false,
+        }
+    }
+    fn code(name: &str, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            code: true,
+        }
+    }
 }
 
 // ---------- the session ----------
@@ -49,8 +148,9 @@ pub struct ProposalRow {
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub connected: bool,
-    pub admin: bool,
     pub dark: bool,
+    /// The taste set: what a member may try before the ballot settles.
+    pub tasting: Vec<TasteRow>,
 }
 
 /// One item of the session subscription: the facts, or why not.
@@ -61,10 +161,10 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("governance.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
             });
             match read {
@@ -91,6 +191,72 @@ pub fn connection_serial_after(was_connected: bool, connected: bool, serial: i64
     }
 }
 
+// ---------- this node's seat ----------
+
+/// One item of the seat subscription: whether this node holds a quorum
+/// seat, or why the valset could not say.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
+pub struct SeatItem {
+    pub admin: bool,
+    pub error: String,
+}
+
+/// Whether this node votes, now and after every valset block. THE ONE
+/// authority predicate on this screen: a ballot's buttons and the rule the
+/// rest of the network reads instead both hang off it, and it is the view's
+/// own read of `rpc.status` against the valset — no host prop carries it.
+pub fn seat(connection: i64) -> ducktape_view_guest::Subscription<SeatItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
+        let live = host::subscribe("rpc.live", b"valset");
+        stream::once(load_seat()).chain(live.then(|_| load_seat()))
+    })
+}
+
+async fn load_seat() -> SeatItem {
+    match read_seat().await {
+        Ok(admin) => SeatItem {
+            admin,
+            error: String::new(),
+        },
+        Err(error) => SeatItem {
+            admin: false,
+            error,
+        },
+    }
+}
+
+async fn read_seat() -> Result<bool, String> {
+    let status = ask("rpc.status", &serde_json::json!({})).await?;
+    let node_key = status["public_key"].as_str().unwrap_or_default().to_owned();
+    let reply = ask(
+        "rpc.query",
+        &serde_json::json!({ "target": "valset", "query": "validators" }),
+    )
+    .await?;
+    Ok(holds_a_seat(&node_key, &reply))
+}
+
+/// This node's key among the valset's validators. An empty key never
+/// matches, so a node that has not said who it is does not vote.
+pub fn holds_a_seat(node_key: &str, reply: &serde_json::Value) -> bool {
+    if node_key.is_empty() {
+        return false;
+    }
+    reply["validators"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .any(|key| hex_encode(&json_bytes(key)) == node_key)
+}
+
+async fn ask(kind: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes"))
+        .await
+        .map_err(host::said)?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
+
 // ---------- the register ----------
 
 /// One item of the register subscription: the rows, or why not.
@@ -102,8 +268,8 @@ pub struct RegisterItem {
 
 /// The register now and after every governance block: read once at start,
 /// then again on each `rpc.live` hit for the governance plane.
-pub fn register(connection: i64) -> iced::Subscription<RegisterItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn register(connection: i64) -> ducktape_view_guest::Subscription<RegisterItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         let live = host::subscribe("rpc.live", b"governance");
         stream::once(load()).chain(live.then(|_| load()))
     })
@@ -124,7 +290,9 @@ async fn load() -> RegisterItem {
 
 async fn read_register() -> Result<Vec<ProposalRow>, String> {
     let query = serde_json::json!({ "target": "governance", "query": "proposals" });
-    let reply = host::request("rpc.query", &serde_json::to_vec(&query).expect("encodes")).await?;
+    let reply = host::request("rpc.query", &serde_json::to_vec(&query).expect("encodes"))
+        .await
+        .map_err(host::said)?;
     let reply: serde_json::Value =
         serde_json::from_slice(&reply).map_err(|error| error.to_string())?;
     let mut rows = fold_proposals(&reply);
@@ -167,8 +335,8 @@ fn fold_proposal(view: &serde_json::Value) -> ProposalRow {
     ProposalRow {
         id: view["proposal_id"].as_str().unwrap_or_default().to_string(),
         open: status == "open",
-        detail: gov_action_detail(&view["action"]),
-        proposer: short_label(&hex_encode(&json_bytes(&view["proposer"]))),
+        fields: gov_action_fields(&view["action"]),
+        proposer: principal_label(&view["proposer"], &view["voter_kind"]),
         deadline: view["deadline"].as_i64().unwrap_or(0),
         approvals: count_i64(approvals),
         rule: tagged_name(&view["voting_rule"]),
@@ -180,9 +348,76 @@ fn fold_proposal(view: &serde_json::Value) -> ProposalRow {
                 .map_or(0, |members| members.len()),
         ),
         settled_height: 0,
-        action: tagged_name(&view["action"]),
-        status,
+        action: action_label(&tagged_name(&view["action"])),
+        status: status_label(&status),
+        module_id: code_ballot(&view["action"])
+            .map(|code| code["module_id"].as_str().unwrap_or_default().to_string())
+            .unwrap_or_default(),
+        code_hash: code_ballot(&view["action"])
+            .map(|code| hex_encode(&json_bytes(&code["code_hash"])))
+            .unwrap_or_default(),
     }
+}
+
+/// The payload of a code ballot — `update_module` / `register_module` —
+/// and nothing for any other action.
+fn code_ballot(action: &serde_json::Value) -> Option<&serde_json::Value> {
+    action
+        .get("update_module")
+        .or_else(|| action.get("register_module"))
+}
+
+/// A `GovAction` variant tag in words: `add_validator` reads `Add validator`.
+pub fn action_label(variant: &str) -> String {
+    match variant {
+        "add_validator" => "Add validator",
+        "remove_validator" => "Remove validator",
+        "signal" => "Signal",
+        "add_resident" => "Add resident",
+        "remove_resident" => "Remove resident",
+        "adopt_shares" => "Adopt shares",
+        "set_shares" => "Set shares",
+        "set_share_mode" => "Ballot mode",
+        "update_module" => "Update module",
+        "register_module" => "Register module",
+        "cancel_module_update" => "Cancel module update",
+        "set_acl_policy" => "Submit policy",
+        other => return sentence_case(other),
+    }
+    .into()
+}
+
+/// `open` / `passed` / `rejected` as a word, and the settled states named
+/// for what they mean to a reader.
+pub fn status_label(status: &str) -> String {
+    match status {
+        "open" => "Open".into(),
+        "passed" => "Passed".into(),
+        "rejected" => "Rejected".into(),
+        other => sentence_case(other),
+    }
+}
+
+/// `some_snake_token` → `Some snake token`: the fallback for a tag the
+/// view has no words for, so a token never reaches the screen raw.
+fn sentence_case(token: &str) -> String {
+    let words = token.replace('_', " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Who a proposal's principal is: `account #42` in share mode (the 8-byte
+/// LE account number), the short node key otherwise.
+fn principal_label(principal: &serde_json::Value, voter_kind: &serde_json::Value) -> String {
+    let bytes = json_bytes(principal);
+    let account_mode = voter_kind.as_str() == Some("account");
+    if account_mode && let Ok(number) = <[u8; 8]>::try_from(bytes.as_slice()) {
+        return format!("account #{}", u64::from_le_bytes(number));
+    }
+    short_label(&hex_encode(&bytes))
 }
 
 /// The block each settled proposal was EXECUTED at, off the recent op
@@ -227,33 +462,112 @@ pub fn fold_settle_heights(blocks: &serde_json::Value) -> BTreeMap<String, i64> 
     heights
 }
 
-/// The `GovAction` payload as one readable clause — what the op DOES, which
-/// the bare variant tag never says.
-pub fn gov_action_detail(action: &serde_json::Value) -> String {
+/// The `GovAction` payload as labelled fields — what the op DOES, which the
+/// bare variant tag never says. Every variant of
+/// `crates/modules/system/governance/src/interface.rs` reads here; a
+/// variant this view has no words for shows each of its scalar fields under
+/// its own name rather than nothing.
+pub fn gov_action_fields(action: &serde_json::Value) -> Vec<Field> {
     let Some(tagged) = action.as_object() else {
-        return String::new();
+        return Vec::new();
     };
     let Some((variant, payload)) = tagged.iter().next() else {
-        return String::new();
+        return Vec::new();
     };
-    let key = payload.get("key").map(json_bytes).unwrap_or_default();
-    if !key.is_empty() {
-        return format!("key {}", short_label(&hex_encode(&key)));
-    }
-    if let Some(text) = payload.get("text").and_then(|text| text.as_str()) {
-        return text.to_string();
-    }
+    let text = |name: &str| payload[name].as_str().unwrap_or_default().to_string();
+    let bytes = |name: &str| short_label(&hex_encode(&json_bytes(&payload[name])));
+    let module = || {
+        vec![
+            Field::prose("Module", text("name")),
+            Field::code("Module id", text("module_id")),
+            Field::prose(
+                "Activates",
+                format!(
+                    "{} after it settles",
+                    plural(
+                        payload["activation_lead"].as_i64().unwrap_or(0),
+                        "block",
+                        "blocks"
+                    )
+                ),
+            ),
+            Field::code("Code hash", bytes("code_hash")),
+        ]
+    };
     match variant.as_str() {
-        "update_module" => format!(
-            "{} → h {}",
-            payload["name"].as_str().unwrap_or_default(),
-            payload["activation_height"].as_i64().unwrap_or(0)
-        ),
-        "set_share_mode" => match payload["enabled"].as_bool().unwrap_or(false) {
-            true => "account shares".into(),
-            false => "one ballot per validator".into(),
-        },
-        _ => String::new(),
+        "add_validator" | "remove_validator" | "add_resident" | "remove_resident" => {
+            vec![Field::code("Node key", bytes("key"))]
+        }
+        "signal" => vec![Field::prose("Message", text("text"))],
+        "adopt_shares" => {
+            let allocations = payload["allocations"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let shares: i64 = allocations
+                .iter()
+                .map(|allocation| allocation["shares"].as_i64().unwrap_or(0))
+                .sum();
+            vec![Field::prose(
+                "Allocation",
+                format!(
+                    "{} across {}",
+                    plural(shares, "share", "shares"),
+                    plural(count_i64(allocations.len()), "account", "accounts")
+                ),
+            )]
+        }
+        "set_shares" => vec![
+            Field::prose(
+                "Account",
+                format!("#{}", payload["account_id"].as_i64().unwrap_or(0)),
+            ),
+            Field::prose(
+                "Shares",
+                payload["shares"].as_i64().unwrap_or(0).to_string(),
+            ),
+        ],
+        "set_share_mode" => {
+            let ballots = match payload["enabled"].as_bool().unwrap_or(false) {
+                true => "one per account share",
+                false => "one per validator",
+            };
+            vec![Field::prose("Ballots", ballots)]
+        }
+        "update_module" | "register_module" => module(),
+        "cancel_module_update" => vec![
+            Field::prose("Module", text("name")),
+            Field::code("Module id", text("module_id")),
+        ],
+        "set_acl_policy" => {
+            let target = match payload["target"].as_str() {
+                Some("*") | None => "every module".to_string(),
+                Some(target) => target.to_string(),
+            };
+            let standing = match payload["standing"].as_str() {
+                Some("validator") => "validators only",
+                Some("node") => "validators and residents",
+                Some("user") => "members with an account",
+                Some("open") | None => "anyone with a signature",
+                Some(other) => other,
+            };
+            vec![
+                Field::prose("Target", target),
+                Field::prose("Who may submit", standing),
+            ]
+        }
+        _ => payload
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, value)| {
+                let value = value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string());
+                Field::prose(&sentence_case(name), value)
+            })
+            .collect(),
     }
 }
 
@@ -373,8 +687,8 @@ fn submit(proposal_id: String, message: serde_json::Value) -> bool {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;
@@ -398,7 +712,7 @@ impl Stream for ActStream {
             let (proposal_id, _) = acts.pending.remove(index);
             Poll::Ready(Some(ActItem {
                 proposal_id,
-                error: answer.err().unwrap_or_default(),
+                error: answer.err().map(host::said).unwrap_or_default(),
             }))
         })
     }
@@ -410,7 +724,44 @@ pub fn badge(open: i64) -> bool {
     true
 }
 
+#[derive(Serialize)]
+struct Taste<'a> {
+    module: &'a str,
+    hash: &'a str,
+}
+
+#[derive(Serialize)]
+struct Untaste<'a> {
+    module: &'a str,
+}
+
+/// `governance.taste` — this device tries the view a proposal would
+/// install for `module`, under `hash`. A preference of the app, never a
+/// write to the network.
+pub fn taste(module: &str, hash: &str) -> bool {
+    let payload = serde_json::to_vec(&Taste { module, hash }).expect("an intent encodes");
+    host::notify("governance.taste", &payload);
+    true
+}
+
+/// `governance.untaste` — back to the current view for `module`.
+pub fn untaste(module: &str) -> bool {
+    let payload = serde_json::to_vec(&Untaste { module }).expect("an intent encodes");
+    host::notify("governance.untaste", &payload);
+    true
+}
+
 // ---------- the readings ----------
+
+/// `Could not read the proposals: not connected to a node` — a host
+/// refusal with the verb a person needs in front of it; no refusal, no
+/// sentence.
+pub fn sentence(verb: &str, error: &str) -> String {
+    if error.is_empty() {
+        return String::new();
+    }
+    format!("{verb}: {error}")
+}
 
 /// `12 open · 3 settled` — the Approvals title's machine subtitle.
 pub fn proposals_summary(connected: bool, rows: &[ProposalRow]) -> String {
@@ -436,33 +787,9 @@ pub fn settled_proposals(rows: &[ProposalRow]) -> Vec<ProposalRow> {
     rows.iter().filter(|row| !row.open).cloned().collect()
 }
 
-/// One seat per REQUIRED signature, filled for each approval already in —
-/// the quorum dots. Capped so a large threshold does not overflow the card.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct QuorumSeat {
-    pub filled: bool,
-}
-
-pub fn quorum_dots(approvals: i64, required: i64) -> Vec<QuorumSeat> {
-    let seats = required.clamp(0, 12) as usize;
-    (0..seats)
-        .map(|seat| QuorumSeat {
-            filled: (seat as i64) < approvals,
-        })
-        .collect()
-}
-
 /// `3 / 4` — the tally, one mono run.
 pub fn tally_label(approvals: i64, required: i64) -> String {
     format!("{approvals} / {required}")
-}
-
-/// `near` one vote from quorum (or past it), else `far` — success vs meta ink.
-pub fn tally_tone(approvals: i64, required: i64) -> String {
-    match approvals >= required.saturating_sub(1) {
-        true => "near".into(),
-        false => "far".into(),
-    }
 }
 
 /// `3 approvals · 1 more for quorum`, or `quorum met`.
@@ -475,30 +802,18 @@ pub fn tally_note(approvals: i64, required: i64) -> String {
     format!("{have} · {remaining} more for quorum")
 }
 
-/// The approve button leans forward at the last vote: `Approve →`.
+/// The approval action distinguishes the last vote needed for quorum.
 pub fn approve_label(approvals: i64, required: i64) -> String {
     match approvals + 1 >= required {
-        true => "Approve →".into(),
+        true => "Approve (final vote)".into(),
         false => "Approve".into(),
-    }
-}
-
-/// The kind pill's two tones: an access-class action reads `access`.
-pub fn proposal_kind_tone(action: &str) -> String {
-    let access = matches!(
-        action,
-        "add_validator" | "add_resident" | "remove_validator" | "remove_resident" | "grant_client"
-    );
-    match access {
-        true => "access".into(),
-        false => "neutral".into(),
     }
 }
 
 /// `h 84,912` — a block height, grouped; a negative one is `h —`.
 pub fn height_label_short(height: i64) -> String {
     if height < 0 {
-        return "h —".into();
+        return "block —".into();
     }
     let digits = height.to_string();
     let mut grouped = String::new();
@@ -509,7 +824,7 @@ pub fn height_label_short(height: i64) -> String {
         }
         grouped.push(digit);
     }
-    format!("h {grouped}")
+    format!("block {grouped}")
 }
 
 fn plural(count: i64, one: &str, many: &str) -> String {

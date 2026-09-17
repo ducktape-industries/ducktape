@@ -31,6 +31,10 @@ pub struct HubNetwork {
     pub probed: bool,
     pub live: bool,
     pub height: i64,
+    /// The node's contract number off the same probe ([`NodeFacts::contract`]);
+    /// `0` until a live node has answered. Read only through
+    /// [`contract_refuses`] — a dead or unprobed row has no number to judge.
+    pub contract: u32,
 }
 
 /// One probe answer. Never an error: a node that does not answer IS the
@@ -40,6 +44,7 @@ pub struct HubProbe {
     pub id: String,
     pub live: bool,
     pub height: i64,
+    pub contract: u32,
 }
 
 /// One wallet row the launch window lists, straight off `keystore::wallet`.
@@ -51,50 +56,6 @@ pub struct WalletInfo {
     pub pubkey: String,
     pub state: String,
     pub active: bool,
-}
-
-/// A row, built. Ice reads extern structs but cannot construct one, so the
-/// wallet-list test's preset needs this to seed rows the way `optimistic_message`
-/// seeds chat ones.
-pub fn wallet_info(name: String, pubkey: String, state: String, active: bool) -> WalletInfo {
-    WalletInfo {
-        name,
-        pubkey,
-        state,
-        active,
-    }
-}
-
-/// A keystore's answer, built — the test seam for the door a network pick
-/// opens, which Ice cannot construct itself.
-pub fn wallet_list(wallets: Vec<WalletInfo>, error: String, keystore: bool) -> WalletList {
-    WalletList {
-        wallets,
-        error,
-        keystore,
-    }
-}
-
-/// A pubkey at row width: enough hex to recognize an identity by, never the
-/// full 64. Empty in, empty out — a row with no reading claims none.
-pub fn short_pubkey(pubkey: &str) -> String {
-    let head: String = pubkey.chars().take(16).collect();
-    match head.len() < pubkey.len() {
-        true => format!("{head}…"),
-        false => head,
-    }
-}
-
-/// The wallet screens' captions name the network whose keystore is on
-/// screen: a wallet is an identity on ONE network, and the screen says which.
-pub fn wallet_caption(network: &str) -> String {
-    format!("Unlock an identity on {network} to sign what you do.")
-}
-
-pub fn password_caption(network: &str) -> String {
-    format!(
-        "Set a password for your key on {network}. It encrypts the key on this disk — the next screen shows the 24 words that are the only way to get that key back."
-    )
 }
 
 /// The launch window's boot read: the known-network list and the row it
@@ -173,6 +134,7 @@ pub(crate) fn known_networks() -> Vec<HubNetwork> {
                 probed: false,
                 live: false,
                 height: -1,
+                contract: 0,
             }
         })
         .collect();
@@ -198,6 +160,7 @@ pub(crate) fn known_networks() -> Vec<HubNetwork> {
             probed: false,
             live: false,
             height: -1,
+            contract: 0,
         });
     }
     rows.sort_by(|a, b| b.last_used.cmp(&a.last_used).then(a.id.cmp(&b.id)));
@@ -293,22 +256,21 @@ pub fn password_problem(password: &str, confirm: &str) -> String {
 }
 
 /// The close/focus target for a window that may not be open. `Some(id)` names
-/// it; `None` yields a fresh id that names NO window, and iced drops a
-/// `window::Action::Close` for an id its manager does not hold (iced_winit
-/// `lib.rs`). That no-op IS how an ice handler — which has no if-blocks and
-/// whose window tasks are terminal — spells a conditional close. It is also
-/// the only way to reach `target=`, which demands `window-id`, not
-/// `window-id?`.
-pub fn window_target(current: Option<iced::window::Id>) -> iced::window::Id {
-    current.unwrap_or_else(iced::window::Id::unique)
+/// it; `None` yields a fresh id that names no window. The native window
+/// manager ignores commands targeting an id it does not hold.
+pub fn window_target(current: Option<crate::shell::WindowKey>) -> crate::shell::WindowKey {
+    current.unwrap_or_else(crate::shell::WindowKey::unique)
 }
 
 /// [`window_target`] gated on a bool: while `keep` holds, yields a fresh id
 /// (a no-op close); once it does not, names the window. How a branch-free
 /// fold spells "close the huddle window only if the huddle ended".
-pub fn window_target_unless(keep: bool, current: Option<iced::window::Id>) -> iced::window::Id {
+pub fn window_target_unless(
+    keep: bool,
+    current: Option<crate::shell::WindowKey>,
+) -> crate::shell::WindowKey {
     if keep {
-        iced::window::Id::unique()
+        crate::shell::WindowKey::unique()
     } else {
         window_target(current)
     }
@@ -343,7 +305,7 @@ pub fn tray_open_action(network_open: bool, window_tracked: bool) -> crate::Tray
 ///
 /// Closing that window is NOT leaving, so this is the ordinary way back into a
 /// call that is still running behind your work.
-pub fn huddle_summon(huddle: Option<iced::window::Id>) -> crate::WindowSummon {
+pub fn huddle_summon(huddle: Option<crate::shell::WindowKey>) -> crate::WindowSummon {
     match huddle.is_none() {
         true => crate::WindowSummon::Open,
         false => crate::WindowSummon::Raise,
@@ -352,14 +314,14 @@ pub fn huddle_summon(huddle: Option<iced::window::Id>) -> crate::WindowSummon {
 
 /// Does this close end the process? Only where the daemon has nowhere else to
 /// live: on a Mac it goes on in the status item with no window at all, but off
-/// macOS there is no status item (`ui-lang-runtime`'s tray is a no-op there),
+/// macOS the native tray has no status item,
 /// so a window is the only handle on the process and closing the last one
 /// must leave — a daemon nobody can reach is a leak, not a menu-bar app. The
 /// huddle window is deliberately not a survivor: a lone call window never
 /// keeps the daemon alive after its console is gone.
 pub fn last_window_closed_exits(
-    console: Option<iced::window::Id>,
-    onboarding: Option<iced::window::Id>,
+    console: Option<crate::shell::WindowKey>,
+    onboarding: Option<crate::shell::WindowKey>,
 ) -> bool {
     let has_status_item = cfg!(target_os = "macos");
     let a_window_remains = console.is_some() || onboarding.is_some();
@@ -368,9 +330,9 @@ pub fn last_window_closed_exits(
 
 /// Clear a tracked window id when it is the one that closed.
 pub fn without_window(
-    current: Option<iced::window::Id>,
-    closed: iced::window::Id,
-) -> Option<iced::window::Id> {
+    current: Option<crate::shell::WindowKey>,
+    closed: crate::shell::WindowKey,
+) -> Option<crate::shell::WindowKey> {
     match current == Some(closed) {
         true => None,
         false => current,
@@ -511,9 +473,21 @@ async fn name_remote_keystore(rpc: &str) -> Result<(), String> {
         .status_json()
         .await
         .map_err(|error| error.to_string())?;
-    let chain_id = super::node::node_facts(&status).chain_id;
+    let facts = super::node::node_facts(&status);
+    // the same refusal the hub row prints for a probed node, for an endpoint
+    // typed in directly: a console never opens against a surface this app was
+    // not written for.
+    match super::node::contract_match(facts.contract) {
+        super::node::ContractMatch::Match => {}
+        super::node::ContractMatch::NodeBehind | super::node::ContractMatch::NodeAhead => {
+            return Err(super::node::contract_hint(facts.contract));
+        }
+    }
+    let chain_id = facts.chain_id;
     if chain_id.is_empty() {
-        return Err("this node serves no network yet, so there is no identity to hold for it".into());
+        return Err(
+            "this node serves no network yet, so there is no identity to hold for it".into(),
+        );
     }
     note_remote_chain(rpc, &chain_id);
     Ok(())
@@ -528,54 +502,89 @@ pub fn apply_network_probe(networks: Vec<HubNetwork>, probe: HubProbe) -> Vec<Hu
                 row.probed = true;
                 row.live = probe.live;
                 row.height = probe.height;
+                row.contract = probe.contract;
             }
             row
         })
         .collect()
 }
 
-/// The command that starts a dead local network's node — the honest row
-/// subtitle, same doctrine as provisioning's `blocked` step.
-pub fn network_run_hint(row: &HubNetwork) -> String {
-    if row.kind != "local" {
-        return "node unreachable".into();
+/// The one line a network row prints after its name: the probe's reading,
+/// and — for a live node whose contract number is not this app's — the
+/// refusal, in the same voice as provisioning's `blocked` step.
+pub fn network_row_label(row: &HubNetwork) -> String {
+    let unprobed = !row.probed;
+    if unprobed {
+        return format!("{} · checking", row.name);
     }
-    let selector = match row.chain_id.is_empty() {
-        true => &row.id,
-        false => &row.chain_id,
-    };
-    format!("not running · ducktape node run -n {selector}")
+    if !row.live {
+        return format!("{} · offline", row.name);
+    }
+    match super::node::contract_match(row.contract) {
+        super::node::ContractMatch::Match => format!("{} · block {}", row.name, row.height),
+        super::node::ContractMatch::NodeBehind | super::node::ContractMatch::NodeAhead => {
+            format!(
+                "{} · {}",
+                row.name,
+                super::node::contract_hint(row.contract)
+            )
+        }
+    }
+}
+
+/// Whether the console must NOT open on this row: the probe measured a live
+/// node and its contract number is not [`EXPECTED_NODE_CONTRACT`]. A row the
+/// probe has not answered for, or a dead one, has no number to refuse on —
+/// opening those is the same as before, and the console says offline itself.
+pub fn contract_refuses(row: &HubNetwork) -> bool {
+    let measured_live = row.probed && row.live;
+    let mismatched = super::node::contract_match(row.contract) != super::node::ContractMatch::Match;
+    measured_live && mismatched
+}
+
+/// Whether the selected row refuses ([`contract_refuses`]); a selection that
+/// names no row refuses nothing — the empty endpoint already stops the open.
+pub fn selected_network_refuses(networks: &[HubNetwork], id: &str) -> bool {
+    networks
+        .iter()
+        .find(|row| row.id == id)
+        .is_some_and(contract_refuses)
 }
 
 /// Probe every known network's endpoint, emitting one reading per row as it
 /// answers. Bounded: one `/v1/status` with a short timeout per endpoint.
-pub fn probe_known_networks() -> iced::futures::stream::BoxStream<'static, HubProbe> {
-    use iced::futures::StreamExt;
+pub fn probe_known_networks() -> futures::stream::BoxStream<'static, HubProbe> {
+    use futures::StreamExt;
     let probes = known_networks().into_iter().map(move |row| async move {
-        let reading = probe_endpoint(&row.endpoint).await;
+        let status = probe_endpoint(&row.endpoint).await;
         HubProbe {
             id: row.id,
-            live: reading.is_some(),
-            height: reading.unwrap_or(-1),
+            live: status.is_some(),
+            // the wire height verbatim: a fresh node at 0 IS at block 0 here,
+            // unlike the overview's `served_height`, which reads 0 as absent.
+            height: status
+                .as_ref()
+                .and_then(|status| status["height"].as_i64())
+                .unwrap_or(-1),
+            contract: status
+                .as_ref()
+                .map_or(0, |status| super::node::node_facts(status).contract),
         }
     });
-    iced::futures::stream::iter(probes)
-        .buffer_unordered(8)
-        .boxed()
+    futures::stream::iter(probes).buffer_unordered(8).boxed()
 }
 
-/// One bounded status read: the height when the node answers, `None` when it
-/// does not. 3s — a liveness dot must not hang the list.
-async fn probe_endpoint(endpoint: &str) -> Option<i64> {
+/// One bounded status read: the `/v1/status` document when the node answers,
+/// `None` when it does not. 3s — a liveness dot must not hang the list.
+async fn probe_endpoint(endpoint: &str) -> Option<serde_json::Value> {
     if endpoint.is_empty() {
         return None;
     }
     let client = rpc_client(endpoint).ok()?;
-    let status = tokio::time::timeout(Duration::from_secs(3), client.status())
+    tokio::time::timeout(Duration::from_secs(3), client.status_json())
         .await
         .ok()?
-        .ok()?;
-    Some(status.height as i64)
+        .ok()
 }
 
 /// Stamp a network's last-used time and — for an endpoint no workspace
@@ -699,8 +708,8 @@ struct MintedPhrase {
     asked: [usize; 3],
 }
 
-/// One row of the phrase screen's two-column grid. Ice cannot index a list,
-/// so the pairing (`1`/`13`, `2`/`14`, …) is done here — twelve rows fit the
+/// One row of the phrase screen's two-column grid. Pairing (`1`/`13`,
+/// `2`/`14`, …) yields twelve rows that fit the
 /// launch window without a scroll, twenty-four do not.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PhraseRow {
@@ -755,8 +764,7 @@ pub fn phrase_rows_of(words: &str) -> Vec<PhraseRow> {
         .collect()
 }
 
-/// "5, 12 and 20" — the positions, in the sentence the two screens name them
-/// in. Ice cannot concatenate, so both sentences are built here.
+/// "5, 12 and 20" — the positions named by both ceremony screens.
 fn asked_label(asked: &[usize; 3]) -> String {
     format!("{}, {} and {}", asked[0], asked[1], asked[2])
 }
@@ -855,7 +863,7 @@ fn end_the_ceremony() {
 pub async fn restore_user_key(
     rpc: String,
     name: String,
-    words: ui_lang_runtime::Secret,
+    words: crate::secret::Secret,
     password: String,
 ) -> Result<String, AppError> {
     async {
@@ -1023,8 +1031,12 @@ mod tests {
             probed: false,
             live: false,
             height: -1,
+            contract: 0,
         }];
-        assert_eq!(selected_network_name(rows.clone(), "demo#a1b2".into()), "demo");
+        assert_eq!(
+            selected_network_name(rows.clone(), "demo#a1b2".into()),
+            "demo"
+        );
         assert_eq!(selected_network_name(rows, "gone".into()), "");
     }
 
@@ -1035,15 +1047,27 @@ mod tests {
     #[test]
     fn the_wallet_door_follows_the_picked_keystore() {
         assert!(matches!(
-            wallet_door(&wallet_list(rows(&[("a", true)]), String::new(), true)),
+            wallet_door(&WalletList {
+                wallets: rows(&[("a", true)]),
+                error: String::new(),
+                keystore: true
+            }),
             crate::WalletDoor::Wallets
         ));
         assert!(matches!(
-            wallet_door(&wallet_list(vec![], String::new(), true)),
+            wallet_door(&WalletList {
+                wallets: vec![],
+                error: String::new(),
+                keystore: true
+            }),
             crate::WalletDoor::Password
         ));
         assert!(matches!(
-            wallet_door(&wallet_list(vec![], "unreachable".into(), false)),
+            wallet_door(&WalletList {
+                wallets: vec![],
+                error: "unreachable".into(),
+                keystore: false
+            }),
             crate::WalletDoor::Unreached
         ));
     }
@@ -1182,17 +1206,6 @@ mod tests {
         assert!(confirmed_phrase(&right).is_err());
     }
 
-    /// A row's pubkey is shortened, never invented.
-    #[test]
-    fn short_pubkey_says_only_what_it_knows() {
-        assert_eq!(short_pubkey(""), "");
-        assert_eq!(short_pubkey("abcd"), "abcd");
-        assert_eq!(
-            short_pubkey(&"a".repeat(64)),
-            format!("{}…", "a".repeat(16))
-        );
-    }
-
     /// The tray's Open row (#1782): a window already tracked is always
     /// raised, whichever it is — and only once nothing is tracked does
     /// connection state decide between reopening the console (reconnect) and
@@ -1201,14 +1214,8 @@ mod tests {
     fn tray_open_reconnects_the_console_only_when_untracked_and_connected() {
         use crate::TrayOpen;
 
-        assert!(matches!(
-            tray_open_action(false, false),
-            TrayOpen::Launch
-        ));
-        assert!(matches!(
-            tray_open_action(true, false),
-            TrayOpen::Console
-        ));
+        assert!(matches!(tray_open_action(false, false), TrayOpen::Launch));
+        assert!(matches!(tray_open_action(true, false), TrayOpen::Console));
         assert!(matches!(tray_open_action(true, true), TrayOpen::Raise));
         assert!(matches!(tray_open_action(false, true), TrayOpen::Raise));
     }

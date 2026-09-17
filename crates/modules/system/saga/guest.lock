@@ -134,7 +134,7 @@ dependencies = [
 [[package]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/orthory/ducktape#a2aa53869c2a8f90843d632546b0e93d56bc7424"
+source = "git+https://github.com/orthory/ducktape#0deef8d34ba7eeb4fefe0a479f333dbb868bc396"
 dependencies = [
  "cc",
  "glob",
@@ -175,7 +175,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "capability"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#a2aa53869c2a8f90843d632546b0e93d56bc7424"
+source = "git+https://github.com/orthory/ducktape#0deef8d34ba7eeb4fefe0a479f333dbb868bc396"
 dependencies = [
  "async-trait",
  "borsh",
@@ -622,7 +622,7 @@ dependencies = [
 [[package]]
 name = "ducktape-module-sdk"
 version = "0.0.0"
-source = "git+https://github.com/orthory/ducktape#a2aa53869c2a8f90843d632546b0e93d56bc7424"
+source = "git+https://github.com/orthory/ducktape#0deef8d34ba7eeb4fefe0a479f333dbb868bc396"
 dependencies = [
  "async-trait",
  "sdk",
@@ -836,17 +836,17 @@ dependencies = [
 [[package]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/orthory/ducktape#a2aa53869c2a8f90843d632546b0e93d56bc7424"
+source = "git+https://github.com/orthory/ducktape#0deef8d34ba7eeb4fefe0a479f333dbb868bc396"
 
 [[package]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/orthory/ducktape#a2aa53869c2a8f90843d632546b0e93d56bc7424"
+source = "git+https://github.com/orthory/ducktape#0deef8d34ba7eeb4fefe0a479f333dbb868bc396"
 
 [[package]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/orthory/ducktape#a2aa53869c2a8f90843d632546b0e93d56bc7424"
+source = "git+https://github.com/orthory/ducktape#0deef8d34ba7eeb4fefe0a479f333dbb868bc396"
 dependencies = [
  "rand_core 0.10.1",
 ]
@@ -924,7 +924,7 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 [[package]]
 name = "index-guest"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#a2aa53869c2a8f90843d632546b0e93d56bc7424"
+source = "git+https://github.com/orthory/ducktape#0deef8d34ba7eeb4fefe0a479f333dbb868bc396"
 dependencies = [
  "borsh",
  "fluent-guest",
@@ -1371,7 +1371,7 @@ dependencies = [
 [[package]]
 name = "saga"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#a2aa53869c2a8f90843d632546b0e93d56bc7424"
+source = "git+https://github.com/orthory/ducktape#0deef8d34ba7eeb4fefe0a479f333dbb868bc396"
 dependencies = [
  "async-trait",
  "borsh",
@@ -1408,7 +1408,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#a2aa53869c2a8f90843d632546b0e93d56bc7424"
+source = "git+https://github.com/orthory/ducktape#0deef8d34ba7eeb4fefe0a479f333dbb868bc396"
 dependencies = [
  "async-trait",
  "borsh",
@@ -1768,7 +1768,7 @@ checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
 [[package]]
 name = "valset"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#a2aa53869c2a8f90843d632546b0e93d56bc7424"
+source = "git+https://github.com/orthory/ducktape#0deef8d34ba7eeb4fefe0a479f333dbb868bc396"
 dependencies = [
  "async-trait",
  "borsh",

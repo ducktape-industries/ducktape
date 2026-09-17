@@ -212,7 +212,7 @@ pub fn create(
         Ok(()) => true,
         Err(error) => {
             tracing::warn!(
-                target: "ducktape::wallet",
+                target: "ducktape::auth",
                 reason = "active_pointer_write_failed",
                 name,
                 %error,

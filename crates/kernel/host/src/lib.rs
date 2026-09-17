@@ -1893,19 +1893,6 @@ impl Host {
         (cached_at == identity).then(|| modules.clone())
     }
 
-    /// realize a verified code swap against a single registered module: route to
-    /// its [`Module::swap_code`], keeping its host-owned state. errors if the
-    /// module is not registered, or is native (no swappable code —
-    /// [`Error::SwapUnsupported`]). the LOW-LEVEL seam;
-    /// [`Host::realize_module_swaps`] is the boundary driver that fetches +
-    /// verifies bytes against the committed hash before calling this.
-    pub fn swap_module_code(&mut self, id: &str, component_bytes: &[u8]) -> Result<(), Error> {
-        match self.registry.get_mut(id) {
-            Some(m) => m.swap_code(component_bytes),
-            None => Err(Error::UnknownModule(id.to_string())),
-        }
-    }
-
     /// Check that an existing module can retain its state under a replacement.
     /// Preparing and dropping the action leaves the running deployment intact.
     /// An admission has no previous state shape to preserve.
@@ -1979,6 +1966,12 @@ impl Host {
         // untouched registry: a miss anywhere returns Err having mutated nothing.
         let mut realizations: Vec<Realization> = Vec::new();
         for m in modules {
+            // a view entry has nothing to seat: its artifact is a UI the
+            // desktop fetches by the registry's hash, and no core runs here.
+            match m.kind {
+                modules::Kind::Module => {}
+                modules::Kind::View => continue,
+            }
             let Some(target) = modules::code_at(&m, height) else {
                 continue; // registered, never activated — nothing to realize.
             };

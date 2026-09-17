@@ -136,6 +136,7 @@ fn setup(program: Program) -> Host {
         Msg {
             target: "agent".into(),
             payload: agent::encode_msg(&AgentMsg::Provision {
+                request_id: "review-program".into(),
                 name: "review-program".into(),
                 program,
             }),

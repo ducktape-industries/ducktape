@@ -167,6 +167,61 @@ pub fn serve_blob_range(
 /// store one pack per request.
 pub type ServedPacks = Arc<Mutex<HashMap<String, [u8; 32]>>>;
 
+/// how many forge packs this node builds at once: ONE. See
+/// [`serve_forge_objects`] — the build is whole-repo libgit2 delta
+/// compression across every core it can find, so a second concurrent one
+/// buys nothing and costs the box.
+static PACK_BUILD: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// the ask a pack answers, canonicalized: the normalized repo name, the head,
+/// and the base set sorted and deduped. It is the single-flight KEY, so two
+/// peers — or one peer's three retries — asking for the same objects must
+/// produce the same tuple.
+type PackAsk = (String, [u8; statesync::FORGE_OID_LEN], Vec<[u8; statesync::FORGE_OID_LEN]>);
+
+/// what a build settled on: the staged digest, `None` for an honest miss
+/// (this node does not hold the head either), or a reason token this node
+/// refuses with. `Copy`, so one build's answer is handed to every waiter.
+type PackOutcome = Result<Option<[u8; 32]>, &'static str>;
+
+/// the repo's pack slot: a build running now, or the digest the last one
+/// staged. [`settle`] keeps at most one `Done` per repo, because
+/// [`record_served`] keeps at most one staged pack per repo — remembering a
+/// second would hand out bytes that were already released.
+enum PackFlight {
+    Building(tokio::sync::broadcast::Sender<PackOutcome>),
+    Done(PackOutcome),
+}
+
+static PACK_FLIGHT: Mutex<std::collections::BTreeMap<PackAsk, PackFlight>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// the wait expired before the pack did. NOT a miss: the build is still
+/// running under its ask, so the requester's next attempt is answered from
+/// the slot instead of starting a second one.
+pub(crate) const PACK_OVER_BUDGET: &str = "forge_pack_over_budget";
+
+/// the build task died (a panic in libgit2, or the runtime shutting down).
+/// Never remembered, so the next ask rebuilds rather than inheriting it.
+pub(crate) const PACK_BUILD_LOST: &str = "forge_pack_build_lost";
+
+/// how long a forge answer waits on a pack before it refuses instead.
+///
+/// Derived from the REQUESTER's patience, not from the repo: a client
+/// abandons a request after [`RETRY_WINDOWS`] in total, so a pack that lands
+/// later than that is work nobody is left to receive. Refusing inside the
+/// first two windows leaves the requester a whole attempt to come back — and
+/// by then the build this refusal abandoned has settled, so the retry is
+/// answered from the slot.
+///
+/// This is also the only SIZE bound the lane needs. A pack too big to build
+/// in the budget is refused by the clock, which calibrates itself to the box;
+/// a byte ceiling would have to be guessed, and guessed low it makes a large
+/// repo permanently unsyncable rather than slow.
+const PACK_BUDGET: std::time::Duration = std::time::Duration::from_secs(
+    statesync::p2p::RETRY_WINDOWS[0].as_secs() + statesync::p2p::RETRY_WINDOWS[1].as_secs(),
+);
+
 /// answer a peer's [`SyncRequest::ForgeObjects`]: build the pack that carries
 /// `head`'s objects (bounded by the `bases` the peer already holds), stage it,
 /// and hand back the digest so the peer pulls the bytes over the ranged lane.
@@ -180,7 +235,7 @@ pub type ServedPacks = Arc<Mutex<HashMap<String, [u8; 32]>>>;
 /// `None` is an honest miss — this node does not hold the head either. it
 /// never packs a walk it has not itself committed to (see
 /// [`forge::build_objects`]), so the lane cannot be turned into an amplifier.
-pub fn serve_forge_objects(
+pub async fn serve_forge_objects(
     forge_repo: &std::path::Path,
     blobs: &blobstore::BlobHandle,
     served: &ServedPacks,
@@ -189,17 +244,85 @@ pub fn serve_forge_objects(
     bases: &[[u8; statesync::FORGE_OID_LEN]],
 ) -> SyncResponse {
     let miss = SyncResponse::ForgeObjects { digest: None };
-    let (Ok(name), Ok(head)) = (forge::norm_repo(repo), forge::Oid::from_bytes(&head)) else {
+    let (Ok(name), Ok(oid)) = (forge::norm_repo(repo), forge::Oid::from_bytes(&head)) else {
         return miss;
     };
-    let bases: Vec<forge::Oid> = bases
+    // CANONICAL, because this tuple is the single-flight key: drop the bases
+    // this node cannot parse (the build drops them too), then sort and dedup.
+    // One peer's three retries, and two peers asking for the same head with
+    // the same haves in a different order, are all ONE build.
+    let mut known: Vec<[u8; statesync::FORGE_OID_LEN]> = bases
+        .iter()
+        .filter(|base| forge::Oid::from_bytes(*base).is_ok())
+        .copied()
+        .collect();
+    known.sort_unstable();
+    known.dedup();
+
+    let staging = Staging {
+        dir: forge_repo.to_path_buf(),
+        blobs: blobs.clone(),
+        served: Arc::clone(served),
+    };
+    let ask: PackAsk = (name, head, known);
+    let building = ask.clone();
+    let outcome = one_pack_per_ask(ask, PACK_BUDGET, move || {
+        build_and_stage(staging, building, oid)
+    })
+    .await;
+
+    match outcome {
+        Ok(Some(digest)) => SyncResponse::ForgeObjects {
+            digest: Some(digest),
+        },
+        Ok(None) => miss,
+        // a refusal the requester can act on AND retry into: the build this
+        // abandoned keeps running, and its digest answers the next ask from
+        // the slot. Silence here is what a 60s build looks like from the
+        // other end.
+        Err(reason) => SyncResponse::Error(reason.into()),
+    }
+}
+
+/// where a built pack lands: the repo it is built from, the store it is
+/// staged in, and the one served-pack slot it takes.
+struct Staging {
+    dir: std::path::PathBuf,
+    blobs: blobstore::BlobHandle,
+    served: ServedPacks,
+}
+
+/// build one ask's pack and stage it. Runs on its OWN task, so no waiter's
+/// deadline can cancel it: the bytes it stages are what the requester's next
+/// ask is answered from, which is the only reason a bounded refusal is
+/// bounded rather than permanent.
+async fn build_and_stage(staging: Staging, ask: PackAsk, head: forge::Oid) -> PackOutcome {
+    let (name, _, bases) = ask;
+    let oids: Vec<forge::Oid> = bases
         .iter()
         .filter_map(|base| forge::Oid::from_bytes(base).ok())
         .collect();
-    let built = match forge::build_objects(forge_repo, &name, head, &bases) {
-        Ok(Some(pack)) => pack,
-        Ok(None) => return miss,
-        Err(e) => {
+    let build_dir = staging.dir;
+    let build_repo = name.clone();
+    // ONE at a time, and the permit is taken HERE rather than by the waiter:
+    // a second concurrent whole-repo delta compression buys nothing (libgit2
+    // already uses every core) and would take the box instead of the runtime.
+    let _one_at_a_time = PACK_BUILD.acquire().await;
+    // a joiner has no bases, so this is `pack_closure_many` over the whole
+    // repo: libgit2 delta compression, tens of seconds of SYNCHRONOUS CPU on
+    // a real mirror, across every worker `set_threads(0)` can find. Run on an
+    // async worker it does not merely block this lane — it blocks the runtime
+    // thread the consensus loop is scheduled on, and the chain stops beating
+    // (#2481: `block_beat_stalled` for 174s while one worker sat in
+    // `ll_find_deltas`). It leaves the runtime, always.
+    let built = match tokio::task::spawn_blocking(move || {
+        forge::build_objects(&build_dir, &build_repo, head, &oids)
+    })
+    .await
+    {
+        Ok(Ok(Some(pack))) => pack,
+        Ok(Ok(None)) => return Ok(None),
+        Ok(Err(e)) => {
             tracing::debug!(
                 target: "ducktape::forge",
                 reason = "objects_build_failed",
@@ -208,18 +331,107 @@ pub fn serve_forge_objects(
                 error = %e,
                 "could not build the objects a peer asked for"
             );
-            return miss;
+            return Ok(None);
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "ducktape::forge",
+                reason = "objects_build_panicked",
+                repo = %name,
+                head = %head,
+                error = %e,
+                "the pack build for a peer's objects request died"
+            );
+            return Err(PACK_BUILD_LOST);
         }
     };
-    let digest = blobs.put_chunk(built);
-    if let Some(previous) = record_served(served, name, digest) {
+    let digest = staging.blobs.put_chunk(built);
+    if let Some(previous) = record_served(&staging.served, name, digest) {
         // a requester mid-pull of the released digest misses, retries, and is
         // handed this one — the conversation is per-attempt anyway.
-        blobs.forget(&previous);
+        staging.blobs.forget(&previous);
     }
-    SyncResponse::ForgeObjects {
-        digest: Some(digest),
+    Ok(Some(digest))
+}
+
+/// ONE build per ask, and a waiter that refuses on a clock rather than
+/// waiting out a build nobody is left to receive.
+///
+/// The two halves only work together. Single-flight alone still leaves the
+/// first asker parked for the whole build; a budget alone would abandon the
+/// build with it, so the retry that follows starts another one and the peer
+/// never converges. Together: the burst collapses to one build, the waiter is
+/// answered inside the requester's patience, and the build it left running
+/// settles into the slot for the retry.
+async fn one_pack_per_ask<F, Fut>(
+    ask: PackAsk,
+    budget: std::time::Duration,
+    build: F,
+) -> PackOutcome
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = PackOutcome> + Send + 'static,
+{
+    let mut waiting = match join_or_start(ask, build) {
+        Joined::Settled(outcome) => return outcome,
+        Joined::Waiting(rx) => rx,
+    };
+    match tokio::time::timeout(budget, waiting.recv()).await {
+        Ok(Ok(outcome)) => outcome,
+        // the builder went away without answering — its slot is gone too, so
+        // the next ask rebuilds instead of inheriting the silence.
+        Ok(Err(_)) => Err(PACK_BUILD_LOST),
+        Err(_) => Err(PACK_OVER_BUDGET),
     }
+}
+
+/// what the slot had for this ask.
+enum Joined {
+    Settled(PackOutcome),
+    Waiting(tokio::sync::broadcast::Receiver<PackOutcome>),
+}
+
+/// take the ask's slot: join the build already running for it, take the
+/// digest it already produced, or become the one that runs it.
+fn join_or_start<F, Fut>(ask: PackAsk, build: F) -> Joined
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = PackOutcome> + Send + 'static,
+{
+    let mut flight = PACK_FLIGHT.lock().expect("pack flight poisoned");
+    match flight.get(&ask) {
+        Some(PackFlight::Done(outcome)) => return Joined::Settled(*outcome),
+        Some(PackFlight::Building(tx)) => return Joined::Waiting(tx.subscribe()),
+        None => {}
+    }
+    let (tx, rx) = tokio::sync::broadcast::channel(1);
+    flight.insert(ask.clone(), PackFlight::Building(tx.clone()));
+    let running = build();
+    tokio::spawn(async move {
+        let outcome = running.await;
+        // settle BEFORE the send: a waiter woken by the send must not find
+        // the slot still claiming the build is running.
+        settle(&ask, outcome);
+        let _ = tx.send(outcome);
+    });
+    Joined::Waiting(rx)
+}
+
+/// record what a build settled on, under its ask.
+///
+/// Only a STAGED digest is remembered. A miss is not — this node may
+/// materialize the head later, and a remembered miss would refuse it forever.
+/// A dead build is not — it would refuse every later ask without ever
+/// retrying. And at most one digest per repo survives, because
+/// [`record_served`] released the bytes of the one it superseded.
+fn settle(ask: &PackAsk, outcome: PackOutcome) {
+    let mut flight = PACK_FLIGHT.lock().expect("pack flight poisoned");
+    let Ok(Some(_)) = outcome else {
+        flight.remove(ask);
+        return;
+    };
+    flight.retain(|other, state| other.0 != ask.0 || !matches!(state, PackFlight::Done(_)));
+    flight.insert(ask.clone(), PackFlight::Done(outcome));
 }
 
 /// take the repo's one served-pack slot, returning the digest this answer
@@ -560,17 +772,18 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> SyncClient for ServeLaneBlobC
 /// it costs one `stat` per tick when nothing is outstanding.
 const PACK_SWEEP_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// the largest forge pack this lane will pull — the smart-HTTP push lane's own
-/// body limit (`GIT_PACK_BODY_LIMIT`), because that is the ceiling on a pack
-/// that could legitimately have reached consensus in the first place.
+/// what this lane will pull for a forge pack: WHATEVER THE PUSH CARRIED.
 ///
-/// The bound is load-bearing, not tidiness. A digest here was chosen by whoever
-/// submitted the push; naming an enormous blob some colluding node will serve
-/// would otherwise have every node in the network stage it, every tick, before
-/// the hash check could reject it. Sizing the cap to what a real push can be
-/// — the smart-HTTP door's own ceiling, `noded::GIT_PACK_BODY_LIMIT` — keeps
-/// that to one legitimate pack's worth of disk.
-pub const MAX_FORGE_PACK_BYTES: u64 = noded::GIT_PACK_BODY_LIMIT as u64;
+/// There is no ceiling on a push — a repository's whole history is one push,
+/// and a node that refused to replicate it would leave its own git mirror
+/// permanently behind a head consensus already committed. So this lane's bound
+/// is the same non-bound, and what stands between a node's disk and an
+/// enormous pack is who may push at all (the module's push-cert and ref
+/// gates), not a number here.
+///
+/// The digest is only ever read out of forge's committed catch-up map, so the
+/// bytes being pulled are bytes the validators already accepted at the door.
+const NO_FORGE_PACK_CEILING: u64 = u64::MAX;
 
 /// keep this node's forge substrate healthy, forever: pull the packs forge is
 /// waiting on, then collapse the packs it has piled up.
@@ -666,7 +879,7 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
             client,
             blobs,
             &pending.digest,
-            MAX_FORGE_PACK_BYTES,
+            NO_FORGE_PACK_CEILING,
             crate::constants::BLOB_FETCH_ATTEMPTS,
         )
         .await;
@@ -767,7 +980,7 @@ async fn objects_once<C: SyncClient>(
         SyncResponse::Error(e) => return Err(SyncError::Server(e).into()),
         other => return Err(SyncError::UnexpectedResponse(other.kind_name()).into()),
     };
-    fetch_once(client, blobs, &digest, MAX_FORGE_PACK_BYTES).await?;
+    fetch_once(client, blobs, &digest, NO_FORGE_PACK_CEILING).await?;
     let Some(pack) = blobs.get_chunk(&digest) else {
         return Err(BlobFetchError::Miss);
     };
@@ -1233,6 +1446,205 @@ mod tests {
         assert_eq!(
             sweep_packs_once(&client, &blobstore::BlobHandle::default(), dir.path(), "n").await,
             0,
+        );
+    }
+}
+
+#[cfg(test)]
+mod pack_flight {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::Duration;
+
+    /// distinct per test: the slot map is process-global, and `settle` evicts
+    /// by repo name.
+    fn ask(repo: &str) -> PackAsk {
+        (repo.to_string(), [7u8; statesync::FORGE_OID_LEN], Vec::new())
+    }
+
+    /// A RETRY BURST IS ONE PACK. The client re-sends the same request up to
+    /// `RETRY_WINDOWS.len()` times, and every peer catching up asks for the
+    /// same head. Keyed only by the permit, those queued behind each other and
+    /// each rebuilt the whole repo; the last one to finish won and the rest
+    /// was heat.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_burst_builds_one_pack_not_one_per_attempt() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let asked = ask("burst");
+        let waiting: Vec<_> = (0..4)
+            .map(|_| {
+                let counted = Arc::clone(&builds);
+                one_pack_per_ask(asked.clone(), Duration::from_secs(30), move || async move {
+                    counted.fetch_add(1, AtomicOrdering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok(Some([1u8; 32]))
+                })
+            })
+            .collect();
+
+        let answers = futures::future::join_all(waiting).await;
+        assert_eq!(
+            builds.load(AtomicOrdering::SeqCst),
+            1,
+            "four asks for one head must start one build"
+        );
+        for answer in answers {
+            assert_eq!(answer, Ok(Some([1u8; 32])), "and all four get its digest");
+        }
+    }
+
+    /// THE REFUSAL IS ON A CLOCK, AND THE BUILD OUTLIVES IT. An impatient
+    /// waiter must be told `forge_pack_over_budget` inside the requester's
+    /// patience rather than held for the whole build — and abandoning it must
+    /// not abandon the work, or the retry that follows starts another one.
+    #[tokio::test(start_paused = true)]
+    async fn an_impatient_waiter_refuses_while_the_build_runs_on() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let asked = ask("over-budget");
+
+        let counted = Arc::clone(&builds);
+        let impatient = one_pack_per_ask(asked.clone(), Duration::from_millis(50), move || async move {
+            counted.fetch_add(1, AtomicOrdering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(Some([2u8; 32]))
+        });
+        let counted = Arc::clone(&builds);
+        let patient = one_pack_per_ask(asked, Duration::from_secs(300), move || async move {
+            counted.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Some([9u8; 32]))
+        });
+
+        let (refused, held) = futures::future::join(impatient, patient).await;
+        assert_eq!(
+            refused,
+            Err(PACK_OVER_BUDGET),
+            "the waiter answers on its budget, it does not wait out the build"
+        );
+        assert_eq!(
+            held,
+            Ok(Some([2u8; 32])),
+            "the build the refusal abandoned still settles, and still answers"
+        );
+        assert_eq!(builds.load(AtomicOrdering::SeqCst), 1, "one build, not two");
+    }
+
+    /// ...AND ITS DIGEST IS WHAT THE RETRY GETS. This is the whole reason the
+    /// refusal above is bounded rather than permanent: without the slot, every
+    /// ask for a repo slower than the budget starts a fresh build and the peer
+    /// never converges.
+    #[tokio::test]
+    async fn a_settled_digest_answers_the_next_ask_without_a_second_build() {
+        let asked = ask("settled");
+        settle(&asked, Ok(Some([3u8; 32])));
+
+        let builds = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&builds);
+        let answer = one_pack_per_ask(asked, Duration::from_millis(1), move || async move {
+            counted.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Some([9u8; 32]))
+        })
+        .await;
+
+        assert_eq!(answer, Ok(Some([3u8; 32])), "the slot answers");
+        assert_eq!(
+            builds.load(AtomicOrdering::SeqCst),
+            0,
+            "and nothing is rebuilt to produce it"
+        );
+    }
+
+    /// A MISS AND A DEAD BUILD ARE NOT ANSWERS TO REMEMBER. This node can
+    /// materialize the head later, and a build that panicked says nothing
+    /// about the next one — remembering either would refuse every later ask
+    /// for that head without ever retrying it.
+    #[tokio::test]
+    async fn neither_a_miss_nor_a_dead_build_is_remembered() {
+        for (name, outcome) in [("miss", Ok(None)), ("lost", Err(PACK_BUILD_LOST))] {
+            let asked = ask(name);
+            settle(&asked, outcome);
+
+            let builds = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&builds);
+            let answer = one_pack_per_ask(asked, Duration::from_secs(30), move || async move {
+                counted.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(Some([4u8; 32]))
+            })
+            .await;
+
+            assert_eq!(answer, Ok(Some([4u8; 32])), "{name}: the next ask builds");
+            assert_eq!(
+                builds.load(AtomicOrdering::SeqCst),
+                1,
+                "{name}: and it really did build"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod forge_pack_shape_lint {
+    /// THE PACK BUILD NEVER RUNS ON AN ASYNC WORKER. A joiner sends no bases,
+    /// so [`super::serve_forge_objects`] reaches `pack_closure_many` — whole-
+    /// repo libgit2 delta compression, tens of seconds of synchronous CPU.
+    /// Called straight from the serve task it blocked the runtime thread the
+    /// consensus loop was scheduled on, and the chain stopped beating with it
+    /// (#2481: `block_beat_stalled ... stalled_ms=173873` while one
+    /// `tokio-rt-worker` sat in `ll_find_deltas`).
+    #[test]
+    fn the_pack_build_is_the_first_thing_inside_spawn_blocking() {
+        const OPEN: &str = "spawn_blocking(move || {";
+        // split so this needle does not match itself in the file it scans.
+        const CALL: &str = concat!("forge::", "build_objects(");
+        let src = include_str!("blob_fetch.rs");
+        let calls: Vec<usize> = src.match_indices(CALL).map(|(at, _)| at).collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "one call site, so one place to keep off the runtime: {calls:?}"
+        );
+        let at = calls[0];
+        let opened = src[..at]
+            .rfind(OPEN)
+            .expect("the pack build runs on the blocking pool");
+        let between = &src[opened + OPEN.len()..at];
+        assert!(
+            between.trim().is_empty(),
+            "the build must be the body of the `spawn_blocking`, not reached \
+             past {between:?}"
+        );
+    }
+
+    /// AND IT NEVER RUNS ON THE SERVE LOOP. `spawn_blocking` keeps the runtime
+    /// beating; it does not keep the statesync serve lane free, because the
+    /// loop would still await the join handle. Awaited inline, one whole-repo
+    /// pack is head-of-line blocking for every other kind a peer is waiting
+    /// on — which is why a resident's `tip_coords` and `frames` timed out too.
+    #[test]
+    fn the_serve_loop_hands_a_forge_answer_to_its_own_task() {
+        let src = include_str!("validator/wiring.rs");
+        let served: Vec<usize> = src
+            .match_indices("serve_forge_objects(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            served.len(),
+            1,
+            "the serve fn is called once, from the spawned answer: {served:?}"
+        );
+        let spawner = src
+            .find("fn spawn_forge_answer(")
+            .expect("forge answers have their own task");
+        assert!(
+            spawner < served[0],
+            "the only call must be inside `spawn_forge_answer`, not on the loop"
+        );
+        let arm_at = src
+            .find("SyncRequest::ForgeObjects { repo, head, bases } => {")
+            .expect("the serve loop routes ForgeObjects");
+        let arm = &src[arm_at..src.len().min(arm_at + 1200)];
+        assert!(
+            arm.contains("spawn_forge_answer(") && arm.contains("continue;"),
+            "the arm must delegate and leave the loop, not produce a response"
         );
     }
 }

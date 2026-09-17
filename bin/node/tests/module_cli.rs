@@ -1,7 +1,6 @@
 //! `ducktape module …` — the operator verbs for a live code swap.
 mod common;
 
-use std::process::Command;
 use std::time::Duration;
 
 use common::Cluster;
@@ -11,7 +10,7 @@ use common::module_verbs::{
 };
 
 fn ducktape(args: &[&str]) -> (bool, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let out = common::ducktape()
         .args(args)
         .output()
         .expect("run ducktape");
@@ -34,7 +33,7 @@ fn pack_prepares_the_deployment_offline_with_or_without_a_mapper() {
     let artifact = scratch.path().join("module.artifact");
     std::fs::write(&index, b"mapper bytes").unwrap();
     for mapper in [None, Some(index.as_path())] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        let mut command = common::ducktape();
         command
             .env("DUCKTAPE_HOME", scratch.path().join("no-node-workspace"))
             .args(["module", "pack", &component, "--out"])
@@ -45,7 +44,11 @@ fn pack_prepares_the_deployment_offline_with_or_without_a_mapper() {
         let result = command.output().unwrap();
         assert!(result.status.success(), "{:?}", result);
         let bytes = std::fs::read(&artifact).unwrap();
-        let decoded = module_artifact::ModuleArtifact::decode(&bytes).unwrap();
+        let module_artifact::Artifact::Module(decoded) =
+            module_artifact::Artifact::decode(&bytes).unwrap()
+        else {
+            panic!("pack writes a module artifact");
+        };
         assert_eq!(decoded.component, std::fs::read(&component).unwrap());
         assert_eq!(decoded.index, mapper.map(|_| b"mapper bytes".to_vec()));
         assert_eq!(
@@ -96,8 +99,8 @@ fn pack_includes_view_assets_and_refuses_pending_or_missing_declared_view() {
     let (ok, message) = pack();
     assert!(ok, "{message}");
     let saved = std::fs::read(&out).unwrap();
-    let artifact = module_artifact::ModuleArtifact::decode(&saved).unwrap();
-    let packaged = artifact.view.unwrap();
+    let artifact = module_artifact::Artifact::decode(&saved).unwrap();
+    let packaged = artifact.view().unwrap();
     assert_eq!(packaged.component, b"view");
     assert_eq!(packaged.assets["logo.svg"], b"svg");
     std::fs::write(dir.join("custom.view.pending"), b"pending").unwrap();
@@ -238,6 +241,88 @@ fn an_activation_inside_the_min_lead_is_refused_with_the_registry_reason() {
     assert_no_proposals(&cluster, 0);
 }
 
+/// `module register <id> --view <view.wasm> --assets <dir>` with no component
+/// admits a `Kind::View` entry: the ceremony schedules it, every validator
+/// signals ready on the view ABI alone (no core to run), it activates at its
+/// height, `module status` lists it as a `view`, and no module seats under
+/// its id. A component under that id afterwards is refused: a swap keeps
+/// the entry's kind.
+#[test]
+fn register_a_view_only_entry_across_three_validators() {
+    let cluster = three_validators();
+    let view = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../crates/noded/tests/fixtures/view.component.wasm"
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let assets = scratch.path().join("assets");
+    std::fs::create_dir_all(assets.join("icons")).unwrap();
+    std::fs::write(assets.join("icons/tab.svg"), b"<svg/>").unwrap();
+    let artifact = module_artifact::Artifact::View(module_artifact::ViewArtifact {
+        component: std::fs::read(view).unwrap(),
+        assets: [("icons/tab.svg".to_owned(), b"<svg/>".to_vec())].into(),
+    });
+    let expected = common::hex(&artifact.hash());
+    let runs = run_on_each(
+        &cluster,
+        &[
+            "module",
+            "register",
+            "dashboard",
+            "--view",
+            view,
+            "--assets",
+            assets.to_str().unwrap(),
+            "--after",
+            AFTER,
+        ],
+    );
+    assert_ceremony_scheduled(&runs, "dashboard");
+    for idx in 0..3 {
+        cluster.await_committed(
+            idx,
+            "dashboard view active",
+            Duration::from_secs(180),
+            || active_hash(&cluster, idx, "dashboard").filter(|hash| *hash == expected),
+        );
+    }
+    for idx in 0..3 {
+        let cfg = cluster.config_file(idx);
+        let (ok, out) = cluster.run_verb(&["module", "status", "--config", cfg.to_str().unwrap()]);
+        assert!(ok, "{out}");
+        let row = out
+            .lines()
+            .find(|line| line.starts_with("dashboard "))
+            .unwrap_or_else(|| panic!("no dashboard row on node {idx}:\n{out}"));
+        assert!(row.contains("view"), "{row}");
+        assert!(row.contains(&expected[..12]), "{row}");
+    }
+    // no module seats under the id: the node's running roster is unchanged
+    let status = cluster.rpc(0, serde_json::json!({ "cmd": "status" }));
+    assert_eq!(status["ok"], true, "{status}");
+    let roster = status["status"]["modules"]
+        .as_object()
+        .expect("status carries the module roster");
+    assert!(
+        !roster.contains_key("dashboard"),
+        "a view entry runs no module: {roster:?}"
+    );
+    // a core under a view id is a different kind: refused before any proposal
+    let cfg = cluster.config_file(0);
+    let (ok, out) = cluster.run_verb(&[
+        "module",
+        "update",
+        "dashboard",
+        &fixture("hello"),
+        "--after",
+        AFTER,
+        "--config",
+        cfg.to_str().unwrap(),
+    ]);
+    assert!(!ok, "{out}");
+    assert!(out.contains("registered as a view"), "{out}");
+}
+
 #[test]
 fn register_carries_a_mapper_and_update_can_remove_it() {
     let cluster = three_validators();
@@ -246,11 +331,12 @@ fn register_carries_a_mapper_and_update_can_remove_it() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../crates/modules/apps/pages/index.wasm"
     );
-    let artifact = module_artifact::ModuleArtifact {
+    let artifact = module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
         view: None,
         component: std::fs::read(&component).unwrap(),
         index: Some(std::fs::read(mapper).unwrap()),
-    };
+        lanes: Vec::new(),
+    });
     let indexed = common::hex(&artifact.hash());
     let runs = run_on_each(
         &cluster,

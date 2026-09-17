@@ -18,8 +18,9 @@
 //! additional controller signature.
 //!
 //! The child receives only a random token for a host endpoint. That endpoint
-//! accepts `RunsMsg::AgentAction` for exactly this run, signs it, waits for the
-//! committed receipt, and dies with the provisioned workspace. A shell can
+//! accepts `RunsMsg::AgentAction` and native history/control boundaries for
+//! exactly this run, signs them, waits for committed readback, and dies with
+//! the provisioned workspace. A shell can
 //! therefore act as the run but can never recover a general-purpose frame
 //! signer.
 //!
@@ -31,7 +32,15 @@ use commonware_cryptography::{Signer as _, ed25519};
 use compute_service::WorkspaceSpec;
 use futures::channel::oneshot;
 use futures::{SinkExt as _, StreamExt as _};
+use std::path::Path;
 use std::sync::Arc;
+
+#[path = "native.rs"]
+mod native;
+
+#[cfg(test)]
+#[path = "native_end_to_end_tests.rs"]
+mod native_end_to_end_tests;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
@@ -45,7 +54,7 @@ use crate::node_link::NodeLink;
 /// the module that owns the session registry.
 const RUNS_MODULE: &str = "runs";
 const ACTION_HEADER: &str = "x-ducktape-run-action";
-const MAX_ACTION_REQUEST_BYTES: usize = runs::MAX_ACTIONS_BYTES + runs::MAX_DELEGATIONS_BYTES;
+const MAX_ACTION_REQUEST_BYTES: usize = runs_wire::MAX_ACTIONS_BYTES + runs_wire::MAX_DELEGATIONS_BYTES;
 
 pub(super) const ENV_ACTION_URL: &str = "DUCKTAPE_RUN_ACTION_URL";
 pub(super) const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
@@ -54,6 +63,7 @@ pub(super) const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
 pub(super) struct RunSession {
     pub(super) action_url: String,
     pub(super) action_token: String,
+    pub(super) native_conversation: Option<provider_host::NativeConversationContext>,
     #[cfg(test)]
     local_addr: std::net::SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
@@ -75,12 +85,13 @@ struct ActionState {
     run_id: String,
     token: String,
     seq: tokio::sync::Mutex<u64>,
+    native: Option<native::NativeState>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ActionRequest {
-    message: runs::RunsMsg,
+    message: runs_wire::RunsMsg,
 }
 
 /// Generate a host-private key and bind its public half to this execution.
@@ -88,6 +99,7 @@ struct ActionRequest {
 pub(super) async fn open(
     node: &NodeLink,
     spec: &WorkspaceSpec,
+    workdir: &Path,
 ) -> Result<Option<RunSession>, String> {
     let Some(agent) = &spec.agent else {
         return Ok(None);
@@ -95,7 +107,7 @@ pub(super) async fn open(
     let mut seed = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
     let key = ed25519::PrivateKey::decode(seed.as_slice()).expect("32 random bytes decode");
-    let payload = runs::encode_msg(&runs::RunsMsg::OpenAgentSession {
+    let payload = runs_wire::encode_msg(&runs_wire::RunsMsg::OpenAgentSession {
         run_id: agent.run_id.clone(),
         attempt: agent.attempt,
         session_key: key.public_key().as_ref().to_vec(),
@@ -109,7 +121,8 @@ pub(super) async fn open(
         );
         format!("open agent session: {error}")
     })?;
-    start_action_server(node.clone(), key, agent.run_id.clone())
+    let native = native::prepare(node, spec, &key, workdir).await?;
+    start_action_server(node.clone(), key, agent.run_id.clone(), native)
         .await
         .inspect_err(|error| {
             tracing::warn!(
@@ -126,6 +139,7 @@ async fn start_action_server(
     node: NodeLink,
     signer: ed25519::PrivateKey,
     run_id: String,
+    native: Option<native::NativeState>,
 ) -> Result<RunSession, String> {
     // A child reaches this signer over a vsock tunnel that terminates on a
     // socket the host process owns, so it dials `127.0.0.1:<port>` exactly
@@ -140,16 +154,24 @@ async fn start_action_server(
     let mut secret = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
     let token = duckfs_core::to_hex(&secret);
+    let native_conversation = native.as_ref().map(|native| native.context.clone());
     let state = Arc::new(ActionState {
         node,
         signer,
         run_id: run_id.clone(),
         token: token.clone(),
         seq: tokio::sync::Mutex::new(0),
+        native,
     });
     let app = Router::new()
-        .route("/v1/run-action", post(run_action))
-        .layer(DefaultBodyLimit::max(MAX_ACTION_REQUEST_BYTES))
+        .route(
+            "/v1/run-action",
+            post(run_action).layer(DefaultBodyLimit::max(MAX_ACTION_REQUEST_BYTES)),
+        )
+        .route(
+            "/v1/native-conversation",
+            post(native::route).layer(DefaultBodyLimit::max(native::MAX_REQUEST_BYTES)),
+        )
         .with_state(state);
     let (shutdown, rx) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -162,6 +184,7 @@ async fn start_action_server(
     Ok(RunSession {
         action_url: format!("http://127.0.0.1:{}/v1/run-action", address.port()),
         action_token: token,
+        native_conversation,
         #[cfg(test)]
         local_addr: address,
         shutdown: Some(shutdown),
@@ -185,7 +208,7 @@ async fn run_action(
         return action_response(StatusCode::UNAUTHORIZED, "action token rejected");
     }
     let names_bound_run = match &request.message {
-        runs::RunsMsg::AgentAction { run_id, .. } => run_id == &state.run_id,
+        runs_wire::RunsMsg::AgentAction { run_id, .. } => run_id == &state.run_id,
         _ => false,
     };
     if !names_bound_run {
@@ -245,25 +268,25 @@ async fn action_events(node: &NodeLink) -> Result<ActionEvents, String> {
 async fn action_result(
     node: &NodeLink,
     request_id: &str,
-) -> Result<Option<Result<runs::ActionRequestView, String>>, String> {
+) -> Result<Option<Result<runs_wire::ActionRequestView, String>>, String> {
     let bytes = node
         .query(
             RUNS_MODULE,
-            &runs::encode_query(&runs::RunsQuery::ActionRequest {
+            &runs_wire::encode_query(&runs_wire::RunsQuery::ActionRequest {
                 request_id: request_id.into(),
             }),
         )
         .await?;
-    let runs::RunsReply::ActionRequest(request) = runs::decode_reply(&bytes)? else {
+    let runs_wire::RunsReply::ActionRequest(request) = runs_wire::decode_reply(&bytes)? else {
         return Err("unexpected action request reply".into());
     };
     let Some(request) = request else {
         return Ok(None);
     };
     match &request.status {
-        runs::ActionStatus::AwaitingProgram | runs::ActionStatus::Claimed { .. } => Ok(None),
-        runs::ActionStatus::Rejected { reason } => Ok(Some(Err(reason.clone()))),
-        runs::ActionStatus::Completed { outcome, .. } => match outcome {
+        runs_wire::ActionStatus::AwaitingProgram | runs_wire::ActionStatus::Claimed { .. } => Ok(None),
+        runs_wire::ActionStatus::Rejected { reason } => Ok(Some(Err(reason.clone()))),
+        runs_wire::ActionStatus::Completed { outcome, .. } => match outcome {
             dispatch::CallOutcomeSummary::Applied { .. } => Ok(Some(Ok(request))),
             dispatch::CallOutcomeSummary::Rejected { reason } => Ok(Some(Err(reason.clone()))),
             dispatch::CallOutcomeSummary::Refused(reason) => {
@@ -280,7 +303,7 @@ async fn await_action_result(
     node: &NodeLink,
     request_id: &str,
     mut events: ActionEvents,
-) -> Result<runs::ActionRequestView, String> {
+) -> Result<runs_wire::ActionRequestView, String> {
     if let Some(result) = action_result(node, request_id).await? {
         return result;
     }
@@ -317,22 +340,22 @@ async fn await_action_result(
 /// response names it `receipt_id` beside the receipt itself.
 async fn submit_action(
     state: &ActionState,
-    message: runs::RunsMsg,
+    message: runs_wire::RunsMsg,
 ) -> Result<serde_json::Value, String> {
-    let runs::RunsMsg::AgentAction {
+    let runs_wire::RunsMsg::AgentAction {
         run_id, request_id, ..
     } = &message
     else {
         return Err("message is outside the run action scope".into());
     };
-    let receipt_id = runs::action_request_id(run_id, request_id);
+    let receipt_id = runs_wire::action_request_id(run_id, request_id);
     // Serialize admission and completion so a later action cannot overtake one
     // whose actual target write is still pending.
     let mut next_seq = state.seq.lock().await;
     let events = action_events(&state.node).await?;
     let msg = sdk::Msg {
         target: RUNS_MODULE.into(),
-        payload: runs::encode_msg(&message),
+        payload: runs_wire::encode_msg(&message),
     };
     let frame = node::encode_frame(&state.signer, *next_seq, &msg);
     *next_seq = next_seq
@@ -379,10 +402,14 @@ mod tests {
     #[tokio::test]
     async fn action_server_binds_loopback_only() {
         let signer = ed25519::PrivateKey::from_seed(1);
-        let session =
-            start_action_server(NodeLink::new("http://127.0.0.1:0"), signer, "run-1".into())
-                .await
-                .expect("bind scoped action signer");
+        let session = start_action_server(
+            NodeLink::new("http://127.0.0.1:0"),
+            signer,
+            "run-1".into(),
+            None,
+        )
+        .await
+        .expect("bind scoped action signer");
         assert!(session.local_addr.ip().is_loopback());
     }
 }

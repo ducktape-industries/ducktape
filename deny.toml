@@ -13,9 +13,10 @@
 #
 # "cannot take" includes the two where cargo would resolve the fix in-range:
 # the lock reaches the wasm guest graph, so moving it rewrites every committed
-# component.wasm and index.wasm and forces a GENESIS_ROOT_HASH repin (measured
-# — the pair below changes crates/modules/system/saga/index.wasm). That is a
-# consensus-visible change and belongs in its own PR, not in a lock bump.
+# component.wasm and index.wasm (measured — the pair below changes
+# crates/modules/system/saga/index.wasm). Those bytes are the descriptor's
+# module table, so that is a consensus-visible change and belongs in its own
+# PR, not in a lock bump.
 
 [advisories]
 # A yanked crate is a maintainer saying "do not use this build". The lock is

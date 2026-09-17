@@ -1,0 +1,21 @@
+[package]
+name = "ducktape-media"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+chat.workspace = true
+ducktape-rpc.workspace = true
+futures.workspace = true
+libc.workspace = true
+media-service.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+subtle = "2"
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-tungstenite = "0.24"

@@ -38,7 +38,9 @@ pub enum GatewayJob {
         publisher_node: [u8; 32],
         max_response_bytes: u64,
         head: gateway::ProxyRequestHead,
-        body: Vec<u8>,
+        /// Streamed, like the response already was. A request body is no
+        /// longer something this process holds.
+        body: GatewayRequestBody,
         reply: oneshot::Sender<Result<GatewayResponse, GatewayFailure>>,
     },
     /// A WebSocket upgrade: the plane bridges the browser message channels to
@@ -96,17 +98,86 @@ pub enum GatewayFailure {
     Forbidden(String),
     NotFound(String),
     Conflict(String),
+    /// The request body went past what its route admits. It is its own variant
+    /// because it is the one failure that can appear MID-BODY: there is no
+    /// declared length to refuse up front any more, so the refusal happens on
+    /// the byte that exceeds the cap.
+    TooLarge(String),
     Unavailable(String),
 }
 
+impl GatewayFailure {
+    /// The refusal's own text. A streamed body carries its failure into an
+    /// `io::Error` the upstream client surfaces, so the detail has to survive
+    /// the crossing as a string.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Invalid(detail)
+            | Self::Forbidden(detail)
+            | Self::NotFound(detail)
+            | Self::Conflict(detail)
+            | Self::TooLarge(detail)
+            | Self::Unavailable(detail) => detail,
+        }
+    }
+}
+
 pub type GatewayLane = tokio::sync::mpsc::Sender<GatewayJob>;
+
+/// A request body on its way to the publisher: chunks until the sender closes
+/// (end of body) or one `Err` (refused mid-stream). Bounded, so a slow
+/// publisher backpressures the browser instead of piling the body up here —
+/// which is the whole reason a push of any size costs this node one frame.
+pub type GatewayRequestBody = tokio::sync::mpsc::Receiver<Result<bytes::Bytes, GatewayFailure>>;
+
+/// How many body frames may sit between the browser and the overlay writer.
+/// Small on purpose: this is the node's entire memory cost for a request body,
+/// whatever the body weighs.
+pub const GATEWAY_BODY_FRAMES: usize = 4;
+
+/// `sha256("")` — what a bodyless request's caller proof is bound to. Spelled
+/// once so a bodyless path never has to reach for a hasher to say "nothing".
+pub const EMPTY_BODY_DIGEST: [u8; 32] = [
+    0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+    0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+];
+
+/// A body that is ALREADY in memory, handed on in the streaming shape. The
+/// JSON proxy lanes decode a base64 field bounded by
+/// [`JSON_LANE_REQUEST_BYTES`], so there is nothing to stream there — but the
+/// plane below takes one shape, not two.
+pub fn one_shot_body(body: Vec<u8>) -> GatewayRequestBody {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    if !body.is_empty() {
+        tx.try_send(Ok(bytes::Bytes::from(body)))
+            .expect("a fresh one-slot channel accepts its only item");
+    }
+    rx
+}
 
 /// How long a caller waits for a slot on the gateway lane. The reply deadline
 /// alone is not enough: a saturated plane stops draining the lane, and an
 /// un-deadlined `send` there hangs the axum handler with no response at all.
 const LANE_ADMIT_TIMEOUT: Duration = Duration::from_secs(15);
-/// How long a caller waits for the publisher's response head.
-const PROXY_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a SILENT publisher may stay silent before its caller gives up on
+/// the response head. It is a ceiling on silence, never on duration: a request
+/// body has no declared size any more, so the head cannot arrive until the
+/// publisher's upstream has consumed a body this side cannot measure. The
+/// gateway plane applies it at the hop that can observe that silence; this
+/// door does not deadline the exchange at all. An upstream whose answer takes
+/// longer (the airlock enclave under Apple's notary wait) commits its head
+/// first and carries its outcome in the stream, so no lane needs more.
+pub const PROXY_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+/// The JSON proxy lane's request cap (`/v1/gateway/proxy`, `body_b64`).
+/// That lane is buffered BY CONTRACT — one JSON blob in, one out — so it
+/// carries a model turn's multi-MB context and nothing bulkier; a route
+/// pinned above this (a release bundle) is reached through the browser
+/// door, which reads each request under the route's own cap.
+pub const JSON_LANE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+/// The browser door's own extractor cap: the `/.duck/ws-token` mint body (a
+/// small JSON). The proxied fallback reads its body itself, under the
+/// resolved route's `max_request_bytes`.
+const WS_TOKEN_REQUEST_BYTES: usize = 64 * 1024;
 /// WebSocket doors one page (an account's route) may hold open at once. The
 /// handshake `Origin` cannot key this — CEF sends the literal "null" for a
 /// `duck://` page — so the grant's route is the page.
@@ -224,6 +295,32 @@ fn gateway_api_origin_guard(headers: &HeaderMap) -> Option<Response> {
     })
 }
 
+/// The deadline covers admission into the actor queue as well as its reply.
+/// A full queue must not leave an HTTP task waiting forever before its timer.
+async fn gateway_query(
+    commands: &futures::channel::mpsc::Sender<NodeCommand>,
+    target: &str,
+    req: Vec<u8>,
+) -> Result<Vec<u8>, GatewayFailure> {
+    let (reply, rx) = oneshot::channel();
+    let mut commands = commands.clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        commands
+            .send(NodeCommand::Query {
+                target: target.into(),
+                req,
+                reply,
+            })
+            .await
+            .map_err(|_| GatewayFailure::Unavailable("node actor is gone".into()))?;
+        rx.await
+            .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
+            .map_err(|refused| GatewayFailure::Unavailable(refused.message))
+    })
+    .await
+    .map_err(|_| GatewayFailure::Unavailable("gateway authorization query timed out".into()))?
+}
+
 async fn current_route(
     handle: &NodeHandle,
     account_id: u64,
@@ -231,24 +328,15 @@ async fn current_route(
 ) -> Result<gateway::RouteRecord, GatewayFailure> {
     gateway::validate_account_number(account_id).map_err(GatewayFailure::Invalid)?;
     name.validate().map_err(GatewayFailure::Invalid)?;
-    let (reply, rx) = oneshot::channel();
-    let mut commands = handle.cmds.clone();
-    commands
-        .send(NodeCommand::Query {
-            target: "gateway".into(),
-            req: gateway::encode_query(&gateway::GatewayQuery::Get {
-                account_id,
-                name: name.clone(),
-            }),
-            reply,
-        })
-        .await
-        .map_err(|_| GatewayFailure::Unavailable("node actor is gone".into()))?;
-    let bytes = tokio::time::timeout(Duration::from_secs(5), rx)
-        .await
-        .map_err(|_| GatewayFailure::Unavailable("gateway route query timed out".into()))?
-        .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
-        .map_err(GatewayFailure::Unavailable)?;
+    let bytes = gateway_query(
+        &handle.cmds,
+        "gateway",
+        gateway::encode_query(&gateway::GatewayQuery::Get {
+            account_id,
+            name: name.clone(),
+        }),
+    )
+    .await?;
     match gateway::decode_reply(&bytes) {
         Ok(gateway::GatewayReply::Route(route)) => match *route {
             Some(record) if record.statement.route.is_some() => Ok(record),
@@ -272,14 +360,22 @@ async fn current_route(
 async fn proxy_current(
     handle: &NodeHandle,
     head: gateway::ProxyRequestHead,
-    body: Vec<u8>,
+    body: GatewayRequestBody,
 ) -> Result<GatewayResponse, GatewayFailure> {
-    gateway::validate_proxy_request_head(&head).map_err(GatewayFailure::Invalid)?;
-    if body.len() as u64 != head.body_len {
-        return Err(GatewayFailure::Invalid(
-            "gateway body length does not match its request head".into(),
+    if head.operator {
+        return Err(GatewayFailure::Forbidden(
+            "operator assertion requires the operator door".into(),
         ));
     }
+    proxy_authorized(handle, head, body).await
+}
+
+async fn proxy_authorized(
+    handle: &NodeHandle,
+    head: gateway::ProxyRequestHead,
+    body: GatewayRequestBody,
+) -> Result<GatewayResponse, GatewayFailure> {
+    gateway::validate_proxy_request_head(&head).map_err(GatewayFailure::Invalid)?;
     let record = current_route(handle, head.account_id, &head.name).await?;
     if record.statement.revision != head.revision {
         return Err(GatewayFailure::Conflict(
@@ -321,9 +417,14 @@ async fn proxy_current(
         .await
         .ok_or_else(|| GatewayFailure::Unavailable("gateway lane is saturated".into()))?;
     slot.send(job);
-    let response = tokio::time::timeout(PROXY_REPLY_TIMEOUT, rx)
+    // NO deadline on the reply. The head cannot arrive until the publisher's
+    // upstream has consumed a request whose size this door never learns, so a
+    // timer here would refuse a large push for being large. Every step under
+    // it is bounded on PROGRESS by the plane instead — per consensus round
+    // trip, per request frame, per upstream read, per response frame — and a
+    // plane that dies drops this sender, which is the error below.
+    let response = rx
         .await
-        .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))?
         .map_err(|_| GatewayFailure::Unavailable("gateway plane dropped the request".into()))??;
     gateway::validate_response_head(&response.head).map_err(GatewayFailure::Unavailable)?;
     Ok(response)
@@ -344,8 +445,31 @@ pub(crate) async fn gateway_proxy(
             return error_response(StatusCode::BAD_REQUEST, &format!("body_b64: {error}"));
         }
     };
-    match proxy_current(&handle, request.head, body).await {
-        // The JSON lane is buffered BY CONTRACT (body_b64); collect the stream.
+    buffered_proxy_reply(proxy_current(&handle, request.head, one_shot_body(body)).await).await
+}
+
+/// The signed-write guard admits exactly the existing node operator credentials.
+/// Never copy those credentials into the upstream request.
+pub(crate) async fn gateway_operator_proxy(
+    State(handle): State<NodeHandle>,
+    headers: HeaderMap,
+    Json(mut request): Json<GatewayProxyRequest>,
+) -> Response {
+    use base64::Engine as _;
+    if let Some(response) = gateway_api_origin_guard(&headers) {
+        return response;
+    }
+    let body = match base64::engine::general_purpose::STANDARD.decode(request.body_b64) {
+        Ok(body) => body,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid body_b64"),
+    };
+    request.head.operator = true;
+    buffered_proxy_reply(proxy_authorized(&handle, request.head, one_shot_body(body)).await).await
+}
+
+async fn buffered_proxy_reply(result: Result<GatewayResponse, GatewayFailure>) -> Response {
+    use base64::Engine as _;
+    match result {
         Ok(mut response) => match collect_body(&mut response.body).await {
             Ok(body) => Json(GatewayProxyReply {
                 head: response.head,
@@ -361,6 +485,204 @@ pub(crate) async fn gateway_proxy(
 #[derive(Debug, Serialize)]
 struct GatewayBrowserBase {
     base: String,
+}
+
+/// How far a caller proof's timestamp may sit from this node's clock. A proof
+/// is minted per request by the app, so a generous window costs nothing but
+/// bounds a captured proof's replay life.
+const CALLER_POP_FRESHNESS_SECS: u64 = 30;
+
+/// The account a request acts FOR, or `None` when it carries no user proof.
+///
+/// A mesh peer is a node, and a node is never an account: the caller's
+/// account comes ONLY from the user proof-of-possession the app stamped on
+/// the request (`x-duck-user-key/-ts/-sig`, carried in the head as
+/// [`gateway::UserPop`]). The proof binds the key to the exact request head,
+/// body and a fresh timestamp under [`gateway::GATEWAY_CALLER_NS`], and verifies
+/// with the scheme identity stores for that key. A present-but-bad proof is a
+/// refusal, never a downgrade to anonymous.
+pub async fn gateway_caller_account(
+    commands: &futures::channel::mpsc::Sender<NodeCommand>,
+    head: &gateway::ProxyRequestHead,
+    statement: &gateway::RouteStatement,
+    body_digest: &[u8; 32],
+) -> Result<Option<u64>, GatewayFailure> {
+    let Some(pop) = &head.user_pop else {
+        return Ok(None);
+    };
+    let reply = gateway_query(
+        commands,
+        "identity",
+        identity::encode_query(&identity::IdentityQuery::OfKey {
+            key: pop.key.clone(),
+        }),
+    )
+    .await?;
+    let account = match identity::decode_reply(&reply) {
+        Ok(identity::IdentityReply::Account(Some(account))) => account,
+        Ok(identity::IdentityReply::Account(None)) => {
+            return Err(GatewayFailure::Forbidden(
+                "gateway caller key belongs to no Identity account".into(),
+            ));
+        }
+        Ok(
+            identity::IdentityReply::Accounts(_)
+            | identity::IdentityReply::Resolved(_)
+            | identity::IdentityReply::Gen(_),
+        ) => {
+            return Err(GatewayFailure::Unavailable(
+                "unexpected Identity caller reply".into(),
+            ));
+        }
+        Err(error) => return Err(GatewayFailure::Unavailable(error)),
+    };
+    let Some(scheme) = account
+        .keys
+        .iter()
+        .find(|key| key.pubkey == pop.key)
+        .map(|key| key.scheme)
+    else {
+        return Err(GatewayFailure::Unavailable(
+            "Identity key index disagrees with its account record".into(),
+        ));
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let fresh = now.abs_diff(pop.ts) <= CALLER_POP_FRESHNESS_SECS;
+    if !fresh {
+        return Err(GatewayFailure::Forbidden(
+            "gateway caller proof is stale".into(),
+        ));
+    }
+    let preimage =
+        gateway::caller_pop_preimage(&statement.publisher_node, head, body_digest, pop.ts);
+    let verifies = scheme.verify(&pop.key, gateway::GATEWAY_CALLER_NS, &preimage, &pop.sig);
+    if !verifies {
+        return Err(GatewayFailure::Forbidden(
+            "gateway caller proof does not verify".into(),
+        ));
+    }
+    Ok(Some(account.number))
+}
+
+/// Native views supply a gateway caller proof in a bounded request head.
+/// The publisher verifies that proof and finalized route before upstream I/O.
+fn native_stream_head(bytes: &[u8]) -> Result<gateway::ProxyRequestHead, String> {
+    let head = gateway::decode_proxy_request_head(bytes)?;
+    let authenticated_upgrade = head.upgrade && head.user_pop.is_some() && !head.operator;
+    if !authenticated_upgrade {
+        return Err("application stream requires a signed upgrade".into());
+    }
+    Ok(head)
+}
+
+pub(crate) async fn gateway_native_stream(
+    State(handle): State<NodeHandle>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    if let Some(response) = gateway_api_origin_guard(&headers) {
+        return response;
+    }
+    let Some(encoded) = headers.get("x-ducktape-gateway-head") else {
+        return error_response(StatusCode::BAD_REQUEST, "missing application stream head");
+    };
+    let head = match native_stream_head(encoded.as_bytes()) {
+        Ok(head) => head,
+        Err(_) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid application stream head");
+        }
+    };
+    open_application_stream(handle, head, upgrade).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperatorStream {
+    // The head is in the signed URI, not an unsigned header: replacing the
+    // target, route, or replay cursor invalidates the operator's signature.
+    head: String,
+}
+
+pub(crate) async fn gateway_operator_stream(
+    State(handle): State<NodeHandle>,
+    axum::extract::Query(request): axum::extract::Query<OperatorStream>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    if let Some(response) = gateway_api_origin_guard(&headers) {
+        return response;
+    }
+    let mut head = match gateway::decode_proxy_request_head(request.head.as_bytes()) {
+        Ok(head) if head.upgrade => head,
+        _ => return error_response(StatusCode::BAD_REQUEST, "invalid operator stream head"),
+    };
+    head.operator = true;
+    open_application_stream(handle, head, upgrade).await
+}
+
+async fn open_application_stream(
+    handle: NodeHandle,
+    head: gateway::ProxyRequestHead,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Some(lane) = handle.gateway.clone() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "no gateway overlay");
+    };
+    let record = match current_route(&handle, head.account_id, &head.name).await {
+        Ok(record) => record,
+        Err(failure) => return gateway_failure_response(failure),
+    };
+    let matches_route = head.revision == record.statement.revision
+        && gateway::request_matches_record(&head, &record);
+    if !matches_route {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "application route changed or refused upgrade",
+        );
+    }
+    // an upgrade carries no body, so its proof is over the digest of nothing.
+    let caller =
+        match gateway_caller_account(&handle.cmds, &head, &record.statement, &EMPTY_BODY_DIGEST)
+            .await
+        {
+            Ok(caller) => caller,
+            Err(failure) => return gateway_failure_response(failure),
+        };
+    let route = record
+        .statement
+        .route
+        .as_ref()
+        .expect("current_route rejects tombstones");
+    let admitted =
+        gateway::audience_allows(&route.policy.audience, record.statement.account_id, caller);
+    if !admitted {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "caller is outside the application route audience",
+        );
+    }
+    let Ok(publisher) = <[u8; 32]>::try_from(record.statement.publisher_node.as_slice()) else {
+        return error_response(StatusCode::BAD_GATEWAY, "invalid route publisher");
+    };
+    let Some(door) = handle
+        .application_doors
+        .admit((head.account_id, head.name.clone()))
+    else {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "application stream limit reached",
+        );
+    };
+    let Some(slot) = reserve_lane(lane).await else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway lane is saturated");
+    };
+    upgrade
+        .max_message_size(gateway::MAX_WS_FRAME_BYTES)
+        .max_frame_size(gateway::MAX_WS_FRAME_BYTES)
+        .on_upgrade(move |socket| bridge_axum_ws(socket, slot, publisher, head, door))
 }
 
 /// Report the dedicated browser-gateway listener's loopback base URL so the
@@ -442,7 +764,7 @@ async fn resolve_duck_authority(
         .await
         .map_err(|_| GatewayFailure::Unavailable("gateway resolve timed out".into()))?
         .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
-        .map_err(GatewayFailure::Unavailable)?;
+        .map_err(|refused| GatewayFailure::Unavailable(refused.message))?;
     match gateway::decode_reply(&bytes) {
         Ok(gateway::GatewayReply::Resolved(Some(account))) => Ok((account.account_id, name)),
         Ok(gateway::GatewayReply::Resolved(None)) => Err(GatewayFailure::NotFound(format!(
@@ -462,9 +784,7 @@ pub fn gateway_browser_router(handle: NodeHandle) -> Router {
         .route("/.duck/ws-token", post(gateway_ws_token_mint))
         .route("/.duck/ws/{token}", get(gateway_ws_door))
         .fallback(gateway_browser_proxy)
-        .layer(DefaultBodyLimit::max(
-            gateway::MAX_REQUEST_BODY_BYTES as usize,
-        ))
+        .layer(DefaultBodyLimit::max(WS_TOKEN_REQUEST_BYTES))
         .with_state(handle)
 }
 
@@ -617,7 +937,10 @@ async fn gateway_browser_proxy(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    // The raw body, NOT `Bytes`: the router's `DefaultBodyLimit` is sized
+    // for the ws-token mint, and this lane's cap is the resolved route's
+    // own `max_request_bytes` — read below, once the record is known.
+    body: Body,
 ) -> Response {
     let Some(gateway) = handle.browser_gateway.clone() else {
         return error_response(
@@ -668,6 +991,7 @@ async fn gateway_browser_proxy(
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
     };
     let head = gateway::ProxyRequestHead {
+        operator: false,
         account_id,
         name,
         revision: record.statement.revision,
@@ -678,11 +1002,16 @@ async fn gateway_browser_proxy(
             .unwrap_or("/")
             .to_string(),
         headers: forwarded,
-        body_len: body.len() as u64,
         upgrade: false,
         user_pop,
     };
-    let response = match proxy_current(&handle, head, body.to_vec()).await {
+    // THE BODY IS NEVER MATERIALIZED HERE. It leaves as frames, counted
+    // against the route's own allowance as they pass, so what this node
+    // spends on a request is a frame and not the request — a git push of a
+    // whole repository's history costs the same as a form post.
+    let allowance = gateway::request_body_allowance(&head, &record);
+    let body = stream_body_under_route_allowance(body, allowance);
+    let response = match proxy_current(&handle, head, body).await {
         Ok(response) => response,
         Err(failure) => return gateway_failure_response(failure),
     };
@@ -752,12 +1081,60 @@ async fn gateway_browser_proxy(
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "invalid publisher response"))
 }
 
+/// Hand the request body on as a STREAM, counting it against the resolved
+/// route's signed allowance as it passes and hashing it for the caller's
+/// proof.
+///
+/// Nothing here holds the body. A route that declared a cap gets it enforced
+/// on the byte that exceeds it — which ends the exchange mid-stream, because
+/// there is no buffered length to refuse up front any more — and a route that
+/// declared none (a git push carries a whole repository's history) is not
+/// bounded by this node at all.
+fn stream_body_under_route_allowance(body: Body, allowance: Option<u64>) -> GatewayRequestBody {
+    use futures::StreamExt as _;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(GATEWAY_BODY_FRAMES);
+    tokio::spawn(async move {
+        let mut frames = body.into_data_stream();
+        let mut seen: u64 = 0;
+        while let Some(frame) = frames.next().await {
+            let chunk = match frame {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(GatewayFailure::Invalid(format!(
+                            "gateway request body: {error}"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+            seen += chunk.len() as u64;
+            if let Some(cap) = allowance
+                && seen > cap
+            {
+                let _ = tx
+                    .send(Err(GatewayFailure::TooLarge(format!(
+                        "gateway_body_exceeds_route_cap: the route admits {cap} bytes per request"
+                    ))))
+                    .await;
+                return;
+            }
+            if tx.send(Ok(chunk)).await.is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
 fn gateway_failure_response(failure: GatewayFailure) -> Response {
     match failure {
         GatewayFailure::Invalid(detail) => error_response(StatusCode::BAD_REQUEST, &detail),
         GatewayFailure::Forbidden(detail) => error_response(StatusCode::FORBIDDEN, &detail),
         GatewayFailure::NotFound(detail) => error_response(StatusCode::NOT_FOUND, &detail),
         GatewayFailure::Conflict(detail) => error_response(StatusCode::CONFLICT, &detail),
+        GatewayFailure::TooLarge(detail) => error_response(StatusCode::PAYLOAD_TOO_LARGE, &detail),
         GatewayFailure::Unavailable(detail) => error_response(StatusCode::BAD_GATEWAY, &detail),
     }
 }
@@ -895,13 +1272,13 @@ async fn gateway_ws_door(
         return error_response(StatusCode::BAD_GATEWAY, "route has an invalid publisher");
     };
     let head = gateway::ProxyRequestHead {
+        operator: false,
         account_id: grant.account_id,
         name: grant.name,
         revision: record.statement.revision,
         method: gateway::RouteMethod::Get,
         path_and_query: grant.path,
         headers: vec![],
-        body_len: 0,
         upgrade: true,
         user_pop: grant.user_pop,
     };
@@ -994,6 +1371,161 @@ mod tests {
     /// A plane that stopped draining must not turn every gateway request into a
     /// handler that never answers: admission gives up at the deadline, and the
     /// caller turns that into a status.
+    #[tokio::test(start_paused = true)]
+    async fn authorization_queue_and_reply_share_a_deadline() {
+        let (mut commands, _receiver) = futures::channel::mpsc::channel(0);
+        let (reply, _answer) = oneshot::channel();
+        commands
+            .try_send(NodeCommand::Query {
+                target: "identity".into(),
+                req: vec![],
+                reply,
+            })
+            .unwrap();
+        let result = gateway_query(&commands, "identity", vec![]).await;
+        assert!(
+            matches!(result, Err(GatewayFailure::Unavailable(reason)) if reason.contains("timed out"))
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_caller_authority_verifies_identity_and_the_exact_path() {
+        use commonware_cryptography::{Signer as _, ed25519};
+        use futures::StreamExt as _;
+        let key = ed25519::PrivateKey::from_seed(71);
+        let account = identity::AccountView {
+            number: 9,
+            name: "reader".into(),
+            control: identity::Control::Keys,
+            keys: vec![identity::KeyView {
+                scheme: identity::KeyScheme::Ed25519,
+                pubkey: key.public_key().as_ref().to_vec(),
+                label: None,
+                added_at: 0,
+            }],
+            avatar: None,
+            bio: None,
+            updated_at: 0,
+        };
+        let statement = gateway::RouteStatement {
+            chain_id: "test".into(),
+            account_id: 7,
+            name: gateway::RouteName::named("canvas"),
+            publisher_node: vec![2; 32],
+            revision: 1,
+            route: None,
+        };
+        let ts = ::node::signed_req::now_secs();
+        let mut head = gateway::ProxyRequestHead {
+            operator: false,
+            account_id: 7,
+            name: statement.name.clone(),
+            revision: 1,
+            method: gateway::RouteMethod::Post,
+            path_and_query: "/events?room=a%20b".into(),
+            headers: vec![gateway::ProxyHeader {
+                name: "content-type".into(),
+                value: "application/octet-stream".into(),
+            }],
+            upgrade: false,
+            user_pop: None,
+        };
+        let body = [0, 1, 255];
+        let preimage = gateway::caller_pop_preimage(
+            &statement.publisher_node,
+            &head,
+            &gateway::body_digest(&body),
+            ts,
+        );
+        head.user_pop = Some(gateway::UserPop {
+            key: key.public_key().as_ref().to_vec(),
+            ts,
+            sig: key
+                .sign(gateway::GATEWAY_CALLER_NS, &preimage)
+                .as_ref()
+                .to_vec(),
+        });
+        let (commands, mut requests) = futures::channel::mpsc::channel(1);
+        let actor = tokio::spawn(async move {
+            while let Some(NodeCommand::Query { target, req, reply }) = requests.next().await {
+                assert_eq!(target, "identity");
+                assert!(matches!(
+                    identity::decode_query(&req).unwrap(),
+                    identity::IdentityQuery::OfKey { .. }
+                ));
+                reply
+                    .send(Ok(identity::encode_reply(
+                        &identity::IdentityReply::Account(Some(account.clone())),
+                    )))
+                    .unwrap();
+            }
+        });
+        assert_eq!(
+            gateway_caller_account(&commands, &head, &statement, &gateway::body_digest(&body))
+                .await
+                .unwrap(),
+            Some(9)
+        );
+        assert!(
+            matches!(
+                gateway_caller_account(
+                    &commands,
+                    &head,
+                    &statement,
+                    &gateway::body_digest(&[0, 2, 255])
+                )
+                .await,
+                Err(GatewayFailure::Forbidden(_))
+            ),
+            "a same-length body substitution must fail"
+        );
+        let original = head.clone();
+        for mutate in [
+            |h: &mut gateway::ProxyRequestHead| h.path_and_query = "/events?room=other".into(),
+            |h: &mut gateway::ProxyRequestHead| h.revision += 1,
+            |h: &mut gateway::ProxyRequestHead| h.headers[0].value = "text/plain".into(),
+            |h: &mut gateway::ProxyRequestHead| h.upgrade = true,
+        ] {
+            head = original.clone();
+            mutate(&mut head);
+            assert!(matches!(
+                gateway_caller_account(&commands, &head, &statement, &gateway::body_digest(&body))
+                    .await,
+                Err(GatewayFailure::Forbidden(_))
+            ));
+        }
+        drop(commands);
+        actor.await.unwrap();
+    }
+
+    #[test]
+    fn native_stream_requires_a_bounded_signed_upgrade_head() {
+        let mut head = gateway::ProxyRequestHead {
+            operator: false,
+            account_id: 7,
+            name: gateway::RouteName::named("canvas"),
+            revision: 1,
+            method: gateway::RouteMethod::Get,
+            path_and_query: "/events".into(),
+            headers: vec![],
+            upgrade: true,
+            user_pop: Some(gateway::UserPop {
+                key: vec![1; 32],
+                ts: 1,
+                sig: vec![2; 64],
+            }),
+        };
+        assert!(native_stream_head(&serde_json::to_vec(&head).unwrap()).is_ok());
+        head.operator = true;
+        assert!(native_stream_head(&serde_json::to_vec(&head).unwrap()).is_err());
+        head.operator = false;
+        head.user_pop = None;
+        assert!(native_stream_head(&serde_json::to_vec(&head).unwrap()).is_err());
+        head.upgrade = false;
+        assert!(native_stream_head(&serde_json::to_vec(&head).unwrap()).is_err());
+        assert!(native_stream_head(&vec![b' '; gateway::MAX_PROXY_HEAD_BYTES + 1]).is_err());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_full_lane_gives_up_at_the_deadline_instead_of_hanging() {
         let (lane, _jobs) = tokio::sync::mpsc::channel::<GatewayJob>(1);

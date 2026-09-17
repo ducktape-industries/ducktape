@@ -21,7 +21,7 @@ use duckfs_core::{
 };
 use futures::channel::oneshot;
 
-use crate::files_http::FILES_MODULE;
+const FILES_MODULE: &str = "files";
 use crate::{BlockSummary, NodeCommand, NodeHandle};
 
 /// a `NodeApi` bound to one node's actor lane. cheap to clone (holds only the
@@ -47,6 +47,7 @@ impl ActorNodeApi {
             let (reply, rx) = oneshot::channel();
             self.handle
                 .send(NodeCommand::Submit {
+                    required_blob: None,
                     target: FILES_MODULE.into(),
                     payload,
                     origin: self.origin.clone(),
@@ -56,8 +57,8 @@ impl ActorNodeApi {
                 .map_err(|_| ApiError::Transport("node actor is gone".into()))?;
             match rx.await {
                 Ok(Ok(block)) => Ok(block),
-                // the module rejection string passes through untouched.
-                Ok(Err(err)) => Err(ApiError::Rejected(err)),
+                // the module's own sentence passes through untouched.
+                Ok(Err(refused)) => Err(ApiError::Rejected(refused.message)),
                 Err(_) => Err(ApiError::Transport("node actor dropped the reply".into())),
             }
         })
@@ -77,7 +78,7 @@ impl ActorNodeApi {
                 .map_err(|_| ApiError::Transport("node actor is gone".into()))?;
             let bytes = match rx.await {
                 Ok(Ok(bytes)) => bytes,
-                Ok(Err(err)) => return Err(map_query_error(err)),
+                Ok(Err(refused)) => return Err(map_query_error(refused.message)),
                 Err(_) => return Err(ApiError::Transport("node actor dropped the reply".into())),
             };
             decode_reply(&bytes).map_err(ApiError::Transport)

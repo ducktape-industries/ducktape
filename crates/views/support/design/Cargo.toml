@@ -1,7 +1,0 @@
-# Desktop font identity and the product type scale. Shared color, shape, and
-# component tokens live in `ducktape-ui`.
-[package]
-name = "design"
-edition = "2024"
-version = "0.1.0"
-publish = false

@@ -126,9 +126,12 @@ async fn check_attempt(
         job_id: task.id.clone(),
     });
     let bytes = ctx.query(tasks_id, &request).await?;
-    let tasks::JobsReply::Job(job) = tasks::decode_job_reply(&bytes).map_err(Error::Module)?;
+    let tasks::JobsReply::Job(job) = tasks::decode_job_reply(&bytes).map_err(Error::Module)? else {
+        return Err(Error::Module("unexpected reply to task lookup".into()));
+    };
     let job = job.ok_or_else(|| Error::Module(format!("no task {}", task.id)))?;
-    if job.attempt != task.expected_attempt {
+    let stale_attempt = job.attempt != task.expected_attempt;
+    if stale_attempt {
         return Err(Error::Module(format!(
             "{what}: task {} is on attempt {}, not the expected {}",
             task.id, job.attempt, task.expected_attempt

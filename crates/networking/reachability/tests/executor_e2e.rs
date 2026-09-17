@@ -49,7 +49,7 @@ impl WireGuardEffect for SharedFake {
 
 const CHAIN: &str = "net#e2e";
 
-/// The canonical `ducktape:netstack` component — the bytes `bin/node` embeds.
+/// The committed `ducktape:netstack` test fixture; node binaries load a file.
 const NETSTACK_COMPONENT: &[u8] = include_bytes!("../../netstack-machine/component.wasm");
 
 fn guest_backend(step_fuel: u64) -> NetstackBackend {
@@ -3139,49 +3139,74 @@ async fn a_guest_backed_node_converges_with_native_peers() {
         .await;
 }
 
-/// A guest that faults mid-epoch fails over LOUDLY: the epoch it was
-/// assembling is reported failed with the backend's reason, the native
-/// machine replays the retarget, and the mesh converges all the same.
+/// A broken deployed component must never run the native protocol instead.
 #[tokio::test]
-async fn a_faulting_guest_fails_over_to_the_native_machine() {
-    let local = LocalSet::new();
-    let dir = tempfile::tempdir().unwrap();
-    local
-        .run_until(async {
-            // one unit of fuel per step: node 0's guest traps on its first
-            // event, the epoch-1 retarget.
-            let (nodes, mut collected) = spawn_mesh_transported(
-                &local,
-                dir.path(),
-                &[1, 2, 3],
-                vec![],
-                Rc::new(|_, _, _| 1),
-                vec![],
-                None,
-                &[],
-                &[],
-                vec![guest_backend(1)],
-            );
-            retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
-            let converged = drain_until_applied(&mut collected, &[0, 1, 2], 1).await;
-
-            assert_eq!(
-                converged.epoch_failures,
-                vec![(0, "netstack_backend_fault".to_string())],
-                "exactly the faulted node reports its epoch failed, once"
-            );
-            assert_eq!(converged.versions.len(), 3);
-            assert_eq!(converged.versions[&0], converged.versions[&1]);
-            assert_eq!(converged.versions[&0], converged.versions[&2]);
-            let fake = nodes[0].effect.0.lock().unwrap();
-            assert_eq!(
-                fake.create_calls, 1,
-                "the native replay brought the interface up once"
-            );
-            assert_eq!(fake.applied.len(), 1);
-            assert_eq!(fake.applied[0].peers.len(), 2);
-        })
+async fn a_faulting_guest_stops_without_native_effects() {
+    for backend in [
+        guest_backend(1),
+        NetstackBackend::Guest {
+            component: b"invalid component".to_vec(),
+            step_fuel: reachability::NETSTACK_STEP_FUEL,
+        },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = PrivateKey::from_seed(1);
+        let policy = PortPolicy::production();
+        let config = ReachabilityConfig {
+            chain_id: CHAIN.into(),
+            signer: signer.clone(),
+            wireguard_key_file: dir.path().join("wg.key"),
+            wireguard_port: 51820,
+            wireguard_advertised: Some(endpoint(&policy, 10, 51820, Transport::Udp)),
+            control_endpoint: endpoint(&policy, 10, 443, Transport::Tcp),
+            coordinators: vec![],
+            port_policy: policy,
+            persist_file: None,
+            gossip_ingress: None,
+            backend,
+        };
+        let (commands, receiver) = mpsc::channel(8);
+        let (events, _received) = mpsc::channel(64);
+        commands
+            .send(ReachabilityCommand::Retarget(MeshEpochEvent {
+                epoch: 1,
+                members: vec![signer.public_key()],
+                standbys: vec![],
+                current_view: 10,
+            }))
+            .await
+            .unwrap();
+        drop(commands);
+        let effect = SharedFake::default();
+        let mut transitions = Vec::new();
+        let outcome = reachability::run_observed(
+            config,
+            effect.clone(),
+            StaticResolver::default(),
+            receiver,
+            events,
+            |status| transitions.push(status),
+        )
         .await;
+        assert_eq!(
+            transitions.first(),
+            Some(&reachability::BackendStatus::Starting)
+        );
+        assert!(matches!(
+            transitions.last(),
+            Some(reachability::BackendStatus::Failed(_))
+        ));
+        assert_eq!(transitions.last().unwrap().code_hash(), None);
+        assert!(
+            matches!(outcome, Err(reachability::ReachabilityError::Backend(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            effect.0.lock().unwrap().create_calls,
+            0,
+            "no native retarget replay"
+        );
+    }
 }
 
 /// Ask the node's plane to swap its backend and await the plane's answer.
@@ -3274,4 +3299,99 @@ async fn a_refused_swap_leaves_the_current_machine_in_place() {
             assert_eq!(fake.applied.len(), 2);
         })
         .await;
+}
+
+/// A component fixture with a distinguishable protocol effect. Its snapshot
+/// is opaque to the executor; both revisions intentionally accept that state.
+fn observable_guest(marker: &str) -> NetstackBackend {
+    let step = netstack_machine::wire::encode_step(&Ok(vec![netstack_machine::Effect::Observe(
+        ReachabilityEvent::PersistFailed {
+            reason: marker.into(),
+        },
+    )]));
+    let data: String = step.iter().map(|byte| format!("\\{byte:02x}")).collect();
+    let length = format!("\\{:02x}", step.len());
+    let component = wat::parse_str(format!(r#"(component
+      (core module $m
+        (memory (export "memory") 1)
+        (global $heap (mut i32) (i32.const 4096))
+        (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+          (local $p i32)
+          global.get $heap local.set $p
+          global.get $heap local.get 3 i32.add global.set $heap
+          local.get $p)
+        (data (i32.const 64) "\00\00\00\00\80\00\00\00{length}\00\00\00")
+        (data (i32.const 128) "{data}")
+        (func (export "configure") (param i32 i32) (result i32) i32.const 0)
+        (func (export "restore") (param i32 i32 i32 i32) (result i32) i32.const 0)
+        (func (export "step") (param i32 i32 i64) (result i32) i32.const 64)
+        (func (export "snapshot") (result i32) i32.const 64))
+      (core instance $i (instantiate $m))
+      (func (export "configure") (param "config" (list u8)) (result (result (error string)))
+        (canon lift (core func $i "configure") (memory $i "memory") (realloc (func $i "realloc"))))
+      (func (export "restore") (param "config" (list u8)) (param "snapshot" (list u8)) (result (result (error string)))
+        (canon lift (core func $i "restore") (memory $i "memory") (realloc (func $i "realloc"))))
+      (func (export "step") (param "event" (list u8)) (param "now-ms" u64) (result (result (list u8) (error string)))
+        (canon lift (core func $i "step") (memory $i "memory") (realloc (func $i "realloc"))))
+      (func (export "snapshot") (result (result (list u8) (error string)))
+        (canon lift (core func $i "snapshot") (memory $i "memory") (realloc (func $i "realloc")))))"#,
+        length = length,
+    )).unwrap();
+    NetstackBackend::Guest {
+        component,
+        step_fuel: reachability::NETSTACK_STEP_FUEL,
+    }
+}
+
+#[tokio::test]
+async fn replacing_wasm_changes_executed_effects_and_reports_actual_code() {
+    use reachability::BackendStatus;
+    let dir = tempfile::tempdir().unwrap();
+    let policy = PortPolicy::production();
+    let config = ReachabilityConfig {
+        chain_id: CHAIN.into(),
+        signer: PrivateKey::from_seed(1),
+        wireguard_key_file: dir.path().join("wg.key"),
+        wireguard_port: 51820,
+        wireguard_advertised: Some(endpoint(&policy, 10, 51820, Transport::Udp)),
+        control_endpoint: endpoint(&policy, 10, 443, Transport::Tcp),
+        coordinators: vec![],
+        port_policy: policy,
+        persist_file: None,
+        gossip_ingress: None,
+        backend: observable_guest("first"),
+    };
+    let (commands, receiver) = mpsc::channel(8);
+    let (events, mut received) = mpsc::channel(8);
+    let (status, mut statuses) = mpsc::unbounded_channel();
+    let local = LocalSet::new();
+    local.run_until(async {
+        let running = tokio::task::spawn_local(reachability::run_observed(
+            config, SharedFake::default(), StaticResolver::default(), receiver, events,
+            move |value| { status.send(value).unwrap(); },
+        ));
+        assert_eq!(statuses.recv().await.unwrap(), BackendStatus::Starting);
+        let first = statuses.recv().await.unwrap();
+        assert!(first.code_hash().is_some());
+        commands.send(ReachabilityCommand::Nudge).await.unwrap();
+        assert!(matches!(received.recv().await.unwrap(), ReachabilityEvent::PersistFailed { reason } if reason == "first"));
+
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        commands.send(ReachabilityCommand::SwapBackend { backend: observable_guest("second"), reply: SwapReply(reply) }).await.unwrap();
+        answer.await.unwrap().unwrap();
+        let second = statuses.recv().await.unwrap();
+        assert_ne!(first.code_hash(), second.code_hash());
+        commands.send(ReachabilityCommand::Nudge).await.unwrap();
+        assert!(matches!(received.recv().await.unwrap(), ReachabilityEvent::PersistFailed { reason } if reason == "second"));
+
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        commands.send(ReachabilityCommand::SwapBackend { backend: NetstackBackend::Guest { component: vec![], step_fuel: 1 }, reply: SwapReply(reply) }).await.unwrap();
+        assert!(answer.await.unwrap().is_err());
+        assert!(statuses.try_recv().is_err(), "a refused candidate never becomes running");
+        commands.send(ReachabilityCommand::Nudge).await.unwrap();
+        assert!(matches!(received.recv().await.unwrap(), ReachabilityEvent::PersistFailed { reason } if reason == "second"));
+        commands.send(ReachabilityCommand::Shutdown).await.unwrap();
+        running.await.unwrap().unwrap();
+        assert_eq!(statuses.recv().await.unwrap(), BackendStatus::Stopped);
+    }).await;
 }

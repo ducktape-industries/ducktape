@@ -21,12 +21,12 @@
 //! all.
 //!
 //! whichever lane materializes it, every run is handed the same TOOL PLANE
-//! ([`run_env`] + [`tool_path_entries`]): the bin dir of the running binary on
-//! `PATH` (where `ducktape mcp` ships), the node's http base as `DUCKTAPE_NODE`,
-//! and its agent id as `DUCKTAPE_RUN_AGENT`. that is enough for the MCP server
-//! — which the runner CLI spawns OUTSIDE the agent's sandbox — to find the node
-//! and know who it acts for; the record itself is never in the env (see
-//! [`run_env`]).
+//! ([`run_env`]): the node's http base as `DUCKTAPE_NODE`, its agent id as
+//! `DUCKTAPE_RUN_AGENT`, and the run-scoped action endpoint. Those are read by
+//! the HOST — the run's node lane serves the MCP catalog itself
+//! (`provider_host::MCP_PATH`) under the identity that lane belongs to — so no
+//! ducktape binary and no write token ever cross into the run. the agent's
+//! record itself is never in the env either (see [`run_env`]).
 //!
 //! D7 (isolation floor): the per-run dir is minted under [`agent_runs_root`],
 //! a root VALIDATED at boot to be OUTSIDE `<storage>` — so a `..` from a
@@ -42,13 +42,14 @@ use compute_service::{
     assemble_context_doc, parse_skill_md,
 };
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
-use runs::is_skill_mount_name;
+use runs_wire::is_skill_mount_name;
 
 use crate::node_link::NodeLink;
 use provider_host::OperatorCredential;
 
 mod duckfs;
 mod forge;
+mod forge_publication;
 mod session;
 
 /// Serve `handle`'s own `/v1` router on loopback and return a [`NodeLink`] to
@@ -94,8 +95,6 @@ pub(crate) async fn test_link(handle: crate::NodeHandle) -> NodeLink {
         None => link,
     }
 }
-
-pub use forge::forge_push_base;
 
 #[cfg(test)]
 #[path = "agent_provision/plane_tests.rs"]
@@ -191,12 +190,12 @@ fn run_slug(run_id: &str) -> String {
 }
 
 /// a W6 skill mount subpath is consensus-supplied data used as ONE host
-/// directory name — never a path. `runs::validate_skills` now enforces this
+/// directory name — never a path. `runs_wire::validate_skills` now enforces this
 /// exact shape at consensus time too, so a bad name is refused before it is
 /// ever committed; this call stays as the trust boundary of last resort (an
 /// older committed record, or a bug in the consensus-side check, must not
 /// let a `..` or `a/b` name escape the ro root). ONE predicate,
-/// [`runs::is_skill_mount_name`], gates both sides so they cannot drift.
+/// [`runs_wire::is_skill_mount_name`], gates both sides so they cannot drift.
 fn mount_dir_name(subpath: &str) -> Result<(), String> {
     if is_skill_mount_name(subpath) {
         Ok(())
@@ -212,9 +211,8 @@ fn mount_dir_name(subpath: &str) -> Result<(), String> {
 /// address, with a wildcard bind rewritten to the SAME family's loopback
 /// (`0.0.0.0` → `127.0.0.1`, `[::]` → `[::1]` — a bindv6only `[::]` listener
 /// refuses v4 loopback dials). the base must be a CONNECTABLE host: a run's
-/// tool plane dials it back (`DUCKTAPE_NODE`), and the forge lane pushes to it
-/// ([`forge_push_base`] is exactly this base plus `/forge`). `None` in = no
-/// http surface = nothing to dial.
+/// tool plane dials it back (`DUCKTAPE_NODE`), as does module publication.
+/// `None` means there is no HTTP surface to dial.
 pub fn node_http_base(http_listen: Option<&str>) -> Option<String> {
     let listen = http_listen?;
     let base = match listen.parse::<std::net::SocketAddr>() {
@@ -227,22 +225,6 @@ pub fn node_http_base(http_listen: Option<&str>) -> Option<String> {
         Err(_) => listen.to_string(),
     };
     Some(format!("http://{base}"))
-}
-
-/// the tool plane's PATH entry: the directory holding the CURRENTLY-RUNNING
-/// binary. `ducktape mcp` ships beside `noded`/`node`, and the runner CLI
-/// (codex/claude) spawns the MCP server by bare command name. The sandbox
-/// stages its commands as a read-only guest asset and translates this PATH entry.
-///
-/// a failing `current_exe` (an exotic platform, a deleted/replaced binary)
-/// degrades to NO entry rather than failing the run: the agent still runs,
-/// just without the tool plane. never the other way round.
-fn tool_path_entries() -> Vec<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        .into_iter()
-        .collect()
 }
 
 /// the run child's environment, shared by both lanes: where its writable tree
@@ -455,28 +437,20 @@ impl NodedProvisioner {
         self
     }
 
-    /// configure the forge worktree lane: `push_base` is the loopback
-    /// smart-HTTP base URL ([`forge_push_base`] derives it from the node's
-    /// http listen address; `None` = this node serves no http surface) and
-    /// `committer_name` is this node's stable identity — the COMMITTER on
-    /// every run commit (D2: author is the agent, committer is the node).
-    /// the repo base is read off the link's forge repo (the same base the
-    /// forge module materializes into). host `git` is probed ONCE here —
-    /// a probe failure makes the lane permanently unavailable, loudly.
-    pub fn with_forge(self, push_base: Option<String>, committer_name: impl Into<String>) -> Self {
-        self.with_forge_probed(push_base, committer_name, forge::probe_host_git)
+    /// Configure local Git materialization and node-authorized module publication.
+    /// Git is probed once before any workspace can be provisioned.
+    pub fn with_forge(self, committer_name: impl Into<String>) -> Self {
+        self.with_forge_probed(committer_name, forge::probe_host_git)
     }
 
     /// [`Self::with_forge`] with the construction-time probe injected — the
     /// seam that lets tests exercise a probe failure without uninstalling git.
     fn with_forge_probed(
         mut self,
-        push_base: Option<String>,
         committer_name: impl Into<String>,
         probe: impl FnOnce() -> Result<(), String>,
     ) -> Self {
-        self.forge =
-            forge::ForgeLane::configure(&self.node, push_base, committer_name.into(), probe);
+        self.forge = forge::ForgeLane::configure(&self.node, committer_name.into(), probe);
         if let Err(reason) = &self.forge {
             tracing::warn!(
                 target: "ducktape::saga",
@@ -704,8 +678,8 @@ mod tests {
 
     #[test]
     fn mount_dir_name_agrees_with_the_consensus_side_predicate() {
-        // `runs::validate_skills` and this provisioner gate the SAME name
-        // shape through ONE function (`runs::is_skill_mount_name`) — this
+        // `runs_wire::validate_skills` and this provisioner gate the SAME name
+        // shape through ONE function (`runs_wire::is_skill_mount_name`) — this
         // pins that `mount_dir_name` is nothing but a call into it, so the
         // two can never drift apart again.
         for name in [
@@ -742,6 +716,7 @@ mod tests {
         let spec = WorkspaceSpec {
             run_id: "s1:0".into(),
             agent: Some(compute_service::AgentExecution {
+                native_conversation: None,
                 run_id: "chat\u{1f}general\u{1f}2\u{1f}bot".into(),
                 attempt: 0,
                 agent_id: "bot".into(),

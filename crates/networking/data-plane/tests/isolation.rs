@@ -17,6 +17,11 @@ use data_plane::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Instant, sleep, timeout};
+/// the lane ids a founding network's registry hands out for the declared
+/// lanes these tests exercise. VALUES, not variants: the id is the
+/// registry's to choose, and this is simply what it chose.
+const VOICE_LANE: Service = Service::from_lane_id(2);
+const VIDEO_LANE: Service = Service::from_lane_id(3);
 
 fn peer(n: u8) -> PeerId {
     PeerId([n; 32])
@@ -110,32 +115,24 @@ async fn voice_under_bulk_impl(bulk_ceiling: u64) -> (Duration, usize) {
     let voice_flow = FlowId::derive(b"voice-channel:general");
     let sync_flow = FlowId::derive(b"snapshot:head");
     for p in [a, b] {
-        admission.allow(p, Service::Voice, voice_flow);
-        admission.allow(p, Service::StateSync, sync_flow);
+        admission.allow(p, VOICE_LANE, voice_flow);
+        admission.allow(p, Service::STATE_SYNC, sync_flow);
     }
 
     let plane_a = DataPlane::new(a_end, admission.clone(), config(bulk_ceiling));
     let plane_b = DataPlane::new(b_end, admission.clone(), config(bulk_ceiling));
 
     let voice_a = plane_a
-        .datagram_flow(
-            Service::Voice,
-            voice_flow,
-            DatagramPolicy { max_queued: 256 },
-        )
+        .datagram_flow(VOICE_LANE, voice_flow, DatagramPolicy { max_queued: 256 })
         .unwrap();
     let voice_b = plane_b
-        .datagram_flow(
-            Service::Voice,
-            voice_flow,
-            DatagramPolicy { max_queued: 256 },
-        )
+        .datagram_flow(VOICE_LANE, voice_flow, DatagramPolicy { max_queued: 256 })
         .unwrap();
     let sync_a = plane_a
-        .stream_service(Service::StateSync, StreamPolicy { accept_backlog: 4 })
+        .stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 4 })
         .unwrap();
     let sync_b = plane_b
-        .stream_service(Service::StateSync, StreamPolicy { accept_backlog: 4 })
+        .stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 4 })
         .unwrap();
 
     let bulk_reader = tokio::spawn(async move {
@@ -206,24 +203,24 @@ async fn overflowing_flow_drops_only_itself() {
     let hot = FlowId::derive(b"voice-channel:hot");
     let calm = FlowId::derive(b"voice-channel:calm");
     for p in [a, b] {
-        admission.allow(p, Service::Voice, hot);
-        admission.allow(p, Service::Voice, calm);
+        admission.allow(p, VOICE_LANE, hot);
+        admission.allow(p, VOICE_LANE, calm);
     }
 
     let plane_a = DataPlane::new(a_end, admission.clone(), config(600_000));
     let plane_b = DataPlane::new(b_end, admission.clone(), config(600_000));
 
     let hot_a = plane_a
-        .datagram_flow(Service::Voice, hot, DatagramPolicy { max_queued: 8 })
+        .datagram_flow(VOICE_LANE, hot, DatagramPolicy { max_queued: 8 })
         .unwrap();
     let calm_a = plane_a
-        .datagram_flow(Service::Voice, calm, DatagramPolicy { max_queued: 8 })
+        .datagram_flow(VOICE_LANE, calm, DatagramPolicy { max_queued: 8 })
         .unwrap();
     let hot_b = plane_b
-        .datagram_flow(Service::Voice, hot, DatagramPolicy { max_queued: 8 })
+        .datagram_flow(VOICE_LANE, hot, DatagramPolicy { max_queued: 8 })
         .unwrap();
     let calm_b = plane_b
-        .datagram_flow(Service::Voice, calm, DatagramPolicy { max_queued: 64 })
+        .datagram_flow(VOICE_LANE, calm, DatagramPolicy { max_queued: 64 })
         .unwrap();
 
     // Nobody drains B's queues while A floods the hot flow and drips the
@@ -264,20 +261,20 @@ async fn one_sender_burst_never_evicts_another_senders_frame() {
     let net = SimNet::new();
     let admission = Arc::new(TestAdmission::default());
     let flow = FlowId::derive(b"video-channel:huddle");
-    admission.allow(hub, Service::Video, flow);
+    admission.allow(hub, VIDEO_LANE, flow);
     for sender in &senders {
         net.set_link(*sender, hub, LINK);
-        admission.allow(*sender, Service::Video, flow);
+        admission.allow(*sender, VIDEO_LANE, flow);
     }
 
     let hub_flow = DataPlane::new(net.endpoint(hub), admission.clone(), config(600_000))
-        .datagram_flow(Service::Video, flow, DatagramPolicy { max_queued: 256 })
+        .datagram_flow(VIDEO_LANE, flow, DatagramPolicy { max_queued: 256 })
         .unwrap();
     let sender_flows: Vec<_> = senders
         .iter()
         .map(|sender| {
             DataPlane::new(net.endpoint(*sender), admission.clone(), config(600_000))
-                .datagram_flow(Service::Video, flow, DatagramPolicy { max_queued: 256 })
+                .datagram_flow(VIDEO_LANE, flow, DatagramPolicy { max_queued: 256 })
                 .unwrap()
         })
         .collect();
@@ -322,22 +319,22 @@ async fn rogue_traffic_never_reaches_consumers() {
     // with a live link but NO consensus standing for it.
     let admission = Arc::new(TestAdmission::default());
     let flow = FlowId::derive(b"voice-channel:general");
-    admission.allow(a, Service::Voice, flow);
-    admission.allow(b, Service::Voice, flow);
+    admission.allow(a, VOICE_LANE, flow);
+    admission.allow(b, VOICE_LANE, flow);
 
     let plane_b = DataPlane::new(b_end, admission.clone(), config(600_000));
     let voice_b = plane_b
-        .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
+        .datagram_flow(VOICE_LANE, flow, DatagramPolicy { max_queued: 64 })
         .unwrap();
     let sync_b = plane_b
-        .stream_service(Service::StateSync, StreamPolicy { accept_backlog: 4 })
+        .stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 4 })
         .unwrap();
 
     // The rogue node bypasses its own plane (byzantine software) and writes
     // raw frames at B's transport.
     use data_plane::DataPlaneTransport;
     for _ in 0..25 {
-        let frame = data_plane::wire::encode_datagram(Service::Voice, flow, b"rogue").unwrap();
+        let frame = data_plane::wire::encode_datagram(VOICE_LANE, flow, b"rogue").unwrap();
         rogue_end.send_datagram(b, frame).await.unwrap();
     }
     // A rogue stream too: hello for a flow it has no standing on.
@@ -345,7 +342,7 @@ async fn rogue_traffic_never_reaches_consumers() {
     data_plane::wire::write_hello(
         &mut stream,
         &data_plane::wire::Hello {
-            service: Service::Voice,
+            service: VOICE_LANE,
             flow,
             intent: 0,
             meta: Vec::new(),
@@ -385,16 +382,16 @@ async fn admission_revocation_cuts_a_live_flow() {
 
     let admission = Arc::new(TestAdmission::default());
     let flow = FlowId::derive(b"voice-channel:general");
-    admission.allow(a, Service::Voice, flow);
-    admission.allow(b, Service::Voice, flow);
+    admission.allow(a, VOICE_LANE, flow);
+    admission.allow(b, VOICE_LANE, flow);
 
     let plane_a = DataPlane::new(a_end, admission.clone(), config(600_000));
     let plane_b = DataPlane::new(b_end, admission.clone(), config(600_000));
     let voice_a = plane_a
-        .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
+        .datagram_flow(VOICE_LANE, flow, DatagramPolicy { max_queued: 64 })
         .unwrap();
     let voice_b = plane_b
-        .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
+        .datagram_flow(VOICE_LANE, flow, DatagramPolicy { max_queued: 64 })
         .unwrap();
 
     for _ in 0..10 {
@@ -407,7 +404,7 @@ async fn admission_revocation_cuts_a_live_flow() {
 
     // Membership change lands (e.g. A kicked from the channel): B's view of
     // A goes first — A keeps emitting but B now drops it as rogue.
-    admission.revoke(a, Service::Voice, flow);
+    admission.revoke(a, VOICE_LANE, flow);
     for _ in 0..10 {
         voice_a.send_to(b, b"stale").await.unwrap();
     }
@@ -420,7 +417,7 @@ async fn admission_revocation_cuts_a_live_flow() {
     assert_eq!(plane_b.rogue_from(a), 10);
 
     // Once A's own view catches up (B revoked), A refuses to emit at all.
-    admission.revoke(b, Service::Voice, flow);
+    admission.revoke(b, VOICE_LANE, flow);
     let refused = voice_a.send_to(b, b"post-revocation").await;
     assert!(matches!(refused, Err(SendError::NotAdmitted)));
     assert_eq!(plane_a.stats().refused_sends, 1);
@@ -435,13 +432,13 @@ async fn unregistered_flow_flood_is_counted_and_bounded() {
 
     let admission = Arc::new(TestAdmission::default());
     let flow = FlowId::derive(b"voice-channel:nobody-home");
-    admission.allow(a, Service::Voice, flow);
-    admission.allow(b, Service::Voice, flow);
+    admission.allow(a, VOICE_LANE, flow);
+    admission.allow(b, VOICE_LANE, flow);
 
     let plane_a = DataPlane::new(a_end, admission.clone(), config(600_000));
     let plane_b = DataPlane::new(b_end, admission.clone(), config(600_000));
     let voice_a = plane_a
-        .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
+        .datagram_flow(VOICE_LANE, flow, DatagramPolicy { max_queued: 64 })
         .unwrap();
 
     // Admitted traffic, but B never registered a consumer: dropped at
@@ -455,7 +452,7 @@ async fn unregistered_flow_flood_is_counted_and_bounded() {
 
     // A consumer registering NOW starts clean — no replay of the flood.
     let voice_b = plane_b
-        .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
+        .datagram_flow(VOICE_LANE, flow, DatagramPolicy { max_queued: 64 })
         .unwrap();
     assert!(
         timeout(Duration::from_millis(50), voice_b.recv())
@@ -483,17 +480,17 @@ async fn bulk_holds_its_ceiling() {
 
     let admission = Arc::new(TestAdmission::default());
     let flow = FlowId::derive(b"snapshot:head");
-    admission.allow(a, Service::StateSync, flow);
-    admission.allow(b, Service::StateSync, flow);
+    admission.allow(a, Service::STATE_SYNC, flow);
+    admission.allow(b, Service::STATE_SYNC, flow);
 
     const CEILING: u64 = 500_000;
     let plane_a = DataPlane::new(a_end, admission.clone(), config(CEILING));
     let plane_b = DataPlane::new(b_end, admission.clone(), config(CEILING));
     let sync_a = plane_a
-        .stream_service(Service::StateSync, StreamPolicy { accept_backlog: 4 })
+        .stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 4 })
         .unwrap();
     let sync_b = plane_b
-        .stream_service(Service::StateSync, StreamPolicy { accept_backlog: 4 })
+        .stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 4 })
         .unwrap();
 
     let reader = tokio::spawn(async move {

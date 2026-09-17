@@ -184,8 +184,8 @@ fn open_log_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
 }
 
 /// a panic in a spawned task kills THAT TASK ONLY: the node stays "up" while one
-/// plane goes dark forever. the reachability plane, the voice hub and the overlay
-/// stack each own a thread, so this is not hypothetical.
+/// plane goes dark forever. the reachability plane, the presence hub and the
+/// overlay stack each own a thread, so this is not hypothetical.
 ///
 /// chain, don't replace — the default hook keeps the backtrace on stderr.
 fn install_panic_hook() {
@@ -271,22 +271,6 @@ impl ModuleNotes {
             );
         }
     }
-}
-
-/// the snake_case `reason` behind a refusal that arrived as prose. a module
-/// rejection or a parser error is a sentence (the client prints it); a reason
-/// is a token (a dashboard counts it) — so a plane that bridges the two keeps
-/// ONE ordered table and looks the sentence up here. first match wins: list
-/// the specific needle ahead of the general one.
-pub(crate) fn reason_of(
-    message: &str,
-    table: &[(&str, &'static str)],
-    fallback: &'static str,
-) -> &'static str {
-    table
-        .iter()
-        .find(|(needle, _)| message.contains(*needle))
-        .map_or(fallback, |(_, reason)| *reason)
 }
 
 /// a first-and-every-Nth latch for a failure that REPEATS on a retry loop.
@@ -399,7 +383,7 @@ fn stuck_saga(height: u64, source: &str, bytes: usize, pending_blocks: u64) {
     }
 }
 
-/// a module payload is arbitrary bytes from a WASM guest, and `runs::note()`
+/// a module payload is arbitrary bytes from a WASM guest, and `runs_wire::note()`
 /// embeds free-form provider/LLM text. cap it and strip control characters before
 /// it reaches a terminal — and the webview, which the ring is streamed to.
 fn sanitize(payload: &[u8]) -> String {

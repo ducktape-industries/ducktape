@@ -16,7 +16,6 @@ pub const GATEWAY_CREDENTIAL_NS: &[u8] = b"ducktape-gateway-credential-v1";
 pub const GATEWAY_CALLER_NS: &[u8] = b"ducktape-gateway-caller-v1";
 pub const MAX_CREDENTIAL_NAME_BYTES: usize = 64;
 pub const MAX_CREDENTIAL_GRANTS: usize = 64;
-pub const SEAL_PK_BYTES: usize = 32;
 pub const MAX_CHAIN_ID_BYTES: usize = 256;
 pub const NODE_KEY_BYTES: usize = 32;
 /// The largest public key any [`identity::KeyScheme`] carries (SEC1
@@ -28,15 +27,10 @@ pub const MAX_SIGNATURE_BYTES: usize = 2048;
 pub const MAX_ROUTE_LABEL_BYTES: usize = 63;
 pub const MAX_ROUTES_PER_ACCOUNT: usize = 64;
 pub const MAX_AUDIENCE_ACCOUNTS: usize = 32;
-/// Request-body admission ceiling. 16 MiB: a `claude` turn carries multi-MB
-/// conversation context through airlock's LoopbackHttp lane; per-route signed
-/// policies may pin far lower. Requests stay buffered (one JSON blob).
-pub const MAX_REQUEST_BODY_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_RESPONSE_BODY_BYTES: u64 = 4 * 1024 * 1024;
 /// A statement now carries only scalars plus (at most) a 32-byte manifest hash,
 /// so it is tiny; the manifest and file table live off consensus.
 pub const MAX_ROUTE_STATEMENT_JSON_BYTES: usize = 4 * 1024;
-pub const SHA256_HEX_BYTES: usize = 64;
 
 /// The account apex (`None`) or one DNS-shaped label below it. The account is
 /// carried separately so a route name can never cross authority boundaries.
@@ -144,7 +138,16 @@ pub struct RoutePolicy {
     /// Strictly sorted and unique. Unknown/unsafe HTTP methods do not exist in
     /// the wire enum, and each method must be explicitly signed into policy.
     pub methods: Vec<RouteMethod>,
-    pub max_request_bytes: u64,
+    /// What this route accepts as a request body, counted AS IT STREAMS —
+    /// nothing materializes a body to measure it. `None` is no cap at all:
+    /// a route whose lane is a whole repository's history (a git push) takes
+    /// whatever the client sends, exactly as it would from any other server.
+    /// `Some(0)` is no body at all; `Some(n)` refuses the byte after `n`.
+    ///
+    /// There is deliberately no global ceiling above this. A cap here is a
+    /// publisher's statement about its OWN lane, never the platform's
+    /// statement about how large a request may be.
+    pub max_request_bytes: Option<u64>,
     /// `0` means an unbounded (streaming/SSE) response, permitted only for
     /// `LoopbackHttp`. Content routes must set a real cap.
     pub max_response_bytes: u64,
@@ -241,6 +244,9 @@ pub struct RouteSummary {
 pub enum CredentialKind {
     Claude,
     Codex,
+    /// A Developer ID signing identity + App Store Connect key, lent for
+    /// signing a release rather than for model calls.
+    AppleCodesign,
 }
 
 impl CredentialKind {
@@ -248,6 +254,7 @@ impl CredentialKind {
         match self {
             Self::Claude => 1,
             Self::Codex => 2,
+            Self::AppleCodesign => 3,
         }
     }
 }
@@ -388,25 +395,41 @@ fn grant_op_preimage(op: u8, statement: &CredentialGrantStatement) -> Result<Vec
     Ok(out)
 }
 
-/// The bytes a caller's user key signs under [`GATEWAY_CALLER_NS`] to prove
-/// possession on ONE proxied request: the serving node, the route's account,
-/// the route name, the HTTP method, the origin-form path and a caller
-/// timestamp (the serving side bounds its skew). Every field is framed, so no
-/// two requests share a preimage.
+/// `sha256` of a request body held in one piece. A streaming caller hashes its
+/// frames as they pass instead; both feed the same 32 bytes to
+/// [`caller_pop_preimage`].
+pub fn body_digest(body: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(body).into()
+}
+
+/// The caller signs the publisher and every forwarded request field, including
+/// the route revision, headers, upgrade mode and body digest. The proof itself
+/// is excluded: installing its signature cannot change the signed bytes.
+/// `body_digest` is `sha256` of the request body — never the body itself. The
+/// preimage always covered only the digest, so a caller that streams its body
+/// hashes it as it passes and proves itself afterwards; nothing on this path
+/// needs the bytes in one piece.
 pub fn caller_pop_preimage(
     publisher_node: &[u8],
-    account_id: u64,
-    route: &RouteName,
-    method: RouteMethod,
-    path: &str,
+    head: &crate::ProxyRequestHead,
+    body_digest: &[u8; 32],
     ts: u64,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     push_bytes(&mut out, publisher_node);
-    out.extend_from_slice(&account_id.to_le_bytes());
-    push_opt_str(&mut out, route.label.as_deref());
-    push_bytes(&mut out, method.as_http_str().as_bytes());
-    push_bytes(&mut out, path.as_bytes());
+    out.extend_from_slice(&head.account_id.to_le_bytes());
+    push_opt_str(&mut out, head.name.label.as_deref());
+    out.extend_from_slice(&head.revision.to_le_bytes());
+    push_bytes(&mut out, head.method.as_http_str().as_bytes());
+    push_bytes(&mut out, head.path_and_query.as_bytes());
+    out.extend_from_slice(&(head.headers.len() as u64).to_le_bytes());
+    for header in &head.headers {
+        push_bytes(&mut out, header.name.as_bytes());
+        push_bytes(&mut out, header.value.as_bytes());
+    }
+    out.push(u8::from(head.upgrade));
+    out.extend_from_slice(body_digest);
     out.extend_from_slice(&ts.to_le_bytes());
     out
 }
@@ -605,7 +628,7 @@ pub fn validate_route(route: &RouteDefinition) -> Result<(), String> {
             // not here. Content stays GET+HEAD, bodyless, no auth, no upgrade,
             // and must set a real (non-streaming) response cap.
             if route.policy.methods != [RouteMethod::Get, RouteMethod::Head]
-                || route.policy.max_request_bytes != 0
+                || route.policy.max_request_bytes != Some(0)
                 || route.policy.allow_authorization
                 || route.policy.allow_upgrade
                 || route.policy.max_response_bytes == 0
@@ -633,16 +656,15 @@ pub fn validate_policy(policy: &RoutePolicy) -> Result<(), String> {
         }
         previous = Some(method);
     }
-    if policy.max_request_bytes > MAX_REQUEST_BODY_BYTES {
-        return Err(format!(
-            "gateway: request body cap exceeds {MAX_REQUEST_BODY_BYTES} bytes"
-        ));
-    }
     // `max_response_bytes == 0` means an unbounded stream (SSE); a non-zero
     // value is a publisher-chosen cap the serving side counts against. Real
-    // byte ceilings are enforced at serve time, not signed into consensus.
-    if policy.methods.iter().any(|method| method.permits_body()) && policy.max_request_bytes == 0 {
-        return Err("gateway: a body-bearing method requires a non-zero request cap".into());
+    // byte ceilings are enforced at serve time, not signed into consensus —
+    // which is also why `max_request_bytes` has no ceiling to check here: a
+    // request body is counted as it streams, so a cap bounds what this route
+    // accepts and nothing bounds what the transport can carry.
+    let forbids_a_body = policy.max_request_bytes == Some(0);
+    if policy.methods.iter().any(|method| method.permits_body()) && forbids_a_body {
+        return Err("gateway: a body-bearing method may not pin a zero request cap".into());
     }
     match &policy.audience {
         RouteAudience::Owner | RouteAudience::Network => {}
@@ -722,7 +744,15 @@ fn encode_policy(out: &mut Vec<u8>, policy: &RoutePolicy) {
             RouteMethod::Delete => 6,
         });
     }
-    out.extend_from_slice(&policy.max_request_bytes.to_le_bytes());
+    // an absent cap and a cap of any value must never sign the same bytes, so
+    // the tag goes in ahead of the number.
+    match policy.max_request_bytes {
+        None => out.push(0),
+        Some(cap) => {
+            out.push(1);
+            out.extend_from_slice(&cap.to_le_bytes());
+        }
+    }
     out.extend_from_slice(&policy.max_response_bytes.to_le_bytes());
     out.push(u8::from(policy.allow_authorization));
     out.push(u8::from(policy.allow_upgrade));

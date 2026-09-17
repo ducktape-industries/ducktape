@@ -125,11 +125,13 @@ pub(crate) struct RpcStatus {
     pub(crate) height: Option<u64>,
     pub(crate) root_hash: String,
     pub(crate) modules: std::collections::BTreeMap<String, String>,
-    /// which netstack backend the reachability plane runs on and how the last
-    /// swap went — the same projection `/v1/status` carries under
-    /// `operations.netstack`. Absent on a node with no plane.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) netstack: Option<noded::NetstackOperationalStatus>,
+    /// the WHOLE operations projection `/v1/status` serves, not a chosen slice
+    /// of it. `node status` is the verb the getting-started screen points an
+    /// operator at, and a slice is what let it print two numbers that are
+    /// identical on a healthy chain and a halted one. The node computes this
+    /// either way; carrying all of it costs one clone and leaves nothing for
+    /// the next question to have to re-plumb.
+    pub(crate) operations: noded::OperationalStatus,
 }
 
 impl RpcReply {
@@ -158,7 +160,17 @@ impl RpcReply {
 }
 
 /// a parsed request plus the blocking thread's reply slot.
-pub(crate) type RpcJob = (RpcRequest, std::sync::mpsc::Sender<RpcReply>);
+pub(crate) struct RpcJob {
+    pub(crate) req: RpcRequest,
+    pub(crate) reply: std::sync::mpsc::Sender<RpcReply>,
+    /// resolves once the connection thread has WRITTEN this job's reply to the
+    /// socket — `reply.send` only hands it over. The shutdown arm waits on this
+    /// before `process::exit`, or the exit races the write and the caller sees
+    /// its connection close with no reply line. It also resolves (as an `Err`)
+    /// when the connection thread is gone, so a dead client cannot park the
+    /// exit.
+    pub(crate) written: futures::channel::oneshot::Receiver<()>,
+}
 
 /// serve json-lines rpc on `listener`, one OS thread per connection (local,
 /// low-volume — an operator console, a script). each line becomes an [`RpcJob`]
@@ -182,10 +194,20 @@ pub(crate) fn spawn_rpc_listener(
                     if line.trim().is_empty() {
                         continue;
                     }
+                    // handed to the pump with the job and signalled after the
+                    // write below: a shutdown must not exit before that.
+                    let (written, written_rx) = futures::channel::oneshot::channel();
                     let reply = match serde_json::from_str::<RpcRequest>(&line) {
                         Ok(req) => {
                             let (tx, rx) = std::sync::mpsc::channel();
-                            if bridge.try_send((req, tx)).is_err() {
+                            if bridge
+                                .try_send(RpcJob {
+                                    req,
+                                    reply: tx,
+                                    written: written_rx,
+                                })
+                                .is_err()
+                            {
                                 RpcReply::err("node busy (rpc queue full)")
                             } else {
                                 // the pump answers within a tick; a stuck node
@@ -201,8 +223,51 @@ pub(crate) fn spawn_rpc_listener(
                     if conn.write_all(out.as_bytes()).is_err() {
                         break;
                     }
+                    let _ = written.send(());
                 }
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt as _;
+    use std::io::{Read as _, Write as _};
+
+    /// The shutdown arm exits the process the moment `written` resolves, so
+    /// that signal has to mean "the reply is on the socket" and not "the reply
+    /// is queued for the connection thread" — the race this pins cost a
+    /// `connection closed before a reply line` on the caller.
+    #[test]
+    fn a_job_reports_written_only_after_the_reply_reaches_the_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rpc listener");
+        let addr = listener.local_addr().expect("listener address");
+        let (jobs, mut pump) = futures::channel::mpsc::channel(1);
+        spawn_rpc_listener(listener, jobs);
+
+        let mut client = std::net::TcpStream::connect(addr).expect("dial the rpc listener");
+        client
+            .write_all(b"{\"cmd\":\"shutdown\"}\n")
+            .expect("send the request");
+
+        let job = futures::executor::block_on(pump.next()).expect("the listener pushed the job");
+        assert!(matches!(job.req, RpcRequest::Shutdown));
+        job.reply
+            .send(RpcReply::ok())
+            .expect("the conn thread waits");
+        futures::executor::block_on(job.written).expect("the conn thread reports the write");
+
+        // where the pump would call `process::exit`: the line is already
+        // readable, with nothing left to wait for.
+        client.set_nonblocking(true).expect("nonblocking client");
+        let mut buf = [0u8; 128];
+        let read = client
+            .read(&mut buf)
+            .expect("the reply is already on the socket");
+        let reply: serde_json::Value =
+            serde_json::from_slice(&buf[..read]).expect("one json reply line");
+        assert_eq!(reply["ok"], serde_json::Value::Bool(true));
+    }
 }

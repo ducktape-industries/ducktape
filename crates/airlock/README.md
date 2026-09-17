@@ -34,6 +34,30 @@ cannot read the credential out of it.
   record; `inspect` (pin an enclave's measurement) and `seal` (verify the quote,
   then seal + upload the credential) are the enclave half.
 
+## Pi harness
+
+Pi can use either existing credential kind; it is not a third credential kind.
+Install its standalone Linux bundle, then select Pi explicitly:
+
+```sh
+ducktape agent install pi -n <chain-id>
+ducktape agent pty pi --account <account> --route <label> \
+  --cred <credential-name> -n <chain-id>
+```
+
+`--account`/`--route` name the installed `ducktape-terminal` application that
+serves the session (see `docs/deploy/application-service.md`); the node reaches
+it through its signed gateway route and spawns no pty of its own. Interactive
+Pi sessions are solo-only: shared command-driven sessions are refused because
+Pi's tool allowlist does not restrict its interactive shell. The same `pi`
+capability works for scheduled runs. A Claude credential selects
+Pi's Anthropic provider; a Codex credential selects its OpenAI Codex provider.
+Without `--cred`, Pi uses the host Anthropic credential path. Real credentials
+stay behind the broker/airlock: the guest receives only a run-scoped capability,
+a fresh `PI_CODING_AGENT_DIR`, and a loopback model endpoint. Pi uses SSE through
+the broker; its headless Ducktape tools use a staged MCP extension, not a host
+Pi configuration or installed plugin set.
+
 ## Two topologies
 
 | topology | when | broker/cred flags |
@@ -109,6 +133,18 @@ ducktape gateway bind --workspace <node-workspace> --label airlock --port 9100
 # node RPC (cmd:submit, target:"gateway"). Also SetHandle <handle> on duckdns.
 ```
 
+A model credential sealed this way is reached by measurement (the compute
+node pins `DUCKTAPE_AIRLOCK_MEASUREMENT`, below), so `cred seal` registers no
+record for it. An `apple-codesign` identity is reached by NAME (`ducktape
+release sign-bundle --credential <name>`), so `cred seal --vendor
+apple-codesign` also writes the on-chain half: the credential record under the
+attested seal key and the account's two airlock routes, both naming the node
+the verb dials as their publisher (its identity and chain read off
+`/v1/status`) — see "Release signing" below. The quote's roots are AMD's
+pinned in the binary; `--snp-ark <pem> --snp-ask <pem>` (with `--snp-vcek`)
+supply a chain out of band for an enclave that is not on AMD silicon, which
+weakens only the operator who passes it.
+
 `cred inspect`/`cred seal` reach a REMOTE enclave with `--remote <handle>.duck`
 instead of `--host`; the `via` is read from this node's own browser gateway, so
 the operator never pastes it. Attestation stays strictly bilateral either way —
@@ -137,8 +173,12 @@ so a relaying node cannot substitute its key or read the session token. The
 overlay proxy **streams** responses end to end: publish the route with
 `max_response_bytes: 0` (an unbounded stream, literally) for live SSE; a
 non-zero cap is enforced as a RUNNING total (declared over-length refused
-before the head; unsized overflow truncates the body mid-stream). The
-request-body admission ceiling is 16 MiB.
+before the head; unsized overflow truncates the body mid-stream). A request
+body is counted at every hop against the route's own signed
+`max_request_bytes`: the `airlock` route pins 16 MiB (a model turn), the
+`airlock-sign` route 256 MiB (a release bundle). Nothing above a route pins a
+ceiling over it — a policy may also decline to cap its body at all (`null`),
+which is what a lane that never holds a request declares.
 
 ## Body AEAD (sealed sessions)
 
@@ -173,7 +213,7 @@ the token.
 
 ## Credential the gateway holds
 
-`ducktape user cred seal` uploads one of two sealed credentials
+`ducktape user cred seal` uploads one of three sealed credentials
 (`CredentialPayload`):
 
 - **`Refresh`** — an OAuth refresh token; the gateway exchanges it for an access
@@ -182,6 +222,79 @@ the token.
   `seal --credentials <file> --cred-kind bearer` seals a live subscription's
   *current* access token without invalidating the token chain its owner is still
   using — the safe way to point a run at a real credential.
+- **`AppleCodesign`** (kind `apple-codesign`) — a Developer ID Application
+  signing identity: the certificate + key as PKCS#12 with its password, the App
+  Store Connect key as the JSON `rcodesign encode-app-store-connect-api-key`
+  writes, and the Team ID. Not a model credential: a session on it is refused
+  on `/v1/*` with `credential_kind_mismatch`. The gateway admits it only after
+  `codesign::AppleCodesign::admit` opens the PKCS#12 (PBES1, what Keychain
+  Access exports; `openssl pkcs12 -export -legacy` for the same), finds Apple's
+  Developer ID Application marker extension `1.2.840.113635.100.6.1.13` on the
+  leaf, and matches the leaf's subject OU to `team_id`; refusals are
+  `p12_unparseable`, `not_developer_id_application`, `team_id_mismatch`,
+  `api_key_malformed`. `ducktape user cred add apple-codesign --p12 <id.p12>
+  --p12-password-file <pw> --api-key <key.json> --team-id <TEAMID> [name]` runs
+  the same admission locally, writes the four files 0600 into this node's
+  store (`airlock_service::apple_codesign_files`), and registers the record;
+  `cred seal --vendor apple-codesign` with the same four flags seals it to a
+  TEE gateway. `cred grant` lends it like any other kind.
+
+## Release signing: `POST /sign/macos-bundle`
+
+The enclave gateway signs, notarizes and staples a release bundle with an
+`apple-codesign` credential it holds, so the identity never leaves it
+(`sign.rs`; mounted beside `/v1/{*rest}` only when the gateway was built with
+a `sign::Tools`, which `airlock-gateway` always is — the self-host lender
+mounts no such route). The caller opens a SEALED session (`body_seal: true`,
+`work: Direct`) on the signing credential — standing is the credential's
+grant, exactly as for a model credential — and posts the `.tar.zst` of an
+UNSIGNED `Ducktape.app` as the sealed body (`bodyseal::seal_request` under
+`POST\n/sign/macos-bundle`; cap `sign::MAX_BUNDLE_BYTES`, 256 MiB). The
+reply is the `.tar.zst` of the signed + notarized + stapled bundle as a sealed
+chunk stream (head content type `application/zstd`), and one request spends
+one of the session's `max_requests`. The head is committed BEFORE the
+pipeline runs — every hop between the enclave and the caller (the node's
+gateway proxy, its overlay drain) waits seconds for a response head, and
+Apple's notary takes minutes — and the outcome rides the stream: an empty
+sealed data chunk every `sign::KEEPALIVE_INTERVAL` while the pipeline runs
+(liveness for each hop's idle deadline; the node plane asserts the interval
+sits under its `BODY_IDLE_TIMEOUT`), then the archive and `Final`, or a
+refusal as the `Final` marker carrying its token
+(`bodyseal::StreamSealer::seal_refused`, opened as `OpenedItem::Refused`).
+Over the overlay the route is `airlock-sign.<handle>.duck`: the same
+enclave the model lane reaches under `airlock.<handle>.duck`, under its own
+label because its signed policy admits a bundle (256 MiB) where the model
+lane's admits a turn (16 MiB); the node fronting the enclave binds both labels
+to the same port. Inside, the pipeline is one state machine
+(`Received → Validated → Signed → Notarized → Stapled`): the bundle's shape is
+checked before the identity is touched (one top-level `Ducktape.app/`, no
+escaping path or symlink, `CFBundleIdentifier` `dev.ducktape.app`,
+`Contents/MacOS` exactly `ducktape-launcher`, `ducktape-app`, `views`), then
+the p12, its password and the App Store Connect key are written 0600 into a
+0700 directory under the tmpfs work root for `rcodesign sign
+--code-signature-flags runtime --entitlements-xml-file …` (the launcher and
+the nested `ducktape-app` both, as `ops/bundle-app-macos.sh` does),
+`rcodesign notary-submit --wait` and `rcodesign staple`, and the directory is
+removed on every exit path. Refusals are tokens: before the pipeline starts
+they are the HTTP status and body — `credential_kind_mismatch` (403, a model
+credential), `bundle_too_large` (413), a plaintext session (400); once it
+runs the head is out and the token is the stream's `Final` —
+`bundle_shape_refused`, `codesign_failed`, `notary_rejected`,
+`staple_failed`, `tool_missing` (the image lacks `rcodesign` or the
+entitlements). Audit under `target: "ducktape::airlock"`:
+`release_sign_requested`, `release_sign_signed`, `release_sign_notarized`,
+`release_sign_refused` — session, credential name, bundle SHA-256s, reason,
+submission id; never key material. The toolchain is part of the image, not
+the binary: `ops/airlock-gateway/install-rcodesign.sh` fetches the pinned
+`rcodesign` release and checks its SHA-256, `ops/airlock-gateway/stage-image.sh`
+(`make airlock-gateway-image`) stages it with the binary and
+`app/packaging/entitlements.plist` at the paths `airlock-gateway`'s
+`--rcodesign`/`--entitlements`/`--work-root` default to. `tests/sign_route.rs`
+drives the route end to end with a throwaway Developer-ID-shaped identity and
+the stubbed Apple seam (`sign::Notary::Stub`) — the real `rcodesign sign`, then
+`rcodesign verify` on what came back; it needs `rcodesign` on `PATH` or
+`DUCKTAPE_RCODESIGN` (`make rcodesign`). Notarization itself is only
+exercised against Apple, from the release lane.
 
 ## Per-vendor attestation (`--attest tdx|snp`, gateway also `auto`)
 

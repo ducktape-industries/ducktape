@@ -36,6 +36,10 @@ pub enum OpCmd {
     List,
     /// the running node's tip: height + root hash (reads the local rpc)
     Status(StatusArgs),
+    /// can THIS binary run this workspace? reopens the checkpoint offline and
+    /// recomposes its committed root hash — what a release launcher asks a
+    /// staged binary before it flips. the node must be STOPPED
+    Qualify(SelectorArgs),
     /// the running node's direct peers: connection, traffic, sync heights
     Peers(StatusArgs),
     /// resident standing: the staged-admission tier
@@ -62,7 +66,7 @@ pub enum NetstackCmd {
     Swap(NetstackSwapArgs),
 }
 
-/// `ducktape node netstack swap --native | --component <PATH>` — the operator
+/// `ducktape node netstack swap --component <PATH>` — the operator
 /// client for `POST /v1/admin/netstack/swap`.
 ///
 /// The swap is node-local and epoch-safe: the running machine's snapshot
@@ -72,14 +76,10 @@ pub enum NetstackCmd {
 /// retry, because a component built against another contract is refused by
 /// name every time.
 #[derive(Debug, clap::Args)]
-#[command(group(clap::ArgGroup::new("backend").required(true).args(["native", "component"])))]
 pub struct NetstackSwapArgs {
-    /// run the machine compiled into the node binary
-    #[arg(long)]
-    pub native: bool,
     /// run a `ducktape:netstack` component at this path ON THE NODE's disk
     #[arg(long, value_name = "PATH")]
-    pub component: Option<PathBuf>,
+    pub component: PathBuf,
     #[command(flatten)]
     pub selector: Selector,
 }
@@ -479,12 +479,55 @@ pub fn workspace_for_base(base: &str) -> Result<PathBuf, String> {
     workspace_serving(base)
 }
 
-fn workspace_serving(base: &str) -> Result<PathBuf, String> {
-    let matches = config::list_workspaces()?
+/// The same reverse lookup for the OPERATOR RPC address rather than the http
+/// base — the lane `ducktape node status`, `join state` and the module verbs
+/// dial.
+///
+/// Those verbs hold an `rpc_listen` string and, several helper frames down, no
+/// longer hold the config they read it out of. Rather than thread a directory
+/// through every one of them, the registry answers the same question it
+/// already answers for a url: which workspace is this address?
+pub fn workspace_for_rpc(addr: &str) -> Result<PathBuf, String> {
+    workspace_for_rpc_in(&config::ducktape_home()?, addr)
+}
+
+/// Split from the home lookup for the same reason [`workspace_serving_in`] is:
+/// two workspaces sharing a default `rpc_listen` is the ordinary case, not an
+/// exotic one, and no registry-free test can reach it.
+fn workspace_for_rpc_in(root: &std::path::Path, addr: &str) -> Result<PathBuf, String> {
+    let matches = config::list_workspaces_in(root)?
         .into_iter()
-        .filter_map(|(chain_id, _)| {
-            let (dir, http) = config::resolve_network(&chain_id).ok()?;
-            (trim_base(&http?) == base).then_some((chain_id, dir))
+        .filter_map(|(chain_id, node_toml)| {
+            let dir = node_toml.parent()?.to_path_buf();
+            let listen = config::rpc_listen_in(&dir).ok()?;
+            (listen == addr).then_some((chain_id, dir))
+        })
+        .collect::<Vec<_>>();
+    workspace_of_matches(addr, matches)
+}
+
+fn workspace_serving(base: &str) -> Result<PathBuf, String> {
+    workspace_serving_in(&config::ducktape_home()?, base)
+}
+
+/// Split from the home lookup so a test can lay out two workspaces that share a
+/// chain id — which is what this used to get wrong, and what no registry-free
+/// test could reach.
+fn workspace_serving_in(root: &std::path::Path, base: &str) -> Result<PathBuf, String> {
+    let matches = config::list_workspaces_in(root)?
+        .into_iter()
+        .filter_map(|(chain_id, node_toml)| {
+            // The workspace the registry just handed us, read for its OWN
+            // http_listen. Asking `resolve_network(&chain_id)` instead threw
+            // that path away and searched the home again by chain id — and a
+            // founder and the resident that joined it SHARE one. Both entries
+            // then answered with whichever directory the scan reached first, so
+            // a base exactly one workspace serves came back matched twice and
+            // every --node verb refused, offering `-n <chain-id>` as the way
+            // out when `-n` is the one thing that cannot separate them.
+            let dir = node_toml.parent()?.to_path_buf();
+            let http = config::http_base_in(&dir).ok()?;
+            (trim_base(&http) == base).then_some((chain_id, dir))
         })
         .collect::<Vec<_>>();
     workspace_of_matches(base, matches)
@@ -940,6 +983,153 @@ mod tests {
         // to say what there is to pick from.
         assert!(why.contains("chain-a") && why.contains("chain-b"), "{why}");
         assert!(why.contains("-n"), "{why}");
+    }
+
+    /// A founder and the resident that joined it live in one ducktape home and
+    /// SHARE a chain id, on different ports. Every `--node`-addressed verb
+    /// refused them: the scan threw away the path the registry handed it and
+    /// re-resolved each workspace by chain id, which cannot tell two workspaces
+    /// on one chain apart — so both entries came back as the same directory,
+    /// and a base exactly one of them serves matched twice. `-n <chain-id>`,
+    /// the remedy the refusal offers, cannot separate them either.
+    #[test]
+    fn a_founder_and_its_resident_on_one_chain_each_answer_for_their_own_port() {
+        let home = tempfile::tempdir().expect("temp home");
+        let founder = write_workspace(
+            home.path(),
+            "net",
+            "dognet#d2a0ec8f",
+            "127.0.0.1:32989",
+            "127.0.0.1:36989",
+        );
+        let resident = write_workspace(
+            home.path(),
+            "net-joiner",
+            "dognet#d2a0ec8f",
+            "127.0.0.1:32990",
+            "127.0.0.1:36990",
+        );
+
+        assert_eq!(
+            workspace_serving_in(home.path(), "http://127.0.0.1:32989"),
+            Ok(founder),
+            "the founder's own port did not reach the founder"
+        );
+        assert_eq!(
+            workspace_serving_in(home.path(), "http://127.0.0.1:32990"),
+            Ok(resident),
+            "the resident's own port did not reach the resident"
+        );
+
+        // A base nobody serves is still absent, not ambiguous.
+        let Err(why) = workspace_serving_in(home.path(), "http://127.0.0.1:1") else {
+            panic!("an unserved base resolved to a workspace");
+        };
+        assert!(why.contains("no registered workspace"), "{why}");
+
+        // And the collision the refusal exists for is untouched: two workspaces
+        // that really do serve one base still refuse rather than pick.
+        write_workspace(
+            home.path(),
+            "other",
+            "kitchen#99887766",
+            "127.0.0.1:32989",
+            "127.0.0.1:36991",
+        );
+        let Err(why) = workspace_serving_in(home.path(), "http://127.0.0.1:32989") else {
+            panic!("two workspaces on one base must refuse, not pick the first");
+        };
+        assert!(why.contains("several workspaces serve"), "{why}");
+    }
+
+    /// The same reverse lookup for the OPERATOR RPC lane, which `node status`,
+    /// `join state` and the module verbs dial. They hold an `rpc_listen` and
+    /// never a url, so a refusal that wants to name the launcher supervising
+    /// this node has to reach the workspace from that address instead.
+    #[test]
+    fn the_rpc_lane_reaches_each_workspace_by_its_own_rpc_address() {
+        let home = tempfile::tempdir().expect("temp home");
+        let founder = write_workspace(
+            home.path(),
+            "net",
+            "dognet#d2a0ec8f",
+            "127.0.0.1:32989",
+            "127.0.0.1:36989",
+        );
+        let resident = write_workspace(
+            home.path(),
+            "net-joiner",
+            "dognet#d2a0ec8f",
+            "127.0.0.1:32990",
+            "127.0.0.1:36990",
+        );
+
+        assert_eq!(
+            workspace_for_rpc_in(home.path(), "127.0.0.1:36989"),
+            Ok(founder),
+            "the founder's own rpc port did not reach the founder"
+        );
+        assert_eq!(
+            workspace_for_rpc_in(home.path(), "127.0.0.1:36990"),
+            Ok(resident),
+            "the resident's own rpc port did not reach the resident"
+        );
+
+        let Err(why) = workspace_for_rpc_in(home.path(), "127.0.0.1:1") else {
+            panic!("an unserved rpc address resolved to a workspace");
+        };
+        assert!(why.contains("no registered workspace"), "{why}");
+
+        // Two networks BOTH left on the default `rpc_listen` is the ordinary
+        // case, and it is why the caller falls back to the plain sentence: a
+        // wrong launcher's log is worse than no launcher's.
+        write_workspace(
+            home.path(),
+            "other",
+            "kitchen#99887766",
+            "127.0.0.1:32991",
+            "127.0.0.1:36989",
+        );
+        let Err(why) = workspace_for_rpc_in(home.path(), "127.0.0.1:36989") else {
+            panic!("two workspaces on one rpc address must refuse, not pick the first");
+        };
+        assert!(why.contains("several workspaces serve"), "{why}");
+    }
+
+    /// A workspace on disk, complete enough for the registry to list it and for
+    /// its own `http_listen` and `rpc_listen` to be read back.
+    fn write_workspace(
+        root: &std::path::Path,
+        ws: &str,
+        chain: &str,
+        http: &str,
+        rpc: &str,
+    ) -> PathBuf {
+        let dir = root.join(ws);
+        std::fs::create_dir_all(&dir).expect("mk workspace");
+        config::NetworkDescriptor {
+            chain_id: chain.into(),
+            validators: Vec::new(),
+            bootstrap: Vec::new(),
+            reach: Vec::new(),
+            coordination: None,
+            block_time_ms: config::DEFAULT_BLOCK_TIME_MS,
+            genesis: String::new(),
+            modules: Vec::new(),
+        }
+        .save(&dir.join("network.toml"))
+        .expect("save descriptor");
+        let node_toml = format!(
+            "network = \"network.toml\"\nkey_file = \"identity.key\"\n\
+             listen = \"127.0.0.1:0\"\nadvertised = \"127.0.0.1:9000\"\n\
+             storage_dir = 'storage'\nhttp_listen = \"{http}\"\n\
+             gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"{rpc}\"\n\
+             wireguard_listen = \"0.0.0.0:51820\"\ninvite_listen = \"0.0.0.0:51821\"\n\
+             wireguard_advertised = \"auto\"\nprimary_coordinator = \"none\"\n\
+             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n"
+        );
+        std::fs::write(dir.join("node.toml"), node_toml).expect("write node.toml");
+        dir
     }
 
     /// `--node mynet#d0cdf950` parses, OUTRANKS `-n`, and then dies inside

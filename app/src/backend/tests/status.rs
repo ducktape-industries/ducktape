@@ -1,100 +1,15 @@
 use super::*;
 
 #[test]
-fn a_count_of_one_takes_the_singular_noun() {
-    assert_eq!(plural(1, "agent", "agents"), "1 agent");
-    assert_eq!(plural(0, "agent", "agents"), "0 agents");
-    assert_eq!(plural(2, "agent", "agents"), "2 agents");
-    // the register subtitles that used to read `1 agents` / `1 validators`.
-    assert_eq!(members_summary(true, &[]), "");
-}
-
-/// A SUBTITLE THAT COUNTS NOTHING, OVER A PLATE THAT ALREADY SAID SO. Approvals
-/// read `0 open · 0 settled` directly above "No proposals yet — a membership or
-/// configuration change opens the first one." Both halves of the subtitle were
-/// zero, so it repeated the plate in digits. #996 settled the rule for the
-/// bell's `0 unread` and Channel details' `MEMBERS 0`; these four folds are the
-/// sites it did not reach, and each of their screens plates the empty case in
-/// words already.
-///
-/// A zero BESIDE a real reading is a different thing and stays: `1 human ·
-/// 0 agents` is the sentence doing its job. The Agents subtitle is the
-/// `agents` module view's now, held to the same rule in `crates/views/agents`.
-#[test]
-fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
-    let human = MemberRow {
-        key: "aa".into(),
-        label: "aa".into(),
-        is_agent: false,
-        role: "validator".into(),
-        is_this_node: false,
-        model: String::new(),
-        live: true,
-    };
-
-    // Nothing there: the plate on each screen says it in words.
-    assert_eq!(members_summary(true, &[]), "");
-
-    // Something there: every subtitle speaks, zeros included.
-    assert_eq!(members_summary(true, &[human]), "1 human · 0 agents");
-}
-
-#[test]
-fn a_log_line_splits_into_time_level_and_message() {
-    let parts =
-        split_log_line("2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident".into());
-    assert_eq!(parts.time, "2026-07-27T09:12:44.918Z");
-    assert_eq!(parts.level, "INFO");
-    assert_eq!(parts.message, "ducktape::join: admitted resident");
-
-    let micro =
-        split_log_line("2026-08-14T01:02:03.918273Z DEBUG ducktape::files: staged chunk".into());
-    assert_eq!(
-        micro.time, "2026-08-14T01:02:03.918Z",
-        "the ring's microsecond timer is trimmed to the column's millisecond width"
-    );
-    assert_eq!(micro.level, "DEBUG");
-
-    let prose = split_log_line("no level here".into());
-    assert_eq!(prose.level, "");
-    assert_eq!(prose.message, "no level here");
-}
-
-#[test]
 fn machine_values_read_as_a_person_reads_them() {
     assert_eq!(mmss(0), "00:00");
     assert_eq!(mmss(4 * 60 + 7), "04:07");
     assert_eq!(initials_of("Kestrel Song"), "KS");
     assert_eq!(initials_of("triage"), "TR");
     assert_eq!(initials_of(""), "?");
-    assert_eq!(height_label(84_912), "h 84,912");
-    assert_eq!(height_label_short(84_912), "h 84,912");
-    assert_eq!(height_label(-1), "h —");
     assert_eq!(optional_number(Some(4)), "4");
     // absent, not zero: a resident's status carries no consensus section.
     assert_eq!(optional_number(None), "—");
-}
-
-/// An `operations` reading the node never published prints `—`, not a
-/// measured value.
-///
-/// `operations` is absent on a resident, a joiner and the embedded local
-/// daemon — which is exactly why the consensus trio beside these two is
-/// `Option`. `last_finalized_at` and `checkpoint_height` are plain `i64`
-/// because `0` is a legal height and a legal timestamp, so they carry
-/// `UNMEASURED` instead and both renderers turn it into an em dash.
-#[test]
-fn an_unpublished_operations_reading_renders_as_unknown() {
-    assert_eq!(height_label(UNMEASURED), "h —");
-    assert_eq!(height_label_short(UNMEASURED), "h —");
-    assert_eq!(relative_time(UNMEASURED, 1), "—");
-
-    // and a real reading of zero is still a real reading: height 0 is the
-    // genesis block, not an absence.
-    assert_eq!(height_label(0), "h 0");
-    // a record with no stamp keeps printing nothing — an em dash on every
-    // unstamped row would be noise, and that is a different fact.
-    assert_eq!(relative_time(0, 1), "");
 }
 
 /// THE OTHER HALF OF THE SAME FACT: the reading has to ARRIVE as `UNMEASURED`.
@@ -202,46 +117,6 @@ fn the_sync_label_shows_progress_only_while_catching_up() {
     assert_eq!(sync_label("", 412, 900), "");
 }
 
-/// A record stamp is a BLOCK HEIGHT on this chain, so every record-time
-/// string counts blocks. Only `/v1/status` supplies unix seconds.
-#[test]
-fn record_stamps_count_blocks_and_status_stamps_count_seconds() {
-    let now = now_seconds();
-    assert_eq!(height_ago(84_500, 84_912, now), "412 blocks ago");
-    assert_eq!(height_ago(84_911, 84_912, now), "1 block ago");
-    assert_eq!(height_ago(84_912, 84_912, now), "this block");
-    // a follower behind the record it is rendering still reads as now.
-    assert_eq!(height_ago(84_913, 84_912, now), "this block");
-    assert_eq!(height_ago(0, 84_912, now), "");
-    assert_eq!(
-        expires_in_blocks(85_324, 84_912, now),
-        "expires in 412 blocks"
-    );
-    assert_eq!(expires_in_blocks(84_913, 84_912, now), "expires in 1 block");
-    assert_eq!(expires_in_blocks(84_912, 84_912, now), "expired");
-    assert_eq!(relative_time(now - 30, now), "just now");
-    assert_eq!(relative_time(now - 40 * 60, now), "40m ago");
-    assert_eq!(relative_time(now - 2 * 60 * 60, now), "2h ago");
-    assert_eq!(relative_time(0, now), "");
-}
-
-/// The OTHER lane: a single-writer noded stamps `consensus_time` in unix
-/// MILLIS, so renderers for consensus stamps use the shared wall reading.
-#[test]
-fn a_unix_millis_consensus_stamp_uses_the_wall_clock() {
-    let now = now_seconds();
-    let two_hours_ago = (now - 2 * 60 * 60) * 1_000;
-    assert_eq!(height_ago(two_hours_ago, 84_912, now), "2h ago");
-    assert_eq!(
-        expires_in_blocks((now + 3 * 60 * 60) * 1_000, 84_912, now),
-        "expires in 3h"
-    );
-    assert_eq!(
-        expires_in_blocks((now - 60) * 1_000, 84_912, now),
-        "expired"
-    );
-}
-
 /// ONE CARD, ONE SAMPLE — AND THE SAMPLE IS THE WHOLE PAIR.
 ///
 /// A checkpoint carries no meaning alone; it only ever says how far the durable
@@ -305,11 +180,6 @@ async fn a_resyncing_replica_has_no_head_to_print_a_checkpoint_against() {
         facts.height, UNMEASURED,
         "a node serving no boundary reports height 0; that is absence, not a measurement"
     );
-    assert_eq!(
-        height_label_short(facts.height),
-        "h —",
-        "the rendered head says it has no reading"
-    );
     assert!(
         facts.height < 0 || facts.checkpoint_height <= facts.height,
         "the pair may say `h —`, but it may never say a checkpoint above its head"
@@ -335,30 +205,81 @@ fn a_defaulted_node_facts_prints_as_unserved_everywhere() {
     // duplication wearing the costume of defence in depth.
 }
 
-/// A dropped file's target is composed under the directory the view stands
-/// in, and the duckfs root is `/`, never "": the module's path check is
-/// `starts_with('/')`, so a "" root answered every root write with a 400.
+/// THE APP↔NODE CONTRACT IS AN EQUALITY, AND THE READING NAMES WHICH SIDE IS
+/// STALE. Three arms, no window: one behind is as refused as ten behind, and
+/// a node ahead of this app is refused too — that is the app's own staleness,
+/// and the line says so.
 #[test]
-fn a_dropped_file_lands_under_its_directory() {
-    assert_eq!(fs_child("/".into(), "notes".into()), "/notes");
-    assert_eq!(fs_child("/shared".into(), "notes".into()), "/shared/notes");
+fn a_contract_number_matches_or_names_the_stale_side() {
+    let expected = EXPECTED_NODE_CONTRACT;
+    assert_eq!(contract_match(expected), ContractMatch::Match);
+    assert_eq!(contract_hint(expected), "");
+    assert_eq!(contract_match(expected + 1), ContractMatch::NodeAhead);
+    assert_eq!(
+        contract_hint(expected + 1),
+        format!(
+            "node contract {} · app expects {expected} · update the app",
+            expected + 1
+        )
+    );
+    // a node publishing no number reads as 0: behind, by definition.
+    assert_eq!(contract_match(0), ContractMatch::NodeBehind);
+    assert_eq!(
+        contract_hint(0),
+        format!("node contract 0 · app expects {expected} · update the node")
+    );
+    assert_eq!(
+        node_facts(&serde_json::json!({ "version": "0.1.0" })).contract,
+        0,
+        "a document without the field is a node from before the number"
+    );
+    assert_eq!(
+        node_facts(&serde_json::json!({ "contract": expected })).contract,
+        expected
+    );
 }
 
-/// THE WRITE GATE IS THE FILES MODULE'S OWN RULE, asked before the round
-/// trip: the roots refuse, and every home and `/shared` answer with nothing.
-/// A device without a key has nothing to check; its refusal comes from the
-/// signer.
+/// THE ROW REFUSES ONLY ON A MEASURED LIVE MISMATCH. An unprobed row and a
+/// dead node carry no number to judge, so they open the way they always did;
+/// a live node with the wrong number prints the two numbers and does not open.
 #[test]
-fn the_files_write_gate_answers_in_the_modules_words() {
-    let me = "ab".repeat(32);
-    let other = "cd".repeat(32);
-    let gate = |dir: &str| files_write_gate(dir.into(), me.clone());
-    assert_eq!(gate("/"), "path is outside /home and /shared");
-    assert_eq!(gate("/home"), "home root is not writable");
-    assert_eq!(gate("/shared"), "");
-    assert_eq!(gate("/shared/reports"), "");
-    assert_eq!(gate(&format!("/home/ext:{me}")), "");
-    assert_eq!(gate(&format!("/home/ext:{me}/notes")), "");
-    assert_eq!(gate(&format!("/home/ext:{other}")), "");
-    assert_eq!(files_write_gate("/".into(), String::new()), "");
+fn a_network_row_refuses_only_a_live_node_with_another_contract() {
+    let row = |probed: bool, live: bool, contract: u32| HubNetwork {
+        id: "demo#a1b2".into(),
+        chain_id: "demo#a1b2".into(),
+        name: "demo".into(),
+        endpoint: "http://127.0.0.1:1".into(),
+        kind: "local".into(),
+        last_used: 0,
+        probed,
+        live,
+        height: 7,
+        contract,
+    };
+    let expected = EXPECTED_NODE_CONTRACT;
+
+    let unprobed = row(false, false, 0);
+    assert!(!contract_refuses(&unprobed));
+    assert_eq!(network_row_label(&unprobed), "demo · checking");
+
+    let dead = row(true, false, 0);
+    assert!(!contract_refuses(&dead));
+    assert_eq!(network_row_label(&dead), "demo · offline");
+
+    let matching = row(true, true, expected);
+    assert!(!contract_refuses(&matching));
+    assert_eq!(network_row_label(&matching), "demo · block 7");
+
+    let behind = row(true, true, 0);
+    assert!(contract_refuses(&behind));
+    assert_eq!(
+        network_row_label(&behind),
+        format!("demo · node contract 0 · app expects {expected} · update the node")
+    );
+
+    // the open button and the handler read the selection through one predicate.
+    let rows = vec![behind.clone(), matching.clone()];
+    assert!(selected_network_refuses(&rows, "demo#a1b2"));
+    assert!(!selected_network_refuses(&rows, "gone"));
+    assert!(!selected_network_refuses(&[matching], "demo#a1b2"));
 }

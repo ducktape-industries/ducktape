@@ -46,29 +46,42 @@ pub struct PackArgs {
     /// View assets rooted here, using canonical relative paths.
     #[arg(long, value_name = "ASSETS", requires = "view")]
     pub assets: Option<PathBuf>,
+    /// The module's data-plane lane declaration (JSON). A module that needs
+    /// no lane passes none, which is most of them.
+    #[arg(long, value_name = "LANES.JSON")]
+    pub lanes: Option<PathBuf>,
     /// Write the canonical deployment artifact here.
     #[arg(long, value_name = "ARTIFACT")]
     pub out: PathBuf,
 }
 
-/// `<id> <component.wasm> [--index <index.wasm>] [--after N]` — shared by update and register.
+/// `<id> [<component.wasm>] [--index <index.wasm>] [--view <view.wasm>] [--after N]`
+/// — shared by update and register. A component (with or without `--view`)
+/// stages a `module` entry; `--view` with no component stages a `view` entry
+/// — a UI with no consensus code, drawn by the desktop off the registry.
 #[derive(Debug, clap::Args)]
 pub struct StageArgs {
     /// the module id the code belongs to
     #[arg(value_name = "ID")]
     pub id: String,
-    /// the component bytes to stage
-    #[arg(value_name = "COMPONENT.WASM")]
-    pub component: PathBuf,
+    /// the component bytes to stage; omit it (with --view) for a view-only entry
+    #[arg(value_name = "COMPONENT.WASM", required_unless_present = "view")]
+    pub component: Option<PathBuf>,
     /// Optional mapper deployed and activated with this component; omission removes it.
-    #[arg(long, value_name = "INDEX.WASM")]
+    #[arg(long, value_name = "INDEX.WASM", requires = "component")]
     pub index: Option<PathBuf>,
-    /// View deployed with the module; omission removes its UI.
+    /// View deployed with the module (omission removes its UI), or, with no
+    /// component, the whole view-only deployment.
     #[arg(long, value_name = "VIEW.WASM")]
     pub view: Option<PathBuf>,
     /// View assets rooted here, using canonical relative paths.
     #[arg(long, value_name = "ASSETS", requires = "view")]
     pub assets: Option<PathBuf>,
+    /// The module's data-plane lane declaration (JSON): the lanes this
+    /// deployment asks the network for. It rides the artifact frame, so the
+    /// hash governance votes on covers the lanes as well as the code.
+    #[arg(long, value_name = "LANES.JSON")]
+    pub lanes: Option<PathBuf>,
     /// blocks after the proposal's EXECUTE height (not this node's height
     /// right now) at which the swap activates — the same value for every
     /// member co-signing the same proposal, whatever height each one is at
@@ -91,10 +104,11 @@ pub fn run(cmd: ModuleCmd) -> CommandResult {
 
 fn cmd_pack(args: PackArgs) -> CommandResult {
     let artifact = workspace_config::read_deployment_files(
-        &args.component,
+        Some(&args.component),
         args.index.as_deref(),
         args.view.as_deref(),
         args.assets.as_deref(),
+        args.lanes.as_deref(),
     )?;
     std::fs::write(&args.out, artifact.encode())?;
     println!("{}", hex_bytes(&artifact.hash()));
@@ -123,13 +137,16 @@ impl Verb {
     fn action(
         self,
         module_id: &str,
+        kind: modules::Kind,
         activation_lead: u64,
         code_hash: [u8; 32],
+        lanes: Vec<modules::LaneDecl>,
     ) -> governance::GovAction {
         let name = format!("{module_id}@{}", short(&code_hash));
         let module_id = module_id.to_string();
         let code_hash = code_hash.to_vec();
         match self {
+            // a swap keeps the entry's kind: the registry fixed it at admission.
             Verb::Update => governance::GovAction::UpdateModule {
                 name,
                 module_id,
@@ -139,8 +156,14 @@ impl Verb {
             Verb::Register => governance::GovAction::RegisterModule {
                 name,
                 module_id,
+                kind,
                 activation_lead,
                 code_hash,
+                // read off the ARTIFACT FRAME, never typed at the command
+                // line: the hash governance votes on covers the declaration,
+                // so what a member approves and what the registry admits are
+                // the same bytes.
+                lanes,
             },
         }
     }
@@ -211,13 +234,19 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         )
         .into());
     }
-    let bytes = workspace_config::read_deployment_files(
-        &args.component,
+    let artifact = workspace_config::read_deployment_files(
+        args.component.as_deref(),
         args.index.as_deref(),
         args.view.as_deref(),
         args.assets.as_deref(),
-    )?
-    .encode();
+        args.lanes.as_deref(),
+    )?;
+    // the frame says what the entry is: a component makes a module frame, a
+    // view alone a view frame — and the registry entry is registered as that.
+    let kind = noded::compose::artifact_kind(&artifact.encode())?;
+    // and it says which lanes the deployment asks for, for the same reason.
+    let declared_lanes = noded::compose::artifact_lanes(&artifact.encode())?;
+    let bytes = artifact.encode();
     let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
     let node = crate::cli::DrivenNode::of(&resolved, verb.name())?;
@@ -237,6 +266,7 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         &read_module_status(rpc_addr)?,
         &live_modules,
         &args.id,
+        kind,
         &code_hash,
     )?;
     match precheck {
@@ -271,9 +301,10 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         &node,
         &signer,
         &pubkey_hex,
+        &pubkey_hex,
         verb.name(),
         "module:",
-        verb.action(&args.id, args.after, code_hash),
+        verb.action(&args.id, kind, args.after, code_hash, declared_lanes),
         &matches,
     );
     let outcome = match ceremony {
@@ -422,10 +453,24 @@ fn registry_precheck(
     modules: &[modules::ModuleCode],
     live_modules: &[String],
     id: &str,
+    kind: modules::Kind,
     code_hash: &[u8; 32],
 ) -> Result<Precheck, String> {
     if let Some(held) = registry_holds(modules, id, code_hash) {
         return Ok(Precheck::AlreadyHeld(held));
+    }
+    // a swap can never change what an entry is: a module id takes module
+    // frames, a view id view frames. every validator would refuse the
+    // mismatched bytes at readiness and the swap would never latch.
+    let entry = modules.iter().find(|m| m.module_id == id);
+    if let Some(registered) = entry
+        && registered.kind != kind
+    {
+        return Err(format!(
+            "module {id} is registered as a {}, and a swap keeps its kind (a {} is a new id)",
+            kind_word(registered.kind),
+            kind_word(kind)
+        ));
     }
     let already_live = live_modules.iter().any(|live| live == id);
     let registering_live_module = matches!(verb, Verb::Register) && already_live;
@@ -434,7 +479,6 @@ fn registry_precheck(
             "module {id} is already registered (code changes go through `module update`)"
         ));
     }
-    let entry = modules.iter().find(|m| m.module_id == id);
     let other_swap_pending = entry.map(|m| m.pending.is_some());
     match (verb, other_swap_pending) {
         (Verb::Register, None) | (Verb::Update, Some(false)) => Ok(Precheck::Proceed),
@@ -476,6 +520,18 @@ fn registry_holds(modules: &[modules::ModuleCode], id: &str, code_hash: &[u8; 32
     already_active.then_some(Held::Active)
 }
 
+/// The chain height, which is what tells a pending swap still in flight from
+/// one whose activation passed without it.
+fn read_height(rpc_addr: &str) -> Result<u64, String> {
+    let reply = rpc_call(rpc_addr, &serde_json::json!({ "cmd": "status" }))?;
+    if reply["ok"] != true {
+        return Err(format!("status: {}", reply["error"]));
+    }
+    reply["status"]["height"]
+        .as_u64()
+        .ok_or_else(|| "node status carries no height".to_owned())
+}
+
 /// The running host determines which ids are occupied, including modules
 /// with no code-registry record. A default build catalog says nothing about
 /// the module set of this network.
@@ -492,7 +548,7 @@ fn read_live_modules(rpc_addr: &str) -> Result<Vec<String>, String> {
 
 /// the signer's public key as hex: the proposal-id seed the ceremony mints
 /// from (and nothing else — the receipt gate is keyed by the NODE's key).
-fn signer_pubkey_hex(signer: &GovSigner) -> String {
+pub(crate) fn signer_pubkey_hex(signer: &GovSigner) -> String {
     match signer {
         GovSigner::Node { key } => hex_bytes(key),
         GovSigner::User { key, .. } => hex_bytes(key.public_key().as_ref()),
@@ -512,8 +568,68 @@ fn cmd_status(args: StatusArgs) -> CommandResult {
         println!("{}", serde_json::to_string_pretty(&modules)?);
         return Ok(());
     }
-    print!("{}", render_status(&modules));
+    let proposed = read_open_code_proposals(&rpc_addr)?;
+    print!("{}", render_status(&modules, read_height(&rpc_addr)?));
+    print!("{}", render_proposed(&proposed));
     Ok(())
+}
+
+/// one open code ballot: the proposal and the module and hash it would
+/// install. every member may taste its view from the app while it is open,
+/// so an operator sees "tasteable" here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenCodeProposal {
+    proposal_id: String,
+    module_id: String,
+    code_hash: Vec<u8>,
+}
+
+/// the open `UpdateModule` / `RegisterModule` proposals off the governance
+/// register, in the register's order.
+fn read_open_code_proposals(rpc_addr: &str) -> Result<Vec<OpenCodeProposal>, String> {
+    use governance::{GovQuery, GovReply, decode_reply, encode_query};
+    let raw = rpc_query(rpc_addr, "governance", &encode_query(&GovQuery::Proposals))?;
+    match decode_reply(&raw)? {
+        GovReply::Proposals(views) => Ok(open_code_proposals(&views)),
+        other => Err(format!("expected Proposals, got {other:?}")),
+    }
+}
+
+fn open_code_proposals(views: &[governance::ProposalView]) -> Vec<OpenCodeProposal> {
+    use governance::{GovAction, ProposalStatus};
+    views
+        .iter()
+        .filter(|view| view.status == ProposalStatus::Open)
+        .filter_map(|view| {
+            let (module_id, code_hash) = match &view.action {
+                GovAction::UpdateModule {
+                    module_id,
+                    code_hash,
+                    ..
+                }
+                | GovAction::RegisterModule {
+                    module_id,
+                    code_hash,
+                    ..
+                } => (module_id, code_hash),
+                GovAction::AddValidator { .. }
+                | GovAction::RemoveValidator { .. }
+                | GovAction::Signal { .. }
+                | GovAction::AddResident { .. }
+                | GovAction::RemoveResident { .. }
+                | GovAction::AdoptShares { .. }
+                | GovAction::SetShares { .. }
+                | GovAction::SetShareMode { .. }
+                | GovAction::CancelModuleUpdate { .. }
+                | GovAction::SetAclPolicy { .. } => return None,
+            };
+            Some(OpenCodeProposal {
+                proposal_id: view.proposal_id.clone(),
+                module_id: module_id.clone(),
+                code_hash: code_hash.clone(),
+            })
+        })
+        .collect()
 }
 
 /// the modules registry over the generic query lane — the same shape
@@ -576,7 +692,7 @@ fn stage_component(
         .header("content-type", "application/octet-stream")
         .body(bytes.to_vec())
         .send()
-        .map_err(|error| crate::node_http::transport_failure(PATH, &error).to_string())?;
+        .map_err(|error| crate::node_http::transport_failure(http_base, PATH, &error).to_string())?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     let refused = !status.is_success();
@@ -700,16 +816,22 @@ fn digest_matches(reply: &StageReply, bytes: &[u8]) -> Result<[u8; 32], String> 
 const SHORT_HASH: usize = 12;
 
 /// one row per module: `id  active  pending`. Either column is `—` when there
-/// is nothing to show; pending is otherwise `<hash> ready <k|✓> activation <h>`.
-fn render_status(modules: &[modules::ModuleCode]) -> String {
+/// is nothing to show; pending is otherwise `<hash> ready <k|✓> activation <h>`,
+/// or `<hash> DEAD activation <h>` for a swap whose height came and went with
+/// readiness never latched — it can only be replaced or cancelled now.
+fn render_status(modules: &[modules::ModuleCode], height: u64) -> String {
     let id_width = modules
         .iter()
         .map(|m| m.module_id.len())
         .max()
         .unwrap_or_default()
         .max(2);
-    let mut out = format!("{:<id_width$}  {:<SHORT_HASH$}  pending\n", "id", "active");
+    let mut out = format!(
+        "{:<id_width$}  {:<KIND_WIDTH$}  {:<SHORT_HASH$}  pending\n",
+        "id", "kind", "active"
+    );
     for m in modules {
+        let kind = kind_word(m.kind);
         // `module register` writes an EMPTY active hash and leaves it empty
         // until the swap activates — the first thing an operator looks at.
         let never_activated = m.active_code_hash.is_empty();
@@ -721,27 +843,67 @@ fn render_status(modules: &[modules::ModuleCode]) -> String {
         let pending = match &m.pending {
             None => "—".to_string(),
             Some(swap) => format!(
-                "{}  ready {}  activation {}",
+                "{}  {}  activation {}",
                 short(&swap.code_hash),
-                readiness_word(swap),
+                readiness_word(swap, height),
                 swap.activation_height
             ),
         };
         out.push_str(&format!(
-            "{:<id_width$}  {active:<SHORT_HASH$}  {pending}\n",
+            "{:<id_width$}  {kind:<KIND_WIDTH$}  {active:<SHORT_HASH$}  {pending}\n",
             m.module_id
         ));
     }
     out
 }
 
-/// how far a pending swap's readiness has come: the count of validators that
-/// signalled, or `✓` once the latch covered the whole set.
-fn readiness_word(swap: &modules::ScheduledSwap) -> String {
-    if swap.ready_at.is_some() {
-        return "✓".into();
+/// the open code ballots under the table, one line each: `proposed
+/// <module>  <hash>  proposal <id>  (tasteable)` — nothing when none is open.
+fn render_proposed(proposed: &[OpenCodeProposal]) -> String {
+    if proposed.is_empty() {
+        return String::new();
     }
-    swap.readiness.len().to_string()
+    let id_width = proposed
+        .iter()
+        .map(|p| p.module_id.len())
+        .max()
+        .unwrap_or_default();
+    let mut out = String::from("\nopen code proposals (tasteable from the app while open):\n");
+    for p in proposed {
+        out.push_str(&format!(
+            "{:<id_width$}  {:<SHORT_HASH$}  proposal {}\n",
+            p.module_id,
+            short(&p.code_hash),
+            p.proposal_id
+        ));
+    }
+    out
+}
+
+/// the `kind` column's width: the longer of its two words.
+const KIND_WIDTH: usize = 6;
+
+/// the registry kind as the status row prints it.
+fn kind_word(kind: modules::Kind) -> &'static str {
+    match kind {
+        modules::Kind::Module => "module",
+        modules::Kind::View => "view",
+    }
+}
+
+/// how far a pending swap's readiness has come: the count of validators that
+/// signalled, or `✓` once the latch covered the whole set — and `DEAD` once
+/// its activation height has passed without that latch. A dead pending never
+/// arms, so an operator reading `ready 1` forever has to be told the swap is
+/// over and has to be re-proposed, not waited on.
+fn readiness_word(swap: &modules::ScheduledSwap, height: u64) -> String {
+    if swap.stale_at(height) {
+        return "DEAD".into();
+    }
+    if swap.ready_at.is_some() {
+        return "ready ✓".into();
+    }
+    format!("ready {}", swap.readiness.len())
 }
 
 fn short(hash: &[u8]) -> String {
@@ -752,6 +914,68 @@ fn short(hash: &[u8]) -> String {
 mod tests {
     use super::*;
     use modules::{ModuleCode, ScheduledSwap};
+
+    #[test]
+    fn status_lists_the_open_code_proposals_as_tasteable() {
+        use governance::{GovAction, ProposalStatus, ProposalView, VoterKind, VotingRule};
+        let view = |id: &str, action: GovAction, status: ProposalStatus| ProposalView {
+            proposal_id: id.into(),
+            action,
+            proposer: vec![1],
+            created_at: 1,
+            deadline: 9,
+            status,
+            votes: Vec::new(),
+            voter_kind: VoterKind::ValidatorNode,
+            electorate: Vec::new(),
+            voting_rule: VotingRule::Threshold { required_yes: 1 },
+        };
+        let update = |module: &str| GovAction::UpdateModule {
+            name: "n".into(),
+            module_id: module.into(),
+            activation_lead: 10,
+            code_hash: vec![0xcd; 32],
+        };
+        let views = vec![
+            view("chat-1", update("chat"), ProposalStatus::Open),
+            view("chat-0", update("chat"), ProposalStatus::Passed),
+            view(
+                "signal",
+                GovAction::Signal { text: "hi".into() },
+                ProposalStatus::Open,
+            ),
+            view(
+                "home-1",
+                GovAction::RegisterModule {
+                    name: "n".into(),
+                    module_id: "home".into(),
+                    kind: modules::Kind::View,
+                    activation_lead: 10,
+                    code_hash: vec![0xab; 32],
+                    lanes: Vec::new(),
+                },
+                ProposalStatus::Open,
+            ),
+        ];
+        let proposed = open_code_proposals(&views);
+        assert_eq!(
+            proposed
+                .iter()
+                .map(|p| p.proposal_id.as_str())
+                .collect::<Vec<_>>(),
+            ["chat-1", "home-1"]
+        );
+        let out = render_proposed(&proposed);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "");
+        assert_eq!(
+            lines[1],
+            "open code proposals (tasteable from the app while open):"
+        );
+        assert_eq!(lines[2], "chat  cdcdcdcdcdcd  proposal chat-1");
+        assert_eq!(lines[3], "home  abababababab  proposal home-1");
+        assert_eq!(render_proposed(&[]), "");
+    }
 
     fn receipt(peer: &[u8], status: &str, ok: bool) -> PeerReceipt {
         PeerReceipt {
@@ -837,12 +1061,14 @@ mod tests {
         };
         let entry = |active: &[u8], pending: Option<ScheduledSwap>| ModuleCode {
             module_id: "hello".into(),
+            kind: modules::Kind::Module,
             active_code_hash: active.to_vec(),
             pending,
             history: Vec::new(),
         };
-        let precheck =
-            |verb, modules: &[ModuleCode]| registry_precheck(verb, modules, &[], "hello", &ours);
+        let precheck = |verb, modules: &[ModuleCode]| {
+            registry_precheck(verb, modules, &[], "hello", modules::Kind::Module, &ours)
+        };
 
         // register: a free id proceeds; any existing entry refuses
         assert!(matches!(
@@ -888,35 +1114,62 @@ mod tests {
         );
         assert_eq!(Held::Active.word(), "active");
         // A familiar name is available when this network does not run it.
+        let module = modules::Kind::Module;
         assert!(matches!(
-            registry_precheck(Verb::Register, &[], &[], "identity", &ours),
+            registry_precheck(Verb::Register, &[], &[], "identity", module, &ours),
             Ok(Precheck::Proceed)
         ));
         let live = vec!["identity".to_string()];
-        let err = registry_precheck(Verb::Register, &[], &live, "identity", &ours).unwrap_err();
+        let err =
+            registry_precheck(Verb::Register, &[], &live, "identity", module, &ours).unwrap_err();
         assert!(err.contains("already registered"), "{err}");
-        let err = registry_precheck(Verb::Update, &[], &live, "identity", &ours).unwrap_err();
+        let err =
+            registry_precheck(Verb::Update, &[], &live, "identity", module, &ours).unwrap_err();
         assert!(err.contains("unregistered module identity"), "{err}");
+        // a swap keeps the entry's kind: view bytes under a module id (and
+        // the reverse) are refused before anything is proposed.
+        let err = registry_precheck(
+            Verb::Update,
+            &[entry(&theirs, None)],
+            &[],
+            "hello",
+            modules::Kind::View,
+            &ours,
+        )
+        .unwrap_err();
+        assert!(err.contains("registered as a module"), "{err}");
     }
 
     #[test]
     fn the_matcher_checks_verb_id_code_and_lead() {
         let hash = [0xabu8; 32];
-        let update = Verb::Update.action("hello", 100, hash);
-        let register = Verb::Register.action("hello", 100, hash);
+        let module = modules::Kind::Module;
+        let no_lanes = Vec::new();
+        let update = Verb::Update.action("hello", module, 100, hash, no_lanes.clone());
+        let register = Verb::Register.action("hello", module, 100, hash, no_lanes.clone());
         let same_update = matches_module_action(Verb::Update, "hello", &hash, 100);
         assert!(same_update(&update));
         assert!(!same_update(&register), "register is not update");
-        assert!(!same_update(&Verb::Update.action("other", 100, hash)));
+        assert!(!same_update(&Verb::Update.action(
+            "other",
+            module,
+            100,
+            hash,
+            no_lanes.clone()
+        )));
         assert!(!same_update(&Verb::Update.action(
             "hello",
+            module,
             100,
-            [0xcdu8; 32]
+            [0xcdu8; 32],
+            no_lanes.clone()
         )));
         // activation_lead is now a fixed part of the action's identity (it is
         // relative to the EXECUTE height, so it never goes stale): a
         // different lead is a DIFFERENT proposal, not one to join.
-        assert!(!same_update(&Verb::Update.action("hello", 999, hash)));
+        assert!(!same_update(
+            &Verb::Update.action("hello", module, 999, hash, no_lanes)
+        ));
         let same_register = matches_module_action(Verb::Register, "hello", &hash, 100);
         assert!(same_register(&register));
         assert!(!same_register(&update));
@@ -949,12 +1202,14 @@ mod tests {
         let modules = vec![
             ModuleCode {
                 module_id: "acl".into(),
+                kind: modules::Kind::Module,
                 active_code_hash: active.clone(),
                 pending: None,
                 history: Vec::new(),
             },
             ModuleCode {
                 module_id: "hello".into(),
+                kind: modules::Kind::Module,
                 active_code_hash: active.clone(),
                 pending: Some(ScheduledSwap {
                     name: "hello-2".into(),
@@ -968,6 +1223,21 @@ mod tests {
             // `module register`: no active code at all until the swap lands.
             ModuleCode {
                 module_id: "runs".into(),
+                kind: modules::Kind::Module,
+                active_code_hash: Vec::new(),
+                pending: Some(ScheduledSwap {
+                    name: "runs-1".into(),
+                    activation_height: 120,
+                    code_hash: next.clone(),
+                    readiness: Vec::new(),
+                    ready_at: None,
+                }),
+                history: Vec::new(),
+            },
+            // a view-only entry: the kind column is how an operator tells it apart.
+            ModuleCode {
+                module_id: "home".into(),
+                kind: modules::Kind::View,
                 active_code_hash: Vec::new(),
                 pending: Some(ScheduledSwap {
                     name: "runs-1".into(),
@@ -979,19 +1249,51 @@ mod tests {
                 history: Vec::new(),
             },
         ];
-        let out = render_status(&modules);
+        let out = render_status(&modules, 100);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "id     active        pending");
-        assert_eq!(lines[1], "acl    abababababab  —");
+        assert_eq!(lines[0], "id     kind    active        pending");
+        assert_eq!(lines[1], "acl    module  abababababab  —");
         assert_eq!(
             lines[2],
-            "hello  abababababab  cdcdcdcdcdcd  ready 2  activation 120"
+            "hello  module  abababababab  cdcdcdcdcdcd  ready 2  activation 120"
         );
         // the active column stays 12 wide even when it is a single dash, so
         // the pending hashes line up with the row above.
         assert_eq!(
             lines[3],
-            "runs   —             cdcdcdcdcdcd  ready 0  activation 120"
+            "runs   module  —             cdcdcdcdcdcd  ready 0  activation 120"
+        );
+        assert_eq!(
+            lines[4],
+            "home   view    —             cdcdcdcdcdcd  ready 0  activation 120"
+        );
+    }
+
+    #[test]
+    fn a_pending_swap_past_its_height_reads_dead() {
+        let modules = vec![ModuleCode {
+            module_id: "pages".into(),
+            kind: modules::Kind::Module,
+            active_code_hash: vec![0xabu8; 32],
+            pending: Some(ScheduledSwap {
+                name: "pages-2".into(),
+                activation_height: 120,
+                code_hash: vec![0xcdu8; 32],
+                readiness: vec![vec![1]],
+                ready_at: None,
+            }),
+            history: Vec::new(),
+        }];
+        // at the height itself the readiness never latched, so the swap can
+        // no longer arm — an operator waiting on `ready 1` waits forever.
+        let out = render_status(&modules, 120);
+        assert!(
+            out.contains("cdcdcdcdcdcd  DEAD  activation 120"),
+            "{out}"
+        );
+        assert!(
+            render_status(&modules, 119).contains("ready 1"),
+            "a swap still short of its height is in flight"
         );
     }
 }

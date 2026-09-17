@@ -327,3 +327,705 @@ fn job_runs_post_live_and_final_replies_under_the_program_account() {
         assert_eq!(finished.comments[1].text, "Finished this job.");
     });
 }
+
+#[test]
+fn native_job_report_relay_is_authenticated_atomic_metered_and_delivered() {
+    fn job_message(operation: &tasks::JobsMsg) -> Msg {
+        Msg {
+            target: "tasks".into(),
+            payload: tasks::encode_job_msg(operation),
+        }
+    }
+    fn report(
+        run_id: &str,
+        attempt: u32,
+        operation_id: &str,
+        kind: tasks::WorkerReportKind,
+        payload: &str,
+    ) -> Msg {
+        msg(
+            "runs",
+            &runs::RunsMsg::ReportJob {
+                run_id: run_id.into(),
+                attempt,
+                operation_id: operation_id.into(),
+                kind,
+                payload: payload.into(),
+            },
+        )
+    }
+    async fn spent(network: &Network, run_id: &str) -> u32 {
+        let bytes = network
+            .host
+            .query("runs", &runs::encode_query(&runs::RunsQuery::AgentSessions))
+            .await
+            .unwrap();
+        let runs::RunsReply::AgentSessions(sessions) = runs::decode_reply(&bytes).unwrap() else {
+            panic!("sessions");
+        };
+        sessions
+            .iter()
+            .find(|session| session.run_id == run_id)
+            .unwrap()
+            .actions
+    }
+    async fn refused(network: &mut Network, origin: sdk::Origin, message: Msg) {
+        let runs_root = network.host.module_root("runs").unwrap();
+        let tasks_root = network.host.module_root("tasks").unwrap();
+        network.height += 1;
+        let rejected = network
+            .host
+            .submit_at(
+                host::BlockContext {
+                    height: network.height,
+                    consensus_time: network.height,
+                    origin,
+                },
+                message,
+            )
+            .await
+            .is_err();
+        assert!(rejected, "invalid report/action must be refused");
+        assert_eq!(
+            network.host.module_root("runs").unwrap(),
+            runs_root,
+            "refusal rolls back both counter and idempotency receipt"
+        );
+        assert_eq!(network.host.module_root("tasks").unwrap(), tasks_root);
+    }
+    async fn start_worker(
+        network: &mut Network,
+        job_id: &str,
+        session_key: u8,
+    ) -> runs::PendingRun {
+        network
+            .submit(
+                sdk::Origin::Program(2),
+                job_message(&tasks::JobsMsg::SubmitConversation {
+                    job_id: job_id.into(),
+                    kind: "agent/worker".into(),
+                    spec: "report durable progress".into(),
+                }),
+            )
+            .await;
+        network.drain().await;
+        let run = network
+            .runs()
+            .await
+            .into_iter()
+            .find(|run| run.job_id.as_deref() == Some(job_id))
+            .unwrap();
+        let saga_id = saga(network, &run).await;
+        network
+            .submit(
+                provider(),
+                msg(
+                    "saga",
+                    &saga::SagaMsg::Accept {
+                        saga_id,
+                        attempt: 0,
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                provider(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::OpenAgentSession {
+                        run_id: run.run_id.clone(),
+                        attempt: 0,
+                        session_key: vec![session_key; 32],
+                    },
+                ),
+            )
+            .await;
+        run
+    }
+    async fn progress(network: &Network) -> Vec<tasks::JobEventDetail> {
+        let bytes = network
+            .host
+            .query(
+                "runs",
+                &runs::encode_query(&runs::RunsQuery::ConversationEvents {
+                    conversation_id: "resident".into(),
+                    from: 1,
+                    limit: 64,
+                }),
+            )
+            .await
+            .unwrap();
+        let runs::RunsReply::ConversationEvents(events) = runs::decode_reply(&bytes).unwrap()
+        else {
+            panic!("events");
+        };
+        events
+            .iter()
+            .filter_map(|event| {
+                let runs::ConversationInput::Event { content, .. } = &event.input else {
+                    return None;
+                };
+                let detail: tasks::JobEventDetail =
+                    serde_json::from_value(content.get("source")?.clone()).ok()?;
+                matches!(detail.operation, tasks::JobsMsg::Checkpoint { .. }).then_some(detail)
+            })
+            .collect()
+    }
+    block_on(async {
+        let mut network = job_network().await;
+        network
+            .submit(
+                member(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::ConfigureConversation {
+                        conversation_id: "resident".into(),
+                        agent_id: "builder".into(),
+                        source: runs::ConversationSource::Channel {
+                            channel_id: "general".into(),
+                        },
+                        history_prefix: "/shared/native/resident".into(),
+                        session_path: "session.jsonl".into(),
+                        packages: Vec::new(),
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                member(),
+                msg(
+                    "agent",
+                    &agent::AgentMsg::Replace {
+                        account: 2,
+                        program: runs::conversation_program("builder"),
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                member(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::ActivateConversation {
+                        conversation_id: "resident".into(),
+                        operation_id: "activate".into(),
+                        active: true,
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                member(),
+                msg(
+                    "agent",
+                    &agent::AgentMsg::Provision {
+                        request_id: "worker".into(),
+                        name: "Worker".into(),
+                        program: runs::model_program("worker"),
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                member(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::ConfigureModel {
+                        operation: runs::ModelMsg::RegisterModel {
+                            account: 3,
+                            agent_id: "worker".into(),
+                            display_name: "Worker".into(),
+                            capability: "model-1".into(),
+                            recipe_hash: None,
+                            skills: None,
+                        },
+                    },
+                ),
+            )
+            .await;
+        let run = start_worker(&mut network, "native-worker", 9).await;
+        let other = start_worker(&mut network, "other-worker", 10).await;
+        assert_eq!(
+            job(&network, "native-worker").await.claim.unwrap().worker,
+            tasks::Party::Module("runs".into())
+        );
+        let first = report(
+            &run.run_id,
+            0,
+            "progress-one",
+            tasks::WorkerReportKind::Checkpoint,
+            "working",
+        );
+        refused(
+            &mut network,
+            sdk::Origin::Program(3),
+            job_message(&tasks::JobsMsg::Checkpoint {
+                job_id: "native-worker".into(),
+                operation_id: "direct".into(),
+                attempt: 1,
+                kind: tasks::WorkerReportKind::Checkpoint,
+                payload: "wrong claimant".into(),
+            }),
+        )
+        .await;
+        refused(
+            &mut network,
+            sdk::Origin::External(vec![7; 32]),
+            first.clone(),
+        )
+        .await;
+        refused(
+            &mut network,
+            session(),
+            report(
+                &run.run_id,
+                1,
+                "stale",
+                tasks::WorkerReportKind::Checkpoint,
+                "old attempt",
+            ),
+        )
+        .await;
+        refused(
+            &mut network,
+            session(),
+            report(
+                &other.run_id,
+                0,
+                "other-job",
+                tasks::WorkerReportKind::Checkpoint,
+                "not this session's job",
+            ),
+        )
+        .await;
+        assert_eq!(spent(&network, &run.run_id).await, 0);
+        network.submit(session(), first.clone()).await;
+        network.drain().await;
+        network
+            .submit(
+                provider(),
+                report(
+                    &run.run_id,
+                    0,
+                    "progress-two",
+                    tasks::WorkerReportKind::Checkpoint,
+                    "blocked on an operator decision",
+                ),
+            )
+            .await;
+        network.drain().await;
+        network
+            .submit(
+                session(),
+                report(
+                    &run.run_id,
+                    0,
+                    "review",
+                    tasks::WorkerReportKind::Report,
+                    "ready for review",
+                ),
+            )
+            .await;
+        network.drain().await;
+        let delivered = progress(&network).await;
+        assert_eq!(delivered.len(), 3);
+        assert!(
+            delivered
+                .iter()
+                .all(|detail| detail.actor == tasks::Party::Module("runs".into())
+                    && detail.job_id == "native-worker"
+                    && detail.job_attempt == 1)
+        );
+        assert!(
+            matches!(&delivered[1].operation,tasks::JobsMsg::Checkpoint {payload,..} if payload=="blocked on an operator decision")
+        );
+        assert!(
+            matches!(&delivered[2].operation,tasks::JobsMsg::Checkpoint {kind:tasks::WorkerReportKind::Report,payload,..} if payload=="ready for review")
+        );
+        assert_eq!(
+            network
+                .runs()
+                .await
+                .iter()
+                .filter(|run| run.agent_id == "builder")
+                .count(),
+            1,
+            "progress queues behind one resident turn"
+        );
+        assert_eq!(spent(&network, &run.run_id).await, 3);
+        network.submit(session(), first.clone()).await;
+        network.drain().await;
+        assert_eq!(spent(&network, &run.run_id).await, 3);
+        assert_eq!(
+            progress(&network).await,
+            delivered,
+            "exact report replay publishes no new immutable source"
+        );
+        refused(
+            &mut network,
+            session(),
+            report(
+                &run.run_id,
+                0,
+                "progress-one",
+                tasks::WorkerReportKind::Checkpoint,
+                "conflicting payload",
+            ),
+        )
+        .await;
+        network
+            .submit(
+                sdk::Origin::Program(2),
+                job_message(&tasks::JobsMsg::Control {
+                    job_id: "native-worker".into(),
+                    operation_id: "collision".into(),
+                    input: tasks::JobControlInput::Steer {
+                        text: "a distinct control".into(),
+                    },
+                }),
+            )
+            .await;
+        network.drain().await;
+        refused(
+            &mut network,
+            session(),
+            report(
+                &run.run_id,
+                0,
+                "collision",
+                tasks::WorkerReportKind::Checkpoint,
+                "target must reject a control/report collision",
+            ),
+        )
+        .await;
+        assert_eq!(
+            spent(&network, &run.run_id).await,
+            3,
+            "Tasks rejection rolls back the tentative shared charge"
+        );
+        network
+            .submit(
+                session(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::AgentAction {
+                        run_id: run.run_id.clone(),
+                        request_id: "ordinary-action".into(),
+                        action: create_task("worker-task", "A real ordinary write"),
+                    },
+                ),
+            )
+            .await;
+        network.drain().await;
+        assert!(network.task("worker-task").await.is_some());
+        assert_eq!(spent(&network, &run.run_id).await, 4);
+        for n in 4..runs::MAX_ACTIONS_PER_SESSION {
+            network
+                .submit(
+                    session(),
+                    report(
+                        &run.run_id,
+                        0,
+                        &format!("progress-{n}"),
+                        tasks::WorkerReportKind::Checkpoint,
+                        "bounded progress",
+                    ),
+                )
+                .await;
+            network.drain().await;
+        }
+        assert_eq!(
+            spent(&network, &run.run_id).await,
+            runs::MAX_ACTIONS_PER_SESSION
+        );
+        assert_eq!(
+            job(&network, "native-worker").await.reports.len(),
+            31,
+            "one ordinary write shares the report allowance"
+        );
+        let bytes = network
+            .host
+            .query(
+                "runs",
+                &runs::encode_query(&runs::RunsQuery::WorkerControls {
+                    run_id: run.run_id.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        let runs::RunsReply::WorkerControls(Some(worker)) = runs::decode_reply(&bytes).unwrap()
+        else {
+            panic!("worker readback");
+        };
+        assert_eq!(
+            worker.reports.len(),
+            31,
+            "the authenticated host can read committed semantic receipts"
+        );
+        refused(
+            &mut network,
+            session(),
+            report(
+                &run.run_id,
+                0,
+                "over-budget",
+                tasks::WorkerReportKind::Report,
+                "no allowance left",
+            ),
+        )
+        .await;
+        refused(
+            &mut network,
+            session(),
+            msg(
+                "runs",
+                &runs::RunsMsg::AgentAction {
+                    run_id: run.run_id.clone(),
+                    request_id: "over-budget-action".into(),
+                    action: create_task("never-created", "must not write"),
+                },
+            ),
+        )
+        .await;
+        network.submit(session(), first.clone()).await;
+        network.drain().await;
+        assert_eq!(
+            spent(&network, &run.run_id).await,
+            32,
+            "receipt replay at the cap stays free"
+        );
+        assert_eq!(progress(&network).await.len(), 31);
+        assert!(network.task("never-created").await.is_none());
+        let claim = job(&network, "native-worker").await.claim.unwrap();
+        network.height = claim.claimed_at_height + claim.lease_views;
+        network
+            .submit(
+                member(),
+                job_message(&tasks::JobsMsg::Reclaim {
+                    job_id: "native-worker".into(),
+                }),
+            )
+            .await;
+        network
+            .submit(
+                member(),
+                job_message(&tasks::JobsMsg::Claim {
+                    job_id: "native-worker".into(),
+                    lease_views: 1000,
+                }),
+            )
+            .await;
+        network.drain().await;
+        assert_eq!(job(&network, "native-worker").await.attempt, 2);
+        network
+            .submit(
+                provider(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::OpenAgentSession {
+                        run_id: run.run_id.clone(),
+                        attempt: 0,
+                        session_key: vec![9; 32],
+                    },
+                ),
+            )
+            .await;
+        refused(&mut network, session(), first).await;
+        assert_eq!(
+            spent(&network, &run.run_id).await,
+            32,
+            "a moved Job claim refuses even an old report receipt replay"
+        );
+    });
+}
+
+#[test]
+fn every_native_worker_checkpoint_and_ack_reaches_the_resident_queue() {
+    fn job_message(target: &str, operation: &tasks::JobsMsg) -> Msg {
+        Msg {
+            target: target.into(),
+            payload: tasks::encode_job_msg(operation),
+        }
+    }
+    block_on(async {
+        let mut network = Network::new().await;
+        let run_id = network.provision().await;
+        let run = network
+            .runs()
+            .await
+            .into_iter()
+            .find(|run| run.run_id == run_id)
+            .unwrap();
+        settle(&mut network, &run, Ok(response(None)), true).await;
+        network
+            .submit(
+                member(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::ConfigureConversation {
+                        conversation_id: "resident".into(),
+                        agent_id: "builder".into(),
+                        source: runs::ConversationSource::Channel {
+                            channel_id: "general".into(),
+                        },
+                        history_prefix: "/shared/native/resident".into(),
+                        session_path: "session.jsonl".into(),
+                        packages: Vec::new(),
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                member(),
+                msg(
+                    "agent",
+                    &agent::AgentMsg::Replace {
+                        account: 2,
+                        program: runs::conversation_program("builder"),
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                member(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::ActivateConversation {
+                        conversation_id: "resident".into(),
+                        operation_id: "activate".into(),
+                        active: true,
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                sdk::Origin::Program(2),
+                job_message(
+                    "tasks",
+                    &tasks::JobsMsg::SubmitConversation {
+                        job_id: "worker".into(),
+                        kind: "manual".into(),
+                        spec: "independent work".into(),
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                member(),
+                job_message(
+                    "tasks",
+                    &tasks::JobsMsg::Claim {
+                        job_id: "worker".into(),
+                        lease_views: 1000,
+                    },
+                ),
+            )
+            .await;
+        for (operation_id, payload) in [
+            ("first", "making progress"),
+            ("second", "blocked on an operator decision"),
+        ] {
+            network
+                .submit(
+                    member(),
+                    job_message(
+                        "tasks",
+                        &tasks::JobsMsg::Checkpoint {
+                            job_id: "worker".into(),
+                            operation_id: operation_id.into(),
+                            attempt: 1,
+                            kind: tasks::WorkerReportKind::Checkpoint,
+                            payload: payload.into(),
+                        },
+                    ),
+                )
+                .await;
+            network.drain().await;
+        }
+        network
+            .submit(
+                sdk::Origin::Program(2),
+                job_message(
+                    "tasks",
+                    &tasks::JobsMsg::Control {
+                        job_id: "worker".into(),
+                        operation_id: "steer".into(),
+                        input: tasks::JobControlInput::Steer {
+                            text: "proceed with option A".into(),
+                        },
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                member(),
+                job_message(
+                    "tasks",
+                    &tasks::JobsMsg::AcknowledgeControl {
+                        job_id: "worker".into(),
+                        operation_id: "steer".into(),
+                        attempt: 1,
+                    },
+                ),
+            )
+            .await;
+        network.drain().await;
+        let bytes = network
+            .host
+            .query(
+                "runs",
+                &runs::encode_query(&runs::RunsQuery::ConversationEvents {
+                    conversation_id: "resident".into(),
+                    from: 1,
+                    limit: 20,
+                }),
+            )
+            .await
+            .unwrap();
+        let runs::RunsReply::ConversationEvents(events) = runs::decode_reply(&bytes).unwrap()
+        else {
+            panic!("conversation events");
+        };
+        let details: Vec<tasks::JobEventDetail> = events
+            .iter()
+            .filter_map(|event| {
+                let runs::ConversationInput::Event { content, .. } = &event.input else {
+                    return None;
+                };
+                serde_json::from_value(content.get("source")?.clone()).ok()
+            })
+            .collect();
+        assert_eq!(
+            details.len(),
+            3,
+            "two progress updates and the ACK cross real Attribution→Agent program→resident intake; self-authored control is not recursion"
+        );
+        assert!(
+            matches!(&details[1].operation,tasks::JobsMsg::Checkpoint {payload,..} if payload=="blocked on an operator decision")
+        );
+        assert!(
+            matches!(&details[2].operation,tasks::JobsMsg::AcknowledgeControl {operation_id,..} if operation_id=="steer")
+        );
+        assert!(
+            details
+                .iter()
+                .all(|detail| detail.actor == tasks::Party::Account(1))
+        );
+        let pending = network.runs().await;
+        assert_eq!(
+            pending.len(),
+            1,
+            "new signals queue behind the active coordinating turn: {pending:?}"
+        );
+    });
+}

@@ -28,7 +28,7 @@ pub use admin::{AdminConfig, AdminExposure};
 // the per-request signature every MUTATING `/v1` route now carries, and the
 // verifier both it and `/v1/admin/*` share. reads stay open.
 pub mod signed_req;
-pub use signed_req::{OperatorCredential, SignedBy, WriteRefusal};
+pub use signed_req::{SignedBy, WriteRefusal};
 
 pub mod blobs;
 // the pieces every process needs AROUND the composer: the on-disk component
@@ -44,11 +44,6 @@ pub use stream::{
     BlockWake, ClientMsg, LogRing, RunOutputEvent, RunOutputRegistry, RunStream, ServerFrame,
     StreamErrorCode, StreamHub, StreamOpRow, StreamOrigin, StreamOriginKind, TailItem,
 };
-// the duckfs product surface lives in its own module; re-exported flat so the
-// router keeps its bare handler names and the public param structs stay at
-// `noded::CommitBody` &c.
-mod files_http;
-pub use files_http::*;
 // the workspace RPC (`/v1/fs/workspaces`) and its actor-lane `NodeApi` adapter.
 // crate-internal: the router registers the handlers and the adapter is used only
 // by the workspace handlers — nothing outside the crate touches either.
@@ -58,13 +53,11 @@ mod workspaces;
 // the D7 root). public so BOTH node binaries can build one and wire it into
 // their DispatchPool constructor.
 pub mod agent_provision;
-// realtime overlay websocket lanes: huddle and Pages-presence session/control types.
+// Pages presence session/control types.
 mod call;
 pub use call::{
-    CallClientControl, CallControlIn, CallControlOut, CallLane, CallParams, CallServerControl,
-    CallSession, CallSessionRequest, PageCursor, PresenceClientControl, PresenceControlIn,
-    PresenceControlOut, PresenceParams, PresenceServerControl, PresenceSession,
-    PresenceSessionRequest, RealtimeSessionRequest,
+    PageCursor, PresenceClientControl, PresenceControlIn, PresenceControlOut, PresenceLane,
+    PresenceParams, PresenceServerControl, PresenceSession, PresenceSessionRequest,
 };
 // the gateway lane: signed-route proxying + the isolated browser-gateway
 // origin (`gateway_http` because the `gateway` crate is a dependency).
@@ -72,16 +65,16 @@ mod gateway_http;
 pub mod gateway_ws_token;
 pub mod origin_guard;
 pub use gateway_http::{
-    GatewayBody, GatewayFailure, GatewayJob, GatewayLane, GatewayProxyReply, GatewayProxyRequest,
-    GatewayResponse, GatewayWsMsg, collect_body, gateway_browser_router, serve_browser_gateway,
+    EMPTY_BODY_DIGEST, GATEWAY_BODY_FRAMES, GatewayBody, GatewayFailure, GatewayJob, GatewayLane,
+    GatewayProxyReply, GatewayProxyRequest, GatewayRequestBody, GatewayResponse, GatewayWsMsg,
+    PROXY_REPLY_TIMEOUT, collect_body, gateway_browser_router, gateway_caller_account,
+    one_shot_body, serve_browser_gateway,
 };
-// git smart-HTTP: forge as a full push+fetch remote over /forge/{repo}/….
-mod git_http;
-pub use git_http::InfoRefsParams;
 // the node-actor command lane and the router's shared state handle.
 mod handle;
 pub use handle::{
-    NetstackSwapRequest, NetstackSwapper, NodeCommand, NodeHandle, PeersStanding, StatusCell,
+    NetstackSwapRequest, NetstackSwapper, NodeCommand, NodeHandle, PeersStanding, Refused,
+    StatusCell,
 };
 
 mod module_code;
@@ -89,15 +82,12 @@ pub mod node_work;
 pub use module_code::{
     CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest, MAX_MODULE_ARTIFACT_BYTES,
 };
-// the node-local, off-chain interactive terminal-session plane. public so
-// `main.rs` can build the manager and wire it onto the handle.
-pub mod term;
-pub use term::{
-    AttachGuard, CreatedSession, PeerAttach, TermChunkEvent, TermCommandEvent, TermCommandRing,
-    TermError, TermFeedEvent, TermRing, TerminalSessions,
-};
-
-pub mod term_remote;
+pub mod run_control;
+// the node ↔ agent-daemon link: the collaboration messaging bus, and the 0600
+// workspace secret the gated ws topics stand on. public so `main.rs` can build
+// it and wire it onto the handle.
+pub mod service_link;
+pub use service_link::{AttachGuard, ServiceLink};
 
 /// the volatile catalog of service daemons signaling presence to this node.
 pub mod services;
@@ -105,17 +95,6 @@ pub mod services;
 /// A service daemon's handle on the node it serves: the `/v1` twin of the
 /// in-process `NodeCommand` actor lane. See [`node_link::NodeLink`].
 pub mod node_link;
-pub use term_remote::{
-    CONTROL_DEADLINE, RemoteSessions, SessionInputWire, SessionJob, SessionLane,
-};
-// PR2 consensus command source: the chat<->pty bridge (channel scheme + the
-// off-loop projector that drives committed chat commands into a session's pty).
-mod term_consensus;
-// the command wire contract, public so a client / integration test can build
-// the exact chat post a member submits and decode it back the way the pty host
-// does: `command_blocks(line)` -> a `PostMessage` body, `command_text(blocks)`
-// -> the line, `session_channel(id)` -> the carrier channel.
-pub use term_consensus::{command_blocks, command_text, session_channel};
 // the derived-index tier: store construction, boundary stamps, /v1/index/* +
 // /v1/blocks.
 mod index;
@@ -148,22 +127,16 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{DefaultBodyLimit, OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use commonware_cryptography::Signer as _;
-use duckfs_core::CHUNK_SIZE;
 use futures::channel::oneshot;
 use sdk::StateRoot;
 use serde::{Deserialize, Serialize};
 use workspace_config::{DEFAULT_INVITE_TTL_DAYS, INVITE_TTL_DAYS};
 
-use crate::call::{call_ws, presence_ws};
+use crate::call::presence_ws;
 use crate::gateway_http::{gateway_browser_base, gateway_proxy};
-use crate::git_http::{git_info_refs, git_receive_pack, git_upload_pack};
-// the forge pack ceiling the smart-HTTP lane accepts — re-exported so the
-// node's relay fan-out cap DERIVES from it (a pack the door took in must be
-// one the relay can carry; two numbers here once drifted 8x apart).
-pub use crate::git_http::GIT_PACK_BODY_LIMIT;
 use crate::index::{blocks, index_ops, index_scan, index_status, index_view};
 use crate::metrics::metrics;
 
@@ -306,12 +279,38 @@ pub fn block_row(record: &BlockRecord) -> Vec<u8> {
     serde_json::to_vec(record).expect("a plain record struct serializes")
 }
 
+/// The shape of this build's app-facing surface, as one integer: the `/v1`
+/// routes and their bodies, the ws topics and their frames, the view-props
+/// JSON a module view is handed, and the `duck://` URI grammar. Served on
+/// `GET /v1/status` and the ws `status` topic as [`NodeStatus::contract`].
+///
+/// Bumped in the PR that changes ANY of those — [`NODE_CONTRACT_SURFACE`] is
+/// the pin that makes forgetting fail the test lane. The desktop app carries
+/// its own copy (`EXPECTED_NODE_CONTRACT`) and opens a console only on
+/// EQUALITY: never a tolerance window, never "N-1 still works" — that would be
+/// the compat the repository forbids. Nothing on the node reads it, no peer
+/// sees it, and no code branches on its value; the app alone compares.
+pub const NODE_CONTRACT: u32 = 6;
+
+/// The surface [`NODE_CONTRACT`] names, fingerprinted: FNV-1a over the sorted
+/// `/v1` route paths of `lib.rs` + `admin.rs` and the ws topic/prefix names
+/// of `stream.rs`. The `contract_lint` test recomputes it from source; when
+/// they differ, the surface changed — bump [`NODE_CONTRACT`] and the app's
+/// `EXPECTED_NODE_CONTRACT` together, then repin this to the value the
+/// failing assertion prints. Repinning WITHOUT the bump is the defect the
+/// test exists to catch.
+pub const NODE_CONTRACT_SURFACE: u64 = 0x3ab4_2d02_809c_f369;
+
 /// the status projection: daemon build version, global root-hash, and each
 /// registered module's root. `Default` is the pre-first-publish snapshot in
 /// [`StatusCell`] — zeroed boundary facts are the honest answer before any
-/// boundary is served.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// boundary is served; the contract number is this build's even then.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeStatus {
+    /// [`NODE_CONTRACT`], always. Every publisher writes the constant, the
+    /// way `version` is always `CARGO_PKG_VERSION`: the number is a fact
+    /// about the binary, not about the boundary being published.
+    pub contract: u32,
     pub version: String,
     pub root_hash: String,
     pub height: u64,
@@ -340,6 +339,23 @@ pub struct NodeStatus {
     /// operators; dependency-specific consensus and transport metrics remain
     /// available on `/metrics` for deeper diagnosis.
     pub operations: OperationalStatus,
+}
+
+impl Default for NodeStatus {
+    fn default() -> Self {
+        Self {
+            contract: NODE_CONTRACT,
+            version: String::new(),
+            root_hash: String::new(),
+            height: 0,
+            consensus_time: 0,
+            consensus_time_unit: ConsensusTimeUnit::default(),
+            modules: Vec::new(),
+            public_key: String::new(),
+            chain_id: String::new(),
+            operations: OperationalStatus::default(),
+        }
+    }
 }
 
 /// The job this process is currently performing.
@@ -427,8 +443,10 @@ pub struct OperationalStatus {
 /// swap this process performed.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetstackOperationalStatus {
-    /// `native` or `guest` — the machine driving the plane right now.
+    /// Actual execution: `starting`, `guest`, `stopped`, or `failed`.
     pub backend: String,
+    /// SHA-256 of the component actually running, absent when no guest runs.
+    pub code_hash: Option<String>,
     /// `null` until this process swaps once. A refused swap is recorded here
     /// AND leaves `backend` unchanged: the running machine continues.
     pub last_swap: Option<NetstackSwap>,
@@ -463,6 +481,11 @@ pub struct ConsensusOperationalStatus {
     /// member. This makes the number directly comparable with `quorum`.
     pub reachable_validators: u64,
     pub pending_ops: u64,
+    /// Seconds since this node last sealed a height, 0 while the chain is
+    /// beating or where no heartbeat sets a floor to measure against. It is
+    /// written by the drain on every turn, not by the throttled operations
+    /// refresh, so a wedge shows here at once rather than at the next refresh.
+    pub block_beat_stalled_seconds: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -578,6 +601,9 @@ pub struct SubmitRequest {
     pub target: String,
     /// the module's `*Msg` enum as a json value — encoded verbatim into `Msg.payload`.
     pub payload: serde_json::Value,
+    /// A transport prerequisite, independent of the module payload.
+    #[serde(default, deserialize_with = "deserialize_required_blob")]
+    pub required_blob: Option<[u8; 32]>,
     /// the submitter identity stamped into `Origin::External` on a daemon that
     /// honours it (the embedded one, and simnode).
     ///
@@ -599,6 +625,22 @@ pub struct SubmitRequest {
     /// symptom.
     #[serde(default)]
     pub origin: Option<String>,
+}
+
+fn deserialize_required_blob<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<[u8; 32]>, D::Error> {
+    let digest = String::deserialize(deserializer)?;
+    duckfs_core::from_hex_32(&digest).map(Some).ok_or_else(|| {
+        serde::de::Error::custom("required_blob must be 64 lowercase hexadecimal characters")
+    })
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitBlob {
+    #[serde(default, deserialize_with = "deserialize_required_blob")]
+    required_blob: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -660,6 +702,28 @@ pub(crate) fn error_response(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
+/// A refusal that came back from the actor, with the token beside the
+/// sentence: `{"error": "<what it says>", "reason": "<what it is>"}`.
+///
+/// The two fields exist so nothing downstream has to parse one out of the
+/// other. `error` is the sentence and NOTHING else — no status line, no
+/// variant name wrapped around it — because that string is shown to a person,
+/// and every character of framing inside it is a character of the sentence a
+/// bounded client cuts off the end.
+pub(crate) fn refused_response(status: StatusCode, refused: &crate::handle::Refused) -> Response {
+    tracing::debug!(
+        target: "ducktape::http",
+        status = status.as_u16(),
+        reason = refused.reason,
+        "request refused"
+    );
+    (
+        status,
+        Json(serde_json::json!({ "error": refused.message, "reason": refused.reason })),
+    )
+        .into_response()
+}
+
 /// the actor dropped the reply oneshot — it panicked or shut down mid-request.
 fn actor_gone() -> Response {
     error_response(
@@ -678,6 +742,7 @@ pub fn router(handle: NodeHandle) -> Router {
         // receipt out. distinct from `/v1/submit` above, whose `origin` is a
         // caller-supplied string.
         .route("/v1/submit/frame", post(submit_frame))
+        .route("/v1/submit/raw/{target}", post(submit_raw).layer(DefaultBodyLimit::max(node::MAX_PAYLOAD_BYTES)))
         .route("/v1/query", post(query))
         // the AUTHENTICATED read lane, to `/v1/query` what `/v1/submit/frame`
         // is to `/v1/submit`: the caller's own proof decides who is asking, so
@@ -699,64 +764,35 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/log-filter", post(log_filter))
         .route("/v1/huddle/node-proof", post(huddle_node_proof))
         .route("/v1/ws", get(ws))
-        .route("/v1/call/ws", get(call_ws))
         .route("/v1/presence/ws", get(presence_ws))
         .route(
             "/v1/gateway/proxy",
             post(gateway_proxy).layer(DefaultBodyLimit::max(
-                gateway::MAX_REQUEST_BODY_BYTES as usize * 2 + gateway::MAX_PROXY_HEAD_BYTES,
+                gateway_http::JSON_LANE_REQUEST_BYTES * 2 + gateway::MAX_PROXY_HEAD_BYTES,
             )),
+        )
+        .route(
+            "/v1/gateway/operator",
+            post(gateway_http::gateway_operator_proxy)
+                .get(gateway_http::gateway_operator_stream)
+                .layer(DefaultBodyLimit::max(
+                    gateway_http::JSON_LANE_REQUEST_BYTES * 2 + gateway::MAX_PROXY_HEAD_BYTES,
+                )),
         )
         .route("/v1/gateway/browser", get(gateway_browser_base))
         .route(
+            "/v1/gateway/stream",
+            get(gateway_http::gateway_native_stream),
+        )
+        .route(
             "/v1/files/blob",
-            // one receipt per request; the json routes keep axum's (smaller)
-            // default limit.
-            post(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BODY_BYTES)),
+            // NO body limit, and the one route that has none: `put_blob`
+            // streams to disk, and the bytes arriving here are a git push's
+            // packfile — capping them caps what anyone may push. The json
+            // routes keep axum's (smaller) default limit.
+            post(put_blob).layer(DefaultBodyLimit::disable()),
         )
         .route("/v1/files/blob/{digest}", get(get_blob))
-        // ---- duckfs product surface ----
-        // thin convenience wrappers over the files module's ops/queries: each
-        // encodes the duckfs wire server-side and threads it through the SAME
-        // submit/query actor seam /v1/submit and /v1/query use — no new
-        // consensus path. distinct plane from the op-receipt /v1/files/blob lane
-        // above (the node-local blobstore), which these never touch.
-        .route(
-            "/v1/files/stage",
-            // one duckfs chunk per request, so the body cap IS the single-chunk
-            // cap (CHUNK_SIZE, the module's own putblob ceiling); a larger body
-            // could never be a valid staged chunk, so the layer rejects it 413.
-            post(files_stage).layer(DefaultBodyLimit::max(CHUNK_SIZE as usize)),
-        )
-        .route("/v1/files/commit", post(files_commit))
-        .route("/v1/files/pin", post(files_pin))
-        // the name rides a signed JSON body, not a path segment: `url`
-        // normalizes `%2E`/`%2E%2E` path segments as dot-segments before the
-        // request leaves the client, so a pin named `.` or `..` (both legal,
-        // see `pin_apply`) could reach a different route or fail signature
-        // verification through a path-shaped route.
-        .route("/v1/files/unpin", post(files_unpin))
-        .route("/v1/files/watch", post(files_watch))
-        .route("/v1/files/stat", get(files_stat))
-        .route("/v1/files/ls", get(files_ls))
-        .route("/v1/files/read", get(files_read))
-        .route("/v1/files/find", get(files_find))
-        .route("/v1/files/grep", get(files_grep))
-        .route("/v1/files/history", get(files_history))
-        // the S3-shaped object facade: one url = one object. PUT is a
-        // single-change commit (stage + put), GET streams the whole file,
-        // DELETE is a single-change rm; LIST is the existing /v1/files/ls.
-        .route(
-            "/v1/files/object/{*path}",
-            put(object_put)
-                .get(object_get)
-                .delete(object_delete)
-                .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES)),
-        )
-        // the read/probe surface the checkout/commit engine drives.
-        .route("/v1/files/refs", get(files_refs))
-        .route("/v1/files/diff", get(files_diff))
-        .route("/v1/files/has-chunks", get(files_has_chunks))
         // ---- duckfs workspace RPC (the jobs/sandbox seam) ----
         // managed checkouts under the injected root: create, commit (409 on a
         // structured conflict), delete. `None` root → 503.
@@ -764,12 +800,8 @@ pub fn router(handle: NodeHandle) -> Router {
         // minting an invite is a WRITE to this node's own descriptor and a read
         // of its persisted mesh — the daemon that owns those files does it.
         .route("/v1/invite", post(mint_invite))
-        // ---- interactive terminal sessions (node-local, off-chain) ----
-        // create returns {session_id, topic}; output rides the ws `term:<id>`
-        // topic. same trusted-local gate as the other mutating /v1 routes (see
-        // term.rs). close is idempotent.
-        .route("/v1/term/sessions", post(term::create_session))
-        .route("/v1/term/sessions/{id}/close", post(term::close_session))
+        // ---- run control (node-local, off-chain) ----
+        .route("/v1/run-control", post(run_control::control))
         // ---- service signaling (node-local, off-chain, volatile) ----
         // a local service daemon says hello; the entry ages out on its own
         // TTL. Presence only — enablement lives in the workspace's
@@ -784,22 +816,8 @@ pub fn router(handle: NodeHandle) -> Router {
         .route(
             "/v1/fs/workspaces/{id}",
             delete(workspaces::delete_workspace),
-        )
-        .route("/forge/{repo}/info/refs", get(git_info_refs))
-        // git smart-HTTP: forge is a full push+fetch remote over one route pair.
-        //   `git push  http://<node>/forge/<repo> main` — receive-pack (push)
-        //   `git clone http://<node>/forge/<repo>`      — upload-pack (fetch)
-        // the info/refs advertisement is tiny; both packfile POSTs carry a whole-
-        // repo pack, so their body caps are lifted far above the json/chunk
-        // defaults.
-        .route(
-            "/forge/{repo}/git-receive-pack",
-            post(git_receive_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
-        )
-        .route(
-            "/forge/{repo}/git-upload-pack",
-            post(git_upload_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
         );
+
     // EVERY mutating route above carries a credential; the reads do not. WHICH
     // credential is `signed_req::Lane::authority`'s call: a module-bound write
     // takes any acting key (the module decides), a node-level one takes this
@@ -811,6 +829,9 @@ pub fn router(handle: NodeHandle) -> Router {
     let public = public.route_layer(axum::middleware::from_fn_with_state(
         handle.clone(),
         signed_req::signed_write_guard,
+    )).route_layer(axum::middleware::from_fn_with_state(
+        std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+        limit_blob_uploads,
     ));
     // the owner-gated `/v1/admin/*` namespace — merged only when exposure is
     // enabled, so `Disabled` leaves the control surface simply ABSENT (a 404),
@@ -893,11 +914,49 @@ async fn submit(
             .unwrap_or_else(|| DEFAULT_ORIGIN.to_string())
             .into_bytes(),
     };
+    submit_payload(&handle, req.target, payload, origin, req.required_blob).await
+}
+
+/// An operator-authorized arbitrary module op, authored as the node. User
+/// clients submit signed frames instead; this endpoint never claims a user.
+async fn submit_raw(
+    State(handle): State<NodeHandle>,
+    axum::extract::Path(target): axum::extract::Path<String>,
+    axum::extract::Query(prerequisite): axum::extract::Query<SubmitBlob>,
+    body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
+) -> Response {
+    let bounded_target = !target.is_empty() && target.len() <= node::MAX_TARGET_BYTES;
+    if !bounded_target { return error_response(StatusCode::BAD_REQUEST, "invalid module target"); }
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => return error_response(error.status(), &error.body_text()),
+    };
+    submit_payload(
+        &handle,
+        target,
+        body.to_vec(),
+        signed_req::acting_origin(None),
+        prerequisite.required_blob,
+    )
+    .await
+}
+
+async fn submit_payload(
+    handle: &NodeHandle,
+    target: String,
+    payload: Vec<u8>,
+    origin: Vec<u8>,
+    required_blob: Option<[u8; 32]>,
+) -> Response {
+    if let Err(reason) = require_local_blob(handle, required_blob.as_ref()) {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
     let (reply, rx) = oneshot::channel();
     if let Err(resp) = handle
         .send(NodeCommand::Submit {
-            target: req.target,
+            target,
             payload: payload.clone(),
+            required_blob,
             origin,
             reply,
         })
@@ -918,9 +977,18 @@ async fn submit(
             })
             .into_response()
         }
-        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
+        Ok(Err(refused)) => refused_response(StatusCode::BAD_REQUEST, &refused),
         Err(_) => actor_gone(),
     }
+}
+
+fn require_local_blob(handle: &NodeHandle, digest: Option<&[u8; 32]>) -> Result<(), &'static str> {
+    let Some(digest) = digest else { return Ok(()) };
+    let available = handle.blobs.has_verified_chunk(digest);
+    if !available {
+        return Err("required blob is not available on this node");
+    }
+    Ok(())
 }
 
 /// POST /v1/submit/frame — an ALREADY-SIGNED op frame (`application/octet-stream`,
@@ -931,7 +999,7 @@ async fn submit(
 /// the embedded daemon honours it, `bin/node` throws it away and signs with its
 /// own node key, so nothing submitted there can carry authorship consensus is
 /// able to check. a frame can — its origin IS its verified signer, bound to
-/// `(seq, target, payload)` under `FRAME_NS`, which every honest validator
+/// `(seq, target, payload, required_blob)` under `FRAME_NS`, which every honest validator
 /// re-verifies identically. that is what lets an agent's ephemeral session key
 /// act for itself instead of borrowing the node's identity.
 ///
@@ -948,13 +1016,16 @@ async fn submit_frame(
         Ok(bytes) => bytes,
         Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
     };
-    let payload = match node::decode_frame(&frame) {
+    let (payload, required_blob) = match node::decode_frame_with_blob(&frame) {
         // the origin is DELIBERATELY dropped here: the http layer never tells an
         // actor who signed — the actor re-derives that from the bytes (or, on
         // the validator, `submit_frame` does). one authority on authorship.
-        Ok((_origin, msg)) => msg.payload,
+        Ok((_origin, msg, required_blob)) => (msg.payload, required_blob),
         Err(err) => return error_response(StatusCode::BAD_REQUEST, &err.to_string()),
     };
+    if let Err(reason) = require_local_blob(&handle, required_blob.as_ref()) {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
     let (reply, rx) = oneshot::channel();
     if let Err(resp) = handle
         .send(NodeCommand::SubmitFrame {
@@ -978,11 +1049,31 @@ async fn submit_frame(
             })
             .into_response()
         }
-        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
+        Ok(Err(refused)) => refused_response(StatusCode::BAD_REQUEST, &refused),
         Err(_) => actor_gone(),
     }
 }
 
+/// A module's reply, typed by what it actually is.
+///
+/// `query` returns `Vec<u8>`: json is a convention most modules speak, never
+/// the contract. The reference module (`crates/guests/hello-wasm`, the one
+/// `docs/dogfood.md` deploys) answers its counter's eight little-endian bytes,
+/// so "not json" is an ORDINARY module answering in its own encoding. The
+/// content type is the discriminant — `application/json` when the reply parses,
+/// `application/octet-stream` with the bytes verbatim when it does not — and
+/// neither is an error. A 500 here blamed the module for the route's limit, and
+/// left the documented way to observe a module unable to read the documented
+/// example of one.
+fn module_reply(bytes: Vec<u8>) -> Response {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response();
+    };
+    Json(value).into_response()
+}
+
+/// POST /v1/query — the OPEN read lane over committed module state. The reply
+/// comes back as [`module_reply`] types it.
 async fn query(State(handle): State<NodeHandle>, Json(req): Json<QueryRequest>) -> Response {
     let req_bytes = serde_json::to_vec(&req.query).expect("a decoded json value re-serializes");
     let (reply, rx) = oneshot::channel();
@@ -997,14 +1088,8 @@ async fn query(State(handle): State<NodeHandle>, Json(req): Json<QueryRequest>) 
         return resp;
     }
     match rx.await {
-        Ok(Ok(bytes)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(value) => Json(value).into_response(),
-            Err(_) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "module reply was not json",
-            ),
-        },
-        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
+        Ok(Ok(bytes)) => module_reply(bytes),
+        Ok(Err(refused)) => refused_response(StatusCode::BAD_REQUEST, &refused),
         Err(_) => actor_gone(),
     }
 }
@@ -1077,14 +1162,8 @@ async fn query_as_reader(
         return resp;
     }
     match rx.await {
-        Ok(Ok(bytes)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(value) => Json(value).into_response(),
-            Err(_) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "module reply was not json",
-            ),
-        },
-        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
+        Ok(Ok(bytes)) => module_reply(bytes),
+        Ok(Err(refused)) => refused_response(StatusCode::BAD_REQUEST, &refused),
         Err(_) => actor_gone(),
     }
 }
@@ -1278,26 +1357,70 @@ async fn mint_invite(
 
 /// body cap for the op-receipt blob lane. a receipt-lane bound only —
 /// unrelated to duckfs chunking, which rides the op stream.
-const MAX_BLOB_BODY_BYTES: usize = 4 * 1024 * 1024;
+async fn limit_blob_uploads(
+    State(slots): State<std::sync::Arc<tokio::sync::Semaphore>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let uploads_blob = request.method() == axum::http::Method::POST
+        && request.uri().path() == "/v1/files/blob";
+    if !uploads_blob { return next.run(request).await; }
+    let Ok(_permit) = slots.try_acquire() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "blob upload capacity exhausted");
+    };
+    next.run(request).await
+}
 
 /// POST /v1/files/blob — raw receipt bytes in, `{"digest":"<64-hex>"}` out.
 ///
 /// bytes go straight into the node-local blob store; NOTHING reaches the node
-/// actor and no op is submitted. the route's body limit is
-/// `MAX_BLOB_BODY_BYTES`, and an oversized body is a 413 in the daemon's json
-/// error envelope.
+/// actor and no op is submitted.
+///
+/// THE BODY HAS NO SIZE LIMIT, and streams: it is written to the store's
+/// staging directory frame by frame and named by its own hash once it ends, so
+/// what a caller uploads costs this process one frame of memory and the disk
+/// the bytes occupy. A git push of a whole repository's history arrives here,
+/// and a limit on it would be a limit on what anyone may push.
 async fn put_blob(
     State(handle): State<NodeHandle>,
-    body: Result<Bytes, BytesRejection>,
+    proof: Option<axum::Extension<signed_req::DeferredProof>>,
+    body: axum::body::Body,
 ) -> Response {
-    let bytes = match body {
-        Ok(bytes) => bytes,
-        // the DefaultBodyLimit layer stops reading past the cap and the
-        // extractor rejects with 413 — re-wrap it in the json envelope.
-        Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
+    use futures::StreamExt as _;
+    let mut ingest = match handle.blobs.ingest() {
+        Ok(ingest) => ingest,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let digest = handle.blobs.put_chunk(bytes.to_vec());
-    Json(serde_json::json!({ "digest": hex_bytes(&digest) })).into_response()
+    let mut frames = body.into_data_stream();
+    while let Some(frame) = frames.next().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            // the upload died in flight; the ingest's Drop takes its file
+            // with it.
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("body: {e}")),
+        };
+        if let Err(e) = ingest.append(&frame) {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+        }
+    }
+    // name the bytes, THEN admit them: an unsealed ingest is nameless and an
+    // unadmitted one is never published, so a signature that does not bind
+    // these exact bytes leaves nothing behind.
+    let digest = match ingest.seal() {
+        Ok(digest) => digest,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    // no proof extension means the gate admitted the request itself (this
+    // node's operator credential); one means the gate deferred to here.
+    if let Some(axum::Extension(proof)) = proof
+        && let Err(refusal) = proof.verify(&handle, &digest)
+    {
+        return error_response(refusal.status(), refusal.message());
+    }
+    match ingest.publish() {
+        Ok(digest) => Json(serde_json::json!({ "digest": hex_bytes(&digest) })).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 /// GET /v1/files/blob/{digest} — chunk bytes back out of the node-local store.

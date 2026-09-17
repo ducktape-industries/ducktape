@@ -118,10 +118,11 @@ async fn run(
     backend.probe()?;
 
     let (line_tx, line_rx) = tokio::sync::mpsc::channel(link::OUTPUT_LANE);
+    let resync = Arc::new(tokio::sync::Notify::new());
     let providers = provider_host::discover(
         &node_key,
         &workspace_config::capability_dir(&service.workspace),
-        Some(output_sink(line_tx)),
+        Some(output_sink(line_tx, resync.clone())),
         // cloned: `discover` consumes the backend, and the teardown below needs
         // the same socket to sweep this instance's containers through.
         backend.clone(),
@@ -130,7 +131,15 @@ async fn run(
     let offered = providers.capabilities();
 
     let hint = Arc::new(tokio::sync::Notify::new());
-    tokio::spawn(link::attach(ws_url(&http_base), hint.clone(), line_rx));
+    let link_token = std::fs::read_to_string(service.workspace.join("service-link.token"))
+        .map_err(|_| "compute service cannot read its node link credential")?;
+    tokio::spawn(link::attach(
+        ws_url(&http_base),
+        hint.clone(),
+        line_rx,
+        link_token,
+        resync,
+    ));
 
     let (mut pump, mut delivered) = build_pool(&node, &service, node_key, providers).await?;
 
@@ -173,8 +182,10 @@ async fn run(
         }
     }
     // Nothing to tear down: every live run's VMM is a child of this process
-    // spawned kill_on_drop, so returning from here IS the teardown — and it
-    // covers SIGKILL, which the container backend's sweep could not.
+    // spawned kill_on_drop, so returning from here IS the teardown. A SIGKILL,
+    // which runs no destructor, is covered by the parent-death signal the
+    // launcher arms instead — the case the container backend's sweep could
+    // not reach either.
     tracing::info!(
         target: "ducktape::service",
         instance = %grant.display_id(),
@@ -219,16 +230,37 @@ async fn await_node(node: &NodeLink) {
 /// the live run tail, across the process boundary. A full lane drops the line
 /// rather than blocking: output is a display buffer, and back-pressuring a
 /// provider's stdout would let a chatty run stall its own execution.
-fn output_sink(lines: tokio::sync::mpsc::Sender<link::OutputLine>) -> provider_host::OutputSink {
+fn output_sink(
+    lines: tokio::sync::mpsc::Sender<link::OutputLine>,
+    resync: Arc<tokio::sync::Notify>,
+) -> provider_host::OutputSink {
     Arc::new(move |ctx, line| {
         let Some(run_key) = ctx.run_key.as_deref() else {
             return;
         };
-        let _ = lines.try_send(link::OutputLine {
+        let offered = lines.try_send(link::OutputLine {
             run_key: run_key.to_string(),
             stderr: line.stream == provider_host::OutputStream::Stderr,
             line: line.line,
         });
+        let Err(tokio::sync::mpsc::error::TrySendError::Full(dropped)) = offered else {
+            return;
+        };
+        let needs_resync = serde_json::from_str::<serde_json::Value>(&dropped.line)
+            .ok()
+            .is_some_and(|event| {
+                event["type"] == "run_control"
+                    && matches!(
+                        event["state"].as_str(),
+                        Some("ready" | "approval" | "approval_resolved" | "closed")
+                    )
+            });
+        if needs_resync {
+            // Control state is not a best-effort log. Reconnect to clear the
+            // node's old reading and replay the authoritative session cache.
+            // Notify coalesces overload without blocking stdout or spawning tasks.
+            resync.notify_one();
+        }
     })
 }
 
@@ -275,10 +307,7 @@ async fn build_pool(
             node.clone(),
             noded::agent_provision::agent_runs_root(&service.storage_dir)?,
         )
-        .with_forge(
-            noded::agent_provision::forge_push_base(service.http_listen.as_deref()),
-            config::hex_bytes(&node_key),
-        )
+        .with_forge(config::hex_bytes(&node_key))
         .with_node_url(noded::agent_provision::node_http_base(
             service.http_listen.as_deref(),
         )),
@@ -356,6 +385,34 @@ fn ws_url(base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn losing_control_state_requests_resync_but_dropping_log_output_does_not() {
+        use futures::FutureExt as _;
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let resync = Arc::new(tokio::sync::Notify::new());
+        let sink = output_sink(sender, resync.clone());
+        let ctx = provider_host::RunContext {
+            run_key: Some("run".into()),
+            ..Default::default()
+        };
+        let emit = |line: &str| {
+            sink(
+                &ctx,
+                provider_host::OutputLine {
+                    stream: provider_host::OutputStream::Stdout,
+                    line: line.into(),
+                },
+            )
+        };
+        emit("fills the queue");
+        emit("ordinary output can be dropped");
+        assert!(resync.notified().now_or_never().is_none());
+        for state in ["ready", "approval", "approval_resolved", "closed"] {
+            emit(&serde_json::json!({"type":"run_control","state":state}).to_string());
+            assert!(resync.notified().now_or_never().is_some());
+        }
+    }
 
     #[test]
     fn the_ws_url_tracks_the_http_scheme() {

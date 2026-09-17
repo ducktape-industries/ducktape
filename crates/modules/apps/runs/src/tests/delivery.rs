@@ -160,18 +160,22 @@ fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
             "the failure reply holds the run's one reply id ({fragment})"
         );
 
-        assert_eq!(blocks.len(), 1, "one ⚠ paragraph ({fragment})");
+        assert_eq!(
+            blocks.len(),
+            2,
+            "one ⚠ paragraph and the reason's code block ({fragment})"
+        );
         let Block::Paragraph(spans) = &blocks[0] else {
             panic!("expected a paragraph");
         };
         let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "⚠ BOT failed", "the reply names the agent's display name");
+        let Block::Code { text: detail, .. } = &blocks[1] else {
+            panic!("expected the reason in a code block");
+        };
         assert!(
-            text.starts_with("⚠ BOT failed: "),
-            "the reply names the agent's display name: {text}"
-        );
-        assert!(
-            text.contains(fragment),
-            "the reply carries the reason excerpt: {text}"
+            detail.contains(fragment),
+            "the code block carries the reason: {detail}"
         );
         let breadcrumbs: Vec<String> = ctx
             .events

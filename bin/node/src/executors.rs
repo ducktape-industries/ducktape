@@ -51,20 +51,23 @@ use std::path::{Path, PathBuf};
 use provider_host::{CapabilitySpec, ReleaseSource, SpecSet};
 use sha2::{Digest as _, Sha256};
 
-use crate::cred_cli::ProviderArg;
+use crate::agent_cli::HarnessArg;
 
 type InstallResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Every provider that has a guest CLI. Adding one here is what makes it
 /// offerable; its capability spec's `[source]` is what makes it installable.
-const ALL: [ProviderArg; 2] = [ProviderArg::Claude, ProviderArg::Codex];
+const ALL: [HarnessArg; 3] = [HarnessArg::Claude, HarnessArg::Codex, HarnessArg::Pi];
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct InstallArgs {
     /// which CLIs to install (omitted = a checklist of what is missing or
     /// behind the vendor's latest release)
     #[arg(value_name = "NAME")]
-    providers: Vec<ProviderArg>,
+    providers: Vec<HarnessArg>,
+    /// install everything the checklist would offer without asking
+    #[arg(short, long, conflicts_with = "providers")]
+    yes: bool,
 }
 
 /// The guest's architecture — the HOST's, because there is no cross-hypervisor:
@@ -93,6 +96,14 @@ impl GuestArch {
         }
     }
 
+    /// Standalone JavaScript-runtime bundles use Node's architecture names.
+    fn bundle_arch(self) -> &'static str {
+        match self {
+            Self::Aarch64 => "arm64",
+            Self::X86_64 => "x64",
+        }
+    }
+
     /// the arch as Anthropic's release feed spells its Linux platforms.
     fn claude_platform(self) -> &'static str {
         match self {
@@ -111,6 +122,8 @@ enum Payload {
     Binary(String),
     /// members to lift out of a gzipped tar, by their path inside the archive.
     TarGz(Vec<String>),
+    /// A standalone executable with sibling runtime assets; keep its tree.
+    Bundle { root: String, bin: String },
 }
 
 /// One vendor release, resolved: the channel's latest, and everything the
@@ -130,6 +143,7 @@ impl Release {
         match &self.payload {
             Payload::Binary(name) => vec![name.as_str()],
             Payload::TarGz(members) => members.iter().map(|m| base_name(m)).collect(),
+            Payload::Bundle { bin, .. } => vec![bin.as_str()],
         }
     }
 }
@@ -186,7 +200,26 @@ impl Vendors {
                 asset,
                 sums,
                 members,
-            } => self.latest_github_release(repo, asset, sums, members, arch),
+            } => self.latest_github_release(
+                repo,
+                &asset.replace("{arch}", arch.rust_triple_arch()),
+                sums,
+                Payload::TarGz(members.clone()),
+            ),
+            ReleaseSource::GithubBundle {
+                repo,
+                asset,
+                sums,
+                root,
+            } => self.latest_github_release(
+                repo,
+                &asset.replace("{arch}", arch.bundle_arch()),
+                sums,
+                Payload::Bundle {
+                    root: root.clone(),
+                    bin: spec.bin.clone(),
+                },
+            ),
         }
     }
 
@@ -218,21 +251,19 @@ impl Vendors {
         repo: &str,
         asset: &str,
         sums: &str,
-        members: &[String],
-        arch: GuestArch,
+        payload: Payload,
     ) -> Result<Release, String> {
         let landing = self.get(&format!("https://github.com/{repo}/releases/latest"))?;
         let tag = release_tag(landing.url().path())?;
-        let asset = asset.replace("{arch}", arch.rust_triple_arch());
         let downloads = format!("https://github.com/{repo}/releases/download/{tag}");
         let sums_text = self.text(&format!("{downloads}/{sums}"))?;
         let sha256 =
-            sums_checksum(&sums_text, &asset).map_err(|e| format!("{downloads}/{sums}: {e}"))?;
+            sums_checksum(&sums_text, asset).map_err(|e| format!("{downloads}/{sums}: {e}"))?;
         Ok(Release {
             version: tag,
             url: format!("{downloads}/{asset}"),
             sha256,
-            payload: Payload::TarGz(members.to_vec()),
+            payload,
         })
     }
 }
@@ -396,7 +427,7 @@ impl Installed {
     }
 }
 
-fn installed(provider: ProviderArg, latest: &Release, dir: &Path, receipts: &Receipts) -> Installed {
+fn installed(provider: HarnessArg, latest: &Release, dir: &Path, receipts: &Receipts) -> Installed {
     // A partial install reports as missing rather than as present: codex
     // without its Code Mode companion is a codex that dies at startup inside
     // the guest.
@@ -430,7 +461,7 @@ fn is_executable(path: &Path) -> bool {
 /// One provider's row in the survey: what the vendor has, and what the
 /// directory holds against it.
 struct Surveyed {
-    provider: ProviderArg,
+    provider: HarnessArg,
     latest: Release,
     state: Installed,
 }
@@ -470,7 +501,12 @@ pub(crate) fn run(args: InstallArgs, workspace: &Path) -> InstallResult {
             println!("\nnothing to install. `ducktape agent install <name>` reinstalls one.");
             return Ok(());
         }
-        choose(&offered)?
+        // `--yes` is the approval given up front, for the whole checklist.
+        if args.yes {
+            offered
+        } else {
+            choose(&offered)?
+        }
     } else {
         survey
             .iter()
@@ -556,13 +592,17 @@ fn choose<'a>(offered: &[&'a Surveyed]) -> Result<Vec<&'a Surveyed>, String> {
 fn install_all(vendors: &Vendors, chosen: &[&Surveyed], dir: &Path) -> InstallResult {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let cache = download_cache()?;
+    let artifacts = fetch_all(vendors, chosen, &cache)?;
+
+    // Phase 2: unpack/install + receipt, sequential and unchanged, now
+    // reading from the cache phase 1 just filled.
     let mut receipts = Receipts::load(dir)?;
-    for row in chosen {
-        let receipt = install_one(vendors, row.provider, &row.latest, dir, &cache)?;
+    for (row, artifact) in chosen.iter().zip(artifacts) {
+        let receipt = install_one(row.provider, &row.latest, dir, &artifact)?;
         receipts
             .providers
             .insert(row.provider.token().to_string(), receipt);
-        // saved per install, so a second download failing does not lose the
+        // saved per install, so a second install failing does not lose the
         // first one's receipt.
         receipts.save(dir)?;
     }
@@ -572,24 +612,81 @@ fn install_all(vendors: &Vendors, chosen: &[&Surveyed], dir: &Path) -> InstallRe
     Ok(())
 }
 
-fn install_one(
+/// Phase 1 of an install: every chosen artifact fetched concurrently, one
+/// thread per row — no pool, since the row count is the checklist's own,
+/// never unbounded. `fetch`/`download_to` keep their existing fail-closed
+/// checksum semantics and `.part`-then-rename discipline unchanged per
+/// thread, so a half-written download still never reads back as a cache hit.
+/// Any fetch failing fails the whole install, same as the sequential version
+/// did.
+fn fetch_all(
     vendors: &Vendors,
-    provider: ProviderArg,
-    latest: &Release,
-    dir: &Path,
+    chosen: &[&Surveyed],
     cache: &Path,
-) -> Result<Receipt, Box<dyn std::error::Error>> {
-    println!("\n{} {} <- {}", provider.token(), latest.version, latest.url);
+) -> Result<Vec<PathBuf>, String> {
+    let single_download = chosen.len() == 1;
+    let fetched: Vec<Result<PathBuf, String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = chosen
+            .iter()
+            .map(|row| {
+                // printed before spawning, on the main thread, so the header
+                // lines themselves never interleave with each other.
+                println!(
+                    "\n{} {} <- {}",
+                    row.provider.token(),
+                    row.latest.version,
+                    row.latest.url
+                );
+                let provider = row.provider;
+                let latest = &row.latest;
+                scope.spawn(move || fetch_one(vendors, provider, latest, cache, single_download))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("fetch thread panicked"))
+            .collect()
+    });
+    // fail-closed: any fetch failing refuses the whole install, same as the
+    // sequential version did.
+    fetched.into_iter().collect()
+}
 
+/// One row of phase 1: land `latest`'s artifact on its cache shelf, verified
+/// against the vendor's checksum.
+fn fetch_one(
+    vendors: &Vendors,
+    provider: HarnessArg,
+    latest: &Release,
+    cache: &Path,
+    single_download: bool,
+) -> Result<PathBuf, String> {
     let shelf = cache.join(provider.token()).join(&latest.version);
     std::fs::create_dir_all(&shelf).map_err(|e| format!("create {}: {e}", shelf.display()))?;
     let artifact = shelf.join(base_name(&latest.url));
-    fetch(vendors, &latest.url, &artifact, &latest.sha256)?;
-    println!("  sha256 ok");
+    fetch(
+        vendors,
+        &latest.url,
+        &artifact,
+        &latest.sha256,
+        single_download,
+    )?;
+    println!("  {} sha256 ok", provider.token());
+    Ok(artifact)
+}
 
+/// Phase 2 of an install: `artifact` is already on the cache shelf and
+/// verified: unpack it into `dir` and write the receipt for it.
+fn install_one(
+    provider: HarnessArg,
+    latest: &Release,
+    dir: &Path,
+    artifact: &Path,
+) -> Result<Receipt, Box<dyn std::error::Error>> {
     match &latest.payload {
-        Payload::Binary(name) => install_file(&artifact, &dir.join(name))?,
-        Payload::TarGz(members) => unpack_into(&artifact, members, dir)?,
+        Payload::Binary(name) => install_file(artifact, &dir.join(name))?,
+        Payload::TarGz(members) => unpack_into(artifact, members, dir)?,
+        Payload::Bundle { root, bin } => unpack_bundle(artifact, root, bin, dir)?,
     }
     for file in latest.files() {
         println!("  installed {}", dir.join(file).display());
@@ -605,9 +702,19 @@ fn install_one(
 /// entry cannot survive into an image. A mismatch deletes the file and stops:
 /// there is no "carry on without it" for an executable that runs beside a
 /// credential.
-fn fetch(vendors: &Vendors, url: &str, dest: &Path, want: &str) -> Result<(), String> {
+///
+/// `single_download` is only about the progress meter: it is the caller
+/// saying no other fetch is in flight beside this one, so a redrawing `\r`
+/// bar is safe to draw without a second thread's bar splicing into it.
+fn fetch(
+    vendors: &Vendors,
+    url: &str,
+    dest: &Path,
+    want: &str,
+    single_download: bool,
+) -> Result<(), String> {
     if !dest.exists() {
-        download_to(vendors, url, dest)?;
+        download_to(vendors, url, dest, single_download)?;
     }
     let got = sha256_file(dest)?;
     if got != want {
@@ -622,13 +729,19 @@ fn fetch(vendors: &Vendors, url: &str, dest: &Path, want: &str) -> Result<(), St
 
 /// Stream to `<dest>.part` and rename on success: an interrupted download must
 /// never be picked up as a cache hit on the next run.
-fn download_to(vendors: &Vendors, url: &str, dest: &Path) -> Result<(), String> {
+fn download_to(
+    vendors: &Vendors,
+    url: &str,
+    dest: &Path,
+    single_download: bool,
+) -> Result<(), String> {
     let part = dest.with_extension("part");
     let mut response = vendors.get(url)?;
     let response_length = response.content_length();
     // The meter draws nothing off a terminal, so say the size once instead: it
     // is the part that tells a long download from a wedged one, and it is the
-    // only part a log wants.
+    // only part a log wants. One line per download is safe to interleave;
+    // only the redrawing bar below needs `single_download`.
     if !std::io::stdout().is_terminal() {
         match response_length {
             Some(total) => println!("  downloading {} MiB", mib(total)),
@@ -637,7 +750,7 @@ fn download_to(vendors: &Vendors, url: &str, dest: &Path) -> Result<(), String> 
     }
     let mut file =
         std::fs::File::create(&part).map_err(|e| format!("create {}: {e}", part.display()))?;
-    let mut metered = Metered::new(&mut response, response_length);
+    let mut metered = Metered::new(&mut response, response_length, single_download);
     let copied = std::io::copy(&mut metered, &mut file);
     metered.finish();
     if let Err(e) = copied {
@@ -667,13 +780,16 @@ struct Metered<R> {
 }
 
 impl<R: std::io::Read> Metered<R> {
-    fn new(inner: R, total: Option<u64>) -> Self {
+    /// `allow_live` is false when a sibling fetch may be drawing its own bar
+    /// at the same time — a redrawing `\r` line only reads correctly when it
+    /// is the only one writing to the terminal.
+    fn new(inner: R, total: Option<u64>, allow_live: bool) -> Self {
         Self {
             inner,
             total,
             done: 0,
             drawn: std::time::Instant::now(),
-            live: std::io::stdout().is_terminal(),
+            live: allow_live && std::io::stdout().is_terminal(),
         }
     }
 
@@ -760,6 +876,154 @@ fn unpack_into(archive: &Path, members: &[String], dir: &Path) -> Result<(), Str
     Ok(())
 }
 
+/// Preserve the vendor's complete standalone distribution, including its runtime
+/// assets. A relative symlink keeps PATH lookup working after the directory is
+/// copied into the guest image; its target is the vendor's Linux ELF, not a host
+/// Node launcher. Bun resolves package assets beside the real executable.
+fn unpack_bundle(archive: &Path, root: &str, bin: &str, dir: &Path) -> Result<(), String> {
+    let names_are_safe = safe_component(root) && safe_component(bin);
+    if !names_are_safe {
+        return Err("bundle root and executable must be plain path components".into());
+    }
+    let unpack = dir.with_extension(format!(
+        "staging-{}-{:x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir(&unpack).map_err(|e| format!("create {}: {e}", unpack.display()))?;
+    let result = install_bundle_tree(archive, root, bin, dir, &unpack);
+    let recovery_needed = result.is_err() && unpack.join("previous").exists();
+    if recovery_needed {
+        return result.map_err(|e| {
+            format!(
+                "{e}; previous bundle retained at {}",
+                unpack.join("previous").display()
+            )
+        });
+    }
+    let _ = std::fs::remove_dir_all(&unpack);
+    result
+}
+
+fn install_bundle_tree(
+    archive: &Path,
+    root: &str,
+    bin: &str,
+    dir: &Path,
+    unpack: &Path,
+) -> Result<(), String> {
+    let content = unpack.join("content");
+    std::fs::create_dir(&content).map_err(|e| format!("create bundle staging: {e}"))?;
+    extract_bundle(archive, root, &content)?;
+    let tree = content.join(root);
+    let executable = tree.join(bin);
+    let mut magic = [0; 4];
+    let read = std::fs::File::open(&executable)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic));
+    let is_linux_executable = is_executable(&executable) && read.is_ok() && magic == *b"\x7fELF";
+    if !is_linux_executable {
+        return Err(format!("bundle contains no Linux executable {root}/{bin}"));
+    }
+    let bundle_name = format!(".{bin}");
+    let bundle = dir.join(&bundle_name);
+    let previous = match std::fs::symlink_metadata(&bundle) {
+        Ok(meta) => {
+            if !meta.is_dir() {
+                return Err(format!("{} is not a bundle directory", bundle.display()));
+            }
+            let previous = unpack.join("previous");
+            std::fs::rename(&bundle, &previous)
+                .map_err(|e| format!("move {}: {e}", bundle.display()))?;
+            Some(previous)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("inspect {}: {e}", bundle.display())),
+    };
+    if let Err(e) = std::fs::rename(&tree, &bundle) {
+        restore_bundle(previous.as_deref(), &bundle)?;
+        return Err(format!("install {}: {e}", bundle.display()));
+    }
+    let link = unpack.join("entrypoint");
+    let publish = std::os::unix::fs::symlink(Path::new(&bundle_name).join(bin), &link)
+        .and_then(|()| std::fs::rename(&link, dir.join(bin)));
+    if let Err(e) = publish {
+        let _ = std::fs::remove_dir_all(&bundle);
+        restore_bundle(previous.as_deref(), &bundle)?;
+        return Err(format!("publish {bin}: {e}"));
+    }
+    Ok(())
+}
+
+fn restore_bundle(previous: Option<&Path>, bundle: &Path) -> Result<(), String> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    std::fs::rename(previous, bundle).map_err(|e| format!("restore {}: {e}", bundle.display()))
+}
+
+fn safe_component(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!(parts.next(), Some(std::path::Component::Normal(_)))
+        && parts.next().is_none()
+        && !name.contains(['/', '\\'])
+}
+
+/// Inspect structured tar entries before writing. No links, devices, absolute
+/// paths or parent traversal are accepted, even from a checksum-verified vendor.
+fn extract_bundle(archive: &Path, root: &str, unpack: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(archive).map_err(|e| format!("open archive: {e}"))?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("read archive: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("read archive entry: {e}"))?;
+        let path = entry
+            .path()
+            .map_err(|e| format!("read archive path: {e}"))?
+            .into_owned();
+        let normal_components = path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
+        let within_root = path.starts_with(root) && normal_components;
+        if !within_root {
+            return Err(format!(
+                "bundle path escapes root {root}: {}",
+                path.display()
+            ));
+        }
+        let kind = entry.header().entry_type();
+        let supported_entry = kind.is_file() || kind.is_dir();
+        if !supported_entry {
+            return Err(format!(
+                "bundle links and special files are refused: {}",
+                path.display()
+            ));
+        }
+        let mode = entry
+            .header()
+            .mode()
+            .map_err(|e| format!("read archive mode: {e}"))?;
+        let extracted = entry
+            .unpack_in(unpack)
+            .map_err(|e| format!("extract {}: {e}", path.display()))?;
+        if !extracted {
+            return Err(format!("bundle path was not extracted: {}", path.display()));
+        }
+        let permissions = if kind.is_dir() {
+            0o755
+        } else {
+            0o644 | (mode & 0o111)
+        };
+        std::fs::set_permissions(
+            unpack.join(path),
+            std::fs::Permissions::from_mode(permissions),
+        )
+        .map_err(|e| format!("set bundle permissions: {e}"))?;
+    }
+    Ok(())
+}
+
 fn install_file(src: &Path, dest: &Path) -> Result<(), String> {
     std::fs::copy(src, dest)
         .map_err(|e| format!("install {} -> {}: {e}", src.display(), dest.display()))?;
@@ -770,6 +1034,245 @@ fn install_file(src: &Path, dest: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bundle_archive(dir: &Path, entries: &[(&str, &[u8], tar::EntryType, u32)]) -> PathBuf {
+        let path = dir.join("bundle.tar.gz");
+        let gzip = flate2::write::GzEncoder::new(
+            std::fs::File::create(&path).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut archive = tar::Builder::new(gzip);
+        for (name, bytes, kind, mode) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(*mode);
+            header.set_entry_type(*kind);
+            if kind.is_symlink() || kind.is_hard_link() {
+                header.set_link_name("../../outside").unwrap();
+            }
+            // Raw names deliberately exercise hostile paths the builder's
+            // normal set_path API would reject before the extractor sees them.
+            header.as_mut_bytes()[..name.len()].copy_from_slice(name.as_bytes());
+            header.set_cksum();
+            archive.append(&header, *bytes).unwrap();
+        }
+        archive.into_inner().unwrap().finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn bundle_preserves_assets_and_relative_entrypoint_after_relocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("executors");
+        std::fs::create_dir(&dir).unwrap();
+        let archive = bundle_archive(
+            temp.path(),
+            &[
+                ("pi/pi", b"\x7fELFbinary", tar::EntryType::Regular, 0o755),
+                (
+                    "pi/package.json",
+                    b"{\"version\":\"1.0\"}",
+                    tar::EntryType::Regular,
+                    0o644,
+                ),
+                ("pi/theme/dark.json", b"{}", tar::EntryType::Regular, 0o644),
+                (
+                    "pi/photon_rs_bg.wasm",
+                    b"wasm",
+                    tar::EntryType::Regular,
+                    0o644,
+                ),
+                (
+                    "pi/node_modules/native/addon.node",
+                    b"addon",
+                    tar::EntryType::Regular,
+                    0o644,
+                ),
+            ],
+        );
+        unpack_bundle(&archive, "pi", "pi", &dir).unwrap();
+        assert_eq!(
+            std::fs::read_link(dir.join("pi")).unwrap(),
+            Path::new(".pi/pi")
+        );
+        assert!(is_executable(&dir.join("pi")));
+        assert!(!is_executable(&dir.join(".pi/package.json")));
+        let relocated = temp.path().join("guest-executors");
+        std::fs::rename(&dir, &relocated).unwrap();
+        let executable = std::fs::canonicalize(relocated.join("pi")).unwrap();
+        let package = executable.parent().unwrap();
+        assert_eq!(
+            std::fs::read(package.join("theme/dark.json")).unwrap(),
+            b"{}"
+        );
+        assert_eq!(
+            std::fs::read(package.join("node_modules/native/addon.node")).unwrap(),
+            b"addon"
+        );
+        // Updating replaces the complete tree, rather than retaining old deps.
+        let archive = bundle_archive(
+            temp.path(),
+            &[
+                ("pi/pi", b"\x7fELFupdated", tar::EntryType::Regular, 0o755),
+                ("pi/package.json", b"{}", tar::EntryType::Regular, 0o644),
+            ],
+        );
+        unpack_bundle(&archive, "pi", "pi", &relocated).unwrap();
+        assert!(!relocated.join(".pi/theme").exists());
+        assert_eq!(
+            std::fs::read(relocated.join("pi")).unwrap(),
+            b"\x7fELFupdated"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires PI_TEST_ARCHIVE pointing to the official host-arch Linux Pi tarball"]
+    fn official_pi_bundle_runs_without_a_host_node_runtime() {
+        let archive =
+            PathBuf::from(std::env::var_os("PI_TEST_ARCHIVE").expect("set PI_TEST_ARCHIVE"));
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("executors");
+        std::fs::create_dir(&dir).unwrap();
+        unpack_bundle(&archive, "pi", "pi", &dir).unwrap();
+        let output = std::process::Command::new(dir.join("pi"))
+            .arg("--version")
+            .env_clear()
+            .env("HOME", temp.path())
+            .env("PATH", "/nonexistent")
+            .env("PI_OFFLINE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let version = String::from_utf8(output.stdout).unwrap();
+        assert!(!version.trim().is_empty());
+        assert_ne!(
+            version.trim(),
+            "0.0.0",
+            "Pi did not find its sibling package.json"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires e2fsprogs (mke2fs and debugfs)"]
+    fn bundle_survives_the_guest_image_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("executors");
+        std::fs::create_dir(&dir).unwrap();
+        let archive = bundle_archive(
+            temp.path(),
+            &[
+                ("pi/pi", b"\x7fELFbinary", tar::EntryType::Regular, 0o755),
+                ("pi/package.json", b"{}", tar::EntryType::Regular, 0o644),
+                (
+                    "pi/theme/dark.json",
+                    b"theme",
+                    tar::EntryType::Regular,
+                    0o644,
+                ),
+            ],
+        );
+        unpack_bundle(&archive, "pi", "pi", &dir).unwrap();
+        let image = sandbox_host::executor_image::ensure(&dir).unwrap().unwrap();
+        let guest = temp.path().join("guest");
+        sandbox_host::workspace_image::read_back(&image, &guest).unwrap();
+        assert_eq!(
+            std::fs::read_link(guest.join("pi")).unwrap(),
+            Path::new(".pi/pi")
+        );
+        assert!(is_executable(&guest.join("pi")));
+        assert_eq!(
+            std::fs::read(guest.join(".pi/theme/dark.json")).unwrap(),
+            b"theme"
+        );
+    }
+
+    #[test]
+    fn bundle_refuses_traversal_links_and_special_files_before_publication() {
+        use tar::EntryType;
+        for (name, kind) in [
+            ("../outside", EntryType::Regular),
+            ("/absolute", EntryType::Regular),
+            ("pi/../../outside", EntryType::Regular),
+            ("other/file", EntryType::Regular),
+            ("pi/link", EntryType::Symlink),
+            ("pi/link", EntryType::Link),
+            ("pi/device", EntryType::Char),
+            ("pi/fifo", EntryType::Fifo),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = temp.path().join("executors");
+            std::fs::create_dir(&dir).unwrap();
+            let archive = bundle_archive(temp.path(), &[(name, b"", kind, 0o755)]);
+            assert!(
+                unpack_bundle(&archive, "pi", "pi", &dir).is_err(),
+                "accepted {name} {kind:?}"
+            );
+            assert!(!dir.join("pi").exists());
+            assert!(!temp.path().join("outside").exists());
+        }
+    }
+
+    #[test]
+    fn bundle_refuses_unsafe_names_and_non_linux_entrypoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("executors");
+        std::fs::create_dir(&dir).unwrap();
+        let archive = bundle_archive(
+            temp.path(),
+            &[(
+                "pi/pi",
+                b"#!/usr/bin/env node",
+                tar::EntryType::Regular,
+                0o755,
+            )],
+        );
+        for name in ["../pi", "/pi", ".", "..", "pi/sub", "pi\\sub", ""] {
+            assert!(unpack_bundle(&archive, name, "pi", &dir).is_err());
+            assert!(unpack_bundle(&archive, "pi", name, &dir).is_err());
+        }
+        assert!(
+            unpack_bundle(&archive, "pi", "pi", &dir)
+                .unwrap_err()
+                .contains("Linux executable")
+        );
+        assert!(!dir.join("pi").exists());
+    }
+
+    #[test]
+    fn bundle_refuses_an_existing_directory_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("executors");
+        std::fs::create_dir(&dir).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(".pi")).unwrap();
+        let archive = bundle_archive(
+            temp.path(),
+            &[("pi/pi", b"\x7fELFbinary", tar::EntryType::Regular, 0o755)],
+        );
+        assert!(unpack_bundle(&archive, "pi", "pi", &dir).is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn bundle_arch_names_and_pi_install_selection() {
+        assert_eq!(GuestArch::Aarch64.bundle_arch(), "arm64");
+        assert_eq!(GuestArch::X86_64.bundle_arch(), "x64");
+        assert!(ALL.contains(&HarnessArg::Pi));
+        use clap::{Args as _, FromArgMatches as _};
+        let matches = InstallArgs::augment_args(clap::Command::new("install"))
+            .try_get_matches_from(["install", "pi"])
+            .unwrap();
+        assert_eq!(
+            InstallArgs::from_arg_matches(&matches).unwrap().providers,
+            vec![HarnessArg::Pi]
+        );
+    }
 
     fn scratch(test: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("dt-exec-{test}-{}", std::process::id()));
@@ -802,7 +1305,7 @@ mod tests {
     #[test]
     fn the_meter_fills_end_to_end_and_degrades_without_a_length() {
         let meter = |done: u64, total: Option<u64>| {
-            let mut meter = Metered::new(std::io::empty(), total);
+            let mut meter = Metered::new(std::io::empty(), total, true);
             meter.done = done;
             meter.line()
         };
@@ -916,12 +1419,12 @@ mod tests {
 
         stand_in(&dir, "codex");
         assert_eq!(
-            installed(ProviderArg::Codex, &latest, &dir, &receipts),
+            installed(HarnessArg::Codex, &latest, &dir, &receipts),
             Installed::Missing
         );
         stand_in(&dir, "codex-code-mode-host");
         assert!(matches!(
-            installed(ProviderArg::Codex, &latest, &dir, &receipts),
+            installed(HarnessArg::Codex, &latest, &dir, &receipts),
             Installed::Foreign { .. }
         ));
 
@@ -952,7 +1455,7 @@ mod tests {
             },
         );
         assert_eq!(
-            installed(ProviderArg::Claude, &latest, &dir, &receipts),
+            installed(HarnessArg::Claude, &latest, &dir, &receipts),
             Installed::Current {
                 sha256: sha256.clone()
             }
@@ -960,15 +1463,15 @@ mod tests {
 
         receipts.providers.get_mut("claude").unwrap().version = "2.1.231".into();
         assert_eq!(
-            installed(ProviderArg::Claude, &latest, &dir, &receipts),
+            installed(HarnessArg::Claude, &latest, &dir, &receipts),
             Installed::Behind {
                 installed: "2.1.231".into()
             }
         );
-        assert!(installed(ProviderArg::Claude, &latest, &dir, &receipts).is_offered());
+        assert!(installed(HarnessArg::Claude, &latest, &dir, &receipts).is_offered());
 
         receipts.providers.get_mut("claude").unwrap().sha256 = "0".repeat(64);
-        let own = installed(ProviderArg::Claude, &latest, &dir, &receipts);
+        let own = installed(HarnessArg::Claude, &latest, &dir, &receipts);
         assert_eq!(own, Installed::Foreign { sha256 });
         assert!(!own.is_offered());
 
@@ -998,7 +1501,14 @@ mod tests {
         std::fs::write(&dest, b"not what the vendor published").unwrap();
         let vendors = Vendors::new().unwrap();
 
-        let err = fetch(&vendors, "https://example.invalid/x", &dest, &"0".repeat(64)).unwrap_err();
+        let err = fetch(
+            &vendors,
+            "https://example.invalid/x",
+            &dest,
+            &"0".repeat(64),
+            true,
+        )
+        .unwrap_err();
         assert!(
             err.contains("refusing to install an unverified executable"),
             "{err}"
@@ -1012,11 +1522,130 @@ mod tests {
             "https://example.invalid/x",
             &dest,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            true,
         )
         .unwrap();
         assert!(dest.exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn sha256_bytes(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
+    }
+
+    struct RendezvousVendor {
+        port: u16,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    /// A vendor stand-in for the concurrency test below: accepts one HTTP
+    /// request, then blocks on `barrier` before answering — so its response
+    /// only goes out once its rendezvous partner also has a request in hand.
+    /// A fetcher that requests its rows one after another (send request,
+    /// read the full response, only then send the next request) can never
+    /// land both halves of the barrier, so it hangs forever; one that fires
+    /// every row's request up front satisfies it immediately.
+    fn rendezvous_vendor(
+        barrier: std::sync::Arc<std::sync::Barrier>,
+        body: &'static [u8],
+    ) -> RendezvousVendor {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            barrier.wait();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            stream.flush().unwrap();
+        });
+        RendezvousVendor { port, handle }
+    }
+
+    /// The bug this proves absent: `install_all` used to fetch its chosen
+    /// providers one after another, so a second provider's download only
+    /// began once the first one's response had been read in full. The two
+    /// vendor stand-ins here only answer once BOTH have a request in hand,
+    /// which a sequential fetcher can never arrange — this test would hang
+    /// under the old behaviour, and completes under `fetch_all`'s
+    /// one-thread-per-row fetch.
+    #[test]
+    fn fetch_all_downloads_every_row_concurrently() {
+        let body_a: &[u8] = b"claude release bytes";
+        let body_b: &[u8] = b"codex release bytes";
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let server_a = rendezvous_vendor(std::sync::Arc::clone(&barrier), body_a);
+        let server_b = rendezvous_vendor(std::sync::Arc::clone(&barrier), body_b);
+
+        let rows = [
+            Surveyed {
+                provider: HarnessArg::Claude,
+                latest: Release {
+                    version: "1".into(),
+                    url: format!("http://127.0.0.1:{}/claude", server_a.port),
+                    sha256: sha256_bytes(body_a),
+                    payload: Payload::Binary("claude".into()),
+                },
+                state: Installed::Missing,
+            },
+            Surveyed {
+                provider: HarnessArg::Codex,
+                latest: Release {
+                    version: "1".into(),
+                    url: format!("http://127.0.0.1:{}/codex", server_b.port),
+                    sha256: sha256_bytes(body_b),
+                    payload: Payload::Binary("codex".into()),
+                },
+                state: Installed::Missing,
+            },
+        ];
+        let cache = scratch("fetch-all-cache");
+        let cache_cleanup = cache.clone();
+        let vendors = Vendors::new().unwrap();
+
+        // `fetch_all` blocks the calling thread until every row lands, so the
+        // call itself runs on a throwaway thread and the test waits on it
+        // with a bound: a regression to sequential fetching hangs that thread
+        // forever (the barrier's other half never arrives), and this test
+        // must fail rather than hang the suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let refs: Vec<&Surveyed> = rows.iter().collect();
+            let _ = tx.send(fetch_all(&vendors, &refs, &cache));
+        });
+        let artifacts = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect(
+                "fetch_all did not return within 10s — it fetched its rows one \
+                 after another instead of concurrently",
+            )
+            .unwrap();
+
+        assert_eq!(std::fs::read(&artifacts[0]).unwrap(), body_a);
+        assert_eq!(std::fs::read(&artifacts[1]).unwrap(), body_b);
+
+        server_a.handle.join().unwrap();
+        server_b.handle.join().unwrap();
+        std::fs::remove_dir_all(&cache_cleanup).unwrap();
     }
 
     /// Both built-in channels answer, live: the feed names a version and a

@@ -41,7 +41,26 @@ pub fn request_message(
     ts: u64,
     body: &[u8],
 ) -> Vec<u8> {
-    let digest = Sha256::digest(body);
+    request_message_digest(
+        method,
+        path_and_query,
+        node_key,
+        ts,
+        &Sha256::digest(body).into(),
+    )
+}
+
+/// the same canonical bytes when the body's digest is already known and the
+/// body itself is not — a blob upload STREAMS, so the only thing either end
+/// ever holds of it is this hash. Identical bytes to [`request_message`] over
+/// the same body: the signature does not know which way the digest arrived.
+pub fn request_message_digest(
+    method: &str,
+    path_and_query: &str,
+    node_key: &[u8],
+    ts: u64,
+    digest: &[u8; 32],
+) -> Vec<u8> {
     let digest = digest.as_slice();
     let mut m = Vec::with_capacity(method.len() + path_and_query.len() + node_key.len() + 45);
     m.extend_from_slice(method.as_bytes());
@@ -65,9 +84,28 @@ pub fn sign_request(
     ts: u64,
     body: &[u8],
 ) -> ed25519::Signature {
+    sign_request_digest(
+        signer,
+        method,
+        path_and_query,
+        node_key,
+        ts,
+        &Sha256::digest(body).into(),
+    )
+}
+
+/// sign one data-plane request whose body is known only by its digest.
+pub fn sign_request_digest(
+    signer: &ed25519::PrivateKey,
+    method: &str,
+    path_and_query: &str,
+    node_key: &[u8],
+    ts: u64,
+    digest: &[u8; 32],
+) -> ed25519::Signature {
     signer.sign(
         DATA_REQ_NS,
-        &request_message(method, path_and_query, node_key, ts, body),
+        &request_message_digest(method, path_and_query, node_key, ts, digest),
     )
 }
 
@@ -81,8 +119,26 @@ pub fn request_headers(
     node_key: &[u8],
     body: &[u8],
 ) -> [(&'static str, String); 3] {
+    request_headers_digest(
+        signer,
+        method,
+        path_and_query,
+        node_key,
+        &Sha256::digest(body).into(),
+    )
+}
+
+/// the same three headers for a body known only by its digest — what a
+/// streamed upload signs, since it never holds the body to hash twice.
+pub fn request_headers_digest(
+    signer: &ed25519::PrivateKey,
+    method: &str,
+    path_and_query: &str,
+    node_key: &[u8],
+    digest: &[u8; 32],
+) -> [(&'static str, String); 3] {
     let ts = now_secs();
-    let sig = sign_request(signer, method, path_and_query, node_key, ts, body);
+    let sig = sign_request_digest(signer, method, path_and_query, node_key, ts, digest);
     [
         (KEY_HEADER, hex(signer.public_key().as_ref())),
         (TS_HEADER, ts.to_string()),
@@ -110,22 +166,22 @@ mod tests {
         let signer = ed25519::PrivateKey::from_seed(11);
         let node_key = [7u8; 32];
         let body = b"raw chunk bytes";
-        let headers = request_headers(&signer, "POST", "/v1/files/stage", &node_key, body);
+        let headers = request_headers(&signer, "POST", "/v1/files/blob", &node_key, body);
         let [(key_name, key_hex), (ts_name, ts), (sig_name, sig_hex)] = headers;
         assert_eq!((key_name, ts_name, sig_name), (KEY_HEADER, TS_HEADER, SIG_HEADER));
         assert_eq!(key_hex, hex(signer.public_key().as_ref()));
 
         let ts: u64 = ts.parse().expect("decimal seconds");
-        let sig = sign_request(&signer, "POST", "/v1/files/stage", &node_key, ts, body);
+        let sig = sign_request(&signer, "POST", "/v1/files/blob", &node_key, ts, body);
         assert_eq!(sig_hex, hex(sig.as_ref()), "the header carries this signature");
-        let message = request_message("POST", "/v1/files/stage", &node_key, ts, body);
+        let message = request_message("POST", "/v1/files/blob", &node_key, ts, body);
         assert!(signer.public_key().verify(DATA_REQ_NS, &message, &sig));
 
         // the body is inside the signed bytes: a swapped payload does not verify.
-        let swapped = request_message("POST", "/v1/files/stage", &node_key, ts, b"other");
+        let swapped = request_message("POST", "/v1/files/blob", &node_key, ts, b"other");
         assert!(!signer.public_key().verify(DATA_REQ_NS, &swapped, &sig));
         // and so is the node: the same request signed for another node fails.
-        let elsewhere = request_message("POST", "/v1/files/stage", &[8u8; 32], ts, body);
+        let elsewhere = request_message("POST", "/v1/files/blob", &[8u8; 32], ts, body);
         assert!(!signer.public_key().verify(DATA_REQ_NS, &elsewhere, &sig));
     }
 }

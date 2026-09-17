@@ -234,6 +234,13 @@ pub fn with_job(chat: &Chat, now: u64, origin: Origin, job: Option<tasks::Job>) 
 pub fn job(job_id: &str, attempt: u64) -> tasks::Job {
     tasks::Job {
         job_id: job_id.into(),
+        execution: tasks::JobExecution::OneShot,
+        conversation_id: format!("{job_id}:1"),
+        previous_job_id: None,
+        continuation_operation_id: None,
+        controls: Vec::new(),
+        reports: Vec::new(),
+        native_history: None,
         kind: "review".into(),
         spec: "{}".into(),
         submitter: tasks::Party::System,

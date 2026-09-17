@@ -27,7 +27,8 @@ use crate::wire::{
     MAX_META_VALUE_BYTES, MAX_OBJECT_READS_PER_OP, MAX_PIN_NAME_BYTES, MAX_PINS,
     MAX_PINS_PER_OWNER, MAX_REFS_IMAGE_BYTES, MAX_STAGING_ENTRIES, MAX_STAGING_ENTRIES_PER_OWNER,
     MAX_SYMLINK_TARGET_BYTES, MAX_SYNC_IDS, MAX_SYNC_REPLY_BYTES, MAX_WATCH_MODULE_ID_BYTES,
-    MAX_WATCHES, STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, SyncObject, from_hex_32, to_hex,
+    MAX_WATCHES, RetentionReference, STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, SyncObject,
+    from_hex_32, to_hex,
 };
 
 pub struct Fs<S: ObjectStore> {
@@ -63,7 +64,7 @@ pub struct Fs<S: ObjectStore> {
     /// per-op DISTINCT committed-store read cap — [`MAX_OBJECT_READS_PER_OP`] in
     /// production, lowered only by the `#[doc(hidden)]` test override so the
     /// object-read budget boundary is exercised with a handful of pre-existing
-    /// directories instead of 4096. `commit` reads it into the per-op
+    /// directories instead of the whole cap. `commit` reads it into the per-op
     /// [`ReadBudget`]; the guest inherits it (same core) so both runtimes reject
     /// the identical oversized commit.
     pub(crate) object_read_cap: usize,
@@ -276,7 +277,7 @@ impl<S: ObjectStore> Fs<S> {
     }
 
     /// read-only access to the object store — the `&self` twin of
-    /// [`Fs::store_mut`]. the host-side odb backing ([`files::FilesOdbBacking`])
+    /// [`Fs::store_mut`]. the host-side odb backing (`files_odb::FilesOdbBacking`)
     /// serves its `HostOdb::stat`/`get` (a `&self` surface) by reading committed
     /// object bodies straight off the concrete `S`, reusing the store's verified
     /// read rather than forking the disk-read logic. glue/test plumbing, not the
@@ -382,6 +383,37 @@ impl<S: ObjectStore> Fs<S> {
     ) -> Result<Vec<Notification>, String> {
         self.transact(authority, height, |fs| {
             fs.commit_apply(authority, height, time, base, message, changes)
+        })
+    }
+
+    /// Project one existing path into a detached candidate snapshot. The public
+    /// head is unchanged; the ordinary history window protects the candidate
+    /// until its owning module accepts a retention reference.
+    pub fn project_snapshot(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        time: u64,
+        snapshot: String,
+        path: String,
+    ) -> Result<String, String> {
+        self.transact(authority, height, |fs| {
+            fs.project_snapshot_apply(authority, height, time, snapshot, path)
+        })
+    }
+
+    /// Only the authenticated module may mutate its protected reference
+    /// namespace. Keys do not share the public pin table or its lifetime cap.
+    pub fn compare_exchange_retention(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        key: String,
+        expected: Option<RetentionReference>,
+        replacement: Option<RetentionReference>,
+    ) -> Result<(), String> {
+        self.transact(authority, height, |fs| {
+            fs.compare_exchange_retention_apply(authority, height, key, expected, replacement)
         })
     }
 
@@ -598,6 +630,106 @@ impl<S: ObjectStore> Fs<S> {
         Ok(built.notifications)
     }
 
+    fn project_snapshot_apply(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        time: u64,
+        snapshot: String,
+        path: String,
+    ) -> Result<String, String> {
+        let segments = canonical(&path)?;
+        let id =
+            from_hex_32(&snapshot).ok_or_else(|| "files: snapshot not resolvable".to_string())?;
+        let pending = self.pending.as_ref().expect("transact sets pending");
+        let budget = ReadBudget::new(&pending.object_ids, self.object_read_cap);
+        let store = Store {
+            store: &self.store,
+            pending: &pending.objects,
+            budget: Some(&budget),
+        };
+        if !refs_contains_snapshot(&pending.refs, &store, &id)? {
+            return Err("files: snapshot not resolvable".into());
+        }
+        let source_root = snapshot_root_tree(&store, &id)?;
+        let mut objects = Vec::new();
+        let root = if segments.is_empty() {
+            source_root
+        } else {
+            let entry = entry_at(&store, Some(source_root), &segments)?
+                .ok_or_else(|| "files: projection path not found".to_string())?;
+            let mut edit = TreeEdit::load(&store, None);
+            edit.put(&store, &segments, entry)?;
+            edit.build(&mut objects)?
+                .expect("projected entry makes a tree")
+        };
+        let body = SnapshotObj {
+            root,
+            parent: None,
+            author: authority.actor(),
+            consensus_time: time,
+            height,
+            message: String::new(),
+        }
+        .encode();
+        let projected = object_id(Kind::Snapshot, &body);
+        objects.push((Kind::Snapshot, body));
+
+        // Only the candidate window changes. Ancestor directories are freshly
+        // built; the selected file/subtree is shared by object id.
+        let pending = self.pending.as_mut().expect("transact sets pending");
+        sweep_expired(&mut pending.refs, height);
+        pending.refs.window.push_back(projected);
+        while pending.refs.window.len() > self.window_cap {
+            pending.refs.window.pop_front();
+        }
+        for (kind, body) in objects {
+            pending.push_object(kind, body);
+        }
+        Ok(to_hex(&projected))
+    }
+
+    fn compare_exchange_retention_apply(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        key: String,
+        expected: Option<RetentionReference>,
+        replacement: Option<RetentionReference>,
+    ) -> Result<(), String> {
+        let Authority::Module(module) = authority else {
+            return Err("files: retention mutation is module-origin only".into());
+        };
+        let pending = self.pending.as_ref().expect("transact sets pending");
+        let budget = ReadBudget::new(&pending.object_ids, self.object_read_cap);
+        let store = Store {
+            store: &self.store,
+            pending: &pending.objects,
+            budget: Some(&budget),
+        };
+        if let Some(reference) = &replacement {
+            let id = crate::retention::snapshot_id(&reference.snapshot)?;
+            if !refs_contains_snapshot(&pending.refs, &store, &id)? {
+                return Err("files: retention snapshot not resolvable".into());
+            }
+        }
+        let built = crate::retention::compare_exchange(
+            &store,
+            pending.refs.retention_root,
+            module,
+            &key,
+            expected.as_ref(),
+            replacement.as_ref(),
+        )?;
+        let pending = self.pending.as_mut().expect("transact sets pending");
+        sweep_expired(&mut pending.refs, height);
+        pending.refs.retention_root = built.root;
+        for (kind, body) in built.objects {
+            pending.push_object(kind, body);
+        }
+        Ok(())
+    }
+
     /// pin a resolvable snapshot under `name`, protecting it from gc. mutates the
     /// PENDING refs view only — the committed root moves at `commit_block` +
     /// `adopt_refs`, never here (the established discipline). validate-then-mutate:
@@ -635,8 +767,8 @@ impl<S: ObjectStore> Fs<S> {
         }
         // per-owner share of the global table (mirrors putblob's staging-entry
         // cap): without it one owner fills MAX_PINS and every other member's pin
-        // — the operator's included — gets "pin table is full" forever, since
-        // only the squatter (or system) may unpin.
+        // — the operator's included — needs another authority to remove pins
+        // before it can make progress.
         let owner_pins = pending
             .refs
             .pins
@@ -646,12 +778,18 @@ impl<S: ObjectStore> Fs<S> {
         if owner_pins >= MAX_PINS_PER_OWNER {
             return Err("files: pin quota exceeded".into());
         }
-        // the id must hex-parse AND resolve in the PENDING view (head, window, or an
-        // already-pinned id). a gc'd / unknown id is unpinnable — naming an
+        // The id must hex-parse AND resolve in the PENDING view (head, window,
+        // public pin, or protected reference). A gc'd / unknown id is unpinnable — naming an
         // unreachable snapshot cannot revive it.
         let id =
             from_hex_32(&snapshot).ok_or_else(|| "files: snapshot not resolvable".to_string())?;
-        if !refs_contains_snapshot(&pending.refs, &id) {
+        let budget = ReadBudget::new(&pending.object_ids, self.object_read_cap);
+        let store = Store {
+            store: &self.store,
+            pending: &pending.objects,
+            budget: Some(&budget),
+        };
+        if !refs_contains_snapshot(&pending.refs, &store, &id)? {
             return Err("files: snapshot not resolvable".into());
         }
         refuse_refs_growth(
@@ -1023,12 +1161,21 @@ impl<S: ObjectStore> Fs<S> {
 // ---- commit internals -------------------------------------------------------
 
 /// whether `id` names a snapshot resolvable in `refs`: the head, anywhere in the
-/// bounded history window, or a pinned snapshot. shared by base resolution
-/// (commit) and snapshot resolution (the stat query) — same membership rule.
-pub(crate) fn refs_contains_snapshot(refs: &Refs, id: &ObjectId) -> bool {
-    refs.head.as_ref() == Some(id)
+/// bounded history window, a public pin, or the protected retention catalog.
+/// Base resolution and snapshot queries use the same membership rule; the
+/// supplied store selects committed-only reads or the pending operation view.
+pub(crate) fn refs_contains_snapshot(
+    refs: &Refs,
+    store: &Store,
+    id: &ObjectId,
+) -> Result<bool, String> {
+    let ordinary = refs.head.as_ref() == Some(id)
         || refs.window.contains(id)
-        || refs.pins.values().any(|p| &p.snapshot == id)
+        || refs.pins.values().any(|p| &p.snapshot == id);
+    if ordinary {
+        return Ok(true);
+    }
+    crate::retention::contains(store, refs.retention_root, id)
 }
 
 /// the fully-built result of a successful commit validation+apply pass, held in
@@ -1090,7 +1237,7 @@ fn commit_apply(
         Some(hex) => {
             let id = from_hex_32(hex)
                 .ok_or_else(|| "files: base snapshot not resolvable".to_string())?;
-            if !refs_contains_snapshot(&refs, &id) {
+            if !refs_contains_snapshot(&refs, store, &id)? {
                 return Err("files: base snapshot not resolvable".into());
             }
             Some(snapshot_root_tree(store, &id)?)
@@ -1439,15 +1586,16 @@ fn refuse_refs_growth(refs: &Refs, entry_len: usize, window_cap: usize) -> Resul
     Err("files: refs image is full".into())
 }
 
-/// the bytes the commit path can still add to `refs` with no gate of its own:
-/// 32 for the head the first time it is set, 32 per window slot not yet
-/// filled — counted against the LIVE window cap the commit path trims to
+/// Bytes the commit/projection/retention paths can still add without a growing
+/// table: 32 for the first head, 32 for the first retention root, and 32 per
+/// unfilled window slot — counted against the LIVE window cap the commit path trims to
 /// ([`HISTORY_WINDOW`] in production, whatever a test set), so the
 /// reservation is exact for any cap rather than assumed.
 fn refs_commit_headroom(refs: &Refs, window_cap: usize) -> usize {
     let head = if refs.head.is_none() { 32 } else { 0 };
     let window = 32 * window_cap.saturating_sub(refs.window.len());
-    head + window
+    let retention = if refs.retention_root.is_none() { 32 } else { 0 };
+    head + window + retention
 }
 
 fn watch_origin_gate(authority: &Authority, module_id: &str) -> Result<(), String> {
@@ -1728,7 +1876,8 @@ mod consensus_uniformity {
 // the wasm files tenant (which runs THIS core) reject the identical oversized
 // commit. driven at the shrunk cap through the `#[doc(hidden)]` test seam — the
 // same pattern the staging-quota / window / entry-cap boundary tests use — so a
-// handful of pre-existing directories exercises the boundary instead of 4096.
+// handful of pre-existing directories exercises the boundary instead of a cap's
+// worth of them.
 #[cfg(test)]
 mod object_read_budget {
     use base64::Engine as _;
@@ -1787,6 +1936,75 @@ mod object_read_budget {
         assert!(seed.is_empty());
         commit_block(fs);
         fs.committed_head_for_test().expect("head present")
+    }
+
+    /// one document inside `/shared/docs`, committed and adopted — the smallest
+    /// state that gives a FOLLOW-UP commit what every commit after the first one
+    /// has: a head snapshot to read and a three-tree spine (the root, `/shared`,
+    /// `/shared/docs`) to walk. returns the committed head hex.
+    fn seed_one_doc(fs: &mut Fs<MemStore>) -> String {
+        fs.commit(
+            &crate::Authority::System,
+            1,
+            1,
+            None,
+            "seed".into(),
+            vec![put_inline("/shared/docs/seed", b"seed")],
+        )
+        .expect("seed commits");
+        commit_block(fs);
+        fs.committed_head_for_test().expect("head present")
+    }
+
+    /// `count` fresh documents into the already-existing `/shared/docs`, based on
+    /// and landing on the head `seed_one_doc` left, under a shrunk `cap`.
+    fn commit_onto_head(count: usize, cap: usize) -> Result<(), String> {
+        let mut fs = new_fs();
+        let head = seed_one_doc(&mut fs);
+        fs.set_object_read_budget_for_tests(cap);
+        let changes = (0..count)
+            .map(|i| {
+                put_inline(
+                    &format!("/shared/docs/add{i}"),
+                    format!("body {i}").as_bytes(),
+                )
+            })
+            .collect();
+        fs.commit(
+            &crate::Authority::System,
+            2,
+            2,
+            Some(head),
+            "add".into(),
+            changes,
+        )
+        .map(|_| ())
+    }
+
+    /// the per-commit constant that makes the cap's accept row DIFFERENT once a
+    /// head exists, pinned exactly: N documents into one already-existing
+    /// `/shared/<dir>` cost `2 * N + 4` distinct committed reads — two
+    /// `object-stat` probes per document (its chunk and its fileobj), plus the
+    /// effective head snapshot and the three directory trees on the spine the
+    /// commit rewrites. the base snapshot and its spine resolve to those same
+    /// ids and dedupe, and the spine gets dedupe across every path in the op, so
+    /// the 4 does not move with N. driven from BOTH sides — the op fits in
+    /// exactly `2 * N + 4` and is refused by one read less — because that is what
+    /// makes the production bound `(MAX_OBJECT_READS_PER_OP - 4) / 2` = 126
+    /// documents onto an existing head, not the 128 an empty tree admits.
+    #[test]
+    fn a_commit_onto_an_existing_head_costs_two_reads_per_document_plus_four() {
+        const DOCUMENTS: usize = 2;
+        const SPINE_READS: usize = 4;
+        let exact = 2 * DOCUMENTS + SPINE_READS;
+
+        commit_onto_head(DOCUMENTS, exact).expect("the op must fit in exactly 2N + 4 reads");
+        let err = commit_onto_head(DOCUMENTS, exact - 1)
+            .expect_err("one read less must refuse the very same op");
+        assert!(
+            err.contains("object-read budget"),
+            "reason must carry the shared needle, got: {err}"
+        );
     }
 
     /// a commit whose committed-store reads exceed the cap is REJECTED with the

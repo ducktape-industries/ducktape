@@ -11,6 +11,13 @@ use std::time::Duration;
 /// (`noded::MAX_MODULE_ARTIFACT_BYTES`) — a peer-facing artifact was 64x
 /// larger than what an operator could ever stage locally.
 pub(crate) const MAX_MODULE_CODE_BYTES: u64 = noded::MAX_MODULE_ARTIFACT_BYTES as u64;
+/// the genesis fetch cap: a joiner without the founder's `genesis` file pulls
+/// it off the mesh, and that blob is the WHOLE founding set composed — every
+/// module's component, index and view — so the one-artifact cap above refused
+/// every real network's genesis (the founding set is ~23 MB at HEAD) and a
+/// joiner could only ever start with `join --genesis`. eight artifacts' worth
+/// bounds a colluding peer's digest the same way the module cap does.
+pub(crate) const MAX_GENESIS_BYTES: u64 = 8 * MAX_MODULE_CODE_BYTES;
 /// one warning when the committed valset read first fails, then one per this
 /// many further drain passes, for a host query that keeps erroring (#1820).
 /// shared by the validator drain and the replica park loop.
@@ -73,8 +80,10 @@ const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::MAX_APPLIED_FRAMES
 /// commonware sizes each channel's inbound mailbox to one burst from every
 /// peer the network may retain, and DROPS an inbound message when that
 /// mailbox is full (it never blocks a peer), so one peer's burst is the drop
-/// boundary a single sender can rely on — `relay::MAX_RELAY_BLOB_BYTES` is
-/// pinned so one offer plus every chunk of a max-size pack fits inside it.
+/// boundary a single sender can rely on — a blob transfer's in-flight WINDOW
+/// (`relay::RELAY_BLOB_WINDOW_CHUNKS`) is pinned so one offer plus a whole
+/// window, times every transfer a node accepts at once, fits inside it. The
+/// pack itself is unbounded: what is outstanding is a window, not a pack.
 /// a node registers EIGHT channels in total (the five fixed engine lanes plus
 /// submit-relay / statesync / reachability), so this burst is paid eight
 /// times over, not once per epoch.

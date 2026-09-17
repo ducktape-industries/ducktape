@@ -45,6 +45,10 @@ pub enum FailureKind {
     NotFound,
     Unavailable,
     Conflict,
+    /// The body went past what the route admits. Its own kind because it is
+    /// the one refusal that arrives MID-BODY — a head declares no length, so
+    /// there is nothing to refuse before the bytes start.
+    TooLarge,
 }
 
 /// One frame in either direction of a proxy stream.

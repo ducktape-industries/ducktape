@@ -16,6 +16,11 @@
 #                      git revision: the ducktape:module WIT world, the
 #                      bindings + adapter every port shares, `sdk` re-exported,
 #                      and the wasm32 patch crates (stubs/) a guest graph needs
+#   crates/git-primitives/ — the six git types of that WIT world as plain data,
+#                      dependency-free: the kernel host speaks them across
+#                      `OdbBacking` and converts at the import boundary, so a
+#                      module's read policy names the shape without naming the
+#                      host it must stay separable from
 #   crates/networking/ — the netstack: transport infra ONLY (wireguard,
 #                      nat-traversal, netstack-machine [the sans-I/O
 #                      reachability decision core, its ducktape:netstack
@@ -45,7 +50,10 @@
 #                      the run-scoped credential loopback + airlock client;
 #                      provider — the executor spec layer + CliProvider run loop;
 #                      agent — the pty session daemon; airlock — the lender;
-#                      media — the huddle voice/video planes + call-socket wire)
+#                      media — the huddle voice/video planes + call-socket wire;
+#                      files-odb / forge-odb — the disk odb a wasm files or
+#                      forge tenant commits through, so neither module names
+#                      a kernel host)
 #   crates/topology/ — the module composition catalog: the id universe, its
 #                      shape/config schema and the named genesis selections
 #                      every composer draws from (pure data, no deps)
@@ -68,7 +76,9 @@
 #                      tenant, in no genesis set), greeter (the types-only
 #                      composition example)
 #   crates/testing/  — dev-only shared test support (nettest: raw-http client,
-#                      port allocation, poll). [dev-dependencies] of the bin
+#                      port allocation, poll; source-lint: which files and items
+#                      hold shipped code, for the repo-wide source lints).
+#                      [dev-dependencies] of the bin
 #                      integration suites ONLY; no shipping crate depends on it
 #   crates/labs/     — quarantined experimental consensus modules (evm,
 #                      multisig): in-tree and tested but registered by NO
@@ -148,6 +158,9 @@ members = [
     # reader links provider-host and with it the microVM sandbox, which a GUI
     # submitting a run must not.
     "crates/run-envelope",
+    # The six git types the host surface speaks, as plain data with no deps, so
+    # a module's read policy can name the shape without naming the kernel host.
+    "crates/git-primitives",
     # A workspace on disk (identity, network.toml, node.toml, the invite codec)
     # and the join ceremony that writes one. Split from bin/node because
     # joining is the one node operation with no running node to ask.
@@ -159,13 +172,27 @@ members = [
     "crates/duckfs/disk",
     "crates/duckfs/client",
     "crates/rpc-client",
+    # the desktop app's self-update state machine + release-manifest verify,
+    # pure (no I/O): driven by the launcher at boot and by the app while running.
+    "crates/app-update",
+    # the pages document editor: Notion-shaped blocks, marks, slash menu and
+    # toolbar on the same gpui-kit. It was a git dependency on a fork pinned to
+    # one revision, so a change to it never appeared in a ducktape diff. It is
+    # ducktape source now — edit it here like any other crate. There is no
+    # upstream to pull from and nothing to re-sync.
+    "crates/gpui-notion",
     # apps — product feature modules
     "crates/modules/apps/forge",
     "crates/modules/apps/pages",
     "crates/modules/apps/chat",
+    "crates/modules/apps/chat/message",
     "crates/modules/apps/agent",
+    "crates/modules/apps/agent/wire",
     "crates/modules/apps/runs",
+    "crates/modules/apps/runs/wire",
     "crates/modules/apps/tasks",
+    "crates/modules/apps/boards",
+    "crates/modules/apps/boards/wire",
     "crates/modules/apps/automations",
     "crates/modules/apps/inbox",
     "crates/modules/apps/files",
@@ -175,38 +202,60 @@ members = [
     "crates/services/airlock",
     "crates/services/broker",
     "crates/services/compute",
+    "crates/services/files-odb",
+    "crates/services/forge-odb",
+    "crates/services/mcp",
     "crates/services/media",
     "crates/services/provider",
     "crates/services/sandbox",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
     # testing — dev-only shared harness helpers (raw-http client, ports,
-    # poll). NOT a Module Rule surface; no shipping crate depends on it.
-    "crates/testing/nettest",
+    # poll; and the source lints' shared "is this shipped code" judgement).
+    # NOT a Module Rule surface; no shipping crate depends on it.
+    "crates/testing/nettest", "crates/testing/source-lint",
     # topology — the module composition catalog every composer draws from
     "crates/topology",
+    # view-wire — the host<->wasm-view format: the tree a view emits, the
+    # events it takes back, and the manifest a host checks before running one.
+    # Built once here and shared with the views workspace by path.
+    "crates/view-wire",
+    # design — the palette, the type scale and the bundled faces. Beside
+    # view-wire and shared the same way: what a view draws with and what the
+    # shell framing it draws with have to be one answer, or the two halves of
+    # a window disagree about what the product looks like.
+    "crates/design",
     # noded — the daemon library behind the /v1 surface
     "crates/noded",
     # bin — runnable binaries
     "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/airlock-gateway",
+    "bin/media-service",
+    "bin/forge-service",
+    "bin/terminal-service",
     "bin/guest-builder",
     "bin/duck-guest-init",
+    # the desktop app's boot-time executor (flip / rollback / exec)
+    "bin/app-launcher",
+    # the node's supervisor: the same machine, holding the flip for the
+    # network's governance-designated activation height
+    "bin/node-launcher",
     # native desktop client — intentionally only Chat + Pages
     "app",
 ]
 # labs is a standalone crate (its own [workspace] + Cargo.lock), NOT a member:
 # its quarantined evm/multisig deps (revm, alloy) must never enter — or slow —
 # the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
-# The shared design crate belongs to the views workspace so Cargo gives
-# its guest dependency a checkout-independent package identity.
-exclude = ["crates/labs", "crates/module-sdk", "crates/views/support/design"]
+exclude = ["crates/labs", "crates/module-sdk", "crates/views/forge", "crates/views/support/guest", "crates/views/support/composer", "crates/views/support/files"]
 
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
+# the host<->wasm-view wire. `manifest` is host-only (it pulls wasmparser to
+# read a built component's custom section); the guests take it bare.
+view-wire = { path = "crates/view-wire" }
 # the ducktape CLI's argument grammar (derive). already in the graph
 # transitively, so this costs no new compilation unit.
 clap = { version = "4.6", features = ["derive"] }
@@ -221,6 +270,10 @@ lru = "0.18"
 libc = "0.2"
 smallvec = "1"
 sha2 = "0.10"
+# the desktop app's release archives (`.tar.zst`): app/src/backend/update.rs
+# extracts a staged release out of one.
+tar = "0.4"
+zstd = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -362,11 +415,13 @@ dispatch = { path = "crates/modules/system/dispatch" }
 attribution = { path = "crates/modules/system/attribution" }
 gateway = { path = "crates/modules/system/gateway" }
 forge = { path = "crates/modules/apps/forge" }
-design = { path = "crates/views/support/design" }
+design = { path = "crates/design" }
 pages = { path = "crates/modules/apps/pages" }
 chat = { path = "crates/modules/apps/chat" }
 agent = { path = "crates/modules/apps/agent" }
+agent-wire = { path = "crates/modules/apps/agent/wire" }
 runs = { path = "crates/modules/apps/runs" }
+runs-wire = { path = "crates/modules/apps/runs/wire" }
 tasks = { path = "crates/modules/apps/tasks" }
 automations = { path = "crates/modules/apps/automations" }
 inbox = { path = "crates/modules/apps/inbox" }
@@ -377,6 +432,9 @@ agent-service = { path = "crates/services/agent" }
 airlock-service = { path = "crates/services/airlock" }
 broker-host = { path = "crates/services/broker" }
 compute-service = { path = "crates/services/compute" }
+files-odb = { path = "crates/services/files-odb" }
+forge-odb = { path = "crates/services/forge-odb" }
+mcp-host = { path = "crates/services/mcp" }
 media-service = { path = "crates/services/media" }
 provider-host = { path = "crates/services/provider" }
 sandbox-host = { path = "crates/services/sandbox" }
@@ -392,13 +450,21 @@ authpage = { path = "crates/authpage" }
 # the run envelope's magic + headless composer, linked by the CLI, the compute
 # service and the desktop app.
 run-envelope = { path = "crates/run-envelope" }
+# the plain git read types `wasm_host::OdbBacking` speaks and `forge`'s read
+# policy names — a zero-dep leaf on purpose, so naming it drags in nothing.
+git-primitives = { path = "crates/git-primitives" }
 # a ducktape workspace on disk + the join ceremony, linked by the CLI and the
 # desktop app.
 workspace-config = { path = "crates/workspace-config" }
+# the app's update state machine, manifest + minisign verify and state.json
+# codec, shared by the launcher and the desktop app.
+app-update = { path = "crates/app-update" }
 # `$DUCKTAPE_HOME` else `~/.ducktape`, resolved once for every reader of it.
 ducktape-home = { path = "crates/ducktape-home" }
 # the module composition catalog (id universe + named genesis selections).
 topology = { path = "crates/topology" }
+# dev-only: the source lints' shared "is this shipped code" judgement.
+source-lint = { path = "crates/testing/source-lint" }
 duckfs-core = { path = "crates/duckfs/core" }
 duckfs-disk = { path = "crates/duckfs/disk" }
 duckfs-client = { path = "crates/duckfs/client" }
@@ -426,133 +492,35 @@ overlay-net = { path = "crates/networking/overlay-net" }
 governor = "0.10.2"
 rand_core = "0.10.1"
 
-[patch.crates-io]
-# A caret move replaces its selection, including clearing the previous anchor.
-iced_graphics = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "00fccc604d5b2fb37a1d64eb47184419ba83de86" }
-# `block` 0.1.6 is still required transitively by Metal and AVFoundation, but
-# its uninhabited extern-static type is future-incompatible with Rust. Keep the
-# API/ABI identical and patch only that declaration locally.
-block = { path = "patches/block" }
-# cosmic-text 0.15.0's font fallback only matched faces at EXACTLY the
-# requested weight before falling back to re-shaping a run against every face
-# in the database. A variable font registers once at 400 and the bundled
-# emoji/CJK fallback faces are static 400s, so every semibold/bold run with a
-# non-Latin glyph paid that walk (26us -> ~3ms per emoji paragraph), and bold
-# Latin could land on a platform face instead of Geist. The patched copy
-# matches a family at its closest weight; see patches/cosmic-text/README.md
-# for the drop condition.
-cosmic-text = { path = "patches/cosmic-text" }
-
 # dev/test builds compile wasm guests through cranelift (consensus components
 # in the kernel tests, index guests at every store open). unoptimized
 # cranelift is 10-30x slower — enough that a fleet of e2e daemons booting
 # concurrently blows readiness deadlines — so the code generator itself is
 # always built optimized. build-time only; artifacts and semantics unchanged.
-# The desktop app's view is one generated function big enough that LLVM's DWARF
-# emitter segfaults on it (rustc 1.96, `-C debuginfo=2`). Dropping debug info for
-# this crate alone keeps the rest of the workspace debuggable — and takes the
-# dev binary from ~516 MB to a fraction of that.
-
-# Build scripts default to opt-level 0, and the app's build script IS the Ice
-# compiler: every `.ice` edit re-runs parse + typecheck + 8.5 MB of codegen
-# through ui-lang-core. Unoptimized that is ~1.3 s of every edit loop.
+# Native build scripts are optimized independently from application code.
 [profile.dev.build-override]
 opt-level = 2
 
 [profile.dev.package.ducktape-app]
 debug = 0
-# opt-level history: 1 was load-bearing for STACK SAFETY when outlining first
-# landed (98e2b82) — outlined debug frames stacked to 8-12 MiB of view render
-# at opt-0, past the 8 MiB main-thread default, and SROA at opt-1 collapsed
-# them under 4 MiB. Since then dedup (fdadedf), lazy bodies as associated fns
-# (360d3a5), and the per-fragment split (66ccc13) shrank every frame in the
-# chain enough for the app's 8 MiB main thread. opt-0 is the dev-loop choice:
-# the per-build fixed cost (whole-crate mono collection + MIR work at opt-1)
-# dominated the post-split edit loop, and app-crate runtime perf never depended
-# on this stanza (hot paths live in the iced / ducktape-ui stanzas below; the
-# 08-01 lag campaign measured zero win here). The smaller libtest stack has its
-# own profile and executable contract below.
 opt-level = 0
 
-# Ice semantic tests render the same generated component tree from libtest's
-# 2 MiB worker threads. At opt-0, the generated ChatScreen frame alone exceeds
-# that budget on arm64 macOS; opt-1's SROA keeps the test harness on its default
-# stack without slowing the normal app edit loop above.
+# Keep native UI unit test code compact on the default test worker stack.
 [profile.test.package.ducktape-app]
 debug = 0
 opt-level = 1
 
-# `make dev` runs the desktop app under the dev profile, and an unoptimized
-# GUI stack is a lag machine on its own: cosmic-text shapes every glyph run
-# ~10x slower and iced re-lays the whole tree per frame. Optimizing ONLY the
-# render/text/gpu dependency stack keeps workspace crates fast to compile
-# (a `package."*"` wildcard would drag the node's wasmtime universe to O2,
-# which this box cannot compile reliably — #887).
-[profile.dev.package.iced]
+# Optimize the native render and text stack without slowing unrelated workspace crates.
+[profile.dev.package.gpui-pre]
 opt-level = 2
 
-# The ice framework layer itself — the widget builders, layout drivers and
-# memo/lazy machinery every view rebuild runs through. These were the LAST
-# opt-0 crates on the view hot path (iced/wgpu/cosmic-text below were already
-# covered), and they are what a module switch actually spends: measured on
-# this box, Pages->Chat with 40 mounted rows stalled ~700 ms with these at
-# opt-0. They rebuild only on a pin bump (ducktape-ui) or rarely (design), so
-# the compile-time cost of optimizing them is paid almost never.
-[profile.dev.package.ui-lang-components]
+[profile.dev.package.gpui-base]
 opt-level = 2
 
-[profile.dev.package.ui-lang-runtime]
+[profile.dev.package.gpui-component]
 opt-level = 2
 
 [profile.dev.package.design]
-opt-level = 2
-
-[profile.dev.package.iced_core]
-opt-level = 2
-
-[profile.dev.package.iced_debug]
-opt-level = 2
-
-[profile.dev.package.iced_futures]
-opt-level = 2
-
-[profile.dev.package.iced_graphics]
-opt-level = 2
-
-[profile.dev.package.iced_program]
-opt-level = 2
-
-[profile.dev.package.iced_renderer]
-opt-level = 2
-
-[profile.dev.package.iced_runtime]
-opt-level = 2
-
-[profile.dev.package.iced_selector]
-opt-level = 2
-
-[profile.dev.package.iced_tiny_skia]
-opt-level = 2
-
-[profile.dev.package.iced_wgpu]
-opt-level = 2
-
-[profile.dev.package.iced_widget]
-opt-level = 2
-
-[profile.dev.package.iced_winit]
-opt-level = 2
-
-[profile.dev.package.winit]
-opt-level = 2
-
-[profile.dev.package.lilt]
-opt-level = 2
-
-[profile.dev.package.cosmic-text]
-opt-level = 2
-
-[profile.dev.package.cryoglyph]
 opt-level = 2
 
 [profile.dev.package.fontdb]
@@ -627,22 +595,8 @@ opt-level = 2
 [profile.dev.package.usvg]
 opt-level = 2
 
-[profile.dev.package.softbuffer]
-opt-level = 2
-
-# The Markdown parse and the syntect pass every fenced code block pays — the
-# agent transcript, the forge reader and the Files preview all render through
-# them, and a regex engine at opt-0 is the slowest thing on that path.
+# The native document readers parse Markdown on their presentation path.
 [profile.dev.package.pulldown-cmark]
-opt-level = 2
-
-[profile.dev.package.syntect]
-opt-level = 2
-
-[profile.dev.package.iced_highlighter]
-opt-level = 2
-
-[profile.dev.package.fancy-regex]
 opt-level = 2
 
 [profile.dev.package.regex-automata]
@@ -674,10 +628,22 @@ opt-level = 3
 
 # The huddle's per-frame video codecs. Every captured frame pays an MJPEG
 # decode (mozjpeg's C, whose cc build inherits this profile's OPT_LEVEL) or a
-# YUYV conversion (nokhwa-core), a JPEG encode (jpeg-encoder), and every peer
-# frame a JPEG decode (zune-jpeg) — 25 times a second each. Unoptimized, the
-# encode alone runs 40-80 ms and eats the whole capture interval; that was
-# most of the "huddle video fps" report under `make dev`.
+# YUYV conversion (nokhwa-core), a JPEG encode, and every peer frame a JPEG
+# decode — 25 times a second each. Unoptimized, a VGA encode runs ~25 ms, a
+# decode ~44 ms and the channel swap ~24 ms, and the capture loop falls behind
+# the camera: the "huddle video latency" report under `make dev`.
+#
+# The pure-Rust codecs (jpeg-encoder, zune-jpeg) are GENERIC over their writer
+# and reader, so their entry points and everything inlined into them
+# instantiate in the crate that CALLS them — an override on the codec
+# packages alone left the app's O0 copy doing the work. That caller is
+# media-service (`video::codec`, non-generic entry points), optimized here so
+# the app crate stays at opt-level 0 and never touches a pixel loop; the codec
+# packages stay optimized too for the non-generic internals (IDCT, Huffman)
+# that are compiled in their own crate.
+[profile.dev.package.media-service]
+opt-level = 3
+
 [profile.dev.package.jpeg-encoder]
 opt-level = 3
 

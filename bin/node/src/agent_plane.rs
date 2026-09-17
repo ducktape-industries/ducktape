@@ -10,14 +10,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use data_plane::{
-    BulkPacer, DataPlane, DataPlaneTransport, FlowId, PeerId, Service, SocketFactory, StreamPacing,
-    StreamPlaneSpec, StreamPolicy, StreamService, bind_stream_plane,
+    BulkPacer, DataPlane, DataPlaneTransport, FlowId, PeerId, SocketFactory, StreamPlaneSpec,
+    StreamService, bind_stream_plane,
 };
 use noded::{RunOutputEvent, RunOutputRegistry};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::overlay_book::{BIND_RETRY, OverlayBook, OverlayPeers, Plane, StreamPlane};
-use crate::term_plane::PerPeerLatch;
+use crate::lane_table::lane_table;
+use crate::overlay_book::{
+    BIND_RETRY, LaneKey, LaneSource, OverlayBook, OverlayPeers, Plane, StreamPlane,
+};
 
 const RUN_OUTPUT_INTENT: u8 = 1;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
@@ -26,9 +28,8 @@ const MAX_EVENT_BYTES: usize = 64 * 1024;
 const DIAL_RETRY: Duration = Duration::from_secs(3);
 
 /// how many distinct run ids ONE peer may hold a first-sender binding for.
-/// Same basis as term_plane's `MAX_OBSERVED_PER_PEER`: per peer, never
-/// node-wide, so a flooding peer only ever exhausts its own budget and never
-/// displaces another peer's bindings.
+/// Per peer, never node-wide, so a flooding peer only ever exhausts its own
+/// budget and never displaces another peer's bindings.
 const MAX_OBSERVED_RUNS_PER_PEER: usize = 64;
 
 fn run_output_flow() -> FlowId {
@@ -38,13 +39,13 @@ fn run_output_flow() -> FlowId {
 /// which peer a mirrored (not locally hosted) run id accepts lines from.
 ///
 /// A run id is consensus state — every member can learn every hosted run's
-/// id, unlike a term session's 16-hex random id — so "nobody has named this
-/// id yet" is not proof a peer owns it. What this DOES settle: once some peer
+/// id — so "nobody has named this id yet" is not proof a peer owns it. What
+/// this DOES settle: once some peer
 /// has streamed lines for an id this node does not host, that peer is the
 /// only one that may keep streaming them. The first sender binds; every other
 /// peer is refused from then on, and [`MAX_OBSERVED_RUNS_PER_PEER`] bounds how
 /// many such bindings one peer may mint, so a flooding peer only ever spends
-/// its own budget. Mirrors [`noded::term_remote::RemoteSessions::feed_host`].
+/// its own budget.
 #[derive(Default)]
 struct RemoteRunBindings(std::sync::Mutex<HashMap<String, PeerId>>);
 
@@ -70,9 +71,35 @@ impl RemoteRunBindings {
     }
 }
 
-/// refused run-output grain, latched per (reason, peer) like term_plane's
-/// feed refusals: a peer drives this — one frame per output line — so an
-/// unlatched line is a log bomb.
+/// Like [`noded::log::Latch`], but keyed on `(reason, peer)` instead of just
+/// `reason` — `Latch::hit` only takes a `&'static str`, and a peer id is not
+/// one. First occurrence per peer, then every `every`th, per peer.
+struct PerPeerLatch {
+    counts: std::sync::Mutex<std::collections::BTreeMap<(&'static str, PeerId), u64>>,
+    every: u64,
+}
+
+impl PerPeerLatch {
+    const fn new(every: u64) -> Self {
+        Self {
+            counts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            every,
+        }
+    }
+
+    /// returns `Some(occurrences)` when this peer's occurrence of `reason`
+    /// should be logged.
+    fn hit(&self, reason: &'static str, peer: PeerId) -> Option<u64> {
+        let mut counts = self.counts.lock().expect("latch lock poisoned");
+        let count = counts.entry((reason, peer)).or_insert(0);
+        *count += 1;
+        let n = *count;
+        (n == 1 || n.is_multiple_of(self.every)).then_some(n)
+    }
+}
+
+/// refused run-output grain, latched per (reason, peer): a peer drives this —
+/// one frame per output line — so an unlatched line is a log bomb.
 static RUN_REFUSED: PerPeerLatch = PerPeerLatch::new(100);
 
 /// the host gate on an inbound run-output grain: refuses a line naming a run
@@ -111,7 +138,10 @@ fn run_refused(reason: &'static str, peer: PeerId) {
 struct AgentPlane;
 
 impl Plane for AgentPlane {
-    const SERVICE: Service = Service::AgentTelemetry;
+    const LANE: LaneSource = LaneSource::Declared(LaneKey {
+        module_id: "agent",
+        name: "telemetry",
+    });
 }
 
 impl StreamPlane for AgentPlane {
@@ -133,15 +163,30 @@ pub(crate) fn spawn(
     registry: RunOutputRegistry,
 ) {
     tokio::spawn(async move {
+        // the lane first: its id decides the ports, its declaration decides
+        // the pacing and the backlog. None of it is this binary's to choose.
+        let binding = lane_table().resolve(AgentPlane::LANE, &label).await;
+        let Some((pacing, policy)) = binding.stream_spec(&pacer) else {
+            tracing::error!(
+                target: "ducktape::agent",
+                node = %label,
+                reason = "lane_has_no_stream_half",
+                lane = %AgentPlane::LANE,
+                "agent telemetry plane needs a stream lane and the registry declares a datagram-only one"
+            );
+            return;
+        };
         let own = peers.own_ip(&me);
         let spec = StreamPlaneSpec {
             own_ip: own,
-            service: Service::AgentTelemetry,
-            pacing: StreamPacing::Shared(pacer),
-            policy: StreamPolicy { accept_backlog: 64 },
+            service: binding.service,
+            pacing,
+            policy,
             retry: BIND_RETRY,
         };
         let book = OverlayBook::<AgentPlane>::new(Arc::clone(&peers));
+        book.bind_lane(binding.service)
+            .expect("a book built here latches its lane once");
         let (plane, service) = match bind_stream_plane(spec, factory, book).await {
             Ok(bound) => bound,
             Err(error) => {
@@ -159,11 +204,18 @@ pub(crate) fn spawn(
             target: "ducktape::agent",
             node = %label,
             service = "agent_telemetry",
+            lane = binding.service.lane_id(),
             own = %own,
             "agent telemetry plane: overlay stream bound"
         );
-        planes.register("agent", Service::AgentTelemetry, plane.watch());
-        run_bound(plane, service, peers, PeerId(me), registry).await;
+        planes.register("agent", "agent-telemetry", plane.watch());
+        crate::lane_table::serve_until_lane_changes(
+            AgentPlane::LANE,
+            binding.service,
+            &label,
+            run_bound(plane, service, peers, PeerId(me), registry),
+        )
+        .await;
     });
 }
 
@@ -368,9 +420,9 @@ async fn read_event<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Option<R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_cryptography::{ed25519, Signer as _};
+    use commonware_cryptography::{Signer as _, ed25519};
     use data_plane::sim::{LinkModel, SimNet};
-    use data_plane::PlaneConfig;
+    use data_plane::{PlaneConfig, Service, StreamPolicy};
 
     #[test]
     fn a_second_peer_is_refused_once_the_first_binds_a_run_id() {
@@ -467,24 +519,22 @@ mod tests {
             bulk_bytes_per_sec: 10_000_000,
             bulk_burst_bytes: 64 * 1024,
         };
-        let plane_a = DataPlane::new(
-            net.endpoint(a),
-            OverlayBook::<AgentPlane>::new(Arc::clone(&peers)),
-            config,
-        );
-        let plane_b = DataPlane::new(
-            net.endpoint(b),
-            OverlayBook::<AgentPlane>::new(Arc::clone(&peers)),
-            config,
-        );
+        // the lane the registry would resolve for agent/telemetry.
+        let lane = Service::from_lane_id(5);
+        let book_a = OverlayBook::<AgentPlane>::new(Arc::clone(&peers));
+        book_a.bind_lane(lane).unwrap();
+        let book_b = OverlayBook::<AgentPlane>::new(Arc::clone(&peers));
+        book_b.bind_lane(lane).unwrap();
+        let plane_a = DataPlane::new(net.endpoint(a), book_a, config);
+        let plane_b = DataPlane::new(net.endpoint(b), book_b, config);
         let service_a = Arc::new(
             plane_a
-                .stream_service(Service::AgentTelemetry, StreamPolicy { accept_backlog: 4 })
+                .stream_service(lane, StreamPolicy { accept_backlog: 4 })
                 .unwrap(),
         );
         let service_b = Arc::new(
             plane_b
-                .stream_service(Service::AgentTelemetry, StreamPolicy { accept_backlog: 4 })
+                .stream_service(lane, StreamPolicy { accept_backlog: 4 })
                 .unwrap(),
         );
         let registry_a = RunOutputRegistry::default();

@@ -1,5 +1,6 @@
 //! process-level harness for the real-socket node e2e: spawns REAL
-//! `ducktape` binaries (via `CARGO_BIN_EXE_ducktape`) with generated
+//! `ducktape` binaries (via [`ducktape()`], which pins one build for the whole
+//! test process — see [`pinned_build`]) with generated
 //! toml configs, drains their output into a feed it waits on for the node's
 //! greppable markers, and speaks the json-lines rpc — the rust replacement for
 //! what `demo-2node.sh` used to orchestrate in bash.
@@ -41,21 +42,231 @@ pub const FIXTURES: &str = concat!(
     "/../../crates/kernel/host/tests/fixtures"
 );
 
-/// the founding set `cargo build` staged beside this test executable
-/// (`target/<profile>/modules`): every `<id>.component.wasm`, every
+/// the founding set `cargo build` staged beside this test executable, under
+/// the name this checkout owns (`target/<profile>/modules%<checkout path>`, so
+/// a sibling checkout sharing the target dir stages its own and never this
+/// one): every `<id>.component.wasm`, every
 /// `<id>.index.wasm`, and the netstack guest. A network has no embedded
 /// wasm, so `node init` composes its genesis out of THIS directory and the
 /// dev shape derives its genesis code set from it — the same resolution the
 /// `ducktape` binary under test performs beside itself.
 pub fn founding_set() -> &'static str {
-    static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
-        workspace_config::modules_dir()
-            .expect("cargo build stages the founding set beside the test executable")
-            .to_str()
-            .expect("utf-8 founding set path")
-            .to_string()
+    &pinned_build().modules
+}
+
+/// THE BINARY EVERY SPAWN IN THIS TEST PROCESS USES. Pinned once, here, so a
+/// test cannot change binaries underneath itself.
+///
+/// `CARGO_BIN_EXE_ducktape` is ONE path — `target/<profile>/ducktape` — and
+/// every worktree that shares a target directory links it, so it belongs to
+/// whichever checkout linked it last. Resolving that path at each spawn lets one
+/// test `node init` with this checkout's binary and `node join`, seconds later,
+/// with a sibling's: the genesis was composed by one `ModuleArtifact` shape and
+/// decoded by another, and the test dies `FATAL: module artifact has trailing
+/// bytes` before a single assertion runs. It reads as a test bug and is not one.
+pub fn node_bin() -> &'static Path {
+    &pinned_build().binary
+}
+
+/// A `ducktape` command on the pinned binary — what every spawn in these
+/// suites builds from, instead of `ducktape()`.
+pub fn ducktape() -> Command {
+    Command::new(node_bin())
+}
+
+/// The binary and the founding set, pinned together for the life of this test
+/// process.
+struct PinnedBuild {
+    binary: PathBuf,
+    modules: String,
+}
+
+/// Pin both, by HARDLINK.
+///
+/// The set has the same shape of problem as the binary, from the other side. It
+/// is written atomically (tmp + rename, `crates/noded/build.rs`), so no read is
+/// ever torn — but the SET can change between two spawns of one test, and a
+/// joiner verifying a genesis against a module that moved fails closed.
+///
+/// The pin directory lives beside the binary, so it is always on the binary's
+/// own filesystem and a link costs nothing. A link is also immune BY
+/// CONSTRUCTION: a relink or a restage renames a NEW inode over the name and
+/// never touches the one we hold.
+///
+/// The modules keep their KEYED name. `workspace_config::staged_modules_dir`
+/// looks beside the executable and then one directory up, keyed name first —
+/// and one directory up from the pin is the live profile directory, so an
+/// unkeyed `modules/` here would be skipped in favour of the very set we are
+/// pinning away from. Keyed, the pinned copy wins outright, and a spawned node
+/// resolving its own set beside itself needs no `$DUCKTAPE_MODULES_DIR` (which
+/// `workspace_home_cli` deliberately unsets to test exactly that resolution).
+fn pinned_build() -> &'static PinnedBuild {
+    static PINNED: std::sync::OnceLock<PinnedBuild> = std::sync::OnceLock::new();
+    PINNED.get_or_init(|| {
+        let shared = Path::new(env!("CARGO_BIN_EXE_ducktape"));
+        let profile = shared
+            .parent()
+            .expect("the built binary sits in a profile directory");
+        sweep_abandoned_pins(profile);
+        let dir = profile.join(format!("ducktape-e2e-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+
+        let binary = dir.join("ducktape");
+        link_or_copy(shared, &binary);
+        refuse_a_foreign_binary(&binary);
+        // the launcher is found BESIDE the node binary (`node_release_e2e`'s
+        // `launcher_exe`), so it has to move with it or the pin would send that
+        // suite looking in a directory with only half a build in it.
+        let launcher = shared.with_file_name("ducktape-node-launcher");
+        if launcher.is_file() {
+            link_or_copy(&launcher, &dir.join("ducktape-node-launcher"));
+        }
+
+        let staged = workspace_config::modules_dir()
+            .expect("cargo build stages the founding set beside the test executable");
+        // keep the set's OWN name: `staged_modules_dir` reads the pointer the
+        // build wrote, and the pin copies the set that pointer named.
+        let staged_name = staged
+            .file_name()
+            .expect("a resolved founding set has a directory name");
+        let modules = dir.join(staged_name);
+        link_tree(&staged, &modules);
+        // and the pointer that names it, because that is what a spawned node
+        // reads. Without one the pin would hold a set nothing resolves and the
+        // node would walk back out to the live profile directory — the very
+        // set being pinned away from.
+        std::fs::write(
+            dir.join(workspace_config::staged_key::STAGED_POINTER),
+            staged_name.to_str().expect("utf-8 founding set name"),
+        )
+        .expect("name the pinned founding set");
+        // the simulator's twin rides along when the build staged one. No node
+        // e2e composes from it today; a pin that silently dropped it would be a
+        // trap for the first one that does.
+        let sim = workspace_config::sim_modules_dir().expect("the twin of a resolved set");
+        if sim.is_dir() {
+            let sim_name = sim.file_name().expect("a twin has a directory name");
+            link_tree(&sim, &dir.join(sim_name));
+        }
+
+        PinnedBuild {
+            binary,
+            modules: modules
+                .to_str()
+                .expect("utf-8 founding set path")
+                .to_string(),
+        }
     })
+}
+
+/// The harness refuses to run against a binary it cannot vouch for.
+///
+/// A TEST-SIDE guard, not an admission gate: the node still treats its own
+/// build stamp as display only, and nothing in the product refuses on it. Here
+/// it is the one cheap way to tell this checkout's binary from a sibling's.
+fn refuse_a_foreign_binary(binary: &Path) {
+    let printed = Command::new(binary)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|e| panic!("{} --version: {e}", binary.display()));
+    let line = String::from_utf8_lossy(&printed.stdout).trim().to_string();
+    // `ducktape <cargo version>+<stamp>`, the stamp a short sha with a
+    // working-tree digest appended when the build was dirty.
+    let Some((_, stamp)) = line.rsplit_once('+') else {
+        panic!("{} --version printed no build stamp: {line:?}", binary.display());
+    };
+    let commit = stamp.split('-').next().unwrap_or(stamp);
+    if commit_is_ours(commit) {
+        return;
+    }
+    panic!(
+        "FOREIGN NODE BINARY: {} was built from {commit}, which is not this checkout's \
+         HEAD or an ancestor of it.\n  \
+         Every worktree on this box shares one target directory, so {} belongs to \
+         whichever checkout linked it last — and its wire shapes need not match this \
+         one's. Re-run the test (cargo relinks it from this checkout) and do not trust \
+         a result from the run that printed this.",
+        binary.display(),
+        env!("CARGO_BIN_EXE_ducktape"),
+    );
+}
+
+/// Is `commit` HEAD or an ancestor of it, as this checkout's git says?
+///
+/// TRUE whenever the question cannot be ASKED — no git, no repository, a
+/// git-less build stamp, or an object this repository does not have (a shallow
+/// clone). The guard exists to catch a SIBLING checkout on a shared target dir,
+/// and sibling worktrees share one object store, so there the question always
+/// answers. Only a definite "no" refuses.
+fn commit_is_ours(commit: &str) -> bool {
+    if commit == "unknown" {
+        return true;
+    }
+    let Ok(answered) = Command::new("git")
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .args(["merge-base", "--is-ancestor", commit, "HEAD"])
+        .output()
+    else {
+        return true;
+    };
+    // 0 = ancestor, 1 = definitely not, anything else (128: no such object) =
+    // unanswerable.
+    answered.status.code() != Some(1)
+}
+
+/// Link `src` to `dest`, copying only where the filesystem has no links. The
+/// link is the point — it pins the INODE, which a rename over the name cannot
+/// reach.
+fn link_or_copy(src: &Path, dest: &Path) {
+    if std::fs::hard_link(src, dest).is_ok() {
+        return;
+    }
+    std::fs::copy(src, dest)
+        .unwrap_or_else(|e| panic!("pin {} -> {}: {e}", src.display(), dest.display()));
+}
+
+/// The same, for a directory. RECURSIVE, because the staged set is not flat: a
+/// view-carrying module stages `<id>.assets/icons/…` beside its components, and
+/// a pin that took only the top level would hand a node a set whose views have
+/// no assets.
+fn link_tree(src: &Path, dest: &Path) {
+    std::fs::create_dir_all(dest).unwrap_or_else(|e| panic!("{}: {e}", dest.display()));
+    let entries = std::fs::read_dir(src).unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if from.is_dir() {
+            link_tree(&from, &to);
+        } else {
+            link_or_copy(&from, &to);
+        }
+    }
+}
+
+/// Remove the pins of dead test processes. They are hardlinks, so an abandoned
+/// one costs nothing UNTIL the binary it names is relinked away — then it is the
+/// last reference to a gigabyte of dead build. Same pid rule as
+/// [`sweep_abandoned_e2e_dirs`]: a LIVE pid is never touched.
+fn sweep_abandoned_pins(profile: &Path) {
+    let Ok(entries) = std::fs::read_dir(profile) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("ducktape-e2e-pin-"))
+            .and_then(|p| p.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid_is_alive(pid) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
 }
 
 /// the beat every harness network is FOUNDED at (`node init --block-time-ms`,
@@ -87,10 +298,34 @@ pub const TEST_BLOCK_TIME_MS: u64 = 100;
 /// process is gone. A LIVE pid is never touched (sibling test binaries run
 /// concurrently), and pid reuse only makes the sweep skip a directory — it can
 /// never make it delete a live one.
+/// `DUCKTAPE_E2E_KEEP` disarms the Drop above so a FAILED run's storage, qmdb
+/// and consensus journal survive the unwind that would otherwise delete them.
+/// A restart bug is only diagnosable from the journal tail it left behind, and
+/// the harness destroyed exactly that evidence every time one reproduced.
+///
+/// The name carries the retention, not a flag file: `ducktape-e2e-keep-<pid>-…`
+/// makes [`sweep_abandoned_e2e_dirs`] skip it forever, because the segment it
+/// parses as a pid is `keep` and the parse fails. So a kept root outlives both
+/// its own process and every later run on the box.
+///
+/// OFF by default and swept BY HAND, because that permanence is the whole point
+/// and these roots are multi-GB — which, where `TMPDIR` is tmpfs, is RAM.
+fn keep_e2e_dirs() -> bool {
+    std::env::var_os("DUCKTAPE_E2E_KEEP").is_some()
+}
+
 pub fn e2e_tempdir(tag: &str) -> tempfile::TempDir {
     sweep_abandoned_e2e_dirs();
+    let keep = keep_e2e_dirs();
+    let pid = std::process::id();
+    let prefix = if keep {
+        format!("ducktape-e2e-keep-{pid}-{tag}-")
+    } else {
+        format!("ducktape-e2e-{pid}-{tag}-")
+    };
     tempfile::Builder::new()
-        .prefix(&format!("ducktape-e2e-{}-{tag}-", std::process::id()))
+        .prefix(&prefix)
+        .disable_cleanup(keep)
         .tempdir()
         .expect("e2e tempdir")
 }
@@ -198,6 +433,35 @@ impl NodeProc {
         )
     }
 
+    /// block until the `nth` (1-based) line carrying every needle lands.
+    ///
+    /// [`Self::expect_line`] rescans the whole run each call, so it answers
+    /// with the FIRST match every time — right for a marker that happens once,
+    /// useless for one a supervised process prints per restart. The count
+    /// lives in the probe, which is offered every line exactly once.
+    pub fn expect_line_nth(&self, needles: &[&str], nth: usize, timeout: Duration) -> String {
+        let mut seen = 0usize;
+        self.feed
+            .wait(Instant::now() + timeout, |unseen| {
+                strip_ansi(unseen).lines().find_map(|line| {
+                    let matches = needles.iter().all(|needle| line.contains(needle));
+                    if !matches {
+                        return None;
+                    }
+                    seen += 1;
+                    (seen == nth).then(|| line.to_string())
+                })
+            })
+            .unwrap_or_else(|why| {
+                panic!(
+                    "{} {} without printing {needles:?} {nth} time(s) (saw {seen});\n{}",
+                    self.what,
+                    why.verb(),
+                    self.tail(60)
+                )
+            })
+    }
+
     /// block until an ANSI-stripped line satisfies `accept`, and answer with
     /// that line; `wanted` names it in the panic when the process never does.
     pub fn expect_line_where(
@@ -274,6 +538,31 @@ impl NodeProc {
     /// the last `lines` lines the process wrote.
     fn tail(&self, lines: usize) -> String {
         log_tail(&self.text(), lines)
+    }
+}
+
+impl NodeProc {
+    /// SIGTERM this process and wait for it to go, SIGKILLing only if it
+    /// outlives `budget`.
+    ///
+    /// `Drop` SIGKILLs, which is right for a node (a crash is a case under
+    /// test) and wrong for a SUPERVISOR: a killed supervisor leaves the node
+    /// it started running, orphaned, over a tempdir the test is about to
+    /// remove. A stop signal is also what `systemctl stop` sends, so this is
+    /// the shutdown the supervisor is built for.
+    pub fn terminate(&mut self, budget: Duration) {
+        // SAFETY: our own child, not yet reaped — `Drop` is the only other
+        // reaper and it runs after this.
+        unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) };
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_)) | Err(_)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -486,8 +775,8 @@ impl Drop for Cluster {
     /// ~45 MB rooted in a tempdir about to vanish, and reaped only when a
     /// SUCCESSOR booted on the same root, which a torn-down cluster never gets
     /// (102 of them, ~4.5 GB, were once swept by hand). A run's VMM is a child
-    /// of its daemon spawned `kill_on_drop`, so the SIGKILL that ends the
-    /// daemon ends its guests too.
+    /// of its daemon, armed with a parent-death signal, so the SIGKILL that
+    /// ends the daemon ends its guests too.
     fn drop(&mut self) {
         for daemon in &mut self.daemons {
             *daemon = None; // NodeProc::drop kills + waits
@@ -561,10 +850,24 @@ impl NetworkShapeCluster {
         }
     }
 
-    /// the `GIT_CONFIG_*` environment a push at node `idx` must carry — the
-    /// shape-cluster twin of [`Cluster::git_push_env`].
-    pub fn git_push_env(&self, idx: usize) -> [(String, String); 3] {
-        git_push_env_for(&self.workspace(idx))
+    /// Seed an automation-owned ref through generic node-origin transport.
+    pub fn seed_forge(&self, idx: usize, source: &Path, repo: &str, branch: &str) {
+        seed_forge_at(
+            self.http_ports[idx],
+            &self.workspace(idx),
+            source,
+            repo,
+            branch,
+        );
+    }
+
+    pub fn clone_forge(&self, idx: usize, repo: &str, destination: &Path) {
+        clone_forge_at(
+            self.http_ports[idx],
+            &self.workspace(idx),
+            repo,
+            destination,
+        );
     }
 
     /// one request against node `idx`'s app surface, carrying that node's
@@ -601,7 +904,7 @@ impl NetworkShapeCluster {
         // plane, and this harness is deliberately coordinator-free — so every
         // founder carries a distinct-port WireGuard listen.
         let wg_listen = format!("127.0.0.1:{}", alloc_ports(1)[0]);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        let out = ducktape()
             .arg("node")
             .args([
                 "init",
@@ -649,7 +952,7 @@ impl NetworkShapeCluster {
     /// and return its pubkey hex — the JOIN CODE the invite locks to.
     /// `join_friend` reuses this pre-generated identity.
     pub fn keygen_friend(&self, _idx: usize) -> String {
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        let out = ducktape()
             .arg("node")
             .args(["key", "--dir"])
             .arg(&self.friend_dir)
@@ -669,7 +972,7 @@ impl NetworkShapeCluster {
     pub fn invite(&self) -> String {
         self.keygen_friend(1);
         let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        let out = ducktape()
             .arg("node")
             .args(["invite", "--config"])
             .arg(cfg)
@@ -700,7 +1003,7 @@ impl NetworkShapeCluster {
     /// `join requests` verb's JSON stdout.
     pub fn join_requests(&self) -> serde_json::Value {
         let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        let out = ducktape()
             .arg("node")
             .args(["join", "requests", "--config"])
             .arg(cfg)
@@ -719,7 +1022,7 @@ impl NetworkShapeCluster {
     /// success — the caller inspects the outcome (a targeted invite refuses a
     /// mismatched local identity at the CLI, before any node spawns).
     pub fn try_join_friend(&self, invite: &str) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        ducktape()
             .arg("node")
             .args([
                 "join",
@@ -771,7 +1074,7 @@ impl NetworkShapeCluster {
             _ => panic!("unknown network-shape node idx {idx}"),
         };
         let log = self.dir.path().join(format!("{label}.log"));
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        let mut cmd = ducktape();
         cmd.arg("node")
             .arg("run")
             .arg("--config")
@@ -963,7 +1266,7 @@ impl NetworkShapeCluster {
         pubkey_hex: &str,
     ) -> (bool, String) {
         let cfg = self.config_file(idx);
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        let mut cmd = ducktape();
         cmd.arg("node");
         for token in verb.split(' ') {
             cmd.arg(token);
@@ -1102,7 +1405,12 @@ impl Cluster {
     /// the bootstrapper), `validator_ids` the consensus subset.
     pub fn new(peer_ids: &[u64], validator_ids: &[u64]) -> Self {
         let seq = CLUSTER_SEQ.fetch_add(1, Ordering::Relaxed);
-        let namespace = format!("ducktape-e2e-{}-{seq}", std::process::id());
+        // SHAPED LIKE A MINTED ONE: `node init` writes `<name>#<8 hex>`, and a
+        // cluster named without the `#` is a cluster that cannot reproduce
+        // anything keyed on a chain id's real shape — forge's push-certificate
+        // nonce went unsignable on every real network while these tests, whose
+        // ids happened to be alphanumeric, signed happily.
+        let namespace = format!("ducktape-e2e-{}-{seq}#{:08x}", std::process::id(), seq);
         let dir = e2e_tempdir("cluster");
         let ports = alloc_ports(peer_ids.len() * 4);
         let (p2p_ports, rest) = ports.split_at(peer_ids.len());
@@ -1278,7 +1586,7 @@ impl Cluster {
         let id = self.peer_ids[idx];
         let cfg = self.config_path(idx);
         let log = self.dir.path().join(format!("node{id}.log"));
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        let mut cmd = ducktape();
         cmd.arg("node")
             .arg("run")
             .arg("--config")
@@ -1322,7 +1630,7 @@ impl Cluster {
         let id = self.peer_ids[idx];
         let cfg = self.config_path(idx);
         let log = self.dir.path().join(format!("compute{id}.log"));
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        let mut cmd = ducktape();
         cmd.arg("service")
             .arg("run")
             .arg("compute")
@@ -1365,7 +1673,7 @@ impl Cluster {
         self.service_kinds[idx].push(kind.to_string());
         self.write_service_grants(idx);
         let log = self.dir.path().join(format!("{kind}{id}.log"));
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        let mut cmd = ducktape();
         cmd.arg("service")
             .arg("run")
             .arg(kind)
@@ -1531,7 +1839,7 @@ impl Cluster {
         std::fs::write(&path, cfg).expect("write joiner config");
 
         let log = self.dir.path().join(format!("node{id}.log"));
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        let mut cmd = ducktape();
         cmd.arg("node").arg("run").arg("--config").arg(&path);
         let joiner = NodeProc::spawn(id, log, cmd, "joiner");
 
@@ -1553,10 +1861,45 @@ impl Cluster {
     /// run a ducktape VERB (resident accept, admit, ...) to completion and
     /// return (success, combined output).
     pub fn run_verb(&self, args: &[&str]) -> (bool, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        let out = ducktape()
             .args(args)
             .output()
             .expect("run ducktape verb");
+        (
+            out.status.success(),
+            format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    }
+
+    /// run a ducktape VERB with extra environment and a piped stdin (the
+    /// `user`/`cred` families read a key password there) and return
+    /// (success, combined output).
+    pub fn run_verb_with(
+        &self,
+        args: &[&str],
+        env: &[(&str, &str)],
+        stdin: &str,
+    ) -> (bool, String) {
+        use std::io::Write as _;
+        let mut child = ducktape()
+            .args(args)
+            .envs(env.iter().copied())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn ducktape verb");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(stdin.as_bytes())
+            .expect("write the verb's stdin");
+        let out = child.wait_with_output().expect("run ducktape verb");
         (
             out.status.success(),
             format!(
@@ -1595,7 +1938,7 @@ impl Cluster {
         let id = self.peer_ids[idx];
         let cfg = self.config_path(idx);
         let log = self.dir.path().join(format!("node{id}-sync.log"));
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        let mut cmd = ducktape();
         cmd.arg("node")
             .arg("run")
             .arg("--config")
@@ -1865,26 +2208,31 @@ impl Cluster {
             .expect("the node minted an operator credential")
     }
 
-    /// the `GIT_CONFIG_*` environment a push at node `idx`'s smart-HTTP
-    /// surface must carry.
-    ///
-    /// `git-receive-pack` refuses a push that proves nothing (#1292): it takes
-    /// git's own push certificate, or this node's operator credential. A
-    /// harness pushing at a node it spawned IS its operator. `GIT_CONFIG_*`
-    /// rather than `git -c`, exactly as `ops/dogfood-forge.sh` sets it — an
-    /// argv is world-readable through /proc, and this is a secret.
-    pub fn git_push_env(&self, idx: usize) -> [(String, String); 3] {
-        git_push_env_for(&self.workspace(idx))
+    /// Seed an automation-owned ref through generic node-origin transport.
+    pub fn seed_forge(&self, idx: usize, source: &Path, repo: &str, branch: &str) {
+        seed_forge_at(
+            self.http_ports[idx],
+            &self.workspace(idx),
+            source,
+            repo,
+            branch,
+        );
+    }
+
+    pub fn clone_forge(&self, idx: usize, repo: &str, destination: &Path) {
+        clone_forge_at(
+            self.http_ports[idx],
+            &self.workspace(idx),
+            repo,
+            destination,
+        );
     }
 
     /// a duckfs transport for node `idx` whose writes it admits.
     pub fn files(&self, idx: usize) -> duckfs_client::http::HttpNode {
         let token = self.operator_token(idx);
-        duckfs_client::http::HttpNode::new(self.http_base(idx)).with_write_auth(
-            std::sync::Arc::new(move |_method, _path, _body| {
-                vec![(noded::admin::ADMIN_TOKEN_HEADER.to_string(), token.clone())]
-            }),
-        )
+        duckfs_client::http::HttpNode::new(self.http_base(idx))
+            .with_operator_credential(std::sync::Arc::new(move || Some(token.clone())))
     }
 
     /// GET a raw TEXT body from node `idx`'s app surface — for non-json
@@ -1949,22 +2297,107 @@ impl Cluster {
     }
 }
 
-/// the `GIT_CONFIG_*` environment carrying the operator credential minted into
-/// `workspace` — one implementation for both cluster shapes.
-fn git_push_env_for(workspace: &Path) -> [(String, String); 3] {
-    let token = noded::admin::read_operator_token(workspace)
-        .expect("the node minted an operator credential");
-    [
-        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
-        (
-            "GIT_CONFIG_KEY_0".to_string(),
-            "http.extraHeader".to_string(),
-        ),
-        (
-            "GIT_CONFIG_VALUE_0".to_string(),
-            format!("{}: {token}", noded::admin::ADMIN_TOKEN_HEADER),
-        ),
-    ]
+/// Seed an automation-owned ref through generic node-origin transport.
+fn seed_forge_at(port: u16, workspace: &Path, source: &Path, name: &str, branch: &str) {
+    let token = noded::admin::read_operator_token(workspace).unwrap();
+    let request = |path: &str, kind: &str, bytes: &[u8]| {
+        let (status, body) = nettest::try_http_bytes_with(
+            port,
+            "POST",
+            path,
+            kind,
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &token)],
+            bytes,
+        )
+        .unwrap();
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+    };
+    let repo = git2::Repository::open(source).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap().id();
+    let pack = forge::pack_closure_many(&repo, &[head]).unwrap();
+    let digest = request("/v1/files/blob", "application/octet-stream", &pack)["digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let query = serde_json::json!({"target":"forge","query":{"list_refs":{"repo":name}}});
+    let reply = request(
+        "/v1/query",
+        "application/json",
+        &serde_json::to_vec(&query).unwrap(),
+    );
+    let previous = reply["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == branch)
+        .map(|item| {
+            git2::Oid::from_str(item["head"].as_str().unwrap())
+                .unwrap()
+                .as_bytes()
+                .to_vec()
+        });
+    let payload = forge::encode_msg(&forge::ForgeMsg::PushRefs {
+        repo: name.into(),
+        updates: vec![forge::RefUpdate {
+            ref_name: branch.into(),
+            prev_oid: previous,
+            new_oid: Some(head.as_bytes().to_vec()),
+        }],
+        pack_digest: Some(duckfs_core::from_hex_32(&digest).unwrap().to_vec()),
+        cert: None,
+    });
+    request(
+        &format!("/v1/submit/raw/forge?required_blob={digest}"),
+        "application/octet-stream",
+        &payload,
+    );
+}
+
+/// Read the peer's actual objects through the installed service protocol.
+fn clone_forge_at(port: u16, workspace: &Path, name: &str, destination: &Path) {
+    let status = nettest::http_json(port, "GET", "/v1/status", None).1;
+    let config = ducktape_forge_service::Config {
+        node_url: format!("http://127.0.0.1:{port}"),
+        node_key: status["public_key"].as_str().unwrap().into(),
+        chain_id: status["chain_id"].as_str().unwrap().into(),
+        account: 1,
+        label: "git".into(),
+        module: "forge".into(),
+        git_store: workspace.join("forge-repo"),
+        signing_seed: "09".repeat(32),
+    };
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let worker = std::thread::spawn(move || {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let router = ducktape_forge_service::router(config, [b'a'; 64]).unwrap();
+                ready_tx
+                    .send(listener.local_addr().unwrap().port())
+                    .unwrap();
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+    });
+    let service_port = ready_rx.recv().unwrap();
+    let output = Command::new("git").args(["-c", "http.extraHeader=x-duck-upstream-token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "-c", "http.extraHeader=x-duck-route-account: 1", "-c", "http.extraHeader=x-duck-route-label: git",
+        "-c", "http.extraHeader=x-duck-route-revision: 1", "clone", "--quiet", &format!("http://127.0.0.1:{service_port}/{name}")])
+        .arg(destination).output().unwrap();
+    let _ = shutdown.send(());
+    worker.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn command_output(out: &std::process::Output) -> String {
@@ -2606,6 +3039,7 @@ pub fn provision_model_program(cluster: &Cluster, idx: usize, model: &str) -> u6
         idx,
         "agent",
         &agent::encode_msg(&agent::AgentMsg::Provision {
+            request_id: model.into(),
             name: model.into(),
             program: runs::model_program(model),
         }),
@@ -2693,6 +3127,101 @@ pub fn attributed_run_id(
             })
             .map(|run| run.run_id)
     })
+}
+
+/// The pin's whole claim: a rebuild of the SHARED path, mid-run, cannot change
+/// what an already-pinned test spawns.
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    /// A relink is a rename over a name — cargo's, and the module staging's
+    /// (`crates/noded/build.rs` writes a tmp file and renames it into place).
+    /// A hardlink holds the INODE, which no rename can reach, so this is the
+    /// property the pin rests on: same path, different bytes, and the pin still
+    /// reads what it linked.
+    ///
+    /// Deliberately on a scratch file and NEVER on the real
+    /// `CARGO_BIN_EXE_ducktape` — every other worktree and test on this box is
+    /// reading that path right now.
+    #[test]
+    fn a_relink_of_the_shared_path_cannot_reach_what_was_pinned() {
+        let scratch = e2e_tempdir("pin");
+        let shared = scratch.path().join("ducktape");
+        std::fs::write(&shared, b"the build the test pinned").expect("write the shared path");
+
+        let pinned = scratch.path().join("pin/ducktape");
+        std::fs::create_dir_all(pinned.parent().expect("pin dir")).expect("create the pin dir");
+        link_or_copy(&shared, &pinned);
+
+        // a sibling checkout relinks the shared name, exactly as cargo does.
+        let relinked = scratch.path().join("ducktape.new");
+        std::fs::write(&relinked, b"a sibling's build, different bytes").expect("write");
+        std::fs::rename(&relinked, &shared).expect("relink the shared path");
+
+        assert_eq!(
+            std::fs::read(&shared).expect("read the shared path"),
+            b"a sibling's build, different bytes",
+            "the shared path is the sibling's now — that is the hazard, not a bug"
+        );
+        assert_eq!(
+            std::fs::read(&pinned).expect("read the pinned path"),
+            b"the build the test pinned",
+            "and the pin still spawns what this test started with"
+        );
+    }
+
+    /// The wiring, not the mechanism: what the suites actually spawn is the
+    /// pinned binary, with the founding set resolving BESIDE it — the keyed
+    /// name, or `staged_modules_dir` would walk one directory up and find the
+    /// live set we are pinning away from.
+    #[test]
+    fn the_harness_spawns_the_pin_and_resolves_the_set_beside_it() {
+        let shared = Path::new(env!("CARGO_BIN_EXE_ducktape"));
+        let pinned = node_bin();
+        assert_ne!(pinned, shared, "the harness must not spawn the shared path");
+        assert_eq!(
+            std::fs::metadata(pinned).expect("pinned binary").len(),
+            std::fs::metadata(shared).expect("shared binary").len(),
+            "the pin is the same build, linked — not some other one"
+        );
+        assert_eq!(
+            workspace_config::staged_modules_dir(pinned)
+                .expect("a founding set resolves beside the pinned binary"),
+            Path::new(founding_set()),
+            "a spawned node must find the PINNED set beside itself, not the live one"
+        );
+        assert!(
+            Path::new(founding_set()).join("chat.component.wasm").exists(),
+            "the pinned set carries the staged artifacts, not an empty directory"
+        );
+    }
+
+    /// The staged set is NOT flat: a view-carrying module stages
+    /// `<id>.assets/icons/…` beside its components. A pin that took only the
+    /// top level would hand a node views with no assets, and nothing above
+    /// would notice.
+    #[test]
+    fn the_pin_carries_subdirectories_not_just_the_top_level() {
+        let scratch = e2e_tempdir("pin-tree");
+        let set = scratch.path().join("set");
+        std::fs::create_dir_all(set.join("home.assets/icons")).expect("stand up a staged set");
+        std::fs::write(set.join("chat.component.wasm"), b"component").expect("write");
+        std::fs::write(set.join("home.assets/icons/tab.svg"), b"<svg/>").expect("write");
+
+        let pinned = scratch.path().join("pinned");
+        link_tree(&set, &pinned);
+
+        assert_eq!(
+            std::fs::read(pinned.join("chat.component.wasm")).expect("the component"),
+            b"component"
+        );
+        assert_eq!(
+            std::fs::read(pinned.join("home.assets/icons/tab.svg")).expect("the view's asset"),
+            b"<svg/>",
+            "a view's assets live one level down"
+        );
+    }
 }
 
 #[cfg(test)]

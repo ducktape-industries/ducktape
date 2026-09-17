@@ -30,8 +30,13 @@ work="$repo/target/wasm-repro"
 rm -rf "$work"
 mkdir -p "$work"
 
-cargo build -q --locked -p guest-builder
-builder="${CARGO_TARGET_DIR:-$repo/target}/debug/guest-builder"
+# This checkout's OWN builder, never the one a host config shares between
+# worktrees: guest-builder bakes its platform root in at compile time, so the
+# binary in a shared target belongs to whichever worktree built it last and
+# refuses every module here by name. The Makefile keeps the same directory.
+builder_dir="$repo/target/guest-builder-bin"
+cargo build -q --locked --target-dir "$builder_dir" -p guest-builder
+builder="$builder_dir/debug/guest-builder"
 
 "$builder" "$repo/$MODULE" --scratch "$work/here" --out "$work/here.wasm"
 "$builder" "$repo/$MODULE" --scratch "$work/there" --out "$work/there.wasm"

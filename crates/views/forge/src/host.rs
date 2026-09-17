@@ -3,33 +3,33 @@
 //!
 //! The kernel pushes only session facts (`forge.props`: connected, dark, the
 //! network's name and chain id, the connected endpoint, and the `duck://`
-//! link the app last routed here). Everything else is the view's own: the
+//! link the app last routed here). Everything else is the view's own: this
+//! node's standing off `rpc.status` and the valset, the
 //! repo namespace, one repo's branches and tracker, one item with its patch
 //! and reviews, the code browse's listing and file, and the item's
 //! discussion all come from `rpc.query` / `rpc.view`, re-read on every
-//! `rpc.live` hit for the forge plane. A review leaves as `op.submit`
+//! `rpc.live` hit for the forge plane. Opening an issue and reviewing both
+//! leave as `op.submit`
 //! carrying the module's own `ForgeMsg`, signed by the kernel with the
 //! seated key — the view never sees the key, the endpoint or the password.
 //!
-//! Three things stay the host's because they are host CAPABILITIES, not
-//! forge readings: the client-computed merge commit (`git.merge` — libgit2
-//! over the node's smart-HTTP remote), the decoded picture behind the
-//! picture surface (`picture.put`), and the pictures a Markdown document
-//! embeds (`picture.inline`).
+//! Merge calculation belongs to the installed service named by this deployment's
+//! `service.json` asset, reached through the generic authenticated Gateway.
+//! Native picture decoding remains a host device capability.
 
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
 
 pub use crate::blocks::{ChatBlock, ChatSpan};
 use crate::blocks::{
     Names, author_display, avatar_initial, avatar_kind, blocks_of_json, blocks_view, body_blocks,
-    deleted_block, message_body, party_handle, party_of_json,
+    deleted_block, party_handle, party_of_json,
 };
 
 /// The module this view reads and writes: its query target, its live plane,
@@ -97,7 +97,6 @@ pub struct ChatMessage {
     pub blocks: Vec<ChatBlock>,
     pub initial: String,
     pub avatar_kind: String,
-    pub render_rev: i64,
 }
 
 /// One line comment a review carried, anchored `path:line (side)`.
@@ -140,8 +139,9 @@ pub struct TreeEntry {
     pub kind: String,
 }
 
-/// One painted row of the unified patch. `kind` is `file` | `hunk` | `add`
-/// | `del` | `ctx`.
+/// One painted row of the unified patch. `kind` is `file` (one per changed
+/// file, `text` naming it) | `hunk` | `add` | `del` | `ctx` | `note` (the
+/// `\ No newline at end of file` remark).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DiffLine {
     pub key: i64,
@@ -166,8 +166,6 @@ pub struct Session {
     pub org: String,
     /// this account's bio, as the empty state introduces the network
     pub about: String,
-    /// this account's seat word on the network
-    pub tier: String,
     pub network_chain_id: String,
     pub connected_rpc: String,
     /// the `duck://forge/...` address the app's open plane last routed here
@@ -184,10 +182,10 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("forge.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
             });
             match read {
@@ -197,11 +195,18 @@ pub fn session() -> iced::Subscription<SessionItem> {
                 },
                 Err(error) => SessionItem {
                     next: Session::default(),
-                    error,
+                    error: failure("Could not read the session", &error),
                 },
             }
         })
     })
+}
+
+/// A refusal as the screen says it: what we were doing, then the kernel's
+/// own words. Every error a reader hands the view passes through here, so
+/// no strip ever shows a bare token.
+fn failure(doing: &str, error: &str) -> String {
+    format!("{doing}: {error}")
 }
 
 /// The serial every read subscription is keyed by: it moves when the
@@ -218,13 +223,17 @@ pub fn connection_serial_after(was_connected: bool, connected: bool, serial: i64
 
 async fn query(target: &str, query: serde_json::Value) -> Result<serde_json::Value, String> {
     let ask = serde_json::json!({ "target": target, "query": query });
-    let reply = host::request("rpc.query", &serde_json::to_vec(&ask).expect("encodes")).await?;
+    let reply = host::request("rpc.query", &serde_json::to_vec(&ask).expect("encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&reply).map_err(|error| error.to_string())
 }
 
 async fn view(target: &str, query: serde_json::Value) -> Result<serde_json::Value, String> {
     let ask = serde_json::json!({ "target": target, "query": query });
-    let reply = host::request("rpc.view", &serde_json::to_vec(&ask).expect("encodes")).await?;
+    let reply = host::request("rpc.view", &serde_json::to_vec(&ask).expect("encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&reply).map_err(|error| error.to_string())
 }
 
@@ -264,6 +273,94 @@ where
     stream::once(load()).chain(live.then(move |_| load()))
 }
 
+// ---------- this node's seat ----------
+
+/// One item of the seat subscription: this node's standing word, or why
+/// the valset could not say.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SeatItem {
+    /// `validator` | `resident` | `guest`, or "" while the valset is silent
+    pub tier: String,
+    pub error: String,
+}
+
+/// This node's standing now and after every valset block — the word the
+/// org head wears. The view folds it off `rpc.status` and the valset
+/// itself; no session prop carries it, so swapping this view changes what
+/// the badge calls this device.
+pub fn seat(connection: i64) -> ducktape_view_guest::Subscription<SeatItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
+        let live = host::subscribe("rpc.live", b"valset");
+        stream::once(load_seat()).chain(live.then(|_| load_seat()))
+    })
+}
+
+async fn load_seat() -> SeatItem {
+    match read_seat().await {
+        Ok(tier) => SeatItem {
+            tier,
+            error: String::new(),
+        },
+        Err(error) => SeatItem {
+            tier: String::new(),
+            error: failure("Could not read this node's standing", &error),
+        },
+    }
+}
+
+async fn read_seat() -> Result<String, String> {
+    let status = host::request("rpc.status", b"{}").await.map_err(host::said)?;
+    let status: serde_json::Value =
+        serde_json::from_slice(&status).map_err(|error| error.to_string())?;
+    let node_key = status["public_key"].as_str().unwrap_or_default().to_owned();
+    let validators = query("valset", serde_json::json!("validators")).await?;
+    let residents = query("valset", serde_json::json!("residents")).await?;
+    Ok(fold_tier(
+        &node_key,
+        &seat_keys(&validators, "validators"),
+        &seat_keys(&residents, "residents"),
+    ))
+}
+
+/// A valset key list — `{"validators": [[byte, …], …]}` — as hex.
+fn seat_keys(reply: &serde_json::Value, seat: &str) -> Vec<String> {
+    reply[seat]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|key| {
+            key.as_array()
+                .map(|bytes| {
+                    bytes
+                        .iter()
+                        .filter_map(|byte| byte.as_u64())
+                        .map(|byte| format!("{:02x}", byte as u8))
+                        .collect::<String>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// This node's seat word, as the two valset lists name it.
+///
+/// AN UNANSWERED VALSET IS NOT A GUEST: an answered valset always carries
+/// the chain's own validators, so an empty pair of lists is silence and
+/// reads `""` — which is what keeps the badge off the head entirely rather
+/// than calling a validator's device a guest.
+pub fn fold_tier(node_key: &str, validators: &[String], residents: &[String]) -> String {
+    let silent = validators.is_empty() && residents.is_empty();
+    let seated = validators.iter().any(|key| key == node_key);
+    let resident = residents.iter().any(|key| key == node_key);
+    match (silent, seated, resident) {
+        (true, _, _) => String::new(),
+        (false, true, _) => "validator".into(),
+        (false, false, true) => "resident".into(),
+        (false, false, false) => "guest".into(),
+    }
+}
+
 // ---------- the repo namespace ----------
 
 /// One item of the repo-list subscription: the cards, or why not.
@@ -274,8 +371,8 @@ pub struct RepoListItem {
 }
 
 /// The repo namespace now and after every forge block.
-pub fn repos(connection: i64) -> iced::Subscription<RepoListItem> {
-    iced::Subscription::run_with(connection, |_| on_forge_blocks(load_repos))
+pub fn repos(connection: i64) -> ducktape_view_guest::Subscription<RepoListItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| on_forge_blocks(load_repos))
 }
 
 async fn load_repos() -> RepoListItem {
@@ -286,7 +383,7 @@ async fn load_repos() -> RepoListItem {
         },
         Err(error) => RepoListItem {
             repos: Vec::new(),
-            error,
+            error: failure("Could not read the repositories", &error),
         },
     }
 }
@@ -324,8 +421,8 @@ pub struct RepoItem {
 
 /// The open repo's branches and tracker items, re-read on every forge
 /// block. No repo open reads nothing.
-pub fn repo(connection: i64, repo: String) -> iced::Subscription<RepoItem> {
-    iced::Subscription::run_with((connection, repo), |(_, repo)| {
+pub fn repo(connection: i64, repo: String) -> ducktape_view_guest::Subscription<RepoItem> {
+    ducktape_view_guest::Subscription::run_with((connection, repo), |(_, repo)| {
         let repo = repo.clone();
         on_forge_blocks(move || load_repo(repo.clone()))
     })
@@ -339,7 +436,7 @@ async fn load_repo(repo: String) -> RepoItem {
         Ok(item) => item,
         Err(error) => RepoItem {
             repo,
-            error,
+            error: failure("Could not read this repository", &error),
             ..RepoItem::default()
         },
     }
@@ -414,6 +511,10 @@ pub struct ItemItem {
     pub merge_oid: String,
     pub diff_rows: Vec<DiffLine>,
     pub diff_truncated: bool,
+    /// Why the patch could not be read, in the module's own words, or "" —
+    /// a refusal the reader has to see, since it decides whether the
+    /// changes are unreachable or merely late.
+    pub diff_error: String,
     pub files_changed: i64,
     pub additions: i64,
     pub deletions: i64,
@@ -424,8 +525,12 @@ pub struct ItemItem {
 }
 
 /// The open item in full, re-read on every forge block.
-pub fn item(connection: i64, repo: String, number: i64) -> iced::Subscription<ItemItem> {
-    iced::Subscription::run_with((connection, repo, number), |(_, repo, number)| {
+pub fn item(
+    connection: i64,
+    repo: String,
+    number: i64,
+) -> ducktape_view_guest::Subscription<ItemItem> {
+    ducktape_view_guest::Subscription::run_with((connection, repo, number), |(_, repo, number)| {
         let (repo, number) = (repo.clone(), *number);
         on_forge_blocks(move || load_item(repo.clone(), number))
     })
@@ -441,7 +546,7 @@ async fn load_item(repo: String, number: i64) -> ItemItem {
         Err(error) => ItemItem {
             repo,
             number,
-            error,
+            error: failure("Could not read this item", &error),
             ..ItemItem::default()
         },
     }
@@ -455,18 +560,31 @@ async fn read_item(repo: &str, number: i64) -> Result<ItemItem, String> {
         return Err("item was not found".to_owned());
     }
     let is_pr = detail["kind"].as_str() == Some("pr");
-    let diff = match is_pr {
-        false => serde_json::Value::Null,
+    // A REFUSED PATCH IS NOT A MISSING ONE. The item still reads — its
+    // conversation is worth showing — but the reason the changes cannot be
+    // drawn is the only thing that tells a reader whether waiting helps, so
+    // it is kept and shown where the lines would have been.
+    let (diff, diff_error) = match is_pr {
+        false => (serde_json::Value::Null, String::new()),
         true => {
             let ask = serde_json::json!({ "pr_diff": { "repo": repo, "number": number } });
-            query(FORGE, ask)
-                .await
-                .map(|reply| reply["pr_diff"].clone())
-                .unwrap_or(serde_json::Value::Null)
+            match query(FORGE, ask).await {
+                Ok(reply) => (reply["pr_diff"].clone(), String::new()),
+                // The module's own sentence, verbatim: the host split the
+                // transport envelope off it, so there is nothing to peel and
+                // nothing here paraphrases a refusal it did not write.
+                Err(said) => (serde_json::Value::Null, said),
+            }
         }
     };
     let names = read_names().await;
-    Ok(fold_item(repo.to_owned(), detail, &diff, &names))
+    Ok(fold_item(
+        repo.to_owned(),
+        detail,
+        &diff,
+        &diff_error,
+        &names,
+    ))
 }
 
 /// The item pane's model from the committed detail plus its pinned diff.
@@ -474,6 +592,7 @@ pub fn fold_item(
     repo: String,
     detail: &serde_json::Value,
     diff: &serde_json::Value,
+    diff_error: &str,
     names: &Names,
 ) -> ItemItem {
     let source_oid = diff["source_oid"].as_str().unwrap_or_default().to_owned();
@@ -483,7 +602,7 @@ pub fn fold_item(
     let target_branch = detail["target_branch"].as_str().unwrap_or_default();
     let branches = match source_branch.is_empty() {
         true => String::new(),
-        false => format!("{source_branch} → {target_branch}"),
+        false => format!("{source_branch} into {target_branch}"),
     };
     let body = detail["body"].as_str().unwrap_or_default().to_owned();
     ItemItem {
@@ -509,6 +628,7 @@ pub fn fold_item(
         change_requests: tally(&reviews).1,
         reviews,
         source_oid,
+        diff_error: diff_error.to_owned(),
         error: String::new(),
     }
 }
@@ -538,11 +658,7 @@ fn tally(reviews: &[ForgeReview]) -> (i64, i64) {
     )
 }
 
-fn fold_reviews(
-    reviews: &serde_json::Value,
-    source_oid: &str,
-    names: &Names,
-) -> Vec<ForgeReview> {
+fn fold_reviews(reviews: &serde_json::Value, source_oid: &str, names: &Names) -> Vec<ForgeReview> {
     reviews
         .as_array()
         .cloned()
@@ -569,11 +685,10 @@ fn fold_reviews(
                     .map(|comment| {
                         let body = comment["body"].as_str().unwrap_or_default().to_owned();
                         ForgeReviewComment {
-                            anchor: format!(
-                                "{}:{} ({})",
+                            anchor: comment_anchor(
                                 comment["path"].as_str().unwrap_or_default(),
-                                comment["line"].as_i64().unwrap_or(0),
-                                comment["side"].as_str().unwrap_or_default()
+                                &comment["line"].as_i64().unwrap_or(0).to_string(),
+                                comment["side"].as_str().unwrap_or_default(),
                             ),
                             blocks: body_blocks(&body),
                             body,
@@ -605,7 +720,7 @@ pub struct ChatMember {
 pub struct DiscussionItem {
     pub channel_id: String,
     pub messages: Vec<ChatMessage>,
-    pub members: Vec<ChatMember>,
+    pub choices: Vec<ducktape_view_composer::MentionChoice>,
     /// Older notes than the window holds: the list says so rather than
     /// pretending the discussion starts where it does.
     pub clipped: bool,
@@ -614,8 +729,11 @@ pub struct DiscussionItem {
 
 /// The item's hidden `forge:<repo>:<n>` channel, re-read on every chat
 /// block — a note posted anywhere lands here the same way it does in Chat.
-pub fn discussion(connection: i64, channel_id: String) -> iced::Subscription<DiscussionItem> {
-    iced::Subscription::run_with((connection, channel_id), |(_, channel_id)| {
+pub fn discussion(
+    connection: i64,
+    channel_id: String,
+) -> ducktape_view_guest::Subscription<DiscussionItem> {
+    ducktape_view_guest::Subscription::run_with((connection, channel_id), |(_, channel_id)| {
         let channel_id = channel_id.clone();
         let live = host::subscribe("rpc.live", CHAT.as_bytes());
         let load = move || load_discussion(channel_id.clone());
@@ -631,7 +749,7 @@ async fn load_discussion(channel_id: String) -> DiscussionItem {
         Ok(item) => item,
         Err(error) => DiscussionItem {
             channel_id,
-            error,
+            error: failure("Could not read the discussion", &error),
             ..DiscussionItem::default()
         },
     }
@@ -654,7 +772,7 @@ async fn read_discussion(channel_id: &str) -> Result<DiscussionItem, String> {
     Ok(DiscussionItem {
         channel_id: channel_id.to_owned(),
         messages: fold_messages(&roots["roots"]["roots"], &names),
-        members: fold_members(&members["members"]["members"], &names),
+        choices: names.composer_choices(&fold_members(&members["members"]["members"], &names)),
         clipped: roots["roots"]["has_more"].as_bool().unwrap_or(false),
         error: String::new(),
     })
@@ -682,39 +800,17 @@ fn fold_message(row: &serde_json::Value, names: &Names) -> ChatMessage {
         false => blocks_view(&wire, names),
     };
     let meta = match edited {
-        true => format!("#{seq} · edited"),
+        true => format!("#{seq} (edited)"),
         false => format!("#{seq}"),
     };
-    let message = ChatMessage {
+    ChatMessage {
         seq,
         author: author_display(author, names),
         meta,
         blocks,
         initial: avatar_initial(author, names),
         avatar_kind: avatar_kind(author, names),
-        render_rev: 0,
-    };
-    let body = match deleted {
-        true => "Message deleted".to_owned(),
-        false => message_body(&wire, names),
-    };
-    seed_render_rev(message, &body)
-}
-
-/// The keyed lazy repaints a row exactly when this (or `seq`) moves, so the
-/// seed hashes everything the row draws with.
-fn seed_render_rev(mut message: ChatMessage, body: &str) -> ChatMessage {
-    use std::hash::{Hash as _, Hasher as _};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    message.seq.hash(&mut hasher);
-    message.author.hash(&mut hasher);
-    message.meta.hash(&mut hasher);
-    message.initial.hash(&mut hasher);
-    message.avatar_kind.hash(&mut hasher);
-    body.hash(&mut hasher);
-    message.render_rev = i64::from_ne_bytes(hasher.finish().to_ne_bytes());
-    message
+    }
 }
 
 /// The composer's mention vocabulary: the channel's members by the label
@@ -734,14 +830,6 @@ pub fn fold_members(members: &serde_json::Value, names: &Names) -> Vec<ChatMembe
             }
         })
         .collect()
-}
-
-/// Seats the discussion channel's roster on the host composer docked over
-/// `scope`: the composer is the host's, so its mention menu is too.
-pub fn seat_roster(scope: &str, members: &[ChatMember]) -> bool {
-    let ask = serde_json::json!({ "scope": scope, "members": members });
-    host::notify("host.roster", &serde_json::to_vec(&ask).expect("encodes"));
-    true
 }
 
 /// The note a deep link's `#seq` names, as a list of at most one — the card
@@ -774,10 +862,16 @@ pub struct TreeItem {
 
 /// One directory listing, pinned to the commit the root listing answered
 /// with. Keyed by what it names, so a move re-reads and nothing else does.
-pub fn tree(connection: i64, repo: String, rev: String, path: String) -> iced::Subscription<TreeItem> {
-    iced::Subscription::run_with((connection, repo, rev, path), |(_, repo, rev, path)| {
-        stream::once(load_tree(repo.clone(), rev.clone(), path.clone()))
-    })
+pub fn tree(
+    connection: i64,
+    repo: String,
+    rev: String,
+    path: String,
+) -> ducktape_view_guest::Subscription<TreeItem> {
+    ducktape_view_guest::Subscription::run_with(
+        (connection, repo, rev, path),
+        |(_, repo, rev, path)| stream::once(load_tree(repo.clone(), rev.clone(), path.clone())),
+    )
 }
 
 async fn load_tree(repo: String, rev: String, path: String) -> TreeItem {
@@ -806,7 +900,7 @@ async fn load_tree(repo: String, rev: String, path: String) -> TreeItem {
             repo,
             rev,
             path,
-            error,
+            error: failure("Could not read the repository tree", &error),
             ..TreeItem::default()
         },
     }
@@ -852,8 +946,8 @@ pub fn blob(
     rev: String,
     path: String,
     net: String,
-) -> iced::Subscription<BlobItem> {
-    iced::Subscription::run_with(
+) -> ducktape_view_guest::Subscription<BlobItem> {
+    ducktape_view_guest::Subscription::run_with(
         (connection, repo, rev, path, net),
         |(_, repo, rev, path, net)| {
             stream::once(load_blob(
@@ -880,7 +974,7 @@ async fn load_blob(repo: String, rev: String, path: String, net: String) -> Blob
         Err(error) => BlobItem {
             repo,
             path,
-            error,
+            error: failure("Could not load this file", &error),
             ..BlobItem::default()
         },
     }
@@ -919,13 +1013,21 @@ async fn read_text(repo: &str, rev: &str, path: &str, net: &str) -> Result<BlobI
 /// the addresses are `duck://` refs, repo-relative paths and web URLs, and
 /// only the app's one open plane knows how to fetch each kind.
 async fn park_inline_pictures(item: &BlobItem, repo: &str, rev: &str, net: &str) {
-    let base = format!("duck://forge/{repo}/blob/{}@{rev}{}", item.path, net_query(net));
+    let base = format!(
+        "duck://forge/{repo}/blob/{}@{rev}{}",
+        item.path,
+        net_query(net)
+    );
     let ask = serde_json::json!({
         "doc": &item.path,
         "source": &item.text,
         "base": base,
     });
-    let _ = host::request("picture.inline", &serde_json::to_vec(&ask).expect("encodes")).await;
+    let _ = host::request(
+        "picture.inline",
+        &serde_json::to_vec(&ask).expect("encodes"),
+    )
+    .await;
 }
 
 /// A picture blob: page it in, hand it to the host's picture store, draw
@@ -951,9 +1053,8 @@ async fn read_picture(repo: &str, rev: &str, path: &str) -> Result<BlobItem, Str
         )));
     };
     let ask = serde_json::json!({ "surface": PICTURE_SURFACE, "path": path, "pages": pages });
-    let parked =
-        host::request("picture.put", &serde_json::to_vec(&ask).expect("encodes")).await;
-    let parked = parked.and_then(|reply| {
+    let parked = host::request("picture.put", &serde_json::to_vec(&ask).expect("encodes")).await;
+    let parked = parked.map_err(host::said).and_then(|reply| {
         serde_json::from_slice::<serde_json::Value>(&reply).map_err(|error| error.to_string())
     });
     match parked {
@@ -1037,7 +1138,7 @@ fn net_query(chain_id: &str) -> String {
 /// refusal if any.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ActItem {
-    /// `review` | `merge`
+    /// `issue` | `review` | `merge`
     pub kind: String,
     pub merge_oid: String,
     pub conflicts: Vec<String>,
@@ -1070,8 +1171,8 @@ fn start(act: impl Future<Output = ActItem> + 'static) -> bool {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;
@@ -1099,10 +1200,43 @@ impl Stream for ActStream {
 }
 
 async fn submit(message: serde_json::Value) -> Result<(), String> {
-    let op = serde_json::json!({ "target": FORGE, "payload": message });
+    submit_with_blob(message, None).await
+}
+
+async fn submit_with_blob(
+    message: serde_json::Value,
+    required_blob: Option<&str>,
+) -> Result<(), String> {
+    let mut op = serde_json::json!({ "target": FORGE, "payload": message });
+    if let Some(digest) = required_blob {
+        op["required_blob"] = serde_json::Value::String(digest.to_owned());
+    }
     host::request("op.submit", &serde_json::to_vec(&op).expect("encodes"))
         .await
         .map(|_| ())
+        .map_err(host::said)
+}
+
+/// Open an issue on `repo` as the seated key: the module numbers it, opens
+/// its discussion channel, and the live hit re-reads the tracker.
+pub fn issue_open(repo: String, title: String, body: String) -> bool {
+    start(async move {
+        let message = serde_json::json!({ "open_issue": {
+            "repo": repo,
+            "title": title,
+            "body": body,
+        }});
+        let error = submit(message).await.err().unwrap_or_default();
+        let error = match error.is_empty() {
+            true => error,
+            false => failure("The issue was not opened", &error),
+        };
+        ActItem {
+            kind: "issue".to_owned(),
+            error,
+            ..ActItem::default()
+        }
+    })
 }
 
 /// Submit a batched review pinned to the source head the reviewer saw. A
@@ -1134,6 +1268,10 @@ pub fn review_submit(
                 submit(message).await.err().unwrap_or_default()
             }
         };
+        let error = match error.is_empty() {
+            true => error,
+            false => failure("The review was not sent", &error),
+        };
         ActItem {
             kind: "review".to_owned(),
             error,
@@ -1161,8 +1299,8 @@ fn review_comments(comments: &[ForgeDraftComment]) -> Vec<serde_json::Value> {
 }
 
 /// Merge an open PR the way the wire demands it: the merge commit is
-/// CLIENT-COMPUTED, so the host builds it against a bare mirror of the
-/// node's git remote and lands the minimal pack, and the double-CAS'd
+/// computed by the configured installed service from its read-only store.
+/// The service lands the minimal pack, and the double-CAS'd
 /// `MergePr` goes out over that. A local conflict submits NOTHING.
 pub fn merge(
     repo: String,
@@ -1172,11 +1310,19 @@ pub fn merge(
     prev_target_oid: String,
 ) -> bool {
     start(async move {
-        match merge_pr(repo, number, source_branch, expected_source_oid, prev_target_oid).await {
+        match merge_pr(
+            repo,
+            number,
+            source_branch,
+            expected_source_oid,
+            prev_target_oid,
+        )
+        .await
+        {
             Ok(item) => item,
             Err(error) => ActItem {
                 kind: "merge".to_owned(),
-                error,
+                error: failure("The merge did not go through", &error),
                 ..ActItem::default()
             },
         }
@@ -1195,15 +1341,52 @@ async fn merge_pr(
         return Err("the pull request diff has not loaded yet".to_owned());
     }
     let ask = serde_json::json!({
-        "target": FORGE,
         "repo": &repo,
         "ours": &prev_target_oid,
         "theirs": &expected_source_oid,
         "message": format!("Merge pull request #{number} from {source_branch}"),
     });
-    let built = host::request("git.merge", &serde_json::to_vec(&ask).expect("encodes")).await?;
+    let config = host::request("asset.read", b"service.json")
+        .await
+        .map_err(|error| format!("Forge merge service is not configured: {error}"))?;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Service {
+        account: u64,
+        route: String,
+    }
+    let service: Service = serde_json::from_slice(&config)
+        .map_err(|error| format!("invalid service.json: {error}"))?;
+    let configured = service.account > 0 && !service.route.is_empty();
+    if !configured {
+        return Err("service.json must name the Forge service account and route".into());
+    }
+    let request = serde_json::json!({"account":service.account,"route":service.route,"method":"post","path":"/merge",
+        "headers":[{"name":"content-type","value":"application/json"}],"body":serde_json::to_vec(&ask).expect("merge request")});
+    let reply = host::request(
+        "net.request",
+        &serde_json::to_vec(&request).expect("application request"),
+    )
+    .await
+    .map_err(host::said)?;
+    let reply: serde_json::Value =
+        serde_json::from_slice(&reply).map_err(|error| error.to_string())?;
+    use base64::Engine as _;
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(
+            reply["body_b64"]
+                .as_str()
+                .ok_or("merge service returned no body")?,
+        )
+        .map_err(|error| error.to_string())?;
     let built: serde_json::Value =
-        serde_json::from_slice(&built).map_err(|error| error.to_string())?;
+        serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+    if reply["head"]["status"].as_u64() != Some(200) {
+        return Err(built["error"]
+            .as_str()
+            .unwrap_or("merge service refused request")
+            .into());
+    }
     let conflicts: Vec<String> = built["conflicts"]
         .as_array()
         .cloned()
@@ -1220,15 +1403,24 @@ async fn merge_pr(
         });
     }
     let merge_oid = built["merge_oid"].as_str().unwrap_or_default().to_owned();
+    let pack = base64::engine::general_purpose::STANDARD
+        .decode(
+            built["pack_b64"]
+                .as_str()
+                .ok_or("merge service returned no pack")?,
+        )
+        .map_err(|error| error.to_string())?;
+    let digest = host::request("blob.put", &pack).await.map_err(host::said)?;
+    let digest = String::from_utf8(digest).map_err(|error| error.to_string())?;
     let message = serde_json::json!({ "merge_pr": {
         "repo": repo,
         "number": number,
         "prev_target_oid": prev_target_oid,
         "expected_source_oid": expected_source_oid,
         "merge_oid": &merge_oid,
-        "pack_digest": built["pack_digest"].as_str().unwrap_or_default(),
+        "pack_digest": &digest,
     }});
-    submit(message).await?;
+    submit_with_blob(message, Some(&digest)).await?;
     Ok(ActItem {
         kind: "merge".to_owned(),
         merge_oid,
@@ -1239,12 +1431,6 @@ async fn merge_pr(
 
 // ---------- the OS doors ----------
 
-/// `forge.open_link` — a link a body or the reader's document carried.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Link {
-    pub url: String,
-}
-
 /// `forge.copy` — the host puts `text` on the clipboard and toasts `label`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Copy {
@@ -1252,8 +1438,11 @@ pub struct Copy {
     pub label: String,
 }
 
+/// A link a body or the reader's document carried, handed to the kernel's
+/// ONE open door.
 pub fn open_link(url: &str) -> bool {
-    notify("forge.open_link", &Link { url: url.into() })
+    ducktape_view_guest::host::open_link(url);
+    true
 }
 
 pub fn copy(text: &str, label: &str) -> bool {
@@ -1328,41 +1517,60 @@ pub fn forge_link(url: &str) -> ForgeLink {
 
 // ---------- the readings ----------
 
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
-}
-
 pub fn plural(count: i64, one: &str, many: &str) -> String {
     let noun = if count == 1 { one } else { many };
     format!("{count} {noun}")
 }
 
 /// The tracker's Pull requests / Issues split; the Code seat lists nothing.
-pub fn filter_forge_items(items: &[ForgeItem], tab: &str) -> Vec<ForgeItem> {
+pub fn filter_forge_items(items: &[ForgeItem], tab: &str, side: &str, query: &str) -> Vec<ForgeItem> {
     let kind = match tab {
         "pulls" => "pr",
         "issues" => "issue",
         _ => return Vec::new(),
     };
+    let wanted = query.trim().to_lowercase();
     items
         .iter()
         .filter(|item| item.kind == kind)
+        .filter(|item| item_is_open(item) == (side == "open"))
+        .filter(|item| item_matches(item, &wanted))
         .cloned()
         .collect()
 }
 
-/// The tab count chips — open work only: a PR counts until it merges, an
-/// issue until it closes.
-pub fn forge_open_count(items: &[ForgeItem], kind: &str) -> i64 {
-    let open = items
+/// Whether an item stands on the Open side of its tracker. One reading for
+/// the list and the tab chip both, so the count can never disagree with the
+/// rows under it — and a closed pull request is closed, which is what
+/// `state != "merged"` used to deny.
+pub fn item_is_open(item: &ForgeItem) -> bool {
+    item.state == "open"
+}
+
+/// Whether a row survives what the reader typed: its title or its number.
+/// An empty filter keeps everything.
+fn item_matches(item: &ForgeItem, wanted: &str) -> bool {
+    if wanted.is_empty() {
+        return true;
+    }
+    let titled = item.title.to_lowercase().contains(wanted);
+    let numbered = format!("#{}", item.number).contains(wanted);
+    titled || numbered
+}
+
+/// How many rows each side of a tracker holds, as its switch shows them.
+pub fn forge_side_count(items: &[ForgeItem], kind: &str, side: &str) -> i64 {
+    let counted = items
         .iter()
         .filter(|item| item.kind == kind)
-        .filter(|item| match kind {
-            "pr" => item.state != "merged",
-            _ => item.state == "open",
-        })
+        .filter(|item| item_is_open(item) == (side == "open"))
         .count();
-    i64::try_from(open).unwrap_or(i64::MAX)
+    i64::try_from(counted).unwrap_or(i64::MAX)
+}
+
+/// The tab count chips — the open work on each tracker.
+pub fn forge_open_count(items: &[ForgeItem], kind: &str) -> i64 {
+    forge_side_count(items, kind, "open")
 }
 
 /// The seat an open item belongs to, by its kind: a pull request lights the
@@ -1380,8 +1588,26 @@ pub fn kind_tab(kind: &str) -> String {
 pub fn forge_merge_note(merge_oid: &str, branches: &str) -> String {
     let short: String = merge_oid.chars().take(8).collect();
     match branches.is_empty() {
-        true => format!("Merged as {short}"),
-        false => format!("Merged as {short} · {branches}"),
+        true => format!("Merged as {short}."),
+        false => format!("Merged {branches} as {short}."),
+    }
+}
+
+/// A state or seat word as a badge reads it: `open` → `Open`.
+pub fn state_label(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// The file pane's line under a failed read: the loader's note, or the
+/// refusal as a sentence.
+pub fn blob_note(note: &str, error: &str) -> String {
+    match error.is_empty() {
+        true => note.to_owned(),
+        false => error.to_owned(),
     }
 }
 
@@ -1394,12 +1620,9 @@ pub fn verdict_label(verdict: &str) -> String {
     }
 }
 
-/// A verdict picker label, dotted when it is the current pick.
-pub fn verdict_pick_label(current: &str, key: &str, label: &str) -> String {
-    match current == key {
-        true => format!("● {label}"),
-        false => label.to_owned(),
-    }
+pub fn tree_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport * 0.45).clamp(180.0, 480.0);
+    (width + delta).clamp(180.0, maximum)
 }
 
 /// A Markdown document reads through the document surface; forge carries no
@@ -1441,11 +1664,9 @@ pub fn duck_forge_item_link(repo: &str, number: i64, chain_id: &str) -> String {
     format!("duck://forge/{repo}/{number}{}", net_query(chain_id))
 }
 
-/// The command that makes a repo: forge IS a git remote, and a repo comes
-/// into existence when a push lands on it.
-pub fn forge_push_command(rpc: &str) -> String {
-    let endpoint = rpc.trim_end_matches('/');
-    format!("git remote add ducktape {endpoint}/forge/my-repo && git push ducktape main")
+/// The installed service supplies the authenticated Git endpoint.
+pub fn forge_push_instructions() -> String {
+    "Push a repository through your network’s installed Git service. Ask its operator for the authenticated Git endpoint and signing configuration.".into()
 }
 
 /// The label a picked-but-unstaged line wears above the composer, empty
@@ -1454,7 +1675,7 @@ pub fn forge_comment_target(path: &str, line: &str, side: &str) -> String {
     if path.is_empty() {
         return String::new();
     }
-    format!("{path}:{line} ({side})")
+    comment_anchor(path, line, side)
 }
 
 /// What the branch selector reads while no branch stands at the browse's
@@ -1474,13 +1695,6 @@ pub fn repo_names(repos: &[ForgeRepo]) -> Vec<String> {
 /// The branch selector's options: the open repo's born branches by name.
 pub fn branch_names(branches: &[ForgeBranch]) -> Vec<String> {
     branches.iter().map(|branch| branch.name.clone()).collect()
-}
-
-/// The branch selector's selection: the branch standing at the browse's
-/// commit, or none once every branch has moved past it.
-pub fn pinned_branch(tree_branch: &str) -> Option<String> {
-    let a_branch_stands_at_the_commit = !tree_branch.is_empty();
-    a_branch_stands_at_the_commit.then(|| tree_branch.to_owned())
 }
 
 /// The commit a branch's head stood on when the repo slice was read, or
@@ -1529,27 +1743,84 @@ pub fn forge_parent(path: &str) -> String {
     }
 }
 
-/// The reader header's path, gated on the directory AND revision the file
-/// was opened under: a preview opened in another directory or an older
-/// commit was retired by that move.
-pub fn forge_file_header(
-    opened_dir: &str,
-    opened_rev: &str,
-    dir: &str,
-    rev: &str,
-    path: &str,
-) -> String {
-    let same_place = opened_dir == dir;
+/// The reader header's path, gated on the revision the file was opened
+/// under: a preview opened at an older commit was retired by the branch
+/// move. Unfolding another directory in the tree retires nothing.
+pub fn forge_file_header(opened_rev: &str, rev: &str, path: &str) -> String {
     let same_commit = opened_rev == rev;
-    match same_place && same_commit {
+    match same_commit {
         true => path.to_owned(),
         false => String::new(),
     }
 }
 
-/// The PR stats line: `3 files · +12 −4`.
+/// The file a repository lands on when it opens — the README at its root,
+/// preferring `README.md` over any other spelling, as every forge does.
+/// Empty when the root carries none, which leaves the reader's own empty
+/// state on screen.
+pub fn readme_of(entries: &[TreeEntry]) -> String {
+    let rank = |name: &str| {
+        let name = name.to_ascii_lowercase();
+        let (stem, extension) = match name.rsplit_once('.') {
+            Some((stem, extension)) => (stem.to_owned(), extension.to_owned()),
+            None => (name, String::new()),
+        };
+        if stem != "readme" {
+            return None;
+        }
+        match extension.as_str() {
+            "md" => Some(0),
+            "markdown" => Some(1),
+            "" => Some(2),
+            _ => Some(3),
+        }
+    };
+    entries
+        .iter()
+        .filter(|entry| entry.kind == "file")
+        .filter_map(|entry| rank(&entry.name).map(|rank| (rank, entry)))
+        // the listing is sorted, so the first of equal rank is stable
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, entry)| entry.path.to_owned())
+        .unwrap_or_default()
+}
+
+/// One breadcrumb per path segment: the directory each one stands for, and
+/// the name it shows. The last crumb is the file itself — it stands for no
+/// directory, which is what makes it the one that does not press.
+pub fn crumbs_of(path: &str) -> Vec<(String, String)> {
+    let mut walked = String::new();
+    let names = path.split('/').filter(|segment| !segment.is_empty());
+    let mut crumbs: Vec<(String, String)> = names
+        .map(|name| {
+            if !walked.is_empty() {
+                walked.push('/');
+            }
+            walked.push_str(name);
+            (walked.to_owned(), name.to_owned())
+        })
+        .collect();
+    if let Some(last) = crumbs.last_mut() {
+        last.0 = String::new();
+    }
+    crumbs
+}
+
+/// The PR stats line: `3 files, +12 −4`.
 pub fn forge_stats(files: i64, additions: i64, deletions: i64) -> String {
-    format!("{files} files · +{additions} −{deletions}")
+    format!(
+        "{}, +{additions} −{deletions}",
+        plural(files, "file", "files")
+    )
+}
+
+/// Where a line comment sits, as a person reads it: `main.rs:12`, and the
+/// side only when it is the removed line.
+pub fn comment_anchor(path: &str, line: &str, side: &str) -> String {
+    match side {
+        "old" => format!("{path}:{line} (removed line)"),
+        _ => format!("{path}:{line}"),
+    }
 }
 
 /// Stage one line comment, or replace the one already on that line.
@@ -1571,7 +1842,7 @@ pub fn stage_forge_comment(
         return staged;
     }
     let comment = ForgeDraftComment {
-        anchor: format!("{path}:{line} ({side})"),
+        anchor: comment_anchor(&path, &line, &side),
         path,
         line,
         side,
@@ -1587,10 +1858,7 @@ pub fn stage_forge_comment(
 }
 
 /// Drop the comment staged at one anchor. A miss leaves the list alone.
-pub fn drop_forge_comment(
-    staged: Vec<ForgeDraftComment>,
-    anchor: &str,
-) -> Vec<ForgeDraftComment> {
+pub fn drop_forge_comment(staged: Vec<ForgeDraftComment>, anchor: &str) -> Vec<ForgeDraftComment> {
     let mut staged = staged;
     staged.retain(|row| row.anchor != anchor);
     staged
@@ -1654,11 +1922,6 @@ pub fn routed_link(fresh: bool, url: &str) -> String {
     }
 }
 
-/// The seq a fresh landing names, or 0 when nothing new landed.
-pub fn landed_seq_of(fresh: bool, seq: i64) -> i64 {
-    if fresh { seq } else { 0 }
-}
-
 /// A read's phase from what it answered: a refusal is `failed`, an answer
 /// is `ready`.
 pub fn phase_of(error: &str) -> String {
@@ -1672,6 +1935,7 @@ pub fn phase_of(error: &str) -> String {
 pub(crate) fn act_of(kind: &str) -> crate::Act {
     match kind {
         "merge" => crate::Act::Merge,
+        "issue" => crate::Act::Issue,
         _ => crate::Act::Review,
     }
 }
@@ -1683,15 +1947,6 @@ pub fn composer_scope(endpoint: &str, channel_id: &str) -> String {
     match channel_id.is_empty() {
         true => String::new(),
         false => format!("{endpoint}\u{1f}{channel_id}"),
-    }
-}
-
-/// The appearance as the word the handler matches on.
-pub(crate) fn appearance_of(dark: bool) -> crate::Appearance {
-    if dark {
-        crate::Appearance::Dark
-    } else {
-        crate::Appearance::Light
     }
 }
 
@@ -1712,8 +1967,10 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
     let mut new_no = 0i64;
     // The path every following code row is anchored to, taken from the
     // patch's own `+++ b/…` header: a comment cannot be authored from a row
-    // that does not know its file.
+    // that does not know its file. The `--- a/…` side is held only to name
+    // a deleted file, whose head side is `/dev/null`.
     let mut path = String::new();
+    let mut old_path = String::new();
     // What the open hunk still owes on each side. A hunk header DECLARES how
     // many lines its body covers, and while either side is still owed one,
     // every line is body content — never a header. That budget is the ONLY
@@ -1724,13 +1981,18 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
     for line in diff.lines() {
         let inside_hunk_body = old_left > 0 || new_left > 0;
         if !inside_hunk_body {
-            if let Some(target) = added_side_path(line) {
-                path = target;
-                rows.push(marker_row(line));
+            if let Some(source) = removed_side_path(line) {
+                old_path = source;
                 continue;
             }
-            if is_file_header(line) {
-                rows.push(marker_row(line));
+            if let Some(target) = added_side_path(line) {
+                path = target;
+                rows.push(file_row(&old_path, &path));
+                old_path.clear();
+                continue;
+            }
+            if let Some(name) = binary_file(line) {
+                rows.push(binary_file_row(&name));
                 continue;
             }
             if let Some(span) = hunk_span(line) {
@@ -1738,15 +2000,34 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
                 new_no = span.new_start;
                 old_left = span.old_len;
                 new_left = span.new_len;
-                rows.push(diff_row("hunk", String::new(), String::new(), "", line, "", ""));
+                rows.push(diff_row(
+                    "hunk",
+                    String::new(),
+                    String::new(),
+                    "",
+                    line,
+                    "",
+                    "",
+                ));
                 continue;
             }
+            // `diff --git`, `index`, a mode or rename line: git's own
+            // bookkeeping between files, which the one file row already says
+            continue;
         }
         // `\ No newline at end of file` is a note ABOUT the previous line. It
         // holds no position on either side, so it consumes neither a line
         // number nor the hunk's budget.
         if line.starts_with('\\') {
-            rows.push(marker_row(line));
+            rows.push(diff_row(
+                "note",
+                String::new(),
+                String::new(),
+                "",
+                line.trim_start_matches('\\').trim(),
+                "",
+                "",
+            ));
             continue;
         }
         match line.chars().next() {
@@ -1800,31 +2081,66 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
     rows
 }
 
-/// The non-code rows: a file header, and the `\ No newline` note. Neither
-/// is a commentable position, so both carry an empty path and side.
-fn marker_row(line: &str) -> DiffLine {
-    diff_row("file", String::new(), String::new(), "", line, "", "")
+/// The one row that opens a changed file: its name, and whether it is new
+/// or gone. Not a commentable position, so it carries no path or side.
+fn file_row(old_path: &str, new_path: &str) -> DiffLine {
+    let name = match (old_path.is_empty(), new_path.is_empty()) {
+        (true, false) => format!("{new_path} (new file)"),
+        (false, false) => new_path.to_owned(),
+        (false, true) => format!("{old_path} (deleted)"),
+        (true, true) => "(unnamed file)".to_owned(),
+    };
+    named_file_row(&name)
 }
 
-fn is_file_header(line: &str) -> bool {
-    line.starts_with("diff ")
-        || line.starts_with("--- ")
-        || line.starts_with("index ")
-        || line.starts_with("new file")
-        || line.starts_with("deleted file")
+fn named_file_row(name: &str) -> DiffLine {
+    diff_row("file", String::new(), String::new(), "", name, "", "")
+}
+
+/// A changed binary, as its own kind of row. A patch says only that the two
+/// sides differ, so the row has no lines under it: it must not wear the fold
+/// control a text file's header does (there is nothing to fold), and it
+/// carries no path, so no line comment can be anchored to it.
+fn binary_file_row(name: &str) -> DiffLine {
+    diff_row(
+        "binary",
+        String::new(),
+        String::new(),
+        "",
+        &format!("{name} (binary file, not shown)"),
+        "",
+        "",
+    )
 }
 
 /// The head-side path a `+++ b/<path>` header names. A pure deletion writes
 /// `+++ /dev/null`, which names no file on the head side and yields an
 /// empty path — its rows are then uncommentable, which is correct.
 fn added_side_path(line: &str) -> Option<String> {
-    let target = line.strip_prefix("+++ ")?;
+    header_path(line.strip_prefix("+++ ")?, "b/")
+}
+
+/// The base-side path a `--- a/<path>` header names; a new file's is empty.
+fn removed_side_path(line: &str) -> Option<String> {
+    header_path(line.strip_prefix("--- ")?, "a/")
+}
+
+fn header_path(target: &str, marker: &str) -> Option<String> {
     if target == "/dev/null" {
         return Some(String::new());
     }
-    // git writes `b/<path>`; a patch produced without prefixes writes the
-    // path bare, so strip the marker only when it is there.
-    Some(target.strip_prefix("b/").unwrap_or(target).to_owned())
+    // git writes `a/<path>` / `b/<path>`; a patch produced without prefixes
+    // writes the path bare, so strip the marker only when it is there.
+    Some(target.strip_prefix(marker).unwrap_or(target).to_owned())
+}
+
+/// The head-side name a `Binary files a/<x> and b/<x> differ` line carries:
+/// git writes no `+++` for one, so this is its only file row.
+fn binary_file(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("Binary files ")?;
+    let (_, head) = rest.split_once(" and ")?;
+    let head = head.strip_suffix(" differ")?;
+    header_path(head, "b/")
 }
 
 fn diff_row(

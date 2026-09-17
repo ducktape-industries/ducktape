@@ -26,22 +26,25 @@ use std::path::{Path, PathBuf};
 const PLANES: &[&str] = &[
     "admin",        // node admin surface: module code pushes, operator commands
     "agent",        // agent sessions: provisioning, run output, the telemetry socket
+    "airlock",      // the attested credential gateway: sessions, grants, signing
     "app",          // the desktop app's own backend
-    "auth",         // account ceremonies: the auth page, sign-in, key association
+    "auth",         // account ceremonies: the auth page, sign-in, key association, wallets
     "blobstore",    // the node-local op-receipt byte store: persist faults, hash mismatches
     "boot",         // node startup, before the running planes exist: genesis seeding
     "broker",       // the run-scoped model broker's proxied requests
+    "collab",       // the collaboration lane: agent message delivery, receipts, the pump
     "compute",      // provider compute: pools, credentials, interactive runs
     "consensus",    // the kernel: blocks, votes, finalization
     "dataplane",    // the WireGuard data path: overlay device, sockets, binds
     "files",        // the files module and the duckfs http lane: stage, commit, pin
     "forge",        // the forge module and its blob/ref plumbing
-    "gateway",      // the http gateway and the airlock in front of it
+    "gateway",      // the http gateway in front of the node
     "http",         // the node's own http listeners
     "index",        // the indexer: store open, refold, poison
     "join",         // invitations, first contact, admission
     "modules",      // the module set: registry, code plane, wasm workers
     "node",         // whole-node lifecycle and identity
+    "presence",     // Pages presence on the declared `chat/presence` overlay lane
     "provider",     // the provider host: a run's own files and their cleanup
     "reachability", // NAT traversal: rendezvous, handshakes, the netstack machine on either backend
     "recovery",     // restart, replay, checkpoint restore
@@ -50,9 +53,10 @@ const PLANES: &[&str] = &[
     "service",      // service registration and admission on the node
     "statesync",    // catch-up: serving and consuming state sync
     "stream",       // the node's websocket topic streams
-    "submit",       // transaction submission from a client
+    "submit",       // transaction submission from a client, and the relay lane carrying a submit's blobs
     "term",         // terminal sessions and the pty plane
-    "voice",        // huddle media: voice, camera, screen share
+    "update",       // the desktop app's self-update: manifest checks, downloads, staging
+    "voice",        // huddle media end to end: the engine, the media service, the app's tiles
 ];
 
 /// the trees an event can live in.

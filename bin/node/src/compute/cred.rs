@@ -189,13 +189,12 @@ fn routable(
     record.ok_or_else(|| format!("unknown credential: {credential}"))
 }
 
-/// The node owns the ONE mapping from the gateway module's on-chain credential
-/// tag to the service plane's vendor vocabulary, because no service crate
-/// depends on the gateway module crate.
+/// Map the committed credential tag to the compute executor vendor vocabulary.
 pub(crate) fn service_kind(kind: gateway::CredentialKind) -> CredentialKind {
     match kind {
         gateway::CredentialKind::Claude => CredentialKind::Claude,
         gateway::CredentialKind::Codex => CredentialKind::Codex,
+        gateway::CredentialKind::AppleCodesign => CredentialKind::AppleCodesign,
     }
 }
 
@@ -256,6 +255,10 @@ mod tests {
         assert_eq!(
             service_kind(gateway::CredentialKind::Codex),
             CredentialKind::Codex
+        );
+        assert_eq!(
+            service_kind(gateway::CredentialKind::AppleCodesign),
+            CredentialKind::AppleCodesign
         );
     }
 }

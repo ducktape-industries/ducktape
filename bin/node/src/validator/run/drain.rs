@@ -1,7 +1,5 @@
 //! Finalized-block drain, checkpoint, and epoch-cutover handling.
 
-use std::collections::HashSet;
-
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::{Recipients, Sender as _};
@@ -16,7 +14,8 @@ use tasks::{TaskQuery, TaskReply, decode_task_reply, encode_task_query};
 use super::ValidatorRuntime;
 use crate::constants::{DRAIN_TICK, NOP_TARGET, VALSET_READ_WARN_EVERY, WORKSPACE_CHECK_INTERVAL};
 use crate::drain_actions::{
-    CutoverTrigger, EpochActions, capture_breakdown, checkpoint_due, cooldown_until,
+    CutoverTrigger, EpochActions, StallVoice, capture_breakdown, checkpoint_due, cooldown_until,
+    observe_block_beat,
 };
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
 use crate::util::{Presence, fatal, hex, participant_bytes, resident_bytes, unix_ms};
@@ -26,46 +25,51 @@ use crate::util::{Presence, fatal, hex, participant_bytes, resident_bytes, unix_
 /// never accepts the rewrite.
 const MARK_LOST_WARN_EVERY: u64 = 600;
 
-/// how many consecutive checkpoints may defer `prune_oplog` for a warm sync
-/// lease before the checkpoint prunes anyway. an active syncer that never
-/// stops asking (or a peer that renews the lease every 10s forever) would
-/// otherwise pin the retained journal open indefinitely — the lease exists to
-/// protect one in-flight sync's boundary, not to suspend retention (#1814).
-/// a joiner still below the new floor gets `Error::RangePruned`, which the
-/// sync path already handles.
-const MAX_PRUNE_DEFERRALS: u32 = 3;
-
 /// the checkpoint's prune outcome — one discriminant covering floor
-/// readiness, sync-lease warmth, and the deferral cap together (see
-/// `MAX_PRUNE_DEFERRALS`).
+/// readiness and the sync retention contract together.
 #[derive(Debug, PartialEq, Eq)]
 enum PruneAction {
     /// the finalization floor hasn't passed this checkpoint yet: nothing to
     /// prune.
     NotDue,
-    /// the sync lease is warm and hasn't deferred past the cap: hold off.
-    Deferred,
-    /// the sync lease is warm but has deferred `MAX_PRUNE_DEFERRALS`
-    /// checkpoints running: prune anyway.
-    Forced,
-    /// the sync lease is not warm: prune normally.
-    Clear,
+    /// this prune would drop frames a syncer we are serving still needs: hold
+    /// it (see `prune_cuts_served_sync`).
+    HeldForSync,
+    /// nothing in flight needs what this prune drops.
+    Prune,
 }
 
-/// decide a checkpoint's prune action from the three governing facts. pure —
-/// the drain loop performs the actual prune/defer effects and counter update
-/// for whichever action this returns, so the decision itself is testable
-/// without a journal or a lease.
-fn decide_prune_action(
-    floor_passed: bool,
-    lease_active: bool,
-    deferral_cap_reached: bool,
-) -> PruneAction {
-    match (floor_passed, lease_active, deferral_cap_reached) {
-        (false, _, _) => PruneAction::NotDue,
-        (true, true, false) => PruneAction::Deferred,
-        (true, true, true) => PruneAction::Forced,
-        (true, false, _) => PruneAction::Clear,
+/// decide a checkpoint's prune action from the two governing facts. pure —
+/// the drain loop performs the prune for whichever action this returns, so
+/// the decision itself is testable without a journal or a lease.
+fn decide_prune_action(floor_passed: bool, cuts_served_sync: bool) -> PruneAction {
+    match (floor_passed, cuts_served_sync) {
+        (false, _) => PruneAction::NotDue,
+        (true, true) => PruneAction::HeldForSync,
+        (true, false) => PruneAction::Prune,
+    }
+}
+
+/// whether pruning the journal below the previous checkpoint at height
+/// `anchor` would drop frames a syncer this node is serving still needs
+/// (`needed_from`, from `sync::serve::SyncRetention::floor`).
+///
+/// THE ANTI-TREADMILL CONTRACT. A prune retains from `anchor + 1`; a syncer
+/// working from `needed_from` asks for the frames after it. Pruning past that
+/// height answers its catch-up with `RangePruned`, it re-bootstraps at a newer
+/// boundary, and a chain that prunes faster than one bootstrap takes never
+/// lets it converge (observed on a 100 ms chain with a 4-block checkpoint
+/// cadence: boundary 1752 → 2117 → 2360 → … forever).
+///
+/// The hold is bounded by the syncer's OWN PROGRESS, never by a count of
+/// checkpoints: every chunk it pulls and every frame batch it folds restates
+/// the height it works from, so retention advances with it and lapses when it
+/// stops asking. A count would be denominated in blocks, and a busy chain
+/// burns any count of checkpoints in seconds.
+fn prune_cuts_served_sync(anchor: Option<u64>, needed_from: Option<u64>) -> bool {
+    match (anchor, needed_from) {
+        (Some(anchor), Some(needed_from)) => anchor > needed_from,
+        _ => false,
     }
 }
 
@@ -77,7 +81,7 @@ fn decide_prune_action(
 fn stall_window(cadence: consensus::Cadence) -> std::time::Duration {
     cadence.block_time * 30
 }
-use crate::validator::code_announce::CodeVerdict;
+use crate::validator::code_announce::{CodeVerdict, Role};
 use crate::{join_gate, relay};
 use noded::projection::{BlockProjection, project_block};
 
@@ -180,13 +184,14 @@ impl ValidatorRuntime<'_> {
             signer,
             label,
             checkpoint_blocks,
-            sync_lease,
+            sync_retention,
             stream_hub,
             index,
             blobs,
             metrics,
             applied,
             pending_submits,
+            pending_rpc_submits,
             pending_relays,
             pending_gates,
             gating,
@@ -195,7 +200,6 @@ impl ValidatorRuntime<'_> {
             blocks_since_checkpoint,
             checkpoint_not_before,
             last_written_root,
-            prune_deferrals,
             last_reach_view,
             pending_retarget,
             next_drain,
@@ -261,27 +265,29 @@ impl ValidatorRuntime<'_> {
         // names which wedge it is (#1766). the heartbeat is what guarantees a
         // block per beat, so a node with it disabled (`make dev`) has no floor
         // to measure against and is not watched.
-        let sealed_something = sealed_heights > 0;
-        if sealed_something {
-            *last_seal = context.current();
-            *stall_windows = 0;
-        } else {
-            let stalled_for = context
-                .current()
-                .duration_since(*last_seal)
-                .unwrap_or_default();
-            let stall_due = !*heartbeat_disabled && stalled_for >= stall_window(cadence);
-            if stall_due {
-                *stall_windows += 1;
-                // re-arm: the next warn is one full window later, so a wedge
-                // that never clears narrates itself at a bounded rate.
-                *last_seal = context.current();
-                tracing::warn!(
+        let beat = observe_block_beat(
+            last_seal,
+            stall_windows,
+            context.current(),
+            sealed_heights > 0,
+            stall_window(cadence),
+            *heartbeat_disabled,
+        );
+        // the gauge every turn, not only on a report: a dashboard's whole job
+        // is to show the silence RISING, and a value that only appears once a
+        // window has elapsed is a value that appears after the outage matters.
+        metrics.record_block_beat(beat.stalled_for);
+        macro_rules! block_beat_stalled {
+            ($emit:ident, $message:literal) => {
+                tracing::$emit!(
                     target: "ducktape::consensus",
                     node = %label,
-                    reason = "block_beat_stalled",
-                    windows = *stall_windows,
-                    stalled_ms = stalled_for.as_millis() as u64,
+                    // `event`, not `reason`: this is an operational-contract
+                    // name the status projection and the metrics key on, not a
+                    // token for something we refused (AGENTS.md, Logging).
+                    event = "block_beat_stalled",
+                    windows = beat.windows,
+                    stalled_ms = beat.stalled_for.as_millis() as u64,
                     epoch = orchestrator.epoch(),
                     validators = orchestrator.current_members().len(),
                     height = node.finalized().map_or(0, |f| f.height),
@@ -289,9 +295,20 @@ impl ValidatorRuntime<'_> {
                     orderer_pending = node.orderer().pending_len(),
                     gate_awaiting = node.orderer().min_unreleased_view().is_some(),
                     gate_min_view = node.orderer().min_unreleased_view().unwrap_or(0),
-                    "no block sealed for a full stall window — the chain is not beating"
-                );
-            }
+                    $message
+                )
+            };
+        }
+        match beat.voice {
+            StallVoice::Quiet => {}
+            StallVoice::Warn => block_beat_stalled!(
+                warn,
+                "no block sealed for a full stall window — the chain is not beating"
+            ),
+            StallVoice::Error => block_beat_stalled!(
+                error,
+                "the chain has been silent past the point it recovers on its own"
+            ),
         }
         // The orderer-independent projection keeps member/System order,
         // explorer rows, and discard handling identical to the replica.
@@ -486,6 +503,21 @@ impl ValidatorRuntime<'_> {
                     "op rejected in consensus"
                 );
             }
+            // the rpc lane's parked callers, answered from the same
+            // disposition and at the same moment as the http lane's (#2533).
+            // A refusal reaches the person who typed the verb, carrying the
+            // module's own reason token — the one the warn above logs.
+            if let Some((rpc_replies, _)) = pending_rpc_submits.remove(&d.id) {
+                let settled =
+                    crate::drain_actions::settled_submit(rejected, d.reason.as_deref());
+                for rpc_reply in rpc_replies {
+                    let line = match &settled {
+                        Ok(()) => crate::rpc::RpcReply::ok(),
+                        Err(reason) => crate::rpc::RpcReply::err(reason.clone()),
+                    };
+                    let _ = rpc_reply.send(line);
+                }
+            }
             let Some((replies, _)) = pending_submits.remove(&d.id) else {
                 continue;
             };
@@ -497,13 +529,19 @@ impl ValidatorRuntime<'_> {
                     // apply several blocks).
                     root_hash: hex(&d.root_hash),
                 }),
-                node::Disposition::Rejected => Err(d.reason.clone().unwrap_or_else(|| {
+                // the two rejections were one string and are now two
+                // tokens, which is the difference between "the module
+                // said no" and "nothing was there to apply".
+                node::Disposition::Rejected => Err(match d.reason.clone() {
                     // the module's VERBATIM reason when the drain
                     // captured one (duckfs-client keys on the
-                    // "files: conflict:" prefix); generic wording
-                    // otherwise.
-                    "op finalized but rejected (deterministic no-op)".into()
-                })),
+                    // "files: conflict:" prefix).
+                    Some(said) => noded::Refused::new("module", said),
+                    None => noded::Refused::new(
+                        "deterministic_no_op",
+                        "op finalized but rejected (deterministic no-op)",
+                    ),
+                }),
                 // unreachable — filtered at the loop top — but
                 // stay total rather than panic.
                 node::Disposition::Discarded => continue,
@@ -529,8 +567,32 @@ impl ValidatorRuntime<'_> {
                     continue;
                 };
                 for reply in replies {
-                    let _ = reply.send(Err(
-                        "timed out awaiting finalization — re-query on the next block".into(),
+                    let _ = reply.send(Err(noded::Refused::new(
+                        "finalization_timeout",
+                        "timed out awaiting finalization — re-query on the next block",
+                    )));
+                }
+            }
+        }
+        // the same contract for the rpc lane's parked callers: now that a
+        // refusal comes back by itself, a timeout here means ONLY that the op
+        // has not finalized yet — which is what the sentence has to say (#2533).
+        if !pending_rpc_submits.is_empty() {
+            let now = context.current();
+            let expired: Vec<node::FrameId> = pending_rpc_submits
+                .iter()
+                .filter(|(_, (_, deadline))| *deadline <= now)
+                .map(|(k, _)| *k)
+                .collect();
+            for k in expired {
+                let Some((replies, _)) = pending_rpc_submits.remove(&k) else {
+                    continue;
+                };
+                for reply in replies {
+                    let _ = reply.send(crate::rpc::RpcReply::err(
+                        "finalization_timeout: submitted, not finalized yet — re-query on the \
+                         next block"
+                            .to_string(),
                     ));
                 }
             }
@@ -1046,52 +1108,22 @@ impl ValidatorRuntime<'_> {
                             Ok(Some(fc))
                                 if prev_ckpt.0.is_none_or(|h| fc.height >= h)
                         );
-                        let lease_active = crate::sync::serve::sync_lease_active(sync_lease);
-                        let deferral_cap_reached = *prune_deferrals >= MAX_PRUNE_DEFERRALS;
-                        let action =
-                            decide_prune_action(floor_passed, lease_active, deferral_cap_reached);
+                        let needed_from = sync_retention.floor();
+                        let cuts_served_sync = prune_cuts_served_sync(prev_ckpt.0, needed_from);
+                        let action = decide_prune_action(floor_passed, cuts_served_sync);
                         match action {
                             PruneAction::NotDue => {}
-                            PruneAction::Deferred => {
-                                // a syncer is actively pulling from this node:
-                                // pruning now would yank its boundary away and
-                                // put it on the rebootstrap treadmill. defer —
-                                // the next checkpoint prunes once the lease
-                                // lapses, up to the deferral cap.
-                                *prune_deferrals += 1;
+                            PruneAction::HeldForSync => {
                                 tracing::debug!(
                                     target: "ducktape::statesync",
                                     node = %label,
-                                    reason = "sync_lease_active",
-                                    deferrals = *prune_deferrals,
-                                    "oplog prune deferred"
+                                    reason = "sync_retention_floor",
+                                    anchor = prev_ckpt.0.unwrap_or_default(),
+                                    needed_from = needed_from.unwrap_or_default(),
+                                    "oplog prune held for a served sync"
                                 );
                             }
-                            PruneAction::Forced => {
-                                // the lease is still warm, but it has stalled
-                                // pruning for MAX_PRUNE_DEFERRALS checkpoints
-                                // running: prune anyway. an in-flight sync
-                                // below the new floor gets `RangePruned`,
-                                // which it already handles.
-                                *prune_deferrals = 0;
-                                tracing::warn!(
-                                    target: "ducktape::statesync",
-                                    node = %label,
-                                    reason = "sync_lease_deferral_cap",
-                                    cap = MAX_PRUNE_DEFERRALS,
-                                    "oplog prune forced past warm sync lease"
-                                );
-                                if let Err(e) = node.sink_mut().prune_oplog(prev_ckpt.1).await {
-                                    tracing::warn!(
-                                        target: "ducktape::recovery",
-                                        node = %label,
-                                        error = %e,
-                                        "oplog prune failed"
-                                    );
-                                }
-                            }
-                            PruneAction::Clear => {
-                                *prune_deferrals = 0;
+                            PruneAction::Prune => {
                                 if let Err(e) = node.sink_mut().prune_oplog(prev_ckpt.1).await {
                                     tracing::warn!(
                                         target: "ducktape::recovery",
@@ -1151,10 +1183,16 @@ impl ValidatorRuntime<'_> {
 
         // the state-driven pumps, each its own method below: block
         // cadence/heartbeat, code readiness, capability announce,
-        // saga crank, dispatch delivery nudge.
+        // saga crank, conversation timers, dispatch delivery nudge.
         self.pump_heartbeat().await;
         self.pump_code_readiness().await;
+        // the committed lane table, into the watch every declared plane
+        // binds off. A no-op when the table did not move, so a lane a swap
+        // declares binds on the block that declared it and nothing else
+        // wakes a waiting plane.
+        crate::lane_table::pump(self.node.host()).await;
         self.pump_saga_crank().await;
+        self.pump_conversation_inputs().await;
         self.pump_dispatch_nudge().await;
 
         let Self {
@@ -1459,55 +1497,16 @@ impl ValidatorRuntime<'_> {
         }
     }
 
-    /// the digests OPEN `RegisterModule`/`UpdateModule` proposals name, read
-    /// from governance ONLY when its root has moved since the last read.
-    ///
-    /// the walk instantiates governance's guest — the same cost class as the
-    /// registry read this pump already pays each tick (~20 ms measured on a
-    /// three-node e2e cluster), on the loop that also answers `/v1` and the
-    /// RPC lane. paying it again every tick buys nothing: governance's root is
-    /// exactly the change gate for this set, since no ballot opens, closes or
-    /// moves without it.
-    ///
-    /// a net with no governance module (no root) names no proposed code, and
-    /// neither does a reply that is not the listing: an EMPTY set, never a
-    /// skipped refresh — the registry half drives readiness on its own.
-    async fn proposed_code_blobs(
-        node: &super::ValidatorNode,
-        cache: &mut Option<(sdk::StateRoot, HashSet<[u8; 32]>)>,
-    ) -> HashSet<[u8; 32]> {
-        let Some(root) = node.host().module_root("governance") else {
-            *cache = None;
-            return HashSet::new();
-        };
-        if let Some((read_at, digests)) = cache.as_ref()
-            && *read_at == root
-        {
-            return digests.clone();
-        }
-        let req = governance::encode_query(&governance::GovQuery::Proposals);
-        let reply = node.host().query("governance", &req).await;
-        let Ok(Ok(governance::GovReply::Proposals(proposals))) =
-            reply.as_deref().map(governance::decode_reply)
-        else {
-            // a read that failed or answered something else names nothing
-            // THIS tick and is retried on the next — never cached, because
-            // no root change would invalidate that emptiness.
-            return HashSet::new();
-        };
-        let digests = crate::code_plane::code_blobs_proposed(&proposals);
-        *cache = Some((root, digests.clone()));
-        digests
-    }
-
-    // CODE READINESS: the byte-receipt half of a pending modreg swap.
-    // a current boundary member checks the committed pending swaps against
-    // its LOCAL blob store: verified-resident bytes earn one truthful
-    // validator-origin `SignalReady` (the covering signal latches the swap
-    // `ready` in consensus); missing bytes spawn one ranged mesh fetch
-    // (the custodian's data-plane push normally lands first — this heals a
-    // node the push missed). state-driven and idempotent; inert while
-    // nothing is pending.
+    // CODE READINESS: the byte-receipt half of a pending modreg swap, and
+    // the byte PULL lane beside it. EVERY member checks the committed pending
+    // swaps and the OPEN code ballots against its LOCAL blob store and spawns
+    // one ranged mesh fetch per digest it lacks (the custodian's data-plane
+    // push normally lands first — this heals a node the push missed, and
+    // carries a proposal's bytes to a node that must hold them before the
+    // ballot closes). A CURRENT boundary member additionally earns one
+    // truthful validator-origin `SignalReady` per verified-resident swap
+    // (the covering signal latches the swap `ready` in consensus).
+    // state-driven and idempotent; inert while nothing is pending or open.
     async fn pump_code_readiness(&mut self) {
         let Self {
             node,
@@ -1526,32 +1525,8 @@ impl ValidatorRuntime<'_> {
             ..
         } = self;
         // reap finished fetch tasks first, so a failed fetch retries — on a
-        // BACKOFF, and speaking only on the first failure and every Nth after
-        // it. Nobody serving these bytes is the steady state, not a blip: the
-        // peer book may be empty (refused synchronously) and the module never
-        // clears a pending swap, so an unpaced retry+warn here is a permanent
-        // ~10/s log bomb that evicts the ring an operator restarted to read.
-        // The warn lives HERE rather than in the task because this is where
-        // the attempt counter — the actual diagnosis — is.
-        while let Ok((digest, failure)) = fetch_done_rx.try_recv() {
-            let Some(error) = failure else {
-                code_signaller.fetch_succeeded(&digest);
-                continue;
-            };
-            let attempt = code_signaller.fetch_failed(&digest);
-            if !attempt.speak {
-                continue;
-            }
-            tracing::warn!(
-                target: "ducktape::modules",
-                node = %label,
-                reason = "code_fetch_unserved",
-                digest = %crate::config::hex_bytes(&digest),
-                attempts = attempt.attempts,
-                error = %error,
-                "pending-swap code fetch failed"
-            );
-        }
+        // backoff, speaking only on the first failure and every Nth after it.
+        code_signaller.reap_fetches(fetch_done_rx, label);
         code_signaller.tick_fetch_backoff();
         let req = modules::encode_query(&modules::ModulesQuery::ModuleStatus);
         let Ok(bytes) = node.host().query(host::MODULES_ID, &req).await else {
@@ -1570,7 +1545,8 @@ impl ValidatorRuntime<'_> {
         // that on every tick as well as the registry read put this loop past
         // the RPC lane's 10 s deadline. nothing but a governance state change
         // can move the set, and the root is exactly that.
-        let proposed = Self::proposed_code_blobs(node, proposed_code).await;
+        let proposed =
+            crate::validator::code_announce::proposed_code_blobs(node.host(), proposed_code).await;
         // the code plane's push admission gate reads THIS set (#1833): a
         // digest nothing here names any more is refused before any staging.
         // reclaim rides the same registry-change point — whatever fell out
@@ -1579,16 +1555,19 @@ impl ValidatorRuntime<'_> {
         // once justified it. activation history stays referenced because
         // checkpoint restore and replay use it.
         let mut referenced = crate::code_plane::code_blobs_referenced(&modules);
-        referenced.extend(proposed);
+        referenced.extend(proposed.iter().copied());
         for digest in code_registry.update(referenced) {
             blobs.forget(&digest);
         }
-        if !orchestrator
+        // the ONE role read: a seat in the current boundary signals; anyone
+        // else running this loop (a seat that rotated out) only pulls.
+        let seated = orchestrator
             .current_members()
-            .contains(&signer.public_key())
-        {
-            return;
-        }
+            .contains(&signer.public_key());
+        let role = match seated {
+            true => Role::Validator,
+            false => Role::Resident,
+        };
         // residency is a VERIFYING read (content re-hashed on the disk path)
         // AND a LOADABILITY read: signing ready must mean sha256(local bytes)
         // == committed hash AND "this binary can instantiate them" AND "this
@@ -1607,15 +1586,24 @@ impl ValidatorRuntime<'_> {
         // and unloadable alike — and every validator pays it at the same
         // moment, right after the swap commits.
         let height = node.finalized().map_or(0, |f| f.height);
-        let actions = code_signaller.decide(height, &modules, |module_id, digest| {
+        let held = |digest: &[u8; 32]| blobs.has_verified_chunk(digest);
+        let verdict = |entry: &modules::ModuleCode, digest: &[u8; 32]| {
             let Some(bytes) = blobs.get_chunk(digest) else {
                 return CodeVerdict::Absent;
             };
-            let realizable = noded::compose::validate_deployment(module_id, &bytes, index)
-                .and_then(|()| {
-                    node.check_module_replacement(module_id, &bytes)
-                        .map_err(|error| error.to_string())
-                });
+            let module_id = entry.module_id.as_str();
+            // what "this node can run it" means is the entry's kind: a
+            // module's bytes must instantiate here AND replace the running
+            // module's state shape; a view's bytes must speak the view ABI,
+            // and no running module is asked about them.
+            let realizable =
+                noded::compose::validate_deployment(module_id, entry.kind, &bytes, index)
+                    .and_then(|()| match entry.kind {
+                        modules::Kind::Module => node
+                            .check_module_replacement(module_id, &bytes)
+                            .map_err(|error| error.to_string()),
+                        modules::Kind::View => Ok(()),
+                    });
             match realizable {
                 Ok(()) => CodeVerdict::Loadable,
                 // the first line only: a wasmtime error carries a multi-line
@@ -1625,7 +1613,14 @@ impl ValidatorRuntime<'_> {
                     detail: detail.lines().next().unwrap_or_default().to_string(),
                 },
             }
-        });
+        };
+        let actions = code_signaller.decide(role, height, &modules, &proposed, held, verdict);
+        crate::validator::code_announce::spawn_fetches(
+            actions.fetches,
+            blob_client,
+            blobs,
+            fetch_done_tx,
+        );
         for (key, detail) in actions.refusals {
             tracing::warn!(
                 target: "ducktape::modules",
@@ -1637,25 +1632,6 @@ impl ValidatorRuntime<'_> {
                 "pending-swap code refused: this binary cannot instantiate it, so \
                  this node will not signal ready"
             );
-        }
-        for digest in actions.fetches {
-            let client = blob_client.clone();
-            let blobs = blobs.clone();
-            let done = fetch_done_tx.clone();
-            tokio::spawn(async move {
-                // the OUTCOME goes back to the pump, which owns the attempt
-                // counter, the backoff and the (latched) warning.
-                let failure = crate::blob_fetch::fetch_blob(
-                    &client,
-                    &blobs,
-                    &digest,
-                    crate::constants::MAX_MODULE_CODE_BYTES,
-                    crate::constants::BLOB_FETCH_ATTEMPTS,
-                )
-                .await
-                .err();
-                let _ = done.send((digest, failure));
-            });
         }
         for (key, msg) in actions.signals {
             let seq = *next_seq;
@@ -1738,6 +1714,36 @@ impl ValidatorRuntime<'_> {
                     "saga crank submitted"
                 );
             }
+        }
+    }
+
+    /// This validator's consensus clock is its committed height. Inspect a
+    /// timer only when that clock changes, not when a host wall-clock tick
+    /// fires. Duplicate cranks from other validators are deterministic no-ops.
+    async fn pump_conversation_inputs(&mut self) {
+        let Some(height) = self.node.finalized().map(|block| block.height) else {
+            return;
+        };
+        let already_inspected = self.last_conversation_height == Some(height);
+        if already_inspected {
+            return;
+        }
+        self.last_conversation_height = Some(height);
+        let due = conversation_next_input_due(self.node.host()).await;
+        let Some(msg) = conversation_input_crank(height, due) else {
+            return;
+        };
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        if let Err(error) = self.node.submit(&self.signer, seq, msg).await {
+            tracing::debug!(
+                target: "ducktape::agent",
+                node = %self.label,
+                reason = "conversation_crank_submit_failed",
+                error = %error,
+                height,
+                "conversation timer submit failed; retrying at the next committed block"
+            );
         }
     }
 
@@ -1899,56 +1905,95 @@ pub(crate) async fn saga_next_expiry(host: &host::Host) -> Option<u64> {
     }
 }
 
-#[cfg(test)]
-mod prune_cadence_tests {
-    use super::{MAX_PRUNE_DEFERRALS, PruneAction, decide_prune_action};
+/// Earliest durable timer; absence of the Runs module requires no host work.
+async fn conversation_next_input_due(host: &host::Host) -> Option<u64> {
+    let reply = host
+        .query("runs", &runs::encode_query(&runs::RunsQuery::NextConversationInputDue))
+        .await
+        .ok()?;
+    let runs::RunsReply::NextConversationInputDue(due) = runs::decode_reply(&reply).ok()? else {
+        return None;
+    };
+    due
+}
 
-    /// no floor, no lease warmth, no cap ever overrides "nothing to prune yet".
+fn conversation_input_crank(height: u64, due: Option<u64>) -> Option<Msg> {
+    let due = due?;
+    let timer_ready = due <= height;
+    if !timer_ready {
+        return None;
+    }
+    Some(Msg {
+        target: "runs".into(),
+        payload: runs::encode_msg(&runs::RunsMsg::CrankConversationInputs),
+    })
+}
+
+#[cfg(test)]
+mod conversation_crank_tests {
+    use super::conversation_input_crank;
+
+    #[test]
+    fn no_timer_or_a_future_consensus_deadline_does_not_submit() {
+        assert!(conversation_input_crank(100, None).is_none());
+        assert!(conversation_input_crank(100, Some(101)).is_none());
+    }
+
+    #[test]
+    fn due_and_overdue_inputs_submit_the_permissionless_crank() {
+        for due in [99, 100] {
+            let msg = conversation_input_crank(100, Some(due)).unwrap();
+            assert_eq!(msg.target, "runs");
+            assert!(matches!(
+                runs::decode_msg(&msg.payload).unwrap(),
+                runs::RunsMsg::CrankConversationInputs
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod prune_retention_tests {
+    use super::{PruneAction, decide_prune_action, prune_cuts_served_sync};
+
+    /// a floor that has not passed overrides everything: there is nothing to
+    /// prune yet, served sync or not.
     #[test]
     fn floor_not_passed_never_prunes() {
-        assert_eq!(decide_prune_action(false, true, true), PruneAction::NotDue);
-        assert_eq!(
-            decide_prune_action(false, false, false),
-            PruneAction::NotDue
-        );
+        assert_eq!(decide_prune_action(false, true), PruneAction::NotDue);
+        assert_eq!(decide_prune_action(false, false), PruneAction::NotDue);
     }
 
-    /// a cold lease prunes normally once the floor has passed, regardless of
-    /// a stale deferral count.
+    /// no syncer, no hold: the checkpoint prunes the moment the floor passes.
     #[test]
-    fn cold_lease_prunes_once_the_floor_passes() {
-        assert_eq!(decide_prune_action(true, false, false), PruneAction::Clear);
-        assert_eq!(decide_prune_action(true, false, true), PruneAction::Clear);
+    fn nothing_in_flight_prunes_once_the_floor_passes() {
+        assert!(!prune_cuts_served_sync(Some(3598), None));
+        assert_eq!(decide_prune_action(true, false), PruneAction::Prune);
     }
 
-    /// #1814: a warm lease defers for up to `MAX_PRUNE_DEFERRALS` consecutive
-    /// checkpoints, then the 4th checkpoint prunes anyway — the counter never
-    /// suspends retention forever.
+    /// the reported shape: the syncer is still installing boundary 3404 while
+    /// the busy chain's next checkpoint anchor is already 3598. pruning there
+    /// answers its catch-up with `RangePruned` and restarts its whole
+    /// bootstrap, so the checkpoint holds instead.
     #[test]
-    fn a_warm_lease_defers_up_to_the_cap_then_prunes_on_the_next_checkpoint() {
-        let mut prune_deferrals: u32 = 0;
-        let mut actions = Vec::new();
-        // four consecutive checkpoints, all under a floor that has passed and
-        // a lease that never lapses.
-        for _ in 0..4 {
-            let deferral_cap_reached = prune_deferrals >= MAX_PRUNE_DEFERRALS;
-            let action = decide_prune_action(true, true, deferral_cap_reached);
-            match action {
-                PruneAction::Deferred => prune_deferrals += 1,
-                PruneAction::Forced | PruneAction::Clear => prune_deferrals = 0,
-                PruneAction::NotDue => {}
-            }
-            actions.push(action);
-        }
-        assert_eq!(
-            actions,
-            vec![
-                PruneAction::Deferred,
-                PruneAction::Deferred,
-                PruneAction::Deferred,
-                PruneAction::Forced,
-            ]
-        );
+    fn a_served_boundary_below_the_anchor_holds_the_prune() {
+        assert!(prune_cuts_served_sync(Some(3598), Some(3404)));
+        assert_eq!(decide_prune_action(true, true), PruneAction::HeldForSync);
+    }
+
+    /// and the hold releases on the syncer's OWN progress — a newer boundary
+    /// or a later frame batch — never on a checkpoint count.
+    #[test]
+    fn the_hold_releases_when_the_syncer_passes_the_anchor() {
+        assert!(!prune_cuts_served_sync(Some(3598), Some(3598)));
+        assert!(!prune_cuts_served_sync(Some(3598), Some(3660)));
+    }
+
+    /// a boot with no previous checkpoint height has no anchor to hold
+    /// against, and prunes nothing either way.
+    #[test]
+    fn no_anchor_holds_nothing() {
+        assert!(!prune_cuts_served_sync(None, Some(3404)));
     }
 }
 

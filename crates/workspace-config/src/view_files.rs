@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 
-use module_artifact::{MAX_ARTIFACT_BYTES, MAX_VIEW_ASSETS, ModuleArtifact, ViewArtifact};
+use module_artifact::{
+    Artifact, LaneDecl, MAX_ARTIFACT_BYTES, MAX_VIEW_ASSETS, ModuleArtifact, ViewArtifact,
+};
 
 pub fn ensure_view_ready(dir: &Path, id: &str) -> Result<(), String> {
     crate::validate_module_id(id)?;
@@ -22,18 +24,24 @@ fn ensure_ready_path(path: &Path) -> Result<(), String> {
     }
 }
 
+/// package the files of one deployment into its artifact frame: a component
+/// (with its optional mapper, view and assets) is a `Kind::Module` frame; a
+/// view alone (with its optional assets) is a `Kind::View` frame. Nothing at
+/// all is no deployment.
 pub fn read_deployment_files(
-    component: &Path,
+    component: Option<&Path>,
     index: Option<&Path>,
     view: Option<&Path>,
     assets: Option<&Path>,
-) -> Result<ModuleArtifact, String> {
+    lanes: Option<&Path>,
+) -> Result<Artifact, String> {
     if let Some(id) = component
-        .file_name()
+        .and_then(Path::file_name)
         .and_then(|s| s.to_str())
         .and_then(|s| s.strip_suffix(".component.wasm"))
     {
-        ensure_view_ready(component.parent().unwrap_or(Path::new(".")), id)?;
+        let dir = component.and_then(Path::parent).unwrap_or(Path::new("."));
+        ensure_view_ready(dir, id)?;
     }
     if let Some(view) = view.filter(|path| {
         path.file_name()
@@ -43,7 +51,9 @@ pub fn read_deployment_files(
         ensure_ready_path(&view.with_extension("pending"))?;
     }
     let mut remaining = MAX_ARTIFACT_BYTES;
-    let component = read_component_file(component, &mut remaining)?;
+    let component = component
+        .map(|path| read_component_file(path, &mut remaining))
+        .transpose()?;
     let index = index
         .map(|path| read_component_file(path, &mut remaining))
         .transpose()?;
@@ -66,13 +76,48 @@ pub fn read_deployment_files(
             None
         }
     };
-    let artifact = ModuleArtifact {
-        component,
-        index,
-        view,
+    let declared_lanes = lanes
+        .map(read_lane_declaration)
+        .transpose()?
+        .unwrap_or_default();
+    let artifact = match (component, view) {
+        (Some(component), view) => Artifact::Module(ModuleArtifact {
+            component,
+            index,
+            view,
+            lanes: declared_lanes,
+        }),
+        (None, Some(view)) => {
+            // a view has no consensus code and no sockets, so it has nothing
+            // to speak on a lane with.
+            if !declared_lanes.is_empty() {
+                return Err("data-plane lanes require a module component".into());
+            }
+            if index.is_some() {
+                return Err("an index guest requires a module component".into());
+            }
+            Artifact::View(view)
+        }
+        (None, None) => return Err("a deployment needs a component or a view".into()),
     };
-    ModuleArtifact::decode(&artifact.encode())?;
+    Artifact::decode(&artifact.encode())?;
     Ok(artifact)
+}
+
+/// a module's own lane declaration: the JSON file it ships beside its
+/// component, read into the frame it is about to be packaged into.
+///
+/// JSON and not borsh because this one is written and reviewed by people —
+/// it is the module saying which lanes it wants, in its own source tree. The
+/// bytes that cross the network are the frame's, and those are borsh.
+fn read_lane_declaration(path: &Path) -> Result<Vec<LaneDecl>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let lanes: Vec<LaneDecl> =
+        serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    module_artifact::validate_lanes(&lanes)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(lanes)
 }
 
 fn read_component_file(path: &Path, remaining: &mut usize) -> Result<Vec<u8>, String> {
@@ -243,6 +288,30 @@ mod tests {
         );
     }
 
+    /// a view frame has no consensus code and no sockets, so a lane
+    /// declaration handed to one is a packaging mistake, refused rather than
+    /// dropped on the floor.
+    #[test]
+    fn a_view_only_frame_may_not_declare_lanes() {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path();
+        std::fs::write(dir.join("view.wasm"), b"view").unwrap();
+        std::fs::write(
+            dir.join("home.lanes"),
+            br#"[{"id": 2, "name": "voice", "stream": null}]"#,
+        )
+        .unwrap();
+        let error = read_deployment_files(
+            None,
+            None,
+            Some(&dir.join("view.wasm")),
+            None,
+            Some(&dir.join("home.lanes")),
+        )
+        .unwrap_err();
+        assert!(error.contains("require a module component"), "{error}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn extraction_unlinks_owned_symlink_without_following_it_and_reader_rejects_asset_symlinks() {
@@ -266,10 +335,11 @@ mod tests {
         symlink(outside.join("keep"), dir.join("custom.assets/link")).unwrap();
         assert!(
             read_deployment_files(
-                &dir.join("code.wasm"),
+                Some(&dir.join("code.wasm")),
                 None,
                 Some(&dir.join("view.wasm")),
-                Some(&dir.join("custom.assets"))
+                Some(&dir.join("custom.assets")),
+                None
             )
             .unwrap_err()
             .contains("symlink")
@@ -282,7 +352,7 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let socket = scratch.path().join("socket");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let error = read_deployment_files(&socket, None, None, None).unwrap_err();
+        let error = read_deployment_files(Some(&socket), None, None, None, None).unwrap_err();
         assert!(
             error.contains("not a regular file"),
             "pre-open metadata guard: {error}"
@@ -295,7 +365,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let error = read_deployment_files(&fifo, None, None, None).unwrap_err();
+        let error = read_deployment_files(Some(&fifo), None, None, None, None).unwrap_err();
         assert!(error.contains("not a regular file"), "{error}");
     }
 

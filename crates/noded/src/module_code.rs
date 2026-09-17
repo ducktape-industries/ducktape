@@ -127,7 +127,7 @@ pub(crate) async fn stage_module_code(
     if body.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "empty artifact body");
     }
-    if let Err(error) = module_artifact::ModuleArtifactRef::decode(&body) {
+    if let Err(error) = module_artifact::ArtifactRef::decode(&body) {
         return error_response(StatusCode::BAD_REQUEST, &error);
     }
     let len = body.len() as u64;

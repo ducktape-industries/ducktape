@@ -45,7 +45,7 @@ pub fn active_hash(cluster: &Cluster, idx: usize, id: &str) -> Option<String> {
 pub fn sha256_hex(path: &str) -> String {
     use sha2::Digest as _;
     let component = std::fs::read(path).expect("fixture");
-    let bytes = module_artifact::ModuleArtifact::component(component).encode();
+    let bytes = module_artifact::Artifact::module(component).encode();
     format!("{:x}", sha2::Sha256::digest(&bytes))
 }
 

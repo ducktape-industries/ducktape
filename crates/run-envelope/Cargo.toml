@@ -12,6 +12,7 @@ version.workspace = true
 # desktop GUI submitting a run must not do, and which is exactly what kept the
 # app spawning `ducktape agent sched` instead of composing the payload itself.
 #
-# The dependency set is the point: serde_json and nothing else.
+# The dependency set is the point: serialization, never host machinery.
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

@@ -24,23 +24,29 @@ fn expected() -> BTreeMap<String, Shape> {
     const CHAIN_ID: &[&str] = &[sdk::genesis_config::CHAIN_ID];
     const INVITE: &[&str] = &[sdk::genesis_config::INVITE];
     const NONE: &[&str] = &[];
-    const CHAIN_ID_AND_TIME_UNIT: &[&str] =
-        &[sdk::genesis_config::CHAIN_ID, sdk::genesis_config::TIME_UNIT];
+    const CHAIN_ID_AND_TIME_UNIT: &[&str] = &[
+        sdk::genesis_config::CHAIN_ID,
+        sdk::genesis_config::TIME_UNIT,
+    ];
     [
         ("acl", shape(Backing::Store, NONE, false)),
         ("agent", shape(Backing::Store, NONE, false)),
         ("automations", shape(Backing::Store, NONE, false)),
+        ("boards", shape(Backing::Store, NONE, false)),
         ("capability", shape(Backing::Store, NONE, false)),
         ("chat", shape(Backing::Store, NONE, false)),
         // the network binding it refuses every op without, and the unit its
         // delivery deadlines are in.
-        ("collaboration", shape(Backing::Store, CHAIN_ID_AND_TIME_UNIT, false)),
+        (
+            "collaboration",
+            shape(Backing::Store, CHAIN_ID_AND_TIME_UNIT, false),
+        ),
         ("directory", shape(Backing::Map, NONE, false)),
         // committed-only queries: the between-block delivery injection must
         // never observe a same-block staged write.
         ("dispatch", shape(Backing::Store, NONE, true)),
-        ("files", shape(Backing::Odb, NONE, false)),
-        ("forge", shape(Backing::Odb, CHAIN_ID, false)),
+        ("files", shape(Backing::Odb, NONE, true)),
+        ("forge", shape(Backing::Git, CHAIN_ID, true)),
         ("gateway", shape(Backing::Store, CHAIN_ID, false)),
         ("governance", shape(Backing::Store, INVITE, false)),
         ("hello", shape(Backing::Map, NONE, false)),
@@ -52,7 +58,8 @@ fn expected() -> BTreeMap<String, Shape> {
         ("valset", shape(Backing::Store, NONE, false)),
         ("noop", shape(Backing::Map, NONE, false)),
         ("pages", shape(Backing::Store, NONE, false)),
-        ("runs", shape(Backing::Map, CHAIN_ID, false)),
+        // the network binding, and the unit its conversation check-ins are in.
+        ("runs", shape(Backing::Store, CHAIN_ID_AND_TIME_UNIT, false)),
         ("saga", shape(Backing::Store, NONE, false)),
         ("attribution", shape(Backing::Store, NONE, false)),
         ("tasks", shape(Backing::Store, NONE, false)),
@@ -69,7 +76,10 @@ fn declared() -> BTreeMap<String, Shape> {
     let mut out = BTreeMap::new();
     for entry in std::fs::read_dir(&dir).expect("fixtures dir") {
         let path = entry.expect("dir entry").path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         let Some(id) = name.strip_suffix(SUFFIX) else {
             continue;
         };
@@ -91,6 +101,12 @@ fn every_committed_component_declares_the_pinned_shape() {
             None => panic!("{id} is pinned but has no fixture component"),
         }
     }
-    let unpinned: Vec<&String> = declared.keys().filter(|id| !expected.contains_key(*id)).collect();
-    assert!(unpinned.is_empty(), "fixture components with no pinned shape: {unpinned:?}");
+    let unpinned: Vec<&String> = declared
+        .keys()
+        .filter(|id| !expected.contains_key(*id))
+        .collect();
+    assert!(
+        unpinned.is_empty(),
+        "fixture components with no pinned shape: {unpinned:?}"
+    );
 }

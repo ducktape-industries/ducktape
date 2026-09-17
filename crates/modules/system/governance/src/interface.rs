@@ -63,10 +63,11 @@ pub enum GovAction {
         /// sha256 of the target component bytes (32 bytes).
         code_hash: Vec<u8>,
     },
-    /// AUTHORIZE the post-genesis ADMISSION of a brand-new wasm module: on
-    /// execution, computes `activation_height = execute_height +
-    /// activation_lead` and emits `ModulesMsg::ScheduleRegister { name,
-    /// module_id, activation_height, code_hash }`. governance only authorizes
+    /// AUTHORIZE the post-genesis ADMISSION of a brand-new registry entry — a
+    /// wasm module, or a view alone (`kind`): on execution, computes
+    /// `activation_height = execute_height + activation_lead` and emits
+    /// `ModulesMsg::ScheduleRegister { name, module_id, kind,
+    /// activation_height, code_hash }`. governance only authorizes
     /// — the code registry owns the not-already-registered / min-lead gates,
     /// the R = n readiness quorum arms it, and the host instantiates the
     /// module from the content-addressed bytes at the activation boundary.
@@ -75,12 +76,20 @@ pub enum GovAction {
     RegisterModule {
         name: String,
         module_id: String,
+        /// what the artifact is; fixed for the entry's life.
+        kind: modules::Kind,
         /// blocks after the EXECUTE height at which the module activates;
         /// validated at Propose against [`crate::MIN_ACTIVATION_LEAD`] and
         /// [`crate::MAX_ACTIVATION_LEAD`].
         activation_lead: u64,
         /// sha256 of the initial component bytes (32 bytes).
         code_hash: Vec<u8>,
+        /// the data-plane lanes the admitted module brings. Authorized by the
+        /// same ballot as the code, because a lane id is network-wide state:
+        /// the registry owns the collision and range gates, this only decides
+        /// that the network wants them at all.
+        #[serde(default)]
+        lanes: Vec<modules::LaneDecl>,
     },
     /// AUTHORIZE clearing a pending module code swap before its boundary: emits
     /// `ModulesMsg::CancelSwap { name, module_id }` on execution.

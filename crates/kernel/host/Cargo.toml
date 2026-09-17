@@ -92,10 +92,16 @@ automations = { workspace = true }
 # its wasm port side by side. files needs an on-disk odb dir (tempfile).
 runs = { workspace = true }
 files = { workspace = true }
+# the wasm files tenant commits through its host-side odb substrate, which is a
+# service crate now — `files` itself names no kernel host.
+files-odb = { workspace = true }
 # the forge root-continuity proof stands the native module beside its wasm port
 # over the git substrate; `testkit` builds the real git history + packs the
 # push ops need.
 forge = { workspace = true, features = ["testkit"] }
+# and the wasm side of that proof stands on forge's substrate, a service crate
+# for the same reason files' is.
+forge-odb = { workspace = true }
 blobstore = { workspace = true }
 tempfile = "3"
 commonware-cryptography = { workspace = true }

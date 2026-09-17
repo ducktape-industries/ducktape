@@ -6,27 +6,74 @@ use std::time::Duration;
 
 use futures::{SinkExt as _, StreamExt as _};
 use reqwest::{Response, Url};
+/// Re-exported with [`refusal`], which takes one: a caller that reads a `/v1`
+/// route itself should not have to pin this client's reqwest to say so.
+pub use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_tungstenite::tungstenite::Message;
 
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
+/// one frame of a streamed blob upload: what this process holds of a file
+/// while it crosses to the node, whatever the file's size.
+const BLOB_UPLOAD_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// The throughput floor a blob's bytes are budgeted at, on both legs they
+/// travel: up to the node ([`Client::put_blob_file`]) and out from it to every
+/// other validator before the submit's block can apply ([`submit_budget`]).
+/// One number, because it is one pack crossing one class of link — a second
+/// floor would be two answers to the same question.
+const BLOB_FLOOR_BYTES_PER_SEC: u64 = 64 * 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(7_500);
 
-/// A node response or transport failure safe to show to a client user.
+/// A node response or transport failure safe to show to a client user: a
+/// stable snake_case `reason` to branch on and the `message` to show.
+///
+/// The two are separate fields because they are BOUNDED separately. This client
+/// used to build one string — `RPC returned 400 Bad Request: {"error":"…"}` —
+/// and then clip the whole thing, so every character of framing was a character
+/// cut off the END of the module's own sentence, which is the half that says
+/// what to do about it.
 #[derive(Debug)]
-pub struct Error(String);
+pub struct Error {
+    reason: String,
+    message: String,
+}
 
 impl Error {
+    /// A failure of THIS CLIENT: it could not send the request, read the
+    /// response, or make sense of it. Never a refusal the node authored — those
+    /// come from [`Error::refusal`], which reads the node's own token.
     fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            reason: "rpc_client".into(),
+            message: message.into(),
+        }
+    }
+
+    /// The node's refusal, as the node classified it.
+    fn refused(reason: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            message: message.into(),
+        }
+    }
+
+    /// What kind of failure this is — the token a caller branches on.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// What it says. A refusal's message is the refusing module's own sentence,
+    /// verbatim: nothing here paraphrases it and nothing wraps it.
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -34,12 +81,111 @@ impl std::error::Error for Error {}
 
 impl From<Error> for String {
     fn from(error: Error) -> Self {
-        error.0
+        error.message
+    }
+}
+
+/// The node's error body on every non-2xx: the sentence in `error`, its token
+/// in `reason` (absent from a refusal no actor classified, and from anything
+/// that is not this node — a proxy, a gateway).
+#[derive(Deserialize)]
+struct NodeRefusal {
+    error: String,
+    reason: Option<String>,
+}
+
+/// Read a non-2xx body as the node's refusal. The sentence is bounded on its
+/// OWN budget here, which is the whole point: a long module sentence is cut
+/// only by its own length, never by a status line in front of it.
+///
+/// `pub` for the one caller that reaches a `/v1` route without this client —
+/// the app kernel's signed admin POST. It parses the node's refusal HERE
+/// rather than writing a second parser, so both lanes split the envelope the
+/// same way and no consumer downstream has to.
+pub fn refusal(status: StatusCode, body: &[u8]) -> Error {
+    match serde_json::from_slice::<NodeRefusal>(body) {
+        Ok(node) => Error::refused(
+            node.reason.unwrap_or_else(|| "refused".into()),
+            bounded_detail(&node.error),
+        ),
+        // not this node's envelope at all: the status IS the classification and
+        // the body is the only evidence there is.
+        Err(_) => Error::refused(
+            "http_error",
+            format!(
+                "{status}: {}",
+                bounded_detail(&String::from_utf8_lossy(body))
+            ),
+        ),
     }
 }
 
 /// Result returned by the RPC client.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Why [`Client::submit_frame`] answered no height — and, decisively, whether
+/// the op is DEAD or merely unaccounted for.
+///
+/// The submit lane is the one call where those differ. The node holds the
+/// response until the block that includes the frame commits, so a client that
+/// stops waiting has learned nothing: the op may be committing at that very
+/// moment. A caller that reports the two the same way tells its user a push
+/// was rejected while the refs are landing, and the retry then collides with
+/// the ref the "rejected" push installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitFailure {
+    /// The node answered, and its answer was no — a malformed frame, an
+    /// unknown module, a module that refused the op. This is a verdict, and
+    /// it is the only failure a caller may relay to a user as a refusal.
+    Refused(String),
+    /// The exchange never completed: the connection failed, the budget ran
+    /// out, or the receipt did not parse. The op's fate is UNKNOWN. Report it
+    /// as an error, never as a refusal, and re-read before retrying.
+    Unresolved(String),
+}
+
+impl fmt::Display for SubmitFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(detail) | Self::Unresolved(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for SubmitFailure {}
+
+/// How long to wait for a submit receipt over a frame carrying `blob_bytes`.
+///
+/// [`TIMEOUT`] is an RPC's budget and a submit is not an RPC: the node answers
+/// only once the block that includes the frame commits, and when the frame
+/// requires a blob, that block cannot apply until the node has fanned those
+/// bytes out to every other validator. So the wait scales with the blob,
+/// exactly as [`Client::put_blob_file`]'s upload does, and over the same links
+/// — which is why it reuses that floor rather than inventing a second one.
+///
+/// A flat budget here is a size limit wearing a clock: at the old 30 s, a
+/// repository-sized push was reported failed while it was committing, and
+/// landed half a minute later. The floor still fails a dead link; it just
+/// refuses to call a slow one dead.
+///
+/// The bar it has to clear is the NODE's own hold for the same frame:
+/// `SUBMIT_HOLD` plus `relay::blob_transfer_allowance(bytes, targets)` — the
+/// node budgets the fan-out at 1 MiB/s over hex-inflated bytes, once per
+/// target (`bin/node/src/relay.rs`). A client that gives up first turns a
+/// submit the node is still honestly working on into a reported failure. At
+/// 64 KiB/s this clears that hold up to EIGHT fan-out targets, since the node
+/// spends `2 * targets` of its floor against this one's 16.
+///
+/// ponytail: a constant that outlasts a formula it cannot read. The node knows
+/// its own deadline exactly — have it state the hold in the submit response
+/// (or a first-byte receipt) and wait for that instead, when a network grows
+/// past eight validators.
+fn submit_budget(blob_bytes: u64) -> Duration {
+    if blob_bytes == 0 {
+        return TIMEOUT;
+    }
+    TIMEOUT + Duration::from_secs(blob_bytes.div_ceil(BLOB_FLOOR_BYTES_PER_SEC))
+}
 
 /// The response header the index view lane stamps its fold watermark into.
 const FOLDED_HEADER: &str = "x-ducktape-folded";
@@ -175,13 +321,6 @@ pub enum StreamOriginKind {
 /// One connected module-event session. Reconnect policy belongs to the caller.
 pub type ModuleEventStream = futures::stream::BoxStream<'static, Result<ModuleEvent>>;
 
-/// One log-ring line from the `logs` topic, with its resume cursor.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogLine {
-    pub cursor: String,
-    pub line: String,
-}
-
 /// Route one server frame for a single snapshot topic: the document, a
 /// failure, or `None` for a frame this subscription does not consume.
 ///
@@ -239,20 +378,23 @@ pub struct Client {
     /// neither it nor a per-request user signature, so a client without one
     /// READS — its writes come back as the node's 401 naming the credential.
     operator_token: Option<String>,
-    /// The PERSON's proof for a raw-bytes write lane (`/v1/files/stage`,
-    /// `/v1/files/blob`): signs each request with the acting key, bound to the
+    /// The PERSON's proof for a raw-bytes write lane (`/v1/files/blob`): signs each request with the acting key, bound to the
     /// target node, so the node records the person as the writer and charges
     /// the write to them. Preferred over the operator credential when both
     /// are held — a credentialed write is the node's, not the person's.
     write_auth: Option<WriteAuth>,
 }
 
-/// Signs one mutating request: `(method, path_and_query, body)` in, the
-/// headers that prove possession out. The signing itself lives with the
-/// kernel's frame codec (`node::signed_req::request_headers`); this crate
-/// carries the hook only, and stays free of node internals.
+/// Signs one mutating request: `(method, path_and_query, sha256 of the body)`
+/// in, the headers that prove possession out. The signing itself lives with
+/// the kernel's frame codec (`node::signed_req::request_headers_digest`); this
+/// crate carries the hook only, and stays free of node internals.
+///
+/// The DIGEST rather than the body, because one caller here uploads a file it
+/// never holds: a git push's packfile streams from disk, and the only thing a
+/// signature can bind is what the bytes hash to.
 pub type WriteAuth =
-    std::sync::Arc<dyn Fn(&str, &str, &[u8]) -> Vec<(String, String)> + Send + Sync>;
+    std::sync::Arc<dyn Fn(&str, &str, &[u8; 32]) -> Vec<(String, String)> + Send + Sync>;
 
 /// The header the operator credential travels in — the same one `/v1/admin/*`
 /// takes, because it is the same secret and the same bar ("can read the node's
@@ -369,10 +511,23 @@ impl Client {
         path: &str,
         body: &[u8],
     ) -> reqwest::RequestBuilder {
+        use sha2::Digest as _;
+        self.proven_digest(request, method, path, &sha2::Sha256::digest(body).into())
+    }
+
+    /// the same proof for a body this process never holds — a streamed upload
+    /// hashes as it sends and signs that.
+    fn proven_digest(
+        &self,
+        request: reqwest::RequestBuilder,
+        method: &str,
+        path: &str,
+        digest: &[u8; 32],
+    ) -> reqwest::RequestBuilder {
         let Some(sign) = self.write_auth.as_ref() else {
             return self.credentialed(request);
         };
-        sign(method, path, body)
+        sign(method, path, digest)
             .into_iter()
             .fold(request, |request, (name, value)| {
                 request.header(name, value)
@@ -458,7 +613,11 @@ impl Client {
             .post(self.url(QUERY_READER_PATH.trim_start_matches('/'))?)
             .header("content-type", "application/json")
             .body(body.clone());
-        let response = sign("POST", QUERY_READER_PATH, &body)
+        let digest: [u8; 32] = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(&body).into()
+        };
+        let response = sign("POST", QUERY_READER_PATH, &digest)
             .into_iter()
             .fold(request, |request, (name, value)| request.header(name, value))
             .send()
@@ -533,55 +692,9 @@ impl Client {
         Ok(reply.blocks)
     }
 
-    /// One GET against a `/v1/files/*` read lane, query-string params, JSON
-    /// reply verbatim — the files browser's transport.
-    pub async fn files_get(
-        &self,
-        lane: &str,
-        params: &[(&str, &str)],
-    ) -> Result<serde_json::Value> {
-        let mut url = self.url(&format!("v1/files/{lane}"))?;
-        {
-            let mut pairs = url.query_pairs_mut();
-            for (key, value) in params {
-                pairs.append_pair(key, value);
-            }
-        }
-        let response = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| Error::new(format!("RPC files {lane} failed: {error}")))?;
-        decode_json(response).await
-    }
-
-    /// Stage one duckfs chunk (`POST /v1/files/stage`, raw bytes ≤ 1 MiB) —
-    /// returns the staged chunk's digest.
-    pub async fn files_stage(&self, bytes: Vec<u8>) -> Result<String> {
-        let response = self
-            .proven(
-                self.http.post(self.url("v1/files/stage")?),
-                "POST",
-                "/v1/files/stage",
-                &bytes,
-            )
-            .header("content-type", "application/octet-stream")
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|error| Error::new(format!("RPC files stage failed: {error}")))?;
-        #[derive(Deserialize)]
-        struct Staged {
-            digest: String,
-        }
-        let reply: Staged = decode_json(response).await?;
-        Ok(reply.digest)
-    }
-
     /// Land raw bytes in the node-local BLOB store (`POST /v1/files/blob`) —
     /// the op-receipt lane forge fetches `PushRefs`/`MergePr` packfiles from by
-    /// digest. A distinct plane from [`Self::files_stage`]'s duckfs chunk lane:
+    /// digest. A distinct plane from module-owned Files chunk staging:
     /// a pack staged there would never be found by a `pack_digest` lookup.
     pub async fn put_blob(&self, bytes: Vec<u8>) -> Result<String> {
         let response = self
@@ -601,6 +714,91 @@ impl Client {
             digest: String,
         }
         let reply: Stored = decode_json(response).await?;
+        Ok(reply.digest)
+    }
+
+    /// Land a FILE's bytes — from `offset` to its end — in the node-local blob
+    /// store, streaming.
+    ///
+    /// This is the door a git push takes, so it has no size: the packfile was
+    /// spooled to disk by whoever received it, one frame of it at a time
+    /// crosses to the node, and the node writes it straight back to disk. The
+    /// file is hashed first because the signature binds the digest — two
+    /// sequential reads of a file, and never the file in memory.
+    pub async fn put_blob_file(&self, path: &std::path::Path, offset: u64) -> Result<String> {
+        use sha2::Digest as _;
+        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+        let open = |offset: u64| async move {
+            let mut file = tokio::fs::File::open(path)
+                .await
+                .map_err(|error| Error::new(format!("RPC blob put failed: {error}")))?;
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|error| Error::new(format!("RPC blob put failed: {error}")))?;
+            Ok::<tokio::fs::File, Error>(file)
+        };
+
+        let mut hashing = open(offset).await?;
+        let mut hasher = sha2::Sha256::new();
+        let mut total = 0u64;
+        let mut buf = vec![0u8; BLOB_UPLOAD_FRAME_BYTES];
+        loop {
+            let read = hashing
+                .read(&mut buf)
+                .await
+                .map_err(|error| Error::new(format!("RPC blob put failed: {error}")))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buf[..read]);
+            total += read as u64;
+        }
+        let digest: [u8; 32] = hasher.finalize().into();
+
+        let sending = open(offset).await?;
+        let body = futures::stream::unfold(sending, |mut file| async move {
+            let mut buf = vec![0u8; BLOB_UPLOAD_FRAME_BYTES];
+            match file.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(read) => {
+                    buf.truncate(read);
+                    Some((Ok::<Vec<u8>, std::io::Error>(buf), file))
+                }
+                Err(error) => Some((Err(error), file)),
+            }
+        });
+
+        // this client's flat [`TIMEOUT`] is an RPC's budget, and a push is not
+        // an RPC: its duration scales with the history it carries. The budget
+        // here is a floor on THROUGHPUT — [`BLOB_FLOOR_BYTES_PER_SEC`] over the
+        // bytes, on top of a five-minute base — so a big push is allowed to
+        // take long and a dead link still fails. The submit that follows this
+        // upload is budgeted off the same floor ([`submit_budget`]).
+        let budget = Duration::from_secs(300 + total.div_ceil(BLOB_FLOOR_BYTES_PER_SEC));
+        let response = self
+            .proven_digest(
+                self.http.post(self.url("v1/files/blob")?),
+                "POST",
+                "/v1/files/blob",
+                &digest,
+            )
+            .header("content-type", "application/octet-stream")
+            .header("content-length", total)
+            .timeout(budget)
+            .body(reqwest::Body::wrap_stream(body))
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC blob put failed: {error}")))?;
+        #[derive(Deserialize)]
+        struct Stored {
+            digest: String,
+        }
+        let reply: Stored = decode_json(response).await?;
+        let expected: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        if reply.digest != expected {
+            return Err(Error::new("blob receipt digest mismatch"));
+        }
         Ok(reply.digest)
     }
 
@@ -635,76 +833,6 @@ impl Client {
             .await
             .map_err(|error| Error::new(format!("RPC peers failed: {error}")))?;
         decode_json(response).await
-    }
-
-    /// Subscribe the node's log ring (`logs` topic): each item is one log
-    /// line with its resume cursor. Reconnect policy belongs to the caller.
-    pub async fn log_events(
-        &self,
-        resume: Option<String>,
-    ) -> Result<futures::stream::BoxStream<'static, Result<LogLine>>> {
-        let mut cursors = BTreeMap::new();
-        if let Some(cursor) = resume {
-            cursors.insert("logs".to_string(), cursor);
-        }
-        let subscribe = serde_json::to_string(&SubscribeRequest {
-            op: "subscribe",
-            topics: vec!["logs".to_string()],
-            resume: cursors,
-        })
-        .map_err(|error| Error::new(format!("could not encode log subscription: {error}")))?;
-        let url = self.stream_url()?;
-        let (mut socket, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(&url))
-            .await
-            .map_err(|_| Error::new("RPC stream connection timed out"))?
-            .map_err(|error| Error::new(format!("RPC stream connection failed: {error}")))?;
-        tokio::time::timeout(TIMEOUT, socket.send(Message::Text(subscribe)))
-            .await
-            .map_err(|_| Error::new("RPC stream subscription timed out"))?
-            .map_err(|error| Error::new(format!("RPC stream subscription failed: {error}")))?;
-        let stream = futures::stream::unfold(Some(socket), move |socket| async move {
-            let mut socket = socket?;
-            loop {
-                let message = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, socket.next()).await {
-                    Ok(Some(message)) => message,
-                    Ok(None) => return Some((Err(Error::new("RPC stream closed")), None)),
-                    Err(_) => {
-                        return Some((Err(Error::new("RPC stream heartbeat timed out")), None));
-                    }
-                };
-                let Ok(Message::Text(text)) = message else {
-                    if matches!(message, Ok(Message::Close(_)) | Err(_)) {
-                        return Some((Err(Error::new("RPC stream closed")), None));
-                    }
-                    continue;
-                };
-                #[derive(Deserialize)]
-                #[serde(tag = "type", rename_all = "snake_case")]
-                enum LogFrame {
-                    Subscribed {},
-                    Tail {
-                        cursor: String,
-                        item: serde_json::Value,
-                    },
-                    Heartbeat,
-                    #[serde(other)]
-                    Other,
-                }
-                match serde_json::from_str::<LogFrame>(&text) {
-                    Ok(LogFrame::Tail { cursor, item }) => {
-                        let line = item["line"].as_str().unwrap_or_default().to_string();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        return Some((Ok(LogLine { cursor, line }), Some(socket)));
-                    }
-                    Ok(_) => continue,
-                    Err(_) => continue,
-                }
-            }
-        })
-        .boxed();
-        Ok(stream)
     }
 
     /// Subscribe ONE snapshot topic on its own socket.
@@ -775,14 +903,6 @@ impl Client {
         self.snapshot_events("status").await
     }
 
-    /// The direct-peer sample, pushed. EXPENSIVE — every sample encodes the
-    /// node's whole metrics registry — so hold it only while a surface draws it.
-    pub async fn peers_events(
-        &self,
-    ) -> Result<futures::stream::BoxStream<'static, Result<serde_json::Value>>> {
-        self.snapshot_events("peers").await
-    }
-
     /// Submit an already-signed operation frame, answering the height of the
     /// block that INCLUDED it.
     ///
@@ -791,23 +911,42 @@ impl Client {
     /// read its own write had to guess. Acceptance is not application: the
     /// derived read models fold behind the block loop, so the height is the
     /// coordinate a follow-up read waits on ([`Client::view_folded`]).
-    pub async fn submit_frame(&self, frame: Vec<u8>) -> Result<u64> {
+    ///
+    /// `carried_blob_bytes` is the size of the blob this frame REQUIRES, or 0
+    /// for an ordinary op — see [`submit_budget`] for why the wait scales with
+    /// it. The caller uploaded those bytes ([`Client::put_blob_file`]), so the
+    /// caller is the one that knows.
+    pub async fn submit_frame(
+        &self,
+        frame: Vec<u8>,
+        carried_blob_bytes: u64,
+    ) -> std::result::Result<u64, SubmitFailure> {
         let response = self
             .http
-            .post(self.url("v1/submit/frame")?)
+            .post(
+                self.url("v1/submit/frame")
+                    .map_err(|error| SubmitFailure::Unresolved(error.to_string()))?,
+            )
             .header("content-type", "application/octet-stream")
+            .timeout(submit_budget(carried_blob_bytes))
             .body(frame)
             .send()
             .await
-            .map_err(|error| Error::new(format!("transaction submission failed: {error}")))?;
+            .map_err(|error| {
+                SubmitFailure::Unresolved(format!("transaction submission failed: {error}"))
+            })?;
         if !response.status().is_success() {
-            return Err(response_error(response).await);
+            return Err(SubmitFailure::Refused(
+                response_error(response).await.to_string(),
+            ));
         }
         #[derive(Deserialize)]
         struct Receipt {
             height: u64,
         }
-        let receipt: Receipt = decode_json(response).await?;
+        let receipt: Receipt = decode_json(response)
+            .await
+            .map_err(|error| SubmitFailure::Unresolved(error.to_string()))?;
         Ok(receipt.height)
     }
 
@@ -1056,10 +1195,7 @@ async fn decode_json<T: DeserializeOwned>(response: Response) -> Result<T> {
     let status = response.status();
     let bytes = read_bounded(response, MAX_JSON_BYTES).await?;
     if !status.is_success() {
-        return Err(Error::new(format!(
-            "RPC returned {status}: {}",
-            bounded_detail(&String::from_utf8_lossy(&bytes))
-        )));
+        return Err(refusal(status, &bytes));
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| Error::new(format!("RPC returned invalid JSON: {error}")))
@@ -1068,11 +1204,10 @@ async fn decode_json<T: DeserializeOwned>(response: Response) -> Result<T> {
 async fn response_error(response: Response) -> Error {
     let status = response.status();
     match read_bounded(response, MAX_ERROR_BYTES).await {
-        Ok(bytes) => Error::new(format!(
-            "transaction was rejected ({status}): {}",
-            bounded_detail(&String::from_utf8_lossy(&bytes))
-        )),
-        Err(error) => Error::new(format!("transaction was rejected ({status}): {error}")),
+        Ok(bytes) => refusal(status, &bytes),
+        // the body itself could not be read: that is this client's failure, not
+        // a refusal anyone authored.
+        Err(error) => Error::new(format!("a rejection ({status}) could not be read: {error}")),
     }
 }
 
@@ -1363,6 +1498,49 @@ mod tests {
             serde_json::from_str::<Status>(r#"{"height":7}"#).is_err(),
             "a status without public_key must not receive a removed default"
         );
+    }
+
+    /// A submit's wait is the node's, not the network's: the node answers only
+    /// once the block commits, and a blob-bearing frame's block cannot apply
+    /// until the pack has reached every other validator. So the only budget
+    /// that is not a guess is one that outlasts the node's own hold.
+    #[test]
+    fn a_submit_budget_outlasts_the_node_still_fanning_the_pack_out() {
+        // the node's hold, from `bin/node/src/relay.rs`: a 10 s base plus the
+        // pack at 1 MiB/s, hex-inflated (2x) and counted once per target.
+        let node_hold = |bytes: u64, targets: u64| {
+            Duration::from_secs(10 + (bytes * 2 * targets).div_ceil(1024 * 1024))
+        };
+        // ducktape's own history, the pack that exposed this.
+        let repository = 133 * 1024 * 1024;
+
+        assert!(
+            submit_budget(repository) > Duration::from_secs(30),
+            "the flat budget is exactly what reported a committing push as failed"
+        );
+        for targets in 1..=8 {
+            assert!(
+                submit_budget(repository) > node_hold(repository, targets),
+                "at {targets} targets the client gives up before the node does"
+            );
+        }
+        // and an op that carries no pack is an ordinary RPC, budgeted as one.
+        assert_eq!(submit_budget(0), TIMEOUT);
+    }
+
+    /// The two failures a caller must never confuse. `Refused` is a verdict it
+    /// may relay; `Unresolved` means nobody said no and the op may be landing.
+    #[test]
+    fn only_an_answered_submit_reads_as_a_refusal() {
+        let refused = SubmitFailure::Refused("forge: non-fast-forward".into());
+        let unresolved = SubmitFailure::Unresolved("transaction submission failed".into());
+        assert_ne!(refused, unresolved);
+        assert!(matches!(refused, SubmitFailure::Refused(_)));
+        assert!(matches!(unresolved, SubmitFailure::Unresolved(_)));
+        // both render as their detail — the distinction is the variant, so a
+        // caller that only prints one cannot accidentally branch on prose.
+        assert_eq!(refused.to_string(), "forge: non-fast-forward");
+        assert_eq!(unresolved.to_string(), "transaction submission failed");
     }
 
     #[tokio::test(start_paused = true)]

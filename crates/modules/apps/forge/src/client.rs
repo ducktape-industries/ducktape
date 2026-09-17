@@ -7,43 +7,9 @@
 //! shell, exactly as the review/merge WIRE stays in `interface.rs`.
 
 use crate::interface::PrDiff;
-use crate::tracker_iface::{ItemDetail, ItemState, ItemSummary, ReviewVerdict};
+use crate::tracker_iface::{ItemDetail, ItemState, ReviewVerdict};
 use crate::{ForgeMsg, decode_msg};
 use chat::client::{ChatBlock, NameDirectory, author_display, author_handle, paragraph_blocks};
-
-/// One tracker listing row.
-#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
-pub struct ItemRow {
-    pub number: i64,
-    /// `issue` | `pr`.
-    pub kind: String,
-    /// `open` | `closed` | `merged`.
-    pub state: String,
-    pub title: String,
-    /// the rendered author handle — avatar identity.
-    pub author: String,
-    pub author_name: String,
-}
-
-/// Listing rows from the committed summaries: the wire lists ascending by
-/// number, the tracker renders newest first.
-pub fn item_rows(items: &[ItemSummary], names: &NameDirectory) -> Vec<ItemRow> {
-    items
-        .iter()
-        .rev()
-        .map(|item| {
-            let handle = author_handle(&item.author);
-            ItemRow {
-                number: i64::try_from(item.number).unwrap_or(i64::MAX),
-                kind: kind_key(item.kind).into(),
-                state: state_key(item.state).into(),
-                title: item.title.clone(),
-                author_name: author_display(&handle, names),
-                author: handle,
-            }
-        })
-        .collect()
-}
 
 /// One rendered line-anchored review comment. `anchor` is display-ready
 /// (`src/main.rs:14 (new)`), so the view never re-derives diff vocabulary.
@@ -293,6 +259,7 @@ fn short_oid(oid: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interface::{DiffFile, FileStatus};
     use crate::tracker_iface::{
         DiffSide, ItemKind, ItemSummary, ReviewComment, ReviewView, channel_id_for,
     };
@@ -343,6 +310,15 @@ mod tests {
             deletions: 1,
             patch: "diff --git a/main.rs b/main.rs".into(),
             truncated: false,
+            files: vec![DiffFile {
+                path: "main.rs".into(),
+                from: None,
+                status: FileStatus::Modified,
+                additions: Some(1),
+                deletions: Some(1),
+                binary: false,
+                truncated: false,
+            }],
         }
     }
 

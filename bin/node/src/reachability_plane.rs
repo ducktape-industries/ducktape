@@ -383,6 +383,7 @@ pub(crate) fn wire_reachability_plane<S, R>(
         futures::channel::oneshot::Sender<S>,
         futures::channel::oneshot::Sender<R>,
     )>,
+    boot: NetstackBoot,
 ) -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>
 where
     S: P2pSender<PublicKey = ed25519::PublicKey> + Send + Sync + 'static,
@@ -408,6 +409,13 @@ where
     let key_file = wireguard_key_file.to_path_buf();
     let state_file = mesh_state_file.to_path_buf();
     let nudge_tx = cmd_tx.clone();
+    let (start, startup) = tokio::sync::oneshot::channel();
+    let generation = publish_live_plane(&cmd_tx, start);
+    match boot {
+        NetstackBoot::Bootstrap => start_pending_netstack(generation, netstack_backend()),
+        NetstackBoot::Selected(backend) => start_pending_netstack(generation, backend),
+        NetstackBoot::AwaitRegistry => {}
+    }
     std::thread::Builder::new()
         .name("reachability".into())
         .spawn(move || {
@@ -436,6 +444,8 @@ where
                     nudge_tx,
                     ev_tx,
                     reach_carrying,
+                    generation,
+                    startup,
                 ));
         })
         .expect("spawn reachability thread");
@@ -741,7 +751,6 @@ where
                 }
             });
     }
-    publish_live_plane(&cmd_tx);
     cmd_tx
 }
 
@@ -755,12 +764,245 @@ where
 /// is created and replaced exactly where it is replaced. It holds a WEAK
 /// sender: a torn-down plane's lane must not be kept alive by an operator
 /// route that may never be called.
-static LIVE_PLANE: std::sync::RwLock<
-    Option<tokio::sync::mpsc::WeakSender<reachability::ReachabilityCommand>>,
-> = std::sync::RwLock::new(None);
+pub(crate) enum NetstackBoot {
+    /// Only a joiner without restored chain state uses the staged bootstrap.
+    Bootstrap,
+    Selected(Result<reachability::NetstackBackend, String>),
+    AwaitRegistry,
+}
 
-fn publish_live_plane(cmds: &tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>) {
-    *LIVE_PLANE.write().expect("live plane lock poisoned") = Some(cmds.downgrade());
+type Startup = tokio::sync::oneshot::Sender<Result<reachability::NetstackBackend, String>>;
+struct LivePlane {
+    generation: u64,
+    commands: tokio::sync::mpsc::WeakSender<reachability::ReachabilityCommand>,
+    startup: Option<Startup>,
+}
+impl LivePlane {
+    fn take_start(&mut self, generation: u64) -> Option<Startup> {
+        if self.generation != generation {
+            return None;
+        }
+        self.startup.take()
+    }
+}
+static LIVE_PLANE: std::sync::RwLock<Option<LivePlane>> = std::sync::RwLock::new(None);
+
+/// Release a restored plane only after reading its authoritative registry.
+/// Already-running planes are replaced through the ordinary snapshot swap.
+pub(crate) fn start_pending_netstack(
+    generation: u64,
+    backend: Result<reachability::NetstackBackend, String>,
+) {
+    let start = LIVE_PLANE
+        .write()
+        .expect("live plane lock poisoned")
+        .as_mut()
+        .and_then(|live| live.take_start(generation));
+    if let Some(start) = start {
+        let _ = start.send(backend);
+    }
+}
+
+pub(crate) fn startup_pending(generation: u64) -> bool {
+    LIVE_PLANE
+        .read()
+        .expect("live plane lock poisoned")
+        .as_ref()
+        .is_some_and(|live| live.generation == generation && live.startup.is_some())
+}
+
+/// A publication identifies one plane life. Revision changes only when actual
+/// execution changes, so a refused deployment is retried after replacement.
+#[derive(Clone, Debug)]
+pub(crate) struct PlaneExecution {
+    pub generation: u64,
+    pub revision: u64,
+    pub status: reachability::BackendStatus,
+}
+
+impl PlaneExecution {
+    fn record(&mut self, generation: u64, status: reachability::BackendStatus) -> bool {
+        let same_plane = self.generation == generation;
+        let changed = self.status != status;
+        if !same_plane || !changed {
+            return false;
+        }
+        self.revision += 1;
+        self.status = status;
+        true
+    }
+}
+
+fn execution() -> &'static tokio::sync::watch::Sender<PlaneExecution> {
+    static EXECUTION: std::sync::OnceLock<tokio::sync::watch::Sender<PlaneExecution>> =
+        std::sync::OnceLock::new();
+    EXECUTION.get_or_init(|| {
+        tokio::sync::watch::channel(PlaneExecution {
+            generation: 0,
+            revision: 0,
+            status: reachability::BackendStatus::Stopped,
+        })
+        .0
+    })
+}
+
+pub(crate) fn watch_execution() -> tokio::sync::watch::Receiver<PlaneExecution> {
+    execution().subscribe()
+}
+
+pub(crate) async fn observe_execution(metrics: noded::NodeMetrics) {
+    let mut changes = watch_execution();
+    loop {
+        let current = changes.borrow_and_update().clone();
+        metrics.set_netstack_execution(
+            current.status.name(),
+            current
+                .status
+                .code_hash()
+                .map(|hash| crate::config::hex_bytes(&hash)),
+        );
+        if changes.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn publish_live_plane(
+    cmds: &tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
+    startup: Startup,
+) -> u64 {
+    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    *LIVE_PLANE.write().expect("live plane lock poisoned") = Some(LivePlane {
+        generation,
+        commands: cmds.downgrade(),
+        startup: Some(startup),
+    });
+    execution().send_replace(PlaneExecution {
+        generation,
+        revision: 0,
+        status: reachability::BackendStatus::Starting,
+    });
+    generation
+}
+
+fn record_execution(generation: u64, status: reachability::BackendStatus) {
+    execution().send_if_modified(|live| live.record(generation, status));
+}
+
+/// The plane's refusal in the terms an operator acts on: the snake_case token
+/// it refused with, and the sentence that says what to do about it. Kept
+/// beside the execution status so a caller ABOUT to blame something else can
+/// ask first — the join path otherwise sends the operator back to the inviter
+/// for a credential that was never the problem.
+static PLANE_FAILURE: std::sync::RwLock<Option<(&'static str, String)>> =
+    std::sync::RwLock::new(None);
+
+/// Refuse to start the plane, on the record. Every caller returns immediately
+/// after; the execution guard is the backstop for a path that does not.
+fn fail_plane(generation: u64, reason: &'static str, detail: String) {
+    *PLANE_FAILURE.write().expect("plane failure lock poisoned") = Some((reason, detail.clone()));
+    record_execution(generation, reachability::BackendStatus::Failed(detail));
+}
+
+/// Why the plane is not running, for a caller about to blame something else.
+/// `None` while it is starting, running or stopped. A failure no site named
+/// still answers — the execution guard marks EVERY early return failed — under
+/// the generic token, because "the plane never started" is already the fact
+/// that matters to the caller.
+pub(crate) fn plane_failure() -> Option<(&'static str, String)> {
+    let reachability::BackendStatus::Failed(detail) = execution().borrow().status.clone() else {
+        return None;
+    };
+    let named = PLANE_FAILURE
+        .read()
+        .expect("plane failure lock poisoned")
+        .clone();
+    Some(named.unwrap_or(("plane_startup_failed", detail)))
+}
+
+/// The socket inodes bound to `port` in one `/proc/net/udp{,6}` table. The
+/// columns are fixed and positional: `local_address` (hex address, hex port)
+/// is the second, `inode` the tenth — the header's `tx_queue rx_queue` and
+/// `tr tm->when` are single colon-joined fields in every data row.
+#[cfg(target_os = "linux")]
+fn udp_inodes_in(table: &str, port: u16) -> Vec<String> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let columns: Vec<&str> = line.split_whitespace().collect();
+            let local = columns.get(1)?;
+            let inode = columns.get(9)?;
+            let bound = u16::from_str_radix(local.rsplit_once(':')?.1, 16).ok()?;
+            (bound == port).then(|| (*inode).to_string())
+        })
+        .collect()
+}
+
+/// Who else holds this UDP port, as far as `/proc` will say. Best effort BY
+/// DESIGN: a port held by another user, or a kernel without `/proc`, answers
+/// `None`, and the caller still names the port and the flag that moves it.
+/// Two nodes on one dev box are the same user, which is the case this serves.
+#[cfg(target_os = "linux")]
+fn udp_port_owner(port: u16) -> Option<String> {
+    let mut wanted: Vec<String> = Vec::new();
+    for table in ["/proc/net/udp", "/proc/net/udp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        wanted.extend(
+            udp_inodes_in(&text, port)
+                .into_iter()
+                .map(|inode| format!("socket:[{inode}]")),
+        );
+    }
+    if wanted.is_empty() {
+        return None;
+    }
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let pid = entry.file_name().to_string_lossy().into_owned();
+        let is_process = !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit());
+        if !is_process {
+            continue;
+        }
+        let Ok(descriptors) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        let holds_the_port = descriptors.flatten().any(|fd| {
+            std::fs::read_link(fd.path())
+                .is_ok_and(|target| wanted.iter().any(|socket| target.as_os_str() == &**socket))
+        });
+        if holds_the_port {
+            return Some(describe_process(&pid));
+        }
+    }
+    None
+}
+
+/// One process in terms an operator can act on: what it was started as, and
+/// the directory it runs in — which for a node started in its workspace IS the
+/// workspace.
+#[cfg(target_os = "linux")]
+fn describe_process(pid: &str) -> String {
+    let command = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|raw| {
+            raw.split(|byte| *byte == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(String::from_utf8_lossy)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+        Ok(cwd) => format!("pid {pid} ({command}) running in {}", cwd.display()),
+        Err(_) => format!("pid {pid} ({command})"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn udp_port_owner(_port: u16) -> Option<String> {
+    None
 }
 
 /// What one swap attempt came to. THE distinction a retrying caller needs: a
@@ -790,7 +1032,6 @@ pub(crate) enum SwapAnswer {
 /// its component is already a verified chunk on the blob plane.
 pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> SwapAnswer {
     let backend = match request {
-        noded::NetstackSwapRequest::Native => reachability::NetstackBackend::Native,
         noded::NetstackSwapRequest::Component(path) => {
             let component = match std::fs::read(&path) {
                 Ok(bytes) => bytes,
@@ -812,8 +1053,8 @@ pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> SwapAn
     let lane = LIVE_PLANE
         .read()
         .expect("live plane lock poisoned")
-        .clone()
-        .and_then(|weak| weak.upgrade());
+        .as_ref()
+        .and_then(|live| live.commands.upgrade());
     let Some(lane) = lane else {
         return SwapAnswer::Unattempted("the reachability plane is not running".to_string());
     };
@@ -842,8 +1083,7 @@ pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> SwapAn
 /// machine that was running still is.
 pub(crate) fn record_swap(metrics: &noded::NodeMetrics, answer: &SwapAnswer) {
     match answer {
-        SwapAnswer::Swapped(backend) => {
-            metrics.set_netstack_backend(backend.clone());
+        SwapAnswer::Swapped(_) => {
             metrics.record_netstack_swap(noded::NetstackSwapOutcome::Swapped, None);
         }
         SwapAnswer::Refused(reason) | SwapAnswer::Unattempted(reason) => {
@@ -886,8 +1126,40 @@ async fn reachability_plane(
     events: tokio::sync::mpsc::Sender<reachability::ReachabilityEvent>,
     // the handshake sampler's publication seam (see [`CarryingPeers`]).
     carrying: CarryingPeers,
+    generation: u64,
+    startup: tokio::sync::oneshot::Receiver<Result<reachability::NetstackBackend, String>>,
 ) {
     use std::net::ToSocketAddrs as _;
+    // Every early return marks this plane failed; successful shutdown is
+    // published by run_observed before this guard drops.
+    struct ExecutionGuard(u64);
+    impl Drop for ExecutionGuard {
+        fn drop(&mut self) {
+            let current = execution().borrow().clone();
+            let still_starting = current.status == reachability::BackendStatus::Starting;
+            if current.generation == self.0 && still_starting {
+                record_execution(
+                    self.0,
+                    reachability::BackendStatus::Failed("plane startup failed".into()),
+                );
+            }
+        }
+    }
+    let _execution_guard = ExecutionGuard(generation);
+    let backend = match startup
+        .await
+        .unwrap_or_else(|_| Err("netstack startup selection cancelled".into()))
+    {
+        Ok(backend) => backend,
+        Err(error) => {
+            record_execution(
+                generation,
+                reachability::BackendStatus::Failed(error.clone()),
+            );
+            tracing::error!(target: "ducktape::reachability", reason = "netstack_guest_unreadable", error = %error, "reachability plane cannot start");
+            return;
+        }
+    };
     let policy = reachability::open_port_policy();
     // the plane's records carry IP literals only (the endpoint parser
     // rejects DNS); a hostname ingress resolves ONCE at plane start.
@@ -1025,13 +1297,29 @@ async fn reachability_plane(
     ) {
         Ok(underlay) => underlay,
         Err(err) => {
+            // the port is only half the answer: what an operator needs is WHO
+            // has it, and the flag that moves this node off it. The join path
+            // reads this back and refuses with it, instead of sending them to
+            // the inviter for a credential that was never the problem.
+            let port = wireguard_listen.port();
+            let held_by = match udp_port_owner(port) {
+                Some(owner) => format!(" — held by {owner}"),
+                None => String::new(),
+            };
+            let detail = format!(
+                "the wireguard underlay could not bind udp port {port} ({err}){held_by}. \
+                 Two workspaces on one host cannot share it: give this one its own with \
+                 `--wireguard-listen 0.0.0.0:<free port>` on `node init`/`node join`, or \
+                 set `wireguard_listen` in its node.toml."
+            );
+            fail_plane(generation, "underlay_bind_failed", detail.clone());
             tracing::error!(
                 target: "ducktape::reachability",
                 node = %label,
-                port = wireguard_listen.port(),
+                port,
                 error = %err,
                 reason = "underlay_bind_failed",
-                "reachability plane NOT started"
+                "reachability plane NOT started: {detail}"
             );
             return;
         }
@@ -1204,7 +1492,7 @@ async fn reachability_plane(
         // joiner's gossip arrives under its REAL key — the mesh re-track at
         // its Redeem grant is what admits it.
         gossip_ingress: None,
-        backend: netstack_backend(),
+        backend,
     };
     // the invite intro listener: a fresh joiner's first contact. one
     // datagram carries the token, the joiner's identity + proof, and its
@@ -1366,7 +1654,12 @@ async fn reachability_plane(
     );
     // take the probe BEFORE the effect is moved into the orchestrator.
     spawn_handshake_sampler(effect.probe_slot(), label.clone(), carrying);
-    if let Err(err) = reachability::run(config, effect, resolver, commands, events).await {
+    if let Err(err) =
+        reachability::run_observed(config, effect, resolver, commands, events, |status| {
+            record_execution(generation, status)
+        })
+        .await
+    {
         tracing::error!(
             target: "ducktape::reachability",
             node = %label,
@@ -1377,54 +1670,20 @@ async fn reachability_plane(
     }
 }
 
-/// Which machine drives the reachability plane. `DUCKTAPE_NETSTACK=guest`
-/// runs the wasm component; unset or `native` runs the machine compiled
-/// into this binary. Any other value is refused loudly and runs native —
-/// a typo must never pick a backend by accident.
-pub(crate) fn netstack_backend() -> reachability::NetstackBackend {
-    let requested = std::env::var("DUCKTAPE_NETSTACK").ok();
-    match requested.as_deref() {
-        Some("guest") => netstack_guest_backend(),
-        Some("native") | None => reachability::NetstackBackend::Native,
-        Some(_) => {
-            tracing::warn!(
-                target: "ducktape::reachability",
-                reason = "netstack_backend_unknown",
-                "DUCKTAPE_NETSTACK names no backend; running native"
-            );
-            reachability::NetstackBackend::Native
-        }
-    }
+/// The node always runs the staged WASM component. A joiner needs this file
+/// before it can reach the mesh and obtain genesis; no native fallback exists.
+pub(crate) fn netstack_backend() -> Result<reachability::NetstackBackend, String> {
+    let dir = noded::services::founding_set()?;
+    let path = workspace_config::netstack_component_path(&dir);
+    load_netstack_backend(&path)
 }
 
-/// The netstack guest: the reachability machine as a `ducktape:netstack`
-/// component, read from the founding set beside this binary
-/// (`netstack.component.wasm`, staged by the build from the machine crate's
-/// committed artifact). Not a genesis artifact: a joiner runs this machine to
-/// reach the mesh BEFORE it holds any genesis. A guest the founding set
-/// cannot supply is refused loudly and runs native, exactly like a backend
-/// name that names nothing — the operator asked for a machine this build
-/// did not stage.
-fn netstack_guest_backend() -> reachability::NetstackBackend {
-    let component = workspace_config::modules_dir().and_then(|dir| {
-        let path = workspace_config::netstack_component_path(&dir);
-        std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))
-    });
-    match component {
-        Ok(component) => reachability::NetstackBackend::Guest {
-            component,
-            step_fuel: reachability::NETSTACK_STEP_FUEL,
-        },
-        Err(error) => {
-            tracing::warn!(
-                target: "ducktape::reachability",
-                reason = "netstack_guest_unreadable",
-                error = %error,
-                "DUCKTAPE_NETSTACK=guest but the founding set has no readable netstack guest; running native"
-            );
-            reachability::NetstackBackend::Native
-        }
-    }
+fn load_netstack_backend(path: &std::path::Path) -> Result<reachability::NetstackBackend, String> {
+    let component = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(reachability::NetstackBackend::Guest {
+        component,
+        step_fuel: reachability::NETSTACK_STEP_FUEL,
+    })
 }
 
 /// how long a peer may hold NO live session before it is called DARK.
@@ -1575,4 +1834,118 @@ pub(crate) fn underlay_addr(
     addrs: impl IntoIterator<Item = std::net::SocketAddr>,
 ) -> Option<std::net::SocketAddr> {
     addrs.into_iter().find(std::net::SocketAddr::is_ipv4)
+}
+
+/// #2386: a join that blames the invite for a plane that never started costs
+/// the operator a credential AND the time to spend it, twice. These pin the
+/// two halves of the answer — who holds the port, and that the plane's refusal
+/// survives for the join path to read.
+#[cfg(test)]
+mod plane_failure_tests {
+    /// a real `/proc/net/udp`, trimmed to three rows: the port we want in hex
+    /// (`ca6c` = 51820), a DIFFERENT port on the same address, and a row whose
+    /// address half happens to contain the same hex — the rsplit is what keeps
+    /// the address out of the comparison.
+    #[cfg(target_os = "linux")]
+    const TABLE: &str = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+   0: 00000000:CA6C 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 918273 2 0000000000000000 0
+   1: 00000000:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 112233 2 0000000000000000 0
+   2: 0000CA6C:0043 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 445566 2 0000000000000000 0
+";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_port_column_names_its_socket_and_only_its_socket() {
+        assert_eq!(super::udp_inodes_in(TABLE, 51820), ["918273"]);
+        assert_eq!(super::udp_inodes_in(TABLE, 53), ["112233"]);
+        assert!(super::udp_inodes_in(TABLE, 9999).is_empty());
+    }
+
+    /// this process holds a port it just bound, so the scan must find ITSELF —
+    /// the only owner a test can assert without a second process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bound_port_names_the_process_holding_it() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a scratch udp port");
+        let port = socket.local_addr().expect("the socket has an address").port();
+        let owner = super::udp_port_owner(port).expect("this process holds it");
+        assert!(
+            owner.contains(&format!("pid {}", std::process::id())),
+            "the owner names the holding process: {owner}"
+        );
+    }
+
+    /// the join path asks `plane_failure()` BEFORE it blames the invite, so a
+    /// named refusal has to survive the plane thread that wrote it.
+    #[test]
+    fn a_named_refusal_reaches_the_caller_that_would_have_blamed_the_invite() {
+        // this generation owns the global execution cell for the test; nothing
+        // else in this binary publishes a plane.
+        super::execution().send_replace(super::PlaneExecution {
+            generation: 77,
+            revision: 0,
+            status: reachability::BackendStatus::Starting,
+        });
+        assert!(
+            super::plane_failure().is_none(),
+            "a starting plane has not failed"
+        );
+
+        super::fail_plane(77, "underlay_bind_failed", "port 51820 is taken".into());
+        let (reason, detail) = super::plane_failure().expect("the refusal is on the record");
+        assert_eq!(reason, "underlay_bind_failed");
+        assert_eq!(detail, "port 51820 is taken");
+    }
+}
+
+#[cfg(test)]
+mod netstack_execution_tests {
+    #[tokio::test]
+    async fn startup_selection_is_delivered_only_to_its_plane_generation() {
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        let (startup, selected) = tokio::sync::oneshot::channel();
+        let mut live = super::LivePlane {
+            generation: 2,
+            commands: commands.downgrade(),
+            startup: Some(startup),
+        };
+        assert!(live.take_start(1).is_none());
+        let start = live
+            .take_start(2)
+            .expect("the current generation is still gated");
+        start
+            .send(Err("designated component unavailable".into()))
+            .unwrap();
+        assert_eq!(
+            selected.await.unwrap().unwrap_err(),
+            "designated component unavailable"
+        );
+        assert!(live.take_start(2).is_none());
+    }
+
+    #[test]
+    fn execution_from_a_retired_plane_cannot_overwrite_its_successor() {
+        let mut live = super::PlaneExecution {
+            generation: 2,
+            revision: 0,
+            status: reachability::BackendStatus::Starting,
+        };
+        assert!(!live.record(1, reachability::BackendStatus::Failed("old plane".into())));
+        assert!(live.record(
+            2,
+            reachability::BackendStatus::Running { code_hash: [7; 32] }
+        ));
+        assert_eq!(live.status.code_hash(), Some([7; 32]));
+        assert!(!live.record(1, reachability::BackendStatus::Stopped));
+        assert_eq!(live.revision, 1);
+        assert!(live.record(2, reachability::BackendStatus::Failed("guest fault".into())));
+        assert_eq!(live.status.code_hash(), None);
+    }
+
+    #[test]
+    fn a_missing_boot_component_is_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(super::load_netstack_backend(&directory.path().join("missing.wasm")).is_err());
+    }
 }

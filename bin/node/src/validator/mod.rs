@@ -52,14 +52,10 @@ pub(crate) async fn run_validator(
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
-    session_manager: Option<noded::TerminalSessions>,
-    session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
-    remote_sessions: noded::RemoteSessions,
-    local_gateway_via: String,
     node_api_ports: Vec<u16>,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
+    presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
     code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     blobs: noded::blobs::BlobHandle,
     overlay_slot: overlay_net::userspace::StackSlot,
@@ -144,9 +140,15 @@ pub(crate) async fn run_validator(
         wireguard_advertised,
         invite_listen,
         coord_cap,
-        voice_requests,
+        presence_requests,
         overlay_slot.clone(),
         planes.clone(),
+        crate::netstack_governance::startup_backend(
+            &host,
+            resumed.as_ref().and_then(|r| r.height).unwrap_or(0),
+            &blobs,
+        )
+        .await,
     )
     .await;
     let wiring::RuntimeWiring {
@@ -163,7 +165,7 @@ pub(crate) async fn run_validator(
         blob_client,
         sync_state_rx,
         sync_state_tx,
-        sync_lease,
+        sync_retention,
         relay_ingress,
     } = wiring::finish(
         &context,
@@ -218,26 +220,6 @@ pub(crate) async fn run_validator(
             bulk_pacer.clone(),
             planes.clone(),
             stream_hub.run_output(),
-        );
-        // the terminal-session plane: forwards a session's output ring and
-        // ordered command log to peers, hosts the directed create/close +
-        // creator-gated input control lanes, and drains the guest-side session
-        // lane (the client half).
-        crate::term_plane::spawn(
-            label.clone(),
-            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
-            std::sync::Arc::clone(peers),
-            me,
-            bulk_pacer.clone(),
-            planes.clone(),
-            stream_hub.terminals(),
-            stream_hub.term_commands(),
-            session_manager,
-            gateway_commands,
-            local_gateway_via,
-            gateway_workspace.clone(),
-            session_requests,
-            remote_sessions,
         );
         // the module-code plane: serves push/pull transfers and drains the
         // admin RPC's stage fan-outs. same overlay book as the agent plane.
@@ -416,7 +398,7 @@ pub(crate) async fn run_validator(
         dev_demo,
         checkpoint_blocks,
         cadence,
-        sync_lease,
+        sync_retention,
         rpc_ingress,
         http_cmds,
         stream_hub,
@@ -557,7 +539,7 @@ pub(crate) async fn run_promoted(
         blob_client,
         sync_state_rx,
         sync_state_tx,
-        sync_lease,
+        sync_retention,
     } = wiring::wire_serve_lanes(
         &context,
         &signer,
@@ -593,7 +575,7 @@ pub(crate) async fn run_promoted(
     // the drain loop always carries one.
     let code_registry = crate::code_plane::CodeRegistry::default();
     // the module-code plane — the one overlay plane a parked node never
-    // hosts. voice/agent/term planes carried over live.
+    // hosts. voice/agent planes carried over live.
     if let Some(book) = &media_peers {
         let me: [u8; 32] = signer
             .public_key()
@@ -663,6 +645,9 @@ pub(crate) async fn run_promoted(
                 reach_tx,
                 reach_rx,
                 None,
+                crate::reachability_plane::NetstackBoot::Selected(
+                    crate::netstack_governance::startup_backend(&host, height, &blobs).await,
+                ),
             ))
         }
         // no wireguard: no plane on either side. a reclaim timeout
@@ -823,7 +808,7 @@ pub(crate) async fn run_promoted(
         dev_demo,
         checkpoint_blocks,
         cadence,
-        sync_lease,
+        sync_retention,
         rpc_ingress,
         http_cmds: http_ingress,
         stream_hub,

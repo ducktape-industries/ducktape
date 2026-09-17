@@ -241,3 +241,102 @@ fn commit_conflict_exits_2_and_names_the_path() {
         "the conflict report names the clashing path: {err}"
     );
 }
+
+// ---- put: one file, one commit, no checkout -------------------------------
+
+/// `put` lands a >2 MiB file (chunk-staged) and a small one (inline) each in
+/// one commit, byte-exact on `cat`, creating the parent directories; a
+/// second put of the same bytes finds every chunk present and still commits.
+#[test]
+fn put_lands_small_and_large_files_without_a_checkout() {
+    let h = Harness::start();
+    let dir = tempfile::tempdir().expect("local dir");
+    let big: Vec<u8> = (0..(2 * 1024 * 1024 + 11))
+        .map(|i| (i % 253) as u8)
+        .collect();
+    let big_path = dir.path().join("archive.bin");
+    std::fs::write(&big_path, &big).expect("write big");
+    let small_path = dir.path().join("stable.json");
+    std::fs::write(&small_path, b"{\"schema\":1}").expect("write small");
+
+    let out = h
+        .cli(&[
+            "put",
+            big_path.to_str().unwrap(),
+            "/shared/releases/archive.bin",
+        ])
+        .output()
+        .expect("put big");
+    assert!(out.status.success(), "put big exits 0: {out:?}");
+    let snapshot = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(snapshot.len(), 64, "put prints the snapshot id: {snapshot}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("staged 3 of 3 chunks"),
+        "the first put stages every chunk: {stderr}"
+    );
+
+    let out = h
+        .cli(&[
+            "put",
+            small_path.to_str().unwrap(),
+            "/shared/releases/stable.json",
+            "--message",
+            "release 1: manifest",
+        ])
+        .output()
+        .expect("put small");
+    assert!(out.status.success(), "put small exits 0: {out:?}");
+
+    let cat = h
+        .cli(&["cat", "/shared/releases/archive.bin"])
+        .output()
+        .expect("cat big");
+    assert!(cat.status.success());
+    assert_eq!(cat.stdout, big, "the chunked file reads back byte-exact");
+    let cat = h
+        .cli(&["cat", "/shared/releases/stable.json"])
+        .output()
+        .expect("cat small");
+    assert_eq!(cat.stdout, b"{\"schema\":1}");
+
+    let history = h.cli(&["history"]).output().expect("history");
+    let listing = String::from_utf8_lossy(&history.stdout);
+    assert!(
+        listing.contains("release 1: manifest"),
+        "the message names the commit: {listing}"
+    );
+    assert!(
+        listing.contains("put /shared/releases/archive.bin"),
+        "the default message names the path: {listing}"
+    );
+
+    // a commit CONSUMES its staging entries, so a re-put stages afresh; what
+    // `put` skips is a chunk still staged — the resume after an interrupted
+    // run. stage the first chunk by hand, then put: two of three are staged.
+    {
+        use duckfs_client::api::NodeApi as _;
+        h.files()
+            .stage_chunk(&big[..1024 * 1024])
+            .expect("pre-stage the first chunk");
+    }
+    let out = h
+        .cli(&[
+            "put",
+            big_path.to_str().unwrap(),
+            "/shared/releases/archive-copy.bin",
+        ])
+        .output()
+        .expect("put again");
+    assert!(out.status.success(), "second put exits 0: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("staged 2 of 3 chunks"),
+        "an already-staged chunk is skipped: {stderr}"
+    );
+    let cat = h
+        .cli(&["cat", "/shared/releases/archive-copy.bin"])
+        .output()
+        .expect("cat copy");
+    assert_eq!(cat.stdout, big, "the resumed put reads back byte-exact");
+}

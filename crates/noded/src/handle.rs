@@ -11,7 +11,7 @@ use axum::response::Response;
 use futures::SinkExt as _;
 use futures::channel::{mpsc, oneshot};
 
-use crate::call::CallLane;
+use crate::call::PresenceLane;
 use crate::gateway_http::{BrowserGateway, GatewayLane};
 use crate::gateway_ws_token::WsTokenStore;
 use crate::metrics::NodeMetrics;
@@ -23,19 +23,105 @@ pub(crate) const COMMAND_BUFFER: usize = 64;
 /// internal block wakeups buffered per lagging websocket subscriber.
 pub(crate) const EVENT_BUFFER: usize = 64;
 
+/// why the actor refused, in the two pieces a caller actually needs: a stable
+/// snake_case token to branch on, and the sentence whoever refused wrote.
+///
+/// they are separate because they are BOUNDED separately — a client that clips
+/// a long message must never clip the token with it — and because a screen that
+/// keys its behaviour off prose keys it off nothing. the token is a literal, so
+/// it is greppable and countable like every other `reason` in this tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refused {
+    pub reason: &'static str,
+    pub message: String,
+}
+
+impl Refused {
+    pub fn new(reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+        }
+    }
+
+    /// the kernel's own refusal, split. ONE match with no `_` arm: a new
+    /// [`sdk::Error`] variant fails this build until it is given a token and a
+    /// sentence, which is why the split lives here rather than in a `Display`
+    /// impl on the enum — `sdk` is the deterministic module ABI, compiled into
+    /// every module guest, and what a screen says is not its business.
+    ///
+    /// the sentence deliberately drops the variant's NAME. `sdk::Error`'s
+    /// `Display` is its `Debug`, so `to_string()` yields `Module(forge: …)` —
+    /// an envelope that then reaches a person, and that every reader
+    /// downstream has to peel back off.
+    pub fn of(error: &sdk::Error) -> Self {
+        let (reason, message) = match error {
+            sdk::Error::UnknownModule(id) => {
+                ("unknown_module", format!("no module is registered as {id}"))
+            }
+            sdk::Error::SelfQuery => (
+                "self_query",
+                "a module reads its own state through itself, not through a query".to_owned(),
+            ),
+            sdk::Error::QueryUnsupported => (
+                "query_unsupported",
+                "this module answers no queries".to_owned(),
+            ),
+            sdk::Error::SyncUnsupported => (
+                "sync_unsupported",
+                "this module serves no state sync".to_owned(),
+            ),
+            sdk::Error::SwapUnsupported => (
+                "swap_unsupported",
+                "this module's code is the node binary itself, so it cannot be swapped".to_owned(),
+            ),
+            sdk::Error::BudgetExceeded => (
+                "budget_exceeded",
+                "the follow-up drain exceeded its dispatch budget".to_owned(),
+            ),
+            // the module's own words, whole: nothing here paraphrases a
+            // refusal it did not write.
+            sdk::Error::Module(said) => ("module", said.clone()),
+        };
+        Self { reason, message }
+    }
+
+    /// a write's refusal. a deterministic rejection is the module's own, whole;
+    /// a boundary fault is THIS NODE's and says so — the two must not read
+    /// alike, because one is the caller's to fix and the other is not.
+    ///
+    /// `SubmitError`'s `Display` writes `op rejected: ` in front of the
+    /// sentence, which is the write lane's version of the same envelope.
+    pub fn of_submit(error: &host::SubmitError) -> Self {
+        match error {
+            host::SubmitError::Rejected(rejected) => Self::of(rejected),
+            host::SubmitError::Fatal(fault) => Self::new("boundary_fault", fault.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 /// a request to the actor that owns the host. replies cross the channel as
-/// wire-ready types so the http layer stays free of sdk conversions.
+/// wire-ready types so the http layer stays free of sdk conversions — the
+/// refusal included, which is what [`Refused`] is for.
 pub enum NodeCommand {
     Submit {
         target: String,
         payload: Vec<u8>,
+        /// Opaque content that must be present before this operation is admitted.
+        required_blob: Option<[u8; 32]>,
         /// `Origin::External` bytes for this block: the key a request's
         /// signature proved possession of on a gated route
         /// ([`crate::signed_req::SignedBy`]), or — on the frameless
         /// `/v1/submit` lane only — the caller's CLAIMED string
         /// (see [`crate::SubmitRequest::origin`], an open finding).
         origin: Vec<u8>,
-        reply: oneshot::Sender<Result<BlockSummary, String>>,
+        reply: oneshot::Sender<Result<BlockSummary, Refused>>,
     },
     /// take custody of an ALREADY-SIGNED op frame (`POST /v1/submit/frame`).
     /// carries the RAW frame bytes: the origin rides INSIDE them as the
@@ -46,7 +132,7 @@ pub enum NodeCommand {
     /// every actor verifies again where it must.
     SubmitFrame {
         frame: Vec<u8>,
-        reply: oneshot::Sender<Result<BlockSummary, String>>,
+        reply: oneshot::Sender<Result<BlockSummary, Refused>>,
     },
     /// read committed module state as the NODE ITSELF (`host::Origin::System`)
     /// — the widest reader there is. Right for the node's own reads and for the
@@ -55,7 +141,7 @@ pub enum NodeCommand {
     Query {
         target: String,
         req: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+        reply: oneshot::Sender<Result<Vec<u8>, Refused>>,
     },
     /// read committed module state as an AUTHENTICATED reader
     /// (`POST /v1/query/reader`). `reader` is the ed25519 key a request's
@@ -74,7 +160,7 @@ pub enum NodeCommand {
         /// the VERIFIED signer ([`crate::signed_req::verify_signed_request`]).
         /// Never a caller-supplied identifier.
         reader: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+        reply: oneshot::Sender<Result<Vec<u8>, Refused>>,
     },
 }
 
@@ -152,8 +238,6 @@ struct StatusCellInner {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NetstackSwapRequest {
-    /// `"native"` — the machine compiled into the node binary.
-    Native,
     /// `{"component": "<path>"}` — a `ducktape:netstack` component on disk.
     Component(PathBuf),
     /// component bytes already in hand — the governance reconciler's variant:
@@ -331,15 +415,15 @@ pub struct NodeHandle {
     /// whose embedder configured no index (the router tests' fake actor) —
     /// index routes answer 503 there.
     pub(crate) index: Option<Arc<indexer::IndexStore>>,
-    /// the call hub's session-request lane. `None` on daemons without a mesh
-    /// (the embedded daemon, router tests) — `/v1/call/ws` answers 503 there.
-    pub(crate) call: Option<CallLane>,
+    /// Pages presence request lane; absent when no overlay runtime exists.
+    pub(crate) presence: Option<PresenceLane>,
     /// Purpose-specific gateway request lane. No raw peer, filesystem, or
     /// arbitrary socket proxy is exposed through the client surface.
     pub(crate) gateway: Option<GatewayLane>,
     /// Dedicated least-privilege browser origin for gateway rendering. It is
     /// a separate loopback listener, never the node API origin.
     pub(crate) browser_gateway: Option<BrowserGateway>,
+    pub(crate) application_doors: Arc<crate::gateway_http::WsDoorLimit>,
     /// the root dir the duckfs workspace RPC materializes managed checkouts
     /// under (`<storage>/duckfs-workspaces`). node-local disk state, threaded in
     /// like `forge_repo`; `None` on a handle that never serves the seam (the
@@ -353,19 +437,11 @@ pub struct NodeHandle {
     /// CLOSED — it refuses every admin request; a real serve path mints a
     /// credential and passes it through [`Self::with_admin`].
     pub(crate) admin: crate::admin::AdminConfig,
-    /// the node-local interactive terminal-session manager. `None` on a handle
-    /// that never wires one (router tests, an embedder that omits it) — the
-    /// `/v1/term/*` routes answer 503 there and ws `TermInput`/`TermResize` are
-    /// no-ops. off-chain, node-local: never consensus state.
-    pub(crate) terminals: Option<crate::term::TerminalSessions>,
-    /// the guest-side remote-session request lane into the overlay client half
-    /// (mirrors [`Self::gateway`]). `None` on a handle without a mesh — a cross-
-    /// node create answers 503 there. off-chain, like the gateway lane.
-    pub(crate) session_lane: Option<crate::term_remote::SessionLane>,
-    /// the guest-side session-id → host-node registry. Always present (Default):
-    /// a remote create remembers its host here; the ws input/resize handlers read
-    /// it to pick the forward lane over the absent local session.
-    pub(crate) remote_sessions: crate::term_remote::RemoteSessions,
+    /// the node ↔ agent-daemon link. `None` on a handle that never wires one
+    /// (router tests, an embedder that omits it) — a `ServiceAttach` is refused
+    /// there and every workspace-gated ws topic fails closed. off-chain,
+    /// node-local: never consensus state.
+    pub(crate) service_link: Option<crate::service_link::ServiceLink>,
     /// the volatile catalog of service daemons signaling presence to this node.
     /// Always present (Default) — it is a bounded in-memory map, never durable
     /// and never consensus state, so there is no shape of node that wants the
@@ -412,15 +488,14 @@ impl NodeHandle {
             blobs: crate::blobs::BlobHandle::default(),
             forge_repo: None,
             index: None,
-            call: None,
+            presence: None,
             gateway: None,
             browser_gateway: None,
+            application_doors: Arc::default(),
             duckfs_workspaces: None,
             code_stage: None,
             admin: crate::admin::AdminConfig::default(),
-            terminals: None,
-            session_lane: None,
-            remote_sessions: crate::term_remote::RemoteSessions::default(),
+            service_link: None,
             services: crate::services::ServiceCatalog::default(),
             index_view_gate: Arc::new(tokio::sync::Semaphore::new(
                 crate::index::MAX_CONCURRENT_INDEX_VIEWS,
@@ -459,11 +534,9 @@ impl NodeHandle {
         self
     }
 
-    /// point this handle at a call hub's session-request lane so
-    /// `/v1/call/ws` can open huddle sessions. only the p2p validator
-    /// wires one — it owns the mesh the audio/video rides.
-    pub fn with_call(mut self, call: CallLane) -> Self {
-        self.call = Some(call);
+    /// Connect the Pages presence overlay request lane.
+    pub fn with_presence(mut self, presence: PresenceLane) -> Self {
+        self.presence = Some(presence);
         self
     }
 
@@ -497,18 +570,17 @@ impl NodeHandle {
         self
     }
 
-    /// wire the node-local interactive terminal-session manager so the
-    /// `/v1/term/*` routes and the ws `TermInput`/`TermResize` handlers can
-    /// reach it. only the daemon wires one; a handle without it 503s the
-    /// routes.
-    pub fn with_terminals(mut self, terminals: crate::term::TerminalSessions) -> Self {
-        self.terminals = Some(terminals);
+    /// wire the node ↔ agent-daemon link so a `ServiceAttach` can take it and
+    /// the workspace-gated ws topics have a secret to check. only the daemon
+    /// wires one; a handle without it refuses both.
+    pub fn with_service_link(mut self, link: crate::service_link::ServiceLink) -> Self {
+        self.service_link = Some(link);
         self
     }
 
-    /// the terminal-session manager, if one is wired.
-    pub(crate) fn terminals(&self) -> Option<&crate::term::TerminalSessions> {
-        self.terminals.as_ref()
+    /// the agent-daemon link, if one is wired.
+    pub(crate) fn service_link(&self) -> Option<&crate::service_link::ServiceLink> {
+        self.service_link.as_ref()
     }
 
     /// Has this caller proved it can read the node's OWN workspace?
@@ -519,35 +591,14 @@ impl NodeHandle {
     /// a signaling hello confers nothing — so this is what a topic gate
     /// (`crate::stream::Admission::Workspace`) stands on. Reusing it invents no
     /// second scheme and adds no second secret file: a holder already owns the
-    /// whole interactive plane via `ServiceAttach`.
+    /// whole daemon link via `ServiceAttach`.
     ///
     /// Constant-time. `false` on a node that minted none (no workspace, or no
-    /// terminal plane wired) — fails closed.
+    /// daemon link wired) — fails closed.
     pub(crate) fn workspace_secret_matches(&self, presented: &str) -> bool {
-        self.terminals
+        self.service_link
             .as_ref()
-            .is_some_and(|terminals| terminals.link_token_matches(presented))
-    }
-
-    /// wire the guest-side remote-session request lane so a cross-node create/
-    /// close/input can reach the overlay client half. only the daemon that owns a
-    /// mesh wires one; a handle without it 503s a cross-node create.
-    pub fn with_session_lane(mut self, lane: crate::term_remote::SessionLane) -> Self {
-        self.session_lane = Some(lane);
-        self
-    }
-
-    /// the guest-side remote-session request lane, if one is wired.
-    pub(crate) fn session_lane(&self) -> Option<&crate::term_remote::SessionLane> {
-        self.session_lane.as_ref()
-    }
-
-    /// the guest-side session-id → host-node registry (always present). Public
-    /// because the term plane's inbound feeds gate on it: a session's chunks and
-    /// command rows are accepted only from the peer this registry names as its
-    /// host.
-    pub fn remote_sessions(&self) -> &crate::term_remote::RemoteSessions {
-        &self.remote_sessions
+            .is_some_and(|link| link.link_token_matches(presented))
     }
 
     /// the volatile service signaling catalog (always present).
@@ -591,16 +642,6 @@ impl NodeHandle {
     /// a clone of the command lane's sender, for embedder-side producers
     /// that inject commands exactly as the http layer does — the oracle
     /// pool's completed provider runs re-enter as `Submit` commands here.
-    /// the loopback base URL of this node's browser gateway (`http://<addr>`),
-    /// or `None` when none is wired. It is the `via` a per-run airlock config
-    /// routes credential traffic through onto the overlay gateway plane; a node
-    /// without it cannot host a lent-credential run.
-    pub fn browser_gateway_url(&self) -> Option<String> {
-        self.browser_gateway
-            .as_ref()
-            .map(|gw| format!("http://{}", gw.listen))
-    }
-
     pub fn command_sender(&self) -> mpsc::Sender<NodeCommand> {
         self.cmds.clone()
     }
@@ -641,6 +682,35 @@ impl NodeHandle {
             .await
             .map_err(|_| error_response(StatusCode::SERVICE_UNAVAILABLE, "node actor is gone"))
     }
+}
+
+/// the account `key` belongs to, read from committed identity state over the
+/// command lane. Shared by the gates that admit only a key holding an account:
+/// the huddle join and node-proof mint (`crate::call`) and the run-output
+/// reader admission (`crate::stream`).
+pub(crate) async fn account_of_key(
+    handle: &NodeHandle,
+    key: Vec<u8>,
+) -> Result<Option<u64>, String> {
+    let (reply, rx) = futures::channel::oneshot::channel();
+    handle
+        .send(NodeCommand::Query {
+            target: "identity".into(),
+            req: identity::encode_query(&identity::IdentityQuery::OfKey { key }),
+            reply,
+        })
+        .await
+        .map_err(|_| "actor gone".to_string())?;
+    // a node-internal read: the caller's own reason names this lookup, so the
+    // refusal's token would only be shadowed by it. the sentence still travels.
+    let bytes = rx
+        .await
+        .map_err(|_| "reply dropped".to_string())?
+        .map_err(|refused| refused.message)?;
+    let identity::IdentityReply::Account(account) = identity::decode_reply(&bytes)? else {
+        return Err("unexpected identity reply".into());
+    };
+    Ok(account.map(|account| account.number))
 }
 
 #[cfg(test)]

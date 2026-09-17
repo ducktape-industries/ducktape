@@ -14,7 +14,13 @@ commentary in the app, with run outcomes available through the query API.
   `127.0.0.1`; `DEV_LISTEN=0.0.0.0 DEV_ADVERTISED=<this box's LAN ip>`
   widens the p2p mesh and HTTP API binds AND the dial hint peers actually
   use, so a second machine can join, huddle in, or point its app at this
-  node (the WireGuard plane is bound wide regardless).
+  node. The WireGuard and invite listeners are the exception: they bind
+  `0.0.0.0` regardless, on the FIXED ports `51820` and `51821`, so a second
+  workspace founded or joined on this host collides by construction unless you
+  give it its own with `--wireguard-listen`/`--invite-listen` (and `--rpc`,
+  whose default `127.0.0.1:8845` is just as fixed). A node whose WireGuard port
+  is taken refuses to start its reachability plane and says which process holds
+  it.
 - **Host `git` on `PATH`, with worktree support.** The provisioner probes
   once at construction (`git init` + `git worktree list` in a scratch dir,
   `crates/noded/src/agent_provision/forge.rs`); a failed probe makes the forge
@@ -55,41 +61,28 @@ make dogfood-forge
 from `DUCKTAPE_DEV_FORGE_URL` or, with exactly one workspace under the
 ducktape home, that workspace's `http_listen` in its `node.toml`, failing if
 neither resolves (the home is `$DUCKTAPE_HOME` when set, else `~/.ducktape`),
-registers a normal git remote `ducktape-dev` at `<base>/forge/ducktape`,
-fetches `origin/dev`, and reconciles it with the forge's `refs/heads/dev`.
-It fast-forwards when possible, retains a Forge descendant, or joins equal-tree
-divergence with a two-parent bridge; differing-tree divergence fails. It reads
-the Forge ref back and verifies the selected tip. Repo creation is the first push — no separate
-create step. The whole packfile travels over git smart-HTTP and is stored
-node-locally; only a tiny `forge Push` (digest + oids) crosses consensus. Run
-this before creating or invoking agent work so a clean but stale local
-checkout cannot silently pin the run to obsolete source.
+fetches `origin/dev`, and reconciles it with Forge's committed `refs/heads/dev`.
+The local workspace's operator credential authorizes generic blob uploads and
+module submissions, so this automation publishes as the node. `ops/forge-import.py`
+builds bounded packs and submits exact previous/new ref comparisons. The script
+reads materialized objects from the workspace's configured storage directory.
 
-Knobs: `FORGE_REPO` (default `ducktape`), `FORGE_REMOTE` (default
-`ducktape-dev`), `SOURCE_REMOTE` (default `origin`), `SOURCE_BRANCH` (default
-`dev`), `SRC_REF` (explicit local-ref override), `DUCKTAPE_DEV_FORGE_URL`.
+An HTTP 413 splits the import at ancestor commits and retries smaller portions.
+Accepted ancestors remain committed if a later import fails. Re-running resumes
+from that tip. A single oversized commit or merge fails with a diagnostic.
+The script fast-forwards when possible, retains a Forge descendant, or joins
+equal-tree divergence with a two-parent bridge; differing-tree divergence fails.
+It queries the final ref and verifies the selected tip. Pack bytes remain in
+blob storage; the digest and ref comparisons cross consensus.
 
-Verify: the `ducktape` repo appears in the desktop **Forge** view with `dev`
-browsable. Re-run `make dogfood-forge` before later agent work; a raw
-`git push ducktape-dev dev` bypasses the fetch and reconciliation checks. Caveat: the
-remote lives in the shared `.git/config`, visible to every worktree of this
-repo — set `FORGE_REMOTE` per worktree if you run several nodes at once.
+Knobs: `FORGE_REPO` (default `ducktape`), `SOURCE_REMOTE` (default `origin`),
+`SOURCE_BRANCH` (default `dev`), `SRC_REF` (explicit local-ref override), and
+`DUCKTAPE_DEV_FORGE_URL`. A local workspace and its operator credential are required.
 
-**A push must prove itself.** `git-receive-pack` takes exactly two proofs:
-git's own push certificate (`git push --signed`, whose signer becomes the
-repo's owner on chain), or the node's operator credential, which makes the
-NODE the owner. `make dogfood-forge` presents the second — it is seeding the
-node's own mirror — and a bare `git push` at a node whose `admin.token` you
-cannot read is refused. To push by hand:
-
-```sh
-export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader
-export GIT_CONFIG_VALUE_0="x-ducktape-admin-token: $(cat <workspace>/admin.token)"
-git push ducktape-dev dev
-```
-
-`GIT_CONFIG_*` rather than `git -c`: an argv is world-readable through
-`/proc`, and this is a secret.
+Verify the repository in the desktop **Forge** view. Re-run `make dogfood-forge`
+before agent work. For user-owned Git push/clone access, install the
+[Git application service](deploy/application-service.md#git-service) and use
+SSH-signed pushes through its Gateway route.
 
 ## 2. Provision the dogfood model user
 
@@ -127,14 +120,14 @@ if [ -z "$CONTROLLER" ]; then
   CONTROLLER="$(query identity "{\"of_key\":{\"key\":$KEY_BYTES}}" | jq -er '.account.number')"
 fi
 
-curl -fsS -X PUT "$BASE/v1/files/object/shared/skills/dogfood/SKILL.md" \
-  -H "x-ducktape-admin-token: $OPERATOR" \
-  --data-binary 'You are the dogfooding duck. Work the referenced spec.'
+FILES_HEAD="$(query files '{"refs":{}}' | jq -c '.refs.head')"
+PERSONA_B64="$(printf '%s' 'You are the dogfooding duck. Work the referenced spec.' | base64 | tr -d '\n')"
+submit files "$(jq -nc --argjson head "$FILES_HEAD" --arg b64 "$PERSONA_B64" '{commit:{base_snapshot:$head,message:"Install dogfood persona",changes:[{put:{path:"/shared/skills/dogfood/SKILL.md",exec:false,meta:{},content:{inline:{b64:$b64}}}}]}}')"
 
 # Serialize the current default script; do not maintain a separate recipe copy.
 PROGRAM="$(ducktape agent model-program dogfood)"
 submit agent "$(jq -nc --argjson program "$PROGRAM" \
-  '{provision:{name:"Dogfood Duck",program:$program}}')"
+  '{provision:{request_id:"dogfood",name:"Dogfood Duck",program:$program}}')"
 MODEL_ACCOUNT="$(query identity "{\"controlled\":{\"by\":$CONTROLLER,\"from\":0,\"limit\":256}}" |
   jq -er '.accounts | map(select(.name == "Dogfood Duck" and .control.program.executor == "agent")) |
     if length == 1 then .[0].number else error("choose a unique dogfood program account") end')"
@@ -182,8 +175,17 @@ curl -s <base>/v1/index/pages/view -X POST -H 'content-type: application/json' \
 
 ## 4. Open the issue with a page link
 
-Forge view → the `ducktape` repo → **Issues** → *New issue*. Put
-`[spec](duck://page/<your-page-id>)` in the body.
+In the desktop Forge view, open the repo's **Issues** tab, type the title and
+the body — the page link goes in the body — and press **Open issue**: the
+message leaves as a signed `op.submit`, authored by the seated key, and the
+tracker lists it when the block lands.
+
+Scripted instead, authored by the node's operator account, through the
+`submit` helper from step 2:
+
+```sh
+submit forge '{"open_issue":{"repo":"ducktape","title":"<title>","body":"[spec](duck://page/<your-page-id>)"}}'
+```
 
 At run compose, every ref found in the trigger message or the injected issue
 body resolves against committed pages state and the page's whole subtree is
@@ -287,12 +289,26 @@ ducktape module register hello crates/kernel/host/tests/fixtures/hello.component
   --after 50 --config "$WORKSPACE/node.toml"
 ```
 
+Read its counter with the raw route rather than the `query` helper above: a
+module's reply is bytes, and `hello` answers eight little-endian ones, so
+`/v1/query` types the response `application/octet-stream` and there is nothing
+for `jq` to parse.
+
+```sh
+curl -fsS "$BASE/v1/query" -H 'content-type: application/json' \
+  -d '{"target":"hello","query":""}' | xxd
+```
+
 Commit an artifact containing the replacement component to the run's repository.
-The guest can build it offline when its image contains the compiler and the
-repository vendors its dependencies. Its network is limited to host tunnels for
-granted services. The executor consumes committed artifacts; source compilation
-belongs to the run's build tools. The existing replacement fixture is
-`crates/kernel/host/tests/fixtures/hello-replacement.component.wasm`.
+The guest builds it with the compiler its image carries, against the vendored
+registry the image also carries: `/.cargo/config.toml` replaces crates.io with
+`/opt/duck/vendor`, so the build resolves offline and a crate outside the
+vendored closure does not resolve at all. The run's egress proxy
+(`HTTP_PROXY`/`HTTPS_PROXY`, which dials off the host and refuses the host
+itself) still carries git and everything that is not cargo's registry. The
+executor consumes committed artifacts; source compilation belongs to the run's
+build tools. The existing replacement
+fixture is `crates/kernel/host/tests/fixtures/hello-replacement.component.wasm`.
 
 The model's final JSON response can include:
 
@@ -318,8 +334,11 @@ length prefixes and optional mapper, rather than the component file alone:
 ducktape module pack hello.component.wasm --out hello.module
 ```
 
-Pass `--index <mapper.wasm>` to include a mapper. An artifact without a
-mapper removes the target's existing mapper when it activates. Activation is
+Pass `--index <mapper.wasm>` to include a mapper and `--view <view.wasm>
+--assets <dir>` to include a desktop view. The artifact is the whole deployment:
+one without a mapper or a view removes the target's existing one when it
+activates, so a view-only change still packs the module's current component and
+mapper. Activation is
 at the governance execute height plus `after`, with readiness required from every
 validator.
 
@@ -351,21 +370,37 @@ workflow checkpoint. Clock values in its query are hints from local committed
 status. Every target still validates messages against its execution context.
 
 The standard Linux guest includes the Rust toolchain from `rust-toolchain.toml`,
-the wasm32 target, native build utilities and the `wasm-tools` CLI of the
+the wasm32 target, native build utilities, the `wasm-tools` CLI of the
 componentizer's release (the `wit-component` pin in
-`bin/guest-builder/Cargo.toml`). Build it at the default location with:
+`bin/guest-builder/Cargo.toml`), and the vendored registry at `/opt/duck/vendor`
+that `guest-builder vendor` derives from every module's dependency closure.
+Build it at the default location with:
 
 ```sh
 ops/build-guest-rootfs.sh
 ```
 
-Linux setup requires Bubblewrap with user namespaces, in addition to the base
-image builder's tools. It runs inside the extracted guest root with private,
+Linux setup requires Bubblewrap, in addition to the base image builder's tools,
+and it needs to be root inside the extracted guest root. Rootless, it asks for
+a user namespace to get there, which Ubuntu 23.10+ refuses while
+`kernel.apparmor_restrict_unprivileged_userns` is 1 (`bwrap: setting up uid map:
+Permission denied`). Lend privilege to that ONE step instead of loosening a
+host-wide kernel setting:
+
+```sh
+GUEST_SETUP_SUDO=sudo ops/build-guest-rootfs.sh
+```
+
+The download, extraction, init build and `mke2fs` all stay rootless, and the
+setup hands `$TREE` and its scratch back to the invoking user afterwards. Under
+sudo the namespace is dropped rather than requested — asking for one buys
+nothing when already root, and the same hosts attach an `unprivileged_userns`
+AppArmor profile to whatever creates one, root included, which then refuses the
+bind itself. The setup runs inside the extracted guest root with private,
 disk-backed scratch and receives no host home, credentials or caches.
 `ROOTFS_SETUP=/path/to/setup.sh` replaces the setup and receives command-line
 arguments; `ROOTFS_SETUP=` builds only the base image. macOS builds the base
-image without this Linux setup hook. Repositories must vendor dependencies for
-offline builds: the run's VM can reach only its host service tunnels.
+image without this Linux setup hook.
 
 Writable run filesystems provide 8 GiB of sparse capacity. Only written blocks
 consume host disk. The read-only input image retains its measured size plus

@@ -57,7 +57,7 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
 console.log(port);
 JS
 )"
-"$NODE_BIN" gateway bind --workspace "$WSDIR" --label app --port "$PORT" >/dev/null \
+"$NODE_BIN" gateway bind --workspace "$WSDIR" --label app --port "$PORT" --trusted-loopback >/dev/null \
   || die "could not bind the app gateway route"
 
 log "route app.$ID.duck -> 127.0.0.1:$PORT"

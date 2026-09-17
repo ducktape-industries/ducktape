@@ -1142,6 +1142,9 @@ mod tests {
         }
     }
 
+    /// a declared lane, as a registry would hand it over.
+    const VOICE_LANE: Service = Service::from_lane_id(2);
+
     struct AllowAll;
 
     impl AdmissionPolicy for AllowAll {
@@ -1223,7 +1226,7 @@ mod tests {
         let (datagrams, _accepts, plane) = stub_plane();
         let flow = FlowId::from_raw(7);
         let handle = plane
-            .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 4 })
+            .datagram_flow(VOICE_LANE, flow, DatagramPolicy { max_queued: 4 })
             .expect("register flow");
 
         let peer = PeerId([1u8; 32]);
@@ -1231,7 +1234,7 @@ mod tests {
             .send(Err(truncated_datagram_error()))
             .await
             .unwrap();
-        let frame = wire::encode_datagram(Service::Voice, flow, b"after").unwrap();
+        let frame = wire::encode_datagram(VOICE_LANE, flow, b"after").unwrap();
         datagrams.send(Ok((peer, frame))).await.unwrap();
 
         // The delivery IS the proof the pump survived the error before it.
@@ -1297,7 +1300,7 @@ mod tests {
     async fn a_reset_accept_is_dropped_and_the_pump_keeps_accepting() {
         let (_datagrams, accepts, plane) = stub_plane();
         let service = plane
-            .stream_service(Service::Voice, StreamPolicy { accept_backlog: 4 })
+            .stream_service(VOICE_LANE, StreamPolicy { accept_backlog: 4 })
             .expect("register service");
         let peer = PeerId([5u8; 32]);
 
@@ -1312,7 +1315,7 @@ mod tests {
         wire::write_hello(
             &mut ours,
             &wire::Hello {
-                service: Service::Voice,
+                service: VOICE_LANE,
                 flow: FlowId::from_raw(1),
                 intent: 0,
                 meta: Vec::new(),

@@ -89,7 +89,7 @@ struct AllowStatesync;
 
 impl AdmissionPolicy for AllowStatesync {
     fn permits(&self, _peer: PeerId, service: Service, flow: FlowId) -> bool {
-        service == Service::StateSync && flow == statesync_flow()
+        service == Service::STATE_SYNC && flow == statesync_flow()
     }
 }
 
@@ -135,11 +135,11 @@ fn joiner_rebuilds_kv_through_the_real_overlay_arm() {
         let server_plane = DataPlane::new(server_sock, admission.clone(), config);
         let joiner_plane = DataPlane::new(joiner_sock, admission.clone(), config);
         let server_svc = server_plane
-            .stream_service(Service::StateSync, StreamPolicy { accept_backlog: 32 })
+            .stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 32 })
             .expect("server registers statesync");
         let joiner_svc = Arc::new(
             joiner_plane
-                .stream_service(Service::StateSync, StreamPolicy { accept_backlog: 32 })
+                .stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 32 })
                 .expect("joiner registers statesync"),
         );
 

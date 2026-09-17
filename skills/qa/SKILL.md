@@ -1,14 +1,15 @@
 ---
 name: qa
-description: Verify a running Ducktape node and cluster — the node's /v1 surface, module transaction round-trips, the real-socket cluster e2e, the desktop app's own unit lane, and the live huddle lane. The app has no headless driving lane; its suites run with cargo test -p ducktape-app.
+description: Verify a running Ducktape node and cluster — the node's /v1 surface, module transactions, real-socket cluster e2e, native GPUI app suites, and the live huddle lane. App suites run with cargo test -p ducktape-app; device and pixel checks require platform support.
 ---
 
 # Node QA
 
-`ducktape-app` (`app/`) is a native Iced client with its UI in
-`app/src/ui/*.ice` and its own `#[cfg(test)]` suites. It has no headless
-driving lane; its unit tests run like any other crate and belong in every QA
-pass.
+`ducktape-app` (`app/`) hosts dynamically loaded WASM views in native GPUI.
+Its `#[cfg(test)]` suites run like any other crate and belong in every QA pass.
+Native test contexts do not prove desktop rendering: font/layout probes need
+the real platform text system, and live device/media behavior needs the huddle
+lane. Do not report unsupported native pixel capture as a passing screenshot.
 
 ## What to run
 
@@ -24,17 +25,71 @@ make test                                    # full local gate: wasm drift + wor
 `cargo test -p ducktape-app` is part of every QA pass; the node lanes above do
 not cover it.
 
+### Reading an e2e failure on a loaded box
+
+The node e2e suites spawn real processes and wait on real markers, so on a box
+where other sessions are compiling they fail for reasons that have nothing to
+do with the code. Three rules, in the order they bite:
+
+**Run the test binary at NORMAL priority.** `nice -n 19` belongs on cargo
+BUILDS. These suites race fixed deadlines — `wait_marker(…, Duration::from_secs(30))` —
+so a deprioritised node misses them by construction and every case goes red at
+once. Build niced, then exec the test binary un-niced.
+
+**A `timed out without printing "<marker>"` panic is LOAD, not a bug.** Quote
+the marker before believing anything: it names the phase that ran out of clock.
+`genesis root_hash=` is first boot, where the node installs every founding
+module's wasm and which is by far the heaviest phase; `recovered root_hash=` is
+restart recovery. Confirm by reading the node's own log tail in the panic — a
+node that is still emitting lines at the deadline (`module installed`,
+`Merkle structure lags behind journal`, `recovering orphaned leaf`) was SLOW,
+not wedged. Never widen a deadline to make one pass: the deadline is what makes
+stopped progress visible at all.
+
+**Pin what the run reads, and guard it.** A build stages into the set named for
+its own checkout (`modules%<path>`), so a peer's `noded` build no longer
+restages yours — but YOUR next `cargo build` does, and that is enough to shift
+artifacts under an iteration. `workspace_config::modules_dir()` honours
+`$DUCKTAPE_MODULES_DIR` before anything else and `founding_set()` resolves
+through it, so a private snapshot holds one set still for the whole run:
+
+```bash
+make views                                             # once, in this worktree
+touch crates/noded/build.rs && cargo check -p noded    # restage; expect 0 *.pending
+cp -a "$CARGO_TARGET_DIR/debug/modules$(pwd | tr / %)/." target/pin-modules/
+export DUCKTAPE_MODULES_DIR=$PWD/target/pin-modules
+```
+
+That variable ALSO redirects `sim_modules_dir()`, and the production set has no
+`kv`, so snapshot both directories or neither — otherwise the app suites fail
+with `kv.component.wasm: no such founding entry`. The node binary cannot be
+pinned at all (`CARGO_BIN_EXE_ducktape` is baked in at compile time), so digest
+it around each iteration and DISCARD any iteration it changed under — a pass on
+shifted artifacts is worth no more than a failure. Digest a directory by hashing
+the hashes (`find . -type f | sort | xargs md5sum | awk '{print $1}' | md5sum`);
+comparing raw `md5sum` output across two directories always differs, because it
+embeds the path.
+
+**Keep the evidence.** `DUCKTAPE_E2E_KEEP=1` disarms the cluster tempdir's Drop
+so a failed run's storage, journal and logs survive the unwind. Kept roots are
+named `ducktape-e2e-keep-…`, which the harness's own sweep skips, so they
+outlive every later run and are yours to delete.
+
 ### The huddle: three lanes, and only the last one is the whole thing
 
 A huddle is the one feature whose failure mode is BETWEEN two people, so its
 coverage is layered and the top layer has to be run by hand:
 
 ```bash
-cargo test -p node-bin --test huddle_media_e2e   # two real nodes, real overlay,
-                                                 # the late-joiner deadlock and its cure
+cargo test -p ducktape-media                    # auth, fanout, revocation, process restart
+cargo test --manifest-path crates/views/Cargo.toml -p call-view # guest/device contract
 ops/huddle-lane.sh                               # stands a two-node network up and
                                                  # prints one command per side
 ```
+
+Before the live lane, install and publish the media service for each channel
+owner and deploy the `call` view using `docs/deploy/application-service.md`. The
+helper launches nodes and apps; it does not install application services.
 
 `ops/huddle-lane.sh` is the live lane: two real nodes, one user key per side,
 and `app/src/tests/huddle_live.rs` run once per side (it is `#[ignore]`d, so it
@@ -166,32 +221,22 @@ A running daemon (`cargo run -p noded-bin -- --modules <dir>`, or a workspace
 node seeded by `make demo-seed`) serves the full `/v1` surface at
 `http://127.0.0.1:8844` by default. Its genesis composes every tenant from
 `<dir>/<id>.component.wasm` and converges every `<dir>/<id>.index.wasm`;
-without `--modules` it reads the founding set the build staged beside the
-binary (`target/<profile>/modules`, or `$DUCKTAPE_MODULES_DIR`) and refuses
+without `--modules` it reads the founding set its own build staged beside the
+binary (`target/<profile>/modules%<checkout path>`, or
+`$DUCKTAPE_MODULES_DIR`) and refuses
 to boot, naming the first file it could not find, if that set is incomplete.
 Query it directly, or drive its module surface with the
 `ops/agent-system` operator CLI (raw query/submit, agent list/pause/resume).
 Do not expose capability-bearing URL paths, keys, passwords, or recovery
 phrases in reports.
 
-## Frame telemetry (felt lag as numbers)
+## Native frame evidence
 
-Screenshots and CPU numbers cannot see a frame hitch. iced 0.14 ships
-per-stage span telemetry (Update/View/Layout/Interact/Draw/Present) behind a
-feature flag; `ops/beacon-collect` is the headless consumer:
-
-```bash
-(cd ops/beacon-collect && cargo run) &        # listens on 127.0.0.1:9167
-cargo run -p ducktape-app --features iced/debug
-```
-
-STALL lines name the stage the instant any span crosses `STALL_MS` (default
-100), and each 10 s summary window is independent, so scenario segments
-(idle / scroll / switch / typing) read clean. A Layout stall that is
-per-interaction and size-independent means a busted/missing layout cache;
-an Interact stall means the cost is inside the event walk. This lane found
-the 2026-08-16 emoji-fallback row cost (a semibold non-ASCII glyph walking the
-whole font DB on every layout).
+The app's `frame_probe` test helpers use native GPUI scenes and the platform
+text system. Separate idle, scrolling, tab switching and typing measurements;
+an aggregate CPU number cannot prove that an individual interaction is smooth.
+Do not substitute the test platform's no-op text backend for font or layout
+measurements. Pixel captures and device behavior require platform support.
 
 ## Process safety
 
@@ -241,11 +286,13 @@ is no longer the admin namespace's alone (below).
 `/v1` route takes EITHER a per-request signature or that same operator
 credential, in the same `x-ducktape-admin-token` header. Reads stay open.
 
-- MODULE-BOUND — `/v1/submit`, the duckfs writes, `/v1/files/object/{path}`
-  PUT/DELETE, `POST /v1/fs/workspaces` and its commit — take ANY key's
-  signature: the key becomes the op's origin and the module authorizes it.
-- NODE-LEVEL — `/v1/invite`, `/v1/log-filter`, `/v1/term/sessions`,
-  `DELETE /v1/fs/workspaces/{id}` — take the operator credential or a signature
+- USER OPERATIONS — `/v1/submit/frame` verifies the operation's signed frame;
+  Files clients send module queries through `/v1/query` and writes through this
+  generic frame lane. No product-specific Files HTTP endpoints are registered.
+- ACTING KEY — the blob upload, `POST /v1/fs/workspaces` and its commit accept
+  a request signature; the workspace adapter carries that acting identity.
+- NODE-LEVEL — `/v1/submit`, `/v1/submit/raw/{target}`, `/v1/invite`, `/v1/log-filter`,
+  `/v1/gateway/operator`, `DELETE /v1/fs/workspaces/{id}` — take the operator credential or a signature
   by the node's own operator key (its active wallet key at boot). A signature by
   any other key is `403 not_operator`.
 

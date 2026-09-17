@@ -93,6 +93,15 @@ impl SnpTestEnclave {
         Box::new(move |rd| enclave.quote(rd))
     }
 
+    /// The test chain as the PEM files an operator would pass `cred seal`
+    /// out of band (`--snp-ark`, `--snp-ask`, `--snp-vcek`): ARK, ASK, and
+    /// the VCEK as DER.
+    pub fn root_files(&self) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let ark = self.ca.ark.to_pem().map_err(|e| anyhow!("ARK pem: {e}"))?;
+        let ask = self.ca.ask.to_pem().map_err(|e| anyhow!("ASK pem: {e}"))?;
+        Ok((ark, ask, self.vcek_der.clone()))
+    }
+
     /// Trust roots under which — and only under which — `quote()` verifies.
     pub fn roots(&self) -> TrustRoots {
         TrustRoots::Snp(Box::new(SnpRoots {

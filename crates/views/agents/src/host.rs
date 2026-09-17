@@ -21,9 +21,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
 
 /// The planes the register follows: `runs` carries every model record and
 /// every run fact, `identity` the controllers and their names.
@@ -43,6 +43,9 @@ const MAX_TOUCHED_PLACES: usize = 128;
 /// The live panel's bounds: the steps it keeps, the answer it previews, and
 /// how much of a step's detail rides its label.
 const MAX_LIVE_ACTIVITY: usize = 12;
+const MAX_TRACE_EVENTS: usize = 128;
+const MAX_PROCESS_STEPS: usize = 32;
+const MAX_TRACE_EVENT_BYTES: usize = 16 * 1024;
 const MAX_LIVE_PREVIEW_BYTES: usize = 512;
 const ACTIVITY_DETAIL_CHARS: usize = 60;
 /// A step's raw detail, before the label clips it further.
@@ -50,9 +53,14 @@ const ACTIVITY_DETAIL_BYTES: usize = 1_200;
 /// A tool name is a label, not a transcript.
 const TOOL_NAME_BYTES: usize = 80;
 
-pub fn journal_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
-    let maximum = (viewport - 10.0 - 320.0).clamp(280.0, 800.0);
-    (width + delta).clamp(280.0, maximum)
+pub fn run_list_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport * 0.35).clamp(200.0, 360.0);
+    (width + delta).clamp(200.0, maximum)
+}
+
+pub fn editor_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport * 0.55).clamp(320.0, 640.0);
+    (width + delta).clamp(320.0, maximum)
 }
 
 /// One curated skill: a duckfs subtree, pinned at a snapshot or tracking the
@@ -72,7 +80,6 @@ pub struct AgentSkill {
 pub struct AgentRow {
     pub id: String,
     pub name: String,
-    pub initials: String,
     pub capability: String,
     pub status: String,
     pub owner_handle: String,
@@ -136,6 +143,15 @@ pub struct RunLink {
     pub kind: String,
     pub label: String,
     pub url: String,
+    /// the chat message a chip names, drawn in place on request
+    pub preview: Option<MessagePreview>,
+}
+
+/// One chat message as a chip previews it: who said it, and what.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessagePreview {
+    pub author: String,
+    pub body: String,
 }
 
 /// The journal of one run. `dispatch_id` names the run it belongs to, so a
@@ -161,7 +177,7 @@ pub struct Session {
     pub dark: bool,
     /// the signing account's number, decimal; "" when the app has none
     pub account: String,
-    /// the run the app has open for the reader, by dispatch id; "" is none
+    /// the latest external run navigation request; consumed when `opened` changes
     pub open_run: String,
     /// one per door a run was opened through, counted
     pub opened: i64,
@@ -175,10 +191,10 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("agents.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
             });
             match read {
@@ -208,7 +224,9 @@ pub fn connection_serial_after(was_connected: bool, connected: bool, serial: i64
 // ---------- what the kernel is asked ----------
 
 async fn ask(kind: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes")).await?;
+    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
@@ -354,8 +372,8 @@ pub struct RegisterItem {
 /// The register now and after every block that moved it: read once at
 /// start, then again on each `rpc.live` hit for the `runs` or `identity`
 /// plane — the two planes an agent record is folded from.
-pub fn register(connection: i64) -> iced::Subscription<RegisterItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn register(connection: i64) -> ducktape_view_guest::Subscription<RegisterItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         let live = stream::select(
             host::subscribe("rpc.live", RUNS_PLANE),
             host::subscribe("rpc.live", IDENTITY_PLANE),
@@ -375,7 +393,11 @@ async fn load_register() -> RegisterItem {
 }
 
 async fn read_register() -> Result<RegisterItem, String> {
-    let reply = query("runs", serde_json::json!({ "model": { "query": "agents" } })).await?;
+    let reply = query(
+        "runs",
+        serde_json::json!({ "model": { "query": "agents" } }),
+    )
+    .await?;
     let records = reply["model"]["agents"]
         .as_array()
         .cloned()
@@ -459,10 +481,12 @@ fn fold_agents(
                 .controllers
                 .get(&account)
                 .ok_or_else(|| "the model account has no program controller".to_string())?;
-            let name = record["display_name"].as_str().unwrap_or_default().to_owned();
+            let name = record["display_name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
             Ok(AgentRow {
                 id: record["agent_id"].as_str().unwrap_or_default().to_owned(),
-                initials: initials_of(&name),
                 capability: record["capability"].as_str().unwrap_or_default().to_owned(),
                 status: tagged_name(&record["status"]),
                 owner_handle: names.account_label(*controller),
@@ -498,10 +522,7 @@ fn fold_skills(skills: &serde_json::Value) -> Vec<AgentSkill> {
 
 /// The tracker's rows. A chat-born run is named by its room, which costs
 /// one channel read per distinct room in the list.
-async fn fold_runs(
-    runs: Vec<serde_json::Value>,
-    named: &BTreeMap<String, String>,
-) -> Vec<RunRow> {
+async fn fold_runs(runs: Vec<serde_json::Value>, named: &BTreeMap<String, String>) -> Vec<RunRow> {
     let mut rooms: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut rows = Vec::with_capacity(runs.len());
     for run in runs {
@@ -567,7 +588,10 @@ fn fold_run(run: &serde_json::Value, named: &BTreeMap<String, String>) -> RunRow
             row.holder = short_pubkey(settled["executing_node"].as_str().unwrap_or_default());
             row.degraded = settled["degraded"].as_bool().unwrap_or(false);
             row.reason = settled["reason"].as_str().unwrap_or_default().to_owned();
-            row.output_ref = settled["output_ref"].as_str().unwrap_or_default().to_owned();
+            row.output_ref = settled["output_ref"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
         }
         _ => {}
     }
@@ -615,13 +639,15 @@ pub struct JournalItem {
 
 /// The open run's journal now, and again on every `runs` block: the facts
 /// it committed and the chips of every place it touched.
-pub fn run_journal(open_run: String, connection: i64) -> iced::Subscription<JournalItem> {
-    iced::Subscription::run_with((open_run, connection), |(open_run, _)| {
+pub fn run_journal(
+    open_run: String,
+    connection: i64,
+) -> ducktape_view_guest::Subscription<JournalItem> {
+    ducktape_view_guest::Subscription::run_with((open_run, connection), |(open_run, _)| {
         let open_run = open_run.clone();
         let again = open_run.clone();
         let live = host::subscribe("rpc.live", RUNS_PLANE);
-        stream::once(load_journal(open_run))
-            .chain(live.then(move |_| load_journal(again.clone())))
+        stream::once(load_journal(open_run)).chain(live.then(move |_| load_journal(again.clone())))
     })
 }
 
@@ -660,7 +686,7 @@ async fn read_journal(dispatch_id: &str) -> Result<RunJournal, String> {
     let mut entries = Vec::with_capacity(JOURNAL_ENTRY_LIMIT + 1);
     if omitted > 0 {
         entries.push(JournalEntry {
-            kind: "history".into(),
+            kind: "History".into(),
             summary: format!(
                 "Showing the latest {JOURNAL_ENTRY_LIMIT} events; {omitted} earlier events are \
                  not shown."
@@ -754,6 +780,7 @@ impl Chips {
             Target::Place(place) => self.place("target", place).await,
             Target::ForgeRepository(repo) => RunLink {
                 relation: "target".into(),
+                preview: None,
                 kind: "forge".into(),
                 label: format!("Repository {repo}"),
                 url: duck_link(&format!("forge/{repo}"), &self.chain),
@@ -766,6 +793,7 @@ impl Chips {
             } => self.forge_proposal(repo, source, target, candidates).await,
             Target::Label { kind, label } => RunLink {
                 relation: "target".into(),
+                preview: None,
                 kind,
                 label,
                 url: String::new(),
@@ -783,6 +811,7 @@ impl Chips {
         let text = |field: &str| place[field].as_str().unwrap_or_default().to_owned();
         let link = |chip: &str, label: String, url: String| RunLink {
             relation: relation.to_owned(),
+            preview: None,
             kind: chip.to_owned(),
             label,
             url,
@@ -821,11 +850,15 @@ impl Chips {
                 duck_link(&format!("page/{}", text("page_id")), &self.chain),
             ),
             "job" => link("job", "Job discussion".into(), String::new()),
-            "task" => link("task", self.task_label(&text("task_id")).await, String::new()),
+            "task" => link(
+                "task",
+                self.task_label(&text("task_id")).await,
+                String::new(),
+            ),
             "file" => link("file", chip_label(&text("path")), String::new()),
             "module" => link(
                 "module",
-                format!("module {}", text("module_id")),
+                format!("Module {}", text("module_id")),
                 String::new(),
             ),
             "conversation" => link("conversation", "Agent conversation".into(), String::new()),
@@ -924,7 +957,11 @@ impl Chips {
             (None, Some(seq)) => self.message_at(&channel, seq).await,
             (None, None) => None,
         };
-        let label = self.message_label(room, seq, message.as_ref());
+        let label = match seq {
+            Some(seq) => format!("{room} · Message {seq}"),
+            None => room,
+        };
+        let preview = seq.map(|_| self.message_preview(message.as_ref()));
         let url = match seq {
             Some(seq) => format!(
                 "{}#{seq}",
@@ -934,6 +971,7 @@ impl Chips {
         };
         RunLink {
             relation: "target".into(),
+            preview,
             kind: "chat".into(),
             label,
             url,
@@ -954,19 +992,16 @@ impl Chips {
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .find(|row| row["channel_id"].as_str() == Some(channel) && row["seq"].as_u64() == Some(seq))
+            .find(|row| {
+                row["channel_id"].as_str() == Some(channel) && row["seq"].as_u64() == Some(seq)
+            })
     }
 
-    fn message_label(
-        &self,
-        room: String,
-        seq: Option<u64>,
-        message: Option<&serde_json::Value>,
-    ) -> String {
+    fn message_preview(&self, message: Option<&serde_json::Value>) -> MessagePreview {
         let Some(row) = message else {
-            return match seq {
-                Some(seq) => format!("{room} · message {seq} unavailable"),
-                None => room,
+            return MessagePreview {
+                author: String::new(),
+                body: "Message unavailable.".into(),
             };
         };
         let author = self
@@ -978,20 +1013,20 @@ impl Chips {
         };
         let body = match row["deleted"].as_bool().unwrap_or(false) {
             true => "Deleted message".to_owned(),
-            false => chip_label(row["text"].as_str().unwrap_or_default())
-                .chars()
-                .take(120)
-                .collect(),
+            false => row["text"].as_str().unwrap_or_default().to_owned(),
         };
-        format!("{room} · {author}: {body}")
+        MessagePreview { author, body }
     }
 
     async fn message(&self, channel: String, thread: Option<u64>, id: String) -> RunLink {
-        let found = view("chat", serde_json::json!({ "message": { "message_id": id } }))
-            .await
-            .ok()
-            .map(|reply| reply["message"].clone())
-            .filter(serde_json::Value::is_object);
+        let found = view(
+            "chat",
+            serde_json::json!({ "message": { "message_id": id } }),
+        )
+        .await
+        .ok()
+        .map(|reply| reply["message"].clone())
+        .filter(serde_json::Value::is_object);
         let Some(row) = found else {
             let mut destination = self.chat(channel, thread, None).await;
             destination.label = format!("Destination · {}", destination.label);
@@ -1026,20 +1061,25 @@ impl Chips {
             let same_branches = item["source_branch"].as_str() == Some(source.as_str())
                 && item["target_branch"].as_str() == Some(target.as_str());
             if same_branches {
-                matching.push((number, item["title"].as_str().unwrap_or_default().to_owned()));
+                matching.push((
+                    number,
+                    item["title"].as_str().unwrap_or_default().to_owned(),
+                ));
             }
         }
         match matching.as_slice() {
             [(number, title)] => RunLink {
                 relation: "target".into(),
+                preview: None,
                 kind: "forge".into(),
                 label: format!("{repo}#{number} · {title}"),
                 url: duck_link(&format!("forge/{repo}/{number}"), &self.chain),
             },
             _ => RunLink {
                 relation: "target".into(),
+                preview: None,
                 kind: "forge".into(),
-                label: format!("{repo} · {source} → {target}"),
+                label: format!("{repo}: {source} into {target}"),
                 url: duck_link(&format!("forge/{repo}"), &self.chain),
             },
         }
@@ -1049,22 +1089,34 @@ impl Chips {
     /// touched in journal order.
     async fn run_links(&mut self, run: &serde_json::Value) -> Vec<RunLink> {
         let mut links = Vec::new();
+        let mut seen = Vec::new();
         let origin = run["origin"].clone();
         if origin.is_object() {
-            let mut link = self.cached(place_target(origin)).await;
+            let target = place_target(origin);
+            seen.push(target.clone());
+            let mut link = self.cached(target).await;
             link.relation = "from".into();
             links.push(link);
         }
-        let places: Vec<serde_json::Value> = run["places"]
+        let places: Vec<Target> = run["places"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
             .rev()
+            .map(place_target)
+            .filter(|target| {
+                let duplicate = seen.contains(target);
+                if duplicate {
+                    return false;
+                }
+                seen.push(target.clone());
+                true
+            })
             .take(MAX_TOUCHED_PLACES)
             .collect();
         for place in places {
-            let mut link = self.cached(place_target(place)).await;
+            let mut link = self.cached(place).await;
             link.relation = "touched".into();
             links.push(link);
         }
@@ -1096,14 +1148,19 @@ impl Chips {
         let operation = acted["operation"].as_str().unwrap_or_default();
         let result = &acted["result"];
         let (status, summary, target) = match &request {
-            Some(request) => (
-                action_status(&request["status"]),
-                action_description(
+            Some(request) => {
+                let (status, reason) = action_status(&request["status"]);
+                let description = action_description(
                     request["operation"].as_str().unwrap_or_default(),
                     &request["result"],
-                ),
-                prepared_action_target(request),
-            ),
+                );
+                // the badge carries the word; the reason is a sentence
+                let summary = match reason.is_empty() {
+                    true => description,
+                    false => format!("{description}. {reason}"),
+                };
+                (status, summary, prepared_action_target(request))
+            }
             None => (
                 "Status unavailable".to_owned(),
                 action_description(operation, result),
@@ -1154,61 +1211,77 @@ fn place_target(place: serde_json::Value) -> Target {
 /// One journal fact in the tracker's words, before its action detail.
 fn plain_entry(row: &serde_json::Value) -> JournalEntry {
     let fact = &row["fact"];
-    let (kind, summary) = journal_fact(fact);
+    let (kind, summary, status) = journal_fact(fact);
     JournalEntry {
         height: height_label_short(row["height"].as_i64().unwrap_or(0)),
         kind: kind.to_owned(),
         summary,
+        status,
         ..JournalEntry::default()
     }
 }
 
-fn journal_fact(fact: &serde_json::Value) -> (&'static str, String) {
+/// One fact as `(kind, summary, status)`: the kind is a sentence-case
+/// label, the status the badge beside it ("" for a fact that has none).
+fn journal_fact(fact: &serde_json::Value) -> (&'static str, String, String) {
     match tagged_name(fact).as_str() {
         "dispatched" => {
             let dispatched = &fact["dispatched"];
             (
-                "dispatched",
+                "Dispatched",
                 format!(
                     "for {} from {}",
                     dispatched["agent_id"].as_str().unwrap_or_default(),
                     run_origin(dispatched)
                 ),
+                String::new(),
             )
         }
         "session_opened" => (
-            "session opened",
+            "Session opened",
             format!(
                 "Attempt {}",
                 fact["session_opened"]["attempt"].as_i64().unwrap_or(0)
             ),
+            String::new(),
         ),
         "acted" => (
-            "action",
+            "Action",
             action_description(
                 fact["acted"]["operation"].as_str().unwrap_or_default(),
                 &fact["acted"]["result"],
             ),
+            String::new(),
         ),
         "settled" => {
             let settled = &fact["settled"];
-            let mut parts = vec![
-                outcome_word(settled["outcome"].as_str().unwrap_or_default()).to_owned(),
-            ];
-            if settled["degraded"].as_bool().unwrap_or(false) {
-                parts.push("degraded".into());
-            }
+            let mut parts = Vec::new();
             if let Some(reason) = settled["reason"].as_str() {
                 parts.push(reason.to_owned());
+            }
+            if settled["degraded"].as_bool().unwrap_or(false) {
+                parts.push("The result was degraded".into());
             }
             if settled["pr"].is_object() {
                 parts.push(pr_label(&settled["pr"]));
             }
-            ("settled", parts.join(" · "))
+            (
+                "Settled",
+                parts.join(". "),
+                outcome_word(settled["outcome"].as_str().unwrap_or_default()).to_owned(),
+            )
         }
-        "result_action_refused" => ("result action refused", "Final action was refused".into()),
-        "pr_linked" => ("pr linked", pr_label(&fact["pr_linked"]["pr"])),
-        _ => ("action", String::new()),
+        "result_action_refused" => (
+            "Result action refused",
+            "Final action was refused".into(),
+            String::new(),
+        ),
+        "pr_linked" => (
+            "PR linked",
+            pr_label(&fact["pr_linked"]["pr"]),
+            String::new(),
+        ),
+        _ => ("Action", String::new(), String::new()),
     }
 }
 
@@ -1251,27 +1324,25 @@ fn action_description(operation: &str, result: &serde_json::Value) -> String {
     }
 }
 
-fn action_status(status: &serde_json::Value) -> String {
+/// An action's status as `(word, reason)`: the word fits a badge, the
+/// reason ("" when there is none) is told beside the action.
+fn action_status(status: &serde_json::Value) -> (String, String) {
+    let reason =
+        |value: &serde_json::Value| value["reason"].as_str().unwrap_or_default().to_owned();
     match tagged_name(status).as_str() {
-        "awaiting_program" => "Queued".into(),
-        "claimed" => "Running".into(),
-        "rejected" => format!(
-            "Rejected: {}",
-            status["rejected"]["reason"].as_str().unwrap_or_default()
-        ),
+        "awaiting_program" => ("Queued".into(), String::new()),
+        "claimed" => ("Running".into(), String::new()),
+        "rejected" => ("Rejected".into(), reason(&status["rejected"])),
         "completed" => {
             let outcome = &status["completed"]["outcome"];
             match tagged_name(outcome).as_str() {
-                "applied" => "Completed".into(),
-                "rejected" => format!(
-                    "Rejected: {}",
-                    outcome["rejected"]["reason"].as_str().unwrap_or_default()
-                ),
-                "refused" => "Refused".into(),
-                _ => "Outcome unavailable".into(),
+                "applied" => ("Completed".into(), String::new()),
+                "rejected" => ("Rejected".into(), reason(&outcome["rejected"])),
+                "refused" => ("Refused".into(), String::new()),
+                _ => ("Outcome unavailable".into(), String::new()),
             }
         }
-        _ => "Status unavailable".into(),
+        _ => ("Status unavailable".into(), String::new()),
     }
 }
 
@@ -1350,12 +1421,7 @@ fn action_target(operation: &str, result: &serde_json::Value) -> Option<Target> 
         }),
         "reply" => {
             let destination = result.get("destination")?;
-            let at = |key: &str| {
-                destination[key]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned()
-            };
+            let at = |key: &str| destination[key].as_str().unwrap_or_default().to_owned();
             match destination["kind"].as_str().unwrap_or_default() {
                 "chat" => Some(Target::Message {
                     channel: at("channel_id"),
@@ -1446,14 +1512,418 @@ pub struct LiveActivity {
 
 /// The progress of the run the reader has open: the node's own output for
 /// that dispatch, folded. `present` is false until a line arrives — a run
-/// that settled, was never dispatched here, or whose output this device may
-/// not read produces none, and the panel stays off rather than guessing.
+/// with no retained output stays distinct from a connection failure. Access
+/// errors remain visible so the reader can reconnect after resolving them.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveRun {
+    pub connection: OutputConnection,
     pub present: bool,
     pub status: String,
     pub activity: Vec<LiveActivity>,
     pub answer_preview: String,
+    /// Provider output available to the authenticated reader of this run.
+    pub trace: Vec<String>,
+    pub process: Vec<ProcessEntry>,
+    pub answer: String,
+    /// Executor-measured duration, available once the provider session closes.
+    pub elapsed_ms: Option<u64>,
+    pub control: Option<RunControl>,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputConnection {
+    #[default]
+    Connecting,
+    Connected,
+    Failed(String),
+}
+
+/// A provider-disclosed step. Stable item ids let completion replace streaming
+/// content in place; control envelopes and token accounting stay in raw trace.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessEntry {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub code: bool,
+    pub state: ProcessState,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessState {
+    Running,
+    Completed,
+    Failed,
+}
+
+impl LiveRun {
+    pub fn empty_process_message(&self, state: &str) -> &str {
+        match &self.connection {
+            OutputConnection::Connecting => "Connecting to the run output…",
+            OutputConnection::Failed(_) => {
+                "Run output could not be connected. See the error above."
+            }
+            OutputConnection::Connected if !self.trace.is_empty() => {
+                "This output contains no thinking or tool steps. Raw events are available in the Raw tab."
+            }
+            OutputConnection::Connected if self.control.is_some() => {
+                "Connected to the session. Waiting for its first process details…"
+            }
+            OutputConnection::Connected if state == "dispatched" => {
+                "Waiting for a worker to start this run."
+            }
+            OutputConnection::Connected if state == "running" => {
+                "No output has reached this node yet. Waiting for the executing worker…"
+            }
+            OutputConnection::Connected => {
+                "This node has no retained output for this run. Output is kept in memory and is lost when the node restarts or the buffer is evicted."
+            }
+        }
+    }
+
+    pub fn process_label(&self, running: bool) -> String {
+        if let Some(ms) = self.elapsed_ms {
+            let seconds = ms / 1000;
+            let minutes = seconds / 60;
+            let hours = minutes / 60;
+            let days = hours / 24;
+            return match (days, hours, minutes) {
+                (0, 0, 0) => format!("Worked for {seconds}s"),
+                (0, 0, _) => format!("Worked for {minutes}m {}s", seconds % 60),
+                (0, _, _) => format!("Worked for {hours}h {}m {}s", minutes % 60, seconds % 60),
+                _ => format!(
+                    "Worked for {days}d {}h {}m {}s",
+                    hours % 24,
+                    minutes % 60,
+                    seconds % 60,
+                ),
+            };
+        }
+        match running {
+            true => "Working…".into(),
+            false => "Work details".into(),
+        }
+    }
+
+    fn step(&mut self, id: String, title: String, body: String, code: bool, state: ProcessState) {
+        let body = clip(&body, MAX_TRACE_EVENT_BYTES);
+        let existing = self
+            .process
+            .iter_mut()
+            .find(|step| !id.is_empty() && step.id == id);
+        match existing {
+            Some(step) => {
+                step.title = title;
+                let has_body_update = !body.is_empty() || state == ProcessState::Running;
+                if has_body_update {
+                    step.body = body;
+                }
+                step.code = code;
+                step.state = state;
+            }
+            None => self.process.push(ProcessEntry {
+                id,
+                title,
+                body,
+                code,
+                state,
+            }),
+        }
+        let overflow = self.process.len().saturating_sub(MAX_PROCESS_STEPS);
+        self.process.drain(..overflow);
+    }
+
+    fn delta(&mut self, id: String, title: &str, text: &str, code: bool) {
+        let body = self
+            .process
+            .iter()
+            .find(|step| step.id == id)
+            .map(|step| step.body.as_str())
+            .unwrap_or_default();
+        self.step(
+            id,
+            title.into(),
+            format!("{body}{text}"),
+            code,
+            ProcessState::Running,
+        );
+    }
+}
+
+fn readable_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => text.clone(),
+        _ => serde_json::to_string_pretty(value).unwrap_or_default(),
+    }
+}
+
+/// The provider's final response includes execution instructions as well as
+/// the reply. Only reply blocks belong in the conversation; the exact
+/// provider event remains available in raw events.
+pub fn answer_markdown(answer: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(answer) else {
+        return answer.to_owned();
+    };
+    let Some(blocks) = value["reply_blocks"].as_array() else {
+        return answer.to_owned();
+    };
+    let rendered: Option<Vec<String>> = blocks
+        .iter()
+        .map(|block| {
+            let text = block["text"].as_str()?;
+            match block["kind"].as_str()? {
+                "paragraph" => Some(text.into()),
+                "heading" => Some(format!("## {text}")),
+                "code" => {
+                    let longest = text.split(|c| c != '~').map(str::len).max().unwrap_or(0);
+                    let fence = "~".repeat(longest.max(2) + 1);
+                    let language = block["lang"].as_str().unwrap_or_default();
+                    Some(format!("{fence}{language}\n{text}\n{fence}"))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    rendered
+        .map(|parts| parts.join("\n\n"))
+        .unwrap_or_else(|| answer.into())
+}
+
+fn reasoning_text(value: &serde_json::Value) -> String {
+    match value.as_array() {
+        Some(parts) => parts
+            .iter()
+            .filter_map(|part| part.as_str().or_else(|| part["text"].as_str()))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        None => value.as_str().unwrap_or_default().into(),
+    }
+}
+
+/// Only text the provider actually discloses is presented as thinking. Opaque
+/// reasoning payloads and protocol bookkeeping are never invented as prose.
+fn fold_process(run: &mut LiveRun, event: &serde_json::Value) {
+    let params = &event["params"];
+    match event["method"].as_str() {
+        Some("item/reasoning/summaryTextDelta") => {
+            let id = params["itemId"].as_str().unwrap_or_default();
+            run.delta(
+                format!("reasoning/{id}"),
+                "Thinking",
+                params["delta"].as_str().unwrap_or_default(),
+                false,
+            );
+            return;
+        }
+        Some("item/agentMessage/delta") => {
+            run.answer = clip(
+                &format!(
+                    "{}{}",
+                    run.answer,
+                    params["delta"].as_str().unwrap_or_default()
+                ),
+                MAX_TRACE_EVENT_BYTES,
+            );
+            return;
+        }
+        Some("item/started" | "item/completed") => {
+            codex_process(run, &params["item"], event["method"] == "item/completed");
+            return;
+        }
+        _ => {}
+    }
+    match event["type"].as_str() {
+        Some("assistant") => {
+            let message = &event["message"];
+            let text = message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if !text.is_empty() {
+                run.answer = clip(&text, MAX_TRACE_EVENT_BYTES);
+            }
+            for (index, block) in message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let id = block["id"].as_str().map(str::to_owned).unwrap_or_else(|| {
+                    format!("{}/{index}", message["id"].as_str().unwrap_or_default())
+                });
+                match block["type"].as_str() {
+                    Some("thinking") => {
+                        let text = block["thinking"].as_str().unwrap_or_default();
+                        if !text.is_empty() {
+                            run.step(
+                                id,
+                                "Thinking".into(),
+                                text.into(),
+                                false,
+                                ProcessState::Completed,
+                            );
+                        }
+                    }
+                    Some("tool_use") => run.step(
+                        id,
+                        block["name"].as_str().unwrap_or("Tool").into(),
+                        readable_json(&block["input"]),
+                        true,
+                        ProcessState::Running,
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        Some("user") => {
+            for block in event["message"]["content"].as_array().into_iter().flatten() {
+                if block["type"] != "tool_result" {
+                    continue;
+                }
+                let id = block["tool_use_id"].as_str().unwrap_or_default();
+                let previous = run.process.iter().find(|step| step.id == id);
+                let name = previous.map(|step| step.title.as_str()).unwrap_or("Tool");
+                let state = match block["is_error"] == true {
+                    true => ProcessState::Failed,
+                    false => ProcessState::Completed,
+                };
+                let title = name.into();
+                let input = previous.map(|step| step.body.as_str()).unwrap_or_default();
+                let output = readable_json(&block["content"]);
+                run.step(
+                    id.into(),
+                    title,
+                    format!("{input}\n\n{output}").trim().into(),
+                    true,
+                    state,
+                );
+            }
+        }
+        Some("result") => {
+            if let Some(answer) = event["result"].as_str() {
+                run.answer = clip(answer, MAX_TRACE_EVENT_BYTES);
+            }
+        }
+        Some("item.started" | "item.completed" | "item.updated") => {
+            codex_process(run, &event["item"], event["type"] == "item.completed");
+        }
+        Some("run_control") if event["state"] == "input" => {
+            let input = &event["input"];
+            if input["action"] == "steer" {
+                run.step(
+                    String::new(),
+                    "Additional instruction".into(),
+                    input["text"].as_str().unwrap_or_default().into(),
+                    false,
+                    ProcessState::Completed,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn codex_process(run: &mut LiveRun, item: &serde_json::Value, done: bool) {
+    let id = item["id"].as_str().unwrap_or_default().to_owned();
+    let kind = item["type"].as_str().unwrap_or_default();
+    let failed = item["status"] == "failed"
+        || item["success"] == false
+        || item.get("error").is_some_and(|error| !error.is_null())
+        || item["exitCode"]
+            .as_i64()
+            .or_else(|| item["exit_code"].as_i64())
+            .is_some_and(|code| code != 0);
+    let state = match (failed, done) {
+        (true, _) => ProcessState::Failed,
+        (false, true) => ProcessState::Completed,
+        (false, false) => ProcessState::Running,
+    };
+    let (title, body, code) = match kind {
+        "agentMessage" | "agent_message" => {
+            if let Some(answer) = item["text"].as_str() {
+                run.answer = clip(answer, MAX_TRACE_EVENT_BYTES);
+            }
+            return;
+        }
+        "reasoning" => {
+            let summary = reasoning_text(&item["summary"]);
+            let body = match summary.is_empty() {
+                true => reasoning_text(item.get("text").unwrap_or(&item["content"])),
+                false => summary,
+            };
+            run.step(
+                format!("reasoning/{id}"),
+                "Thinking".into(),
+                body,
+                false,
+                state,
+            );
+            return;
+        }
+        "commandExecution" | "command_execution" => {
+            let command = readable_json(&item["command"]);
+            let output = readable_json(
+                item.get("aggregatedOutput")
+                    .unwrap_or(&item["aggregated_output"]),
+            );
+            (
+                "Command".into(),
+                format!("{command}\n\n{output}").trim().into(),
+                true,
+            )
+        }
+        "mcpToolCall" | "mcp_tool_call" | "dynamicToolCall" => {
+            let tool = item["tool"].as_str().unwrap_or("Tool");
+            let input = readable_json(&item["arguments"]);
+            let output = readable_json(
+                item.get("error")
+                    .filter(|error| !error.is_null())
+                    .or_else(|| item.get("result"))
+                    .unwrap_or(&item["contentItems"]),
+            );
+            (
+                tool.into(),
+                format!("{input}\n\n{output}").trim().into(),
+                true,
+            )
+        }
+        "fileChange" | "file_change" => {
+            ("File changes".into(), readable_json(&item["changes"]), true)
+        }
+        "webSearch" | "web_search" => ("Web search".into(), readable_json(&item["query"]), false),
+        _ => return,
+    };
+    run.step(id, title, body, code, state);
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunControl {
+    pub turn: String,
+    pub steers: bool,
+    pub approvals: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum ControlState {
+    #[default]
+    Idle,
+    Sending,
+    Accepted,
+    Failed(String),
+}
+
+pub async fn control_run(run: String, input: serde_json::Value) -> Result<(), String> {
+    ask(
+        "rpc.admin",
+        &serde_json::json!({"route":"/v1/run-control","payload":{"run":run,"input":input}}),
+    )
+    .await
+    .map(|_| ())
 }
 
 pub fn empty_live() -> LiveRun {
@@ -1465,8 +1935,8 @@ pub fn empty_live() -> LiveRun {
 /// key that asked for the run and nobody else — and hands the view every
 /// frame verbatim. Every reading below is folded HERE; the kernel carries
 /// bytes and knows nothing about a run.
-pub fn live_run(open_run: String, connection: i64) -> iced::Subscription<LiveRun> {
-    iced::Subscription::run_with((open_run, connection), |(open_run, _)| {
+pub fn live_run(open_run: String, connection: i64) -> ducktape_view_guest::Subscription<LiveRun> {
+    ducktape_view_guest::Subscription::run_with((open_run, connection), |(open_run, _)| {
         let topic = format!("run-output:{open_run}");
         let ask = serde_json::json!({
             "topic": topic,
@@ -1475,7 +1945,8 @@ pub fn live_run(open_run: String, connection: i64) -> iced::Subscription<LiveRun
         let frames = host::subscribe(
             "rpc.stream",
             &serde_json::to_vec(&ask).expect("a request encodes"),
-        );
+        )
+        .chain(stream::once(std::future::ready(Ok(Vec::new()))));
         // the empty reading first: this subscription is keyed on the run, so
         // a door onto another one starts here and the run before it cannot
         // linger under the new name
@@ -1492,19 +1963,104 @@ pub fn live_run(open_run: String, connection: i64) -> iced::Subscription<LiveRun
 /// One frame of the node's output stream, folded into the panel's reading.
 /// A frame this view cannot read — another topic, a refusal, a line that is
 /// not a provider event — leaves the reading as it was.
-fn fold_output(run: &mut LiveRun, topic: &str, frame: Result<Vec<u8>, String>) {
-    let Ok(bytes) = frame else {
-        return;
+fn fold_output(run: &mut LiveRun, topic: &str, frame: host::Answer) {
+    let bytes = match frame {
+        Ok(bytes) => bytes,
+        Err(refusal) => {
+            run.connection =
+                OutputConnection::Failed(clip(&refusal.sentence, MAX_TRACE_EVENT_BYTES));
+            run.control = None;
+            return;
+        }
     };
+    if bytes.is_empty() {
+        if !matches!(run.connection, OutputConnection::Failed(_)) {
+            run.connection = OutputConnection::Failed(
+                "The run output connection closed. Reconnect to continue receiving updates.".into(),
+            );
+        }
+        run.control = None;
+        return;
+    }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return;
     };
     if value["topic"].as_str() != Some(topic) {
         return;
     }
+    if value["type"] == "error" {
+        let detail = value["detail"]
+            .as_str()
+            .unwrap_or("The node refused this run output subscription.");
+        run.connection = OutputConnection::Failed(clip(detail, MAX_TRACE_EVENT_BYTES));
+        run.control = None;
+        return;
+    }
+    run.connection = OutputConnection::Connected;
+    if value["type"] == "run_control_snapshot" {
+        let control = &value["control"];
+        run.control = control["turn"].as_str().map(|turn| RunControl {
+            turn: turn.into(),
+            steers: control["steers"].as_bool().unwrap_or(false),
+            approvals: control["approvals"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|approval| {
+                    (
+                        approval["request_id"].as_str().unwrap_or_default().into(),
+                        approval["detail"].to_string(),
+                    )
+                })
+                .collect(),
+        });
+        return;
+    }
     let Some(line) = value["item"]["line"].as_str() else {
         return;
     };
+    run.trace.push(clip(line, MAX_TRACE_EVENT_BYTES));
+    let overflow = run.trace.len().saturating_sub(MAX_TRACE_EVENTS);
+    run.trace.drain(..overflow);
+    if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+        fold_process(run, &event);
+        match (event["type"].as_str(), event["state"].as_str()) {
+            (Some("run_control"), Some("ready")) => {
+                if run.elapsed_ms.take().is_some() {
+                    run.process.clear();
+                    run.answer.clear();
+                    run.activity.clear();
+                    run.answer_preview.clear();
+                    run.present = false;
+                }
+                run.control = Some(RunControl {
+                    turn: event["turn"].as_str().unwrap_or_default().into(),
+                    steers: event["steers"].as_bool().unwrap_or(false),
+                    approvals: Vec::new(),
+                });
+            }
+            (Some("run_control"), Some("approval")) => {
+                if let Some(control) = &mut run.control {
+                    control.approvals.push((
+                        event["request_id"].as_str().unwrap_or_default().into(),
+                        event["detail"].to_string(),
+                    ));
+                }
+            }
+            (Some("run_control"), Some("approval_resolved")) => {
+                if let Some(control) = &mut run.control {
+                    control
+                        .approvals
+                        .retain(|(id, _)| Some(id.as_str()) != event["request_id"].as_str());
+                }
+            }
+            (Some("run_control"), Some("closed")) => {
+                run.control = None;
+                run.elapsed_ms = event["elapsed_ms"].as_u64();
+            }
+            _ => {}
+        }
+    }
     let Some(output) = provider_output(line) else {
         return;
     };
@@ -1552,10 +2108,28 @@ enum Output {
 }
 
 /// One line of a run's stdout, as the panel reads it. Tool NAMES describe
-/// observed activity; arguments, tool output and thinking blocks never
-/// reach the screen.
+/// observed activity; full provider events are available separately in Trace.
 fn provider_output(line: &str) -> Option<Output> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    match value["method"].as_str() {
+        Some("turn/started") => return Some(Output::Status("Working".into())),
+        Some("item/completed") if value["params"]["item"]["type"] == "agentMessage" => {
+            return Some(Output::Preview(
+                value["params"]["item"]["text"].as_str()?.into(),
+            ));
+        }
+        Some("item/started" | "item/completed") => {
+            return Some(Output::Activity {
+                title: value["params"]["item"]["type"].as_str()?.into(),
+                detail: value["params"]["item"]["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+                done: value["method"] == "item/completed",
+            });
+        }
+        _ => {}
+    }
     let claude_kind = value["type"].as_str().unwrap_or_default();
     if claude_kind == "result" {
         return Some(Output::Preview(value["result"].as_str()?.to_owned()));
@@ -1577,8 +2151,8 @@ fn provider_output(line: &str) -> Option<Output> {
             .find(|block| block["type"] == "tool_result")?;
         let failed = result["is_error"] == true;
         let title = match failed {
-            true => "Tool failed · waiting for agent",
-            false => "Tool finished · waiting for agent",
+            true => "Tool failed, waiting for the agent",
+            false => "Tool finished, waiting for the agent",
         };
         return Some(Output::Status(title.into()));
     }
@@ -1606,7 +2180,10 @@ fn provider_output(line: &str) -> Option<Output> {
         "mcp_tool_call" => {
             let server = item["server"].as_str().unwrap_or("tool");
             let tool = item["tool"].as_str().unwrap_or("call");
-            (format!("{server} · {tool}"), json_text(item.get("arguments")))
+            (
+                format!("{tool} on {server}"),
+                json_text(item.get("arguments")),
+            )
         }
         "web_search" => ("Web search".to_owned(), json_text(item.get("query"))),
         _ => return None,
@@ -1725,8 +2302,8 @@ fn skills_wire(skills: &[AgentSkill]) -> serde_json::Value {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;
@@ -1749,7 +2326,7 @@ impl Stream for ActStream {
             };
             acts.pending.remove(index);
             Poll::Ready(Some(ActItem {
-                error: answer.err().unwrap_or_default(),
+                error: answer.err().map(host::said).unwrap_or_default(),
             }))
         })
     }
@@ -1757,33 +2334,14 @@ impl Stream for ActStream {
 
 // ---------- the intents ----------
 
-/// The run the reader opened, whose panel the app is asked to follow; an
-/// empty id closes it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenRun {
-    pub dispatch_id: String,
-}
-
-pub fn open_run(dispatch_id: &str) -> bool {
-    notify(
-        "agents.open_run",
-        &OpenRun {
-            dispatch_id: dispatch_id.into(),
-        },
-    )
-}
-
-/// A chip pressed: the duck:// address the app's open plane warps to.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenLink {
-    pub url: String,
-}
-
+/// A chip pressed: the `duck://` address, handed to the kernel's ONE open
+/// door, which warps to whatever owns it.
 pub fn open_link(url: &str) -> bool {
-    notify("agents.open_link", &OpenLink { url: url.into() })
+    ducktape_view_guest::host::open_link(url);
+    true
 }
 
-/// The editor's whole record, as the app's `AgentDraft` decodes it.
+/// The guest-owned registration draft.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Draft {
     pub agent_id: String,
@@ -1792,32 +2350,58 @@ pub struct Draft {
     pub skills: Vec<AgentSkill>,
 }
 
-/// Register a new agent from the draft. THE ONE WRITE THAT IS STILL THE
-/// APP'S: a registration first provisions the agent's program account, and
-/// the program it binds is composed by the runs module's own crate
-/// (`runs::model_program`) — a guest cannot build it without keeping a
-/// second copy of that module's workflow.
-pub fn register_agent(
-    agent_id: &str,
-    display_name: &str,
-    capability: &str,
-    skills: &[AgentSkill],
-) -> bool {
-    notify(
-        "agents.register",
-        &Draft {
-            agent_id: agent_id.trim().to_owned(),
-            display_name: display_name.trim().to_owned(),
-            capability: capability.trim().to_owned(),
-            skills: skills.to_vec(),
-        },
+/// Provision, read the controller-scoped receipt, then configure the model.
+/// Runs supplies its deployed default program; the view owns the write sequence.
+pub async fn register_agent(controller: String, draft: Draft) -> Result<(), String> {
+    let controller: u64 = controller.parse().map_err(
+        |_| "registering an agent needs an account to control it — create one in Settings first",
+    )?;
+    if !valid_agent_id(&draft.agent_id) {
+        return Err("agent_id must be a lowercase DNS label of 1–63 bytes".into());
+    }
+    let name = draft.display_name.trim();
+    if name.is_empty() {
+        return Err("give the agent a display name".into());
+    }
+    let reply = query(
+        "runs",
+        serde_json::json!({"model_program":{"agent_id":draft.agent_id}}),
     )
-}
-
-fn notify<T: Serialize>(operation: &str, payload: &T) -> bool {
-    let bytes = serde_json::to_vec(payload).expect("an intent encodes");
-    host::notify(operation, &bytes);
-    true
+    .await?;
+    let program = reply
+        .get("model_program")
+        .filter(|program| program.is_object())
+        .ok_or("the runs module returned no model program")?;
+    ask(
+        "op.submit",
+        &serde_json::json!({"target":"agent", "payload": {
+            "provision": {"request_id":draft.agent_id, "name":name, "program":program}
+        }}),
+    )
+    .await?;
+    let reply = query(
+        "agent",
+        serde_json::json!({"provision":{"controller":controller, "request_id":draft.agent_id}}),
+    )
+    .await?;
+    let receipt = reply
+        .get("provision")
+        .ok_or("the agent module returned the wrong provisioning reply")?;
+    let account = receipt
+        .get("account")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("the agent provisioning receipt was not found after provisioning")?;
+    ask(
+        "op.submit",
+        &serde_json::json!({"target":"runs", "payload":{
+            "configure_model":{"operation":{"register_model":{
+                "account":account, "agent_id":draft.agent_id, "display_name":name,
+                "capability":draft.capability, "skills":skills_wire(&draft.skills)
+            }}}
+        }}),
+    )
+    .await?;
+    Ok(())
 }
 
 // ---------- the readings ----------
@@ -1834,6 +2418,12 @@ pub fn drafts_consumed(
     let write_landed = acted != seeded;
     let registration_landed = creating && rows.iter().any(|row| row.id == draft_id);
     write_landed || registration_landed
+}
+
+/// `3 skills` — a count with its noun.
+pub(crate) fn plural(count: i64, one: &str, many: &str) -> String {
+    let noun = if count == 1 { one } else { many };
+    format!("{count} {noun}")
 }
 
 /// `4 agents · 2 working` — the title's machine subtitle. `working` is runs
@@ -1872,6 +2462,60 @@ pub fn runs_summary(runs: &[RunRow]) -> String {
     format!("{} {noun} · {in_flight} in flight", runs.len())
 }
 
+/// What a fault strip says: the verb, then the kernel's reason; "" when
+/// there is no fault.
+pub fn fault(verb: &str, error: &str) -> String {
+    if error.is_empty() {
+        return String::new();
+    }
+    format!("{verb}: {error}")
+}
+
+/// The journal's title: the agent that ran, never the run's key.
+pub fn run_title(run: &RunRow) -> String {
+    if run.agent_name.is_empty() {
+        return "Run".into();
+    }
+    run.agent_name.clone()
+}
+
+/// The run's receipt as `(name, value, is_code)` rows: only the facts this
+/// run has. Keys and hashes are code; heights, counts and names are not.
+pub fn run_facts(run: &RunRow) -> Vec<(String, String, bool)> {
+    let mut facts = vec![("Run".to_owned(), run.run_id.clone(), true)];
+    facts.push(("Dispatch".to_owned(), run.dispatch_id.clone(), true));
+    facts.push(("Agent".to_owned(), run.agent_id.clone(), true));
+    facts.push(("Dispatched at".to_owned(), run.dispatched.clone(), false));
+    if !run.settled.is_empty() {
+        facts.push(("Settled".to_owned(), run.settled.clone(), false));
+    }
+    if run.attempt > 0 {
+        facts.push(("Attempt".to_owned(), run.attempt.to_string(), false));
+    }
+    if !run.holder.is_empty() {
+        facts.push(("Executing node".to_owned(), run.holder.clone(), true));
+    }
+    facts.push((
+        "Actions".to_owned(),
+        plural(run.actions, "action", "actions"),
+        false,
+    ));
+    if run.pr_number > 0 {
+        facts.push((
+            "Pull request".to_owned(),
+            format!("#{}", run.pr_number),
+            false,
+        ));
+    }
+    if run.degraded {
+        facts.push(("Result".to_owned(), "Degraded".to_owned(), false));
+    }
+    if !run.output_ref.is_empty() {
+        facts.push(("Output".to_owned(), run.output_ref.clone(), true));
+    }
+    facts
+}
+
 /// The run listed under `run_id`; an empty row when the list has none.
 pub fn run_named(runs: &[RunRow], run_id: &str) -> RunRow {
     runs.iter()
@@ -1890,24 +2534,6 @@ pub fn run_at(runs: &[RunRow], dispatch_id: &str) -> RunRow {
 
 pub fn empty_journal() -> RunJournal {
     RunJournal::default()
-}
-
-/// The glyph a chip wears for the kind of place it names.
-pub fn link_glyph(kind: &str) -> String {
-    match kind {
-        "chat" => "#",
-        "page" => "¶",
-        "forge" => "⎇",
-        "file" => "▤",
-        "task" => "☐",
-        "job" => "⚙",
-        "module" => "⬡",
-        "conversation" => "✉",
-        "run" => "▶",
-        "output" => "⇣",
-        _ => "·",
-    }
-    .to_owned()
 }
 
 pub fn empty_run() -> RunRow {
@@ -2019,10 +2645,6 @@ pub fn some_str(value: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
-pub fn skill_count(skills: &[AgentSkill]) -> i64 {
-    count_i64(skills.len())
-}
-
 /// What the pane on screen IS, stated where a reader lands rather than
 /// discovered by using it.
 pub fn pane_note(pane: &str) -> String {
@@ -2038,10 +2660,6 @@ pub fn pane_note(pane: &str) -> String {
 
 pub fn or_empty(value: &Option<String>) -> String {
     value.clone().unwrap_or_default()
-}
-
-pub fn pick_list(condition: bool, then: &[String], or: &[String]) -> Vec<String> {
-    if condition { then } else { or }.to_vec()
 }
 
 pub fn pick_skills(condition: bool, then: &[AgentSkill], or: &[AgentSkill]) -> Vec<AgentSkill> {
@@ -2145,33 +2763,10 @@ fn chip_label(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The avatar text of a display name: two letters, or one glyph.
-fn initials_of(name: &str) -> String {
-    let words: Vec<&str> = name.split_whitespace().take(2).collect();
-    if words.len() == 2 {
-        let letters: String = words
-            .iter()
-            .filter_map(|word| word.chars().find(char::is_ascii_alphanumeric))
-            .collect();
-        if letters.chars().count() == 2 {
-            return letters.to_uppercase();
-        }
-    }
-    let letters: String = name
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(2)
-        .collect();
-    match letters.is_empty() {
-        true => "?".into(),
-        false => letters.to_uppercase(),
-    }
-}
-
 /// `h 84,912` — a block height, grouped; a negative one is `h —`.
 fn height_label_short(height: i64) -> String {
     if height < 0 {
-        return "h —".into();
+        return "block —".into();
     }
     let digits = height.to_string();
     let mut grouped = String::new();
@@ -2182,7 +2777,7 @@ fn height_label_short(height: i64) -> String {
         }
         grouped.push(digit);
     }
-    format!("h {grouped}")
+    format!("block {grouped}")
 }
 
 /// `duck://<path>?net=<chain>` — an address spelled for the chain it was
@@ -2192,4 +2787,223 @@ fn duck_link(path: &str, chain: &str) -> String {
         return format!("duck://{path}");
     }
     format!("duck://{path}?net={chain}")
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn output(run: &mut LiveRun, event: serde_json::Value) {
+        fold_output(
+            run,
+            "run-output:test",
+            Ok(
+                json!({"topic":"run-output:test","item":{"line":event.to_string()}})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
+    }
+
+    #[test]
+    fn output_failures_are_visible_and_never_leave_stale_controls_enabled() {
+        let mut run = LiveRun::default();
+        let topic = "run-output:test";
+        fold_output(
+            &mut run,
+            topic,
+            Err(host::Refusal::new(
+                "unauthorized",
+                "HTTP error: 403 Forbidden",
+            )),
+        );
+        assert_eq!(
+            run.connection,
+            OutputConnection::Failed("HTTP error: 403 Forbidden".into())
+        );
+        fold_output(&mut run, topic, Ok(Vec::new()));
+        assert_eq!(
+            run.connection,
+            OutputConnection::Failed("HTTP error: 403 Forbidden".into())
+        );
+        let snapshot = json!({"type":"run_control_snapshot","topic":topic,"control":{"turn":"a","steers":true}});
+        fold_output(&mut run, topic, Ok(serde_json::to_vec(&snapshot).unwrap()));
+        assert_eq!(run.connection, OutputConnection::Connected);
+        assert!(run.control.is_some());
+        let refusal = json!({"type":"error","topic":topic,"detail":"not_this_runs_reader"});
+        fold_output(&mut run, topic, Ok(serde_json::to_vec(&refusal).unwrap()));
+        assert_eq!(
+            run.connection,
+            OutputConnection::Failed("not_this_runs_reader".into())
+        );
+        assert!(run.control.is_none());
+    }
+
+    #[test]
+    fn an_empty_trace_distinguishes_connection_waiting_and_retention() {
+        let mut run = LiveRun::default();
+        assert!(run.empty_process_message("running").contains("Connecting"));
+        let snapshot =
+            json!({"type":"run_control_snapshot","topic":"run-output:test","control":null});
+        fold_output(
+            &mut run,
+            "run-output:test",
+            Ok(serde_json::to_vec(&snapshot).unwrap()),
+        );
+        assert!(
+            run.empty_process_message("dispatched")
+                .contains("start this run")
+        );
+        assert!(
+            run.empty_process_message("running")
+                .contains("executing worker")
+        );
+        assert!(
+            run.empty_process_message("accepted")
+                .contains("retained output")
+        );
+        run.trace.push("{}".into());
+        assert!(run.empty_process_message("accepted").contains("Raw events"));
+    }
+
+    #[test]
+    fn retained_steps_survive_transport_noise_and_stay_bounded() {
+        let mut run = LiveRun::default();
+        output(
+            &mut run,
+            json!({"method":"item/completed","params":{"item":{"id":"thought","type":"reasoning","summary":["Look at the wrapping constraint."]}}}),
+        );
+        for id in 0..200 {
+            output(&mut run, json!({"id":id,"result":{}}));
+        }
+        assert_eq!(run.trace.len(), MAX_TRACE_EVENTS);
+        assert_eq!(run.process[0].body, "Look at the wrapping constraint.");
+        for id in 0..40 {
+            output(
+                &mut run,
+                json!({"method":"item/completed","params":{"item":{"id":id.to_string(),"type":"commandExecution","command":"echo hello","aggregatedOutput":"한".repeat(MAX_TRACE_EVENT_BYTES)}}}),
+            );
+        }
+        assert_eq!(run.process.len(), MAX_PROCESS_STEPS);
+        assert!(
+            run.process
+                .iter()
+                .all(|step| step.body.len() <= MAX_TRACE_EVENT_BYTES + '…'.len_utf8())
+        );
+        assert!(run.process.last().unwrap().body.ends_with('…'));
+    }
+
+    #[test]
+    fn structured_answers_render_reply_blocks_and_keep_execution_fields_in_raw_events() {
+        let response = json!({
+            "reply_blocks": [
+                {"id":"title","kind":"heading","text":"Result"},
+                {"id":"reply","kind":"paragraph","text":"A **readable** answer.\n한글 답변"},
+                {"id":"code","kind":"code","lang":"sh","text":"echo '~~~'"}
+            ],
+            "actions":[{"operation":"tasks.create","input":{"title":"internal"}}],
+            "commit_message":"internal commit"
+        })
+        .to_string();
+        assert_eq!(
+            answer_markdown(&response),
+            "## Result\n\nA **readable** answer.\n한글 답변\n\n~~~~sh\necho '~~~'\n~~~~"
+        );
+        for answer in [
+            "Plain answer",
+            "{\"reply_blocks\":[",
+            "{\"example\":1}",
+            "{\"reply_blocks\":[{\"kind\":\"unknown\",\"text\":\"keep\"}]}",
+        ] {
+            assert_eq!(answer_markdown(answer), answer);
+        }
+        let mut run = LiveRun::default();
+        output(&mut run, json!({"type":"result","result":response}));
+        assert_eq!(run.answer, response);
+        assert!(run.trace.last().unwrap().contains("internal commit"));
+        assert_eq!(answer_markdown("{\"reply_blocks\":[],\"actions\":[]}"), "");
+    }
+
+    #[test]
+    fn elapsed_labels_carry_seconds_minutes_hours_and_days_at_their_boundaries() {
+        for (elapsed_ms, expected) in [
+            (0, "Worked for 0s"),
+            (999, "Worked for 0s"),
+            (1_000, "Worked for 1s"),
+            (59_999, "Worked for 59s"),
+            (60_000, "Worked for 1m 0s"),
+            (3_599_999, "Worked for 59m 59s"),
+            (3_600_000, "Worked for 1h 0m 0s"),
+            (3_661_999, "Worked for 1h 1m 1s"),
+            (86_399_999, "Worked for 23h 59m 59s"),
+            (86_400_000, "Worked for 1d 0h 0m 0s"),
+            (90_061_999, "Worked for 1d 1h 1m 1s"),
+            (172_800_000, "Worked for 2d 0h 0m 0s"),
+            (u64::MAX, "Worked for 213503982334d 14h 25m 51s"),
+        ] {
+            let mut run = LiveRun::default();
+            output(
+                &mut run,
+                json!({"type":"run_control","state":"closed","elapsed_ms":elapsed_ms}),
+            );
+            assert_eq!(
+                run.process_label(false),
+                expected,
+                "elapsed_ms={elapsed_ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn duration_is_unknown_until_executor_close_and_resets_for_a_new_attempt() {
+        let mut run = LiveRun::default();
+        assert_eq!(run.process_label(false), "Work details");
+        output(
+            &mut run,
+            json!({"type":"result","result":"first attempt","duration_ms":125000}),
+        );
+        assert_eq!(run.process_label(true), "Working…");
+        output(
+            &mut run,
+            json!({"type":"run_control","state":"closed","elapsed_ms":125999}),
+        );
+        assert_eq!(run.process_label(true), "Worked for 2m 5s");
+        output(
+            &mut run,
+            json!({"type":"run_control","state":"ready","turn":"next","steers":true}),
+        );
+        assert_eq!(run.process_label(true), "Working…");
+        assert!(run.answer.is_empty());
+    }
+
+    #[test]
+    fn completed_tools_with_errors_are_failed_steps() {
+        let mut run = LiveRun::default();
+        output(
+            &mut run,
+            json!({"method":"item/completed","params":{"item":{"id":"command","type":"commandExecution","command":"cargo test","exitCode":1}}}),
+        );
+        output(
+            &mut run,
+            json!({"method":"item/completed","params":{"item":{"id":"tool","type":"mcpToolCall","tool":"read","error":{"message":"permission denied"}}}}),
+        );
+        assert_eq!(run.process.len(), 2);
+        assert!(
+            run.process
+                .iter()
+                .all(|step| step.state == ProcessState::Failed)
+        );
+    }
+
+    #[test]
+    fn claude_text_blocks_are_kept_together_and_redacted_thinking_is_not_invented() {
+        let mut run = LiveRun::default();
+        output(
+            &mut run,
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"First paragraph."},{"type":"redacted_thinking","data":"opaque"},{"type":"thinking","thinking":""},{"type":"text","text":"Second paragraph."}]}}),
+        );
+        assert_eq!(run.answer, "First paragraph.\n\nSecond paragraph.");
+        assert!(run.process.is_empty());
+    }
 }

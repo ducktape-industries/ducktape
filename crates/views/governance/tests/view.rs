@@ -3,10 +3,10 @@
 //! settle heights through `rpc.blocks`), re-reads it on every `rpc.live`
 //! hit, and a press leaves as `op.submit` carrying the governance message.
 
-use governance_view::host::Session;
+use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts};
+use ducktape_view_guest::wire::{Frame, Length, Node, Request, Wrapping};
+use governance_view::host::{Session, TasteRow};
 use governance_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{answer, has_text, item, press, refuse, texts};
-use ui_lang_guest::wire::{Frame, Node, Request};
 
 fn boot() -> Frame {
     boot_native();
@@ -47,10 +47,69 @@ fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
 fn session(connected: bool) -> Vec<u8> {
     serde_json::to_vec(&Session {
         connected,
-        admin: true,
         dark: false,
+        tasting: Vec::new(),
     })
     .expect("session encodes")
+}
+
+/// This node's key, as `/v1/status` reports it and the valset lists it.
+const THIS_NODE: &str = "01020304";
+
+/// Answers the seat read the view starts on connect: `rpc.status`, then the
+/// valset's validators. `seated` is the ONE knob behind every ballot button
+/// on this screen, and it is the VALSET'S answer — the session carries no
+/// standing at all, so a host cannot decide who votes here.
+fn answer_seat(frame: &Frame, seated: bool) {
+    let status = request(frame, "rpc.status").id;
+    let frame = tick_native(vec![answer(
+        status,
+        serde_json::json!({ "public_key": THIS_NODE })
+            .to_string()
+            .as_bytes(),
+    )]);
+    let validators = match seated {
+        true => serde_json::json!({ "validators": [[1, 2, 3, 4]] }),
+        false => serde_json::json!({ "validators": [[9, 9, 9, 9]] }),
+    };
+    let query = request(&frame, "rpc.query").id;
+    tick_native(vec![answer(query, validators.to_string().as_bytes())]);
+}
+
+/// The session with one taste row for the open code ballot below.
+fn session_tasting(tasting: bool, reason: &str) -> Vec<u8> {
+    serde_json::to_vec(&Session {
+        connected: true,
+        dark: false,
+        tasting: vec![TasteRow {
+            module: "chat".into(),
+            name: "Chat".into(),
+            proposal: "prop-code".into(),
+            hash: "ab".repeat(32),
+            status: "open".into(),
+            activation_height: 0,
+            tasting,
+            reason: reason.into(),
+        }],
+    })
+    .expect("session encodes")
+}
+
+/// The node's `proposals` reply: one open code ballot for the chat module.
+fn code_proposals() -> Vec<u8> {
+    serde_json::json!({ "proposals": [{
+        "proposal_id": "prop-code",
+        "action": { "update_module": {
+            "name": "chat-2", "module_id": "chat", "activation_lead": 10,
+            "code_hash": vec![0xab_u8; 32]
+        }},
+        "proposer": [1, 2, 3], "created_at": 1, "deadline": 4200,
+        "status": "open", "votes": [], "voter_kind": "validator_node",
+        "electorate": [[[1], 1], [[2], 1]],
+        "voting_rule": { "threshold": { "required_yes": 2 } }
+    }]})
+    .to_string()
+    .into_bytes()
 }
 
 /// The node's `proposals` reply: one open proposal one vote from its bar,
@@ -98,6 +157,7 @@ fn connected_with_register() -> (Frame, u64) {
     let frame = tick_native(vec![item(session_id, &session(true))]);
     let live = request(&frame, "rpc.live").id;
     let query = request(&frame, "rpc.query").id;
+    answer_seat(&frame, true);
     let frame = tick_native(vec![answer(query, &proposals())]);
     let blocks_id = request(&frame, "rpc.blocks").id;
     let frame = tick_native(vec![answer(blocks_id, &blocks())]);
@@ -123,13 +183,19 @@ fn a_connected_view_reads_its_own_register() {
         "1 open · 1 settled",
         "1 pending",
         "prop-open",
-        "key 8c4fa211",
+        "Add validator",
+        "Node key",
+        "8c4fa211",
+        "proposed by 010203",
+        "expires block 4,200",
         "1 / 2",
         "1 approval · 1 more for quorum",
-        "Approve →",
-        "RECENTLY FINALIZED",
+        "Approve (final vote)",
+        "Recently finalized",
         "prop-done",
-        "h 84,912",
+        "Signal",
+        "Passed",
+        "block 84,912",
     ] {
         assert!(
             has_text(&frame, expected),
@@ -151,7 +217,12 @@ fn a_connected_view_reads_its_own_register() {
 fn a_live_hit_reads_the_register_again() {
     let (_, live) = connected_with_register();
     let frame = tick_native(vec![item(live, b"{}")]);
-    assert_eq!(kinds(&frame.requests), ["rpc.query"], "{:?}", frame.requests);
+    assert_eq!(
+        kinds(&frame.requests),
+        ["rpc.query"],
+        "{:?}",
+        frame.requests
+    );
 }
 
 /// Approve leaves as `op.submit` with the governance vote; the card is busy
@@ -177,6 +248,7 @@ fn a_vote_leaves_as_a_signed_op_and_the_card_waits_for_the_answer() {
         "a busy card's buttons are disabled: {:?}",
         texts(&frame)
     );
+    assert!(has_text(&frame, "Sending…"), "{:?}", texts(&frame));
 
     let frame = tick_native(vec![refuse(submit.id, "the local user key is locked")]);
     assert!(
@@ -184,11 +256,90 @@ fn a_vote_leaves_as_a_signed_op_and_the_card_waits_for_the_answer() {
         "the answer frees the card: {:?}",
         texts(&frame)
     );
+    assert!(!has_text(&frame, "Sending…"), "{:?}", texts(&frame));
     assert!(
-        has_text(&frame, "the local user key is locked"),
+        has_text(
+            &frame,
+            "The network refused it: the local user key is locked"
+        ),
+        "a refusal reads as a sentence: {:?}",
+        texts(&frame)
+    );
+}
+
+/// Between the session coming up and the first register answer the screen
+/// says it is reading, not that nothing waits.
+#[test]
+fn a_register_still_being_read_is_not_an_empty_one() {
+    let frame = boot();
+    let session_id = request(&frame, "governance.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    assert!(
+        has_text(&frame, "Reading proposals…"),
         "{:?}",
         texts(&frame)
     );
+    assert!(
+        !has_text(&frame, "No proposals waiting."),
+        "{:?}",
+        texts(&frame)
+    );
+
+    // a refused read says why, and still claims nothing about the register
+    let query = request(&frame, "rpc.query").id;
+    let frame = tick_native(vec![refuse(query, "not connected to a node")]);
+    assert!(
+        has_text(
+            &frame,
+            "Could not read the proposals: not connected to a node"
+        ),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(
+        !has_text(&frame, "Reading proposals…"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(
+        !has_text(&frame, "No proposals waiting."),
+        "{:?}",
+        texts(&frame)
+    );
+}
+
+/// A node without validator standing reads every card but presses nothing:
+/// the ballot buttons are not there to refuse. What makes it a reader is
+/// the VALSET's answer — the same session the validator above got.
+#[test]
+fn a_reader_without_standing_sees_the_tally_and_no_ballot() {
+    let frame = boot();
+    let session_id = request(&frame, "governance.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    let query = request(&frame, "rpc.query").id;
+    answer_seat(&frame, false);
+    let frame = tick_native(vec![answer(query, &proposals())]);
+    let blocks_id = request(&frame, "rpc.blocks").id;
+    let frame = tick_native(vec![answer(blocks_id, &blocks())]);
+    for expected in [
+        "Only this network's validators vote here. You can follow every proposal and its tally.",
+        "1 / 2",
+        "1 approval · 1 more for quorum",
+    ] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+    let mut root = frame.root.clone().expect("a tree");
+    root.for_each_mut(&mut |node| {
+        assert!(
+            !matches!(node, Node::Button { .. }),
+            "a reader has nothing to press: {:?}",
+            texts(&frame)
+        );
+    });
 }
 
 /// Once the rule is met the card offers Settle instead of Approve, and it
@@ -199,6 +350,7 @@ fn a_met_rule_offers_settle_which_leaves_as_execute() {
     let session_id = request(&frame, "governance.props").id;
     let frame = tick_native(vec![item(session_id, &session(true))]);
     let query = request(&frame, "rpc.query").id;
+    answer_seat(&frame, true);
     let met = serde_json::json!({ "proposals": [{
         "proposal_id": "prop-met",
         "action": { "signal": { "text": "ship it" } },
@@ -218,4 +370,187 @@ fn a_met_rule_offers_settle_which_leaves_as_execute() {
         op["payload"],
         serde_json::json!({ "execute": { "proposal_id": "prop-met" } })
     );
+}
+
+/// Every text the screen may break onto a second line, by key: the view's
+/// own title and its two section headings, a proposal field's value, and a
+/// refused taste. Each sits in a row with no fixed height, so a second line
+/// grows the card instead of landing on the row below. The list is spelled
+/// out so a new wrapping cell fails here rather than in front of a reader.
+const MAY_WRAP: &[&str] = &[
+    "governance/finalized",
+    "governance/pending",
+    "governance/proposal/prop-code/field/0/value",
+    "governance/proposal/prop-code/field/1/value",
+    "governance/proposal/prop-code/field/2/value",
+    "governance/proposal/prop-code/field/3/value",
+    "governance/proposal/prop-code/taste/refused",
+    "governance/proposal/prop-open/field/0/value",
+    "governance/title",
+];
+
+/// Whether `node` is built at one fixed height: the row shape that cannot
+/// afford a cell breaking onto a second line.
+fn is_fixed_height(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::Linear {
+            height: Some(Length::Fixed(_)),
+            ..
+        } | Node::Container {
+            height: Some(Length::Fixed(_)),
+            ..
+        } | Node::Button {
+            height: Some(Length::Fixed(_)),
+            ..
+        } | Node::Scroll {
+            height: Some(Length::Fixed(_)),
+            ..
+        }
+    )
+}
+
+/// The keys of every text under `node` that does not keep one line.
+fn wrapping_texts(node: &Node) -> Vec<String> {
+    let mut tree = node.clone();
+    let mut keys = Vec::new();
+    tree.for_each_mut(&mut |node| {
+        let Node::Text { key, options, .. } = node else {
+            return;
+        };
+        if options.wrapping != Some(Wrapping::None) {
+            keys.push(key.clone());
+        }
+    });
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Every fixed-height row in `node`, itself included.
+fn fixed_height_rows(node: &Node) -> Vec<Node> {
+    let mut tree = node.clone();
+    let mut rows = Vec::new();
+    tree.for_each_mut(&mut |node| {
+        if is_fixed_height(node) {
+            rows.push(node.clone());
+        }
+    });
+    rows
+}
+
+/// The keys of the cells a fixed-height row would let wrap.
+fn wrapping_cells(frame: &Frame) -> Vec<String> {
+    let page = frame.root.clone().expect("a drawn page");
+    let mut keys: Vec<String> = fixed_height_rows(&page)
+        .iter()
+        .flat_map(wrapping_texts)
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// A proposal's head row and a settled row are built at one fixed height:
+/// a cell allowed to wrap breaks onto a second line in a narrow pane and is
+/// drawn under the row below it. Every cell in such a row keeps one line;
+/// the texts that are MEANT to wrap are named in `MAY_WRAP` and none of
+/// them sits in a fixed-height row.
+#[test]
+fn every_row_cell_keeps_one_line() {
+    // the register: an open proposal's head row, and a settled row
+    let (register, _) = connected_with_register();
+
+    // the code ballot draws the taste line the register frame has not got,
+    // and a refused one draws the sentence that says why
+    let ballot = boot();
+    let session_id = request(&ballot, "governance.props").id;
+    let ballot = tick_native(vec![item(session_id, &session_tasting(false, ""))]);
+    let query = request(&ballot, "rpc.query").id;
+    answer_seat(&ballot, true);
+    let ballot = tick_native(vec![answer(query, &code_proposals())]);
+    let refused = tick_native(vec![item(
+        session_id,
+        &session_tasting(false, "core_changes_too"),
+    )]);
+
+    let drawn = [&register, &ballot, &refused];
+    for frame in drawn {
+        let cells = wrapping_cells(frame);
+        assert!(
+            cells.is_empty(),
+            "a fixed-height row cannot hold a wrapping cell: {cells:?}"
+        );
+    }
+
+    let mut may_wrap: Vec<String> = drawn
+        .iter()
+        .flat_map(|frame| wrapping_texts(&frame.root.clone().expect("a drawn page")))
+        .collect();
+    may_wrap.sort();
+    may_wrap.dedup();
+    assert_eq!(
+        may_wrap.iter().map(String::as_str).collect::<Vec<_>>(),
+        MAY_WRAP,
+        "the wrappable set moved: {:?}",
+        texts(&refused)
+    );
+}
+
+/// A code ballot in the taste set offers "Try this view", which leaves as
+/// the `governance.taste` intent naming the module and hash; a tasted row
+/// offers "Back to current" (`governance.untaste`); a refused row shows
+/// the reason and nothing to press; a ballot the set does not name shows
+/// no taste line at all.
+#[test]
+fn a_code_ballots_view_can_be_tried_and_left_from_its_card() {
+    let frame = boot();
+    let session_id = request(&frame, "governance.props").id;
+    let frame = tick_native(vec![item(session_id, &session_tasting(false, ""))]);
+    let query = request(&frame, "rpc.query").id;
+    answer_seat(&frame, true);
+    let frame = tick_native(vec![answer(query, &code_proposals())]);
+    assert!(has_text(&frame, "On the ballot"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "Back to current"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Try this view"));
+    let taste = request(&frame, "governance.taste");
+    let intent: serde_json::Value = serde_json::from_slice(&taste.payload).expect("decodes");
+    assert_eq!(
+        intent,
+        serde_json::json!({ "module": "chat", "hash": "ab".repeat(32) })
+    );
+
+    // the app seated it: the session says so
+    let frame = tick_native(vec![item(session_id, &session_tasting(true, ""))]);
+    assert!(
+        has_text(&frame, "On the ballot · you are trying it"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(!has_text(&frame, "Try this view"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Back to current"));
+    let untaste = request(&frame, "governance.untaste");
+    let intent: serde_json::Value = serde_json::from_slice(&untaste.payload).expect("decodes");
+    assert_eq!(intent, serde_json::json!({ "module": "chat" }));
+
+    // refused: the reason, and nothing to press
+    let frame = tick_native(vec![item(
+        session_id,
+        &session_tasting(false, "core_changes_too"),
+    )]);
+    assert!(
+        has_text(
+            &frame,
+            "Changes the module's code too — it becomes current when it activates"
+        ),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(!has_text(&frame, "Try this view"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "Back to current"), "{:?}", texts(&frame));
+
+    // a ballot the taste set does not name has no taste line
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    assert!(!has_text(&frame, "On the ballot"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "Try this view"), "{:?}", texts(&frame));
 }

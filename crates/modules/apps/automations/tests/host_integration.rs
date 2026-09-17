@@ -199,7 +199,10 @@ fn user_post_fires_rule_and_creates_task_atomically() {
 
         let tasks = tasks_of(&host).await;
         assert_eq!(tasks.len(), 1, "the rule created exactly one task");
-        assert_eq!(tasks[0].id, "auto-general-5", "deterministic task id");
+        assert_eq!(
+            tasks[0].id, "auto-capture-general-5",
+            "deterministic task id, the firing rule named in it"
+        );
         assert_eq!(tasks[0].title, "post 5 in general");
 
         let recs = run_history(&host, "capture").await;
@@ -275,7 +278,7 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
             Msg {
                 target: TASKS.into(),
                 payload: tasks::encode_task_msg(&tasks::TaskMsg::CreateTask {
-                    task_id: "auto-general-5".into(),
+                    task_id: "auto-capture-general-5".into(),
                     title: "squatted".into(),
                     owner: None,
                 }),
@@ -303,15 +306,14 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
     });
 }
 
+/// Two rules carrying the SAME task prefix fire on one post. The composed id
+/// names its rule, so they are two distinct tasks and the post commits — it
+/// used to be one id composed twice, the second create failing at tasks and
+/// unwinding the poster's message.
 #[test]
-fn post_probe_collision_still_aborts_the_block() {
+fn two_rules_sharing_a_prefix_both_fire_and_the_post_commits() {
     block_on(async {
         let mut host = genesis().await;
-        // two rules composing the SAME task id fire on one event: both probes
-        // run before either follow-up applies, so both pass and both emit —
-        // the second follow-up then fails at tasks and the whole block aborts
-        // (P2). the probe layer is best-effort by design; atomicity is the
-        // backstop.
         for rule_id in ["r1", "r2"] {
             let (ctx, msg) = from_user(create_rule_msg(
                 rule_id,
@@ -327,32 +329,101 @@ fn post_probe_collision_still_aborts_the_block() {
             ));
             host.submit_at(ctx, msg).await.expect("create rule");
         }
-        let app_before = host.root_hash();
 
-        let err = host
-            .submit_at(
+        host.submit_at(
+            BlockContext {
+                height: 2,
+                consensus_time: 200,
+                origin: Origin::External(b"poster".to_vec()),
+            },
+            chat_event_msg("general", 5, Party::Key(vec![1; 4])),
+        )
+        .await
+        .expect("two rules on one prefix must not abort the post");
+
+        let ids: Vec<String> = tasks_of(&host).await.into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, ["auto-r1-general-5", "auto-r2-general-5"]);
+        for rule_id in ["r1", "r2"] {
+            let recs = run_history(&host, rule_id).await;
+            assert_eq!(recs.len(), 1, "{rule_id} fired once");
+            assert!(recs[0].action_ok, "{rule_id}: {}", recs[0].detail);
+        }
+    });
+}
+
+/// One task short of the owner's cap, two rules fire on one post. The census
+/// each probe reads cannot see the other rule's create, so the reservation
+/// is what keeps the second from emitting a create tasks would refuse —
+/// which would unwind the post. The first takes the last slot; the second is
+/// recorded as refused and the post commits.
+#[test]
+fn a_second_rule_refuses_the_slot_the_first_one_took() {
+    block_on(async {
+        let mut host = genesis().await;
+        // the rule owner is the identity genesis founded (account 1), which
+        // is also who `from_user` submits the rules as.
+        let owner = 1u64;
+        let last = tasks::MAX_OPEN_TASKS_PER_OWNER as u64 - 1;
+        for n in 0..last {
+            host.submit_at(
                 BlockContext {
-                    height: 2,
-                    consensus_time: 200,
-                    origin: Origin::External(b"poster".to_vec()),
+                    height: 1,
+                    consensus_time: 100 + n,
+                    origin: Origin::External(vec![9; 32]),
                 },
-                chat_event_msg("general", 5, Party::Key(vec![1; 4])),
+                Msg {
+                    target: TASKS.into(),
+                    payload: tasks::encode_task_msg(&tasks::TaskMsg::CreateTask {
+                        task_id: format!("fill-{n}"),
+                        title: "filler".into(),
+                        owner: Some(owner),
+                    }),
+                },
             )
             .await
-            .expect_err("the same-event id collision aborts the block");
-        assert!(
-            matches!(err, host::SubmitError::Rejected(Error::Module(ref m)) if m.contains("already exists")),
-            "unexpected error: {err:?}"
-        );
+            .expect("fill the owner's board");
+        }
+
+        for (rule_id, prefix) in [("r1", "one"), ("r2", "two")] {
+            let (ctx, msg) = from_user(create_rule_msg(
+                rule_id,
+                Trigger {
+                    channel_id: None,
+                    mention: None,
+                    text_contains: None,
+                },
+                Action::CreateTask {
+                    task_id_prefix: prefix.into(),
+                    title_template: "T".into(),
+                },
+            ));
+            host.submit_at(ctx, msg).await.expect("create rule");
+        }
+
+        host.submit_at(
+            BlockContext {
+                height: 2,
+                consensus_time: 200,
+                origin: Origin::External(b"poster".to_vec()),
+            },
+            chat_event_msg("general", 5, Party::Key(vec![1; 4])),
+        )
+        .await
+        .expect("the owner's full board must not abort the post");
+
         assert_eq!(
-            host.root_hash(),
-            app_before,
-            "the aborted block left the root-hash untouched"
+            tasks_of(&host).await.len() as u64,
+            tasks::MAX_OPEN_TASKS_PER_OWNER as u64,
+            "the board holds exactly its cap"
         );
-        assert!(tasks_of(&host).await.is_empty(), "no task landed");
+        let first = run_history(&host, "r1").await;
+        assert!(first[0].action_ok, "the first rule took the last slot");
+        let second = run_history(&host, "r2").await;
+        assert!(!second[0].action_ok, "the second rule found none left");
         assert!(
-            run_history(&host, "r1").await.is_empty(),
-            "aborted records leave no trace"
+            second[0].detail.contains("at task cap"),
+            "unexpected detail: {}",
+            second[0].detail
         );
     });
 }

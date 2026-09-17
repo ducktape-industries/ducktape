@@ -4,10 +4,11 @@ A **capability spec** is a TOML file that teaches a Ducktape node how to run
 one executor — an installed CLI that can turn a prompt into text. Everything
 the node needs is in the file: how to detect the binary, where its Linux
 build comes from, the exact argv to invoke it, and how to parse its output.
-**Adding an executor is a config
-change, never a code change** — the embedded built-ins are themselves spec
-files globbed out of `crates/services/provider/specs/` at build time; no
-Rust source names an executor.
+An executor using one of the supported output protocols and an implemented
+credential broker is configured entirely through its spec. The embedded
+built-ins are spec files globbed out of `crates/services/provider/specs/` at
+build time. A new bidirectional protocol requires a host driver as well as its
+spec, and a new authentication contract requires host code and tests.
 
 Specs are the data half of the capability system:
 
@@ -74,8 +75,8 @@ in the same trust class as a shell profile or a systemd unit:
   process. A run-scoped, loopback-only broker serves the model API, and the
   child gets only an unrelated opaque run bearer, a localhost base URL, and a
   **fresh, empty config home** (which is what stops the CLI reading the
-  operator's real one and forces it through the broker). Codex and Claude
-  are both here.
+  operator's real one and forces it through the broker). Codex, Claude Code,
+  and Pi all use this path.
 
 **A spec cannot ask for a host directory instead.** A run executes inside its
 own microVM, which shares no filesystem with the host — the only things that
@@ -228,12 +229,13 @@ this format does not have (`[sandbox]`, `[models]`, `[session]`,
 
 | Field | Type | Required | Rules |
 |---|---|---|---|
-| `kind` | string | yes | `"claude-releases"` \| `"github-release"`; the rest of the table is that kind's fields, any other field is unknown |
+| `kind` | string | yes | `"claude-releases"` \| `"github-release"` \| `"github-bundle"`; the rest of the table is that kind's fields, any other field is unknown |
 | `base` | string | `claude-releases` | https url of the feed: `<base>/latest`, `<base>/<version>/manifest.json`, `<base>/<version>/<platform>/<bin>`; `detect.companions` must be empty |
-| `repo` | string | `github-release` | `owner/name` |
-| `asset` | string | `github-release` | the release's gzipped-tar asset name, with `{arch}` where the Rust triple's arch goes (`x86_64` \| `aarch64`) |
-| `sums` | string | `github-release` | the release's sha256 sums file, `<hex>  <asset>` per line |
+| `repo` | string | either GitHub kind | `owner/name` |
+| `asset` | string | either GitHub kind | gzipped-tar asset name with `{arch}`: `x86_64` \| `aarch64` for `github-release`, `x64` \| `arm64` for `github-bundle` |
+| `sums` | string | either GitHub kind | the release's sha256 sums file, `<hex>  <asset>` per line |
 | `members` | string array | `github-release` | archive paths of exactly `detect.bin` and every `detect.companions` entry |
+| `root` | string | `github-bundle` | one safe archive directory containing `detect.bin`; its entire tree is preserved, and `detect.companions` must be empty |
 
 ### `[invoke]`
 
@@ -248,14 +250,30 @@ this format does not have (`[sandbox]`, `[models]`, `[session]`,
 
 | Field | Type | Required | Rules |
 |---|---|---|---|
-| `format` | string | yes | `"jsonl-events"` \| `"json-result"` \| `"text"` |
+| `format` | string | yes | `"codex-session"` \| `"claude-session"` \| `"pi-json"` \| `"jsonl-events"` \| `"json-result"` \| `"text"` |
+
+`codex-session` uses App Server JSON-RPC stdin; `claude-session` uses persistent
+stream-json stdin. They carry the prompt, steering, interrupt and approval replies
+inside the same provider process. The built-in specs select these protocols.
+The sandbox and credential broker still wrap the process; the driver enforces
+idle and hard deadlines and reports the provider's final token counters.
 
 ### `[isolation]`
 
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `config_home_env` | string | no | executor config-home env name such as `CODEX_HOME`; must match `[A-Z_][A-Z0-9_]*` |
-| `broker` | string | no | `"codex-responses"` \| `"anthropic-messages"`; credentials remain in the host process |
+| `broker` | string | no | `"codex-responses"` \| `"anthropic-messages"` \| `"pi"`; credentials remain in the host process |
+
+Pi's `pi` broker selects Anthropic or OpenAI Codex from the borrowed credential;
+without an explicit credential it uses the host Anthropic path. The runner
+writes a fresh `PI_CODING_AGENT_DIR` with a model endpoint override and SSE
+transport. Headless Pi runs explicitly load the staged Ducktape MCP extension;
+interactive runs do not. Pi is solo-only: it declares no `restricted_args`, since
+its interactive shell bypasses model-tool allowlists. Shared sessions are refused.
+`pi-json` extracts the last completed assistant answer,
+refuses failed or unfinished turns, and sums authoritative per-message usage
+without counting streaming snapshots or repeated lifecycle events.
 
 ### `[tools]`
 
@@ -286,7 +304,7 @@ in a spec or in Rust: what installs is whatever is current when the operator
 approves it, and a receipt behind the channel's latest is offered as a bump on
 the next install.
 
-Two channel kinds exist:
+Three channel kinds exist:
 
 - `claude-releases` — Anthropic's feed: `<base>/latest` is the version,
   `<base>/<version>/manifest.json` carries `platforms.<platform>.checksum`,
@@ -300,6 +318,11 @@ Two channel kinds exist:
   a source that delivered fewer would leave a declared companion missing, and
   one that delivered more would bake an undeclared executable into the guest
   image.
+
+- `github-bundle` — a GitHub release with a standalone executable and required
+  sibling assets. The installer preserves `root` as a private package directory
+  and exposes `detect.bin` through a relative symlink. Pi uses this source;
+  copying only its executable loses package metadata and native modules.
 
 A spec with no `[source]` is still a complete executor: the operator puts the
 Linux build in the executors directory themselves, and `agent install`
@@ -350,40 +373,52 @@ vsock. The CLI dials the localhost URL its env names and never knows.
 
 ---
 
-## Tools — argv injected into every argv the file produces
+## Tools — which MCP syntax this CLI takes its tool plane in
 
-`[tools]` names the flags that wire a tool plane in — in the built-ins, the
-Ducktape MCP server — without making every argv in the file repeat them:
+`[tools]` names the DIALECT, and nothing else:
 
 ```toml
 [tools]
-args = ["-c", 'mcp_servers.ducktape.command="ducktape"', "-c", 'mcp_servers.ducktape.args=["mcp"]']
+mcp = "codex"   # or "claude"
 ```
 
-- **Insertion is immediately after `args[0]`, never at the end.** An argv
-  like codex's ends in a bare `-` (the stdin marker) that must stay LAST;
-  `args[0]` is always the mode/subcommand selector (`exec`, `-p`), so the
-  slot after it is legal for every executor and stable across variants.
-- It applies to the `[invoke] args` and to **every** `[[variants]]` `args`
-  list (variants inherit `[tools]` like everything else — they never repeat
-  it). No `[tools]` section, or an argv with fewer than one arg, means no
-  insertion.
-- Injection happens once, at load time: a spec in hand already has its
-  tools, and one tag still means one fixed, fully literal argv.
-- Override is still wholesale, by tag: an operator spec that replaces a
-  built-in replaces its `[tools]` too. A `[tools]` section with no `args` is
-  a hard error, like every other section that would do nothing.
+The Ducktape tool plane is a **streamable-HTTP MCP endpoint on the run's own
+node lane** — `{DUCKTAPE_NODE}/mcp`, served by the compute daemon rather than
+forwarded to the node. So the address is per RUN, drawn when that run's lane
+binds a loopback port, and a spec cannot write it down. The host composes the
+argv instead, per run, exactly the way the credential broker's `-c` overrides
+are composed:
 
-The binary a `[tools]` argv names (`ducktape`, with `mcp` as its argument) is resolved
-from the **run's `PATH`** — the provisioner puts its directory there — so specs
-name no absolute path and stay portable across hosts. Claude's built-in also
-passes `--allowedTools mcp__ducktape`: in `-p` print mode there is no human to
-approve a tool call, so an unapproved MCP call is a denial and a merely
-*configured* server would be dead weight. Headless Claude invocation also allows
-shell and file tools inside the microVM, so builds need no permission prompt.
-Interactive and restricted invocation keep their separate arguments. Claude streams verbose
-JSON events and the provider extracts its terminal result. Events refresh the
-idle budget and count toward the same 4 MiB output bound as other providers.
+- `claude` → `--mcp-config {"mcpServers":{"ducktape":{"type":"http","url":…}}}`
+  plus `--allowedTools mcp__ducktape`. In `-p` print mode there is no human to
+  approve a tool call, so an unapproved MCP call is a denial and a merely
+  *configured* server would be dead weight.
+- `codex` → `-c mcp_servers.ducktape.url=…` plus
+  `-c mcp_servers.ducktape.default_tools_approval_mode="approve"`, which is the
+  same requirement in codex's words: without it `exec` cancels every call.
+
+- **It lands after a leading subcommand if there is one, otherwise at the
+  front.** Never at the end — an argv like codex's ends in a bare `-` (the
+  stdin marker) that must stay LAST — and never blindly after `args[0]`, since
+  a restricted Claude session opens `--permission-mode plan` and splitting a
+  flag from its value is an argv the CLI rejects.
+- It reaches the `[invoke] args`, **every** `[[variants]]` `args` list, and the
+  `[interactive]` argv, because the host wires it where the run boots rather
+  than where the file is parsed. No `[tools]` section means no wiring.
+- Override is still wholesale, by tag: an operator spec that replaces a
+  built-in replaces its `[tools]` too. A `[tools]` with no `mcp`, or an unknown
+  dialect, is a hard error, like every other section that would do nothing.
+
+Nothing about the tool plane enters the guest: no server command, no `ducktape`
+binary on the run's `PATH`, and no run-scoped write token in its environment.
+The run reaches the catalog over the one tunnel it already has, and the node
+knows which run is calling because that lane *is* that run.
+
+Headless Claude invocation also allows shell and file tools inside the microVM,
+so builds need no permission prompt. Interactive and restricted invocation keep
+their separate arguments. Claude streams verbose JSON events and the provider
+extracts its terminal result. Events refresh the idle budget and count toward
+the same 4 MiB output bound as other providers.
 
 ---
 

@@ -1,7 +1,6 @@
 use gateway::{
-    GatewayReply, MAX_REQUEST_BODY_BYTES, RouteAudience, RouteDefinition, RouteMethod, RouteName,
-    RoutePolicy, RouteStatement, RouteSummary, RouteTarget, route_signing_preimage,
-    validate_policy,
+    GatewayReply, RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy,
+    RouteStatement, RouteSummary, RouteTarget, route_signing_preimage, validate_policy,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -20,7 +19,7 @@ fn statement() -> RouteStatement {
             policy: RoutePolicy {
                 audience: RouteAudience::Network,
                 methods: vec![RouteMethod::Get, RouteMethod::Head, RouteMethod::Post],
-                max_request_bytes: 1024,
+                max_request_bytes: Some(1024),
                 max_response_bytes: 4096,
                 allow_authorization: false,
                 allow_upgrade: true,
@@ -33,10 +32,12 @@ fn statement() -> RouteStatement {
 fn signing_preimage_has_a_cross_language_fixed_vector() {
     let encoded = hex(&route_signing_preimage(&statement()).unwrap());
     // chain ‖ account LE8 ‖ label ‖ publisher ‖ revision ‖ route-present ‖
-    // policy (audience, methods, caps, flags) ‖ target tag.
+    // policy (audience, methods, caps, flags) ‖ target tag. The request cap is
+    // tagged (`01` = a cap follows, `00` = this route declares none), so an
+    // uncapped route and a capped one can never sign the same bytes.
     assert_eq!(
         encoded,
-        "04000000000000007465737407000000000000000103000000000000006170692000000000000000030303030303030303030303030303030303030303030303030303030303030307000000000000000102030000000000000001020300040000000000000010000000000000000102"
+        "0400000000000000746573740700000000000000010300000000000000617069200000000000000003030303030303030303030303030303030303030303030303030303030303030700000000000000010203000000000000000102030100040000000000000010000000000000000102"
     );
 }
 
@@ -50,7 +51,7 @@ fn content_route_preimage_binds_only_the_manifest_hash() {
         policy: RoutePolicy {
             audience: RouteAudience::Network,
             methods: vec![RouteMethod::Get, RouteMethod::Head],
-            max_request_bytes: 0,
+            max_request_bytes: Some(0),
             max_response_bytes: 4096,
             allow_authorization: false,
             allow_upgrade: false,
@@ -59,7 +60,7 @@ fn content_route_preimage_binds_only_the_manifest_hash() {
     let encoded = hex(&route_signing_preimage(&statement).unwrap());
     assert_eq!(
         encoded,
-        "040000000000000074657374070000000000000001030000000000000061706920000000000000000303030303030303030303030303030303030303030303030303030303030303070000000000000001020200000000000000010200000000000000000010000000000000000001bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "04000000000000007465737407000000000000000103000000000000006170692000000000000000030303030303030303030303030303030303030303030303030303030303030307000000000000000102020000000000000001020100000000000000000010000000000000000001bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     );
 }
 
@@ -95,10 +96,13 @@ fn management_replies_keep_the_small_external_json_shape() {
     );
 }
 
+/// There is no platform ceiling on a request body, and this is the test that
+/// says so: a route may decline to name one at all, and one that names an
+/// enormous one is not second-guessed. A cap is a publisher's statement about
+/// its own lane — a git push carries a whole repository's history, and the
+/// route that serves it declares `None`.
 #[test]
-fn request_cap_admission_stops_exactly_at_the_16_mib_ceiling() {
-    // A claude turn's context is multi-MB; per-route policies may pin lower,
-    // but the ceiling itself is 16 MiB — one byte over is refused at ingest.
+fn a_route_may_decline_to_cap_its_request_body_at_all() {
     let policy = |max_request_bytes| RoutePolicy {
         audience: RouteAudience::Network,
         methods: vec![RouteMethod::Get, RouteMethod::Head, RouteMethod::Post],
@@ -107,7 +111,10 @@ fn request_cap_admission_stops_exactly_at_the_16_mib_ceiling() {
         allow_authorization: false,
         allow_upgrade: false,
     };
-    assert_eq!(MAX_REQUEST_BODY_BYTES, 16 * 1024 * 1024);
-    assert!(validate_policy(&policy(MAX_REQUEST_BODY_BYTES)).is_ok());
-    assert!(validate_policy(&policy(MAX_REQUEST_BODY_BYTES + 1)).is_err());
+    assert!(validate_policy(&policy(None)).is_ok());
+    assert!(validate_policy(&policy(Some(16 * 1024 * 1024))).is_ok());
+    assert!(validate_policy(&policy(Some(u64::MAX))).is_ok());
+    // the one refusal left: a route that takes POST cannot also say it takes
+    // no body, which would be a policy that contradicts itself.
+    assert!(validate_policy(&policy(Some(0))).is_err());
 }

@@ -4,43 +4,6 @@
 use super::*;
 use capability::validate_tag;
 
-pub const MAX_AGENT_ID_LEN: usize = 63;
-
-/// an agent id must be a legal DNS label: lowercase ASCII `[a-z0-9-]`, 1..=63
-/// bytes, no leading/trailing hyphen. the id IS the agent's address — forge
-/// attributes its commits to `<agent_id>@agents.duck` (`agents` is reserved in
-/// duckdns, see `RESERVED_ROOT_LABELS`), so an id that is not a label cannot
-/// round-trip. deliberately a COPY of duckdns's `validate_handle` shape rule
-/// rather than a call into it: two consensus modules must not share an
-/// admission rule that either could silently move (duckdns's reserved-label
-/// list is its own business — an agent may be called `net`). the tests pin the
-/// two rules to the same shape.
-pub fn validate_agent_id(agent_id: &str) -> Result<(), String> {
-    if agent_id.is_empty() {
-        return Err("agent_id must not be empty".into());
-    }
-    if agent_id.len() > MAX_AGENT_ID_LEN {
-        return Err(format!(
-            "agent_id exceeds {MAX_AGENT_ID_LEN} bytes: {} bytes",
-            agent_id.len()
-        ));
-    }
-    if agent_id.starts_with('-') || agent_id.ends_with('-') {
-        return Err(format!(
-            "agent_id must not start or end with a hyphen: {agent_id:?}"
-        ));
-    }
-    if !agent_id
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
-        return Err(format!(
-            "agent_id must be a DNS label (lowercase [a-z0-9-]): {agent_id:?}"
-        ));
-    }
-    Ok(())
-}
-
 /// a skill's `source_prefix` must be a SCOPED duckfs subtree, never a
 /// namespace root: `resolve_skills` copies it verbatim into a run's
 /// dispatch payload, and the provisioner's checkout runs one full checkout

@@ -2,214 +2,6 @@ use super::*;
 use ::forge;
 use std::net::IpAddr;
 
-/// The local half of the client-computed merge.
-pub enum MergeBuild {
-    Clean { merge_oid: String, pack: Vec<u8> },
-    Conflicts(Vec<String>),
-}
-
-/// Build the merge commit for `theirs` (source head) into `ours` (target
-/// head) without touching the mirror: a throwaway bare repo whose odb reads
-/// the mirror's objects through a disk alternate. Returns the new oid plus
-/// the MINIMAL pack — only objects reachable from the merge but from
-/// NEITHER parent.
-///
-/// This is the `git.merge` kernel door's whole body, and it is a host
-/// capability rather than a module's reading: a git implementation plus a
-/// second transport, neither of which a wasm view has. `module` names the
-/// git-backed module whose smart-HTTP route the mirror is fetched from.
-pub fn build_git_merge(
-    endpoint: &str,
-    module: &str,
-    repo: &str,
-    ours: &str,
-    theirs: &str,
-    message: &str,
-) -> Result<MergeBuild, String> {
-    let mirror = sync_git_mirror(endpoint, module, repo)?;
-    let ours_oid = git2::Oid::from_str(ours).map_err(git_err)?;
-    let theirs_oid = git2::Oid::from_str(theirs).map_err(git_err)?;
-    merge_against_mirror(&mirror, ours_oid, theirs_oid, message)
-}
-
-/// The mirror-independent half: merge two commits readable from `mirror`'s
-/// odb and pack what neither parent already carries.
-pub(crate) fn merge_against_mirror(
-    mirror: &git2::Repository,
-    ours_oid: git2::Oid,
-    theirs_oid: git2::Oid,
-    message: &str,
-) -> Result<MergeBuild, String> {
-    let scratch = ScratchDir::create()?;
-    let temp = git2::Repository::init_bare(scratch.path()).map_err(git_err)?;
-    let objects = mirror.path().join("objects");
-    let objects = objects
-        .to_str()
-        .ok_or_else(|| format!("non-utf8 objects path {}", objects.display()))?;
-    temp.odb()
-        .map_err(git_err)?
-        .add_disk_alternate(objects)
-        .map_err(git_err)?;
-
-    let ours_commit = temp.find_commit(ours_oid).map_err(|_| {
-        "the target head is not in the local mirror; the branch may have moved — reload the item"
-            .to_string()
-    })?;
-    let theirs_commit = temp.find_commit(theirs_oid).map_err(|_| {
-        "the source head is not in the local mirror; the branch may have moved — reload the item"
-            .to_string()
-    })?;
-    let mut index = temp
-        .merge_commits(&ours_commit, &theirs_commit, None)
-        .map_err(git_err)?;
-    if index.has_conflicts() {
-        let mut conflicts = Vec::new();
-        for conflict in index.conflicts().map_err(git_err)? {
-            let conflict = conflict.map_err(git_err)?;
-            let Some(entry) = conflict.our.or(conflict.their).or(conflict.ancestor) else {
-                continue;
-            };
-            conflicts.push(String::from_utf8_lossy(&entry.path).into_owned());
-        }
-        conflicts.sort();
-        conflicts.dedup();
-        return Ok(MergeBuild::Conflicts(conflicts));
-    }
-
-    let tree_oid = index.write_tree_to(&temp).map_err(git_err)?;
-    let tree = temp.find_tree(tree_oid).map_err(git_err)?;
-    let signature = git2::Signature::now("ducktape", "ducktape@localhost").map_err(git_err)?;
-    let merge_oid = temp
-        .commit(
-            None,
-            &signature,
-            &signature,
-            message,
-            &tree,
-            &[&ours_commit, &theirs_commit],
-        )
-        .map_err(git_err)?;
-
-    let mut builder = temp.packbuilder().map_err(git_err)?;
-    let mut walk = temp.revwalk().map_err(git_err)?;
-    walk.push(merge_oid).map_err(git_err)?;
-    walk.hide(ours_oid).map_err(git_err)?;
-    walk.hide(theirs_oid).map_err(git_err)?;
-    builder.insert_walk(&mut walk).map_err(git_err)?;
-    let mut buf = git2::Buf::new();
-    builder.write_buf(&mut buf).map_err(git_err)?;
-
-    Ok(MergeBuild::Clean {
-        merge_oid: merge_oid.to_string(),
-        pack: buf.to_vec(),
-    })
-}
-
-/// Open (creating on first use) and refresh the bare mirror of one repo's
-/// smart-HTTP remote. The mirror is a persistent per-endpoint cache under the
-/// same root the user key lives in, so two networks' repos never shadow each
-/// other.
-static FORGE_MIRROR_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-
-fn forge_mirror_lock(dir: &Path) -> Result<Arc<Mutex<()>>, String> {
-    let locks = FORGE_MIRROR_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut locks = locks
-        .lock()
-        .map_err(|_| "forge mirror lock registry is poisoned".to_string())?;
-    Ok(locks
-        .entry(dir.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone())
-}
-
-fn sync_git_mirror(
-    endpoint: &str,
-    module: &str,
-    repo: &str,
-) -> Result<git2::Repository, String> {
-    let dir = git_mirror_dir(endpoint, module, repo)?;
-    let lock = forge_mirror_lock(&dir)?;
-    let _guard = lock
-        .lock()
-        .map_err(|_| format!("git mirror lock is poisoned for {repo:?}"))?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| format!("create git mirror dir {}: {error}", dir.display()))?;
-    let mirror = match git2::Repository::open_bare(&dir) {
-        Ok(existing) => existing,
-        Err(_) => git2::Repository::init_bare(&dir).map_err(git_err)?,
-    };
-    {
-        let mut remote = mirror
-            .remote_anonymous(&format!(
-                "{}/{module}/{repo}",
-                endpoint.trim_end_matches('/')
-            ))
-            .map_err(git_err)?;
-        remote
-            .fetch(&["+refs/heads/*:refs/heads/*"], None, None)
-            .map_err(|error| format!("fetch git remote for {repo:?}: {error}"))?;
-    }
-    Ok(mirror)
-}
-
-/// `<app cache>/git-remote/<endpoint-slug>/<module>/<repo>` — a rebuildable
-/// mirror, so it lives in the app's cache directory
-/// ([`super::app_dirs::cache_dir`]), never under the ducktape home.
-fn git_mirror_dir(endpoint: &str, module: &str, repo: &str) -> Result<PathBuf, String> {
-    let named = |segment: &str| {
-        !segment.is_empty()
-            && !segment.contains('/')
-            && !segment.contains('\\')
-            && !segment.starts_with('.')
-    };
-    if !named(repo) || !named(module) {
-        return Err(format!("invalid git repo name {module:?}/{repo:?}"));
-    }
-    let root = super::app_dirs::cache_dir()?;
-    let slug: String = endpoint
-        .chars()
-        .map(|character| match character.is_ascii_alphanumeric() {
-            true => character,
-            false => '-',
-        })
-        .collect();
-    Ok(root.join("git-remote").join(slug).join(module).join(repo))
-}
-
-fn git_err(error: git2::Error) -> String {
-    error.message().to_string()
-}
-
-/// Process-unique throwaway directory under the OS temp dir, removed
-/// (best-effort) on drop — the merge scratch is one bare repo per click.
-struct ScratchDir(PathBuf);
-
-impl ScratchDir {
-    fn create() -> Result<Self, String> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "ducktape-forge-merge-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir)
-            .map_err(|error| format!("create merge scratch dir {}: {error}", dir.display()))?;
-        Ok(Self(dir))
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Page one blob's bytes in through `blob_bytes` (1 MiB pages to eof).
 /// Page 1 asks by the caller's rev (a branch name or an oid); every later
 /// page asks by the exact oid page 1 answered, so a branch that moves
@@ -274,10 +66,11 @@ pub async fn load_inline_pictures(
     use super::picture::{MAX_INLINE_PICTURES, decode_off_thread, park_inline_pictures};
     let anchor = super::duck_uri::resolve_duck_link(base, net.clone());
     let mut wanted: Vec<String> = Vec::new();
-    for item in iced::widget::markdown::parse(source) {
-        let iced::widget::markdown::Item::Image { url, .. } = item else {
+    for item in pulldown_cmark::Parser::new_ext(source, pulldown_cmark::Options::all()) {
+        let pulldown_cmark::Event::Start(pulldown_cmark::Tag::Image { dest_url, .. }) = item else {
             continue;
         };
+        let url = dest_url.into_string();
         let seen = wanted.contains(&url);
         if !seen {
             wanted.push(url);
@@ -296,7 +89,7 @@ pub async fn load_inline_pictures(
             Some((url, picture))
         }
     });
-    let pictures = iced::futures::future::join_all(fetches)
+    let pictures = futures::future::join_all(fetches)
         .await
         .into_iter()
         .flatten()
@@ -489,14 +282,6 @@ pub(crate) fn blocked_picture_host(ip: IpAddr) -> bool {
     }
 }
 
-
-/// The forge code reader's row metrics. One place on purpose: the shape lint
-/// in `app/src/tests.rs` pins these against `DiffRow`'s Ice metrics so the
-/// source and patch surfaces cannot drift apart.
-pub const CODE_SIZE: f32 = 11.5;
-pub const CODE_ROW_HEIGHT: f32 = 20.0;
-pub const CODE_GUTTER_WIDTH: f32 = 44.0;
-
 /// The highlighter's language token: the path's final extension, else the
 /// file name itself lowercased (Makefile, Dockerfile). syntect matches both
 /// and falls back to plain text on an unknown token — an unknown file renders
@@ -509,1013 +294,120 @@ pub fn code_token(path: &str) -> String {
     }
 }
 
-/// The syntect theme per appearance. Only token FOREGROUNDS are taken from
-/// it — the plate and gutter stay the app's own rail tokens, so the reader
-/// keeps one surface even where the theme's background would disagree.
-pub fn code_theme(dark: bool) -> iced::highlighter::Theme {
-    match dark {
-        true => iced::highlighter::Theme::Base16Eighties,
-        false => iced::highlighter::Theme::InspiredGitHub,
-    }
+/// A retained native code editor in read-only mode, including selection and copy.
+pub struct CodeView {
+    state: gpui_kit::Entity<gpui_kit::component::input::EditorState>,
+    source: String,
+    path: String,
+    dark: bool,
 }
-
-/// The forge blob reader: numbered gutter + syntect-highlighted code, one
-/// paragraph each at the same row pitch, and the code one drag-selectable
-/// across lines ([`CodeSelect`]). Replaces the Ice `ForgeCodeLine` loop —
-/// token colour needs per-span inks, which Ice's named-token text nodes
-/// cannot carry, so the whole surface renders here (the `agent_markdown`
-/// idiom). Colours are the app palette's stable code roles (`rail`,
-/// `forge_gutter_ink`, `strong_ink` in `theme.ice`), matched per appearance
-/// like `AgentMarkdown`.
-///
-/// EAGER ON PURPOSE. This extern once wrapped its surface in a raw
-/// `iced::widget::lazy` — the app's ONLY use of iced's own Lazy, a boundary
-/// nothing else in the codebase exercises — and the shipped pane drew nothing
-/// for every code blob while the same tree passed the headless probes. The
-/// memo boundary lives at the Ice mount now (`lazy … by` in
-/// screens/forge.ice), the projection idiom every other cached surface here
-/// already uses, so the tokenize + paragraph build still runs only when the blob,
-/// path, or appearance moves. `BlobView.text` is read-capped at 64 KiB
-/// upstream, which bounds the one-time build; the screen's scroll pane owns
-/// scrolling.
-pub fn forge_code(source: String, path: String, dark: bool) -> iced::Element<'static, ()> {
-    code_surface(&source, &path, dark)
-}
-
-fn code_surface(source: &str, path: &str, dark: bool) -> iced::Element<'static, ()> {
-    use iced::Length;
-    use iced::advanced::text::{LineHeight, Span};
-    use iced::alignment::Horizontal;
-    use iced::highlighter::{Settings, Stream};
-    use iced::widget::{container, row, text};
-
-    let (rail, gutter_ink, plain_ink) = match dark {
-        true => (
-            iced::Color::from_rgb8(0x20, 0x1f, 0x1b),
-            iced::Color::from_rgb8(0x9d, 0x9b, 0x92),
-            iced::Color::from_rgb8(0xdc, 0xda, 0xd2),
-        ),
-        false => (
-            iced::Color::from_rgb8(0xfa, 0xfa, 0xf8),
-            iced::Color::from_rgb8(0x66, 0x64, 0x5e),
-            iced::Color::from_rgb8(0x3a, 0x39, 0x34),
-        ),
-    };
-    // An empty blob must say so: zero rows is a zero-height, invisible
-    // surface, and a pane that renders nothing is unreportable.
-    if source.is_empty() {
-        return container(
-            text("This file is empty.")
-                .size(CODE_SIZE)
-                .font(CODE_FONT)
-                .color(gutter_ink),
-        )
-        .padding(iced::Padding::ZERO.left(13.0))
-        .into();
-    }
-    let mut stream = Stream::new(&Settings {
-        theme: code_theme(dark),
-        token: code_token(path),
-    });
-    // The gutter is one numbers paragraph at the plate's row pitch; the plate
-    // is one drag-selectable paragraph of the highlighted lines.
-    let lines: Vec<Vec<Span<'static, (), iced::Font>>> = source
-        .lines()
-        .map(|line| {
-            let spans = stream
-                .highlight_line(line)
-                .map(|(range, highlight)| {
-                    Span::new(line[range].to_string()).color(highlight.color().unwrap_or(plain_ink))
-                })
-                .collect();
-            stream.commit();
-            spans
-        })
-        .collect();
-    let numbers = (1..=lines.len())
-        .map(|number| number.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let code = CodeSelect::new(lines, READER_METRICS, Some(plain_ink), Length::Fill);
-    let gutter = container(
-        text(numbers)
-            .size(CODE_SIZE)
-            .font(CODE_FONT)
-            .color(gutter_ink)
-            .line_height(LineHeight::Absolute(CODE_ROW_HEIGHT.into()))
-            .width(Length::Fill)
-            .align_x(Horizontal::Right),
-    )
-    .width(CODE_GUTTER_WIDTH)
-    .padding(iced::Padding::ZERO.right(12.0))
-    .style(move |_| iced::widget::container::Style {
-        background: Some(rail.into()),
-        ..Default::default()
-    });
-    let code = container(code)
-        .width(Length::Fill)
-        .padding(iced::Padding::ZERO.left(13.0))
-        .clip(true);
-    row![gutter, code].width(Length::Fill).into()
-}
-
-const CODE_FONT: iced::Font = iced::Font::with_name("Geist Mono");
-
-/// The renderer's paragraph by its concrete name: the plate needs the
-/// cosmic-text buffer under it, because `Paragraph::hit_test` answers with
-/// the byte index INSIDE the hit line and drops the line — right for one
-/// line of text, wrong for a file of them.
-type CodeParagraph = iced::advanced::graphics::text::Paragraph;
-
-/// Which document's selection a run of text takes part in, and where it sits
-/// in that document's reading order. A Markdown document is many widgets — a
-/// heading, a paragraph, a list item, a code plate are each their own run —
-/// and a drag crosses them, so neither end of the selection is one run's to
-/// hold: they share the one in [`drag`], and each answers only how much of
-/// ITSELF that selection covers. A run built on its own — the forge reader's
-/// whole blob — is a document of one, keyed by its own text.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SelectPlace {
-    doc: u64,
-    ordinal: usize,
-}
-
-impl SelectPlace {
-    /// The `ordinal`th run of the document keyed `doc`, in reading order.
-    pub fn block(doc: u64, ordinal: usize) -> Self {
-        Self { doc, ordinal }
-    }
-}
-
-/// The window's open selection, ACROSS the runs it covers.
-/// `ui_lang_runtime::selection` already says which surface the window is
-/// showing a selection on; this says where that selection runs inside it,
-/// which a Markdown document cannot keep in any one widget.
-///
-/// A document is keyed by its own text, so two documents spelling the same
-/// bytes on screen at once show one selection twice. That is the whole cost
-/// of not threading an identity down through iced's Markdown viewer.
-mod drag {
-    use super::SelectPlace;
-    use std::cell::{Cell, RefCell};
-
-    /// One end of a selection: which run, and the byte offset inside it.
-    type Spot = (usize, usize);
-
-    #[derive(Clone, Copy)]
-    struct Drag {
-        doc: u64,
-        token: u64,
-        held: bool,
-        anchor: Spot,
-        cursor: Spot,
-        /// Bumped where a selection ENDS — a press starting another one, or
-        /// Escape letting this one go. A run's quads are drawn only while they
-        /// carry the current revision, so a run the event walk reaches before
-        /// the run that ended it cannot go on painting what it was showing:
-        /// the press that collapses a selection is delivered to the runs in
-        /// reading order, and the one it lands in is rarely the first.
-        revision: u64,
-    }
-
-    thread_local! {
-        static OPEN: Cell<Drag> = const {
-            Cell::new(Drag {
-                doc: 0,
-                token: 0,
-                held: false,
-                anchor: (0, 0),
-                cursor: (0, 0),
-                revision: 0,
-            })
-        };
-        /// The copy being built: every run the selection covers appends its
-        /// own words as the key walk reaches it — reading order — and the run
-        /// holding the far end takes the whole thing to the clipboard.
-        static COPY: RefCell<String> = const { RefCell::new(String::new()) };
-    }
-
-    /// Take the window's selection for `place`, anchored at `offset`.
-    pub fn open(place: SelectPlace, offset: usize) {
-        let spot = (place.ordinal, offset);
-        OPEN.set(Drag {
-            doc: place.doc,
-            token: ui_lang_runtime::selection::claim(),
-            held: true,
-            anchor: spot,
-            cursor: spot,
-            revision: OPEN.get().revision + 1,
-        });
-    }
-
-    /// Whether the selection the window is showing is this run's document's.
-    pub fn shows(place: SelectPlace) -> bool {
-        let open = OPEN.get();
-        open.doc == place.doc && ui_lang_runtime::selection::holds(open.token)
-    }
-
-    /// Whether the pointer is still down on it.
-    pub fn held(place: SelectPlace) -> bool {
-        shows(place) && OPEN.get().held
-    }
-
-    /// Which revision of the selection the runs must be painting.
-    pub fn revision() -> u64 {
-        OPEN.get().revision
-    }
-
-    /// Move the far end into `place` at `offset`. No new revision: the runs
-    /// whose share of the selection this moves refresh their own quads in the
-    /// same event walk.
-    pub fn reach(place: SelectPlace, offset: usize) {
-        let mut open = OPEN.get();
-        open.cursor = (place.ordinal, offset);
-        OPEN.set(open);
-    }
-
-    /// Take the document from its first byte through `place`'s `offset`.
-    /// Ctrl+A reaches the document's END because EVERY run runs this as the
-    /// key walk reaches it: the last one to run leaves the far end at its own
-    /// end, and each run before it painted itself full on the way past. No
-    /// new revision, for the same reason `reach` opens none — the walk that
-    /// moves the selection refreshes every run it moves.
-    pub fn all(place: SelectPlace, offset: usize) {
-        let mut open = OPEN.get();
-        open.anchor = (0, 0);
-        open.cursor = (place.ordinal, offset);
-        OPEN.set(open);
-    }
-
-    /// Let the pointer go; the selection stays.
-    pub fn release() {
-        let mut open = OPEN.get();
-        open.held = false;
-        OPEN.set(open);
-    }
-
-    /// Let the selection go.
-    pub fn clear() {
-        let mut open = OPEN.get();
-        open.held = false;
-        open.revision += 1;
-        OPEN.set(open);
-        ui_lang_runtime::selection::clear();
-    }
-
-    /// The selection's near and far end, in reading order.
-    fn ends() -> (Spot, Spot) {
-        let open = OPEN.get();
-        (open.anchor.min(open.cursor), open.anchor.max(open.cursor))
-    }
-
-    /// How much of `place`'s `len` bytes the selection covers. `None` where
-    /// the window is showing another document's selection, or this run is
-    /// outside the one it is showing. The range can be EMPTY on purpose: a
-    /// run the selection ends at the very start of is inside it and covers
-    /// nothing, and a copy still walks through it to reach the runs after.
-    pub fn part(place: SelectPlace, len: usize) -> Option<std::ops::Range<usize>> {
-        if !shows(place) {
-            return None;
-        }
-        let (start, end) = ends();
-        let inside = start.0 <= place.ordinal && place.ordinal <= end.0;
-        if !inside {
-            return None;
-        }
-        let from = match place.ordinal == start.0 {
-            true => start.1.min(len),
-            false => 0,
-        };
-        let to = match place.ordinal == end.0 {
-            true => end.1.min(len),
-            false => len,
-        };
-        (from <= to).then_some(from..to)
-    }
-
-    /// Whether the selection starts in this run — where a copy starts over.
-    pub fn starts_at(place: SelectPlace) -> bool {
-        let (start, _) = ends();
-        shows(place) && start.0 == place.ordinal
-    }
-
-    /// Whether it ends in this run — where a copy is taken to the clipboard.
-    pub fn ends_at(place: SelectPlace) -> bool {
-        let (_, end) = ends();
-        shows(place) && end.0 == place.ordinal
-    }
-
-    /// Start a copy over.
-    pub fn copy_open() {
-        COPY.with_borrow_mut(String::clear);
-    }
-
-    /// Add one run's words to it, a line apart from the run before.
-    pub fn copy_add(words: &str) {
-        COPY.with_borrow_mut(|copy| {
-            let joins_a_run = !copy.is_empty() && !words.is_empty();
-            if joins_a_run {
-                copy.push('\n');
-            }
-            copy.push_str(words);
-        });
-    }
-
-    /// Take the whole thing.
-    pub fn copy_take() -> String {
-        COPY.with_borrow_mut(std::mem::take)
-    }
-}
-
-/// One selectable run of text, the state every selectable surface here
-/// shares: a paragraph laid out like the drawn one (for the code plate it IS
-/// the drawn one), the run's place in its document, and the quads.
-#[derive(Default)]
-struct SelectState {
-    key: u64,
-    place: SelectPlace,
-    paragraph: CodeParagraph,
-    /// The quads for the part of the document's selection this run covers,
-    /// paragraph-relative, and the revision they were built at. Refreshed
-    /// where the selection or the bounds move (`update`, `layout`) and never
-    /// in `draw`, so a scroll with a selection open costs nothing extra.
-    highlight: Vec<iced::Rectangle>,
-    revision: u64,
-}
-
-impl SelectState {
-    /// The part of the document's selection this run covers, the empty range
-    /// included — which a copy walking to the runs after needs, and a
-    /// highlight does not.
-    fn part(&self, text: &SelectText) -> Option<std::ops::Range<usize>> {
-        let part = drag::part(self.place, text.content.len())?;
-        text.content.get(part.clone()).is_some().then_some(part)
-    }
-
-    fn range(&self, text: &SelectText) -> Option<std::ops::Range<usize>> {
-        self.part(text).filter(|part| !part.is_empty())
-    }
-
-    /// Whether the quads may be drawn: this run's share of the selection the
-    /// window is showing, built for the run it is showing now.
-    fn is_painting(&self) -> bool {
-        drag::shows(self.place) && self.revision == drag::revision()
-    }
-
-    /// The byte offset under a paragraph-relative point. cosmic-text already
-    /// lands a point above the first line on it, one below the last on its
-    /// end, and one past a line's right edge on that line's end — the clamps
-    /// a drag needs, within a run and across them both.
-    fn hit(&self, point: iced::Point, text: &SelectText) -> Option<usize> {
-        let cursor = self.paragraph.buffer().hit(point.x, point.y)?;
-        let line_start = text.line_starts.get(cursor.line).copied()?;
-        Some(line_start + cursor.index)
-    }
-
-    /// One quad per laid-out line the selection touches, read off its
-    /// glyphs: the run of the first glyph that ends inside the selection
-    /// through the last that starts inside it. A line the selection only
-    /// passes the newline of (an empty line, or a start exactly at a line's
-    /// end) has no such glyphs and draws nothing.
-    fn reselect(&mut self, text: &SelectText) {
-        self.highlight.clear();
-        self.revision = drag::revision();
-        let Some(range) = self.range(text) else {
-            return;
-        };
-        for run in self.paragraph.buffer().layout_runs() {
-            let Some(&line_start) = text.line_starts.get(run.line_i) else {
-                continue;
-            };
-            let low = range.start.saturating_sub(line_start);
-            let high = range.end.saturating_sub(line_start);
-            let first = run.glyphs.iter().find(|glyph| glyph.end > low);
-            let last = run.glyphs.iter().rev().find(|glyph| glyph.start < high);
-            let (Some(first), Some(last)) = (first, last) else {
-                continue;
-            };
-            let right = last.x + last.w;
-            if right <= first.x {
-                continue;
-            }
-            self.highlight.push(iced::Rectangle::new(
-                iced::Point::new(first.x, run.line_top),
-                iced::Size::new(right - first.x, run.line_height),
-            ));
-        }
-    }
-
-    /// A (re)laid-out paragraph: a new key drops the old text's quads, whose
-    /// offsets meant other text — and a document is keyed by its own text, so
-    /// the selection that indexed it is nobody's document's now. The same key
-    /// keeps them and refreshes them where the bounds moved.
-    fn relayout<Link>(
-        &mut self,
-        key: u64,
-        place: SelectPlace,
-        text: iced::advanced::text::Text<
-            &[iced::advanced::text::Span<'_, Link, iced::Font>],
-            iced::Font,
-        >,
-        select: &SelectText,
-    ) {
-        use iced::advanced::text::{Difference, Paragraph as _, Text};
-        self.place = place;
-        let other_text = self.key != key;
-        if other_text {
-            self.paragraph = CodeParagraph::with_spans(text);
-            self.key = key;
-            self.highlight.clear();
-            return;
-        }
-        let probe = Text {
-            content: (),
-            bounds: text.bounds,
-            size: text.size,
-            line_height: text.line_height,
-            font: text.font,
-            align_x: text.align_x,
-            align_y: text.align_y,
-            shaping: text.shaping,
-            wrapping: text.wrapping,
-        };
-        match self.paragraph.compare(probe) {
-            Difference::None => {}
-            Difference::Bounds => {
-                self.paragraph.resize(text.bounds);
-                self.reselect(select);
-            }
-            Difference::Shape => {
-                self.paragraph = CodeParagraph::with_spans(text);
-                self.reselect(select);
-            }
-        }
-    }
-
-    /// The selection's own input: a press takes the window's selection and
-    /// anchors the drag here, a move reaches the far end through here, Ctrl+A
-    /// takes the whole document, Ctrl+C copies it, Escape lets go.
-    fn update<Message>(
-        &mut self,
-        text: &SelectText,
-        event: &iced::Event,
-        layout: iced::advanced::Layout<'_>,
-        cursor: iced::mouse::Cursor,
-        clipboard: &mut dyn iced::advanced::Clipboard,
-        shell: &mut iced::advanced::Shell<'_, Message>,
-    ) {
-        use iced::advanced::clipboard;
-        use iced::keyboard;
-        use iced::mouse;
-        match event {
-            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                let Some(position) = cursor.position_in(layout.bounds()) else {
-                    return;
-                };
-                let Some(offset) = self.hit(position, text) else {
-                    return;
-                };
-                drag::open(self.place, offset);
-                self.reselect(text);
-                shell.request_redraw();
-            }
-            iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if drag::held(self.place) => {
-                // THE FAR END IS TAKEN BY EVERY RUN THE POINTER IS AT OR PAST,
-                // in reading order, so the last one to take it is the run the
-                // pointer is in: a run above the pointer hits its own end —
-                // cosmic-text clamps a point below the last line there — which
-                // is exactly how much of that run the selection covers. A run
-                // below the pointer leaves the end alone and only repaints the
-                // share the runs around it moved.
-                //
-                // The cursor is LANDED first because a drag owns the pointer
-                // wherever it goes: a scroller hands the content it is not
-                // under a levitating cursor, which has no position at all, and
-                // a Markdown code block is a plate inside its own horizontal
-                // scroller — a drag running past one could never reach into
-                // it, and the block would drop out of a selection that covers
-                // the paragraphs on both sides of it.
-                let pointer = cursor.land().position_from(layout.position());
-                let past_the_top =
-                    pointer.filter(|point| point.y >= 0.0 || self.place.ordinal == 0);
-                let before = self.range(text);
-                if let Some(offset) = past_the_top.and_then(|point| self.hit(point, text)) {
-                    drag::reach(self.place, offset);
-                }
-                let settled = self.range(text) == before && self.revision == drag::revision();
-                if settled {
-                    return;
-                }
-                self.reselect(text);
-                shell.request_redraw();
-            }
-            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-                if drag::held(self.place) =>
-            {
-                drag::release();
-            }
-            iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                physical_key,
-                modifiers,
-                ..
-            }) if drag::shows(self.place) && modifiers.command() => {
-                match key.to_latin(*physical_key) {
-                    Some('a') => {
-                        drag::all(self.place, text.content.len());
-                        self.reselect(text);
-                        shell.capture_event();
-                        shell.request_redraw();
-                    }
-                    Some('c') => {
-                        let Some(part) = self.part(text) else {
-                            return;
-                        };
-                        if drag::starts_at(self.place) {
-                            drag::copy_open();
-                        }
-                        drag::copy_add(&text.content[part]);
-                        if drag::ends_at(self.place) {
-                            let copy = drag::copy_take();
-                            let copied = !copy.is_empty();
-                            if copied {
-                                clipboard.write(clipboard::Kind::Standard, copy);
-                            }
-                        }
-                        shell.capture_event();
-                    }
-                    _ => {}
-                }
-            }
-            iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                ..
-            }) if drag::shows(self.place) => {
-                drag::clear();
-                self.highlight.clear();
-                shell.request_redraw();
-            }
-            _ => {}
-        }
-    }
-
-    /// The highlight wash under the text, clipped to what is on screen.
-    fn draw(
-        &self,
-        renderer: &mut iced::Renderer,
-        bounds: iced::Rectangle,
-        clip: iced::Rectangle,
-        ink: iced::Color,
-    ) {
-        use iced::advanced::Renderer as _;
-        if !self.is_painting() {
-            return;
-        }
-        let translation = bounds.position() - iced::Point::ORIGIN;
-        let wash = ink.scale_alpha(0.28);
-        for quad in &self.highlight {
-            let Some(quad) = (*quad + translation).intersection(&clip) else {
-                continue;
-            };
-            renderer.fill_quad(
-                iced::advanced::renderer::Quad {
-                    bounds: quad,
-                    ..Default::default()
-                },
-                wash,
-            );
-        }
-    }
-}
-
-/// The text a selection indexes: the exact string the spans spell, byte
-/// for byte, and the byte offset of each line's first character — what
-/// turns the buffer's (line, index) cursor into one offset and back.
-struct SelectText {
-    content: String,
-    line_starts: Vec<usize>,
-}
-
-impl SelectText {
-    fn new(content: String) -> Self {
-        let line_starts = std::iter::once(0)
-            .chain(content.match_indices('\n').map(|(at, _)| at + 1))
-            .collect();
-        Self {
-            content,
-            line_starts,
-        }
-    }
-}
-
-/// The text layout a code plate draws with: a pinned size and row pitch in
-/// the code font, no wrapping.
-#[derive(Clone, Copy)]
-pub struct CodeMetrics {
-    pub size: iced::Pixels,
-    pub line_height: iced::advanced::text::LineHeight,
-    pub font: iced::Font,
-}
-
-/// The reader's metrics, pinned to `DiffRow`'s by the shape lint.
-const READER_METRICS: CodeMetrics = CodeMetrics {
-    size: iced::Pixels(CODE_SIZE),
-    line_height: iced::advanced::text::LineHeight::Absolute(iced::Pixels(CODE_ROW_HEIGHT)),
-    font: CODE_FONT,
-};
-
-fn code_text<C>(
-    content: C,
-    bounds: iced::Size,
-    metrics: CodeMetrics,
-) -> iced::advanced::text::Text<C, iced::Font> {
-    use iced::advanced::text::{Alignment, Shaping, Text, Wrapping};
-    Text {
-        content,
-        bounds,
-        size: metrics.size,
-        line_height: metrics.line_height,
-        font: metrics.font,
-        align_x: Alignment::Left,
-        align_y: iced::alignment::Vertical::Top,
-        shaping: Shaping::Advanced,
-        wrapping: Wrapping::None,
-    }
-}
-
-/// A code plate: highlighted lines as one paragraph that can be dragged
-/// across, like every plain Ice `text` in the app (ducktape-ui wraps those in
-/// `selectable_text`; this is the same contract for per-span inks, which
-/// that wrapper's plain `Text` cannot carry). It takes the window's
-/// selection through `ui_lang_runtime::selection`, so a drag here quiets any
-/// other highlight and vice versa; Ctrl+A takes the document, Ctrl+C copies
-/// it, Escape lets go. The forge reader and Markdown code blocks both draw
-/// it — the reader's plate is its own document, a Markdown code block is one
-/// block of the document around it ([`CodeSelect::at`]).
-pub struct CodeSelect {
-    /// Identity of the lines and their inks: a new key rebuilds the
-    /// paragraph and drops the old text's selection.
-    key: u64,
-    /// Where the plate sits in the document whose selection it takes part
-    /// in — a document of one until [`CodeSelect::at`] says otherwise.
-    place: SelectPlace,
-    text: SelectText,
-    spans: Vec<iced::advanced::text::Span<'static, (), iced::Font>>,
-    /// The ink for spans without one; `None` takes the theme's text colour.
-    ink: Option<iced::Color>,
-    metrics: CodeMetrics,
-    width: iced::Length,
-}
-
-impl CodeSelect {
-    /// One plate from per-line spans, newline spans between the lines, so a
-    /// drag runs across rows and a copy carries the line breaks. `content` is
-    /// the exact text the spans spell, byte for byte: the selection's
-    /// offsets index it.
-    pub fn new<'a, Link>(
-        lines: impl IntoIterator<Item = impl AsRef<[iced::advanced::text::Span<'a, Link, iced::Font>]>>,
-        metrics: CodeMetrics,
-        ink: Option<iced::Color>,
-        width: iced::Length,
-    ) -> Self {
-        use iced::advanced::text::Span;
-        use std::hash::{Hash as _, Hasher as _};
-        let mut content = String::new();
-        let mut spans = Vec::new();
-        let mut hasher = std::hash::DefaultHasher::new();
-        for (index, line) in lines.into_iter().enumerate() {
-            if index > 0 {
-                content.push('\n');
-                spans.push(Span::new("\n"));
-            }
-            for span in line.as_ref() {
-                content.push_str(&span.text);
-                span.color
-                    .map(|color| [color.r, color.g, color.b, color.a].map(f32::to_bits))
-                    .hash(&mut hasher);
-                spans.push(
-                    Span::new(span.text.to_string())
-                        .color_maybe(span.color)
-                        .font_maybe(span.font),
-                );
-            }
-        }
-        content.hash(&mut hasher);
-        let key = hasher.finish();
-        Self {
-            key,
-            place: SelectPlace::block(key, 0),
-            text: SelectText::new(content),
-            spans,
-            ink,
-            metrics,
-            width,
-        }
-    }
-
-    /// Put the plate in a document, where a drag runs on past it: a Markdown
-    /// code block is one of its document's blocks, and the selection crosses
-    /// into the paragraphs around it.
-    pub fn at(mut self, place: SelectPlace) -> Self {
-        self.place = place;
-        self
-    }
-}
-
-impl<Message> iced::advanced::Widget<Message, iced::Theme, iced::Renderer> for CodeSelect {
-    fn tag(&self) -> iced::advanced::widget::tree::Tag {
-        iced::advanced::widget::tree::Tag::of::<SelectState>()
-    }
-
-    fn state(&self) -> iced::advanced::widget::tree::State {
-        iced::advanced::widget::tree::State::new(SelectState::default())
-    }
-
-    fn size(&self) -> iced::Size<iced::Length> {
-        iced::Size::new(self.width, iced::Length::Shrink)
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut iced::advanced::widget::Tree,
-        _renderer: &iced::Renderer,
-        limits: &iced::advanced::layout::Limits,
-    ) -> iced::advanced::layout::Node {
-        use iced::advanced::text::Paragraph as _;
-        let state = tree.state.downcast_mut::<SelectState>();
-        iced::advanced::layout::sized(limits, self.width, iced::Length::Shrink, |limits| {
-            let text = code_text(self.spans.as_slice(), limits.max(), self.metrics);
-            state.relayout(self.key, self.place, text, &self.text);
-            state.paragraph.min_bounds()
-        })
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut iced::advanced::widget::Tree,
-        event: &iced::Event,
-        layout: iced::advanced::Layout<'_>,
-        cursor: iced::mouse::Cursor,
-        _renderer: &iced::Renderer,
-        clipboard: &mut dyn iced::advanced::Clipboard,
-        shell: &mut iced::advanced::Shell<'_, Message>,
-        _viewport: &iced::Rectangle,
-    ) {
-        let state = tree.state.downcast_mut::<SelectState>();
-        state.update(&self.text, event, layout, cursor, clipboard, shell);
-    }
-
-    fn mouse_interaction(
-        &self,
-        _tree: &iced::advanced::widget::Tree,
-        layout: iced::advanced::Layout<'_>,
-        cursor: iced::mouse::Cursor,
-        _viewport: &iced::Rectangle,
-        _renderer: &iced::Renderer,
-    ) -> iced::mouse::Interaction {
-        match cursor.is_over(layout.bounds()) {
-            true => iced::mouse::Interaction::Text,
-            false => iced::mouse::Interaction::default(),
-        }
-    }
-
-    fn draw(
-        &self,
-        tree: &iced::advanced::widget::Tree,
-        renderer: &mut iced::Renderer,
-        _theme: &iced::Theme,
-        style: &iced::advanced::renderer::Style,
-        layout: iced::advanced::Layout<'_>,
-        _cursor: iced::mouse::Cursor,
-        viewport: &iced::Rectangle,
-    ) {
-        use iced::advanced::text::Renderer as _;
-        let bounds = layout.bounds();
-        let Some(clip) = bounds.intersection(viewport) else {
-            return;
-        };
-        let ink = self.ink.unwrap_or(style.text_color);
-        let state = tree.state.downcast_ref::<SelectState>();
-        state.draw(renderer, bounds, clip, ink);
-        renderer.fill_paragraph(&state.paragraph, bounds.position(), ink, clip);
-    }
-}
-
-impl<'a, Message: 'a> From<CodeSelect> for iced::Element<'a, Message> {
-    fn from(code: CodeSelect) -> Self {
-        Self::new(code)
-    }
-}
-
-/// A rich text run that can be dragged across — iced's own `Rich` draws it
-/// (inline-code plates, link inks, link clicks all stay its), and a shadow
-/// paragraph laid out with the same spans, size, font and bounds answers
-/// where the glyphs are. A drag runs on past the run's edge into the rest of
-/// its document ([`SelectPlace`]); a run standing on its own is a document of
-/// one, and stops there like the app's plain Ice `text`.
-pub struct SelectRich<'a, Message> {
-    key: u64,
-    /// Where the run sits in its document — see [`CodeSelect::at`].
-    place: SelectPlace,
-    child: iced::Element<'a, Message>,
-    text: SelectText,
-    spans: std::sync::Arc<[iced::advanced::text::Span<'static, String, iced::Font>]>,
-    size: iced::Pixels,
-}
-
-impl<'a, Message: 'a> SelectRich<'a, Message> {
-    /// `rich` must be the `Rich` built from `spans` at `size` in the
-    /// renderer's default font — the shadow paragraph mirrors those.
+impl CodeView {
     pub fn new(
-        rich: iced::widget::text::Rich<'a, String, Message>,
-        spans: std::sync::Arc<[iced::advanced::text::Span<'static, String, iced::Font>]>,
-        size: iced::Pixels,
+        source: String,
+        path: String,
+        dark: bool,
+        window: &mut gpui_kit::Window,
+        cx: &mut gpui_kit::Context<Self>,
     ) -> Self {
-        use std::hash::{Hash as _, Hasher as _};
-        let content: String = spans.iter().map(|span| span.text.as_ref()).collect();
-        let mut hasher = std::hash::DefaultHasher::new();
-        (&content, size.0.to_bits()).hash(&mut hasher);
-        let key = hasher.finish();
+        use gpui_kit::AppContext as _;
+        let language = language_name(&path);
+        let state = cx.new(|cx| {
+            let mut state = gpui_kit::component::input::EditorState::new(window, cx)
+                .language(language)
+                .line_number(true);
+            state.set_value(expand_tabs(&source), window, cx);
+            state
+        });
         Self {
-            key,
-            place: SelectPlace::block(key, 0),
-            child: rich.into(),
-            text: SelectText::new(content),
-            spans,
-            size,
+            state,
+            source,
+            path,
+            dark,
         }
     }
-
-    /// Put the run in a document — see [`CodeSelect::at`].
-    pub fn at(mut self, place: SelectPlace) -> Self {
-        self.place = place;
-        self
+    pub fn replace(
+        &mut self,
+        source: String,
+        path: String,
+        dark: bool,
+        window: &mut gpui_kit::Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if self.source != source || self.path != path {
+            *self = Self::new(source, path, dark, window, cx);
+        } else {
+            self.dark = dark;
+        }
+        cx.notify();
     }
 }
-
-impl<Message> iced::advanced::Widget<Message, iced::Theme, iced::Renderer>
-    for SelectRich<'_, Message>
-{
-    fn tag(&self) -> iced::advanced::widget::tree::Tag {
-        iced::advanced::widget::tree::Tag::of::<SelectState>()
-    }
-
-    fn state(&self) -> iced::advanced::widget::tree::State {
-        iced::advanced::widget::tree::State::new(SelectState::default())
-    }
-
-    fn children(&self) -> Vec<iced::advanced::widget::Tree> {
-        vec![iced::advanced::widget::Tree::new(&self.child)]
-    }
-
-    fn diff(&self, tree: &mut iced::advanced::widget::Tree) {
-        tree.children[0].diff(&self.child);
-    }
-
-    fn size(&self) -> iced::Size<iced::Length> {
-        self.child.as_widget().size()
-    }
-
-    fn size_hint(&self) -> iced::Size<iced::Length> {
-        self.child.as_widget().size_hint()
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut iced::advanced::widget::Tree,
-        renderer: &iced::Renderer,
-        limits: &iced::advanced::layout::Limits,
-    ) -> iced::advanced::layout::Node {
-        use iced::advanced::text::{Alignment, LineHeight, Renderer as _, Shaping, Text, Wrapping};
-        let node = self
-            .child
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits);
-        // The same `Text` `Rich::layout` lays its spans out with, bounds
-        // included — it reads `limits.max()` before sizing, as this does.
-        let text = Text {
-            content: self.spans.as_ref(),
-            bounds: limits.max(),
-            size: self.size,
-            line_height: LineHeight::default(),
-            font: renderer.default_font(),
-            align_x: Alignment::Default,
-            align_y: iced::alignment::Vertical::Top,
-            shaping: Shaping::Advanced,
-            wrapping: Wrapping::default(),
-        };
-        let state = tree.state.downcast_mut::<SelectState>();
-        state.relayout(self.key, self.place, text, &self.text);
-        node
-    }
-
-    fn operate(
-        &mut self,
-        tree: &mut iced::advanced::widget::Tree,
-        layout: iced::advanced::Layout<'_>,
-        renderer: &iced::Renderer,
-        operation: &mut dyn iced::advanced::widget::Operation,
-    ) {
-        self.child
-            .as_widget_mut()
-            .operate(&mut tree.children[0], layout, renderer, operation);
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut iced::advanced::widget::Tree,
-        event: &iced::Event,
-        layout: iced::advanced::Layout<'_>,
-        cursor: iced::mouse::Cursor,
-        renderer: &iced::Renderer,
-        clipboard: &mut dyn iced::advanced::Clipboard,
-        shell: &mut iced::advanced::Shell<'_, Message>,
-        viewport: &iced::Rectangle,
-    ) {
-        self.child.as_widget_mut().update(
-            &mut tree.children[0],
-            event,
-            layout,
-            cursor,
-            renderer,
-            clipboard,
-            shell,
-            viewport,
-        );
-        let state = tree.state.downcast_mut::<SelectState>();
-        state.update(&self.text, event, layout, cursor, clipboard, shell);
-    }
-
-    fn mouse_interaction(
-        &self,
-        tree: &iced::advanced::widget::Tree,
-        layout: iced::advanced::Layout<'_>,
-        cursor: iced::mouse::Cursor,
-        viewport: &iced::Rectangle,
-        renderer: &iced::Renderer,
-    ) -> iced::mouse::Interaction {
-        let own = self.child.as_widget().mouse_interaction(
-            &tree.children[0],
-            layout,
-            cursor,
-            viewport,
-            renderer,
-        );
-        let over_a_link = own != iced::mouse::Interaction::default();
-        match (over_a_link, cursor.is_over(layout.bounds())) {
-            (true, _) => own,
-            (false, true) => iced::mouse::Interaction::Text,
-            (false, false) => own,
+/// Tabs as spaces to the next 4-column stop. Neither the editor nor the text
+/// shaper expands a tab: it draws as the font's tab glyph, one space wide,
+/// so a tab-indented file loses its indentation.
+pub(crate) fn expand_tabs(source: &str) -> String {
+    const STOP: usize = 4;
+    let mut out = String::with_capacity(source.len());
+    let mut column = 0;
+    for ch in source.chars() {
+        match ch {
+            '\t' => {
+                let width = STOP - column % STOP;
+                out.extend(std::iter::repeat_n(' ', width));
+                column += width;
+            }
+            '\n' => {
+                out.push(ch);
+                column = 0;
+            }
+            _ => {
+                out.push(ch);
+                column += 1;
+            }
         }
     }
+    out
+}
 
-    fn draw(
-        &self,
-        tree: &iced::advanced::widget::Tree,
-        renderer: &mut iced::Renderer,
-        theme: &iced::Theme,
-        style: &iced::advanced::renderer::Style,
-        layout: iced::advanced::Layout<'_>,
-        cursor: iced::mouse::Cursor,
-        viewport: &iced::Rectangle,
-    ) {
-        let bounds = layout.bounds();
-        if let Some(clip) = bounds.intersection(viewport) {
-            let state = tree.state.downcast_ref::<SelectState>();
-            state.draw(renderer, bounds, clip, style.text_color);
+fn language_name(path: &str) -> String {
+    match code_token(path).as_str() {
+        "rs" => "rust",
+        "js" | "jsx" => "javascript",
+        "ts" => "typescript",
+        "tsx" => "tsx",
+        "py" => "python",
+        "sh" | "bash" => "bash",
+        "md" => "markdown",
+        "yml" => "yaml",
+        extension => return extension.to_owned(),
+    }
+    .to_owned()
+}
+impl gpui_kit::Render for CodeView {
+    fn render(
+        &mut self,
+        _: &mut gpui_kit::Window,
+        _: &mut gpui_kit::Context<Self>,
+    ) -> impl gpui_kit::IntoElement {
+        use gpui_kit::*;
+        if self.source.is_empty() {
+            return div().p_3().child("This file is empty.").into_any_element();
         }
-        self.child.as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            layout,
-            cursor,
-            viewport,
-        );
-    }
-
-    fn overlay<'b>(
-        &'b mut self,
-        tree: &'b mut iced::advanced::widget::Tree,
-        layout: iced::advanced::Layout<'b>,
-        renderer: &iced::Renderer,
-        viewport: &iced::Rectangle,
-        translation: iced::Vector,
-    ) -> Option<iced::advanced::overlay::Element<'b, Message, iced::Theme, iced::Renderer>> {
-        self.child.as_widget_mut().overlay(
-            &mut tree.children[0],
-            layout,
-            renderer,
-            viewport,
-            translation,
-        )
+        // the reader takes whatever height its pane leaves it and scrolls
+        // inside; the pane, not the file's line count, sizes it. Grown, not
+        // 100%: a percentage would count the header's row twice.
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h_0()
+            .child(
+                gpui_kit::component::input::Editor::new(&self.state)
+                    .readonly(true)
+                    .bordered(false)
+                    .aria_label(format!("Code: {}", self.path))
+                    .flex_1()
+                    .min_h_0(),
+            )
+            .into_any_element()
     }
 }
-
-impl<'a, Message: 'a> From<SelectRich<'a, Message>> for iced::Element<'a, Message> {
-    fn from(rich: SelectRich<'a, Message>) -> Self {
-        Self::new(rich)
-    }
-}
-

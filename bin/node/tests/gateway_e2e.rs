@@ -62,7 +62,7 @@ fn signed_route(
             policy: RoutePolicy {
                 audience,
                 methods: vec![RouteMethod::Get, RouteMethod::Head, RouteMethod::Post],
-                max_request_bytes: 1024,
+                max_request_bytes: Some(1024),
                 max_response_bytes: 4096,
                 allow_authorization: false,
                 allow_upgrade: false,
@@ -103,6 +103,9 @@ fn route_revision(cluster: &Cluster, reader: usize, account: u64) -> Option<u64>
     }
 }
 
+/// the zero-length chunk that ends a chunk-framed body.
+const CHUNKED_END: &str = "0\r\n\r\n";
+
 fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
@@ -117,6 +120,18 @@ fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
             continue;
         };
         let headers = String::from_utf8_lossy(&request[..header_end + 4]);
+        // A body the gateway forwarded has no declared length — the head it
+        // was carried in no longer states one — so it arrives CHUNK FRAMED and
+        // the terminating zero-length chunk is what says it is whole.
+        let chunked = headers
+            .lines()
+            .any(|line| line.to_ascii_lowercase().trim() == "transfer-encoding: chunked");
+        if chunked {
+            if request.ends_with(CHUNKED_END.as_bytes()) {
+                return request;
+            }
+            continue;
+        }
         let content_length = headers
             .lines()
             .find_map(|line| {
@@ -164,7 +179,10 @@ fn spawn_loopback(
             assert!(!lower.contains("x-forwarded-"));
             assert_ne!(alice_node, bob_node);
             if expected.starts_with("POST") {
-                assert!(text.ends_with("{\"name\":\"duck\"}"));
+                assert!(
+                    text.contains("{\"name\":\"duck\"}") && text.ends_with(CHUNKED_END),
+                    "the body arrives chunk framed and whole:\n{text}"
+                );
                 stream
                     .write_all(
                         b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nSet-Cookie: secret=nope\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
@@ -205,7 +223,6 @@ fn proxy_request(
                 "method": method,
                 "path_and_query": path,
                 "headers": headers,
-                "body_len": body.len(),
                 // `ProxyRequestHead` is `deny_unknown_fields` AND has no
                 // `serde(default)` on `upgrade`, so omitting it is not a
                 // permissive miss — the whole head fails to deserialize and the
@@ -286,6 +303,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     let (ok, output) = cluster.run_verb(&[
         "gateway",
         "bind",
+        "--trusted-loopback",
         "--workspace",
         workspace.to_str().unwrap(),
         "--label",

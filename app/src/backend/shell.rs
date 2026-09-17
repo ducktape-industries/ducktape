@@ -1,105 +1,5 @@
 use super::*;
 
-/// One shell navigation entry. `live` is the capsule's pulse dot.
-#[derive(Clone, Debug, PartialEq)]
-pub struct NavItem {
-    pub id: crate::ShellTab,
-    pub title: String,
-    pub icon: String,
-    pub badge: i64,
-    pub active: bool,
-    pub live: bool,
-}
-
-/// `1 repository` / `3 repositories` — the ONE place a count and its noun are
-/// joined. English has no rule that derives the plural (repository/repositories,
-/// directory/directories), so both forms are stated by the caller. Every
-/// count label goes through here; a bare `format!("{n} agents")` renders the
-/// `1 agents` the register-machine subtitles used to show.
-pub fn plural(count: i64, one: &str, many: &str) -> String {
-    let noun = if count == 1 { one } else { many };
-    format!("{count} {noun}")
-}
-
-/// A HEADER SUBTITLE IS A MEASUREMENT, AND A DISCONNECTED APP MEASURED NOTHING.
-/// Every `*_summary` below folds rows that only a live node can deliver, so with
-/// the node down they all read `0 … · 0 …` — a claim about content, asserted off
-/// a listing nobody fetched. They take `connected` and say nothing instead, the
-/// same trade `count_label` (backend/document.rs) and `member_tier`
-/// (backend/roster.rs) already make: silence over a confident zero.
-///
-/// AND AN ALL-ZERO PAIR IS THE SAME NOISE ONE STEP LATER. Every one of these
-/// screens plates the empty case in words — "No proposals yet…", "No agents
-/// registered…", "No members here yet…", "Empty directory…" — so a subtitle
-/// reading `0 open · 0 settled` over the top of it says the same nothing twice,
-/// in digits. #996 settled the rule for the bell and the member count: gate the
-/// digit AND its word together. These four were the sites it did not reach.
-/// A zero that sits BESIDE a real reading stays — `1 agent · 0 working` is the
-/// sentence doing its job.
-///
-/// `2 humans · 1 agent` — the machine subtitle beside the Members title, and
-/// the same reading in Settings' network card.
-///
-/// IT FOLDS THE ROWS IT IS PRINTED ABOVE. This used to fold the valset queries
-/// instead — validators plus residents — while the list under it also draws the
-/// registered agents, which hold no valset standing at all. Both numbers were
-/// true and the sentence they formed was not: a demo workspace read
-/// `1 validator · 0 residents` above two rows, and "residents" is a word the
-/// screen never says anywhere else. `is_agent` is the one split the screen
-/// itself makes — the Humans / Agents chips are `filter_members` over exactly
-/// that field — so these two counts partition the list and sum to the All chip
-/// beside them. The validator count is not lost: it is its own chip, and every
-/// row carries its role marker.
-pub fn members_summary(connected: bool, rows: &[MemberRow]) -> String {
-    if !connected || rows.is_empty() {
-        return String::new();
-    }
-    let agents = rows.iter().filter(|row| row.is_agent).count();
-    let left = plural(count_i64(rows.len() - agents), "human", "humans");
-    let right = plural(count_i64(agents), "agent", "agents");
-    format!("{left} · {right}")
-}
-
-/// `tally_label` for two readings that are ALREADY rendered — the consensus
-/// trio off `/v1/status` is optional per field, so each arrives as its own
-/// `optional_number` string (`—` when the node reports nothing). Joining the
-/// numbers instead would mean carrying them as `i64` and printing a measured
-/// `0` for "not reported".
-pub fn reading_pair(left: &str, right: &str) -> String {
-    format!("{left} / {right}")
-}
-
-/// The rail's navigation: nine collaboration surfaces plus the node operator
-/// surface, with the active pane flagged. `settings` is not here because the
-/// rail pins it to its own footer beside the account avatar.
-pub fn shell_nav(tab: crate::ShellTab, approvals: i64, agent_live: bool) -> Vec<NavItem> {
-    [
-        (crate::ShellTab::Chat, "Chat", "nav-chat"),
-        (crate::ShellTab::Pages, "Pages", "nav-pages"),
-        (crate::ShellTab::Forge, "Forge", "nav-forge"),
-        (crate::ShellTab::Agents, "Agents", "nav-agents"),
-        (crate::ShellTab::Files, "Files", "nav-files"),
-        (crate::ShellTab::Explorer, "Explorer", "nav-explorer"),
-        (crate::ShellTab::Node, "Node", "node"),
-        (crate::ShellTab::Members, "Members", "nav-members"),
-        (crate::ShellTab::Governance, "Approvals", "shield-check"),
-    ]
-    .into_iter()
-    .map(|(id, title, icon)| NavItem {
-        id,
-        title: title.into(),
-        icon: icon.into(),
-        badge: if id == crate::ShellTab::Governance {
-            approvals
-        } else {
-            0
-        },
-        active: id == tab,
-        live: id == crate::ShellTab::Forge && agent_live,
-    })
-    .collect()
-}
-
 /// Does the pane `tab` mounts actually read `plane`'s rows?
 ///
 /// THE TAB-SWITCH GATE. Every tab move used to refetch members, governance,
@@ -109,25 +9,21 @@ pub fn shell_nav(tab: crate::ShellTab, approvals: i64, agent_live: bool) -> Vec<
 /// commits (`live.rs`), which is both cheaper and earlier. So a tab move only
 /// needs the plane its destination screen is about to draw.
 ///
-/// The titlebar chips (tier, approvals, agent dot, account name) read all four
-/// from state, and state is what the connect load and the live-plane lane fill
-/// — no chip depends on a tab click.
+/// The titlebar chips (approvals, agent dot, account name) read from state,
+/// and state is what the connect load and the live-plane lane fill — no chip
+/// depends on a tab click.
+/// The list is keyed by view id and stays HOST-SIDE by ruling: a view
+/// declaring which planes it reads would be widening its own read surface,
+/// which is a policy call and not a tab's to make. An id named nowhere here —
+/// every registry-listed view, which reads its own planes through `rpc.live` —
+/// puts no app-side load on its screen's path.
 pub fn tab_reads_plane(tab: crate::ShellTab, plane: String) -> bool {
+    let crate::ShellTab::View(view) = tab;
     match plane.as_str() {
-        // the tier badge, the admin gate and the forge write gate all read the
-        // roster, so five panes draw it.
-        "members" => matches!(
-            tab,
-            crate::ShellTab::Members
-                | crate::ShellTab::Governance
-                | crate::ShellTab::Forge
-                | crate::ShellTab::Node
-                | crate::ShellTab::Settings
-        ),
-        "governance" => tab == crate::ShellTab::Governance,
-        "agents" => tab == crate::ShellTab::Agents,
+        "governance" => view == "governance",
+        "agents" => view == "agents",
         // Settings draws the account card; Forge draws the org "about".
-        "account" => matches!(tab, crate::ShellTab::Settings | crate::ShellTab::Forge),
+        "account" => matches!(view, "settings" | "forge"),
         _ => false,
     }
 }
@@ -200,7 +96,7 @@ pub struct WorkspaceInit {
 /// ([`workspace_config::join_workspace`]) rather than an endpoint. It writes a
 /// directory, mints two keys and runs argon2-free but still blocking file work,
 /// hence `spawn_blocking`.
-pub async fn join_network(blob: ui_lang_runtime::Secret) -> Result<WorkspaceInit, AppError> {
+pub async fn join_network(blob: crate::secret::Secret) -> Result<WorkspaceInit, AppError> {
     async {
         let blob = blob.expose().trim().to_string();
         let valid = !blob.is_empty()
@@ -240,8 +136,7 @@ pub async fn join_network(blob: ui_lang_runtime::Secret) -> Result<WorkspaceInit
 /// so a network nobody is serving has nothing useful to hand out anyway.
 ///
 /// The app takes no TTL: it mints the ONE default every other door mints
-/// (`workspace_config::DEFAULT_INVITE_TTL_DAYS`). Ice cannot read a Rust
-/// constant, so the constant is applied here rather than passed from a handler.
+/// (`workspace_config::DEFAULT_INVITE_TTL_DAYS`).
 pub async fn mint_invite(workspace: String) -> Result<String, AppError> {
     let minted: Result<String, String> = async {
         let endpoint = workspace_rpc(&workspace)?;
@@ -286,7 +181,7 @@ pub struct ProvisionStep {
 pub fn provision_progress(
     workspace: String,
     rpc: String,
-) -> iced::futures::stream::BoxStream<'static, ProvisionStep> {
+) -> futures::stream::BoxStream<'static, ProvisionStep> {
     struct State {
         dir: Option<PathBuf>,
         chain_id: String,
@@ -301,7 +196,7 @@ pub fn provision_progress(
         Some((chain_id, dir)) => (chain_id, Some(dir)),
         None => (workspace, None),
     };
-    Box::pin(iced::futures::stream::unfold(
+    Box::pin(futures::stream::unfold(
         State {
             dir,
             chain_id,
@@ -458,10 +353,7 @@ pub fn network_label(chain_id: impl AsRef<str>, rpc: impl AsRef<str>) -> String 
     host.to_string()
 }
 
-// THE STATUS ITEM'S WORDS. Ice has no string concatenation, so every tray text
-// that joins a count or a name to a label is spelled here, beside the
-// titlebar's. A row's text is also what a test chooses it by, so each verb
-// below is a contract with `tests/app.ice`.
+// Shared status-item labels, alongside the titlebar labels.
 
 /// The count beside the menu-bar icon: nothing at all while the bell is empty.
 pub fn tray_badge(unread: i64) -> String {
@@ -500,58 +392,6 @@ pub fn tray_choice_row(label: String, chosen: bool) -> String {
     }
 }
 
-/// A consensus stamp at or above this is unix MILLIS, not a block height.
-///
-/// `consensus_time` is stamped `= height` by the validator lane
-/// (crates/noded/src/index.rs) and `= unix_millis()` by a single-writer noded
-/// (bin/noded/src/main.rs), and every module record time is that value. No
-/// chain reaches 10^12 blocks and no unix-millis clock has ever been below it,
-/// so the two lanes are told apart by the magnitude alone. Rendering the millis
-/// lane as a height is how `h 1,753,622,400,000` reaches the screen.
-const MILLIS_LANE_FLOOR: i64 = 1_000_000_000_000;
-
-/// The wall clock a stamp carries when it came off the unix-millis lane.
-fn wall_clock_seconds(stamp: i64) -> Option<i64> {
-    match stamp >= MILLIS_LANE_FLOOR {
-        true => Some(stamp / 1_000),
-        false => None,
-    }
-}
-
-/// The titlebar's machine value: `h 84,912`, grouped the way the artifact
-/// writes heights. A height the node has not reported yet reads `h —`.
-pub fn height_label(height: i64) -> String {
-    if height < 0 {
-        return "h —".into();
-    }
-    format!("h {}", grouped_digits(height))
-}
-
-/// The same `h 84,912` run under the name the record-meta call sites use, where
-/// the artifact printed a wall clock the validator lane cannot supply. One
-/// renderer on purpose — the two names mark the two slots, not two formats.
-pub fn height_label_short(height: i64) -> String {
-    height_label(height)
-}
-
-/// The honest renderer for a consensus-stamped record time: `412 blocks ago`,
-/// `1 block ago`, `this block` — or, on the unix-millis lane, the real elapsed
-/// wall clock. A record with no stamp prints nothing.
-pub fn height_ago(then_height: i64, now_height: i64, wall_now: i64) -> String {
-    if then_height <= 0 {
-        return String::new();
-    }
-    if let Some(seconds) = wall_clock_seconds(then_height) {
-        return relative_time(seconds, wall_now);
-    }
-    let elapsed = now_height.saturating_sub(then_height);
-    match elapsed {
-        blocks if blocks <= 0 => "this block".into(),
-        1 => "1 block ago".into(),
-        blocks => format!("{} blocks ago", grouped_digits(blocks)),
-    }
-}
-
 /// A non-negative count with thousands separators: `84,912`.
 pub(crate) fn grouped_digits(value: i64) -> String {
     let digits = value.max(0).to_string();
@@ -564,6 +404,27 @@ pub(crate) fn grouped_digits(value: i64) -> String {
         grouped.push(digit);
     }
     grouped
+}
+
+/// The rail's foot names who is signed in: the account by its name, else by
+/// its number; no account reads as a sign-in. The second line is the short
+/// prefix of the key this desktop signs with, or that nothing signs.
+pub fn rail_identity(
+    account_exists: bool,
+    account_name: &str,
+    account_number: &str,
+    signer_key: &str,
+) -> (String, String) {
+    let who = match (account_exists, account_name.is_empty()) {
+        (true, false) => account_name.to_owned(),
+        (true, true) => format!("Account #{account_number}"),
+        (false, _) => "Sign in".to_owned(),
+    };
+    let whose_key = match signer_key.is_empty() {
+        true => "No signing key".to_owned(),
+        false => format!("key {}", signer_key.chars().take(8).collect::<String>()),
+    };
+    (who, whose_key)
 }
 
 /// TWO uppercase letters for a 28px+ avatar plate: the initials of the first
@@ -590,72 +451,6 @@ pub fn initials_of(name: &str) -> String {
     }
 }
 
-/// `2h ago` / `40m ago` / `just now`, for a genuine UNIX-SECONDS stamp.
-///
-/// In this app exactly two values qualify, both off `/v1/status`:
-/// `NodeFacts.last_finalized_at` and `operations.phase_since`. NEVER call it on
-/// a module record's time — the consensus validator stamps `consensus_time =
-/// height` (crates/noded/src/index.rs) and a single-writer noded stamps unix
-/// MILLIS, so a record time is a block height, not seconds. Render those with
-/// [`height_ago`] / [`height_label_short`].
-pub fn relative_time(unix_seconds: i64, wall_now: i64) -> String {
-    // [`UNMEASURED`] and "this record carries no stamp" are different facts and
-    // print differently: the first is a reading the node never published and
-    // owes the reader a `—`, the second is a record that legitimately has no
-    // time and prints nothing rather than an em dash on every row.
-    if unix_seconds < 0 {
-        return "—".into();
-    }
-    if unix_seconds == 0 {
-        return String::new();
-    }
-    let elapsed = wall_now.saturating_sub(unix_seconds);
-    if elapsed < 60 {
-        return "just now".into();
-    }
-    let (value, unit) = duration_parts(elapsed);
-    format!("{value}{unit} ago")
-}
-
-/// `expires in 412 blocks`; a passed deadline reads `expired`. A governance
-/// deadline is `consensus_time + voting_period`, so on the validator lane it is
-/// a HEIGHT and the remaining span is counted in blocks — never in hours. On
-/// the unix-millis lane the same field genuinely is a clock, and `height` is
-/// not comparable to it at all, so that lane is counted against the wall.
-pub fn expires_in_blocks(deadline_height: i64, height: i64, wall_now: i64) -> String {
-    if let Some(seconds) = wall_clock_seconds(deadline_height) {
-        let remaining = seconds.saturating_sub(wall_now);
-        if remaining <= 0 {
-            return "expired".into();
-        }
-        let (value, unit) = duration_parts(remaining);
-        return format!("expires in {value}{unit}");
-    }
-    let remaining = deadline_height.saturating_sub(height);
-    match remaining {
-        blocks if blocks <= 0 => "expired".into(),
-        1 => "expires in 1 block".into(),
-        blocks => format!("expires in {} blocks", grouped_digits(blocks)),
-    }
-}
-
-/// A span in seconds as its largest whole unit: `(45, "m")`, `(23, "h")`.
-fn duration_parts(seconds: i64) -> (i64, &'static str) {
-    const MINUTE: i64 = 60;
-    const HOUR: i64 = 60 * MINUTE;
-    const DAY: i64 = 24 * HOUR;
-    match seconds {
-        span if span < HOUR => (span / MINUTE, "m"),
-        span if span < DAY => (span / HOUR, "h"),
-        span => (span / DAY, "d"),
-    }
-}
-
-// A wall clock (`14:32`) and a day divider (`Today`) are DELIBERATELY absent:
-// a module record's stamp is a block height on a validator network and unix
-// millis on a single-writer node, so neither could be rendered honestly. The
-// artifact's clock is divergence, not a gap — see height_ago/height_label_short.
-
 /// Elapsed `mm:ss` for the huddle pills and panel.
 pub fn mmss(seconds: i64) -> String {
     let seconds = seconds.max(0);
@@ -674,45 +469,3 @@ pub fn current_wall_seconds() -> i64 {
     now_seconds()
 }
 
-/// A serde `Vec<u8>` as it arrives over JSON: an array of numbers.
-pub(crate) fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
-    value
-        .as_array()
-        .map(|bytes| {
-            bytes
-                .iter()
-                .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The first grapheme of a display name, upper-cased, for an avatar plate.
-/// The single-glyph avatar label for a name — EMPTY when there is no name.
-///
-/// It used to fall back to `?`, and the only principal that reaches the
-/// fallback is an account nobody has named yet: its avatar sits in the corner
-/// of the module rail, and a `?` in a circle there does not read as "unnamed",
-/// it reads as HELP. `PrincipalPlate` draws an empty string as a bare plate,
-/// which is what an identity with no name looks like.
-pub fn initial_of(name: &str) -> String {
-    name.trim()
-        .chars()
-        .next()
-        .map(|first| first.to_uppercase().to_string())
-        .unwrap_or_default()
-}
-
-/// The account controlled by the actual local signer, read at the write edge.
-pub(crate) async fn local_account(rpc: &RpcClient) -> Result<Option<u64>, String> {
-    let Some(key) = local_user_key().await else {
-        return Ok(None);
-    };
-    let reply: identity::IdentityReply = rpc
-        .query("identity", &identity::IdentityQuery::OfKey { key })
-        .await?;
-    let identity::IdentityReply::Account(account) = reply else {
-        return Err("the identity module returned the wrong reply".to_string());
-    };
-    Ok(account.map(|account| account.number))
-}

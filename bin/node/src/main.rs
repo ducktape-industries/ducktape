@@ -52,6 +52,7 @@ use commonware_runtime::{Metrics as _, Runner, Supervisor};
 mod account_cli;
 mod agent;
 mod agent_cli;
+mod chief_cli;
 mod agent_plane;
 mod airlock;
 mod announce;
@@ -83,9 +84,9 @@ mod host_resources;
 mod host_state;
 mod join_gate;
 mod known_nodes;
+mod lane_table;
 #[cfg(test)]
 mod main_tests;
-mod mcp;
 mod mesh_book;
 mod mesh_lanes;
 mod mesh_window;
@@ -94,11 +95,15 @@ mod netstack_governance;
 mod node_http;
 mod overlay_book;
 mod plane_metrics;
+mod presence;
+mod presence_plane;
+mod qualify;
 mod reachability_plane;
 #[cfg(test)]
 mod reachability_plane_tests;
 mod relay;
 mod relay_runtime;
+mod release_cli;
 mod replica;
 mod resource_limits;
 mod rpc;
@@ -106,13 +111,10 @@ mod sandbox_cli;
 mod services;
 mod sync;
 mod task_dump;
-mod term_plane;
 mod tty;
 mod userkey_cli;
 mod util;
 mod validator;
-mod voice;
-mod voice_plane;
 mod wallet_cli;
 mod work_admission;
 use crate::util::fatal;
@@ -300,7 +302,10 @@ enum Family {
     /// live code swaps: update, register, status
     #[command(subcommand)]
     Module(module_cli::ModuleCmd),
-    /// the stdio MCP server an agent runner spawns
+    /// the desktop app's release: manifest sign/verify, bundle signing through the airlock gateway
+    #[command(subcommand)]
+    Release(release_cli::ReleaseCmd),
+    /// the agent tool plane over stdio, for driving it by hand
     Mcp,
 }
 
@@ -308,8 +313,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = <Cli as clap::Parser>::parse();
     match cli.family {
         // `fs` owns a 0/1/2 exit-code contract, so it exits directly (after
-        // flushing the stream `cat` wrote to); `mcp` is the stdio server the
-        // agent runner spawns and holds until its stdin closes.
+        // flushing the stream `cat` wrote to); `mcp` serves the tool plane over
+        // stdio until its stdin closes. A sandboxed RUN does not use this: its
+        // CLI reaches the same catalog as a streamable-HTTP MCP endpoint on the
+        // run's own node lane, so no ducktape binary is inside the guest.
         Family::Fs(cmd) => {
             let code = fs_cli::run(cmd);
             use std::io::Write as _;
@@ -317,7 +324,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(code.into());
         }
         Family::Mcp => {
-            mcp::serve();
+            mcp_host::serve_stdio();
             Ok(())
         }
         // The `__egress-hook` subcommand lived here: an OCI createRuntime hook
@@ -333,6 +340,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Family::Gateway(cmd) => gateway_routes::run(cmd),
         Family::Service(cmd) => services::run(cmd),
         Family::Module(cmd) => module_cli::run(cmd),
+        Family::Release(cmd) => release_cli::run(cmd),
         Family::Node(cli_args::NodeCmd::Run(args)) => run_node_verb(args),
         Family::Node(cli_args::NodeCmd::Op(op)) => cli::run(op),
     }
@@ -353,7 +361,19 @@ fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Erro
     noded::log::init(Some(log_ring.clone()), Some(workspace.join("daemon.log")));
     report_open_file_limit();
 
-    run_node(config::resolve(&cfg_path)?, cfg_path, sync_only, log_ring)
+    let resolved = config::resolve(&cfg_path)?;
+    // BEFORE any of the boot: a binary whose module world is not the one this
+    // workspace was founded with cannot instantiate the network's components.
+    // Without this guard the failure is a "type-checking export func `shape`"
+    // deep inside the restore compose — hours of reading the wrong plane.
+    // Refused by name, with no tolerance window: rebuild or re-found.
+    config::guard_founding_binary(
+        &resolved.service.workspace,
+        &resolved.service.chain_id,
+        noded::services::build_identity_or_unknown(),
+        wasm_host::module_world_digest(),
+    )?;
+    run_node(resolved, cfg_path, sync_only, log_ring)
 }
 
 /// Put the startup open-file raise ([`main`]) in `daemon.log`, ONCE, now that
@@ -535,16 +555,13 @@ fn run_node(
         status,
         stream_hub,
         index,
-        voice_requests,
+        presence_requests,
         code_stage_requests,
         blobs,
         services,
         gateway_requests,
         gateway_commands,
-        terminals,
-        session_requests,
-        remote_sessions,
-        local_gateway_via,
+        service_link,
         node_api_ports,
     } = boot::surfaces::bind(boot::surfaces::BindConfig {
         sync_only,
@@ -657,7 +674,7 @@ fn run_node(
         collab_pump::spawn(
             gateway_commands.clone(),
             status.clone(),
-            terminals.as_ref(),
+            service_link.as_ref(),
             workspace.clone(),
             &chain_id,
         );
@@ -687,7 +704,7 @@ fn run_node(
         // without one names no backend rather than naming a plane it never
         // started.
         if wireguard_listen.is_some() {
-            metrics.set_netstack_backend(reachability_plane::netstack_backend().name());
+            tokio::spawn(reachability_plane::observe_execution(metrics.clone()));
             let swap_metrics = metrics.clone();
             status.wire_netstack_swapper(move |request| {
                 let metrics = swap_metrics.clone();
@@ -724,6 +741,7 @@ fn run_node(
             ));
         }
         status.publish(noded::NodeStatus {
+            contract: noded::NODE_CONTRACT,
             version: build_version(),
             public_key: status_public_key.clone(),
             ..Default::default()
@@ -769,7 +787,7 @@ fn run_node(
                 blobs,
                 &index,
                 &genesis,
-                voice_requests,
+                presence_requests,
             )
             .await;
             return;
@@ -859,16 +877,12 @@ fn run_node(
                 http_cmds,
                 gateway_requests,
                 gateway_commands.clone(),
-                terminals,
-                session_requests,
-                remote_sessions.clone(),
-                local_gateway_via,
                 node_api_ports,
                 &stream_hub,
                 index.clone(),
                 metrics.clone(),
                 status.clone(),
-                voice_requests,
+                presence_requests,
                 blobs.clone(),
                 overlay_slot.clone(),
                 bulk_pacer.clone(),
@@ -955,14 +969,10 @@ fn run_node(
             http_cmds,
             gateway_requests,
             gateway_commands,
-            terminals,
-            session_requests,
-            remote_sessions,
-            local_gateway_via,
             node_api_ports,
             stream_hub,
             index,
-            voice_requests,
+            presence_requests,
             code_stage_requests,
             blobs,
             overlay_slot,

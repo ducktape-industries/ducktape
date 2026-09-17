@@ -7,9 +7,10 @@ namespace = "ducktape-demo"
 peer_seeds = [0, 1, 2, 3]
 validator_seeds = [0, 1, 2]
 # the genesis wasm set: no code is embedded in the binary, so every node of the
-# cluster must point at the SAME founding set — the one `cargo build` stages
-# beside the binary (path is relative to the cwd the node is run from — the
-# repo root).
-modules = "target/debug/modules"
+# cluster must run on the SAME founding set. No `modules` key here means the
+# set the running binary's own build staged beside it, which is the same set
+# for every node of this cluster — and the directory carries the checkout's
+# path in its name, so no checked-in file can spell it. Point `modules` at a
+# directory only to run a cluster on a set that is not this build's.
 storage_dir = "/tmp/ducktape-0"
 rpc_listen = "127.0.0.1:52300"

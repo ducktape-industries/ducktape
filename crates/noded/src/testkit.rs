@@ -264,10 +264,8 @@ impl InProcDaemon {
     /// what `NodeLink::files()` builds for a real daemon.
     pub fn files(&self) -> duckfs_client::http::HttpNode {
         let token = self.operator_token.clone();
-        duckfs_client::http::HttpNode::new(self.node_url()).with_write_auth(std::sync::Arc::new(
-            move |_method, _path, _body| {
-                vec![(crate::admin::ADMIN_TOKEN_HEADER.to_string(), token.clone())]
-            },
+        duckfs_client::http::HttpNode::new(self.node_url()).with_operator_credential(std::sync::Arc::new(
+            move || Some(token.clone()),
         ))
     }
 
@@ -381,6 +379,7 @@ fn run_actor(mut host: Host, status_modules: Vec<String>, io: ActorIo) {
                 NodeCommand::Submit {
                     target,
                     payload,
+                    required_blob: _,
                     origin,
                     reply,
                 } => {
@@ -413,12 +412,15 @@ fn run_actor(mut host: Host, status_modules: Vec<String>, io: ActorIo) {
                             )
                             .await
                         }
-                        Err(err) => Err(err.to_string()),
+                        Err(err) => Err(crate::Refused::new("malformed_frame", err.to_string())),
                     };
                     let _ = reply.send(result);
                 }
                 NodeCommand::Query { target, req, reply } => {
-                    let result = host.query(&target, &req).await.map_err(|e| e.to_string());
+                    let result = host
+                        .query(&target, &req)
+                        .await
+                        .map_err(|e| crate::Refused::of(&e));
                     let _ = reply.send(result);
                 }
                 NodeCommand::QueryAs {
@@ -430,7 +432,7 @@ fn run_actor(mut host: Host, status_modules: Vec<String>, io: ActorIo) {
                     let result = host
                         .query_as(&target, &req, sdk::Origin::External(reader))
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| crate::Refused::of(&e));
                     let _ = reply.send(result);
                 }
             }
@@ -453,6 +455,7 @@ fn publish_status(status: &crate::StatusCell, host: &Host, status_modules: &[Str
         })
         .collect();
     status.publish(NodeStatus {
+        contract: crate::NODE_CONTRACT,
         version: env!("CARGO_PKG_VERSION").into(),
         root_hash: hex_root(&host.root_hash()),
         height,
@@ -482,7 +485,7 @@ async fn commit(
     status_modules: &[String],
     origin: Origin,
     msg: Msg,
-) -> Result<BlockSummary, String> {
+) -> Result<BlockSummary, crate::Refused> {
     let next = *height + 1;
     let ctx = BlockContext {
         height: next,
@@ -503,7 +506,7 @@ async fn commit(
                 root_hash: hex_root(&out.root_hash),
             })
         }
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(crate::Refused::of_submit(&err)),
     }
 }
 

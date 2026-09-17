@@ -20,6 +20,16 @@
 //!   `/v1/submit/frame`, the volatile `/v1/services/hello`, the module-bound
 //!   mutations whose per-request signature IS their authority, and the gateway
 //!   routes runs use for egress.
+//!
+//! One route is SERVED here rather than forwarded: [`MCP_PATH`], the agent tool
+//! plane ([`mcp_host`]) as a streamable-HTTP MCP endpoint. It is on this lane
+//! because this lane already IS the run — it was built from the run's own
+//! host-side environment, so the tools act for exactly the agent that lane
+//! belongs to and the guest supplies no identity at all. That also keeps the
+//! tool plane on the HOST: nothing about it enters the guest, so there is no
+//! ducktape binary in the image, no run-scoped write token in the guest's
+//! environment, and no way for the guest's build of the tools to differ from
+//! this daemon's, because there is only one.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -52,6 +62,11 @@ impl Drop for ReadLane {
     }
 }
 
+/// the lane path the run's CLI speaks MCP to. A run's whole tool plane is this
+/// one url — `{DUCKTAPE_NODE}{MCP_PATH}` — which is why nothing else about the
+/// tool plane has to reach the guest.
+pub const MCP_PATH: &str = "/mcp";
+
 /// what the lane does with one request, decided from its path and query alone.
 enum Route {
     /// forward verbatim.
@@ -60,6 +75,8 @@ enum Route {
     Refuse(&'static str),
     /// a git push on a forge repo: forward carrying the operator credential.
     ForgePush,
+    /// the agent tool plane, served here rather than forwarded.
+    Mcp,
 }
 
 struct Lane {
@@ -70,6 +87,16 @@ struct Lane {
     /// this node's operator credential, lent to a push; `None` refuses every
     /// push (there is no proof to lend).
     credential: Option<OperatorCredential>,
+    /// the run's own host-side environment, which is what the tool plane is
+    /// built FROM ([`mcp_host::Run::from_vars`]).
+    ///
+    /// The env and not the built `Run`, because a `Run` owns blocking http
+    /// clients and each of those owns a runtime — constructing or dropping one
+    /// on this lane's async thread panics tokio outright. So the whole `Run`
+    /// lives and dies inside the `spawn_blocking` that serves one message,
+    /// which costs a client per call and is nothing beside the node round trip
+    /// that call is about to make.
+    mcp_env: Vec<(String, String)>,
     client: reqwest::Client,
     /// reasons already logged for this run: a refusal is a per-request event
     /// and an agent in a retry loop would otherwise evict the log ring.
@@ -87,6 +114,12 @@ impl ReadLane {
         agent_id: Option<String>,
         credential: Option<OperatorCredential>,
     ) -> Result<Option<Self>, String> {
+        // SNAPSHOT BEFORE the url below is rewritten to this lane's own
+        // address: the tool plane runs on the host and dials the node directly,
+        // and the rest of what it reads here (the agent, the run-scoped action
+        // endpoint and its token) is likewise the host's, never the guest's
+        // translated copy.
+        let mcp_env = envs.to_vec();
         let Some(node) = envs.iter_mut().find(|(key, _)| key == crate::NODE_URL_ENV) else {
             return Ok(None);
         };
@@ -101,6 +134,7 @@ impl ReadLane {
             upstream: node.1.trim_end_matches('/').to_string(),
             agent_id,
             credential,
+            mcp_env,
             client: reqwest::Client::builder()
                 // a loopback daemon is never behind a corporate proxy.
                 .no_proxy()
@@ -132,6 +166,7 @@ async fn handle(State(lane): State<Arc<Lane>>, req: Request) -> Response {
         Route::Pass => lane.forward(req).await,
         Route::Refuse(reason) => lane.refuse(reason),
         Route::ForgePush => lane.forge_push(req).await,
+        Route::Mcp => lane.mcp(req).await,
     }
 }
 
@@ -144,6 +179,7 @@ fn classify(path: &str, query: &str) -> Route {
         // no credential of any kind, and it carries the `logs` topic: this
         // operator's log ring is not a run's to read.
         "/v1/ws" => Route::Refuse("ws_refused"),
+        MCP_PATH => Route::Mcp,
         _ => Route::Pass,
     }
 }
@@ -173,7 +209,60 @@ fn advertised_service(query: &str) -> Option<&str> {
         .find_map(|pair| pair.strip_prefix("service="))
 }
 
+/// the largest MCP message this lane will read. A tool call is a few hundred
+/// bytes of arguments and the biggest legitimate one is a file write; the cap
+/// is what keeps a guest from making the daemon buffer its whole memory.
+const MAX_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
 impl Lane {
+    /// the agent tool plane, over streamable HTTP: one JSON-RPC message in the
+    /// POST body, one JSON response back — or `202` with no body when the
+    /// message was a notification, which is what the transport says to answer
+    /// and what keeps a client from waiting for a reply that must never come.
+    ///
+    /// No SSE stream: this server never initiates a message, so there is
+    /// nothing for a `GET` to carry and offering one would be a socket held
+    /// open per run for no traffic.
+    async fn mcp(&self, req: Request) -> Response {
+        let is_message = req.method() == axum::http::Method::POST;
+        if !is_message {
+            return (
+                StatusCode::METHOD_NOT_ALLOWED,
+                [(header::ALLOW, "POST")],
+                "the ducktape tool plane takes one JSON-RPC message per POST",
+            )
+                .into_response();
+        }
+        let body = match axum::body::to_bytes(req.into_body(), MAX_MCP_MESSAGE_BYTES).await {
+            Ok(body) => body,
+            Err(_) => return self.refuse("mcp_message_too_large"),
+        };
+        let message = String::from_utf8_lossy(&body).into_owned();
+        let env = self.mcp_env.clone();
+        // the tool catalog is blocking (one http request to the node per call,
+        // on a blocking client), so the whole of it — building the run, serving
+        // the message, dropping the clients — happens off the lane's runtime
+        // thread. See [`Lane::mcp_env`] for why none of it may happen on one.
+        let answered = tokio::task::spawn_blocking(move || {
+            let run = mcp_host::Run::from_vars(&|key| {
+                env.iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.clone())
+            });
+            mcp_host::handle(&run, &message)
+        })
+        .await;
+        let Ok(answered) = answered else {
+            return self.refuse("mcp_call_panicked");
+        };
+        // a notification is answered with 202 and NOTHING: the transport's own
+        // rule, and the same rule the stdio host follows by writing no line.
+        let Some(response) = answered else {
+            return StatusCode::ACCEPTED.into_response();
+        };
+        axum::Json(response).into_response()
+    }
+
     /// a git push, carrying this node's operator credential upstream: forge's
     /// receive-pack wants proof, and only this lane can vouch for the run.
     async fn forge_push(&self, req: Request) -> Response {
@@ -429,6 +518,88 @@ mod tests {
         let (status, body) = get(&base, "/forge/app/info/refs?service=git-receive-pack").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["operator"], json!("node-secret"));
+    }
+
+    /// THE contract the run's CLI depends on: a client that speaks streamable
+    /// HTTP at this lane gets the ducktape tool catalog, over the one socket
+    /// the guest has — no server command, no binary in the guest, no identity
+    /// it had to supply.
+    ///
+    /// Drives the exact three frames claude and codex send at startup
+    /// (`initialize`, the `notifications/initialized` notification, then
+    /// `tools/list`), because the notification is the one a server must answer
+    /// with NOTHING — a body there desynchronizes every id after it.
+    #[tokio::test]
+    async fn the_tool_plane_answers_an_mcp_session_on_the_lane() {
+        let (_lane, base) = lane_with(None).await;
+        let rpc = |id: Option<u32>, method: &str| {
+            let body = match id {
+                Some(id) => json!({"jsonrpc": "2.0", "id": id, "method": method}),
+                None => json!({"jsonrpc": "2.0", "method": method}),
+            };
+            let base = base.clone();
+            async move {
+                reqwest::Client::new()
+                    .post(format!("{base}{MCP_PATH}"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let response = rpc(Some(0), "initialize").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let initialized: Value = response.json().await.unwrap();
+        assert_eq!(initialized["id"], 0, "the answer names its request");
+        assert_eq!(initialized["result"]["serverInfo"]["name"], "ducktape");
+        assert!(
+            initialized["result"]["instructions"]
+                .as_str()
+                .is_some_and(|guide| guide.contains("ducktape_")),
+            "the guide is the model's only orientation: {initialized}"
+        );
+
+        let notified = rpc(None, "notifications/initialized").await;
+        assert_eq!(
+            notified.status(),
+            StatusCode::ACCEPTED,
+            "a notification is accepted and NOT answered"
+        );
+        assert!(notified.bytes().await.unwrap().is_empty());
+
+        let listed: Value = rpc(Some(1), "tools/list").await.json().await.unwrap();
+        let tools = listed["result"]["tools"].as_array().expect("a catalog");
+        assert!(!tools.is_empty(), "an empty catalog is no tool plane");
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool["name"].as_str().unwrap().starts_with("ducktape_")),
+            "{listed}"
+        );
+    }
+
+    /// there is no SSE stream to open: the server never initiates a message,
+    /// so a `GET` is answered rather than left holding a socket for the run's
+    /// whole life.
+    #[tokio::test]
+    async fn the_tool_plane_offers_no_stream_to_hold_open() {
+        let (_lane, base) = lane_with(None).await;
+        let response = reqwest::Client::new()
+            .get(format!("{base}{MCP_PATH}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers().get(header::ALLOW).unwrap(), "POST");
+    }
+
+    /// the lane SERVES this route; forwarding it would send the run's tool
+    /// calls to the node, which has no such route and no idea which run asked.
+    #[test]
+    fn the_tool_plane_is_served_here_and_never_forwarded() {
+        assert!(matches!(classify(MCP_PATH, ""), Route::Mcp));
+        assert!(matches!(classify("/v1/query", ""), Route::Pass));
     }
 
     #[tokio::test]

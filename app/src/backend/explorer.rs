@@ -1,54 +1,21 @@
 use super::*;
 
-/// First 12 hex chars of a digest — the display form where a screen has no
-/// detail to show the whole value in.
-pub(crate) fn short_digest(digest: &str) -> String {
-    let mut short: String = digest.chars().take(12).collect();
-    if digest.chars().count() > 12 {
-        short.push('…');
-    }
-    short
-}
-
-/// The global-key router for the command palette: platform-Command+K
-/// toggles, Escape closes an open palette; anything else is `none`.
-pub fn palette_key_action(
-    logical: iced::keyboard::Key,
-    physical: iced::keyboard::key::Physical,
-    modifiers: iced::keyboard::Modifiers,
-    open: bool,
-) -> String {
-    use iced::keyboard::{
-        Key,
-        key::{Code, Named, Physical},
-    };
-    let is_toggle = modifiers.command() && physical == Physical::Code(Code::KeyK);
-    if is_toggle {
-        return match open {
-            true => "close".into(),
-            false => "open".into(),
-        };
-    }
-    if open && logical == Key::Named(Named::Escape) {
-        return "close".into();
-    }
-    "none".into()
-}
-
 /// Is the command modifier down? The cheap half of the quit chord: it is read
-/// off the modifier stream to ARM the key-press route, so an ordinary keystroke
-/// never publishes one. It asks the same `command()` [`quit_chord`] judges by —
-/// Command on a Mac, Control elsewhere — because arming on one modifier and
-/// judging on another yields a chord that can never fire.
-pub fn command_held(modifiers: iced::keyboard::Modifiers) -> bool {
-    modifiers.command()
+/// off the native modifier stream. Command on a Mac, Control elsewhere:
+/// arming and routing a chord must use the same platform modifier.
+pub fn command_held(modifiers: gpui_kit::Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.platform
+    } else {
+        modifiers.control
+    }
 }
 
 /// Is ⇧ down right now? A press carries no modifiers of its own, so the chat's
 /// shift-click reads the arming this fills instead of the app growing a second
 /// key route to learn the same fact.
-pub fn shift_held(modifiers: iced::keyboard::Modifiers) -> bool {
-    modifiers.shift()
+pub fn shift_held(modifiers: gpui_kit::Modifiers) -> bool {
+    modifiers.shift
 }
 
 /// Which command chord this press is (⌘Q / ⌘W, Ctrl off a Mac), or none. The
@@ -56,33 +23,20 @@ pub fn shift_held(modifiers: iced::keyboard::Modifiers) -> bool {
 /// each use site — macOS binds both through an app menu this app does not have,
 /// so it reads them itself.
 ///
-/// Both key readings, like the palette's toggle: the physical code is what a
-/// Dvorak or AZERTY layout still calls Q or W, and the logical character is
-/// what a layout that remaps the code actually types.
-pub fn command_chord(
-    logical: iced::keyboard::Key,
-    physical: iced::keyboard::key::Physical,
-    modifiers: iced::keyboard::Modifiers,
-) -> crate::CommandChord {
-    use iced::keyboard::key::{Code, Physical};
-    if !modifiers.command() {
+/// GPUI supplies the platform-resolved key name, including keyboard layout.
+pub fn command_chord(logical: String, modifiers: gpui_kit::Modifiers) -> crate::CommandChord {
+    if !command_held(modifiers) {
         return crate::CommandChord::Ignored;
     }
-    let quit = physical == Physical::Code(Code::KeyQ) || types_letter(&logical, "q");
+    let quit = logical.eq_ignore_ascii_case("q");
     if quit {
         return crate::CommandChord::Quit;
     }
-    let close_window = physical == Physical::Code(Code::KeyW) || types_letter(&logical, "w");
+    let close_window = logical.eq_ignore_ascii_case("w");
     if close_window {
         return crate::CommandChord::CloseWindow;
     }
     crate::CommandChord::Ignored
-}
-
-/// The letter a press actually types, after the layout has had its say — the
-/// other half of the physical code in every chord above.
-fn types_letter(logical: &iced::keyboard::Key, letter: &str) -> bool {
-    matches!(logical, iced::keyboard::Key::Character(typed) if typed.eq_ignore_ascii_case(letter))
 }
 
 /// The transient layer currently over the console's content — the TOPMOST one
@@ -94,139 +48,40 @@ fn types_letter(logical: &iced::keyboard::Key, letter: &str) -> bool {
 /// it would otherwise move. Every keyboard route that ignores this list routes
 /// a key at the screen BEHIND the layer the reader is looking at.
 ///
-/// EVERY PER-TAB RUNG IS SCOPED TO THE TAB THAT MOUNTS ITS SURFACE, because no
-/// tab switch clears any of this state — `select_shell_tab` leaves every one
-/// of these flags set. A flag left set on the tab you came from
-/// names a layer that is no longer on screen: Escape then "closes" an
-/// invisible menu while the visible screen swallows the press, and the scroll
-/// reader refuses to move a pane nothing is actually covering. Which scope a
-/// rung gets is read off the slot layout in `components/shell.ice`, not
-/// guessed: `slot chat` / `slot forge` sit inside `match tab`, so their menus
-/// are per-tab mounts, while `slot palette` and `slot bell` sit OUTSIDE it —
-/// the palette, the bell and the create modal ride every tab and stay global
-/// on purpose.
+/// NO PER-TAB RUNG IS LEFT, so the ladder takes no tab. The chat tab's menus,
+/// drawer and rail belong to the chat view (`crates/views/chat`); the pages
+/// tab's armed delete, block menu and comments card belong to the pages view
+/// (`crates/views/pages`); the forge's switchers are the host's own pick lists.
+/// Each guest paints its own scrim and dismisses its own layers — a key the
+/// kernel contract carries no door for. What is enumerated here is what rides
+/// EVERY tab and is still the shell's: the bell. The palette is a view of its
+/// own now — it claims its chord, paints its scrim and answers its own
+/// Escape, like every other guest layer above.
 //
-// One argument per layer, plus the tab that scopes them: the Ice extern
-// surface is flat, and the reading must see every layer at once to name the
-// topmost. Scoping lives HERE rather than in the call sites' argument lists —
-// a conjunction per caller is one guard per rung to forget.
-#[allow(clippy::too_many_arguments)]
-pub fn topmost_overlay(
-    shell_tab: crate::ShellTab,
-    palette_open: bool,
-    bell_open: bool,
-    channel_create_open: bool,
-    thread_message_action: crate::MessageAction,
-    message_action: crate::MessageAction,
-    channel_settings_open: bool,
-    page_delete_armed: bool,
-) -> String {
-    let on_chat = shell_tab == crate::ShellTab::Chat;
-    let on_pages = shell_tab == crate::ShellTab::Pages;
-    if palette_open {
-        return "palette".into();
-    }
+// Inspect every shell layer together to name the topmost.
+pub fn topmost_overlay(bell_open: bool) -> String {
     if bell_open {
         return "bell".into();
     }
-    if channel_create_open {
-        return "channel_create".into();
-    }
-    // THE DRAWER UNMOUNTS THE THREAD RAIL — `if active_thread_seq > 0 &&
-    // !channel_settings_open` in `screens/chat.ice` — and nothing clears the ⋯
-    // flag on the way in, so the same rule the tab scoping states one level up
-    // applies here: a rung answers only while its surface is mounted. Without
-    // the term, opening a thread action and then Channel details was a
-    // mouse-reachable state where the first Escape wiped a half-typed
-    // `thread_edit_draft` and left the drawer standing. It cannot be expressed
-    // by moving one rung in the ladder's total order — the stream's own menu
-    // really does float over the drawer and must stay above it.
-    if on_chat && !channel_settings_open && thread_message_action != crate::MessageAction::Toolbar {
-        return "thread_menu".into();
-    }
-    if on_chat && message_action != crate::MessageAction::Toolbar {
-        return "message_menu".into();
-    }
-    // BELOW the stream's message menu, which floats over the drawer. The drawer
-    // had no rung at all: it shipped with an `×` and no keyboard exit while
-    // every other overlay in the app answered Escape. Measured on the running
-    // app — Escape over an open Channel details changed exactly zero pixels.
-    if on_chat && channel_settings_open {
-        return "channel_settings".into();
-    }
-    // The pages block-actions menu and insert row used to sit here, and the
-    // comments rail is a persistent panel with its own close. THE ARMED DELETE
-    // IS NEITHER: it paints a scrim and a confirm over the canvas, and it
-    // shipped with the mouse as its only exit. `pages_ready` in
-    // `handlers/overlays.ice` names it for the same reason — a layer that eats
-    // the mouse must eat the keyboard, or Cmd/Ctrl+Z mutates (and autosaves)
-    // the document the reader is being asked to confirm the deletion of.
-    if on_pages && page_delete_armed {
-        return "page_delete".into();
-    }
+    // THE CHAT, PAGES AND FILES LAYERS ARE THEIR VIEWS' OWN. Each holds the
+    // keyboard inside its tab and answers Escape itself — the chat menus and
+    // drawer, the pages armed delete, the comments card. The guest paints the
+    // scrim, so the guest owns the exit.
+    //
     // The forge's repository and branch switchers are the host's own pick
     // lists: the host dismisses their menus itself, so they hold no rung.
     String::new()
 }
 
-/// The surface Escape dismisses — the topmost transient layer, minus the one
-/// rung Escape does not own. Menus, popovers, the create modal, the bell and
-/// the channel drawer close; the thread and comments rails keep their explicit
-/// × — closing one from a global key would also have to adjudicate its
-/// half-typed drafts. The drawer carries no such debt: its only opener
-/// re-seeds the name draft from the live channel name on every open, so its
-/// rung leaks nothing the × doesn't.
-#[allow(clippy::too_many_arguments)]
-pub fn escape_target(
-    logical: iced::keyboard::Key,
-    shell_tab: crate::ShellTab,
-    palette_open: bool,
-    bell_open: bool,
-    channel_create_open: bool,
-    thread_message_action: crate::MessageAction,
-    message_action: crate::MessageAction,
-    channel_settings_open: bool,
-    page_delete_armed: bool,
-) -> String {
-    use iced::keyboard::{Key, key::Named};
-    let not_escape = logical != Key::Named(Named::Escape);
+/// The surface Escape dismisses — the topmost transient layer the SHELL
+/// still owns. What is left after the views took their own layers is the
+/// bell, which rides every tab.
+pub fn escape_target(logical: String, bell_open: bool) -> String {
+    let not_escape = logical != "escape";
     if not_escape {
         return String::new();
     }
-    let topmost = topmost_overlay(
-        shell_tab,
-        palette_open,
-        bell_open,
-        channel_create_open,
-        thread_message_action,
-        message_action,
-        channel_settings_open,
-        page_delete_armed,
-    );
-    // `palette_key_action` owns the palette's keys — an open palette swallows
-    // Escape, so the ladder yields rather than naming a rung.
-    let palette_owns_it = topmost == "palette";
-    if palette_owns_it {
-        return String::new();
-    }
-    topmost
-}
-
-pub fn close_message_action(close: bool, current: crate::MessageAction) -> crate::MessageAction {
-    if close {
-        crate::MessageAction::Toolbar
-    } else {
-        current
-    }
-}
-
-/// True when the live connection is in a state the shell should banner:
-/// the stream is down, retrying, or a resync failed and is backing off.
-pub fn connection_degraded(status: &str) -> bool {
-    status == "Offline"
-        || status == "Sync delayed"
-        || status == "Reconnecting…"
-        || status == "Live · resyncing"
+    topmost_overlay(bell_open)
 }
 
 pub fn canonical_endpoint(input: String) -> String {
@@ -244,11 +99,6 @@ pub fn canonical_endpoint(input: String) -> String {
 /// It reaches that route only when no widget captured the press (the
 /// subscription is `status=ignored`), so a caret in a composer or a field with
 /// its own selection keeps its own copy, exactly as it should.
-pub fn is_copy_chord(
-    logical: iced::keyboard::Key,
-    physical: iced::keyboard::key::Physical,
-    modifiers: iced::keyboard::Modifiers,
-) -> bool {
-    use iced::keyboard::key::{Code, Physical};
-    modifiers.command() && (physical == Physical::Code(Code::KeyC) || types_letter(&logical, "c"))
+pub fn is_copy_chord(logical: String, modifiers: gpui_kit::Modifiers) -> bool {
+    command_held(modifiers) && logical.eq_ignore_ascii_case("c")
 }

@@ -357,6 +357,72 @@ fn save(workspace: &Path, services: &Services) -> Result<(), String> {
     Ok(())
 }
 
+/// The exclusive lock a read-modify-write of the grants is taken under.
+///
+/// A READER needs none: [`save`] replaces the file by rename, so a reader sees
+/// the old grants or the new ones and never a torn file. What that atomicity
+/// cannot survive is two WRITERS, because each writes the whole file back. Two
+/// `service run --enable` processes read the same grants, and whichever saves
+/// second erases the other's — leaving a daemon that is enabled by its own log,
+/// absent from `services.toml`, and ungranted to the node, which answers every
+/// saga accept `accept_not_capability_provider` while its log says it is up.
+///
+/// The lock lives in a file BESIDE the grants, never on the grants themselves:
+/// `save` replaces that inode by rename, so a lock taken on it would be held on
+/// a file nothing reads any more the moment the first writer finished.
+struct GrantLock(std::fs::File);
+
+fn lock_grants(workspace: &Path) -> Result<GrantLock, String> {
+    use std::os::unix::io::AsRawFd as _;
+    std::fs::create_dir_all(workspace).map_err(|error| format!("create {workspace:?}: {error}"))?;
+    let path = workspace.join(format!(".{FILE_NAME}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("open {path:?}: {error}"))?;
+    // BLOCKING. The guarded section is a read and a rename, so a node bringing
+    // three daemons up at once waits microseconds; telling an operator to retry
+    // would be a worse answer than waiting.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "lock {path:?}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(GrantLock(file))
+}
+
+impl Drop for GrantLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd as _;
+        // Dropping the file would release it anyway; unlocking explicitly keeps
+        // the release at the end of the guarded section rather than at whatever
+        // point the descriptor happens to close.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+/// Read, change and write the grants as ONE step under [`lock_grants`]. Every
+/// writer of `services.toml` goes through here.
+///
+/// Anything derived FROM the grants is derived INSIDE the closure — the
+/// announced set above all — or it would describe a set the file no longer
+/// holds. Network I/O deliberately is not: the caller submits after the guard
+/// has dropped, because a `/v1/submit` waits on consensus and holding a
+/// cross-process file lock for that long would serialize the very daemons this
+/// exists to let start together.
+fn with_grants<T>(
+    workspace: &Path,
+    change: impl FnOnce(&mut Services) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = lock_grants(workspace)?;
+    let mut services = load(workspace)?;
+    let derived = change(&mut services)?;
+    save(workspace, &services)?;
+    Ok(derived)
+}
+
 // ============================================================================
 // list/status state derivation
 // ============================================================================
@@ -887,26 +953,42 @@ struct Catalog {
     node_build: Option<String>,
 }
 
-/// The services signaling to the workspace's own node. A node that is not
-/// running is NOT an error here: nothing signaling is exactly what `list` must
-/// render, and the grants still come off disk.
-fn catalog_now(base: &str) -> Catalog {
+/// The services signaling to the workspace's own node, or why the node could
+/// not be asked. `list` renders the grants off disk either way; what neither
+/// verb may do is turn "I could not ask" into "nothing is signaling".
+fn catalog_now(base: &str, workspace: &std::path::Path) -> (Catalog, Option<String>) {
     match read_catalog(base) {
-        Ok(catalog) => catalog,
+        Ok(catalog) => (catalog, None),
         // A node that is not running is the ordinary case — `list` must still
-        // render the grants — so it stays quiet. Anything else (a 404, a 500,
-        // a body whose shape changed) would otherwise be indistinguishable
-        // from "nothing is signaling", which is exactly the wrong thing to
-        // tell someone who is about to consent to something.
-        Err(crate::node_http::ReadFailure::Unreachable) => Catalog::default(),
-        Err(error) => {
-            let _ = write_err(&format!(
-                "{} could not read the signaling catalog: {error}\n",
-                paint(YELLOW, "warning:")
-            ));
-            Catalog::default()
-        }
+        // render the grants — so it stays quiet on stderr. It is NOT silent in
+        // the answer: the caller is told the catalog is unknown rather than
+        // empty, because those render differently and exit differently.
+        //
+        // The DIRECTORY is what says whether a launcher owns this node, and
+        // this verb already opened it. `ReadFailure` renders the same sentence
+        // from the url instead, by asking the registry which workspace serves
+        // it — an answer two networks left on the default `http_listen` make
+        // ambiguous. Same renderer either way; this one just has the better
+        // input, so it hands it over rather than throwing it away.
+        Err(crate::node_http::ReadFailure::Unreachable(_)) => (
+            Catalog::default(),
+            Some(crate::node_http::not_running_in(Some(workspace)).to_string()),
+        ),
+        // No warning printed here: the caller ends on this reason, and printing
+        // it twice made the second line read like a second fault.
+        Err(error) => (Catalog::default(), Some(error.to_string())),
     }
+}
+
+/// What is signaling right now, with "could not ask" flattened to "nothing".
+///
+/// Only for the enable/disable paths: those already hold a plan the node
+/// answered for, so an unreadable catalog there is a node that went away
+/// mid-verb, and the announce set they build is refused on its own terms. The
+/// read verbs must NOT use this — for them the difference between an empty
+/// catalog and an unread one is the whole answer.
+fn signaling_now(base: &str) -> Vec<noded::services::Signaling> {
+    read_catalog(base).unwrap_or_default().signaling
 }
 
 fn read_catalog(base: &str) -> Result<Catalog, crate::node_http::ReadFailure> {
@@ -923,16 +1005,35 @@ fn read_catalog(base: &str) -> Result<Catalog, crate::node_http::ReadFailure> {
 }
 
 /// the rendered rows and the node build they are to be judged against.
-fn view(args: &ReadArgs) -> Result<(Vec<ServiceRow>, Option<String>), Box<dyn std::error::Error>> {
+/// What the read verbs render: the rows, the node's own build stamp, and —
+/// when the node could not be asked — why. The third is not decoration: the
+/// rows alone cannot distinguish an empty catalog from an unread one.
+struct View {
+    rows: Vec<ServiceRow>,
+    node_build: Option<String>,
+    /// why the catalog is unknown, already carrying what to do about it —
+    /// `ReadFailure` renders that, so this verb neither reconstructs the
+    /// sentence nor guesses at a launcher it cannot see.
+    unread: Option<String>,
+}
+
+fn view(args: &ReadArgs) -> Result<View, Box<dyn std::error::Error>> {
     let workspace = args.workspace.dir()?;
     let grants = load(&workspace)?;
     let service = config::resolve_service(&args.workspace.config_file()?)?;
-    let catalog = match service.http_listen.as_deref() {
-        Some(listen) => catalog_now(&config::http_base_of(listen)),
-        None => Catalog::default(),
+    let (catalog, unread) = match service.http_listen.as_deref() {
+        Some(listen) => catalog_now(&config::http_base_of(listen), &workspace),
+        None => (
+            Catalog::default(),
+            Some("this workspace's config names no http address to ask".into()),
+        ),
     };
     let all = rows(&catalog.signaling, &grants.grants);
-    Ok((only_kind(all, args.kind.as_deref())?, catalog.node_build))
+    Ok(View {
+        rows: only_kind(all, args.kind.as_deref())?,
+        node_build: catalog.node_build,
+        unread,
+    })
 }
 
 /// Narrow the rendered rows to one kind, or say that kind is not here.
@@ -962,25 +1063,56 @@ fn only_kind(rows: Vec<ServiceRow>, kind: Option<&str>) -> Result<Vec<ServiceRow
 }
 
 fn list(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let (rows, _node_build) = view(&args)?;
+    let view = view(&args)?;
+    // With nothing on disk AND nothing read, the renderer's line is "no
+    // services signaling and none enabled" — an assertion about the world this
+    // call did not establish. The refusal below is then the whole answer.
+    let has_rows = !view.rows.is_empty();
     if args.json {
-        println!("{}", serde_json::to_string(&rows)?);
-        return Ok(());
+        println!("{}", serde_json::to_string(&view.rows)?);
+    } else if has_rows || view.unread.is_none() {
+        // no build column in `list`: it is the one-line-per-service view, and
+        // the node's stamp belongs beside the daemon's, which only `status`
+        // has room for.
+        write_out(&render_list(&view.rows))?;
     }
-    // no build column in `list`: it is the one-line-per-service view, and the
-    // node's stamp belongs beside the daemon's, which only `status` has room for.
-    write_out(&render_list(&rows))?;
-    Ok(())
+    match view.unread {
+        None => Ok(()),
+        Some(reason) => Err(unread_refusal(&reason, has_rows).into()),
+    }
 }
 
 fn status(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let (rows, node_build) = view(&args)?;
+    let view = view(&args)?;
+    // See `list`: an empty render is an assertion, and an unread catalog did
+    // not earn it. A caller that asked for `--json` and got `[]` must not read
+    // it as "no services" either, which is why the exit code covers both.
+    let has_rows = !view.rows.is_empty();
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
-        return Ok(());
+        println!("{}", serde_json::to_string_pretty(&view.rows)?);
+    } else if has_rows || view.unread.is_none() {
+        write_out(&render_status(&view.rows, view.node_build.as_deref()))?;
     }
-    write_out(&render_status(&rows, node_build.as_deref()))?;
-    Ok(())
+    // Whatever printed came off disk and is real. What is SIGNALING is not
+    // known, and every state word in that render is about signaling — so a
+    // verb that could not ask must not exit as though it had.
+    match view.unread {
+        None => Ok(()),
+        Some(reason) => Err(unread_refusal(&reason, has_rows).into()),
+    }
+}
+
+/// The sentence a read verb ends on when the node never answered: what is
+/// still true (whatever is on disk), what is not known (what is signaling
+/// right now), and then `reason` on its own line — which already carries the
+/// next step, whether that is starting the node or reading the log of the
+/// launcher that is starting it.
+fn unread_refusal(reason: &str, printed_grants: bool) -> String {
+    let disk = match printed_grants {
+        true => "the grants above are what this workspace holds on disk",
+        false => "this workspace holds no grants on disk",
+    };
+    format!("{disk}; what is SIGNALING could not be read.\n{reason}")
 }
 
 fn join_or_dash(items: &[String]) -> String {
@@ -1075,7 +1207,7 @@ pub(crate) fn plan_enable(
         kind,
         service,
         node_id,
-        catalog_now(&config::http_base_of(listen)).signaling,
+        signaling_now(&config::http_base_of(listen)),
     )
 }
 
@@ -1223,29 +1355,29 @@ pub(crate) fn commit_enable(
     base: &str,
     plan: &EnablePlan,
 ) -> Result<u64, String> {
-    let mut services = load(workspace)?;
-    // REPLACE on a re-consent, insert on a first grant — one record per kind
-    // either way, which is what `Services::validate` enforces on the next load.
-    match services
-        .grants
-        .binary_search_by(|existing| existing.kind.as_str().cmp(&plan.kind))
-    {
-        Ok(standing) => services.grants[standing] = plan.grant.clone(),
-        Err(position) => services.grants.insert(position, plan.grant.clone()),
-    }
-    // derived HERE, from the grants as they stand now — not carried down from
-    // the plan. A human may have sat on the consent prompt for a while, and
-    // another `enable` on this node could have landed in the meantime;
-    // announcing a set decided before that pause would retract it. Cannot be
-    // refused at this point: `plan_enable` bounded the widest set these grants
-    // can produce, and this is a subset of it.
-    let announce = crate::announce::announced_set(
-        &services.grants,
-        &catalog_now(base).signaling,
-        &plan.capacity,
-    )
-    .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))?;
-    save(workspace, &services)?;
+    let announce = with_grants(workspace, |services| {
+        // REPLACE on a re-consent, insert on a first grant — one record per kind
+        // either way, which is what `Services::validate` enforces on the next load.
+        match services
+            .grants
+            .binary_search_by(|existing| existing.kind.as_str().cmp(&plan.kind))
+        {
+            Ok(standing) => services.grants[standing] = plan.grant.clone(),
+            Err(position) => services.grants.insert(position, plan.grant.clone()),
+        }
+        // derived HERE, from the grants as they stand now — not carried down from
+        // the plan. A human may have sat on the consent prompt for a while, and
+        // another `enable` on this node could have landed in the meantime;
+        // announcing a set decided before that pause would retract it. Cannot be
+        // refused at this point: `plan_enable` bounded the widest set these grants
+        // can produce, and this is a subset of it.
+        crate::announce::announced_set(
+            &services.grants,
+            &signaling_now(base),
+            &plan.capacity,
+        )
+        .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))
+    })?;
     let height = crate::announce::submit(base, workspace, &announce).map_err(|error| {
         format!(
             "{} is granted but NOT announced, so nothing will be placed on it yet — this node \
@@ -2040,29 +2172,29 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
              Revoking consent is a transaction now, so it needs a reachable node and a \
              finalizing chain — a grant cannot be revoked while the node is down",
         )?;
-    let mut services = load(&workspace)?;
-    let position = services
-        .grants
-        .iter()
-        .position(|grant| grant.kind == kind)
-        .ok_or_else(|| format!("{kind} is not enabled in {}", workspace.display()))?;
-    let retired = services.grants.remove(position);
     // PERSIST first, retract second — the same order `commit_enable` uses and
     // for the same reason: a watcher tick between the two must never read a
     // revoked grant off the chain and a live one off disk, and re-announce
     // consent the operator has just withdrawn. Revocation lands on disk first,
     // so the worst a concurrent tick can do is retract it slightly early.
-    //
-    // A refusal here cannot come from this removal (a disable only shrinks the
-    // set); it would mean the file already held something the registry refuses,
-    // which `Services::validate` prevents on load.
-    let announce = crate::announce::announced_set(
-        &services.grants,
-        &catalog_now(&base).signaling,
-        &service.sandbox_capacity,
-    )
-    .map_err(|refusal| format!("{kind} was not disabled: {refusal}"))?;
-    save(&workspace, &services)?;
+    let (retired, announce) = with_grants(&workspace, |services| {
+        let position = services
+            .grants
+            .iter()
+            .position(|grant| grant.kind == kind)
+            .ok_or_else(|| format!("{kind} is not enabled in {}", workspace.display()))?;
+        let retired = services.grants.remove(position);
+        // A refusal here cannot come from this removal (a disable only shrinks
+        // the set); it would mean the file already held something the registry
+        // refuses, which `Services::validate` prevents on load.
+        let announce = crate::announce::announced_set(
+            &services.grants,
+            &signaling_now(&base),
+            &service.sandbox_capacity,
+        )
+        .map_err(|refusal| format!("{kind} was not disabled: {refusal}"))?;
+        Ok((retired, announce))
+    })?;
     let height = crate::announce::submit(&base, &workspace, &announce).map_err(|error| {
         format!(
             "{kind}'s grant is revoked but the announce was NOT retracted — this node retries \
@@ -2315,29 +2447,6 @@ mod tests {
                 "the {daemon} daemon builds its own runtime, so its stop handlers are its own to get wrong"
             );
         }
-    }
-
-    /// A daemon must not leave a run alive behind it, and under the microVM
-    /// backend that is a property of the code rather than of a sweep: the VMM
-    /// is spawned `kill_on_drop`, so it dies with the daemon — including on a
-    /// SIGKILL, which is the case the deleted sweep existed for.
-    ///
-    /// Guarded by parsing the source because there is no way to observe it from
-    /// a unit test: the alternative is a hardware test that SIGKILLs a daemon
-    /// and looks for stray `firecracker` processes, which is what this replaces.
-    #[test]
-    fn a_runs_vmm_cannot_outlive_the_daemon_that_spawned_it() {
-        let source = include_str!("../../../crates/services/sandbox/src/microvm.rs");
-        let (_, after_spawn) = source
-            .split_once("Command::new(&vmm_path)")
-            .expect("the VMM spawn");
-        let (args, _) = after_spawn.split_once(".spawn()").expect("spawn call");
-        assert!(
-            args.contains("kill_on_drop(true)"),
-            "the VMM must die with the daemon: without kill_on_drop a SIGKILLed \
-             daemon leaves a guest holding its whole memory footprint, with no \
-             successor able to find it"
-        );
     }
 
     const NODE_A: [u8; 32] = [7u8; 32];
@@ -2668,6 +2777,61 @@ mod tests {
             .expect("63 executors + the kind tag is exactly the cap");
     }
 
+    /// Three daemons granting themselves at once keep all three grants.
+    ///
+    /// The real shape is a setup script or a supervisor starting `compute`,
+    /// `agent` and `airlock` in one loop: they land in the same millisecond,
+    /// every time, and each writes the WHOLE file back. Unlocked, the last
+    /// writer's copy is the one that survives and the others' grants are gone —
+    /// with no error anywhere, because each writer succeeded. The daemon then
+    /// runs enabled by its own log and ungranted to the node, refusing every
+    /// saga accept with `accept_not_capability_provider`.
+    ///
+    /// Threads rather than processes because `flock` is per open file
+    /// description: each call opens the lock file itself, so two threads
+    /// contend exactly as two processes do.
+    #[test]
+    fn concurrent_grants_all_survive() {
+        let home = tempfile::tempdir().expect("a workspace");
+        let workspace = home.path().to_path_buf();
+        let kinds = ["agent", "airlock", "compute"];
+        let start = std::sync::Barrier::new(kinds.len());
+        std::thread::scope(|scope| {
+            for (n, kind) in kinds.iter().enumerate() {
+                let workspace = workspace.clone();
+                let start = &start;
+                scope.spawn(move || {
+                    // every thread reaches the read-modify-write together
+                    start.wait();
+                    with_grants(&workspace, |services| {
+                        let fresh = grant(kind, [n as u8 + 1; 32]);
+                        match services
+                            .grants
+                            .binary_search_by(|existing| existing.kind.as_str().cmp(kind))
+                        {
+                            Ok(standing) => services.grants[standing] = fresh,
+                            Err(position) => services.grants.insert(position, fresh),
+                        }
+                        Ok(())
+                    })
+                    .expect("grant under the lock");
+                });
+            }
+        });
+
+        let survived = load(&workspace).expect("the grants");
+        let kept: Vec<&str> = survived
+            .grants
+            .iter()
+            .map(|grant| grant.kind.as_str())
+            .collect();
+        assert_eq!(
+            kept, kinds,
+            "a concurrent grant was lost: each writer rewrites the whole file, so without a \
+             lock across load..save the last one to save erases the others"
+        );
+    }
+
     /// Consent lands on DISK before it lands on chain, in both verbs.
     ///
     /// A source lint because the property is an ORDER between two writers, not
@@ -2691,8 +2855,12 @@ mod tests {
                 .nth(1)
                 .and_then(|rest| rest.split("\nfn ").next())
                 .unwrap_or_else(|| panic!("{verb} has a body"));
+            // `with_grants(` IS the persist: it is the only writer of the file
+            // (it holds the lock across load..save), so a verb that reaches
+            // `announce::submit(` without having gone through it has either
+            // announced before persisting or bypassed the lock.
             let saved = body
-                .find("save(")
+                .find("with_grants(")
                 .unwrap_or_else(|| panic!("{verb} persists"));
             let announced = body
                 .find("announce::submit(")
@@ -3370,6 +3538,36 @@ mod tests {
                 json,
                 format!("\"{}\"", state.label()),
                 "the json token and the printed label must agree"
+            );
+        }
+    }
+
+    /// A node that cannot be asked is not a node with nothing to say. The
+    /// refusal has to name which of the two it is, because the rows above it
+    /// are about grants on disk and every state word in them is about
+    /// signaling, which is exactly what went unread.
+    #[test]
+    fn the_unread_refusal_never_claims_the_catalog_was_empty() {
+        // what a live `Unreachable` renders: the sentence arrives WITH its next
+        // step already in it, which is why this verb no longer appends one.
+        let reason = crate::node_http::not_running_in(Some(std::path::Path::new(
+            "/home/duck/.ducktape/dognet",
+        )))
+        .to_string();
+        for (printed_grants, expected) in [
+            (true, "the grants above are what this workspace holds on disk"),
+            (false, "this workspace holds no grants on disk"),
+        ] {
+            let said = unread_refusal(&reason, printed_grants);
+            assert!(said.starts_with(expected), "{said}");
+            assert!(said.contains(&reason), "the reason must survive: {said}");
+            assert!(
+                said.contains("could not be read"),
+                "it must say the catalog went UNREAD, never that it was empty: {said}"
+            );
+            assert!(
+                !said.contains("none enabled") && !said.contains("nothing is signaling"),
+                "it must not assert what it failed to establish: {said}"
             );
         }
     }

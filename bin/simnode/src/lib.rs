@@ -732,7 +732,7 @@ impl Drop for SimHandle {
 struct HeldOp {
     origin: Origin,
     msg: Msg,
-    reply: oneshot::Sender<Result<BlockSummary, String>>,
+    reply: oneshot::Sender<Result<BlockSummary, noded::Refused>>,
 }
 
 struct Sim {
@@ -806,8 +806,8 @@ fn run_sim(
         // wasm, so its code registry is wired and UpdateModule proposals are
         // live in the sim.
         let substrates = Substrates {
-            forge_repo,
-            duckfs_dir,
+            directory: duckfs_dir.with_file_name("module-storage"),
+            bindings: [("forge".into(), forge_repo), ("files".into(), duckfs_dir)].into(),
             blobs: blobs.clone(),
         };
         let bindings = Bindings {
@@ -907,7 +907,7 @@ fn run_sim(
                     None => break,
                 },
                 cmd = cmds.next() => match cmd {
-                    Some(NodeCommand::Submit { target, payload, origin, reply }) => {
+                    Some(NodeCommand::Submit { target, payload, required_blob: _, origin, reply }) => {
                         // the `hex:` origin escape resolves to raw bytes here, so a
                         // client can author as a real ed25519 key; malformed hex is
                         // a hard reject, never a literal-string fall-through.
@@ -921,7 +921,7 @@ fn run_sim(
                                 .await;
                             }
                             Err(err) => {
-                                let _ = reply.send(Err(err));
+                                let _ = reply.send(Err(noded::Refused::new("malformed_origin", err)));
                             }
                         }
                     }
@@ -939,7 +939,8 @@ fn run_sim(
                                 sim.handle_submit(origin, msg, reply).await;
                             }
                             Err(err) => {
-                                let _ = reply.send(Err(err.to_string()));
+                                let _ = reply
+                                    .send(Err(noded::Refused::new("malformed_frame", err.to_string())));
                             }
                         }
                     }
@@ -947,8 +948,12 @@ fn run_sim(
                         // reads serve COMMITTED state — the ordered lane applies
                         // only in `drain_delivered`, so a held/parked op is
                         // invisible here until a step commits it.
-                        let result =
-                            sim.node.host().query(&target, &req).await.map_err(|err| err.to_string());
+                        let result = sim
+                            .node
+                            .host()
+                            .query(&target, &req)
+                            .await
+                            .map_err(|err| noded::Refused::of(&err));
                         let _ = reply.send(result);
                     }
                     Some(NodeCommand::QueryAs { target, req, reader, reply }) => {
@@ -957,7 +962,7 @@ fn run_sim(
                             .host()
                             .query_as(&target, &req, sdk::Origin::External(reader))
                             .await
-                            .map_err(|err| err.to_string());
+                            .map_err(|err| noded::Refused::of(&err));
                         let _ = reply.send(result);
                     }
                     None => break,
@@ -977,7 +982,7 @@ impl Sim {
         &mut self,
         origin: Origin,
         msg: Msg,
-        reply: oneshot::Sender<Result<BlockSummary, String>>,
+        reply: oneshot::Sender<Result<BlockSummary, noded::Refused>>,
     ) {
         if !self.auto {
             self.held.push_back(HeldOp { origin, msg, reply });
@@ -989,10 +994,15 @@ impl Sim {
         // parity) and the submitter gets the rejection — no follow-ups to drain.
         let result = match self.commit_block(vec![(origin, msg)]).await {
             Ok((drained, events)) => match Self::member_summary(&drained) {
-                Ok(block) => self.drive_auto(events).await.map(|()| block),
-                Err(reason) => Err(reason),
+                Ok(block) => self
+                    .drive_auto(events)
+                    .await
+                    .map(|()| block)
+                    .map_err(|reason| noded::Refused::new("sim_halted", reason)),
+                Err(refused) => Err(refused),
             },
-            Err(reason) => Err(reason), // fatal — the sim halted
+            // fatal — the sim halted
+            Err(reason) => Err(noded::Refused::new("sim_halted", reason)),
         };
         let _ = reply.send(result); // caller may have hung up
     }
@@ -1074,7 +1084,9 @@ impl Sim {
             Ok(out) => out,
             Err(reason) => {
                 // fatal: the sim halted; surface it to the parked submitter.
-                let _ = held.reply.send(Err(reason));
+                let _ = held
+                    .reply
+                    .send(Err(noded::Refused::new("sim_halted", reason)));
                 return None;
             }
         };
@@ -1294,22 +1306,35 @@ impl Sim {
     /// applied op, `Err(reason)` for a rejected one (the block STILL sealed —
     /// validator parity — but the op moved no state). the sim feeds exactly one
     /// op per non-batch commit, so there is exactly one member frame.
-    fn member_summary(drained: &[DrainedFrame]) -> Result<BlockSummary, String> {
+    fn member_summary(drained: &[DrainedFrame]) -> Result<BlockSummary, noded::Refused> {
         let Some(frame) = drained.iter().find(|d| d.op.is_some()) else {
-            return Err("commit produced no member".into());
+            return Err(noded::Refused::new(
+                "no_member",
+                "commit produced no member",
+            ));
         };
         let block = BlockSummary {
             height: frame.height,
             root_hash: hex_root(&frame.root_hash),
         };
+        // the same two tokens the validator's own drain answers with, for the
+        // same two facts: the module said no, or nothing was there to apply.
         match frame.disposition {
             node::Disposition::Applied => Ok(block),
-            node::Disposition::Rejected => Err(frame.reason.clone().unwrap_or_default()),
-            // a discarded frame carries no `reason`, so the rejected arm would
-            // hand the submitter an EMPTY error. it cannot happen in the sim
-            // (no cutover ceiling), and the arm exists so a fourth variant
-            // fails the build rather than inheriting that empty string.
-            node::Disposition::Discarded => Err("discarded at the cutover ceiling".into()),
+            node::Disposition::Rejected => Err(match frame.reason.clone() {
+                Some(said) => noded::Refused::new("module", said),
+                None => noded::Refused::new(
+                    "deterministic_no_op",
+                    "op finalized but rejected (deterministic no-op)",
+                ),
+            }),
+            // it cannot happen in the sim (no cutover ceiling); the arm exists
+            // so a fourth variant fails the build rather than inheriting one of
+            // the two above.
+            node::Disposition::Discarded => Err(noded::Refused::new(
+                "cutover_ceiling",
+                "discarded at the cutover ceiling",
+            )),
         }
     }
 
@@ -1362,6 +1387,7 @@ impl Sim {
             .collect();
         let height = self.height();
         NodeStatus {
+            contract: noded::NODE_CONTRACT,
             version: env!("CARGO_PKG_VERSION").into(),
             root_hash: hex_root(&host.root_hash()),
             height,

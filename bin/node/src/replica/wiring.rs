@@ -54,7 +54,7 @@ pub(super) struct ReplicaChannels {
     /// task the moment a member's doorbell answers the gate with the
     /// AUTHORITATIVE `Admitted` — the park loop reads it directly.
     pub(super) admitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub(super) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
+    pub(super) presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
     /// the mesh window tracker, genesis already tracked — the park loop
     /// advances it as generations land, and promotion carries it on.
     pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
@@ -97,7 +97,7 @@ pub(super) async fn wire(
     // invite token deleted (the workspace dir — same one `park` gates reads
     // from).
     workspace: std::path::PathBuf,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
+    presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> ReplicaChannels {
     if manifest.is_none() && !recovery.journal_is_empty().await {
@@ -237,6 +237,10 @@ pub(super) async fn wire(
                     // promotion reclaims the lane once the standby plane
                     // shuts down, and wires the member plane over it.
                     Some((tx_handback, rx_handback)),
+                    match manifest {
+                        Some(_) => crate::reachability_plane::NetstackBoot::AwaitRegistry,
+                        None => crate::reachability_plane::NetstackBoot::Bootstrap,
+                    },
                 ))
             }
             None => {
@@ -430,6 +434,29 @@ pub(super) async fn wire(
                                     reason,
                                 } => {
                                     if !restart_with_standing {
+                                        // THE INVITE IS THE LAST THING TO SUSPECT. A
+                                        // plane that never started took every offered
+                                        // path down with it before any of them was
+                                        // tried, and an operator sent back to the
+                                        // inviter spends a credential that was never
+                                        // the problem — then fails identically.
+                                        if let Some((reason, detail)) =
+                                            crate::reachability_plane::plane_failure()
+                                        {
+                                            tracing::error!(
+                                                target: "ducktape::join",
+                                                node = %race_label,
+                                                tried,
+                                                reason,
+                                                detail = %detail,
+                                                "FATAL: no overlay to reach the mesh \
+                                                 with — the reachability plane never \
+                                                 started, so every offered path was \
+                                                 dead before it was tried. A fresh \
+                                                 invite cannot help."
+                                            );
+                                            std::process::exit(3);
+                                        }
                                         // NOT `fatal!`: this path exits 3, not 1 — a
                                         // join that ran out of paths is distinct from a
                                         // node that broke, and callers read the code.
@@ -496,7 +523,7 @@ pub(super) async fn wire(
         relay_tx,
         relay_rx,
         admitted,
-        voice_requests,
+        presence_requests,
         mesh_window,
         mesh_book,
     }

@@ -22,7 +22,7 @@ mod view_abi {
             wasmtime::component::bindgen!({ inline: $wit, world: "view" });
         };
     }
-    ui_lang_wire::with_view_wit!(bindings);
+    view_wire::with_view_wit!(bindings);
 }
 
 /// a boxed, non-`Send` future (the host and every store are `!Send`).
@@ -39,20 +39,25 @@ pub type StoreSource<'a> = dyn FnMut(&str) -> BoxFut<'a, Result<Box<dyn MerkleSt
 pub type SnapshotSource<'a> =
     dyn FnMut(&str, Backing) -> BoxFut<'a, Result<Option<(Vec<u8>, StateRoot)>, String>> + 'a;
 
-/// the host-side disk substrates the odb-backed tenants open over.
+/// Storage locations are node configuration, while the guest declares its
+/// engine. An unbound module gets a private directory without a native ID list.
 #[derive(Clone)]
 pub struct Substrates {
-    /// forge's git repo base dir.
-    pub forge_repo: PathBuf,
-    /// files' duckfs data dir (`<dir>/objects` + `<dir>/refs`).
-    pub duckfs_dir: PathBuf,
-    /// the node-local blob plane forge materializes pushed packs from.
+    pub directory: PathBuf,
+    pub bindings: std::collections::BTreeMap<String, PathBuf>,
     pub blobs: blobstore::BlobHandle,
 }
 
-/// the module ids this host provides an odb substrate for — the only ids a
-/// component declaring [`Backing::Odb`] can run under.
-const ODB_SUBSTRATES: &[&str] = &["files", "forge"];
+impl Substrates {
+    pub fn path(&self, id: &str) -> Result<PathBuf, String> {
+        workspace_config::validate_module_id(id)?;
+        Ok(self
+            .bindings
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| self.directory.join(id)))
+    }
+}
 
 /// the per-network values every composition binds into module state: the
 /// invite namespace governance verifies tokens and join proofs against, the
@@ -110,6 +115,54 @@ pub enum Start<'a, 'b> {
     },
 }
 
+/// one founding deployment, fetched and verified: what the registry seeds
+/// for it (`kind`) is what its frame says it is.
+pub struct Founding {
+    pub id: String,
+    pub hash: [u8; 32],
+    pub kind: modules::Kind,
+    /// what the frame declares it needs on the data plane. Read off the same
+    /// bytes the hash covers, so genesis is not a second declarer.
+    pub lanes: Vec<modules::LaneDecl>,
+}
+
+/// what a deployment frame IS, by its tag: the kind the registry seeds a
+/// genesis entry with, and the kind a post-genesis registration must match.
+pub fn artifact_kind(bytes: &[u8]) -> Result<modules::Kind, String> {
+    Ok(match module_artifact::ArtifactRef::decode(bytes)? {
+        module_artifact::ArtifactRef::Module(_) => modules::Kind::Module,
+        module_artifact::ArtifactRef::View(_) => modules::Kind::View,
+    })
+}
+
+/// the data-plane lanes a deployment frame declares — what the registry
+/// admits for it, whether the frame arrives at genesis or through a
+/// governance admission. A view frame declares none: it has no consensus code
+/// and no sockets, so it has nothing to speak on a lane with.
+pub fn artifact_lanes(bytes: &[u8]) -> Result<Vec<modules::LaneDecl>, String> {
+    Ok(match module_artifact::ArtifactRef::decode(bytes)? {
+        module_artifact::ArtifactRef::Module(module) => module.lanes,
+        module_artifact::ArtifactRef::View(_) => Vec::new(),
+    })
+}
+
+/// the registry's genesis seed table for the founding set: every entry's
+/// kind is its frame's tag — a `<id>.component.wasm` founds a module, a
+/// `<id>.view.wasm` alone founds a view (`workspace_config::Genesis::compose`).
+pub fn genesis_seeds(founding: &[Founding]) -> BTreeMap<String, modules::Seed> {
+    founding
+        .iter()
+        .map(|entry| {
+            let seed = modules::Seed {
+                kind: entry.kind,
+                code_hash: entry.hash.to_vec(),
+                lanes: entry.lanes.clone(),
+            };
+            (entry.id.clone(), seed)
+        })
+        .collect()
+}
+
 /// Compose the boot mode's deployment set into a [`Host`];
 /// the boot mode supplies the authenticated module set and initialization or
 /// snapshot data. Every module uses the same Wasm constructor.
@@ -121,13 +174,6 @@ pub async fn compose(
     mut boot: Boot<'_, '_>,
 ) -> Result<Host, String> {
     let mut host = Host::new();
-    let parameters = match &boot {
-        Boot::Genesis { validators, bundle } => sdk::genesis_config::encode_config(&[
-            ("modules", &sdk::wire::encode(bundle)),
-            ("validators", &sdk::wire::encode(validators)),
-        ]),
-        Boot::Reopen { .. } => sdk::genesis_config::encode_config(&[]),
-    };
     let codes = match &boot {
         Boot::Genesis { bundle, .. } => *bundle,
         Boot::Reopen { codes, .. } => *codes,
@@ -135,8 +181,30 @@ pub async fn compose(
     for id in codes.keys() {
         workspace_config::validate_module_id(id)?;
     }
+    // every deployment is fetched and verified before anything seats: the
+    // genesis seed table names each entry's kind off its frame, and a
+    // reopen's set is the seated modules' hashes (a checkpoint records what
+    // ran, and a view never runs), so a view frame can only be a founding one.
+    let mut founding = Vec::with_capacity(codes.len());
+    let mut fetched = Vec::with_capacity(codes.len());
     for (id, hash) in codes {
         let bytes = fetch_code(code, id, hash).await?;
+        founding.push(Founding {
+            id: id.clone(),
+            hash: *hash,
+            kind: artifact_kind(&bytes)?,
+            lanes: artifact_lanes(&bytes)?,
+        });
+        fetched.push((id, bytes));
+    }
+    let parameters = match &boot {
+        Boot::Genesis { validators, .. } => sdk::genesis_config::encode_config(&[
+            ("modules", &sdk::wire::encode(&genesis_seeds(&founding))),
+            ("validators", &sdk::wire::encode(validators)),
+        ]),
+        Boot::Reopen { .. } => sdk::genesis_config::encode_config(&[]),
+    };
+    for (entry, (id, bytes)) in founding.iter().zip(fetched) {
         let start = match &mut boot {
             Boot::Genesis { .. } => Start::Fresh {
                 parameters: &parameters,
@@ -145,8 +213,15 @@ pub async fn compose(
                 snapshots: &mut **snapshots,
             },
         };
-        let module = wasm_module(id, &bytes, stores, substrates, bindings, start).await?;
-        register_new(&mut host, Box::new(module))?;
+        match entry.kind {
+            modules::Kind::Module => {
+                let module = wasm_module(id, &bytes, stores, substrates, bindings, start).await?;
+                register_new(&mut host, Box::new(module))?;
+            }
+            // a view seats nothing: the registry entry carries its hash and
+            // the desktop fetches the artifact by that hash.
+            modules::Kind::View => {}
+        }
     }
     // Durable stores can have advanced beyond the checkpoint. Its registry
     // names admissions replay will encounter; prepare those through the same
@@ -237,6 +312,11 @@ async fn registry_active_set(host: &Host, height: u64) -> Result<Vec<ActiveCode>
     };
     Ok(roster
         .into_iter()
+        .filter(|entry| match entry.kind {
+            modules::Kind::Module => true,
+            // a view is a registry entry with nothing to seat.
+            modules::Kind::View => false,
+        })
         .filter_map(|entry| {
             let (hash, seat) = seat_at(&entry, height)?;
             Some(ActiveCode {
@@ -304,8 +384,8 @@ pub async fn wasm_module(
             }
             compiled.over_store(id, store)
         }
-        Backing::Odb => {
-            let backing = open_odb(id, substrates)?;
+        Backing::Odb | Backing::Git => {
+            let backing = open_odb(id, shape.backing, substrates)?;
             let config = odb_genesis_config(id, &shape, bindings)?;
             compiled.over_odb(id, backing, config)
         }
@@ -350,18 +430,45 @@ pub async fn wasm_module(
     Ok(module)
 }
 
-/// Readiness covers consensus code, the optional mapper, and the optional view.
-/// Mapper validation matches its eventual index install. View validation checks
-/// strict metadata and the canonical Ice ABI without instantiating or executing
-/// the view. Unknown imports follow the desktop host's trap policy; static
-/// acceptance does not guarantee that instantiation, init, or boot will succeed.
+/// Readiness is "a validator can run what the registry entry IS": for a
+/// `Kind::Module` entry the consensus code (declared shape realizable here),
+/// its optional mapper (matching its eventual index install) and its optional
+/// view; for a `Kind::View` entry the view alone. Either way the frame's tag
+/// must be the entry's kind — a view frame under a module id (or a module
+/// frame under a view id) is a named refusal, never a vote. View validation
+/// checks strict metadata and the canonical Ice ABI without instantiating or
+/// executing the view; unknown imports follow the desktop host's trap policy,
+/// so static acceptance does not guarantee that instantiation, init, or boot
+/// will succeed.
 pub fn validate_deployment(
     id: &str,
+    kind: modules::Kind,
     bytes: &[u8],
     index: &indexer::IndexStore,
 ) -> Result<(), String> {
     workspace_config::validate_module_id(id)?;
-    let artifact = module_artifact::ModuleArtifactRef::decode(bytes)?;
+    let artifact = module_artifact::ArtifactRef::decode(bytes)?;
+    match (kind, artifact) {
+        (modules::Kind::Module, module_artifact::ArtifactRef::Module(module)) => {
+            validate_module(id, module, index)
+        }
+        (modules::Kind::View, module_artifact::ArtifactRef::View(view)) => {
+            validate_view(view.component)
+        }
+        (modules::Kind::Module, module_artifact::ArtifactRef::View(_)) => Err(format!(
+            "artifact_kind_mismatch: {id} is registered as a module, but the artifact is a view-only frame"
+        )),
+        (modules::Kind::View, module_artifact::ArtifactRef::Module(_)) => Err(format!(
+            "artifact_kind_mismatch: {id} is registered as a view, but the artifact is a module frame"
+        )),
+    }
+}
+
+fn validate_module(
+    id: &str,
+    artifact: module_artifact::ModuleArtifactRef<'_>,
+    index: &indexer::IndexStore,
+) -> Result<(), String> {
     let shape =
         WasmModule::declared_shape(artifact.component).map_err(|error| error.to_string())?;
     check_realizable(id, &shape)?;
@@ -377,7 +484,7 @@ pub fn validate_deployment(
 }
 
 fn validate_view(bytes: &[u8]) -> Result<(), String> {
-    ui_lang_wire::manifest::read_manifest(bytes)
+    view_wire::manifest::read_manifest(bytes)
         .ok_or_else(|| "invalid Ice view manifest".to_string())?;
     let engine = wasmtime::Engine::default();
     let component = wasmtime::component::Component::from_binary(&engine, bytes)
@@ -393,48 +500,33 @@ fn validate_view(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// can THIS host run a component of `shape` under `id`? an odb declaration
-/// needs a host substrate for the id, and every config key must be one the
+/// Can this host run a component of `shape` under `id`? Every config key must be one the
 /// network binds. the same check a validator applies before it signals a
 /// swap ready, so an admission the boundary could not realize is refused
 /// before it is ever scheduled, never at the boundary of every validator.
 pub fn check_realizable(id: &str, shape: &Shape) -> Result<(), String> {
-    let declares_odb = shape.backing == Backing::Odb;
-    let has_odb_substrate = ODB_SUBSTRATES.contains(&id);
-    if declares_odb && !has_odb_substrate {
-        return Err(no_odb_substrate(id));
-    }
+    workspace_config::validate_module_id(id)?;
     for key in &shape.config {
         require_config_key(id, key)?;
     }
     Ok(())
 }
 
-fn no_odb_substrate(id: &str) -> String {
-    format!(
-        "module {id} declares an odb backing, but this host provides an odb substrate only for {ODB_SUBSTRATES:?}"
-    )
-}
-
-/// the odb-backed tenants' disk substrates, by id — `open` recovers each
-/// substrate's committed position (files' refs envelope, forge's branches).
-fn open_odb(id: &str, substrates: &Substrates) -> Result<Box<dyn wasm_host::OdbBacking>, String> {
-    match id {
-        "files" => {
-            let backing = files::FilesOdbBacking::open(id, substrates.duckfs_dir.clone())
-                .map_err(|e| format!("files open: {e}"))?;
-            Ok(Box::new(backing))
-        }
-        "forge" => {
-            let backing = forge::ForgeOdbBacking::open(
-                id,
-                substrates.forge_repo.clone(),
-                substrates.blobs.clone(),
-            )
-            .map_err(|e| format!("forge open: {e}"))?;
-            Ok(Box::new(backing))
-        }
-        other => Err(no_odb_substrate(other)),
+/// Open the engine named by the component over this tenant's private state.
+fn open_odb(
+    id: &str,
+    engine: Backing,
+    substrates: &Substrates,
+) -> Result<Box<dyn wasm_host::OdbBacking>, String> {
+    let path = substrates.path(id)?;
+    match engine {
+        Backing::Odb => files_odb::FilesOdbBacking::open(id, path)
+            .map(|backing| Box::new(backing) as Box<dyn wasm_host::OdbBacking>)
+            .map_err(|error| format!("object storage open: {error}")),
+        Backing::Git => forge_odb::ForgeOdbBacking::open(id, path, substrates.blobs.clone())
+            .map(|backing| Box::new(backing) as Box<dyn wasm_host::OdbBacking>)
+            .map_err(|error| format!("git storage open: {error}")),
+        Backing::Map | Backing::Store => Err("component does not declare object storage".into()),
     }
 }
 
@@ -565,8 +657,20 @@ impl host::ModuleFactory for Admissions {
         // plane's record committed through the same id-generic registry. Skip
         // and latch — a hard error here is a permanent code stall on every
         // node, for bytes this boundary never owned.
-        let Ok(artifact) = module_artifact::ModuleArtifactRef::decode(bytes) else {
+        let Ok(artifact) = module_artifact::ArtifactRef::decode(bytes) else {
             return Ok(host::Admitted::ForeignAbi);
+        };
+        // the host never asks this factory for a `Kind::View` entry
+        // (`Host::realize_module_swaps` skips them), so a view frame here is
+        // a module entry whose bytes are no module: fail closed rather than
+        // seat an empty core.
+        let artifact = match artifact {
+            module_artifact::ArtifactRef::Module(module) => module,
+            module_artifact::ArtifactRef::View(_) => {
+                return Err(sdk::Error::Module(format!(
+                    "artifact_kind_mismatch: {id} is a module entry, but the artifact is a view-only frame"
+                )));
+            }
         };
         let bindings = Bindings {
             invite: &self.invite,

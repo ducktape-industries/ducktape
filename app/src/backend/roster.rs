@@ -1,30 +1,6 @@
 use super::*;
 use identity::{AccountNumber, AccountView, IdentityQuery, IdentityReply};
 
-/// One member of the network: a validator (quorum seat), a resident
-/// (mesh + statesync standing), or a registered agent.
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
-pub struct MemberRow {
-    pub key: String,
-    pub label: String,
-    pub role: String,
-    pub is_this_node: bool,
-    pub is_agent: bool,
-    /// an agent's capability tag; empty for a human member.
-    pub model: String,
-    /// a HUMAN row: the mesh reports this key as a live peer (this node is
-    /// live by definition). An AGENT row: the registry says active rather than
-    /// paused — `MemberPresence` renders the two vocabularies apart on
-    /// `is_agent`. Neither is "working right now"; that is `AgentRow.live`.
-    pub live: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct MembersData {
-    pub generation: i64,
-    pub members: Vec<MemberRow>,
-}
-
 /// The network's name directory as this process last read it: the account
 /// name bound to every user key. Every surface that names a key reads it, and
 /// every read of the identity roster ([`read_accounts`]) rewrites it whole —
@@ -62,19 +38,6 @@ fn seat_names(directory: NameDirectory) {
 /// lend it across its awaits and the update thread can read it without one.
 pub(crate) fn names() -> NameDirectory {
     read_names().directory.clone()
-}
-
-/// The generation the directory is at: it moves on every read that seats
-/// one, so a holder of [`names_at`]'s snapshot compares generations instead
-/// of directories.
-pub(crate) fn names_generation() -> u64 {
-    read_names().generation
-}
-
-/// The directory and the generation it is at, read together.
-pub(crate) fn names_at() -> (u64, NameDirectory) {
-    let names = read_names();
-    (names.generation, names.directory.clone())
 }
 
 /// Every identity account, paged the way the module serves them: numbered
@@ -151,21 +114,6 @@ impl Drop for SeededNames {
     }
 }
 
-/// Whether the account or exact key represented by `me` holds a seat.
-pub(crate) fn seated_in(members: &[ChatMember], me: &str) -> bool {
-    let Ok(key) = hex_decode(me) else {
-        return false;
-    };
-    let names = names();
-    members.iter().any(|member| {
-        let handle = match member.key.starts_with("acct:") || member.key.starts_with("user:") {
-            true => member.key.clone(),
-            false => format!("user:{}", member.key),
-        };
-        names.owns_handle(&handle, &key)
-    })
-}
-
 /// Refresh the directory and nothing else — what a chat load does before it
 /// renders a row.
 pub(crate) async fn refresh_names(client: &RpcClient) -> Result<(), String> {
@@ -188,15 +136,6 @@ impl ReaderFacts {
         }
     }
 
-    /// The update thread's reading — it cannot await, so it takes the cached
-    /// key (warm by the time anyone sends) and the directory as last read.
-    pub(crate) fn cached() -> Self {
-        Self {
-            key: rpc::cached_user_key(),
-            names: names(),
-        }
-    }
-
     pub(crate) fn reader(&self) -> ChatReader<'_> {
         ChatReader::new(self.key.as_deref(), &self.names)
     }
@@ -205,110 +144,3 @@ impl ReaderFacts {
         &self.names
     }
 }
-
-/// Load the roster: validators, then residents, then the registered agents —
-/// one list, this node marked, liveness folded in from the mesh sample.
-pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, HydrationError> {
-    async {
-        let client = rpc_client(&rpc)?;
-        let node_key = client.status().await?.public_key;
-        let live_keys = live_peer_keys(&client).await;
-        let mut members = Vec::new();
-        for (query, role) in [("validators", "validator"), ("residents", "resident")] {
-            let reply: serde_json::Value =
-                client.query("valset", &serde_json::json!(query)).await?;
-            let keys = reply[query].as_array().cloned().unwrap_or_default();
-            for key in keys {
-                let hex = hex_encode(&json_bytes(&key));
-                let is_this_node = hex == node_key;
-                members.push(MemberRow {
-                    label: short_label(&hex),
-                    live: is_this_node || live_keys.contains(&hex),
-                    is_this_node,
-                    is_agent: false,
-                    model: String::new(),
-                    role: role.into(),
-                    key: hex,
-                });
-            }
-        }
-        // registered agents are members of the workspace too — the roster shows
-        // people AND machines, keyed on the agent id (agents hold no node key;
-        // the roster labels that cell "agent id", not "public key").
-        let agents = load_agents(rpc, generation).await.map(|data| data.agents);
-        for agent in agents.unwrap_or_default() {
-            members.push(MemberRow {
-                key: agent.id,
-                label: agent.name,
-                role: "agent".into(),
-                is_this_node: false,
-                is_agent: true,
-                model: agent.capability,
-                // for an agent row this is REGISTRATION state (active vs
-                // paused), which is what `MemberPresence` renders for a
-                // machine — not "working now". The run-in-flight fact is
-                // `AgentRow.live`, and only that one may pulse the rail.
-                live: agent.status == "active",
-            });
-        }
-        Ok(MembersData {
-            generation,
-            members,
-        })
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-/// The peer sample's live keys, full hex — the join key for member liveness.
-/// A node that cannot answer `/v1/peers` simply reports nobody live.
-async fn live_peer_keys(rpc: &RpcClient) -> BTreeSet<String> {
-    let Ok(reply) = rpc.peers().await else {
-        return BTreeSet::new();
-    };
-    reply["peers"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        // `connected` and `peer`, NOT `live`/`key`: those are the names
-        // `PeerView` serializes (crates/noded/src/peers.rs). Reading the wrong
-        // ones made every lookup return null, so this set came back empty on
-        // every call and every member rendered offline.
-        .filter(|peer| peer["connected"].as_bool().unwrap_or(false))
-        .filter_map(|peer| peer["peer"].as_str().map(str::to_string))
-        .collect()
-}
-
-/// This node holds a quorum seat — the ONE authority predicate behind the
-/// approvals gate, the members Invite button and the forge write gate.
-pub fn members_is_admin(rows: &[MemberRow]) -> bool {
-    rows.iter()
-        .any(|row| row.is_this_node && row.role == "validator")
-}
-
-/// This node's standing: `validator` | `resident` | `guest`, or `""` when the
-/// roster has not answered.
-///
-/// The empty answer is load-bearing. `load_members` is one of thirteen parallel
-/// loads, so it can be the only one that fails, and folding its silence into
-/// `guest` told a validator's operator — with no error anywhere on screen —
-/// that this device may not post. `""` lights the STANDING UNKNOWN arm in
-/// node.ice instead.
-///
-/// An empty vec is the only unanswered signal a pure row function has, and it
-/// is a sound one: an answered roster always carries the chain's own
-/// validators. So a roster that DID answer and holds no row for this node is a
-/// real guest and still reads `guest` — the guest card is not collateral here.
-pub fn member_tier(rows: &[MemberRow]) -> String {
-    if rows.is_empty() {
-        return String::new();
-    }
-    rows.iter()
-        .find(|row| row.is_this_node)
-        .map_or_else(|| "guest".into(), |row| row.role.clone())
-}
-

@@ -39,16 +39,44 @@ pub const MAX_CHANGES_PER_COMMIT: usize = 4096;
 /// touching files under enough distinct pre-existing directories (or staging
 /// enough new objects) reads unboundedly.
 ///
-/// this MUST equal the wasm kernel's per-dispatch object-plane budget
-/// (`wasm_host::MAX_OBJECT_READS`, also 4096), and the core counts EXACTLY what
-/// the kernel counts: distinct `object-get` + distinct `object-stat` ids that
-/// MISS the same-block object overlay (the block-local object index here). the
-/// core charges a read BEFORE issuing it, so the guest — which runs this same
-/// core — trips this cap and rejects STRICTLY BEFORE it can reach the kernel
-/// trap, and native applies the same cap over `DiskStore`. a commit accepted by
-/// one runtime is therefore accepted by both (the `files` crate compile-asserts
-/// the two constants are equal). the `files` crate re-exports this const.
-pub const MAX_OBJECT_READS_PER_OP: usize = 4096;
+/// the number is what a GUEST DISPATCH can actually SPEND, measured, not a
+/// round number picked for its shape. every unresolved committed read replays
+/// the pure guest once with the answer memoized, out of ONE
+/// `wasm_host::DEFAULT_FUEL` budget spent across the rounds, so an op that
+/// spends the whole cap re-treads a prefix growing by one read per round: its
+/// cost is quadratic in the reads and linear in the bytes each round re-walks.
+/// a cap the guest cannot reach inside that fuel is not a cap at all — wasm
+/// would trap on fuel where native still accepted, which is a native↔wasm
+/// interchange break dressed as a resource limit. the binding shape is the most
+/// expensive commit the other budgets admit: [`MAX_INLINE_COMMIT_BYTES`] of
+/// inline bodies spread over cap/2 distinct files (each stages a chunk and a
+/// fileobj — two reads). that commit COMPLETES on the guest at this cap and
+/// traps above it, which `wasm_files_parity` drives on the real component from
+/// both runtimes.
+///
+/// cap/2 documents is the GENESIS shape, and only that: an empty tree has no
+/// spine to walk. every commit after the first also charges the effective head
+/// snapshot plus each pre-existing directory tree on the spine of the paths it
+/// writes. those gets dedupe across the whole op, so they are a per-commit
+/// CONSTANT — it grows with the depth and the spread of the written paths, never
+/// with the document count and never with how many entries those directories
+/// already hold. for the ordinary shape, N documents into one existing
+/// `/shared/<dir>`, the constant is 4 (the head snapshot, then the root tree,
+/// `/shared` and `/shared/<dir>`), so such a commit carries (cap - 4) / 2 = 126
+/// documents and is refused at 127. `wasm_files_parity` drives that accept row
+/// and its one-document-over reject beside the genesis pair.
+///
+/// it must also stay within the wasm kernel's per-dispatch object-plane budget
+/// (`wasm_host::MAX_OBJECT_READS`) — the outer bound the kernel itself enforces
+/// — and the core counts EXACTLY what the kernel counts: the distinct
+/// `object-get` and distinct `object-stat` ids that MISS the same-block object
+/// overlay (the block-local object index here). it charges a read BEFORE issuing
+/// it, so the guest — which runs this same core — trips this cap and rejects
+/// STRICTLY BEFORE it can reach the kernel trap, and native applies the same cap
+/// over `DiskStore`. a commit accepted by one runtime is therefore accepted by
+/// both (the `files` crate compile-asserts the ordering). the `files` crate
+/// re-exports this const.
+pub const MAX_OBJECT_READS_PER_OP: usize = 256;
 pub const MAX_MESSAGE_BYTES: usize = 4096;
 pub const MAX_META_ENTRIES: usize = 16;
 pub const MAX_META_KEY_BYTES: usize = 64;
@@ -149,6 +177,19 @@ pub enum FilesMsg {
         message: String,
         changes: Vec<Change>,
     },
+    /// Create a detached snapshot of one path and its ancestor spine. The
+    /// candidate enters the history window without moving the public head.
+    ProjectSnapshot {
+        snapshot: DigestHex,
+        path: String,
+    },
+    /// Atomically replace a module-owned retention reference. The authenticated
+    /// module origin supplies the namespace; ordinary pins cannot remove it.
+    CompareExchangeRetention {
+        key: String,
+        expected: Option<RetentionReference>,
+        replacement: Option<RetentionReference>,
+    },
     Pin {
         snapshot: DigestHex,
         name: String,
@@ -246,6 +287,12 @@ pub enum FilesQuery {
         prefix: String,
     },
     Refs {},
+    /// Committed reference only. Writers derive their expected CAS value from
+    /// their own canonical state, not this preceding-boundary query.
+    Retention {
+        module_id: String,
+        key: String,
+    },
     /// the client staging probe: which of these chunk ids the cluster already
     /// holds (staged in refs OR durable in the odb). advisory — the reply can go
     /// stale between a gc sweep and the commit, which re-validates; a stale answer
@@ -309,6 +356,14 @@ pub struct GrepHit {
     pub locator: String,
 }
 
+/// A module-owned immutable snapshot reference. Replacements compare the whole
+/// previous value and advance its nonzero revision; release names that value too.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RetentionReference {
+    pub snapshot: DigestHex,
+    pub revision: u64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RefsInfo {
     pub head: Option<DigestHex>,
@@ -339,13 +394,16 @@ pub enum FilesReply {
     History(Vec<SnapshotInfo>),
     Diff(Vec<DiffEntry>),
     Refs(RefsInfo),
+    Retention(Option<RetentionReference>),
     /// per-id presence, in request order — `present[i]` answers `ids[i]`.
     HasChunks {
         present: Vec<bool>,
     },
 }
 
-/// The actual result of an accepted write, declared in the dispatch receipt.
+/// The actual result of an accepted write. Identical metadata-only JSON bytes
+/// are published as both output and assigned stamp, so generic call/action
+/// summaries retain minted snapshot IDs without carrying file bodies.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct FilesWriteOutput {
     pub actor: crate::Actor,
@@ -356,12 +414,34 @@ pub struct FilesWriteOutput {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteOutcome {
-    PutBlob { chunk: DigestHex },
-    Commit { snapshot: DigestHex },
-    Pin { snapshot: DigestHex, name: String },
-    Unpin { name: String },
-    Watch { prefix: String, module_id: String },
-    Unwatch { prefix: String, module_id: String },
+    PutBlob {
+        chunk: DigestHex,
+    },
+    Commit {
+        snapshot: DigestHex,
+    },
+    ProjectSnapshot {
+        snapshot: DigestHex,
+    },
+    CompareExchangeRetention {
+        key: String,
+        reference: Option<RetentionReference>,
+    },
+    Pin {
+        snapshot: DigestHex,
+        name: String,
+    },
+    Unpin {
+        name: String,
+    },
+    Watch {
+        prefix: String,
+        module_id: String,
+    },
+    Unwatch {
+        prefix: String,
+        module_id: String,
+    },
 }
 
 pub fn encode_write_output(output: &FilesWriteOutput) -> Vec<u8> {

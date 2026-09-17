@@ -132,9 +132,53 @@ impl OverlayPeers {
     }
 }
 
-/// a per-use plane's identity tag: the service its sockets register as.
+/// WHICH lane a plane serves, by the pair the registry keys on: the module
+/// that declares the lane and the name it declares it under.
+///
+/// The key is compile-time because a plane knows what it IS — the presence
+/// plane serves chat's presence lane whatever id that lane holds. Everything
+/// the id decides (the two overlay ports, the pacing, the accept backlog) comes
+/// from the lane table at bind, so a network can renumber a lane without a
+/// binary that knows about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaneKey {
+    pub module_id: &'static str,
+    pub name: &'static str,
+}
+
+impl std::fmt::Display for LaneKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.module_id, self.name)
+    }
+}
+
+/// where a plane's lane id comes from. Exactly two kinds exist, and the
+/// difference is not a preference — it is whether the node can read the
+/// registry yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneSource {
+    /// fixed in the binary because it is bound BEFORE any registry can be
+    /// read: state sync pulls the state the registry lives in, and the code
+    /// plane fetches the bytes that would declare the lanes. The registry
+    /// refuses to declare these ids (`modules::RESERVED_LANE_IDS`), so a
+    /// kernel lane and a declared one can never collide.
+    Kernel(Service),
+    /// the committed lane table names the id. The plane waits for it.
+    Declared(LaneKey),
+}
+
+impl std::fmt::Display for LaneSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Kernel(service) => write!(f, "kernel/{}", service.lane_id()),
+            Self::Declared(key) => write!(f, "{key}"),
+        }
+    }
+}
+
+/// a per-use plane's identity tag: the lane its sockets serve.
 pub trait Plane: 'static {
-    const SERVICE: Service;
+    const LANE: LaneSource;
 }
 
 /// a stream-class plane's tag: the one stream flow its admission permits.
@@ -152,16 +196,52 @@ pub trait StreamPlane: Plane {
 /// service port it is sending on).
 pub struct OverlayBook<P> {
     peers: Arc<OverlayPeers>,
+    /// the lane this book stamps ports from, latched the moment the lane
+    /// table answers for `P::LANE`. Empty until then, and an empty book
+    /// resolves NO address: a plane whose lane the network has not declared
+    /// must not dial a port it guessed. The book is built before the table
+    /// can be read (the gateway's is shared with the announce pump from
+    /// boot), which is why this is a latch and not a constructor argument.
+    lane: std::sync::OnceLock<Service>,
     /// `fn() -> P` keeps the book Send+Sync regardless of the tag type.
     _plane: PhantomData<fn() -> P>,
 }
 
 impl<P: Plane> OverlayBook<P> {
     pub fn new(peers: Arc<OverlayPeers>) -> Arc<Self> {
-        Arc::new(Self {
+        let book = Self {
             peers,
+            lane: std::sync::OnceLock::new(),
             _plane: PhantomData,
-        })
+        };
+        // a kernel book is bound from birth — its id is not the registry's to
+        // give, so there is nothing to wait for.
+        if let LaneSource::Kernel(service) = P::LANE {
+            book.lane.set(service).expect("a fresh book has no lane");
+        }
+        Arc::new(book)
+    }
+
+    /// latch the lane the registry resolved for `P::LANE`. Idempotent on the
+    /// same id; a SECOND, DIFFERENT id is a renumber, which this process does
+    /// not follow — the sockets are already bound to the first one's ports,
+    /// so the plane restarts rather than silently serving two.
+    pub fn bind_lane(&self, service: Service) -> Result<(), Service> {
+        match self.lane.set(service) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let bound = *self.lane.get().expect("set failed means it is full");
+                match bound == service {
+                    true => Ok(()),
+                    false => Err(bound),
+                }
+            }
+        }
+    }
+
+    /// the lane this book resolves ports from, once the table has answered.
+    pub fn lane(&self) -> Option<Service> {
+        self.lane.get().copied()
     }
 
     /// the tracked peer set this book answers from.
@@ -180,14 +260,14 @@ impl<P: Plane> AddressBook for OverlayBook<P> {
     fn datagram_addr(&self, peer: PeerId) -> Option<SocketAddr> {
         Some(SocketAddr::new(
             self.peers.overlay_ip(&peer.0),
-            P::SERVICE.overlay_datagram_port(),
+            self.lane()?.overlay_datagram_port(),
         ))
     }
 
     fn stream_addr(&self, peer: PeerId) -> Option<SocketAddr> {
         Some(SocketAddr::new(
             self.peers.overlay_ip(&peer.0),
-            P::SERVICE.overlay_stream_port(),
+            self.lane()?.overlay_stream_port(),
         ))
     }
 
@@ -198,6 +278,7 @@ impl<P: Plane> AddressBook for OverlayBook<P> {
 
 impl<P: StreamPlane> AdmissionPolicy for OverlayBook<P> {
     fn permits(&self, peer: PeerId, service: Service, flow: FlowId) -> bool {
-        service == P::SERVICE && flow == P::flow() && self.peers.contains(peer)
+        let on_our_lane = self.lane() == Some(service);
+        on_our_lane && flow == P::flow() && self.peers.contains(peer)
     }
 }

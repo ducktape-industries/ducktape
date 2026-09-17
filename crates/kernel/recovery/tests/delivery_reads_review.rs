@@ -375,6 +375,7 @@ impl Module for RegistryBoundary {
                     &modules::ModulesReply::ModuleStatus {
                         modules: vec![modules::ModuleCode {
                             module_id: "receiver".into(),
+                            kind: modules::Kind::Module,
                             active_code_hash: vec![1; 32],
                             pending,
                             history: vec![modules::Activation {
@@ -388,6 +389,12 @@ impl Module for RegistryBoundary {
             modules::ModulesQuery::ArmedAt { .. } => {
                 Ok(modules::encode_reply(&modules::ModulesReply::ArmedAt {
                     swaps: Vec::new(),
+                }))
+            }
+            // this stub's network declares no data-plane lanes
+            modules::ModulesQuery::Lanes => {
+                Ok(modules::encode_reply(&modules::ModulesReply::Lanes {
+                    lanes: Vec::new(),
                 }))
             }
         }

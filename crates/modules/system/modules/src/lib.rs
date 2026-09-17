@@ -33,8 +33,8 @@
 //! ## state model
 //!
 //! pure logic over a host-injected [`sdk::MerkleStore`]: one point record per
-//! registered module (`mod\0{id}` → active hash + optional pending swap,
-//! borsh) behind the sorted module roster (`modules`, bounded by
+//! registered module (`mod\0{id}` → kind + activation history + optional
+//! pending swap, borsh) behind the sorted module roster (`modules`, bounded by
 //! [`MAX_MODULES`]) the status/advance walks read. writes are staged during a
 //! block and flushed in one batch at `commit_block`; the module root IS the
 //! store's merkle root, and sync belongs to the store. the `Advance` decide
@@ -80,11 +80,24 @@ fn mod_key(module_id: &str) -> Vec<u8> {
 /// the module roster's whole key (sorted module ids).
 const MODULE_ROSTER_KEY: &[u8] = b"modules";
 
+/// the data-plane lane table's whole key: every declared lane, ascending by
+/// id. ONE record rather than a per-module list, because the invariant that
+/// matters is uniqueness ACROSS modules — a collision check has to read one
+/// place, and the host's bind pass wants the whole table in one read.
+const LANE_TABLE_KEY: &[u8] = b"lanes";
+
+/// serialized lane-table byte bound. [`MAX_LANE_ID`] already caps the table at
+/// 99 entries; this is the uniform poison backstop on top of it.
+const MAX_LANE_TABLE_BYTES: usize = 64 * 1024;
+
 /// one registered module's code state — stored verbatim (borsh; a readiness
 /// list stays strictly increasing by construction, so one state has exactly
 /// one encoding).
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct ModuleEntry {
+    /// what the artifact under this id is — set at admission, kept by every
+    /// swap ([`Kind`]).
+    kind: Kind,
     pending: Option<ScheduledSwap>,
     /// every activation in block order — appended by a register/seed and by
     /// each `Advance` flip, never rewritten; its last entry IS the active
@@ -100,6 +113,16 @@ impl ModuleEntry {
     fn active_code_hash(&self) -> &[u8] {
         self.history.last().map_or(&[], |a| &a.code_hash)
     }
+}
+
+/// WHAT is being admitted, as one value — as opposed to WHEN and under what
+/// NAME, which is the schedule's business. These three travel together through
+/// both register paths and genesis seeding, and grouping them keeps the
+/// admission handler's signature about the decision rather than the fields.
+struct Admission {
+    kind: Kind,
+    code_hash: Vec<u8>,
+    lanes: Vec<LaneDecl>,
 }
 
 /// the activation `code_hash` makes for block `height`.
@@ -152,7 +175,9 @@ impl Modules {
     pub async fn seed(
         &mut self,
         module_id: impl Into<String>,
+        kind: Kind,
         code_hash: Vec<u8>,
+        lanes: Vec<LaneDecl>,
     ) -> Result<(), Error> {
         assert_eq!(
             code_hash.len(),
@@ -160,6 +185,9 @@ impl Modules {
             "genesis code hash must be {CODE_HASH_LEN} bytes"
         );
         let module_id = module_id.into();
+        // a refused genesis declaration must fail the FOUND, not seed a
+        // network whose lane table disagrees with its module set.
+        self.declare_lanes(&module_id, lanes).await?;
         let mut roster = self.roster().await?;
         if let Err(position) = roster.binary_search(&module_id) {
             roster.insert(position, module_id.clone());
@@ -174,6 +202,7 @@ impl Modules {
         self.store(
             mod_key(&module_id),
             &ModuleEntry {
+                kind,
                 history: vec![activation(0, &code_hash)],
                 pending: None,
             },
@@ -342,6 +371,109 @@ impl Modules {
         }
     }
 
+    /// the lane table, ascending by id. absent until the first declaration.
+    async fn lane_table(&self) -> Result<Vec<LaneRecord>, Error> {
+        Ok(self.load(LANE_TABLE_KEY).await?.unwrap_or_default())
+    }
+
+    /// Admit `decls` for `module_id` into `table`, or refuse the whole op.
+    ///
+    /// Every rule here exists because the id is a CROSS-NODE fact: it decides
+    /// two overlay ports, and a node that admitted a different set would bind
+    /// different sockets while still agreeing on every other piece of state.
+    /// So a declaration is all-or-nothing and never renumbered.
+    fn admit_lanes(
+        mut table: Vec<LaneRecord>,
+        module_id: &str,
+        decls: Vec<LaneDecl>,
+    ) -> Result<Vec<LaneRecord>, Error> {
+        for decl in decls {
+            let reserved = RESERVED_LANE_IDS.contains(&decl.id);
+            let out_of_range = decl.id == 0 || decl.id > MAX_LANE_ID;
+            if reserved {
+                return Err(Error::Module(format!(
+                    "lane id {} is a kernel lane and is never declarable",
+                    decl.id
+                )));
+            }
+            if out_of_range {
+                return Err(Error::Module(format!(
+                    "lane id {} out of range: declarable ids are 1..={MAX_LANE_ID} \
+                     (above that a lane's stream port collides with another's datagram port)",
+                    decl.id
+                )));
+            }
+            if !lane_name_is_well_formed(&decl.name) {
+                return Err(Error::Module(format!(
+                    "lane name {:?} is malformed: 1..={MAX_LANE_NAME_BYTES} bytes of [a-z0-9_]",
+                    decl.name
+                )));
+            }
+            // the NAME is what a host binds by, so a module with two lanes of
+            // one name is a binding with no answer — refused like a taken id.
+            let name_taken = table
+                .iter()
+                .any(|lane| lane.module_id == module_id && lane.name == decl.name);
+            if name_taken {
+                return Err(Error::Module(format!(
+                    "module {module_id} already declares a lane named {:?}",
+                    decl.name
+                )));
+            }
+            let Err(position) = table.binary_search_by_key(&decl.id, |lane| lane.id) else {
+                let owner = table
+                    .iter()
+                    .find(|lane| lane.id == decl.id)
+                    .map_or("", |lane| lane.module_id.as_str());
+                return Err(Error::Module(format!(
+                    "lane id {} is already declared by module {owner}",
+                    decl.id
+                )));
+            };
+            table.insert(
+                position,
+                LaneRecord {
+                    id: decl.id,
+                    module_id: module_id.to_string(),
+                    name: decl.name,
+                    stream: decl.stream,
+                },
+            );
+        }
+        Ok(table)
+    }
+
+    /// declare `decls` for `module_id` and persist the table.
+    async fn declare_lanes(&mut self, module_id: &str, decls: Vec<LaneDecl>) -> Result<(), Error> {
+        if decls.is_empty() {
+            return Ok(());
+        }
+        let table = Self::admit_lanes(self.lane_table().await?, module_id, decls)?;
+        self.store_bounded(
+            LANE_TABLE_KEY.to_vec(),
+            &table,
+            MAX_LANE_TABLE_BYTES,
+            "lane table",
+        )
+    }
+
+    /// drop every lane `module_id` owns — the entry is going away, so its ids
+    /// become declarable again.
+    async fn release_lanes(&mut self, module_id: &str) -> Result<(), Error> {
+        let mut table = self.lane_table().await?;
+        let before = table.len();
+        table.retain(|lane| lane.module_id != module_id);
+        if table.len() == before {
+            return Ok(());
+        }
+        self.store_bounded(
+            LANE_TABLE_KEY.to_vec(),
+            &table,
+            MAX_LANE_TABLE_BYTES,
+            "lane table",
+        )
+    }
+
     fn require_hash_len(code_hash: &[u8]) -> Result<(), Error> {
         if code_hash.len() != CODE_HASH_LEN {
             return Err(Error::Module(format!(
@@ -358,7 +490,9 @@ impl Modules {
         &mut self,
         ctx: &mut dyn Ctx,
         module_id: String,
+        kind: Kind,
         code_hash: Vec<u8>,
+        lanes: Vec<LaneDecl>,
     ) -> Result<(), Error> {
         self.require_governance_or_system(ctx)?;
         Self::require_hash_len(&code_hash)?;
@@ -367,11 +501,15 @@ impl Modules {
                 "module {module_id} is already registered (code changes go through ScheduleSwap)"
             )));
         }
+        // lanes FIRST: a refused declaration must leave no half-registered
+        // module behind, and the roster write is the point of no return.
+        self.declare_lanes(&module_id, lanes).await?;
         let roster = self.roster().await?;
         self.register_entry(
             roster,
             module_id,
             &ModuleEntry {
+                kind,
                 history: vec![activation(ctx.env().height, &code_hash)],
                 pending: None,
             },
@@ -439,8 +577,13 @@ impl Modules {
         name: String,
         module_id: String,
         activation_height: u64,
-        code_hash: Vec<u8>,
+        admitted: Admission,
     ) -> Result<(), Error> {
+        let Admission {
+            kind,
+            code_hash,
+            lanes,
+        } = admitted;
         self.require_governance_or_system(ctx)?;
         Self::require_hash_len(&code_hash)?;
         if module_id.is_empty() {
@@ -467,11 +610,13 @@ impl Modules {
                 "activation_height {activation_height} must exceed height+MIN_SWAP_LEAD ({floor})"
             )));
         }
+        self.declare_lanes(&module_id, lanes).await?;
         let roster = self.roster().await?;
         self.register_entry(
             roster,
             module_id,
             &ModuleEntry {
+                kind,
                 pending: Some(ScheduledSwap {
                     name,
                     activation_height,
@@ -525,6 +670,9 @@ impl Modules {
                 self.store(MODULE_ROSTER_KEY.to_vec(), &roster);
             }
             self.staged.delete(mod_key(&module_id));
+            // the entry is gone, so its lane ids are declarable again —
+            // otherwise a withdrawn admission would burn them forever.
+            self.release_lanes(&module_id).await?;
         } else {
             self.store(mod_key(&module_id), &entry);
         }
@@ -656,6 +804,7 @@ impl Modules {
             let active_code_hash = e.active_code_hash().to_vec();
             modules.push(ModuleCode {
                 module_id: id,
+                kind: e.kind,
                 active_code_hash,
                 pending: e.pending,
                 history: e.history,
@@ -677,6 +826,12 @@ impl Modules {
             }
         }
         Ok(ModulesReply::ArmedAt { swaps })
+    }
+
+    async fn lanes(&self) -> Result<ModulesReply, Error> {
+        Ok(ModulesReply::Lanes {
+            lanes: self.lane_table().await?,
+        })
     }
 }
 
@@ -709,18 +864,18 @@ impl Module for Modules {
 
     async fn initialize(&mut self, params: &[u8]) -> Result<(), Error> {
         let config = sdk::genesis_config::decode_config(params)?;
-        let roster: std::collections::BTreeMap<String, Vec<u8>> =
+        let roster: std::collections::BTreeMap<String, Seed> =
             match sdk::genesis_config::find(&config, "modules") {
                 Some(bytes) => sdk::wire::decode(bytes).map_err(Error::Module)?,
                 None => Default::default(),
             };
-        for (id, hash) in roster {
-            if hash.len() != CODE_HASH_LEN {
+        for (id, seed) in roster {
+            if seed.code_hash.len() != CODE_HASH_LEN {
                 return Err(Error::Module(
                     "initial module code hash must be 32 bytes".into(),
                 ));
             }
-            self.seed(id, hash).await?;
+            self.seed(id, seed.kind, seed.code_hash, seed.lanes).await?;
         }
         self.finish_seed().await
     }
@@ -729,8 +884,13 @@ impl Module for Modules {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             ModulesMsg::RegisterModule {
                 module_id,
+                kind,
                 code_hash,
-            } => self.handle_register_module(ctx, module_id, code_hash).await,
+                lanes,
+            } => {
+                self.handle_register_module(ctx, module_id, kind, code_hash, lanes)
+                    .await
+            }
             ModulesMsg::ScheduleSwap {
                 name,
                 module_id,
@@ -743,11 +903,23 @@ impl Module for Modules {
             ModulesMsg::ScheduleRegister {
                 name,
                 module_id,
+                kind,
                 activation_height,
                 code_hash,
+                lanes,
             } => {
-                self.handle_schedule_register(ctx, name, module_id, activation_height, code_hash)
-                    .await
+                self.handle_schedule_register(
+                    ctx,
+                    name,
+                    module_id,
+                    activation_height,
+                    Admission {
+                        kind,
+                        code_hash,
+                        lanes,
+                    },
+                )
+                .await
             }
             ModulesMsg::CancelSwap { name, module_id } => {
                 self.handle_cancel_swap(ctx, name, module_id).await
@@ -769,6 +941,7 @@ impl Module for Modules {
         match decode_query(req).map_err(Error::Module)? {
             ModulesQuery::ModuleStatus => Ok(encode_reply(&self.module_status().await?)),
             ModulesQuery::ArmedAt { height } => Ok(encode_reply(&self.armed_at(height).await?)),
+            ModulesQuery::Lanes => Ok(encode_reply(&self.lanes().await?)),
         }
     }
 

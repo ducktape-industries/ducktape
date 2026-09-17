@@ -1,11 +1,11 @@
 // This fixture exercises the source registry, not the app navigation consumers.
 #[allow(dead_code, unused_imports)]
-#[path = "../../../../../../app/src/pages/guest_document.rs"]
+#[path = "support/source.rs"]
 mod source_registry;
 // The actual generated guest, driven through its editor transaction handlers.
 // Native editor layout/painting is owned by the runtime's separate host tests.
+use ducktape_view_guest::{testing, wire};
 use pages_editor_binding_fixture::{boot_native, restore_native, snapshot_native, tick_native};
-use ui_lang_guest::{testing, wire};
 use wire::keyboard::{Key, KeyState, Location, Modifiers, Named, NativeCode, Physical};
 use wire::{
     EditorCursor, EditorDecision, EditorEditKind, EditorHistoryEffect, EditorPosition,
@@ -344,9 +344,9 @@ fn interrupted_bootstrap_keeps_the_old_document_and_restores_from_a_new_begin() 
     let request = frame
         .requests
         .iter()
-        .find(|request| request.kind == "pages.document")
+        .find(|request| request.kind == "fixture.document")
         .expect("document subscription");
-    let identity: pages_editor_binding_fixture::document_source::DocumentIdentity =
+    let identity: pages_editor_binding_fixture::fixture_source::DocumentIdentity =
         wire::decode(&request.payload).unwrap();
     let source = wire::editor_document::EditorDocumentRef {
         document: identity.document.clone(),
@@ -386,7 +386,7 @@ fn interrupted_bootstrap_keeps_the_old_document_and_restores_from_a_new_begin() 
     let request = resumed
         .requests
         .iter()
-        .find(|request| request.kind == "pages.document")
+        .find(|request| request.kind == "fixture.document")
         .expect("restored subscription asks from Begin");
     assert_eq!(request.payload, wire::encode(&identity));
     let resumed_id = request.id;
@@ -439,7 +439,7 @@ fn interrupted_bootstrap_keeps_the_old_document_and_restores_from_a_new_begin() 
         resumed
             .requests
             .iter()
-            .all(|request| request.kind != "pages.document"),
+            .all(|request| request.kind != "fixture.document"),
         "a completed source must not restart and overwrite unsaved guest edits"
     );
     assert_eq!(guest.editor().0, edited_reference);
@@ -521,7 +521,21 @@ fn actual_menu_edit_commits_after_accept_and_undo_survives_restore() {
     assert_eq!(guest.text, "- 한글\n");
     let menu = guest.menu().expect("accepted plus opens the caret menu");
     assert_eq!(menu.anchor, EditorMenuAnchor::Caret);
-    assert_eq!(menu.items.len(), 12);
+    // The palette named, not counted. A bare length says a menu grew without
+    // saying into what, so a deliberate row and an accidental duplicate read
+    // the same; the tags tell them apart on sight.
+    let tags: Vec<&str> = menu.items.iter().map(|item| item.tag.as_str()).collect();
+    assert_eq!(
+        tags,
+        [
+            "page", //
+            "text", "h1", "h2", "h3", "todo", "bullet", "number", "toggle", "quote", "callout",
+            "code", "divider", //
+            "mention", "emoji", //
+            "image",
+        ],
+        "the page row, the twelve turns, the two pickers and the picture"
+    );
     let pick = || EditorInteraction::MenuPick { tag: "h1".into() };
     let cancelled = guest.interaction(pick());
     assert!(
@@ -549,7 +563,7 @@ fn actual_menu_edit_commits_after_accept_and_undo_survives_restore() {
 }
 
 #[test]
-fn fresh_guest_receives_latest_unsaved_source_but_restored_guest_keeps_its_editor() {
+fn fresh_guest_receives_latest_source_but_restored_guest_keeps_its_edits() {
     use source_registry::{DocumentIdentity, SourceStore};
     let mut sources = SourceStore::default();
     let identity = DocumentIdentity {
@@ -581,7 +595,7 @@ fn fresh_guest_receives_latest_unsaved_source_but_restored_guest_keeps_its_edito
     let request = frame
         .requests
         .iter()
-        .find(|r| r.kind == "pages.document")
+        .find(|r| r.kind == "fixture.document")
         .unwrap();
     assert_eq!(request.payload, marker);
     let request_id = request.id;
@@ -597,7 +611,7 @@ fn fresh_guest_receives_latest_unsaved_source_but_restored_guest_keeps_its_edito
     };
     assert!(
         testing::has_text(&frame, text),
-        "fresh instance must use unsaved host mirror, not original saved bytes"
+        "fresh instance must use latest synthetic source, not original saved bytes"
     );
     let snapshot = snapshot_native().unwrap();
     let before = guest.editor().0;
@@ -605,7 +619,7 @@ fn fresh_guest_receives_latest_unsaved_source_but_restored_guest_keeps_its_edito
     let frame = guest.tick(vec![]);
     assert_eq!(guest.editor().0, before);
     assert!(
-        frame.requests.iter().all(|r| r.kind != "pages.document"),
+        frame.requests.iter().all(|r| r.kind != "fixture.document"),
         "restore must not re-bootstrap a completed source"
     );
 }
@@ -631,7 +645,7 @@ fn source_change_during_transfer_keeps_the_previous_guest_document() {
     let request = frame
         .requests
         .iter()
-        .find(|r| r.kind == "pages.document")
+        .find(|r| r.kind == "fixture.document")
         .unwrap();
     let request_id = request.id;
     let mut transfer = sources.transfer(&request.payload, 10, request_id).unwrap();

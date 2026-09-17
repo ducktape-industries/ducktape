@@ -23,9 +23,9 @@ pub const VSOCK_PORT: u32 = 1024;
 /// `TUNNEL_PORT_BASE + N`.
 ///
 /// Three services ride it today, over ordinary HTTP at `127.0.0.1:<port>`: a
-/// run's credential broker, the node's run-action RPC when the run has one, and
-/// the node's own http listener — the read plane every `ducktape mcp` tool
-/// reaches through `DUCKTAPE_NODE`. That last one is a WHOLE listener and the
+/// run's credential broker, its egress proxy, and the node lane it reaches
+/// through `DUCKTAPE_NODE` — which is both its read plane and, at
+/// `provider_host::MCP_PATH`, its whole tool plane. That last one is a WHOLE listener and the
 /// widest thing a run touches (the overlay gateway included);
 /// `provider::wire_guest_tunnels` enumerates exactly what it opens. With no tap
 /// device there is no route to the host, so the guest listens on those loopback

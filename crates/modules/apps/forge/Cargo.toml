@@ -9,9 +9,10 @@ version.workspace = true
 # host `git` install needed) is native-only, behind the `native` feature.
 [features]
 default = ["native"]
-# the on-disk git substrate: the `Forge` module, its `ForgeOdbBacking` twin for
-# the wasm tenant, snapshot packing, and materialization.
-native = ["dep:git2", "dep:blobstore", "dep:tracing", "dep:wasm-host"]
+# the on-disk git substrate: the `Forge` module, snapshot packing, and
+# materialization. the wasm tenant's `OdbBacking` twin is NOT here — it is
+# `forge-odb`, so this crate names no kernel host (#2303).
+native = ["dep:git2", "dep:blobstore", "dep:tracing", "dep:git-primitives"]
 # the wasm-guest port: the pure `ForgeState` core over the host state lane +
 # object plane. non-default and wasm-only (the ducktape-module-sdk bindings compile
 # only for wasm32-unknown-unknown).
@@ -52,9 +53,12 @@ tracing = { workspace = true, optional = true }
 # vendored libgit2 (built via cmake + cc). default-features=false drops the
 # ssh/https transport (openssl/libssh2) — forge only touches local repos.
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"], optional = true }
-# the kernel host: `ForgeOdbBacking` implements its `OdbBacking` trait. native
-# feature only; no cycle — wasm-host has no forge dep.
-wasm-host = { workspace = true, optional = true }
+# the git read types the product read policy (`query.rs`) answers in, on its
+# NATIVE arm. a zero-dep leaf held outside the kernel on purpose: that arm used
+# to bind them out of `wasm-host`, which was the one thing keeping this module
+# from being lifted out of the repository. optional so it stays out of the guest
+# graph — the guest arm binds the same shapes from its own bindgen.
+git-primitives = { workspace = true, optional = true }
 # wasm-only, behind `guest`: the port harness (WitCtx / host imports). a
 # standalone-workspace path crate, pulled only when the `guest` feature builds
 # for wasm32 — never by the native gate.

@@ -290,8 +290,8 @@ fn receipt_history_does_not_increase_one_actions_reads_or_writes() {
     commit(&mut module);
     let stored = backing.0.borrow();
     assert_eq!(
-        stored.reads, 2,
-        "one id lookup and the empty queue metadata"
+        stored.reads, 3,
+        "one id lookup, empty queue metadata, and the optional retained-conversation binding"
     );
     assert_eq!(
         stored.writes.len(),

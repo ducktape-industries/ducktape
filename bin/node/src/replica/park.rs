@@ -270,6 +270,7 @@ async fn publish_replica_status(
         None => (0, String::new(), Vec::new()),
     };
     status.publish(noded::NodeStatus {
+        contract: noded::NODE_CONTRACT,
         version: crate::build_version(),
         root_hash,
         height,
@@ -319,10 +320,6 @@ pub(super) async fn park(
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
-    session_manager: Option<noded::TerminalSessions>,
-    session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
-    remote_sessions: noded::RemoteSessions,
-    local_gateway_via: String,
     node_api_ports: Vec<u16>,
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
@@ -353,7 +350,7 @@ pub(super) async fn park(
         mut relay_tx,
         relay_rx,
         admitted,
-        voice_requests,
+        presence_requests,
         mut mesh_window,
         mesh_book,
     } = channels;
@@ -376,12 +373,13 @@ pub(super) async fn park(
             .as_ref()
             .try_into()
             .expect("ed25519 keys are 32 bytes");
-        crate::voice::spawn_hub(
-            voice_requests,
+        crate::presence::spawn_hub(
+            presence_requests,
             crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
             std::sync::Arc::clone(&tracked),
             me,
             planes.clone(),
+            label.clone(),
         );
         crate::agent_plane::spawn(
             label.clone(),
@@ -392,35 +390,15 @@ pub(super) async fn park(
             planes.clone(),
             stream_hub.run_output(),
         );
-        // the terminal-session plane: forwards a session's output ring and
-        // ordered command log to peers, hosts the directed create/close +
-        // creator-gated input control lanes, and drains the guest-side session
-        // lane (the client half).
-        crate::term_plane::spawn(
-            label.clone(),
-            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
-            std::sync::Arc::clone(&tracked),
-            me,
-            bulk_pacer.clone(),
-            planes.clone(),
-            stream_hub.terminals(),
-            stream_hub.term_commands(),
-            session_manager,
-            gateway_commands.clone(),
-            local_gateway_via,
-            workspace.clone(),
-            session_requests,
-            remote_sessions,
-        );
         Some(tracked)
     } else {
         tracing::warn!(
-            target: "ducktape::voice",
+            target: "ducktape::presence",
             node = %label,
             reason = "overlay_unavailable",
-            "realtime sessions disabled"
+            "page presence disabled"
         );
-        drop(voice_requests);
+        drop(presence_requests);
         None
     };
     // the announce pump re-reads the grant from this path per tick; the
@@ -434,6 +412,10 @@ pub(super) async fn park(
         book.peers().set_peers(peers.iter());
         crate::gateway_plane::spawn(
             crate::gateway_plane::SpawnConfig {
+                bindings: crate::plane_metrics::ApplicationBindings::register(
+                    &context,
+                    workspace.clone(),
+                ),
                 label: label.clone(),
                 book: std::sync::Arc::clone(&book),
                 me: signer.public_key(),
@@ -605,10 +587,16 @@ pub(super) async fn park(
     // so installing the fetching source HERE, before the journal is ever read
     // or handed on, is what makes the live fold, the recovery replay and the
     // catch-up apply resolve committed component bytes identically. a resident
-    // is not a module-code PUSH fan-out target (that plane is members-only), so
+    // never hosts the module-code plane and is not a push fan-out target, so
     // a local-only live fold is a guaranteed halt at the first code swap.
     recovery.set_code_source(code_source.clone());
     let mut recovery_slot = Some(recovery);
+    // the EAGER twin of `code_source`: once per non-empty drain pass, pull the
+    // bytes every pending swap and every open code ballot names, ahead of
+    // the fold that would otherwise stall on them — and ahead of the ballot,
+    // so a member can taste a proposal's view off its own node. pull only,
+    // over the same ranged lane; nothing here serves or admits a push.
+    let mut code_pull = crate::validator::code_announce::ResidentCodePull::new();
     let mut recovery_reopens = 0u32;
     // fold-driver state, all epoch-scoped and reset at (re)ascension:
     // the verifier for the CURRENT epoch's certificates, the view
@@ -748,6 +736,14 @@ pub(super) async fn park(
         // the live replica fold realizes code-registry swaps through the SAME
         // source recovery replay just used — the park loop's one fetching
         // source, installed on this journal above.
+        let plane_generation = crate::reachability_plane::watch_execution()
+            .borrow()
+            .generation;
+        crate::reachability_plane::start_pending_netstack(
+            plane_generation,
+            crate::netstack_governance::startup_backend(&host, rec.height.unwrap_or(0), &blobs)
+                .await,
+        );
         let mut node_r = node::OrderedNode::resume(
             host,
             follower,
@@ -875,20 +871,26 @@ pub(super) async fn park(
             source = "recovery"
         );
     }
-    let not_serving = |standing: bool| -> String {
+    // two refusals a caller must be able to tell apart without reading prose:
+    // one clears on its own in seconds, the other needs the join to land.
+    let not_serving = |standing: bool| -> noded::Refused {
         if standing {
-            "resident: no boundary pre-synced yet — retry shortly".into()
+            noded::Refused::new(
+                "no_boundary_yet",
+                "resident: no boundary pre-synced yet — retry shortly",
+            )
         } else {
-            "joining: redemption not landed yet — no state to serve".into()
+            noded::Refused::new(
+                "not_joined",
+                "joining: redemption not landed yet — no state to serve",
+            )
         }
     };
     // The relay runtime owns caller holds, Forge pack fanout, and the
     // persisted resident sequence. This loop only supplies current
     // validator targets and consumes unclaimed pump replies.
-    let mut resident_relay = relay_runtime::ResidentRelay::new(
-        storage_for_sync.join("relay-submit-seq"),
-        std::sync::Arc::new(blobs.clone()),
-    );
+    let mut resident_relay =
+        relay_runtime::ResidentRelay::new(storage_for_sync.join("relay-submit-seq"), blobs.clone());
     // bridge the relay lane ONCE, before the park loop: the serve
     // window's select is torn down every 2s tick, and dropping the p2p
     // receiver's actor-backed `recv()` mid-flight could eat a delivered
@@ -983,7 +985,7 @@ pub(super) async fn park(
             loop {
                 futures::select_biased! {
                     job = rpc_ingress.next() => {
-                        let Some((req, reply)) = job else { continue };
+                        let Some(RpcJob { req, reply, written }) = job else { continue };
                         let resp = match req {
                             // WITH standing AND a pre-synced boundary, a
                             // write leaves here: sign it, relay to a
@@ -993,7 +995,7 @@ pub(super) async fn park(
                             // un-standing / not-yet-serving cases.
                             RpcRequest::Submit { target, payload_hex } => {
                                 if !resident_standing || serving.is_none() {
-                                    RpcReply::err(not_serving(resident_standing))
+                                    RpcReply::err(not_serving(resident_standing).message)
                                 } else {
                                     match unhex(&payload_hex) {
                                         Ok(payload) => match resident_relay.submit(
@@ -1031,7 +1033,7 @@ pub(super) async fn park(
                                     }
                                     Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
                                 },
-                                None => RpcReply::err(not_serving(resident_standing)),
+                                None => RpcReply::err(not_serving(resident_standing).message),
                             },
                             RpcRequest::Status => match &serving {
                                 Some((height, node_r)) => {
@@ -1041,12 +1043,12 @@ pub(super) async fn park(
                                             height: Some(*height),
                                             root_hash: hex(&node_r.host().root_hash()),
                                             modules,
-                                            netstack: metrics.operational_status().netstack,
+                                            operations: metrics.operational_status(),
                                         }),
                                         ..RpcReply::ok()
                                     }
                                 }
-                                None => RpcReply::err(not_serving(resident_standing)),
+                                None => RpcReply::err(not_serving(resident_standing).message),
                             },
                             RpcRequest::JoinRequests => RpcReply::err(
                                 "this node is not a member — join requests queue on \
@@ -1095,6 +1097,9 @@ pub(super) async fn park(
                                 // a resident writes no checkpoint — nothing to
                                 // flush; a restart parks straight back here.
                                 let _ = reply.send(RpcReply::ok());
+                                // wait for the rpc thread to WRITE it: the
+                                // exit below would otherwise race the write.
+                                let _ = written.await;
                                 tracing::info!(
                                     target: "ducktape::node",
                                     node = %label,
@@ -1116,6 +1121,7 @@ pub(super) async fn park(
                             noded::NodeCommand::Submit {
                                 target,
                                 payload,
+                                required_blob,
                                 origin: _,
                                 reply,
                             } => {
@@ -1123,16 +1129,19 @@ pub(super) async fn park(
                                     let _ =
                                         reply.send(Err(not_serving(resident_standing)));
                                 } else {
-                                    match resident_relay.submit(
+                                    match resident_relay.submit_with_blob(
                                         &signer,
                                         &announce_targets,
                                         &mut relay_tx,
                                         target,
                                         payload,
+                                        required_blob,
                                         relay_runtime::ResidentHold::Http(reply),
                                     ) {
                                         Ok(_) => {}
-                                        Err((hold, e)) => hold.fail(e),
+                                        Err((hold, detail)) => {
+                                            hold.fail(noded::Refused::new("relay_refused", detail))
+                                        }
                                     }
                                 }
                             }
@@ -1156,7 +1165,9 @@ pub(super) async fn park(
                                         relay_runtime::ResidentHold::Http(reply),
                                     ) {
                                         Ok(_) => {}
-                                        Err((hold, e)) => hold.fail(e),
+                                        Err((hold, detail)) => {
+                                            hold.fail(noded::Refused::new("relay_refused", detail))
+                                        }
                                     }
                                 }
                             }
@@ -1166,7 +1177,7 @@ pub(super) async fn park(
                                         .host()
                                         .query(&target, &req)
                                         .await
-                                        .map_err(|e| e.to_string()),
+                                        .map_err(|error| noded::Refused::of(&error)),
                                     None => Err(not_serving(resident_standing)),
                                 };
                                 let _ = reply.send(result);
@@ -1182,7 +1193,7 @@ pub(super) async fn park(
                                         .host()
                                         .query_as(&target, &req, sdk::Origin::External(reader))
                                         .await
-                                        .map_err(|e| e.to_string()),
+                                        .map_err(|error| noded::Refused::of(&error)),
                                     None => Err(not_serving(resident_standing)),
                                 };
                                 let _ = reply.send(result);
@@ -1560,6 +1571,17 @@ pub(super) async fn park(
             {
                 metrics.record_sync_progress(*served_height);
                 metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
+            }
+            // the code pull pass rides the fold pass: a record naming bytes
+            // (a pending swap, an open ballot) only changes with a block.
+            if !drained.is_empty() {
+                code_pull
+                    .pump(&label, *served_height, node_r.host(), &blobs, &client)
+                    .await;
+                // and so does the lane table: a swap that declares a lane
+                // must bind it without a restart, which means re-reading the
+                // table on the same block that moved it.
+                crate::lane_table::pump(node_r.host()).await;
             }
             // the boundary this pass folded is visible NOW on /v1/status.
             if !drained.is_empty() {
@@ -2051,7 +2073,9 @@ pub(super) async fn park(
                 pending_cutover_view: None,
             };
         }
-        resident_relay.expire(std::time::Instant::now());
+        // drives the open pack transfers too: a window whose chunks the mesh
+        // dropped only heals when this tick rewinds it.
+        resident_relay.expire(std::time::Instant::now(), &mut relay_tx);
         // a FOLDING replica's window closes per certificate; this
         // poll is only the fallback DETECTION lane now (standing
         // detection pre-ascension; promotion, cutover, and revocation

@@ -3,12 +3,13 @@
 //!
 //! Two session verbs, one credential+targeting story:
 //!
-//! - `agent pty [<provider>] [--host-node <hex>] [--cred <name>] [--cpu <n>] [--mem <gb>]`
-//!   attaches THIS terminal to a provider running in a microVM on a host
-//!   node (default: this node). The CLI talks ONLY to its own node's ws surface
-//!   (`/v1/ws`); the node does the cross-node mesh. Raw terminal mode + resize
-//!   forwarding make it feel like ssh.
-//! - `agent sched [<provider>] --cred <name> [--host-node <hex>] [--cpu] [--mem] -- "<prompt>"`
+//! - `agent pty [<harness>] --account <n> --route <label> [--cred <name>]
+//!   [--cpu <n>] [--mem <gb>]` attaches THIS terminal to a provider running in a
+//!   microVM, inside the independently installed `ducktape-terminal` process the
+//!   named `(account, route)` publishes. The CLI talks ONLY to its own node's
+//!   operator door (`/v1/gateway/operator`); the gateway reaches the publisher.
+//!   Raw terminal mode + resize forwarding make it feel like ssh.
+//! - `agent sched [<harness>] --cred <name> [--host-node <hex>] [--cpu] [--mem] -- "<prompt>"`
 //!   submits a durable, node-pinned headless run (a `saga::SagaMsg::Trigger`)
 //!   as a frame the USER key signs, and prints its run id. The saga's origin is
 //!   the user key, so the lender attributes the run to the user's account
@@ -44,9 +45,9 @@
 //! back `unknown run: ext:<hex>…`. That sentence means "not your run", not "no
 //! such run" — sign with the key that submitted the `agent sched`.
 //!
-//! `<provider>` is optional when `--cred` names a credential: the registry
-//! record's kind decides what to launch; an explicit provider contradicting the
-//! cred is an error.
+//! `<harness>` is optional when `--cred` names a credential: the registry
+//! record's kind infers Claude/Codex, or selects explicit Pi's backend at runtime.
+//! A native harness contradicting the credential is an error.
 //!
 //! TWO addressing inputs, deliberately two names. `--node`/`-n`/`DUCKTAPE_NODE`
 //! (the shared [`NodeAddr`] group) say which node this CLI DIALS — an http base.
@@ -66,7 +67,7 @@ use commonware_cryptography::Signer as _;
 
 use crate::cli_args::NodeAddr;
 use crate::config::{self, hex_bytes};
-use crate::cred_cli::{ProviderArg, VerbCtx, query_node};
+use crate::cred_cli::{VerbCtx, query_node};
 use crate::userkey_cli::{load_user_signer, user_frame};
 
 type AgentResult = Result<(), Box<dyn std::error::Error>>;
@@ -80,14 +81,16 @@ pub(crate) struct AgentArgs {
     cmd: AgentCmd,
     #[command(flatten)]
     addr: NodeAddr,
-    /// path to the user key file that signs a `sched`, `cancel` or `reassign`
-    /// submit (defaults to the keystore's active wallet)
+    /// path to the user key file signing Chief, `sched`, `cancel` and
+    /// `reassign` submits (defaults to the keystore's active wallet)
     #[arg(long, value_name = "PATH", global = true)]
     key: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, clap::Subcommand)]
 pub(crate) enum AgentCmd {
+    /// explicitly install and control a network-resident Chief
+    Chief(crate::chief_cli::ChiefArgs),
     /// attach this terminal to a sandboxed provider (raw pty, resize-aware)
     Pty(PtyArgs),
     /// print the current default programmable model-user script as JSON
@@ -138,15 +141,38 @@ pub(crate) struct ReassignArgs {
     attempt: u32,
 }
 
+/// The executable harness, independent of the credential's backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum HarnessArg {
+    Claude,
+    Codex,
+    Pi,
+}
+
+impl HarnessArg {
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+        }
+    }
+}
+
 #[derive(Debug, clap::Args)]
 pub(crate) struct PtyArgs {
-    /// provider to launch (`claude`|`codex`); optional when `--cred` names one
-    provider: Option<ProviderArg>,
-    /// host node to RUN on: its raw 64-hex node key (omitted = this node).
-    /// NOT `--node`, which is the http base this CLI dials.
-    #[arg(long = "host-node", value_name = "HEX")]
-    host_node: Option<String>,
-    /// credential name to serve the session (required for a cross-node host)
+    /// harness to launch (claude|codex|pi); omitted = infer from --cred
+    harness: Option<HarnessArg>,
+    /// the account whose signed gateway route publishes the terminal service.
+    /// Required: nothing here picks a default service.
+    #[arg(long, value_name = "ACCOUNT")]
+    account: u64,
+    /// that account's route label for the installed `ducktape-terminal`.
+    /// Required: there is no default terminal route.
+    #[arg(long, value_name = "LABEL")]
+    route: String,
+    /// credential name to serve the session (required when the route's
+    /// publisher is not the node this CLI dials — the service decides)
     #[arg(long, value_name = "NAME")]
     cred: Option<String>,
     /// cpu-cores ceiling for the sandbox (minimum 2)
@@ -159,8 +185,8 @@ pub(crate) struct PtyArgs {
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct SchedArgs {
-    /// provider to launch (`claude`|`codex`); optional — the `--cred` kind decides
-    provider: Option<ProviderArg>,
+    /// harness to launch (claude|codex|pi); omitted = infer from --cred
+    harness: Option<HarnessArg>,
     /// credential name (required: a headless guest run must bring a credential).
     /// With `--host-node`, THIS RUN LETS THAT NODE SPEND YOUR SUBSCRIPTION: the
     /// lender admits the executing node on YOUR grant, for this credential and
@@ -211,10 +237,11 @@ pub(crate) fn run(args: AgentArgs) -> AgentResult {
     // the ladder is resolved per-verb rather than up front: it answers "which
     // workspace" for `install` and "which node" for everything else.
     match cmd {
-        // pty takes the whole group, not just the resolved base: attaching needs
-        // the node's WORKSPACE too (its 0600 service-link token admits the
-        // session's ws topic), and only the ladder knows which workspace the
-        // address it just resolved belongs to.
+        // pty takes the whole group, not just the resolved base: the operator
+        // door takes this node's own operator credential, which lives in the
+        // WORKSPACE, and only the ladder knows which workspace the address it
+        // just resolved belongs to.
+        AgentCmd::Chief(chief) => crate::chief_cli::run(chief, &ctx, &mut stdin),
         AgentCmd::ModelProgram { model_id } => cmd_model_program(&model_id),
         AgentCmd::Pty(pty) => cmd_pty(pty, &ctx.http_base()?, &ctx.addr),
         AgentCmd::Sched(sched) => cmd_sched(sched, &ctx, &mut stdin),
@@ -231,35 +258,52 @@ fn cmd_model_program(model_id: &str) -> AgentResult {
 }
 
 // ============================================================================
-// pty — create the session, then attach this terminal in raw mode
+// pty — create the session on the installed terminal service, then attach this
+// terminal in raw mode
 // ============================================================================
+//
+// There is no node-side terminal plane. `agent pty` names an installed
+// application by its signed gateway route — `--account` + `--route`, both
+// required, because a hidden default would silently pick whose machine runs the
+// session — and every byte crosses the common operator door
+// (`/v1/gateway/operator`): a POST for the create, a WebSocket upgrade for the
+// attachment. The node forwards this CLI's EXISTING operator authentication as
+// an attestation and never the credential itself; the `ducktape-terminal`
+// process on the other side decides admission from its own work policy.
+
+/// The installed application this session runs on: the `(account, route)` the
+/// operator named, resolved to the revision of the route record the gateway
+/// will match the request against.
+///
+/// The revision is read ONCE, before the create: it is what binds this whole
+/// session to the policy the operator saw, and a route republished mid-session
+/// answers the next request with the gateway's own `409` rather than silently
+/// moving the session to a new policy.
+struct Destination {
+    account: u64,
+    name: gateway::RouteName,
+    revision: u64,
+}
 
 fn cmd_pty(args: PtyArgs, base: &str, addr: &NodeAddr) -> AgentResult {
-    // read BEFORE the create: the ws surface admits a session's topic against
-    // this secret, so a workspace we cannot read is a session we could never
-    // attach to — and failing here costs no container.
-    let secret = workspace_secret(addr)?;
-    // spawning a pty MUTATES this node (a process, a container, a guest VM), so
-    // the create and close carry a credential like every other mutation. This
-    // CLI acts as the operator of the node it just addressed, and the proof is
-    // the same directory read the ws topic already needs.
+    // the node's own operator credential, exactly as before: creating and
+    // driving a session MUTATES a host, so the operator door takes the same
+    // proof every other mutating `/v1` route does. Nothing about it reaches the
+    // service — the node attests the caller instead.
     let operator = workspace_operator(addr);
-    let provider = resolve_provider(base, args.provider, args.cred.as_deref())?;
-    let host_hex = match args.host_node.as_deref() {
-        Some(hex) => Some(hex_bytes(&host_node_key(hex)?)),
-        None => None,
-    };
+    let capability = resolve_harness(base, args.harness, args.cred.as_deref())?;
+    let destination = resolve_destination(base, args.account, &args.route)?;
 
-    let created = create_session(
+    let session = create_session(
         base,
         operator.as_deref(),
-        provider.token(),
-        host_hex.as_deref(),
+        &destination,
+        capability,
         args.cred.as_deref(),
         args.cpu,
         args.mem,
     )?;
-    eprintln!("attached to {} ({})", created.session_id, created.topic);
+    eprintln!("attached to {session}");
 
     // A dedicated single-thread runtime drives the ws pump; the raw-mode guard
     // lives on the pump's own stack so it restores the tty on normal exit AND on
@@ -268,92 +312,157 @@ fn cmd_pty(args: PtyArgs, base: &str, addr: &NodeAddr) -> AgentResult {
         .enable_all()
         .build()
         .map_err(|e| format!("attach runtime: {e}"))?;
-    let outcome = runtime.block_on(attach(base, &created.session_id, &created.topic, &secret));
+    let outcome = runtime.block_on(attach(base, operator.as_deref(), &destination, &session));
     // `shutdown_background`, NOT drop: the attach loop's stdin forwarder reads
     // `tokio::io::stdin()`, which parks a BLOCKING thread on `read(0)`. On a real
     // tty that read never returns, and `abort()` cannot interrupt an OS-level
     // blocking read — so a normal runtime drop WAITS for that thread forever,
-    // wedging `agent pty` AFTER the session already ended (the second half of the
-    // wedge; the first was the missing end signal). Detach instead: the stuck
-    // reader dies with the process.
+    // wedging `agent pty` AFTER the session already ended. Detach instead: the
+    // stuck reader dies with the process.
     runtime.shutdown_background();
-
-    // Best-effort close (idempotent host-side; the 4 h wall-clock + kill-on-drop
-    // are the backstops if it never lands).
-    let _ = close_session(base, operator.as_deref(), &created.session_id);
     outcome
 }
 
-/// the create reply — `{ session_id, topic }`.
-struct Created {
-    session_id: String,
-    topic: String,
+/// Resolve the operator's `(account, route)` to the published route record.
+///
+/// A label that names no live route is refused HERE, before a container exists,
+/// with the sentence that says which half is wrong.
+fn resolve_destination(
+    base: &str,
+    account: u64,
+    label: &str,
+) -> Result<Destination, Box<dyn std::error::Error>> {
+    let name = gateway::RouteName::named(label.to_string());
+    name.validate().map_err(|why| format!("--route: {why}"))?;
+    let query = gateway::GatewayQuery::Get {
+        account_id: account,
+        name: name.clone(),
+    };
+    let value = query_node(base, "gateway", serde_json::to_value(&query)?)?;
+    let gateway::GatewayReply::Route(record) = serde_json::from_value(value)? else {
+        return Err("unexpected gateway reply to a route query".into());
+    };
+    let published = record
+        .filter(|record| record.statement.route.is_some())
+        .ok_or_else(|| format!("account {account} publishes no live gateway route {label:?}"))?;
+    Ok(Destination {
+        account,
+        name,
+        revision: published.statement.revision,
+    })
 }
 
-/// `POST /v1/term/sessions` on the operator's own node. The node routes locally
-/// or over the mesh to the host; its refusal strings (`host refused: …`,
-/// `a cross-node session requires --cred`, …) come back verbatim.
+/// One request head for the operator door. `operator` stays FALSE here: the
+/// assertion is the node's to make after it has checked this caller's operator
+/// credential, and a client-set flag would be a claim nothing verified.
+fn operator_head(
+    destination: &Destination,
+    method: gateway::RouteMethod,
+    path_and_query: String,
+    headers: Vec<gateway::ProxyHeader>,
+    upgrade: bool,
+) -> gateway::ProxyRequestHead {
+    gateway::ProxyRequestHead {
+        operator: false,
+        account_id: destination.account,
+        name: destination.name.clone(),
+        revision: destination.revision,
+        method,
+        path_and_query,
+        headers,
+        upgrade,
+        user_pop: None,
+    }
+}
+
+/// `POST /sessions` on the installed terminal service, through the operator
+/// door. The reply carries `session_id` and NOTHING else — output rides the
+/// attachment's own WebSocket, so there is no topic to hand back.
 fn create_session(
     base: &str,
     operator: Option<&str>,
+    destination: &Destination,
     provider: &str,
-    node_hex: Option<&str>,
     cred: Option<&str>,
     cpu: Option<u64>,
     mem_gb: Option<u64>,
-) -> Result<Created, Box<dyn std::error::Error>> {
-    let mut body = serde_json::json!({ "agent": provider, "mode": "single" });
-    if let Some(node) = node_hex {
-        body["node"] = serde_json::Value::String(node.to_string());
-    }
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut request = serde_json::json!({ "agent": provider });
     if let Some(cred) = cred {
-        body["cred"] = serde_json::Value::String(cred.to_string());
+        request["cred"] = serde_json::Value::String(cred.to_string());
     }
     if let Some(cpu) = cpu {
-        body["cpu"] = serde_json::Value::Number(cpu.into());
+        request["cpu"] = serde_json::Value::Number(cpu.into());
     }
     if let Some(mem_gb) = mem_gb {
-        body["mem_gb"] = serde_json::Value::Number(mem_gb.into());
+        request["mem_gb"] = serde_json::Value::Number(mem_gb.into());
     }
+    let payload = serde_json::to_vec(&request)?;
+    let head = operator_head(
+        destination,
+        gateway::RouteMethod::Post,
+        "/sessions".into(),
+        vec![gateway::ProxyHeader {
+            name: "content-type".into(),
+            value: "application/json".into(),
+        }],
+        false,
+    );
+    let text = operator_proxy(base, operator, &head, &payload)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| format!("create reply is not JSON: {text}"))?;
+    Ok(value["session_id"]
+        .as_str()
+        .ok_or_else(|| format!("create reply missing session_id: {text}"))?
+        .to_string())
+}
 
-    let resp = with_operator(
+/// One buffered exchange through `/v1/gateway/operator`, answered with the
+/// service's own response body.
+///
+/// Two refusals can reach an operator here and they mean different things, so
+/// neither is flattened into the other: the node's (a route that moved, a
+/// missing overlay, a credential this CLI could not present) comes back as the
+/// outer status, and the service's (`not_operator`, `work_not_admitted`,
+/// `unknown_provider`, …) as the envelope's upstream status.
+fn operator_proxy(
+    base: &str,
+    operator: Option<&str>,
+    head: &gateway::ProxyRequestHead,
+    body: &[u8],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let envelope = serde_json::json!({
+        "head": head,
+        "body_b64": STANDARD.encode(body),
+    });
+    let response = with_operator(
         reqwest::blocking::Client::new()
-            .post(format!("{base}/v1/term/sessions"))
-            .json(&body),
+            .post(format!("{base}/v1/gateway/operator"))
+            .json(&envelope),
         operator,
     )
     .send()
-    .map_err(|e| format!("POST {base}/v1/term/sessions: {e}"))?;
-    let status = resp.status();
-    let text = resp.text().unwrap_or_default();
+    .map_err(|e| format!("POST {base}/v1/gateway/operator: {e}"))?;
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
     if !status.is_success() {
         return Err(error_field(&text).into());
     }
-    let value: serde_json::Value = serde_json::from_str(&text)?;
-    let session_id = value["session_id"]
-        .as_str()
-        .ok_or_else(|| format!("create reply missing session_id: {text}"))?
-        .to_string();
-    let topic = value["topic"]
-        .as_str()
-        .ok_or_else(|| format!("create reply missing topic: {text}"))?
-        .to_string();
-    Ok(Created { session_id, topic })
-}
-
-fn close_session(
-    base: &str,
-    operator: Option<&str>,
-    session_id: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    with_operator(
-        reqwest::blocking::Client::new()
-            .post(format!("{base}/v1/term/sessions/{session_id}/close")),
-        operator,
-    )
-    .send()
-    .map_err(|e| format!("close session: {e}"))?;
-    Ok(())
+    let reply: serde_json::Value = serde_json::from_str(&text)?;
+    let upstream = reply["head"]["status"]
+        .as_u64()
+        .ok_or_else(|| format!("gateway reply missing an upstream status: {text}"))?;
+    let served =
+        String::from_utf8(STANDARD.decode(reply["body_b64"].as_str().unwrap_or_default())?)?;
+    let refused = !(200..300).contains(&upstream);
+    if refused {
+        return Err(format!(
+            "the terminal service refused ({upstream}): {}",
+            error_field(&served)
+        )
+        .into());
+    }
+    Ok(served)
 }
 
 /// attach the node's operator credential when this host could read it.
@@ -367,44 +476,38 @@ fn with_operator(
     }
 }
 
-/// Attach this terminal to the session's ws output topic and forward keystrokes
-/// and resizes. Raw mode is entered on this stack so its guard restores the tty
-/// whichever way this future ends.
-async fn attach(base: &str, session_id: &str, topic: &str, secret: &str) -> AgentResult {
-    use futures::{SinkExt as _, StreamExt as _};
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+/// How one attachment ended — the redial loop's one discriminant.
+#[derive(Debug, PartialEq, Eq)]
+enum Detached {
+    /// The session itself is over: the service reported `ended` and this
+    /// attachment drained it, or the operator's signal closed it.
+    Ended,
+    /// The socket dropped with the session still live. `served` is how many
+    /// frames this attachment consumed, which is what makes a redial PROGRESS
+    /// rather than spin against a service that upgrades and hangs up.
+    Dropped { served: u64 },
+}
+
+/// Attach this terminal to the session on the installed service and forward
+/// keystrokes and resizes. Raw mode is entered on this stack so its guard
+/// restores the tty whichever way this future ends — including a refused
+/// upgrade, which returns before any of it.
+async fn attach(
+    base: &str,
+    operator: Option<&str>,
+    destination: &Destination,
+    session: &str,
+) -> AgentResult {
+    use tokio::io::AsyncReadExt as _;
     use tokio::signal::unix::{SignalKind, signal};
-    use tokio_tungstenite::tungstenite::Message;
 
-    let (socket, _resp) = tokio_tungstenite::connect_async(ws_url(base))
-        .await
-        .map_err(|e| format!("connect ws /v1/ws: {e}"))?;
-    let (mut ws_tx, mut ws_rx) = socket.split();
-
-    // raw mode for the whole attach; the guard restores on drop (normal + panic).
-    let _raw = crate::tty::RawGuard::enter();
-    let stdin_fd = libc::STDIN_FILENO;
-
-    // one outbound lane: the subscribe carries the node's workspace secret and
-    // is what ADMITS this connection to the session, so it must reach the node
-    // before any input — every client frame funnels through this ordered mpsc.
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(256);
-    out_tx.send(subscribe_frame(topic, secret)).await.ok();
-    let (cols, rows) = window_size(stdin_fd);
-    out_tx.send(resize_frame(session_id, cols, rows)).await.ok();
-
-    let writer = tokio::spawn(async move {
-        while let Some(text) = out_rx.recv().await {
-            if ws_tx.send(Message::text(text)).await.is_err() {
-                break;
-            }
-        }
-        let _ = ws_tx.close().await;
-    });
-
-    let input_tx = out_tx.clone();
-    let input_session = session_id.to_string();
-    let stdin_task = tokio::spawn(async move {
+    // ONE stdin reader for the whole attach, across every redial: it parks a
+    // blocking thread on `read(0)`, so a reader per connection would leak one
+    // per drop. Keystrokes typed while disconnected queue here and are sent
+    // when the socket returns — they are the operator's input, never a replay.
+    let (keys, typed) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    let mut typed = Some(typed);
+    let reader = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 4096];
         loop {
@@ -412,70 +515,258 @@ async fn attach(base: &str, session_id: &str, topic: &str, secret: &str) -> Agen
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            let data = STANDARD.encode(&buf[..read]);
-            if input_tx
-                .send(input_frame(&input_session, &data))
-                .await
-                .is_err()
-            {
+            if keys.send(buf[..read].to_vec()).await.is_err() {
                 break;
             }
         }
     });
-
     let mut winch = signal(SignalKind::window_change()).map_err(|e| format!("SIGWINCH: {e}"))?;
     let mut term = signal(SignalKind::terminate()).map_err(|e| format!("SIGTERM: {e}"))?;
     let mut hup = signal(SignalKind::hangup()).map_err(|e| format!("SIGHUP: {e}"))?;
-    let mut stdout = tokio::io::stdout();
 
-    // the loop's outcome, not a steering flag: `Some` means the node refused
-    // this attach's topic, which every other exit path is not.
-    let mut refused = None;
+    let _raw = crate::tty::RawGuard::enter();
+    // What this attachment has actually CONSUMED — the resume position, and the
+    // only thing a reconnect may present. A snapshot's `head` is a BOUND it
+    // announces, never a receipt: this advances on the frame that was written
+    // to the terminal, so a socket that dies between the bound and its frames
+    // resumes at the byte the operator last saw.
+    let mut cursor = 0u64;
+    let outcome = loop {
+        let detached = attached(
+            base,
+            operator,
+            destination,
+            session,
+            &mut cursor,
+            &mut typed,
+            &mut winch,
+            &mut term,
+            &mut hup,
+        )
+        .await?;
+        match detached {
+            Detached::Ended => break Ok(()),
+            // a redial that consumed nothing consumed nothing the next one
+            // would either: report the loss instead of looping on it.
+            Detached::Dropped { served: 0 } => {
+                break Err(
+                    "the terminal attachment dropped before the service served a frame".into(),
+                );
+            }
+            Detached::Dropped { .. } => continue,
+        }
+    };
+    reader.abort();
+    outcome
+}
+
+/// The next keystrokes this terminal typed, or a future that never completes
+/// once stdin has ended.
+///
+/// A closed channel is READY forever, so an attachment that kept selecting on
+/// one would spin at 100% CPU the moment stdin hit EOF — which is every
+/// `agent pty < script` and every closed tty. Ending the attachment there would
+/// be wrong the other way: the operator's input is over, the session is not, so
+/// the receiver is dropped and this arm parks.
+async fn typed_keys(typed: &mut Option<tokio::sync::mpsc::Receiver<Vec<u8>>>) -> Vec<u8> {
+    if let Some(keys) = typed.as_mut() {
+        if let Some(bytes) = keys.recv().await {
+            return bytes;
+        }
+        *typed = None;
+    }
+    std::future::pending().await
+}
+
+/// One attachment: open the session's WebSocket at the cursor this terminal has
+/// consumed, then pump until it ends or drops.
+#[allow(clippy::too_many_arguments)]
+async fn attached(
+    base: &str,
+    operator: Option<&str>,
+    destination: &Destination,
+    session: &str,
+    cursor: &mut u64,
+    typed: &mut Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    winch: &mut tokio::signal::unix::Signal,
+    term: &mut tokio::signal::unix::Signal,
+    hup: &mut tokio::signal::unix::Signal,
+) -> Result<Detached, Box<dyn std::error::Error>> {
+    use futures::{SinkExt as _, StreamExt as _};
+    use tokio::io::AsyncWriteExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let head = operator_head(
+        destination,
+        gateway::RouteMethod::Get,
+        format!("/sessions/{session}?after={cursor}"),
+        Vec::new(),
+        true,
+    );
+    let mut socket = open_attachment(base, operator, &head).await?.split();
+    let stdin_fd = libc::STDIN_FILENO;
+    let (cols, rows) = window_size(stdin_fd);
+    socket
+        .0
+        .send(Message::text(resize_command(cols, rows)))
+        .await
+        .map_err(|e| format!("resize: {e}"))?;
+
+    let mut stdout = tokio::io::stdout();
+    let mut served = 0u64;
+    // `Some` once a snapshot reported the session over; the loop still drains
+    // that snapshot's frames before it agrees.
+    let mut complete: Option<u64> = None;
     loop {
         tokio::select! {
-            frame = ws_rx.next() => {
-                let Some(Ok(message)) = frame else { break };
-                if message.is_close() {
-                    break;
-                }
-                if let Message::Text(text) = message {
-                    // the node refused the subscription — this attach can never
-                    // receive a byte, and every keystroke it sends is dropped.
-                    // Ctrl-C is a keystroke, so without this the terminal is
-                    // black and unkillable until SIGTERM: the same wedge class
-                    // the `term_ended` signal below closed, through a path the
-                    // ws topic gate made reachable for the first time.
-                    if let Some(detail) = topic_refusal(&text, topic) {
-                        refused = Some(detail);
-                        break;
-                    }
-                    // the session's child exited — the node signals the topic is
-                    // over. Stop attaching (the wedge fix): without this the loop
-                    // blocks on a dead topic and no keystroke, not even Ctrl-C,
-                    // can end it (input is dropped as the session is gone).
-                    if is_term_ended(&text) {
-                        break;
-                    }
-                    if let Some(bytes) = decode_term_chunk(&text) {
+            frame = socket.1.next() => {
+                let Some(Ok(message)) = frame else { return Ok(Detached::Dropped { served }) };
+                let Message::Text(text) = message else {
+                    let closed = message.is_close();
+                    if closed { return Ok(Detached::Dropped { served }); }
+                    continue;
+                };
+                served += 1;
+                match serve_frame(&text, cursor)? {
+                    Served::Output(bytes) => {
                         stdout.write_all(&bytes).await.map_err(|e| format!("stdout: {e}"))?;
                         stdout.flush().await.map_err(|e| format!("stdout flush: {e}"))?;
                     }
+                    Served::Snapshot(bound) => complete = bound,
+                    Served::Nothing => {}
                 }
+                if complete.is_some_and(|bound| *cursor >= bound) {
+                    return Ok(Detached::Ended);
+                }
+            }
+            keys = typed_keys(typed) => {
+                socket.0.send(Message::text(input_command(&STANDARD.encode(keys)))).await
+                    .map_err(|e| format!("input: {e}"))?;
             }
             _ = winch.recv() => {
                 let (cols, rows) = window_size(stdin_fd);
-                out_tx.send(resize_frame(session_id, cols, rows)).await.ok();
+                socket.0.send(Message::text(resize_command(cols, rows))).await
+                    .map_err(|e| format!("resize: {e}"))?;
             }
             _ = term.recv() => break,
             _ = hup.recv() => break,
         }
     }
-    stdin_task.abort();
-    writer.abort();
-    match refused {
-        Some(detail) => Err(detail.into()),
-        None => Ok(()),
+    // the operator ended it: ask the service to close the session rather than
+    // leaving a pty running behind a socket this process is about to drop.
+    let _ = socket
+        .0
+        .send(Message::text(CLOSE_COMMAND.to_string()))
+        .await;
+    let _ = socket.0.close().await;
+    Ok(Detached::Ended)
+}
+
+/// Open the session WebSocket through the operator door, surfacing the node's
+/// own refusal sentence when it declines the upgrade.
+///
+/// The destination and the resume cursor live in the SIGNED uri query, never in
+/// a side header: changing either changes what this caller's operator
+/// credential covers.
+async fn open_attachment(
+    base: &str,
+    operator: Option<&str>,
+    head: &gateway::ProxyRequestHead,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Box<dyn std::error::Error>,
+> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let encoded = gateway::encode_proxy_request_head(head)?;
+    let mut url = reqwest::Url::parse(&operator_ws_url(base))?;
+    url.query_pairs_mut()
+        .append_pair("head", std::str::from_utf8(&encoded)?);
+    let mut request = url.as_str().into_client_request()?;
+    if let Some(token) = operator {
+        request
+            .headers_mut()
+            .insert(noded::admin::ADMIN_TOKEN_HEADER, token.parse()?);
     }
+    match tokio_tungstenite::connect_async(request).await {
+        Ok((socket, _)) => Ok(socket),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            let status = response.status();
+            let body = response.body().as_deref().unwrap_or_default();
+            Err(format!(
+                "the terminal attachment was refused ({status}): {}",
+                error_field(&String::from_utf8_lossy(body))
+            )
+            .into())
+        }
+        Err(error) => Err(format!("open the terminal attachment: {error}").into()),
+    }
+}
+
+/// What one server frame gave this terminal, after the cursor advanced past it.
+enum Served {
+    /// raw pty bytes to write.
+    Output(Vec<u8>),
+    /// a replay snapshot: `Some(head)` when it reported the session over. The
+    /// session is over once the cursor has consumed every frame up to that
+    /// head — reading `ended` is not the same as having read the final screen
+    /// the service already queued behind it.
+    Snapshot(Option<u64>),
+    /// a command result, or anything else this client does not draw.
+    Nothing,
+}
+
+/// Decode one service frame and advance the cursor by exactly what it carried.
+///
+/// A refused command (`result` with an `Err`) is reported and does NOT end the
+/// attachment: a resize the service declined is not a dead session, and the
+/// `ended` bound is the one thing that says a session is over.
+fn serve_frame(text: &str, cursor: &mut u64) -> Result<Served, Box<dyn std::error::Error>> {
+    let frame: serde_json::Value = match serde_json::from_str(text) {
+        Ok(frame) => frame,
+        Err(_) => return Ok(Served::Nothing),
+    };
+    match frame["event"].as_str() {
+        Some("output") => {
+            let Some(seq) = frame["seq"].as_u64() else {
+                return Ok(Served::Nothing);
+            };
+            let bytes = STANDARD.decode(frame["data_b64"].as_str().unwrap_or_default())?;
+            *cursor = (*cursor).max(seq);
+            Ok(Served::Output(bytes))
+        }
+        Some("replay") => Ok(Served::Snapshot(snapshot_bound(&frame, *cursor))),
+        Some("result") => {
+            if let Some(refusal) = frame["result"]["Err"].as_str() {
+                eprint!("\r\n-- the terminal service refused a command: {refusal}\r\n");
+            }
+            Ok(Served::Nothing)
+        }
+        _ => Ok(Served::Nothing),
+    }
+}
+
+/// Read a replay snapshot: report output this attachment can never see, and
+/// answer with the completion bound when the snapshot says the session ended.
+///
+/// `first` is the oldest sequence the service still retains. A `first` past the
+/// cursor means the frames between them are gone, which is a visible hole in the
+/// terminal — say so once, where it happened, rather than printing bytes that
+/// silently skip.
+fn snapshot_bound(frame: &serde_json::Value, cursor: u64) -> Option<u64> {
+    let first = frame["first"].as_u64().unwrap_or(cursor + 1);
+    let lost = first > cursor + 1;
+    if lost {
+        eprint!(
+            "\r\n-- output {}..{} was dropped by the terminal service\r\n",
+            cursor + 1,
+            first - 1
+        );
+    }
+    frame["ended"]
+        .as_bool()
+        .unwrap_or(false)
+        .then(|| frame["head"].as_u64().unwrap_or(cursor))
 }
 
 /// the tty window size (cols, rows), or an 80x24 fallback when the ioctl fails.
@@ -494,8 +785,7 @@ fn window_size(fd: i32) -> (u16, u16) {
 
 fn cmd_sched(args: SchedArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> AgentResult {
     let base = &ctx.http_base()?;
-    let provider = resolve_provider(base, args.provider, Some(&args.cred))?;
-    let tag = provider.token();
+    let tag = resolve_harness(base, args.harness, Some(&args.cred))?;
 
     let target = match args.host_node.as_deref() {
         Some(hex) => host_node_key(hex)?.to_vec(),
@@ -757,22 +1047,6 @@ fn control_outcome(lane: ControlLane, verb: ControlVerb, run_id: &str, height: u
 // shared resolution
 // ============================================================================
 
-/// the service-link secret of the node this CLI is dialling — what its ws
-/// surface admits a session's `term:<id>` topic against.
-///
-/// Reading it is the whole proof: the file is 0600 beside `node.toml`, so a
-/// caller that can read it is the operator of that node — the same bar the node
-/// key already sets, and the same secret the agent daemon presents to attach.
-/// The DIRECTORY comes from the shared addressing ladder
-/// ([`NodeAddr::workspace`]), so "which node" is answered once for both the url
-/// this CLI dials and the files behind it.
-fn workspace_secret(addr: &NodeAddr) -> Result<String, Box<dyn std::error::Error>> {
-    let workspace = addr
-        .workspace()
-        .map_err(|why| format!("attaching a pty needs this node's workspace: {why}"))?;
-    noded::services::read_link_token(&workspace).map_err(Into::into)
-}
-
 /// this boot's operator credential for the node being addressed — the second
 /// thing behind that same 0600 directory, and what a MUTATING `/v1` route wants
 /// from a caller acting as the node's operator rather than as an account.
@@ -798,38 +1072,50 @@ fn own_node_key(base: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     config::unhex(hex).map_err(|e| format!("node key hex: {e}").into())
 }
 
-/// Resolve the pty/sched provider: `--cred`'s registered kind decides, and an
-/// explicit provider contradicting it is an error. Without `--cred`, a provider
-/// is required.
-fn resolve_provider(
+/// Resolve a harness and credential backend to the capability the host offers.
+fn resolve_harness(
     base: &str,
-    provider: Option<ProviderArg>,
+    harness: Option<HarnessArg>,
     cred: Option<&str>,
-) -> Result<ProviderArg, Box<dyn std::error::Error>> {
+) -> Result<&'static str, Box<dyn std::error::Error>> {
     let Some(name) = cred else {
-        return provider
-            .ok_or_else(|| "a provider (claude|codex) is required without --cred".into());
+        return Ok(harness_capability(harness, None)?);
     };
     let record = query_credential(base, name)?
         .ok_or_else(|| format!("unknown credential {name:?} — {}", credential_hint(base)))?;
-    let from_cred = provider_from_kind(record.kind);
-    if let Some(explicit) = provider
-        && explicit != from_cred
-    {
-        return Err(format!(
-            "provider {} contradicts credential {name:?} (kind {})",
-            explicit.token(),
-            from_cred.token()
-        )
-        .into());
-    }
-    Ok(from_cred)
+    harness_capability(harness, Some(record.kind))
+        .map_err(|e| format!("credential {name:?}: {e}").into())
 }
 
-fn provider_from_kind(kind: gateway::CredentialKind) -> ProviderArg {
-    match kind {
-        gateway::CredentialKind::Claude => ProviderArg::Claude,
-        gateway::CredentialKind::Codex => ProviderArg::Codex,
+fn harness_capability(
+    harness: Option<HarnessArg>,
+    kind: Option<gateway::CredentialKind>,
+) -> Result<&'static str, String> {
+    use gateway::CredentialKind;
+    match (harness, kind) {
+        // a signing identity answers no harness: it signs releases, it does
+        // not run a model session.
+        (
+            None | Some(HarnessArg::Pi) | Some(HarnessArg::Claude) | Some(HarnessArg::Codex),
+            Some(CredentialKind::AppleCodesign),
+        ) => {
+            Err("credential kind apple-codesign is a signing identity, not a model provider".into())
+        }
+        (
+            Some(HarnessArg::Pi),
+            None | Some(CredentialKind::Claude) | Some(CredentialKind::Codex),
+        ) => Ok("pi"),
+        (None | Some(HarnessArg::Claude), Some(CredentialKind::Claude))
+        | (Some(HarnessArg::Claude), None) => Ok("claude"),
+        (None | Some(HarnessArg::Codex), Some(CredentialKind::Codex))
+        | (Some(HarnessArg::Codex), None) => Ok("codex"),
+        (Some(HarnessArg::Claude), Some(CredentialKind::Codex)) => {
+            Err("harness claude contradicts credential kind codex".into())
+        }
+        (Some(HarnessArg::Codex), Some(CredentialKind::Claude)) => {
+            Err("harness codex contradicts credential kind claude".into())
+        }
+        (None, None) => Err("a harness (claude|codex|pi) is required without --cred".into()),
     }
 }
 
@@ -902,65 +1188,31 @@ fn error_field(body: &str) -> String {
         .unwrap_or_else(|| body.to_string())
 }
 
-/// the subscribe that ADMITS this connection to a session's output topic. The
-/// `token` is the node's own 0600 service-link secret; without it the node
-/// refuses the topic and this connection has nothing to send keystrokes on.
-fn subscribe_frame(topic: &str, token: &str) -> String {
-    serde_json::json!({ "op": "subscribe", "topics": [topic], "token": token }).to_string()
+/// `http(s)://host:port` → the operator door's ws url. The destination and the
+/// resume cursor ride the query this url is completed with, because the signed
+/// uri is what the node's operator gate covers.
+fn operator_ws_url(base: &str) -> String {
+    let ws_base = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        base.to_string()
+    };
+    format!("{}/v1/gateway/operator", ws_base.trim_end_matches('/'))
 }
 
-fn input_frame(session: &str, data_b64: &str) -> String {
-    serde_json::json!({ "op": "term_input", "session": session, "data": data_b64 }).to_string()
+/// The three commands an attachment may send the terminal service. Each names
+/// its session by the socket it arrived on, so none carries a session id.
+fn input_command(data_b64: &str) -> String {
+    serde_json::json!({ "op": "input", "data_b64": data_b64 }).to_string()
 }
 
-fn resize_frame(session: &str, cols: u16, rows: u16) -> String {
-    serde_json::json!({ "op": "term_resize", "session": session, "cols": cols, "rows": rows })
-        .to_string()
+fn resize_command(cols: u16, rows: u16) -> String {
+    serde_json::json!({ "op": "resize", "cols": cols, "rows": rows }).to_string()
 }
 
-/// Decode one server ws text frame to the raw pty bytes it carries, or `None`
-/// for any non-output frame (subscribed, heartbeat, module event, error).
-fn decode_term_chunk(text: &str) -> Option<Vec<u8>> {
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    if value["type"].as_str() != Some("event") {
-        return None;
-    }
-    let item = value["item"].as_str()?;
-    STANDARD.decode(item).ok()
-}
-
-/// The node's refusal of THIS attach's topic, if that is what this frame is.
-///
-/// `ServerFrame::Error` is `{type:"error", topic, code, detail}`; the `detail`
-/// is the node's own sentence and reaches the operator verbatim, like every
-/// other refusal string this CLI surfaces.
-///
-/// Matched on the topic, not just the type: an error about some other topic on
-/// a shared connection is not this attach's business. `agent pty` holds one
-/// topic, but keying on it is what keeps that true.
-fn topic_refusal(text: &str, topic: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    let is_our_refusal =
-        value["type"].as_str() == Some("error") && value["topic"].as_str() == Some(topic);
-    if !is_our_refusal {
-        return None;
-    }
-    let detail = value["detail"]
-        .as_str()
-        .unwrap_or("the node refused this session's topic");
-    Some(detail.to_string())
-}
-
-/// the node's terminal frame for this topic: the session's child exited and the
-/// `term:<id>` topic is complete (`{"type":"term_ended",...}`). The signal the
-/// attach loop ends on — see [`stream::ServerFrame::TermEnded`].
-fn is_term_ended(text: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(text)
-        .ok()
-        .as_ref()
-        .and_then(|v| v["type"].as_str())
-        == Some("term_ended")
-}
+const CLOSE_COMMAND: &str = r#"{"op":"close"}"#;
 
 #[cfg(test)]
 mod tests {
@@ -1007,15 +1259,90 @@ mod tests {
     }
 
     #[test]
-    fn cred_kind_wins_and_contradiction_is_an_error() {
-        // The reverse map is the whole authority when a provider is omitted.
+    fn harness_and_credential_select_the_capability() {
+        use gateway::CredentialKind::{Claude, Codex};
+        for (harness, kind, expected) in [
+            (None, Claude, "claude"),
+            (None, Codex, "codex"),
+            (Some(HarnessArg::Claude), Claude, "claude"),
+            (Some(HarnessArg::Codex), Codex, "codex"),
+            (Some(HarnessArg::Pi), Claude, "pi"),
+            (Some(HarnessArg::Pi), Codex, "pi"),
+        ] {
+            assert_eq!(harness_capability(harness, Some(kind)).unwrap(), expected);
+        }
+        for (harness, kind) in [(HarnessArg::Claude, Codex), (HarnessArg::Codex, Claude)] {
+            assert!(
+                harness_capability(Some(harness), Some(kind))
+                    .unwrap_err()
+                    .contains("contradicts")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_harnesses_work_without_a_credential() {
+        for harness in [HarnessArg::Claude, HarnessArg::Codex, HarnessArg::Pi] {
+            assert_eq!(
+                harness_capability(Some(harness), None).unwrap(),
+                harness.token()
+            );
+        }
+        assert!(harness_capability(None, None).is_err());
+    }
+
+    #[test]
+    fn pty_and_sched_accept_pi_positionally() {
+        use clap::{Args as _, FromArgMatches as _};
+        let pty = PtyArgs::augment_args(clap::Command::new("pty"))
+            .try_get_matches_from([
+                "pty",
+                "pi",
+                "--account",
+                "12",
+                "--route",
+                "terminal",
+                "--cred",
+                "work",
+            ])
+            .unwrap();
         assert_eq!(
-            provider_from_kind(gateway::CredentialKind::Claude),
-            ProviderArg::Claude
+            PtyArgs::from_arg_matches(&pty).unwrap().harness,
+            Some(HarnessArg::Pi)
         );
+        let sched = SchedArgs::augment_args(clap::Command::new("sched"))
+            .try_get_matches_from(["sched", "pi", "--cred", "work", "--", "hello"])
+            .unwrap();
         assert_eq!(
-            provider_from_kind(gateway::CredentialKind::Codex),
-            ProviderArg::Codex
+            SchedArgs::from_arg_matches(&sched).unwrap().harness,
+            Some(HarnessArg::Pi)
+        );
+    }
+
+    #[test]
+    fn pi_is_a_harness_not_a_credential_kind() {
+        use clap::ValueEnum as _;
+        assert_eq!(HarnessArg::from_str("pi", false).unwrap(), HarnessArg::Pi);
+        assert!(crate::cred_cli::ProviderArg::from_str("pi", false).is_err());
+    }
+
+    /// An `apple-codesign` credential runs no harness, whichever one is
+    /// named — including pi, which otherwise takes any model credential.
+    #[test]
+    fn a_signing_credential_answers_no_harness() {
+        for harness in [
+            None,
+            Some(HarnessArg::Pi),
+            Some(HarnessArg::Claude),
+            Some(HarnessArg::Codex),
+        ] {
+            let err = harness_capability(harness, Some(gateway::CredentialKind::AppleCodesign))
+                .unwrap_err();
+            assert!(err.contains("signing identity"), "{harness:?}: {err}");
+        }
+        assert_eq!(
+            harness_capability(Some(HarnessArg::Pi), Some(gateway::CredentialKind::Claude)),
+            Ok("pi")
         );
     }
 
@@ -1031,112 +1358,185 @@ mod tests {
     fn ws_url_maps_scheme_and_appends_path() {
         assert_eq!(ws_url("http://127.0.0.1:8080"), "ws://127.0.0.1:8080/v1/ws");
         assert_eq!(ws_url("https://host:9/"), "wss://host:9/v1/ws");
-    }
-
-    #[test]
-    fn term_chunk_decodes_only_output_frames() {
-        let chunk = serde_json::json!({
-            "type": "event", "topic": "term:abc", "cursor": "3", "item": STANDARD.encode(b"hi")
-        })
-        .to_string();
-        assert_eq!(decode_term_chunk(&chunk), Some(b"hi".to_vec()));
-
-        let module_event = serde_json::json!({
-            "type": "event", "topic": "chat", "cursor": "1", "op": { "height": 1 }
-        })
-        .to_string();
-        assert_eq!(decode_term_chunk(&module_event), None);
-
-        let heartbeat = serde_json::json!({ "type": "heartbeat", "height": 1 }).to_string();
-        assert_eq!(decode_term_chunk(&heartbeat), None);
-    }
-
-    #[test]
-    fn term_ended_frame_ends_the_attach_but_output_chunks_do_not() {
-        // the node's terminal signal (ServerFrame::TermEnded) — the attach loop
-        // breaks on it; an output chunk or any other frame keeps it running.
-        let ended = serde_json::json!({ "type": "term_ended", "topic": "term:abc" }).to_string();
-        assert!(is_term_ended(&ended));
-
-        let chunk = serde_json::json!({
-            "type": "event", "topic": "term:abc", "cursor": "3", "item": STANDARD.encode(b"hi")
-        })
-        .to_string();
-        assert!(!is_term_ended(&chunk));
-        assert!(!is_term_ended(
-            &serde_json::json!({ "type": "heartbeat" }).to_string()
-        ));
-    }
-
-    /// The node's refusal must END the attach, not be swallowed.
-    ///
-    /// By the time a topic refusal can arrive, `cmd_pty` has already created a
-    /// real pty holding a lent credential, entered raw mode and printed
-    /// "attached". Every keystroke after that is dropped by the node — Ctrl-C
-    /// included, since it is just a keystroke — so ignoring this frame is a
-    /// black, unkillable terminal, the same wedge class the `term_ended` signal
-    /// closed. The ws topic gate is what made this frame reachable for `term:`
-    /// at all, so the handler ships with it.
-    #[test]
-    fn a_topic_refusal_ends_the_attach_and_carries_the_nodes_own_sentence() {
-        let refusal = serde_json::json!({
-            "type": "error",
-            "topic": "term:abc",
-            "code": "forbidden",
-            "detail": "this topic requires the node's service-link token",
-        })
-        .to_string();
         assert_eq!(
-            topic_refusal(&refusal, "term:abc").as_deref(),
-            Some("this topic requires the node's service-link token"),
-            "the node's sentence must reach the operator verbatim"
+            operator_ws_url("http://127.0.0.1:8080"),
+            "ws://127.0.0.1:8080/v1/gateway/operator"
         );
+        assert_eq!(
+            operator_ws_url("https://host:9/"),
+            "wss://host:9/v1/gateway/operator"
+        );
+    }
 
-        // an error about ANOTHER topic is not this attach's business ...
-        assert_eq!(topic_refusal(&refusal, "term:other"), None);
-        // ... and no ordinary frame is mistaken for one. A term chunk in
-        // particular rides `type:"event"` on the very same topic.
-        for benign in [
-            serde_json::json!({ "type": "event", "topic": "term:abc", "item": "aGk=" }),
-            serde_json::json!({ "type": "term_ended", "topic": "term:abc" }),
-            serde_json::json!({ "type": "subscribed", "topics": { "term:abc": "0" } }),
-            serde_json::json!({ "type": "heartbeat", "height": 1 }),
-        ] {
-            assert_eq!(
-                topic_refusal(&benign.to_string(), "term:abc"),
-                None,
-                "{benign}"
-            );
+    fn destination() -> Destination {
+        Destination {
+            account: 12,
+            name: gateway::RouteName::named("terminal".to_string()),
+            revision: 7,
         }
-        assert_eq!(topic_refusal("not json", "term:abc"), None);
+    }
 
-        // a refusal with no detail still ends the attach rather than wedging it.
-        let bare = serde_json::json!({ "type": "error", "topic": "term:abc" }).to_string();
-        assert!(topic_refusal(&bare, "term:abc").is_some());
+    /// The operator door stamps the operator assertion; a client that stamped
+    /// it itself would be asserting something nothing verified. The head must
+    /// therefore leave it false — and carry the destination the operator named,
+    /// not a default one.
+    #[test]
+    fn an_operator_head_names_the_route_and_asserts_nothing() {
+        let head = operator_head(
+            &destination(),
+            gateway::RouteMethod::Post,
+            "/sessions".into(),
+            vec![gateway::ProxyHeader {
+                name: "content-type".into(),
+                value: "application/json".into(),
+            }],
+            false,
+        );
+        assert!(!head.operator);
+        assert!(head.user_pop.is_none());
+        assert_eq!(head.account_id, 12);
+        assert_eq!(head.name.label.as_deref(), Some("terminal"));
+        assert_eq!(head.revision, 7);
+        gateway::validate_proxy_request_head(&head).unwrap();
+    }
+
+    /// The attachment's destination AND its resume cursor live in the head the
+    /// signed uri query carries, so the whole path is what the operator
+    /// credential covers.
+    #[test]
+    fn an_attachment_head_is_a_bodyless_upgrade_carrying_its_cursor() {
+        let cursor = 41u64;
+        let head = operator_head(
+            &destination(),
+            gateway::RouteMethod::Get,
+            format!("/sessions/{}?after={cursor}", "0000000000000001"),
+            Vec::new(),
+            true,
+        );
+        gateway::validate_proxy_request_head(&head).unwrap();
+        assert_eq!(head.path_and_query, "/sessions/0000000000000001?after=41");
+        assert!(head.upgrade);
+    }
+
+    /// The cursor advances on the frame that reached the terminal, never on the
+    /// snapshot bound announced ahead of it: a socket that dies between the
+    /// `replay` head and its chunks must resume at the last byte SHOWN.
+    #[test]
+    fn the_cursor_advances_only_past_frames_this_terminal_consumed() {
+        let mut cursor = 0u64;
+        let snapshot = serde_json::json!({
+            "event": "replay", "first": 1, "head": 3, "ended": false,
+        })
+        .to_string();
+        assert!(matches!(
+            serve_frame(&snapshot, &mut cursor).unwrap(),
+            Served::Snapshot(None)
+        ));
+        assert_eq!(cursor, 0, "a head is a bound, not a receipt");
+
+        let chunk = serde_json::json!({
+            "event": "output", "seq": 1, "data_b64": STANDARD.encode(b"hi"),
+        })
+        .to_string();
+        let Served::Output(bytes) = serve_frame(&chunk, &mut cursor).unwrap() else {
+            panic!("output frame");
+        };
+        assert_eq!(bytes, b"hi");
+        assert_eq!(cursor, 1);
+    }
+
+    /// An `ended` snapshot is a bound too: the final screen the service already
+    /// queued behind it still has to reach the terminal, so the attachment ends
+    /// when the cursor REACHES the bound, not when it reads it.
+    #[test]
+    fn an_ended_snapshot_ends_the_attachment_only_once_its_frames_are_drained() {
+        let mut cursor = 0u64;
+        let ended = serde_json::json!({
+            "event": "replay", "first": 1, "head": 2, "ended": true,
+        })
+        .to_string();
+        let Served::Snapshot(Some(bound)) = serve_frame(&ended, &mut cursor).unwrap() else {
+            panic!("ended snapshot");
+        };
+        assert!(cursor < bound);
+        for seq in 1..=2 {
+            let chunk = serde_json::json!({
+                "event": "output", "seq": seq, "data_b64": STANDARD.encode(b"x"),
+            })
+            .to_string();
+            serve_frame(&chunk, &mut cursor).unwrap();
+        }
+        assert!(cursor >= bound);
+
+        // an already-drained ended snapshot ends the attachment immediately.
+        let mut drained = 2u64;
+        let Served::Snapshot(Some(bound)) = serve_frame(&ended, &mut drained).unwrap() else {
+            panic!("ended snapshot");
+        };
+        assert!(drained >= bound);
+    }
+
+    /// A refused command is reported, never mistaken for the session ending —
+    /// and an unknown frame is ignored rather than breaking the pump.
+    #[test]
+    fn a_refused_command_and_an_unknown_frame_both_keep_the_attachment() {
+        let mut cursor = 0u64;
+        for frame in [
+            serde_json::json!({"event":"result","result":{"Err":"session is not running"}})
+                .to_string(),
+            serde_json::json!({"event":"result","result":{"Ok":null}}).to_string(),
+            serde_json::json!({"event":"who-knows"}).to_string(),
+            "not json".to_string(),
+        ] {
+            assert!(matches!(
+                serve_frame(&frame, &mut cursor).unwrap(),
+                Served::Nothing
+            ));
+        }
+        assert_eq!(cursor, 0);
     }
 
     #[test]
-    fn client_frames_carry_the_snake_case_op_tags() {
-        let sub: serde_json::Value =
-            serde_json::from_str(&subscribe_frame("term:x", "s3cr3t")).unwrap();
-        assert_eq!(sub["op"], "subscribe");
-        assert_eq!(sub["topics"][0], "term:x");
-        // the field the node's topic gate reads. Without it the node refuses
-        // `term:` and this client has nothing to send keystrokes on, so its
-        // absence is a broken pty, not a cosmetic omission.
-        assert_eq!(sub["token"], "s3cr3t");
+    fn client_commands_carry_the_snake_case_op_tags() {
+        let input: serde_json::Value = serde_json::from_str(&input_command("ZGF0YQ==")).unwrap();
+        assert_eq!(input["op"], "input");
+        assert_eq!(input["data_b64"], "ZGF0YQ==");
+        // the session is the socket's, never a field a client may retarget.
+        assert!(input.get("session").is_none());
 
-        let input: serde_json::Value =
-            serde_json::from_str(&input_frame("sid", "ZGF0YQ==")).unwrap();
-        assert_eq!(input["op"], "term_input");
-        assert_eq!(input["session"], "sid");
-        assert_eq!(input["data"], "ZGF0YQ==");
-
-        let resize: serde_json::Value =
-            serde_json::from_str(&resize_frame("sid", 120, 40)).unwrap();
-        assert_eq!(resize["op"], "term_resize");
+        let resize: serde_json::Value = serde_json::from_str(&resize_command(120, 40)).unwrap();
+        assert_eq!(resize["op"], "resize");
         assert_eq!(resize["cols"], 120);
         assert_eq!(resize["rows"], 40);
+
+        let close: serde_json::Value = serde_json::from_str(CLOSE_COMMAND).unwrap();
+        assert_eq!(close["op"], "close");
+    }
+
+    /// Both halves of the selection are required: nothing here defaults to an
+    /// account or invents a terminal route label.
+    #[test]
+    fn pty_refuses_to_guess_which_installed_service_runs_the_session() {
+        use clap::Args as _;
+        let command = PtyArgs::augment_args(clap::Command::new("pty"));
+        for missing in [
+            vec!["pty", "claude"],
+            vec!["pty", "claude", "--account", "12"],
+            vec!["pty", "claude", "--route", "terminal"],
+        ] {
+            assert!(
+                command
+                    .clone()
+                    .try_get_matches_from(missing.clone())
+                    .is_err(),
+                "{missing:?} must be refused"
+            );
+        }
+        assert!(
+            command
+                .try_get_matches_from(["pty", "claude", "--account", "12", "--route", "terminal"])
+                .is_ok()
+        );
     }
 
     /// The RUN ID picks the module, and the USER key signs either way — the

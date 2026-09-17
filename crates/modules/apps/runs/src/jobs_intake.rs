@@ -150,6 +150,31 @@ impl RunsModule {
             return Ok(());
         }
 
+        let bytes = ctx
+            .query(
+                &jobs,
+                &jobs_encode_query(&JobsQuery::Get {
+                    job_id: job_id.clone(),
+                }),
+            )
+            .await?;
+        let JobsReply::Job(Some(job)) = jobs_decode_reply(&bytes).map_err(Error::Module)? else {
+            return Ok(());
+        };
+        if job.status != JobStatus::Pending {
+            return Ok(());
+        }
+        let conversation = match job.execution {
+            tasks::JobExecution::OneShot => None,
+            tasks::JobExecution::Conversation => {
+                let Some(conversation) =
+                    self.prepare_worker_conversation(ctx, &agent, &job).await?
+                else {
+                    return Ok(());
+                };
+                Some(conversation)
+            }
+        };
         let claim_height = ctx.env().height;
         let run_id = job_run_id_for(&job_id, agent_id, claim_height);
         let dispatch_id = dispatch_id_for(&run_id);
@@ -174,8 +199,14 @@ impl RunsModule {
             }
         };
         let sink = portable.sink.clone();
-        let payload =
-            envelope::render_job_payload(&agent, &run_id, &job_id, &spec, portable).into_bytes();
+        let rendered = envelope::render_job_payload(&agent, &run_id, &job_id, &spec, portable);
+        let payload = match &conversation {
+            Some(conversation) => {
+                let event = self.worker_conversation_event(ctx, conversation, &job)?;
+                envelope::with_native_conversation(rendered, conversation, &[event])
+            }
+            None => rendered.into_bytes(),
+        };
         if payload.len() > MAX_PAYLOAD_BYTES {
             self.note(
                 ctx,
@@ -184,6 +215,10 @@ impl RunsModule {
             return Ok(());
         }
 
+        if let Some(conversation) = &conversation {
+            self.start_worker_conversation(ctx, conversation, &job, &run_id)
+                .await?;
+        }
         let now = ctx.env().consensus_time;
         let requester = canonical_origin(&ctx.env().origin)?;
         ctx.emit_msg(Msg {
@@ -265,6 +300,9 @@ impl RunsModule {
             .map_err(|e| format!("jobs lookup failed: {e}"))?;
         let job = match jobs_decode_reply(&reply) {
             Ok(JobsReply::Job(job)) => job,
+            Ok(JobsReply::Worker(_) | JobsReply::Controls(_)) => {
+                return Err("unexpected jobs reply".into());
+            }
             Err(e) => return Err(format!("undecodable jobs reply: {e}")),
         };
         Ok(job.is_some_and(|job| {

@@ -1,0 +1,29 @@
+[package]
+name = "ducktape-terminal"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+rand.workspace = true
+agent-service.workspace = true
+gateway.workspace = true
+ducktape-rpc.workspace = true
+futures.workspace = true
+serde.workspace = true
+base64.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+serde_json.workspace = true
+subtle = "2"
+libc.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+provider-host.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "net", "time", "signal", "rt-multi-thread"] }
+
+[dev-dependencies]
+reqwest.workspace = true
+tokio = { workspace = true, features = ["process"] }
+tempfile.workspace = true
+async-trait.workspace = true
+tokio-tungstenite = "0.24"

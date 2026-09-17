@@ -18,8 +18,9 @@
 //! [`PushCert`]; every validator then checks, in this order: the SSHSIG
 //! verifies for the key it embeds; the certificate's update list IS the op's
 //! (a cert cannot be borrowed to authorize different moves); the nonce is
-//! EXACTLY `<this chain's id>/<repo>`. Freshness is not a concern: a
-//! certificate names exact old→new moves, so a replay is a no-op CAS.
+//! EXACTLY what [`nonce`] makes of this chain and this repo. Freshness is not
+//! a concern: a certificate names exact old→new moves, so a replay is a no-op
+//! CAS.
 //!
 //! ## the chain half — #1761 / #1773
 //!
@@ -53,10 +54,37 @@ pub struct Certificate {
 }
 
 /// the nonce a node advertises for `repo`, and the one consensus requires a
-/// certificate's nonce to equal exactly: `<chain id>/<repo>`.
+/// certificate's nonce to equal exactly: `<sha256 of the chain id>/<repo>`.
+///
+/// THE CHAIN ID IS HASHED, NOT SPELLED, because git validates a nonce before
+/// it will sign one and a chain id does not survive that check
+/// (`send-pack.c`'s `reject_invalid_nonce`, measured against git 2.43):
+///
+/// * a byte outside `[A-Za-z0-9]` and `-._/<>=` is refused outright, and every
+///   chain id carries a `#` (`<name>#<8 hex>`) — so `git push --signed` died
+///   on every real network with "the receiving end asked to sign an invalid
+///   nonce", while an e2e cluster named `ducktape-e2e-<pid>-<seq>` signed fine;
+/// * a nonce of 256 bytes or more is refused, and a chain NAME has no length
+///   bound to keep one under it;
+/// * a space would not even be refused — it ends the capability value, so git
+///   would sign a silently truncated nonce that consensus then rejects.
+///
+/// A sha256 answers all three at once: 64 bytes of `[0-9a-f]`, whatever the
+/// chain id is. It binds exactly as tightly — a certificate still names one
+/// chain and one repo — and both sides reach it through this one function, so
+/// the bridge advertises what [`signer`] recomputes.
 pub fn nonce(chain_id: &str, repo: &str) -> String {
-    format!("{chain_id}/{repo}")
+    use sha2::Digest as _;
+    let chain = sha2::Sha256::digest(chain_id.as_bytes());
+    format!("{}/{repo}", crate::hex(&chain))
 }
+
+/// the widest nonce [`nonce`] can produce — 64 hex of chain digest, a `/`, and
+/// a repo name at its own ceiling — against the limit git enforces. A nonce at
+/// or past `GIT_NONCE_LEN_LIMIT` is refused unsigned, so this has to hold for
+/// every repo name the module admits, not just the ones a test tries.
+const GIT_NONCE_LEN_LIMIT: usize = 256;
+const _: () = assert!(64 + 1 + crate::MAX_REPO_NAME_LEN < GIT_NONCE_LEN_LIMIT);
 
 /// the certificate text git would write for `updates` under `nonce` — the
 /// shape the bridge's and forge's tests sign; git's own carries pusher/pushee
@@ -191,13 +219,16 @@ mod tests {
     use keyscheme::sshsig::{GIT_SSH_NS, dearmor};
     use keyscheme::testkit::{ssh_key, ssh_pubkey, sshsig};
 
-    /// the same real `ssh-keygen -Y sign -n git` fixture keyscheme pins.
-    const CERT: &str = "certificate version 0.1\npusher key::ssh-ed25519 AAAA 1756332000 +0000\npushee http://127.0.0.1:8844/forge/lab\nnonce chain-a/lab\n\n0000000000000000000000000000000000000000 ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 refs/heads/main\n";
+    /// a real `ssh-keygen -Y sign -n git` signature over [`CERT`] — git's own
+    /// output, not ours, so the parser and the SSHSIG check are held to what
+    /// git actually writes. Its nonce is the one [`nonce`] produces for chain
+    /// `chain-a` and repo `lab`.
+    const CERT: &str = "certificate version 0.1\npusher key::ssh-ed25519 AAAA 1756332000 +0000\npushee http://127.0.0.1:8844/forge/lab\nnonce 594586ec8545839343436a12f8c85fe8ca603c2a050cb9130f31c78cabcdecd9/lab\n\n0000000000000000000000000000000000000000 ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 refs/heads/main\n";
     const ARMORED: &str = "-----BEGIN SSH SIGNATURE-----\n\
-U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJjhQt02r3vG8+pxaBdryKnexRC\n\
-cULQqMrrcadzt/2iEAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5\n\
-AAAAQAkqyuC4rshUkBgUVsgAqGxBltLKRLcwdq5LAQn+2lCUmiUJWTsYTykmuaNO+cntB2\n\
-ZYBzkWoVNWmNV5YTCuZwE=\n\
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgVMCTLbeHvqm1iVUMxR1FbRxp6L\n\
+/FUdZm0jg3wdq6tLMAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5\n\
+AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
+6Zl9YeToLeI+xpoeMG4Q4=\n\
 -----END SSH SIGNATURE-----\n";
 
     fn main_birth() -> RefUpdate {
@@ -221,7 +252,7 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
     #[test]
     fn gits_own_certificate_parses_and_names_its_signer() {
         let parsed = parse(CERT.as_bytes()).unwrap();
-        assert_eq!(parsed.nonce, "chain-a/lab");
+        assert_eq!(parsed.nonce, nonce("chain-a", "lab"));
         assert_eq!(parsed.updates, vec![main_birth()]);
         let cert = PushCert {
             cert: CERT.as_bytes().to_vec(),
@@ -231,7 +262,7 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
         assert_eq!(
             key,
             keyscheme::sshsig::authorized_key(
-                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICY4ULdNq97xvPqcWgXa8ip3sUQnFC0KjK63Gnc7f9oh"
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFTAky23h76ptYlVDMUdRW0caei/xVHWZtI4N8HaurSz"
             )
             .unwrap()
         );
@@ -279,9 +310,10 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
         ];
         let text = certificate(&nonce("chain-b", "lab"), &updates);
         assert!(
-            std::str::from_utf8(&text)
-                .unwrap()
-                .starts_with("certificate version 0.1\nnonce chain-b/lab\n\n")
+            std::str::from_utf8(&text).unwrap().starts_with(&format!(
+                "certificate version 0.1\nnonce {}\n\n",
+                nonce("chain-b", "lab")
+            ))
         );
         assert_eq!(parse(&text).unwrap().updates, updates);
         let cert = PushCert {
@@ -317,6 +349,50 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
                 .unwrap_err()
                 .contains("sha1 hex")
         );
-        assert_eq!(nonce("chain", "lab"), "chain/lab");
+    }
+
+    /// A nonce git will not sign is a repo nobody can push to, and the shape
+    /// that broke was the ORDINARY one: every id `node init` mints is
+    /// `<name>#<8 hex>`, while an e2e cluster is named `ducktape-e2e-<pid>-<n>`
+    /// and carries no `#` — so this is checked against real-shaped ids, and
+    /// against the two things git refuses (`send-pack.c`'s
+    /// `reject_invalid_nonce`): a byte outside its alphabet, and 256 or more of
+    /// them.
+    #[test]
+    fn a_minted_chain_ids_nonce_is_one_git_will_sign() {
+        let git_accepts = |byte: u8| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'/' | b'<' | b'>' | b'=' | b'_')
+        };
+        let longest_repo = "r".repeat(crate::MAX_REPO_NAME_LEN);
+        for (chain, repo) in [
+            ("gw-a#238d3908", "ducktape"),
+            ("dognet#25c07300", "default"),
+            // a name is only "not empty, no `#`": whatever an operator typed
+            // rides through the digest, including bytes that would otherwise
+            // end the capability value or leave the alphabet.
+            ("a network someone named#0b821df3", "lab"),
+            ("실험망#deadbeef", longest_repo.as_str()),
+        ] {
+            let nonce = nonce(chain, repo);
+            assert!(
+                nonce.len() < GIT_NONCE_LEN_LIMIT,
+                "{nonce:?} is {} bytes, at or past git's limit",
+                nonce.len()
+            );
+            assert!(
+                nonce.bytes().all(git_accepts),
+                "{nonce:?} carries a byte git will not sign"
+            );
+        }
+        assert_ne!(
+            nonce("chain-a", "lab"),
+            nonce("chain-b", "lab"),
+            "two chains never share a nonce"
+        );
+        assert_ne!(
+            nonce("chain-a", "lab"),
+            nonce("chain-a", "other"),
+            "two repos on one chain never share a nonce"
+        );
     }
 }

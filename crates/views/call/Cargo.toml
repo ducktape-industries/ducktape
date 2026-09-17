@@ -1,0 +1,15 @@
+[package]
+name = "call-view"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ducktape-view-guest.workspace = true
+ducktape-view-composer.workspace = true

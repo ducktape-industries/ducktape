@@ -6,40 +6,33 @@ publish = false
 description = "A local-first consensus workspace for people and agents"
 authors = ["Ducktape contributors"]
 
-[package.metadata.ice.bundle]
-icon = "assets/icon.svg"
-category = "public.app-category.productivity"
-# the module-owned views `make views` stages, carried into the bundle beside
-# the executable (basename kept: `views/<module>_view.wasm`), where
-# `module_view::views_dir` looks first. Relative to this manifest.
-resources = ["../target/views"]
-
-# macOS terminates the process the instant a huddle opens a device whose reason
-# the bundle does not state; these are the sentences its prompt shows. Screen
-# capture has no usage key — macOS grants it through Screen Recording instead.
-[package.metadata.ice.bundle.usage]
-camera = "Ducktape uses the camera for video in huddles."
-microphone = "Ducktape uses the microphone for voice in huddles."
-
-[build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", version = "=0.1.0" }
-
 [dependencies]
+gpui-kit = { version = "=0.6.1", features = ["tree-sitter-languages"] }
+# the pages document editor: Notion-shaped blocks, marks, slash menu and
+# toolbar on the same gpui-kit; the guest keeps the markdown canonical.
+gpui-notion = { path = "../crates/gpui-notion" }
+unicode-segmentation = "1"
+qrcode = { version = "0.14", default-features = false }
+futures.workspace = true
 pulldown-cmark = "0.12.2"
-# the program-account module: the Agents editor provisions a new agent's
-# keyless account through it before the runs module registers the record.
-agent.workspace = true
-# the network's node -> announced-provider registry, behind the Shell's host
-# picker: which peers can actually run an agent.
+# chat's CLIENT view model: the block parse a composer's text goes through
+# and the account link a mention spells. One implementation, whether the
+# reader of it is this app or the chat view.
 chat.workspace = true
 # the huddle media planes: the call-socket framing and voice/video wire.
 media-service.workspace = true
 design.workspace = true
 ducktape-rpc.workspace = true
+# the desktop app's self-update machine; `backend/update.rs` is its executor.
+app-update.workspace = true
+tar.workspace = true
+zstd.workspace = true
 module-artifact.workspace = true
-# the files read lane's wire (`b64` pages), the one codec duckfs-core writes
+# the `b64` pages the node's read lane answers with
 base64.workspace = true
 sha2.workspace = true
+# the blob read lane's own bounds and reply shape: a page size spelled here
+# as a literal would be a second copy the module cannot see move.
 forge.workspace = true
 gateway.workspace = true
 # the client-computed merge lane: a bare mirror fetched over the node's
@@ -51,7 +44,6 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 # zero-dependency leaf so every reader of that root agrees about it.
 ducktape-home.workspace = true
 identity.workspace = true
-inbox.workspace = true
 # THE device keystore, linked rather than spawned. Opening your own key is the
 # app's own business: it used to reach argon2id by starting `ducktape` and
 # piping to it, which made "can this process find a binary on disk?" a
@@ -62,25 +54,15 @@ keystore.workspace = true
 # of holding the key in-process; `node::encode_frame` is the ONE encoder, and a
 # second implementation of a machine wire format is not a thing to write.
 node.workspace = true
-# the duckfs wire bounds an upload must agree with (inline cap, chunk size):
-# a threshold spelled here as a literal is a second copy the module cannot
-# see move.
-duckfs-core.workspace = true
 authpage.workspace = true
 # the ed25519 signer `keystore` hands back and `node::encode_frame` signs with.
 commonware-cryptography.workspace = true
-# scheduling a durable agent run in-process: the work spec the saga carries and
-# the run envelope's headless composer. `run-envelope` is the SCHEMA only —
-# reaching the composer through `compute-service` would link provider-host and
-# the microVM sandbox into a GUI.
-dispatch.workspace = true
+# the run envelope a durable agent run is scheduled with — the SCHEMA only.
+# Reaching the composer through `compute-service` would link provider-host
+# and the microVM sandbox into a GUI.
 run-envelope.workspace = true
-runs.workspace = true
-tasks.workspace = true
 # the 32 random bytes of a fresh dispatch id.
 rand.workspace = true
-pages.workspace = true
-saga.workspace = true
 # Consensus payloads and authenticated origin types used by signed writes.
 sdk.workspace = true
 # The join ceremony, linked rather than spawned. Joining is the one node
@@ -95,22 +77,13 @@ serde_json = "1"
 # `/v1/call/ws` socket the node's call hub serves.
 cpal = "0.15"
 tokio-tungstenite = "0.24"
-# The camera leg (`src/video.rs`): capture + the pure-Rust intra-only JPEG
-# codec v1 (see the module doc for the codec seam).
+# The camera leg (`src/video.rs`): capture. The JPEG codec it feeds is
+# `media_service::video::codec`, deliberately NOT a dep here (see that module).
 nokhwa = { version = "0.10", features = ["input-native"] }
-# The screen-share leg (`src/video.rs`): a root-window grab over X11. Already
-# in this binary under winit, and pure Rust — the portal/pipewire route would
-# put a build-time system library on every machine that builds this app. A
-# Wayland session's X root holds X clients only, so the share refuses there
-# rather than grab a black desktop (`ScreenSource::open`).
-x11rb = "0.13"
-jpeg-encoder = "0.6"
-zune-jpeg = "0.4"
 # The picture viewer (`src/backend/picture.rs`) decodes to RGBA off-thread;
-# iced itself stays codec-less (`image-without-codecs`).
+# GPUI receives the decoded pixels.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
-# The same viewer validates and measures an SVG before handing it to iced's
-# `svg` widget (resvg draws it); usvg is already in the graph under resvg.
+# The same viewer validates and measures an SVG before native rendering.
 usvg = "0.45"
 # A web picture in forge Markdown is one capped GET (`web_picture_bytes`);
 # the workspace's reqwest is already in the binary under rpc-client.
@@ -127,23 +100,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # works on every OS the app runs on.
 gethostname = "1"
 zeroize.workspace = true
-# BOTH LINUX DISPLAY SERVERS, NATIVELY. With `x11` alone a Wayland session
-# runs this app under XWayland: the compositor upscales a 1x buffer on every
-# fractionally scaled monitor (a blurred, pixelated console) and text input
-# reaches the window only through XIM, which an input method such as fcitx5
-# serves only when `XMODIFIERS` names it. `wayland` (winit's sctk backend,
-# pure Rust, libwayland dlopen'd at runtime) gives the compositor's own
-# fractional scale and the text-input-v3 protocol every Wayland input method
-# speaks. winit picks Wayland when `WAYLAND_DISPLAY` is set, X11 otherwise.
-iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "wayland", "x11"] }
-ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", default-features = false, features = ["log-timeline", "terminal"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
 # The module-owned views (`src/module_view.rs`): the wire a view's tree and
 # events cross on, and the runtime that executes the view's component. The
 # same wasmtime pin as the node — a view is not consensus, but one runtime
 # in one binary is one set of semantics to reason about.
-ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", features = ["manifest"] }
+view-wire = { workspace = true, features = ["manifest"] }
 wasmtime.workspace = true
 
 # The native notification leg (`src/backend/notify.rs`): being @mentioned or
@@ -154,6 +115,10 @@ wasmtime.workspace = true
 # process with no bundle identifier, so `notify` reads NSBundle first and a
 # bare binary (every `cargo test`) degrades to a debug! line.
 [target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { version = "0.24", default-features = false }
+# The screen-share leg (`src/video.rs`): the main display through
+# `CGDisplayCreateImage`. Already in this binary's graph under gpui.
+core-graphics = "0.24"
 block2 = "0.5"
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSBundle", "NSString", "NSError"] }
@@ -164,14 +129,25 @@ objc2-user-notifications = { version = "0.2", default-features = false, features
 # under the accessibility stack; this only names it.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 zbus = "5"
+# The screen-share leg (`src/video.rs`): a root-window grab over X11. Already
+# in this binary under winit, and pure Rust — the portal/pipewire route would
+# put a build-time system library on every machine that builds this app. A
+# Wayland session's X root holds X clients only, so the share refuses there
+# rather than grab a black desktop (`ScreenSource::open`).
+# `composite` for the window shares: an unredirected window cannot be named as
+# a pixmap, and reading the window drawable itself returns undefined bytes
+# wherever something overlaps it. `randr` (the heads) and `xfixes` (the pointer)
+# are already on through gpui; naming them here keeps the picker from silently
+# losing them if gpui ever stops asking.
+x11rb = { version = "0.13", features = ["composite", "randr", "xfixes"] }
 
 [dev-dependencies]
+gpui-kit = { version = "=0.6.1", features = ["test-support"] }
+syn = { version = "2", features = ["full", "visit"] }
+quote = "1"
+# the dependency line this app is held to is read off the manifests, not
+# asserted about from memory: `the_app_links_only_what_it_still_speaks_for`
+toml = "0.8"
 commonware-cryptography.workspace = true
-# `src/frame_probe.rs` needs a headless `UserInterface` to measure a whole
-# frame (build + layout + event walk + draw), and iced does not re-export
-# `iced_runtime`. The explicit test-only ui-lang runtime feature below keeps
-# that renderer out of the product dependency surface.
-iced_test = "=0.14.0"
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", version = "=0.1.0", default-features = false, features = ["test-runtime"] }

@@ -129,6 +129,10 @@ pub struct CapabilitySpec {
     pub hard_timeout_factor: u32,
     /// which named stdout parser extracts the assistant's final text.
     pub output: OutputFormat,
+    /// optional `[tools]` — which CLI's syntax this executor is handed the
+    /// run's MCP endpoint in (see [`McpDialect`]). absent = this executor is
+    /// not told about the tool plane through its argv at all.
+    pub tools: Option<McpDialect>,
     /// optional `[isolation]` — the auth path: a host-owned broker
     /// holding the credential, and the fresh executor config home that forces
     /// the CLI through it (see [`IsolationSpec`]).
@@ -173,6 +177,15 @@ pub enum ReleaseSource {
         asset: String,
         sums: String,
         members: Vec<String>,
+    },
+    /// A self-contained release bundle whose sibling assets must remain beside
+    /// the executable. `{arch}` uses x64/arm64. `root` is the archive directory
+    /// containing `detect.bin`; the installer preserves that whole directory.
+    GithubBundle {
+        repo: String,
+        asset: String,
+        sums: String,
+        root: String,
     },
 }
 
@@ -253,6 +266,30 @@ pub enum BrokerKind {
     /// `claudeAiOauth` creds file seeded into the config home, not argv (see
     /// [`crate::broker`]).
     AnthropicMessages,
+    /// Pi speaks either existing model API, selected by the borrowed credential.
+    /// Its run-local models/auth configuration is distinct from either vendor CLI.
+    Pi,
+}
+
+/// how a CLI is told where this run's tool plane is. a CLOSED set, like
+/// [`OutputFormat`] and [`BrokerKind`]: each name is a real CLI's MCP
+/// configuration syntax, written in host code with a test, never a template an
+/// operator fills in.
+///
+/// the spec declares only the DIALECT, never the address. The endpoint is the
+/// run's own — a loopback port drawn when its node lane binds — so a spec that
+/// named it would be naming something that does not exist until the run does,
+/// and the file would need a placeholder. The host writes the argv per run
+/// instead (`crate::mcp_argv`), which is the same thing the credential broker's
+/// `-c` overrides already do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpDialect {
+    /// Claude Code: `--mcp-config <json>`, whose `ducktape` entry is an
+    /// `http` server, plus the `--allowedTools` prefix that pre-approves it.
+    Claude,
+    /// codex: `-c mcp_servers.ducktape.url=…` and the approval mode that lets
+    /// `exec` call it without a human.
+    Codex,
 }
 
 /// the named stdout parsers. a CLOSED set on purpose: each name is a tested
@@ -260,6 +297,10 @@ pub enum BrokerKind {
 /// adding a name is a code change with tests — that is the point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
+    /// Pi's authoritative `message_end` events, including per-turn usage.
+    PiJson,
+    CodexSession,
+    ClaudeSession,
     /// a JSONL event stream; the LAST `agent_message` item wins.
     JsonlEvents,
     /// a single `{"type":"result",...}` object (the contract of
@@ -332,6 +373,32 @@ enum RawSource {
         sums: String,
         members: Vec<String>,
     },
+    #[serde(rename = "github-bundle")]
+    GithubBundle {
+        repo: String,
+        asset: String,
+        sums: String,
+        root: String,
+    },
+}
+
+fn validate_github_source(repo: &str, asset: &str, sums: &str, origin: &str) -> Result<(), String> {
+    let is_owner_slash_name = matches!(
+        repo.split('/').collect::<Vec<_>>().as_slice(),
+        [owner, name] if !owner.is_empty() && !name.is_empty()
+    );
+    if !is_owner_slash_name {
+        return Err(format!("{origin}: source.repo {repo:?} is not owner/name"));
+    }
+    if !asset.contains("{arch}") {
+        return Err(format!(
+            "{origin}: source.asset {asset:?} names no {{arch}} placeholder"
+        ));
+    }
+    if sums.is_empty() {
+        return Err(format!("{origin}: source.sums must be non-empty"));
+    }
+    Ok(())
 }
 
 /// validate `[source]` against `[detect]`: the channel must deliver exactly
@@ -368,21 +435,7 @@ fn parse_source(
             sums,
             members,
         } => {
-            let is_owner_slash_name = matches!(
-                repo.split('/').collect::<Vec<_>>().as_slice(),
-                [owner, name] if !owner.is_empty() && !name.is_empty()
-            );
-            if !is_owner_slash_name {
-                return Err(format!("{origin}: source.repo {repo:?} is not owner/name"));
-            }
-            if !asset.contains("{arch}") {
-                return Err(format!(
-                    "{origin}: source.asset {asset:?} names no {{arch}} placeholder"
-                ));
-            }
-            if sums.is_empty() {
-                return Err(format!("{origin}: source.sums must be non-empty"));
-            }
+            validate_github_source(&repo, &asset, &sums, origin)?;
             let delivered: std::collections::BTreeSet<&str> = members
                 .iter()
                 .map(|m| m.rsplit('/').next().unwrap_or(m.as_str()))
@@ -403,6 +456,36 @@ fn parse_source(
                 asset,
                 sums,
                 members,
+            }))
+        }
+        RawSource::GithubBundle {
+            repo,
+            asset,
+            sums,
+            root,
+        } => {
+            validate_github_source(&repo, &asset, &sums, origin)?;
+            let safe_root = !root.is_empty()
+                && root != "."
+                && root != ".."
+                && root
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+            if !safe_root {
+                return Err(format!(
+                    "{origin}: source.root must be one safe directory name"
+                ));
+            }
+            if !companions.is_empty() {
+                return Err(format!(
+                    "{origin}: a github-bundle preserves its assets; detect.companions must be empty"
+                ));
+            }
+            Ok(Some(ReleaseSource::GithubBundle {
+                repo,
+                asset,
+                sums,
+                root,
             }))
         }
     }
@@ -438,9 +521,10 @@ fn parse_isolation(raw: Option<RawIsolation>, origin: &str) -> Result<IsolationS
         .map(|broker| match broker.as_str() {
             "codex-responses" => Ok(BrokerKind::CodexResponses),
             "anthropic-messages" => Ok(BrokerKind::AnthropicMessages),
+            "pi" => Ok(BrokerKind::Pi),
             other => Err(format!(
                 "{origin}: isolation.broker {other:?} is unsupported \
-                 (want codex-responses | anthropic-messages)"
+                 (want codex-responses | anthropic-messages | pi)"
             )),
         })
         .transpose()?;
@@ -577,13 +661,13 @@ struct RawOutput {
     format: String,
 }
 
-/// the on-disk `[tools]` shape. `args` is required: a `[tools]` section that
-/// injects nothing is operator confusion, and the format fails loud rather
+/// the on-disk `[tools]` shape. `mcp` is required: a `[tools]` section that
+/// wires nothing is operator confusion, and the format fails loud rather
 /// than quietly doing nothing.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTools {
-    args: Vec<String>,
+    mcp: String,
 }
 
 /// the on-disk `[interactive]` shape — a dumb serde mirror. `args` defaults to
@@ -598,42 +682,19 @@ struct RawInteractive {
     restricted_args: Option<Vec<String>>,
 }
 
-/// splice `[tools].args` into every argv this spec can produce, ONCE, at load
-/// time — so nothing downstream (discovery, invoke, resume) knows tools exist:
-/// a spec in hand already has them.
-///
-/// the insertion point is IMMEDIATELY AFTER `args[0]`, never the end: an argv
-/// like codex's must keep its trailing bare `-` (the stdin marker) LAST, so
-/// appending is not an option. `args[0]` is always the mode/subcommand
-/// selector (`exec`, `-p`), so right after it is the one position that is
-/// simultaneously legal for every executor and stable across variants. an argv
-/// with fewer than 1 arg has no such position and is left alone.
-fn inject_tool_args(spec: &mut CapabilitySpec, tools: &[String]) {
-    let splice = |argv: &mut Vec<String>| {
-        if !argv.is_empty() {
-            argv.splice(1..1, tools.iter().cloned());
-        }
-    };
-    if tools.is_empty() {
-        return;
-    }
-    splice(&mut spec.args);
-}
-
 impl CapabilitySpec {
     /// parse and validate one SINGLE-tag spec's TOML — the convenience for
     /// callers holding a spec that declares no `[[variants]]` (a file that
     /// does is a hard error here, never a silent drop of its variants; load
     /// whole files through [`CapabilitySpec::parse_all`]).
     pub fn parse(toml_text: &str, origin: &str) -> Result<Self, String> {
-        let (mut base, variants, tools) = Self::parse_raw(toml_text, origin)?;
+        let (base, variants) = Self::parse_raw(toml_text, origin)?;
         if !variants.is_empty() {
             return Err(format!(
                 "{origin}: spec declares [[variants]] and expands to multiple \
                  tags; load it via parse_all"
             ));
         }
-        inject_tool_args(&mut base, &tools);
         Ok(base)
     }
 
@@ -641,32 +702,19 @@ impl CapabilitySpec {
     /// the base spec first, then its `[[variants]]` expansions in declaration
     /// order. this is the loaders' entry point — one file, 1+ tags.
     ///
-    /// `[tools]` injection runs LAST, over the expanded set, so a file's tool
-    /// args reach the base tag and every variant tag alike — variants inherit
-    /// them the same way they inherit the rest of the file, without
-    /// [`crate::variants`] knowing tools exist.
     pub fn parse_all(toml_text: &str, origin: &str) -> Result<Vec<Self>, String> {
-        let (base, raw_variants, tools) = Self::parse_raw(toml_text, origin)?;
+        let (base, raw_variants) = Self::parse_raw(toml_text, origin)?;
         let mut specs = variants::expand(&base, &raw_variants, origin)?;
         specs.insert(0, base);
-        for spec in &mut specs {
-            inject_tool_args(spec, &tools);
-        }
         Ok(specs)
     }
 
-    /// the shared parse core: the validated base spec, its still-raw variant
-    /// entries, and the file's `[tools]` args (empty when the section is
-    /// absent) — the base is returned UNINJECTED, because expansion copies it
-    /// into the variants and injecting twice would double the tool flags.
-    /// `origin` names the source (a file path or "embedded:<file>") so every
-    /// error says WHICH spec is broken. unknown fields are rejected
+    /// the shared parse core: the validated base spec and its still-raw variant
+    /// entries. `origin` names the source (a file path or "embedded:<file>") so
+    /// every error says WHICH spec is broken. unknown fields are rejected
     /// (`deny_unknown_fields`): a typo like `patern` fails loud instead of
     /// silently changing routing.
-    fn parse_raw(
-        toml_text: &str,
-        origin: &str,
-    ) -> Result<(Self, Vec<RawVariant>, Vec<String>), String> {
+    fn parse_raw(toml_text: &str, origin: &str) -> Result<(Self, Vec<RawVariant>), String> {
         let raw: RawSpec =
             toml::from_str(toml_text).map_err(|e| format!("{origin}: not a valid spec: {e}"))?;
         if raw.spec != SPEC_VERSION {
@@ -706,16 +754,21 @@ impl CapabilitySpec {
             ));
         }
         let output = match raw.output.format.as_str() {
+            "pi-json" => OutputFormat::PiJson,
+            "codex-session" => OutputFormat::CodexSession,
+            "claude-session" => OutputFormat::ClaudeSession,
             "jsonl-events" => OutputFormat::JsonlEvents,
             "json-result" => OutputFormat::JsonResult,
             "text" => OutputFormat::Text,
             other => {
                 return Err(format!(
                     "{origin}: output.format {other:?} is not a known parser \
-                     (want jsonl-events | json-result | text)"
+                     (want codex-session | claude-session | pi-json | jsonl-events | \
+                     json-result | text)"
                 ));
             }
         };
+        let tools = parse_tools(raw.tools, origin)?;
         let isolation = parse_isolation(raw.isolation, origin)?;
         // AFTER isolation: `config-home:` is only meaningful when the spec asked
         // for a fresh config home, so the check needs the parsed block.
@@ -732,6 +785,7 @@ impl CapabilitySpec {
                 timeout_secs: raw.invoke.timeout_secs,
                 hard_timeout_factor: raw.invoke.hard_timeout_factor,
                 output,
+                tools,
                 isolation,
                 context,
                 interactive: raw.interactive.map(|i| InteractiveSpec {
@@ -741,8 +795,21 @@ impl CapabilitySpec {
                 source,
             },
             raw.variants,
-            raw.tools.map(|t| t.args).unwrap_or_default(),
         ))
+    }
+}
+
+/// the `[tools]` section: which CLI's MCP-server syntax this executor takes.
+fn parse_tools(raw: Option<RawTools>, origin: &str) -> Result<Option<McpDialect>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw.mcp.as_str() {
+        "claude" => Ok(Some(McpDialect::Claude)),
+        "codex" => Ok(Some(McpDialect::Codex)),
+        other => Err(format!(
+            "{origin}: tools.mcp {other:?} is not a known MCP dialect (want claude | codex)"
+        )),
     }
 }
 
@@ -969,6 +1036,62 @@ base = "https://releases.example/feed/"
             let err = CapabilitySpec::parse(&toml, "t").unwrap_err();
             assert!(err.contains(expected), "{case}: {err}");
         }
+    }
+
+    #[test]
+    fn pi_spec_declares_both_run_modes_and_isolated_auth() {
+        let specs = builtin_specs();
+        let pi = specs.iter().find(|spec| spec.tag == "pi").unwrap();
+        assert_eq!(pi.output, OutputFormat::PiJson);
+        assert_eq!(pi.isolation.broker, Some(BrokerKind::Pi));
+        assert_eq!(
+            pi.isolation.config_home_env.as_deref(),
+            Some("PI_CODING_AGENT_DIR")
+        );
+        assert!(matches!(
+            pi.source,
+            Some(ReleaseSource::GithubBundle { .. })
+        ));
+        let interactive = pi.interactive.as_ref().unwrap();
+        for args in [&pi.args, &interactive.args] {
+            assert!(args.iter().any(|arg| arg == "--no-extensions"));
+            assert!(args.iter().any(|arg| arg == "--offline"));
+        }
+        assert!(
+            interactive.restricted_args.is_none(),
+            "Pi's interactive !shell bypasses model-tool allowlists; shared sessions must be refused"
+        );
+    }
+
+    #[test]
+    fn bundle_source_requires_one_safe_root_and_no_flattened_companions() {
+        let bundle = spec_toml("bundle")
+            + r#"
+    [source]
+    kind = "github-bundle"
+    repo = "vendor/pkg"
+    asset = "pkg-{arch}.tar.gz"
+    sums = "SHA256SUMS"
+    root = "pkg"
+    "#;
+        assert!(CapabilitySpec::parse(&bundle, "t").is_ok());
+        for root in ["", ".", "..", "../pkg", "/pkg", "pkg/sub"] {
+            let invalid = bundle.replace("root = \"pkg\"", &format!("root = {root:?}"));
+            assert!(
+                CapabilitySpec::parse(&invalid, "t")
+                    .unwrap_err()
+                    .contains("safe directory")
+            );
+        }
+        let companions = bundle.replace(
+            "bin = \"bundle-cli\"",
+            "bin = \"bundle-cli\"\ncompanions = [\"helper\"]",
+        );
+        assert!(
+            CapabilitySpec::parse(&companions, "t")
+                .unwrap_err()
+                .contains("companions must be empty")
+        );
     }
 
     #[test]
@@ -1333,9 +1456,8 @@ base = "https://releases.example/feed/"
     }
 
     /// a family file whose every argv ends in a trailing "-" (the stdin
-    /// marker shape that makes appending tool args impossible). `tools` is
-    /// spliced in verbatim by the caller so the same fixture serves the with-
-    /// and without-[tools] cases.
+    /// marker shape). `tools` is spliced in verbatim by the caller so the same
+    /// fixture serves the with- and without-[tools] cases.
     fn family_with_tools(tools: &str) -> String {
         format!(
             r#"{base}
@@ -1352,130 +1474,84 @@ args = ["run", "--model", "m", "--hard", "-"]
         )
     }
 
-    const TOOLS_SECTION: &str = "[tools]\nargs = [\"--mcp\", \"srv\"]\n";
-
     #[test]
-    fn tool_args_splice_in_after_args0_of_every_argv_the_file_produces() {
-        let specs = CapabilitySpec::parse_all(&family_with_tools(TOOLS_SECTION), "t").unwrap();
+    fn a_files_mcp_dialect_reaches_its_base_tag_and_every_variant() {
+        let specs =
+            CapabilitySpec::parse_all(&family_with_tools("[tools]\nmcp = \"codex\"\n"), "t")
+                .unwrap();
         assert_eq!(specs.len(), 3, "base + two variants");
-
         for spec in &specs {
-            // args[0] is the mode/subcommand selector and STAYS first; the
-            // tool args follow it; the trailing stdin marker stays LAST.
+            assert_eq!(
+                spec.tools,
+                Some(McpDialect::Codex),
+                "{}: variants inherit the file's dialect",
+                spec.tag
+            );
+            // the DIALECT is all the file carries: the argv is the operator's,
+            // verbatim, because the endpoint does not exist until a run does.
             assert_eq!(spec.args[0], "run", "{}: selector first", spec.tag);
-            assert_eq!(
-                spec.args[1..3],
-                ["--mcp", "srv"],
-                "{}: tools right after args[0]",
-                spec.tag
-            );
-            assert_eq!(
-                spec.args.last().unwrap(),
-                "-",
-                "{}: the stdin marker is still last",
-                spec.tag
-            );
+            assert_eq!(spec.args.last().unwrap(), "-", "{}: marker last", spec.tag);
         }
-
-        // the variant argvs are otherwise verbatim — injection ADDS, never
-        // reorders or drops.
-        let get = |tag: &str| specs.iter().find(|s| s.tag == tag).unwrap();
         assert_eq!(
-            get("ok_m_high").args,
-            ["run", "--mcp", "srv", "--model", "m", "--hard", "-"]
+            specs.iter().find(|s| s.tag == "ok_m_high").unwrap().args,
+            ["run", "--model", "m", "--hard", "-"]
         );
     }
 
     #[test]
-    fn a_spec_without_tools_is_untouched() {
-        // the regression guard for every spec that predates [tools]: no
-        // section, no insertion — argv byte-identical to the file.
+    fn a_spec_without_tools_declares_no_dialect_and_a_broken_one_is_loud() {
         let specs = CapabilitySpec::parse_all(&family_with_tools(""), "t").unwrap();
+        assert_eq!(specs[0].tools, None, "no section, no tool plane wiring");
         assert_eq!(specs[0].args, ["run", "-"], "base argv verbatim");
-        assert_eq!(specs[1].args, ["run", "--model", "m", "-"]);
 
-        // an empty [tools].args is inert too — and a [tools] with no args at
-        // all is a loud parse error, not a silent no-op.
-        let empty =
-            CapabilitySpec::parse_all(&family_with_tools("[tools]\nargs = []\n"), "t").unwrap();
-        assert_eq!(empty[0].args, ["run", "-"]);
-        let err = CapabilitySpec::parse_all(&family_with_tools("[tools]\n"), "t").unwrap_err();
-        assert!(err.contains("not a valid spec"), "got {err:?}");
+        // a [tools] with no dialect, or an unknown one, is a loud parse error
+        // rather than a silent no-op.
+        let missing = CapabilitySpec::parse_all(&family_with_tools("[tools]\n"), "t").unwrap_err();
+        assert!(missing.contains("not a valid spec"), "got {missing:?}");
+        let unknown =
+            CapabilitySpec::parse_all(&family_with_tools("[tools]\nmcp = \"nope\"\n"), "t")
+                .unwrap_err();
+        assert!(
+            unknown.contains("not a known MCP dialect"),
+            "got {unknown:?}"
+        );
     }
 
     #[test]
-    fn embedded_specs_carry_their_mcp_tool_args() {
-        // a DATA pin, like the curated-matrix test in [`crate::variants`]:
-        // the built-ins' whole point is that an agent run gets the ducktape
-        // MCP server, and the invariant is per-executor — codex takes a `-c`
-        // config override, claude needs the server BOTH configured and
-        // pre-allowed (an unapproved MCP call in -p print mode is a denial).
+    fn embedded_specs_declare_their_mcp_dialect_and_carry_no_server_argv() {
+        // a DATA pin, like the curated-matrix test in [`crate::variants`]: the
+        // built-ins' whole point is that an agent run gets the ducktape tool
+        // plane, and after the move to an http endpoint on the run's own node
+        // lane, a spec says only WHICH SYNTAX its CLI takes. The argv itself is
+        // composed per run (`crate::mcp_argv`), so a spec that still spelled a
+        // server out would be a second, stale copy of that decision.
         let specs = builtin_specs();
         let get = |tag: &str| specs.iter().find(|s| s.tag == tag).unwrap();
 
-        let claude = &get("claude").args;
-        assert_eq!(claude[0], "-p", "the mode selector stays first");
-        assert!(
-            claude.windows(2).any(|w| w[0] == "--mcp-config"
-                && w[1].contains("\"command\":\"ducktape\"")
-                && w[1].contains("\"args\":[\"mcp\"]")),
-            "claude configures the ducktape MCP server: {claude:?}"
-        );
-        assert!(
-            claude
-                .windows(2)
-                .any(|w| w == ["--allowedTools", "mcp__ducktape"]),
-            "claude pre-allows it (print mode cannot prompt): {claude:?}"
-        );
+        assert_eq!(get("claude").tools, Some(McpDialect::Claude));
+        assert_eq!(get("codex").tools, Some(McpDialect::Codex));
 
-        // codex's approval mode is LOAD-BEARING and its name reads backwards.
-        // `codex exec` is non-interactive: an MCP tool call that wants approval
-        // is auto-cancelled ("user cancelled MCP tool call") and the agent
-        // silently loses its entire tool plane. Of auto/prompt/writes/approve,
-        // only `approve` means "already approved — do not ask". Verified live
-        // against codex-cli 0.144.1. Dropping this flag does not fail a build;
-        // it fails every codex agent run, quietly. Hence a pin.
-        for spec in specs.iter().filter(|s| s.tag.starts_with("codex")) {
+        for spec in &specs {
+            // NOTHING in a shipped argv names an MCP server. The one that used
+            // to — `mcp_servers.ducktape.command="ducktape"` — is exactly the
+            // line that put a ducktape binary inside every guest.
             assert!(
-                spec.args.windows(2).any(|w| w == [
-                    "-c",
-                    "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_ACTION_URL\",\"DUCKTAPE_RUN_ACTION_TOKEN\",\"DUCKTAPE_RUN_ID\",\"DUCKTAPE_PROVIDER_CONTROL_URL\",\"DUCKTAPE_PROVIDER_CONTROL_TOKEN\"]"
-                ]),
-                "{}: codex passes only the run env names to its MCP child: {:?}",
-                spec.tag,
-                spec.args
-            );
-            assert!(
-                spec.args.windows(2).any(|w| w[0] == "-c"
-                    && w[1] == "mcp_servers.ducktape.default_tools_approval_mode=\"approve\""),
-                "{}: codex must PRE-APPROVE the ducktape tools, or exec cancels every call: {:?}",
+                !spec.args.iter().any(|arg| arg.contains("mcp_servers.")
+                    || arg == "--mcp-config"
+                    || arg.contains("\"mcpServers\"")),
+                "{}: the MCP server is per-run, not in the file: {:?}",
                 spec.tag,
                 spec.args
             );
         }
 
-        // every codex argv keeps its trailing bare "-" LAST — the reason the
-        // tool args splice after args[0] instead of being appended.
+        // App Server receives JSON-RPC on persistent stdin; it takes no prompt marker.
         for spec in specs.iter().filter(|s| s.tag.starts_with("codex")) {
-            assert_eq!(
-                spec.args[..5],
-                [
-                    "exec",
-                    "-c",
-                    "mcp_servers.ducktape.command=\"ducktape\"",
-                    "-c",
-                    "mcp_servers.ducktape.args=[\"mcp\"]"
-                ],
-                "{}: mcp override right after the subcommand",
-                spec.tag
-            );
-            assert_eq!(
-                spec.args.last().unwrap(),
-                "-",
-                "{}: the stdin marker survives injection",
-                spec.tag
-            );
+            assert_eq!(spec.args[0], "app-server", "{}: subcommand first", spec.tag);
+            assert_eq!(spec.output, OutputFormat::CodexSession);
+            assert!(!spec.args.iter().any(|arg| arg == "-"));
         }
+        assert_eq!(get("claude").args[0], "-p", "the mode selector stays first");
     }
 
     #[test]

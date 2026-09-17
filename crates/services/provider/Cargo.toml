@@ -22,6 +22,10 @@ runs = { workspace = true }
 # the shared capability-tag shape rule: a tag that validates at spec-parse
 # time can never bounce off the consensus registry's Announce validation.
 capability = { workspace = true }
+# the agent tool plane's catalog, which each run's node lane serves as a
+# streamable-HTTP MCP endpoint (src/read_lane.rs). Serving it HERE is what keeps
+# it out of the guest entirely.
+mcp-host = { workspace = true }
 # the sandbox muscle: SandboxBackend + its boot probe, the microVM lifecycle
 # (guest manifest, workspace image, vsock frames) and the tap's egress
 # firewall. carved out of this crate; re-exported from src/lib.rs so callers
@@ -33,6 +37,8 @@ sandbox-host = { workspace = true }
 broker-host = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
+run-envelope = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 # the capability spec format: executors are described by TOML files (embedded
@@ -61,6 +67,7 @@ testkit = ["sandbox-host/testkit"]
 verify = ["broker-host/verify"]
 
 [dev-dependencies]
+tempfile = { workspace = true }
 # depending on ourselves with `testkit` on is how a test-only feature is turned
 # on for our OWN unit tests (cargo allows dev-dependency cycles). it also means
 # `sandbox-host/testkit` can only ever be on in a graph where our `testkit` is

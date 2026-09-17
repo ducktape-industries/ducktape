@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # The fixed HEAD snapshot includes every tracked dependency of a view. Neither
 # private worktrees nor the source checkout are modified by the two builds.
+# The two snapshots sit at different paths: a view whose bytes move with the
+# source root fails here, which is what `ops/build-views.sh` compiles through
+# one constant path to prevent. That path is a prefix below, so the constant
+# itself may not reach a component either.
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-ice=$1
-wasm_tools_root=$2
-ice_root=$3
+wasm_tools_root=$1
 work="$repo/target/views-repro"
 rm -rf "$work"
 mkdir -p "$work"
@@ -18,7 +20,7 @@ for place in here there; do
   else
     view_target="$work/outside-target"
   fi
-  CARGO_TARGET_DIR="$view_target" make -C "$work/$place" views ICE_BIN="$ice" ICE_ROOT="$ice_root" WASM_TOOLS_ROOT="$wasm_tools_root"
+  CARGO_TARGET_DIR="$view_target" make -C "$work/$place" views WASM_TOOLS_ROOT="$wasm_tools_root"
   (cd "$work/$place/target/views" && printf '%s\n' *.wasm | sort) > "$work/$place.names"
 done
 cmp "$work/here.names" "$work/there.names"
@@ -28,6 +30,7 @@ for component in "$work/here/target/views/"*.wasm; do
   name=$(basename "$component")
   cmp "$component" "$work/there/target/views/$name"
   for prefix in "$work/here" "$work/there" "$work/outside-target" \
+    /var/tmp/ducktape-view-root \
     "$(cd "${CARGO_HOME:-$HOME/.cargo}" && pwd -P)" \
     "$(cd "${RUSTUP_HOME:-$HOME/.rustup}" && pwd -P)" \
     "$(cd "$HOME" && pwd -P)"; do

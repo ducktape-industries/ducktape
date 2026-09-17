@@ -1,491 +1,501 @@
-//! Actual staged Chat overlays, laid out and clicked through ModuleView.
+//! Actual staged Chat and Pages views in native GPUI windows.
 use super::*;
-use iced::advanced::clipboard;
-use iced::advanced::renderer::Headless as _;
-use iced_test::runtime::{UserInterface, user_interface};
+use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::{self as gpui, Entity, TestAppContext, VisualTestContext};
 
-struct TextBounds<'a> {
-    text: &'a str,
-    found: Option<Rectangle>,
-}
-impl Operation for TextBounds<'_> {
-    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-        visit(self);
-    }
-    fn text(&mut self, _: Option<&iced::widget::Id>, bounds: Rectangle, text: &str) {
-        if text == self.text {
-            self.found = Some(bounds);
-        }
-    }
-}
-
-type Ui = UserInterface<'static, ModuleViewEvent, iced::Theme, iced::Renderer>;
-fn bounds(ui: &mut Ui, renderer: &iced::Renderer, text: &str) -> Option<Rectangle> {
-    let mut op = TextBounds { text, found: None };
-    ui.operate(renderer, &mut op);
-    op.found
-}
-
-fn seated(action: &str) -> Arc<Mutex<Mounted>> {
+fn seated(opened: &[&str]) -> Arc<Mutex<Mounted>> {
+    tests::can_the_chat_room();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/views/chat_view.wasm");
     let mut guest = Guest::load_from("chat", &path).expect("build current chat view first");
+    let props = tests::chat_facts();
     guest.redraw(&None);
-    let mut props: serde_json::Value =
-        serde_json::from_slice(&tests::chat_facts().unwrap()).unwrap();
-    props["selected_message_seq"] = 1.into();
-    props["selected_message_rev"] = 1.into();
-    props["message_action"] = action.into();
-    let props = Some(serde_json::to_vec(&props).unwrap());
-    guest.redraw(&props);
+    settle(&mut guest, &props);
+    for label in opened {
+        guest
+            .pending
+            .push(wire::Event::Message(tests::button_message(&guest, label)));
+        settle(&mut guest, &props);
+    }
     assert!(guest.fault.is_none());
-    Arc::new(Mutex::new(Mounted {
+    let seat = Arc::new(Mutex::new(Mounted {
+        changes: tokio::sync::watch::channel(()).0,
         slot: Slot::Ready(Box::new(guest)),
         props,
         generation: 1,
         hash: None,
         in_flight: false,
         wanted: None,
+        tasting: None,
         waiting_since: None,
         replacement: Replacement::Preserve,
         retry: None,
-    }))
+    }));
+    registry().lock().unwrap().insert("chat", seat.clone());
+    seat
 }
-
-fn view(mounted: &Arc<Mutex<Mounted>>) -> Element<'static, ModuleViewEvent> {
-    let mounted_guard = mounted.lock().unwrap();
-    let Slot::Ready(guest) = &mounted_guard.slot else {
-        panic!("a live guest")
+fn settle(guest: &mut Guest, props: &Option<Vec<u8>>) {
+    for _ in 0..32 {
+        if !guest.redraw(props) {
+            return;
+        }
+    }
+    panic!("view did not settle: {:?}", guest.fault);
+}
+fn open(cx: &mut TestAppContext) -> (Entity<NativeModuleView>, VisualTestContext) {
+    cx.update(gpui_kit::init);
+    let window = cx.open_window(gpui::size(gpui::px(1200.), gpui::px(800.)), |_, _| {
+        NativeModuleView::new("chat")
+    });
+    let view = window.root(cx).unwrap();
+    let mut native = VisualTestContext::from_window(window.into(), cx);
+    native.update(|window, cx| window.render_frame(cx));
+    (view, native)
+}
+fn button(seat: &Arc<Mutex<Mounted>>, label: &str) -> String {
+    fn shows(node: &wire::Node, label: &str) -> bool {
+        matches!(node, wire::Node::Text { content, .. } if content == label)
+            || node.children().iter().any(|child| shows(child, label))
+    }
+    let locked = seat.lock().unwrap();
+    let Slot::Ready(guest) = &locked.slot else {
+        panic!("live guest")
     };
-    Element::new(ModuleView {
-        mounted: mounted.clone(),
-        generation: mounted_guard.generation,
-        rev: guest.frame_rev,
-        alive: guest.alive.clone(),
-        content: guest.render(),
-    })
+    let mut root = guest.frame.root.clone().unwrap();
+    let mut visible_label = None;
+    root.for_each_mut(&mut |node| {
+        if let wire::Node::Button {
+            key,
+            content: wire::ButtonContent::Child(child),
+            on_press: Some(_),
+            ..
+        } = node
+            && shows(child, label)
+        {
+            visible_label = Some(key.clone());
+        }
+    });
+    visible_label.unwrap_or_else(|| tests::button_key(guest, label))
+}
+fn click_before_frame(native: &mut VisualTestContext, key: String) {
+    native.update(|window, cx| {
+        let position = window.find(key).bounds().center();
+        window.dispatch_event(
+            gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers: Default::default(),
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                position,
+                button: gpui::MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                position,
+                button: gpui::MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+            }),
+            cx,
+        );
+    });
+}
+#[test]
+fn shell_tab_switches_hide_and_restore_the_retained_guest() {
+    let _turn = tests::blocking_connection_turn();
+    let seat = seated(&[]);
+    let mut cx = crate::frame_probe::headless_context();
+    let mut state = crate::Ducktape::initial_state();
+    state.shell_tab = crate::ShellTab::View("chat");
+    let mut presenter = None;
+    let window = cx
+        .open_window(gpui::size(gpui::px(1200.), gpui::px(800.)), |window, cx| {
+            let view =
+                crate::shell::test_window(state, crate::shell::WindowKind::Console, window, cx);
+            presenter = Some(view.clone());
+            cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
+        })
+        .unwrap();
+    let presenter = presenter.unwrap();
+    let visible = || {
+        let locked = seat.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("live guest");
+        };
+        guest.visible
+    };
+    cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(visible());
+    presenter.update(&mut cx, |view, cx| {
+        view.test_dispatch(
+            crate::AppMessage::SelectShellTab(crate::ShellTab::View("files")),
+            cx,
+        )
+    });
+    cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(
+        !visible(),
+        "the previous tab remains hidden while another tab is rendered"
+    );
+    presenter.update(&mut cx, |view, cx| {
+        view.test_dispatch(crate::AppMessage::SelectShellTab(crate::ShellTab::View("chat")), cx)
+    });
+    cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(visible());
+    cx.update_window(window.into(), |_, window, _| window.remove_window())
+        .unwrap();
+    drop(presenter);
+    cx.run_until_parked();
+    assert!(!visible(), "closing retires the tab presentation");
 }
 
-#[test]
-fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses() {
-    let mut renderer = crate::frame_probe::headless_renderer();
-    for (action, label, expected) in [
-        ("more", "Add reaction", "message_reactions"),
-        ("reactions", "🦆", "reaction_submit"),
+#[gpui_kit::test]
+fn native_presenter_reports_hidden_and_visible_lifecycle(cx: &mut TestAppContext) {
+    let _turn = tests::blocking_connection_turn();
+    let seat = seated(&[]);
+    let (view, mut native) = open(cx);
+    let visible = || {
+        let locked = seat.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("live guest");
+        };
+        guest.visible
+    };
+    assert!(visible());
+    view.update(&mut native, |view, _| {
+        let _ = view.hide();
+        assert!(!visible(), "hidden before the presenter leaves");
+    });
+    native.update(|window, cx| window.render_frame(cx));
+    assert!(visible());
+}
+
+#[gpui_kit::test]
+fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut TestAppContext) {
+    let _turn = tests::blocking_connection_turn();
+    for (opened, label, reacted) in [
+        (&["More message actions"][..], "Add reaction", false),
+        (&["Manage reactions"][..], "🦆", true),
     ] {
-        let mounted = seated(action);
+        let seat = seated(&[]);
+        let (view, mut native) = open(cx);
+        for label in opened {
+            let key = button(&seat, label);
+            // The message actions float over the card while the pointer is on it.
+            let hover = format!("{}/hover", key.rsplit_once('/').expect("scoped key").0);
+            native.update(|window, cx| window.hover(hover, cx));
+            native.update(|window, cx| window.render_frame(cx));
+            click_before_frame(&mut native, key);
+            native.update(|window, cx| window.render_frame(cx));
+        }
+        let focus = if reacted { "reaction" } else { "action" };
+        native.update(|window, cx| {
+            let content = view.read(cx).content.clone().unwrap();
+            content.update(cx, |tree, cx| {
+                let reply = tree
+                    .execute_widget_command(
+                        wire::WidgetCommand::Focused {
+                            target: format!("ChatView/chat/message-{focus}-focus"),
+                        },
+                        window,
+                        cx,
+                    )
+                    .unwrap();
+                assert!(
+                    wire::decode::<bool>(&reply).unwrap(),
+                    "guest {focus} menu requests real native focus; queued commands: {:?}",
+                    match &seat.lock().unwrap().slot {
+                        Slot::Ready(guest) => guest.widget_commands.clone(),
+                        Slot::Failed(_) | Slot::Loading | Slot::Empty => Vec::new(),
+                    }
+                );
+            });
+        });
+        let key = button(&seat, label);
+        native.update(|window, _| {
+            assert!(
+                window.find(key.clone()).visible(),
+                "native popup {label:?} at {key:?} is visible: {:?}",
+                window.find(key.clone()).bounds()
+            )
+        });
         {
-            let mut locked = mounted.lock().unwrap();
+            let mut locked = seat.lock().unwrap();
             let Slot::Ready(guest) = &mut locked.slot else {
                 unreachable!()
             };
-            // Exercise the host's opt-in observation contract on the actual menu.
             guest.frame.mouse_interest = true;
         }
-        // The guest already emitted the menu; exposing its native overlay is
-        // the missing host behavior, not a props or wire-tree setup failure.
-        let mut content = view(&mounted);
-        let mut tree = Tree::new(content.as_widget());
-        let node = content.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(1200.0, 800.0)),
-        );
-        assert!(
-            content
-                .as_widget_mut()
-                .overlay(
-                    &mut tree,
-                    Layout::new(&node),
-                    &renderer,
-                    &Rectangle::with_size(Size::new(1200.0, 800.0)),
-                    Vector::ZERO
-                )
-                .is_some(),
-            "an open Chat menu must expose its native overlay"
-        );
-        let mut ui = UserInterface::build(
-            view(&mounted),
-            Size::new(1200.0, 800.0),
-            user_interface::Cache::default(),
-            &mut renderer,
-        );
-        let point = bounds(&mut ui, &renderer, label)
-            .expect("the menu label is laid out")
-            .center();
-        ui.draw(
-            &mut renderer,
-            &iced::Theme::Light,
-            &renderer::Style {
-                text_color: iced::Color::BLACK,
-            },
-            mouse::Cursor::Unavailable,
-        );
-        let rgba = renderer.screenshot(Size::new(1200, 800), 1.0, iced::Color::WHITE);
-        let directory =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/chat-input-evidence");
-        std::fs::create_dir_all(&directory).unwrap();
-        image::RgbaImage::from_raw(1200, 800, rgba)
-            .unwrap()
-            .save(directory.join(format!("{action}.png")))
-            .unwrap();
-        let mut messages = Vec::new();
-        ui.update(
-            &[
-                Event::Mouse(mouse::Event::CursorMoved { position: point }),
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-            ],
-            mouse::Cursor::Available(point),
-            &mut renderer,
-            &mut clipboard::Null,
-            &mut messages,
-        );
+        input::record_inputs();
+        click_before_frame(&mut native, key);
+        let delivered = input::recorded_inputs();
         {
-            let locked = mounted.lock().unwrap();
-            let Slot::Ready(guest) = &locked.slot else {
-                unreachable!()
-            };
-            let routed = guest
-                .pending
+            // GPUI flushes dirty test windows before update returns. Observe
+            // admitted events, not a queue that the real guest already drained.
+            let routed = delivered
                 .iter()
                 .position(|event| matches!(event, wire::Event::Message(_)))
-                .expect("the clicked popup queues its route");
-            let observed = guest
-                .pending
+                .unwrap_or_else(|| panic!("popup {label:?} routes: {delivered:?}"));
+            let observed = delivered
                 .iter()
                 .position(|event| {
                     matches!(
                         event,
                         wire::Event::Mouse {
                             event: wire::mouse::Event::ButtonReleased(wire::mouse::Button::Left),
-                            ..
+                            captured: true
                         }
                     )
                 })
-                .expect("a captured release is observed when opted in");
-            assert!(
-                routed < observed,
-                "popup route must precede its release observation"
-            );
+                .unwrap_or_else(|| panic!("captured release observed: {delivered:?}"));
+            assert!(routed < observed, "widget output precedes its observation");
         }
-        ui.update(
-            &[Event::Window(window::Event::RedrawRequested(
-                iced::time::Instant::now(),
-            ))],
-            mouse::Cursor::Available(point),
-            &mut renderer,
-            &mut clipboard::Null,
-            &mut messages,
-        );
-        assert!(
-            messages.iter().any(|event| event.kind == expected),
-            "{messages:?}"
-        );
+        native.update(|window, cx| window.render_frame(cx));
+        let locked = seat.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            unreachable!()
+        };
+        let texts = tests::texts(guest);
+        if reacted {
+            assert!(texts.windows(2).any(|pair| pair == ["🦆", "1"]));
+        } else {
+            assert!(texts.iter().any(|text| text == "🦆"));
+        }
     }
 }
-
-#[test]
-fn a_retained_overlay_cannot_send_a_press_to_a_replacement_instance() {
-    let renderer = crate::frame_probe::headless_renderer();
-    let mounted = seated("more");
-    let mut content = view(&mounted);
-    let mut tree = Tree::new(content.as_widget());
-    let size = Size::new(1200.0, 800.0);
-    let node = content.as_widget_mut().layout(
-        &mut tree,
-        &renderer,
-        &layout::Limits::new(Size::ZERO, size),
-    );
-    // Float exposes its text operation through the base widget, while its
-    // overlay owns drawing and input. Locate the label before retaining it.
-    let mut label = TextBounds {
-        text: "Add reaction",
-        found: None,
+#[gpui_kit::test]
+fn candidate_preparation_and_rejection_keep_the_seated_native_input(cx: &mut TestAppContext) {
+    let _turn = tests::blocking_connection_turn();
+    let seat = seated(&[]);
+    let (view, mut native) = open(cx);
+    let input = || {
+        let locked = seat.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("seated Chat")
+        };
+        let mut found = None;
+        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+            if let wire::Node::Input {
+                key,
+                value,
+                options,
+                ..
+            } = node
+                && options.label == "Search messages"
+            {
+                found = Some((key.clone(), value.clone()));
+            }
+        });
+        found.expect("Chat search input")
     };
-    content
-        .as_widget_mut()
-        .operate(&mut tree, Layout::new(&node), &renderer, &mut label);
-    let point = label.found.expect("the retained menu is laid out").center();
-    let mut overlay = content
-        .as_widget_mut()
-        .overlay(
-            &mut tree,
-            Layout::new(&node),
-            &renderer,
-            &Rectangle::with_size(size),
-            Vector::ZERO,
-        )
-        .unwrap();
-    let overlay_node = overlay.as_overlay_mut().layout(&renderer, size);
-    let layout = Layout::new(&overlay_node);
+    let key = input().0;
+    native.update(|window, cx| window.click(key.clone(), cx));
+    let content = view.read_with(&native, |view, _| view.content.clone().unwrap());
+    let attempt = seat.lock().unwrap().start(Some([7; 32]));
+
+    // A real OS key may arrive before the first repaint after a deployment
+    // check. TestWindowExt::input paints first, which would hide that race.
+    native.update(|window, cx| {
+        let mut key = gpui::Keystroke::parse("x").unwrap();
+        key.key_char = Some("x".into());
+        window.dispatch_keystroke(key, cx);
+    });
+    native.update(|window, cx| window.render_frame(cx));
+    assert_eq!(
+        input().1,
+        "x",
+        "candidate preparation lost the accepted key"
+    );
+    assert_eq!(
+        view.read_with(&native, |view, _| view
+            .content
+            .as_ref()
+            .unwrap()
+            .entity_id()),
+        content.entity_id(),
+        "an uninstalled candidate must not replace native controls"
+    );
     {
-        let mut locked = mounted.lock().unwrap();
+        let mut locked = seat.lock().unwrap();
+        assert_eq!(locked.generation, attempt);
+        locked.in_flight = false;
+        locked.retry = Some(Retry::after(None, Some([7; 32])));
+    }
+    native.update(|window, cx| {
+        let mut key = gpui::Keystroke::parse("y").unwrap();
+        key.key_char = Some("y".into());
+        window.dispatch_keystroke(key, cx);
+    });
+    native.update(|window, cx| window.render_frame(cx));
+    assert_eq!(
+        input().1,
+        "xy",
+        "rejected candidate disabled the seated input"
+    );
+    assert_eq!(
+        view.read_with(&native, |view, _| view
+            .content
+            .as_ref()
+            .unwrap()
+            .entity_id()),
+        content.entity_id()
+    );
+}
+
+#[gpui_kit::test]
+fn a_retained_overlay_cannot_send_a_press_to_a_replacement_instance(cx: &mut TestAppContext) {
+    let _turn = tests::blocking_connection_turn();
+    let seat = seated(&["More message actions"]);
+    let (view, mut native) = open(cx);
+    let content = view.read_with(&native, |view, _| view.content.clone().unwrap());
+    let message = {
+        let mut locked = seat.lock().unwrap();
         let Slot::Ready(guest) = &mut locked.slot else {
             unreachable!()
         };
-        assert!(guest.pending.is_empty());
+        let message = tests::button_message(guest, "Manage reactions");
+        guest.pending.clear();
         guest.alive = Arc::new(());
-    }
-    let mut events = Vec::new();
-    let mut shell = Shell::new(&mut events);
-    for event in [
-        mouse::Event::ButtonPressed(mouse::Button::Left),
-        mouse::Event::ButtonReleased(mouse::Button::Left),
-    ] {
-        overlay.as_overlay_mut().update(
-            &Event::Mouse(event),
-            layout,
-            mouse::Cursor::Available(point),
-            &renderer,
-            &mut clipboard::Null,
-            &mut shell,
-        );
-    }
-    let locked = mounted.lock().unwrap();
+        message
+    };
+    // The old native entity's real subscription remains live until the next frame.
+    content.update(&mut native, |_, cx| cx.emit(wire::Event::Message(message)));
+    let locked = seat.lock().unwrap();
     let Slot::Ready(guest) = &locked.slot else {
         unreachable!()
     };
     assert!(
         guest.pending.is_empty(),
-        "an old overlay delivered an event into its replacement"
+        "retired overlay routed into its replacement"
     );
 }
-
-#[test]
-fn a_native_pointer_drag_resizes_the_thread_and_release_ends_it() {
-    let mut renderer = crate::frame_probe::headless_renderer();
-    let mounted = seated("toolbar");
-    {
-        let mut locked = mounted.lock().unwrap();
-        let mut props: serde_json::Value =
-            serde_json::from_slice(locked.props.as_ref().unwrap()).unwrap();
-        props["active_thread_seq"] = 1.into();
-        props["selected_message_seq"] = 0.into();
-        props["thread_messages"] = props["messages"].clone();
-        let props = Some(serde_json::to_vec(&props).unwrap());
+#[gpui_kit::test]
+fn a_retained_control_cannot_address_a_new_frames_handler_table(cx: &mut TestAppContext) {
+    let _turn = tests::blocking_connection_turn();
+    let seat = seated(&["More message actions"]);
+    let (view, mut native) = open(cx);
+    let content = view.read_with(&native, |view, _| view.content.clone().unwrap());
+    let message = {
+        let mut locked = seat.lock().unwrap();
         let Slot::Ready(guest) = &mut locked.slot else {
             unreachable!()
         };
-        guest.redraw(&props);
-        locked.props = props;
-    }
-    let width = || {
-        fn find(node: &wire::Node) -> Option<f32> {
-            if let wire::Node::Container {
-                key,
-                width: Some(wire::Length::Fixed(width)),
-                ..
-            } = node
-                && key.ends_with("/thread-pane")
-            {
-                return Some(*width);
-            }
-            node.children().iter().find_map(find)
-        }
-        let locked = mounted.lock().unwrap();
-        let Slot::Ready(guest) = &locked.slot else {
-            unreachable!()
-        };
-        find(guest.frame.root.as_ref().unwrap()).unwrap()
+        let message = tests::button_message(guest, "Manage reactions");
+        guest.pending.clear();
+        guest.frame_rev += 1;
+        message
     };
-    let mut ui = UserInterface::build(
-        view(&mounted),
-        Size::new(1200.0, 800.0),
-        user_interface::Cache::default(),
-        &mut renderer,
-    );
-    assert_eq!(width(), 330.0);
-    struct DividerBounds {
-        key: iced::widget::Id,
-        bounds: Option<Rectangle>,
-    }
-    impl Operation for DividerBounds {
-        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-            visit(self);
-        }
-        fn container(&mut self, id: Option<&iced::widget::Id>, bounds: Rectangle) {
-            if id == Some(&self.key) {
-                self.bounds = Some(bounds);
-            }
-        }
-    }
-    fn divider_key(node: &wire::Node) -> Option<String> {
-        if node
-            .key()
-            .is_some_and(|key| key.ends_with("/thread-divider"))
-        {
-            return node.key().map(str::to_owned);
-        }
-        node.children().iter().find_map(divider_key)
-    }
-    let key = {
-        let locked = mounted.lock().unwrap();
-        let Slot::Ready(guest) = &locked.slot else {
-            unreachable!()
-        };
-        divider_key(guest.frame.root.as_ref().unwrap()).unwrap()
+    content.update(&mut native, |_, cx| cx.emit(wire::Event::Message(message)));
+    let locked = seat.lock().unwrap();
+    let Slot::Ready(guest) = &locked.slot else {
+        unreachable!()
     };
-    let mut divider = DividerBounds {
-        key: iced::widget::Id::from(key),
-        bounds: None,
-    };
-    ui.operate(&renderer, &mut divider);
-    let divider = divider.bounds.expect("actual thread divider layout");
-    assert_eq!(divider.width, 10.0);
-    let start = iced::Point::new(divider.center_x(), divider.y + 100.0);
-    let end = iced::Point::new(start.x - 100.0, start.y);
-    let mut messages = Vec::new();
-    {
-        let mut dispatch = |ui: &mut Ui, position: iced::Point, event: Event, redraw: bool| {
-            ui.update(
-                &[event],
-                mouse::Cursor::Available(position),
-                &mut renderer,
-                &mut clipboard::Null,
-                &mut messages,
-            );
-            if redraw {
-                ui.update(
-                    &[Event::Window(window::Event::RedrawRequested(
-                        iced::time::Instant::now(),
-                    ))],
-                    mouse::Cursor::Available(position),
-                    &mut renderer,
-                    &mut clipboard::Null,
-                    &mut messages,
-                );
-            }
-        };
-        // All three native events arrive before one frame. Coalescing must retain
-        // the pre-press pointer baseline, not initialize this drag from zero.
-        dispatch(
-            &mut ui,
-            start,
-            Event::Mouse(mouse::Event::CursorMoved { position: start }),
-            false,
-        );
-        dispatch(
-            &mut ui,
-            start,
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-            false,
-        );
-        dispatch(
-            &mut ui,
-            end,
-            Event::Mouse(mouse::Event::CursorMoved { position: end }),
-            true,
-        );
-        assert_eq!(
-            width(),
-            430.0,
-            "same-frame native border drag keeps its press baseline"
-        );
-        let across = iced::Point::new(start.x + 30.0, start.y);
-        dispatch(
-            &mut ui,
-            across,
-            Event::Mouse(mouse::Event::CursorMoved { position: across }),
-            true,
-        );
-        assert_eq!(
-            width(),
-            300.0,
-            "drag crosses back over the original divider"
-        );
-        let left = iced::Point::new(0.0, start.y);
-        dispatch(
-            &mut ui,
-            left,
-            Event::Mouse(mouse::Event::CursorMoved { position: left }),
-            true,
-        );
-        assert_eq!(
-            width(),
-            634.0,
-            "channel/sidebar and the 10px divider retain their minimum widths"
-        );
-        let right = iced::Point::new(1190.0, start.y);
-        dispatch(
-            &mut ui,
-            right,
-            Event::Mouse(mouse::Event::CursorMoved { position: right }),
-            true,
-        );
-        assert_eq!(width(), 280.0, "thread retains its minimum width");
-        dispatch(
-            &mut ui,
-            right,
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-            true,
-        );
-        dispatch(
-            &mut ui,
-            left,
-            Event::Mouse(mouse::Event::CursorMoved { position: left }),
-            true,
-        );
-        assert_eq!(width(), 280.0, "release outside the divider ends the drag");
-    }
-    let mut ui = UserInterface::build(
-        view(&mounted),
-        Size::new(1200.0, 800.0),
-        ui.into_cache(),
-        &mut renderer,
+    assert!(
+        guest.pending.is_empty(),
+        "old frame's handler index reached a new table"
     );
-    assert!(bounds(&mut ui, &renderer, "−").is_none());
-    assert!(bounds(&mut ui, &renderer, "+").is_none());
-    ui.draw(
-        &mut renderer,
-        &iced::Theme::Light,
-        &renderer::Style {
-            text_color: iced::Color::BLACK,
-        },
-        mouse::Cursor::Unavailable,
-    );
-    let rgba = renderer.screenshot(Size::new(1200, 800), 1.0, iced::Color::WHITE);
-    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/chat-input-evidence");
-    std::fs::create_dir_all(&directory).unwrap();
-    image::RgbaImage::from_raw(1200, 800, rgba)
-        .unwrap()
-        .save(directory.join("thread-border-drag.png"))
-        .unwrap();
 }
-
+fn thread_width(seat: &Arc<Mutex<Mounted>>) -> f32 {
+    let locked = seat.lock().unwrap();
+    let Slot::Ready(guest) = &locked.slot else {
+        unreachable!()
+    };
+    let mut root = guest.frame.root.clone().unwrap();
+    let mut width = None;
+    root.for_each_mut(&mut |node| {
+        if let wire::Node::Container {
+            key,
+            width: Some(wire::Length::Fixed(value)),
+            ..
+        }
+        | wire::Node::Linear {
+            key,
+            width: Some(wire::Length::Fixed(value)),
+            ..
+        } = node
+            && key.ends_with("/thread-pane")
+        {
+            width = Some(*value);
+        }
+    });
+    width.expect("thread pane")
+}
+#[gpui_kit::test]
+fn a_native_pointer_drag_resizes_the_thread_and_release_ends_it(cx: &mut TestAppContext) {
+    let _turn = tests::blocking_connection_turn();
+    let seat = seated(&["Open thread"]);
+    let (_, mut native) = open(cx);
+    let key = {
+        let locked = seat.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            unreachable!()
+        };
+        let mut root = guest.frame.root.clone().unwrap();
+        let mut key = None;
+        root.for_each_mut(&mut |node| {
+            if node
+                .key()
+                .is_some_and(|key| key.ends_with("/thread-resize"))
+            {
+                key = node.key().map(str::to_owned);
+            }
+        });
+        key.unwrap()
+    };
+    let bounds = native.update(|window, _| window.find(key.clone()).bounds());
+    assert!(
+        bounds.size.width >= gpui::px(10.) && bounds.size.height > gpui::px(100.),
+        "native divider fills its pane: {bounds:?}"
+    );
+    assert_eq!(thread_width(&seat), 330.);
+    let start = bounds.center();
+    let end = start - gpui::point(gpui::px(100.), gpui::px(0.));
+    native.update(|window, cx| window.drag(start, end, cx));
+    assert_eq!(thread_width(&seat), 430.);
+    native.simulate_mouse_move(start, None, Default::default());
+    native.update(|window, cx| window.render_frame(cx));
+    assert_eq!(thread_width(&seat), 430., "release ends the grab");
+}
 #[test]
 fn opted_in_mouse_moves_are_local_coalesced_and_keep_button_order() {
-    let mounted = seated("toolbar");
-    let mut locked = mounted.lock().unwrap();
+    let _turn = tests::blocking_connection_turn();
+    let seat = seated(&[]);
+    let mut locked = seat.lock().unwrap();
     let Slot::Ready(guest) = &mut locked.slot else {
         unreachable!()
     };
-    let origin = iced::Point::new(20.0, 30.0);
-    let movement = |x, y| mouse::Event::CursorMoved {
-        position: iced::Point::new(x, y),
-    };
-    assert!(!input::mouse(guest, movement(25.0, 35.0), origin, false));
-    assert!(guest.pending.is_empty());
+    let movement = |x, y| wire::mouse::Event::CursorMoved { x, y };
+    assert!(!input::mouse(guest, movement(5., 5.), false));
     guest.frame.mouse_interest = true;
-    assert!(input::mouse(guest, movement(25.0, 35.0), origin, false));
-    assert!(input::mouse(
+    input::mouse(guest, movement(5., 5.), false);
+    input::mouse(
         guest,
-        mouse::Event::ButtonPressed(mouse::Button::Left),
-        origin,
-        true
-    ));
-    assert!(input::mouse(guest, movement(55.0, 65.0), origin, false));
-    assert!(input::mouse(guest, movement(60.0, 70.0), origin, false));
-    assert!(input::mouse(
+        wire::mouse::Event::ButtonPressed(wire::mouse::Button::Left),
+        true,
+    );
+    input::mouse(guest, movement(35., 35.), false);
+    input::mouse(guest, movement(40., 40.), false);
+    input::mouse(
         guest,
-        mouse::Event::ButtonReleased(mouse::Button::Left),
-        origin,
-        true
-    ));
+        wire::mouse::Event::ButtonReleased(wire::mouse::Button::Left),
+        true,
+    );
     assert_eq!(
         guest.pending,
         vec![
             wire::Event::Mouse {
-                event: wire::mouse::Event::CursorMoved { x: 5.0, y: 5.0 },
+                event: movement(5., 5.),
                 captured: false
             },
             wire::Event::Mouse {
@@ -493,7 +503,7 @@ fn opted_in_mouse_moves_are_local_coalesced_and_keep_button_order() {
                 captured: true
             },
             wire::Event::Mouse {
-                event: wire::mouse::Event::CursorMoved { x: 40.0, y: 40.0 },
+                event: movement(40., 40.),
                 captured: false
             },
             wire::Event::Mouse {
@@ -502,4 +512,432 @@ fn opted_in_mouse_moves_are_local_coalesced_and_keep_button_order() {
             },
         ]
     );
+    assert!(!input::mouse(guest, movement(f32::NAN, 0.), false));
+}
+#[test]
+fn ime_observations_keep_unicode_selection_and_commit_order() {
+    use wire::events::{Event as E, InputMethod as I};
+    let mut previous = None;
+    let events = input::ime_events(&mut previous, "a🦆한", Some(1..4), 8, 5..8);
+    assert_eq!(
+        events,
+        vec![
+            wire::Event::Observation {
+                event: E::InputMethod(I::Opened),
+                captured: true
+            },
+            wire::Event::Observation {
+                event: E::InputMethod(I::Preedit {
+                    content: "🦆한".into(),
+                    selection: Some((4, 7))
+                }),
+                captured: true
+            },
+        ]
+    );
+    let events = input::ime_events(&mut previous, "a🦆한", None, 8, 8..8);
+    assert_eq!(
+        events,
+        vec![
+            wire::Event::Observation {
+                event: E::InputMethod(I::Commit("🦆한".into())),
+                captured: true
+            },
+            wire::Event::Observation {
+                event: E::InputMethod(I::Closed),
+                captured: true
+            },
+        ]
+    );
+}
+
+#[gpui_kit::test]
+fn pages_wasm_owns_native_menu_and_input_rules(cx: &mut TestAppContext) {
+    let _turn = tests::blocking_connection_turn();
+    tests::can_a_commented_page();
+    tests::can_reads([
+        ("model", serde_json::json!({"model": {"agents": []}})),
+        ("op.submit", serde_json::json!(1)),
+    ]);
+    let props = tests::pages_facts();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/views/pages_view.wasm");
+    let mut guest = Guest::load_from("pages", &path).expect("build current Pages view first");
+    tests::settle_documents(&mut guest, &props);
+    let seat = Arc::new(Mutex::new(Mounted {
+        changes: tokio::sync::watch::channel(()).0,
+        slot: Slot::Ready(Box::new(guest)),
+        props,
+        generation: 1,
+        hash: None,
+        in_flight: false,
+        wanted: None,
+        tasting: None,
+        waiting_since: None,
+        replacement: Replacement::Preserve,
+        retry: None,
+    }));
+    registry().lock().unwrap().insert("pages", seat.clone());
+    cx.update(gpui_kit::init);
+    cx.update(crate::editor::wire::init_notion);
+    let window = cx.open_window(gpui::size(gpui::px(1200.), gpui::px(800.)), |_, _| {
+        NativeModuleView::new("pages")
+    });
+    let mut native = VisualTestContext::from_window(window.into(), cx);
+    native.update(|window, cx| window.render_frame(cx));
+    settle_native_documents(&mut native, &seat);
+    native.update(|window, cx| {
+        window.render_frame(cx);
+        window.click(("block", 3usize), cx);
+        window.press("end", cx);
+        window.input(" ", cx);
+    });
+    settle_native_documents(&mut native, &seat);
+    native.update(|window, cx| window.input("@", cx));
+    settle_native_documents(&mut native, &seat);
+    let projection = || {
+        let locked = seat.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("live Pages view");
+        };
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
+        let mut result = None;
+        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+            if let wire::Node::Editor {
+                options, editable, ..
+            } = node
+            {
+                assert!(
+                    *editable,
+                    "the fixture remains editable: {:?}",
+                    tests::texts(guest)
+                );
+                result = Some((
+                    options.rich.clone().unwrap(),
+                    options.presentation.clone().unwrap(),
+                ));
+            }
+        });
+        result.expect("Pages document editor")
+    };
+    let (rich, paint) = projection();
+    let menu = paint.affordances.menu.unwrap_or_else(|| {
+        panic!(
+            "the WASM opens the mention menu; first blocks: {:?}, cursor: {:?}",
+            &rich.document.blocks[..3],
+            rich.document.cursor
+        )
+    });
+    let row = menu
+        .items
+        .iter()
+        .position(|item| item.label.contains("Ada Lovelace"))
+        .expect("the WASM supplies the account directory");
+    native.update(|window, cx| {
+        window.render_frame(cx);
+        window.click(("application-suggestion", row), cx);
+    });
+    settle_native_documents(&mut native, &seat);
+    let (rich, paint) = projection();
+    assert!(
+        paint.affordances.menu.is_none(),
+        "the guest closes the committed menu"
+    );
+    assert!(
+        rich.document
+            .blocks
+            .iter()
+            .any(|block| block.text.ends_with(" @Ada Lovelace ")),
+        "the guest replaces the mention in its document: {:?}",
+        rich.document
+    );
+    native.update(|window, cx| {
+        assert!(
+            window.focused(cx).is_some(),
+            "menu selection preserves keyboard focus"
+        )
+    });
+    for (source, kind, text) in [
+        ("# Heading", "heading", "Heading"),
+        ("**bold** plain", "paragraph", "bold plain"),
+        ("(c)", "paragraph", "©"),
+    ] {
+        native.update(|window, cx| window.press("enter", cx));
+        settle_native_documents(&mut native, &seat);
+        for character in source.chars() {
+            native.update(|window, cx| window.input(&character.to_string(), cx));
+            settle_native_documents(&mut native, &seat);
+        }
+        let (rich, _) = projection();
+        let block = &rich.document.blocks[rich.document.cursor.position.line as usize];
+        assert_eq!(
+            block.kind, kind,
+            "guest interpretation of {source:?}: {block:?}"
+        );
+        assert_eq!(block.text, text, "guest interpretation of {source:?}");
+        if source.starts_with("**") {
+            assert_eq!(
+                block
+                    .marks
+                    .iter()
+                    .filter(|mark| mark.kind == "bold")
+                    .map(|mark| (mark.start, mark.end))
+                    .collect::<Vec<_>>(),
+                vec![(0, 4)],
+                "text after the completed delimiter stays plain"
+            );
+        }
+    }
+}
+
+fn settle_native_documents(native: &mut VisualTestContext, seat: &Arc<Mutex<Mounted>>) {
+    loop {
+        native.run_until_parked();
+        let ticks = {
+            let locked = seat.lock().unwrap();
+            let Slot::Ready(guest) = &locked.slot else {
+                panic!("seated view");
+            };
+            assert!(guest.fault.is_none(), "{:?}", guest.fault);
+            let pending = guest.frame.busy
+                || guest.inputs.pending()
+                || !guest.pending.is_empty()
+                || guest.inputs.ready() == Ok(false);
+            if !pending {
+                return;
+            }
+            guest.ticks
+        };
+        native.update(|window, cx| window.render_frame(cx));
+        let locked = seat.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("seated view");
+        };
+        assert!(
+            guest.ticks > ticks,
+            "a requested native frame must advance the guest"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn call_panel_renders_staged_wasm_and_routes_native_control_clicks(cx: &mut TestAppContext) {
+    let _turn = tests::blocking_connection_turn();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/views/call_view.wasm");
+    let mut guest = Guest::load_from("call", &path).expect("build current Call view first");
+    let props = Some(br#"{"panel":{"status":"live","muted":false}}"#.to_vec());
+    guest.redraw(&None);
+    settle(&mut guest, &props);
+    assert!(guest.fault.is_none(), "{:?}", guest.fault);
+    let seat = Arc::new(Mutex::new(Mounted {
+        changes: tokio::sync::watch::channel(()).0,
+        slot: Slot::Ready(Box::new(guest)),
+        props,
+        generation: 1,
+        hash: None,
+        in_flight: false,
+        wanted: None,
+        tasting: None,
+        waiting_since: None,
+        replacement: Replacement::Preserve,
+        retry: None,
+    }));
+    registry().lock().unwrap().insert("call", seat.clone());
+    cx.update(gpui_kit::init);
+    let window = cx.open_window(gpui::size(gpui::px(560.), gpui::px(600.)), |_, _| {
+        NativeModuleView::new("call")
+    });
+    let view = window.root(cx).unwrap();
+    let mut native = VisualTestContext::from_window(window.into(), cx);
+    let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    native.update(|_, cx| {
+        let events = events.clone();
+        cx.subscribe(&view, move |_, event: &ModuleViewEvent, _| {
+            events.borrow_mut().push(event.kind.clone());
+        })
+        .detach();
+    });
+    native.update(|window, cx| window.render_frame(cx));
+    for (label, intent) in [
+        ("Mute", "mute"),
+        ("Camera", "camera"),
+        ("Share screen", "screen"),
+        ("Go to channel", "channel"),
+        ("Leave huddle", "leave"),
+    ] {
+        click_before_frame(&mut native, button(&seat, label));
+        native.update(|window, cx| window.render_frame(cx));
+        native.run_until_parked();
+        assert_eq!(events.borrow_mut().drain(..).collect::<Vec<_>>(), [intent]);
+    }
+}
+
+/// Driven by node-bin's real Gateway/Git fixture. Resolve the deployed view;
+/// only service.json is supplied here. Queries, merge and writes use the host.
+#[gpui::test]
+#[ignore = "run with node-bin's compiled_wasm_merge_updates_the_real_forge_branch fixture"]
+fn forge_wasm_merges_through_the_real_service(cx: &mut TestAppContext) {
+    // Real socket replies wake the presenter from the kernel runtime thread.
+    cx.executor().allow_parking();
+    fn has_key(node: &wire::Node, wanted: &str) -> bool {
+        node.key().is_some_and(|key| key.ends_with(wanted))
+            || node.children().iter().any(|child| has_key(child, wanted))
+    }
+    fn until(
+        seat: &Arc<Mutex<Mounted>>,
+        live: &tokio::sync::watch::Sender<()>,
+        ready: impl Fn(&Guest) -> bool,
+    ) {
+        loop {
+            let mut live = live.subscribe();
+            let mut locked = seat.lock().unwrap();
+            let props = locked.props.clone();
+            let Slot::Ready(guest) = &mut locked.slot else {
+                panic!("live Forge guest")
+            };
+            let mut replies = guest.replies.changes();
+            let again = guest.redraw(&props);
+            assert!(guest.fault.is_none(), "{:?}", guest.fault);
+            if guest
+                .frame
+                .root
+                .as_ref()
+                .is_some_and(|root| has_key(root, "forge/error"))
+            {
+                panic!("Forge view refused the request: {:?}", guest.frame.root);
+            }
+            if ready(guest) {
+                return;
+            }
+            drop(locked);
+            if !again {
+                runtime().block_on(async {
+                    tokio::select! {
+                        result = replies.changed() => result.expect("Forge reply event"),
+                        result = live.changed() => result.expect("Forge module event"),
+                    }
+                });
+            }
+        }
+    }
+    let _turn = tests::blocking_connection_turn();
+    let rpc = std::env::var("DUCK_FORGE_RPC").expect("node fixture RPC");
+    let key = std::env::var("DUCK_FORGE_KEY").expect("fixture user key");
+    let account: u64 = std::env::var("DUCK_FORGE_ACCOUNT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    runtime()
+        .block_on(crate::backend::seat_signer(
+            key.into(),
+            zeroize::Zeroizing::new("forge-test-password".into()),
+        ))
+        .unwrap();
+    let client = crate::backend::rpc_client(&rpc).unwrap();
+    connection().lock().unwrap().client = Some(client.clone());
+    let source = runtime()
+        .block_on(crate::backend::view_source::resolve(
+            &client,
+            "forge",
+            None,
+            &mut crate::backend::view_source::Asked::default(),
+        ))
+        .expect("resolve deployed Forge view");
+    let crate::backend::view_source::ViewSource::Ready {
+        hash, component, ..
+    } = source
+    else {
+        panic!("Forge fixture must deploy its view");
+    };
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/views/forge_view.wasm");
+    assert_eq!(
+        component,
+        std::fs::read(path).unwrap(),
+        "fixture deploys current Forge WASM"
+    );
+    let mut guest = Guest::from_bytes("forge", &component, "deployed Forge").unwrap();
+    guest.assets = Arc::new(
+        [(
+            "service.json".into(),
+            serde_json::to_vec(&serde_json::json!({"account":account,"route":"git"})).unwrap(),
+        )]
+        .into(),
+    );
+    let props = Some(
+        forge_view(
+            false,
+            true,
+            "",
+            "",
+            "",
+            &rpc,
+            "duck://forge/wasm-merge/1",
+            1,
+        )
+        .props,
+    );
+    let seat = Arc::new(Mutex::new(Mounted {
+        changes: tokio::sync::watch::channel(()).0,
+        slot: Slot::Ready(Box::new(guest)),
+        props,
+        generation: 1,
+        hash: Some(hash),
+        in_flight: false,
+        wanted: None,
+        tasting: None,
+        waiting_since: None,
+        replacement: Replacement::Preserve,
+        retry: None,
+    }));
+    registry().lock().unwrap().insert("forge", seat.clone());
+    struct LivePump(tokio::task::JoinHandle<()>);
+    impl Drop for LivePump {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let (ready, listening) = tokio::sync::oneshot::channel();
+    let origin = rpc.clone();
+    let live = tokio::sync::watch::channel(()).0;
+    let signal = live.clone();
+    let _live = LivePump(runtime().spawn(async move {
+        use futures::StreamExt as _;
+        let mut events = crate::backend::live_events(origin);
+        let mut ready = Some(ready);
+        let mut serial = 0;
+        while let Some(event) = events.next().await {
+            serial = view_live_hit(&event.module, serial);
+            signal.send_replace(());
+            let became_ready = event.kind == crate::LiveKind::Ready;
+            if became_ready && let Some(ready) = ready.take() {
+                let _ = ready.send(());
+            }
+        }
+    }));
+    runtime()
+        .block_on(listening)
+        .expect("real module subscription ready");
+    until(&seat, &live, |guest| {
+        guest
+            .frame
+            .root
+            .as_ref()
+            .is_some_and(|root| has_key(root, "forge/merge"))
+    });
+    cx.update(gpui_kit::init);
+    let window = cx.open_window(gpui::size(gpui::px(1200.), gpui::px(900.)), |_, _| {
+        NativeModuleView::new("forge")
+    });
+    let mut native = VisualTestContext::from_window(window.into(), cx);
+    native.update(|window, cx| window.render_frame(cx));
+    click_before_frame(&mut native, button(&seat, "Merge pull request"));
+    native.update(|window, cx| window.render_frame(cx));
+    native.run_until_parked();
+    until(&seat, &live, |guest| {
+        guest
+            .frame
+            .root
+            .as_ref()
+            .is_some_and(|root| has_key(root, "forge/merged"))
+    });
+    native.update(|window, cx| window.render_frame(cx));
 }

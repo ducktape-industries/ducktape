@@ -22,6 +22,11 @@ const DELIVERY_RECEIPT_MARKER: u32 = 1;
 pub(super) struct RunnerResult {
     pub(super) ducktape_runner_result: u32,
     pub(super) response_text: String,
+    /// Native event-only execution: not an empty model response fallback.
+    #[serde(default)]
+    pub(super) native_input_handled: bool,
+    #[serde(default)]
+    pub(super) native_cancelled: bool,
     pub(super) workspace_receipt: WorkspaceReceipt,
     /// O1/O2 output sink; default [`WireSink::Chain`].
     #[serde(default)]

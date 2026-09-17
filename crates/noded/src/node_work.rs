@@ -30,7 +30,8 @@ async fn query(
         .map_err(|_| "node command lane closed".to_string())?;
     let bytes = rx
         .await
-        .map_err(|_| "node dropped work query".to_string())??;
+        .map_err(|_| "node dropped work query".to_string())?
+        .map_err(|refused| refused.message)?;
     let Reply::NodeWork(directive) = sdk::wire::decode(&bytes)?;
     Ok(directive)
 }
@@ -47,6 +48,7 @@ async fn submit(handle: &NodeHandle, message: Submission) -> Result<(), String> 
     handle
         .command_sender()
         .send(NodeCommand::Submit {
+            required_blob: None,
             target: message.target,
             payload: message.payload,
             origin: key,
@@ -55,7 +57,8 @@ async fn submit(handle: &NodeHandle, message: Submission) -> Result<(), String> 
         .await
         .map_err(|_| "node command lane closed".to_string())?;
     rx.await
-        .map_err(|_| "node dropped work submission".to_string())??;
+        .map_err(|_| "node dropped work submission".to_string())?
+        .map_err(|refused| refused.message)?;
     Ok(())
 }
 
@@ -180,7 +183,7 @@ async fn stage(
         Ok(()) => submit(handle, on_ready).await,
         Err(BlobError::Unavailable(reason)) => Err(reason),
         Err(BlobError::Invalid(reason)) => {
-            tracing::debug!(target: "ducktape::node_work", reason = "blob_invalid", error = %reason,
+            tracing::debug!(target: "ducktape::saga", reason = "blob_invalid", error = %reason,
                 "node work selected its invalid-blob continuation");
             submit(handle, on_invalid).await
         }
@@ -231,7 +234,7 @@ pub fn spawn(handle: NodeHandle, source: String) {
                     failures = failures.saturating_add(1);
                     let speak = failures.is_power_of_two();
                     if speak {
-                        tracing::warn!(target: "ducktape::node_work", reason = "node_work_retry",
+                        tracing::warn!(target: "ducktape::saga", reason = "node_work_retry",
                             module = %source, attempts = failures, error = %error.lines().next().unwrap_or_default(),
                             "node work will retry at a committed block");
                     }
@@ -417,6 +420,7 @@ mod tests {
                 let NodeCommand::Submit {
                     target,
                     payload,
+                    required_blob: _,
                     origin,
                     reply,
                 } = commands.next().await.unwrap()

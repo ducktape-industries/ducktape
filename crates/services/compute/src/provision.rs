@@ -30,6 +30,7 @@ use crate::workspace_source::WorkspaceSource;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortablePlan {
     pub source: WorkspaceSource,
+    pub native_conversation: Option<run_envelope::NativeConversation>,
     /// the run's CONSENSUS id, verbatim from the (required) envelope field —
     /// see [`WorkspaceSpec::agent`]. always present: a run the
     /// session lane cannot name is a run whose mid-run writes silently vanish.
@@ -44,6 +45,7 @@ pub struct PortablePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentExecution {
     pub run_id: String,
+    pub native_conversation: Option<run_envelope::NativeConversation>,
     pub attempt: u32,
     pub agent_id: String,
     pub display_name: String,
@@ -216,14 +218,16 @@ pub trait ProvisionedWorkspace: Send + Sync {
     fn workdir(&self) -> PathBuf;
     /// run-scoped tool/workspace env vars → additive `ctx.env`.
     fn env(&self) -> BTreeMap<String, String>;
-    /// tool bin dirs prepended to `PATH` (populated in phase 4).
-    fn path_entries(&self) -> Vec<PathBuf>;
     /// the run's SOUL: its curated skills assembled into one document
     /// ([`crate::assemble_context_doc`]) by whoever materialized the ro mounts
     /// — the only layer that can read them. `None` = the agent curated no
     /// skills. defaulted for embedders whose workspace has no skill plane; the
     /// production provisioner always answers.
     fn context_doc(&self) -> Option<String> {
+        None
+    }
+    /// Explicit native history and pinned package mounts, never ambient home.
+    fn native_conversation(&self) -> Option<provider_host::NativeConversationContext> {
         None
     }
     /// the node's operator credential the run's node lane lends to every
@@ -249,13 +253,26 @@ pub trait ProvisionedWorkspace: Send + Sync {
 pub type SharedProvisioner = Arc<dyn WorkspaceProvisioner>;
 
 /// the ONE place a materialized workspace is bound onto the run context: the
-/// mount becomes the child's cwd, its env is layered additively, its tool bin
-/// dirs feed `PATH`, and its assembled soul rides into the run — the provider
-/// decides the door (the executor's auto-load path, or the stdin prompt).
+/// mount becomes the child's cwd, its env is layered additively, and its
+/// assembled soul rides into the run — the provider decides the door (the
+/// executor's auto-load path, or the stdin prompt).
+///
+/// It contributes no `PATH` entry. It used to contribute one — the directory
+/// the node binary runs from, so a run's CLI could exec `ducktape mcp` — and
+/// that meant copying the node's whole binary into every run's image. The tool
+/// plane is served by the run's node lane now, so the run needs no host command
+/// at all.
 pub fn bind_workspace(ws: &dyn ProvisionedWorkspace, ctx: &mut RunContext) {
     ctx.workdir_override = Some(ws.workdir());
     ctx.env.extend(ws.env());
-    ctx.path_entries = ws.path_entries();
+    if let Some(mut conversation) = ws.native_conversation() {
+        conversation.system_prompt = [ws.context_doc(), ctx.context_doc.take()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        ctx.native_conversation = Some(conversation);
+    }
     ctx.context_doc = ws.context_doc();
     ctx.operator_credential = ws.operator_credential();
 }
@@ -317,6 +334,10 @@ impl Status {
 struct RunnerResultWire<'a> {
     ducktape_runner_result: u64,
     response_text: &'a str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    native_input_handled: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    native_cancelled: bool,
     workspace_receipt: &'a WorkspaceReceipt,
     #[serde(skip_serializing_if = "Sink::is_chain")]
     sink: Sink,
@@ -343,10 +364,60 @@ pub fn assemble_runner_result(
     sink: Sink,
     status: Status,
 ) -> Vec<u8> {
+    assemble_result(
+        response_text,
+        receipt,
+        sink,
+        status,
+        provider_host::OutputDisposition::Answer,
+    )
+}
+
+/// An authenticated package handled this input without asking for a model
+/// reply. Runs consumes the explicit marker instead of parsing empty prose.
+pub fn assemble_handled_input_result(
+    receipt: &WorkspaceReceipt,
+    sink: Sink,
+    status: Status,
+) -> Vec<u8> {
+    assemble_result(
+        "",
+        receipt,
+        sink,
+        status,
+        provider_host::OutputDisposition::InputHandled,
+    )
+}
+
+/// A control reached a native boundary and its job cancellation settled. This
+/// terminal result is neither a package-handled input nor model-authored prose.
+pub fn assemble_cancelled_result(
+    receipt: &WorkspaceReceipt,
+    sink: Sink,
+    status: Status,
+) -> Vec<u8> {
+    assemble_result(
+        "",
+        receipt,
+        sink,
+        status,
+        provider_host::OutputDisposition::Cancelled,
+    )
+}
+
+fn assemble_result(
+    response_text: &str,
+    receipt: &WorkspaceReceipt,
+    sink: Sink,
+    status: Status,
+    disposition: provider_host::OutputDisposition,
+) -> Vec<u8> {
     let encode = |text: &str| {
         serde_json::to_vec(&RunnerResultWire {
             ducktape_runner_result: crate::envelope::RUNNER_RESULT_MARKER,
             response_text: text,
+            native_input_handled: disposition == provider_host::OutputDisposition::InputHandled,
+            native_cancelled: disposition == provider_host::OutputDisposition::Cancelled,
             workspace_receipt: receipt,
             sink: sink.clone(),
             status,
@@ -361,7 +432,13 @@ pub fn assemble_runner_result(
     // grows a byte), so cutting the overage plus the note's own length (with
     // slack for the note's escaped newline) always fits — one re-serialize,
     // no loop.
-    let note = format!("\n[output truncated ({} bytes)]", response_text.len());
+    let note = match disposition {
+        provider_host::OutputDisposition::Answer => {
+            format!("\n[output truncated ({} bytes)]", response_text.len())
+        }
+        provider_host::OutputDisposition::InputHandled
+        | provider_host::OutputDisposition::Cancelled => String::new(),
+    };
     let mut keep = response_text
         .len()
         .saturating_sub(full.len() - saga::MAX_RESULT_BYTES + note.len() + 16);
@@ -393,6 +470,8 @@ pub fn assemble_runner_result(
     serde_json::to_vec(&RunnerResultWire {
         ducktape_runner_result: crate::envelope::RUNNER_RESULT_MARKER,
         response_text: &note,
+        native_input_handled: disposition == provider_host::OutputDisposition::InputHandled,
+        native_cancelled: disposition == provider_host::OutputDisposition::Cancelled,
         workspace_receipt: &stub,
         sink: Sink::Chain,
         status,
@@ -534,6 +613,7 @@ mod tests {
         WorkspaceSpec {
             run_id: "s1:0".into(),
             agent: Some(AgentExecution {
+                native_conversation: None,
                 run_id: CONSENSUS_RUN_ID.into(),
                 attempt: 0,
                 agent_id: "bot".into(),
@@ -551,6 +631,7 @@ mod tests {
         WorkspaceSpec {
             run_id: "s1:0".into(),
             agent: Some(AgentExecution {
+                native_conversation: None,
                 run_id: CONSENSUS_RUN_ID.into(),
                 attempt: 0,
                 agent_id: "bot".into(),
@@ -565,6 +646,37 @@ mod tests {
             },
             ro_mounts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn handled_input_result_has_a_terminal_marker_not_an_assistant_reply() {
+        let receipt = WorkspaceReceipt::no_changes(&spec());
+        let bytes = assemble_handled_input_result(&receipt, Sink::Chain, Status::Ok);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["native_input_handled"], true);
+        assert_eq!(value["response_text"], "");
+        assert_eq!(
+            value["ducktape_runner_result"],
+            crate::envelope::RUNNER_RESULT_MARKER
+        );
+        let ordinary: serde_json::Value = serde_json::from_slice(&assemble_runner_result(
+            "answer",
+            &receipt,
+            Sink::Chain,
+            Status::Ok,
+        ))
+        .unwrap();
+        assert!(ordinary.get("native_input_handled").is_none());
+    }
+
+    #[test]
+    fn cancelled_result_is_distinct_from_handled_input_and_model_reply() {
+        let receipt = WorkspaceReceipt::no_changes(&spec());
+        let bytes = assemble_cancelled_result(&receipt, Sink::Chain, Status::Ok);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["native_cancelled"], true);
+        assert!(value.get("native_input_handled").is_none());
+        assert_eq!(value["response_text"], "");
     }
 
     #[test]

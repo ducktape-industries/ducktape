@@ -1,11 +1,10 @@
 //! The existing Pages Markdown policy copied into a bounded wire presentation.
 //! The guest computes styles and hit ranges; the host alone lays out and paints.
-use crate::{editor_binding, editor_binding::MenuState, markdown};
-use iced::advanced::text::Highlighter;
+use crate::{editor_binding, editor_binding::MenuState, editor_view::EditorReserve, markdown};
+use ducktape_view_guest::{EditorStateView, wire};
 use std::collections::HashMap;
-use ui_lang_guest::{EditorStateView, wire};
 use wire::editor_presentation::{
-    EditorFormat, EditorGutter, EditorHit, EditorPresentation, EditorSpan, PresentationError,
+    EditorGutter, EditorHit, EditorPresentation, EditorSpan, PresentationError,
 };
 
 pub fn paint(
@@ -13,9 +12,25 @@ pub fn paint(
     menu: MenuState,
     dark: bool,
     commented: Vec<i64>,
-    focused: bool,
 ) -> EditorPresentation {
-    build(state, menu, dark, commented, focused).unwrap_or_default()
+    build(state, menu, dark, commented, EditorReserve::default()).unwrap_or_default()
+}
+
+/// The line's own padding, as the host reads it: the LAST non-zero one of the
+/// line's runs wins, so a reserve has to ride on that same padding or it would
+/// erase the nesting indent the line was already owed.
+fn reserved_padding(
+    runs: &[(std::ops::Range<usize>, markdown::Mark)],
+    dark: bool,
+    height: i64,
+) -> wire::Edges {
+    let mut padding = runs
+        .iter()
+        .map(|(_, mark)| markdown::format(mark, dark).line_padding)
+        .rfind(|padding| *padding != wire::Edges::default())
+        .unwrap_or(wire::Edges::default());
+    padding.bottom += height as f32;
+    padding
 }
 
 pub fn build(
@@ -23,7 +38,7 @@ pub fn build(
     menu: MenuState,
     dark: bool,
     commented: Vec<i64>,
-    focused: bool,
+    reserve: EditorReserve,
 ) -> Result<EditorPresentation, PresentationError> {
     // Keep one paint pass inside the desktop tick budget. The canonical editor
     // remains complete when rich presentation is too dense to publish at once.
@@ -39,13 +54,7 @@ pub fn build(
         top: 0.0,
         bottom: 0.0,
     });
-    let caret = markdown::Caret {
-        focused,
-        line: state.cursor.position.line as usize,
-        column: state.cursor.position.column as usize,
-        dark,
-        commented,
-    };
+    let caret = markdown::Caret { dark, commented };
     let mut highlighter = markdown::DocumentHighlighter::new(&caret);
     let mut formats = HashMap::new();
     for (line, text) in wire::editor_lines(state.text).enumerate() {
@@ -74,8 +83,18 @@ pub fn build(
                 return Err(PresentationError::Limit);
             }
         }
+        // THE GAP IS LAYOUT, NOT PAINT. An inline comment card is a stack layer
+        // over one editor widget — nothing can be inserted between two of its
+        // lines — so the room it needs is taken as bottom padding on the line
+        // it anchors to, and the card floats into what that opens.
+        let reserved_line = reserve.height > 0 && line as i64 == reserve.line;
+        let padded = match reserved_line {
+            true => reserved_padding(&runs, dark, reserve.height),
+            false => wire::Edges::default(),
+        };
+        let last_run = runs.len().saturating_sub(1);
         let mut links = Vec::new();
-        for (range, mark) in runs {
+        for (index, (range, mark)) in runs.into_iter().enumerate() {
             if matches!(mark, markdown::Mark::Body(style) if style.link) {
                 links.push(EditorHit {
                     line: line as u32,
@@ -84,15 +103,29 @@ pub fn build(
                     tag: 2,
                 });
             }
-            let format = match formats.get(&mark) {
-                Some(index) => *index,
+            // The host takes the line's padding from its last run that asks for
+            // one, so the reserve rides on that run alone and every other line
+            // keeps sharing the cached format for its mark.
+            let carries_reserve = reserved_line && index == last_run;
+            let cached = match carries_reserve {
+                true => None,
+                false => formats.get(&mark).copied(),
+            };
+            let format = match cached {
+                Some(index) => index,
                 None => {
                     if result.formats.len() == wire::editor_presentation::MAX_EDITOR_FORMATS {
                         return Err(PresentationError::Limit);
                     }
                     let index = result.formats.len() as u16;
-                    result.formats.push(convert(markdown::format(&mark, dark))?);
-                    formats.insert(mark, index);
+                    let mut format = markdown::format(&mark, dark);
+                    if carries_reserve {
+                        format.line_padding = padded;
+                    }
+                    result.formats.push(format);
+                    if !carries_reserve {
+                        formats.insert(mark, index);
+                    }
                     index
                 }
             };
@@ -113,19 +146,6 @@ pub fn build(
                 handle: true,
             });
         }
-        let trimmed = text.trim_start_matches([' ', '\t']);
-        let todo = ["- [ ] ", "- [x] ", "- [X] "]
-            .iter()
-            .any(|prefix| trimmed.starts_with(prefix));
-        if todo {
-            let start = (text.len() - trimmed.len() + 2) as u32;
-            result.affordances.hits.push(EditorHit {
-                line: line as u32,
-                start,
-                end: start + 3,
-                tag: 1,
-            });
-        }
         result.affordances.hits.extend(links);
         // Interactive maps have a separate aggregate cap. Reject while building
         // instead of allocating an arbitrarily large map and dropping its tail.
@@ -140,107 +160,6 @@ pub fn build(
         .collect();
     result.validate(state.text)?;
     Ok(result)
-}
-
-fn color(value: iced::Color) -> wire::Rgba {
-    wire::Rgba([value.r, value.g, value.b, value.a])
-}
-fn edges(value: iced::Padding) -> wire::Edges {
-    wire::Edges {
-        top: value.top,
-        right: value.right,
-        bottom: value.bottom,
-        left: value.left,
-    }
-}
-fn border(value: iced::Border) -> wire::Border {
-    wire::Border {
-        color: Some(color(value.color)),
-        width: Some(value.width),
-        radius: Some([
-            value.radius.top_left,
-            value.radius.top_right,
-            value.radius.bottom_right,
-            value.radius.bottom_left,
-        ]),
-    }
-}
-fn background(value: iced::Background) -> Result<wire::Rgba, PresentationError> {
-    match value {
-        iced::Background::Color(value) => Ok(color(value)),
-        iced::Background::Gradient(_) => Err(PresentationError::Format),
-    }
-}
-fn font(value: iced::Font) -> wire::NamedFont {
-    use iced::font::{Family, Stretch, Style, Weight};
-    wire::NamedFont {
-        family: match value.family {
-            Family::Name(name) => wire::FontFamily::Named(name.into()),
-            Family::Serif => wire::FontFamily::Serif,
-            Family::SansSerif => wire::FontFamily::SansSerif,
-            Family::Cursive => wire::FontFamily::Cursive,
-            Family::Fantasy => wire::FontFamily::Fantasy,
-            Family::Monospace => wire::FontFamily::Monospace,
-        },
-        weight: match value.weight {
-            Weight::Thin => wire::Weight::Thin,
-            Weight::ExtraLight => wire::Weight::ExtraLight,
-            Weight::Light => wire::Weight::Light,
-            Weight::Normal => wire::Weight::Normal,
-            Weight::Medium => wire::Weight::Medium,
-            Weight::Semibold => wire::Weight::Semibold,
-            Weight::Bold => wire::Weight::Bold,
-            Weight::ExtraBold => wire::Weight::ExtraBold,
-            Weight::Black => wire::Weight::Black,
-        },
-        stretch: match value.stretch {
-            Stretch::UltraCondensed => wire::FontStretch::UltraCondensed,
-            Stretch::ExtraCondensed => wire::FontStretch::ExtraCondensed,
-            Stretch::Condensed => wire::FontStretch::Condensed,
-            Stretch::SemiCondensed => wire::FontStretch::SemiCondensed,
-            Stretch::Normal => wire::FontStretch::Normal,
-            Stretch::SemiExpanded => wire::FontStretch::SemiExpanded,
-            Stretch::Expanded => wire::FontStretch::Expanded,
-            Stretch::ExtraExpanded => wire::FontStretch::ExtraExpanded,
-            Stretch::UltraExpanded => wire::FontStretch::UltraExpanded,
-        },
-        style: match value.style {
-            Style::Normal => wire::FontStyle::Normal,
-            Style::Italic => wire::FontStyle::Italic,
-            Style::Oblique => wire::FontStyle::Oblique,
-        },
-    }
-}
-pub(crate) fn convert(
-    value: ui_lang_runtime::editor_format::Format,
-) -> Result<EditorFormat, PresentationError> {
-    Ok(EditorFormat {
-        color: value.color.map(color),
-        font: value.font.map(font),
-        size: value.size.map(|pixels| pixels.0),
-        line_height: value.line_height.map(|height| match height {
-            iced::advanced::text::LineHeight::Relative(value) => wire::LineHeight::Relative(value),
-            iced::advanced::text::LineHeight::Absolute(value) => {
-                wire::LineHeight::Absolute(value.0)
-            }
-        }),
-        background: value
-            .highlight
-            .map(|highlight| background(highlight.background))
-            .transpose()?,
-        border: value.highlight.map(|highlight| border(highlight.border)),
-        line_background: value
-            .line_highlight
-            .map(|highlight| background(highlight.background))
-            .transpose()?,
-        line_border: value
-            .line_highlight
-            .map(|highlight| border(highlight.border)),
-        line_padding: edges(value.line_padding),
-        line_rule: value.line_rule.map(color),
-        strikethrough: value.strikethrough.map(color),
-        padding: edges(value.padding),
-    })
 }
 
 fn work_bound(text: &str) -> usize {

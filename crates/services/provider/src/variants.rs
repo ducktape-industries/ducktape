@@ -88,6 +88,9 @@ pub(crate) fn expand(
             timeout_secs: base.timeout_secs,
             hard_timeout_factor: base.hard_timeout_factor,
             output: base.output,
+            // WHICH MCP syntax the CLI takes its tool plane in is a property of
+            // the CLI, so every variant is wired the same way the base is.
+            tools: base.tools,
             // HOW the executor authenticates — its broker and its config home —
             // is a property of the CLI, not of the model or the effort a variant
             // pins. so the auth section inherits whole.
@@ -325,35 +328,22 @@ args = ["run", "--model", "m1"]
         };
 
         // base tags keep their no-model argv — tools-enabled sandbox posture
-        // (workspace-write / acceptEdits), no model, no effort flag — plus the
-        // [tools] MCP args every embedded spec injects after args[0].
+        // (workspace-write / acceptEdits), no model, no effort flag. The MCP
+        // server is NOT here: its address is the run's own, so `crate::mcp_argv`
+        // composes it per run.
         assert_eq!(
             get("codex").args,
-            vec![
-                "exec",
-                "-c",
-                "mcp_servers.ducktape.command=\"ducktape\"",
-                "-c",
-                "mcp_servers.ducktape.args=[\"mcp\"]",
-                "-c",
-                "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_ACTION_URL\",\"DUCKTAPE_RUN_ACTION_TOKEN\",\"DUCKTAPE_RUN_ID\",\"DUCKTAPE_PROVIDER_CONTROL_URL\",\"DUCKTAPE_PROVIDER_CONTROL_TOKEN\"]",
-                "-c",
-                "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"",
-                "--json",
-                "--sandbox",
-                "workspace-write",
-                "--skip-git-repo-check",
-                "-"
-            ],
+            vec!["app-server", "-c", "sandbox_mode=\"workspace-write\""],
         );
         assert_eq!(
             get("claude").args,
             vec![
                 "-p",
-                "--mcp-config",
-                "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape\",\"args\":[\"mcp\"]}}}",
-                "--allowedTools",
-                "mcp__ducktape",
+                "--input-format",
+                "stream-json",
+                "--replay-user-messages",
+                "--permission-prompts",
+                "host",
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -375,34 +365,24 @@ args = ["run", "--model", "m1"]
         assert_eq!(
             get("codex_gpt-5.5_xhigh").args,
             vec![
-                "exec",
+                "app-server",
                 "-c",
-                "mcp_servers.ducktape.command=\"ducktape\"",
+                "sandbox_mode=\"workspace-write\"",
                 "-c",
-                "mcp_servers.ducktape.args=[\"mcp\"]",
-                "-c",
-                "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_ACTION_URL\",\"DUCKTAPE_RUN_ACTION_TOKEN\",\"DUCKTAPE_RUN_ID\",\"DUCKTAPE_PROVIDER_CONTROL_URL\",\"DUCKTAPE_PROVIDER_CONTROL_TOKEN\"]",
-                "-c",
-                "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"",
-                "--json",
-                "--sandbox",
-                "workspace-write",
-                "--skip-git-repo-check",
-                "-m",
-                "gpt-5.5",
+                "model=\"gpt-5.5\"",
                 "-c",
                 "model_reasoning_effort=\"xhigh\"",
-                "-",
             ],
         );
         assert_eq!(
             get("claude_opus_max").args,
             vec![
                 "-p",
-                "--mcp-config",
-                "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape\",\"args\":[\"mcp\"]}}}",
-                "--allowedTools",
-                "mcp__ducktape",
+                "--input-format",
+                "stream-json",
+                "--replay-user-messages",
+                "--permission-prompts",
+                "host",
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -468,7 +448,7 @@ args = ["run", "--model", "m1"]
             );
         }
 
-        // the full matrix is present: 19 codex + 16 claude variants + 2 bases.
+        // the full matrix is present: 19 codex + 16 claude variants + 3 bases.
         // codex efforts are per-model — the 5.6 family reaches `max`, 5.5 caps
         // at `xhigh` — so the codex side is not a rectangle.
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
@@ -484,6 +464,7 @@ args = ["run", "--model", "m1"]
                 get(&format!("claude_{model}_{effort}"));
             }
         }
-        assert_eq!(specs.len(), 37, "2 bases + 19 codex + 16 claude variants");
+        assert_eq!(get("pi").isolation.broker, Some(crate::spec::BrokerKind::Pi));
+        assert_eq!(specs.len(), 38, "3 bases + 19 codex + 16 claude variants");
     }
 }

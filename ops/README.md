@@ -20,6 +20,18 @@ make demo-clear  # ops/demo-clear.sh — stop and delete the demo workspace
 `demo-gateway.mjs` and `demo-kanban.mjs` publish the demo's gateway web-app
 routes (a network-hosted DuckFS site and a user-hosted loopback app).
 
+## Replacing a network
+
+`refound-net.sh` runs the whole re-found: it stops what is running, archives the
+workspaces, founds a validator and joins a resident from this checkout's binary
+and founding set under `ducktape-node-launcher`, installs the agent executors,
+mints the workspace wallet and founds its account, grants the service daemons,
+and mirrors a repo into the new forge. The target is `--root` and has no default; workspaces are moved
+aside, never deleted. It ends by running `refound-smoke.py`, which seeds an
+agent and mentions it: the one check that crosses the whole chain, and the
+script's exit code. `docs/refound-a-network.md` is the recipe and says why
+each step is ordered the way it is.
+
 ## Running a node as a service
 
 - `node/` — `ducktape-node@.service` (instance = workspace selector for
@@ -33,6 +45,13 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
   a per-user LaunchAgent template and the script that renders it for one
   workspace and hands it to `launchctl bootstrap gui/$(id -u)`
   (`--dry-run` prints the rendered plist, `--uninstall` boots it out).
+
+## Independent application services
+
+`application-service/install.py` verifies and installs an application executable
+with a systemd-held socket, private Gateway handoff credential, isolated Unix
+identity, and resource limits. See `docs/deploy/application-service.md` for the
+manifest, process contract, and install/activate/stop/restart commands.
 
 ## Sandbox (microVM) hosts
 
@@ -50,6 +69,16 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
   fixes it can.
 - `firecracker/` — `boot-bench.sh` and `snapshot-bench.sh`, the cold-boot and
   snapshot-restore timing lanes for the microVM sandbox.
+
+## Airlock enclave image
+
+- `airlock-gateway/install-rcodesign.sh` — the pinned `rcodesign` release
+  (SHA-256 checked) into `<prefix>/bin`; what the gateway's
+  `POST /sign/macos-bundle` signs with, and what `cargo test -p airlock`
+  needs on `PATH` (`make rcodesign`).
+- `airlock-gateway/stage-image.sh` (`make airlock-gateway-image`) — the
+  enclave image root: the release `airlock-gateway`, `rcodesign`, and
+  `app/packaging/entitlements.plist` at the binary's default paths.
 
 ## Forge
 
@@ -80,9 +109,6 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 - `huddle-lane.sh` — two real nodes in the dev shape with userspace
   WireGuard between them, one channel, one user key per side: the live
   arrangement a huddle (voice/camera/screen share) actually breaks in.
-- `beacon-collect/` — a standalone headless consumer for iced's frame
-  telemetry (`cargo run -p ducktape-app --features iced/debug`), for QA rigs
-  where the upstream GUI is useless; own `Cargo.toml`, not a workspace member.
 
 ## Dedicated Proxmox view lane
 
@@ -178,6 +204,10 @@ under `target`, records their SHA-256 values and the supplied exact source/UI
 revisions in `owner.json`, and allocates fresh loopback ports. The binary's
 version must match the source revision. Build the input files from the stated
 revisions; the supervisor cannot infer the compiler provenance of view bytes.
+`$MODULES` is the set the build staged for THAT checkout —
+`target/<profile>/modules%<checkout path>` (`%` for each `/`) — not a plain
+`modules`, which on a box where checkouts share a target dir is whichever
+build ran last.
 
 ```sh
 python3 ops/proxmox-view-local.py --binary "$NODE_BINARY" --modules "$MODULES" \
@@ -295,6 +325,11 @@ node ops/proxmox-view-observe-test.mjs
 
 ## Wasm guests
 
+- `make wasm-embed-check` — refuses an `include_bytes!`/`include_str!` of a
+  `.wasm` outside a test, so a binary can never carry a second copy of a module.
+  No script here: it is a source-parsing lint,
+  `crates/topology/tests/wasm_embed.rs`, beside `sdk_shaped` and
+  `tracing_plane_lint`.
 - `wasm-repro-check.sh` (`make wasm-repro-check`) — builds one guest component
   twice, in two scratch directories, and asserts the bytes are identical and
   carry no host path, so a committed artifact never depends on the builder's

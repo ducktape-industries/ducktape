@@ -422,6 +422,75 @@ fn a_preexisting_symlink_in_place_of_a_dir_is_replaced_on_recheckout() {
     );
 }
 
+/// upstream may replace a directory with a symlink — the module's tree put
+/// replaces whatever entry was there. a client holding the old directory must
+/// be able to check the new snapshot out, empty directory or not: `symlink(2)`
+/// never overwrites, and the destination is not a file to unlink (#1981).
+#[test]
+fn a_directory_replaced_by_a_symlink_re_checks_out() {
+    let node = ModuleNode::new();
+    node.seed_commit(
+        None,
+        "seed",
+        vec![
+            put_inline(&format!("{PREFIX}/readme.txt"), b"hello duckfs", false),
+            put_inline(&format!("{PREFIX}/full/inside.txt"), b"a child", false),
+            Change::Mkdir {
+                path: format!("{PREFIX}/empty"),
+            },
+        ],
+    )
+    .expect("seed commit");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    checkout(&node, root, PREFIX, None).expect("checkout");
+    assert!(root.join("full").is_dir() && root.join("empty").is_dir());
+
+    // upstream turns both directories into links.
+    node.seed_commit(
+        node.head().as_deref(),
+        "directories become links",
+        vec![
+            Change::Symlink {
+                path: format!("{PREFIX}/full"),
+                target: "readme.txt".into(),
+            },
+            Change::Symlink {
+                path: format!("{PREFIX}/empty"),
+                target: "readme.txt".into(),
+            },
+        ],
+    )
+    .expect("seed the replacement");
+
+    // the SAME directory checks the new snapshot out — the documented
+    // resumable operation, run again over what the last one left.
+    checkout(&node, root, PREFIX, None).expect("re-checkout over the old directories");
+
+    for name in ["full", "empty"] {
+        let meta = fs::symlink_metadata(root.join(name)).unwrap();
+        assert!(meta.file_type().is_symlink(), "{name} is a symlink now");
+        assert_eq!(
+            fs::read_link(root.join(name)).unwrap().to_str().unwrap(),
+            "readme.txt",
+            "{name} points where the snapshot says"
+        );
+    }
+    let index = Index::load(root).expect("index");
+    for name in ["full", "empty"] {
+        assert_eq!(
+            index.entries[&format!("{PREFIX}/{name}")].kind,
+            duckfs_client::index::EntryKind::Symlink,
+            "{name} is recorded as a symlink"
+        );
+    }
+    assert!(
+        duckfs_client::status::status(root).unwrap().clean,
+        "converged clean"
+    );
+}
+
 /// a pre-existing hard link at a File path must never be written through —
 /// `checkout` replaces the directory entry (temp file + rename), it does not
 /// open and truncate the shared inode (issue #1802, sibling of #1610).

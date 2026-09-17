@@ -865,6 +865,27 @@ impl Governance {
                 ));
             }
         }
+        // a promotion names a key the network has already met. `AddValidator`
+        // is the second half of a STAGED admission — valset is deliberately
+        // permissionless ("no authorization, no gating", its own header), so
+        // governance is the layer that decides who may be seated, and the
+        // resident tier is what "has a node behind it, and it is caught up"
+        // means. seating a key nobody has met grows the quorum by a seat that
+        // never votes, and the chain stops at the next epoch cutover with no
+        // way back: removing the phantom is itself a proposal, and it now
+        // needs the phantom's ballot to pass.
+        if let GovAction::AddValidator { key } = &action {
+            let seated = self.members(ctx).await?.iter().any(|m| m == key);
+            let stands_for_promotion =
+                seated || self.residents(ctx).await?.iter().any(|r| r == key);
+            if !stands_for_promotion {
+                return Err(Error::Module(
+                    "not_a_resident: a validator is promoted out of the resident tier — \
+                     grant standing first and let it sync"
+                        .into(),
+                ));
+            }
+        }
         // module-update authorizations: shape-checked at the door (a proposal
         // that can never execute is rejected here, not at tally time); the code
         // registry's min-lead / at-most-one / no-op gates are NOT duplicated —
@@ -1140,7 +1161,15 @@ impl Governance {
                     let members = self.members(ctx).await?;
                     let already_seated = members.iter().any(|m| m == key);
                     let would_overflow_capacity = !already_seated && members.len() >= MAX_MEMBERS;
-                    if would_overflow_capacity {
+                    // the propose door refuses a key with no resident record,
+                    // and it is not the last word: standing can be revoked
+                    // while the ballot is open, and a proposal can arrive from
+                    // a peer's synced store minted before this rule. seating a
+                    // key that stands for nothing halts the chain at the next
+                    // epoch cutover, so settle Rejected here too.
+                    let stands_for_promotion =
+                        already_seated || self.residents(ctx).await?.iter().any(|r| r == key);
+                    if would_overflow_capacity || !stands_for_promotion {
                         proposal.status = ProposalStatus::Rejected;
                     } else {
                         ctx.emit_msg(Msg {
@@ -1204,8 +1233,10 @@ impl Governance {
                 GovAction::RegisterModule {
                     name,
                     module_id,
+                    kind,
                     activation_lead,
                     code_hash,
+                    lanes,
                 } => match &self.code_registry_id {
                     Some(registry) => {
                         let activation_height = ctx.env().height.saturating_add(*activation_lead);
@@ -1214,8 +1245,10 @@ impl Governance {
                             payload: modules_encode_msg(&ModulesMsg::ScheduleRegister {
                                 name: name.clone(),
                                 module_id: module_id.clone(),
+                                kind: *kind,
                                 activation_height,
                                 code_hash: code_hash.clone(),
+                                lanes: lanes.clone(),
                             }),
                         })
                     }

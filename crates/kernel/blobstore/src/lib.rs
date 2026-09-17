@@ -20,7 +20,9 @@
 //! duckfs. don't start a third.
 
 mod staging;
-pub use staging::{LARGE_BLOB_CACHE_BYTES, STAGING_RESUME_WINDOW, StageError, StagedBlob};
+pub use staging::{
+    IngestBlob, LARGE_BLOB_CACHE_BYTES, STAGING_RESUME_WINDOW, StageError, StagedBlob,
+};
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};

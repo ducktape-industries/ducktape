@@ -19,13 +19,20 @@ path = "src/lib.rs"
 client = ["dep:reqwest"]
 # The gateway HTTP service (airlock::server), used by airlock-gateway and the
 # in-process e2e test. Off by default so the pure core stays IO/async-free.
-server = ["dep:reqwest", "dep:axum", "dep:tokio", "dep:tokio-stream", "dep:futures-util"]
+# Admission of the `apple-codesign` credential kind (airlock::codesign): opens
+# the PKCS#12 and reads the leaf certificate. `server` needs it to validate an
+# upload; `ducktape user cred add apple-codesign` runs the same checks locally.
+# Also the `POST /sign/macos-bundle` pipeline (airlock::sign): the bundle
+# archive in and out (tar + zstd), the per-request tmpfs work dir, and the
+# `rcodesign` runs it drives.
+codesign = ["dep:p12", "dep:x509-cert", "dep:tar", "dep:zstd", "dep:tempfile", "dep:tracing"]
+server = ["dep:reqwest", "dep:axum", "dep:tokio", "dep:tokio-stream", "dep:futures-util", "dep:tracing", "codesign"]
 # Real quote verification: TDX via dcap-qvl (Intel root pinned in-crate), SNP
 # via the AMD VCEK chain (sev crate, crypto_nossl). reqwest for PCS/KDS fetch.
 verify = ["dep:dcap-qvl", "dep:sev", "dep:reqwest"]
 # Test-only fake silicon: mints an SNP-format quote signed by a test chain that
 # verifies ONLY under its own minted roots — never under AMD's.
-testkit = ["verify", "dep:p384", "dep:rsa", "dep:x509-cert", "dep:rand"]
+testkit = ["verify", "codesign", "dep:p384", "dep:rsa", "dep:x509-cert", "dep:rand"]
 
 [dependencies]
 anyhow = "1"
@@ -47,9 +54,16 @@ sev = { version = "8", default-features = false, features = ["snp", "crypto_noss
 p384 = { version = "0.13", optional = true }
 rsa = { version = "0.9", features = ["sha2"], optional = true }
 x509-cert = { version = "0.2", features = ["builder"], optional = true }
+# PKCS#12 for the `apple-codesign` credential kind: the same crate rcodesign
+# opens a `--p12-file` with, so what the gateway admits is what it will sign with.
+p12 = { version = "0.6", optional = true }
 rand = { version = "0.8", optional = true }
 tokio-stream = { version = "0.1", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false }
+tracing = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 # A SELF dev-dependency, the `data-plane`/`provider-host` pattern: every feature
@@ -60,7 +74,7 @@ futures-util = { version = "0.3", optional = true, default-features = false }
 # per-crate loop, alive only when some OTHER package's dev-deps happened to
 # unify the features in (`bin/node`, `broker-host`). Turning them on here means
 # the focused invocation runs what it claims to.
-airlock = { path = ".", features = ["client", "server", "verify", "testkit"] }
+airlock = { path = ".", features = ["client", "server", "verify", "testkit", "codesign"] }
 # The fixture test names dcap-qvl types (QuoteCollateralV3, Quote) directly.
 dcap-qvl = { version = "0.5" }
 axum = "0.8"
@@ -68,3 +82,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "macro
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 hex = "0.4"
+# the signing-route e2e unpacks the sealed reply and runs `rcodesign verify`
+tempfile = { workspace = true }
+tar = { workspace = true }
+zstd = { workspace = true }

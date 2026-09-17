@@ -1,0 +1,32 @@
+# the host-side ODB substrate a wasm `files` tenant delegates its committed
+# surface to. it serves the module without being one: the kernel drives it
+# through `wasm_host::OdbBacking`, over the SAME duckfs machinery the native
+# `Files` runs on. it lives here and not in `files` so the module crate names
+# no kernel host at all — a module is repo-separable, its host substrate is not.
+[package]
+name = "files-odb"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+# the durability ordering is single-sourced: this backing and the native
+# `Files::commit_block` call the same `files::{persist_objects, commit_refs}`.
+files = { workspace = true }
+duckfs-core = { workspace = true }
+duckfs-disk = { workspace = true }
+sdk = { workspace = true }
+# the kernel host whose `OdbBacking` trait this crate implements. no cycle —
+# wasm-host has no files dep.
+wasm-host = { workspace = true }
+
+[dev-dependencies]
+# the crash-safety suite stands the DEPLOYED files guest on this backing, so it
+# needs the guest loader as well as the trait.
+base64 = { workspace = true }
+futures = "0.3"
+# `test_ctx` answers the identity query the native `Files` makes while building
+# the committed dir the backing is then opened on.
+identity = { workspace = true }
+sdk-testkit = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }

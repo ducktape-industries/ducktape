@@ -9,39 +9,41 @@ _ducktape() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local families="node user account wallet gateway fs service agent module collab mcp help --help -h --version -V"
+    local families="node user account wallet gateway fs service agent module collab mcp release help --help -h --version -V"
 
-    local node_verbs="run key init invite admit join list status peers resident member work sandbox log-filter netstack help"
+    local node_verbs="run key init invite admit join list status qualify peers resident member work sandbox log-filter netstack help"
     local node_resident="accept remove"
     local node_member="promote remove leave status"
     local node_work="list admit revoke"
     local node_join="requests state"
     local node_netstack="swap"
-    local node_flags="--config -n --network --sync-only --json --yes --out --dir --name --modules --genesis --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --block-time-ms --ttl-days --node --key --native --component --trust-node"
+    local node_flags="--config -n --network --sync-only --json --yes --out --dir --name --modules --genesis --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --block-time-ms --ttl-days --node --key --component --trust-node"
 
     local user_key="init restore unlock reveal status"
     local user_cred="add list remove grant revoke inspect seal"
-    local user_verbs="key sign-gateway-route sign-frame sign-admin sign-caller cred help"
-    local user_flags="--path --method --statement --out --key --node -n --network --node-key --publisher-node --account --route --name --json --host --remote --attest --pccs-url --snp-product --snp-vcek --vendor --measurement --credentials --cred-kind --token-stdin"
+    local user_verbs="codex claude apple-codesign key sign-gateway-route sign-frame sign-admin sign-caller cred help"
+    local user_flags="--snp-ask --snp-ark --team-id --p12-password-file --p12 --api-key --path --method --statement --out --key --node -n --network --node-key --publisher-node --head --body --name --json --host --remote --attest --pccs-url --snp-product --snp-vcek --vendor --measurement --credentials --cred-kind --token-stdin"
     local account_verbs="create show key login set-name set-profile help"
     local account_key="list approve add join remove"
     local account_flags="--node -n --network --key --auth-page --no-browser --name --eth --number --pubkey --scheme --passkey --ssh --label --ticket --avatar --bio"
     local wallet_verbs="new import list use help"
     local wallet_flags="--config --workspace -n --network --json"
     local gateway_verbs="bind unbind list help"
-    local gateway_flags="--config --workspace -n --network --label --port --account"
-    local fs_verbs="ls cat stat history diff checkout status commit pin unpin help"
+    local gateway_flags="--config --workspace -n --network --label --port --account --credential-file --trusted-loopback"
+    local fs_verbs="put ls cat stat history diff checkout status commit pin unpin help"
     local fs_flags="-n --network --json --node --message --no-rebase --snapshot --limit --prefix --path --key --trust-node"
     local service_verbs="run list enable disable status help"
     local service_flags="--config --workspace -n --network --json --yes -y --enable --no-enable"
     # every service verb takes a KIND now, `list`/`status` included.
     local service_kinds="compute agent airlock"
-    local agent_verbs="pty model-program sched install cancel reassign help"
-    local agent_flags="-n --network --node --key --host-node --cred --cpu --mem --attempt"
+    local agent_verbs="pty model-program sched install cancel reassign chief add status pause resume help"
+    local agent_flags="-n --network --node --key --host-node --account --route --cred --cpu --mem --attempt --package --worker --channel --retry-initialization --installed-by --yes -y"
     local module_verbs="pack update register status help"
-    local module_flags="--index --view --assets --out --after --config -n --network --json"
+    local module_flags="--index --view --assets --lanes --out --after --config -n --network --json"
+    local release_verbs="sign-bundle manifest sign verify schedule status help"
+    local release_flags="-n --unpack-into --node --network --config --credential --out --sequence --display --node-contract --notes-url --kind --archive --successor-key --successor-from --key --sig --pubkey --sha --at --json"
     local collab_verbs="query key attach send ack help"
-    local collab_flags="--target --node -n --network --key --trust-node --conversation --participant --existing-only --device --expect --to --kind --credential --seq --ttl-secs --state --reason"
+    local collab_flags="--target --node -n --network --key --trust-node --channel --participant --existing-only --device --expect --to --kind --message-id --credential --seq --ttl-secs --state --reason"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=( $(compgen -W "$families" -- "$cur") )
@@ -87,6 +89,7 @@ _ducktape() {
         agent)   COMPREPLY=( $(compgen -W "$agent_verbs $agent_flags" -- "$cur") ) ;;
         module)  COMPREPLY=( $(compgen -W "$module_verbs $module_flags" -- "$cur") ) ;;
         collab)  COMPREPLY=( $(compgen -W "$collab_verbs $collab_flags" -- "$cur") ) ;;
+        release) COMPREPLY=( $(compgen -W "$release_verbs $release_flags" -- "$cur") ) ;;
     esac
 }
 

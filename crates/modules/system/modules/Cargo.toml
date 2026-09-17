@@ -13,6 +13,10 @@ ducktape-module-sdk = { workspace = true, optional = true }
 sdk = { workspace = true }
 # the store-record codec: compact, canonical, deterministic. wire stays sdk::wire.
 borsh = { workspace = true }
+# the lane declaration shapes: a module declares them in its artifact frame
+# and this registry commits what the frame said, so the definition is the
+# frame crate's and there is no second copy to drift.
+module-artifact = { workspace = true }
 valset = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }

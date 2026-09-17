@@ -37,7 +37,7 @@ use noded::node_link::NodeLink;
 use saga::{SagaMsg, SagaOrigin, SagaQuery, SagaReply, WorkerRequest};
 use sdk::{Event, Msg};
 
-use crate::work_admission::{self, WorkSource, WorkVerdict};
+use crate::work_admission::{self, WorkVerdict};
 
 /// the daemon's committed-read transport, behind the one method the work
 /// admission needs. The node's own actor lane wears the same trait in
@@ -295,7 +295,7 @@ impl WorkPump {
         let Some(origin) = saga_origin(node, saga_id).await else {
             return WorkVerdict::AuthorityUnavailable;
         };
-        work_admission::admit(node, &self.workspace, &self.me, WorkSource::Saga(&origin)).await
+        work_admission::admit(node, &self.workspace, &self.me, &origin).await
     }
 
     /// the CLAIM lane: announcements no node holds a lease on.

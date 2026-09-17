@@ -9,13 +9,13 @@
 //! step. The guest keeps the only history: [`History::undo`] and
 //! [`History::redo`] are decisions too.
 //!
-//! Every name here mirrors the `ui_lang_guest` / `wire` editor API
+//! Every name here mirrors the `ducktape_view_guest` / `wire` editor API
 //! (`EditorDecision`, `EditorPatch`, `EditorCursor`, `EditorPosition`,
 //! `EditorHistoryEffect`) so wiring is a rename, not a translation. Nothing
-//! here touches iced, the wire, or the host: it compiles for wasm32 and the
+//! here depends on a renderer, the wire, or the host: it compiles for wasm32 and the
 //! native tests alike.
 //!
-//! The transforms are the app's (`app/src/pages/mod.rs`): Enter after a list
+//! The transforms preserve Markdown structure: Enter after a list
 //! item carries the marker down, on an empty item ends the list, at the end of
 //! an unmatched fence closes it; Backspace at the content edge drops the
 //! marker rather than the line above; Tab / Shift+Tab move a line one
@@ -341,16 +341,32 @@ fn remove_list_marker(doc: &Doc) -> Option<Edit> {
     }
     let line = doc.cursor.position.line as usize;
     let text = doc.line(line)?;
-    let marker = list_marker(text)?;
-    if doc.cursor.position.column as usize != marker.content {
+    let (indent, content) = match list_marker(text) {
+        Some(marker) => (marker.indent, marker.content),
+        None => block_prefix(text)?,
+    };
+    // At the content edge, or anywhere inside the collapsed prefix (an arrow
+    // hop can land on column 0): the shape goes, the line above stays.
+    let past_the_prefix = doc.cursor.position.column as usize > content;
+    if past_the_prefix {
         return None;
     }
     let start = doc.offset(EditorPosition::new(line, 0));
     Some(Edit {
-        range: start + marker.indent..start + marker.content,
+        range: start + indent..start + content,
         replacement: String::new(),
-        cursor: EditorCursor::at(line, marker.indent),
+        cursor: EditorCursor::at(line, indent),
     })
+}
+
+/// A heading, quote or callout prefix as `(indent, content)`: the shape
+/// Backspace at the content edge drops — the line turns into a paragraph —
+/// before it would join the line above, the way a list marker does.
+fn block_prefix(text: &str) -> Option<(usize, usize)> {
+    let indent = text.len() - text.trim_start_matches([' ', '\t']).len();
+    let content = crate::markdown::content_start(text);
+    let prefixed = content > indent;
+    prefixed.then_some((indent, content))
 }
 
 /// Tab / Shift+Tab move the caret's line by one nesting step. Two spaces is

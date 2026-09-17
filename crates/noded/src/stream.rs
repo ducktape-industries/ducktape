@@ -4,8 +4,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use duckfs_core::{Change, FilesMsg};
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
@@ -49,7 +47,7 @@ pub const FILES_SCAN_BUDGET: usize = STREAM_CATCHUP_BUDGET * 4;
 pub const LOG_RING_CAPACITY: usize = 4_096;
 pub const RUN_OUTPUT_MAX_RUNS: usize = 32;
 pub const RUN_OUTPUT_MAX_LINES: usize = 2_048;
-/// the exact width of a run-output id: `runs::dispatch_id_for` is a hex
+/// the exact width of a run-output id: `runs_wire::dispatch_id_for` is a hex
 /// sha256, and the agent data plane's `valid_event` enforces the same 64-hex
 /// shape before forwarding a line to a peer. This is NOT cosmetic — see
 /// [`ClientMsg::RunOutput`].
@@ -61,7 +59,7 @@ const RUN_OUTPUT_ID_LEN: usize = 64;
 /// there would be the same stream teardown, one layer later. 16 KiB is far
 /// above any real provider line while leaving room for the peer forwarder's
 /// `[node xxxxxxxx] ` prefix and the json envelope.
-const MAX_RUN_OUTPUT_LINE: usize = 16 * 1024;
+pub(crate) const MAX_RUN_OUTPUT_LINE: usize = 16 * 1024;
 
 /// how long a command may wait to reach the attached service daemon before the
 /// link is declared wedged. Generous — a healthy daemon takes one in microseconds
@@ -79,6 +77,13 @@ const SERVICE_COMMAND_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMsg {
+    ComputeAttach {
+        token: String,
+    },
+    RunControlReply {
+        id: u64,
+        result: Result<serde_json::Value, String>,
+    },
     /// join one or more topics. THIS is where a topic's admission is decided —
     /// see [`Topic::admission`] — so the handles this frame hands back are
     /// themselves the capability, and a family a caller was never admitted to
@@ -105,35 +110,6 @@ pub enum ClientMsg {
     },
     Unsubscribe {
         topics: Vec<String>,
-    },
-    /// keystrokes for an interactive terminal session (see `crate::term`).
-    /// `data` is base64 of the raw bytes to write to the session's pty. A
-    /// session this connection holds no admitted handle on — and an unknown id
-    /// — is dropped with a named reason, never a panic ([`holds_session`]).
-    TermInput {
-        session: String,
-        data: String,
-    },
-    /// a terminal resize for an interactive session: set the pty window size so
-    /// the CLI's TUI reflows.
-    TermResize {
-        session: String,
-        cols: u16,
-        rows: u16,
-    },
-    /// a submitted COMMAND for an interactive session — the ordered "command
-    /// grain" (a prompt / line), not raw keystrokes. `origin` is the
-    /// caller-supplied attribution (the app passes a member label), stored
-    /// verbatim and UNTRUSTED until consensus signs it (PR 2). Gated exactly
-    /// like [`Self::TermInput`] (the
-    /// connection must be subscribed to the session's `term:<id>` topic); the
-    /// session's serial consumer assigns the total order and feeds `text` +
-    /// Enter to the pty. This is the `CommandSource` seam consensus (PR 2) will
-    /// drive; `TermInput` stays for the solo raw-keystroke case.
-    TermCommand {
-        session: String,
-        text: String,
-        origin: String,
     },
     /// one live output line from a run this node's COMPUTE DAEMON is executing.
     ///
@@ -202,12 +178,14 @@ pub enum ClientMsg {
     },
 }
 
-// Serialize-only: the node SENDS frames and never parses its own, so there is
-// no `Deserialize` to conflict when [`Self::TermChunk`] shares the `event` tag
-// with [`Self::Event`] (a derived deserializer's tag match would be ambiguous).
+// Serialize-only: the node SENDS frames and never parses its own.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
+    RunControlSnapshot {
+        topic: String,
+        control: Option<serde_json::Value>,
+    },
     Subscribed {
         /// admitted topic -> its start cursor. A REFUSED topic is not in here;
         /// it got its own `Error` frame, ahead of this one, naming the code.
@@ -221,49 +199,13 @@ pub enum ServerFrame {
         cursor: String,
         op: StreamOpRow,
     },
-    /// one raw chunk of interactive-terminal output on a `term:<session>`
-    /// topic: `item` is base64 of the pty bytes and `cursor` is the ring
-    /// sequence used to resume without replaying bytes already rendered. It
-    /// rides the SAME `type: "event"` tag the client keys on, but carries no
-    /// `op` — the client routes it by the `term:` topic prefix + string `item`,
-    /// distinct from the op-carrying
-    /// module [`Self::Event`]. ServerFrame is
-    /// serialize-only at runtime (the node sends, never parses its own frames),
-    /// so sharing the `event` tag is safe.
-    #[serde(rename = "event")]
-    TermChunk {
-        topic: String,
-        cursor: String,
-        item: String,
-    },
-    /// one entry of an interactive session's ordered, attributed command log on
-    /// a `term-cmd:<session>` topic: the total-order `seq`, the command's
-    /// `origin` (attribution), and its `text` (the submitted line). Distinct
-    /// from the raw-output [`Self::TermChunk`] — this is the
-    /// shared-conversation-object view. Delivered + caught up like a run-output
-    /// tail: a `seq` cursor, replayed on (re)subscribe.
-    TermCommandLog {
-        topic: String,
-        seq: u64,
-        origin: String,
-        text: String,
-    },
     Tail {
         topic: String,
         cursor: String,
         item: TailItem,
     },
-    /// the interactive session's child (and its container) has exited: the
-    /// `term:<session>` topic is complete and will never append again. Sent
-    /// ONCE, after the session's final output chunks, then the topic is dropped.
-    /// A driving `agent pty` client breaks its attach loop on this (the desktop
-    /// app closes the pane); without it a client blocks forever on a dead topic.
-    TermEnded {
-        topic: String,
-    },
-    /// one command for the attached agent daemon: spawn a pty, feed it, resize
-    /// it, end it. Sent only on the connection that holds the service link, so
-    /// it never reaches an ordinary subscriber.
+    /// one command for the attached agent daemon. Sent only on the connection
+    /// that holds the service link, so it never reaches an ordinary subscriber.
     ServiceCommand {
         command: agent_service::wire::Command,
     },
@@ -489,14 +431,6 @@ pub struct StreamHub {
     tip: Arc<RwLock<Option<(u64, String)>>>,
     logs: LogRing,
     run_output: RunOutputRegistry,
-    /// per-session interactive-terminal scrollback. Always present (cheap), the
-    /// same way `run_output` is: the terminal manager appends to it and the ws
-    /// catch-up path replays it for `term:<session>` subscribers.
-    terminals: crate::term::TermRing,
-    /// per-session ordered command log — a focused twin of `terminals`: the
-    /// session's serial command consumer appends `(seq, origin, text)` and the
-    /// ws catch-up path replays it for `term-cmd:<session>` subscribers.
-    term_commands: crate::term::TermCommandRing,
     /// wired once at boot by a daemon that registers [`crate::NodeMetrics`], so
     /// the index sweeps this hub gates can be COUNTED. Unwired (simnode, the
     /// router tests) every record is a no-op.
@@ -516,8 +450,6 @@ impl StreamHub {
             tip: Arc::new(RwLock::new(None)),
             logs,
             run_output: RunOutputRegistry::default(),
-            terminals: crate::term::TermRing::default(),
-            term_commands: crate::term::TermCommandRing::default(),
             metrics: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -560,21 +492,6 @@ impl StreamHub {
 
     pub fn run_output(&self) -> RunOutputRegistry {
         self.run_output.clone()
-    }
-
-    /// the interactive-terminal scrollback ring. The daemon hands this to the
-    /// [`crate::term::TerminalSessions`] manager so its pump appends to the same
-    /// ring the ws catch-up replays.
-    pub fn terminals(&self) -> crate::term::TermRing {
-        self.terminals.clone()
-    }
-
-    /// the interactive-terminal ordered command-log ring. The daemon hands this
-    /// to the [`crate::term::TerminalSessions`] manager so each session's serial
-    /// command consumer appends to the same ring the ws `term-cmd:<session>`
-    /// catch-up replays.
-    pub fn term_commands(&self) -> crate::term::TermCommandRing {
-        self.term_commands.clone()
     }
 
     /// one subscription to the block wake. The ws sessions ride it, and so
@@ -816,6 +733,7 @@ pub(crate) fn resume_within(after: u64, floor: u64, head: u64) -> u64 {
 
 #[derive(Clone)]
 pub struct RunOutputRegistry {
+    pub(crate) controls: crate::run_control::Hub,
     inner: Arc<Mutex<RunOutputInner>>,
     watch: watch::Sender<u64>,
     appends: broadcast::Sender<RunOutputEvent>,
@@ -888,6 +806,7 @@ impl Default for RunOutputRegistry {
         let (watch, _) = watch::channel(0);
         let (appends, _) = broadcast::channel(RUN_OUTPUT_MAX_LINES);
         Self {
+            controls: crate::run_control::Hub::default(),
             inner: Arc::new(Mutex::new(RunOutputInner::default())),
             watch,
             appends,
@@ -1088,20 +1007,6 @@ enum TopicState {
         id: String,
         seq: u64,
     },
-    /// an interactive terminal session's output stream (`term:<session>`).
-    /// `seq` is the last emitted ring chunk — the same seq-cursor model as
-    /// `RunOutput`.
-    Term {
-        session: String,
-        seq: u64,
-    },
-    /// an interactive session's ordered command log (`term-cmd:<session>`).
-    /// `seq` is the last emitted command — the same seq-cursor model as `Term`,
-    /// against the command-log ring instead of the output ring.
-    TermCommand {
-        session: String,
-        seq: u64,
-    },
     /// a SNAPSHOT topic: each wakeup re-samples the whole exposition, so the
     /// cursor (the last sample's `time_ms`) is bookkeeping, never a resume
     /// point — there is no backlog to replay and the topic never lags.
@@ -1124,10 +1029,7 @@ impl TopicState {
     fn cursor(&self) -> String {
         match self {
             Self::Module { cursor, .. } | Self::FilesWatch { cursor } => cursor.clone(),
-            Self::Logs { seq }
-            | Self::RunOutput { seq, .. }
-            | Self::Term { seq, .. }
-            | Self::TermCommand { seq, .. } => seq.to_string(),
+            Self::Logs { seq } | Self::RunOutput { seq, .. } => seq.to_string(),
             Self::Metrics { sampled_ms }
             | Self::Peers { sampled_ms }
             | Self::Status { sampled_ms } => sampled_ms.to_string(),
@@ -1167,8 +1069,6 @@ enum Wake {
     Block,
     Logs,
     RunOutput,
-    Term,
-    TermCommand,
     Tick,
     All,
 }
@@ -1180,8 +1080,6 @@ impl TopicState {
             Wake::Block => matches!(self, Self::Module { .. } | Self::FilesWatch { .. }),
             Wake::Logs => matches!(self, Self::Logs { .. }),
             Wake::RunOutput => matches!(self, Self::RunOutput { .. }),
-            Wake::Term => matches!(self, Self::Term { .. }),
-            Wake::TermCommand => matches!(self, Self::TermCommand { .. }),
             Wake::Tick => matches!(
                 self,
                 Self::Metrics { .. } | Self::Peers { .. } | Self::Status { .. }
@@ -1193,7 +1091,7 @@ impl TopicState {
 /// Serve one ws connection.
 ///
 /// `reader_of` is the ONE capability this socket may have been given before it
-/// existed: the dispatch id whose output ring the caller proved it created
+/// existed: the dispatch id whose output ring the caller proved it may read
 /// ([`admit_run_reader`]). It is set at the upgrade and never changes, so a
 /// connection cannot talk its way into another run's output mid-session.
 pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of: Option<String>) {
@@ -1201,8 +1099,6 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of
     let mut block_rx = hub.subscribe_blocks();
     let mut log_rx = hub.log_ring().subscribe();
     let mut run_rx = hub.run_output().subscribe();
-    let mut term_rx = hub.terminals().subscribe();
-    let mut term_cmd_rx = hub.term_commands().subscribe();
     let mut heartbeat = tokio::time::interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
     // FIRST TICK AFTER ONE PERIOD, not immediately: `interval` fires at once,
     // and a session that has just run its subscribe-time `Wake::All` owes
@@ -1215,36 +1111,38 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of
     let mut topics = BTreeMap::new();
     // set once, by a `ServiceAttach` that this node accepts. The guard's Drop —
     // on every `return` below, and on the task being cancelled — releases the
-    // link and ends every session the daemon was serving, so a client attached
-    // to a dead session's topic is told rather than left blocked.
-    let mut attached: Option<crate::term::AttachGuard> = None;
+    // link, so the next daemon can take it.
+    let mut attached: Option<crate::service_link::AttachGuard> = None;
     let mut service_rx: Option<mpsc::Receiver<agent_service::wire::Command>> = None;
+    let controls_changed = hub.run_output().controls.changed.clone();
+    let mut worker: Option<crate::run_control::Worker> = None;
+    let mut control_rx: Option<mpsc::Receiver<crate::run_control::Command>> = None;
 
     loop {
         tokio::select! {
+            _ = controls_changed.notified() => {
+                if !catch_up(&handle, &mut socket, &mut topics, Wake::RunOutput).await { return; }
+            }
             frame = socket.next() => {
                 let Some(frame) = frame else { return };
                 match frame {
                     Ok(Message::Text(text)) => {
                         match serde_json::from_str::<ClientMsg>(text.as_str()) {
-                            // terminal input/resize act on the session manager,
-                            // not on this connection's topic set — and the write
-                            // is async — so they're handled here, before the
-                            // sync topic path.
-                            Ok(ClientMsg::TermInput { session, data }) => {
-                                handle_term_input(&handle, &topics, &session, &data).await;
-                            }
-                            Ok(ClientMsg::TermResize { session, cols, rows }) => {
-                                handle_term_resize(&handle, &topics, &session, cols, rows).await;
-                            }
-                            Ok(ClientMsg::TermCommand { session, text, origin }) => {
-                                handle_term_command(&handle, &topics, &session, origin, text);
-                            }
                             // a compute daemon's live run tail: append to the
                             // same ring the in-process sink used to feed, so
                             // `run-output:<id>` subscribers cannot tell which
                             // process produced the line.
+                            Ok(ClientMsg::ComputeAttach { token }) => {
+                                let authorized = worker.is_none() && handle.workspace_secret_matches(&token);
+                                if !authorized { return; }
+                                let (attached, receiver) = hub.run_output().controls.attach();
+                                worker = Some(attached); control_rx = Some(receiver);
+                            }
+                            Ok(ClientMsg::RunControlReply { id, result }) => {
+                                if let Some(worker) = &worker { worker.reply(id,result); }
+                            }
                             Ok(ClientMsg::RunOutput { id, stream, line }) => {
+                                if let Some(worker) = &worker { worker.observe(&id,&line); }
                                 handle_run_output(&hub, id, stream, line);
                             }
                             // a service daemon claiming this connection as its
@@ -1349,22 +1247,6 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of
                     return;
                 }
             }
-            changed = term_rx.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                if !catch_up(&handle, &mut socket, &mut topics, Wake::Term).await {
-                    return;
-                }
-            }
-            changed = term_cmd_rx.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                if !catch_up(&handle, &mut socket, &mut topics, Wake::TermCommand).await {
-                    return;
-                }
-            }
             // the service link's outbound half. Inert on every connection that
             // is not the attached daemon (see `next_service_command`).
             //
@@ -1377,6 +1259,16 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of
             // them, permanently. A daemon that cannot accept a command in this
             // long is wedged; dropping the link ends its sessions cleanly
             // (`AttachGuard`) and lets it redial.
+            command = async {
+                match &mut control_rx {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(command) = command else { return; };
+                let frame = serde_json::json!({"type":"run_control","command":command});
+                if socket.send(Message::Text(frame.to_string().into())).await.is_err() { return; }
+            }
             command = next_service_command(&mut service_rx) => {
                 let sent = tokio::time::timeout(
                     SERVICE_COMMAND_WRITE_TIMEOUT,
@@ -1444,7 +1336,7 @@ fn take_service_link(
     token: &str,
 ) -> Result<
     (
-        crate::term::AttachGuard,
+        crate::service_link::AttachGuard,
         mpsc::Receiver<agent_service::wire::Command>,
     ),
     &'static str,
@@ -1452,32 +1344,31 @@ fn take_service_link(
     if kind != crate::services::AGENT_KIND {
         return Err("only the agent service has a command link on this node");
     }
-    let terminals = handle
-        .terminals()
-        .ok_or("terminal sessions are not enabled on this node")?;
-    terminals.attach(token).ok_or(
+    let link = handle
+        .service_link()
+        .ok_or("the agent service link is not enabled on this node")?;
+    link.attach(token).ok_or(
         "refused: present this node's service-link token, and only one agent service may attach",
     )
 }
 
-/// every `ducktape::term` refusal below that a CLIENT drives per frame (a held
-/// key, a resize, a command, a publisher hammering an unattached connection),
-/// latched by reason. Unlatched, any one of them repeats at whatever rate the
-/// client sends frames — ~30/s for a held key — and evicts the whole
-/// 4096-line ring in about two minutes. First occurrence, then every 100th,
-/// carrying `occurrences`; the counter is the diagnosis.
-static TERM_WARN: crate::log::Latch = crate::log::Latch::new(100);
+/// every `ducktape::service` refusal below that a CLIENT drives per frame (a
+/// publisher hammering an unattached connection), latched by reason. Unlatched,
+/// it repeats at whatever rate the client sends frames and evicts the whole
+/// 4096-line ring. First occurrence, then every 100th, carrying `occurrences`;
+/// the counter is the diagnosis.
+static LINK_WARN: crate::log::Latch = crate::log::Latch::new(100);
 
-/// Apply one daemon-published event to the terminal plane, or drop it.
+/// Apply one daemon-published event to the service link, or drop it.
 ///
-/// The `attached` gate is a trust boundary, not tidiness: these events append to
-/// scrollback rings and terminate sessions, so an unattached connection
-/// publishing one would be injecting into another member's terminal.
+/// The `attached` gate is a trust boundary, not tidiness: a receipt reaches the
+/// collaboration pump, which acknowledges it on-chain, so an unattached
+/// connection publishing one would be speaking for another member's daemon.
 fn handle_agent_event(handle: &NodeHandle, attached: bool, event: agent_service::wire::Event) {
     if !attached {
-        if let Some(occurrences) = TERM_WARN.hit("unattached_publisher") {
+        if let Some(occurrences) = LINK_WARN.hit("unattached_publisher") {
             tracing::warn!(
-                target: "ducktape::term",
+                target: "ducktape::service",
                 reason = "unattached_publisher",
                 occurrences,
                 "agent event dropped"
@@ -1485,18 +1376,18 @@ fn handle_agent_event(handle: &NodeHandle, attached: bool, event: agent_service:
         }
         return;
     }
-    let Some(terminals) = handle.terminals() else {
-        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
+    let Some(link) = handle.service_link() else {
+        if let Some(occurrences) = LINK_WARN.hit("no_service_link") {
             tracing::warn!(
-                target: "ducktape::term",
-                reason = "no_terminal_plane",
+                target: "ducktape::service",
+                reason = "no_service_link",
                 occurrences,
                 "agent event dropped"
             );
         }
         return;
     };
-    terminals.on_event(event);
+    link.on_event(event);
 }
 
 fn handle_client_msg(
@@ -1527,9 +1418,8 @@ fn handle_client_msg(
         // handled inline in `stream_session` (they act on the session manager,
         // off this connection's topic set), so they never reach here — but the
         // match stays exhaustive.
-        ClientMsg::TermInput { .. }
-        | ClientMsg::TermResize { .. }
-        | ClientMsg::TermCommand { .. }
+        ClientMsg::ComputeAttach { .. }
+        | ClientMsg::RunControlReply { .. }
         | ClientMsg::RunOutput { .. }
         | ClientMsg::ServiceAttach { .. }
         | ClientMsg::AgentEvent { .. } => Vec::new(),
@@ -1574,247 +1464,6 @@ fn handle_run_output(hub: &StreamHub, id: String, stream: RunStream, line: Strin
         return;
     }
     hub.run_output().append(id, stream, line);
-}
-
-/// Does this connection hold an ADMITTED handle on `session`'s pty?
-///
-/// The handle IS the capability, and that is no longer circular. Its predecessor
-/// (`term_entitled`) asked `topics.contains_key("term:<id>")` while subscribing
-/// was unconditional, so any connection self-granted pty write access by
-/// subscribing first — the check answered "are you subscribed?" as a proxy for
-/// "are you allowed?", and nothing gated the subscribe. Admission now happens at
-/// the subscribe ([`Topic::admission`]: `term:<session>` is
-/// [`Admission::Workspace`]), so a connection that holds this handle has already
-/// proved it can read this node's own workspace — the same proof
-/// [`take_service_link`] makes the agent daemon give.
-///
-/// The state VARIANT is part of the answer, not just the key: nothing but an
-/// admitted `term:` subscription may drive a pty, whatever else is on the
-/// connection.
-fn holds_session(topics: &BTreeMap<String, TopicState>, session: &str) -> bool {
-    matches!(
-        topics.get(&crate::term::topic(session)),
-        Some(TopicState::Term { .. })
-    )
-}
-
-/// the host node a session's input must be forwarded to, or `None` for a local
-/// session (write to this node's pty). Just the guest-side registry lookup.
-fn forward_target(handle: &NodeHandle, session: &str) -> Option<[u8; 32]> {
-    handle.remote_sessions().host_of(session)
-}
-
-/// forward one input event to the session's host over the guest lane. A missing
-/// lane or a full channel drops the frame (never a panic); never logs the bytes.
-async fn forward_input(handle: &NodeHandle, host: [u8; 32], event: crate::SessionInputWire) {
-    let Some(lane) = handle.session_lane() else {
-        if let Some(occurrences) = TERM_WARN.hit("no_session_lane") {
-            tracing::warn!(
-                target: "ducktape::term",
-                reason = "no_session_lane",
-                occurrences,
-                "term input dropped"
-            );
-        }
-        return;
-    };
-    if lane
-        .send(crate::SessionJob::Input { host, event })
-        .await
-        .is_err()
-        && let Some(occurrences) = TERM_WARN.hit("input_forward_failed")
-    {
-        tracing::warn!(
-            target: "ducktape::term",
-            reason = "input_forward_failed",
-            occurrences,
-            "term input dropped"
-        );
-    }
-}
-
-/// write base64-decoded keystrokes to a session's pty. Refused (no-op + a log
-/// line) when the connection holds no admitted handle on the session
-/// (`unadmitted_session`), the terminal plane is absent, the session is unknown,
-/// or the base64 is bad — never a panic. Never logs the bytes; the refusal logs
-/// no id (an id the caller was not admitted to is not the node's to echo into
-/// the log ring the app streams).
-///
-/// `unadmitted_session` is `debug`, not `warn`, and for the reason
-/// [`refuse_topic`] already gives: it is PER-KEYSTROKE. An unadmitted client
-/// held-down key would otherwise mint one `warn` per repeat into the 4096-line
-/// ring — evicting the very context an operator opened the Logs tab to read,
-/// and doing it through the `logs` topic any ws caller may hold. The other three
-/// reasons here stay `warn`, each once per frame class rather than once per
-/// byte — but a stuck client can still hold ANY of those frame classes down,
-/// so they go through [`TERM_WARN`] too.
-async fn handle_term_input(
-    handle: &NodeHandle,
-    topics: &BTreeMap<String, TopicState>,
-    session: &str,
-    data_b64: &str,
-) {
-    if !holds_session(topics, session) {
-        tracing::debug!(target: "ducktape::term", reason = "unadmitted_session", "term input dropped");
-        return;
-    }
-    // a remote session lives on a host peer — forward the keystrokes there rather
-    // than writing a (nonexistent) local pty.
-    if let Some(host) = forward_target(handle, session) {
-        forward_input(
-            handle,
-            host,
-            crate::SessionInputWire::Input {
-                session: session.to_string(),
-                data_b64: data_b64.to_string(),
-            },
-        )
-        .await;
-        return;
-    }
-    let Some(terminals) = handle.terminals() else {
-        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
-            tracing::warn!(
-                target: "ducktape::term",
-                reason = "no_terminal_plane",
-                occurrences,
-                "term input dropped"
-            );
-        }
-        return;
-    };
-    // a live session has a mode; an unknown or already-ended one has none. Two
-    // causes, two countable reasons — collapsing them would hide "the id is
-    // stale" behind "you used the wrong lane".
-    let Some(mode) = terminals.mode(session) else {
-        if let Some(occurrences) = TERM_WARN.hit("unknown_session") {
-            tracing::warn!(
-                target: "ducktape::term",
-                session = %session,
-                reason = "unknown_session",
-                occurrences,
-                "term input dropped"
-            );
-        }
-        return;
-    };
-    // raw keystrokes are the SINGLE-session path only. A shared session refuses
-    // them so nothing bypasses its ordered command lane (drive it with
-    // TermCommand).
-    if mode != crate::term::SessionMode::Single {
-        if let Some(occurrences) = TERM_WARN.hit("raw_input_on_shared") {
-            tracing::warn!(
-                target: "ducktape::term",
-                session = %session,
-                reason = "raw_input_on_shared",
-                occurrences,
-                "term input dropped"
-            );
-        }
-        return;
-    }
-    // decoded here purely to refuse a malformed frame at this boundary; the
-    // daemon takes the base64 as-is, so the bytes never round-trip.
-    if STANDARD.decode(data_b64).is_err() {
-        if let Some(occurrences) = TERM_WARN.hit("bad_base64") {
-            tracing::warn!(
-                target: "ducktape::term",
-                session = %session,
-                reason = "bad_base64",
-                occurrences,
-                "term input dropped"
-            );
-        }
-        return;
-    }
-    terminals.input(session, data_b64).await;
-}
-
-/// resize a session's pty. Same admission gate + no-op-on-unknown discipline
-/// as input.
-async fn handle_term_resize(
-    handle: &NodeHandle,
-    topics: &BTreeMap<String, TopicState>,
-    session: &str,
-    cols: u16,
-    rows: u16,
-) {
-    if !holds_session(topics, session) {
-        tracing::debug!(target: "ducktape::term", reason = "unadmitted_session", "term resize dropped");
-        return;
-    }
-    // a remote session's window change forwards to its host.
-    if let Some(host) = forward_target(handle, session) {
-        forward_input(
-            handle,
-            host,
-            crate::SessionInputWire::Resize {
-                session: session.to_string(),
-                cols,
-                rows,
-            },
-        )
-        .await;
-        return;
-    }
-    let Some(terminals) = handle.terminals() else {
-        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
-            tracing::warn!(
-                target: "ducktape::term",
-                reason = "no_terminal_plane",
-                occurrences,
-                "term resize dropped"
-            );
-        }
-        return;
-    };
-    // the same no-op-on-unknown discipline as input: refuse here rather than
-    // spending a link frame on a session that is already gone.
-    if terminals.mode(session).is_none() {
-        if let Some(occurrences) = TERM_WARN.hit("unknown_session") {
-            tracing::warn!(
-                target: "ducktape::term",
-                session = %session,
-                reason = "unknown_session",
-                occurrences,
-                "term resize dropped"
-            );
-        }
-        return;
-    }
-    terminals.resize(session, cols, rows).await;
-}
-
-/// enqueue a submitted COMMAND onto a session's ordered command lane (the
-/// `CommandSource` seam). Gated exactly like [`handle_term_input`]: the
-/// connection must hold an ADMITTED handle on the session's `term:<id>` output
-/// topic ([`holds_session`]). Refused (no-op + `warn`) when it does not, or the
-/// terminal plane is absent; an unknown session id is warned inside
-/// `enqueue_command`. Never logs the command text (it can carry secrets); the
-/// serial consumer assigns the total order and feeds the pty.
-fn handle_term_command(
-    handle: &NodeHandle,
-    topics: &BTreeMap<String, TopicState>,
-    session: &str,
-    origin: String,
-    text: String,
-) {
-    if !holds_session(topics, session) {
-        tracing::debug!(target: "ducktape::term", reason = "unadmitted_session", "term command dropped");
-        return;
-    }
-    let Some(terminals) = handle.terminals() else {
-        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
-            tracing::warn!(
-                target: "ducktape::term",
-                reason = "no_terminal_plane",
-                occurrences,
-                "term command dropped"
-            );
-        }
-        return;
-    };
-    terminals.enqueue_command(session, origin, text);
 }
 
 fn subscribe_topics(
@@ -1918,10 +1567,6 @@ const PEERS_TOPIC: &str = "peers";
 const STATUS_TOPIC: &str = "status";
 const MODULE_PREFIX: &str = "module:";
 const RUN_OUTPUT_PREFIX: &str = "run-output:";
-/// checked before [`TERM_PREFIX`] for readability only — the two diverge at the
-/// fifth byte (`-` vs `:`), so neither is a prefix of the other.
-const TERM_COMMAND_PREFIX: &str = "term-cmd:";
-const TERM_PREFIX: &str = "term:";
 
 /// every topic family this node serves, parsed from the wire name exactly once.
 ///
@@ -1940,10 +1585,6 @@ enum Topic<'a> {
     Logs,
     /// one run's stdout/stderr tail.
     RunOutput(&'a str),
-    /// one interactive session's ordered, attributed command log.
-    TermCommand(&'a str),
-    /// one interactive session's raw pty bytes, local or remote-hosted.
-    Term(&'a str),
     /// the Prometheus exposition, re-sampled per heartbeat.
     Metrics,
     /// the direct-peer sample, re-sampled per heartbeat.
@@ -1964,8 +1605,6 @@ enum Admission<'a> {
     /// no gate on it, so a check here would refuse an honest client and stop
     /// nobody.
     Public,
-    /// this node's own 0600 workspace secret ([`crate::services::LINK_TOKEN_FILE`]).
-    Workspace,
     /// ONE run's output ring: the workspace secret, or an upgrade signed by the
     /// key that CREATED this dispatch (`?run=<id>`, admitted in
     /// [`admit_run_reader`] before the socket exists).
@@ -1987,12 +1626,6 @@ impl<'a> Topic<'a> {
         }
         if let Some(id) = name.strip_prefix(RUN_OUTPUT_PREFIX) {
             return Some(Self::RunOutput(id));
-        }
-        if let Some(session) = name.strip_prefix(TERM_COMMAND_PREFIX) {
-            return Some(Self::TermCommand(session));
-        }
-        if let Some(session) = name.strip_prefix(TERM_PREFIX) {
-            return Some(Self::Term(session));
         }
         match name {
             FILES_WATCH_TOPIC => Some(Self::FilesWatch),
@@ -2019,14 +1652,11 @@ impl<'a> Topic<'a> {
     /// asymmetry is real and survives this change deliberately rather than
     /// silently.
     ///
-    /// The gated three all carry provider/member bytes with no unauthenticated
-    /// HTTP twin at all: a pty's raw output, the command log whose `text`
-    /// `crate::term` documents as able to carry secrets, and a run's stdout.
-    ///
-    /// A run's stdout is the one of those three a caller can reach WITHOUT the
-    /// workspace, and only for a run it created: a remote app is the device that
-    /// asked for the run, and refusing it the progress of its own work made the
-    /// feature local-only. It is still not public — see [`Admission::Run`].
+    /// A run's stdout carries provider bytes with no unauthenticated HTTP twin
+    /// at all, so it is gated — and a caller can reach it WITHOUT the workspace
+    /// only for a run it created: a remote app is the device that asked for the
+    /// run, and refusing it the progress of its own work made the feature
+    /// local-only. It is still not public — see [`Admission::Run`].
     fn admission(self) -> Admission<'a> {
         match self {
             Self::Module(_) => Admission::Public,
@@ -2036,8 +1666,6 @@ impl<'a> Topic<'a> {
             Self::Peers => Admission::Public,
             Self::Status => Admission::Public,
             Self::RunOutput(id) => Admission::Run(id),
-            Self::TermCommand(_) => Admission::Workspace,
-            Self::Term(_) => Admission::Workspace,
         }
     }
 }
@@ -2098,9 +1726,8 @@ impl TopicRefusal {
                  the workspace and send it as `token` on the subscribe"
             }
             Self::NotThisRunsReader => {
-                "a run's output is for the device that hosts this node or the key \
-                 that created the run — present the service-link token, or open \
-                 the socket as `/v1/ws?run=<dispatch>` signed by that key"
+                "run output requires the workspace token, the requester, or its program \
+                 controller — open `/v1/ws?run=<dispatch>` signed by an authorized key"
             }
         }
     }
@@ -2127,31 +1754,58 @@ fn refuse_topic(topic: &str, refusal: TopicRefusal) -> ServerFrame {
     }
 }
 
-/// Is `requester` the key that signed this upgrade?
-///
-/// A chat run is created by a SIGNED FRAME the app submits, so the committed
-/// run's `requester` is `Origin::External(<that key>)` — the same bytes
-/// [`crate::signed_req::verify_signed_request`] hands back. The two are compared
-/// directly: no account lookup stands between them, and no authority is
-/// invented. The device that asked for the work may watch it.
-///
-/// NARROWER THAN CANCELLING ON PURPOSE. `runs`'s own rule
-/// (`admin.rs::controlled_dispatch_id`) also lets the agent's program controller
-/// stop a run; that arm needs an in-module `control_model` read this node cannot
-/// make, so it is left out. Leaving it out refuses a reader who could have been
-/// admitted; it admits nobody who could not.
-fn created_by(requester: &sdk::Origin, key: &[u8]) -> bool {
-    matches!(requester, sdk::Origin::External(id) if id == key)
+/// An external requester proves its exact key. A program requester has no
+/// key: its current controller's key-held account may read and steer its runs.
+/// Module/system origins grant no interactive authority. Both the live and
+/// settled paths resolve the same committed identity records.
+pub(crate) async fn run_reader(
+    handle: &NodeHandle,
+    requester: &sdk::Origin,
+    key: &[u8],
+) -> Result<bool, String> {
+    match requester {
+        sdk::Origin::External(id) => Ok(!id.is_empty() && id == key),
+        sdk::Origin::Program(number) => program_run_reader(handle, *number, key).await,
+        sdk::Origin::Module(_) | sdk::Origin::System => Ok(false),
+    }
 }
 
-/// Admit a `/v1/ws?run=<dispatch>` upgrade as that run's creator, or answer the
+async fn program_run_reader(handle: &NodeHandle, number: u64, key: &[u8]) -> Result<bool, String> {
+    let (reply, rx) = futures::channel::oneshot::channel();
+    handle
+        .send(crate::NodeCommand::Query {
+            target: "identity".into(),
+            req: identity::encode_query(&identity::IdentityQuery::Get { number }),
+            reply,
+        })
+        .await
+        .map_err(|_| "actor gone".to_string())?;
+    let bytes = rx
+        .await
+        .map_err(|_| "reply dropped".to_string())?
+        .map_err(|refused| refused.message)?;
+    let identity::IdentityReply::Account(account) = identity::decode_reply(&bytes)? else {
+        return Err("unexpected identity reply".into());
+    };
+    let Some(identity::AccountView {
+        control: identity::Control::Program { controller, .. },
+        ..
+    }) = account
+    else {
+        return Ok(false);
+    };
+    let reader = crate::handle::account_of_key(handle, key.to_vec()).await?;
+    Ok(reader == Some(controller))
+}
+
+/// Admit a `/v1/ws?run=<dispatch>` upgrade as a run reader, or answer the
 /// refusal to send instead.
 ///
 /// Two steps, in this order, because the cheap one is the one that must not be
 /// skipped: the signature over `GET` + this exact path+query + an empty body
 /// (the data-plane trio, carried as headers so the proof never enters a query
-/// string or a log), then ONE committed `runs` read asking whether the key that
-/// signed it created this dispatch.
+/// string or a log), then committed run and identity reads resolving the
+/// requester or its current program controller.
 ///
 /// Decided BEFORE the socket exists, which is what keeps
 /// [`subscribe_topics`] synchronous: the committed read happens once per
@@ -2173,15 +1827,22 @@ pub(crate) async fn admit_run_reader(
     let pending = pending_runs(handle).await.map_err(|reason| {
         crate::error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, &reason)
     })?;
-    let created = pending
-        .iter()
-        .find(|run| run.dispatch_id == dispatch)
-        .is_some_and(|run| created_by(&run.requester, &key));
-    if !created {
+    let authorized = match pending.iter().find(|run| run.dispatch_id == dispatch) {
+        Some(run) => run_reader(handle, &run.requester, &key)
+            .await
+            .map_err(|_| {
+                crate::error_response(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Could not verify run access.",
+                )
+            })?,
+        None => indexed_run_reader(handle, dispatch, &key).await?,
+    };
+    if !authorized {
         // the same sentence the topic refusal carries, for the same reason: it
         // names what to present and never what this node holds. A run that has
-        // already settled is indistinguishable from one that was never this
-        // caller's — both are "not yours to read", and saying which would
+        // owned by someone else is indistinguishable from an unknown run —
+        // both are "not yours to read", and saying which would
         // answer a probe about runs the caller may not see.
         tracing::debug!(
             target: "ducktape::stream",
@@ -2197,20 +1858,86 @@ pub(crate) async fn admit_run_reader(
     Ok(())
 }
 
+/// Settled runs retain their creator in the materialized journal. Missing or
+/// evicted live output remains an empty trace, never a reason to widen access.
+async fn indexed_run_reader(
+    handle: &NodeHandle,
+    dispatch: &str,
+    key: &[u8],
+) -> Result<bool, axum::response::Response> {
+    let Some(store) = handle.index.clone() else {
+        return Ok(false);
+    };
+    let permit = handle
+        .index_view_gate
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            crate::error_response(
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "Run journal is busy.",
+            )
+        })?;
+    let request = serde_json::to_vec(&runs_wire::view::RunsViewQuery::Run {
+        dispatch_id: dispatch.into(),
+    })
+    .expect("run query");
+    let reading = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        store.view_with_tip("runs", &request)
+    })
+    .await
+    .map_err(|_| {
+        crate::error_response(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Run journal unavailable.",
+        )
+    })?;
+    let reading = reading.map_err(|_| {
+        crate::error_response(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Run journal unavailable.",
+        )
+    })?;
+    let reply =
+        serde_json::from_slice::<runs_wire::view::RunsViewReply>(&reading.bytes).map_err(|_| {
+            crate::error_response(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Run journal unavailable.",
+            )
+        })?;
+    match reply {
+        runs_wire::view::RunsViewReply::Run(Some(detail)) => {
+            run_reader(handle, &detail.run.requester, key)
+                .await
+                .map_err(|_| {
+                    crate::error_response(
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "Could not verify run access.",
+                    )
+                })
+        }
+        runs_wire::view::RunsViewReply::Run(None) | runs_wire::view::RunsViewReply::Runs(_) => Ok(false),
+    }
+}
+
 /// every run `runs` has pending, as committed state.
-async fn pending_runs(handle: &NodeHandle) -> Result<Vec<runs::PendingRun>, String> {
+pub(crate) async fn pending_runs(handle: &NodeHandle) -> Result<Vec<runs_wire::PendingRun>, String> {
     let (reply, rx) = futures::channel::oneshot::channel();
     handle
         .send(crate::NodeCommand::Query {
             target: "runs".to_string(),
-            req: runs::encode_query(&runs::RunsQuery::PendingRuns),
+            req: runs_wire::encode_query(&runs_wire::RunsQuery::PendingRuns),
             reply,
         })
         .await
         .map_err(|_| "actor gone".to_string())?;
-    let bytes = rx.await.map_err(|_| "reply dropped".to_string())??;
-    match runs::decode_reply(&bytes)? {
-        runs::RunsReply::PendingRuns(runs) => Ok(runs),
+    let bytes = rx
+        .await
+        .map_err(|_| "reply dropped".to_string())?
+        .map_err(|refused| refused.message)?;
+    match runs_wire::decode_reply(&bytes)? {
+        runs_wire::RunsReply::PendingRuns(runs) => Ok(runs),
         _ => Err("unexpected runs reply".to_string()),
     }
 }
@@ -2238,7 +1965,6 @@ fn prepare_topic(
     };
     let admitted = match family.admission() {
         Admission::Public => true,
-        Admission::Workspace => holds_workspace_secret,
         Admission::Run(id) => holds_workspace_secret || reader_of == Some(id),
     };
     if !admitted {
@@ -2253,8 +1979,6 @@ fn prepare_topic(
         Topic::FilesWatch => prepare_files_watch(topic, resume, store),
         Topic::Logs => prepare_logs(topic, resume),
         Topic::RunOutput(id) => prepare_run_output(topic, id, resume),
-        Topic::TermCommand(session) => prepare_term_command(topic, session, resume),
-        Topic::Term(session) => prepare_term(topic, session, resume),
         Topic::Metrics => prepare_metrics(),
         Topic::Peers => prepare_peers(),
         Topic::Status => prepare_status(),
@@ -2318,41 +2042,6 @@ fn prepare_run_output(
     Ok((
         TopicState::RunOutput {
             id: id.to_string(),
-            seq: start_seq(topic, resume)?,
-        },
-        None,
-    ))
-}
-
-/// the ordered command log — like `term:`, any session id subscribes once the
-/// caller is admitted (unknown/evicted → empty catch-up, never an error).
-#[allow(clippy::result_large_err)]
-fn prepare_term_command(
-    topic: &str,
-    session: &str,
-    resume: Option<&String>,
-) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
-    Ok((
-        TopicState::TermCommand {
-            session: session.to_string(),
-            seq: start_seq(topic, resume)?,
-        },
-        None,
-    ))
-}
-
-/// like run-output, any session id subscribes once the caller is admitted
-/// (unknown/evicted → empty catch-up, never an error); the manager gates who may
-/// CREATE one.
-#[allow(clippy::result_large_err)]
-fn prepare_term(
-    topic: &str,
-    session: &str,
-    resume: Option<&String>,
-) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
-    Ok((
-        TopicState::Term {
-            session: session.to_string(),
             seq: start_seq(topic, resume)?,
         },
         None,
@@ -2456,12 +2145,19 @@ async fn catch_up(
             TopicState::Module { .. }
             | TopicState::FilesWatch { .. }
             | TopicState::Logs { .. }
-            | TopicState::RunOutput { .. }
-            | TopicState::Term { .. }
-            | TopicState::TermCommand { .. } => catch_up_topic(&topic, state, store.as_ref(), &hub),
+            | TopicState::RunOutput { .. } => catch_up_topic(&topic, state, store.as_ref(), &hub),
         };
         if !send_frames(socket, result.frames).await {
             return false;
+        }
+        if let TopicState::RunOutput { id, .. } = state {
+            let frame = ServerFrame::RunControlSnapshot {
+                topic: topic.clone(),
+                control: hub.run_output().controls.reading(id),
+            };
+            if !send_frame(socket, frame).await {
+                return false;
+            }
         }
         if result.drop_topic {
             topics.remove(&topic);
@@ -2491,10 +2187,6 @@ fn catch_up_topic(
         }
         TopicState::Logs { seq } => catch_up_logs(topic, seq, &hub.log_ring()),
         TopicState::RunOutput { id, seq } => catch_up_run_output(topic, id, seq, &hub.run_output()),
-        TopicState::Term { session, seq } => catch_up_term(topic, session, seq, &hub.terminals()),
-        TopicState::TermCommand { session, seq } => {
-            catch_up_term_command(topic, session, seq, &hub.term_commands())
-        }
         // routed to catch_up_metrics by the caller (it needs the actor lane,
         // an await this sync path cannot make) — nothing owed here.
         TopicState::Metrics { .. } | TopicState::Peers { .. } | TopicState::Status { .. } => {
@@ -2732,108 +2424,6 @@ fn catch_up_run_output(
                 topic: topic.to_string(),
                 cursor: line_seq.to_string(),
                 item: TailItem::RunOutput { stream, line },
-            });
-        }
-        if row_count < STREAM_CATCHUP_BUDGET {
-            break;
-        }
-    }
-    CatchUpResult::keep(frames)
-}
-
-/// replay a terminal session's ring the way `catch_up_run_output` replays a
-/// run's: a `Lagged` frame if the reader fell behind an eviction, then every
-/// buffered chunk after the cursor as a `Term` tail item. Emits nothing for an
-/// unknown/evicted session (the ring read returns empty) — never an error.
-fn catch_up_term(
-    topic: &str,
-    session: &str,
-    seq: &mut u64,
-    ring: &crate::term::TermRing,
-) -> CatchUpResult {
-    let mut frames = Vec::new();
-    // BOTH directions: below the floor the rows were evicted, above the head
-    // the cursor names numbering this ring no longer has (a restart, or an
-    // entry evicted and re-created). Either way the reader must be told, or it
-    // waits on rows that will never come.
-    let resume = ring.resume_cursor(session, *seq);
-    let rewound = resume != *seq;
-    if rewound {
-        *seq = resume;
-        frames.push(ServerFrame::Lagged {
-            topic: topic.to_string(),
-            cursor: resume.to_string(),
-        });
-    }
-    loop {
-        let (rows, _) = ring.read_after(session, *seq, STREAM_CATCHUP_BUDGET);
-        if rows.is_empty() {
-            break;
-        }
-        let row_count = rows.len();
-        for (chunk_seq, item) in rows {
-            *seq = chunk_seq;
-            frames.push(ServerFrame::TermChunk {
-                topic: topic.to_string(),
-                cursor: chunk_seq.to_string(),
-                item,
-            });
-        }
-        if row_count < STREAM_CATCHUP_BUDGET {
-            break;
-        }
-    }
-    // the pump reached EOF and the ring is fully drained: tell the subscriber the
-    // session is over and drop the topic, so a driving client stops waiting on a
-    // stream that will never append again. Only after every buffered chunk above
-    // has been emitted — the terminal frame is the LAST thing on the topic.
-    if ring.is_ended(session) {
-        frames.push(ServerFrame::TermEnded {
-            topic: topic.to_string(),
-        });
-        return CatchUpResult::drop(frames);
-    }
-    CatchUpResult::keep(frames)
-}
-
-/// replay a session's ordered command log the way `catch_up_term` replays its
-/// output ring: a `Lagged` frame if the reader fell behind an eviction, then
-/// every buffered command after the cursor as a `TermCommandLog` frame — the
-/// ordered, attributed view of the shared session. Emits nothing for an
-/// unknown/evicted session (the ring read returns empty) — never an error.
-fn catch_up_term_command(
-    topic: &str,
-    session: &str,
-    seq: &mut u64,
-    ring: &crate::term::TermCommandRing,
-) -> CatchUpResult {
-    let mut frames = Vec::new();
-    // BOTH directions: below the floor the rows were evicted, above the head
-    // the cursor names numbering this ring no longer has (a restart, or an
-    // entry evicted and re-created). Either way the reader must be told, or it
-    // waits on rows that will never come.
-    let resume = ring.resume_cursor(session, *seq);
-    let rewound = resume != *seq;
-    if rewound {
-        *seq = resume;
-        frames.push(ServerFrame::Lagged {
-            topic: topic.to_string(),
-            cursor: resume.to_string(),
-        });
-    }
-    loop {
-        let (rows, _) = ring.read_after(session, *seq, STREAM_CATCHUP_BUDGET);
-        if rows.is_empty() {
-            break;
-        }
-        let row_count = rows.len();
-        for (cmd_seq, origin, text) in rows {
-            *seq = cmd_seq;
-            frames.push(ServerFrame::TermCommandLog {
-                topic: topic.to_string(),
-                seq: cmd_seq,
-                origin,
-                text,
             });
         }
         if row_count < STREAM_CATCHUP_BUDGET {
@@ -3123,17 +2713,15 @@ mod tests {
     /// the workspace secret a test node mints.
     const TEST_SECRET: &str = "d3adb33fd3adb33fd3adb33fd3adb33f";
 
-    /// a handle whose terminal plane holds [`TEST_SECRET`] — a node with a
+    /// a handle whose service link holds [`TEST_SECRET`] — a node with a
     /// workspace, i.e. the only shape that can admit a gated topic at all. The
     /// actor lane is unused on every subscribe path, so its receiver is dropped
     /// here rather than parked in each caller.
     fn handle_with_secret() -> crate::NodeHandle {
         let (handle, _cmds, _hub) = crate::NodeHandle::channel();
-        handle.with_terminals(crate::term::TerminalSessions::new(
-            crate::term::TermRing::default(),
-            crate::term::TermCommandRing::default(),
-            Some(TEST_SECRET.into()),
-        ))
+        handle.with_service_link(crate::service_link::ServiceLink::new(Some(
+            TEST_SECRET.into(),
+        )))
     }
 
     fn temp_store(modules: &[&str]) -> (tempfile::TempDir, Arc<indexer::IndexStore>) {
@@ -3551,80 +3139,6 @@ mod tests {
     }
 
     #[test]
-    fn term_topic_subscribes_and_replays_as_event_tagged_chunks() {
-        // any session id subscribes (the manager gates who may CREATE one);
-        // a fresh subscribe starts at cursor 0 and needs no index store.
-        let (state, lagged) = prepare_topic("term:abc", HOLDS_SECRET, NO_RUN, None, None)
-            .expect("term topic subscribes");
-        assert!(lagged.is_none());
-        assert_eq!(state.cursor(), "0");
-
-        let ring = crate::term::TermRing::default();
-        ring.append("s", "aGk=".to_string()); // base64("hi")
-        ring.append("s", "eW8=".to_string()); // base64("yo")
-        let mut seq = 0u64;
-        let result = catch_up_term("term:s", "s", &mut seq, &ring);
-        assert!(!result.drop_topic);
-        assert_eq!(result.frames.len(), 2);
-        assert_eq!(seq, 2, "the cursor advances past the replayed chunks");
-        // the LOAD-BEARING wire shape the app's `isTermChunkFrame` keys on: a
-        // `type:"event"` frame with a bare-string `item`, its resume cursor,
-        // and no module op.
-        let json = serde_json::to_value(&result.frames[0]).expect("frame json");
-        assert_eq!(json["type"], "event");
-        assert_eq!(json["topic"], "term:s");
-        assert_eq!(json["cursor"], "1");
-        assert_eq!(json["item"], "aGk=");
-        assert!(json.get("op").is_none(), "a term chunk carries no op");
-        let mut resumed = 1;
-        let resumed_result = catch_up_term("term:s", "s", &mut resumed, &ring);
-        assert_eq!(resumed_result.frames.len(), 1);
-        assert_eq!(resumed, 2);
-        let json = serde_json::to_value(&resumed_result.frames[0]).expect("resumed frame json");
-        assert_eq!(json["cursor"], "2");
-        assert_eq!(json["item"], "eW8=");
-        // a caught-up reader sees nothing new.
-        assert!(
-            catch_up_term("term:s", "s", &mut seq, &ring)
-                .frames
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn term_command_topic_subscribes_and_replays_the_ordered_attributed_log() {
-        // any session id subscribes to its command log (like `term:`); a fresh
-        // subscribe starts at cursor 0 and needs no index store.
-        let (state, lagged) = prepare_topic("term-cmd:abc", HOLDS_SECRET, NO_RUN, None, None)
-            .expect("term-cmd topic subscribes");
-        assert!(lagged.is_none());
-        assert_eq!(state.cursor(), "0");
-        assert!(matches!(state, TopicState::TermCommand { .. }));
-
-        let ring = crate::term::TermCommandRing::default();
-        let _ = ring.append("s", "alice", "list files");
-        let _ = ring.append("s", "", "run tests"); // empty origin = "local" (attribution kept verbatim)
-        let mut seq = 0u64;
-        let result = catch_up_term_command("term-cmd:s", "s", &mut seq, &ring);
-        assert!(!result.drop_topic);
-        assert_eq!(result.frames.len(), 2);
-        assert_eq!(seq, 2, "the cursor advances past the replayed commands");
-        // ordered + attributed: seq 1 first, carrying its origin + text.
-        let json = serde_json::to_value(&result.frames[0]).expect("frame json");
-        assert_eq!(json["type"], "term_command_log");
-        assert_eq!(json["topic"], "term-cmd:s");
-        assert_eq!(json["seq"], 1);
-        assert_eq!(json["origin"], "alice");
-        assert_eq!(json["text"], "list files");
-        // a caught-up reader sees nothing new.
-        assert!(
-            catch_up_term_command("term-cmd:s", "s", &mut seq, &ring)
-                .frames
-                .is_empty()
-        );
-    }
-
-    #[test]
     fn published_run_output_is_bounded_and_shaped_before_it_reaches_the_ring() {
         // the guard exists because a line that reaches the ring is broadcast to
         // every overlay peer, and the agent data plane REFUSES to write an event
@@ -3689,48 +3203,6 @@ mod tests {
         assert_eq!(caught.frames.len(), 1, "a line at the cap is admitted");
     }
 
-    #[test]
-    fn only_an_admitted_session_handle_may_drive_a_pty() {
-        let mut topics: BTreeMap<String, TopicState> = BTreeMap::new();
-        // a connection that holds no handle drives nothing.
-        assert!(!holds_session(&topics, "sess1"));
-        // an admitted handle on a session drives it — and only it.
-        topics.insert(
-            crate::term::topic("sess1"),
-            TopicState::Term {
-                session: "sess1".into(),
-                seq: 0,
-            },
-        );
-        assert!(holds_session(&topics, "sess1"));
-        assert!(!holds_session(&topics, "sess2"));
-        // a non-terminal handle never drives a pty, whatever its name.
-        topics.insert(LOGS_TOPIC.into(), TopicState::Logs { seq: 0 });
-        assert!(!holds_session(&topics, LOGS_TOPIC));
-        // and neither does the COMMAND-log handle for the same session: it is a
-        // different key, so it can never stand in for the output handle.
-        topics.insert(
-            crate::term::command_topic("sess3"),
-            TopicState::TermCommand {
-                session: "sess3".into(),
-                seq: 0,
-            },
-        );
-        assert!(!holds_session(&topics, "sess3"));
-
-        // the VARIANT is load-bearing, not decoration. Every case above differs
-        // by KEY too, so a revert to the deleted check's key-only
-        // `contains_key` would pass them all; this one cannot be built by
-        // `prepare_topic` and exists precisely to fail that revert. A `term:`
-        // key whose state is not a `Term` is a map this node never wrote — and
-        // "never written" is a claim worth a test rather than a comment.
-        topics.insert(crate::term::topic("sess4"), TopicState::Logs { seq: 0 });
-        assert!(
-            !holds_session(&topics, "sess4"),
-            "a term-keyed handle that is not a Term state must never drive a pty"
-        );
-    }
-
     /// Every family's admission is DECIDED, and the table is the decision.
     ///
     /// A new family cannot reach this list by accident: `Topic::admission` has
@@ -3751,8 +3223,6 @@ mod tests {
             // the workspace secret OR this run's creator, and the id travels
             // with the decision so one run's reader is not every run's.
             (Topic::RunOutput("r1"), Admission::Run("r1")),
-            (Topic::TermCommand("s1"), Admission::Workspace),
-            (Topic::Term("s1"), Admission::Workspace),
         ];
         for (family, expected) in decided {
             assert_eq!(family.admission(), expected, "{family:?}");
@@ -3766,14 +3236,10 @@ mod tests {
         assert_eq!(Topic::parse("peers"), Some(Topic::Peers));
         assert_eq!(Topic::parse("status"), Some(Topic::Status));
         assert_eq!(Topic::parse("run-output:r1"), Some(Topic::RunOutput("r1")));
-        assert_eq!(Topic::parse("term:s1"), Some(Topic::Term("s1")));
-        // `term-cmd:` is its own family and never decodes as a `term:` session
-        // named "cmd:s1" — the two prefixes diverge before the colon.
-        assert_eq!(Topic::parse("term-cmd:s1"), Some(Topic::TermCommand("s1")));
 
         // ... and a name no family owns parses to nothing, which is what makes
         // admission deny-by-default rather than a habit.
-        for unknown in ["", "term", "logs2", "modules:chat", "files:watch2"] {
+        for unknown in ["", "term:s1", "logs2", "modules:chat", "files:watch2"] {
             assert_eq!(Topic::parse(unknown), None, "{unknown:?} owns no family");
             assert!(matches!(
                 prepare_topic(unknown, HOLDS_SECRET, NO_RUN, None, None),
@@ -3785,52 +3251,203 @@ mod tests {
         }
     }
 
-    /// A workspace-gated family hands back NO handle without the secret.
+    /// The workspace-gated family hands back NO handle without the secret.
     #[test]
-    fn gated_families_refuse_a_caller_with_no_workspace_secret() {
-        for gated in ["term:s1", "term-cmd:s1", "run-output:r1"] {
-            let Err(ServerFrame::Error { code, detail, .. }) =
-                prepare_topic(gated, NO_SECRET, NO_RUN, None, None)
-            else {
-                panic!("{gated} must refuse a caller with no workspace secret");
-            };
-            assert_eq!(code, StreamErrorCode::Forbidden);
-            // A TRIPWIRE, not the live check: `detail()` is a `&'static str`
-            // with no access to any secret, so this cannot fail today — it fails
-            // the day someone gives the refusal a formatted body. The real
-            // guarantee is structural and is stated where it is enforced, on
-            // `TopicRefusal::detail`.
-            assert!(
-                !detail.contains(TEST_SECRET),
-                "a refusal must never carry the secret: {detail}"
-            );
-            // and it admits the same caller once the secret matches.
-            assert!(prepare_topic(gated, HOLDS_SECRET, NO_RUN, None, None).is_ok());
-        }
+    fn the_gated_family_refuses_a_caller_with_no_workspace_secret() {
+        // the one family the workspace secret still gates: a run's output.
+        const GATED: &str = "run-output:r1";
+        let Err(ServerFrame::Error { code, detail, .. }) =
+            prepare_topic(GATED, NO_SECRET, NO_RUN, None, None)
+        else {
+            panic!("{GATED} must refuse a caller with no workspace secret");
+        };
+        assert_eq!(code, StreamErrorCode::Forbidden);
+        // A TRIPWIRE, not the live check: `detail()` is a `&'static str`
+        // with no access to any secret, so this cannot fail today — it fails
+        // the day someone gives the refusal a formatted body. The real
+        // guarantee is structural and is stated where it is enforced, on
+        // `TopicRefusal::detail`.
+        assert!(
+            !detail.contains(TEST_SECRET),
+            "a refusal must never carry the secret: {detail}"
+        );
+        // and it admits the same caller once the secret matches.
+        assert!(prepare_topic(GATED, HOLDS_SECRET, NO_RUN, None, None).is_ok());
         // the public families need nothing, on the same call.
         assert!(prepare_topic("logs", NO_SECRET, NO_RUN, None, None).is_ok());
         assert!(prepare_topic("metrics", NO_SECRET, NO_RUN, None, None).is_ok());
     }
 
-    /// THE AUTHORITY RULE, stated over every origin a run can have.
-    ///
-    /// Only an external submitter — a device holding a key — can prove itself
-    /// over a signed upgrade at all. A run a program or the system created has no
-    /// key behind it, so no signature admits one, whatever it signs with.
-    #[test]
-    fn only_the_external_key_that_created_a_run_is_its_reader() {
-        let key = [7u8; 32];
-        assert!(created_by(&sdk::Origin::External(key.to_vec()), &key));
-        assert!(!created_by(&sdk::Origin::External(vec![9u8; 32]), &key));
-        assert!(!created_by(&sdk::Origin::External(Vec::new()), &key));
-        // a truncated prefix of the right key is a different key.
-        assert!(!created_by(
-            &sdk::Origin::External(key[..16].to_vec()),
-            &key
-        ));
-        assert!(!created_by(&sdk::Origin::Program(7), &key));
-        assert!(!created_by(&sdk::Origin::Module("runs".into()), &key));
-        assert!(!created_by(&sdk::Origin::System, &key));
+    #[tokio::test]
+    async fn program_runs_admit_only_the_current_controller_through_a_signed_upgrade() {
+        use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+        use futures::SinkExt as _;
+        let reader = PrivateKey::from_seed(91);
+        let key = reader.public_key().as_ref().to_vec();
+        let stranger = PrivateKey::from_seed(92);
+        let node_key = vec![0xab; 32];
+        let dispatch = "d".repeat(64);
+        let (mut handle, mut commands, _) = crate::NodeHandle::channel();
+        handle.admin.node_key = Some(node_key.clone());
+        let program = |controller| identity::Control::Program {
+            controller,
+            executor: "runs".into(),
+            generation: 0,
+            standing: identity::ProgramStanding::Active,
+        };
+        let control = Arc::new(Mutex::new(Some(program(7))));
+        let current = control.clone();
+        let id = dispatch.clone();
+        let actor_key = key.clone();
+        let actor = tokio::spawn(async move {
+            while let Some(command) = commands.next().await {
+                let crate::NodeCommand::Query { target, req, reply } = command else {
+                    continue;
+                };
+                let bytes = match target.as_str() {
+                    "runs" => {
+                        runs_wire::encode_reply(&runs_wire::RunsReply::PendingRuns(vec![runs_wire::PendingRun {
+                            run_id: "attributed/3/chiefduck".into(),
+                            dispatch_id: id.clone(),
+                            agent_id: "chiefduck".into(),
+                            channel_id: "general".into(),
+                            anchor_seq: 4,
+                            thread_root: None,
+                            job_id: None,
+                            job_claim_height: 0,
+                            requester: sdk::Origin::Program(42),
+                            created_at: 0,
+                        }]))
+                    }
+                    "identity" => {
+                        let account = match identity::decode_query(&req).unwrap() {
+                            identity::IdentityQuery::Get { number: 42 } => {
+                                current.lock().unwrap().clone().map(|control| {
+                                    identity::AccountView {
+                                        number: 42,
+                                        name: "ChiefDuck".into(),
+                                        control,
+                                        keys: vec![],
+                                        avatar: None,
+                                        bio: None,
+                                        updated_at: 0,
+                                    }
+                                })
+                            }
+                            identity::IdentityQuery::OfKey { key } if key == actor_key => {
+                                Some(identity::AccountView {
+                                    number: 7,
+                                    name: "Reader".into(),
+                                    control: identity::Control::Keys,
+                                    keys: vec![],
+                                    avatar: None,
+                                    bio: None,
+                                    updated_at: 0,
+                                })
+                            }
+                            identity::IdentityQuery::OfKey { .. } => None,
+                            query => panic!("unexpected query {query:?}"),
+                        };
+                        identity::encode_reply(&identity::IdentityReply::Account(account))
+                    }
+                    target => panic!("unexpected target {target}"),
+                };
+                let _ = reply.send(Ok(bytes));
+            }
+        });
+        let path = format!("/v1/ws?run={dispatch}");
+        let signed = |signer: &PrivateKey| {
+            let mut headers = axum::http::HeaderMap::new();
+            for (name, value) in
+                ::node::signed_req::request_headers(signer, "GET", &path, &node_key, b"")
+            {
+                headers.insert(name, value.parse().unwrap());
+            }
+            headers
+        };
+        assert!(
+            admit_run_reader(&handle, &dispatch, &signed(&reader), &path)
+                .await
+                .is_ok()
+        );
+        assert!(
+            admit_run_reader(&handle, &dispatch, &signed(&stranger), &path)
+                .await
+                .is_err()
+        );
+        // The same proof must deliver actual buffered output over the GUI's
+        // WebSocket path, not merely return true from the admission helper.
+        use tokio_tungstenite::tungstenite::{
+            Message as WsMessage, client::IntoClientRequest as _,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = crate::router(handle.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let output = r#"{"method":"item/completed","params":{"item":{"id":"thought","type":"reasoning","summary":["Visible process details"]}}}"#;
+        handle
+            .stream_hub()
+            .run_output()
+            .append(&dispatch, RunStream::Stdout, output);
+        let mut request = format!("ws://{address}{path}")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().extend(signed(&reader));
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        socket
+            .send(WsMessage::Text(
+                serde_json::json!({"op":"subscribe","topics":[format!("run-output:{dispatch}")]})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let message = socket
+                .next()
+                .await
+                .expect("run output stream ended")
+                .unwrap();
+            let WsMessage::Text(text) = message else {
+                continue;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_ne!(frame["type"], "error", "{frame}");
+            if frame["type"] == "tail" {
+                assert_eq!(frame["item"]["line"], output);
+                break;
+            }
+        }
+        socket.close(None).await.unwrap();
+        server.abort();
+        for next in [
+            Some(program(8)),
+            Some(identity::Control::Revoked { controller: 7 }),
+            Some(identity::Control::Keys),
+            None,
+        ] {
+            *control.lock().unwrap() = next;
+            assert!(
+                admit_run_reader(&handle, &dispatch, &signed(&reader), &path)
+                    .await
+                    .is_err()
+            );
+        }
+        for origin in [
+            sdk::Origin::External(vec![]),
+            sdk::Origin::External(key[..16].to_vec()),
+            sdk::Origin::Module("runs".into()),
+            sdk::Origin::System,
+        ] {
+            assert!(!run_reader(&handle, &origin, &key).await.unwrap());
+        }
+        assert!(
+            run_reader(&handle, &sdk::Origin::External(key.clone()), &key)
+                .await
+                .unwrap()
+        );
+        actor.abort();
     }
 
     /// THE WHOLE REMOTE ADMISSION, END TO END: a real signature over the real
@@ -3855,7 +3472,7 @@ mod tests {
         handle.admin.node_key = Some(node_key.clone());
         // the committed answer, as `runs` would give it: one pending run, created
         // by `creator`.
-        let pending = runs::PendingRun {
+        let pending = runs_wire::PendingRun {
             run_id: "chat\u{1f}channel-a\u{1f}2\u{1f}agent-1".into(),
             dispatch_id: dispatch.clone(),
             agent_id: "agent-1".into(),
@@ -3872,7 +3489,7 @@ mod tests {
                 let crate::NodeCommand::Query { reply, .. } = command else {
                     continue;
                 };
-                let _ = reply.send(Ok(runs::encode_reply(&runs::RunsReply::PendingRuns(vec![
+                let _ = reply.send(Ok(runs_wire::encode_reply(&runs_wire::RunsReply::PendingRuns(vec![
                     pending.clone(),
                 ]))));
             }
@@ -3949,12 +3566,7 @@ mod tests {
             prepare_topic("run-output:dispatch-a", NO_SECRET, mine, None, None).is_ok(),
             "the run this connection proved must admit"
         );
-        for someone_elses in [
-            "run-output:dispatch-b",
-            "run-output:",
-            "term:dispatch-a",
-            "term-cmd:dispatch-a",
-        ] {
+        for someone_elses in ["run-output:dispatch-b", "run-output:"] {
             let Err(ServerFrame::Error { code, .. }) =
                 prepare_topic(someone_elses, NO_SECRET, mine, None, None)
             else {
@@ -3982,231 +3594,59 @@ mod tests {
             subscribe_topics(
                 &handle,
                 &mut states,
-                vec!["term:s1".into()],
+                vec!["run-output:r1".into()],
                 &BTreeMap::new(),
                 presented,
                 NO_RUN,
             );
-            assert!(states.is_empty(), "presented {presented:?} admitted a pty");
+            assert!(
+                states.is_empty(),
+                "presented {presented:?} admitted a gated topic"
+            );
         }
-        // a node with NO TERMINAL PLANE admits nobody, whatever they present.
+        // a node with NO SERVICE LINK admits nobody, whatever they present.
         let (bare, _cmds, _hub) = crate::NodeHandle::channel();
         let mut states = BTreeMap::new();
         subscribe_topics(
             &bare,
             &mut states,
-            vec!["term:s1".into()],
+            vec!["run-output:r1".into()],
             &BTreeMap::new(),
             Some(TEST_SECRET),
             NO_RUN,
         );
-        assert!(states.is_empty(), "a node with no plane admits nobody");
+        assert!(states.is_empty(), "a node with no link admits nobody");
 
-        // and NEITHER does a node whose plane minted no secret — the case that
+        // and NEITHER does a node whose link minted no secret — the case that
         // actually ships. `bin/noded/src/main.rs` passes `None`, and
         // `bin/node/src/boot/surfaces.rs` does too whenever `mint_link_token`
         // fails. It must reach `link_token_matches` itself rather than
         // short-circuiting in `workspace_secret_matches` one level up, which is
-        // where the plane-less case above stops: an `is_none_or` slip inside
+        // where the link-less case above stops: an `is_none_or` slip inside
         // that function turns "this node minted no secret" into "this node
         // admits EVERYBODY", and only this case can see it.
         let (unminted, _cmds, _hub) = crate::NodeHandle::channel();
-        let unminted = unminted.with_terminals(crate::term::TerminalSessions::new(
-            crate::term::TermRing::default(),
-            crate::term::TermCommandRing::default(),
-            None,
-        ));
+        let unminted =
+            unminted.with_service_link(crate::service_link::ServiceLink::new(None));
         for presented in ["", TEST_SECRET] {
             assert!(
                 !unminted.workspace_secret_matches(presented),
-                "a plane that minted no secret must match nothing, got {presented:?}"
+                "a link that minted no secret must match nothing, got {presented:?}"
             );
             let mut states = BTreeMap::new();
             subscribe_topics(
                 &unminted,
                 &mut states,
-                vec!["term:s1".into()],
+                vec!["run-output:r1".into()],
                 &BTreeMap::new(),
                 Some(presented),
                 NO_RUN,
             );
             assert!(
                 states.is_empty(),
-                "a plane with no minted secret admitted {presented:?}"
+                "a link with no minted secret admitted {presented:?}"
             );
         }
-    }
-
-    /// THE hole, end to end: a connection that never presented the node's
-    /// workspace secret cannot write a keystroke into a live pty, and one that
-    /// did can.
-    ///
-    /// The old `term_entitled` asked `topics.contains_key("term:<id>")` while
-    /// the subscribe was unconditional, so this test's first half passed only
-    /// because the attacker had not bothered to subscribe. It subscribes here.
-    ///
-    /// Waits on the daemon's own receive, never on a duration: the assertion is
-    /// that the FIRST input to reach the link is the admitted one, which is
-    /// false the moment the gate leaks.
-    /// a live session plus the ORDERED feed of what actually reached the
-    /// daemon's link.
-    ///
-    /// The link is the observation seam every terminal-frame test below waits
-    /// on: a frame this node dropped never arrives on it, so an assertion about
-    /// what did arrive is an assertion about the gate — with no duration in it.
-    /// One channel for all three command kinds, because ORDER is half the claim.
-    async fn session_on_the_link(
-        mode: crate::term::SessionMode,
-    ) -> (
-        crate::NodeHandle,
-        String,
-        crate::term::AttachGuard,
-        mpsc::Receiver<String>,
-    ) {
-        use agent_service::wire;
-
-        let handle = handle_with_secret();
-        let terminals = handle.terminals().expect("a wired terminal plane").clone();
-        let (link, mut commands) = terminals.attach(TEST_SECRET).expect("the daemon attaches");
-        let (seen_tx, seen) = mpsc::channel::<String>(8);
-        let daemon = terminals.clone();
-        tokio::spawn(async move {
-            while let Some(command) = commands.recv().await {
-                match command {
-                    wire::Command::TermCreate(create) => {
-                        daemon.on_event(wire::Event::TermCreated {
-                            session: create.session,
-                        })
-                    }
-                    wire::Command::TermInput { data_b64, .. } => {
-                        let _ = seen_tx.send(format!("input:{data_b64}")).await;
-                    }
-                    wire::Command::TermResize { cols, rows, .. } => {
-                        let _ = seen_tx.send(format!("resize:{cols}x{rows}")).await;
-                    }
-                    wire::Command::TermClose { .. } => {}
-                    // this fake daemon serves the PTY plane. The collaboration
-                    // commands ride the same link and are the pump's, which
-                    // these tests do not stand up — named rather than
-                    // wildcarded so a new pty command still fails the build.
-                    wire::Command::MsgBind(_)
-                    | wire::Command::MsgUnbind { .. }
-                    | wire::Command::MsgDeliver(_)
-                    | wire::Command::MsgTime { .. }
-                    | wire::Command::MsgReplay { .. } => {}
-                }
-            }
-        });
-        let created = terminals
-            .create("claude", mode, crate::term::SessionSize::default())
-            .await
-            .expect("the daemon answered the create");
-        (handle, created.session_id, link, seen)
-    }
-
-    /// the two subscription maps a session is driven through: one that
-    /// subscribed WITHOUT the node's secret (the self-grant attempt) and one
-    /// that presented it.
-    fn unadmitted_and_admitted(
-        handle: &crate::NodeHandle,
-        session: &str,
-    ) -> (
-        BTreeMap<String, TopicState>,
-        BTreeMap<String, TopicState>,
-        Vec<ServerFrame>,
-    ) {
-        let mut unadmitted = BTreeMap::new();
-        let refusals = subscribe_topics(
-            handle,
-            &mut unadmitted,
-            vec![crate::term::topic(session)],
-            &BTreeMap::new(),
-            None,
-            NO_RUN,
-        );
-        let mut admitted = BTreeMap::new();
-        subscribe_topics(
-            handle,
-            &mut admitted,
-            vec![crate::term::topic(session)],
-            &BTreeMap::new(),
-            Some(TEST_SECRET),
-            NO_RUN,
-        );
-        (unadmitted, admitted, refusals)
-    }
-
-    #[tokio::test]
-    async fn a_connection_without_the_workspace_secret_cannot_drive_a_pty() {
-        let (handle, session, _link, mut seen) =
-            session_on_the_link(crate::term::SessionMode::Single).await;
-        let (unadmitted, admitted, refusals) = unadmitted_and_admitted(&handle, &session);
-
-        // the unadmitted connection SUBSCRIBED FIRST — the exact self-grant the
-        // deleted check waved through — and still got nothing to send on.
-        assert!(unadmitted.is_empty(), "subscribing self-granted a handle");
-        assert!(!holds_session(&unadmitted, &session));
-        assert!(refusals.iter().any(|frame| matches!(
-            frame,
-            ServerFrame::Error {
-                code: StreamErrorCode::Forbidden,
-                ..
-            }
-        )));
-        assert!(holds_session(&admitted, &session));
-
-        handle_term_input(&handle, &unadmitted, &session, "dW5hZG1pdHRlZA==").await;
-        handle_term_input(&handle, &admitted, &session, "YWRtaXR0ZWQ=").await;
-
-        assert_eq!(
-            seen.recv().await.as_deref(),
-            Some("input:YWRtaXR0ZWQ="),
-            "the first keystroke to reach the pty must be the ADMITTED one — an \
-             unadmitted write reaching the link at all is the hole"
-        );
-    }
-
-    /// The other two write frames, which `term_input` alone does not cover.
-    ///
-    /// Both were unguarded-by-any-test before: deleting `holds_session` from
-    /// `handle_term_resize` or `handle_term_command` left every unit green,
-    /// because nothing in-tree constructed either frame. `term_command` is the
-    /// sharper of the two — its `text` is documented as able to carry secrets
-    /// and its caller-chosen `origin` is attribution written into a shared
-    /// session's ordered lane.
-    ///
-    /// Shared mode, because the command lane exists only there (raw input is
-    /// refused on it, which is why the test above uses a Single session).
-    /// Ordering is deterministic, not raced: the resize is awaited onto the link
-    /// channel before the command is enqueued, and the command's serial consumer
-    /// writes to that SAME channel, which is FIFO.
-    #[tokio::test]
-    async fn neither_a_resize_nor_a_command_reaches_an_unadmitted_session() {
-        let (handle, session, _link, mut seen) =
-            session_on_the_link(crate::term::SessionMode::Shared).await;
-        let (unadmitted, admitted, _) = unadmitted_and_admitted(&handle, &session);
-
-        handle_term_resize(&handle, &unadmitted, &session, 1, 1).await;
-        handle_term_command(
-            &handle,
-            &unadmitted,
-            &session,
-            "attacker".into(),
-            "unadmitted".into(),
-        );
-        handle_term_resize(&handle, &admitted, &session, 120, 40).await;
-        handle_term_command(&handle, &admitted, &session, "operator".into(), "ls".into());
-
-        assert_eq!(
-            seen.recv().await.as_deref(),
-            Some("resize:120x40"),
-            "the first resize to reach the pty must be the ADMITTED one"
-        );
-        assert_eq!(
-            seen.recv().await.as_deref(),
-            Some(format!("input:{}", STANDARD.encode(b"ls\r")).as_str()),
-            "the first command to reach the pty must be the ADMITTED one"
-        );
     }
 
     #[test]
@@ -4317,23 +3757,10 @@ mod tests {
         };
         let metrics = TopicState::Metrics { sampled_ms: 0 };
         let peers = TopicState::Peers { sampled_ms: 0 };
-        let term = TopicState::Term {
-            session: "s".into(),
-            seq: 0,
-        };
-        let term_cmd = TopicState::TermCommand {
-            session: "s".into(),
-            seq: 0,
-        };
         assert!(module.wakes_on(Wake::Block) && files.wakes_on(Wake::Block));
         assert!(!logs.wakes_on(Wake::Block) && !run.wakes_on(Wake::Block));
         assert!(logs.wakes_on(Wake::Logs) && !module.wakes_on(Wake::Logs));
         assert!(run.wakes_on(Wake::RunOutput) && !files.wakes_on(Wake::RunOutput));
-        // the two terminal planes are distinct wake sources: an output append
-        // never re-scans the command log and vice versa.
-        assert!(term.wakes_on(Wake::Term) && !term.wakes_on(Wake::TermCommand));
-        assert!(term_cmd.wakes_on(Wake::TermCommand) && !term_cmd.wakes_on(Wake::Term));
-        assert!(!run.wakes_on(Wake::Term) && !run.wakes_on(Wake::TermCommand));
         // metrics is time-driven ONLY: a block/log/run wakeup never re-samples
         // it, and no other topic class re-scans on the heartbeat tick.
         assert!(metrics.wakes_on(Wake::Tick) && !metrics.wakes_on(Wake::Block));
@@ -4344,7 +3771,7 @@ mod tests {
         assert!(peers.wakes_on(Wake::Tick) && !peers.wakes_on(Wake::Block));
         assert!(!peers.wakes_on(Wake::Logs) && !peers.wakes_on(Wake::RunOutput));
         assert!(peers.wakes_on(Wake::All));
-        for state in [&module, &files, &logs, &run, &term, &term_cmd] {
+        for state in [&module, &files, &logs, &run] {
             assert!(state.wakes_on(Wake::All));
             assert!(!state.wakes_on(Wake::Tick));
         }
@@ -4541,13 +3968,9 @@ mod tests {
     #[test]
     fn a_service_link_is_granted_on_the_token_alone() {
         const TOKEN: &str = "b0a1c2d3e4f50617";
-        let terminals = crate::term::TerminalSessions::new(
-            crate::term::TermRing::default(),
-            crate::term::TermCommandRing::default(),
-            Some(TOKEN.into()),
-        );
         let (handle, _cmds, _hub) = crate::NodeHandle::channel();
-        let handle = handle.with_terminals(terminals);
+        let handle =
+            handle.with_service_link(crate::service_link::ServiceLink::new(Some(TOKEN.into())));
 
         // the whole admission: the right kind, the node's own token.
         let (guard, _rx) = take_service_link(&handle, crate::services::AGENT_KIND, TOKEN)
@@ -4568,16 +3991,16 @@ mod tests {
             .expect("a released link is claimable again");
     }
 
-    /// A handle with no terminal plane refuses every link, and that refusal is
+    /// A handle with no service link refuses every attach, and that refusal is
     /// about the NODE's wiring, never about a build.
     #[test]
-    fn a_node_with_no_terminal_plane_has_no_link_to_give() {
+    fn a_node_with_no_service_link_has_nothing_to_give() {
         let (handle, _cmds, _hub) = crate::NodeHandle::channel();
         let Err(refusal) = take_service_link(&handle, crate::services::AGENT_KIND, "any") else {
-            panic!("a handle with no terminal plane has no link to give");
+            panic!("a handle with no service link has nothing to give");
         };
         assert!(
-            refusal.contains("terminal sessions are not enabled"),
+            refusal.contains("service link is not enabled"),
             "{refusal}"
         );
     }

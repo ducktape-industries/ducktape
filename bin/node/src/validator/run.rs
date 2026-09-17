@@ -33,7 +33,24 @@ pub(super) type ValidatorNode = node::OrderedNode<
 type PendingSubmits = std::collections::HashMap<
     node::FrameId,
     (
-        Vec<futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>>,
+        Vec<futures::channel::oneshot::Sender<Result<noded::BlockSummary, noded::Refused>>>,
+        std::time::SystemTime,
+    ),
+>;
+
+/// held rpc `submit` replies, the same shape as [`PendingSubmits`] over a
+/// different sink: the rpc lane answers with a json line, not a `BlockSummary`.
+///
+/// It exists because `node.submit` returns when the op is ACCEPTED, and the
+/// module that will refuse it has not run yet. The rpc handler used to answer
+/// `ok` there, so every op refused IN CONSENSUS — which is every governance
+/// door check — reached the daemon log and nothing else, and the verb that
+/// submitted it sat until its own unrelated deadline and blamed that (#2533).
+/// The http lane already waited; this is the rpc lane learning to.
+type PendingRpcSubmits = std::collections::HashMap<
+    node::FrameId,
+    (
+        Vec<std::sync::mpsc::Sender<crate::rpc::RpcReply>>,
         std::time::SystemTime,
     ),
 >;
@@ -87,6 +104,7 @@ pub(super) fn publish_boundary_status(
 ) {
     let height = node.finalized().map(|f| f.height).unwrap_or(0);
     status.publish(noded::NodeStatus {
+        contract: noded::NODE_CONTRACT,
         version: crate::build_version(),
         root_hash: crate::util::hex(&node.root_hash()),
         height,
@@ -143,9 +161,10 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) dev_demo: bool,
     pub(super) checkpoint_blocks: u64,
     pub(super) cadence: consensus::Cadence,
-    /// sync retention lease (unix secs of the last served state-sync request)
-    /// — the drain defers oplog pruning while it is fresh.
-    pub(super) sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// what the syncers this node is serving still need retained — the
+    /// checkpoint's oplog prune never passes it (see
+    /// `sync::serve::SyncRetention`).
+    pub(super) sync_retention: std::sync::Arc<crate::sync::serve::SyncRetention>,
     /// the local rpc bridge's parsed-request queue — the caller owns the
     /// listener spawn (a promoted node's listener pump carries over from
     /// its parked life; a fresh boot spawns one), so both entries feed the
@@ -168,7 +187,7 @@ pub(super) struct ValidatorLoopState<'a> {
 
 /// one finished pending-swap code fetch: the digest, and the error if the
 /// bytes did not land.
-type FetchOutcome = ([u8; 32], Option<crate::blob_fetch::BlobFetchError>);
+type FetchOutcome = super::code_announce::FetchOutcome;
 
 struct ValidatorRuntime<'a> {
     context: &'a commonware_runtime::tokio::Context,
@@ -206,7 +225,7 @@ struct ValidatorRuntime<'a> {
     dev_demo: bool,
     checkpoint_blocks: u64,
     cadence: consensus::Cadence,
-    sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    sync_retention: std::sync::Arc<crate::sync::serve::SyncRetention>,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     blobs: noded::blobs::BlobHandle,
@@ -225,6 +244,7 @@ struct ValidatorRuntime<'a> {
     applied: usize,
     converged: bool,
     pending_submits: PendingSubmits,
+    pending_rpc_submits: PendingRpcSubmits,
     pending_relays:
         std::collections::HashMap<node::FrameId, (Vec<ed25519::PublicKey>, std::time::SystemTime)>,
     /// join gates held open awaiting their `Redeem` frame's consensus fate,
@@ -247,11 +267,6 @@ struct ValidatorRuntime<'a> {
     /// `checkpoint_due`: an idle chain's nop blocks must not buy a full
     /// re-encode of the manifest already on disk (#1308).
     last_written_root: Option<sdk::StateRoot>,
-    /// consecutive checkpoints that deferred `prune_oplog` for a warm sync
-    /// lease. capped at [`drain::MAX_PRUNE_DEFERRALS`]: past the cap the
-    /// checkpoint prunes anyway (see `drain::drain_pass`) so a joiner that
-    /// never releases the lease cannot pin the retained journal forever.
-    prune_deferrals: u32,
     last_reach_view: Option<u64>,
     last_flush: std::time::SystemTime,
     /// when this loop last SEALED a block, and how many stall windows have
@@ -275,6 +290,9 @@ struct ValidatorRuntime<'a> {
     /// nudge per view; every finalized block moves the estimate and re-arms.
     last_nudged_view: Option<u64>,
     last_crank: std::time::SystemTime,
+    /// Conversation timers are inspected once per committed block, including
+    /// the recovered block on process startup.
+    last_conversation_height: Option<u64>,
     last_nudge: std::time::SystemTime,
     workers: Vec<Box<dyn host::worker::Worker>>,
     code_signaller: super::code_announce::CodeReadinessSignaller,
@@ -333,7 +351,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         dev_demo,
         checkpoint_blocks,
         cadence,
-        sync_lease,
+        sync_retention,
         rpc_ingress,
         http_cmds,
         stream_hub,
@@ -374,6 +392,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // same id gets the same outcome, and the FIRST one's deadline governs.
     let mut http_ingress = http_cmds;
     let pending_submits: PendingSubmits = std::collections::HashMap::new();
+    let pending_rpc_submits: PendingRpcSubmits = std::collections::HashMap::new();
     // relayed submits held for a wire answer, keyed like pending_submits by
     // the frame's content address: resolved by the SAME drain that resolves
     // local holds, expired on the same SUBMIT_HOLD budget. the peers are where
@@ -389,7 +408,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         std::collections::HashMap::new();
     let gating: std::collections::HashMap<Vec<u8>, node::FrameId> =
         std::collections::HashMap::new();
-    let validator_relay = relay_runtime::ValidatorRelay::new(std::sync::Arc::new(blobs.clone()));
+    let validator_relay = relay_runtime::ValidatorRelay::new(blobs.clone());
     let last_published: Option<u64> = None;
     // verified-but-unapproved join requests, keyed by joiner key. NODE-
     // LOCAL and in-memory by design: this is a doorbell, not state — the
@@ -400,8 +419,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         std::collections::BTreeMap::new();
     // recovery cadence: sealed blocks since the last checkpoint manifest.
     let blocks_since_checkpoint: u64 = 0;
-    // no lease-deferred prune owed yet at boot.
-    let prune_deferrals: u32 = 0;
     // no cooldown owed at boot: the first checkpoint's own cost is the
     // estimate every later one is held off by.
     let checkpoint_not_before = context.current();
@@ -559,7 +576,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         dev_demo,
         checkpoint_blocks,
         cadence,
-        sync_lease,
+        sync_retention,
         stream_hub,
         index,
         blobs,
@@ -573,6 +590,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         applied,
         converged,
         pending_submits,
+        pending_rpc_submits,
         pending_relays,
         pending_gates,
         gating,
@@ -582,7 +600,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         blocks_since_checkpoint,
         checkpoint_not_before,
         last_written_root: None,
-        prune_deferrals,
         last_reach_view,
         last_flush,
         last_seal: context.current(),
@@ -593,6 +610,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         real_work_parked: false,
         last_nudged_view: None,
         last_crank,
+        last_conversation_height: None,
         last_nudge,
         workers,
         code_signaller,

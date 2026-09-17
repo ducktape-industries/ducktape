@@ -114,10 +114,10 @@
 //!   (persisting `<base>/.tracker.bin`), `abort_block` drops everything staged.
 //! * the wasm `guest` (the production node): the core runs inside the
 //!   component, re-entering each block through the host state lane, while a
-//!   native [`ForgeOdbBacking`] on the host keeps the git substrate — the root,
-//!   the browse/diff reads, snapshot packing, and materialization at the block
-//!   boundary. the root is byte-identical across the two, so the cutover moves
-//!   no committed state.
+//!   native `forge_odb::ForgeOdbBacking` on the host keeps the git substrate —
+//!   the root, the browse/diff reads, snapshot packing, and materialization at
+//!   the block boundary. the root is byte-identical across the two, so the
+//!   cutover moves no committed state.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -142,15 +142,13 @@ mod module;
 pub mod pushcert;
 pub mod refs;
 pub mod state;
+#[cfg(any(feature = "native", feature = "guest"))]
+mod query;
 #[cfg(feature = "native")]
 pub use module::{
     COMPACT_PACK_LIMIT, Forge, PendingBranch, build_objects, compact_repos, install_objects,
     on_disk_heads, pending_branches,
 };
-#[cfg(feature = "native")]
-mod backing;
-#[cfg(feature = "native")]
-pub use backing::ForgeOdbBacking;
 #[cfg(feature = "guest")]
 mod guest;
 #[cfg(feature = "native")]
@@ -213,8 +211,8 @@ pub fn norm_repo(repo: &str) -> Result<String, Error> {
     Ok(repo.to_string())
 }
 
-/// lowercase-hex a byte slice — for human-readable log lines only.
-#[cfg(feature = "native")]
+/// lowercase-hex a byte slice. An oid has its own encoder ([`oid`]); this is
+/// for log lines and for the chain digest in [`pushcert::nonce`].
 pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(bytes.len() * 2);

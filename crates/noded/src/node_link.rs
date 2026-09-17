@@ -42,6 +42,7 @@ const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 fn http_client(timeout: std::time::Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .build()
         .expect("build a reqwest client")
@@ -154,26 +155,65 @@ impl NodeLink {
         // other attach: an engine built once at boot must not pin this boot's
         // token into every later commit.
         let link = self.clone();
-        HttpNode::new(self.base.clone()).with_write_auth(Arc::new(move |_method, _path, _body| {
-            match link.operator_token() {
-                Some(token) => vec![(crate::admin::ADMIN_TOKEN_HEADER.to_string(), token)],
-                None => Vec::new(),
-            }
-        }))
+        HttpNode::new(self.base.clone())
+            .with_operator_credential(Arc::new(move || link.operator_token()))
     }
 
     /// submit one module op. `payload` is the module's own serde_json wire
     /// bytes, which `/v1/submit` takes as a json value and re-serializes — the
     /// module decodes the same value either way.
     pub async fn submit(&self, target: &str, payload: &[u8]) -> Result<u64, String> {
+        self.submit_with_blob(target, payload, None).await
+    }
+
+    /// Submit an op with an explicitly declared, already uploaded blob.
+    pub async fn submit_with_blob(
+        &self,
+        target: &str,
+        payload: &[u8],
+        required_blob: Option<[u8; 32]>,
+    ) -> Result<u64, String> {
         let payload: serde_json::Value = serde_json::from_slice(payload)
             .map_err(|error| format!("op payload is not json: {error}"))?;
-        let body = serde_json::json!({ "target": target, "payload": payload });
+        let mut body = serde_json::json!({ "target": target, "payload": payload });
+        if let Some(digest) = required_blob {
+            body["required_blob"] = serde_json::Value::String(
+                digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+            );
+        }
         let text = self.post_json("/v1/submit", &body).await?;
         serde_json::from_str::<serde_json::Value>(&text)
             .ok()
             .and_then(|value| value["height"].as_u64())
             .ok_or_else(|| format!("unexpected submit receipt: {text}"))
+    }
+
+    /// Store opaque content under its digest using this service's node authority.
+    ///
+    /// No size bound: the route this posts to streams what it receives onto
+    /// disk. The caller that must not hold its bytes at all — the git push
+    /// bridge — uploads from a file through `ducktape_rpc::Client::put_blob_file`.
+    pub async fn put_blob(&self, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+        use sha2::{Digest as _, Sha256};
+        let digest = Sha256::digest(&bytes).to_vec();
+        let response = self
+            .credentialed(self.client.post(format!("{}/v1/files/blob", self.base)))
+            .header("content-type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|error| format!("blob upload: {error}"))?;
+        let body = Self::body_of(response).await?;
+        let reply: serde_json::Value =
+            serde_json::from_str(&body).map_err(|error| error.to_string())?;
+        let expected = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if reply["digest"] != expected {
+            return Err("blob receipt digest mismatch".into());
+        }
+        Ok(digest)
     }
 
     /// submit an ALREADY-SIGNED frame verbatim. The node verifies the signature
@@ -198,12 +238,22 @@ impl NodeLink {
         let query: serde_json::Value =
             serde_json::from_slice(req).map_err(|error| format!("query is not json: {error}"))?;
         let body = serde_json::json!({ "target": target, "query": query });
-        self.post_json("/v1/query", &body)
-            .await
-            .map(String::into_bytes)
+        Self::bytes_of(self.send_json("/v1/query", &body).await?).await
     }
 
     async fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<String, String> {
+        Self::body_of(self.send_json(path, body).await?).await
+    }
+
+    /// the credentialed json POST every lane above rides, up to the response.
+    /// How the reply DECODES is the caller's: [`Self::body_of`] for the routes
+    /// that answer json, [`Self::bytes_of`] for a module's own reply, which is
+    /// `Vec<u8>` and need not be text at all.
+    async fn send_json(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, String> {
         let response = self
             .credentialed(self.client.post(format!("{}{path}", self.base)))
             .json(body)
@@ -222,7 +272,7 @@ impl NodeLink {
                 "this node refused the daemon's operator credential"
             );
         }
-        Self::body_of(response).await
+        Ok(response)
     }
 
     /// attach the operator credential when this link has one to read. Harmless
@@ -237,16 +287,28 @@ impl NodeLink {
     /// the node's rejection string rides through VERBATIM — the duckfs conflict
     /// taxonomy and the saga's refusal messages both key on the exact text.
     async fn body_of(response: reqwest::Response) -> Result<String, String> {
+        Self::bytes_of(response)
+            .await
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// the reply BYTES, verbatim. A module's `query` answers `Vec<u8>` and json
+    /// is the convention most of them speak, not the contract — the reference
+    /// module answers its counter's eight little-endian bytes. Decoding that as
+    /// text replaces every non-utf8 byte with U+FFFD, so the lane that carries a
+    /// module's own reply must never go through a `String`.
+    async fn bytes_of(response: reqwest::Response) -> Result<Vec<u8>, String> {
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let bytes = response.bytes().await.unwrap_or_default().to_vec();
         if !status.is_success() {
+            let text = String::from_utf8_lossy(&bytes);
             let detail = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
                 .and_then(|value| value["error"].as_str().map(str::to_string))
-                .unwrap_or(text);
+                .unwrap_or_else(|| text.into_owned());
             return Err(detail);
         }
-        Ok(text)
+        Ok(bytes)
     }
 }
 

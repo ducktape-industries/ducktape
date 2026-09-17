@@ -292,6 +292,7 @@ impl MicroVm {
         if cfg.vmm == crate::sandbox::Vmm::Firecracker {
             command.arg("--no-api");
         }
+        die_with_the_daemon(&mut command, std::process::id());
         let vmm = command
             .arg("--config-file")
             .arg(&config_path)
@@ -304,6 +305,8 @@ impl MicroVm {
                     .map_err(|e| format!("dup console: {e}"))?,
             )
             .stderr(console_file)
+            // ordinary cancellation — a dropped run, a panic, an orderly stop.
+            // The daemon dying outright is the kernel's job, armed above.
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("spawn firecracker: {e}"))?;
@@ -730,6 +733,46 @@ fn slot_of(run_dir: &Path) -> std::borrow::Cow<'_, str> {
         })
 }
 
+/// Arm the kernel to end the VMM when the daemon that spawned it dies.
+///
+/// `kill_on_drop` is a destructor, and a SIGKILLed — or OOM-killed — daemon
+/// runs none: without this the guest keeps its whole memory footprint with no
+/// successor able to find it, since a replacement daemon inherits no ownership
+/// state. The signal is delivered by the kernel, so it needs nothing of the
+/// VMM and covers the shim as well as Firecracker.
+///
+/// Two properties of `PR_SET_PDEATHSIG` this relies on: it survives the
+/// `execve` that follows (only a set-user-ID target clears it), and it is tied
+/// to the spawning THREAD's death — tokio's runtime threads live as long as
+/// the runtime, and a runtime that has gone is a daemon that is going too.
+///
+/// The parent check after arming closes the race where the daemon died between
+/// the fork and the `prctl`: that death's signal is already spent, so the child
+/// reads its parent itself and leaves rather than being left behind by a
+/// microsecond.
+#[cfg(target_os = "linux")]
+fn die_with_the_daemon(command: &mut tokio::process::Command, daemon: u32) {
+    // SAFETY: both calls are async-signal-safe and touch no allocator, which
+    // is the whole of what a `pre_exec` closure may do after a fork.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != daemon as libc::pid_t {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// macOS has no parent-death signal: the launcher cannot arm one, and only the
+/// VZ shim itself could watch its parent. `kill_on_drop` still covers an
+/// orderly stop and a panic; a SIGKILLed daemon does not reach it.
+#[cfg(not(target_os = "linux"))]
+fn die_with_the_daemon(_command: &mut tokio::process::Command, _daemon: u32) {}
+
 /// Firecracker connects a guest's outbound vsock to `<uds_path>_<port>`.
 fn vsock_port_path(uds: &Path, port: u32) -> PathBuf {
     let mut name = uds.as_os_str().to_os_string();
@@ -862,14 +905,12 @@ async fn pump_frames(
             };
             match frame {
                 Frame::Stdout(bytes) => {
-                    if stdout.write_all(&bytes).await.is_err() {
-                        return;
-                    }
+                    // A session reader may finish at its result before the
+                    // CLI finishes cleanup. Keep draining to the exit frame.
+                    let _ = stdout.write_all(&bytes).await;
                 }
                 Frame::Stderr(bytes) => {
-                    if stderr.write_all(&bytes).await.is_err() {
-                        return;
-                    }
+                    let _ = stderr.write_all(&bytes).await;
                 }
                 // Last frame of the run, and closing here is the guest's
                 // signal that it may reset. Firecracker relays the guest's
@@ -1045,6 +1086,28 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), input_tx.closed())
             .await
             .expect("the feed task is still parked, holding the vsock write half");
+    }
+
+    #[tokio::test]
+    async fn closed_output_readers_do_not_discard_the_guest_exit() {
+        let (host, mut guest) = UnixStream::pair().expect("socketpair");
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel(INPUT_QUEUE);
+        let (out_task, stdout) = tokio::io::duplex(1024);
+        let (err_task, stderr) = tokio::io::duplex(1024);
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        drop(stdout);
+        drop(stderr);
+        let pump = tokio::spawn(pump_frames(host, input_rx, out_task, err_task, exit_tx));
+        for frame in [
+            Frame::Stdout(b"after result".to_vec()),
+            Frame::Stderr(b"cleanup".to_vec()),
+            Frame::Exit(0),
+        ] {
+            guest.write_all(&guest_proto::encode(&frame)).await.unwrap();
+        }
+        assert_eq!(exit_rx.await.expect("guest exit survives closed readers"), 0);
+        pump.await.unwrap();
+        input_tx.closed().await;
     }
 
     /// The two halves of the ownership contract `boot` documents: a directory
@@ -1321,5 +1384,137 @@ mod tests {
         assert_eq!(n, 0, "a tunnel idle in both directions was not closed");
 
         accept.abort();
+    }
+
+    // ------------------------------------------------------------------
+    // #1972: the VMM cannot outlive the daemon that spawned it.
+    //
+    // Three processes, all this test binary: the test, a re-exec of it playing
+    // the daemon, and a re-exec of that playing a quiet fake VMM. The fake VMM
+    // dials a socket the test holds, so the accept is the ready event and the
+    // read's EOF is its exit — the test waits on those, never on a clock, and
+    // never touches the grandchild itself.
+    // ------------------------------------------------------------------
+
+    /// where a role reports: the test's rendezvous socket, inherited down the
+    /// whole chain.
+    const RENDEZVOUS: &str = "DUCKTAPE_TEST_VMM_RENDEZVOUS";
+    /// what the fake VMM sends if it is still there after its bound. Only a
+    /// failing run reaches it: it makes the failure a named assertion instead
+    /// of a test that hangs for the VMM's whole lifetime.
+    const VMM_SURVIVED: &[u8] = b"outlived-its-daemon";
+    /// long enough that no scheduling delay reaches it, short enough that a
+    /// leaked role process is gone before anyone notices.
+    const ROLE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// re-exec this test binary running exactly one of the role tests below,
+    /// reporting to `rendezvous` and saying nothing on any other stream.
+    fn role_command(role: &str, rendezvous: &Path) -> std::process::Command {
+        let module = module_path!()
+            .split_once("::")
+            .expect("the test module sits under the crate root")
+            .1;
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("the test binary"));
+        command
+            .args(["--exact", &format!("{module}::{role}"), "--ignored"])
+            .env(RENDEZVOUS, rendezvous)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    /// A VMM that ignores its stdin and never stops on its own — a real one
+    /// keeps the guest running long after the host end of anything goes quiet.
+    #[tokio::test]
+    #[ignore = "a role this file's own tests re-exec; never a test of its own"]
+    async fn the_fake_vmm_a_daemon_owns() {
+        let path = std::env::var(RENDEZVOUS).expect("the rendezvous socket");
+        let mut host = UnixStream::connect(path).await.expect("dial the test");
+        tokio::time::sleep(ROLE_BOUND).await;
+        let _ = host.write_all(VMM_SURVIVED).await;
+    }
+
+    /// The daemon that owns one: it spawns through the same arming the run
+    /// path uses, and then does nothing — it is here to be killed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "a role this file's own tests re-exec; never a test of its own"]
+    async fn the_daemon_that_owns_a_fake_vmm() {
+        let rendezvous = std::env::var(RENDEZVOUS).expect("the rendezvous socket");
+        let mut command = tokio::process::Command::from(role_command(
+            "the_fake_vmm_a_daemon_owns",
+            Path::new(&rendezvous),
+        ));
+        die_with_the_daemon(&mut command, std::process::id());
+        let _vmm = command
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn a fake VMM");
+        tokio::time::sleep(ROLE_BOUND).await;
+    }
+
+    /// `kill_on_drop` is a destructor and a SIGKILLed daemon runs none, so
+    /// without a parent-death signal the guest keeps its whole memory
+    /// footprint — and a replacement daemon, holding none of the old
+    /// ownership state, has nothing to find it with.
+    ///
+    /// Linux only, like the signal: macOS is the stated gap at
+    /// [`die_with_the_daemon`].
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_vmm_cannot_outlive_a_sigkilled_daemon() {
+        let path = unique_socket_path("sigkilled-daemon");
+        let rendezvous = UnixListener::bind(&path).expect("bind the rendezvous");
+        let mut daemon = role_command("the_daemon_that_owns_a_fake_vmm", &path)
+            .spawn()
+            .expect("spawn the daemon role");
+
+        // the ready event: the fake VMM is up and dialled in itself. Bounded
+        // only so a role that never starts fails instead of hanging.
+        let (mut vmm, _) = tokio::time::timeout(ROLE_BOUND, rendezvous.accept())
+            .await
+            .expect("the fake VMM never dialled in")
+            .expect("accept the fake VMM");
+
+        // only the owner.
+        daemon.kill().expect("SIGKILL the daemon");
+        daemon.wait().expect("reap the daemon");
+
+        let mut tail = Vec::new();
+        vmm.read_to_end(&mut tail).await.expect("wait out the VMM");
+        assert!(
+            tail.is_empty(),
+            "the fake VMM outlived the daemon that spawned it"
+        );
+    }
+
+    /// And the ordinary path the same spawn still owes: a run that is dropped
+    /// — cancelled, or ended by a panic — takes its VMM with it.
+    #[tokio::test]
+    async fn a_dropped_vmm_goes_with_its_run() {
+        let path = unique_socket_path("dropped-run");
+        let rendezvous = UnixListener::bind(&path).expect("bind the rendezvous");
+        let mut command =
+            tokio::process::Command::from(role_command("the_fake_vmm_a_daemon_owns", &path));
+        die_with_the_daemon(&mut command, std::process::id());
+        let vmm = command
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn a fake VMM");
+        let (mut stream, _) = tokio::time::timeout(ROLE_BOUND, rendezvous.accept())
+            .await
+            .expect("the fake VMM never dialled in")
+            .expect("accept the fake VMM");
+
+        drop(vmm);
+
+        let mut tail = Vec::new();
+        stream
+            .read_to_end(&mut tail)
+            .await
+            .expect("wait out the VMM");
+        assert!(tail.is_empty(), "a dropped run left its VMM behind");
     }
 }

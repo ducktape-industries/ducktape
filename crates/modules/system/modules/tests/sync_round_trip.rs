@@ -13,7 +13,7 @@
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use modules::{
-    CODE_HASH_LEN, Modules, ModulesMsg, ModulesQuery, ModulesReply, decode_reply, encode_msg,
+    CODE_HASH_LEN, Kind, Modules, ModulesMsg, ModulesQuery, ModulesReply, decode_reply, encode_msg,
     encode_query,
 };
 use sdk::{Env, Error, MerkleStore as _, Module, Msg, Origin, StateRoot};
@@ -89,8 +89,12 @@ fn synced_store_reconstructs_source_root_registry_and_swaps() {
         // exactly the production genesis seam.
         let src_store = QmdbStore::init(context.child("src"), "src").await;
         let mut src = modules_over(Box::new(src_store));
-        src.seed("hello", hash(1)).await.unwrap();
-        src.seed("directory", hash(2)).await.unwrap();
+        src.seed("hello", Kind::Module, hash(1), Vec::new())
+            .await
+            .unwrap();
+        src.seed("directory", Kind::View, hash(2), Vec::new())
+            .await
+            .unwrap();
         src.finish_seed().await.unwrap();
         let seeded_root = src.root();
         assert_ne!(seeded_root, StateRoot::ZERO, "seeds alone move the root");
@@ -130,8 +134,10 @@ fn synced_store_reconstructs_source_root_registry_and_swaps() {
             msg(ModulesMsg::ScheduleRegister {
                 name: "newcomer".into(),
                 module_id: "newmod".into(),
+                kind: Kind::Module,
                 activation_height: 30,
                 code_hash: hash(5),
+                lanes: Vec::new(),
             }),
         )
         .await;

@@ -1,10 +1,11 @@
 //! What the view asks of the host kernel, and the readings the screen folds
 //! off the roster it reads for itself.
 //!
-//! The kernel pushes only session facts (`members.props`: connected, admin,
-//! dark). The roster is the view's own: it asks the node through
-//! `rpc.status`, `rpc.peers` and `rpc.query`, re-reads on every `rpc.live`
-//! hit for the valset plane, and folds the members into rows here. A pause
+//! The kernel pushes only session facts (`members.props`: connected, dark).
+//! The roster is the view's own, and so is this node's authority over it:
+//! the view asks the node through `rpc.status`, `rpc.peers` and `rpc.query`,
+//! re-reads on every `rpc.live` hit for the valset plane, folds the members
+//! into rows here, and reads its own quorum seat off those rows. A pause
 //! and a membership ballot leave as `op.submit` carrying the module message
 //! the kernel signs with the seated key — the view never sees the key, the
 //! endpoint or the password. A key copy is still an intent: the clipboard is
@@ -17,9 +18,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
 
 /// How long a membership ballot stays open, in the chain's own consensus
 /// time — the same window the desktop app opened one with.
@@ -45,11 +46,12 @@ pub struct MemberRow {
 
 // ---------- the session ----------
 
-/// The session facts the kernel pushes, one item per change.
+/// The session facts the kernel pushes, one item per change. This node's
+/// authority is NOT among them: the view folds it off the roster it reads
+/// for itself ([`roster_is_admin`]).
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub connected: bool,
-    pub admin: bool,
     pub dark: bool,
 }
 
@@ -61,10 +63,10 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("members.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
             });
             match read {
@@ -106,8 +108,8 @@ pub struct RosterItem {
 
 /// The roster now and after every valset block: read once at start, then
 /// again on each `rpc.live` hit for the valset plane.
-pub fn roster(connection: i64) -> iced::Subscription<RosterItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn roster(connection: i64) -> ducktape_view_guest::Subscription<RosterItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         let live = host::subscribe("rpc.live", b"valset");
         stream::once(load()).chain(live.then(|_| load()))
     })
@@ -176,17 +178,27 @@ pub fn fold_agents(reply: &serde_json::Value) -> Vec<MemberRow> {
         .cloned()
         .unwrap_or_default()
         .iter()
-        .map(|record| MemberRow {
-            key: text(&record["agent_id"]),
-            label: text(&record["display_name"]),
-            role: "agent".into(),
-            is_this_node: false,
-            is_agent: true,
-            model: text(&record["capability"]),
-            // for an agent row this is REGISTRATION state (active vs
-            // paused), which is what the record renders for a machine —
-            // not "working now".
-            live: record["status"].as_str() == Some("active"),
+        .map(|record| {
+            let agent_id = text(&record["agent_id"]);
+            // a machine registered without a name is still called
+            // something: its id, never a blank row
+            let named = text(&record["display_name"]);
+            let label = match named.is_empty() {
+                true => agent_id.clone(),
+                false => named,
+            };
+            MemberRow {
+                key: agent_id,
+                label,
+                role: "agent".into(),
+                is_this_node: false,
+                is_agent: true,
+                model: text(&record["capability"]),
+                // for an agent row this is REGISTRATION state (active vs
+                // paused), which is what the record renders for a machine —
+                // not "working now".
+                live: record["status"].as_str() == Some("active"),
+            }
         })
         .collect()
 }
@@ -215,7 +227,9 @@ pub fn fold_live_keys(reply: &serde_json::Value) -> BTreeSet<String> {
 
 /// One kernel request, asked and answered as JSON.
 async fn ask(kind: &str, request: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let reply = host::request(kind, &serde_json::to_vec(request).expect("encodes")).await?;
+    let reply = host::request(kind, &serde_json::to_vec(request).expect("encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&reply).map_err(|error| error.to_string())
 }
 
@@ -378,8 +392,8 @@ fn submit(subject: String, target: &str, message: serde_json::Value) -> bool {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;
@@ -403,7 +417,7 @@ impl Stream for ActStream {
             let (key, _) = acts.pending.remove(index);
             Poll::Ready(Some(ActItem {
                 key,
-                error: answer.err().unwrap_or_default(),
+                error: answer.err().map(host::said).unwrap_or_default(),
             }))
         })
     }
@@ -411,8 +425,8 @@ impl Stream for ActStream {
 
 // ---------- the readings ----------
 
-/// `2 humans · 1 agent` — the title's machine subtitle, folded off the same
-/// rows the filter strip splits.
+/// `2 humans, 1 agent` — the title's subtitle, folded off the same rows the
+/// filter strip splits.
 pub fn members_summary(connected: bool, rows: &[MemberRow]) -> String {
     if !connected || rows.is_empty() {
         return String::new();
@@ -420,7 +434,39 @@ pub fn members_summary(connected: bool, rows: &[MemberRow]) -> String {
     let agents = rows.iter().filter(|row| row.is_agent).count();
     let left = plural(rows.len() - agents, "human", "humans");
     let right = plural(agents, "agent", "agents");
-    format!("{left} · {right}")
+    format!("{left}, {right}")
+}
+
+/// What an empty list says under each filter: the roster may be full while
+/// the chosen tab is not, so the words name the tab, not the network.
+pub(crate) fn empty_words(filter: crate::MembersFilter) -> (&'static str, &'static str) {
+    match filter {
+        crate::MembersFilter::All => (
+            "No members yet",
+            "Validators, residents and registered agents appear as they join.",
+        ),
+        crate::MembersFilter::Humans => (
+            "No humans here",
+            "Validators and residents appear as they join the network.",
+        ),
+        crate::MembersFilter::Agents => (
+            "No agents registered",
+            "Agents appear here once a run registers them.",
+        ),
+        crate::MembersFilter::Validators => (
+            "No validators",
+            "A resident becomes a validator when a ballot to promote it passes.",
+        ),
+    }
+}
+
+/// This node holds a quorum seat — the ONE authority predicate behind the
+/// Invite button and every ballot this screen opens. It is folded off the
+/// roster the view read itself, so a view swap that re-labels a seat
+/// re-decides who may act; no host prop carries it.
+pub fn roster_is_admin(rows: &[MemberRow]) -> bool {
+    rows.iter()
+        .any(|row| row.is_this_node && row.role == "validator")
 }
 
 /// The All / Humans / Agents / Validators strip.
@@ -436,37 +482,29 @@ pub(crate) fn filter_members(rows: &[MemberRow], filter: crate::MembersFilter) -
         .collect()
 }
 
-/// Two letters for a machine principal: the first of each of two words, else
-/// the first two alphanumerics.
-pub fn initials_of(name: &str) -> String {
-    let words: Vec<&str> = name.split_whitespace().take(2).collect();
-    if words.len() == 2 {
-        let letters: String = words
-            .iter()
-            .filter_map(|word| word.chars().find(char::is_ascii_alphanumeric))
-            .collect();
-        if letters.chars().count() == 2 {
-            return letters.to_uppercase();
-        }
-    }
-    let letters: String = name
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(2)
-        .collect();
-    match letters.is_empty() {
-        true => "?".into(),
-        false => letters.to_uppercase(),
+/// A role or presence word as a badge reads it: `validator` -> `Validator`.
+pub(crate) fn sentence_case(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
-/// One letter for a person.
-pub fn initial_of(name: &str) -> String {
-    name.trim()
-        .chars()
-        .next()
-        .map(|first| first.to_uppercase().to_string())
-        .unwrap_or_default()
+/// A human is `live`/`offline` on the mesh; an agent is `active`/`paused`
+/// in the registry.
+pub(crate) fn presence_label(row: &MemberRow) -> &'static str {
+    match (row.is_agent, row.live) {
+        (true, true) => "active",
+        (true, false) => "paused",
+        (false, true) => "live",
+        (false, false) => "offline",
+    }
+}
+
+pub fn member_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport * 0.5).clamp(260.0, 520.0);
+    (width + delta).clamp(260.0, maximum)
 }
 
 fn plural(count: usize, one: &str, many: &str) -> String {

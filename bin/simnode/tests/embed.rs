@@ -189,3 +189,41 @@ fn held_mode_step_via_handle() {
     assert_eq!(status, 200, "held submit resolves after step: {stepped}");
     sim.shutdown();
 }
+
+#[test]
+fn an_unwritten_home_lists_over_http_and_accepts_its_first_child() {
+    let storage = tempfile::tempdir().expect("storage");
+    let sim = boot_auto(storage.path());
+    let port = sim.addr().port();
+    let home = serde_json::json!({"target":"files","query":{"ls":{"path":"/home/acct:7","snapshot":null,"after":null,"limit":256}}});
+    let (status, reply) = harness::try_request(port, "POST", "/v1/query", Some(&home)).expect("list home");
+    assert_eq!(status, 200, "an unwritten home is empty: {reply}");
+    assert_eq!(reply["ls"]["entries"], serde_json::json!([]));
+    assert!(reply["ls"]["next"].is_null());
+
+    let (status, reply) = harness::credentialed_request(
+        port,
+        &operator(storage.path()),
+        "POST",
+        "/v1/submit",
+        Some(&serde_json::json!({
+            "target": "files",
+            "payload": files::FilesMsg::Commit {
+                base_snapshot: None,
+                message: "First home folder".into(),
+                changes: vec![files::Change::Mkdir {
+                    path: "/home/acct:7/notes".into(),
+                }],
+            },
+        })),
+    )
+    .expect("commit first child");
+    assert_eq!(status, 200, "home write: {reply}");
+    let (status, reply) = harness::try_request(port, "POST", "/v1/query", Some(&home)).expect("list home");
+    assert_eq!(status, 200);
+    assert_eq!(reply["ls"]["entries"][0]["path"], "/home/acct:7/notes");
+    let (status, _) =
+        harness::try_request(port, "POST", "/v1/query", Some(&serde_json::json!({"target":"files","query":{"ls":{"path":"/home/acct:7/missing","snapshot":null,"after":null,"limit":256}}})))
+            .expect("list missing descendant");
+    assert_eq!(status, 400, "the module rejects an ordinary missing path");
+}

@@ -20,11 +20,12 @@ from inside a checkout of it.
 - The guest image carries the repository's pinned Rust toolchain,
   `wasm-tools`, `git` and the ordinary build utilities; anything else you
   need, fetch.
-- Your credential never enters the VM. `ducktape` is on PATH and speaks to the
-  node for you; your `ducktape_*` tools are its MCP server. Every forge
-  repository is at `$DUCKTAPE_NODE/forge/<repo>`: clone, fetch and push it
-  with plain `git`. The node signs your push as its operator, so a push lands
-  under your name and the node's authority.
+- Your credential never enters the VM, and neither does any ducktape binary.
+  Your `ducktape_*` tools are an MCP server the node itself runs, on your
+  lane at `$DUCKTAPE_NODE/mcp`; it acts as you because the lane is yours.
+  Every forge repository is at `$DUCKTAPE_NODE/forge/<repo>`: clone, fetch and
+  push it with plain `git`. The node signs your push as its operator, so a push
+  lands under your name and the node's authority.
 
 ## How you work
 

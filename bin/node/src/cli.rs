@@ -29,6 +29,7 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::Join(cmd) => dispatch_join(cmd),
         OpCmd::List => cmd_list(),
         OpCmd::Status(args) => cmd_node_status(args),
+        OpCmd::Qualify(args) => crate::qualify::run(args),
         OpCmd::Peers(args) => cmd_node_peers(args),
         OpCmd::Resident(cmd) => dispatch_resident(cmd),
         OpCmd::Member(cmd) => dispatch_member(cmd),
@@ -75,7 +76,7 @@ fn cmd_log_filter(args: crate::cli_args::LogFilterArgs) -> CommandResult {
     }
     let response = request
         .send()
-        .map_err(|error| crate::node_http::transport_failure(PATH, &error).to_string())?;
+        .map_err(|error| crate::node_http::transport_failure(&base, PATH, &error).to_string())?;
     let status_code = response.status();
     let text = response.text().unwrap_or_default();
     if !status_code.is_success() {
@@ -257,16 +258,89 @@ fn cmd_node_status(args: StatusArgs) -> CommandResult {
         println!("{status}");
         return Ok(());
     }
+    for line in status_lines(status) {
+        println!("{line}");
+    }
+    let Some(seconds) = stalled_past_recovery(status) else {
+        return Ok(());
+    };
+    // NOT an `Err`: the verb did its job, and an `Err` here would print the
+    // node's own `FATAL:` marker — the string the desktop app classifies a
+    // dead node by — for a node that answered perfectly well. A distinct code
+    // says "answered, and the news is bad", which is the difference a script
+    // needs.
+    eprintln!(
+        "the chain has sealed nothing for {seconds}s, past the point it recovers on its own — \
+         compare reachable against quorum above, and check the other members"
+    );
+    std::process::exit(CHAIN_IS_STALLED);
+}
+
+/// `node status` exit code for a node that answered and reported a stalled
+/// chain. Distinct from 1, which every verb uses for "could not answer at all"
+/// — an operator's `ducktape node status || alert` must not treat a node that
+/// is merely unreachable as a wedged network, or the reverse.
+const CHAIN_IS_STALLED: i32 = 2;
+
+/// What `node status` prints, in order — one `key=value` line per subject, so
+/// the whole answer stays greppable.
+fn status_lines(status: &serde_json::Value) -> Vec<String> {
     let height = match status["height"].as_u64() {
         Some(h) => h.to_string(),
         None => "none".into(),
     };
     let root_hash = status["root_hash"].as_str().unwrap_or("");
-    println!("height={height} root_hash={root_hash}");
-    if let Some(line) = netstack_line(&status["netstack"]) {
-        println!("{line}");
+    let operations = &status["operations"];
+    let mut lines = vec![format!("height={height} root_hash={root_hash}")];
+    lines.extend(standing_line(operations));
+    lines.extend(netstack_line(&operations["netstack"]));
+    lines
+}
+
+/// the `role=`/`phase=` line: where this node stands, and — when it is in
+/// consensus — whether the chain under it is moving.
+///
+/// Height and root hash cannot answer that: on a wedged chain they are
+/// byte-identical six seconds and six minutes later, which is how a halted
+/// network read as a healthy one. `reachable` beside `quorum` is the diagnosis
+/// and `stalled_for` is how long it has been true, so both belong on the line
+/// an operator was told to run.
+///
+/// Consensus fields are absent, never zeroed, on a role that has no consensus
+/// section — `quorum=0 reachable=0` on a syncing resident reads as a dead
+/// chain, and it is not one.
+fn standing_line(operations: &serde_json::Value) -> Option<String> {
+    let role = operations["role"].as_str()?;
+    let phase = operations["phase"].as_str()?;
+    let mut line = format!("role={role} phase={phase}");
+    let consensus = &operations["consensus"];
+    if let Some(quorum) = consensus["quorum"].as_u64() {
+        let reachable = consensus["reachable_validators"].as_u64().unwrap_or(0);
+        line.push_str(&format!(" quorum={quorum} reachable={reachable}"));
     }
-    Ok(())
+    // 0 is the beating case and prints nothing: a field that is always there
+    // is a field nobody reads, and this one has to be noticed.
+    if let Some(seconds) = consensus["block_beat_stalled_seconds"]
+        .as_u64()
+        .filter(|seconds| *seconds > 0)
+    {
+        line.push_str(&format!(" stalled_for={seconds}s"));
+    }
+    Some(line)
+}
+
+/// How long the chain has been silent, once that is past the point it recovers
+/// on its own ([`crate::drain_actions::STALL_IS_AN_ERROR_AFTER`], the same
+/// threshold the node's own `block_beat_stalled` error fires on).
+///
+/// `None` is "nothing to report", which covers a beating chain, a brief
+/// silence, and a node with no consensus section to ask. The verb exits
+/// non-zero on `Some` — the whole point being that a script can tell a wedged
+/// chain from a healthy one without parsing anything.
+fn stalled_past_recovery(status: &serde_json::Value) -> Option<u64> {
+    let seconds = status["operations"]["consensus"]["block_beat_stalled_seconds"].as_u64()?;
+    let past_recovery = seconds >= crate::drain_actions::STALL_IS_AN_ERROR_AFTER.as_secs();
+    past_recovery.then_some(seconds)
 }
 
 /// the `netstack=` line of `node status`: which machine the reachability plane
@@ -289,7 +363,7 @@ fn netstack_line(netstack: &serde_json::Value) -> Option<String> {
     ))
 }
 
-/// `ducktape node netstack swap --native | --component <PATH>` — move a
+/// `ducktape node netstack swap --component <PATH>` — move a
 /// RUNNING node's reachability plane onto another netstack backend, mid-life.
 ///
 /// The operator's trigger, next to the governance-delivered one: roll one node
@@ -305,10 +379,7 @@ fn cmd_netstack_swap(args: crate::cli_args::NetstackSwapArgs) -> CommandResult {
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
-    let backend = match args.component {
-        Some(path) => serde_json::json!({ "component": path }),
-        None => serde_json::json!("native"),
-    };
+    let backend = serde_json::json!({ "component": args.component });
     const PATH: &str = "/v1/admin/netstack/swap";
     let base = config::http_base_in(&workspace)?;
     let token = noded::admin::read_operator_token(&workspace)?;
@@ -317,7 +388,7 @@ fn cmd_netstack_swap(args: crate::cli_args::NetstackSwapArgs) -> CommandResult {
         .header(noded::admin::ADMIN_TOKEN_HEADER, token)
         .json(&serde_json::json!({ "backend": backend }))
         .send()
-        .map_err(|error| crate::node_http::transport_failure(PATH, &error).to_string())?;
+        .map_err(|error| crate::node_http::transport_failure(&base, PATH, &error).to_string())?;
     let status_code = response.status();
     let text = response.text().unwrap_or_default();
     if !status_code.is_success() {
@@ -522,7 +593,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     // holding a freshly minted `identity.key` behind on every attempt.
     let founding_set = match args.modules {
         Some(src) => src,
-        None => config::modules_dir()?,
+        None => noded::services::founding_set()?,
     };
     let genesis = config::Genesis::compose(&founding_set).map_err(|e| {
         format!("{e} — pass --modules <dir> holding every <id>.component.wasm and <id>.index.wasm")
@@ -624,6 +695,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     descriptor.save(&descriptor_path)?;
     config::write_node_toml(&dir, &plumbing)?;
+    record_founding_binary(&dir)?;
     eprintln!(
         "{} identity {}",
         if generated { "generated" } else { "reusing" },
@@ -651,6 +723,18 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("invite: ducktape node invite {selector}");
     println!("{chain_id}");
     Ok(())
+}
+
+/// stamp the binary that just materialized `dir` into the workspace's founding
+/// record — the identity `node run` refuses a disagreeing binary against
+/// (`config::guard_founding_binary`). Written by the two verbs that BRING a
+/// workspace into existence, `init` and `join`, and by nothing else.
+fn record_founding_binary(dir: &std::path::Path) -> Result<(), String> {
+    config::FoundingBinary {
+        build: noded::services::build_identity_or_unknown().to_string(),
+        module_world: wasm_host::module_world_digest().to_string(),
+    }
+    .save(dir)
 }
 
 /// install the genesis file a joiner was handed (`join --genesis <file>`) into
@@ -941,9 +1025,15 @@ fn cmd_admit(args: AdmitArgs) -> Result<(), Box<dyn std::error::Error>> {
 pub(super) fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json::Value, String> {
     use std::io::{BufRead as _, BufReader, Write as _};
     // the same calm sentence the http lane gives, for the same condition: an
-    // `os error 111` with a port in it is a diagnosis nobody asked for.
+    // `os error 111` with a port in it is a diagnosis nobody asked for. It is
+    // reached the same way too — one renderer, asked which workspace this
+    // address is, so every verb on this lane names a launcher when there is
+    // one instead of recommending a second `node run` into its restart loop.
     let conn = std::net::TcpStream::connect(addr).map_err(|error| match error.kind() {
-        std::io::ErrorKind::ConnectionRefused => crate::node_http::NODE_NOT_RUNNING.to_string(),
+        std::io::ErrorKind::ConnectionRefused => {
+            let workspace = crate::cli_args::workspace_for_rpc(addr).ok();
+            crate::node_http::not_running_in(workspace.as_deref()).to_string()
+        }
         _ => format!("cannot reach this node's operator rpc on {addr}: {error}"),
     })?;
     conn.set_read_timeout(Some(std::time::Duration::from_secs(15)))
@@ -1424,17 +1514,27 @@ pub(super) fn open_proposal_matching<'a>(
 
 /// drive a governance proposal ceremony for `wanted` through this eligible
 /// account's running node: adopt an existing OPEN proposal `matches` accepts
-/// (else mint an unused `<id_prefix><key>:<n>` id and propose), cast a yes
+/// (else mint an unused `<id_prefix><id_seed>:<n>` id and propose), cast a yes
 /// ballot, and execute once decidable. idempotent across
 /// members — each runs the same verb; the run landing the deciding ballot
 /// executes. shared by the membership verbs — `resident accept`
 /// (AddResident), `member promote` (AddValidator), `resident remove`
-/// (RemoveResident) — and the module verbs `module update`/`module register`
-/// (UpdateModule/RegisterModule).
+/// (RemoveResident) — the module verbs `module update`/`module register`
+/// (UpdateModule/RegisterModule), and `release schedule` (Signal).
+///
+/// `id_seed` is what keeps two members minting at the same instant off each
+/// other's id: the proposer's own key for a per-member verb. A ceremony whose
+/// settled proposal must be FOUND AGAIN by id from any node — the node
+/// release designation, which every launcher reads back — passes an EMPTY
+/// seed instead, so the id space is `<id_prefix>:<n>` and a reader can walk
+/// it. A concurrent second proposer then simply mints `:<n+1>` for the same
+/// decision rather than colliding.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn drive_proposal_ceremony(
     node: &DrivenNode,
     signer: &GovSigner,
     pubkey_hex: &str,
+    id_seed: &str,
     verb: &str,
     id_prefix: &str,
     wanted: governance::GovAction,
@@ -1463,7 +1563,7 @@ pub(super) fn drive_proposal_ceremony(
             p.proposal_id.clone()
         }
         None => {
-            let prefix: String = pubkey_hex.chars().take(16).collect();
+            let prefix: String = id_seed.chars().take(16).collect();
             // MINT AGAINST THE RECORD, not the roster. `GovQuery::Proposals`
             // walks the OPEN roster, but a settled proposal's record is kept
             // forever under its id — so an id missing from that list can still
@@ -1579,6 +1679,7 @@ fn cmd_invite_accept(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
         &node,
         &signer,
         pubkey_hex,
+        pubkey_hex,
         "node resident accept",
         "resident:",
         wanted,
@@ -1596,13 +1697,56 @@ fn cmd_invite_accept(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
     }
 }
 
+/// What `member promote` decides before it proposes anything.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Promotion {
+    /// the key already holds the seat — an idempotent re-run.
+    AlreadySeated,
+    /// it stands in the resident tier: propose the promotion.
+    Proceed,
+}
+
+/// Governance refuses a promotion of a key with no resident record, and it
+/// refuses it at APPLY — inside a block, long after `/v1/submit/frame`
+/// answered — so the refusal reaches the daemon log (`reason=not_a_resident`)
+/// and never the terminal: the ceremony just polls for a proposal that will
+/// never exist and reports its own deadline, thirty seconds later, saying
+/// nothing about why.
+///
+/// So read the rosters and say it here, before anything is submitted, the way
+/// [`crate::module_cli`]'s own precheck reads the registry before proposing.
+/// This is the SENTENCE and never the gate: a CLI check is walked past by the
+/// app, by a script and by `curl` on `/v1`, and consensus owns the safety
+/// property.
+pub(super) fn precheck_promotion(
+    pubkey_hex: &str,
+    key: &[u8],
+    members: &[Vec<u8>],
+    residents: &[Vec<u8>],
+) -> Result<Promotion, String> {
+    let already_seated = members.iter().any(|m| m == key);
+    if already_seated {
+        return Ok(Promotion::AlreadySeated);
+    }
+    let stands_for_promotion = residents.iter().any(|r| r == key);
+    if stands_for_promotion {
+        return Ok(Promotion::Proceed);
+    }
+    Err(format!(
+        "not_a_resident: {pubkey_hex} holds no resident standing, and a validator is promoted \
+         out of that tier — grant it first with `ducktape node resident accept {pubkey_hex}`, \
+         then promote it once its node is synced"
+    ))
+}
+
 /// `member promote <hex pubkey> [--config node.toml]` — seat a key in the
 /// consensus quorum: drive a governance AddValidator proposal through this
-/// account's own RUNNING node. the passing proposal's valset Join clears any
-/// resident standing in the same block and schedules the epoch cutover; a
+/// account's own RUNNING node. the passing proposal's valset Join clears the
+/// key's resident standing in the same block and schedules the epoch cutover; a
 /// pre-synced resident then catches up a small delta and reboots as a
-/// validator, so the quorum only ever gains a warm member. also serves DIRECT
-/// (un-staged) admission — exactly the pre-resident `resident accept` semantics.
+/// validator, so the quorum only ever gains a warm member. the resident tier is
+/// the only way in: consensus refuses a promotion of a key it has never met,
+/// and [`precheck_promotion`] says so before this verb submits anything.
 fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     use governance::GovAction;
 
@@ -1615,9 +1759,13 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     let signer = gov_signer(node.rpc(), &cfg_path, &resolved)?;
 
     let members = read_members(node.rpc())?;
-    if members.contains(&key_bytes) {
-        eprintln!("{pubkey_hex} is already a validator — nothing to do");
-        return Ok(());
+    let residents = read_residents(node.rpc())?;
+    match precheck_promotion(pubkey_hex, &key_bytes, &members, &residents)? {
+        Promotion::AlreadySeated => {
+            eprintln!("{pubkey_hex} is already a validator — nothing to do");
+            return Ok(());
+        }
+        Promotion::Proceed => {}
     }
     let wanted = GovAction::AddValidator { key: key_bytes };
     let same_action = {
@@ -1627,6 +1775,7 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     match drive_proposal_ceremony(
         &node,
         &signer,
+        pubkey_hex,
         pubkey_hex,
         "node member promote",
         "admit:",
@@ -1689,6 +1838,7 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
     match drive_proposal_ceremony(
         &node,
         &signer,
+        pubkey_hex,
         pubkey_hex,
         "node resident remove",
         "revoke:",
@@ -1955,6 +2105,7 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     };
     let overrides = args.plumbing.overrides();
     let joined = config::join_workspace(&blob, args.dir.clone(), &overrides)?;
+    record_founding_binary(&joined.dir)?;
     match (&genesis_bytes, joined.is_member) {
         (Some(bytes), _) => install_joiner_genesis(&joined.dir, bytes)?,
         (None, true) => {
@@ -2053,6 +2204,107 @@ mod tests {
             })),
             Some("netstack=native last_swap=refused@4 reason=foreign contract".to_string())
         );
+    }
+
+    /// A node answers `status` with everything an operator needs to tell a
+    /// wedged chain from a healthy one, so the verb prints it. Height and root
+    /// hash alone are identical on both, forever.
+    #[test]
+    fn a_stalled_chain_reads_as_stalled_and_a_beating_one_does_not() {
+        let stalled = serde_json::json!({
+            "height": 399,
+            "root_hash": "2170",
+            "operations": {
+                "role": "validator", "phase": "validating",
+                "consensus": {
+                    "epoch": 2, "view": 0, "validators": 2, "quorum": 2,
+                    "reachable_validators": 1, "pending_ops": 3,
+                    "block_beat_stalled_seconds": 116,
+                },
+            },
+        });
+        assert_eq!(
+            super::status_lines(&stalled),
+            [
+                "height=399 root_hash=2170",
+                // `reachable=1` under `quorum=2` IS the diagnosis, and the
+                // seconds say how long it has been true.
+                "role=validator phase=validating quorum=2 reachable=1 stalled_for=116s",
+            ]
+        );
+        assert_eq!(super::stalled_past_recovery(&stalled), Some(116));
+
+        let beating = serde_json::json!({
+            "height": 400,
+            "root_hash": "2171",
+            "operations": {
+                "role": "validator", "phase": "validating",
+                "consensus": {
+                    "epoch": 2, "view": 1, "validators": 2, "quorum": 2,
+                    "reachable_validators": 2, "pending_ops": 0,
+                    "block_beat_stalled_seconds": 0,
+                },
+            },
+        });
+        assert_eq!(
+            super::status_lines(&beating),
+            [
+                "height=400 root_hash=2171",
+                "role=validator phase=validating quorum=2 reachable=2",
+            ]
+        );
+        assert_eq!(super::stalled_past_recovery(&beating), None);
+    }
+
+    /// A silence shorter than the point the chain recovers on its own is
+    /// PRINTED and not exited on: a view change or a slow disk is not a dead
+    /// chain, and a verb that exits non-zero on one teaches an operator to
+    /// ignore it.
+    #[test]
+    fn a_brief_silence_is_reported_without_a_verdict() {
+        let blipping = serde_json::json!({
+            "height": 399, "root_hash": "2170",
+            "operations": {
+                "role": "validator", "phase": "validating",
+                "consensus": {
+                    "validators": 2, "quorum": 2, "reachable_validators": 2,
+                    "block_beat_stalled_seconds": 12,
+                },
+            },
+        });
+        assert_eq!(
+            super::status_lines(&blipping)[1],
+            "role=validator phase=validating quorum=2 reachable=2 stalled_for=12s"
+        );
+        assert_eq!(super::stalled_past_recovery(&blipping), None);
+    }
+
+    /// A role with no consensus section gets no consensus fields, rather than
+    /// zeroes that read as "quorum 0, nothing reachable" — the projection omits
+    /// what does not apply and so does the line.
+    #[test]
+    fn a_node_outside_consensus_prints_what_it_has() {
+        let syncing = serde_json::json!({
+            "height": 12, "root_hash": "aa",
+            "operations": {
+                "role": "resident", "phase": "syncing",
+                "netstack": { "backend": "native", "last_swap": null },
+            },
+        });
+        assert_eq!(
+            super::status_lines(&syncing),
+            [
+                "height=12 root_hash=aa",
+                "role=resident phase=syncing",
+                "netstack=native",
+            ]
+        );
+        assert_eq!(super::stalled_past_recovery(&syncing), None);
+
+        // a daemon that answers no operations at all still answers a tip.
+        let bare = serde_json::json!({ "height": 1, "root_hash": "bb" });
+        assert_eq!(super::status_lines(&bare), ["height=1 root_hash=bb"]);
+        assert_eq!(super::stalled_past_recovery(&bare), None);
     }
 
     #[test]
@@ -2251,8 +2503,10 @@ mod tests {
             GovAction::RegisterModule {
                 name: "x".into(),
                 module_id: "hello".into(),
+                kind: modules::Kind::Module,
                 activation_lead: 60,
                 code_hash: hash.clone(),
+                lanes: Vec::new(),
             },
         );
         let views = vec![settled, other, founders];
@@ -2347,5 +2601,43 @@ mod tests {
         assert_eq!(human_duration(42), "42s");
         assert_eq!(human_duration(192), "3m12s");
         assert_eq!(human_duration(7500), "2h05m");
+    }
+
+    /// #2526: the node refuses a promotion of a key it has never met, but it
+    /// refuses it at APPLY, so the operator used to get thirty seconds of
+    /// silence and then `timed out waiting for the proposal to finalize`. The
+    /// precheck reads the same two rosters consensus reads and says it first.
+    #[test]
+    fn a_promotion_of_a_key_with_no_standing_is_refused_before_anything_is_submitted() {
+        use super::{Promotion, precheck_promotion};
+        let hex = "0000000000000000000000000000000000000000000000000000000000000000";
+        let stranger = vec![0u8; 32];
+        let seated = vec![1u8; 32];
+        let resident = vec![2u8; 32];
+        let members = vec![seated.clone()];
+        let residents = vec![resident.clone()];
+
+        let refusal = precheck_promotion(hex, &stranger, &members, &residents)
+            .expect_err("a key in neither tier has nothing to be promoted out of");
+        assert!(refusal.starts_with("not_a_resident: "), "{refusal}");
+        assert!(refusal.contains(hex), "the refusal names the key: {refusal}");
+        assert!(
+            refusal.contains("ducktape node resident accept"),
+            "and the command that fixes it: {refusal}"
+        );
+
+        // a resident is exactly what a promotion is for.
+        assert_eq!(
+            precheck_promotion(hex, &resident, &members, &residents),
+            Ok(Promotion::Proceed)
+        );
+        // an already-seated key stays the idempotent re-run it has always been,
+        // NOT a refusal — the desired state already holds.
+        assert_eq!(
+            precheck_promotion(hex, &seated, &members, &residents),
+            Ok(Promotion::AlreadySeated)
+        );
+        // empty rosters refuse rather than wave everything through.
+        assert!(precheck_promotion(hex, &stranger, &[], &[]).is_err());
     }
 }

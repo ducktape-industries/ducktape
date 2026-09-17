@@ -1,0 +1,32 @@
+# The wire between the gpui host and a ducktape view running in wasm: a widget
+# tree out, meaning-level events in, requests and responses beside. Both ends
+# live in this repo — the guests under `crates/views/*` build against it, and
+# `app` + `crates/noded` decode what they emit — so the format is ours and the
+# two halves are only ever built from one copy of it. `WIRE_EPOCH` is what a
+# host checks a `.component.wasm` against before running it.
+[package]
+name = "view-wire"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Reads the manifest custom section out of a built component: host-only, so the
+# guests skip `wasmparser` entirely.
+manifest = ["dep:wasmparser"]
+# Derives a view's snapshot layout from its own serde impls. A dev-dependency
+# feature: the tracer never enters wasm, so a guest builds without either crate.
+schema = ["dep:serde-reflection", "dep:sha2"]
+
+[dependencies]
+wasmparser = { version = "0.251", optional = true }
+serde-reflection = { version = "0.6", optional = true }
+sha2 = { version = "0.10", optional = true }
+serde = { version = "1", features = ["derive"] }
+# `task` and `subscription` are futures glue, and `kit` composes the tree
+# below out of the shared palette. Both are already in every graph that
+# reaches this crate.
+futures = "0.3"
+design = { path = "../design" }
+bincode = "1.3"
+memchr = "2"
+unicode-segmentation = "1"

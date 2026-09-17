@@ -1,13 +1,11 @@
 //! THE LIVE HUDDLE LANE — ignored by default, because it needs a live node, a
 //! second person, and the camera and microphone this box may not have.
 //!
-//! Every other test of the huddle stops at a boundary: the unit suites run
-//! pure folds, and the node's `huddle_media_e2e` drives two real nodes with a
-//! client written for the test. This one is the app's OWN leg —
-//! `backend::join_huddle`, `call::call_session`, its roster poll, its ws pump,
-//! its capture thread, its decode store — run as ONE SIDE of a two-sided
-//! huddle. The other side is another process (another machine, in the real
-//! thing) doing the same.
+//! The deployed call guest drives this side's native camera and microphone
+//! through the generic media resources. The independently installed media
+//! service must be published for the room owner's account, and the registry
+//! must deploy the `call` view. The process and guest unit suites cover
+//! authentication, protocol, and lifecycle without physical devices.
 //!
 //! ONE PROCESS IS ONE PERSON, which is the whole reason this is not a
 //! two-session test: identity is process-global (`DUCKTAPE_HOME`/
@@ -41,14 +39,12 @@
 
 use std::time::Duration;
 
-use iced::futures::StreamExt as _;
+use futures::StreamExt as _;
 
 /// The huddle is a meeting: this side waits for the other one to show up,
 /// join, and start publishing. Generous on purpose — a person is slower than
 /// a test.
 const MEETING: Duration = Duration::from_secs(120);
-/// One roster read per second, the same cadence the session's own poll runs.
-const ROSTER_READ: Duration = Duration::from_secs(1);
 /// How long this side keeps publishing after it is satisfied, so the other
 /// side — a second behind at worst — still has somebody to see.
 const COURTESY: Duration = Duration::from_secs(15);
@@ -72,23 +68,10 @@ async fn this_side_hears_and_sees_the_other_through_the_apps_own_leg() {
         .await
         .expect("this side joins the huddle");
 
-    // Wait for the other side, by the only fact that says they are here: the
-    // fan-out this device would steer to names exactly them. (A chain read is
-    // the event; there is no push for "somebody joined a room you are in".)
-    let deadline = std::time::Instant::now() + MEETING;
-    let peer = loop {
-        let fanout = crate::backend::huddle_fanout_nodes(&node, &channel)
-            .await
-            .expect("the node serves the huddle roster");
-        if let [peer] = &fanout[..] {
-            break peer.clone();
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no second side joined {channel} within {MEETING:?}; the roster reads {fanout:?}"
-        );
-        tokio::time::sleep(ROSTER_READ).await;
-    };
+    let client = crate::backend::rpc_client(&node).expect("live node client");
+    crate::module_view::connected(&client).settled().await;
+    let joined_at = std::time::Instant::now();
+    let mut events = crate::call::call_session(node, channel);
 
     // What this side publishes. Both are one video flow and one tile at the
     // far end, so a screen is not a second stream — it is the other source.
@@ -96,20 +79,37 @@ async fn this_side_hears_and_sees_the_other_through_the_apps_own_leg() {
     // status line, which is what the failure below prints.
     let sharing = std::env::var("DUCKTAPE_HUDDLE_SOURCE").is_ok_and(|source| source == "screen");
     match sharing {
-        true => assert!(
-            crate::video::call_use_screen(true).sharing,
-            "the share toggle must take"
-        ),
+        // Through the picker's own enumeration, so the lane proves the list as
+        // well as the capture. `DUCKTAPE_HUDDLE_SHARE` names the row — the
+        // default is the first, which is the whole desktop on a multi-head box
+        // and the one head there is otherwise; the printed list is how you pick
+        // a window's row for the next run.
+        true => {
+            let offered =
+                crate::video::call_share_targets().expect("this box offers a share target");
+            for (index, choice) in offered.iter().enumerate() {
+                println!("share target {index}: {}", choice.label);
+            }
+            let row = std::env::var("DUCKTAPE_HUDDLE_SHARE")
+                .ok()
+                .and_then(|row| row.parse::<usize>().ok())
+                .unwrap_or_default();
+            let choice = offered.get(row).expect("that share row is offered");
+            assert!(
+                crate::video::call_use_screen(Some(choice.target)).sharing,
+                "the share toggle must take"
+            );
+        }
         false => assert!(
             crate::video::call_use_camera(true).camera,
             "the camera toggle must take"
         ),
     }
 
-    let joined_at = std::time::Instant::now();
-    let mut events = crate::call::call_session(node, channel);
     let mut seen_peer = false;
+    let mut peer = String::new();
     let mut note = String::new();
+    let mut peer_image = String::new();
     let watch = async {
         loop {
             // Every event is also a chance to ask the store whether their
@@ -121,11 +121,15 @@ async fn this_side_hears_and_sees_the_other_through_the_apps_own_leg() {
             if !event.message.is_empty() {
                 note = format!("{}: {}", event.kind, event.message);
             }
-            seen_peer |= event.peer == peer;
+            if let [other] = event.peers.as_slice() {
+                seen_peer = true;
+                peer.clone_from(&other.peer);
+                peer_image.clone_from(&other.image);
+            }
             if !seen_peer {
                 continue;
             }
-            let Some((width, height, _)) = crate::video::stage_frame(&peer) else {
+            let Some((width, height, _)) = crate::video::stage_frame(&peer_image) else {
                 continue;
             };
             let heard = crate::call::voice_frames_heard();
@@ -151,7 +155,7 @@ async fn this_side_hears_and_sees_the_other_through_the_apps_own_leg() {
             panic!(
                 "the other side must arrive, be seen AND be heard — beacon: {seen_peer}, \
                  picture: {}, audible frames: {} (last note: {note})",
-                crate::video::stage_frame(&peer).is_some(),
+                crate::video::stage_frame(&peer_image).is_some(),
                 crate::call::voice_frames_heard(),
             )
         });

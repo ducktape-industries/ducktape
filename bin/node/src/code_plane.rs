@@ -14,7 +14,11 @@
 //!   The receiver acks with its resume offset (transfers survive drops),
 //!   streams the tail into a disk-staged slot, and answers one result frame.
 //! - PULL: a node missing a committed artifact asks a peer to stream it —
-//!   the data-plane twin of the mesh's ranged blob lane.
+//!   the data-plane twin of the mesh's ranged blob lane. The eager puller on
+//!   every member (`validator::code_announce`: pending swaps AND open
+//!   ballots, validators and residents alike) rides that mesh lane; this
+//!   plane is hosted by validators only, and a resident is never a push
+//!   target.
 //!
 //! Admission is default-deny per the plane's contract: members only, one
 //! live transfer per digest, [`MAX_INBOUND_PUSHES_PER_PEER`] concurrent
@@ -39,7 +43,7 @@ use data_plane::{
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::constants::MAX_MODULE_CODE_BYTES;
-use crate::overlay_book::{BIND_RETRY, OverlayBook, OverlayPeers, Plane, StreamPlane};
+use crate::overlay_book::{BIND_RETRY, LaneSource, OverlayBook, OverlayPeers, Plane, StreamPlane};
 
 const INTENT_PUSH: u8 = 1;
 const INTENT_PULL: u8 = 2;
@@ -91,7 +95,9 @@ fn code_flow() -> FlowId {
 struct CodePlane;
 
 impl Plane for CodePlane {
-    const SERVICE: Service = Service::ModuleCode;
+    // KERNEL: this plane fetches the very bytes a declaration would arrive
+    // in, so it cannot wait on a registry to learn its own id.
+    const LANE: LaneSource = LaneSource::Kernel(Service::MODULE_CODE);
 }
 
 impl StreamPlane for CodePlane {
@@ -221,7 +227,7 @@ pub(crate) fn spawn(
         let own = peers.own_ip(&me);
         let spec = StreamPlaneSpec {
             own_ip: own,
-            service: Service::ModuleCode,
+            service: Service::MODULE_CODE,
             pacing: StreamPacing::Shared(pacer),
             policy: StreamPolicy { accept_backlog: 16 },
             retry: BIND_RETRY,
@@ -245,7 +251,7 @@ pub(crate) fn spawn(
             own = %own,
             "module-code plane: overlay stream bound"
         );
-        planes.register("module-code", Service::ModuleCode, plane.watch());
+        planes.register("module-code", "module-code", plane.watch());
         let _plane = plane;
         tokio::select! {
             _ = accept_loop(Arc::clone(&service), blobs.clone(), registry) => {}
@@ -773,12 +779,12 @@ mod tests {
         let plane_b = plane(b);
         let sa = Arc::new(
             plane_a
-                .stream_service(Service::ModuleCode, StreamPolicy { accept_backlog: 4 })
+                .stream_service(Service::MODULE_CODE, StreamPolicy { accept_backlog: 4 })
                 .unwrap(),
         );
         let sb = Arc::new(
             plane_b
-                .stream_service(Service::ModuleCode, StreamPolicy { accept_backlog: 4 })
+                .stream_service(Service::MODULE_CODE, StreamPolicy { accept_backlog: 4 })
                 .unwrap(),
         );
         // the planes must outlive the services; leak them for test lifetime.
@@ -1047,8 +1053,10 @@ mod tests {
         let action = |hash: [u8; 32]| GovAction::RegisterModule {
             name: "hello@x".into(),
             module_id: "hello".into(),
+            kind: modules::Kind::Module,
             activation_lead: 50,
             code_hash: hash.to_vec(),
+            lanes: Vec::new(),
         };
         let proposals = vec![
             proposal(ProposalStatus::Open, action(register)),
@@ -1152,6 +1160,7 @@ mod tests {
         registry.update(HashSet::from([old, active, cancelled]));
         let modules = vec![modules::ModuleCode {
             module_id: "hello".into(),
+            kind: modules::Kind::Module,
             active_code_hash: active.to_vec(),
             pending: None,
             history: vec![

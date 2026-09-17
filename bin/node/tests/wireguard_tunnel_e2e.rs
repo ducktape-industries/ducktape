@@ -208,7 +208,7 @@ impl Underlay {
         for (key, value) in extra_env {
             cmd.arg(format!("{key}={value}"));
         }
-        cmd.arg(env!("CARGO_BIN_EXE_ducktape")).arg("node");
+        cmd.arg(common::node_bin()).arg("node");
         cmd
     }
 

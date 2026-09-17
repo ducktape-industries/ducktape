@@ -15,10 +15,6 @@ impl<Member> EpochMembership<Member>
 where
     Member: Ord + Clone,
 {
-    pub fn from_validator_set(members: impl IntoIterator<Item = Member>) -> Self {
-        Self::from_sets(members, std::iter::empty())
-    }
-
     /// the two-tier epoch membership: `validators` seat the consensus engine;
     /// `residents` (the staged-admission tier) hold transport standing only.
     /// transport is the UNION — the seam where the two fields diverge.

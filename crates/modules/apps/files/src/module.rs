@@ -28,7 +28,7 @@ pub(crate) fn gc_due(height: u64, watermark: u64) -> bool {
 /// steps 2-3 of the durability ordering (the object side): flush the block's
 /// objects into the odb, then fsync the touched fanout dirs so every published
 /// object is durable BEFORE the refs commit point. shared verbatim by the native
-/// [`Files::commit_block`] and the wasm-tenant [`crate::backing::FilesOdbBacking`]'s
+/// [`Files::commit_block`] and the wasm-tenant `files_odb::FilesOdbBacking`'s
 /// `publish_block`, so the crash-safety contract is single-sourced (extract-and-
 /// share, not forked). objects are content-addressed + idempotent, so a re-put on
 /// replay is a cheap no-op.
@@ -38,7 +38,7 @@ pub(crate) fn gc_due(height: u64, watermark: u64) -> bool {
 /// `DiskStore` to any [`ObjectStore`]. the wasm-tenant backing still passes its
 /// concrete `DiskStore`, which satisfies the bound unchanged — the single-source
 /// contract is preserved.
-pub(crate) fn persist_objects<S: ObjectStore>(
+pub fn persist_objects<S: ObjectStore>(
     store: &mut S,
     objects: &[(Kind, Vec<u8>)],
 ) -> Result<(), Error> {
@@ -58,7 +58,7 @@ pub(crate) fn persist_objects<S: ObjectStore>(
 /// (the ONLY place the root moves), then run the consensus-neutral gc watermark
 /// trigger and re-save the advanced watermark. returns the (possibly advanced) gc
 /// watermark. shared verbatim by the native [`Files::commit_block`] and the
-/// wasm-tenant [`crate::backing::FilesOdbBacking`]'s `adopt_refs`.
+/// wasm-tenant `files_odb::FilesOdbBacking`'s `adopt_refs`.
 ///
 /// the caller MUST have persisted the block's objects (via [`persist_objects`])
 /// first: the refs file names those objects, so a crash after this returns must
@@ -68,7 +68,7 @@ pub(crate) fn persist_objects<S: ObjectStore>(
 /// the concrete `Fs<DiskStore>`/`DiskRefs` so the native `Files<S, R>` commit path
 /// can share it; the wasm-tenant backing passes its concrete disk stores, still
 /// satisfying the bounds.
-pub(crate) fn commit_refs<S: ObjectStore, R: RefsStore>(
+pub fn commit_refs<S: ObjectStore, R: RefsStore>(
     fs: &mut Fs<S>,
     refs_store: &mut R,
     refs: Refs,

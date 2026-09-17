@@ -24,7 +24,7 @@ use crate::join_gate;
 use crate::reachability_plane::{wire_reachability_plane, GateHook, GateOutcomes};
 use crate::sync::catchup::derive_pending_boot;
 use crate::sync::serve::{drive_sync_request, SyncStateRequest};
-use crate::{overlay_book, voice};
+use crate::{overlay_book, presence};
 use futures::StreamExt as _;
 use statesync::SyncServer;
 
@@ -65,10 +65,10 @@ pub(super) struct RuntimeWiring {
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
     /// the send half of that seam, for this node's own root divergence watch.
     pub(super) sync_state_tx: futures::channel::mpsc::Sender<SyncStateRequest>,
-    /// unix seconds of the last served state-sync request — the drain reads it
-    /// to defer oplog pruning while a syncer is actively pulling (the sync
-    /// retention lease, see sync/serve.rs).
-    pub(super) sync_lease: Arc<std::sync::atomic::AtomicU64>,
+    /// what syncers this node is serving still need retained — the drain
+    /// reads it to hold its oplog prune off their history (see
+    /// `sync::serve::SyncRetention`).
+    pub(super) sync_retention: Arc<crate::sync::serve::SyncRetention>,
     pub(super) relay_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
 }
 
@@ -161,6 +161,10 @@ pub(super) async fn finish(
         );
         crate::gateway_plane::spawn(
             crate::gateway_plane::SpawnConfig {
+                bindings: crate::plane_metrics::ApplicationBindings::register(
+                    context,
+                    gateway_workspace.clone(),
+                ),
                 label: label.clone(),
                 book: std::sync::Arc::clone(&book),
                 me: signer.public_key(),
@@ -180,7 +184,7 @@ pub(super) async fn finish(
         blob_client,
         sync_state_rx,
         sync_state_tx,
-        sync_lease,
+        sync_retention,
     } = wire_serve_lanes(
         context,
         &signer,
@@ -230,7 +234,7 @@ pub(super) async fn finish(
         blob_client,
         sync_state_rx,
         sync_state_tx,
-        sync_lease,
+        sync_retention,
         relay_ingress,
     }
 }
@@ -247,7 +251,46 @@ pub(super) struct ServeLanes {
     /// divergence watch asks this node for its own tip coordinates exactly as
     /// a peer would (see `sync::divergence`).
     pub(super) sync_state_tx: futures::channel::mpsc::Sender<SyncStateRequest>,
-    pub(super) sync_lease: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) sync_retention: Arc<crate::sync::serve::SyncRetention>,
+}
+
+/// answer one `ForgeObjects` request on its OWN task, so the serve loop is
+/// free while the pack builds. The whole reply path moves with it — bounded
+/// encode, the serve-lane observation, the mesh send — because a reply that
+/// outlives its turn on the loop has to carry its own `rpc_id` and peer.
+/// Ordering is not owed here: every answer is addressed by rpc id, and the
+/// requester's `pending` map completes whichever lands.
+#[allow(clippy::too_many_arguments)]
+fn spawn_forge_answer(
+    context: &commonware_runtime::tokio::Context,
+    forge_repo: std::path::PathBuf,
+    blobs: noded::blobs::BlobHandle,
+    served: blob_fetch::ServedPacks,
+    monitor: statesync::monitor::ServeMonitor,
+    mut sync_tx: super::MeshSender,
+    peer: ed25519::PublicKey,
+    rpc_id: u64,
+    req_kind: &'static str,
+    repo: String,
+    head: [u8; statesync::FORGE_OID_LEN],
+    bases: Vec<[u8; statesync::FORGE_OID_LEN]>,
+) {
+    context
+        .child("statesync_forge")
+        .spawn(move |_ctx| async move {
+            let resp =
+                blob_fetch::serve_forge_objects(&forge_repo, &blobs, &served, &repo, head, &bases)
+                    .await;
+            let (resp, body) = crate::sync::serve::encode_bounded_response(resp);
+            let framed = statesync::encode_rpc(&[0u8; 32], &[0u8; 64], rpc_id, &body);
+            monitor.record(
+                &config::hex_bytes(peer.as_ref()),
+                req_kind,
+                &resp,
+                framed.len() as u64,
+            );
+            let _ = sync_tx.send(Recipients::One(peer), IoBuf::from(framed), false);
+        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -316,17 +359,17 @@ pub(super) fn wire_serve_lanes(
         blob_requester,
         blob_proof,
     );
-    let sync_lease = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sync_retention = Arc::new(crate::sync::serve::SyncRetention::default());
     let watch_state_tx = sync_state_tx.clone();
     let state_tx = sync_state_tx;
-    let sync_lease_serve = sync_lease.clone();
+    let sync_retention_serve = sync_retention.clone();
     let mut sync_tx = sync_tx;
     let mut ingress = sync_ingress;
     // the genesis namespace the standing proof is bound to.
     let serve_namespace = namespace.to_vec();
     context
         .child("statesync_serve")
-        .spawn(move |_ctx| async move {
+        .spawn(move |ctx| async move {
             let mut server = SyncServer::new();
             // the joiner backfill lane's read-ahead: one loop touch reads a
             // budget of wire pages, and this hands the surplus out.
@@ -526,29 +569,36 @@ pub(super) fn wire_serve_lanes(
                     } => blob_fetch::serve_blob_range(&sync_blobs, &digest, offset, len),
                     // forge object catch-up: also host state, built off this
                     // node's own git substrate — SyncServer cannot see it.
+                    // Answered OFF this loop: a joiner sends no bases, so the
+                    // build is a whole-repo pack, and every other kind a peer
+                    // is waiting on (tip_coords, frames, blob_info) would
+                    // queue behind it (#2481).
                     statesync::SyncRequest::ForgeObjects { repo, head, bases } => {
-                        blob_fetch::serve_forge_objects(
-                            &forge_repo,
-                            &sync_blobs,
-                            &served_packs,
-                            &repo,
+                        spawn_forge_answer(
+                            &ctx,
+                            forge_repo.clone(),
+                            sync_blobs.clone(),
+                            served_packs.clone(),
+                            sync_monitor.clone(),
+                            sync_tx.clone(),
+                            peer,
+                            rpc_id,
+                            req_kind,
+                            repo,
                             head,
-                            &bases,
-                        )
+                            bases,
+                        );
+                        continue;
                     }
                     req => {
-                        // renew the sync retention lease: this node is
-                        // actively serving a syncer, so the drain defers
-                        // oplog pruning until the lease lapses. only the
-                        // state-bearing lanes renew it (see
-                        // `sync::serve::renews_sync_lease`) — the
-                        // coordinates-only TipCoords poll and the
-                        // never-pruned IndexOps backfill must not.
-                        if crate::sync::serve::renews_sync_lease(&req) {
-                            sync_lease_serve.store(
-                                crate::sync::serve::unix_now_secs(),
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                        // record the claim on history this request makes —
+                        // BEFORE it is served, so a checkpoint that lands
+                        // mid-serve already holds its prune off the height
+                        // being read. a lane that claims nothing (a tip
+                        // query, the never-pruned index backfill) leaves the
+                        // lease to lapse; see `sync::serve::SyncRetention`.
+                        if let Some(needed_from) = crate::sync::serve::sync_retention_need(&req) {
+                            sync_retention_serve.claim(needed_from);
                         }
                         drive_sync_request(&mut server, &mut pager, &state_tx, req).await
                     }
@@ -575,7 +625,7 @@ pub(super) fn wire_serve_lanes(
         blob_client,
         sync_state_rx,
         sync_state_tx: watch_state_tx,
-        sync_lease,
+        sync_retention,
     }
 }
 
@@ -603,9 +653,10 @@ pub(super) async fn wire(
     wireguard_advertised: Option<Ingress>,
     invite_listen: Option<std::net::SocketAddr>,
     coord_cap: Option<nat_traversal::CoordCap>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
+    presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
     planes: data_plane::PlaneMonitor,
+    netstack_backend: Result<reachability::NetstackBackend, String>,
 ) -> PreWiring {
     // consensus membership comes from the RECOVERY RECORD: the epoch's
     // ENGINE PARTICIPANT SET (at genesis: exactly the config seed). the
@@ -685,15 +736,15 @@ pub(super) async fn wire(
     // the ingress select arm and the drain-resolution/expiry code.
     let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota);
 
-    // the voice + video hub: huddle media between members. one per-use data
-    // plane per service: media rides the OVERLAY — audio+control on
-    // Service::Voice's overlay socket (45902), camera on Service::Video's
-    // (45903) — never the mesh.
+    // the Pages presence hub, on the declared `chat/presence` lane's overlay
+    // datagram socket. Huddle media is NOT here and never was: a call reaches
+    // the installed media service through a gateway route, so nothing on this
+    // plane carries one.
     let media_peers = {
-        // media needs the overlay: with no overlay (fake effect, or the
-        // reachability plane unconfigured) there is no media transport at
+        // presence needs the overlay: with no overlay (fake effect, or the
+        // reachability plane unconfigured) there is no transport for it at
         // all (the overlay-only cutover — no mesh fallback), so drop the
-        // session lane and huddle joins refuse fast instead of hanging.
+        // session lane and presence joins refuse fast instead of hanging.
         let overlay_capable = wireguard_listen.is_some();
         if overlay_capable {
             // tracked media set = transport members ∪ residents, refreshed
@@ -711,24 +762,25 @@ pub(super) async fn wire(
                 .as_ref()
                 .try_into()
                 .expect("ed25519 keys are 32 bytes");
-            voice::spawn_hub(
-                voice_requests,
+            presence::spawn_hub(
+                presence_requests,
                 crate::overlay_book::socket_factory(overlay_capable, &overlay_slot),
                 std::sync::Arc::clone(&peers),
                 me,
                 planes,
+                label.clone(),
             );
             Some(peers)
         } else {
-            // Say it at boot: an operator whose node can never host a huddle
+            // Say it at boot: an operator whose node can never carry presence
             // otherwise learns it one failed join at a time, from the webview.
             tracing::warn!(
-                target: "ducktape::voice",
+                target: "ducktape::presence",
                 node = %label,
                 reason = "overlay_unavailable",
-                "calls disabled; set wireguard_listen to enable huddles"
+                "page presence disabled; set wireguard_listen to enable the overlay"
             );
-            drop(voice_requests);
+            drop(presence_requests);
             None
         }
     };
@@ -804,6 +856,7 @@ pub(super) async fn wire(
                     // a validator never hands this plane off in-process:
                     // demotion exits, promotion already happened.
                     None,
+                    crate::reachability_plane::NetstackBoot::Selected(netstack_backend),
                 ))
             }
             None => {

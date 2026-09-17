@@ -42,9 +42,14 @@ jobs:
       # the exact channel + targets, so this just makes rustup install it.
       - run: rustup show
       # the committed guest bytes agree with their fixture copies, and no
-      # binary embeds one — the binary is not the module set. Text checks,
-      # no toolchain.
+      # binary embeds one — the binary is not the module set. The first is a
+      # text check; the second is a source-parsing lint over the whole tree,
+      # which this job builds two steps below anyway.
       - run: make wasm-modules-check wasm-embed-check
+      # airlock's signing-route tests sign a fixture bundle with the pinned
+      # `rcodesign` the enclave image carries (ops/airlock-gateway/); the
+      # test refuses to skip without it.
+      - run: ops/airlock-gateway/install-rcodesign.sh --prefix "$HOME/.local" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       # simnode's lib tests boot the sim, which mounts the view bundle; the
       # whole crate runs in nightly.yml after `make views`.
       - run: cargo test --locked --workspace --lib --exclude simnode --no-fail-fast

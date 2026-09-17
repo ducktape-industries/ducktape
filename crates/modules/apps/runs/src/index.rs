@@ -45,7 +45,10 @@ use crate::{
     RunEvent, RunFact, RunOutcome, decode_assigned, delegated_run_id_for, dispatch_id_for,
     page_source,
 };
-use sdk::Origin as RunOrigin;
+// the shapes this fold answers with live in the wire crate, so the daemon can
+// decode a `/v1/index/runs` reply without linking the module that folded it.
+// re-exported here, so `runs::index::RunsViewQuery` still names the same type.
+pub use runs_wire::view::*;
 
 /// [`Fail`] code: an applied op's assigned stamp did not decode — interface
 /// drift, which only a refold can honestly repair.
@@ -55,120 +58,6 @@ const FAIL_ROW_DECODE: i32 = 3;
 /// [`Fail`] code: a view request this mapper does not speak.
 const FAIL_BAD_REQUEST: i32 = 4;
 
-/// where in the chain a fact was committed.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Stamp {
-    pub height: u64,
-    /// the block's agreed timestamp (consensus time).
-    pub time: u64,
-}
-
-/// a run's lifecycle position: the fold of its journal.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum RunState {
-    /// staged on the dispatch plane; no node has bound a session yet.
-    Dispatched,
-    /// the lease holder bound its session key.
-    Running { attempt: u32, holder: String },
-    /// delivered. `outcome` mirrors the module's ring: a later result-action
-    /// refusal turns an accepted result into [`RunOutcome::ActionRejected`],
-    /// never the other way.
-    Settled {
-        outcome: RunOutcome,
-        reason: Option<String>,
-        degraded: bool,
-        executing_node: String,
-        output_ref: Option<String>,
-        at: Stamp,
-    },
-}
-
-/// one run as the list and detail views return it.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RunView {
-    pub run_id: String,
-    pub dispatch_id: String,
-    pub agent_id: String,
-    /// empty for job-backed runs.
-    pub channel_id: String,
-    /// 0 for job-backed runs.
-    pub anchor_seq: u64,
-    pub job_id: Option<String>,
-    pub delegation_id: Option<String>,
-    pub requester: RunOrigin,
-    pub dispatched: Stamp,
-    pub state: RunState,
-    /// actions the run staged, on either lane.
-    pub actions: u64,
-    /// where the run was called from; `None` for a delegated run, whose
-    /// caller is a run rather than a place.
-    pub origin: Option<RunPlace>,
-    /// every place the run's journal names, in the order it named them, each
-    /// once: what its receipts landed on and what it settled with.
-    pub places: Vec<RunPlace>,
-}
-
-/// one addressable resource a run's journal names — the origin it answers,
-/// a destination a receipt resolved, an id a receipt minted, an output it
-/// settled with. Every variant is one place the app can open.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum RunPlace {
-    /// a chat message: the anchor the run answers, or the thread root it
-    /// posted under.
-    ChatMessage {
-        channel_id: String,
-        seq: u64,
-    },
-    /// a channel the run posted into at top level.
-    Channel {
-        channel_id: String,
-    },
-    /// a page block: the block a run was called on, a comment's target, a
-    /// todo it ticked. A page's root block is the page itself.
-    PageBlock {
-        block_id: String,
-    },
-    /// a page comment thread the run was called in or commented into.
-    PageThread {
-        thread_id: String,
-    },
-    /// a page the run made.
-    Page {
-        page_id: String,
-        title: String,
-    },
-    Job {
-        job_id: String,
-    },
-    Task {
-        task_id: String,
-    },
-    /// a duckfs path the run wrote.
-    File {
-        path: String,
-    },
-    /// a module the run proposed an update of.
-    Module {
-        module_id: String,
-    },
-    /// another run: the callee of an `agent.call`, by its dispatch id.
-    Run {
-        dispatch_id: String,
-    },
-    /// a forge tracker item: the issue or PR a run was called on, or the
-    /// PR its sink opened or updated.
-    ForgeItem {
-        repo: String,
-        number: u64,
-    },
-    /// what the run produced: forge `branch@commit` or a duckfs snapshot.
-    Output {
-        output_ref: String,
-    },
-}
 
 /// the place a run was called from, read off its dispatch fact. A delegated
 /// run has none: its caller is a run, and the journal keys that edge by its
@@ -387,62 +276,6 @@ fn pr_place(pr: &PrRef) -> RunPlace {
     }
 }
 
-impl RunView {
-    /// name a place once: a second receipt on the same destination is the
-    /// same place, and a PR the settle found is the PR the link confirms.
-    fn touch(&mut self, place: RunPlace) {
-        let known = self.places.contains(&place);
-        if known {
-            return;
-        }
-        self.places.push(place);
-    }
-}
-
-/// one journal entry as the detail view returns it.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct JournalRow {
-    pub height: u64,
-    pub time: u64,
-    pub fact: RunFact,
-}
-
-/// one run with its whole journal.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RunDetail {
-    pub run: RunView,
-    pub journal: Vec<JournalRow>,
-}
-
-/// runs' view requests, externally tagged:
-/// `{"recent": {"agent_id": "bot", "limit": 50}}`, `{"run": {"dispatch_id": "…"}}`.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunsViewQuery {
-    /// runs newest-dispatch first, every agent's or one agent's. `limit`
-    /// defaults to, and is clamped at, one scan page ([`MAX_SCAN_LIMIT`]).
-    Recent {
-        #[serde(default)]
-        agent_id: Option<String>,
-        #[serde(default)]
-        limit: Option<usize>,
-    },
-    /// one run and its journal, by the dispatch id that addresses a run
-    /// everywhere outside this module ([`dispatch_id_for`]).
-    Run { dispatch_id: String },
-}
-
-/// runs' view replies.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunsViewReply {
-    Runs(Vec<RunView>),
-    /// boxed only to keep the reply enum small — serde is transparent over
-    /// `Box`, so the wire shape is the bare detail or `null`.
-    Run(Option<Box<RunDetail>>),
-}
 
 fn run_key(dispatch_id: &str) -> String {
     format!("run/{dispatch_id}")
@@ -716,7 +549,7 @@ pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode_assigned;
+    use crate::{RunOrigin, encode_assigned};
     use index_guest::{OriginTag, apply_to_map};
 
     type Map = BTreeMap<Vec<u8>, Vec<u8>>;

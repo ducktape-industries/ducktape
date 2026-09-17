@@ -15,6 +15,11 @@ version.workspace = true
 # the datagram transport the media planes ride, and the peer identity that
 # names every speaker (the plane's WireGuard identity binding).
 data-plane = { workspace = true }
+# the huddle's picture codec (`video::codec`): intra-only JPEG both ways.
+# Here rather than in the app because both APIs are generic and instantiate
+# in their caller — this crate is the one the dev profile optimizes.
+jpeg-encoder = "0.6"
+zune-jpeg = "0.4"
 opus-rs = { workspace = true }
 # one random per-session media epoch: the field that tells a receiver a peer
 # restarted their stream rather than replaying an old one.

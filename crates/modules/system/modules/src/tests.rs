@@ -86,13 +86,18 @@ fn advance() -> Msg {
 // ---- module-code path helpers -----------------------------------------------
 
 fn register_module(lc: &mut Modules, module_id: &str, code: u8) {
+    register_kind(lc, module_id, Kind::Module, code);
+}
+fn register_kind(lc: &mut Modules, module_id: &str, kind: Kind, code: u8) {
     let mut sys = ctx(Origin::System, 0);
     run(
         lc,
         &mut sys,
         &msg(ModulesMsg::RegisterModule {
             module_id: module_id.into(),
+            kind,
             code_hash: hash(code),
+            lanes: Vec::new(),
         }),
     )
     .unwrap();
@@ -107,11 +112,16 @@ fn schedule_swap(module_id: &str, name: &str, ah: u64, code: u8) -> Msg {
     })
 }
 fn schedule_register(module_id: &str, name: &str, ah: u64, code: u8) -> Msg {
+    schedule_register_kind(module_id, Kind::Module, name, ah, code)
+}
+fn schedule_register_kind(module_id: &str, kind: Kind, name: &str, ah: u64, code: u8) -> Msg {
     msg(ModulesMsg::ScheduleRegister {
         name: name.into(),
         module_id: module_id.into(),
+        kind,
         activation_height: ah,
         code_hash: hash(code),
+        lanes: Vec::new(),
     })
 }
 fn cancel_swap(module_id: &str, name: &str) -> Msg {
@@ -172,7 +182,9 @@ fn a_non_governance_module_authors_nothing() {
     let refused = [
         msg(ModulesMsg::RegisterModule {
             module_id: "kanban".into(),
+            kind: Kind::Module,
             code_hash: hash(1),
+            lanes: Vec::new(),
         }),
         schedule_swap("governance", "capture", 10, 9),
         schedule_register("kanban", "capture", 10, 9),
@@ -209,7 +221,9 @@ fn register_and_schedule_origin_gate() {
             &mut ext,
             &msg(ModulesMsg::RegisterModule {
                 module_id: "hello".into(),
-                code_hash: hash(1)
+                kind: Kind::Module,
+                code_hash: hash(1),
+                lanes: Vec::new()
             })
         ),
         Err(Error::Module(_))
@@ -220,7 +234,9 @@ fn register_and_schedule_origin_gate() {
         &mut gov,
         &msg(ModulesMsg::RegisterModule {
             module_id: "hello".into(),
+            kind: Kind::Module,
             code_hash: hash(1),
+            lanes: Vec::new(),
         }),
     )
     .unwrap();
@@ -266,7 +282,9 @@ fn register_rejects_reregistration_and_bad_hash() {
             &mut sys,
             &msg(ModulesMsg::RegisterModule {
                 module_id: "hello".into(),
-                code_hash: hash(9)
+                kind: Kind::Module,
+                code_hash: hash(9),
+                lanes: Vec::new()
             })
         )
         .is_err()
@@ -277,7 +295,9 @@ fn register_rejects_reregistration_and_bad_hash() {
             &mut sys,
             &msg(ModulesMsg::RegisterModule {
                 module_id: "other".into(),
-                code_hash: vec![1, 2, 3]
+                kind: Kind::Module,
+                code_hash: vec![1, 2, 3],
+                lanes: Vec::new()
             })
         )
         .is_err()
@@ -686,6 +706,157 @@ fn cancelled_admission_removes_entry() {
     assert!(module_status(&lc).is_empty());
 }
 
+// ---- kind ------------------------------------------------------------------
+
+/// what an entry IS travels with it: a seed, a register and an admission each
+/// record their kind, and status reports it.
+#[test]
+fn seed_register_and_admission_carry_kind_and_status_reports_it() {
+    let mut lc = fresh();
+    futures::executor::block_on(async {
+        lc.seed("chat", Kind::Module, hash(1), Vec::new())
+            .await
+            .unwrap();
+        lc.seed("home", Kind::View, hash(2), Vec::new())
+            .await
+            .unwrap();
+        lc.finish_seed().await.unwrap();
+    });
+    register_kind(&mut lc, "kanban", Kind::Module, 3);
+    register_kind(&mut lc, "board", Kind::View, 4);
+    let mut gov = ctx(Origin::Module("governance".into()), 0);
+    run(
+        &mut lc,
+        &mut gov,
+        &schedule_register_kind("later", Kind::View, "v1", 10, 5),
+    )
+    .unwrap();
+    commit(&mut lc);
+    let kinds: Vec<(String, Kind)> = module_status(&lc)
+        .into_iter()
+        .map(|entry| (entry.module_id, entry.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("board".into(), Kind::View),
+            ("chat".into(), Kind::Module),
+            ("home".into(), Kind::View),
+            ("kanban".into(), Kind::Module),
+            ("later".into(), Kind::View),
+        ]
+    );
+}
+
+/// the kind is in the root: two registries that differ only in one entry's
+/// kind commit different state.
+#[test]
+fn kind_is_committed_state() {
+    let mut as_module = fresh();
+    register_kind(&mut as_module, "home", Kind::Module, 1);
+    let mut as_view = fresh();
+    register_kind(&mut as_view, "home", Kind::View, 1);
+    assert_ne!(as_module.root(), as_view.root());
+}
+
+/// a swap keeps the entry's kind: schedule, readiness, activation and the
+/// history behave for a `View` exactly as they do for a `Module`, and the
+/// kind never changes across the flip.
+#[test]
+fn a_swap_preserves_kind_and_a_view_swaps_like_a_module() {
+    let mut lc = fresh();
+    register_kind(&mut lc, "home", Kind::View, 1);
+    register_kind(&mut lc, "chat", Kind::Module, 1);
+    let mut gov = ctx(Origin::Module("governance".into()), 0);
+    for id in ["home", "chat"] {
+        run(&mut lc, &mut gov, &schedule_swap(id, "next", 10, 2)).unwrap();
+    }
+    commit(&mut lc);
+    for entry in module_status(&lc) {
+        assert_eq!(entry.pending.as_ref().unwrap().code_hash, hash(2));
+        assert_eq!(entry.active_code_hash, hash(1));
+    }
+    assert!(armed_at(&lc, 10).is_empty(), "not armed until ready");
+    make_swap_ready(&mut lc, "home", "next", 2);
+    make_swap_ready(&mut lc, "chat", "next", 2);
+    let armed: Vec<String> = armed_at(&lc, 10)
+        .into_iter()
+        .map(|swap| swap.module_id)
+        .collect();
+    assert_eq!(armed, ["chat", "home"]);
+    let mut at = ctx(Origin::System, 10);
+    run(&mut lc, &mut at, &advance()).unwrap();
+    commit(&mut lc);
+    let status = module_status(&lc);
+    let home = status
+        .iter()
+        .find(|entry| entry.module_id == "home")
+        .unwrap();
+    let chat = status
+        .iter()
+        .find(|entry| entry.module_id == "chat")
+        .unwrap();
+    assert_eq!(home.kind, Kind::View, "the swap kept the view's kind");
+    assert_eq!(chat.kind, Kind::Module);
+    for entry in [home, chat] {
+        assert_eq!(entry.active_code_hash, hash(2));
+        assert!(entry.pending.is_none());
+        assert_eq!(entry.history.len(), 2);
+    }
+    // the same gates: a no-op swap and a second in-flight pending refuse
+    // for a view exactly as for a module.
+    assert!(run(&mut lc, &mut gov, &schedule_swap("home", "same", 20, 2)).is_err());
+    run(&mut lc, &mut gov, &schedule_swap("home", "third", 20, 3)).unwrap();
+    commit(&mut lc);
+    assert!(run(&mut lc, &mut gov, &schedule_swap("home", "fourth", 30, 4)).is_err());
+    let mut sys = ctx(Origin::System, 0);
+    run(&mut lc, &mut sys, &cancel_swap("home", "third")).unwrap();
+    commit(&mut lc);
+    let home = module_status(&lc)
+        .into_iter()
+        .find(|entry| entry.module_id == "home")
+        .unwrap();
+    assert!(home.pending.is_none());
+    assert_eq!(home.kind, Kind::View);
+}
+
+/// an admission of a view realizes at its boundary like a module's, and a
+/// cancelled one leaves no entry behind.
+#[test]
+fn a_view_admission_realizes_and_cancels_like_a_module() {
+    let mut lc = fresh();
+    let mut gov = ctx(Origin::Module("governance".into()), 0);
+    run(
+        &mut lc,
+        &mut gov,
+        &schedule_register_kind("home", Kind::View, "v1", 10, 5),
+    )
+    .unwrap();
+    commit(&mut lc);
+    let home = &module_status(&lc)[0];
+    assert_eq!(home.kind, Kind::View);
+    assert!(home.active_code_hash.is_empty());
+    make_swap_ready(&mut lc, "home", "v1", 5);
+    let mut at = ctx(Origin::System, 10);
+    run(&mut lc, &mut at, &advance()).unwrap();
+    commit(&mut lc);
+    let home = &module_status(&lc)[0];
+    assert_eq!(home.kind, Kind::View);
+    assert_eq!(home.active_code_hash, hash(5));
+
+    let mut lc = fresh();
+    run(
+        &mut lc,
+        &mut gov,
+        &schedule_register_kind("home", Kind::View, "v1", 10, 5),
+    )
+    .unwrap();
+    commit(&mut lc);
+    run(&mut lc, &mut gov, &cancel_swap("home", "v1")).unwrap();
+    commit(&mut lc);
+    assert!(module_status(&lc).is_empty());
+}
+
 // ---- the activation history (code-at-height) --------------------------------
 
 fn activation(height: u64, code: u8) -> Activation {
@@ -699,6 +870,7 @@ fn activation(height: u64, code: u8) -> Activation {
 fn entry(history: &[(u64, u8)], pending: Option<ScheduledSwap>) -> ModuleCode {
     ModuleCode {
         module_id: "hello".into(),
+        kind: Kind::Module,
         active_code_hash: history.last().map(|(_, c)| hash(*c)).unwrap_or_default(),
         pending,
         history: history.iter().map(|(h, c)| activation(*h, *c)).collect(),
@@ -758,7 +930,9 @@ fn every_activation_is_appended_in_block_order() {
         &mut at7,
         &msg(ModulesMsg::RegisterModule {
             module_id: "hello".into(),
+            kind: Kind::Module,
             code_hash: hash(1),
+            lanes: Vec::new(),
         }),
     )
     .unwrap();
@@ -801,7 +975,9 @@ fn every_activation_is_appended_in_block_order() {
     // a genesis seed is the activation at block zero.
     let mut lc = fresh();
     futures::executor::block_on(async {
-        lc.seed("hello", hash(1)).await.unwrap();
+        lc.seed("hello", Kind::Module, hash(1), Vec::new())
+            .await
+            .unwrap();
         lc.finish_seed().await.unwrap();
     });
     assert_eq!(module_status(&lc)[0].history, [activation(0, 1)]);
@@ -833,8 +1009,12 @@ fn root_empty_fresh_then_state_moves_it() {
 fn genesis_seed_publishes_once_and_reseeding_is_a_no_op() {
     let mut lc = fresh();
     futures::executor::block_on(async {
-        lc.seed("hello", hash(1)).await.unwrap();
-        lc.seed("directory", hash(2)).await.unwrap();
+        lc.seed("hello", Kind::Module, hash(1), Vec::new())
+            .await
+            .unwrap();
+        lc.seed("directory", Kind::Module, hash(2), Vec::new())
+            .await
+            .unwrap();
         lc.finish_seed().await.unwrap();
     });
     let seeded = lc.root();
@@ -844,7 +1024,9 @@ fn genesis_seed_publishes_once_and_reseeding_is_a_no_op() {
     // a reopened workspace re-entering the genesis path re-seeds — the
     // idempotence gate must leave the store byte-untouched.
     futures::executor::block_on(async {
-        lc.seed("hello", hash(9)).await.unwrap();
+        lc.seed("hello", Kind::Module, hash(9), Vec::new())
+            .await
+            .unwrap();
         lc.finish_seed().await.unwrap();
     });
     assert_eq!(
@@ -861,5 +1043,304 @@ fn genesis_seed_publishes_once_and_reseeding_is_a_no_op() {
             .active_code_hash,
         hash(1),
         "the original seed survived the re-entry"
+    );
+}
+
+// ============================================================================
+// data-plane lanes
+//
+// A lane id is not a local preference: it decides two overlay ports on EVERY
+// node, so the registry has to be the thing that refuses a bad one. These
+// assert the refusals, not the happy path — the happy path is one insert.
+// ============================================================================
+
+fn lanes_of(lc: &Modules) -> Vec<LaneRecord> {
+    let bytes = futures::executor::block_on(
+        lc.query_with(&ctx(Origin::System, 0), &encode_query(&ModulesQuery::Lanes)),
+    )
+    .unwrap();
+    match decode_reply(&bytes).unwrap() {
+        ModulesReply::Lanes { lanes } => lanes,
+        other => panic!("expected Lanes, got {other:?}"),
+    }
+}
+
+/// a lane whose name is derived from its id — these tests are about the ID
+/// rules, so the name only has to be well-formed and distinct.
+fn lane(id: u8) -> LaneDecl {
+    named_lane(id, &format!("lane{id}"))
+}
+
+fn named_lane(id: u8, name: &str) -> LaneDecl {
+    LaneDecl {
+        id,
+        name: name.to_string(),
+        stream: Some(LaneStream {
+            pacing: LanePacing::Shared,
+            accept_backlog: 8,
+        }),
+    }
+}
+
+fn register_with_lanes(
+    lc: &mut Modules,
+    module_id: &str,
+    lanes: Vec<LaneDecl>,
+) -> Result<(), Error> {
+    let mut sys = ctx(Origin::System, 0);
+    run(
+        lc,
+        &mut sys,
+        &msg(ModulesMsg::RegisterModule {
+            module_id: module_id.into(),
+            kind: Kind::Module,
+            code_hash: hash(1),
+            lanes,
+        }),
+    )
+}
+
+#[test]
+fn a_declared_lane_is_readable_by_its_owner_and_name() {
+    let mut lc = fresh();
+    register_with_lanes(
+        &mut lc,
+        "chat",
+        vec![named_lane(2, "voice"), named_lane(3, "video")],
+    )
+    .unwrap();
+    commit(&mut lc);
+    let lanes = lanes_of(&lc);
+    assert_eq!(lanes.len(), 2);
+    // (module_id, name) is the binding key — the id is only the port it
+    // resolves to. A host that bound by position would swap voice and video
+    // the day chat declares a third lane.
+    let voice = lanes
+        .iter()
+        .find(|l| l.module_id == "chat" && l.name == "voice")
+        .expect("chat declares a lane named voice");
+    assert_eq!(voice.id, 2);
+    let video = lanes
+        .iter()
+        .find(|l| l.module_id == "chat" && l.name == "video")
+        .expect("chat declares a lane named video");
+    assert_eq!(video.id, 3);
+    assert_eq!(video.stream.as_ref().unwrap().accept_backlog, 8);
+}
+
+#[test]
+fn a_datagram_only_lane_declares_no_stream_half() {
+    // the media lanes are this shape: sockets, no stream plane, so nothing to
+    // pace and no backlog. A record that forced a budget on them would be
+    // inventing a number the node does not use.
+    let mut lc = fresh();
+    register_with_lanes(
+        &mut lc,
+        "chat",
+        vec![LaneDecl {
+            id: 2,
+            name: "voice".into(),
+            stream: None,
+        }],
+    )
+    .unwrap();
+    commit(&mut lc);
+    assert!(lanes_of(&lc)[0].stream.is_none());
+}
+
+#[test]
+fn the_lane_table_stays_sorted_by_id_across_modules() {
+    let mut lc = fresh();
+    register_with_lanes(&mut lc, "agent", vec![lane(9)]).unwrap();
+    register_with_lanes(&mut lc, "chat", vec![lane(2)]).unwrap();
+    commit(&mut lc);
+    // sorted by ID, not by insertion or by owner: the host binds in id order
+    // and a node that read them in a different order would still agree, but
+    // the record has ONE encoding only if the order is fixed.
+    let ids: Vec<u8> = lanes_of(&lc).iter().map(|l| l.id).collect();
+    assert_eq!(ids, [2, 9]);
+}
+
+#[test]
+fn a_second_module_cannot_take_a_declared_lane_id() {
+    let mut lc = fresh();
+    register_with_lanes(&mut lc, "chat", vec![lane(2)]).unwrap();
+    commit(&mut lc);
+    let err = register_with_lanes(&mut lc, "agent", vec![lane(2)]).unwrap_err();
+    let Error::Module(text) = err else {
+        panic!("expected a module error")
+    };
+    assert!(
+        text.contains("already declared by module chat"),
+        "the refusal must name the OWNER, or an operator cannot tell who took it: {text}"
+    );
+}
+
+#[test]
+fn one_module_cannot_declare_two_lanes_of_one_name() {
+    // the host binds by (module_id, name), so a duplicate name is a lookup
+    // with two answers. A module declares its whole set in ONE op, so this is
+    // where the collision has to be caught — the check reads the table as it
+    // grows, not once before the loop.
+    let mut lc = fresh();
+    let err = register_with_lanes(
+        &mut lc,
+        "chat",
+        vec![named_lane(2, "voice"), named_lane(3, "voice")],
+    )
+    .unwrap_err();
+    let Error::Module(text) = err else {
+        panic!("expected a module error")
+    };
+    assert!(text.contains("already declares a lane named"), "{text}");
+    commit(&mut lc);
+    assert!(lanes_of(&lc).is_empty(), "the refused op left nothing");
+
+    // a DIFFERENT module may use the same name: the key is the pair, and two
+    // modules each having a "telemetry" lane is normal.
+    register_with_lanes(&mut lc, "chat", vec![named_lane(2, "voice")]).unwrap();
+    register_with_lanes(&mut lc, "agent", vec![named_lane(4, "voice")]).unwrap();
+    commit(&mut lc);
+    assert_eq!(lanes_of(&lc).len(), 2);
+}
+
+#[test]
+fn a_malformed_lane_name_is_refused() {
+    // the name is stored in the root-hashed table and read by every node, so
+    // it is bounded and lowercase-ASCII — never free-form text a module could
+    // grow the table with.
+    let mut lc = fresh();
+    let too_long = "a".repeat(MAX_LANE_NAME_BYTES + 1);
+    for bad in ["", "Voice", "voice-lane", "voice lane", "보이스", &too_long] {
+        let err = register_with_lanes(&mut lc, "chat", vec![named_lane(2, bad)]).unwrap_err();
+        let Error::Module(text) = err else {
+            panic!("expected a module error")
+        };
+        assert!(text.contains("malformed"), "name {bad:?}: {text}");
+    }
+    // the longest legal name still lands
+    let longest = "a".repeat(MAX_LANE_NAME_BYTES);
+    register_with_lanes(&mut lc, "chat", vec![named_lane(2, &longest)]).unwrap();
+    commit(&mut lc);
+    assert_eq!(lanes_of(&lc)[0].name, longest);
+}
+
+#[test]
+fn a_kernel_lane_id_is_never_declarable() {
+    let mut lc = fresh();
+    for id in RESERVED_LANE_IDS {
+        let err = register_with_lanes(&mut lc, "squatter", vec![lane(*id)]).unwrap_err();
+        let Error::Module(text) = err else {
+            panic!("expected a module error")
+        };
+        assert!(text.contains("kernel lane"), "id {id}: {text}");
+    }
+}
+
+#[test]
+fn a_lane_id_above_the_cap_is_refused_because_the_port_ranges_would_overlap() {
+    // THE REASON IS ARITHMETIC. stream = 45800 + id, datagram = 45900 + id.
+    // At id 100 the stream port is 45900, which IS lane 0's datagram port, so
+    // two lanes would share a socket instead of failing a bind. Six
+    // compile-time variants could never reach this; a declared id can.
+    assert_eq!(45800 + MAX_LANE_ID as u16 + 1, 45900);
+    let mut lc = fresh();
+    for bad in [0u8, MAX_LANE_ID + 1, 255] {
+        let err = register_with_lanes(&mut lc, "squatter", vec![lane(bad)]).unwrap_err();
+        let Error::Module(text) = err else {
+            panic!("expected a module error")
+        };
+        assert!(text.contains("out of range"), "id {bad}: {text}");
+    }
+    // the last good id still lands
+    register_with_lanes(&mut lc, "edge", vec![lane(MAX_LANE_ID)]).unwrap();
+    commit(&mut lc);
+    assert_eq!(lanes_of(&lc)[0].id, MAX_LANE_ID);
+}
+
+#[test]
+fn a_refused_lane_registers_no_module() {
+    // all-or-nothing: the lane check runs BEFORE the roster write, so a module
+    // whose declaration is refused must not exist at all. A half-registered
+    // module would be a codeless entry the registry promises never to hold.
+    let mut lc = fresh();
+    register_with_lanes(&mut lc, "chat", vec![lane(2)]).unwrap();
+    commit(&mut lc);
+    register_with_lanes(&mut lc, "agent", vec![lane(4), lane(2)]).unwrap_err();
+    commit(&mut lc);
+    let ids: Vec<String> = module_status(&lc)
+        .into_iter()
+        .map(|m| m.module_id)
+        .collect();
+    assert_eq!(ids, ["chat"], "the refused module must not be rostered");
+    let lanes: Vec<u8> = lanes_of(&lc).iter().map(|l| l.id).collect();
+    assert_eq!(lanes, [2], "and lane 4 from the same op must not survive");
+}
+
+#[test]
+fn cancelling_an_admission_frees_its_lane_ids() {
+    let mut lc = fresh();
+    let mut sys = ctx(Origin::System, 0);
+    run(
+        &mut lc,
+        &mut sys,
+        &msg(ModulesMsg::ScheduleRegister {
+            name: "admit-chat".into(),
+            module_id: "chat".into(),
+            kind: Kind::Module,
+            activation_height: 10,
+            code_hash: hash(1),
+            lanes: vec![lane(2)],
+        }),
+    )
+    .unwrap();
+    commit(&mut lc);
+    assert_eq!(lanes_of(&lc).len(), 1);
+
+    run(&mut lc, &mut sys, &cancel_swap("chat", "admit-chat")).unwrap();
+    commit(&mut lc);
+    assert!(
+        lanes_of(&lc).is_empty(),
+        "a withdrawn admission must not burn its lane id forever"
+    );
+    // and the id is declarable again by someone else
+    register_with_lanes(&mut lc, "agent", vec![lane(2)]).unwrap();
+    commit(&mut lc);
+    assert_eq!(lanes_of(&lc)[0].module_id, "agent");
+}
+
+#[test]
+fn a_genesis_seed_declares_its_lanes() {
+    let mut lc = fresh();
+    futures::executor::block_on(async {
+        lc.seed(
+            "chat",
+            Kind::Module,
+            hash(1),
+            vec![LaneDecl {
+                id: 2,
+                name: "voice".into(),
+                stream: Some(LaneStream {
+                    pacing: LanePacing::Local {
+                        bulk_bytes_per_sec: 24 * 1024 * 1024,
+                        bulk_burst_bytes: 512 * 1024,
+                    },
+                    accept_backlog: 16,
+                }),
+            }],
+        )
+        .await
+        .unwrap();
+        lc.finish_seed().await.unwrap();
+    });
+    let lanes = lanes_of(&lc);
+    assert_eq!(lanes.len(), 1);
+    assert_eq!(lanes[0].module_id, "chat");
+    assert_eq!(
+        lanes[0].stream.as_ref().unwrap().pacing,
+        LanePacing::Local {
+            bulk_bytes_per_sec: 24 * 1024 * 1024,
+            bulk_burst_bytes: 512 * 1024,
+        }
     );
 }

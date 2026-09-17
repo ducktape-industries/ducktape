@@ -162,6 +162,7 @@ mod tests {
                 oauth_client_id: "test-client".into(),
                 session_ttl_secs: 3600,
                 max_requests: 100,
+                sign: None,
             },
             "snp",
             test_enclave().quoter(),

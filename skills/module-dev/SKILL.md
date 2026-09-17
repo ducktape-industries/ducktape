@@ -1,6 +1,6 @@
 ---
 name: module-dev
-description: Use when creating a new ducktape consensus module, porting a native module to a wasm guest, or wiring a module into the genesis set — topology::PRODUCTION, host_state, crates/guests, Makefile wasm-modules. Also when a module change breaks the root-hash pin, the registry parity test, a missing component in the fixtures/modules dir, or wasm-modules-check.
+description: Use when creating a new ducktape consensus module, porting a native module to a wasm guest, or wiring a module into the genesis set — topology::PRODUCTION, host_state, crates/guests, Makefile wasm-modules. Also when a module change breaks the registry parity test, a missing component in the fixtures/modules dir, or wasm-modules-check.
 ---
 
 # Module development — the end-to-end wiring runbook
@@ -16,9 +16,10 @@ A module written outside this tree needs none of it: see "Decide first".
 ## Decide first: genesis registration is a root-hash break
 
 A module in `topology::PRODUCTION` (the selection `bin/node` composes,
-opens its index over, and reports) joins the genesis set: every existing
-workspace fails closed, dev networks re-genesis, and `GENESIS_ROOT_HASH`
-moves. A genesis module ⇒ a new genesis — get that agreed before wiring.
+opens its index over, and reports) joins the genesis set: the descriptor's
+module table gains a row, its `genesis_namespace()` fingerprint moves, so
+every existing workspace fails closed and dev networks re-genesis. A genesis
+module ⇒ a new genesis — get that agreed before wiring.
 
 A post-genesis module leaves the genesis unchanged, changes the live root at
 activation, and needs no genesis edit, no
@@ -28,8 +29,18 @@ network:
 ```
 ducktape module register <id> <component.wasm> [--index <index.wasm>] [--after N]  # admit a new id
 ducktape module update   <id> <component.wasm> [--index <index.wasm>] [--after N]  # swap live code
-ducktape module status                                      # the registry
+ducktape module register <id> --view target/views/<id>_view.wasm [--assets crates/views/<id>/assets] [--after N]  # admit a VIEW-ONLY entry (kind `view`: a UI with no core, built by `ops/build-views.sh -p <id>-view`; the app draws its tab off the registry)
+ducktape module status                                      # the registry, plus the open code proposals (tasteable)
 ```
+
+While a code proposal is open (and once it is scheduled), every member may
+TASTE its view: `module update <id> <active core> --view <new wasm>` opens the
+ballot and fans the bytes out; the app's Governance card and Settings →
+Proposed views offer "Try this view" for a frame whose core is byte-identical
+to the active one (a `View`-kind frame always), seating it on that device
+alone with the tab reading "· proposed"; withdrawal returns the seat,
+activation keeps it. A proposal that changes the core is listed as
+`core_changes_too` with nothing to try.
 
 `register`/`update` drive the governance proposal that schedules the
 admission/swap FIRST, then stage the component at this node's owner-gated admin
@@ -42,9 +53,9 @@ a refusal to propose: the swap activates at `height + N` (`N > MIN_SWAP_LEAD`,
 i.e. `> 3`; default 50 to leave room for the ceremony's own blocks) only once
 every validator holds the code and signals ready, and a holdout fetches the
 committed artifact off a peer before that boundary. `status` prints one row per
-module — `id  active
-pending`, a pending swap carrying `ready k` (validators that signalled) or
-`ready ✓`. Restore and state sync compose the wasm set from the registry's
+entry — `id  kind  active  pending` (`kind` is `module` or `view`: what the
+registry says the artifact is, fixed at admission), a pending swap carrying
+`ready k` (validators that signalled) or `ready ✓`. Restore and state sync compose the wasm set from the registry's
 roster at the boundary (`noded::compose`, `Boot::Reopen`), so an admitted id
 composes like a genesis one; a module admitted after the last checkpoint
 starts fresh and is rebuilt by replay (`seat_at`, unit-pinned in
@@ -159,7 +170,7 @@ in `sim-modules/` beside the binaries.
 | Where | What to touch |
 |---|---|
 | `crates/topology/src/lib.rs` | Add a catalog row and selection only when the module belongs in a shipped default. The component declares its own backing and configuration. Arbitrary founding directories and live admissions need no catalog entry. |
-| `crates/noded/src/compose.rs` | Only a new ODB substrate needs an `open_odb` implementation and an entry in `ODB_SUBSTRATES`. Store and map modules use the generic Wasm path. |
+| `crates/noded/src/compose.rs` | Components select a supported `Backing` engine over a private module directory. A genuinely new engine needs a host capability; a new module id needs no native table entry. |
 | the indexer | Ship `src/index_guest.rs`, add the crate to `INDEX_MODULES` in the Makefile, and pass `--index` on live registration or update. `converge_host_modules` installs the running deployment's mapper at boot and activation. Omitting `--index` removes an old mapper; its derived rows clear while the feed survives. |
 
 The deployment hash covers component and mapper together. A mapper-only
@@ -169,15 +180,15 @@ and state-sync manifests authenticate the code needed to reopen the registries.
 
 `SIM_BASE` contains 15 modules; `--with-valset` adds `acl`, `governance`,
 `modules`, `valset`, and `kv`, all Wasm. When changing a shipped default set,
-update its membership tests and `host_state.rs`'s `GENESIS_ROOT_HASH` after
-rebuilding the artifacts; the failing pin prints the expected root.
+update its membership tests after rebuilding the artifacts.
 
 ## 4. Gates — ordering is load-bearing
 
 ```
 cargo test -p <id>                                        # 1. native logic
 git push                                                  # 2. the guest build reads HEAD out of the repository
-cargo run -p guest-builder -- crates/modules/<plane>/<id> # 3. catches native-dep leaks
+cargo run --target-dir target/guest-builder-bin \
+  -p guest-builder -- crates/modules/<plane>/<id>          # 3. catches native-dep leaks
 make wasm-modules                                         # 4. BEFORE the node pins run —
                                                           #    the fixtures dir needs the artifact
 cargo check --workspace --all-targets                     # 5. registry parity test gates
@@ -186,12 +197,58 @@ make wasm-modules-check                                   # 6. committed copies 
 make wasm-rebuild-check                                   # 7. every guest matches a rebuild of its source (needs wasm32)
 ```
 
+Step 3 carries `--target-dir` and is not a bare `cargo run -p guest-builder`
+BECAUSE OF THE TARGET DIRECTORY. `guest-builder` bakes its platform root in at
+compile time, and a host config that points `CARGO_TARGET_DIR` at one directory
+for every worktree — this box does — leaves ONE binary at ONE path, owned by
+whichever checkout built it last. Running that one refuses every module you own
+by name:
+
+```
+guest-builder: crates/modules/apps/chat is outside the platform checkout <someone else's worktree>
+```
+
+and it can happen MID-SWEEP, when a sibling's build lands between two of your
+guests. `touch bin/guest-builder/src/main.rs` only wins that race until the next
+session builds. Every guest-builder invocation in the `Makefile`, in
+`ops/wasm-repro-check.sh` and in `ops/build-guest-rootfs.sh` builds into a
+directory of its own checkout: `target/guest-builder-bin`, a sibling of
+`target/guest-builder/<id>/` where the builder puts each module's ephemeral
+build tree. Reach for the bare `cargo run` and you are back in the race.
+
+Step 7 names EVERY stale guest in one run, not just the first — a guest is stale
+because something it compiles in moved, and that is rarely true of one guest
+alone.
+
+**Scope step 7 to what you changed.** The full sweep is 31 guest builds, most of
+an hour on a loaded box, and a PR that moved one crate does not owe the other
+twenty-eight:
+
+```
+make wasm-rebuild-check CRATES="files duckfs-core"    # the guests that compile those
+make wasm-rebuild-check                               # all 31 — what an SDK or toolchain move owes
+```
+
+`CRATES` is the crates the change touched, and the guest list is derived from
+each module's own `guest.lock`, which records what it actually compiled — the
+same answer as `grep -l 'name = "<crate>"' crates/modules/*/*/guest.lock`, which
+is also how you check the scope by hand before running anything. A module that
+ships an index guest has ONE lock covering both: the builder's shell workspace
+holds every guest the module declares, so the lock is their union. A crate no
+lock names is refused rather than quietly checking nothing.
+
+The rule this serves is in `AGENTS.md`: a guest's bytes move with EVERY crate it
+compiles in, a deletion included. `crates/duckfs/core` is not a module crate and
+is not the SDK, and it moves `files`, `pages` and `runs` — five deleted lines
+shift every panic-path line number below them. Reach for `CRATES` after any
+change and the check is cheap enough to actually run.
+
 ## Common mistakes
 
 | Mistake | Reality |
 |---|---|
 | Adding the id to `PRODUCTION` only | noded/simnode compose `SIM_BASE`/`SIM_VALSET`; the module is invisible in daemon/sim lanes until it joins one of those too |
-| Topology pins or `GENESIS_ROOT_HASH` left stale after adding/removing a module | `cargo test -p topology` and the root-hash pin fail; update both in the same commit |
+| Topology pins left stale after adding/removing a module | `cargo test -p topology` and the genesis registry parity test fail; update both in the same commit |
 | Guest added to root workspace members | guests are standalone BY DESIGN; membership poisons native feature unification |
 | Node pins run before `make wasm-modules` | the fixtures dir lacks the component; `hash_bundle` refuses by name |
 | Building a guest before pushing | guest-builder reads the module out of the repository at HEAD: an unpushed HEAD fails to fetch, an uncommitted edit is refused. Commit, push, then build |

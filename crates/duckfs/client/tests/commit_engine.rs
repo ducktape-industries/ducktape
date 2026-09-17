@@ -330,6 +330,181 @@ fn a_pathspec_commits_one_subtree_and_leaves_the_rest_dirty() {
     assert!(!dir3.path().join("docs/gone.md").exists());
 }
 
+/// work that lands while the commit is in flight belongs to the NEXT commit.
+/// the index records the bytes the cluster accepted, so a rescan of the
+/// working copy after the submit must not claim them: an edit, an addition and
+/// a deletion made in that window all stay dirty (#1975).
+#[test]
+fn disk_that_moves_after_the_submit_stays_uncommitted() {
+    let node = ModuleNode::new();
+    node.seed_commit(
+        None,
+        "seed",
+        vec![
+            put_inline(&format!("{PREFIX}/a.txt"), b"A"),
+            put_inline(&format!("{PREFIX}/doomed.txt"), b"tracked"),
+        ],
+    )
+    .expect("seed");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    checkout(&node, root, PREFIX, None).expect("checkout");
+
+    // the edit this commit carries.
+    fs::write(root.join("a.txt"), b"B").unwrap();
+
+    // ...and the three things that happen to the working copy while it waits.
+    let racing = root.to_path_buf();
+    node.on_commit(move || {
+        fs::write(racing.join("a.txt"), b"C").unwrap();
+        fs::write(racing.join("late.txt"), b"unsubmitted").unwrap();
+        fs::remove_file(racing.join("doomed.txt")).unwrap();
+    });
+
+    let summary = commit(&node, root, "commit B").expect("commit");
+
+    // the snapshot holds exactly what was submitted.
+    let snap = Some(summary.snapshot.as_str());
+    let (bytes, _) = node
+        .read(&format!("{PREFIX}/a.txt"), snap, 0, 64)
+        .expect("read a.txt");
+    assert_eq!(bytes, b"B", "the accepted commit carries B, not C");
+    assert!(
+        node.stat(&format!("{PREFIX}/late.txt"), snap)
+            .expect("stat late.txt")
+            .is_none(),
+        "a file created after the submit was never in the plan"
+    );
+    assert!(
+        node.stat(&format!("{PREFIX}/doomed.txt"), snap)
+            .expect("stat doomed.txt")
+            .is_some(),
+        "a deletion made after the submit was never in the plan"
+    );
+
+    // so all three are still uncommitted work, not swallowed by the index.
+    let st = duckfs_client::status::status(root).expect("status");
+    assert_eq!(
+        st.modified
+            .iter()
+            .map(|e| e.path.clone())
+            .collect::<Vec<_>>(),
+        vec![format!("{PREFIX}/a.txt")],
+        "C is still uncommitted"
+    );
+    assert_eq!(
+        st.added.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
+        vec![format!("{PREFIX}/late.txt")],
+        "the new file is still added"
+    );
+    assert_eq!(
+        st.removed,
+        vec![format!("{PREFIX}/doomed.txt")],
+        "the deletion is still removed"
+    );
+
+    // and the next commit publishes exactly them.
+    node.on_commit(|| {});
+    let second = commit(&node, root, "the rest").expect("second commit");
+    let dir2 = tempfile::tempdir().unwrap();
+    checkout(&node, dir2.path(), PREFIX, Some(&second.snapshot)).expect("re-checkout");
+    assert_eq!(fs::read(dir2.path().join("a.txt")).unwrap(), b"C");
+    assert_eq!(
+        fs::read(dir2.path().join("late.txt")).unwrap(),
+        b"unsubmitted"
+    );
+    assert!(!dir2.path().join("doomed.txt").exists());
+    assert!(
+        duckfs_client::status::status(root).unwrap().clean,
+        "clean once the leftovers land"
+    );
+}
+
+/// committing the last file out of a directory leaves the directory behind —
+/// the module's `Rm` takes the entry, never its parent. the index has to record
+/// that empty directory, or the next status calls it new and plans a `Mkdir`
+/// the module rejects for a target that already exists.
+#[test]
+fn a_directory_emptied_by_a_commit_stays_recorded() {
+    let node = ModuleNode::new();
+    node.seed_commit(
+        None,
+        "seed",
+        vec![put_inline(&format!("{PREFIX}/d/only.txt"), b"x")],
+    )
+    .expect("seed");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    checkout(&node, root, PREFIX, None).expect("checkout");
+
+    fs::remove_file(root.join("d/only.txt")).unwrap();
+    commit(&node, root, "empty out d").expect("commit");
+
+    assert!(root.join("d").is_dir(), "the directory is still on disk");
+    assert!(
+        duckfs_client::status::status(root).unwrap().clean,
+        "the emptied directory is recorded, so nothing is left to commit"
+    );
+    assert!(
+        matches!(commit(&node, root, "again"), Err(CommitError::Nothing)),
+        "a second commit has nothing to say, rather than a Mkdir the module refuses"
+    );
+}
+
+/// a commit whose height is no longer on the page the client can read is NOT
+/// resolved by taking the current head — that head is another writer's commit,
+/// and recording it as this working copy's base is how a peer's files start
+/// looking like deletions. the refusal says the change already landed, so the
+/// caller does not submit it a second time (#1982).
+#[test]
+fn a_commit_whose_history_entry_is_gone_refuses_instead_of_taking_the_head() {
+    let node = ModuleNode::new();
+    node.seed_commit(
+        None,
+        "seed",
+        vec![put_inline(&format!("{PREFIX}/a.txt"), b"A")],
+    )
+    .expect("seed");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    checkout(&node, root, PREFIX, None).expect("checkout");
+    let base_before = Index::load(root).expect("index").base_snapshot;
+
+    // somebody else's commit is the head the client would fall back to.
+    node.seed_commit(
+        node.head().as_deref(),
+        "theirs",
+        vec![put_inline(&format!("{PREFIX}/theirs.txt"), b"not ours")],
+    )
+    .expect("seed theirs");
+    let unrelated_head = node.head().expect("a head");
+
+    fs::write(root.join("a.txt"), b"B").unwrap();
+    node.hide_history();
+
+    let err = commit(&node, root, "commit B").expect_err("cannot name the snapshot");
+    let CommitError::Landed { height, .. } = &err else {
+        panic!("the commit landed and must say so: {err}");
+    };
+    assert!(*height > 0, "the refusal names the height it landed at");
+    assert!(
+        err.to_string().contains("do not commit it again"),
+        "the refusal tells the caller the work is already upstream: {err}"
+    );
+
+    // the local base is untouched — above all it is NOT the unrelated head.
+    let index = Index::load(root).expect("index");
+    assert_eq!(index.base_snapshot, base_before, "the base did not move");
+    assert_ne!(
+        index.base_snapshot,
+        Some(unrelated_head),
+        "another writer's head is never this checkout's base"
+    );
+}
+
 /// a pathspec that selects none of the changes is a named refusal, not a
 /// "nothing to commit" that reads as "the tree is clean".
 #[test]

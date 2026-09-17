@@ -23,7 +23,19 @@ fn fixtures() -> PathBuf {
 /// one `SnapshotSource` call's future.
 type SnapshotFut<'a> = BoxFut<'a, Result<Option<(Vec<u8>, StateRoot)>, String>>;
 
-const SELECTION: &[&str] = &["kv", "valset", "acl", "governance", "modules", "runs"];
+/// `directory` is the MAP tenant here, and the only one: the reopen half of
+/// [`composes_only_wasm_over_injected_stores`] proves a map installs its
+/// snapshot while a store is never asked, so the selection needs one of each
+/// and every other id below is store-backed.
+const SELECTION: &[&str] = &[
+    "kv",
+    "valset",
+    "acl",
+    "governance",
+    "modules",
+    "runs",
+    "directory",
+];
 
 const BINDINGS: Bindings<'static> = Bindings {
     invite: b"t",
@@ -41,8 +53,12 @@ fn run(body: impl FnOnce(commonware_runtime::tokio::Context, PathBuf) -> BoxFut<
 
 fn substrates(dir: &std::path::Path) -> Substrates {
     Substrates {
-        forge_repo: dir.join("forge"),
-        duckfs_dir: dir.join("duckfs"),
+        directory: dir.join("module-storage"),
+        bindings: [
+            ("forge".into(), dir.join("forge")),
+            ("files".into(), dir.join("duckfs")),
+        ]
+        .into(),
         blobs: blobstore::BlobHandle::default(),
     }
 }
@@ -96,11 +112,11 @@ fn composes_only_wasm_over_injected_stores() {
             let genesis_root = genesis.root_hash();
             let (captured, _) =
                 genesis.capture_current_snapshot(0, CapturePayloads::All, || Duration::ZERO);
-            let runs = captured.module("runs").expect("runs composed");
-            let StateSyncHandle::SnapshotBytes(runs_snapshot) = runs.state_sync.clone() else {
+            let map = captured.module("directory").expect("directory composed");
+            let StateSyncHandle::SnapshotBytes(map_snapshot) = map.state_sync.clone() else {
                 panic!("a map tenant syncs by snapshot bytes");
             };
-            let runs_root = runs.root;
+            let map_root = map.root;
             drop(genesis);
 
             // ---- reopen the same stores at block zero: the wasm set comes off
@@ -112,9 +128,9 @@ fn composes_only_wasm_over_injected_stores() {
                     Backing::Store,
                     "a store-backed module is never asked"
                 );
-                let bytes = runs_snapshot.clone();
-                let is_runs = id == "runs";
-                Box::pin(async move { Ok(is_runs.then_some((bytes, runs_root))) })
+                let bytes = map_snapshot.clone();
+                let is_map = id == "directory";
+                Box::pin(async move { Ok(is_map.then_some((bytes, map_root))) })
             };
             let reopened = compose(
                 &code,
@@ -165,6 +181,83 @@ fn genesis_module_membership_comes_from_the_bundle() {
                 "an omitted registry is not inserted by the binary"
             );
             assert_eq!(genesis.module_roots().len(), 1);
+        })
+    });
+}
+
+/// genesis declares no lane of its own. The lane table a founding module
+/// lands in is the one its FRAME carries — read off the same bytes the code
+/// hash covers — so there is no native table beside the deployment to
+/// disagree with it, and a frame that declares nothing founds no lane.
+#[test]
+fn founding_lanes_come_from_the_frame_and_nowhere_else() {
+    use module_artifact::{Artifact, ModuleArtifact};
+    run(|context, dir| {
+        Box::pin(async move {
+            let telemetry = modules::LaneDecl {
+                id: 7,
+                name: "telemetry".into(),
+                stream: Some(modules::LaneStream {
+                    pacing: modules::LanePacing::Shared,
+                    accept_backlog: 16,
+                }),
+            };
+            let read = |id: &str| std::fs::read(fixtures().join(format!("{id}.component.wasm")));
+            let mut source = ArtifactSource(Default::default());
+            let codes = std::collections::BTreeMap::from([
+                // the registry's own frame declares nothing…
+                (
+                    "modules".to_string(),
+                    source.add(Artifact::module(read("modules").unwrap())),
+                ),
+                // …and this one declares one lane, in its artifact.
+                (
+                    "valset".to_string(),
+                    source.add(Artifact::Module(ModuleArtifact {
+                        component: read("valset").unwrap(),
+                        index: None,
+                        view: None,
+                        lanes: vec![telemetry.clone()],
+                    })),
+                ),
+            ]);
+
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
+            let host = compose(
+                &source,
+                &mut stores,
+                &substrates,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: &[],
+                    bundle: &codes,
+                },
+            )
+            .await
+            .unwrap();
+
+            let reply = host
+                .query(
+                    host::MODULES_ID,
+                    &modules::encode_query(&modules::ModulesQuery::Lanes),
+                )
+                .await
+                .unwrap();
+            let modules::ModulesReply::Lanes { lanes } = modules::decode_reply(&reply).unwrap()
+            else {
+                panic!("the lane query answers with lanes");
+            };
+            assert_eq!(
+                lanes,
+                vec![modules::LaneRecord {
+                    id: telemetry.id,
+                    module_id: "valset".into(),
+                    name: telemetry.name.clone(),
+                    stream: telemetry.stream.clone(),
+                }],
+                "the committed table is the frame's declaration, and only it"
+            );
         })
     });
 }
@@ -246,24 +339,19 @@ fn a_code_source_whose_bytes_miss_the_hash_is_refused() {
     });
 }
 
-/// a shape this host cannot realize is refused BY NAME, before any substrate
-/// is touched: an odb declaration under an id the host has no substrate for,
-/// or a config key no network binds. the same check the readiness probe runs
-/// before a validator signals a swap ready.
+/// Supported engines are available to every valid tenant; host-provided
+/// configuration keys remain an explicit capability contract.
 #[test]
-fn a_shape_the_host_cannot_realize_is_refused_by_name() {
-    let odb = Shape {
-        backing: Backing::Odb,
-        config: Vec::new(),
-        committed_queries: false,
-    };
-    let err = check_realizable("kanban", &odb).unwrap_err();
-    assert!(
-        err.contains("kanban") && err.contains("odb"),
-        "an odb declaration without a substrate names the module: {err}"
-    );
-    check_realizable("files", &odb).expect("files has an odb substrate");
-    check_realizable("forge", &odb).expect("forge has an odb substrate");
+fn supported_storage_is_not_restricted_to_founding_module_names() {
+    for backing in [Backing::Odb, Backing::Git] {
+        let shape = Shape {
+            backing,
+            config: Vec::new(),
+            committed_queries: true,
+        };
+        check_realizable("kanban", &shape).expect("supported engine for a new module");
+        assert!(check_realizable("../escape", &shape).is_err());
+    }
 
     let unknown_key = Shape {
         backing: Backing::Store,
@@ -286,11 +374,8 @@ fn a_shape_the_host_cannot_realize_is_refused_by_name() {
     check_realizable("kanban", &bound).expect("the network binds both keys");
 }
 
-/// a post-genesis admission builds through the SAME wasm path a genesis
-/// tenant took: the factory wraps the bytes over the substrate they declare
-/// (a map-declared fixture over a fresh map) and refuses a declaration the
-/// host cannot realize under that id (the odb-declared fixture under an id
-/// with no substrate), by name.
+/// Post-genesis admission uses the same factory as genesis for maps and
+/// tenant-scoped object storage, including module ids unknown to the host.
 #[test]
 fn admissions_build_through_the_one_wasm_path() {
     run(|context, dir| {
@@ -306,7 +391,7 @@ fn admissions_build_through_the_one_wasm_path() {
             let admitted = host::ModuleFactory::instantiate(
                 &admissions,
                 "hello",
-                &module_artifact::ModuleArtifact::component(hello).encode(),
+                &module_artifact::Artifact::module(hello).encode(),
             )
             .await
             .expect("a map-declared component admits over a fresh map");
@@ -314,18 +399,22 @@ fn admissions_build_through_the_one_wasm_path() {
                 panic!("the hello fixture is a `ducktape:module`");
             };
             assert_eq!(module.id(), "hello");
-            let err = host::ModuleFactory::instantiate(
+            let admitted = host::ModuleFactory::instantiate(
                 &admissions,
                 "kanban",
-                &module_artifact::ModuleArtifact::component(object).encode(),
+                &module_artifact::Artifact::module(object).encode(),
             )
             .await
-            .err()
-            .expect("an odb declaration under an id with no substrate is refused");
-            assert!(
-                err.to_string().contains("kanban"),
-                "the refusal names the module: {err}"
+            .expect("a new tenant can use supported object storage");
+            let host::Admitted::Module(module) = admitted else {
+                panic!("object fixture is a module")
+            };
+            assert_eq!(module.id(), "kanban");
+            assert_eq!(
+                substrates.path("kanban").unwrap(),
+                dir.join("module-storage/kanban")
             );
+            assert!(substrates.path("../escape").is_err());
             // and the ONE refusal that is not fail-closed: bytes that are no
             // `ducktape:module` at all are another plane's commitment record.
             let netstack = std::fs::read(
@@ -336,7 +425,7 @@ fn admissions_build_through_the_one_wasm_path() {
             let admitted = host::ModuleFactory::instantiate(
                 &admissions,
                 "netstack",
-                &module_artifact::ModuleArtifact::component(netstack).encode(),
+                &module_artifact::Artifact::module(netstack).encode(),
             )
             .await
             .expect("a foreign-world component is answered, not errored");
@@ -381,7 +470,7 @@ fn an_odb_backed_module_reads_its_chain_id_from_genesis_config() {
             };
             let mut module = wasm_module(
                 "files",
-                &module_artifact::ModuleArtifact::component(object).encode(),
+                &module_artifact::Artifact::module(object).encode(),
                 &mut stores,
                 &substrates,
                 &bindings,
@@ -417,7 +506,8 @@ fn an_odb_backed_module_reads_its_chain_id_from_genesis_config() {
 struct ArtifactSource(std::collections::BTreeMap<Vec<u8>, Vec<u8>>);
 
 impl ArtifactSource {
-    fn add(&mut self, artifact: module_artifact::ModuleArtifact) -> [u8; 32] {
+    fn add(&mut self, artifact: impl Into<module_artifact::Artifact>) -> [u8; 32] {
+        let artifact = artifact.into();
         let hash = artifact.hash();
         self.0.insert(hash.to_vec(), artifact.encode());
         hash
@@ -485,13 +575,168 @@ async fn schedule_swap(host: &mut host::Host, height: u64, id: &str, hash: [u8; 
     .await;
 }
 
+/// a founding `<id>.view.wasm` with no core is a `Kind::View` registry entry:
+/// the genesis seeds it (the registry lists it, kind `view`, active on its
+/// hash), no module seats under its id, the boundary leaves it alone at every
+/// height, a reopen off the seated set does not miss it, and a live
+/// registration of a second view latches on the view frame alone and never
+/// asks the admission factory for a core.
+#[test]
+fn a_view_entry_composes_no_module_and_the_boundary_leaves_it_alone() {
+    use commonware_cryptography::Signer as _;
+    use module_artifact::{Artifact, ViewArtifact};
+    use sdk::Origin;
+    run(|context, dir| {
+        Box::pin(async move {
+            let member = commonware_cryptography::ed25519::PrivateKey::from_seed(1)
+                .public_key()
+                .as_ref()
+                .to_vec();
+            let mut source = ArtifactSource(Default::default());
+            let mut codes = std::collections::BTreeMap::new();
+            for id in ["modules", "valset"] {
+                let bytes = std::fs::read(fixtures().join(format!("{id}.component.wasm"))).unwrap();
+                codes.insert(id.to_string(), source.add(Artifact::module(bytes)));
+            }
+            let home = source.add(Artifact::View(ViewArtifact {
+                component: view_component(),
+                assets: [("icons/tab.svg".to_owned(), b"<svg/>".to_vec())].into(),
+            }));
+            codes.insert("home".into(), home);
+            assert_eq!(
+                noded::compose::genesis_seeds(&[noded::compose::Founding {
+                    id: "home".into(),
+                    hash: home,
+                    kind: modules::Kind::View,
+                    lanes: Vec::new(),
+                }])["home"],
+                modules::Seed {
+                    kind: modules::Kind::View,
+                    code_hash: home.to_vec(),
+                    lanes: Vec::new()
+                }
+            );
+
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
+            let mut host = compose(
+                &source,
+                &mut stores,
+                &substrates,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: std::slice::from_ref(&member),
+                    bundle: &codes,
+                },
+            )
+            .await
+            .unwrap();
+            host.set_module_factory(Box::new(Admissions::new(&context, &substrates, &BINDINGS)));
+            assert!(host.module_root("home").is_none(), "a view seats no module");
+            let ids: Vec<String> = host.module_roots().into_iter().map(|(id, _)| id).collect();
+            assert_eq!(ids, ["modules", "valset"]);
+            let status = host.module_status().await.unwrap().unwrap();
+            let entry = status.iter().find(|m| m.module_id == "home").unwrap();
+            assert_eq!(entry.kind, modules::Kind::View);
+            assert_eq!(entry.active_code_hash, home.to_vec());
+            assert_eq!(entry.history.len(), 1, "seeded active at genesis");
+
+            // every boundary: nothing to realize for the view, no factory
+            // call, the roster unchanged.
+            let root = host.root_hash();
+            for height in 1..=3 {
+                host.realize_module_swaps(height, &source).await.unwrap();
+                registry_op(
+                    &mut host,
+                    height,
+                    Origin::System,
+                    modules::ModulesMsg::Advance,
+                )
+                .await;
+            }
+            assert!(host.module_root("home").is_none());
+            assert_eq!(host.root_hash(), root);
+
+            // a second view registered live: readiness is the view ABI alone
+            // (the drain's verdict), the swap latches at R = n and advances
+            // with no core ever asked of the factory.
+            let dashboard = source.add(Artifact::View(ViewArtifact {
+                component: view_component(),
+                assets: [("icons/tab.svg".to_owned(), b"<svg>2</svg>".to_vec())].into(),
+            }));
+            let index = indexer::IndexStore::open_bare(dir.join("index"), &["modules"]).unwrap();
+            noded::compose::validate_deployment(
+                "dashboard",
+                modules::Kind::View,
+                &source.0[&dashboard.to_vec()],
+                &index,
+            )
+            .unwrap();
+            registry_op(
+                &mut host,
+                4,
+                Origin::System,
+                modules::ModulesMsg::ScheduleRegister {
+                    name: "deploy-dashboard".into(),
+                    module_id: "dashboard".into(),
+                    kind: modules::Kind::View,
+                    activation_height: 10,
+                    code_hash: dashboard.to_vec(),
+                    lanes: Vec::new(),
+                },
+            )
+            .await;
+            ready(&mut host, 5, &member, "dashboard", dashboard).await;
+            host.realize_module_swaps(10, &source).await.unwrap();
+            registry_op(&mut host, 10, Origin::System, modules::ModulesMsg::Advance).await;
+            assert!(host.module_root("dashboard").is_none());
+            let status = host.module_status().await.unwrap().unwrap();
+            let entry = status.iter().find(|m| m.module_id == "dashboard").unwrap();
+            assert_eq!(entry.kind, modules::Kind::View);
+            assert_eq!(entry.active_code_hash, dashboard.to_vec());
+            assert!(entry.pending.is_none(), "the view activated at its height");
+
+            // reopen off the SEATED set (what a checkpoint records): the
+            // registry still lists both views, and the root is the same.
+            let root = host.root_hash();
+            drop(host);
+            let mut snapshots =
+                |_: &str, _: Backing| -> SnapshotFut<'_> { Box::pin(async { Ok(None) }) };
+            codes.remove("home");
+            let reopened = compose(
+                &source,
+                &mut stores,
+                &substrates,
+                &BINDINGS,
+                Boot::Reopen {
+                    height: 10,
+                    codes: &codes,
+                    snapshots: &mut snapshots,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(reopened.root_hash(), root);
+            assert!(reopened.module_root("home").is_none());
+            assert!(reopened.module_root("dashboard").is_none());
+            let status = reopened.module_status().await.unwrap().unwrap();
+            let views: Vec<&str> = status
+                .iter()
+                .filter(|m| m.kind == modules::Kind::View)
+                .map(|m| m.module_id.as_str())
+                .collect();
+            assert_eq!(views, ["dashboard", "home"]);
+        })
+    });
+}
+
 /// Both registries are actual Wasm. A live admission carries its mapper, an
 /// update can remove that mapper, and the registry can replace ITSELF. Reopen
 /// uses authenticated deployment hashes, including the registry's new code.
 #[test]
 fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
     use commonware_cryptography::Signer as _;
-    use module_artifact::ModuleArtifact;
+    use module_artifact::{Artifact, ModuleArtifact};
     use sdk::Origin;
     run(|context, dir| {
         Box::pin(async move {
@@ -503,7 +748,7 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
             let mut codes = std::collections::BTreeMap::new();
             for id in ["modules", "valset", "identity", "attribution"] {
                 let bytes = std::fs::read(fixtures().join(format!("{id}.component.wasm"))).unwrap();
-                codes.insert(id.to_string(), source.add(ModuleArtifact::component(bytes)));
+                codes.insert(id.to_string(), source.add(Artifact::module(bytes)));
             }
             let pages = std::fs::read(fixtures().join("pages.component.wasm")).unwrap();
             let mapper = std::fs::read(
@@ -514,14 +759,15 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
                 view: None,
                 component: pages.clone(),
                 index: Some(mapper),
+                lanes: Vec::new(),
             });
-            let bare = source.add(ModuleArtifact::component(pages));
+            let bare = source.add(Artifact::module(pages));
             assert_ne!(indexed, bare, "mapper removal is a different deployment");
             let mut replacement = std::fs::read(fixtures().join("modules.component.wasm")).unwrap();
             // A valid custom section changes the deployment identity while keeping
             // the registry ABI and storage layout, so the replacement can reopen it.
             replacement.extend_from_slice(&[0, 6, 5, b'p', b'r', b'o', b'o', b'f']);
-            let registry_replacement = source.add(ModuleArtifact::component(replacement));
+            let registry_replacement = source.add(Artifact::module(replacement));
             assert_ne!(registry_replacement, codes["modules"]);
 
             let substrates = substrates(&dir);
@@ -543,7 +789,7 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
             for (fixture, reason) in [("hello", "backing"), ("identity", "configuration")] {
                 let bytes =
                     std::fs::read(fixtures().join(format!("{fixture}.component.wasm"))).unwrap();
-                let deployment = ModuleArtifact::component(bytes).encode();
+                let deployment = Artifact::module(bytes).encode();
                 let error = host
                     .check_module_replacement("valset", &deployment)
                     .unwrap_err();
@@ -561,13 +807,27 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
             let index =
                 indexer::IndexStore::open_bare(dir.join("index"), &["modules", "valset"]).unwrap();
             noded::converge_host_modules(&index, &host).unwrap();
-            noded::compose::validate_deployment("pages", &source.0[&indexed.to_vec()], &index)
-                .unwrap();
-            let mut invalid_mapper = ModuleArtifact::decode(&source.0[&indexed.to_vec()]).unwrap();
+            noded::compose::validate_deployment(
+                "pages",
+                modules::Kind::Module,
+                &source.0[&indexed.to_vec()],
+                &index,
+            )
+            .unwrap();
+            let Artifact::Module(mut invalid_mapper) =
+                Artifact::decode(&source.0[&indexed.to_vec()]).unwrap()
+            else {
+                panic!("the indexed deployment is a module");
+            };
             invalid_mapper.index = Some(b"not wasm".to_vec());
             assert!(
-                noded::compose::validate_deployment("pages", &invalid_mapper.encode(), &index)
-                    .is_err()
+                noded::compose::validate_deployment(
+                    "pages",
+                    modules::Kind::Module,
+                    &Artifact::Module(invalid_mapper).encode(),
+                    &index
+                )
+                .is_err()
             );
 
             registry_op(
@@ -577,8 +837,10 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
                 modules::ModulesMsg::ScheduleRegister {
                     name: "deploy-pages".into(),
                     module_id: "pages".into(),
+                    kind: modules::Kind::Module,
                     activation_height: 10,
                     code_hash: indexed.to_vec(),
+                    lanes: Vec::new(),
                 },
             )
             .await;
@@ -710,9 +972,9 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
     });
 }
 
-fn ice_view() -> Vec<u8> {
+fn view_component() -> Vec<u8> {
     std::fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ice-view.component.wasm"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/view.component.wasm"),
     )
     .unwrap()
 }
@@ -729,12 +991,16 @@ fn view_deployment(component: Vec<u8>) -> module_artifact::ModuleArtifact {
     }
 }
 
+fn encode(artifact: &module_artifact::ModuleArtifact) -> Vec<u8> {
+    module_artifact::Artifact::Module(artifact.clone()).encode()
+}
+
 #[test]
 fn deployment_readiness_rejects_invalid_view_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
-    let mut view = ice_view();
-    let marker = b"ice.manifest.v2";
+    let mut view = view_component();
+    let marker = b"ducktape.view.manifest.v1";
     // The guest retains the text in data as well as its custom section.
     // Corrupt every copy so the actual metadata, not just data, is invalid.
     let offsets: Vec<_> = view
@@ -746,10 +1012,14 @@ fn deployment_readiness_rejects_invalid_view_manifest() {
     for offset in offsets {
         view[offset] = b'x';
     }
-    assert!(ui_lang_wire::manifest::read_manifest(&view).is_none());
-    let error =
-        noded::compose::validate_deployment("pages", &view_deployment(view).encode(), &index)
-            .expect_err("invalid view manifest must refuse readiness");
+    assert!(view_wire::manifest::read_manifest(&view).is_none());
+    let error = noded::compose::validate_deployment(
+        "pages",
+        modules::Kind::Module,
+        &encode(&view_deployment(view)),
+        &index,
+    )
+    .expect_err("invalid view manifest must refuse readiness");
     assert!(error.contains("view manifest"), "{error}");
 }
 
@@ -766,9 +1036,13 @@ fn deployment_readiness_rejects_invalid_view_abi() {
     )
     .unwrap();
     append_manifest(&mut view);
-    let error =
-        noded::compose::validate_deployment("pages", &view_deployment(view).encode(), &index)
-            .expect_err("wrong view export type must refuse readiness");
+    let error = noded::compose::validate_deployment(
+        "pages",
+        modules::Kind::Module,
+        &encode(&view_deployment(view)),
+        &index,
+    )
+    .expect_err("wrong view export type must refuse readiness");
     assert!(
         error.contains("view ABI") && error.contains("init"),
         "{error}"
@@ -776,10 +1050,10 @@ fn deployment_readiness_rejects_invalid_view_abi() {
 }
 
 fn append_manifest(view: &mut Vec<u8>) {
-    let name = b"ice.manifest";
+    let name = b"ducktape.view.manifest";
     let text = format!(
-        "ice.manifest.v2\nTest\n\n\nnone\n{}",
-        ui_lang_wire::WIRE_EPOCH
+        "ducktape.view.manifest.v1\nTest\n\n\nnone\n{}",
+        view_wire::WIRE_EPOCH
     );
     let text = text.as_bytes();
     view.extend_from_slice(&[0, (1 + name.len() + text.len()) as u8, name.len() as u8]);
@@ -791,8 +1065,54 @@ fn append_manifest(view: &mut Vec<u8>) {
 fn deployment_readiness_accepts_actual_view() {
     let dir = tempfile::tempdir().unwrap();
     let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
-    noded::compose::validate_deployment("pages", &view_deployment(ice_view()).encode(), &index)
-        .unwrap();
+    noded::compose::validate_deployment(
+        "pages",
+        modules::Kind::Module,
+        &encode(&view_deployment(view_component())),
+        &index,
+    )
+    .unwrap();
+}
+
+/// a `Kind::View` entry is ready on the view ABI alone: no core to compile,
+/// no shape to realize. the frame's tag must be the entry's kind either way.
+#[test]
+fn a_view_entry_is_ready_on_the_view_alone_and_the_tag_must_match_the_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
+    let view_frame = module_artifact::Artifact::View(module_artifact::ViewArtifact {
+        component: view_component(),
+        assets: [("icons/tab.svg".to_owned(), b"<svg/>".to_vec())].into(),
+    })
+    .encode();
+    assert_eq!(
+        noded::compose::artifact_kind(&view_frame).unwrap(),
+        modules::Kind::View
+    );
+    noded::compose::validate_deployment("home", modules::Kind::View, &view_frame, &index).unwrap();
+    let error =
+        noded::compose::validate_deployment("home", modules::Kind::Module, &view_frame, &index)
+            .unwrap_err();
+    assert!(error.starts_with("artifact_kind_mismatch"), "{error}");
+    let module_frame = encode(&view_deployment(view_component()));
+    assert_eq!(
+        noded::compose::artifact_kind(&module_frame).unwrap(),
+        modules::Kind::Module
+    );
+    let error =
+        noded::compose::validate_deployment("pages", modules::Kind::View, &module_frame, &index)
+            .unwrap_err();
+    assert!(error.starts_with("artifact_kind_mismatch"), "{error}");
+    // a view that is no view refuses a view entry the same way it refuses a
+    // module's embedded one
+    let broken = module_artifact::Artifact::View(module_artifact::ViewArtifact {
+        component: b"not a component".to_vec(),
+        assets: Default::default(),
+    })
+    .encode();
+    let error = noded::compose::validate_deployment("home", modules::Kind::View, &broken, &index)
+        .unwrap_err();
+    assert!(error.contains("view manifest"), "{error}");
 }
 
 #[test]
@@ -822,8 +1142,13 @@ fn deployment_readiness_does_not_instantiate_view() {
             (result (result (error string)))
             (canon lift (core func $i "restore") (memory $i "memory") (realloc (func $i "realloc")))))"#).unwrap();
     append_manifest(&mut view);
-    noded::compose::validate_deployment("pages", &view_deployment(view.clone()).encode(), &index)
-        .expect("static view readiness must not execute the trapping start");
+    noded::compose::validate_deployment(
+        "pages",
+        modules::Kind::Module,
+        &encode(&view_deployment(view.clone())),
+        &index,
+    )
+    .expect("static view readiness must not execute the trapping start");
     // Prove the fixture's trap is reached on real instantiation; a passing
     // readiness assertion alone would not establish this counterexample.
     let engine = wasmtime::Engine::default();
@@ -845,15 +1170,15 @@ async fn assert_deployment(
         .await
         .unwrap();
     assert_eq!(
-        module_artifact::ModuleArtifact::decode(&bytes).unwrap(),
-        *expected
+        module_artifact::Artifact::decode(&bytes).unwrap(),
+        module_artifact::Artifact::Module(expected.clone())
     );
 }
 
 #[test]
 fn wasm_registry_activates_view_assets_and_reopens_after_view_removal() {
     use commonware_cryptography::Signer as _;
-    use module_artifact::ModuleArtifact;
+    use module_artifact::{Artifact, ModuleArtifact};
     use sdk::Origin;
     run(|context, dir| {
         Box::pin(async move {
@@ -865,9 +1190,9 @@ fn wasm_registry_activates_view_assets_and_reopens_after_view_removal() {
             let mut codes = std::collections::BTreeMap::new();
             for id in ["modules", "valset", "identity", "attribution"] {
                 let bytes = std::fs::read(fixtures().join(format!("{id}.component.wasm"))).unwrap();
-                codes.insert(id.to_string(), source.add(ModuleArtifact::component(bytes)));
+                codes.insert(id.to_string(), source.add(Artifact::module(bytes)));
             }
-            let mut first = view_deployment(ice_view());
+            let mut first = view_deployment(view_component());
             first.index = Some(
                 std::fs::read(
                     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -925,7 +1250,13 @@ fn wasm_registry_activates_view_assets_and_reopens_after_view_removal() {
             let index =
                 indexer::IndexStore::open_bare(dir.join("index"), &["modules", "valset"]).unwrap();
             for deployment in &deployments {
-                noded::compose::validate_deployment("pages", &deployment.encode(), &index).unwrap();
+                noded::compose::validate_deployment(
+                    "pages",
+                    modules::Kind::Module,
+                    &encode(deployment),
+                    &index,
+                )
+                .unwrap();
                 assert_eq!(deployment.component, deployments[0].component);
                 assert_eq!(deployment.index, deployments[0].index);
             }
@@ -936,8 +1267,10 @@ fn wasm_registry_activates_view_assets_and_reopens_after_view_removal() {
                 modules::ModulesMsg::ScheduleRegister {
                     name: "deploy-pages".into(),
                     module_id: "pages".into(),
+                    kind: modules::Kind::Module,
                     activation_height: 10,
                     code_hash: hashes[0].to_vec(),
+                    lanes: Vec::new(),
                 },
             )
             .await;

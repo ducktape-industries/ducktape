@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (a path and a hash table) then rides into the actor.
     let modules_dir = match modules {
         Some(dir) => dir,
-        None => workspace_config::modules_dir()?,
+        None => noded::services::founding_set()?,
     };
     let wasm_ids = TOPOLOGY.wasm_ids(MODULE_IDS);
     let (code, code_hashes) = DirCodeSource::open(&modules_dir, &wasm_ids).map_err(|err| {
@@ -145,18 +145,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // in the compute daemon and reaches this node over /v1.
     let actor_handle = handle.clone();
 
-    // the node-local, off-chain interactive terminal-session plane (lives in the
-    // daemon like the stream hub — never consensus). This node spawns no pty:
-    // the plane is the RINGS and the metadata, and an agent daemon (`ducktape
-    // service run agent`) attaches over the ws to own the ptys. With none
-    // attached, create returns a clear 503 — a bare spawn is unrepresentable.
-    let term_ring = handle.stream_hub().terminals();
-    let term_cmd_ring = handle.stream_hub().term_commands();
-    // no link token: this test daemon has no workspace to hold one, so it
-    // refuses every attach and therefore has no interactive plane. Nothing
-    // runs an agent daemon against it.
-    let handle =
-        handle.with_terminals(noded::TerminalSessions::new(term_ring, term_cmd_ring, None));
     std::thread::Builder::new()
         .name("node-actor".into())
         .spawn(move || {
@@ -235,8 +223,8 @@ fn run_node(
         // stages what clients POST).
         let op_blobs = blobs.clone();
         let substrates = Substrates {
-            forge_repo,
-            duckfs_dir,
+            directory: duckfs_dir.with_file_name("module-storage"),
+            bindings: [("forge".into(), forge_repo), ("files".into(), duckfs_dir)].into(),
             blobs,
         };
         let bindings = Bindings {
@@ -352,6 +340,7 @@ fn run_node(
                 NodeCommand::Submit {
                     target,
                     payload,
+                    required_blob: _,
                     origin,
                     reply,
                 } => {
@@ -396,7 +385,7 @@ fn run_node(
                         // junk never reaches the store: the http gate already
                         // refused it, and this is the second wall for any
                         // embedder-side producer on the command lane.
-                        Err(err) => Err(err.to_string()),
+                        Err(err) => Err(noded::Refused::new("malformed_frame", err.to_string())),
                     };
                     publish_status(&status, &metrics, &index, &host, height);
                     let _ = reply.send(result);
@@ -405,7 +394,7 @@ fn run_node(
                     let result = host
                         .query(&target, &req)
                         .await
-                        .map_err(|err| err.to_string());
+                        .map_err(|err| noded::Refused::of(&err));
                     let _ = reply.send(result);
                 }
                 NodeCommand::QueryAs {
@@ -417,7 +406,7 @@ fn run_node(
                     let result = host
                         .query_as(&target, &req, sdk::Origin::External(reader))
                         .await
-                        .map_err(|err| err.to_string());
+                        .map_err(|err| noded::Refused::of(&err));
                     let _ = reply.send(result);
                 }
             }
@@ -448,7 +437,7 @@ async fn submit_and_drain(
     metrics: &NodeMetrics,
     origin: Origin,
     msg: Msg,
-) -> Result<BlockSummary, String> {
+) -> Result<BlockSummary, noded::Refused> {
     let (included, events) =
         match submit_one(host, height, index, blobs, stream_hub, metrics, origin, msg).await {
             Ok(out) => out,
@@ -456,7 +445,9 @@ async fn submit_and_drain(
                 tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
                 std::process::exit(1);
             }
-            Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
+            Err(err @ SubmitError::Rejected(_)) => {
+                return Err(noded::Refused::of_submit(&err))
+            }
         };
 
     // The reactor nudges committed delivery and call queues through this
@@ -475,7 +466,7 @@ async fn submit_and_drain(
             tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
             std::process::exit(1);
         }
-        Err(err) => return Err(err.to_string()),
+        Err(err) => return Err(noded::Refused::new("queue_drain_failed", err.to_string())),
     };
 
     // an unclaimed event is a module's ONLY diagnostic channel (a wasm guest
@@ -577,6 +568,7 @@ fn publish_status(
         })
         .collect();
     status.publish(NodeStatus {
+        contract: noded::NODE_CONTRACT,
         version: env!("CARGO_PKG_VERSION").into(),
         root_hash: hex_root(&host.root_hash()),
         height,

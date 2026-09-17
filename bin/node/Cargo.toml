@@ -53,6 +53,9 @@ saga = { workspace = true }
 # provider discovery announces this node's installed executor CLIs into it.
 capability = { workspace = true }
 provider-host = { workspace = true }
+# the agent tool plane's catalog. `ducktape mcp` is its stdio transport; the
+# compute daemon serves the SAME `handle` over each run's node lane.
+mcp-host = { workspace = true }
 # the task plane: recipe manifests + capability dispatch + its host worker.
 dispatch = { workspace = true }
 attribution = { workspace = true }
@@ -62,7 +65,6 @@ forge = { workspace = true }
 pages = { workspace = true }
 chat = { workspace = true }
 # the huddle media planes the voice hub runs: Opus engine, video wire, call-socket framing.
-media-service = { workspace = true }
 tasks = { workspace = true }
 # `ducktape collab` constructs the module's own ops, so a shape change is a
 # compile error here rather than a hand-rolled json payload that drifts.
@@ -70,6 +72,8 @@ collaboration = { workspace = true }
 identity = { workspace = true }
 # the passkey enrollment challenge — the same bytes `KeyScheme::Secp256r1` verifies.
 keyscheme = { workspace = true }
+# the desktop app's release manifest + signature: `ducktape release sign`.
+app-update = { workspace = true }
 authpage = { workspace = true }
 gateway = { workspace = true }
 # the airlock contract: `server` supplies the GrantCheck type the lender daemon
@@ -104,6 +108,8 @@ workspace-config = { workspace = true }
 blobstore = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
+run-envelope = { workspace = true }
+borsh = { workspace = true }
 # the staged node-driven WireGuard plane: the reachability executor runs
 # on its own plain-tokio thread (mirroring the app-surface split) behind the
 # `wireguard_listen` node.toml key; the wireguard crate supplies the
@@ -145,6 +151,10 @@ indexer = { workspace = true }
 # feature behind the SIGUSR1 task dump is added by the Linux-only target
 # table below: tokio makes it a compile_error! on any other OS.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal", "io-std", "io-util"] }
+# a request body reaches the loopback upstream as a channel of frames, and
+# `reqwest::Body::wrap_stream` wants a Stream: this is the adapter that makes a
+# receiver one, without holding the body to build it.
+tokio-stream = "0.1"
 
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
@@ -161,6 +171,12 @@ reqwest = { workspace = true }
 # WebSocket bridge to a route's loopback upstream (ws://127.0.0.1, no TLS).
 tokio-tungstenite = "0.24"
 sha2 = { workspace = true }
+# Validate standalone executor archives before extracting their runtime assets.
+tar = "0.4"
+# `release sign-bundle` unpacks the bundle it sends and the one it receives
+# into a scratch dir that goes away on every exit path.
+tempfile = "3"
+flate2 = "1"
 toml = "0.8"
 # identity keygen entropy (`Signer::random`).
 rand = "0.8"
@@ -212,6 +228,11 @@ verify = ["airlock/verify", "airlock/testkit", "provider-host/verify"]
 # drives them through the rpc with TYPED interface-crate payloads — payload
 # drift fails to compile instead of rotting silently like the old bash demo.
 [dev-dependencies]
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+ducktape-forge-service = { path = "../forge-service" }
+# the node release e2e packs its own `.tar.zst` releases (tar is already a
+# runtime dep above); the launcher under test unpacks them.
+zstd = { workspace = true }
 # the shared raw-http/port/poll harness helpers (was: a per-suite copy each).
 nettest = { path = "../../crates/testing/nettest" }
 # a scripted fixture lifts its guest shell out of the rootfs with the same
@@ -240,6 +261,11 @@ keyscheme = { workspace = true, features = ["testkit"] }
 # commit-building op — this is how production gets them too (a stock git push).
 forge = { workspace = true, features = ["testkit"] }
 async-trait = { workspace = true }
+# `lane_key_lint.rs` parses `bin/node/src` rather than matching text in it: the
+# `#[cfg(test)]` half is shared with topology's `wasm_embed.rs` (source-lint),
+# the `LaneKey` half is the lint's own.
+syn = { version = "2", features = ["full", "visit", "parsing"] }
+source-lint = { workspace = true }
 # the mcp harness genesis has no commonware runtime context, so the agent
 # registry rides the in-memory MerkleStore test double.
 sdk-testkit = { workspace = true }
@@ -248,8 +274,6 @@ sdk-testkit = { workspace = true }
 # in milliseconds of wall time instead of minutes.
 tokio = { version = "1", features = ["test-util", "macros"] }
 tempfile = "3"
-# the streaming e2e feeds an SSE upstream through a channel-backed Body.
-tokio-stream = "0.1"
 # the componentizer: the self-heal e2e builds the seed repository's guest the
 # way the network's own modules are built.
 guest-builder = { path = "../guest-builder" }

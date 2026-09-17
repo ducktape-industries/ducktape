@@ -10,10 +10,9 @@
 mod common;
 
 use std::path::Path;
-use std::process::Command;
 
 fn ducktape(home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    common::ducktape()
         .arg("node")
         .args(args)
         .env("DUCKTAPE_HOME", home)
@@ -62,6 +61,32 @@ fn init_defaults_into_the_home_and_n_selects_it() {
     assert!(err.contains("no workspace"), "run -n stderr: {err:?}");
 }
 
+/// `init` records the binary that founded the workspace, and `run` refuses a
+/// binary whose module WIT world is not that one — up front, naming both
+/// builds, instead of dying inside component instantiation once booted.
+#[test]
+fn run_refuses_a_binary_whose_module_world_is_not_the_founding_one() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let chain_id = init(home.path(), "wornet");
+    let record = home.path().join(&chain_id).join("founding.toml");
+    let founded = std::fs::read_to_string(&record).expect("init records the founding binary");
+    assert!(founded.contains("module_world"), "record: {founded:?}");
+
+    // the same workspace, founded by a binary that spoke another module world.
+    let foreign = format!("build = \"fc4ad8d5a\"\nmodule_world = \"{}\"\n", "0".repeat(64));
+    std::fs::write(&record, foreign).expect("rewrite the founding record");
+
+    let out = ducktape(home.path(), &["run", "-n", &chain_id]);
+    assert!(!out.status.success(), "run booted a foreign module world");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains(&format!("refusing to boot {chain_id}"))
+            && err.contains("founded by fc4ad8d5a")
+            && err.contains("module world differs"),
+        "run stderr: {err:?}"
+    );
+}
+
 #[test]
 fn same_name_founds_two_distinct_workspaces() {
     let home = tempfile::tempdir().expect("tempdir");
@@ -79,7 +104,7 @@ fn same_name_founds_two_distinct_workspaces() {
 /// test owns: the probe only checks executability on PATH, it never runs the
 /// binary.
 fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::path::PathBuf) {
-    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let out = common::ducktape()
         .args(["node", "init", "--name", name, "--primary-coordinator", "none"])
         .env("DUCKTAPE_HOME", home)
         .env("PATH", path_dir)
@@ -177,7 +202,7 @@ fn detection_follows_the_host(path_dir: &Path) {
 /// Its exit status is about the WORKSPACE (an unbuilt image refuses), so only
 /// the verdict line is read.
 fn host_verdict(home: &Path, path_dir: &Path) -> bool {
-    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let out = common::ducktape()
         .args(["node", "sandbox"])
         .env("DUCKTAPE_HOME", home)
         .env("PATH", path_dir)
@@ -196,7 +221,7 @@ fn host_verdict(home: &Path, path_dir: &Path) -> bool {
 
 /// Run any family, not just `node`.
 fn ducktape_raw(home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    common::ducktape()
         .args(args)
         .env("DUCKTAPE_HOME", home)
         .output()
@@ -274,7 +299,7 @@ fn init_writes_module_hashes_and_the_genesis() {
     use sha2::Digest as _;
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("ws");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let out = common::ducktape()
         .args(["node", "init", "--name", "bundled", "--primary-coordinator", "none", "--dir"])
         .arg(&ws)
         .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
@@ -284,7 +309,10 @@ fn init_writes_module_hashes_and_the_genesis() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let d = workspace_config::NetworkDescriptor::load(&ws.join("network.toml")).unwrap();
     let ids: Vec<&str> = d.modules.iter().map(|m| m.id.as_str()).collect();
+    // the descriptor pins every founding entry: the module set and the
+    // founding views (`home`), each under its own hash
     let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
+    want.extend(topology::VIEWS);
     want.sort_unstable();
     assert_eq!(ids, want);
     let file = ws.join("genesis");
@@ -339,7 +367,7 @@ fn init_accepts_a_module_absent_from_the_binary_catalog() {
     )
     .unwrap();
     let workspace = tmp.path().join("network");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let output = common::ducktape()
         .args([
             "node",
             "init",
@@ -385,7 +413,7 @@ fn init_accepts_a_module_absent_from_the_binary_catalog() {
 fn init_founds_from_the_set_the_build_staged_beside_the_binary() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("ws");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let out = common::ducktape()
         .args(["node", "init", "--name", "staged", "--primary-coordinator", "none", "--dir"])
         .arg(&ws)
         .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1"])
@@ -396,6 +424,7 @@ fn init_founds_from_the_set_the_build_staged_beside_the_binary() {
     let genesis = workspace_config::Genesis::load(&ws.join("genesis")).expect("the genesis file");
     let ids: Vec<&str> = genesis.modules.iter().map(|a| a.id.as_str()).collect();
     let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
+    want.extend(topology::VIEWS);
     want.sort_unstable();
     assert_eq!(ids, want);
 }
@@ -565,7 +594,7 @@ fn init_refuses_a_zero_byte_component_and_writes_nothing() {
     // to nothing.
     std::fs::write(workspace_config::component_path(&source, "oops"), b"").unwrap();
     let workspace = tmp.path().join("network");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let output = common::ducktape()
         .args(["node", "init", "--name", "zero-byte", "--primary-coordinator", "none", "--dir"])
         .arg(&workspace)
         .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
@@ -588,7 +617,7 @@ fn init_refuses_an_empty_module_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let empty = tmp.path().join("empty");
     std::fs::create_dir_all(&empty).unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let out = common::ducktape()
         .args(["node", "init", "--name", "x", "--primary-coordinator", "none", "--dir"])
         .arg(tmp.path().join("ws"))
         .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])

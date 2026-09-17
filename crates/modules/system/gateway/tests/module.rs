@@ -106,7 +106,7 @@ fn statement(account_id: u64, node: Vec<u8>, name: RouteName, revision: u64) -> 
             policy: RoutePolicy {
                 audience: RouteAudience::Network,
                 methods: vec![RouteMethod::Get, RouteMethod::Post],
-                max_request_bytes: 4096,
+                max_request_bytes: Some(4096),
                 max_response_bytes: 8192,
                 allow_authorization: false,
                 allow_upgrade: false,

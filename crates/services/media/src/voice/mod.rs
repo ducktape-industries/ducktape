@@ -31,14 +31,13 @@ pub mod engine;
 pub mod jitter;
 pub mod media;
 
-pub use codec::{CodecError, VoiceDecoder, VoiceEncoder};
+pub use codec::{CodecError, MAX_ENCODED, VoiceDecoder, VoiceEncoder};
 pub use engine::{SpeakerStats, VoiceConfig, VoiceEngine};
 pub use jitter::{JitterStats, MinimalJitter, PlayoutStep};
 pub use media::{MediaError, MediaHeader};
 
 /// Voice runs at Opus's native rate, mono.
 pub const SAMPLE_RATE: u32 = 48_000;
-/// One media frame = 20 ms — Opus's sweet spot and the packet cadence.
-pub const FRAME_MILLIS: u64 = 20;
-/// Samples per frame: 48 kHz × 20 ms.
+/// Samples per frame: 48 kHz × 20 ms — Opus's sweet spot and the packet
+/// cadence.
 pub const FRAME_SAMPLES: usize = 960;

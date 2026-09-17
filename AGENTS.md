@@ -22,7 +22,9 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
 - Version numbering is reset to v1 and stays there: no protocol-version bumps,
   no v2/v3 names, no admission gates keyed on a version number. The
   invitation/join flow in particular is v1 — a "v2" hint anywhere in it is a
-  bug.
+  bug — except the app↔node contract number (`noded::NODE_CONTRACT`): an
+  equality check the desktop app alone performs against `/v1/status`; it is
+  never a tolerance window and nothing on the node or between peers reads it.
 - This holds until a real network is live. Re-introducing versioning, upgrade
   gating, or migration machinery is an explicit, user-requested decision —
   never a side effect of a task.
@@ -100,6 +102,54 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
   or low, leave the PR open with the risks, failed checks, or follow-up review
   needed instead of merging by default.
 
+## Delivery Speed (high confidence is the gate, not the calendar)
+
+- **Local gates decide the merge; CI is not waited on.** When the touched
+  crates' gates are green locally and the change is understood, merge at once
+  (`gh pr merge --squash`). Do not arm a watch on the CI run, do not wait for
+  a review round, do not open a follow-up "verify" pass. CI stays light and
+  catches what the box missed after the fact; a red there is a new issue, not
+  a reason to have waited.
+- **Gate what you touched, not the tree.** Run the per-crate clippy gate and
+  the tests of the crates the diff changes. A whole-workspace run is for a
+  change that spans the workspace. Never run the e2e node suites for a change
+  that cannot reach them.
+- **One session, one task, end to end.** The session that implements a unit
+  also gates it, opens the PR, merges it, and closes the issue by hand (a
+  merge into `dev` closes nothing; `main` is the default branch). No
+  implement → review → verify chains; a second pair of eyes is for a change
+  the author says they do not understand.
+- **Reproduce before fixing, at current `dev`.** A report names a symptom; an
+  attached cause may be stale. If it does not reproduce, close the issue with
+  the evidence and move on — that is delivery, not a skipped task.
+- **Merged means gone.** Remove the worktree and delete the branch as soon as
+  the PR merges. Then `git grep` your symbol on `origin/dev`: a sibling's
+  merge commit can revert it.
+- **A module's bytes move with everything it compiles in.** A change to ANY
+  crate a guest compiles (a module crate's `src/`, the module SDK, a library a
+  module wraps such as `duckfs-core` or `files`) or to any shape a guest
+  decodes (`Seed`, a module's message or query enum, a `deny_unknown_fields`
+  record) ships the rebuilt `component.wasm`, `index.wasm` and kernel fixture
+  in the SAME PR, for EVERY guest it reached. Even a deletion moves bytes:
+  panic paths carry line numbers. `make wasm-rebuild-check` names the guests;
+  `grep -l 'name = "<crate>"' crates/modules/*/*/guest.lock` says which
+  guests compile a crate in. A lock names only what a guest COMPILES, so it
+  can never name the BUILDER: a change to `bin/guest-builder`, to the
+  `[profile.release]` it synthesizes into the scratch workspace, to the
+  vendored registry seed, to the module WIT or to the toolchain pin moves every
+  guest at once and that grep finds nothing at all. Scope by the grep only after
+  ruling that case out; in it, the scope is all of them.
+  `make wasm-rebuild-check` covers the five standalone fixture guests under
+  `crates/guests/` (hello, hello-replacement, noop, sibling, object) too, on
+  every run — they carry no `guest.lock`, so `CRATES` cannot scope them and
+  does not try. Its success line names the number of artifacts it compared.
+  The committed guest is what every composed genesis runs; a host that speaks a
+  field the guest never learned fails closed on every network founded from
+  that `dev`, and the failure surfaces as a stranger's red hours later.
+- **Hold only what is really uncertain.** A PR stays open only when the
+  author can name the risk in one sentence. "Waiting for CI", "waiting for
+  review", or "someone else should look" are not risks.
+
 ## Worktree Cleanup (a merged worktree is garbage — remove it)
 
 - **A worktree's life ends when its PR merges.** Once merged, remove the
@@ -170,6 +220,10 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
   `--no-deps` is deliberate. Without it, a crate whose dev-deps pull
   host/dispatch/saga inherits ~a dozen pre-existing version-drift lints from
   those crates; a task is accountable only for lints in the crates it touched.
+- A crate with a bin target AND dev-dependencies (node-bin, simnode, the
+  service bins) also needs `cargo build -p <crate>` with no `--tests`: under
+  `--tests` every target sees the dev-dependency graph, so a source file that
+  reaches a dev-only crate is green in clippy and fails the real binary.
 - Don't run `cargo fmt --all`: large bin files carry pre-existing fmt debt,
   and a tree-wide reformat forces painful rebases on in-flight branches. Only
   format code you touched; the mechanical whole-tree sweep is a dedicated PR.

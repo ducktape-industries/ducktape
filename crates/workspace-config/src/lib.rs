@@ -37,6 +37,7 @@ use tracing::warn;
 // back in bin/node reaches several of them by path (`node_toml::RawNodeToml`),
 // and it is the one caller that wants the raw, pre-resolution shapes.
 pub mod genesis;
+pub mod staged_key;
 mod view_files;
 pub use view_files::{ensure_view_ready, read_deployment_files};
 pub mod identity;
@@ -106,9 +107,11 @@ pub fn modules_dir() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current executable: {e}"))?;
     staged_modules_dir(&exe).ok_or_else(|| {
         format!(
-            "no founding set beside {} — `cargo build` stages one (target/<profile>/modules), \
-             `make install-node` installs one beside the binary, or set $DUCKTAPE_MODULES_DIR",
-            exe.display()
+            "no founding set beside {} — `cargo build` stages this checkout's own \
+             (target/<profile>/modules%<checkout>, named by its `{}`), `make install-node` \
+             installs one beside the binary as `modules`, or set $DUCKTAPE_MODULES_DIR",
+            exe.display(),
+            staged_key::STAGED_POINTER,
         )
     })
 }
@@ -120,7 +123,19 @@ pub fn sim_modules_dir() -> Result<PathBuf, String> {
     if let Some(dir) = configured {
         return Ok(PathBuf::from(dir));
     }
-    Ok(modules_dir()?.with_file_name("sim-modules"))
+    Ok(sim_twin(&modules_dir()?))
+}
+
+/// the simulation set beside a resolved founding set: this checkout's keyed
+/// pair (`modules-<checkout>` -> `sim-modules-<checkout>`), or the installed
+/// pair (`modules` -> `sim-modules`).
+fn sim_twin(modules: &Path) -> PathBuf {
+    let resolved = modules.file_name().and_then(|name| name.to_str());
+    let sim = match resolved.and_then(|name| name.strip_prefix("modules")) {
+        Some(key) => format!("sim-modules{key}"),
+        None => "sim-modules".to_owned(),
+    };
+    modules.with_file_name(sim)
 }
 
 /// the founding set the build staged beside `exe`: `<exe dir>/modules` (a
@@ -128,13 +143,50 @@ pub fn sim_modules_dir() -> Result<PathBuf, String> {
 /// `<exe dir>/../modules` (a test executable cargo runs from
 /// `target/<profile>/deps/`). `None` when neither directory exists.
 pub fn staged_modules_dir(exe: &Path) -> Option<PathBuf> {
+    // The set the LAST build staged, named by the pointer that build wrote
+    // beside the binaries — then the unkeyed one. The pointer is read at
+    // RUNTIME and never baked: several checkouts share a profile directory
+    // because their source is identical, which is exactly why cargo shares the
+    // compiled unit a baked key would live in (see `STAGED_POINTER`). Unkeyed
+    // is the INSTALLED layout, which `make install-node` and the pinned dognet
+    // binaries use, and where nothing else writes.
     let exe_dir = exe.parent()?;
-    let beside = exe_dir.join("modules");
-    if beside.is_dir() {
-        return Some(beside);
-    }
-    let beside_parent = exe_dir.parent()?.join("modules");
-    beside_parent.is_dir().then_some(beside_parent)
+    let deps_parent = exe_dir.parent();
+    let staged = [Some(exe_dir), deps_parent]
+        .into_iter()
+        .flatten()
+        .find_map(|dir| Some(dir.join(staged_pointer_target(dir)?)));
+    let candidates = [
+        staged,
+        Some(exe_dir.join("modules")),
+        deps_parent.map(|dir| dir.join("modules")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| candidate.is_dir())
+}
+
+/// The set name `dir`'s pointer names, if it has one.
+fn staged_pointer_target(dir: &Path) -> Option<String> {
+    let name = std::fs::read_to_string(dir.join(staged_key::STAGED_POINTER)).ok()?;
+    let name = name.trim();
+    // a pointer naming anything but a plain directory name is not one this
+    // build wrote; refuse it rather than following it out of the profile dir.
+    let names_one_directory =
+        !name.is_empty() && !name.contains('/') && name != ".." && name != ".";
+    names_one_directory.then(|| name.to_owned())
+}
+
+/// The build that staged `set`, as `crates/noded/build.rs` recorded it, or
+/// `None` for a set with no record (an installed layout, or one staged before
+/// this file existed).
+///
+/// A set is not a shared thing, and a profile directory is shared, so the
+/// record is what lets a reader tell its own set from a stranger's.
+pub fn staged_by(set: &Path) -> Option<String> {
+    let recorded = std::fs::read_to_string(set.join(staged_key::STAGED_OWNER)).ok()?;
+    Some(recorded.trim().to_owned())
 }
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
@@ -1065,6 +1117,84 @@ pub fn sync_source_candidates<A>(
 }
 
 // ============================================================================
+// the founding record — `founding.toml`, the binary identity a workspace was
+// founded with. Node-local: never shared with a peer, never in the genesis
+// fingerprint, read by nothing but this node's own boot.
+// ============================================================================
+
+/// the founding record's file name inside a workspace.
+pub const FOUNDING_FILE: &str = "founding.toml";
+
+/// what the binary that materialized this workspace (`node init`, `node join`)
+/// wrote down about itself.
+///
+/// `module_world` is the whole comparison. A module component is compiled
+/// against the `ducktape:module` WIT world, and a host binding a different one
+/// cannot instantiate it — the failure lands deep in component instantiation
+/// ("type-checking export func `shape`"), reading like a compose bug rather
+/// than the binary skew it is. `build` is DISPLAY only: a different commit is
+/// fine, a different module world is not.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FoundingBinary {
+    /// the founding binary's build identity (`noded::services::build_identity`)
+    /// or `unknown` — named in the refusal, never compared.
+    pub build: String,
+    /// sha256 (hex) of the `ducktape:module` WIT world that binary speaks
+    /// (`wasm_host::module_world_digest`).
+    pub module_world: String,
+}
+
+impl FoundingBinary {
+    /// write the record into `dir`, atomically like every other workspace
+    /// identity file.
+    pub fn save(&self, dir: &Path) -> Result<(), String> {
+        let text = toml::to_string_pretty(self).expect("founding record serializes");
+        genesis::write_atomic(&dir.join(FOUNDING_FILE), text.as_bytes())
+    }
+
+    /// the record in `dir`, or `None` where there is none — the dev-seed
+    /// harness shape, which no `init`/`join` ever wrote one for.
+    pub fn load(dir: &Path) -> Result<Option<Self>, String> {
+        let path = dir.join(FOUNDING_FILE);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("read {path:?}: {e}")),
+        };
+        toml::from_str(&text)
+            .map(Some)
+            .map_err(|e| format!("{path:?}: {e}"))
+    }
+}
+
+/// refuse a boot whose module world is not the one `dir` was founded with.
+///
+/// Up front and by name, because the alternative is a node that comes up,
+/// replays, and dies inside component instantiation naming a `shape` export.
+/// There is no tolerance window and no migration: the operator rebuilds the
+/// binary from the founding commit, or re-founds the network.
+pub fn guard_founding_binary(
+    dir: &Path,
+    chain_id: &str,
+    build: &str,
+    module_world: &str,
+) -> Result<(), String> {
+    let Some(founding) = FoundingBinary::load(dir)? else {
+        return Ok(());
+    };
+    let speaks_the_founding_world = founding.module_world == module_world;
+    if speaks_the_founding_world {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to boot {chain_id}: founded by {}, running {build} (module world differs) — \
+         rebuild this binary from the founding commit, or re-found the network",
+        founding.build
+    ))
+}
+
+// ============================================================================
 // the ducktape home — one directory per network, `~/.ducktape/<id>/`, and
 // nothing else. A workspace is a network's WHOLE node home: node.toml,
 // network.toml, identity.key, keys/, guest/, executors/, capabilities/ and
@@ -1136,7 +1266,7 @@ fn find_workspace_config_in(root: &Path, needle: &str) -> Result<PathBuf, String
             Ok(d) => d,
             Err(e) => {
                 warn!(
-                    target: "ducktape::workspace",
+                    target: "ducktape::node",
                     reason = "descriptor_unreadable",
                     dir = %dir.display(),
                     error = %e,
@@ -1199,6 +1329,15 @@ pub fn http_base_in(dir: &Path) -> Result<String, String> {
     Ok(http_base_of(&raw.http_listen))
 }
 
+/// the node's OPERATOR RPC address for a workspace DIRECTORY, verbatim — the
+/// twin of [`http_base_in`] for the other local lane. Not normalized to
+/// loopback the way an http base is: `rpc_listen` is dialed as written, so the
+/// string a caller compares against is the string the config holds.
+pub fn rpc_listen_in(dir: &Path) -> Result<String, String> {
+    let (raw, _) = node_toml::load_node_toml(&dir.join("node.toml"))?;
+    Ok(raw.rpc_listen)
+}
+
 /// `http://<loopback>:<port>` for a node.toml `http_listen`. ALWAYS loopback,
 /// whatever the operator bound: every caller of this is a same-box process
 /// dialing its OWN node, and the node's write gate admits a credentialed
@@ -1247,7 +1386,7 @@ pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String>
             Ok(d) => d,
             Err(e) => {
                 warn!(
-                    target: "ducktape::workspace",
+                    target: "ducktape::node",
                     reason = "descriptor_unreadable",
                     dir = %dir.display(),
                     error = %e,
@@ -1265,6 +1404,100 @@ pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A binary resolves the set THE POINTER BESIDE IT names, before the
+    /// unkeyed one, from the profile directory and from `deps/` where cargo
+    /// runs tests — and an installed layout (a plain `modules` beside the
+    /// binary, which is what `make install-node` and the pinned dognet
+    /// binaries have) resolves exactly as it did before any keying.
+    #[test]
+    fn a_binary_resolves_the_set_its_pointer_names_before_the_installed_one() {
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = scratch.path().join("debug");
+        let exe = profile.join("ducktape");
+        std::fs::create_dir_all(profile.join("deps")).unwrap();
+
+        std::fs::create_dir(profile.join("modules")).unwrap();
+        assert_eq!(staged_modules_dir(&exe).unwrap(), profile.join("modules"));
+
+        let ours = "modules%home%someone%checkout";
+        std::fs::create_dir(profile.join(ours)).unwrap();
+        std::fs::write(profile.join(staged_key::STAGED_POINTER), ours).unwrap();
+        assert_eq!(
+            staged_modules_dir(&exe).unwrap(),
+            profile.join(ours),
+            "another checkout's `modules` must not outrank the one we were pointed at"
+        );
+        let test_exe = profile.join("deps/noded-1234");
+        assert_eq!(
+            staged_modules_dir(&test_exe).unwrap(),
+            profile.join(ours),
+            "a test binary runs from deps/"
+        );
+
+        // the installed layout: one unkeyed set beside the binary, nothing else
+        let installed = scratch.path().join("bin");
+        std::fs::create_dir_all(installed.join("modules")).unwrap();
+        assert_eq!(
+            staged_modules_dir(&installed.join("ducktape")).unwrap(),
+            installed.join("modules")
+        );
+        assert_eq!(
+            sim_twin(&installed.join("modules")),
+            installed.join("sim-modules")
+        );
+        assert_eq!(
+            sim_twin(&profile.join(ours)),
+            profile.join("sim-modules%home%someone%checkout")
+        );
+    }
+
+    /// A pointer is a NAME, never a path: a profile directory is written by
+    /// every checkout sharing the target, so one that could carry `..` would
+    /// be a way to aim a node at any directory on the box.
+    #[test]
+    fn a_pointer_that_is_not_a_plain_name_is_refused() {
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = scratch.path().join("debug");
+        let exe = profile.join("ducktape");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::create_dir(profile.join("modules")).unwrap();
+
+        for refused in ["../elsewhere", "/etc", "..", ".", "", "  "] {
+            std::fs::write(profile.join(staged_key::STAGED_POINTER), refused).unwrap();
+            assert_eq!(
+                staged_modules_dir(&exe).unwrap(),
+                profile.join("modules"),
+                "{refused:?} must not resolve"
+            );
+        }
+    }
+
+    /// The record inside a set says which build wrote it. Reading it back is
+    /// what lets `noded::services::founding_set` refuse a stranger's.
+    #[test]
+    fn a_set_reports_the_build_that_staged_it() {
+        let scratch = tempfile::tempdir().unwrap();
+        let set = scratch.path().join("modules%somewhere");
+        std::fs::create_dir_all(&set).unwrap();
+        assert_eq!(staged_by(&set), None, "a set with no record claims nothing");
+        std::fs::write(set.join(staged_key::STAGED_OWNER), "abc1234\n").unwrap();
+        assert_eq!(staged_by(&set).as_deref(), Some("abc1234"));
+    }
+
+    /// A set name encodes its checkout, and the encoding round-trips — which
+    /// is how the stager tells a set whose worktree is gone from a live one.
+    #[test]
+    fn a_set_name_names_the_checkout_it_belongs_to() {
+        let checkout = Path::new("/home/eddy/dev/ducktape/ducktape");
+        let name = staged_key::staged_set_name("modules", checkout);
+        assert_eq!(name, "modules%home%eddy%dev%ducktape%ducktape");
+        assert_eq!(
+            staged_key::checkout_of_set_name(&name).as_deref(),
+            Some(checkout)
+        );
+        assert_eq!(staged_key::checkout_of_set_name("modules"), None);
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

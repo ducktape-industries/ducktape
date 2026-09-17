@@ -25,8 +25,8 @@ testkit = ["dep:nettest"]
 verify = ["provider-host/verify"]
 
 [dependencies]
-# Static Ice view readiness; no graphics or guest execution.
-ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", features = ["manifest"] }
+# Static view readiness; no graphics or guest execution.
+view-wire = { workspace = true, features = ["manifest"] }
 wasmtime.workspace = true
 
 node-work = { workspace = true }
@@ -50,32 +50,31 @@ valset = { workspace = true }
 modules = { workspace = true }
 kv = { workspace = true }
 files = { workspace = true }
+# the disk odb `open_odb` hands a wasm files tenant. a service crate, not the
+# module: `files` names no kernel host.
+files-odb = { workspace = true }
+# the git substrate `open_odb` hands a wasm forge tenant, on the same grounds.
+forge-odb = { workspace = true }
 chat = { workspace = true }
 # the `/v1/call/ws` framing (the webview leg of a huddle) and the voice frame size.
-media-service = { workspace = true }
 tasks = { workspace = true }
 identity = { workspace = true }
 gateway = { workspace = true }
-agent = { workspace = true }
-runs = { workspace = true }
+agent-wire = { workspace = true }
+runs-wire = { workspace = true }
 dispatch = { workspace = true }
 attribution = { workspace = true }
 compute-service = { workspace = true }
-# the interactive-terminal wire: this node holds the rings, the ws topics and
-# the admission decisions; the agent daemon on the other end of `wire` holds the
-# ptys. Linking the crate is how both sides agree on the protocol — the node
-# never constructs a `Sessions`.
+# the agent-daemon wire: the messaging bus this node's service link carries.
+# Linking the crate is how both sides agree on the protocol.
 agent-service = { workspace = true }
 # host-side provider discovery: the dispatch worker runs the operator's locally
 # installed executor CLIs (BYO), never any credential file.
 provider-host = { workspace = true }
 saga = { workspace = true }
-# the forge module's wire types — the git smart-HTTP receive-pack bridge encodes
-# ForgeMsg::PushRefs / ForgeQuery::HeadOf onto the actor lane (the ONE forge-specific
-# route pair; every other route stays module-agnostic opaque json).
+# Forge wire types and native automation object storage primitives.
 forge = { workspace = true }
-# `git push --signed`: the bridge dearmors the push certificate's OpenSSH
-# signature and refuses a bad one early (consensus re-verifies regardless).
+# Generic signed request verification.
 keyscheme = { workspace = true }
 # duckfs wire/path/object helpers used by the daemon's HTTP and workspace
 # adapter surfaces without depending on the module adapter re-export.
@@ -123,12 +122,7 @@ async-trait = { workspace = true }
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors"] }
-# inflate a gzip-compressed git receive-pack request body (Content-Encoding: gzip).
-flate2 = "1"
-# the git upload-pack (clone/fetch) lane opens a forge repo READ-ONLY and builds
-# the wanted oids' closure into a packfile. same vendored libgit2 forge builds,
-# so the node stays self-contained (no host `git`); default-features drops the
-# ssh/https transport forge doesn't use either.
+# Local automation worktree and pack construction primitives.
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 # the log subscriber every bin installs (src/log.rs): ONE reloadable filter over
@@ -144,6 +138,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 topology = { workspace = true }
 
 [dev-dependencies]
+# the NATIVE modules, which only the in-crate provision tests stand up
+# (`RunsModule::new`, `agent::AgentModule::new` in agent_provision's two
+# `#[cfg(test)]` files). The daemon itself speaks to them over the wire and
+# links `runs-wire`/`agent-wire` alone — which is the point of the split, and
+# what these two lines being DEV-only proves.
+agent = { workspace = true }
+runs = { workspace = true }
+pages = { workspace = true }
+run-envelope = { workspace = true }
 wat = "1"
 # MemStore: the in-memory MerkleStore double behind store-backed modules in
 # the in-crate provision tests.

@@ -13,18 +13,50 @@
 //! being encoded — presence IS openness.
 
 use commonware_runtime::telemetry::metrics::{EncodeMetric, MetricEncoder, MetricType, Registered};
-use data_plane::{PlaneMonitor, PlaneReport, Service};
+use data_plane::{PlaneMonitor, PlaneReport};
 
-/// The metric label for a [`Service`] — wire-stable like the enum itself.
-fn service_name(service: Service) -> &'static str {
-    match service {
-        Service::StateSync => "statesync",
-        Service::Voice => "voice",
-        Service::Video => "video",
-        Service::Gateway => "gateway",
-        Service::AgentTelemetry => "agent-telemetry",
-        Service::ModuleCode => "module-code",
-        Service::TermSession => "term-session",
+/// Operator-installed bindings are named at runtime. Scrape the bounded,
+/// canonical local registry rather than retaining labels after retirement.
+/// This reports local admission, not process health or consensus authorization.
+#[derive(Debug)]
+pub(crate) struct ApplicationBindings(std::path::PathBuf);
+
+impl ApplicationBindings {
+    pub(crate) fn register<C: commonware_runtime::Metrics>(
+        context: &C,
+        workspace: std::path::PathBuf,
+    ) -> Registered<Self> {
+        context.register(
+            "ducktape_application_binding",
+            "locally bound application routes (1 = bound, not a health check)",
+            Self(workspace),
+        )
+    }
+}
+
+impl EncodeMetric for ApplicationBindings {
+    fn encode(&self, mut encoder: MetricEncoder) -> Result<(), std::fmt::Error> {
+        let Ok(bindings) = crate::gateway_routes::load(&self.0) else {
+            return Ok(());
+        };
+        for binding in bindings.routes {
+            let authentication = match binding.trust {
+                crate::gateway_routes::UpstreamTrust::TrustedLoopback => "trusted_loopback",
+                crate::gateway_routes::UpstreamTrust::AuthenticatedLoopback { .. } => "credential",
+            };
+            let account = binding.account.to_string();
+            let labels = [
+                ("account", account.as_str()),
+                ("route", binding.name.local_key()),
+                ("authentication", authentication),
+            ];
+            encoder.encode_family(&labels)?.encode_gauge(&1_i64)?;
+        }
+        Ok(())
+    }
+
+    fn metric_type(&self) -> MetricType {
+        MetricType::Gauge
     }
 }
 
@@ -48,10 +80,8 @@ impl EncodeMetric for PlaneSeries {
     fn encode(&self, mut encoder: MetricEncoder) -> Result<(), std::fmt::Error> {
         for report in self.monitor.snapshot() {
             for (extra, value) in (self.project)(&report) {
-                let mut labels: Vec<(&'static str, &'static str)> = vec![
-                    ("service", service_name(report.service)),
-                    ("owner", report.owner),
-                ];
+                let mut labels: Vec<(&'static str, &'static str)> =
+                    vec![("service", report.service), ("owner", report.owner)];
                 labels.extend_from_slice(extra);
                 encoder.encode_family(&labels)?.encode_gauge(&value)?;
             }
@@ -209,7 +239,7 @@ mod tests {
             let watch_alive = Arc::clone(&alive);
             monitor.register(
                 "chat",
-                Service::Voice,
+                "voice",
                 PlaneWatch::new(move || {
                     watch_alive.load(Ordering::Relaxed).then(|| {
                         let mut observation = PlaneObservation::default();
@@ -244,16 +274,37 @@ mod tests {
         });
     }
 
+    #[test]
+    fn application_names_appear_and_retire_without_native_registration() {
+        use crate::gateway_routes::{FILE_NAME, LocalRoute, LocalRoutes, UpstreamTrust};
+        use commonware_runtime::{Metrics as _, Runner as _};
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
+            let workspace = tempfile::tempdir().unwrap();
+            let _metric = ApplicationBindings::register(&context, workspace.path().into());
+            let path = workspace.path().join(FILE_NAME);
+            let routes = LocalRoutes { routes: vec![LocalRoute {
+                account: 17,
+                name: gateway::RouteName::named("unlisted-application"),
+                port: 9876,
+                trust: UpstreamTrust::AuthenticatedLoopback { credential_file: workspace.path().join("private-token") },
+            }] };
+            std::fs::write(&path, serde_json::to_vec_pretty(&routes).unwrap()).unwrap();
+            assert!(context.encode().contains(r#"ducktape_application_binding{account="17",route="unlisted-application",authentication="credential"} 1"#));
+            std::fs::write(&path, serde_json::to_vec_pretty(&LocalRoutes::default()).unwrap()).unwrap();
+            assert!(!context.encode().contains("ducktape_application_binding{"));
+        });
+    }
+
     /// Age and halted project through with the shared label identity.
     #[test]
     fn projections_cover_age_and_halted() {
         let report = PlaneReport {
             owner: "gateway",
-            service: Service::Gateway,
+            service: "gateway",
             age: Duration::from_secs(90),
             observation: PlaneObservation::default(),
         };
-        assert_eq!(service_name(report.service), "gateway");
+        assert_eq!(report.service, "gateway");
         assert_eq!(gauge(report.age.as_secs()), 90);
     }
 }

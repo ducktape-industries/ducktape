@@ -182,6 +182,45 @@ fn cluster_lifecycle() {
     // 6. governance: node 0 proposes admitting node 3's key, nodes 0+1 vote
     // yes (2 of 3 = strict majority), node 1 executes; the passing proposal
     // emits the valset Join follow-up governance alone is authorized to make.
+    //
+    // A promotion names a key the network has already met (#2507), so node 3
+    // is staged into the resident tier first — the standing a live joiner gets
+    // by redeeming its invite, granted here by ballot because this cluster
+    // seats node 3 without one.
+    cluster.submit(
+        0,
+        "governance",
+        &governance::encode_msg(&GovMsg::Propose {
+            proposal_id: "stand-node3".into(),
+            action: GovAction::AddResident {
+                key: Cluster::identity(3),
+            },
+            voting_period: 600_000,
+        }),
+    );
+    cluster.await_committed(1, "resident proposal to open on node 1", FINALIZE, || {
+        proposal_status(&cluster, 1, "stand-node3").filter(|(s, _)| *s == ProposalStatus::Open)
+    });
+    let stand_vote = governance::encode_msg(&GovMsg::Vote {
+        proposal_id: "stand-node3".into(),
+        approve: true,
+    });
+    cluster.submit(0, "governance", &stand_vote);
+    cluster.submit(1, "governance", &stand_vote);
+    cluster.await_committed(1, "both resident ballots to land", FINALIZE, || {
+        proposal_status(&cluster, 1, "stand-node3").filter(|(_, votes)| *votes == 2)
+    });
+    cluster.submit(
+        1,
+        "governance",
+        &governance::encode_msg(&GovMsg::Execute {
+            proposal_id: "stand-node3".into(),
+        }),
+    );
+    cluster.await_committed(0, "resident standing to settle", FINALIZE, || {
+        proposal_status(&cluster, 0, "stand-node3").filter(|(s, _)| *s == ProposalStatus::Passed)
+    });
+
     cluster.submit(
         0,
         "governance",
@@ -609,4 +648,27 @@ fn reachability_plane_converges_mesh_on_boot() {
         cluster.wait_marker(i, "mesh verified", Duration::from_secs(60));
         cluster.wait_marker(i, "tunnels applied (config accepted", Duration::from_secs(60));
     }
+}
+
+/// The presence plane's lane id comes from the committed table, which comes
+/// from the declaration `chat` ships in its frame — not from a constant in the
+/// binary. Asserting the ID and not merely the bind is the point: an absent
+/// key is a silent forever-wait, and a key resolving to the WRONG id would
+/// bind two overlay ports another lane owns.
+#[test]
+fn presence_binds_the_lane_its_module_declares() {
+    let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
+    cluster.wireguard = true;
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
+    cluster.spawn(1);
+    cluster.wait_marker(0, "mesh verified", Duration::from_secs(60));
+    // stripped, because the node colours every field name and its `=`
+    // separately — a `key=value` needle never matches the raw bytes.
+    let bound =
+        common::strip_ansi(&cluster.wait_marker(0, "voice_hub_bound", Duration::from_secs(90)));
+    assert!(
+        bound.contains("lane=7"),
+        "presence must bind the id chat/lanes.json declares for `presence`: {bound}"
+    );
 }

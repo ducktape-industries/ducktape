@@ -10,7 +10,7 @@
 //! the same mountpoints. So this module is a substring rewrite over a handful
 //! of known pairs, not a mount planner.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// the neutral root every per-run input appears under. A guest sees
 /// `/duck/workspace` and `/duck/ro0` — never a host path, so the operator's
@@ -31,6 +31,22 @@ pub const GUEST_WORKSPACE: &str = "/duck/workspace";
 /// skills tree, and any host PATH directories the run declared.
 pub const GUEST_ASSETS: &str = "/duck";
 
+/// THE IDENTITY A RUN EXECUTES AS, and therefore the identity that must own
+/// every file it works on. `duck-guest-init` is PID 1 and `execve`s the run
+/// without changing credentials, so every tool in the guest runs as root.
+///
+/// The host must stamp it into the workspace image, because nothing else
+/// will: `mke2fs -d` copies the OPERATOR's uid off the host tree, and a run
+/// then meets a checkout owned by a user that does not exist inside the VM.
+/// Git is only the first tool to say so — "detected dubious ownership in
+/// repository at '/duck/workspace'", the whole of #2107 — and every later
+/// tool with an ownership check would need its own exception. One number both
+/// sides agree on is enough here: this is a VM boundary, not a container, so
+/// there is no idmap to arrange.
+pub const GUEST_RUN_UID: u32 = 0;
+/// the group half of [`GUEST_RUN_UID`].
+pub const GUEST_RUN_GID: u32 = 0;
+
 /// where the agent CLI a run executes appears inside the guest.
 ///
 /// A MOUNTPOINT the rootfs ships empty, not a directory it fills. The CLIs used
@@ -40,6 +56,17 @@ pub const GUEST_ASSETS: &str = "/duck";
 /// image, built from that directory and attached per run — so what a node
 /// announces and what a run can exec are the same bytes by construction.
 pub const GUEST_BIN_DIR: &str = "/opt/duck/bin";
+
+/// the guest's `PATH`: the CLI image's mountpoint, then the rootfs's own
+/// directories.
+///
+/// FIXED, and never the host's. A run used to inherit the operator's `PATH`
+/// string, which named directories that do not exist inside the VM — the only
+/// entry that ever resolved was the one the host copied in. The guest is a
+/// known filesystem, so its `PATH` is a known list, and a run that declares its
+/// own entries gets them prepended to this.
+pub const GUEST_PATH: &str =
+    "/opt/duck/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// the guest's `HOME`. The rootfs ships it; no host home is ever visible.
 pub const GUEST_HOME: &str = "/root";
@@ -96,15 +123,6 @@ impl GuestLayout {
             out = out.replace(host.as_str(), guest.as_str());
         }
         out
-    }
-
-    /// the guest path for a host path that is mapped exactly.
-    pub fn guest_of(&self, host: &Path) -> Option<PathBuf> {
-        let host = host.to_string_lossy();
-        self.pairs
-            .iter()
-            .find(|(candidate, _)| *candidate == host)
-            .map(|(_, guest)| PathBuf::from(guest))
     }
 }
 

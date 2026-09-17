@@ -177,7 +177,7 @@ pub fn frame_id(bytes: &[u8]) -> FrameId {
 // device keys, secp256k1 for a wallet, secp256r1 for a passkey), a per-origin
 // monotonic `seq` (so two intentionally identical msgs are still DISTINCT
 // frames — the order key must be tie-free), and a PROOF binding (scheme,
-// origin, seq, target, payload) to the origin key: after
+// origin, seq, target, payload, required_blob) to the origin key: after
 // [`decode_frame`] verifies it, `Origin::External(pubkey)` is AUTHENTICATED
 // AUTHORSHIP a module (e.g. governance voting) may rely on — no validator can
 // forge another identity's op. the agreed order is the byte-lexicographic
@@ -216,17 +216,18 @@ pub const MAX_TARGET_BYTES: usize = 64;
 
 /// the bytes [`encode_frame`] wraps around a payload: scheme tag 1, origin
 /// length prefix 8 + 32-byte ed25519 pubkey, seq 8, target length prefix 8 +
-/// up to [`MAX_TARGET_BYTES`] of target, payload length prefix 8, 64-byte
-/// signature. the `max_payload_frame_fits_the_cap_exactly` frame-size guard
-/// test pins the arithmetic against a real `encode_frame`.
-const ED25519_FRAME_ENVELOPE_BYTES: usize = 1 + 8 + 32 + 8 + 8 + MAX_TARGET_BYTES + 8 + 64;
+/// up to [`MAX_TARGET_BYTES`] of target, payload length prefix 8,
+/// one-byte absent-blob tag, and 64-byte signature. The
+/// `max_payload_frame_fits_the_cap_exactly` test pins this arithmetic.
+const ED25519_FRAME_ENVELOPE_BYTES: usize = 1 + 8 + 32 + 8 + 8 + MAX_TARGET_BYTES + 8 + 1 + 64;
 
 /// the largest payload a device-signed op ([`encode_frame`]) can carry and
 /// still fit [`MAX_FRAME_BYTES`] — the cap a client checks BEFORE signing.
 /// the envelope budgets a full [`MAX_TARGET_BYTES`] of target, so this is
 /// exact only at the widest target; under a shorter one it is conservative by
 /// that target's slack (a 5-byte target leaves 59 bytes a client refuses and
-/// the node would have taken).
+/// the node would have taken). A required blob adds 32 bytes to this envelope,
+/// so its payload allowance is `MAX_PAYLOAD_BYTES - 32`.
 pub const MAX_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - ED25519_FRAME_ENVELOPE_BYTES;
 
 /// [`MAX_FRAME_BYTES`] as a hex string: two digits per byte.
@@ -256,8 +257,26 @@ fn take_slice<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
 /// prefix without rebuilding anything. PUBLIC so a wallet or passkey client
 /// signs the exact bytes the decoder verifies — never a reconstruction.
 pub fn frame_preimage(scheme: KeyScheme, origin: &[u8], seq: u64, msg: &Msg) -> Vec<u8> {
+    frame_preimage_with_blob(scheme, origin, seq, msg, None)
+}
+
+/// Canonical signed frame prefix. After the payload, tag 0 means no required
+/// blob; tag 1 carries exactly one 32-byte digest. Both are inside the proof.
+pub fn frame_preimage_with_blob(
+    scheme: KeyScheme,
+    origin: &[u8],
+    seq: u64,
+    msg: &Msg,
+    required_blob: Option<[u8; 32]>,
+) -> Vec<u8> {
     let target = msg.target.as_bytes();
-    let mut out = Vec::with_capacity(1 + 8 * 3 + origin.len() + target.len() + msg.payload.len());
+    let mut out = Vec::with_capacity(
+        2 + 8 * 4
+            + origin.len()
+            + target.len()
+            + msg.payload.len()
+            + required_blob.map_or(0, |_| 32),
+    );
     out.push(scheme.tag());
     out.extend_from_slice(&(origin.len() as u64).to_le_bytes());
     out.extend_from_slice(origin);
@@ -266,6 +285,13 @@ pub fn frame_preimage(scheme: KeyScheme, origin: &[u8], seq: u64, msg: &Msg) -> 
     out.extend_from_slice(target);
     out.extend_from_slice(&(msg.payload.len() as u64).to_le_bytes());
     out.extend_from_slice(&msg.payload);
+    match required_blob {
+        None => out.push(0),
+        Some(digest) => {
+            out.push(1);
+            out.extend_from_slice(&digest);
+        }
+    }
     out
 }
 
@@ -275,8 +301,19 @@ pub fn frame_preimage(scheme: KeyScheme, origin: &[u8], seq: u64, msg: &Msg) -> 
 /// the 64-byte signature appended. other schemes sign [`frame_preimage`]
 /// externally and append their own proof.
 pub fn encode_frame(signer: &PrivateKey, seq: u64, msg: &Msg) -> Vec<u8> {
+    encode_frame_with_blob(signer, seq, msg, None)
+}
+
+/// Sign one operation and its optional required blob as a single frame.
+pub fn encode_frame_with_blob(
+    signer: &PrivateKey,
+    seq: u64,
+    msg: &Msg,
+    required_blob: Option<[u8; 32]>,
+) -> Vec<u8> {
     let origin = signer.public_key();
-    let mut frame = frame_preimage(KeyScheme::Ed25519, origin.as_ref(), seq, msg);
+    let mut frame =
+        frame_preimage_with_blob(KeyScheme::Ed25519, origin.as_ref(), seq, msg, required_blob);
     let sig = signer.sign(FRAME_NS, &frame);
     frame.extend_from_slice(sig.as_ref());
     frame
@@ -284,8 +321,8 @@ pub fn encode_frame(signer: &PrivateKey, seq: u64, msg: &Msg) -> Vec<u8> {
 
 /// decode a delivered frame back to `(Origin, Msg)`, VERIFYING the proof
 /// first under the frame's declared scheme. rejects deterministically on: an
-/// unknown scheme tag, a parse failure, TRAILING BYTES between the payload
-/// and the proof (exactly one valid encoding per frame — this is what makes
+/// unknown scheme tag, a parse failure, TRAILING BYTES after the declared
+/// fields and their proof (exactly one valid encoding per frame — this is what makes
 /// an appended continuation section unrepresentable; every scheme's proof is
 /// self-delimiting so the boundary is the preimage's own end), an origin
 /// malformed for its scheme — which INCLUDES a secp key spelled any way but
@@ -298,6 +335,13 @@ pub fn encode_frame(signer: &PrivateKey, seq: u64, msg: &Msg) -> Vec<u8> {
 /// schemes without a discrete log on the other curve); the `seq` is
 /// ordering/replay metadata, not surfaced.
 pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
+    decode_frame_with_blob(bytes).map(|(origin, msg, _)| (origin, msg))
+}
+
+/// Verify the canonical frame and return its signed required-blob digest.
+/// Unknown tags, missing metadata, truncated digests and surplus proof bytes
+/// are rejected. The ordinary decoder uses this same codec and drops metadata.
+pub fn decode_frame_with_blob(bytes: &[u8]) -> Result<(Origin, Msg, Option<[u8; 32]>), Error> {
     let parse_err = || Error::Host(sdk::Error::Module("frame does not parse".into()));
     let mut buf = bytes;
     let (tag, rest) = buf.split_first().ok_or_else(parse_err)?;
@@ -315,6 +359,17 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
     let target = std::str::from_utf8(take_slice(&mut buf).ok_or_else(parse_err)?)
         .map_err(|_| parse_err())?;
     let payload = take_slice(&mut buf).ok_or_else(parse_err)?;
+    let (blob_tag, rest) = buf.split_first().ok_or_else(parse_err)?;
+    buf = rest;
+    let required_blob = match blob_tag {
+        0 => None,
+        1 => {
+            let (digest, rest) = buf.split_at_checked(32).ok_or_else(parse_err)?;
+            buf = rest;
+            Some(digest.try_into().expect("split of 32"))
+        }
+        _ => return Err(parse_err()),
+    };
     let preimage_len = bytes.len() - buf.len();
     if !scheme.pubkey_wellformed(origin) {
         return Err(Error::Host(sdk::Error::Module(
@@ -332,6 +387,7 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
             target: target.to_string(),
             payload: payload.to_vec(),
         },
+        required_blob,
     ))
 }
 
@@ -2290,14 +2346,6 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// operations that must not require dismantling the node.
     pub fn orderer_mut(&mut self) -> &mut O {
         &mut self.orderer
-    }
-
-    /// borrow the sink mutably AND the host immutably in one call — the
-    /// replica's self-checkpoint at promotion captures the live host through
-    /// the very journal the node owns as its sink, and two separate
-    /// accessors cannot borrow both at once.
-    pub fn sink_and_host(&mut self) -> (&mut S, &Host) {
-        (&mut self.sink, &self.host)
     }
 
     /// Readiness preflight against the running module's retained state shape.

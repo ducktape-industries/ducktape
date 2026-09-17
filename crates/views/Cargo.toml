@@ -1,28 +1,16 @@
-# Module-owned desktop views: each member is an ordinary Ice application
-# compiled for the `tree` target and exported as an `ice:view` component the
-# desktop app loads FROM A FILE at runtime (`make views` stages them under
-# `target/views`). A standalone workspace like `crates/guests/*`: these build
-# for wasm32 and carry the guest runtime's profile overrides, neither of which
-# belongs in the root workspace or its lockfile.
-#
-# The Ice pin is the app's: `make views` refuses when this rev and the one in
-# app/Cargo.toml differ, so a view is never compiled by a different language
-# revision than the host that renders it.
-# Shared design source lives in this workspace so Cargo hashes guest package
-# identities relative to the workspace instead of an external checkout path.
+# Rust-authored WASM views are loaded from files; GPUI renders their wire trees.
+# A separate workspace keeps the WASM build profile independent of the desktop.
 [workspace]
 resolver = "2"
-members = ["governance", "members", "agents", "node", "explorer", "settings", "chat", "files", "pages", "forge", "support/design", "pages/tests/editor-binding-app"]
+members = ["canvas", "governance", "home", "inbox", "members", "agents", "node", "explorer", "palette", "settings", "chat", "call", "files", "pages", "forge", "support/guest", "support/composer", "support/files", "pages/tests/editor-binding-app"]
 
 [workspace.dependencies]
-ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23" }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23" }
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", default-features = false }
-ui-lang-guest = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23" }
-# No renderer: a view builds a node tree, never a picture, so it needs only
-# iced's types. The desktop app draws the tree with its own renderer.
-iced = { version = "=0.14.0", default-features = false, features = ["advanced"] }
+futures = "0.3"
+ducktape-view-guest = { path = "support/guest" }
+ducktape-view-composer = { path = "support/composer" }
+ducktape-view-files = { path = "support/files" }
+design = { path = "../design" }
+view-wire = { path = "../view-wire" }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -33,14 +21,3 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
-
-# iced with no renderer feature runs on its null renderer, which exists only
-# under `debug_assertions`, and `iced_renderer` refuses a release build
-# without one. A view draws nothing, so the null renderer is the right one in
-# release too: these three crates keep the cfg on.
-[profile.release.package.iced_core]
-debug-assertions = true
-[profile.release.package.iced_graphics]
-debug-assertions = true
-[profile.release.package.iced_renderer]
-debug-assertions = true

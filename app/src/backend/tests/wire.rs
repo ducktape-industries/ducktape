@@ -68,19 +68,10 @@ async fn one_unlock_signs_every_request_of_the_session() {
     assert!(locked.contains("locked"), "{locked}");
 }
 
-/// THE FAN-OUT SET, READ THROUGH A REAL NODE — the poll a live call session
-/// runs once a second, and the read the whole huddle rides on. Everything
-/// downstream of it is exact: the hub parses each entry with `from_hex_32` and
-/// admits that peer's media by the key it gets, so a roster row that is not 64
-/// lowercase hex characters of NODE key is a call that stays silent with
-/// nothing to see anywhere.
-///
-/// It also pins the vocabulary that made the LIVE pill unreachable once
-/// already: `HuddleEntry.user` is the kernel's BARE user id, and a comparison
-/// against any other spelling of it marks nobody as you — which here would
-/// mean fanning this device's own media at itself and never at the peer.
+/// Channel hydration preserves each participant's identity and node key.
 #[tokio::test(flavor = "current_thread")]
 async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
+    let _turn = crate::module_view::canary::connection_turn().await;
     let storage = tempfile::tempdir().unwrap();
     let sim = simnode::boot(
         storage.path(),
@@ -92,6 +83,7 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
     )
     .unwrap();
     let rpc = RpcClient::new(&format!("http://{}", sim.addr())).unwrap();
+    crate::module_view::canary::stage_chat(&rpc);
     let (me, peer) = (
         ed25519::PrivateKey::from_seed(11),
         ed25519::PrivateKey::from_seed(12),
@@ -157,10 +149,19 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
 
     let mine = me.public_key().as_ref().to_vec();
     let names = NameDirectory::default();
-    let (_channel, roster) = load_channel_facts(&rpc, "eng", ChatReader::new(Some(&mine), &names))
-        .await
-        .expect("the huddle's channel reads back")
-        .expect("the huddle's channel is on this node");
+    let result = chat_background(
+        rpc.origin(),
+        serde_json::json!({
+            "kind":"channel", "channel":"eng", "key":hex_encode(&mine), "names":names
+        }),
+    )
+    .await
+    .expect("the huddle's channel reads back");
+    let (_channel, roster): (ChatChannel, Vec<HuddleParticipant>) = serde_json::from_value::<
+        Option<(ChatChannel, Vec<HuddleParticipant>)>,
+    >(result["channel"].clone())
+    .expect("channel facts decode")
+    .expect("the huddle's channel is on this node");
     assert_eq!(roster.len(), 2, "both people are on the roster");
     assert_eq!(
         roster.iter().filter(|row| row.is_you).count(),
@@ -168,20 +169,12 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         "exactly one row is this device's — the id vocabulary has to match"
     );
 
-    let nodes = huddle_recipient_nodes(roster, None);
+    let nodes: std::collections::BTreeSet<_> = roster.iter().map(|row| row.node.clone()).collect();
     assert_eq!(
         nodes,
-        vec![hex_encode(&peer_node_pub)],
-        "the fan-out is the OTHER node's key: ours in it would aim this \
-         device's media at itself, and the peer's missing from it is the \
-         silence this whole poll exists to end"
-    );
-    let admissible = nodes[0].len() == 64 && nodes[0].chars().all(|c| c.is_ascii_hexdigit());
-    assert!(
-        admissible,
-        "the hub parses a recipient with `from_hex_32`; anything else is \
-         dropped and the peer is never admitted: {}",
-        nodes[0]
+        [hex_encode(&my_node_pub), hex_encode(&peer_node_pub)]
+            .into_iter()
+            .collect()
     );
     // `shutdown`, not a drop: the handle's last executor reference cannot be
     // dropped on this async thread (see `SimHandle::shutdown`).
@@ -203,6 +196,7 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
 /// the room there is to read.
 #[tokio::test(flavor = "current_thread")]
 async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
+    let _turn = crate::module_view::canary::connection_turn().await;
     let storage = tempfile::tempdir().unwrap();
     let sim = simnode::boot(
         storage.path(),
@@ -214,11 +208,12 @@ async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
     )
     .unwrap();
     let rpc = RpcClient::new(&format!("http://{}", sim.addr())).unwrap();
+    crate::module_view::canary::stage_chat(&rpc);
     let me = ed25519::PrivateKey::from_seed(11);
 
     // The joining resident: nothing folded yet, so no id resolves — including
     // the one the sidebar is asking for.
-    let unfolded = load_channel_window_data(&rpc, "dm-from-the-old-network", MessageWindow::Tail)
+    let unfolded = load_channel_window_data(&rpc, "dm-from-the-old-network")
         .await
         .expect("an unseen room is an empty console, not a failed load");
     assert!(
@@ -252,7 +247,7 @@ async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
     )
     .await;
 
-    let landed = load_channel_window_data(&rpc, "dm-from-the-old-network", MessageWindow::Tail)
+    let landed = load_channel_window_data(&rpc, "dm-from-the-old-network")
         .await
         .expect("an unseen room is a landing, not a failed load");
     assert_eq!(
@@ -260,33 +255,52 @@ async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
         "the id nothing answers for resolves to the landing channel"
     );
     assert_eq!(landed.active_channel_name, "Engineering");
-    assert_eq!(landed.messages.len(), 1, "and it lands with its timeline");
     sim.shutdown();
 }
 
-#[test]
-fn post_commit_hydration_errors_are_not_retryable() {
-    let error = committed_error("read failed".into());
-    assert!(error.committed);
-    assert_eq!(error.message, "read failed");
-}
-
 #[tokio::test(flavor = "current_thread")]
-async fn chat_and_pages_round_trip_over_signed_frames() {
+async fn chat_round_trips_over_signed_frames() {
+    let _turn = crate::module_view::canary::connection_turn().await;
     let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let storage = tempfile::tempdir().unwrap();
+    let modules = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(workspace_config::sim_modules_dir().unwrap()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().is_file() {
+            std::fs::copy(entry.path(), modules.path().join(entry.file_name())).unwrap();
+        }
+    }
+    let view =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/views/chat_view.wasm");
+    std::fs::copy(view, modules.path().join("chat.view.wasm")).unwrap();
+    let artifact = workspace_config::read_module_artifact(modules.path(), "chat").unwrap();
+    let signer = ed25519::PrivateKey::from_seed(7);
     let sim = simnode::boot(
         storage.path(),
         "127.0.0.1:0".parse().unwrap(),
         simnode::SimOpts {
             auto: true,
+            valset_keys: vec![signer.public_key().as_ref().to_vec()],
+            modules_dir: Some(modules.path().into()),
             ..Default::default()
         },
     )
     .unwrap();
     let origin = format!("http://{}", sim.addr());
     let rpc = RpcClient::new(&origin).unwrap();
-    let signer = ed25519::PrivateKey::from_seed(7);
+    // The registry pins the founding artifact; serve those same bytes through
+    // the ordinary content-addressed download used by connected views.
+    let token = std::fs::read_to_string(storage.path().join("admin.token")).unwrap();
+    reqwest::Client::new()
+        .post(format!("{origin}/v1/admin/module-code/stage?fanout=false"))
+        .header("x-ducktape-admin-token", token.trim())
+        .body(artifact.encode())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    crate::module_view::connected(&rpc).settled().await;
 
     submit_test(
         &rpc,
@@ -313,87 +327,31 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         }),
     )
     .await;
-    submit_test(
-        &rpc,
-        &signer,
-        3,
-        "pages",
-        pages::encode_msg(&PageMsg::CreatePage {
-            page_id: "welcome".into(),
-            title: "Welcome".into(),
-            blocks: Vec::new(),
-        }),
-    )
-    .await;
-    submit_test(
-        &rpc,
-        &signer,
-        4,
-        "pages",
-        pages::encode_msg(&PageMsg::InsertBlock {
-            parent: "welcome".into(),
-            after: None,
-            block: NewBlock {
-                id: "intro".into(),
-                kind: BlockKind::Paragraph,
-                text: "A signed page block".into(),
-                marks: Vec::new(),
-            },
-        }),
-    )
-    .await;
-
     let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
     assert_eq!(chat.channels[0].name, "General");
-    assert_eq!(chat.messages[0].body, "hello from the app");
-    let pages = load_pages_data(&rpc, Some("welcome")).await.unwrap();
-    assert_eq!(pages.active_page_title, "Welcome");
-    assert_eq!(pages.blocks[0].text, "A signed page block");
+    let posted = load_messages(&rpc, "general").await.unwrap();
+    assert_eq!(posted[0].body, "hello from the app");
 
     let origin = rpc.origin().to_string();
-    let loaded_page = load_page(origin.clone(), "welcome".into()).await.unwrap();
-    assert_eq!(loaded_page.active_page, "welcome");
-    assert_eq!(loaded_page.blocks[0].text, "A signed page block");
-
-    // A SAVE AGAINST A PAGE THE INDEX DOES NOT HOLD MUST REFUSE, NOT RETARGET.
-    // `load_pages_data` answers a missing id with `pages.first()` — here that is
-    // `welcome`, a real page full of real blocks. Without the guard in
-    // `save_page_document` this call plans one buffer against another page's
-    // blocks and emits removes against ITS ids. It refuses before any write, so
-    // the password never has to be real.
-    //
-    // THE TITLE MUST MATCH THE PAGE IT WOULD FALL BACK TO, or this test proves
-    // nothing: a differing title makes the title write fire first, and it dies
-    // `BlockNotFound` on the id that does not exist. That accident is the only
-    // thing standing between today's code and the corruption — and it does not
-    // happen when the titles agree, which two untitled pages always do. With
-    // the title matched, the body plan is `remove every line`.
-    let stray = save_page_document(
-        origin.clone(),
-        String::new(),
-        "no-such-page".into(),
-        "Welcome\n".into(),
-        "Welcome\n".into(),
-    )
-    .await;
-    // ASSERT THE REASON, NOT JUST THE FAILURE. An unsigned save fails anyway —
-    // at the signer, several steps after the plan was already built against the
-    // wrong page's blocks. Only the message separates "refused before planning"
-    // from "planned the damage, then could not sign it".
-    let refusal = stray.expect_err("a save must not retarget to another page");
-    assert_eq!(
-        refusal.message, "page was not found",
-        "the save must refuse on the page it cannot find, before it plans or signs anything"
-    );
-    let after = load_pages_data(&rpc, Some("welcome")).await.unwrap();
-    assert_eq!(
-        after.blocks[0].text, "A signed page block",
-        "the refused save must not have touched the page it fell back to"
-    );
-    // the module views load from whatever node connects last: take the
-    // turn the deployment tests take, so this node is not theirs
-    let _turn = crate::module_view::tests::connection_turn().await;
-    let workspace = connect(origin.clone(), 0, 0).await.unwrap();
+    let mut opening = connect(origin.clone(), 0, 0).into_stream();
+    assert!(matches!(
+        opening.next().await,
+        Some(crate::AppMessage::ConnectionProgress(
+            0,
+            "Loading chat and workspace…"
+        ))
+    ));
+    match opening.next().await {
+        Some(crate::AppMessage::ConnectionProgress(0, "Preparing workspace screens…")) => {}
+        Some(crate::AppMessage::ConnectFailed(error)) => {
+            panic!("workspace load failed: {}", error.message)
+        }
+        _ => panic!("workspace load must publish its screen preparation"),
+    }
+    let Some(crate::AppMessage::WorkspaceConnected(workspace)) = opening.next().await else {
+        panic!("workspace connects after both progress publications");
+    };
+    assert!(opening.next().await.is_none());
     let mut live = live_events(origin.clone());
     let ready = next_change(&mut live).await;
     assert_eq!(ready.kind, crate::LiveKind::Ready);
@@ -411,34 +369,32 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         }),
     )
     .await;
-    let changed = next_change(&mut live).await;
+    // The full founding set also publishes governance/registry plane events.
+    // Drain those publications until the committed Chat event arrives.
+    let changed = loop {
+        let update = next_change(&mut live).await;
+        if update.kind == crate::LiveKind::Chat {
+            break update;
+        }
+    };
     assert_eq!(
         changed.kind,
         crate::LiveKind::Chat,
         "a chat op folds into a chat delta"
     );
     assert_eq!(changed.chat.len(), 1);
-    let ChatDelta::Posted {
-        channel_id,
-        seq,
-        message,
-    } = &changed.chat[0]
-    else {
-        panic!("a post must publish a Posted payload")
+    let ChatDelta::Head { channel_id, seq } = &changed.chat[0] else {
+        panic!("a post must publish its unread head")
     };
     assert_eq!(channel_id, "general");
     assert_eq!(
         *seq, 2,
         "the delta carries the module-assigned sequence from the feed stamp"
     );
-    assert_eq!(message.body, "arrived on the next block");
-    assert!(
-        !changed.load_chat && !changed.load_pages,
-        "a folded chat delta requires no reload"
-    );
+    assert!(!changed.load_chat, "a folded chat delta requires no reload");
     assert!(changed.height > workspace.height);
     let base_height = changed.height;
-    // Production drops this payload when the generated LiveUpdated reducer
+    // Production drops this payload when the LiveUpdated reducer
     // returns. This direct stream fixture is that consumer, so release its
     // one-in-flight permit before asking the stream for later blocks.
     drop(changed);
@@ -484,198 +440,21 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     wait_for_block(&mut live, base_height + 3).await;
     let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
     assert_eq!(chat.active_channel_name, "General");
-    assert_eq!(chat.messages[0].body, "hello, edited");
-    assert!(chat.messages[0].edited);
-    assert_eq!(chat.messages[0].reply_count, 1);
-    assert_eq!(chat.messages[0].reactions[0].emoji, "👍");
-    let thread = load_thread_data(&rpc, "general", 1).await.unwrap();
-    assert_eq!(thread.messages.len(), 2);
-    assert_eq!(thread.messages[1].body, "a threaded reply");
-    let hit = load_chat_hit(origin.clone(), "general".into(), 1, 3, 7)
-        .await
-        .unwrap();
-    // ONE ROW BACK, NOT A PRE-CLICK LIST SNAPSHOT. Search navigation reads only
-    // the selected channel row; carrying a list back would revert deltas the
-    // live stream folded during the round trip (`upsert_channel_rows`).
-    assert_eq!(
-        hit.channels
-            .iter()
-            .map(|row| row.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["general"]
-    );
-    assert_eq!(hit.generation, 7);
-    assert_eq!(hit.selected_message_seq, 1);
-    assert_eq!(hit.active_thread_seq, 1);
-    assert_eq!(hit.thread_target_seq, 3);
-    assert_eq!(hit.thread_messages[1].body, "a threaded reply");
-    // A duck://channel/general#3 link supplies only the reply's sequence.
-    // Resolve its canonical thread root instead of looking for reply 3 in
-    // the root-only channel window and reporting "message was not found".
-    let linked_reply = load_chat_hit(origin.clone(), "general".into(), 3, 3, 8)
-        .await
-        .unwrap();
-    assert_eq!(linked_reply.generation, 8);
-    assert_eq!(linked_reply.selected_message_seq, 1);
-    assert_eq!(linked_reply.active_thread_seq, 1);
-    assert_eq!(linked_reply.thread_target_seq, 3);
-    assert_eq!(linked_reply.thread_messages[1].body, "a threaded reply");
-    let linked_root = load_chat_hit(origin.clone(), "general".into(), 1, 1, 9)
-        .await
-        .unwrap();
-    assert_eq!(linked_root.selected_message_seq, 1);
-    assert_eq!(linked_root.active_thread_seq, 0);
-    assert!(linked_root.thread_messages.is_empty());
-    let wrong_thread = load_chat_hit(origin.clone(), "general".into(), 2, 3, 10).await;
-    assert!(
-        wrong_thread.is_err(),
-        "a supplied root must still match the reply"
-    );
-    let missing = load_chat_hit(origin.clone(), "general".into(), 999, 999, 11).await;
-    assert!(
-        missing.is_err(),
-        "an index-clamped neighbor is not the requested message"
-    );
-    submit_test(
-        &rpc,
-        &signer,
-        9,
-        "pages",
-        pages::encode_msg(&PageMsg::InsertBlock {
-            parent: "welcome".into(),
-            after: Some("intro".into()),
-            block: NewBlock {
-                id: "heading".into(),
-                kind: BlockKind::Heading2,
-                text: "Nested work".into(),
-                marks: Vec::new(),
-            },
-        }),
-    )
-    .await;
-    submit_test(
-        &rpc,
-        &signer,
-        10,
-        "pages",
-        pages::encode_msg(&PageMsg::InsertBlock {
-            parent: "heading".into(),
-            after: None,
-            block: NewBlock {
-                id: "todo".into(),
-                kind: BlockKind::Todo,
-                text: "Ship the editor".into(),
-                marks: Vec::new(),
-            },
-        }),
-    )
-    .await;
-    submit_test(
-        &rpc,
-        &signer,
-        11,
-        "pages",
-        pages::encode_msg(&PageMsg::SetChecked {
-            block_id: "todo".into(),
-            checked: true,
-        }),
-    )
-    .await;
-    submit_test(
-        &rpc,
-        &signer,
-        12,
-        "pages",
-        pages::encode_msg(&PageMsg::InsertBlock {
-            parent: "welcome".into(),
-            after: Some("heading".into()),
-            block: NewBlock {
-                id: "child".into(),
-                kind: BlockKind::Page,
-                text: "Child page".into(),
-                marks: Vec::new(),
-            },
-        }),
-    )
-    .await;
+    // THE EDIT, THE REPLY AND THE REACTION ARE THE VIEW'S TO READ. What the
+    // app still reads of a room is its record and its rosters; the rows those
+    // three ops changed are read back in `chat-view`'s own tests.
+    let edited = load_messages(&rpc, "general").await.unwrap();
+    assert_eq!(edited[0].body, "hello, edited");
+    assert!(edited[0].edited);
+    assert_eq!(edited[0].reply_count, 1);
+    assert_eq!(edited[0].reactions[0].emoji, "👍");
 
-    wait_for_block(&mut live, base_height + 7).await;
-    let pages = load_pages_data(&rpc, Some("welcome")).await.unwrap();
-    assert_eq!(pages.pages[0].id, "welcome");
-    assert_eq!(pages.pages[1].id, "child");
-    assert_eq!(pages.pages[1].prefix, "  ");
-    assert_eq!(pages.blocks[2].id, "todo");
-    assert_eq!(pages.blocks[2].prefix, "  ");
-    assert!(pages.blocks[2].checked);
-
-    submit_test(
-        &rpc,
-        &signer,
-        13,
-        "pages",
-        pages::encode_msg(&PageMsg::AddComment {
-            thread_id: "thread-live".into(),
-            comment_id: "comment-live".into(),
-            target: "intro".into(),
-            text: "temporary".into(),
-            anchor: None,
-            mentions: Vec::new(),
-        }),
-    )
-    .await;
-    wait_for_block(&mut live, base_height + 8).await;
-    let threads = load_page_threads(origin.clone(), "welcome".into(), 1)
+    let refreshed = live_resync_load(origin, "general".into(), true, false, 7, 0)
         .await
         .unwrap();
-    assert!(
-        threads
-            .threads
-            .iter()
-            .any(|thread| thread.id == "thread-live"),
-        "the live comment's thread is on the page rail"
-    );
-    submit_test(
-        &rpc,
-        &signer,
-        14,
-        "pages",
-        pages::encode_msg(&PageMsg::DeleteComment {
-            comment_id: "comment-live".into(),
-        }),
-    )
-    .await;
-    wait_for_block(&mut live, base_height + 9).await;
-    let threads = load_page_threads(origin.clone(), "welcome".into(), 2)
-        .await
-        .unwrap();
-    assert!(
-        !threads
-            .threads
-            .iter()
-            .any(|thread| thread.id == "thread-live"),
-        "the deleted comment's thread is gone from the page rail"
-    );
-
-    let refreshed = live_resync_load(
-        origin,
-        "general".into(),
-        "welcome".into(),
-        "both".into(),
-        false,
-        7,
-        3,
-        0,
-    )
-    .await
-    .unwrap();
     assert_eq!(refreshed.generation, 7);
-    assert_eq!(
-        refreshed.fold_serial, 3,
-        "the reply echoes the fold serial the request snapshotted (#1041)"
-    );
-    assert!(refreshed.chat_loaded && refreshed.pages_loaded);
-    assert_eq!(refreshed.messages[1].body, "arrived on the next block");
-    assert_eq!(refreshed.active_page, "welcome");
+    assert!(refreshed.chat_loaded);
+    assert_eq!(refreshed.active_channel_name, "General");
     sim.shutdown();
 }
 
@@ -717,8 +496,8 @@ async fn a_runs_op_is_a_plane_signal_the_agents_view_reads_on() {
     assert_eq!(update.module, "runs", "the module IS the whole payload");
     assert_eq!(update.height, 7);
     assert!(
-        !update.load_chat && !update.load_pages,
-        "the signal buys a plane hit, not a chat or pages slice"
+        !update.load_chat,
+        "the signal buys a plane hit, not a chat slice"
     );
 }
 
@@ -733,38 +512,25 @@ async fn a_runs_op_is_a_plane_signal_the_agents_view_reads_on() {
 /// topic dropped here fails nothing else.
 #[test]
 fn the_live_stream_subscribes_to_every_plane_the_console_reads() {
-    const LIVE: &str = include_str!("../live.rs");
-    let list = LIVE
-        .split_once("rpc.module_events(")
-        .expect("the subscribe call")
-        .1
-        .split_once("],")
-        .expect("the topic list")
-        .0;
-    let topics: Vec<&str> = list
-        .lines()
-        .filter_map(|line| {
-            line.trim()
-                .strip_prefix('"')?
-                .split_once("\".to_string(),")
-                .map(|(topic, _)| topic)
-        })
-        .collect();
-    assert_eq!(
-        topics,
-        [
-            "chat",
-            "pages",
-            "inbox",
-            "forge",
-            "valset",
-            "governance",
-            "identity",
-            "agent",
-            "runs",
-            "files",
-        ]
-    );
+    let built_in = [
+        "chat",
+        "pages",
+        "inbox",
+        "forge",
+        "valset",
+        "governance",
+        "identity",
+        "agent",
+        "runs",
+        "files",
+    ];
+    assert_eq!(crate::backend::live::subscribed_planes(&[]), built_in);
+    // a registry-listed id rides after the built-in planes, once: a
+    // registered view reads its module's plane through `rpc.live`
+    let registry = ["boards".to_string(), "canvas".to_string(), "chat".to_string()];
+    let mut expected: Vec<&str> = built_in.to_vec();
+    expected.extend(["boards", "canvas"]);
+    assert_eq!(crate::backend::live::subscribed_planes(&registry), expected);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -782,13 +548,13 @@ async fn the_live_subscription_waits_for_the_ui_to_drop_its_publication() {
     assert!(update.permit.is_held());
     assert!(gate.clone().try_acquire_owned().is_err());
 
-    let generated_message_clone = update.clone();
+    let message_clone = update.clone();
     drop(update);
     assert!(
         gate.clone().try_acquire_owned().is_err(),
-        "every clone must leave the generated update before the stream resumes"
+        "every message clone must be dropped before the stream resumes"
     );
-    drop(generated_message_clone);
+    drop(message_clone);
     assert!(gate.try_acquire_owned().is_ok());
 }
 
@@ -801,15 +567,14 @@ async fn the_live_subscription_waits_for_the_ui_to_drop_its_publication() {
 /// checkpoint-gated (`backend/live.rs`), so that poll would also be the thing
 /// that hands a healthy node's console "error sending request".
 ///
-/// `assert_no_polling` cannot see this: it greps `lifecycle.ice` for lines
-/// starting with `every ` and a load reached through a live update is invisible
-/// to it. So the guard is here, on the value itself.
+/// Subscription shape checks cannot detect a load reached through a live
+/// update, so the guard is here, on the value itself.
 #[test]
 fn a_tip_carries_the_head_and_loads_nothing() {
     let tip = live_update(crate::LiveKind::Tip, "Live · block 41", 41);
     assert_eq!(tip.height, 41, "the head is the tip's entire payload");
     assert!(
-        !tip.load_chat && !tip.load_pages,
+        !tip.load_chat,
         "a tip must not trigger a load — that is a 1 Hz poll on an idle chain"
     );
     assert!(

@@ -12,7 +12,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -346,15 +346,17 @@ pub fn verify_closure(repo: &Repository, head: Oid) -> Result<(), git2::Error> {
 #[derive(Debug)]
 pub enum BoundedDiffError {
     Git(git2::Error),
+    /// the WALK could not be completed within its ceilings, so there is no
+    /// index to answer with. blob bytes are deliberately absent: they no longer
+    /// refuse a diff, they decide which files this reply can afford to examine
+    /// (see [`affordable`]).
     TooLarge {
         files_changed: usize,
-        blob_bytes: usize,
         commit_bytes: usize,
         tree_entries: usize,
         tree_bytes: usize,
         tree_depth: usize,
         max_files: usize,
-        max_blob_bytes: usize,
         max_commit_bytes: usize,
         max_tree_entries: usize,
         max_tree_bytes: usize,
@@ -368,20 +370,18 @@ impl std::fmt::Display for BoundedDiffError {
             Self::Git(e) => e.fmt(f),
             Self::TooLarge {
                 files_changed,
-                blob_bytes,
                 commit_bytes,
                 tree_entries,
                 tree_bytes,
                 tree_depth,
                 max_files,
-                max_blob_bytes,
                 max_commit_bytes,
                 max_tree_entries,
                 max_tree_bytes,
                 max_tree_depth,
             } => write!(
                 f,
-                "diff is too large: {files_changed} changed files / {blob_bytes} materialized blob bytes / {commit_bytes} materialized commit bytes / {tree_entries} visited tree entries / {tree_bytes} materialized tree bytes / tree depth {tree_depth} (limits: {max_files} files / {max_blob_bytes} blob bytes / {max_commit_bytes} commit bytes / {max_tree_entries} tree entries / {max_tree_bytes} tree bytes / depth {max_tree_depth})"
+                "diff is too large: {files_changed} changed files / {commit_bytes} materialized commit bytes / {tree_entries} visited tree entries / {tree_bytes} materialized tree bytes / tree depth {tree_depth} (limits: {max_files} files / {max_commit_bytes} commit bytes / {max_tree_entries} tree entries / {max_tree_bytes} tree bytes / depth {max_tree_depth})"
             ),
         }
     }
@@ -402,15 +402,24 @@ struct TreeEntryMeta {
     mode: i32,
 }
 
+/// one changed path the preflight found, and what examining it would cost.
+///
+/// `blob_bytes` is old-plus-new: what libgit2 has to materialize to produce
+/// this file's hunks. It is read from the object HEADERS, so knowing the cost
+/// is cheap even when paying it would not be.
+struct Leaf {
+    blob_bytes: usize,
+    status: git_primitives::GitFileStatus,
+}
+
 struct DiffPreflight {
-    paths: BTreeSet<String>,
+    leaves: BTreeMap<String, Leaf>,
     blob_bytes: usize,
     commit_bytes: usize,
     tree_entries: usize,
     tree_bytes: usize,
     tree_depth: usize,
     max_files: usize,
-    max_blob_bytes: usize,
     max_commit_bytes: usize,
     max_tree_entries: usize,
     max_tree_bytes: usize,
@@ -418,9 +427,11 @@ struct DiffPreflight {
 }
 
 impl DiffPreflight {
+    /// the WALK's ceilings — every one of them is a reason there is no index to
+    /// answer with at all. Blob bytes are NOT here: a file too expensive to
+    /// examine still has a row, it just has no counts (see [`affordable`]).
     fn too_large(&self) -> bool {
-        self.paths.len() > self.max_files
-            || self.blob_bytes > self.max_blob_bytes
+        self.leaves.len() > self.max_files
             || self.commit_bytes > self.max_commit_bytes
             || self.tree_entries > self.max_tree_entries
             || self.tree_bytes > self.max_tree_bytes
@@ -429,14 +440,12 @@ impl DiffPreflight {
 
     fn error(&self) -> BoundedDiffError {
         BoundedDiffError::TooLarge {
-            files_changed: self.paths.len(),
-            blob_bytes: self.blob_bytes,
+            files_changed: self.leaves.len(),
             commit_bytes: self.commit_bytes,
             tree_entries: self.tree_entries,
             tree_bytes: self.tree_bytes,
             tree_depth: self.tree_depth,
             max_files: self.max_files,
-            max_blob_bytes: self.max_blob_bytes,
             max_commit_bytes: self.max_commit_bytes,
             max_tree_entries: self.max_tree_entries,
             max_tree_bytes: self.max_tree_bytes,
@@ -508,7 +517,7 @@ impl DiffPreflight {
         &mut self,
         repo: &Repository,
         entry: TreeEntryMeta,
-    ) -> Result<(), git2::Error> {
+    ) -> Result<usize, git2::Error> {
         match entry.kind {
             ObjectType::Blob => {
                 let (size, kind) = repo.odb()?.read_header(entry.oid)?;
@@ -517,10 +526,8 @@ impl DiffPreflight {
                         "tree entry expected a blob but its object has another type",
                     ));
                 }
-                self.blob_bytes = self
-                    .blob_bytes
-                    .saturating_add(size)
-                    .min(self.max_blob_bytes.saturating_add(1));
+                self.blob_bytes = self.blob_bytes.saturating_add(size);
+                return Ok(size);
             }
             // Gitlinks commonly name commits absent from the superproject's
             // object database. They carry no materialized blob bytes.
@@ -532,7 +539,7 @@ impl DiffPreflight {
             }
             _ => return Err(git2::Error::from_str("unsupported git tree entry type")),
         }
-        Ok(())
+        Ok(0)
     }
 
     fn add_leaf(
@@ -542,12 +549,50 @@ impl DiffPreflight {
         old: Option<TreeEntryMeta>,
         new: Option<TreeEntryMeta>,
     ) -> Result<(), git2::Error> {
-        self.paths.insert(path);
+        let status = match (&old, &new) {
+            (None, Some(_)) => git_primitives::GitFileStatus::Added,
+            (Some(_), None) => git_primitives::GitFileStatus::Deleted,
+            (Some(old), Some(new)) if old.kind != new.kind => {
+                git_primitives::GitFileStatus::TypeChanged
+            }
+            (Some(_), Some(_)) => git_primitives::GitFileStatus::Modified,
+            (None, None) => unreachable!("a changed leaf came from one of the trees"),
+        };
+        let mut blob_bytes = 0usize;
         for entry in old.into_iter().chain(new) {
-            self.add_blob_bytes(repo, entry)?;
+            blob_bytes = blob_bytes.saturating_add(self.add_blob_bytes(repo, entry)?);
         }
+        self.leaves.insert(path, Leaf { blob_bytes, status });
         Ok(())
     }
+}
+
+/// which changed paths this reply can afford to produce hunks for, cheapest
+/// first, until `max_blob_bytes` is spent — plus a per-file ceiling, so one
+/// oversized blob is skipped rather than eating the whole budget.
+///
+/// Cheapest-first is the reader-serving order: a change that pairs a 9 MiB
+/// asset with a source file is the common shape, and the source file is the
+/// part anyone is going to read. Skipping a file costs it its counts and its
+/// hunks, never its row in the index.
+///
+/// ponytail: one sort by size, no packing. A knapsack would fit marginally
+/// more bytes into the same budget and would reorder nothing a reader notices.
+fn affordable(leaves: &BTreeMap<String, Leaf>, max_blob_bytes: usize) -> BTreeSet<&str> {
+    let mut by_cost: Vec<(&String, &Leaf)> = leaves.iter().collect();
+    by_cost.sort_by_key(|(path, leaf)| (leaf.blob_bytes, *path));
+    let mut spent = 0usize;
+    let mut chosen = BTreeSet::new();
+    for (path, leaf) in by_cost {
+        let fits = spent.saturating_add(leaf.blob_bytes) <= max_blob_bytes;
+        if !fits {
+            // sorted ascending, so nothing after this fits either.
+            break;
+        }
+        spent += leaf.blob_bytes;
+        chosen.insert(path.as_str());
+    }
+    chosen
 }
 
 fn next_tree_entry<'repo>(
@@ -745,65 +790,287 @@ fn compare_trees(
     Ok(())
 }
 
-/// Compare two materialized commits and return a bounded unified-diff prefix
-/// plus full statistics for a preflight-bounded diff. No fetch, rename
-/// detection, or shell command is attempted.
+/// Compare two materialized commits: a bounded unified-diff prefix plus an
+/// index carrying EVERY changed path, whether or not this reply could afford
+/// to produce its hunks. No fetch and no shell command is attempted; rename
+/// detection runs, over the affordable set only.
+///
+/// The index is the reply's spine. A reader navigates by the file list, so the
+/// list is complete even when the patch is a prefix and even when one path's
+/// blobs were too large to examine — those rows lose their counts and carry
+/// `truncated`, rather than taking the whole answer down with them.
 pub fn bounded_diff(
     repo: &Repository,
-    target: Oid,
+    target: Option<Oid>,
     source: Oid,
     max_bytes: usize,
     max_files: usize,
     max_blob_bytes: usize,
-) -> Result<(String, bool, usize, usize, usize), BoundedDiffError> {
+) -> Result<git_primitives::GitDiff, BoundedDiffError> {
     let mut preflight = DiffPreflight {
-        paths: BTreeSet::new(),
+        leaves: BTreeMap::new(),
         blob_bytes: 0,
         commit_bytes: 0,
         tree_entries: 0,
         tree_bytes: 0,
         tree_depth: 0,
         max_files,
-        max_blob_bytes,
         max_commit_bytes: crate::interface::MAX_PR_DIFF_COMMIT_BYTES,
         max_tree_entries: crate::interface::MAX_PR_DIFF_TREE_ENTRIES,
         max_tree_bytes: crate::interface::MAX_PR_DIFF_TREE_BYTES,
         max_tree_depth: crate::interface::MAX_PR_DIFF_TREE_DEPTH,
     };
-    let target_tree_oid = preflight.load_commit(repo, target)?.tree_id();
-    let source_tree_oid = if source == target {
-        target_tree_oid
-    } else {
-        preflight.load_commit(repo, source)?.tree_id()
+    let target_tree_oid = match target {
+        Some(target) => Some(preflight.load_commit(repo, target)?.tree_id()),
+        None => None,
     };
-    if target_tree_oid == source_tree_oid {
-        preflight.load_tree(repo, target_tree_oid, 0)?;
-        return Ok((String::new(), false, 0, 0, 0));
+    let source_tree_oid = match (target, target_tree_oid) {
+        (Some(target), Some(tree)) if source == target => tree,
+        _ => preflight.load_commit(repo, source)?.tree_id(),
+    };
+    match target_tree_oid {
+        // a root commit has no target, and every leaf of its tree is an
+        // addition. libgit2 spells the absent side `None`, which is the same
+        // answer `git show` gives for the first commit -- an empty diff there
+        // would say "this commit changed nothing", which is a lie about every
+        // file it introduced.
+        None => collect_tree_leaves(repo, source_tree_oid, "", false, 0, &mut preflight)?,
+        Some(tree) if tree == source_tree_oid => {
+            preflight.load_tree(repo, tree, 0)?;
+            return Ok(empty_diff());
+        }
+        Some(tree) => compare_trees(repo, tree, source_tree_oid, "", 0, &mut preflight)?,
     }
-    compare_trees(
-        repo,
-        target_tree_oid,
-        source_tree_oid,
-        "",
-        0,
-        &mut preflight,
-    )?;
-    let target_tree = repo.find_tree(target_tree_oid)?;
+    let chosen = affordable(&preflight.leaves, max_blob_bytes);
+    let target_tree = target_tree_oid.map(|tree| repo.find_tree(tree)).transpose()?;
     let source_tree = repo.find_tree(source_tree_oid)?;
     let mut opts = DiffOptions::new();
     opts.context_lines(3)
         .interhunk_lines(0)
         .disable_pathspec_match(true);
-    for path in &preflight.paths {
+    for path in &chosen {
         opts.pathspec(path);
     }
-    let diff = repo.diff_tree_to_tree(Some(&target_tree), Some(&source_tree), Some(&mut opts))?;
-    let stats = diff.stats()?;
-    let counts = (stats.files_changed(), stats.insertions(), stats.deletions());
+    let mut diff =
+        repo.diff_tree_to_tree(target_tree.as_ref(), Some(&source_tree), Some(&mut opts))?;
+    // over the affordable set only, so a rename's cost is already paid for.
+    diff.find_similar(None)?;
+    assemble(&diff, &preflight.leaves, max_bytes)
+}
 
+/// The last step both diff readers share: print a bounded patch, index EVERY
+/// changed path against it, and total the counts the index carries.
+///
+/// The totals come from the index rather than from libgit2's stats so that they
+/// agree with the rows a caller can see: a file whose blobs were too large to
+/// examine contributes no counts and says so, instead of inflating a total
+/// nothing itemizes.
+fn assemble(
+    diff: &git2::Diff<'_>,
+    leaves: &BTreeMap<String, Leaf>,
+    max_bytes: usize,
+) -> Result<git_primitives::GitDiff, BoundedDiffError> {
+    let (patch, truncated, printed) = print_bounded(diff, max_bytes)?;
+    let files = index(diff, leaves, &printed)?;
+    let additions = files.iter().filter_map(|file| file.additions).sum();
+    let deletions = files.iter().filter_map(|file| file.deletions).sum();
+    Ok(git_primitives::GitDiff {
+        patch,
+        truncated,
+        files_changed: files.len() as u64,
+        additions,
+        deletions,
+        files,
+    })
+}
+
+/// One path's diff between two commits, bounded by THAT FILE and nothing else.
+///
+/// This is the escape hatch from [`bounded_diff`]'s aggregate blob budget: a
+/// change that pairs a source file with an oversized asset leaves the asset's
+/// row counted but unexamined, and this is how a reader then asks for the one
+/// file they actually want. It resolves the path in the two trees directly
+/// rather than walking the pair, so its cost is the path's depth plus its own
+/// two blobs — it never sees, and is never priced by, the rest of the change.
+///
+/// A file over its own `max_blob_bytes` still answers, with its row marked
+/// `truncated` and no patch. "Too big to show you" is a thing a reader can act
+/// on; an error is not.
+pub fn bounded_file_diff(
+    repo: &Repository,
+    target: Option<Oid>,
+    source: Oid,
+    path: &str,
+    max_bytes: usize,
+    max_blob_bytes: usize,
+) -> Result<git_primitives::GitDiff, BoundedDiffError> {
+    let mut preflight = DiffPreflight {
+        leaves: BTreeMap::new(),
+        blob_bytes: 0,
+        commit_bytes: 0,
+        tree_entries: 0,
+        tree_bytes: 0,
+        tree_depth: 0,
+        max_files: 1,
+        max_commit_bytes: crate::interface::MAX_PR_DIFF_COMMIT_BYTES,
+        max_tree_entries: crate::interface::MAX_PR_DIFF_TREE_ENTRIES,
+        max_tree_bytes: crate::interface::MAX_PR_DIFF_TREE_BYTES,
+        max_tree_depth: crate::interface::MAX_PR_DIFF_TREE_DEPTH,
+    };
+    let target_tree_oid = match target {
+        Some(target) => Some(preflight.load_commit(repo, target)?.tree_id()),
+        None => None,
+    };
+    let source_tree_oid = match (target, target_tree_oid) {
+        (Some(target), Some(tree)) if source == target => tree,
+        _ => preflight.load_commit(repo, source)?.tree_id(),
+    };
+    if target_tree_oid == Some(source_tree_oid) {
+        // load it anyway: an identical pair must still fail honestly when the
+        // tree is not in the object database, the same as the whole-change read.
+        preflight.load_tree(repo, source_tree_oid, 0)?;
+        return Ok(empty_diff());
+    }
+    // no target tree is no old entry: against nothing, the path is an addition.
+    let old = match target_tree_oid {
+        Some(tree) => entry_at(repo, tree, path, &mut preflight)?,
+        None => None,
+    };
+    let new = entry_at(repo, source_tree_oid, path, &mut preflight)?;
+    let unchanged = match (&old, &new) {
+        (None, None) => true,
+        (Some(old), Some(new)) => {
+            old.oid == new.oid && old.kind == new.kind && old.mode == new.mode
+        }
+        _ => false,
+    };
+    if unchanged {
+        return Ok(empty_diff());
+    }
+    preflight.add_leaf(repo, path.to_string(), old, new)?;
+    let leaf = preflight
+        .leaves
+        .get(path)
+        .expect("the leaf just added is present");
+    if leaf.blob_bytes > max_blob_bytes {
+        return Ok(git_primitives::GitDiff {
+            patch: String::new(),
+            truncated: true,
+            files_changed: 1,
+            additions: 0,
+            deletions: 0,
+            files: vec![git_primitives::GitDiffFile {
+                path: path.to_string(),
+                previous_path: None,
+                status: leaf.status,
+                additions: None,
+                deletions: None,
+                // NOT a claim that the blob is text. Binariness is decided by
+                // reading the content, and refusing to read this blob is the
+                // whole point of the branch -- `false` is the field's "nothing
+                // was determined" value, and `truncated` beside it is what a
+                // render site must consult. There is no third state to say it
+                // in: the WIT spells `binary` a plain bool, because everywhere
+                // else the diff read HAS looked.
+                binary: false,
+                truncated: true,
+            }],
+        });
+    }
+    let target_tree = target_tree_oid.map(|tree| repo.find_tree(tree)).transpose()?;
+    let source_tree = repo.find_tree(source_tree_oid)?;
+    let mut opts = DiffOptions::new();
+    opts.context_lines(3)
+        .interhunk_lines(0)
+        .disable_pathspec_match(true)
+        .pathspec(path);
+    let diff =
+        repo.diff_tree_to_tree(target_tree.as_ref(), Some(&source_tree), Some(&mut opts))?;
+    // NOT `find_similar`: a one-path scope cannot see a rename's other half,
+    // so asking would only ever produce the add/delete it already has.
+    assemble(&diff, &preflight.leaves, max_bytes)
+}
+
+/// resolve one repo-relative path inside a tree, one component at a time, so
+/// the cost is the path's depth rather than the tree's size.
+fn entry_at(
+    repo: &Repository,
+    tree_oid: Oid,
+    path: &str,
+    preflight: &mut DiffPreflight,
+) -> Result<Option<TreeEntryMeta>, BoundedDiffError> {
+    let mut current = tree_oid;
+    let mut components = path.split('/').filter(|part| !part.is_empty()).peekable();
+    let mut depth = 0usize;
+    while let Some(name) = components.next() {
+        let tree = preflight.load_tree(repo, current, depth)?;
+        let Some(entry) = tree.get_name(name) else {
+            return Ok(None);
+        };
+        preflight.visit_tree_entry()?;
+        let meta = TreeEntryMeta {
+            oid: entry.id(),
+            kind: entry.kind().unwrap_or(ObjectType::Any),
+            mode: entry.filemode(),
+        };
+        if components.peek().is_none() {
+            return Ok(Some(meta));
+        }
+        let descends = meta.kind == ObjectType::Tree;
+        if !descends {
+            // an interior component is a file, so the path names nothing.
+            return Ok(None);
+        }
+        current = meta.oid;
+        depth += 1;
+    }
+    Ok(None)
+}
+
+fn empty_diff() -> git_primitives::GitDiff {
+    git_primitives::GitDiff {
+        patch: String::new(),
+        truncated: false,
+        files_changed: 0,
+        additions: 0,
+        deletions: 0,
+        files: Vec::new(),
+    }
+}
+
+/// which paths the print walk got through, and which one it was cut inside.
+///
+/// A path is fully in the patch when the walk reached it and the ceiling did
+/// not stop there. That is the only way to know: libgit2 emits deltas in its
+/// own order, so "before the cut" has to be observed, not computed from the
+/// sorted index.
+struct Printed {
+    seen: BTreeSet<String>,
+    cut_at: Option<String>,
+}
+
+impl Printed {
+    fn whole(&self, path: &str) -> bool {
+        self.seen.contains(path) && self.cut_at.as_deref() != Some(path)
+    }
+}
+
+/// render the diff as a unified patch, stopping at `max_bytes`.
+fn print_bounded(
+    diff: &git2::Diff<'_>,
+    max_bytes: usize,
+) -> Result<(String, bool, Printed), BoundedDiffError> {
     let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
     let mut truncated = false;
-    let print_result = diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+    let mut printed = Printed {
+        seen: BTreeSet::new(),
+        cut_at: None,
+    };
+    let print_result = diff.print(DiffFormat::Patch, |delta, _hunk, line| {
+        let path = delta_path(&delta);
+        if let Some(path) = path.clone() {
+            printed.seen.insert(path);
+        }
         let prefix = match line.origin() {
             'F' | 'H' | 'B' => None,
             origin => Some(origin as u8),
@@ -819,6 +1086,7 @@ pub fn bounded_diff(
             let remaining = max_bytes.saturating_sub(bytes.len());
             bytes.extend_from_slice(&line.content()[..remaining.min(line.content().len())]);
             truncated = true;
+            printed.cut_at = path;
             return false;
         }
         if let Some(prefix) = prefix {
@@ -842,5 +1110,114 @@ pub fn bounded_diff(
             return Err(git2::Error::from_str("diff is not valid UTF-8 text").into());
         }
     };
-    Ok((patch, truncated, counts.0, counts.1, counts.2))
+    Ok((patch, truncated, printed))
+}
+
+/// the path a delta is filed under: its new path, or its old one for a delete.
+fn delta_path(delta: &git2::DiffDelta<'_>) -> Option<String> {
+    delta
+        .new_file()
+        .path()
+        .or_else(|| delta.old_file().path())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// `Copied` folding into `Added` would lose the source path, and does not:
+/// copy detection is `GIT_DIFF_FIND_COPIES`, which `find_similar(None)` leaves
+/// off, so a tree-to-tree diff here never produces one. The worktree and index
+/// states below cannot reach a tree-to-tree diff either; they are folded rather
+/// than matched on so that a new `git2::Delta` variant fails the build.
+fn delta_status(status: git2::Delta) -> git_primitives::GitFileStatus {
+    match status {
+        git2::Delta::Added | git2::Delta::Copied | git2::Delta::Untracked => {
+            git_primitives::GitFileStatus::Added
+        }
+        git2::Delta::Deleted => git_primitives::GitFileStatus::Deleted,
+        git2::Delta::Renamed => git_primitives::GitFileStatus::Renamed,
+        git2::Delta::Typechange => git_primitives::GitFileStatus::TypeChanged,
+        git2::Delta::Modified
+        | git2::Delta::Ignored
+        | git2::Delta::Unmodified
+        | git2::Delta::Unreadable
+        | git2::Delta::Conflicted => git_primitives::GitFileStatus::Modified,
+    }
+}
+
+/// every changed path, ordered by path: the affordable ones described by the
+/// diff itself, the rest by what the preflight walk already learned about them.
+///
+/// A rename collapses two preflight leaves into one row, which is why
+/// `files_changed` is this list's length rather than the walk's leaf count.
+fn index(
+    diff: &git2::Diff<'_>,
+    leaves: &BTreeMap<String, Leaf>,
+    printed: &Printed,
+) -> Result<Vec<git_primitives::GitDiffFile>, BoundedDiffError> {
+    let mut files: BTreeMap<String, git_primitives::GitDiffFile> = BTreeMap::new();
+    let mut renamed_away = BTreeSet::new();
+    for (position, delta) in diff.deltas().enumerate() {
+        let Some(path) = delta_path(&delta) else {
+            continue;
+        };
+        let status = delta_status(delta.status());
+        let is_rename = matches!(status, git_primitives::GitFileStatus::Renamed);
+        let previous_path = is_rename
+            .then(|| {
+                delta
+                    .old_file()
+                    .path()
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .flatten();
+        if let Some(from) = &previous_path {
+            renamed_away.insert(from.clone());
+        }
+        // a binary file has no lines to count, which is not the same fact as a
+        // file whose lines were never examined -- `binary` says which.
+        let binary = delta.flags().is_binary();
+        let counted = if binary {
+            None
+        } else {
+            git2::Patch::from_diff(diff, position)?
+                .map(|patch| patch.line_stats())
+                .transpose()?
+        };
+        files.insert(
+            path.clone(),
+            git_primitives::GitDiffFile {
+                previous_path,
+                status,
+                additions: counted.map(|(_, additions, _)| additions as u64),
+                deletions: counted.map(|(_, _, deletions)| deletions as u64),
+                binary,
+                truncated: !printed.whole(&path),
+                path,
+            },
+        );
+    }
+    for (path, leaf) in leaves {
+        // keyed on what the index ALREADY has, not on what was affordable: a
+        // path the walk found but libgit2 reported no delta for (a gitlink, say)
+        // is affordable and still needs its row, or it vanishes from a list
+        // whose whole job is to be complete.
+        let described_by_the_diff = files.contains_key(path);
+        if described_by_the_diff || renamed_away.contains(path) {
+            continue;
+        }
+        files.insert(
+            path.clone(),
+            git_primitives::GitDiffFile {
+                path: path.clone(),
+                previous_path: None,
+                status: leaf.status,
+                additions: None,
+                deletions: None,
+                // unknown, not false -- nothing read this file's bytes. the
+                // truncated flag is what says the row is incomplete.
+                binary: false,
+                truncated: true,
+            },
+        );
+    }
+    Ok(files.into_values().collect())
 }

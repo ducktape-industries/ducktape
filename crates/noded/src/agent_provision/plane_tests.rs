@@ -1,6 +1,6 @@
-//! the agent TOOL PLANE both lanes hand every run: the node base its tools
-//! dial (`DUCKTAPE_NODE`), the identity they act under (`DUCKTAPE_RUN_AGENT`),
-//! and the bin dir on PATH where `ducktape mcp` is found.
+//! the agent TOOL PLANE both lanes hand every run: the node base its lane
+//! serves the MCP catalog on (`DUCKTAPE_NODE`), the identity it acts under
+//! (`DUCKTAPE_RUN_AGENT`), and the run-scoped endpoint its writes go through.
 //!
 //! the duckfs-lane cases here run the REAL `checkout_with` engine against a
 //! stand-in files actor on the `NodeCommand` lane ([`spawn_files_actor`], which
@@ -113,7 +113,10 @@ fn spawn_session_actor(
                     seen.lock()
                         .unwrap()
                         .push(runs::decode_msg(&payload).expect("a runs op"));
-                    let _ = reply.send(bind.map(|()| committed_block()).map_err(Into::into));
+                    let _ = reply.send(
+                        bind.map(|()| committed_block())
+                            .map_err(|said| crate::Refused::new("module", said)),
+                    );
                 }
                 NodeCommand::Query {
                     target, req, reply, ..
@@ -206,7 +209,7 @@ pub(super) fn files_reply(
     tree: &BTreeMap<String, Vec<u8>>,
     reject_reads: bool,
     req: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, crate::Refused> {
     match decode_query(req).expect("a files query") {
         FilesQuery::Refs {} => Ok(encode_reply(&FilesReply::Refs(RefsInfo {
             head: None,
@@ -229,7 +232,10 @@ pub(super) fn files_reply(
             }))
         }
         // the verbatim module contract string the engine's taxonomy keys on.
-        FilesQuery::Read { .. } => Err("files: chunk not available".to_string()),
+        FilesQuery::Read { .. } => Err(crate::Refused::new(
+            "module",
+            "files: chunk not available",
+        )),
         other => panic!("the checkout asked for {other:?}"),
     }
 }
@@ -267,6 +273,7 @@ fn duckfs_spec(agent: Option<&str>, mounts: Vec<RoMount>) -> WorkspaceSpec {
     WorkspaceSpec {
         run_id: "s1:0".into(),
         agent: agent.map(|id| compute_service::AgentExecution {
+            native_conversation: None,
             run_id: consensus_run_id(),
             attempt: 0,
             agent_id: id.into(),
@@ -313,11 +320,6 @@ fn the_node_base_is_the_bare_http_root_the_forge_lane_hangs_off() {
         !base.contains("/forge"),
         "the node base carries no suffix: {base}"
     );
-    assert_eq!(
-        forge_push_base(Some("0.0.0.0:8844")).unwrap(),
-        format!("{base}/forge"),
-        "one derivation, two bases — the push lane is the node base plus /forge"
-    );
 }
 
 // ---- what a run actually gets ---------------------------------------------
@@ -361,15 +363,6 @@ async fn a_run_gets_the_node_base_its_agent_id_and_the_tool_bin_dir_on_path() {
         SKILL_BODY
     );
 
-    // PATH: the dir holding the RUNNING binary — `ducktape mcp` ships beside
-    // it, and the runner CLI resolves the server by bare command name.
-    let exe_dir = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    assert_eq!(ws.path_entries(), vec![exe_dir]);
-
     ws.cleanup().await;
     assert!(
         !dir.exists() && !ro.exists(),
@@ -400,10 +393,6 @@ async fn an_unreachable_node_or_an_anonymous_run_omits_the_var_rather_than_guess
     );
     // the run still runs — only the tool plane is missing, never the workspace.
     assert!(env.contains_key("DUCKTAPE_RUN_WORKSPACE"));
-    assert!(
-        !ws.path_entries().is_empty(),
-        "the bin dir is unconditional"
-    );
     ws.cleanup().await;
 }
 
@@ -705,10 +694,13 @@ async fn tool_http_waits_for_the_actual_committed_outcome_and_surfaces_target_fa
         let (handle, commands, hub) = NodeHandle::channel();
         let (actor, state, mut observed) = spawn_receipt_actor(commands);
         let link = test_link(handle).await;
-        let session = super::session::open(&link, &duckfs_spec(Some("quackbot"), Vec::new()))
-            .await
-            .unwrap()
-            .expect("agent session");
+        let workdir = tempfile::tempdir().unwrap();
+        let session = super::session::open(
+            &link, &duckfs_spec(Some("quackbot"), Vec::new()), workdir.path(),
+        )
+        .await
+        .unwrap()
+        .expect("agent session");
         let request = request_tool_action(&session);
         observed
             .recv()
@@ -786,10 +778,12 @@ async fn disconnecting_the_registered_receipt_stream_fails_the_pending_tool_requ
     });
     let link =
         NodeLink::new(format!("http://{address}")).with_workspace_credential(directory.path());
-    let session = super::session::open(&link, &duckfs_spec(Some("quackbot"), Vec::new()))
-        .await
-        .unwrap()
-        .expect("agent session");
+    let session = super::session::open(
+        &link, &duckfs_spec(Some("quackbot"), Vec::new()), directory.path(),
+    )
+    .await
+    .unwrap()
+    .expect("agent session");
     let request = request_tool_action(&session);
     observed.recv().await.unwrap();
     assert!(!request.is_finished());

@@ -1,0 +1,831 @@
+use boards::*;
+use sdk::{Module, Msg, Origin};
+use sdk_testkit::{MemStore, TestCtx};
+fn blank() -> Board {
+    Board::new("Design room".into(), "alice".into()).unwrap()
+}
+fn create(id: &str) -> Change {
+    Change::Create {
+        id: id.into(),
+        shape: Shape::default(),
+    }
+}
+/// An end bound to a card at its middle — the only anchor a test needs unless
+/// it is about anchors.
+fn on(card: &str) -> Option<Bond> {
+    Some(Bond {
+        card: card.into(),
+        at: [ANCHOR_SPAN / 2; 2],
+    })
+}
+/// A two-point path. Every connector carries its own samples; binding an
+/// endpoint to a card only overrides where that end is drawn.
+fn path(kind: Kind) -> Shape {
+    Shape {
+        kind,
+        width: 160,
+        height: 90,
+        points: vec![[0, 0], [160, 90]],
+        ..Default::default()
+    }
+}
+
+fn stack(board: &Board) -> Vec<&str> {
+    board.ordered().iter().map(|(id, _)| id.as_str()).collect()
+}
+
+#[test]
+fn a_connector_is_re_routed_whole_and_a_card_has_no_run_to_re_route() {
+    let board = blank()
+        .changed_many(&[
+            create("card"),
+            Change::Create {
+                id: "edge".into(),
+                shape: path(Kind::Arrow),
+            },
+        ])
+        .unwrap();
+    let route = |id: &str, points: Vec<[i32; 2]>, to: Option<Bond>| Change::Route {
+        id: id.into(),
+        x: 40,
+        y: 60,
+        width: 200,
+        height: 120,
+        points,
+        from: None,
+        to,
+    };
+    let moved = board
+        .changed(&route(
+            "edge",
+            vec![[0, 0], [100, 60], [200, 120]],
+            on("card"),
+        ))
+        .unwrap();
+    let edge = &moved.shapes["edge"].shape;
+    // box, samples and binding all arrive together, in one revision
+    assert_eq!(
+        [edge.x, edge.y, edge.width, edge.height],
+        [40, 60, 200, 120]
+    );
+    assert_eq!(edge.points, vec![[0, 0], [100, 60], [200, 120]]);
+    assert_eq!(held(&edge.to), Some("card"));
+    assert_eq!(moved.revision, board.revision + 1);
+    // a card is a box, not a run: naming one here is a mistake, not a no-op
+    let refused = moved.changed(&route("card", vec![[0, 0], [10, 10]], None));
+    assert_eq!(refused, Err("Only a connector carries a run.".into()));
+    // and a re-route still answers to every rule a path is held to
+    let empty = moved.changed(&route("edge", vec![[0, 0]], None));
+    assert!(empty.is_err());
+}
+
+#[test]
+fn stacking_names_what_rises_and_naming_everything_states_the_whole_stack() {
+    let board = blank()
+        .changed_many(&[create("a"), create("b"), create("c")])
+        .unwrap();
+    assert_eq!(stack(&board), ["a", "b", "c"]);
+    let raised = board
+        .changed(&Change::Order {
+            ids: vec!["a".into()],
+        })
+        .unwrap();
+    assert_eq!(stack(&raised), ["b", "c", "a"]);
+    // to send "a" back is to raise everything else, in its own order
+    let sunk = raised
+        .changed(&Change::Order {
+            ids: vec!["b".into(), "c".into()],
+        })
+        .unwrap();
+    assert_eq!(stack(&sunk), ["a", "b", "c"]);
+    // naming the whole board restores an exact stack, which is how undo works
+    let restored = sunk
+        .changed(&Change::Order {
+            ids: vec!["b".into(), "c".into(), "a".into()],
+        })
+        .unwrap();
+    assert_eq!(stack(&restored), stack(&raised));
+    for ids in [
+        vec!["a".into(), "a".into()],
+        vec!["missing".into()],
+        vec!["a".into(); MAX_SHAPES + 1],
+    ] {
+        assert!(board.changed(&Change::Order { ids }).is_err());
+    }
+    // a new shape still lands on top of a renumbered board
+    let after = raised.changed(&create("d")).unwrap();
+    assert_eq!(stack(&after).last(), Some(&"d"));
+}
+
+#[test]
+fn concurrent_fields_compose_and_same_field_follows_consensus_order() {
+    let initial = blank().changed(&create("a")).unwrap();
+    let edits = [
+        Change::Move {
+            id: "a".into(),
+            x: 50,
+            y: 80,
+        },
+        Change::Text {
+            id: "a".into(),
+            text: "한글 아이디어 🦆".into(),
+        },
+    ];
+    let a = edits
+        .iter()
+        .try_fold(initial.clone(), |b, c| b.changed(c))
+        .unwrap();
+    let b = edits
+        .iter()
+        .rev()
+        .try_fold(initial, |b, c| b.changed(c))
+        .unwrap();
+    assert_eq!(a.shapes["a"].shape, b.shapes["a"].shape);
+    assert_eq!(a.shapes["a"].shape.text, "한글 아이디어 🦆");
+    assert_eq!(
+        a.changed(&Change::Move {
+            id: "a".into(),
+            x: 200,
+            y: 300
+        })
+        .unwrap()
+        .shapes["a"]
+            .shape
+            .x,
+        200
+    );
+}
+#[test]
+fn deleting_a_card_removes_connections_and_late_edits_do_not_resurrect_it() {
+    let mut board = blank()
+        .changed(&create("a"))
+        .unwrap()
+        .changed(&create("b"))
+        .unwrap();
+    let arrow = Shape {
+        from: on("a"),
+        to: on("b"),
+        ..path(Kind::Arrow)
+    };
+    board = board
+        .changed(&Change::Create {
+            id: "arrow".into(),
+            shape: arrow,
+        })
+        .unwrap();
+    board = board.changed(&Change::Delete { id: "a".into() }).unwrap();
+    assert_eq!(board.shapes.len(), 1);
+    assert_eq!(
+        board
+            .changed(&Change::Text {
+                id: "a".into(),
+                text: "late".into()
+            })
+            .unwrap(),
+        board
+    );
+}
+#[test]
+fn invalid_geometry_content_and_edges_leave_state_untouched() {
+    let board = blank().changed(&create("a")).unwrap();
+    for shape in [
+        Shape {
+            x: i32::MIN,
+            ..Default::default()
+        },
+        Shape {
+            text: "x".repeat(MAX_TEXT + 1),
+            ..Default::default()
+        },
+        Shape {
+            color: 5,
+            ..Default::default()
+        },
+        Shape {
+            to: on("missing"),
+            ..path(Kind::Arrow)
+        },
+        // an anchor is a share of the card's box, so it cannot point outside it
+        Shape {
+            to: Some(Bond {
+                card: "a".into(),
+                at: [ANCHOR_SPAN + 1, 0],
+            }),
+            ..path(Kind::Arrow)
+        },
+        // a connector with no samples has nowhere to be drawn
+        Shape {
+            points: Vec::new(),
+            ..path(Kind::Arrow)
+        },
+        Shape {
+            points: vec![[0, 0]; MAX_POINTS + 1],
+            ..path(Kind::Draw)
+        },
+        // only arrows bind; a plain line and a card carry neither endpoint
+        Shape {
+            to: on("a"),
+            ..path(Kind::Line)
+        },
+        Shape {
+            points: vec![[0, 0], [40, 40]],
+            ..Default::default()
+        },
+        // a card keeps a minimum box; a path's box is its samples' span
+        Shape {
+            height: 8,
+            ..Default::default()
+        },
+    ] {
+        assert!(
+            board
+                .changed(&Change::Create {
+                    id: "bad".into(),
+                    shape
+                })
+                .is_err()
+        );
+        assert_eq!(board.shapes.len(), 1);
+    }
+    let encoded = serde_json::to_vec(&board).unwrap();
+    assert_eq!(serde_json::from_slice::<Board>(&encoded).unwrap(), board);
+}
+#[test]
+fn a_flat_stroke_is_legal_and_a_shape_never_changes_family() {
+    let mut board = blank().changed(&create("card")).unwrap();
+    board = board
+        .changed(&Change::Create {
+            id: "flat".into(),
+            shape: Shape {
+                height: 0,
+                points: vec![[0, 0], [160, 0]],
+                ..path(Kind::Line)
+            },
+        })
+        .unwrap();
+    assert_eq!(board.shapes["flat"].shape.height, 0);
+    for (id, shape) in [("flat", Shape::default()), ("card", path(Kind::Draw))] {
+        assert!(
+            board
+                .changed(&Change::Create {
+                    id: id.into(),
+                    shape
+                })
+                .unwrap()
+                == board,
+            "create over an existing id is idempotent, never a family swap"
+        );
+    }
+    // resizing a stroke scales its samples; the module only moves the box
+    board = board
+        .changed(&Change::Resize {
+            id: "flat".into(),
+            width: 320,
+            height: 0,
+        })
+        .unwrap();
+    assert_eq!(board.shapes["flat"].shape.points, vec![[0, 0], [160, 0]]);
+}
+#[test]
+fn an_arrow_binds_one_end_and_stands_on_its_own_point_at_the_other() {
+    let board = blank()
+        .changed(&create("card"))
+        .unwrap()
+        .changed(&Change::Create {
+            id: "half".into(),
+            shape: Shape {
+                from: on("card"),
+                ..path(Kind::Arrow)
+            },
+        })
+        .unwrap();
+    assert_eq!(board.shapes["half"].shape.to, None);
+    assert!(
+        board
+            .changed(&Change::Create {
+                id: "loop".into(),
+                shape: Shape {
+                    from: on("card"),
+                    to: on("card"),
+                    ..path(Kind::Arrow)
+                },
+            })
+            .is_err()
+    );
+    // the card goes, and with it every connector that named it
+    let after = board
+        .changed(&Change::Delete { id: "card".into() })
+        .unwrap();
+    assert!(after.shapes.is_empty());
+}
+#[test]
+fn board_caps_bound_storage_and_create_replay_is_idempotent() {
+    let mut board = blank();
+    for i in 0..MAX_SHAPES {
+        board = board.changed(&create(&format!("shape-{i}"))).unwrap();
+    }
+    assert!(board.changed(&create("overflow")).is_err());
+    assert_eq!(board.changed(&create("shape-0")).unwrap(), board);
+    assert!(serde_json::to_vec(&board).unwrap().len() < MAX_BOARD_BYTES);
+}
+#[test]
+fn real_module_stages_commits_aborts_and_rejects_unauthenticated_writes() {
+    futures::executor::block_on(async {
+        let mut module = Boards::new(Box::new(MemStore::new()));
+        let mut env = TestCtx::at_height(1).env().clone();
+        env.origin = Origin::External(vec![7; 32]);
+        let mut ctx = TestCtx::with_env(env);
+        let op = |operation| Msg {
+            target: "boards".into(),
+            payload: serde_json::to_vec(&operation).unwrap(),
+        };
+        let initial = module.root();
+        module
+            .execute(
+                &mut ctx,
+                &op(Operation::Create {
+                    id: "room".into(),
+                    title: "Planning".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut ctx,
+                &op(Operation::Edit {
+                    board: "room".into(),
+                    change: create("a"),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(module.root(), initial);
+        module.commit_block().await.unwrap();
+        let committed = module.root();
+        assert_ne!(committed, initial);
+        module
+            .execute(
+                &mut ctx,
+                &op(Operation::Edit {
+                    board: "room".into(),
+                    change: Change::Delete { id: "a".into() },
+                }),
+            )
+            .await
+            .unwrap();
+        module.abort_block().await.unwrap();
+        assert_eq!(module.root(), committed);
+        let reply = module
+            .query(&serde_json::to_vec(&Query::Get { id: "room".into() }).unwrap())
+            .await
+            .unwrap();
+        let Reply::Board(Some(board)) = serde_json::from_slice(&reply).unwrap() else {
+            panic!("board reply")
+        };
+        assert!(board.shapes.contains_key("a"));
+        let mut anonymous = TestCtx::at_height(2);
+        assert!(
+            module
+                .execute(
+                    &mut anonymous,
+                    &op(Operation::Create {
+                        id: "bad".into(),
+                        title: "No".into()
+                    })
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(module.root(), committed);
+    });
+}
+use sdk::Ctx;
+
+#[test]
+fn board_creator_uses_the_shared_actor_convention_for_passkeys() {
+    futures::executor::block_on(async {
+        let mut module = Boards::new(Box::new(MemStore::new()));
+        let mut env = TestCtx::at_height(1).env().clone();
+        env.origin = Origin::External(vec![2; 33]);
+        let owner = env.origin.actor_string();
+        let mut ctx = TestCtx::with_env(env);
+        let op = Operation::Create {
+            id: "passkey".into(),
+            title: "Passkey board".into(),
+        };
+        let message = Msg {
+            target: "boards".into(),
+            payload: serde_json::to_vec(&op).unwrap(),
+        };
+        module.execute(&mut ctx, &message).await.unwrap();
+        module.execute(&mut ctx, &message).await.unwrap();
+        let bytes = module
+            .query(
+                &serde_json::to_vec(&Query::Get {
+                    id: "passkey".into(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let Reply::Board(Some(board)) = serde_json::from_slice(&bytes).unwrap() else {
+            panic!("board reply")
+        };
+        assert_eq!(board.owner, owner);
+    });
+}
+
+#[test]
+fn batch_is_atomic_and_editing_does_not_change_stacking_order() {
+    let original = Board::new("Board".into(), "owner".into()).unwrap();
+    let board = original
+        .changed_many(&[
+            Change::Create {
+                id: "z".into(),
+                shape: Shape::default(),
+            },
+            Change::Create {
+                id: "a".into(),
+                shape: Shape::default(),
+            },
+        ])
+        .unwrap();
+    let edited = board
+        .changed(&Change::Text {
+            id: "z".into(),
+            text: "Edited".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        edited
+            .ordered()
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["z", "a"]
+    );
+    let failed = board.changed_many(&[
+        Change::Move {
+            id: "z".into(),
+            x: 70,
+            y: 10,
+        },
+        Change::Text {
+            id: "a".into(),
+            text: "x".repeat(boards::MAX_TEXT + 1),
+        },
+    ]);
+    assert!(failed.is_err());
+    assert_eq!(board.shapes["z"].shape.x, 0);
+    assert!(original.shapes.is_empty());
+}
+
+#[test]
+fn how_the_words_sit_and_how_big_they_are_are_fields_like_any_other() {
+    let board = blank().changed(&create("a")).unwrap();
+    let shape = &board.shapes["a"].shape;
+    assert_eq!(
+        (shape.align, shape.text_size),
+        (Align::Middle, TextSize::Medium),
+        "a card written with no opinion is centred at the middle size"
+    );
+    // They compose with each other and with everything else, because each
+    // carries only its own field forward.
+    let edits = [
+        Change::Align {
+            id: "a".into(),
+            align: Align::End,
+        },
+        Change::TextSize {
+            id: "a".into(),
+            text_size: TextSize::Huge,
+        },
+        Change::Text {
+            id: "a".into(),
+            text: "flush right".into(),
+        },
+    ];
+    let forwards = edits
+        .iter()
+        .try_fold(board.clone(), |b, c| b.changed(c))
+        .unwrap();
+    let backwards = edits
+        .iter()
+        .rev()
+        .try_fold(board.clone(), |b, c| b.changed(c))
+        .unwrap();
+    assert_eq!(forwards.shapes["a"].shape, backwards.shapes["a"].shape);
+    let written = &forwards.shapes["a"].shape;
+    assert_eq!(
+        (written.align, written.text_size, written.text.as_str()),
+        (Align::End, TextSize::Huge, "flush right")
+    );
+    // And naming a shape that is not there is the no-op every other field op
+    // is, not a rejection that would take a whole batch down with it.
+    let missing = board
+        .changed(&Change::Align {
+            id: "gone".into(),
+            align: Align::Start,
+        })
+        .unwrap();
+    assert_eq!(missing.shapes.len(), 1);
+}
+
+/// A group is a name its members share and nothing else, so one change puts
+/// them in it and the same change takes them out.
+#[test]
+fn a_group_is_a_name_its_members_share_and_one_change_binds_or_frees_them() {
+    let board = blank()
+        .changed_many(&[create("a"), create("b"), create("c")])
+        .unwrap();
+    let held = board
+        .changed(&Change::Group {
+            ids: vec!["a".into(), "b".into()],
+            group: Some("pair".into()),
+        })
+        .unwrap();
+    let group = |board: &Board, id: &str| board.shapes[id].shape.group.clone();
+    assert_eq!(group(&held, "a").as_deref(), Some("pair"));
+    assert_eq!(group(&held, "b").as_deref(), Some("pair"));
+    assert_eq!(
+        group(&held, "c"),
+        None,
+        "a shape nobody named joined a group"
+    );
+
+    // The same verb in the other direction: no name, no group.
+    let freed = held
+        .changed(&Change::Group {
+            ids: vec!["a".into(), "b".into()],
+            group: None,
+        })
+        .unwrap();
+    assert_eq!(group(&freed, "a"), None);
+    assert_eq!(group(&freed, "b"), None);
+
+    // Freeing one member of a pair leaves the other where it was: the group is
+    // the name, so what is left is simply a shape still carrying it.
+    let split = held
+        .changed(&Change::Group {
+            ids: vec!["a".into()],
+            group: None,
+        })
+        .unwrap();
+    assert_eq!(group(&split, "a"), None);
+    assert_eq!(group(&split, "b").as_deref(), Some("pair"));
+    // And that lone member can be put back where it was, which is why a group
+    // of one is inert rather than invalid: it is what undoing the split is.
+    let rejoined = split
+        .changed(&Change::Group {
+            ids: vec!["a".into()],
+            group: Some("pair".into()),
+        })
+        .unwrap();
+    assert_eq!(group(&rejoined, "a").as_deref(), Some("pair"));
+}
+
+/// What a board refuses to call a group.
+#[test]
+fn a_group_needs_two_shapes_that_exist_and_a_name_the_board_can_address() {
+    let board = blank().changed_many(&[create("a"), create("b")]).unwrap();
+    let refused = |change: Change| {
+        board
+            .changed(&change)
+            .expect_err("the board took a grouping it should have refused")
+    };
+    // A shape that is not on the board cannot be in a group on it.
+    refused(Change::Group {
+        ids: vec!["a".into(), "ghost".into()],
+        group: Some("pair".into()),
+    });
+    // Naming a shape twice states a group the caller cannot have meant.
+    refused(Change::Group {
+        ids: vec!["a".into(), "a".into()],
+        group: Some("pair".into()),
+    });
+    // Nothing to group.
+    refused(Change::Group {
+        ids: Vec::new(),
+        group: None,
+    });
+    // A name the board cannot address is a group nothing can be put into.
+    refused(Change::Group {
+        ids: vec!["a".into(), "b".into()],
+        group: Some("not a group name".into()),
+    });
+    // And the same name is refused on the way in, through a create.
+    blank()
+        .changed(&Change::Create {
+            id: "a".into(),
+            shape: Shape {
+                group: Some("not a group name".into()),
+                ..Shape::default()
+            },
+        })
+        .expect_err("a shape carried a group name the board cannot address");
+}
+
+/// How a shape is painted is two questions and the board answers each on its
+/// own: whether the body behind the outline is there, and whether the outline
+/// is unbroken. Both ride every shape, because a dashed box and a dashed arrow
+/// are the same statement and a board that stored them apart could disagree
+/// with itself about what dashed means.
+#[test]
+fn a_shape_carries_its_fill_and_its_dash_and_each_changes_alone() {
+    let board = blank().changed_many(&[create("a")]).unwrap();
+    assert_eq!(board.shapes["a"].shape.fill, Fill::Solid);
+    assert_eq!(board.shapes["a"].shape.dash, Dash::Solid);
+
+    let hollow = board
+        .changed(&Change::Fill {
+            id: "a".into(),
+            fill: Fill::None,
+        })
+        .unwrap();
+    assert_eq!(hollow.shapes["a"].shape.fill, Fill::None);
+    assert_eq!(
+        hollow.shapes["a"].shape.dash,
+        Dash::Solid,
+        "emptying a shape also broke its outline"
+    );
+
+    let broken = hollow
+        .changed(&Change::Dash {
+            id: "a".into(),
+            dash: Dash::Dashed,
+        })
+        .unwrap();
+    assert_eq!(broken.shapes["a"].shape.dash, Dash::Dashed);
+    assert_eq!(
+        broken.shapes["a"].shape.fill,
+        Fill::None,
+        "breaking an outline also filled the shape back in"
+    );
+
+    // And a run takes the same two answers, so the panel can ask one question
+    // of whatever is picked rather than one question per family.
+    let run = blank()
+        .changed_many(&[Change::Create {
+            id: "line".into(),
+            shape: path(Kind::Arrow),
+        }])
+        .unwrap()
+        .changed(&Change::Dash {
+            id: "line".into(),
+            dash: Dash::Dashed,
+        })
+        .unwrap();
+    assert_eq!(run.shapes["line"].shape.dash, Dash::Dashed);
+}
+
+/// What the picker lists.
+async fn catalogue(module: &Boards) -> std::collections::BTreeMap<String, String> {
+    let request = serde_json::to_vec(&Query::List).unwrap();
+    let Reply::List(catalog) =
+        serde_json::from_slice(&module.query(&request).await.unwrap()).unwrap()
+    else {
+        panic!("list reply")
+    };
+    catalog
+}
+/// The board itself, or nothing if the store no longer holds one.
+async fn opened(module: &Boards, id: &str) -> Option<Board> {
+    let request = serde_json::to_vec(&Query::Get { id: id.into() }).unwrap();
+    let Reply::Board(board) =
+        serde_json::from_slice(&module.query(&request).await.unwrap()).unwrap()
+    else {
+        panic!("board reply")
+    };
+    board
+}
+
+/// A board is renamed by anyone and removed only while nobody has drawn on it.
+///
+/// The rename is open because every shape edit already is — `Board::owner` is
+/// written once, read only to make a repeated create idempotent, and authorises
+/// nothing. The removal is closed to a board with work on it because there is
+/// no ownership rule in this module to say whose work would be thrown away.
+#[test]
+fn a_board_is_renamed_by_anyone_and_removed_only_while_nobody_has_drawn_on_it() {
+    futures::executor::block_on(async {
+        let mut module = Boards::new(Box::new(MemStore::new()));
+        let mut env = TestCtx::at_height(1).env().clone();
+        env.origin = Origin::External(vec![7; 32]);
+        let mut author = TestCtx::with_env(env);
+        let mut env = TestCtx::at_height(2).env().clone();
+        env.origin = Origin::External(vec![9; 32]);
+        let mut somebody_else = TestCtx::with_env(env);
+        let op = |operation| Msg {
+            target: "boards".into(),
+            payload: serde_json::to_vec(&operation).unwrap(),
+        };
+        module
+            .execute(
+                &mut author,
+                &op(Operation::Create {
+                    id: "room".into(),
+                    title: "Q3 plannign".into(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Somebody who did not make it renames it, because a board is shared.
+        module
+            .execute(
+                &mut somebody_else,
+                &op(Operation::Rename {
+                    board: "room".into(),
+                    title: "Q3 planning".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        let renamed = opened(&module, "room").await.unwrap();
+        assert_eq!(renamed.title, "Q3 planning");
+        assert_eq!(
+            catalogue(&module).await.get("room").map(String::as_str),
+            Some("Q3 planning"),
+            "the catalogue kept the old name, so the picker and the board disagree"
+        );
+
+        // A rename cannot leave a board in a state a create would have refused.
+        assert!(
+            module
+                .execute(
+                    &mut author,
+                    &op(Operation::Rename {
+                        board: "room".into(),
+                        title: "   ".into(),
+                    }),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(opened(&module, "room").await.unwrap().title, "Q3 planning");
+
+        // Draw on it and it can no longer be removed — by anyone, its author
+        // included.
+        module
+            .execute(
+                &mut author,
+                &op(Operation::Edit {
+                    board: "room".into(),
+                    change: create("a"),
+                }),
+            )
+            .await
+            .unwrap();
+        let drawn_on = op(Operation::Remove {
+            board: "room".into(),
+        });
+        assert!(
+            module.execute(&mut author, &drawn_on).await.is_err(),
+            "a board with work on it was thrown away"
+        );
+        assert!(opened(&module, "room").await.is_some());
+
+        // Clear it and it goes: out of the catalogue and out of the store.
+        module
+            .execute(
+                &mut author,
+                &op(Operation::Edit {
+                    board: "room".into(),
+                    change: Change::Delete { id: "a".into() },
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut somebody_else,
+                &op(Operation::Remove {
+                    board: "room".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            opened(&module, "room").await.is_none(),
+            "the board's state outlived it"
+        );
+        assert!(
+            catalogue(&module).await.is_empty(),
+            "the picker still lists a board that is gone"
+        );
+
+        // And it cannot be removed twice.
+        assert!(
+            module
+                .execute(
+                    &mut author,
+                    &op(Operation::Remove {
+                        board: "room".into(),
+                    }),
+                )
+                .await
+                .is_err()
+        );
+    });
+}

@@ -223,7 +223,7 @@ mod tests {
         let book = Arc::new(NullBook);
         let spec = StreamPlaneSpec {
             own_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
-            service: Service::StateSync,
+            service: Service::STATE_SYNC,
             pacing: StreamPacing::Local(PlaneConfig {
                 bulk_bytes_per_sec: 1_000_000,
                 bulk_burst_bytes: 64 * 1024,
@@ -253,7 +253,7 @@ mod tests {
         // The returned StreamService must already be registered on the
         // returned plane: a second registration for the same service is
         // refused.
-        let dup = plane.stream_service(Service::StateSync, StreamPolicy { accept_backlog: 1 });
+        let dup = plane.stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 1 });
         assert!(
             matches!(dup, Err(RegisterError::AlreadyRegistered)),
             "bind_stream_plane's returned service must already be registered on the plane"

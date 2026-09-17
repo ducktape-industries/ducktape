@@ -44,6 +44,13 @@ OUT="${OUT:?set OUT=<workspace>/guest — a guest is built per workspace}"
 # one, and re-fetching 250 MB per lap is not a rebuild), and never under /tmp,
 # which on this class of host is both memory-backed and periodically reaped.
 WORK="${WORK:-$HERE/target/guest-build}"
+# This build's OWN cargo target directory, never the one a host config shares
+# between worktrees. `guest-builder` bakes its platform root in at compile time,
+# so the binary sitting in a shared target belongs to whichever worktree built
+# it last: run it and you vendor a sibling's dependency set, or bake a sibling's
+# init as PID 1, and nothing in the output says which tree it came from. Under
+# $WORK it is warm on the second lap and wrong on none.
+export CARGO_TARGET_DIR="$WORK/cargo"
 
 if [[ -z "${ROOTFS_SETUP+x}" && "$(uname -s)" == "Linux" ]]; then
   ROOTFS_SETUP="$HERE/ops/guest-rust-tools.sh"
@@ -53,6 +60,31 @@ if [[ -z "${ROOTFS_SETUP+x}" && "$(uname -s)" == "Linux" ]]; then
   WASM_TOOLS_VERSION="1.$(sed -n 's/^wit-component = "=0\.\([0-9.]*\)".*/\1/p' "$HERE/bin/guest-builder/Cargo.toml")"
   set -- "$RUST_CHANNEL" "$WASM_TOOLS_VERSION"
 fi
+# The setup step is the ONLY one that needs to be root inside the tree, and a
+# host can refuse to give an unprivileged process the user namespace that gets
+# it there: Ubuntu 23.10+ ships `kernel.apparmor_restrict_unprivileged_userns=1`,
+# and bwrap dies with "setting up uid map: Permission denied" before any of
+# this runs.
+#
+#   GUEST_SETUP_SUDO=sudo OUT=… ops/build-guest-rootfs.sh
+#
+# lends privilege to THAT STEP ALONE — the download, the extraction, the init
+# build and the image all stay rootless, and an operator never has to loosen a
+# host-wide kernel setting to build a guest.
+#
+# The two modes differ by exactly the flags that buy rootlessness. Under sudo
+# we are ALREADY root, so asking for the namespace anyway buys nothing and
+# costs the build: the same hosts attach an `unprivileged_userns` AppArmor
+# profile to whatever creates one, root included, and the confined bwrap is
+# then refused the bind itself ("Can't find source path …: Permission denied").
+# where the vendored registry lands INSIDE the guest. Beside the CLI mountpoint
+# under `/opt/duck`, because it is the same kind of thing: something the host
+# put there for a run to read, never something a run writes.
+GUEST_VENDOR_ROOT="/opt/duck"
+
+SETUP_PRIVILEGE="${GUEST_SETUP_SUDO:-}"
+SETUP_AS_ROOT=(--unshare-user --uid 0 --gid 0)
+[[ -z "$SETUP_PRIVILEGE" ]] || SETUP_AS_ROOT=()
 if [[ -n "${ROOTFS_SETUP:-}" ]]; then
   command -v bwrap >/dev/null || { echo "guest setup requires bubblewrap" >&2; exit 1; }
 fi
@@ -162,7 +194,7 @@ if [[ -n "${ROOTFS_SETUP:-}" ]]; then
   [[ -f "$SETUP" ]] || { echo "ROOTFS_SETUP is not a file: $SETUP" >&2; exit 1; }
   mkdir -p "$WORK/setup-tmp"
   say "preparing guest tools"
-  bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --die-with-parent \
+  $SETUP_PRIVILEGE bwrap "${SETUP_AS_ROOT[@]}" --unshare-pid --die-with-parent \
     --bind "$TREE" / --proc /proc --dev /dev \
     --bind "$WORK/setup-tmp" /tmp \
     --ro-bind /etc/resolv.conf /etc/resolv.conf \
@@ -170,11 +202,36 @@ if [[ -n "${ROOTFS_SETUP:-}" ]]; then
     --clearenv --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     --setenv DEBIAN_FRONTEND noninteractive \
     /bin/bash /run/ducktape-guest-setup "$@"
+  # A privileged setup writes root-owned files in BOTH places it can write:
+  # the tree that becomes the image, and the scratch it saw as /tmp. The tree
+  # matters because `mke2fs -d` below stays rootless and would fail on the
+  # first file it cannot read; the scratch matters because it lives under the
+  # operator's own target directory, and root-owned build litter there is a
+  # directory they can no longer delete. Hand both back.
+  [[ -z "$SETUP_PRIVILEGE" ]] ||
+    $SETUP_PRIVILEGE chown -R "$(id -u):$(id -g)" "$TREE" "$WORK/setup-tmp"
+
+  # The registry that toolchain has nothing to compile without. A run reaches
+  # the network through vsock tunnels and nothing else, so `cargo build` in
+  # there resolves against vendored sources or not at all. `guest-builder
+  # vendor` owns the set — it already owns module discovery, the shell
+  # synthesis and the wasm32 patch stubs, and a second implementation of any of
+  # those is one that drifts.
+  say "vendoring the guest registry"
+  (cd "$HERE" && cargo run -q -p guest-builder -- \
+    vendor --out "$TREE$GUEST_VENDOR_ROOT" --directory "$GUEST_VENDOR_ROOT/vendor")
+  # `/.cargo/config.toml`, not `$CARGO_HOME`'s: the rootfs is READ-ONLY, so a
+  # run must point CARGO_HOME at somewhere writable for the package-cache lock,
+  # and a config under the home it no longer uses would never be read. Cargo
+  # walks from the build directory up to `/`, so the filesystem root is the one
+  # place a config is found no matter where the run builds or what it sets.
+  mkdir -p "$TREE/.cargo"
+  mv "$TREE$GUEST_VENDOR_ROOT/config.toml" "$TREE/.cargo/config.toml"
 fi
 
 # ---- 3. the init -----------------------------------------------------------
 MUSL_TARGET="$ARCH-unknown-linux-musl"
-INIT="$HERE/target/$MUSL_TARGET/release/duck-guest-init"
+INIT="$CARGO_TARGET_DIR/$MUSL_TARGET/release/duck-guest-init"
 # ALWAYS, never "only if it is missing". cargo is already incremental, so this
 # costs nothing when the source has not moved — while skipping it on an
 # existing binary bakes a stale PID 1 into the image and the next boot silently
