@@ -328,7 +328,8 @@ impl Default for GuestLimits {
 /// `name_interface` and `type_resource`, never by `type_record`, so a record key
 /// is never matched and the macro then fails the build for an unused key.
 pub use git_primitives::{
-    GitCommit, GitDiff, GitDiffError, GitObject, GitObjectData, GitTreeEntry,
+    GitCommit, GitDiff, GitDiffBudget, GitDiffError, GitDiffFile, GitFileStatus, GitObject,
+    GitObjectData, GitTreeEntry,
 };
 
 /// A local Git object read: confined repository, exact object id, body cap.
@@ -341,7 +342,7 @@ fn valid_git_repository(repository: &str) -> bool {
 }
 
 type GitObjectKey = (String, Vec<u8>, u64);
-type GitDiffKey = (String, Vec<u8>, Vec<u8>, u64, u64, u64);
+type GitDiffKey = (String, Vec<u8>, Vec<u8>, Option<String>, u64, u64, u64);
 
 /// Content-addressed object storage; writes publish only at the block boundary.
 pub trait HostOdb {
@@ -388,14 +389,18 @@ pub trait OdbBacking: HostOdb {
     ) -> Result<GitObject, SdkError> {
         Err(SdkError::QueryUnsupported)
     }
+    /// `path` scopes the read to one file: the substrate resolves that path in
+    /// the two trees rather than walking the pair, so the read is bounded by
+    /// its own file and ignores `max_files` and any aggregate ceiling. That is
+    /// what lets a reader still examine a change one oversized blob makes
+    /// unreadable whole.
     fn git_diff_read(
         &self,
         _repository: &str,
         _target: &[u8],
         _source: &[u8],
-        _max_bytes: u64,
-        _max_files: u64,
-        _max_blob_bytes: u64,
+        _path: Option<&str>,
+        _budget: GitDiffBudget,
     ) -> Result<GitDiff, GitDiffError> {
         Err(GitDiffError::Unsupported)
     }
@@ -713,6 +718,27 @@ fn object_bytes(puts: &BTreeMap<Vec<u8>, Vec<u8>>) -> usize {
         .sum()
 }
 
+/// the longest path a scoped `git-diff-read` may name. git's own limit is the
+/// filesystem's; this one is the host's, and it bounds a guest-fed string that
+/// reaches a tree walk.
+const MAX_GIT_DIFF_PATH_BYTES: usize = 4096;
+
+/// what a diff's per-file index costs the read memo. the index is complete even
+/// when the patch is clipped, so it is charged separately from the patch — a
+/// clipped patch does not mean a cheap answer.
+fn git_diff_index_bytes(files: &[GitDiffFile]) -> usize {
+    files
+        .iter()
+        .map(|file| {
+            file.path.len()
+                + file.previous_path.as_ref().map_or(0, String::len)
+                + HOST_ENTRY_BYTES
+                // status, the two optional counts, and the two flags.
+                + 20
+        })
+        .sum()
+}
+
 /// what one git-object answer costs the read memo: the record's fixed fields
 /// plus whatever body the backing materialized.
 fn git_object_bytes(answer: &Result<GitObject, WitError>) -> usize {
@@ -726,6 +752,8 @@ fn git_object_bytes(answer: &Result<GitObject, WitError>) -> usize {
         Some(GitObjectData::Blob(bytes) | GitObjectData::Tag(bytes)) => bytes.len(),
         Some(GitObjectData::Commit(commit)) => {
             commit.tree.len()
+                + commit.author.len()
+                + commit.message.len()
                 + commit
                     .parents
                     .iter()
@@ -924,11 +952,14 @@ impl host::Host for HostData {
         self.memo.git_objects.insert(key, answer.clone());
         Ok(answer.map(git_wit::object))
     }
+    // the WIT declares these flat, and this impl answers the WIT.
+    #[allow(clippy::too_many_arguments)]
     fn git_diff_read(
         &mut self,
         repository: String,
         target: Vec<u8>,
         source: Vec<u8>,
+        path: Option<String>,
         max_bytes: u64,
         max_files: u64,
         max_blob_bytes: u64,
@@ -936,9 +967,19 @@ impl host::Host for HostData {
         if !self.local_reads {
             return Ok(Err(host::GitDiffError::Unsupported));
         }
+        // a scoped path is bounded like every other guest-fed string: it names
+        // one entry of one tree, so a path longer than a git path can be is a
+        // malformed read rather than one that happens to find nothing.
+        let scoped_path_fits = path.as_ref().is_none_or(|path| {
+            !path.is_empty() && path.len() <= MAX_GIT_DIFF_PATH_BYTES && !path.starts_with('/')
+        });
+        // an EMPTY target is "no target": the diff against nothing a root
+        // commit needs. Any other short length is a malformed oid.
+        let target_fits = target.len() == 20 || target.is_empty();
         let valid = valid_git_repository(&repository)
-            && target.len() == 20
+            && target_fits
             && source.len() == 20
+            && scoped_path_fits
             && max_bytes <= 1024 * 1024
             && max_files <= 4096
             && max_blob_bytes <= 16 * 1024 * 1024;
@@ -951,6 +992,7 @@ impl host::Host for HostData {
             repository,
             target,
             source,
+            path,
             max_bytes,
             max_files,
             max_blob_bytes,
@@ -958,18 +1000,28 @@ impl host::Host for HostData {
         if let Some(answer) = self.memo.git_diffs.get(&key) {
             return Ok(git_wit::diff_result(answer.clone()));
         }
-        let key_bytes = key.0.len() + key.1.len() + key.2.len() + 24;
+        let key_bytes =
+            key.0.len() + key.1.len() + key.2.len() + key.3.as_ref().map_or(0, String::len) + 24;
         self.admit_object_read(key_bytes)?;
         let answer = self
             .odb
             .as_ref()
             .ok_or(GitDiffError::Unsupported)
             .and_then(|odb| {
-                odb.borrow()
-                    .git_diff_read(&key.0, &key.1, &key.2, key.3, key.4, key.5)
+                odb.borrow().git_diff_read(
+                    &key.0,
+                    &key.1,
+                    &key.2,
+                    key.3.as_deref(),
+                    GitDiffBudget {
+                        max_bytes: key.4,
+                        max_files: key.5,
+                        max_blob_bytes: key.6,
+                    },
+                )
             });
         let answer_bytes = match &answer {
-            Ok(diff) => diff.patch.len() + 25,
+            Ok(diff) => diff.patch.len() + 25 + git_diff_index_bytes(&diff.files),
             Err(GitDiffError::Unavailable(message) | GitDiffError::Limit(message)) => message.len(),
             Err(GitDiffError::Unsupported) => 0,
         };
@@ -2791,6 +2843,7 @@ mod bounds {
                 "repo".into(),
                 vec![0; 20],
                 vec![0; 20],
+                None,
                 1024,
                 4097,
                 1024

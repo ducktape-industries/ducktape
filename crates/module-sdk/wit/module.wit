@@ -9,9 +9,18 @@ interface host {
   /// Read-only local Git objects. Repository names are confined to this
   /// module's substrate; no filesystem paths, fetches or reference mutations.
   /// The host enforces byte ceilings before materializing object bodies.
+  /// a commit as a history walk needs it. `author` is the raw identity line
+  /// ("Name <email>"), `committed-at` the committer's epoch seconds — the
+  /// committer, not the author, because that is the order a branch was built
+  /// in and the order a log is read in. `message` is the WHOLE message; a
+  /// walk that wants only the summary takes the first line, which the host
+  /// cannot do for it without deciding what a summary is.
   record git-commit {
     tree: list<u8>,
     parents: list<list<u8>>,
+    author: string,
+    committed-at: u64,
+    message: string,
   }
   record git-tree-entry {
     kind: u8,
@@ -29,12 +38,45 @@ interface host {
     size: u64,
     data: option<git-object-data>,
   }
+  /// what happened to one path between the two commits. a closed set: a new
+  /// kind must fail the build wherever it is matched rather than fall into a
+  /// wildcard that renders it as "modified".
+  enum git-file-status {
+    added,
+    modified,
+    deleted,
+    renamed,
+    type-changed,
+  }
+  /// one path's row in a diff's index. the index is COMPLETE even when the
+  /// patch is not: a reader can always see which files changed and navigate
+  /// them, and only the numbers go missing.
+  ///
+  /// `additions`/`deletions` are absent, not zero, when this file's patch was
+  /// never produced — the byte ceiling stopped the walk before it, or the
+  /// file's own blobs were too large to examine. a zero that means "unknown"
+  /// is a lie a reader cannot detect; `none` cannot be misread. `truncated`
+  /// says WHY they are absent.
+  record git-diff-file {
+    path: string,
+    /// the previous path, set only when `status` is `renamed`. NOT spelled
+    /// `from`, which is a WIT keyword.
+    previous-path: option<string>,
+    status: git-file-status,
+    additions: option<u64>,
+    deletions: option<u64>,
+    binary: bool,
+    truncated: bool,
+  }
   record git-diff {
     patch: string,
     truncated: bool,
     files-changed: u64,
     additions: u64,
     deletions: u64,
+    /// every changed path, ordered by path. complete even when `patch` is a
+    /// prefix: `files-changed` always equals its length.
+    files: list<git-diff-file>,
   }
   variant git-diff-error {
     unavailable(string),
@@ -42,7 +84,17 @@ interface host {
     unsupported,
   }
   git-object-read: func(repository: string, oid: list<u8>, max-bytes: u64) -> result<git-object, error>;
-  git-diff-read: func(repository: string, target: list<u8>, source: list<u8>, max-bytes: u64, max-files: u64, max-blob-bytes: u64) -> result<git-diff, git-diff-error>;
+  /// an EMPTY `target` is a diff against NOTHING, and every path in `source`
+  /// comes out `added`. That is what a root commit needs, and it is not the
+  /// same read as passing `source` for both, which answers an empty diff. Any
+  /// other `target` length is a malformed oid and is refused.
+  ///
+  /// `path` scopes the read to ONE file. a scoped read resolves that path in
+  /// the two trees directly instead of walking the whole pair, so it is bounded
+  /// by its own file and never by the aggregate ceilings — which is what makes
+  /// it the escape hatch for a change one oversized blob would otherwise make
+  /// entirely unreadable. `max-files` is ignored when `path` is set.
+  git-diff-read: func(repository: string, target: list<u8>, source: list<u8>, path: option<string>, max-bytes: u64, max-files: u64, max-blob-bytes: u64) -> result<git-diff, git-diff-error>;
 
   /// the deterministic environment for this dispatch (block-constant fields
   /// are identical on every validator; NOT wall clock, NOT per-node).

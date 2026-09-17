@@ -150,6 +150,36 @@ pub enum ForgeQuery {
     /// committed branch heads. The node-local object store must contain both
     /// commits and their trees; this query never fetches missing objects.
     PrDiff { repo: String, number: u64 },
+    /// ONE file's patch inside a pull request's change, addressed by path.
+    ///
+    /// Not a variant of [`Self::PrDiff`] with an optional path: the reply means
+    /// a different thing. It is priced by this file alone rather than by the
+    /// change's aggregate blob budget, which makes it the way to read a file
+    /// that [`Self::PrDiff`] reported with `truncated` because it could not
+    /// afford to examine it.
+    PrFileDiff {
+        repo: String,
+        number: u64,
+        path: String,
+    },
+    /// one bounded page of a repo's history, newest first, from `rev` (empty
+    /// selects the `dev` head, falling back to `main`).
+    ///
+    /// `after` resumes a previous page at the oid it handed back; `path` (empty
+    /// for none) keeps only the commits that changed that path. A filtered walk
+    /// reads commits it does not return, so the SCAN is bounded as well as the
+    /// page: a page can come back short with a `next` cursor, and that means
+    /// "ask again", not "end of history".
+    ListCommits {
+        repo: String,
+        rev: String,
+        path: String,
+        after: String,
+        limit: u64,
+    },
+    /// one commit in full: its message, its parents, and its patch against its
+    /// first parent. `rev` is an exact 40-hex oid reachable from a born branch.
+    Commit { repo: String, rev: String },
     /// one directory at an exact committed revision. An empty `rev` selects
     /// the repo's `dev` head, falling back to `main`; a non-empty revision is
     /// exactly 40 hex characters and must be that head or one of its ancestors.
@@ -202,6 +232,15 @@ pub enum ForgeReply {
     /// a bounded, reviewable pull-request patch (the reply to
     /// [`ForgeQuery::PrDiff`]).
     PrDiff(PrDiff),
+    /// one file's patch (the reply to [`ForgeQuery::PrFileDiff`]). The same
+    /// payload as [`Self::PrDiff`] with an index of one, under its own name so
+    /// a reader of the reply never has to know which question was asked.
+    PrFileDiff(PrDiff),
+    /// one page of history (the reply to [`ForgeQuery::ListCommits`]).
+    Commits(CommitPage),
+    /// one commit in full (the reply to [`ForgeQuery::Commit`]), absent when
+    /// the oid is not reachable from a born branch. boxed: it carries a patch.
+    Commit(Option<Box<CommitDetail>>),
     /// a bounded directory listing (the reply to [`ForgeQuery::Tree`]).
     Tree(TreeReply),
     /// a bounded text preview (the reply to [`ForgeQuery::Blob`]).
@@ -285,8 +324,20 @@ pub struct BlobBytesReply {
 pub const MAX_PR_DIFF_BYTES: usize = 48 * 1024;
 /// Maximum number of changed paths examined for one PR diff.
 pub const MAX_PR_DIFF_FILES: usize = 256;
-/// Maximum aggregate old-plus-new blob bytes examined for one PR diff.
+/// Maximum aggregate old-plus-new blob bytes examined for one PR diff. Spent
+/// cheapest file first: a path this does not reach keeps its row in the index
+/// and loses only its hunks and its counts, so one oversized asset never makes
+/// the rest of a change unreadable.
 pub const MAX_PR_DIFF_BLOB_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum UTF-8 bytes returned in one SCOPED file patch
+/// ([`ForgeQuery::PrFileDiff`]). Larger than the whole-diff ceiling because
+/// here one file is the entire answer rather than one row of it.
+pub const MAX_PR_FILE_DIFF_BYTES: usize = 128 * 1024;
+/// Maximum old-plus-new blob bytes examined for one scoped file diff: the
+/// host's own per-read ceiling, because a scoped read is priced by its file
+/// and never by the change it belongs to. That is what makes it the way to
+/// read a file the aggregate budget above could not afford.
+pub const MAX_PR_FILE_DIFF_BLOB_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum aggregate bytes of the two commit objects inspected for one PR
 /// diff. Headers are checked before libgit2 materializes either commit.
 pub const MAX_PR_DIFF_COMMIT_BYTES: usize = 256 * 1024;
@@ -308,10 +359,114 @@ pub struct PrDiff {
     pub additions: usize,
     pub deletions: usize,
     pub patch: String,
-    /// True when `patch` is only a prefix of the full unified diff. Statistics
-    /// are still complete because over-limit file/blob inputs fail instead of
-    /// returning a partial reply.
+    /// True when `patch` is only a prefix of the full unified diff. `files` is
+    /// complete regardless — see [`DiffFile`].
     pub truncated: bool,
+    /// every changed path, ordered by path; `files_changed` is its length.
+    pub files: Vec<DiffFile>,
+}
+
+/// What happened to one path. A closed set, so a kind this does not name fails
+/// the build where it is matched rather than rendering as "modified".
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum FileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    TypeChanged,
+}
+
+/// One path's row in a diff. The index is COMPLETE even when the patch is a
+/// prefix and even when a path's blobs were too large to examine, because the
+/// file list is what a reader navigates by — losing it loses the whole screen,
+/// while losing a row's numbers loses a decoration.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiffFile {
+    pub path: String,
+    /// The previous path, present only when `status` is [`FileStatus::Renamed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    pub status: FileStatus,
+    /// Absent, NOT zero, when this file's lines were never counted — it is
+    /// binary, or `truncated` says the reply could not examine it. A zero that
+    /// means "unknown" is a lie the reader cannot detect locally.
+    #[serde(default)]
+    pub additions: Option<u64>,
+    #[serde(default)]
+    pub deletions: Option<u64>,
+    pub binary: bool,
+    /// This file's hunks are not fully in `patch`: the byte ceiling stopped at
+    /// or before it, or its blobs cost more than the reply's budget.
+    /// [`ForgeQuery::PrFileDiff`] is the way to read it anyway.
+    pub truncated: bool,
+}
+
+/// Largest page [`ForgeQuery::ListCommits`] will return.
+pub const MAX_COMMITS_PAGE: usize = 100;
+
+/// The object reads one history page may make — the walk's only bound, because
+/// a page size does not bound one. A path filter reads commits it does not
+/// return, so filtering a path touched once at the root of a long history is an
+/// unbounded read wearing a page size.
+///
+/// It MIRRORS the kernel host's per-dispatch ceiling (`wasm_host::
+/// MAX_OBJECT_READS`, 4096) with headroom, and it is duplicated rather than
+/// imported because a module names no kernel host (#2303) and the WIT does not
+/// carry the number. `crates/kernel/host/tests/wasm_forge_parity.rs` holds the
+/// two against each other so the copy cannot drift upward silently.
+///
+/// Counting READS rather than commits is load-bearing: skipping to a cursor is
+/// one read per commit, while collecting is one read per commit plus a tree
+/// read per path segment. A walk that charged both at the collect rate could
+/// spend its whole budget skipping and hand back the cursor it started from,
+/// which is a caller that pages forever.
+pub const MAX_HISTORY_OBJECT_READS: usize = 3 * 1024;
+
+/// One page of history, newest first.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommitPage {
+    /// The resolved starting revision — empty on an unborn repo.
+    pub rev: String,
+    pub commits: Vec<CommitSummary>,
+    /// Where to resume. `Some` means history continues past this page, whether
+    /// because the page filled or because the scan bound was reached first; a
+    /// short page with a cursor means "ask again", never "that is all".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// One commit as a log row.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommitSummary {
+    pub oid: String,
+    /// The raw author identity line, `Name <email>`, as git recorded it.
+    pub author: String,
+    /// The COMMITTER's epoch seconds: the order the branch was built in, which
+    /// is the order a log reads in. A rebase moves this and not the author.
+    pub committed_at: u64,
+    /// The message's first line.
+    pub summary: String,
+    pub parents: Vec<String>,
+}
+
+/// One commit in full, with its patch against its FIRST parent — the same
+/// bounded shape a pull request's diff answers in, so one renderer draws both.
+/// A root commit (no parents) diffs against itself and carries an empty patch.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommitDetail {
+    pub oid: String,
+    pub author: String,
+    pub committed_at: u64,
+    /// The whole message, not just its first line.
+    pub message: String,
+    pub parents: Vec<String>,
+    pub diff: PrDiff,
 }
 
 /// one repo's committed head in a [`ForgeReply::Repos`] listing.

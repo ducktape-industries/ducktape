@@ -259,6 +259,7 @@ fn short_oid(oid: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interface::{DiffFile, FileStatus};
     use crate::tracker_iface::{
         DiffSide, ItemKind, ItemSummary, ReviewComment, ReviewView, channel_id_for,
     };
@@ -309,6 +310,15 @@ mod tests {
             deletions: 1,
             patch: "diff --git a/main.rs b/main.rs".into(),
             truncated: false,
+            files: vec![DiffFile {
+                path: "main.rs".into(),
+                from: None,
+                status: FileStatus::Modified,
+                additions: Some(1),
+                deletions: Some(1),
+                binary: false,
+                truncated: false,
+            }],
         }
     }
 

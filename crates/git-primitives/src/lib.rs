@@ -11,12 +11,18 @@
 //!
 //! [`wasm_host::OdbBacking`]: ../wasm_host/trait.OdbBacking.html
 
-/// a commit's structural fields — what a bounded read can answer without
-/// materializing the message or the author.
+/// a commit as a history walk needs it. `author` is the raw identity line
+/// ("Name <email>"), `committed_at` the COMMITTER's epoch seconds — the order
+/// a branch was built in, which is the order a log is read in. `message` is
+/// the whole message; the first line is a summary only by convention, and the
+/// host does not get to decide that for its caller.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitCommit {
     pub tree: Vec<u8>,
     pub parents: Vec<Vec<u8>>,
+    pub author: String,
+    pub committed_at: u64,
+    pub message: String,
 }
 
 /// one entry of a tree: the raw mode nibble the host packs into a byte, the
@@ -46,6 +52,50 @@ pub struct GitObject {
     pub data: Option<GitObjectData>,
 }
 
+/// the ceilings one diff read may spend, carried together because they are one
+/// policy decision rather than three: how much patch text, how many files, and
+/// how many blob bytes this reply is allowed to materialize.
+///
+/// `max_files` is ignored by a path-scoped read, which examines exactly one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GitDiffBudget {
+    pub max_bytes: u64,
+    pub max_files: u64,
+    pub max_blob_bytes: u64,
+}
+
+/// what happened to one path between two commits. a closed set: a new kind
+/// must fail the build wherever it is matched rather than land in a wildcard
+/// that renders it as "modified".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    TypeChanged,
+}
+
+/// one path's row in a diff's index. the index is COMPLETE even when the patch
+/// is not, so a reader can always see which files changed and navigate them.
+///
+/// `additions`/`deletions` are `None`, not zero, when this file's patch was
+/// never produced — the byte ceiling stopped the walk before it, or the file's
+/// own blobs were too large to examine. a zero meaning "unknown" is a lie the
+/// reader cannot detect; `None` cannot be misread. `truncated` says why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitDiffFile {
+    pub path: String,
+    /// the previous path, set only when `status` is [`GitFileStatus::Renamed`].
+    /// Spelled out rather than `from`, which the WIT this mirrors cannot use.
+    pub previous_path: Option<String>,
+    pub status: GitFileStatus,
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
+    pub binary: bool,
+    pub truncated: bool,
+}
+
 /// a diff between two commits, with the counts that stay true even when
 /// `patch` was clipped at the ceiling.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +105,8 @@ pub struct GitDiff {
     pub files_changed: u64,
     pub additions: u64,
     pub deletions: u64,
+    /// every changed path, ordered by path. `files_changed` is its length.
+    pub files: Vec<GitDiffFile>,
 }
 
 /// why a diff could not be answered. `Unsupported` is the substrate saying it

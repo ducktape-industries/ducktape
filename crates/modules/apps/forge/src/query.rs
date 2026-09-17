@@ -11,20 +11,126 @@ use std::collections::{BTreeSet, VecDeque};
 
 #[cfg(all(feature = "guest", not(feature = "native")))]
 use ducktape_module_sdk::host::{
-    GitDiff, GitDiffError as DiffError, GitObject as Object, GitObjectData,
+    GitDiff, GitDiffError as DiffError, GitDiffFile, GitFileStatus, GitObject as Object,
+    GitObjectData,
 };
 #[cfg(feature = "native")]
-use git_primitives::{GitDiff, GitDiffError as DiffError, GitObject as Object, GitObjectData};
+use git_primitives::{
+    GitDiff, GitDiffError as DiffError, GitDiffFile, GitFileStatus, GitObject as Object,
+    GitObjectData,
+};
 
 pub(crate) trait GitRead {
     fn object(&self, repo: &str, oid: Oid, cap: usize) -> Result<Object, Error>;
-    fn diff(&self, repo: &str, target: Oid, source: Oid) -> Result<GitDiff, DiffError>;
+    /// `path` scopes the read to one file, which is priced by that file alone
+    /// and not by the aggregate ceilings the whole-change read spends.
+    /// `target: None` is a diff against nothing, which is what a root commit
+    /// needs: every path in `source` comes out Added. It is not the same as
+    /// passing `source` twice, which is an empty diff.
+    fn diff(
+        &self,
+        repo: &str,
+        target: Option<Oid>,
+        source: Oid,
+        path: Option<&str>,
+    ) -> Result<GitDiff, DiffError>;
+}
+
+/// one sentence for a refused diff read, shaped so the DIAGNOSIS leads and the
+/// `pins` trail.
+///
+/// A module refusal reaches a view as one flat string clipped from the END
+/// (#2471), so the ceiling that fired has to be in the first clause; the oid
+/// pair is the part a caller that asked for this diff already knows. Both diff
+/// readers route through here because #2471 is about to key on these sentences,
+/// and a second copy is a second thing to keep in step with it.
+fn diff_refusal(error: DiffError, pins: &str) -> Error {
+    let detail = match error {
+        DiffError::Unavailable(reason) => {
+            format!("{reason} -- objects are not fully materialized ({pins})")
+        }
+        DiffError::Unsupported => "git diff unsupported".into(),
+        DiffError::Limit(reason) => format!("{reason} -- diff is too large to serve ({pins})"),
+    };
+    Error::Module(format!("forge: {detail}"))
+}
+
+/// a host diff wearing the oid pair it was taken at.
+///
+/// Every reply that carries a patch carries the pair, per-file ones included:
+/// a branch can move between the query and the render, and a view that anchors
+/// a line comment to a patch it cannot match to a pair anchors it to the wrong
+/// side of the change.
+fn pinned_diff(target: Option<Oid>, source: Oid, diff: GitDiff) -> PrDiff {
+    PrDiff {
+        source_oid: source.to_string(),
+        // empty when there is no target: a root commit is pinned by its source
+        // alone, and an empty string is a pin a view cannot mistake for an oid.
+        target_oid: target.map(|oid| oid.to_string()).unwrap_or_default(),
+        patch: diff.patch,
+        truncated: diff.truncated,
+        files_changed: diff.files_changed as usize,
+        additions: diff.additions as usize,
+        deletions: diff.deletions as usize,
+        files: diff.files.into_iter().map(diff_file).collect(),
+    }
+}
+
+fn diff_file(file: GitDiffFile) -> DiffFile {
+    DiffFile {
+        path: file.path,
+        // `from` on the wire, `previous_path` in the WIT twin: the consumer-
+        // facing name stays the one the view was built against, and the host
+        // name stays off the WIT keyword list.
+        from: file.previous_path,
+        status: match file.status {
+            GitFileStatus::Added => FileStatus::Added,
+            GitFileStatus::Modified => FileStatus::Modified,
+            GitFileStatus::Deleted => FileStatus::Deleted,
+            GitFileStatus::Renamed => FileStatus::Renamed,
+            GitFileStatus::TypeChanged => FileStatus::TypeChanged,
+        },
+        additions: file.additions,
+        deletions: file.deletions,
+        binary: file.binary,
+        truncated: file.truncated,
+    }
+}
+
+/// `(max_bytes, max_files, max_blob_bytes)`: the ceilings one diff read is
+/// allowed, which differ by scope — a whole change splits its blob budget
+/// across every file, a scoped read spends it on one. Both arms of this file
+/// pass the same numbers, because they are product policy and the native module
+/// and the guest must not disagree about them.
+///
+/// A flat tuple rather than `git_primitives::GitDiffBudget` because the guest
+/// arm never links that crate; it hands the same three numbers to the WIT
+/// import, which declares them flat.
+fn diff_limits(scoped: bool) -> (u64, u64, u64) {
+    if scoped {
+        return (
+            MAX_PR_FILE_DIFF_BYTES as u64,
+            1,
+            MAX_PR_FILE_DIFF_BLOB_BYTES as u64,
+        );
+    }
+    (
+        MAX_PR_DIFF_BYTES as u64,
+        MAX_PR_DIFF_FILES as u64,
+        MAX_PR_DIFF_BLOB_BYTES as u64,
+    )
 }
 
 pub(crate) struct Reader<'a, G> {
     pub image: &'a Image,
     pub git: G,
 }
+
+/// the git object kinds this reader names, as the host's `git-object` numbers
+/// them. Spelled once: a bare `2` in a tree walk reads as a depth, a count or a
+/// limit just as easily as it reads as "this entry is a directory".
+const KIND_TREE: u8 = 2;
+const KIND_BLOB: u8 = 3;
 
 const MAX_BROWSE_COMMITS: usize = 256;
 const MAX_BROWSE_COMMIT_BYTES: usize = 4 * 1024 * 1024;
@@ -33,11 +139,70 @@ pub(crate) const MAX_BROWSE_TREE_DEPTH: usize = 64;
 struct Commit {
     tree: Oid,
     parents: Vec<Oid>,
+    author: String,
+    committed_at: u64,
+    message: String,
 }
 struct Entry {
     kind: u8,
     name: Vec<u8>,
     oid: Oid,
+}
+
+/// the OBJECT READS one history call may make, across both of its phases.
+///
+/// Counted in reads rather than in commits because the two phases cost
+/// different amounts, and getting that wrong costs liveness rather than
+/// performance: skipping to a cursor is one commit read per step and nothing
+/// else, while collecting also resolves the path filter in each commit's tree.
+/// Charging the skip at the collect's rate lets a deep page spend its whole
+/// budget skipping, return the cursor it started from, and loop the caller.
+struct ScanBudget {
+    reads: usize,
+    /// what one COLLECTED commit costs: its own object, plus one tree read per
+    /// path segment. The parent's trees are the previous step's and come back
+    /// from the host's read memo, so they are not charged twice.
+    per_collected: usize,
+}
+
+impl ScanBudget {
+    fn for_path(path: Option<&str>) -> Self {
+        Self {
+            reads: 0,
+            per_collected: 1 + path.map_or(0, |path| path.split('/').count()),
+        }
+    }
+
+    /// charge one SKIPPED commit: one object read, no tree walk.
+    fn skip_one(&mut self) -> Option<()> {
+        self.charge(1)
+    }
+
+    /// charge one COLLECTED commit.
+    fn collect_one(&mut self) -> Option<()> {
+        self.charge(self.per_collected)
+    }
+
+    fn charge(&mut self, reads: usize) -> Option<()> {
+        let would_spend = self.reads.saturating_add(reads);
+        if would_spend > MAX_HISTORY_OBJECT_READS {
+            return None;
+        }
+        self.reads = would_spend;
+        Some(())
+    }
+}
+
+/// where [`Reader::skip_to`] stopped.
+enum Skipped {
+    /// the cursor is in hand; collection starts here.
+    Found(Oid),
+    /// the budget ran out before the cursor came up. The oid it stopped at is
+    /// deliberately NOT carried: it is one the caller already has, so it is
+    /// useless as a resume point and dangerous as one.
+    OutOfBudget,
+    /// the chain ended without the cursor: it was never on this history.
+    NotOnTheChain,
 }
 
 impl<G: GitRead> Reader<'_, G> {
@@ -63,7 +228,50 @@ impl<G: GitRead> Reader<'_, G> {
             .iter()
             .map(|parent| Oid::from_bytes(parent))
             .collect::<Result<_, _>>()?;
-        Ok((Commit { tree, parents }, object.size as usize))
+        Ok((
+            Commit {
+                tree,
+                parents,
+                author: commit.author,
+                committed_at: commit.committed_at,
+                message: commit.message,
+            },
+            object.size as usize,
+        ))
+    }
+
+    /// what `path` names inside `root`, or `None` when it names nothing there.
+    ///
+    /// Unlike [`Self::tree`] a missing path is an ANSWER, not an error: the
+    /// history filter asks this of every commit it scans, and "this path did
+    /// not exist yet" is the ordinary case at the bottom of a history.
+    fn path_oid(&self, repo: &str, root: Oid, path: &str) -> Result<Option<Oid>, Error> {
+        let mut oid = root;
+        let mut total = 0usize;
+        let mut segments = path.split('/').filter(|segment| !segment.is_empty()).peekable();
+        while let Some(segment) = segments.next() {
+            let object = self.object(repo, oid, KIND_TREE, MAX_TREE_BYTES.saturating_sub(total))?;
+            total += object.size as usize;
+            let Some(GitObjectData::Tree(entries)) = object.data else {
+                return Err(Error::Module("forge: expected a tree".into()));
+            };
+            let Some(entry) = entries
+                .into_iter()
+                .find(|entry| entry.name == segment.as_bytes())
+            else {
+                return Ok(None);
+            };
+            let found = Oid::from_bytes(&entry.oid)?;
+            if segments.peek().is_none() {
+                return Ok(Some(found));
+            }
+            let descends = entry.kind == KIND_TREE;
+            if !descends {
+                return Ok(None);
+            }
+            oid = found;
+        }
+        Ok(None)
     }
 
     fn revision(&self, repo: &str, rev: &str) -> Result<Option<Oid>, Error> {
@@ -117,12 +325,242 @@ impl<G: GitRead> Reader<'_, G> {
         )))
     }
 
+    /// the committed (target, source) heads a pull request compares, pinned.
+    fn pr_endpoints(&self, repo: &str, number: u64) -> Result<(Oid, Oid), Error> {
+        let item = self.image.tracker.get(repo, number).ok_or_else(|| {
+            Error::Module(format!("forge: no item #{number} in repo {repo:?}"))
+        })?;
+        if item.summary.kind != ItemKind::Pr {
+            return Err(Error::Module(format!(
+                "forge: item #{number} is an issue, not a pull request"
+            )));
+        }
+        let source_branch = item.source_branch.ok_or_else(|| {
+            Error::Module(format!(
+                "forge: pull request #{number} has no source branch"
+            ))
+        })?;
+        let target_branch = item.target_branch.ok_or_else(|| {
+            Error::Module(format!(
+                "forge: pull request #{number} has no target branch"
+            ))
+        })?;
+        let refs = self
+            .image
+            .repos
+            .get(repo)
+            .ok_or_else(|| Error::Module(format!("forge: no repo {repo:?}")))?;
+        let source = refs.get(&source_branch).copied().ok_or_else(|| Error::Module(format!("forge: pull request #{number} source branch {source_branch:?} is not materialized")))?;
+        let target = refs.get(&target_branch).copied().ok_or_else(|| Error::Module(format!("forge: pull request #{number} target branch {target_branch:?} is not materialized")))?;
+        Ok((target, source))
+    }
+
+    /// one pull request's patch, whole or scoped to `path`, carrying the oid
+    /// pair it was pinned to so the caller can refuse a moved branch.
+    fn pr_patch(
+        &self,
+        repo: &str,
+        number: u64,
+        target: Oid,
+        source: Oid,
+        path: Option<&str>,
+    ) -> Result<PrDiff, Error> {
+        let diff = self
+            .git
+            .diff(repo, Some(target), source, path)
+            .map_err(|error| {
+                let scope = path.map_or(String::new(), |path| format!(", path {path:?}"));
+                diff_refusal(
+                    error,
+                    &format!("pull request #{number}, target {target}, source {source}{scope}"),
+                )
+            })?;
+        Ok(pinned_diff(Some(target), source, diff))
+    }
+
+    /// one commit in full, with its patch against its first parent.
+    fn commit_detail(&self, repo: &str, oid: Oid) -> Result<CommitDetail, Error> {
+        let (commit, _) = self.commit(repo, oid)?;
+        // NOT `unwrap_or(oid)`: diffing a root commit against itself answers an
+        // empty diff, which tells a reader the first commit changed nothing
+        // when it in fact introduced every file in the tree. `None` is a diff
+        // against nothing, and every path comes out Added -- what `git show`
+        // does for the same commit.
+        let parent = commit.parents.first().copied();
+        let diff = self.git.diff(repo, parent, oid, None).map_err(|error| {
+            let against =
+                parent.map_or_else(|| "no parent".into(), |parent| format!("parent {parent}"));
+            diff_refusal(error, &format!("commit {oid}, {against}"))
+        })?;
+        Ok(CommitDetail {
+            oid: oid.to_string(),
+            author: commit.author,
+            committed_at: commit.committed_at,
+            message: commit.message,
+            parents: commit.parents.iter().map(ToString::to_string).collect(),
+            diff: pinned_diff(parent, oid, diff),
+        })
+    }
+
+    /// one page of history, newest first, along FIRST PARENTS.
+    ///
+    /// First-parent is `git log --first-parent`: the history of this branch
+    /// rather than of everything ever merged into it. It also makes the cursor
+    /// exactly one oid — a DAG frontier is not one oid, and paging one would
+    /// mean re-walking from the head on every page.
+    ///
+    /// The SCAN is bounded as well as the page, because a path filter reads
+    /// commits it does not return. A short page with a `next` cursor therefore
+    /// means "ask again", never "that is all there is".
+    fn history(
+        &self,
+        repo: &str,
+        rev: &str,
+        after: &str,
+        path: Option<&str>,
+        limit: u64,
+    ) -> Result<CommitPage, Error> {
+        let page = (limit as usize).clamp(1, MAX_COMMITS_PAGE);
+        let Some(head) = self.revision(repo, rev)? else {
+            return Ok(CommitPage {
+                rev: String::new(),
+                commits: Vec::new(),
+                next: None,
+            });
+        };
+        // the cursor is confined by being FOUND on the chain from a validated
+        // head rather than validated on its own: that is what stops a caller
+        // naming any oid in the object database and reading outside the
+        // committed history.
+        //
+        // ponytail: re-walking to the cursor makes page N cost N pages of
+        // commit reads, so `MAX_HISTORY_OBJECT_READS` is also how deep paging
+        // can go — past it the walk refuses rather than returning a cursor it
+        // has already handed out. Fine for a repo a person browses; the upgrade
+        // is a committed commit index, not a bigger number.
+        let resume = (!after.is_empty())
+            .then(|| parse_browse_oid(after))
+            .transpose()?;
+        let mut budget = ScanBudget::for_path(path);
+        // TWO phases, not one loop with a flag: skip to the cursor, then
+        // collect. Either can run out of scan budget, and each says so by
+        // handing back the oid it stopped at.
+        let start = match resume {
+            None => Some(head),
+            Some(resume) => match self.skip_to(repo, head, resume, &mut budget)? {
+                Skipped::Found(oid) => Some(oid),
+                // NOT a cursor: the oid the skip stopped at is one the caller
+                // was already handed, so returning it would duplicate rows and
+                // never converge. Refuse instead.
+                Skipped::OutOfBudget => {
+                    return Err(Error::Module(format!(
+                        "forge: {head} is too far ahead of cursor {after} to page from \
+                         within {MAX_HISTORY_OBJECT_READS} object reads"
+                    )));
+                }
+                Skipped::NotOnTheChain => {
+                    return Err(Error::Module(format!(
+                        "forge: cursor {after} is not on the first-parent chain of {head}"
+                    )));
+                }
+            },
+        };
+
+        let spent_skipping = budget.reads;
+        let mut commits = Vec::with_capacity(page.min(64));
+        let mut cursor = start;
+        let mut next = None;
+        while let Some(oid) = cursor {
+            if budget.collect_one().is_none() {
+                next = Some(oid);
+                break;
+            }
+            let (commit, _) = self.commit(repo, oid)?;
+            let parent = commit.parents.first().copied();
+            if self.touches(repo, &commit, parent, path)? {
+                commits.push(CommitSummary {
+                    oid: oid.to_string(),
+                    author: commit.author,
+                    committed_at: commit.committed_at,
+                    summary: commit.message.lines().next().unwrap_or_default().to_string(),
+                    parents: commit.parents.iter().map(ToString::to_string).collect(),
+                });
+                if commits.len() == page {
+                    next = parent;
+                    break;
+                }
+            }
+            cursor = parent;
+        }
+        // The skip spent everything and collection never ran. Returning a
+        // cursor here would hand the caller back the oid it just sent, and a
+        // view that pages on `next` would spin on it forever — so refuse, and
+        // name the reason. This is the depth at which first-parent paging ends.
+        let collection_never_ran = budget.reads == spent_skipping;
+        if collection_never_ran && next.is_some() {
+            return Err(Error::Module(format!(
+                "forge: {head} is too far ahead of cursor {after} to page from \
+                 within {MAX_HISTORY_OBJECT_READS} object reads"
+            )));
+        }
+        Ok(CommitPage {
+            rev: head.to_string(),
+            commits,
+            next: next.map(|oid| oid.to_string()),
+        })
+    }
+
+    /// walk first parents from `head` until `resume` is the commit in hand.
+    /// One object read per step and no tree walk, which is why the skip is
+    /// charged at its own rate.
+    fn skip_to(
+        &self,
+        repo: &str,
+        head: Oid,
+        resume: Oid,
+        budget: &mut ScanBudget,
+    ) -> Result<Skipped, Error> {
+        let mut cursor = Some(head);
+        while let Some(oid) = cursor {
+            if oid == resume {
+                return Ok(Skipped::Found(oid));
+            }
+            if budget.skip_one().is_none() {
+                return Ok(Skipped::OutOfBudget);
+            }
+            cursor = self.commit(repo, oid)?.0.parents.first().copied();
+        }
+        Ok(Skipped::NotOnTheChain)
+    }
+
+    /// did this commit change `path` against its first parent? No filter means
+    /// every commit qualifies, which is the unfiltered walk.
+    fn touches(
+        &self,
+        repo: &str,
+        commit: &Commit,
+        parent: Option<Oid>,
+        path: Option<&str>,
+    ) -> Result<bool, Error> {
+        let Some(path) = path else {
+            return Ok(true);
+        };
+        let here = self.path_oid(repo, commit.tree, path)?;
+        let Some(parent) = parent else {
+            // a root commit introduces whatever it has.
+            return Ok(here.is_some());
+        };
+        let (parent, _) = self.commit(repo, parent)?;
+        let before = self.path_oid(repo, parent.tree, path)?;
+        Ok(here != before)
+    }
+
     fn tree(&self, repo: &str, root: Oid, path: &str) -> Result<Vec<Entry>, Error> {
         let mut oid = root;
         let mut total = 0usize;
         let mut segments = path.split('/').filter(|segment| !segment.is_empty());
         loop {
-            let object = self.object(repo, oid, 2, MAX_TREE_BYTES.saturating_sub(total))?;
+            let object = self.object(repo, oid, KIND_TREE, MAX_TREE_BYTES.saturating_sub(total))?;
             total += object.size as usize;
             let Some(GitObjectData::Tree(entries)) = object.data else {
                 return Err(Error::Module("forge: expected a tree".into()));
@@ -146,7 +584,7 @@ impl<G: GitRead> Reader<'_, G> {
                 .ok_or_else(|| {
                     Error::Module(format!("forge: no directory {path:?} at this revision"))
                 })?;
-            if entry.kind != 2 {
+            if entry.kind != KIND_TREE {
                 return Err(Error::Module(format!(
                     "forge: path {path:?} is not a directory"
                 )));
@@ -166,11 +604,11 @@ impl<G: GitRead> Reader<'_, G> {
             .into_iter()
             .find(|entry| entry.name == name.as_bytes())
             .ok_or_else(|| Error::Module(format!("forge: no file {path:?} at revision {oid}")))?;
-        if entry.kind != 3 {
+        if entry.kind != KIND_BLOB {
             return Err(Error::Module(format!("forge: path {path:?} is not a file")));
         }
         let object = self.git.object(repo, entry.oid, cap)?;
-        if object.kind != 3 {
+        if object.kind != KIND_BLOB {
             return Err(Error::Module(format!("forge: path {path:?} is not a blob")));
         }
         Ok((oid, object))
@@ -230,48 +668,40 @@ impl<G: GitRead> Reader<'_, G> {
             ),
             ForgeQuery::PrDiff { repo, number } => {
                 let name = norm_repo(&repo)?;
-                let item = self.image.tracker.get(&name, number).ok_or_else(|| {
-                    Error::Module(format!("forge: no item #{number} in repo {name:?}"))
-                })?;
-                if item.summary.kind != ItemKind::Pr {
-                    return Err(Error::Module(format!(
-                        "forge: item #{number} is an issue, not a pull request"
-                    )));
+                let (target, source) = self.pr_endpoints(&name, number)?;
+                let diff = self.pr_patch(&name, number, target, source, None)?;
+                ForgeReply::PrDiff(diff)
+            }
+            ForgeQuery::PrFileDiff { repo, number, path } => {
+                let name = norm_repo(&repo)?;
+                let path = browse_path(&path, false)?;
+                let (target, source) = self.pr_endpoints(&name, number)?;
+                let diff = self.pr_patch(&name, number, target, source, Some(&path))?;
+                ForgeReply::PrFileDiff(diff)
+            }
+            ForgeQuery::ListCommits {
+                repo,
+                rev,
+                path,
+                after,
+                limit,
+            } => {
+                let name = norm_repo(&repo)?;
+                let path = browse_path(&path, true)?;
+                let filter = (!path.is_empty()).then_some(path.as_str());
+                ForgeReply::Commits(self.history(&name, &rev, &after, filter, limit)?)
+            }
+            ForgeQuery::Commit { repo, rev } => {
+                let name = norm_repo(&repo)?;
+                if rev.is_empty() {
+                    return Err(Error::Module(
+                        "forge: a commit query names an exact revision".into(),
+                    ));
                 }
-                let source_branch = item.source_branch.ok_or_else(|| {
-                    Error::Module(format!(
-                        "forge: pull request #{number} has no source branch"
-                    ))
-                })?;
-                let target_branch = item.target_branch.ok_or_else(|| {
-                    Error::Module(format!(
-                        "forge: pull request #{number} has no target branch"
-                    ))
-                })?;
-                let refs = self
-                    .image
-                    .repos
-                    .get(&name)
-                    .ok_or_else(|| Error::Module(format!("forge: no repo {name:?}")))?;
-                let source = refs.get(&source_branch).copied().ok_or_else(|| Error::Module(format!("forge: pull request #{number} source branch {source_branch:?} is not materialized")))?;
-                let target = refs.get(&target_branch).copied().ok_or_else(|| Error::Module(format!("forge: pull request #{number} target branch {target_branch:?} is not materialized")))?;
-                let diff = self.git.diff(&name, target, source).map_err(|error| {
-                    let detail = match error {
-                        DiffError::Unavailable(reason) => format!("objects for pull request #{number} are not fully materialized (target {target}, source {source}): {reason}"),
-                        DiffError::Unsupported => "git diff unsupported".into(),
-                        DiffError::Limit(reason) => format!("pull request #{number} diff is too large to serve (target {target}, source {source}): {reason}"),
-                    };
-                    Error::Module(format!("forge: {detail}"))
-                })?;
-                ForgeReply::PrDiff(PrDiff {
-                    source_oid: source.to_string(),
-                    target_oid: target.to_string(),
-                    patch: diff.patch,
-                    truncated: diff.truncated,
-                    files_changed: diff.files_changed as usize,
-                    additions: diff.additions as usize,
-                    deletions: diff.deletions as usize,
-                })
+                let Some(oid) = self.revision(&name, &rev)? else {
+                    return Ok(encode_reply(&ForgeReply::Commit(None)));
+                };
+                ForgeReply::Commit(Some(Box::new(self.commit_detail(&name, oid)?)))
             }
             ForgeQuery::Tree { repo, rev, path } => {
                 let name = norm_repo(&repo)?;
@@ -287,8 +717,8 @@ impl<G: GitRead> Reader<'_, G> {
                 let (commit, _) = self.commit(&name, oid)?;
                 let tree = self.tree(&name, commit.tree, &path)?;
                 let mut entries = Vec::new();
-                let mut truncated = tree.iter().any(|entry| !matches!(entry.kind, 2 | 3));
-                for (kind, entry_kind) in [(2, TreeEntryKind::Dir), (3, TreeEntryKind::File)] {
+                let mut truncated = tree.iter().any(|entry| !matches!(entry.kind, KIND_TREE | KIND_BLOB));
+                for (kind, entry_kind) in [(KIND_TREE, TreeEntryKind::Dir), (KIND_BLOB, TreeEntryKind::File)] {
                     for entry in tree.iter().filter(|entry| entry.kind == kind) {
                         let Ok(name) = std::str::from_utf8(&entry.name) else {
                             truncated = true;
@@ -424,21 +854,44 @@ impl GitRead for NativeGit<'_> {
     fn object(&self, repo: &str, oid: Oid, cap: usize) -> Result<Object, Error> {
         read_object(self.0, repo, oid.as_bytes(), cap as u64)
     }
-    fn diff(&self, repo: &str, target: Oid, source: Oid) -> Result<GitDiff, DiffError> {
+    fn diff(
+        &self,
+        repo: &str,
+        target: Option<Oid>,
+        source: Oid,
+        path: Option<&str>,
+    ) -> Result<GitDiff, DiffError> {
+        let (max_bytes, max_files, max_blob_bytes) = diff_limits(path.is_some());
         read_diff(
             self.0,
             repo,
-            target.as_bytes(),
+            target.as_ref().map_or(&[][..], |oid| &oid.as_bytes()[..]),
             source.as_bytes(),
-            MAX_PR_DIFF_BYTES as u64,
-            MAX_PR_DIFF_FILES as u64,
-            MAX_PR_DIFF_BLOB_BYTES as u64,
+            path,
+            git_primitives::GitDiffBudget {
+                max_bytes,
+                max_files,
+                max_blob_bytes,
+            },
         )
     }
 }
 
 /// Storage confinement and allocation ceilings are host rules, independent of
 /// the guest's path/revision policy. No reference or product query is decoded.
+/// `Name <email>`, the raw identity line, with whatever git recorded. it is one
+/// string rather than two because that is what a signature IS on disk, and
+/// splitting it here would make the host decide what an author's name is.
+#[cfg(feature = "native")]
+fn identity_line(who: &git2::Signature<'_>) -> String {
+    let name = String::from_utf8_lossy(who.name_bytes());
+    let email = String::from_utf8_lossy(who.email_bytes());
+    if email.is_empty() {
+        return name.into_owned();
+    }
+    format!("{name} <{email}>")
+}
+
 #[cfg(feature = "native")]
 pub(crate) fn read_object(
     base: &std::path::Path,
@@ -469,12 +922,22 @@ pub(crate) fn read_object(
                 let commit = repo
                     .find_commit(oid)
                     .map_err(|error| Error::Module(error.to_string()))?;
+                let committer = commit.committer();
                 GitObjectData::Commit(git_primitives::GitCommit {
                     tree: commit.tree_id().as_bytes().to_vec(),
                     parents: commit
                         .parent_ids()
                         .map(|oid| oid.as_bytes().to_vec())
                         .collect(),
+                    // the AUTHOR line is what a log shows beside a commit; the
+                    // COMMITTER's time is what it is ordered by. a rebase moves
+                    // the second and not the first, and a reader wants the
+                    // order the branch was actually built in.
+                    author: identity_line(&commit.author()),
+                    committed_at: committer.when().seconds().max(0) as u64,
+                    // lossy: a commit message is bytes, and a non-UTF-8 one
+                    // must still be readable rather than fail the whole walk.
+                    message: String::from_utf8_lossy(commit.message_bytes()).into_owned(),
                 })
             }
             git2::ObjectType::Tree => {
@@ -532,40 +995,43 @@ pub(crate) fn read_diff(
     repository: &str,
     target: &[u8],
     source: &[u8],
-    max_bytes: u64,
-    max_files: u64,
-    max_blob_bytes: u64,
+    path: Option<&str>,
+    budget: git_primitives::GitDiffBudget,
 ) -> Result<git_primitives::GitDiff, git_primitives::GitDiffError> {
     let name = norm_repo(repository)
         .map_err(|error| git_primitives::GitDiffError::Unavailable(error.to_string()))?;
     let repo = git::open(&base.join(name))
         .map_err(|error| git_primitives::GitDiffError::Unavailable(error.to_string()))?;
-    let target = git2::Oid::from_bytes(target)
-        .map_err(|error| git_primitives::GitDiffError::Unavailable(error.to_string()))?;
+    // no bytes is no target: the root-commit read, which diffs against nothing.
+    let target = match target.is_empty() {
+        true => None,
+        false => Some(
+            git2::Oid::from_bytes(target)
+                .map_err(|error| git_primitives::GitDiffError::Unavailable(error.to_string()))?,
+        ),
+    };
     let source = git2::Oid::from_bytes(source)
         .map_err(|error| git_primitives::GitDiffError::Unavailable(error.to_string()))?;
-    let (patch, truncated, files_changed, additions, deletions) = git::bounded_diff(
-        &repo,
-        target,
-        source,
-        max_bytes.min(1024 * 1024) as usize,
-        max_files.min(4096) as usize,
-        max_blob_bytes.min(16 * 1024 * 1024) as usize,
-    )
-    .map_err(|error| match error {
+    let max_bytes = budget.max_bytes.min(1024 * 1024) as usize;
+    let max_blob_bytes = budget.max_blob_bytes.min(16 * 1024 * 1024) as usize;
+    let scoped = match path {
+        Some(path) => git::bounded_file_diff(&repo, target, source, path, max_bytes, max_blob_bytes),
+        None => git::bounded_diff(
+            &repo,
+            target,
+            source,
+            max_bytes,
+            budget.max_files.min(4096) as usize,
+            max_blob_bytes,
+        ),
+    };
+    scoped.map_err(|error| match error {
         git::BoundedDiffError::Git(error) => {
             git_primitives::GitDiffError::Unavailable(error.to_string())
         }
         error @ git::BoundedDiffError::TooLarge { .. } => {
             git_primitives::GitDiffError::Limit(error.to_string())
         }
-    })?;
-    Ok(git_primitives::GitDiff {
-        patch,
-        truncated,
-        files_changed: files_changed as u64,
-        additions: additions as u64,
-        deletions: deletions as u64,
     })
 }
 
@@ -578,14 +1044,24 @@ impl GitRead for GuestGit {
         ducktape_module_sdk::host::git_object_read(repo, oid.as_bytes(), cap as u64)
             .map_err(ducktape_module_sdk::error_from_wit)
     }
-    fn diff(&self, repo: &str, target: Oid, source: Oid) -> Result<GitDiff, DiffError> {
+    fn diff(
+        &self,
+        repo: &str,
+        target: Option<Oid>,
+        source: Oid,
+        path: Option<&str>,
+    ) -> Result<GitDiff, DiffError> {
+        let (max_bytes, max_files, max_blob_bytes) = diff_limits(path.is_some());
         ducktape_module_sdk::host::git_diff_read(
             repo,
-            target.as_bytes(),
+            // an empty target is "no target": the WIT spells an oid as bytes,
+            // and no oid is no bytes.
+            target.as_ref().map_or(&[][..], |oid| &oid.as_bytes()[..]),
             source.as_bytes(),
-            MAX_PR_DIFF_BYTES as u64,
-            MAX_PR_DIFF_FILES as u64,
-            MAX_PR_DIFF_BLOB_BYTES as u64,
+            path,
+            max_bytes,
+            max_files,
+            max_blob_bytes,
         )
     }
 }
