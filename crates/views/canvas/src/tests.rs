@@ -3768,3 +3768,64 @@ fn a_shape_is_drawn_with_the_fill_and_the_dash_it_carries() {
     let next = view.creation_shape(Kind::Ellipse, [0., 0.], [100., 80.]);
     assert_eq!((next.fill, next.dash), (Fill::None, Dash::Dashed));
 }
+
+/// Picking a shape takes up the pen it was drawn with, all of it. A pick-up
+/// that took the colour and left the rest made "match that one" work for one
+/// third of how a shape looks, and made the panel — which reads the pen —
+/// describe a shape nobody had selected.
+#[test]
+fn picking_a_shape_takes_up_the_whole_pen_it_was_drawn_with() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.edit(Change::Create {
+        id: "plain".into(),
+        shape: Shape {
+            kind: Kind::Rectangle,
+            x: 100,
+            y: 100,
+            width: 200,
+            height: 140,
+            ..Default::default()
+        },
+    });
+    view.edit(Change::Create {
+        id: "drawn".into(),
+        shape: Shape {
+            kind: Kind::Rectangle,
+            x: 500,
+            y: 100,
+            width: 200,
+            height: 140,
+            color: 3,
+            fill: Fill::None,
+            dash: Dash::Dashed,
+            ..Default::default()
+        },
+    });
+
+    // Take up the plain one first, so what follows cannot be the default.
+    view.on_press(view.screen(200., 170.)[0], view.screen(200., 170.)[1]);
+    view.on_release();
+    let after_plain = view.pen;
+    view.on_press(view.screen(600., 170.)[0], view.screen(600., 170.)[1]);
+    view.on_release();
+    assert_ne!(
+        view.pen, after_plain,
+        "picking a second shape changed nothing"
+    );
+    assert_eq!(
+        view.pen,
+        Pen::of(&view.visible().unwrap().shapes["drawn"].shape),
+        "the pick-up took part of how the shape looks and left the rest"
+    );
+
+    // Which is the same as saying the next shape comes out looking like the
+    // one that was picked — the whole reason to take a pen up at all.
+    let next = view.creation_shape(Kind::Ellipse, [0., 0.], [100., 80.]);
+    assert_eq!(
+        (next.color, next.fill, next.dash),
+        (3, Fill::None, Dash::Dashed)
+    );
+}

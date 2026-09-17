@@ -707,8 +707,8 @@ impl BoardsView {
                         // outlines is a decision you make before drawing, and
                         // having to draw one filled and empty it afterwards is
                         // the same complaint the colour row was added for.
-                        fill_row(self.fill),
-                        dash_row(self.dash),
+                        fill_row(self.pen.fill),
+                        dash_row(self.pen.dash),
                     ],
                 ),
                 6.,
@@ -719,7 +719,7 @@ impl BoardsView {
         kit::spaced(
             kit::row(
                 "boards/colors",
-                (0..5).map(|color| swatch(color, self.palette == color)),
+                (0..5).map(|color| swatch(color, self.pen.color == color)),
             ),
             4.,
         )
@@ -737,10 +737,10 @@ impl BoardsView {
             self.swatches(),
         ];
         if any_body {
-            properties.push(fill_row(self.fill));
+            properties.push(fill_row(self.pen.fill));
         }
         if any_outline {
-            properties.push(dash_row(self.dash));
+            properties.push(dash_row(self.pen.dash));
         }
         properties.push(kit::divider("boards/properties-rule"));
         if let Some(shape) = writable {
@@ -1776,8 +1776,8 @@ impl BoardsView {
                 self.paint_stroke(
                     Kind::Draw,
                     &screen,
-                    Rgba(tint(self.palette)),
-                    self.dash,
+                    Rgba(tint(self.pen.color)),
+                    self.pen.dash,
                     boards::MAX_POINTS,
                     out,
                 );
