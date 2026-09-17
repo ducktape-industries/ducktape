@@ -979,7 +979,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 [[package]]
 name = "governance"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#d91dbe32c9d6275383f4ae742acf7a3b94beac5b"
+source = "git+https://github.com/ducktape-industries/ducktape#0a732216f18396ef265739b16e6e64b2c6ccb50f"
 dependencies = [
  "acl-wire",
  "async-trait",

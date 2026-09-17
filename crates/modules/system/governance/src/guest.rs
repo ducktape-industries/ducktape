@@ -52,7 +52,7 @@
 //! port's sibling ids.
 
 use crate::Governance;
-use ducktape_module_sdk::{WitStore, host, load_store_config};
+use ducktape_module_sdk::{WitStore, host, load_store_config, rejected};
 use sdk::genesis_config;
 
 /// the genesis-constant id this module registers under (the native twin's id:
@@ -74,14 +74,20 @@ const ACL_ID: &str = acl::DEFAULT_ACL_ID;
 /// would refuse every `Redeem` its peers accept, which forks).
 fn invite_binding() -> Result<Vec<u8>, host::Error> {
     let raw = load_store_config().ok_or_else(|| {
-        host::Error::Rejected("governance genesis config missing (__config)".into())
+        rejected(
+            "no_invite_binding",
+            "governance genesis config missing (__config)",
+        )
     })?;
     let params = genesis_config::decode_config(&raw)
-        .map_err(|e| host::Error::Rejected(format!("governance genesis config: {e}")))?;
+        .map_err(|e| rejected("codec", format!("governance genesis config: {e}")))?;
     genesis_config::find(&params, genesis_config::INVITE)
         .map(<[u8]>::to_vec)
         .ok_or_else(|| {
-            host::Error::Rejected("governance genesis config carries no invite binding".into())
+            rejected(
+                "no_invite_binding",
+                "governance genesis config carries no invite binding",
+            )
         })
 }
 

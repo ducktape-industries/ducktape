@@ -201,18 +201,24 @@ fn compiled_guest_and_native_finalize_identical_call_results_and_roots() {
     let cases: &[(&[u8], Option<&str>)] = &[
         (
             b"output-cap",
-            Some("Module(op output exceeds cap (262145 > 262144))"),
+            Some("Module(declaration_cap: op output exceeds cap (262145 > 262144))"),
         ),
         (
             b"output-cap-then-small",
-            Some("Module(op output exceeds cap (262145 > 262144))"),
+            Some("Module(declaration_cap: op output exceeds cap (262145 > 262144))"),
         ),
-        (b"output-cap-then-error", Some("Module(explicit refusal)")),
+        (
+            b"output-cap-then-error",
+            Some("Module(explicit_refusal: explicit refusal)"),
+        ),
         (
             b"assigned-cap",
-            Some("Module(op assigned stamp exceeds cap (65537 > 65536))"),
+            Some("Module(declaration_cap: op assigned stamp exceeds cap (65537 > 65536))"),
         ),
-        (b"module-error", Some("Module(explicit refusal)")),
+        (
+            b"module-error",
+            Some("Module(explicit_refusal: explicit refusal)"),
+        ),
         (b"self-query", Some("SelfQuery")),
         (b"missing-query", Some("UnknownModule(missing)")),
         (b"declarations-valid", None),

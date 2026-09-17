@@ -857,13 +857,10 @@ fn a_push_certificate_checks_the_chain_id_identically_on_both_runtimes() {
 ///
 /// If the host's ceiling ever drops below forge's copy, a deep history page
 /// stops paging and starts TRAPPING the guest — which surfaces as a wasm trap
-/// on a validator rather than as a red anywhere. So it is held here.
-#[test]
-fn forges_history_budget_stays_under_the_hosts_object_read_ceiling() {
-    assert!(
-        forge::MAX_HISTORY_OBJECT_READS < wasm_host::MAX_OBJECT_READS,
-        "forge would spend {} object reads against the host's ceiling of {}",
-        forge::MAX_HISTORY_OBJECT_READS,
-        wasm_host::MAX_OBJECT_READS,
-    );
-}
+/// on a validator rather than as a red anywhere. So it is held here, at COMPILE
+/// time: both numbers are `const`, so a ceiling that drops under forge's copy
+/// fails the build rather than one run.
+const _: () = assert!(
+    forge::MAX_HISTORY_OBJECT_READS < wasm_host::MAX_OBJECT_READS,
+    "forge's history budget must stay under the host's per-dispatch object-read ceiling",
+);

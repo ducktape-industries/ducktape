@@ -157,7 +157,7 @@ pub async fn dispatch<S: ObjectStore>(
 mod entry {
     use super::{BLOCK_OBJECTS_KEY, REFS_KEY, dispatch};
     use duckfs_core::{Fs, Refs, decode_refs};
-    use ducktape_module_sdk::{GuestOdb, WitCtx, block_on, error_to_wit, host};
+    use ducktape_module_sdk::{GuestOdb, WitCtx, block_on, error_to_wit, host, rejected};
 
     /// the wasm-facing entry surface. all object I/O rides [`GuestOdb`]; the
     /// refs image rides the host `state-*` lane under [`REFS_KEY`]. a zero-sized
@@ -173,7 +173,7 @@ mod entry {
             let refs = match host::state_get(REFS_KEY) {
                 None => Refs::default(),
                 Some(bytes) => decode_refs(&bytes)
-                    .map_err(|e| host::Error::Rejected(format!("files: refs image decode: {e}")))?,
+                    .map_err(|e| rejected("files_refs_load", format!("files: refs load: {e}")))?,
             };
             Ok(Fs::new(GuestOdb, refs))
         }
@@ -200,8 +200,10 @@ mod entry {
 
         /// Project committed refs and objects through the same pure core as native.
         pub fn query(req: Vec<u8>) -> Result<Vec<u8>, host::Error> {
-            let query = duckfs_core::decode_query(&req).map_err(host::Error::Rejected)?;
-            let reply = Self::load()?.query(query).map_err(host::Error::Rejected)?;
+            let query = duckfs_core::decode_query(&req).map_err(|e| rejected("codec", e))?;
+            let reply = Self::load()?
+                .query(query)
+                .map_err(|e| rejected("files_query", e))?;
             Ok(duckfs_core::encode_reply(&reply))
         }
     }
