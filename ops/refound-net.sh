@@ -25,7 +25,12 @@ ASSUME_YES=0
 SKIP_APP=0
 SKIP_SMOKE=0
 WALLET_NAME="operator"
-WALLET_PASSWORD="ducktape"
+# EMPTY ON PURPOSE — there is no default password. A word committed in this
+# file would unlock the release-signing key of every network founded by it.
+# Left empty, the wallet step below generates one; --wallet-password overrides.
+# Either way it lands in a 0600 file beside the mnemonic, so the release lane
+# reads it back the same way whoever chose it.
+WALLET_PASSWORD=""
 
 # The founder's and the resident's port sets. They must not collide with each
 # other or with anything else on the host: two workspaces on one box share the
@@ -80,8 +85,9 @@ usage: ops/refound-net.sh --root DIR [options]
   --wallet-name NAME  the workspace's active wallet, and the display name of
                       the account founded for it (default: operator). the
                       service daemons refuse to boot without both.
-  --wallet-password P its password (default: ducktape). the mnemonic is written
-                      to a 0600 file in the workspace, never to stdout.
+  --wallet-password P its password. NO DEFAULT: left out, one is generated.
+                      the mnemonic and the password are each written to their
+                      own 0600 file in the workspace, never to stdout.
   --skip-app          do not rebuild the desktop app.
   --no-smoke          do not seed an agent and mention it at the end. the smoke
                       is the only step that crosses the WHOLE chain, and it
@@ -426,16 +432,24 @@ echo "founded $CHAIN at $FOUNDER_WS"
 #
 # `wallet new` PRINTS A MNEMONIC. It is written to a 0600 file in the
 # workspace and never to this script's stdout, which is a log an operator
-# pastes around.
+# pastes around. The PASSWORD gets the same treatment and for the same
+# reason: this key signs the network's node releases, so a password an
+# operator did not choose is generated here — never carried in this file,
+# where it would unlock every network ever founded by this script.
 # --------------------------------------------------------------------------
 say "wallet"
 SECRETS="$FOUNDER_WS/wallet-$WALLET_NAME.secret"
+PASSFILE="$FOUNDER_WS/wallet-$WALLET_NAME.password"
+[ -n "$WALLET_PASSWORD" ] || WALLET_PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -d '\n')
+( umask 077; printf '%s\n' "$WALLET_PASSWORD" > "$PASSFILE" )
 ( umask 077; : > "$SECRETS" )
 if printf '%s\n' "$WALLET_PASSWORD" \
     | DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" wallet new "$WALLET_NAME" \
       --config "$FOUNDER_CFG" > "$SECRETS" 2>&1; then
     chmod 600 "$SECRETS"
     echo "minted wallet $WALLET_NAME — mnemonic in $SECRETS (0600), not echoed here"
+    echo "password in $PASSFILE (0600) — feed it to the release lane with"
+    echo "  RELEASE_WALLET_PASSWORD=\$(cat $PASSFILE)"
     DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" wallet use "$WALLET_NAME" --config "$FOUNDER_CFG" \
         || echo "could not set $WALLET_NAME active (continuing)"
 else
@@ -803,6 +817,7 @@ cat <<REPORT
   binary      $VOUCH
   set         $MODULES_SRC
   release key $RELEASE_PINNED
+  wallet      $WALLET_NAME — mnemonic $SECRETS, password $PASSFILE (both 0600)
   follows     $FOLLOWS
   smoke       $SMOKE
 

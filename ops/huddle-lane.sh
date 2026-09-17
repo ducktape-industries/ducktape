@@ -44,7 +44,10 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LANE="${HUDDLE_LANE_DIR:-${TMPDIR:-/tmp}/ducktape-huddle-lane}"
 NODE_BIN="${DUCKTAPE_BIN:-$ROOT/target/debug/ducktape}"
 CHANNEL="${HUDDLE_LANE_CHANNEL:-eng}"
-PASSWORD="${HUDDLE_LANE_PASSWORD:-ducktape}"
+# The default says what it is: these two identities live in a throwaway lane
+# directory and are printed below in the clear. Nothing outside this lane is
+# ever minted with it.
+PASSWORD="${HUDDLE_LANE_PASSWORD:-scratch-only-password}"
 NAMESPACE="${HUDDLE_LANE_NAMESPACE:-huddle-lane}"
 
 log(){ printf '\033[36m[huddle-lane]\033[0m %s\n' "$*"; }
