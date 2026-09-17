@@ -3888,6 +3888,46 @@ fn the_zoom_readout_never_has_to_hold_more_than_four_digits() {
     view.on_fit_selection();
     assert_eq!(view.zoom_label(), "200%");
 }
+/// Zoom-to-selection with nothing to zoom to must leave the camera alone. Both
+/// ways in are the same empty answer — no selection at all, and a selection
+/// holding only a connector two cards are carrying, which stands nowhere of its
+/// own — and neither is a reason to throw away the place you are working in.
+#[test]
+fn zooming_to_a_selection_that_frames_nothing_leaves_the_camera_where_it_is() {
+    let mut linked_view = linked();
+    linked_view.on_size(1080., 800.);
+    let resting = [-4000., 2500.];
+    linked_view.camera = resting;
+    linked_view.zoom = 0.4;
+
+    // The selection is the arrow, and a card is holding each of its ends.
+    linked_view.on_fit_selection();
+    assert_eq!(linked_view.camera, resting, "a bound arrow moved the camera");
+    assert_eq!(linked_view.zoom, 0.4, "a bound arrow moved the zoom");
+
+    linked_view.selected.clear();
+    linked_view.on_fit_selection();
+    assert_eq!(
+        linked_view.camera, resting,
+        "an empty selection moved the camera"
+    );
+    assert_eq!(linked_view.zoom, 0.4, "an empty selection moved the zoom");
+
+    // A card in hand is something to frame, and then it is framed.
+    linked_view.selected = ["a".into()].into();
+    linked_view.on_fit_selection();
+    assert_ne!(linked_view.camera, resting, "a card in hand was not framed");
+
+    // The sibling key keeps its own answer: "show me everything" on a board
+    // with nothing on it has nowhere to go but home.
+    let mut bare = view();
+    bare.on_size(1080., 800.);
+    bare.camera = resting;
+    bare.zoom = 0.4;
+    bare.on_fit();
+    assert_eq!(bare.camera, [80., 80.], "an empty board did not go home");
+    assert_eq!(bare.zoom, 1., "an empty board kept a zoom");
+}
 /// The weight a shape carries has to reach the line it is drawn with, and it
 /// has to keep the four steps apart at every zoom — the clamp that keeps a line
 /// sane across zoom is exactly what would collapse thick into heavy if the
