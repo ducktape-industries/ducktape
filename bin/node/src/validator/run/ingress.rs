@@ -102,6 +102,9 @@ impl ValidatorRuntime<'_> {
             written,
         }: RpcJob,
     ) {
+        // read before the destructure borrows the rest of `self`: a parked
+        // submit needs the same wall clock the drain expires it against.
+        let now = self.context.current();
         let Self {
             node,
             orchestrator,
@@ -110,6 +113,7 @@ impl ValidatorRuntime<'_> {
             label,
             join_requests,
             metrics,
+            pending_rpc_submits,
             ..
         } = self;
 
@@ -122,7 +126,19 @@ impl ValidatorRuntime<'_> {
                     let seq = *next_seq;
                     *next_seq += 1;
                     match node.submit(signer, seq, Msg { target, payload }).await {
-                        Ok(_) => RpcReply::ok(),
+                        // ACCEPTED, not applied: the module that will refuse
+                        // this op has not run yet. Answering `ok` here is what
+                        // made every consensus refusal silent — park the caller
+                        // against the frame's own id and let `on_drain` answer
+                        // with its fate (#2533).
+                        Ok(frame_id) => {
+                            pending_rpc_submits
+                                .entry(frame_id)
+                                .or_insert_with(|| (Vec::new(), now + crate::constants::SUBMIT_HOLD))
+                                .0
+                                .push(reply);
+                            return;
+                        }
                         Err(e) => RpcReply::err(format!("submit failed: {e}")),
                     }
                 }

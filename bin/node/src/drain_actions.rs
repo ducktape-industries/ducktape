@@ -248,6 +248,31 @@ pub(crate) fn observe_block_beat(
     }
 }
 
+// ============================================================================
+// what a parked submitter is told when its frame settles
+// ============================================================================
+
+/// The token a rejection with no reason of its own carries. A module that
+/// refuses deliberately says why; a frame that finalized and changed nothing
+/// did not refuse anything, and the two must not read alike.
+pub(crate) const NO_REASON_GIVEN: &str = "deterministic_no_op";
+
+/// What to tell a caller parked against a frame, once the drain knows the
+/// frame's disposition.
+///
+/// A submit is answered when the op is ACCEPTED, and the module that will
+/// refuse it has not run yet — so for every op refused IN CONSENSUS (which is
+/// every governance door check) the refusal existed only in the daemon log, and
+/// the verb that submitted it sat until an unrelated deadline and blamed that
+/// (#2533). Both lanes now answer from this one decision, so the sentence a
+/// person reads and the `reason` the log records are the same string.
+pub(crate) fn settled_submit(rejected: bool, reason: Option<&str>) -> Result<(), String> {
+    if !rejected {
+        return Ok(());
+    }
+    Err(reason.unwrap_or(NO_REASON_GIVEN).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use commonware_cryptography::{Signer as _, ed25519};
@@ -474,5 +499,30 @@ mod tests {
         let plan = validator_plan.expect("boundary cuts over");
         assert_eq!(plan.epoch(), 1);
         assert_eq!(plan.cutover_app_height(), 9);
+    }
+
+    /// #2533: a submit is answered at ADMISSION, so an op the module refuses in
+    /// consensus used to leave its submitter with `ok` and nothing else — the
+    /// reason reached the daemon log and never the terminal. What a parked
+    /// caller is told is now one decision, and a refusal carries the module's
+    /// own words.
+    #[test]
+    fn a_settled_submit_hands_back_the_modules_own_reason() {
+        assert_eq!(settled_submit(false, None), Ok(()));
+        assert_eq!(
+            settled_submit(false, Some("ignored — an applied op refused nothing")),
+            Ok(())
+        );
+        assert_eq!(
+            settled_submit(true, Some("not_a_resident: grant standing first")),
+            Err("not_a_resident: grant standing first".to_string()),
+            "the sentence a person reads is the string the log records"
+        );
+        // a frame that finalized and changed nothing refused nothing, and must
+        // not borrow the vocabulary of one that did.
+        assert_eq!(
+            settled_submit(true, None),
+            Err(NO_REASON_GIVEN.to_string())
+        );
     }
 }
