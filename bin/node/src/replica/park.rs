@@ -373,7 +373,7 @@ pub(super) async fn park(
             .as_ref()
             .try_into()
             .expect("ed25519 keys are 32 bytes");
-        crate::voice::spawn_hub(
+        crate::presence::spawn_hub(
             voice_requests,
             crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
             std::sync::Arc::clone(&tracked),
@@ -393,10 +393,10 @@ pub(super) async fn park(
         Some(tracked)
     } else {
         tracing::warn!(
-            target: "ducktape::voice",
+            target: "ducktape::presence",
             node = %label,
             reason = "overlay_unavailable",
-            "realtime sessions disabled"
+            "page presence disabled"
         );
         drop(voice_requests);
         None

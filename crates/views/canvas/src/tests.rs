@@ -3888,6 +3888,49 @@ fn the_zoom_readout_never_has_to_hold_more_than_four_digits() {
     view.on_fit_selection();
     assert_eq!(view.zoom_label(), "200%");
 }
+/// Zoom-to-selection with nothing to zoom to must leave the camera alone. Both
+/// ways in are the same empty answer — no selection at all, and a selection
+/// holding only a connector two cards are carrying, which stands nowhere of its
+/// own — and neither is a reason to throw away the place you are working in.
+#[test]
+fn zooming_to_a_selection_that_frames_nothing_leaves_the_camera_where_it_is() {
+    let mut linked_view = linked();
+    linked_view.on_size(1080., 800.);
+    let resting = [-4000., 2500.];
+    linked_view.camera = resting;
+    linked_view.zoom = 0.4;
+
+    // The selection is the arrow, and a card is holding each of its ends.
+    linked_view.on_fit_selection();
+    assert_eq!(
+        linked_view.camera, resting,
+        "a bound arrow moved the camera"
+    );
+    assert_eq!(linked_view.zoom, 0.4, "a bound arrow moved the zoom");
+
+    linked_view.selected.clear();
+    linked_view.on_fit_selection();
+    assert_eq!(
+        linked_view.camera, resting,
+        "an empty selection moved the camera"
+    );
+    assert_eq!(linked_view.zoom, 0.4, "an empty selection moved the zoom");
+
+    // A card in hand is something to frame, and then it is framed.
+    linked_view.selected = ["a".into()].into();
+    linked_view.on_fit_selection();
+    assert_ne!(linked_view.camera, resting, "a card in hand was not framed");
+
+    // The sibling key keeps its own answer: "show me everything" on a board
+    // with nothing on it has nowhere to go but home.
+    let mut bare = view();
+    bare.on_size(1080., 800.);
+    bare.camera = resting;
+    bare.zoom = 0.4;
+    bare.on_fit();
+    assert_eq!(bare.camera, [80., 80.], "an empty board did not go home");
+    assert_eq!(bare.zoom, 1., "an empty board kept a zoom");
+}
 /// The weight a shape carries has to reach the line it is drawn with, and it
 /// has to keep the four steps apart at every zoom — the clamp that keeps a line
 /// sane across zoom is exactly what would collapse thick into heavy if the
@@ -4299,6 +4342,128 @@ fn the_drift_clock_is_only_asked_for_while_it_is_needed() {
     );
 }
 /// The rows the board's menu is showing, by their own keys.
+/// Whether the tree holds a button under `key`, and whether it can be pressed.
+/// `None` means the button is not on screen at all, which is a different answer
+/// from a button that is there and dark.
+fn pressable(view: &BoardsView, key: &str) -> Option<bool> {
+    fn walk(node: &wire::Node, key: &str) -> Option<bool> {
+        if let wire::Node::Button {
+            key: found,
+            on_press,
+            ..
+        } = node
+            && found == key
+        {
+            return Some(on_press.is_some());
+        }
+        node.children().iter().find_map(|child| walk(child, key))
+    }
+    walk(&view.view(), key)
+}
+/// A board holding one card, live on a connected session, with the picker open.
+fn with_the_picker_open() -> BoardsView {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.session.connected = true;
+    view.current = "room".into();
+    view.catalog.insert("room".into(), "Planning".into());
+    view.on_board_picker();
+    view
+}
+/// Renaming happens where the name is shown, and it reaches the list as well as
+/// the board: before this a board was called whatever it was called at the
+/// moment it was made, for good, on a network everyone else finds it by name on.
+#[test]
+fn a_board_is_renamed_from_the_picker_and_the_list_says_so_at_once() {
+    let mut view = with_the_picker_open();
+    assert_eq!(
+        view.rename, "Planning",
+        "the box did not open with the board's own name in it"
+    );
+    assert_eq!(
+        pressable(&view, "boards/rename"),
+        Some(false),
+        "a name nobody has changed offered a rename"
+    );
+
+    view.on_rename_title("  Design room  ".into());
+    assert_eq!(pressable(&view, "boards/rename"), Some(true));
+    view.on_rename_board();
+    let sent = view.pending.back().expect("nothing was sent");
+    assert_eq!(
+        sent,
+        &Operation::Rename {
+            board: "room".into(),
+            title: "Design room".into(),
+        },
+        "the rename did not go out trimmed, or did not go out at all"
+    );
+    assert_eq!(view.visible().unwrap().title, "Design room");
+    assert_eq!(
+        view.catalog.get("room").map(String::as_str),
+        Some("Design room"),
+        "the picker still lists the old name"
+    );
+    assert_eq!(
+        pressable(&view, "boards/rename"),
+        Some(false),
+        "the board's own name was offered as a rename of itself"
+    );
+
+    // A name the module would refuse is a name the button refuses first.
+    view.on_rename_title("   ".into());
+    assert_eq!(pressable(&view, "boards/rename"), Some(false));
+    view.on_rename_title("x".repeat(161));
+    assert_eq!(pressable(&view, "boards/rename"), Some(false));
+
+    // And walking away from a half-typed name leaves the board's own name in
+    // the box the next time it is opened.
+    view.on_board_picker();
+    view.on_board_picker();
+    assert_eq!(view.rename, "Design room");
+}
+/// A board made by accident goes; a board somebody has drawn on stays. The rule
+/// is the whole design: an empty board holds nobody's work, so removing one can
+/// take nothing from anyone — and this module has no ownership rule that could
+/// say whose the work on a used board is.
+#[test]
+fn only_a_board_nobody_has_drawn_on_can_be_removed() {
+    let mut view = with_the_picker_open();
+    assert_eq!(pressable(&view, "boards/remove"), Some(true));
+
+    card(&mut view, "a", 0);
+    assert_eq!(
+        pressable(&view, "boards/remove"),
+        Some(false),
+        "a board with a card on it offered to remove itself"
+    );
+
+    view.edit(Change::Delete { id: "a".into() });
+    view.pending.clear();
+    assert_eq!(pressable(&view, "boards/remove"), Some(true));
+
+    view.on_remove_board();
+    assert_eq!(
+        view.pending.back(),
+        Some(&Operation::Remove {
+            board: "room".into()
+        })
+    );
+    assert!(
+        view.current.is_empty(),
+        "the view is still on a board it removed"
+    );
+    assert!(view.confirmed.is_none());
+    assert!(
+        !view.catalog.contains_key("room"),
+        "the picker still lists it"
+    );
+    assert_eq!(
+        pressable(&view, "boards/remove"),
+        None,
+        "a board that is gone still offers its own controls"
+    );
+}
 fn menu_rows(view: &BoardsView) -> Vec<String> {
     let tree = view.view();
     let mut keys = Vec::new();

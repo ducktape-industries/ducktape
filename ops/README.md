@@ -20,6 +20,16 @@ make demo-clear  # ops/demo-clear.sh — stop and delete the demo workspace
 `demo-gateway.mjs` and `demo-kanban.mjs` publish the demo's gateway web-app
 routes (a network-hosted DuckFS site and a user-hosted loopback app).
 
+## Replacing a network
+
+`refound-net.sh` runs the whole re-found: it stops what is running, archives the
+workspaces, founds a validator and joins a resident from this checkout's binary
+and founding set under `ducktape-node-launcher`, installs the agent executors,
+mints the workspace wallet and founds its account, grants the service daemons,
+and mirrors a repo into the new forge. The target is `--root` and has no default; workspaces are moved
+aside, never deleted. `docs/refound-a-network.md` is the recipe and says why
+each step is ordered the way it is.
+
 ## Running a node as a service
 
 - `node/` — `ducktape-node@.service` (instance = workspace selector for
@@ -313,13 +323,11 @@ node ops/proxmox-view-observe-test.mjs
 
 ## Wasm guests
 
-- `wasm-embed-check.sh` (`make wasm-embed-check`) — refuses an
-  `include_bytes!`/`include_str!` of a `.wasm` outside a test, so a binary can
-  never carry a second copy of a module. Pure text, no toolchain, part of the
-  offline `test` gate. It is item-aware: `#[cfg(test)]` governs one item, not
-  the rest of the file, and an invocation may span lines. The scanner proves
-  itself against six fixtures before it scans;
-  `bash ops/wasm-embed-check.sh --self-test` runs those alone.
+- `make wasm-embed-check` — refuses an `include_bytes!`/`include_str!` of a
+  `.wasm` outside a test, so a binary can never carry a second copy of a module.
+  No script here: it is a source-parsing lint,
+  `crates/topology/tests/wasm_embed.rs`, beside `sdk_shaped` and
+  `tracing_plane_lint`.
 - `wasm-repro-check.sh` (`make wasm-repro-check`) — builds one guest component
   twice, in two scratch directories, and asserts the bytes are identical and
   carry no host path, so a committed artifact never depends on the builder's

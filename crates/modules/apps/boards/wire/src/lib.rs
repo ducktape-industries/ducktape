@@ -237,9 +237,41 @@ pub struct Board {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
-    Create { id: String, title: String },
-    Edit { board: String, change: Change },
-    Batch { board: String, changes: Vec<Change> },
+    Create {
+        id: String,
+        title: String,
+    },
+    /// The board under another name.
+    ///
+    /// Open to everyone, the way every shape edit already is. `Board::owner` is
+    /// written once at creation and read in exactly one place — the idempotence
+    /// check in `create` — and no edit has ever asked who is making it. Letting
+    /// the author alone rename would be half an ownership model with no other
+    /// half, and the name is what the rest of the network finds a board by.
+    Rename {
+        board: String,
+        title: String,
+    },
+    /// The board, gone: out of the catalogue and out of the store.
+    ///
+    /// Only a board with NOTHING on it. That is not a stand-in for an ownership
+    /// rule, it is the reason none is needed — a board with no shapes on it is
+    /// a board nobody has done any work on, so removing one cannot take work
+    /// away from anyone, whoever asks. A board someone has drawn on is refused
+    /// outright: who may throw away another person's work is a question this
+    /// module has never had an answer to, and a delete button is the wrong
+    /// place to invent one.
+    Remove {
+        board: String,
+    },
+    Edit {
+        board: String,
+        change: Change,
+    },
+    Batch {
+        board: String,
+        changes: Vec<Change>,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -345,17 +377,41 @@ pub fn valid_id(id: &str) -> bool {
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"-_:".contains(&c))
 }
+/// The rule a board's name has to meet, in one place: a rename must not be able
+/// to leave a board in a state a create would have refused.
+pub fn valid_title(title: &str) -> Result<(), String> {
+    let named = !title.trim().is_empty() && title.len() <= 160;
+    match named {
+        true => Ok(()),
+        false => Err("Use a board name between 1 and 160 bytes.".into()),
+    }
+}
 impl Board {
     pub fn new(title: String, owner: String) -> Result<Self, String> {
-        let title_valid = !title.trim().is_empty() && title.len() <= 160;
-        if !title_valid {
-            return Err("Use a board name between 1 and 160 bytes.".into());
-        }
+        valid_title(&title)?;
         Ok(Self {
             title,
             owner,
             revision: 0,
             shapes: BTreeMap::new(),
+        })
+    }
+    /// The same board under another name, one revision on.
+    ///
+    /// The bump is what makes the new name reach a peer: a reader keeps the
+    /// board it has until a revision at least as high arrives, and a rename
+    /// that left the number alone would be a title that only landed on the next
+    /// shape someone drew.
+    pub fn renamed(&self, title: String) -> Result<Self, String> {
+        valid_title(&title)?;
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or("Board revision exhausted.")?;
+        Ok(Self {
+            title,
+            revision,
+            ..self.clone()
         })
     }
 

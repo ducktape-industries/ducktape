@@ -24,7 +24,7 @@ use crate::join_gate;
 use crate::reachability_plane::{wire_reachability_plane, GateHook, GateOutcomes};
 use crate::sync::catchup::derive_pending_boot;
 use crate::sync::serve::{drive_sync_request, SyncStateRequest};
-use crate::{overlay_book, voice};
+use crate::{overlay_book, presence};
 use futures::StreamExt as _;
 use statesync::SyncServer;
 
@@ -686,15 +686,15 @@ pub(super) async fn wire(
     // the ingress select arm and the drain-resolution/expiry code.
     let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota);
 
-    // the voice + video hub: huddle media between members. one per-use data
-    // plane per service: media rides the OVERLAY — audio+control on
-    // Service::Voice's overlay socket (45902), camera on Service::Video's
-    // (45903) — never the mesh.
+    // the Pages presence hub, on the declared `chat/presence` lane's overlay
+    // datagram socket. Huddle media is NOT here and never was: a call reaches
+    // the installed media service through a gateway route, so nothing on this
+    // plane carries one.
     let media_peers = {
-        // media needs the overlay: with no overlay (fake effect, or the
-        // reachability plane unconfigured) there is no media transport at
+        // presence needs the overlay: with no overlay (fake effect, or the
+        // reachability plane unconfigured) there is no transport for it at
         // all (the overlay-only cutover — no mesh fallback), so drop the
-        // session lane and huddle joins refuse fast instead of hanging.
+        // session lane and presence joins refuse fast instead of hanging.
         let overlay_capable = wireguard_listen.is_some();
         if overlay_capable {
             // tracked media set = transport members ∪ residents, refreshed
@@ -712,7 +712,7 @@ pub(super) async fn wire(
                 .as_ref()
                 .try_into()
                 .expect("ed25519 keys are 32 bytes");
-            voice::spawn_hub(
+            presence::spawn_hub(
                 voice_requests,
                 crate::overlay_book::socket_factory(overlay_capable, &overlay_slot),
                 std::sync::Arc::clone(&peers),
@@ -722,13 +722,13 @@ pub(super) async fn wire(
             );
             Some(peers)
         } else {
-            // Say it at boot: an operator whose node can never host a huddle
+            // Say it at boot: an operator whose node can never carry presence
             // otherwise learns it one failed join at a time, from the webview.
             tracing::warn!(
-                target: "ducktape::voice",
+                target: "ducktape::presence",
                 node = %label,
                 reason = "overlay_unavailable",
-                "calls disabled; set wireguard_listen to enable huddles"
+                "page presence disabled; set wireguard_listen to enable the overlay"
             );
             drop(voice_requests);
             None

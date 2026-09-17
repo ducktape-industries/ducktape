@@ -44,6 +44,7 @@ const PLANES: &[&str] = &[
     "join",         // invitations, first contact, admission
     "modules",      // the module set: registry, code plane, wasm workers
     "node",         // whole-node lifecycle and identity
+    "presence",     // Pages presence on the declared `chat/presence` overlay lane
     "provider",     // the provider host: a run's own files and their cleanup
     "reachability", // NAT traversal: rendezvous, handshakes, the netstack machine on either backend
     "recovery",     // restart, replay, checkpoint restore

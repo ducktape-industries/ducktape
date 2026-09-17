@@ -741,10 +741,53 @@ impl BoardsView {
         );
         kit::sized(strip, Some(Length::Fixed(280.)), None)
     }
-    /// The board list under the switcher: a name to create, the rest to open.
+    /// The open board's own section: its name, editable where the name is
+    /// shown, and the way out of a board that should not have been made.
+    ///
+    /// It sits above the create box rather than on the title chip because the
+    /// chip is one press wide and already spends that press opening this list.
+    fn this_board(&self) -> Vec<Node> {
+        let Some(board) = self.confirmed.as_ref() else {
+            return Vec::new();
+        };
+        let clear = board.shapes.is_empty();
+        vec![
+            kit::caption("boards/this", "This board"),
+            kit::input(
+                "boards/rename-title",
+                "Name this board",
+                &self.rename,
+                slots::handler(Box::new(|s| Some(Message::RenameTitle(s)))),
+                Some(slots::message(Message::RenameBoard)),
+            ),
+            wide(button(
+                "boards/rename",
+                "Rename",
+                "Rename this board for everyone",
+                Message::RenameBoard,
+                self.rename_would_hold(),
+                ButtonPreset::Subtle,
+            )),
+            wide(button(
+                "boards/remove",
+                "Remove board",
+                match clear {
+                    true => "Remove this board for everyone",
+                    false => "Clear the board before removing it",
+                },
+                Message::RemoveBoard,
+                self.removal_would_hold(),
+                ButtonPreset::Danger,
+            )),
+            kit::divider("boards/this-rule"),
+        ]
+    }
+    /// The board list under the switcher: this board, a name to create, the
+    /// rest to open.
     fn picker(&self) -> Vec<Node> {
         let idle = self.pending.is_empty() && self.inline.is_none();
-        let mut list = vec![
+        let mut list = self.this_board();
+        list.extend([
             kit::input(
                 "boards/new-title",
                 "Name a new board",
@@ -760,7 +803,7 @@ impl BoardsView {
                 self.session.connected && idle && !self.title.trim().is_empty(),
                 ButtonPreset::Primary,
             )),
-        ];
+        ]);
         if !self.catalog.is_empty() {
             list.push(kit::divider("boards/picker-rule"));
             list.push(kit::caption("boards/shared", "Shared with this network"));

@@ -367,7 +367,8 @@ test: wasm-modules-check wasm-embed-check
 	@if python3 -c 'import tomllib' >/dev/null 2>&1; then \
 	  PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s ops/application-service && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/proxmox-view-lane-test.py && \
-	  PYTHONDONTWRITEBYTECODE=1 python3 ops/worktree-clean-test.py; \
+	  PYTHONDONTWRITEBYTECODE=1 python3 ops/worktree-clean-test.py && \
+	  PYTHONDONTWRITEBYTECODE=1 python3 ops/dogfood-forge-test.py; \
 	else echo "[test] skipped the ops/ script tests — they need python 3.11 (tomllib)" >&2; fi
 # demo-clear's refusal line against a stub admin surface (the reason token it
 # prints has to be the node's own, not one invented in the script) and its
@@ -555,12 +556,12 @@ wasm-modules-check:
 ## the binary embeds no wasm (AGENTS.md, "No Embedded Wasm"): an
 ## include_bytes!/include_str! of a `.wasm` is allowed only in a test — a file
 ## under a `tests/` directory or named `tests.rs`, or an item a `#[cfg(test)]`
-## governs. Pure text, no toolchain: it runs in the per-push CI lane beside
-## `wasm-modules-check`. The scanner proves itself against six fixtures before
-## it scans the tree; `bash ops/wasm-embed-check.sh --self-test` runs those
-## alone. See ops/wasm-embed-check.sh.
+## governs. A source-parsing lint like `sdk_shaped` and `tracing_plane_lint`:
+## it parses every `.rs` in the tree with `syn`, so which items `#[cfg(test)]`
+## governs and whether a `.wasm` is an argument or text inside a literal are
+## answered by the parser rather than guessed. Its own fixtures run beside it.
 wasm-embed-check:
-	@bash ops/wasm-embed-check.sh
+	$(CARGO) test $(LOCKED) -p topology --test wasm_embed
 
 ## the reproducibility gate: one guest built twice, in two scratch directories,
 ## must be byte-identical and carry no host path. Needs the wasm32 target
