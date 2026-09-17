@@ -501,6 +501,19 @@ pub struct NetstackOperationalStatus {
     /// `null` until this process swaps once. A refused swap is recorded here
     /// AND leaves `backend` unchanged: the running machine continues.
     pub last_swap: Option<NetstackSwap>,
+    /// Why this node has NO overlay, for as long as it has none: the stable
+    /// snake_case token the plane refused to start with (or exited under).
+    /// Absent while the plane is starting, running or stopped.
+    ///
+    /// A node whose plane never started keeps producing blocks and answering
+    /// this route, so nothing else on the surface says the mesh is dead —
+    /// every join, every tunnel and every overlay service is gone while this
+    /// is set, and it does not self-heal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    /// The sentence behind `failure_reason`: what an operator does about it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
 }
 
 /// One swap attempt's outcome — the projection half of the

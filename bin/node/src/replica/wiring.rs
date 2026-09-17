@@ -466,9 +466,19 @@ pub(super) async fn wire(
                                             tried,
                                             reason = "first_contact_terminal",
                                             detail = %reason,
+                                            // THE INVITE IS STILL THE LAST THING TO
+                                            // SUSPECT. This node's own plane is up (the
+                                            // branch above owns the other case), so what
+                                            // stayed silent was the far side — and a
+                                            // fresh blob from the same inviter fails
+                                            // identically. Say what was observed, not a
+                                            // cause we cannot see from here.
                                             "FATAL: first contact failed across all offered \
-                                             path(s) — ask the inviter for a fresh invite once \
-                                             the mesh is reachable"
+                                             path(s) — the inviter's mesh never answered on \
+                                             any of them. Check the inviter's node: \
+                                             `operations.netstack` in its /v1/status says \
+                                             whether its reachability plane is running. A \
+                                             fresh invite changes nothing while it is not."
                                         );
                                         std::process::exit(3);
                                     }
