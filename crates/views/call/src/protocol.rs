@@ -1,7 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
-pub const SAMPLES: usize = 960;
+/// The largest audio payload this room moves: one encoded 20 ms frame, the
+/// same ceiling `media_service::call_wire` checks. The guest never decodes
+/// one — the host encodes at the microphone and decodes at the speaker — so
+/// this is a bound, not a shape.
+pub const MAX_AUDIO_PAYLOAD: usize = 1275;
 const MAX_PEERS: usize = 32;
 const JITTER_FRAMES: usize = 3;
 
@@ -25,12 +29,32 @@ pub struct Beacon {
 #[derive(Clone, Debug)]
 pub enum Event {
     Properties(Props),
-    LocalAudio(Vec<i16>),
-    LocalImage { timestamp_ms: u32, jpeg: Vec<u8> },
-    Peer { peer: String, beacon: Beacon },
+    /// One encoded frame from this device's microphone, with the host's
+    /// verdict on whether it carried sound. The energy that decides `sound`
+    /// is measured on the samples, which live and die at the device: the
+    /// guest owns what SPEAKING means to the room (hangover, beacons), never
+    /// the audio itself.
+    LocalAudio {
+        frame: Vec<u8>,
+        sound: bool,
+    },
+    LocalImage {
+        timestamp_ms: u32,
+        jpeg: Vec<u8>,
+    },
+    Peer {
+        peer: String,
+        beacon: Beacon,
+    },
     Left(String),
-    RemoteAudio { peer: String, samples: Vec<i16> },
-    RemoteImage { peer: String, jpeg: Vec<u8> },
+    RemoteAudio {
+        peer: String,
+        frame: Vec<u8>,
+    },
+    RemoteImage {
+        peer: String,
+        jpeg: Vec<u8>,
+    },
     Tick,
 }
 
@@ -41,8 +65,15 @@ pub enum Effect {
     SelfState(Beacon),
     Capture(String),
     Mute(bool),
-    Play(Vec<i16>),
-    Image { peer: String, jpeg: Vec<u8> },
+    /// This tick's audio, one encoded frame per peer that had one. The host
+    /// decodes each with that peer's decoder and mixes: a codec is stateful
+    /// per stream, so mixing cannot happen before decoding and decoding
+    /// cannot happen without knowing whose frame it is.
+    Play(Vec<(String, Vec<u8>)>),
+    Image {
+        peer: String,
+        jpeg: Vec<u8>,
+    },
     DropImage(String),
 }
 
@@ -50,7 +81,7 @@ pub enum Effect {
 pub struct Machine {
     pub props: Props,
     pub peers: BTreeMap<String, Beacon>,
-    audio: BTreeMap<String, VecDeque<Vec<i16>>>,
+    audio: BTreeMap<String, VecDeque<Vec<u8>>>,
     ticks: u64,
     last_sound: Option<u64>,
     speaking: bool,
@@ -60,11 +91,11 @@ impl Machine {
     pub fn step(&mut self, event: Event) -> Vec<Effect> {
         match event {
             Event::Properties(props) => self.properties(props),
-            Event::LocalAudio(samples) => self.local_audio(samples),
+            Event::LocalAudio { frame, sound } => self.local_audio(frame, sound),
             Event::LocalImage { timestamp_ms, jpeg } => self.local_image(timestamp_ms, jpeg),
             Event::Peer { peer, beacon } => self.peer(peer, beacon),
             Event::Left(peer) => self.left(peer),
-            Event::RemoteAudio { peer, samples } => self.remote_audio(peer, samples),
+            Event::RemoteAudio { peer, frame } => self.remote_audio(peer, frame),
             Event::RemoteImage { peer, jpeg } => self.remote_image(peer, jpeg),
             Event::Tick => self.tick(),
         }
@@ -103,16 +134,12 @@ impl Machine {
         effects
     }
 
-    fn local_audio(&mut self, samples: Vec<i16>) -> Vec<Effect> {
-        let may_send = !self.props.muted && samples.len() == SAMPLES;
+    fn local_audio(&mut self, frame: Vec<u8>, sound: bool) -> Vec<Effect> {
+        let carries_one_frame = !frame.is_empty() && frame.len() <= MAX_AUDIO_PAYLOAD;
+        let may_send = !self.props.muted && carries_one_frame;
         if !may_send {
             return Vec::new();
         }
-        let energy: f64 = samples
-            .iter()
-            .map(|sample| f64::from(*sample).powi(2))
-            .sum();
-        let sound = energy / SAMPLES as f64 >= 400.0 * 400.0;
         let mut effects = Vec::new();
         if sound {
             self.last_sound = Some(self.ticks);
@@ -122,9 +149,7 @@ impl Machine {
             }
         }
         let mut bytes = vec![1];
-        for sample in samples {
-            bytes.extend_from_slice(&sample.to_le_bytes());
-        }
+        bytes.extend(frame);
         effects.push(Effect::SendBinary(bytes));
         effects
     }
@@ -159,8 +184,9 @@ impl Machine {
         vec![Effect::DropImage(peer)]
     }
 
-    fn remote_audio(&mut self, peer: String, samples: Vec<i16>) -> Vec<Effect> {
-        let valid = self.peers.contains_key(&peer) && samples.len() == SAMPLES;
+    fn remote_audio(&mut self, peer: String, frame: Vec<u8>) -> Vec<Effect> {
+        let carries_one_frame = !frame.is_empty() && frame.len() <= MAX_AUDIO_PAYLOAD;
+        let valid = self.peers.contains_key(&peer) && carries_one_frame;
         if !valid {
             return Vec::new();
         }
@@ -168,7 +194,7 @@ impl Machine {
         if queue.len() == JITTER_FRAMES {
             queue.pop_front();
         }
-        queue.push_back(samples);
+        queue.push_back(frame);
         Vec::new()
     }
 
@@ -194,20 +220,15 @@ impl Machine {
             self.speaking = false;
             effects.extend(self.beacon());
         }
-        let mut mixed = vec![0i32; SAMPLES];
-        for queue in self.audio.values_mut() {
-            if let Some(frame) = queue.pop_front() {
-                for (mix, sample) in mixed.iter_mut().zip(frame) {
-                    *mix += i32::from(sample);
-                }
-            }
-        }
-        effects.push(Effect::Play(
-            mixed
-                .into_iter()
-                .map(|sample| sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16)
-                .collect(),
-        ));
+        // one frame per talking peer, in roster order; the host decodes each
+        // with that peer's decoder and mixes. An empty list is the silence a
+        // playout tick still has to hear about.
+        let due: Vec<(String, Vec<u8>)> = self
+            .audio
+            .iter_mut()
+            .filter_map(|(peer, queue)| Some((peer.clone(), queue.pop_front()?)))
+            .collect();
+        effects.push(Effect::Play(due));
         effects
     }
 }
@@ -215,13 +236,12 @@ impl Machine {
 pub fn binary(bytes: &[u8]) -> Result<Event, String> {
     let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     match bytes.first() {
-        Some(4) if bytes.len() == 41 + SAMPLES * 2 => Ok(Event::RemoteAudio {
-            peer: hex(&bytes[9..41]),
-            samples: bytes[41..]
-                .chunks_exact(2)
-                .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
-                .collect(),
-        }),
+        Some(4) if bytes.len() > 41 && bytes.len() <= 41 + MAX_AUDIO_PAYLOAD => {
+            Ok(Event::RemoteAudio {
+                peer: hex(&bytes[9..41]),
+                frame: bytes[41..].to_vec(),
+            })
+        }
         Some(3) if bytes.len() > 38 && bytes.len() <= 65_568 => Ok(Event::RemoteImage {
             peer: hex(&bytes[6..38]),
             jpeg: bytes[38..].to_vec(),
@@ -233,6 +253,13 @@ pub fn binary(bytes: &[u8]) -> Result<Event, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// one encoded frame, as the host hands it over. The guest never reads
+    /// inside one, so a marker byte stands in for a codec here.
+    fn voice(marker: u8) -> Vec<u8> {
+        vec![marker; 80]
+    }
+
     #[test]
     fn mute_and_source_switch_are_guest_protocol_decisions() {
         let mut machine = Machine::default();
@@ -248,8 +275,12 @@ mod tests {
         );
         assert!(
             machine
-                .step(Event::LocalAudio(vec![1000; SAMPLES]))
-                .is_empty()
+                .step(Event::LocalAudio {
+                    frame: voice(7),
+                    sound: true
+                })
+                .is_empty(),
+            "a muted device sends nothing, however loud the room"
         );
         assert!(
             matches!(machine.step(Event::LocalImage { timestamp_ms: 7, jpeg: vec![9] }).as_slice(), [Effect::SendBinary(bytes)] if bytes == &[2,1,0,0,0,7,9])
@@ -285,14 +316,17 @@ mod tests {
         let speaker = machine.peers.keys().next().expect("a seated peer").clone();
         let jpeg = vec![7u8; 16 * 1024];
         let sources: [(&str, &dyn Fn() -> Event); 5] = [
-            ("local_audio", &|| Event::LocalAudio(vec![1200; SAMPLES])),
+            ("local_audio", &|| Event::LocalAudio {
+                frame: vec![7u8; 80],
+                sound: true,
+            }),
             ("local_image", &|| Event::LocalImage {
                 timestamp_ms: 7,
                 jpeg: vec![7u8; 16 * 1024],
             }),
             ("remote_audio", &|| Event::RemoteAudio {
                 peer: format!("{:064x}", 0),
-                samples: vec![900; SAMPLES],
+                frame: vec![9u8; 80],
             }),
             ("remote_image", &|| Event::RemoteImage {
                 peer: format!("{:064x}", 0),
@@ -320,9 +354,18 @@ mod tests {
     }
 
     #[test]
-    fn sound_hangover_and_bounded_jitter_mix_are_owned_by_the_guest() {
+    fn sound_hangover_and_bounded_jitter_are_owned_by_the_guest() {
         let mut machine = Machine::default();
-        machine.step(Event::LocalAudio(vec![1000; SAMPLES]));
+        machine.step(Event::LocalAudio {
+            frame: voice(1),
+            sound: true,
+        });
+        assert!(machine.speaking);
+        // silence does not end the turn — the hangover does
+        machine.step(Event::LocalAudio {
+            frame: voice(1),
+            sound: false,
+        });
         assert!(machine.speaking);
         for _ in 0..20 {
             machine.step(Event::Tick);
@@ -336,15 +379,49 @@ mod tests {
             for _ in 0..20 {
                 machine.step(Event::RemoteAudio {
                     peer: peer.into(),
-                    samples: vec![20_000; SAMPLES],
+                    frame: voice(9),
                 });
             }
             assert_eq!(machine.audio[peer].len(), JITTER_FRAMES);
         }
+        // the tick hands the host one frame per talking peer, named, for it
+        // to decode and mix — the guest moves audio it cannot read.
         assert!(
-            matches!(machine.step(Event::Tick).as_slice(), [Effect::Play(samples)] if samples[0] == i16::MAX)
+            matches!(machine.step(Event::Tick).as_slice(), [Effect::Play(due)]
+                if due.len() == 2 && due[0].0 == "a" && due[0].1 == voice(9))
         );
         machine.step(Event::Left("a".into()));
         assert!(!machine.audio.contains_key("a"));
+        assert!(
+            matches!(machine.step(Event::Tick).as_slice(), [Effect::Play(due)] if due.len() == 1)
+        );
+    }
+
+    /// A frame the host could not have produced is refused at the seam it
+    /// arrives on, in both directions: these bytes reach the guest from an
+    /// untrusted peer through the hub, and from its own host.
+    #[test]
+    fn an_audio_frame_outside_the_bound_is_dropped() {
+        let mut machine = Machine::default();
+        machine.step(Event::Peer {
+            peer: "a".into(),
+            beacon: Beacon::default(),
+        });
+        for frame in [Vec::new(), vec![3; MAX_AUDIO_PAYLOAD + 1]] {
+            assert!(
+                machine
+                    .step(Event::LocalAudio {
+                        frame: frame.clone(),
+                        sound: true
+                    })
+                    .is_empty()
+            );
+            machine.step(Event::RemoteAudio {
+                peer: "a".into(),
+                frame,
+            });
+            assert!(!machine.audio.contains_key("a"));
+        }
+        assert!(!machine.speaking, "a dropped frame is not a spoken one");
     }
 }

@@ -43,9 +43,12 @@
 //! - `host.emit` raw bytes publishes at most 16 KiB per item, queue 16, from
 //!   an active companion. `host.finish` empty bytes drains queued output then
 //!   ends it and releases its tasks/devices. Navigation preserves the instance.
-//! - `media.audio` subscribes to 960-sample mono 48 kHz PCM capture;
-//!   `media.play` `{audio,samples}` plays one frame, `media.mute`
-//!   `{audio,muted}` controls capture. `media.video` `{source,max_bytes}`
+//! - `media.audio` subscribes to encoded 20 ms mono voice capture, each item
+//!   `{frame,sound}` — the codec and the sound/energy verdict live with the
+//!   microphone, so PCM never reaches a guest. `media.play`
+//!   `{audio,frames:[{peer,frame}]}` decodes each peer's frame with that
+//!   peer's decoder and mixes one playout frame; `media.mute` `{audio,muted}`
+//!   controls capture. `media.video` `{source,max_bytes}`
 //!   subscribes to camera/screen JPEG capture, including an opaque `preview`
 //!   image key for local display. `media.image` allocates an
 //!   opaque image key; `media.put` `{image,jpeg}` updates it and `media.drop`

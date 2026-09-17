@@ -275,10 +275,17 @@ impl Session {
             );
             return Ok(Vec::new());
         }
-        let samples =
-            serde_json::from_value(value.get("samples").cloned().ok_or("missing PCM samples")?)
+        // the device hands over an ENCODED frame and its own verdict on
+        // whether it carried sound: the samples the verdict was measured on
+        // never leave the host.
+        let frame =
+            serde_json::from_value(value.get("frame").cloned().ok_or("missing voice frame")?)
                 .map_err(|error| error.to_string())?;
-        Ok(vec![Event::LocalAudio(samples)])
+        let sound = value
+            .get("sound")
+            .and_then(Value::as_bool)
+            .unwrap_or_default();
+        Ok(vec![Event::LocalAudio { frame, sound }])
     }
 
     fn captured_video(&mut self, item: Answer) -> Result<Vec<Event>, String> {
@@ -331,10 +338,16 @@ impl Session {
                     "media.mute",
                     json!({"audio": self.audio.id(), "muted": muted}),
                 ),
-                Effect::Play(samples) => notify(
-                    "media.play",
-                    json!({"audio": self.audio.id(), "samples": samples}),
-                ),
+                Effect::Play(due) => {
+                    let frames: Vec<Value> = due
+                        .into_iter()
+                        .map(|(peer, frame)| json!({"peer": peer, "frame": frame}))
+                        .collect();
+                    notify(
+                        "media.play",
+                        json!({"audio": self.audio.id(), "frames": frames}),
+                    )
+                }
                 Effect::Image { peer, jpeg } => self.picture(peer, jpeg).await?,
                 Effect::DropImage(peer) => self.drop_picture(&peer),
             }

@@ -419,7 +419,7 @@ mod tests {
         assert!(host.streams.contains_key("net.stream"));
         host.item(
             "media.audio",
-            json!({"samples": vec![1200; protocol::SAMPLES]}),
+            json!({"frame": vec![7u8; 80], "sound": true}),
         );
         assert!(
             host.effects
@@ -432,20 +432,16 @@ mod tests {
         let mut audio = vec![4];
         audio.extend_from_slice(&43u64.to_be_bytes());
         audio.extend_from_slice(&[2; 32]);
-        for _ in 0..protocol::SAMPLES {
-            audio.extend_from_slice(&500i16.to_le_bytes());
-        }
+        audio.extend_from_slice(&[5u8; 80]);
         host.item("net.stream", json!({"binary": audio}));
         host.step(vec![wire::Event::Response {
             id: host.streams["clock.ticks"],
             result: Ok(Vec::new()),
             done: false,
         }]);
-        assert!(
-            host.effects
-                .iter()
-                .any(|(kind, body)| kind == "media.play" && body["samples"][0] == 500)
-        );
+        assert!(host.effects.iter().any(|(kind, body)| kind == "media.play"
+            && body["frames"][0]["peer"] == peer
+            && body["frames"][0]["frame"][0] == 5));
 
         host.item(
             "call.props",
@@ -460,7 +456,7 @@ mod tests {
         let before = host.effects.len();
         host.item(
             "media.audio",
-            json!({"samples": vec![1200; protocol::SAMPLES]}),
+            json!({"frame": vec![7u8; 80], "sound": true}),
         );
         assert!(
             !host.effects[before..]
@@ -511,7 +507,7 @@ mod tests {
         host.refuse_beacon = true;
         host.item(
             "media.audio",
-            json!({"samples": vec![1200; protocol::SAMPLES]}),
+            json!({"frame": vec![7u8; 80], "sound": true}),
         );
         assert!(
             beacons(&host) > connected,
@@ -532,7 +528,7 @@ mod tests {
         let before = host.effects.len();
         host.item(
             "media.audio",
-            json!({"samples": vec![1200; protocol::SAMPLES]}),
+            json!({"frame": vec![7u8; 80], "sound": true}),
         );
         assert!(
             host.effects[before..]

@@ -16,8 +16,10 @@ use opus_rs::{Application, OpusDecoder, OpusEncoder};
 
 use super::{FRAME_SAMPLES, SAMPLE_RATE};
 
-/// Room for any 20 ms mono Opus frame at sane bitrates.
-const MAX_ENCODED: usize = 1275;
+/// Room for any 20 ms mono Opus frame at sane bitrates. Public because it is
+/// also the bound every wire that CARRIES one of these frames checks against
+/// — a frame larger than the encoder can produce is not one of ours.
+pub const MAX_ENCODED: usize = 1275;
 /// Full-scale for i16 ↔ normalized-f32 conversion.
 const SCALE: f32 = 32_768.0;
 
