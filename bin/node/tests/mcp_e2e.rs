@@ -435,6 +435,196 @@ fn the_catalog_reaches_the_model_from_consensus_with_its_schemas() {
     assert_eq!(list["kind"], "read");
 }
 
+/// the duckfs read tools serve PAGES, and a walk has to reach the end of a
+/// directory wider than one page and a file longer than one range — over ONE
+/// snapshot, so the pages compose into one listing of one tree rather than a
+/// mixture of the commits that happened while the agent was reading.
+///
+/// the file is 2 MiB of text with a two-byte `ñ` straddling the 1 MiB range
+/// boundary (which is also a duckfs chunk boundary): the first range must stop
+/// before the character, not report a file that is not text.
+#[test]
+fn a_duckfs_walk_pages_to_the_end_of_a_wide_directory_and_a_long_file() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use duckfs_client::api::NodeApi as _;
+    use serde_json::Value;
+
+    let h = Harness::start();
+    let files = h.files();
+    let commit = |message: &str, changes: Value| {
+        files
+            .commit(
+                None,
+                message,
+                serde_json::from_value(changes).expect("changes are duckfs's own wire"),
+            )
+            .expect("duckfs commit")
+    };
+    let inline = |path: String, body: &[u8]| {
+        json!({"put": {"path": path, "exec": false, "meta": {},
+               "content": {"inline": {"b64": STANDARD.encode(body)}}}})
+    };
+    let entry_names = |page: &Value| -> Vec<String> {
+        page["entries"]
+            .as_array()
+            .expect("a page carries entries")
+            .iter()
+            .map(|entry| {
+                entry["path"]
+                    .as_str()
+                    .expect("an entry names its path")
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    // 300 entries — wider than the 256-entry page — seeded in batches, because
+    // one commit walks the tree spine of every path it touches and the per-op
+    // object-read cap admits ~126 new documents.
+    let names: Vec<String> = (0..300).map(|i| format!("e{i:03}.txt")).collect();
+    for batch in names.chunks(100) {
+        let changes = batch
+            .iter()
+            .map(|name| inline(format!("/shared/many/{name}"), name.as_bytes()))
+            .collect::<Vec<_>>();
+        commit("seed a wide directory", json!(changes));
+    }
+
+    // 2 MiB, as two exactly-CHUNK_SIZE chunks, with the ñ across their seam.
+    let chunk = duckfs_core::CHUNK_SIZE as usize;
+    let mut body = vec![b'a'; chunk - 1];
+    body.extend_from_slice("ñ".as_bytes());
+    body.resize(2 * chunk, b'b');
+    let digests: Vec<String> = body
+        .chunks(chunk)
+        .map(|part| files.stage_chunk(part).expect("stage a chunk"))
+        .collect();
+    commit(
+        "seed a long file",
+        json!([{"put": {"path": "/shared/big.txt", "exec": false, "meta": {},
+                "content": {"chunks": {"size": body.len(), "chunks": digests}}}}]),
+    );
+
+    // ---- the directory, in two pages ----
+    let first = payload(&h.call(
+        h.mcp(),
+        "ducktape_query",
+        json!({"operation": "files.ls", "target": {"path": "/shared/many"}}),
+    ));
+    let snapshot = first["snapshot"]
+        .as_str()
+        .expect("a page names the snapshot it was read at")
+        .to_owned();
+    let cursor = first["next"]
+        .as_str()
+        .expect("300 entries do not fit in one page")
+        .to_owned();
+    let mut seen = entry_names(&first);
+    assert_eq!(seen.len(), 256, "the page is the module's own bound");
+    assert_eq!(
+        cursor, "e255.txt",
+        "the cursor is the last NAME of the page"
+    );
+
+    // a commit BETWEEN the two pages. the pin is what keeps the walk coherent —
+    // without it this entry would appear in a listing that never saw the rest.
+    commit(
+        "a commit while the agent is reading",
+        json!([inline("/shared/many/zzz-late.txt".into(), b"late")]),
+    );
+
+    let second = payload(&h.call(
+        h.mcp(),
+        "ducktape_query",
+        json!({"operation": "files.ls", "target": {"path": "/shared/many"},
+               "input": {"after": cursor, "snapshot": snapshot}}),
+    ));
+    assert!(second["next"].is_null(), "the walk ended: {second}");
+    assert_eq!(entry_names(&second).len(), 44, "300 - 256");
+    seen.extend(entry_names(&second));
+    let expected: Vec<String> = names
+        .iter()
+        .map(|name| format!("/shared/many/{name}"))
+        .collect();
+    assert_eq!(
+        seen, expected,
+        "the pages compose with no gap and no repetition"
+    );
+
+    // unpinned, the very same call sees the later commit: the walk above was
+    // held still by the snapshot, not by the directory happening not to change.
+    let now = payload(&h.call(
+        h.mcp(),
+        "ducktape_query",
+        json!({"operation": "files.ls", "target": {"path": "/shared/many"},
+               "input": {"after": "e299.txt"}}),
+    ));
+    assert_eq!(entry_names(&now), vec!["/shared/many/zzz-late.txt"]);
+    assert_ne!(now["snapshot"].as_str(), Some(snapshot.as_str()));
+
+    // ---- the file, range by range ----
+    let mut text = String::new();
+    let mut offset = 0u64;
+    let mut pin: Option<String> = None;
+    let mut ranges = 0;
+    let mut boundaries = Vec::new();
+    loop {
+        let mut input = json!({"offset": offset});
+        if let Some(snapshot) = &pin {
+            input["snapshot"] = json!(snapshot);
+        }
+        let range = payload(&h.call(
+            h.mcp(),
+            "ducktape_query",
+            json!({"operation": "files.read", "target": {"path": "/shared/big.txt"},
+                   "input": input}),
+        ));
+        ranges += 1;
+        assert!(ranges <= 4, "a 2 MiB file took more than four ranges");
+        let body_text = range["text"]
+            .as_str()
+            .expect("a range carries text")
+            .to_owned();
+        if ranges == 1 {
+            // the ñ straddles the boundary, so the first range stops one byte
+            // short of its cap instead of calling the file non-text.
+            assert_eq!(body_text.len(), chunk - 1, "{}", &body_text[..64]);
+            assert_eq!(range["eof"], json!(false));
+        }
+        pin = Some(
+            range["snapshot"]
+                .as_str()
+                .expect("a range names its snapshot")
+                .to_owned(),
+        );
+        text.push_str(&body_text);
+        offset = range["next_offset"]
+            .as_u64()
+            .expect("a range says where the next one starts");
+        boundaries.push(offset);
+        if range["eof"]
+            .as_bool()
+            .expect("a range says whether it ended")
+        {
+            break;
+        }
+    }
+    // the first range stops one byte short of its 1 MiB cap (the ñ starts
+    // there), so the second ends one byte short of the file and a third closes
+    // it. paging is exact, not approximate.
+    assert_eq!(
+        boundaries,
+        vec![chunk as u64 - 1, 2 * chunk as u64 - 1, 2 * chunk as u64]
+    );
+    assert_eq!(offset as usize, body.len());
+    assert_eq!(
+        text.as_bytes(),
+        body.as_slice(),
+        "the ranges reassemble the file byte for byte"
+    );
+}
+
 #[test]
 fn initialize_hands_the_model_the_guide() {
     let h = Harness::start();
