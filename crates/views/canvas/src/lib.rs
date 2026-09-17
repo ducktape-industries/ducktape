@@ -4,7 +4,9 @@ mod host;
 mod interaction;
 mod markdown;
 mod presentation;
-use boards_wire::{Align, Board, Change, Dash, Fill, Kind, Operation, Shape, TextSize, Weight};
+use boards_wire::{
+    Align, Board, Change, Dash, Fill, Heads, Kind, Operation, Shape, TextSize, Weight,
+};
 use ducktape_view_guest::{Editor, wire};
 use ducktape_view_guest::{Subscription, Task};
 use serde::{Deserialize, Serialize};
@@ -181,6 +183,7 @@ pub(crate) struct Pen {
     fill: Fill,
     dash: Dash,
     weight: Weight,
+    heads: Heads,
 }
 impl Pen {
     /// The pen this shape was drawn with.
@@ -190,6 +193,7 @@ impl Pen {
             fill: shape.fill,
             dash: shape.dash,
             weight: shape.weight,
+            heads: shape.heads,
         }
     }
     /// A shape in this pen with nothing else decided. Every gesture that mints
@@ -201,6 +205,7 @@ impl Pen {
             fill: self.fill,
             dash: self.dash,
             weight: self.weight,
+            heads: self.heads,
             ..Shape::default()
         }
     }
@@ -320,6 +325,7 @@ pub enum Message {
     Painting(Fill),
     Outline(Dash),
     Stroke(Weight),
+    Pointing(Heads),
     Align(Align),
     Lettering(TextSize),
     Delete,
@@ -450,6 +456,7 @@ impl BoardsView {
             Message::Painting(fill) => self.on_fill(fill),
             Message::Outline(dash) => self.on_dash(dash),
             Message::Stroke(weight) => self.on_weight(weight),
+            Message::Pointing(heads) => self.on_heads(heads),
             Message::Align(align) => self.on_align(align),
             Message::Lettering(text_size) => self.on_lettering(text_size),
             Message::Delete => self.on_delete(),
@@ -953,6 +960,16 @@ fn inverse(board: &Board, change: &Change) -> Vec<Change> {
                 vec![Change::Weight {
                     id: id.clone(),
                     weight: r.shape.weight,
+                }]
+            })
+            .unwrap_or_default(),
+        Change::Heads { id, .. } => board
+            .shapes
+            .get(id)
+            .map(|r| {
+                vec![Change::Heads {
+                    id: id.clone(),
+                    heads: r.shape.heads,
                 }]
             })
             .unwrap_or_default(),

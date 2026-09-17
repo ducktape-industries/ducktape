@@ -27,6 +27,18 @@ fn pen(color: Rgba, width: f32, dash: Dash) -> wire::CanvasStroke {
 /// The board's own chrome — rings, guides, previews — is never dashed and never
 /// hollow: a broken selection ring would read as a shape somebody drew.
 const CHROME: Dash = Dash::Solid;
+/// How a run is drawn, resolved: the colour it came out as, and the pen
+/// properties the painter has still to apply. One value because every caller
+/// carries all of them together and not one of them ever varies alone — and
+/// because a run's painter threading them as separate arguments is how it ended
+/// up at eight.
+#[derive(Clone, Copy)]
+struct Ink {
+    color: Rgba,
+    dash: Dash,
+    weight: Weight,
+    heads: Heads,
+}
 /// What the pen's weight does to a line — a multiplier, not a width. The width
 /// a shape is drawn at is already two facts: how big it reads at this zoom, and
 /// what KIND it is (a note's border is a hairline, a freehand nib is fat). The
@@ -35,17 +47,6 @@ const CHROME: Dash = Dash::Solid;
 ///
 /// Which is also why `Medium` is exactly 1: every board drawn before a shape
 /// could carry a weight reads back at the width it was drawn at, to the pixel.
-/// How a run is drawn, resolved: the colour it came out as, and the two pen
-/// properties the painter has still to apply. One value because every caller
-/// carries all three together and not one of them ever varies alone — and
-/// because a run's painter threading them as three arguments is how it ended up
-/// at eight.
-#[derive(Clone, Copy)]
-struct Ink {
-    color: Rgba,
-    dash: Dash,
-    weight: Weight,
-}
 fn heft(weight: Weight) -> f32 {
     match weight {
         Weight::Thin => 0.5,
@@ -578,8 +579,9 @@ impl BoardsView {
         let picked = || self.selected.iter().filter_map(|id| board.shapes.get(id));
         let any_body = picked().any(|record| has_body(record.shape.kind));
         let any_outline = picked().any(|record| has_outline(record.shape.kind));
+        let any_arrow = picked().any(|record| record.shape.kind == Kind::Arrow);
         Some(kit::sized(
-            self.inspector(name, count, writable, any_body, any_outline),
+            self.inspector(name, count, writable, any_body, any_outline, any_arrow),
             Some(Length::Fixed(204.)),
             None,
         ))
@@ -739,25 +741,24 @@ impl BoardsView {
     /// The colour the next shape will be drawn in, on its own, for when there
     /// is no selection to recolour.
     fn next_color(&self) -> Node {
+        // The whole pen, not just its colour: choosing to draw outlines is a
+        // decision you make before drawing, and having to draw one filled and
+        // empty it afterwards is the same complaint the colour row was added
+        // for. All but the heads, which only one tool can use — offering them
+        // under the select tool would be a control with nothing to point at.
+        let mut pen = vec![
+            kit::caption("boards/next-color-label", "New shape"),
+            self.swatches(),
+            fill_row(self.pen.fill),
+            dash_row(self.pen.dash),
+            weight_row(self.pen.weight),
+        ];
+        if self.tool == Tool::Arrow {
+            pen.push(heads_row(self.pen.heads));
+        }
         kit::card(
             "boards/next-color",
-            kit::spaced(
-                kit::column(
-                    "boards/next-color-body",
-                    [
-                        kit::caption("boards/next-color-label", "New shape"),
-                        self.swatches(),
-                        // The whole pen, not just its colour: choosing to draw
-                        // outlines is a decision you make before drawing, and
-                        // having to draw one filled and empty it afterwards is
-                        // the same complaint the colour row was added for.
-                        fill_row(self.pen.fill),
-                        dash_row(self.pen.dash),
-                        weight_row(self.pen.weight),
-                    ],
-                ),
-                6.,
-            ),
+            kit::spaced(kit::column("boards/next-color-body", pen), 6.),
         )
     }
     fn swatches(&self) -> Node {
@@ -776,6 +777,7 @@ impl BoardsView {
         writable: Option<&Shape>,
         any_body: bool,
         any_outline: bool,
+        any_arrow: bool,
     ) -> Node {
         let mut properties = vec![
             kit::heading("boards/selection-title", name),
@@ -789,6 +791,12 @@ impl BoardsView {
             // Same gate as the dash: both rows are about a line, and the one
             // kind with no line has no use for either.
             properties.push(weight_row(self.pen.weight));
+        }
+        // A tighter gate than the outline's: a line and a freehand stroke draw
+        // a line but have no head to put on it, so the row is offered to the
+        // one kind that does.
+        if any_arrow {
+            properties.push(heads_row(self.pen.heads));
         }
         properties.push(kit::divider("boards/properties-rule"));
         if let Some(shape) = writable {
@@ -1231,6 +1239,7 @@ impl BoardsView {
                     color: edge(1.),
                     dash: s.dash,
                     weight: s.weight,
+                    heads: s.heads,
                 };
                 self.paint_stroke(s.kind, &screen, ink, budget, out);
             }
@@ -1248,10 +1257,16 @@ impl BoardsView {
             return;
         }
         // Samples finer than a pixel buy nothing; past that the budget decides.
-        // The run costs one command plus a segment each, and an arrowhead two
-        // more commands on top.
-        let head = if kind == Kind::Arrow { 2 } else { 0 };
-        let limit = budget.saturating_sub(1 + head);
+        // The run costs one command plus a segment each, and every head two
+        // more commands on top — one per barb.
+        let barbs = match kind == Kind::Arrow {
+            false => 0,
+            true => match ink.heads {
+                Heads::Start | Heads::End => 2,
+                Heads::Both => 4,
+            },
+        };
+        let limit = budget.saturating_sub(1 + barbs);
         if limit < 2 {
             return;
         }
@@ -1284,24 +1299,36 @@ impl BoardsView {
             // rather than as the thing the line is pointing at.
             return;
         }
-        // The head points the way the line arrives, which on a curve is the way
-        // its last control point leaves — not the way the sample before it lies.
-        let before = match bent {
+        // A head points the way the line LEAVES the end it sits on, which on a
+        // curve is the way that end's control point lies rather than the way
+        // the neighbouring sample does. A bent connector is one quadratic and
+        // both of its ends share the single control, so both ask for the same
+        // one and get opposite answers out of it.
+        let toward = |neighbour: usize| match bent {
             true => bend_control(&path),
-            false => path[path.len() - 2],
+            false => path[neighbour],
         };
-        let angle = (end[1] - before[1]).atan2(end[0] - before[0]);
-        let head = (12. * self.zoom).clamp(7., 30.);
-        for turn in [-0.5_f32, 0.5] {
-            out.push(line(
-                end,
-                [
-                    end[0] - head * (angle + turn).cos(),
-                    end[1] - head * (angle + turn).sin(),
-                ],
-                ink.color,
-                width,
-            ));
+        let at_start = (path[0], toward(1));
+        let at_end = (end, toward(path.len() - 2));
+        let (start_head, end_head) = match ink.heads {
+            Heads::Start => (Some(at_start), None),
+            Heads::End => (None, Some(at_end)),
+            Heads::Both => (Some(at_start), Some(at_end)),
+        };
+        let barb = (12. * self.zoom).clamp(7., 30.);
+        for (tip, toward) in [start_head, end_head].into_iter().flatten() {
+            let angle = (tip[1] - toward[1]).atan2(tip[0] - toward[0]);
+            for turn in [-0.5_f32, 0.5] {
+                out.push(line(
+                    tip,
+                    [
+                        tip[0] - barb * (angle + turn).cos(),
+                        tip[1] - barb * (angle + turn).sin(),
+                    ],
+                    ink.color,
+                    width,
+                ));
+            }
         }
     }
     /// How a card's words are laid out. The painter and the inline editor both
@@ -1805,6 +1832,7 @@ impl BoardsView {
                         color: accent,
                         dash: shape.dash,
                         weight: shape.weight,
+                        heads: shape.heads,
                     };
                     self.paint_stroke(*kind, &screen, ink, 8, out);
                     return;
@@ -1849,6 +1877,7 @@ impl BoardsView {
                     color: Rgba(tint(self.pen.color)),
                     dash: self.pen.dash,
                     weight: self.pen.weight,
+                    heads: self.pen.heads,
                 };
                 self.paint_stroke(Kind::Draw, &screen, ink, boards_wire::MAX_POINTS, out);
             }
@@ -2550,7 +2579,12 @@ fn icon(name: &str) -> Node {
         "weight-thin" => "<path d='M3 12h18' stroke-width='1'/>",
         "weight-medium" => "<path d='M3 12h18' stroke-width='2'/>",
         "weight-thick" => "<path d='M3 12h18' stroke-width='3.5'/>",
-        "weight-heavy" => "<path d='M3 12h18' stroke-width='5.5'/>",
+        // which ends of an arrow carry a head: the same line again, with the
+        // barbs the painter would draw on it. Same reason as the weight row —
+        // the icon is the arrow it makes.
+        "heads-end" => "<path d='M3 12h18M15 7l5 5-5 5'/>",
+        "heads-start" => "<path d='M3 12h18M9 7l-5 5 5 5'/>",
+        "heads-both" => "<path d='M3 12h18M15 7l5 5-5 5M9 7l-5 5 5 5'/>",
         _ => "",
     };
     let bytes=format!("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='#222222' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'>{path}</svg>").into_bytes();
@@ -2822,6 +2856,34 @@ fn weight_row(current: Weight) -> Node {
                     Message::Stroke(weight),
                     true,
                     weight == current,
+                )
+            }),
+        ),
+        4.,
+    )
+}
+/// Which ends of the arrow carry a head, the one it is set to checked. Three
+/// buttons and not two toggles: an arrow with a head at neither end is a line,
+/// and a line is a tool you pick off the toolbar rather than a state you fall
+/// into by switching both ends off.
+fn heads_row(current: Heads) -> Node {
+    kit::spaced(
+        kit::row(
+            "boards/heads",
+            [
+                (Heads::End, "heads-end", "Head at the end"),
+                (Heads::Start, "heads-start", "Head at the start"),
+                (Heads::Both, "heads-both", "A head at both ends"),
+            ]
+            .map(|(heads, name, label)| {
+                icon_button(
+                    &format!("boards/heads/{name}"),
+                    name,
+                    label,
+                    "Which ends the arrow points at",
+                    Message::Pointing(heads),
+                    true,
+                    heads == current,
                 )
             }),
         ),

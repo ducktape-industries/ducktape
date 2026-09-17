@@ -96,6 +96,27 @@ pub enum Weight {
     Thick,
     Heavy,
 }
+/// Which ends of an arrow carry a head. "A ↔ B" is what you draw for a
+/// dependency that goes both ways, a two-way sync, a negotiation, a bus — and
+/// until this existed the board could not draw it at all, only lay two arrows
+/// on top of each other that then moved, bound and deleted separately.
+///
+/// Three states and not two toggles, because it is ONE decision about a line
+/// rather than two about its ends, and because the fourth combination the
+/// toggles would offer — neither end — is already a shape you pick from the
+/// toolbar. Two ways to say headless would be one too many.
+///
+/// Read only for [`Kind::Arrow`]. A line has no heads and is not asked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Heads {
+    /// A head where the arrow finished, which is every arrow drawn before this
+    /// existed and the one a new arrow gets.
+    #[default]
+    End,
+    Start,
+    Both,
+}
 /// How big a shape's words are. Four steps and not a number: the size decides
 /// the box a text shape hugs and the column a card wraps in, so a free number
 /// would let a board hold writing that no zoom level can read and no box can
@@ -154,6 +175,10 @@ pub struct Shape {
     /// that draws a line at all, which is every kind but text.
     #[serde(default)]
     pub weight: Weight,
+    /// Which ends of it carry a head. Stored for every shape and read only by
+    /// an arrow, the same way fill is stored for a line that has no body.
+    #[serde(default)]
+    pub heads: Heads,
     pub align: Align,
     pub text_size: TextSize,
     /// A path's samples, relative to `x`/`y` and spanning `width`/`height`,
@@ -183,6 +208,7 @@ impl Default for Shape {
             fill: Fill::Solid,
             dash: Dash::Solid,
             weight: Weight::Medium,
+            heads: Heads::End,
             align: Align::Middle,
             text_size: TextSize::Medium,
             points: Vec::new(),
@@ -251,6 +277,10 @@ pub enum Change {
     Weight {
         id: String,
         weight: Weight,
+    },
+    Heads {
+        id: String,
+        heads: Heads,
     },
     Align {
         id: String,
@@ -360,6 +390,7 @@ impl Board {
             Change::Fill { id, fill } => self.fill(id, *fill),
             Change::Dash { id, dash } => self.dash(id, *dash),
             Change::Weight { id, weight } => self.weight(id, *weight),
+            Change::Heads { id, heads } => self.heads(id, *heads),
             Change::Align { id, align } => self.align(id, *align),
             Change::TextSize { id, text_size } => self.text_size(id, *text_size),
             Change::Route {
@@ -518,6 +549,14 @@ impl Board {
         };
         let mut shape = record.shape.clone();
         shape.weight = weight;
+        self.replace(id, Some(shape))
+    }
+    fn heads(&mut self, id: &str, heads: Heads) -> Result<(), String> {
+        let Some(record) = self.shapes.get(id) else {
+            return Ok(());
+        };
+        let mut shape = record.shape.clone();
+        shape.heads = heads;
         self.replace(id, Some(shape))
     }
     fn align(&mut self, id: &str, align: Align) -> Result<(), String> {
