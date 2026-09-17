@@ -214,6 +214,15 @@ pub const MAX_FRAME_BYTES: usize = (1 << 20) + (16 << 10);
 /// the decoder enforces.
 pub const MAX_TARGET_BYTES: usize = 64;
 
+/// the idle-chain heartbeat filler's target — a module that deliberately does
+/// not exist, so the nop rejects identically on every validator and leaves no
+/// state. it is a member like any other on the wire, so the drain counts it
+/// apart from real rejections: a rejected member with any OTHER target is an
+/// op that died. the heartbeat SUBMITS with this exact target and noded's
+/// projection hides a block whose only op is it (both re-export this
+/// constant), so the submit, the count and the filter can never drift.
+pub const NOP_TARGET: &str = "consensus.nop";
+
 /// the bytes [`encode_frame`] wraps around a payload: scheme tag 1, origin
 /// length prefix 8 + 32-byte ed25519 pubkey, seq 8, target length prefix 8 +
 /// up to [`MAX_TARGET_BYTES`] of target, payload length prefix 8,
@@ -2098,7 +2107,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     .push((height, outcome.internal_dispatches()));
             }
             let mut any_applied = false;
-            let (mut applied_count, mut rejected_count) = (0usize, 0usize);
+            let (mut applied_count, mut rejected_count, mut nop_count) = (0usize, 0usize, 0usize);
             // one record per applying member, in member (input/FIFO) order; the
             // host guarantees `members` is 1:1 with `ops` in input order. custody
             // ends for each resolved member.
@@ -2110,6 +2119,10 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     payload: op_payload,
                 } = meta;
                 self.release_custody(&mid);
+                // the heartbeat nop is rejected BY DESIGN (its target does not
+                // exist); it is counted on its own so `rejected` below means
+                // only what the comment on the idle-block line says it means.
+                let is_heartbeat_nop = op_target == NOP_TARGET;
                 let (disposition, dispatches, reason) = match member_outcome {
                     MemberOutcome::Applied { dispatches } => {
                         any_applied = true;
@@ -2121,7 +2134,11 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     // framed refusal so the receipt lane can split it into the
                     // module's own token and sentence. node-local only.
                     MemberOutcome::Rejected { reason } => {
-                        rejected_count += 1;
+                        if is_heartbeat_nop {
+                            nop_count += 1;
+                        } else {
+                            rejected_count += 1;
+                        }
                         (
                             Disposition::Rejected,
                             Vec::new(),
@@ -2180,16 +2197,19 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     root_hash = %hex_root(&batch_hash),
                     applied = applied_count,
                     rejected = rejected_count,
+                    nops = nop_count,
                     "block committed"
                 );
             } else {
-                // the member counts ride it: an "idle block" carrying rejected
-                // members is a REAL op silently dying, not the heartbeat nop.
+                // the member counts ride it: the heartbeat nop is `nops` (its
+                // rejection is the design), so an "idle block" with a non-zero
+                // `rejected` is a REAL op silently dying.
                 tracing::debug!(
                     target: "ducktape::consensus",
                     height,
                     view,
                     rejected = rejected_count,
+                    nops = nop_count,
                     "idle block"
                 );
             }
