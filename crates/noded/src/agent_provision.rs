@@ -100,6 +100,12 @@ pub(crate) async fn test_link(handle: crate::NodeHandle) -> NodeLink {
 #[path = "agent_provision/plane_tests.rs"]
 mod plane_tests;
 
+// the composer → provisioner → consensus id boundary, crossed end to end: the
+// one test that fails when a session bind names a run `runs` cannot resolve.
+#[cfg(test)]
+#[path = "agent_provision/session_boundary_tests.rs"]
+mod session_boundary_tests;
+
 /// the D7 relocation lever: the root per-run agent workspaces are minted
 /// under. MUST be outside `<storage>` — VALIDATED here at boot, never trusted.
 /// `DUCKTAPE_AGENT_RUNS_ROOT` overrides the base (operators point it at an

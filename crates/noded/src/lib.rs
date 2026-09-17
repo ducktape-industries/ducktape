@@ -19,6 +19,18 @@
 //! asks the process to exit gracefully — the managing app has no pid, only
 //! this port.
 
+// The app modules' wire crates under the module's OWN name, for the suites
+// only. Core links them as `agent-wire` / `runs-wire` (the native modules ship
+// from ducktape-modules), while bin/node links the same crates bare — and the
+// provisioning suites `#[path]`-include bin/node's chief planner, whose `use
+// agent::…` / `use runs::…` resolve against the crate root. One alias here is
+// what lets that one source file compile in both crates; cargo refuses the
+// same package twice under two names, so it cannot be a second dependency.
+#[cfg(test)]
+extern crate agent_wire as agent;
+#[cfg(test)]
+extern crate runs_wire as runs;
+
 // the owner-gated control namespace: `/v1/admin/*` on the same
 // listener, PoP-gated to the node owner. shutdown + module-code moved here off
 // the unauthenticated public surface.
@@ -116,9 +128,12 @@ pub use projection::{BlockProjection, NOP_TARGET, project_block, project_root_op
 // metrics exposition.
 pub mod peers;
 
-// the in-process daemon testkit (a real Host + router on loopback threads) for
-// e2e harnesses. dev-only: gated so the shipping node never compiles it.
-#[cfg(feature = "testkit")]
+// the in-process daemon testkit (a real Host + router on loopback threads, and
+// the committed app guests read off the checkout) for e2e harnesses. dev-only:
+// gated so the shipping node never compiles it. `test` compiles it too, so this
+// crate's own suites reach the same harness a consumer's do rather than keeping
+// a second copy of it.
+#[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
 use axum::body::Bytes;

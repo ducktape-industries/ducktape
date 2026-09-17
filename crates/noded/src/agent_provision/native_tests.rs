@@ -11,6 +11,9 @@ mod files_node;
 #[path = "native_events_tests.rs"]
 mod events;
 
+#[path = "native_boundary_tests.rs"]
+mod boundary;
+
 const RUN_ID: &str = "chat\u{1f}room\u{1f}1\u{1f}resident";
 const LOGICAL_TURN_ID: &str = "events/0/1";
 
