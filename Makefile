@@ -17,7 +17,7 @@ LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app app-release release-app publish-app airlock-gateway-image rcodesign views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
+.PHONY: all app app-release release-app publish-app airlock-gateway-image rcodesign views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check wasm-rebuild-refresh labs-gate audit
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -636,8 +636,68 @@ wasm-rebuild-check:
 	    echo "    $(GUEST_BUILDER_SHOWN) $$1"; shift; \
 	  fi; \
 	done; \
-	echo "  Run each, and commit the result with its kernel fixture copy."; \
+	echo "  make wasm-rebuild-refresh CRATES=\"$(CRATES)\" promotes what this run already built."; \
+	echo "  Then re-run this check, and commit the result with its kernel fixture copy."; \
 	exit 1
+
+## promote what `wasm-rebuild-check` just built, instead of building it again.
+##
+## The check rebuilds every guest in scope into `$(REBUILD_CHECK_DIR)` and then
+## tells you to rebuild the stale ones — so shipping three refreshed guests cost
+## six full builds, and a 4 MB component is minutes each. The builder now writes
+## the shell lock beside every artifact it emits (`<out>.lock`), so the check's
+## output directory already holds everything a refresh needs: the bytes, and the
+## record of what produced them. This target copies both into place.
+#
+# It REFUSES a pair whose lock names a revision other than HEAD. The check
+# directory is a build output, not a fact: it survives a rebase, a pull and a
+# branch switch, and promoting it afterwards would commit bytes built from
+# source that is no longer here — the one failure a guest artifact must never
+# have, because nothing downstream would notice. The lock records the exact
+# platform revision every guest compiled (`source = "git+…#<sha>"`), so the
+# mismatch is a refusal by name rather than a silent wrong answer.
+wasm-rebuild-refresh:
+	@head=$$(git rev-parse HEAD); \
+	ls "$(REBUILD_CHECK_DIR)"/*.wasm >/dev/null 2>&1 || { \
+	  echo "wasm-rebuild-refresh: $(REBUILD_CHECK_DIR) holds no build to promote."; \
+	  echo "  Run wasm-rebuild-check first; it builds what this promotes."; \
+	  exit 1; }; \
+	promoted=""; \
+	promote() { \
+	  built="$$1"; lock="$$2"; artifact="$$3"; module="$$4"; \
+	  [ -f "$$built" ] && [ -f "$$lock" ] || { \
+	    echo "wasm-rebuild-refresh: $$built has no build to promote."; \
+	    echo "  Run wasm-rebuild-check first; it builds what this promotes."; \
+	    exit 1; }; \
+	  grep -sq "#$$head\"" "$$lock" || { \
+	    echo "wasm-rebuild-refresh: $$lock was built from another revision, not $$head."; \
+	    echo "  That build predates your HEAD. Re-run wasm-rebuild-check."; \
+	    exit 1; }; \
+	  cmp -s "$$built" "$$artifact" && return 0; \
+	  cp "$$built" "$$artifact"; \
+	  cp "$$lock" "$$module/guest.lock"; \
+	  promoted="$$promoted $$artifact"; \
+	}; \
+	for m in $(BUILDER_MODULES) $(NETSTACK_GUEST); do \
+	  id=$$(basename $$m); \
+	  [ -f "$(REBUILD_CHECK_DIR)/$$id.component.wasm" ] || continue; \
+	  promote "$(REBUILD_CHECK_DIR)/$$id.component.wasm" \
+	          "$(REBUILD_CHECK_DIR)/$$id.component.lock" \
+	          "$$m/component.wasm" "$$m" || exit 1; \
+	done; \
+	for m in $(INDEX_MODULES); do \
+	  id=$$(basename $$m); \
+	  [ -f "$(REBUILD_CHECK_DIR)/$$id.index.wasm" ] || continue; \
+	  promote "$(REBUILD_CHECK_DIR)/$$id.index.wasm" \
+	          "$(REBUILD_CHECK_DIR)/$$id.index.lock" \
+	          "$$m/index.wasm" "$$m" || exit 1; \
+	done; \
+	if [ -z "$$promoted" ]; then \
+	  echo "nothing to promote: every built guest already matches its committed bytes"; exit 0; \
+	fi; \
+	echo "promoted:"; \
+	for a in $$promoted; do echo "    $$a"; done; \
+	echo "  Copy each component into crates/kernel/host/tests/fixtures/, then re-run wasm-rebuild-check."
 
 ## the supply-chain tripwire: RustSec advisories and yanked crates against the
 ## committed Cargo.lock, under `deny.toml` — where every carried advisory is
