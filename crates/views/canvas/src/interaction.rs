@@ -307,19 +307,41 @@ impl BoardsView {
         self.board_picker || self.confirmed.is_none()
     }
     pub(super) fn on_board_picker(&mut self) -> Task<Message> {
+        // Leave the card before the menu opens over it. The menu carries text
+        // boxes of its own and a card's editor holds the keyboard while it is
+        // open, so every letter typed into the menu's name box went into the
+        // CARD — over the whole of what it said, because a card opens with its
+        // words selected — while the rows that would have got you out sat dark.
+        // `on_open` already takes this door one press later; this is the same
+        // door, at the moment the menu is asked for.
+        let leaving = self.finish_text();
+        if self.inline.is_some() {
+            // The card refused to be left — too long, or too many edits still
+            // queued. `finish_text` has said which; the menu does not open over
+            // an answer nobody would then be able to read.
+            return leaving;
+        }
         self.board_picker = !self.board_picker;
         if self.board_picker {
-            // The rename box says what the board is called, every time it is
-            // opened. Keeping a half-typed name across a close would offer to
-            // rename the board to something you walked away from.
-            self.rename = self
-                .confirmed
-                .as_ref()
-                .map(|board| board.title.clone())
-                .unwrap_or_default();
-            return Task::none();
+            self.name_the_board_we_are_on();
+            return leaving;
         }
-        self.take_the_keyboard()
+        Task::batch([leaving, self.take_the_keyboard()])
+    }
+    /// The rename box names the board the view is on, and nothing else.
+    ///
+    /// Called wherever the view ARRIVES at a board rather than only where the
+    /// menu opens: seeding it at the menu alone left the box holding the last
+    /// board's name when a board was made from the menu, which stays open —
+    /// the chip said one name, the box under it said another, and Rename was
+    /// live and would have taken the wrong one. It also drops a half-typed name
+    /// you walked away from, which must never come back as an offer.
+    pub(super) fn name_the_board_we_are_on(&mut self) {
+        self.rename = self
+            .confirmed
+            .as_ref()
+            .map(|board| board.title.clone())
+            .unwrap_or_default();
     }
     pub(super) fn on_snap(&mut self) -> Task<Message> {
         self.snap = !self.snap;
