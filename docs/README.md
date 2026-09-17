@@ -25,6 +25,7 @@ document nothing cites is deleted, not archived.
 | Run the untrusted coordinator (rendezvous + first-contact relay); stand up two NAT'd validators | [`deploy/coordinator.md`](deploy/coordinator.md) |
 | Front a validator with a sentry so it exposes no inbound port | [`deploy/sentry-deployment.md`](deploy/sentry-deployment.md) |
 | Replace a network: stop it, archive its workspaces, found a new one and re-import its forge | [`refound-a-network.md`](refound-a-network.md) |
+| Move a live network onto a new node binary: pin, publish, designate, and watch every node flip | [`roll-a-node-release.md`](roll-a-node-release.md) |
 | Run the dogfooding loop: this repo in its own forge, an agent working it | [`dogfood.md`](dogfood.md) |
 | Install and operate the shared resident Chief conversation and its Pages workspace | [`../agents/chief/README.md`](../agents/chief/README.md) |
 | Bring the microVM sandbox up on macOS (the vz shim) | [`sandbox-macos.md`](sandbox-macos.md) |

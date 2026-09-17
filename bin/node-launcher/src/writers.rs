@@ -232,7 +232,7 @@ pub fn seal(dir: &Path) {
     set_writable(dir, false);
 }
 
-fn unseal(dir: &Path) {
+pub fn unseal(dir: &Path) {
     set_writable(dir, true);
 }
 

@@ -592,8 +592,24 @@ fn seed(
     std::fs::create_dir_all(&release_dir)
         .map_err(|error| Refusal::io("install_failed", &release_dir, &error))?;
     let exe = release_dir.join(NODE_EXE);
-    let _ = std::fs::remove_file(&exe);
-    std::fs::copy(from, &exe).map_err(|error| Refusal::io("install_failed", &exe, &error))?;
+    // This verb is also how a workspace is told which release key to follow,
+    // so it has to be runnable over the release that is already installed —
+    // and the binary an operator reaches for then is the one the workspace
+    // runs, `<workspace>/current/ducktape`, which IS this path. Removing and
+    // re-copying would delete the source and leave the workspace with no
+    // binary at all. An install onto itself copies nothing; the sha named the
+    // directory, so what is there is already the bytes asked for.
+    let installed_here = match (std::fs::canonicalize(from), std::fs::canonicalize(&exe)) {
+        (Ok(source), Ok(target)) => source == target,
+        _ => false,
+    };
+    if !installed_here {
+        // A staged release directory is SEALED read-only, so a re-install over
+        // a different binary has to lift that first or it dies on its own seal.
+        writers::unseal(&release_dir);
+        let _ = std::fs::remove_file(&exe);
+        std::fs::copy(from, &exe).map_err(|error| Refusal::io("install_failed", &exe, &error))?;
+    }
     writers::require_release(&release_dir)?;
     writers::seal(&release_dir);
     writers::replace_symlink(&layout.current_link(), &Layout::link_target(sha))?;
@@ -813,5 +829,35 @@ mod tests {
         assert!(layout.exe().exists(), "current/ducktape resolves");
         // no release key pinned: this install follows no channel.
         assert_eq!(update::trusted_keys(&layout).unwrap(), None);
+    }
+
+    /// Pinning a key on a workspace that is already running one is this verb
+    /// over `<workspace>/current/ducktape` — the release it installed, sealed
+    /// read-only, and the source and the target are then the same file.
+    #[test]
+    fn a_second_install_over_the_running_release_pins_without_losing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::of(dir.path());
+        let binary = dir.path().join("ducktape-built");
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sha = seed(&layout, &binary, None).unwrap();
+
+        let key = "11".repeat(32);
+        let again = seed(&layout, &layout.exe(), Some(&key)).unwrap();
+
+        assert_eq!(again, sha, "the same bytes are the same release");
+        assert!(layout.exe().exists(), "the binary it was running is still there");
+        assert_eq!(
+            std::fs::read(layout.exe()).unwrap(),
+            b"#!/bin/sh\nexit 0\n",
+            "and it is the same bytes, not a truncated copy of itself"
+        );
+        writers::require_release(&layout.release_dir(sha)).expect("still a runnable release");
+        assert!(
+            update::trusted_keys(&layout).unwrap().is_some(),
+            "the workspace now follows the channel"
+        );
     }
 }
