@@ -725,6 +725,19 @@ impl ForgeView {
                 8.,
             ));
         }
+        section(
+            "forge/reviews",
+            native::heading("forge/reviews-title", "Reviews"),
+            content,
+        )
+    }
+
+    /// What a reader ADDS to a pull request: the verdict, the line comment
+    /// the diff asked for, the comments staged so far, and the one button
+    /// that sends them. It rides the files screen — the lines a comment
+    /// anchors to are there, and a form on a screen without them is a form
+    /// nobody can see.
+    pub(super) fn review_compose(&self) -> wire::Node {
         let available = self.connected && !self.review_busy;
         let mut compose = vec![native::spaced(
             native::row(
@@ -893,14 +906,9 @@ impl ForgeView {
             ),
             6.,
         ));
-        content.push(native::card(
+        native::card(
             "forge/compose",
             native::spaced(native::column("forge/compose-column", compose), 8.),
-        ));
-        section(
-            "forge/reviews",
-            native::heading("forge/reviews-title", "Reviews"),
-            content,
         )
     }
 

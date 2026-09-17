@@ -22,6 +22,7 @@ impl super::ForgeView {
             Message::ForgeOpenItem(number) => self.on_forge_open_item(number),
             Message::ForgeCloseItem => self.on_forge_close_item(),
             Message::SelectForgeTab(next) => self.on_select_forge_tab(next),
+            Message::SelectItemTab(next) => self.on_select_item_tab(next),
             Message::SelectTrackerSide(side) => self.on_select_tracker_side(side),
             Message::TrackerFilterChanged(text) => self.on_tracker_filter_changed(text),
             Message::Key(event, captured) => self.on_key(event, captured),
@@ -525,6 +526,9 @@ impl super::ForgeView {
         self.linked_note = Vec::new();
         self.host_error = "".to_owned();
         self.item_phase = "loading".to_owned();
+        // an item opens on its conversation, whichever screen the last one
+        // was left on
+        self.item_tab = "conversation".to_owned();
         self.forge_item_channel = "".to_owned();
         self.review_verdict = "comment".to_owned();
         self.staged_comments = Vec::new();
@@ -543,6 +547,7 @@ impl super::ForgeView {
     fn on_forge_close_item(&mut self) -> ducktape_view_guest::Task<Message> {
         self.forge_item_number = 0;
         self.item_phase = "idle".to_owned();
+        self.item_tab = "conversation".to_owned();
         self.forge_item_channel = "".to_owned();
         self.linked_note = Vec::new();
         self.focus_seq = 0;
@@ -562,6 +567,10 @@ impl super::ForgeView {
         // the close carries its own focus request; this one is for the tab
         // press itself, so the keys land on the page either way
         (::ducktape_view_guest::Task::done(true)).map(|_value| Message::ForgeCloseItem)
+    }
+    fn on_select_item_tab(&mut self, next: String) -> ducktape_view_guest::Task<Message> {
+        self.item_tab = next;
+        self.take_the_keyboard()
     }
     fn on_select_tracker_side(&mut self, side: String) -> ducktape_view_guest::Task<Message> {
         self.item_side = side;
