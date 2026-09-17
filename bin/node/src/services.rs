@@ -953,26 +953,35 @@ struct Catalog {
     node_build: Option<String>,
 }
 
-/// The services signaling to the workspace's own node. A node that is not
-/// running is NOT an error here: nothing signaling is exactly what `list` must
-/// render, and the grants still come off disk.
-fn catalog_now(base: &str) -> Catalog {
+/// The services signaling to the workspace's own node, or why the node could
+/// not be asked. `list` renders the grants off disk either way; what neither
+/// verb may do is turn "I could not ask" into "nothing is signaling".
+fn catalog_now(base: &str) -> (Catalog, Option<String>) {
     match read_catalog(base) {
-        Ok(catalog) => catalog,
+        Ok(catalog) => (catalog, None),
         // A node that is not running is the ordinary case — `list` must still
-        // render the grants — so it stays quiet. Anything else (a 404, a 500,
-        // a body whose shape changed) would otherwise be indistinguishable
-        // from "nothing is signaling", which is exactly the wrong thing to
-        // tell someone who is about to consent to something.
-        Err(crate::node_http::ReadFailure::Unreachable) => Catalog::default(),
-        Err(error) => {
-            let _ = write_err(&format!(
-                "{} could not read the signaling catalog: {error}\n",
-                paint(YELLOW, "warning:")
-            ));
-            Catalog::default()
-        }
+        // render the grants — so it stays quiet on stderr. It is NOT silent in
+        // the answer: the caller is told the catalog is unknown rather than
+        // empty, because those render differently and exit differently.
+        Err(crate::node_http::ReadFailure::Unreachable) => (
+            Catalog::default(),
+            Some("the node is not running, so nothing could be asked what is signaling".into()),
+        ),
+        // No warning printed here any more: the caller ends on this reason,
+        // and printing it twice made the second line read like a second fault.
+        Err(error) => (Catalog::default(), Some(error.to_string())),
     }
+}
+
+/// What is signaling right now, with "could not ask" flattened to "nothing".
+///
+/// Only for the enable/disable paths: those already hold a plan the node
+/// answered for, so an unreadable catalog there is a node that went away
+/// mid-verb, and the announce set they build is refused on its own terms. The
+/// read verbs must NOT use this — for them the difference between an empty
+/// catalog and an unread one is the whole answer.
+fn signaling_now(base: &str) -> Vec<noded::services::Signaling> {
+    catalog_now(base).0.signaling
 }
 
 fn read_catalog(base: &str) -> Result<Catalog, crate::node_http::ReadFailure> {
@@ -989,16 +998,32 @@ fn read_catalog(base: &str) -> Result<Catalog, crate::node_http::ReadFailure> {
 }
 
 /// the rendered rows and the node build they are to be judged against.
-fn view(args: &ReadArgs) -> Result<(Vec<ServiceRow>, Option<String>), Box<dyn std::error::Error>> {
+/// What the read verbs render: the rows, the node's own build stamp, and —
+/// when the node could not be asked — why. The third is not decoration: the
+/// rows alone cannot distinguish an empty catalog from an unread one.
+struct View {
+    rows: Vec<ServiceRow>,
+    node_build: Option<String>,
+    unread: Option<String>,
+}
+
+fn view(args: &ReadArgs) -> Result<View, Box<dyn std::error::Error>> {
     let workspace = args.workspace.dir()?;
     let grants = load(&workspace)?;
     let service = config::resolve_service(&args.workspace.config_file()?)?;
-    let catalog = match service.http_listen.as_deref() {
+    let (catalog, unread) = match service.http_listen.as_deref() {
         Some(listen) => catalog_now(&config::http_base_of(listen)),
-        None => Catalog::default(),
+        None => (
+            Catalog::default(),
+            Some("this workspace's config names no http address to ask".into()),
+        ),
     };
     let all = rows(&catalog.signaling, &grants.grants);
-    Ok((only_kind(all, args.kind.as_deref())?, catalog.node_build))
+    Ok(View {
+        rows: only_kind(all, args.kind.as_deref())?,
+        node_build: catalog.node_build,
+        unread,
+    })
 }
 
 /// Narrow the rendered rows to one kind, or say that kind is not here.
@@ -1028,25 +1053,59 @@ fn only_kind(rows: Vec<ServiceRow>, kind: Option<&str>) -> Result<Vec<ServiceRow
 }
 
 fn list(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let (rows, _node_build) = view(&args)?;
+    let view = view(&args)?;
+    // With nothing on disk AND nothing read, the renderer's line is "no
+    // services signaling and none enabled" — an assertion about the world this
+    // call did not establish. The refusal below is then the whole answer.
+    let has_rows = !view.rows.is_empty();
     if args.json {
-        println!("{}", serde_json::to_string(&rows)?);
-        return Ok(());
+        println!("{}", serde_json::to_string(&view.rows)?);
+    } else if has_rows || view.unread.is_none() {
+        // no build column in `list`: it is the one-line-per-service view, and
+        // the node's stamp belongs beside the daemon's, which only `status`
+        // has room for.
+        write_out(&render_list(&view.rows))?;
     }
-    // no build column in `list`: it is the one-line-per-service view, and the
-    // node's stamp belongs beside the daemon's, which only `status` has room for.
-    write_out(&render_list(&rows))?;
-    Ok(())
+    match view.unread {
+        None => Ok(()),
+        Some(reason) => Err(unread_refusal(&reason, has_rows).into()),
+    }
 }
 
 fn status(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let (rows, node_build) = view(&args)?;
+    let view = view(&args)?;
+    // See `list`: an empty render is an assertion, and an unread catalog did
+    // not earn it. A caller that asked for `--json` and got `[]` must not read
+    // it as "no services" either, which is why the exit code covers both.
+    let has_rows = !view.rows.is_empty();
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
-        return Ok(());
+        println!("{}", serde_json::to_string_pretty(&view.rows)?);
+    } else if has_rows || view.unread.is_none() {
+        write_out(&render_status(&view.rows, view.node_build.as_deref()))?;
     }
-    write_out(&render_status(&rows, node_build.as_deref()))?;
-    Ok(())
+    // Whatever printed came off disk and is real. What is SIGNALING is not
+    // known, and every state word in that render is about signaling — so a
+    // verb that could not ask must not exit as though it had.
+    match view.unread {
+        None => Ok(()),
+        Some(reason) => Err(unread_refusal(&reason, has_rows).into()),
+    }
+}
+
+/// The sentence a read verb ends on when the node never answered. Names what
+/// is still true (whatever is on disk), what is not known (what is signaling
+/// right now), and where the node's own reason lives — it writes an exact one,
+/// into a file rather than in front of anyone.
+fn unread_refusal(reason: &str, printed_grants: bool) -> String {
+    let disk = match printed_grants {
+        true => "the grants above are what this workspace holds on disk",
+        false => "this workspace holds no grants on disk",
+    };
+    format!(
+        "{disk}; what is SIGNALING could not be read — {reason}.\n\
+         if a launcher is supervising this node, its own reason is the last \
+         FATAL line in <workspace>/launcher.log"
+    )
 }
 
 fn join_or_dash(items: &[String]) -> String {
@@ -1141,7 +1200,7 @@ pub(crate) fn plan_enable(
         kind,
         service,
         node_id,
-        catalog_now(&config::http_base_of(listen)).signaling,
+        signaling_now(&config::http_base_of(listen)),
     )
 }
 
@@ -1307,7 +1366,7 @@ pub(crate) fn commit_enable(
         // can produce, and this is a subset of it.
         crate::announce::announced_set(
             &services.grants,
-            &catalog_now(base).signaling,
+            &signaling_now(base),
             &plan.capacity,
         )
         .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))
@@ -2123,7 +2182,7 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
         // refuses, which `Services::validate` prevents on load.
         let announce = crate::announce::announced_set(
             &services.grants,
-            &catalog_now(&base).signaling,
+            &signaling_now(&base),
             &service.sandbox_capacity,
         )
         .map_err(|refusal| format!("{kind} was not disabled: {refusal}"))?;
@@ -3472,6 +3531,31 @@ mod tests {
                 json,
                 format!("\"{}\"", state.label()),
                 "the json token and the printed label must agree"
+            );
+        }
+    }
+
+    /// A node that cannot be asked is not a node with nothing to say. The
+    /// refusal has to name which of the two it is, because the rows above it
+    /// are about grants on disk and every state word in them is about
+    /// signaling, which is exactly what went unread.
+    #[test]
+    fn the_unread_refusal_never_claims_the_catalog_was_empty() {
+        let reason = "the node is not running";
+        for (printed_grants, expected) in [
+            (true, "the grants above are what this workspace holds on disk"),
+            (false, "this workspace holds no grants on disk"),
+        ] {
+            let said = unread_refusal(reason, printed_grants);
+            assert!(said.starts_with(expected), "{said}");
+            assert!(said.contains(reason), "the reason must survive: {said}");
+            assert!(
+                said.contains("could not be read"),
+                "it must say the catalog went UNREAD, never that it was empty: {said}"
+            );
+            assert!(
+                !said.contains("none enabled") && !said.contains("nothing is signaling"),
+                "it must not assert what it failed to establish: {said}"
             );
         }
     }
