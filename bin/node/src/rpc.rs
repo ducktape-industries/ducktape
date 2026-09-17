@@ -125,11 +125,13 @@ pub(crate) struct RpcStatus {
     pub(crate) height: Option<u64>,
     pub(crate) root_hash: String,
     pub(crate) modules: std::collections::BTreeMap<String, String>,
-    /// which netstack backend the reachability plane runs on and how the last
-    /// swap went — the same projection `/v1/status` carries under
-    /// `operations.netstack`. Absent on a node with no plane.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) netstack: Option<noded::NetstackOperationalStatus>,
+    /// the WHOLE operations projection `/v1/status` serves, not a chosen slice
+    /// of it. `node status` is the verb the getting-started screen points an
+    /// operator at, and a slice is what let it print two numbers that are
+    /// identical on a healthy chain and a halted one. The node computes this
+    /// either way; carrying all of it costs one clone and leaves nothing for
+    /// the next question to have to re-plumb.
+    pub(crate) operations: noded::OperationalStatus,
 }
 
 impl RpcReply {
