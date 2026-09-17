@@ -151,6 +151,10 @@ indexer = { workspace = true }
 # feature behind the SIGUSR1 task dump is added by the Linux-only target
 # table below: tokio makes it a compile_error! on any other OS.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal", "io-std", "io-util"] }
+# a request body reaches the loopback upstream as a channel of frames, and
+# `reqwest::Body::wrap_stream` wants a Stream: this is the adapter that makes a
+# receiver one, without holding the body to build it.
+tokio-stream = "0.1"
 
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
@@ -265,8 +269,6 @@ sdk-testkit = { workspace = true }
 # in milliseconds of wall time instead of minutes.
 tokio = { version = "1", features = ["test-util", "macros"] }
 tempfile = "3"
-# the streaming e2e feeds an SSE upstream through a channel-backed Body.
-tokio-stream = "0.1"
 # the componentizer: the self-heal e2e builds the seed repository's guest the
 # way the network's own modules are built.
 guest-builder = { path = "../guest-builder" }

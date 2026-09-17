@@ -136,7 +136,7 @@ fn signed_loopback_route(
             policy: RoutePolicy {
                 audience: RouteAudience::Network,
                 methods: vec![RouteMethod::Get, RouteMethod::Head, RouteMethod::Post],
-                max_request_bytes: 1024 * 1024,
+                max_request_bytes: Some(1024 * 1024),
                 max_response_bytes,
                 allow_authorization,
                 allow_upgrade: false,
@@ -411,7 +411,7 @@ fn alice_fronts_the_gateway(
         let (ok, output) = cluster.run_verb(&[
             "gateway",
             "bind",
-        "--trusted-loopback",
+            "--trusted-loopback",
             "--workspace",
             workspace.to_str().unwrap(),
             "--label",
@@ -456,8 +456,10 @@ fn alice_serves_airlock(
     (alice, alice_account, alice_node)
 }
 
-/// The published `max_request_bytes` of one of alice's routes.
-fn route_request_cap(cluster: &Cluster, account: u64, name: &str) -> Option<u64> {
+/// The published `max_request_bytes` of one of alice's routes. The outer
+/// `None` is "no such route committed yet"; the inner one is a route that
+/// declares no cap at all.
+fn route_request_cap(cluster: &Cluster, account: u64, name: &str) -> Option<Option<u64>> {
     let bytes = cluster.query(
         0,
         "gateway",
@@ -636,7 +638,7 @@ fn release_sign_bundle_round_trips_through_the_node() {
     cluster.await_committed(0, "both airlock routes published", FINALIZE, || {
         let model = route_request_cap(&cluster, alice_account, "airlock")?;
         let sign = route_request_cap(&cluster, alice_account, "airlock-sign")?;
-        (model == 16 * 1024 * 1024 && sign == 256 * 1024 * 1024).then_some(())
+        (model == Some(16 * 1024 * 1024) && sign == Some(256 * 1024 * 1024)).then_some(())
     });
 
     // a wrong measurement never releases the identity: refused by name
@@ -1170,7 +1172,7 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
         let (ok, output) = cluster.run_verb(&[
             "gateway",
             "bind",
-        "--trusted-loopback",
+            "--trusted-loopback",
             "--workspace",
             workspace.to_str().unwrap(),
             "--label",

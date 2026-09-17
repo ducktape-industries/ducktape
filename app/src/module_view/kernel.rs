@@ -1504,7 +1504,6 @@ fn application_request(value: serde_json::Value) -> Result<ApplicationRequest, S
         method: request.method,
         path_and_query: request.path.clone(),
         headers: request.headers.clone(),
-        body_len: request.body.len() as u64,
         upgrade: false,
         user_pop: None,
     })?;
@@ -1545,7 +1544,6 @@ async fn application_head(
         method: request.method,
         path_and_query: request.path.clone(),
         headers: request.headers.clone(),
-        body_len: request.body.len() as u64,
         upgrade,
         user_pop: None,
     };

@@ -23,15 +23,25 @@ use data_plane::{
 use duckfs_core::{EntryKindWire, FilesQuery, FilesReply};
 use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt as _, StreamExt as _};
-use noded::{GatewayFailure, GatewayJob, GatewayResponse, NodeCommand};
+use noded::{
+    EMPTY_BODY_DIGEST, GATEWAY_BODY_FRAMES, GatewayFailure, GatewayJob, GatewayRequestBody,
+    GatewayResponse, NodeCommand, one_shot_body,
+};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 const PROXY_IO_TIMEOUT: Duration = Duration::from_secs(15);
-/// Idle ceiling between BODY reads from a loopback upstream. A live SSE feed
-/// emits events/keepalives well inside this; a silent-forever upstream would
-/// otherwise pin its accept permit (16 total) and its serve task for good.
+/// Idle ceiling between BODY reads — from a loopback upstream, and equally
+/// between a caller's request frames. A live SSE feed emits events/keepalives
+/// well inside this, and a client streaming a pack keeps writing as it packs;
+/// a silent-forever peer would otherwise pin its accept permit (16 total) and
+/// its serve task for good. It bounds each READ, never the exchange: a body
+/// has no size any more, so the only honest deadline is one on progress.
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// One number, named on both sides of the door: what noded publishes as the
+// ceiling on a silent publisher IS this ceiling, because this plane is the hop
+// that applies it.
+const _: () = assert!(BODY_IDLE_TIMEOUT.as_secs() == noded::PROXY_REPLY_TIMEOUT.as_secs());
 // The airlock signing route answers its head at once and then goes quiet for
 // as long as Apple's notary takes, sealing a keepalive into its stream every
 // `KEEPALIVE_INTERVAL` so this per-read ceiling sees progress; a keepalive
@@ -54,6 +64,14 @@ const MAX_CONCURRENT_UPGRADES: usize = 64;
 /// reading, so charging it to the request budget lets 16 peers that never read
 /// starve every gateway request on the node.
 const MAX_CONCURRENT_STREAMS: usize = 64;
+/// Inbound exchanges ONE caller node may hold at once. A request permit used
+/// to end within a one-shot deadline; now that a request body streams, it ends
+/// when the caller stops sending, and a caller that dribbles one frame per
+/// [`BODY_IDLE_TIMEOUT`] holds its permit for as long as it likes. The count
+/// is the bound: without this, one peer taking all
+/// [`MAX_CONCURRENT_REQUESTS`] slots is the whole gateway, and with it that
+/// costs four distinct admitted peers instead of one.
+const MAX_INBOUND_REQUESTS_PER_CALLER: usize = 4;
 
 type PlaneSlot = Arc<OnceLock<Arc<StreamService<OverlaySockets>>>>;
 
@@ -69,6 +87,30 @@ struct GatewayBudget {
     requests: Arc<tokio::sync::Semaphore>,
     streams: Arc<tokio::sync::Semaphore>,
     upgrades: Arc<tokio::sync::Semaphore>,
+    /// Inbound exchanges per caller node, so the request budget cannot be
+    /// taken whole by one peer. Only the INBOUND half counts here: the caller
+    /// half serves this node's own browser, which is not a stranger.
+    inbound: std::sync::Mutex<std::collections::HashMap<[u8; 32], usize>>,
+}
+
+/// One caller node's share of the inbound request budget, released on drop.
+struct CallerSlot {
+    budget: Arc<GatewayBudget>,
+    caller: [u8; 32],
+}
+
+impl Drop for CallerSlot {
+    fn drop(&mut self) {
+        let mut inbound = self.budget.inbound.lock().expect("gateway budget poisoned");
+        let std::collections::hash_map::Entry::Occupied(mut entry) = inbound.entry(self.caller)
+        else {
+            return;
+        };
+        *entry.get_mut() -= 1;
+        if *entry.get() == 0 {
+            entry.remove();
+        }
+    }
 }
 
 impl GatewayBudget {
@@ -77,6 +119,24 @@ impl GatewayBudget {
             requests: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             streams: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
             upgrades: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UPGRADES)),
+            inbound: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// Take `caller`'s share of the inbound budget, or `None` when it already
+    /// holds [`MAX_INBOUND_REQUESTS_PER_CALLER`]. Taken BEFORE the plane-wide
+    /// permit, which queues: a caller already at its own limit must be refused
+    /// outright, not parked in the queue ahead of everyone else.
+    fn admit_caller(self: &Arc<Self>, caller: [u8; 32]) -> Option<CallerSlot> {
+        let mut inbound = self.inbound.lock().expect("gateway budget poisoned");
+        let held = inbound.entry(caller).or_insert(0);
+        if *held >= MAX_INBOUND_REQUESTS_PER_CALLER {
+            return None;
+        }
+        *held += 1;
+        Some(CallerSlot {
+            budget: Arc::clone(self),
+            caller,
         })
     }
 
@@ -220,9 +280,13 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                 )));
                                 return;
                             };
-                            // The deadline covers everything up to the response
-                            // HEAD; the body streams beyond it (WS precedent).
-                            let result = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
+                            // No deadline over the exchange. The request body
+                            // has no declared size, so a one-shot timer here
+                            // would refuse a large push for being large; every
+                            // step inside is bounded on PROGRESS instead —
+                            // per consensus round trip, per request frame, per
+                            // upstream read, per response frame.
+                            let result = async {
                                 if publisher_node == own_node {
                                     // Self-serve rides the SAME frame protocol as
                                     // the overlay path over a local duplex, so a
@@ -236,7 +300,6 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                     let serve_workspace = workspace.clone();
                                     let serve_ports = node_api_ports.clone();
                                     let head_for_server = head.clone();
-                                    let body_for_server = body.clone();
                                     let serve_slot = RequestSlot {
                                         budget: Arc::clone(&budget),
                                         permit,
@@ -252,7 +315,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                             &scope,
                                             &own_node,
                                             head_for_server,
-                                            Some(body_for_server),
+                                            Some(body),
                                             serve_slot,
                                             server_end,
                                         )
@@ -267,17 +330,12 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                         publisher_node,
                                         max_response_bytes,
                                         &head,
-                                        &body,
+                                        body,
                                     )
                                     .await
                                 }
-                            })
-                            .await
-                            .unwrap_or_else(|_| {
-                                Err(GatewayFailure::Unavailable(
-                                    "gateway proxy request timed out".into(),
-                                ))
-                            });
+                            }
+                            .await;
                             let _ = reply.send(result);
                         }
                         // A WebSocket upgrade is long-lived, so it is not wrapped
@@ -460,6 +518,22 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                         serve_ws(&commands, &scope, &requester.0, &head, stream).await;
                         return;
                     }
+                    let Some(_caller_slot) = budget.admit_caller(requester.0) else {
+                        tracing::warn!(
+                            target: "ducktape::gateway",
+                            reason = "caller_request_budget_full",
+                            open = MAX_INBOUND_REQUESTS_PER_CALLER,
+                            "inbound gateway request refused"
+                        );
+                        let _ = write_proxy_response(
+                            &mut stream,
+                            Err(GatewayFailure::Unavailable(
+                                "this caller already holds its share of the gateway".into(),
+                            )),
+                        )
+                        .await;
+                        return;
+                    };
                     let Some(permit) = budget.admit_request().await else {
                         tracing::warn!(
                             target: "ducktape::gateway",
@@ -501,36 +575,32 @@ async fn proxy_remote(
     publisher: [u8; 32],
     max_response_bytes: u64,
     head: &gateway::ProxyRequestHead,
-    body: &[u8],
+    mut body: GatewayRequestBody,
 ) -> Result<GatewayResponse, GatewayFailure> {
     let service = slot
         .get()
         .ok_or_else(|| GatewayFailure::Unavailable("gateway overlay is still starting".into()))?;
-    if body.len() as u64 != head.body_len {
-        return Err(GatewayFailure::Invalid(
-            "gateway proxy: request body length mismatch".into(),
-        ));
-    }
     let meta = gateway::encode_proxy_request_head(head).map_err(GatewayFailure::Invalid)?;
     let mut stream = service
         .open(PeerId(publisher), proxy_flow(), gateway::PROXY_INTENT, meta)
         .await
         .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-    // The deadline covers the request write + response HEAD; the body pump
-    // streams beyond it.
-    tokio::time::timeout(PROXY_IO_TIMEOUT, async {
-        stream
-            .write_all(body)
-            .await
-            .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-        stream
-            .flush()
-            .await
-            .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-        read_streamed_response(budget, stream, max_response_bytes).await
-    })
-    .await
-    .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))?
+    // The head declares no length, so the body goes out as frames and `End`
+    // closes it — the same `ProxyFrame` pair the response direction has always
+    // used. Each frame is written under its own deadline, so a push is as long
+    // as it needs to be while a dead link still fails.
+    while let Some(item) = body.recv().await {
+        let chunk = item?;
+        for piece in chunk.chunks(gateway::MAX_CHUNK_BYTES) {
+            push_frame(&mut stream, &gateway::ProxyFrame::BodyChunk(piece.to_vec()))
+                .await
+                .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
+        }
+    }
+    push_frame(&mut stream, &gateway::ProxyFrame::End)
+        .await
+        .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
+    read_streamed_response(budget, stream, max_response_bytes).await
 }
 
 /// What serving a route needs of THIS node, shared by the HTTP proxy and the
@@ -544,46 +614,101 @@ struct LoopbackScope<'a> {
 
 /// One proxied HTTP exchange over a frame-capable stream (the overlay socket
 /// or the self-serve duplex). `body`: `Some` when the caller already holds the
-/// request body (self-serve); `None` reads `head.body_len` bytes off the
-/// stream (overlay). `slot`: the request permit this exchange holds, swapped
-/// for a stream permit at the response head — every serve path holds one,
-/// overlay-inbound and local self-serve alike. The deadline covers the body
-/// read + serve up to the response HEAD; the drain past it is bounded per
-/// frame instead, by [`write_proxy_response`].
+/// request body (self-serve); `None` reads `BodyChunk` frames off the stream
+/// until its `End` (overlay). `slot`: the request permit this exchange holds,
+/// swapped for a stream permit at the response head — every serve path holds
+/// one, overlay-inbound and local self-serve alike.
+///
+/// NOTHING here deadlines the exchange as a whole. A request body has no
+/// declared size, so a total deadline would refuse a large push for being
+/// large rather than for being stalled. Each STEP is bounded instead: a
+/// consensus round trip by [`PROXY_IO_TIMEOUT`], each request frame and each
+/// upstream read by [`BODY_IDLE_TIMEOUT`], and the response drain per frame by
+/// [`write_proxy_response`].
 async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     commands: &mpsc::Sender<NodeCommand>,
     scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     head: gateway::ProxyRequestHead,
-    body: Option<Vec<u8>>,
+    body: Option<GatewayRequestBody>,
     slot: RequestSlot,
-    mut stream: S,
+    stream: S,
 ) {
-    let outcome = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
-        let body = match body {
-            Some(body) => body,
-            None => {
-                let body_len = usize::try_from(head.body_len).map_err(|_| {
-                    GatewayFailure::Invalid("gateway proxy: body length overflows usize".into())
-                })?;
-                let mut body = vec![0u8; body_len];
-                stream
-                    .read_exact(&mut body)
-                    .await
-                    .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-                body
-            }
-        };
-        serve_current(commands, scope, caller_node, &head, &body).await
-    })
-    .await
-    .unwrap_or_else(|_| {
-        Err(GatewayFailure::Unavailable(
-            "gateway proxy request timed out".into(),
-        ))
-    });
+    // Reading the request and writing the response are independent halves of
+    // one stream: the body can go on arriving while the upstream is already
+    // being fed, which is what keeps a large request off this process's heap.
+    let (reader, mut writer) = tokio::io::split(stream);
+    // self-serve hands us a stream; the overlay hands us frames still on the
+    // wire. Which one it is cannot decide the allowance — only the resolved
+    // route can — so the source is opened inside `serve_current`.
+    let source = match body {
+        Some(body) => RequestBodySource::Ready(body),
+        None => RequestBodySource::Frames(reader),
+    };
+    let outcome = serve_current(commands, scope, caller_node, &head, source).await;
     let (outcome, _drain_permit) = charge_drain(outcome, slot);
-    let _ = write_proxy_response(&mut stream, outcome).await;
+    let _ = write_proxy_response(&mut writer, outcome).await;
+}
+
+/// Pull a request body off the stream as frames, refusing the chunk that takes
+/// it past what the route admits. A body is never accumulated here: each frame
+/// is handed on as it lands, and the channel's depth is the only memory this
+/// costs.
+fn request_body_frames<R: AsyncRead + Unpin + Send + 'static>(
+    reader: R,
+    allowance: Option<u64>,
+) -> GatewayRequestBody {
+    let (tx, rx) = tokio::sync::mpsc::channel(GATEWAY_BODY_FRAMES);
+    tokio::spawn(async move {
+        let mut reader = reader;
+        let mut buf = Vec::new();
+        let mut seen: u64 = 0;
+        loop {
+            // Per FRAME, never per body: a caller that keeps writing may take
+            // as long as its pack takes, and one that stops is gone.
+            let next = tokio::time::timeout(BODY_IDLE_TIMEOUT, read_frame(&mut reader, &mut buf))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(GatewayFailure::Unavailable(
+                        "gateway proxy: the caller stopped sending its body".into(),
+                    ))
+                });
+            let frame = match next {
+                Ok(frame) => frame,
+                Err(failure) => {
+                    let _ = tx.send(Err(failure)).await;
+                    return;
+                }
+            };
+            let chunk = match frame {
+                gateway::ProxyFrame::BodyChunk(chunk) => chunk,
+                gateway::ProxyFrame::End => return,
+                _ => {
+                    let _ = tx
+                        .send(Err(GatewayFailure::Invalid(
+                            "gateway proxy: unexpected frame in a request body".into(),
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            seen += chunk.len() as u64;
+            if let Some(cap) = allowance
+                && seen > cap
+            {
+                let _ = tx
+                    .send(Err(GatewayFailure::TooLarge(format!(
+                        "gateway_body_exceeds_route_cap: the route admits {cap} bytes per request"
+                    ))))
+                    .await;
+                return;
+            }
+            if tx.send(Ok(bytes::Bytes::from(chunk))).await.is_err() {
+                return;
+            }
+        }
+    });
+    rx
 }
 
 /// Swap the serve task's request permit for a stream permit before the head
@@ -631,7 +756,14 @@ async fn read_streamed_response<S: AsyncRead + Unpin + Send + 'static>(
     max_response_bytes: u64,
 ) -> Result<GatewayResponse, GatewayFailure> {
     let mut buf = Vec::new();
-    let head = read_proxy_head(&mut stream, &mut buf).await?;
+    // The HEAD under the idle ceiling, not the request one: the publisher
+    // answers only once its upstream has consumed the whole request, and a
+    // push's upstream spends that time unpacking. Silence is the failure, not
+    // duration — and it is the same ceiling the publisher holds its own
+    // upstream to. The body past the head is bounded per frame by the pump.
+    let head = tokio::time::timeout(BODY_IDLE_TIMEOUT, read_proxy_head(&mut stream, &mut buf))
+        .await
+        .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))??;
     let Some(permit) = budget.admit_stream() else {
         tracing::warn!(
             target: "ducktape::gateway",
@@ -686,21 +818,46 @@ async fn proxy_remote_ws(
     caller_ws_pump(stream, to_browser, from_browser).await;
 }
 
-async fn serve_current(
+async fn serve_current<R: AsyncRead + Unpin + Send + 'static>(
     commands: &mpsc::Sender<NodeCommand>,
     scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
-    body: &[u8],
+    body: RequestBodySource<R>,
 ) -> Result<GatewayResponse, GatewayFailure> {
     gateway::validate_proxy_request_head(head).map_err(GatewayFailure::Invalid)?;
-    if body.len() as u64 != head.body_len {
-        return Err(GatewayFailure::Invalid(
-            "gateway proxy: request body length mismatch".into(),
-        ));
-    }
-    let record = current_route(commands, scope.own_node, head).await?;
-    let caller = caller_account(commands, head, &record.statement, body).await?;
+    let record = one_round_trip(current_route(commands, scope.own_node, head)).await?;
+    let allowance = gateway::request_body_allowance(head, &record);
+    let body = body.open(allowance);
+
+    // THE BRANCH: a caller proof binds the body's digest, and a proxy cannot
+    // unsend what it forwarded — so a proved request is verified BEFORE the
+    // upstream is touched, which means holding it, which means its route's own
+    // cap is what bounds it. A request with no proof has nothing to verify, so
+    // nothing has to wait for its last byte and it streams unbounded: who may
+    // push is then the upstream's own gate (forge's push certificate and ref
+    // rules), not a byte count here. Relaying first and checking afterwards
+    // would be acting before authenticating, and is never the answer.
+    let (caller, body) = match head.user_pop.is_some() {
+        true => {
+            let held = hold_for_proof(body).await?;
+            let digest = gateway::body_digest(&held);
+            let caller =
+                one_round_trip(caller_account(commands, head, &record.statement, &digest)).await?;
+            (caller, one_shot_body(held))
+        }
+        false => (
+            one_round_trip(caller_account(
+                commands,
+                head,
+                &record.statement,
+                &EMPTY_BODY_DIGEST,
+            ))
+            .await?,
+            body,
+        ),
+    };
+
     let route = record
         .statement
         .route
@@ -717,6 +874,51 @@ async fn serve_current(
             proxy_loopback(scope, caller_node, caller, head, body, &record).await
         }
     }
+}
+
+/// One consensus round trip, deadlined. These are the steps of a proxied
+/// exchange that are single question-and-answer and must never hang it; the
+/// body transfer is deliberately NOT one of them, because a body has no size
+/// and a deadline over it would be a size limit wearing a clock.
+async fn one_round_trip<T>(
+    work: impl Future<Output = Result<T, GatewayFailure>>,
+) -> Result<T, GatewayFailure> {
+    tokio::time::timeout(PROXY_IO_TIMEOUT, work)
+        .await
+        .unwrap_or_else(|_| {
+            Err(GatewayFailure::Unavailable(
+                "gateway proxy step timed out".into(),
+            ))
+        })
+}
+
+/// Where a served request's body comes from: a stream the caller already
+/// built (self-serve), or frames still on the wire (overlay). Either way the
+/// route's allowance is only known once the record resolves, which is why this
+/// is opened late rather than passed in ready.
+enum RequestBodySource<R> {
+    Ready(GatewayRequestBody),
+    Frames(R),
+}
+
+impl<R: AsyncRead + Unpin + Send + 'static> RequestBodySource<R> {
+    fn open(self, allowance: Option<u64>) -> GatewayRequestBody {
+        match self {
+            RequestBodySource::Ready(body) => body,
+            RequestBodySource::Frames(reader) => request_body_frames(reader, allowance),
+        }
+    }
+}
+
+/// Hold a body whose caller proof has to be checked against it. Bounded by the
+/// route's own cap, which [`request_body_frames`] has already enforced — this
+/// only assembles what that allowed through.
+async fn hold_for_proof(mut body: GatewayRequestBody) -> Result<Vec<u8>, GatewayFailure> {
+    let mut held = Vec::new();
+    while let Some(item) = body.recv().await {
+        held.extend_from_slice(&item?);
+    }
+    Ok(held)
 }
 
 /// The caller-independent half of the gate: the route still resolves (a
@@ -957,7 +1159,7 @@ async fn proxy_loopback(
     caller_node: &[u8; 32],
     caller_account: Option<u64>,
     head: &gateway::ProxyRequestHead,
-    body: &[u8],
+    body: GatewayRequestBody,
     record: &gateway::RouteRecord,
 ) -> Result<GatewayResponse, GatewayFailure> {
     let route = record
@@ -966,15 +1168,16 @@ async fn proxy_loopback(
         .as_ref()
         .expect("current route is live");
     let target = loopback_port(scope, caller_node, record.statement.account_id, head)?;
-    // Connect + per-read deadlines only: a TOTAL timeout would kill long
-    // streamed (SSE) bodies, but a silent-forever upstream must not pin its
-    // accept permit — the idle read timeout reclaims it. The head is still
-    // deadline-bound by serve_proxy_stream.
+    // Connect deadline only. NEITHER `timeout` NOR `read_timeout` belongs on
+    // a request that carries a body: both arm when the request starts, and
+    // nothing arrives to read while this node is still SENDING, so either one
+    // refuses a large push for being long rather than for being stalled.
+    // `upstream_made_no_progress` below is the progress bound that replaces
+    // them, and the response body is read frame by frame under the same one.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .connect_timeout(PROXY_IO_TIMEOUT)
-        .read_timeout(BODY_IDLE_TIMEOUT)
         .build()
         .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
     let method = reqwest::Method::from_bytes(head.method.as_http_str().as_bytes())
@@ -1023,13 +1226,28 @@ async fn proxy_loopback(
             .map_err(|error| GatewayFailure::Invalid(error.to_string()))?;
         upstream = upstream.header(name, value);
     }
-    if !body.is_empty() {
-        upstream = upstream.body(body.to_vec());
+    // The upstream is fed from the same stream the caller is still sending on,
+    // so the pack never lands in this process: `wrap_stream` pulls a frame,
+    // writes it, and pulls the next. A method that carries no body sends none
+    // — reqwest would otherwise announce a chunked body on a GET. Every frame
+    // handed over is progress, so it resets the exchange's clock.
+    let progress = Arc::new(tokio::sync::Notify::new());
+    if head.method.permits_body() {
+        let handed = Arc::clone(&progress);
+        let frames = tokio_stream::wrappers::ReceiverStream::new(body).map(move |item| {
+            handed.notify_waiters();
+            item.map_err(|failure| std::io::Error::other(failure.detail().to_string()))
+        });
+        upstream = upstream.body(reqwest::Body::wrap_stream(frames));
     }
-    let response = upstream
-        .send()
-        .await
-        .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
+    let response = tokio::select! {
+        sent = upstream.send() => sent.map_err(|error| GatewayFailure::Unavailable(error.to_string()))?,
+        () = upstream_made_no_progress(Arc::clone(&progress)) => {
+            return Err(GatewayFailure::Unavailable(
+                "loopback upstream neither took the request nor answered".into(),
+            ));
+        }
+    };
     let capped = route.policy.max_response_bytes != 0; // 0 = unbounded stream
     if capped
         && response
@@ -1106,7 +1324,21 @@ async fn proxy_loopback(
         }
         let mut chunks = response.bytes_stream();
         let mut total: u64 = 0;
-        while let Some(chunk) = chunks.next().await {
+        loop {
+            // Per-chunk, not per-body: a declared SSE stream is answered for as
+            // long as it likes, an upstream that goes quiet mid-body is not.
+            let chunk = match tokio::time::timeout(BODY_IDLE_TIMEOUT, chunks.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => return,
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(GatewayFailure::Unavailable(
+                            "loopback upstream stopped sending its response".into(),
+                        )))
+                        .await;
+                    return;
+                }
+            };
             let item = match chunk {
                 Ok(chunk) => {
                     let chunk_len = chunk.len() as u64;
@@ -1146,6 +1378,19 @@ async fn proxy_loopback(
         head: response_head,
         body: rx,
     })
+}
+
+/// Resolve once a loopback exchange has made no progress for
+/// [`BODY_IDLE_TIMEOUT`]: no further frame of the request handed to the
+/// upstream, and no response. A request body has no declared size, so the
+/// exchange can only be bounded on progress — the same shape as
+/// [`ws_idle_deadline`]. A request with no body never notifies, which makes
+/// this the plain "answer within [`BODY_IDLE_TIMEOUT`]" deadline it should be.
+async fn upstream_made_no_progress(progress: Arc<tokio::sync::Notify>) {
+    while tokio::time::timeout(BODY_IDLE_TIMEOUT, progress.notified())
+        .await
+        .is_ok()
+    {}
 }
 
 /// DuckFS reads are windowed at 1 MiB; a manifest (≤ 4 MiB) or a file
@@ -1329,8 +1574,7 @@ async fn serve_duckfs(
     if !matches!(
         head.method,
         gateway::RouteMethod::Get | gateway::RouteMethod::Head
-    ) || head.body_len != 0
-    {
+    ) {
         return Err(GatewayFailure::Invalid(
             "content routes serve bodyless GET/HEAD only".into(),
         ));
@@ -1529,7 +1773,8 @@ async fn authorize_ws(
         ));
     }
     let record = current_route(commands, scope.own_node, head).await?;
-    let caller = caller_account(commands, head, &record.statement, &[]).await?;
+    // an upgrade carries no body; its proof is over the digest of nothing.
+    let caller = caller_account(commands, head, &record.statement, &EMPTY_BODY_DIGEST).await?;
     let route = record
         .statement
         .route
@@ -2045,6 +2290,9 @@ fn failure_frame(failure: &GatewayFailure) -> gateway::ProxyFrame {
         GatewayFailure::Forbidden(detail) => (FailureKind::Forbidden, detail.clone()),
         GatewayFailure::NotFound(detail) => (FailureKind::NotFound, detail.clone()),
         GatewayFailure::Conflict(detail) => (FailureKind::Conflict, detail.clone()),
+        // the detail is this node's own refusal text naming the route's cap,
+        // not a diagnostic about its innards, so it crosses as written.
+        GatewayFailure::TooLarge(detail) => (FailureKind::TooLarge, detail.clone()),
         GatewayFailure::Unavailable(_) => (
             FailureKind::Unavailable,
             "gateway publisher is unavailable".to_string(),
@@ -2076,6 +2324,7 @@ fn failure_from(failure: gateway::ProxyFailure) -> GatewayFailure {
         FailureKind::Forbidden => GatewayFailure::Forbidden(failure.detail),
         FailureKind::NotFound => GatewayFailure::NotFound(failure.detail),
         FailureKind::Conflict => GatewayFailure::Conflict(failure.detail),
+        FailureKind::TooLarge => GatewayFailure::TooLarge(failure.detail),
         FailureKind::Unavailable => GatewayFailure::Unavailable(failure.detail),
     }
 }
@@ -2302,7 +2551,6 @@ mod tests {
             method: gateway::RouteMethod::Get,
             path_and_query: "/socket".into(),
             headers: vec![],
-            body_len: 0,
             upgrade: true,
             user_pop: None,
         };
@@ -2366,7 +2614,6 @@ mod tests {
                 name: "€".repeat(200),
                 value: "v".into(),
             }],
-            body_len: 0,
             upgrade: false,
             user_pop: None,
         };
@@ -2482,6 +2729,36 @@ mod tests {
             error.kind(),
             std::io::ErrorKind::TimedOut,
             "the drain ends on its own progress deadline: {error:?}"
+        );
+    }
+
+    /// The wedge a streamed request body opens: a permit now ends when the
+    /// caller stops sending, so one peer dribbling frames could hold the whole
+    /// request budget forever. Its own share is what stops that — and the
+    /// share is released when the exchange ends, not when the peer says so.
+    #[tokio::test(start_paused = true)]
+    async fn one_caller_cannot_take_the_whole_inbound_request_budget() {
+        let budget = GatewayBudget::new();
+        let greedy = [7u8; 32];
+        let held: Vec<_> = (0..MAX_INBOUND_REQUESTS_PER_CALLER)
+            .map(|_| budget.admit_caller(greedy).expect("under its own share"))
+            .collect();
+        assert!(
+            budget.admit_caller(greedy).is_none(),
+            "a caller at its share is refused outright, never queued ahead of others"
+        );
+        // Another peer is unaffected, and the plane-wide budget is untouched:
+        // what the greedy caller spent is four slots, not the gateway.
+        assert!(budget.admit_caller([8u8; 32]).is_some());
+        assert!(budget.admit_request().await.is_some());
+        drop(held);
+        assert!(
+            budget.admit_caller(greedy).is_some(),
+            "a finished exchange frees the caller's share"
+        );
+        assert!(
+            !budget.inbound.lock().unwrap().contains_key(&[9u8; 32]),
+            "a caller that never called holds no entry — the map is not a leak"
         );
     }
 
@@ -2768,7 +3045,6 @@ mod tests {
             method: gateway::RouteMethod::Get,
             path_and_query: "/socket".into(),
             headers: vec![],
-            body_len: 0,
             upgrade: true,
             user_pop: None,
         };
@@ -2813,7 +3089,6 @@ mod tests {
             method: gateway::RouteMethod::Get,
             path_and_query: "/socket".into(),
             headers: vec![],
-            body_len: 0,
             upgrade: true,
             user_pop: None,
         };
@@ -3152,7 +3427,6 @@ mod tests {
             method: gateway::RouteMethod::Get,
             path_and_query: "/socket".into(),
             headers: vec![],
-            body_len: 0,
             upgrade: true,
             user_pop: None,
         };
@@ -3312,7 +3586,6 @@ mod tests {
             method: gateway::RouteMethod::Get,
             path_and_query: "/socket".into(),
             headers: vec![],
-            body_len: 0,
             upgrade: true,
             user_pop: Some(pop),
         };
@@ -3377,7 +3650,7 @@ mod tests {
                 policy: gateway::RoutePolicy {
                     audience,
                     methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
-                    max_request_bytes: 1024,
+                    max_request_bytes: Some(1024),
                     max_response_bytes: 4096,
                     allow_authorization: false,
                     allow_upgrade,
@@ -3416,6 +3689,12 @@ mod tests {
         }
     }
 
+    /// A request that carries nothing: an empty reader, framed like any other
+    /// body so the bodyless path runs the code the real one does.
+    fn no_body() -> RequestBodySource<&'static [u8]> {
+        RequestBodySource::Frames(b"")
+    }
+
     /// a fresh user proof for `head`'s route/method/path, signed by `user`.
     fn user_pop(
         user: &ed25519::PrivateKey,
@@ -3437,11 +3716,15 @@ mod tests {
             method,
             path_and_query: path.into(),
             headers,
-            body_len: 0,
             upgrade,
             user_pop: None,
         };
-        let preimage = gateway::caller_pop_preimage(&statement.publisher_node, &head, &[], ts);
+        let preimage = gateway::caller_pop_preimage(
+            &statement.publisher_node,
+            &head,
+            &noded::EMPTY_BODY_DIGEST,
+            ts,
+        );
         gateway::UserPop {
             key: user.public_key().as_ref().to_vec(),
             ts,
@@ -3557,11 +3840,10 @@ mod tests {
                         value: "session=abc".into(),
                     },
                 ],
-                body_len: body.len() as u64,
                 upgrade: false,
                 user_pop: None,
             },
-            body,
+            RequestBodySource::Frames(&body[..]),
         )
         .await
         .unwrap();
@@ -3677,11 +3959,10 @@ mod tests {
                 method: gateway::RouteMethod::Get,
                 path_and_query: "/whoami".into(),
                 headers: vec![],
-                body_len: 0,
                 upgrade: false,
                 user_pop: Some(pop),
             },
-            &[],
+            no_body(),
         )
         .await
         .unwrap();
@@ -3743,17 +4024,113 @@ mod tests {
                 method: gateway::RouteMethod::Get,
                 path_and_query: "/whoami".into(),
                 headers: vec![],
-                body_len: 0,
                 upgrade: false,
                 user_pop: Some(pop),
             },
-            &[],
+            no_body(),
         )
         .await
         .unwrap_err();
         assert!(
             matches!(error, GatewayFailure::Forbidden(ref why) if why.contains("proof does not verify")),
             "{error:?}"
+        );
+    }
+
+    /// A proved caller's body is held so its digest can be checked, so its
+    /// route's own cap is what bounds the hold — and the refusal lands on the
+    /// byte past the cap, before the upstream is dialled at all. Nothing is
+    /// forwarded and then regretted: the listener never even accepts.
+    #[tokio::test]
+    async fn a_proved_request_past_its_route_cap_is_refused_before_the_upstream_is_touched() {
+        use futures::FutureExt as _;
+
+        // 4 KiB against the fixture route's 1 KiB cap.
+        const OVER_CAP: &[u8] = &[b'x'; 4096];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let workspace = tempfile::tempdir().unwrap();
+        let routes = crate::gateway_routes::LocalRoutes {
+            routes: vec![crate::gateway_routes::LocalRoute {
+                account: 1,
+                name: gateway::RouteName::named("api"),
+                port,
+                trust: authenticated_test_binding(workspace.path()),
+            }],
+        };
+        std::fs::write(
+            workspace.path().join(crate::gateway_routes::FILE_NAME),
+            serde_json::to_vec_pretty(&routes).unwrap(),
+        )
+        .unwrap();
+
+        let publisher = [2u8; 32];
+        let member = ed25519::PrivateKey::from_seed(44);
+        let user = ed25519::PrivateKey::from_seed(55);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Network, false);
+        let pop = user_pop(
+            &user,
+            &route.statement,
+            gateway::RouteMethod::Post,
+            "/items",
+            vec![],
+            false,
+        );
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("route query")
+            };
+            let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
+                Box::new(Some(route)),
+            ))));
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("publisher authority query")
+            };
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(account(1, &member))),
+            )));
+            // No third query: the body is refused before the caller's account
+            // is ever resolved, let alone before anything is forwarded.
+            assert!(
+                requests.next().await.is_none(),
+                "an over-cap request resolved its caller instead of being refused"
+            );
+        });
+
+        let error = serve_current(
+            &commands,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[],
+                own_node: &publisher,
+            },
+            &[3u8; 32],
+            &gateway::ProxyRequestHead {
+                operator: false,
+                account_id: 1,
+                name: gateway::RouteName::named("api"),
+                revision: 4,
+                method: gateway::RouteMethod::Post,
+                path_and_query: "/items".into(),
+                headers: vec![],
+                upgrade: false,
+                user_pop: Some(pop),
+            },
+            RequestBodySource::Frames(OVER_CAP),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, GatewayFailure::TooLarge(ref why) if why.contains("1024")),
+            "{error:?}"
+        );
+        // serve_current has returned, so any connection it opened would already
+        // be queued here: one poll is the whole answer.
+        assert!(
+            listener.accept().now_or_never().is_none(),
+            "the upstream was dialled for a request that never passed its cap"
         );
     }
 
@@ -3773,7 +4150,7 @@ mod tests {
             },
             &[3u8; 32],
             &head,
-            &[],
+            no_body(),
         )
         .await
         .unwrap_err();
@@ -3865,7 +4242,6 @@ mod tests {
             method: gateway::RouteMethod::Get,
             path_and_query: path_and_query.into(),
             headers: vec![],
-            body_len: 0,
             upgrade,
             user_pop: None,
         };
@@ -3910,11 +4286,10 @@ mod tests {
                 method: gateway::RouteMethod::Get,
                 path_and_query: "/".into(),
                 headers: vec![],
-                body_len: 0,
                 upgrade: false,
                 user_pop: None,
             },
-            &[],
+            no_body(),
         )
         .await
         .unwrap_err();
@@ -3967,7 +4342,6 @@ mod tests {
             method: gateway::RouteMethod::Get,
             path_and_query: "/socket".into(),
             headers: vec![],
-            body_len: 0,
             upgrade: true,
             user_pop: Some(pop),
         };
@@ -4102,11 +4476,10 @@ mod tests {
                 method: gateway::RouteMethod::Get,
                 path_and_query: "/".into(),
                 headers: vec![],
-                body_len: 0,
                 upgrade: false,
                 user_pop: None,
             },
-            &[],
+            no_body(),
         )
         .await
         .unwrap_err();
@@ -4185,7 +4558,7 @@ mod tests {
                 policy: gateway::RoutePolicy {
                     audience: gateway::RouteAudience::Owner,
                     methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Head],
-                    max_request_bytes: 0,
+                    max_request_bytes: Some(0),
                     max_response_bytes: 1024,
                     allow_authorization: false,
                     allow_upgrade: false,
@@ -4308,12 +4681,11 @@ mod tests {
                 method,
                 path_and_query: path_and_query.into(),
                 headers,
-                body_len: 0,
                 upgrade: false,
                 // an `Owner` route: only the owner's own user proof admits.
                 user_pop: Some(pop),
             },
-            &[],
+            no_body(),
         )
         .await;
         // Dropping the sender closes the mock's request stream, which ends

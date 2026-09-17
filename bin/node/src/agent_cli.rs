@@ -360,7 +360,6 @@ fn operator_head(
     method: gateway::RouteMethod,
     path_and_query: String,
     headers: Vec<gateway::ProxyHeader>,
-    body_len: u64,
     upgrade: bool,
 ) -> gateway::ProxyRequestHead {
     gateway::ProxyRequestHead {
@@ -371,7 +370,6 @@ fn operator_head(
         method,
         path_and_query,
         headers,
-        body_len,
         upgrade,
         user_pop: None,
     }
@@ -408,7 +406,6 @@ fn create_session(
             name: "content-type".into(),
             value: "application/json".into(),
         }],
-        payload.len() as u64,
         false,
     );
     let text = operator_proxy(base, operator, &head, &payload)?;
@@ -604,7 +601,6 @@ async fn attached(
         gateway::RouteMethod::Get,
         format!("/sessions/{session}?after={cursor}"),
         Vec::new(),
-        0,
         true,
     );
     let mut socket = open_attachment(base, operator, &head).await?.split();
@@ -1394,7 +1390,6 @@ mod tests {
                 name: "content-type".into(),
                 value: "application/json".into(),
             }],
-            2,
             false,
         );
         assert!(!head.operator);
@@ -1416,12 +1411,10 @@ mod tests {
             gateway::RouteMethod::Get,
             format!("/sessions/{}?after={cursor}", "0000000000000001"),
             Vec::new(),
-            0,
             true,
         );
         gateway::validate_proxy_request_head(&head).unwrap();
         assert_eq!(head.path_and_query, "/sessions/0000000000000001?after=41");
-        assert_eq!(head.body_len, 0);
         assert!(head.upgrade);
     }
 

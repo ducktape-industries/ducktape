@@ -131,7 +131,12 @@ impl GatewayGit {
                 policy: gateway::RoutePolicy {
                     audience: gateway::RouteAudience::Network,
                     methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
-                    max_request_bytes: gateway::MAX_REQUEST_BODY_BYTES,
+                    // NO cap. A git push is a whole repository's history and
+                    // carries no length to check against one anyway (stock git
+                    // sends anything past `http.postBuffer` chunked). Who may
+                    // push is forge's own gate — the push certificate and its
+                    // ref rules — not a byte count on this hop.
+                    max_request_bytes: None,
                     max_response_bytes: gateway::MAX_RESPONSE_BODY_BYTES,
                     allow_authorization: false,
                     allow_upgrade: false,

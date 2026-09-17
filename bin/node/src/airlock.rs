@@ -63,8 +63,8 @@ use crate::work_admission::{CommittedReader, account_of_key};
 pub(crate) const AIRLOCK_ROUTE: &str = "airlock";
 /// What the model lane admits per request: a `claude` turn carries multi-MB
 /// conversation context and nothing bulkier. Pinned in the `airlock` route's
-/// signed policy; the module ceiling (`gateway::MAX_REQUEST_BODY_BYTES`) is
-/// sized for the signing lane and is not this lane's number.
+/// signed policy, which is the only ceiling there is — the gateway module
+/// pins none, so each lane declares the number it means.
 pub(crate) const AIRLOCK_MODEL_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 /// The SIGNING lane: the same enclave, under its own label, so a release
 /// bundle's cap is the sign route's and never the model lane's. Only a TEE
@@ -75,9 +75,9 @@ pub(crate) const AIRLOCK_MODEL_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 /// `<AIRLOCK_SIGN_ROUTE>.<owner-handle>.duck`.
 pub(crate) const AIRLOCK_SIGN_ROUTE: &str = "airlock-sign";
 /// What the signing lane admits per request: the sealed `.tar.zst` of an
-/// unsigned bundle, the enclave's own `sign::MAX_BUNDLE_BYTES` — which is the
-/// module ceiling (`release_cli` asserts the three agree).
-pub(crate) const AIRLOCK_SIGN_REQUEST_BYTES: u64 = gateway::MAX_REQUEST_BODY_BYTES;
+/// unsigned bundle, the enclave's own `sign::MAX_BUNDLE_BYTES`
+/// (`release_cli` asserts the two agree).
+pub(crate) const AIRLOCK_SIGN_REQUEST_BYTES: u64 = airlock::sign::MAX_BUNDLE_BYTES as u64;
 // the model lane is the smaller one, or the split is pointless
 const _: () = assert!(AIRLOCK_MODEL_REQUEST_BYTES < AIRLOCK_SIGN_REQUEST_BYTES);
 

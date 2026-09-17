@@ -62,7 +62,7 @@ fn loopback_route() -> gateway::RouteDefinition {
         policy: gateway::RoutePolicy {
             audience: gateway::RouteAudience::Owner,
             methods: vec![gateway::RouteMethod::Get],
-            max_request_bytes: 0,
+            max_request_bytes: Some(0),
             max_response_bytes: 1024,
             allow_authorization: false,
             allow_upgrade: false,
@@ -335,18 +335,21 @@ fn the_per_name_revision_is_a_strict_monotonic_cas() {
 /// routes must be GET+HEAD/bodyless/capped, and every policy's methods must be
 /// strictly sorted and unique. the signer is a genuine current member, so these
 /// are the POLICY gate refusing — not the membership or signature gates.
+/// The request cap is the route's own number and the module pins no ceiling
+/// over it: a route that declares none, and a route that declares one far past
+/// anything a node would buffer, are both admitted. What a publisher will hold
+/// in memory is a property of the lane serving the route, not of consensus.
 #[test]
-fn request_cap_past_the_16_mib_ceiling_is_refused_at_admission() {
+fn a_route_declares_its_own_request_cap_or_none_at_all() {
     let storage = tempfile::tempdir().expect("storage dir");
     let (sim, key, origin) = published(storage.path());
 
-    // At the ceiling: admitted (a claude turn's context is multi-MB).
-    let at_ceiling = gateway::RouteDefinition {
+    let uncapped = gateway::RouteDefinition {
         target: gateway::RouteTarget::LoopbackHttp,
         policy: gateway::RoutePolicy {
             audience: gateway::RouteAudience::Owner,
             methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
-            max_request_bytes: gateway::MAX_REQUEST_BODY_BYTES,
+            max_request_bytes: None,
             max_response_bytes: 1024,
             allow_authorization: false,
             allow_upgrade: false,
@@ -354,30 +357,25 @@ fn request_cap_past_the_16_mib_ceiling_is_refused_at_admission() {
     };
     sim.submit_ok(
         "gateway",
-        signed_set_route(&key, statement(&key, named("big"), 1, Some(at_ceiling))),
+        signed_set_route(&key, statement(&key, named("git"), 1, Some(uncapped))),
         Some(&origin),
     );
 
-    // One byte past: refused by the admission gate.
-    let over = gateway::RouteDefinition {
+    let huge = gateway::RouteDefinition {
         target: gateway::RouteTarget::LoopbackHttp,
         policy: gateway::RoutePolicy {
             audience: gateway::RouteAudience::Owner,
             methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
-            max_request_bytes: gateway::MAX_REQUEST_BODY_BYTES + 1,
+            max_request_bytes: Some(u64::MAX),
             max_response_bytes: 1024,
             allow_authorization: false,
             allow_upgrade: false,
         },
     };
-    let error = sim.submit_rejected(
+    sim.submit_ok(
         "gateway",
-        unsigned_set_route(&key, statement(&key, named("huge"), 1, Some(over))),
+        signed_set_route(&key, statement(&key, named("huge"), 1, Some(huge))),
         Some(&origin),
-    );
-    assert!(
-        error.contains("request body cap exceeds"),
-        "the 16 MiB request-cap admission gate: {error}"
     );
 }
 
@@ -395,7 +393,7 @@ fn malformed_route_policies_are_refused_by_the_content_and_method_gates() {
         policy: gateway::RoutePolicy {
             audience: gateway::RouteAudience::Owner,
             methods: vec![gateway::RouteMethod::Get],
-            max_request_bytes: 0,
+            max_request_bytes: Some(0),
             max_response_bytes: 1024,
             allow_authorization: false,
             allow_upgrade: false,
@@ -417,7 +415,7 @@ fn malformed_route_policies_are_refused_by_the_content_and_method_gates() {
         policy: gateway::RoutePolicy {
             audience: gateway::RouteAudience::Owner,
             methods: vec![gateway::RouteMethod::Post, gateway::RouteMethod::Get],
-            max_request_bytes: 1024,
+            max_request_bytes: Some(1024),
             max_response_bytes: 1024,
             allow_authorization: false,
             allow_upgrade: false,

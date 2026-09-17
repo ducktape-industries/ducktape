@@ -904,7 +904,7 @@ pub(crate) fn ensure_airlock_route(
             policy: gateway::RoutePolicy {
                 audience: gateway::RouteAudience::Network,
                 methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
-                max_request_bytes: lane.max_request_bytes(),
+                max_request_bytes: Some(lane.max_request_bytes()),
                 max_response_bytes: 0,
                 allow_authorization: true,
                 allow_upgrade: false,

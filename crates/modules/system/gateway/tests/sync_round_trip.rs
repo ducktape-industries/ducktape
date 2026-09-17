@@ -99,7 +99,7 @@ fn content_route(seed: u8) -> RouteDefinition {
         policy: RoutePolicy {
             audience: RouteAudience::Network,
             methods: vec![RouteMethod::Get, RouteMethod::Head],
-            max_request_bytes: 0,
+            max_request_bytes: Some(0),
             max_response_bytes: 1024 * 1024,
             allow_authorization: false,
             allow_upgrade: false,

@@ -174,10 +174,11 @@ overlay proxy **streams** responses end to end: publish the route with
 `max_response_bytes: 0` (an unbounded stream, literally) for live SSE; a
 non-zero cap is enforced as a RUNNING total (declared over-length refused
 before the head; unsized overflow truncates the body mid-stream). A request
-body is read at every hop under the route's own signed `max_request_bytes`:
-the `airlock` route pins 16 MiB (a model turn), the `airlock-sign` route 256
-MiB (a release bundle, `gateway::MAX_REQUEST_BODY_BYTES`, the most any policy
-may pin).
+body is counted at every hop against the route's own signed
+`max_request_bytes`: the `airlock` route pins 16 MiB (a model turn), the
+`airlock-sign` route 256 MiB (a release bundle). Nothing above a route pins a
+ceiling over it — a policy may also decline to cap its body at all (`null`),
+which is what a lane that never holds a request declares.
 
 ## Body AEAD (sealed sessions)
 
