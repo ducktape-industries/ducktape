@@ -12,6 +12,16 @@
 //! lane, the binder and the declaration had to move together, and nothing but
 //! this test would have said so if they had not.
 //!
+//! It PARSES the source. The scanner this replaces read text: it cut each file
+//! at its first `#[cfg(test)]` and called the rest test code, so a key bound by
+//! a production `const` below any test-only item was never checked at all — a
+//! planted `chat/nope` under `presence_plane.rs`'s own test constant passed it
+//! green. The `#[cfg(test)]` judgement is [`source_lint`]'s now, shared with
+//! `crates/topology/tests/wasm_embed.rs`, which had the identical bug; this
+//! file walks what the binary actually compiles and matches `LaneKey` struct
+//! expressions by AST, so a key split across lines, nested in a call, or
+//! sitting beside a brace in a string literal reads the same as any other.
+//!
 //! It lives in the node binary's tests for the same reason
 //! `tracing_plane_lint.rs` does: the two halves it compares are in different
 //! trees — planes in `bin/node/src`, declarations in `crates/modules` — and
@@ -19,22 +29,76 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-
-/// the literal a declared lane key starts with, escaped so this file's own
-/// text is not read back as a key site when the scan walks the tree.
-const PREFIX: &str = "LaneKey {";
+use syn::visit::Visit;
 
 /// A lane key, as source spells it.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Key {
     module_id: String,
     name: String,
 }
 
-struct Site {
-    key: Key,
-    file: PathBuf,
-    line: usize,
+impl std::fmt::Display for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.module_id, self.name)
+    }
+}
+
+/// What one file's shipped code binds: the keys it names, and how many `LaneKey`
+/// sites named something this cannot read.
+#[derive(Default)]
+struct Bound {
+    keys: Vec<Key>,
+    /// A key assembled from anything but two string literals. Reported, never
+    /// skipped: a plane knows what it IS, so a key it cannot state literally is
+    /// either not a bind or not checkable, and both deserve a look. Silently
+    /// passing what it cannot read is the failure this lint was rewritten to
+    /// stop making.
+    unreadable: usize,
+}
+
+impl<'ast> Visit<'ast> for Bound {
+    fn visit_expr_struct(&mut self, expr: &'ast syn::ExprStruct) {
+        let names_a_lane_key = expr
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "LaneKey");
+        if names_a_lane_key {
+            match (
+                literal_field(expr, "module_id"),
+                literal_field(expr, "name"),
+            ) {
+                (Some(module_id), Some(name)) => self.keys.push(Key { module_id, name }),
+                _ => self.unreadable += 1,
+            }
+        }
+        syn::visit::visit_expr_struct(self, expr);
+    }
+}
+
+/// The string a named field is initialized with, when it is a plain literal.
+/// `LitStr::value` has already resolved escapes and raw strings, so the
+/// spelling in the source does not matter.
+fn literal_field(expr: &syn::ExprStruct, field: &str) -> Option<String> {
+    let initialized = expr.fields.iter().find(|value| match &value.member {
+        syn::Member::Named(ident) => ident == field,
+        syn::Member::Unnamed(_) => false,
+    })?;
+    match &initialized.expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(literal),
+            ..
+        }) => Some(literal.value()),
+        _ => None,
+    }
+}
+
+/// Every lane key the SHIPPED half of one source binds.
+fn bound_keys(file: &syn::File) -> Bound {
+    let mut bound = Bound::default();
+    bound.visit_file(&source_lint::production_only(file));
+    bound
 }
 
 fn repo_root() -> PathBuf {
@@ -43,59 +107,6 @@ fn repo_root() -> PathBuf {
         .join("..")
         .canonicalize()
         .expect("resolve the repo root")
-}
-
-/// The string literal a named field is initialized with, on this line or the
-/// two after it — `LaneKey { module_id: "chat", name: "presence" }` is one
-/// line under rustfmt only while it fits, and the struct-literal form wraps.
-fn field<'a>(window: &'a str, field: &str) -> Option<&'a str> {
-    let at = window.find(&format!("{field}:"))?;
-    let after = &window[at..];
-    let open = after.find('"')? + 1;
-    let end = after[open..].find('"')? + open;
-    Some(&after[open..end])
-}
-
-fn scan(dir: &Path, sites: &mut Vec<Site>) {
-    for entry in std::fs::read_dir(dir).expect("read a source dir") {
-        let path = entry.expect("dir entry").path();
-        if path.is_dir() {
-            scan(&path, sites);
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let src = std::fs::read_to_string(&path).expect("read source file");
-        // A unit test may name a key on purpose that nothing declares — the
-        // lane table's own tests resolve an absent one to prove the wait. Test
-        // modules sit at the bottom of a file in this tree, so cutting at the
-        // first `cfg(test)` leaves exactly the code that binds for real.
-        let shipped = match src.find("#[cfg(test)]") {
-            Some(at) => &src[..at],
-            None => &src[..],
-        };
-        let lines: Vec<&str> = shipped.lines().collect();
-        for (n, line) in lines.iter().enumerate() {
-            if !line.contains(PREFIX) {
-                continue;
-            }
-            let window = lines[n..(n + 4).min(lines.len())].join(" ");
-            let (Some(module_id), Some(name)) =
-                (field(&window, "module_id"), field(&window, "name"))
-            else {
-                continue;
-            };
-            sites.push(Site {
-                key: Key {
-                    module_id: module_id.to_owned(),
-                    name: name.to_owned(),
-                },
-                file: path.clone(),
-                line: n + 1,
-            });
-        }
-    }
 }
 
 /// Every lane any module in the tree declares, read from the FILES that are
@@ -137,27 +148,42 @@ fn declared() -> BTreeSet<Key> {
 
 #[test]
 fn every_lane_a_plane_binds_is_a_lane_a_module_declares() {
-    let mut sites = Vec::new();
-    scan(&repo_root().join("bin/node/src"), &mut sites);
-    assert!(
-        !sites.is_empty(),
-        "the scan found no lane keys at all — the walker is broken, not the tree",
-    );
-
+    let root = repo_root();
+    let planes = root.join("bin/node/src");
     let declared = declared();
-    let undeclared: Vec<String> = sites
-        .iter()
-        .filter(|site| !declared.contains(&site.key))
-        .map(|site| {
-            format!(
-                "{}:{} -> {}/{}",
-                site.file.display(),
-                site.line,
-                site.key.module_id,
-                site.key.name
-            )
-        })
-        .collect();
+
+    let mut scanned = 0usize;
+    let mut sites = 0usize;
+    let mut undeclared = Vec::new();
+    let mut unreadable = Vec::new();
+    for file in source_lint::rust_sources(&planes) {
+        let bound = bound_keys(&source_lint::parse_source(&file));
+        scanned += 1;
+        sites += bound.keys.len();
+        let relative = file.strip_prefix(&root).unwrap_or(&file).display();
+        if bound.unreadable > 0 {
+            unreadable.push(format!("{relative}: {} site(s)", bound.unreadable));
+        }
+        undeclared.extend(
+            bound
+                .keys
+                .into_iter()
+                .filter(|key| !declared.contains(key))
+                .map(|key| format!("{relative} -> {key}")),
+        );
+    }
+
+    assert!(
+        scanned > 50 && sites > 0,
+        "{scanned} sources and {sites} lane keys — the walk found nothing, which passes for the \
+         wrong reason"
+    );
+    assert!(
+        unreadable.is_empty(),
+        "these `LaneKey` sites name something other than two string literals, so this lint cannot \
+         check them — state the key literally, or the lane it waits on is unguarded:\n{}",
+        unreadable.join("\n"),
+    );
     assert!(
         undeclared.is_empty(),
         "these planes wait on a lane no module declares. The wait is silent and \
@@ -166,4 +192,128 @@ fn every_lane_a_plane_binds_is_a_lane_a_module_declares() {
          declares:\n{}",
         undeclared.join("\n"),
     );
+}
+
+/// The gate judges these correctly, or it is not judging anything.
+///
+/// The first is what the text scanner shipped green — a production key below
+/// the file's first `#[cfg(test)]` item, which is exactly how the real drift
+/// would have re-entered. The rest are the shapes a line-window parser cannot
+/// read: a literal holding a brace, an initializer wrapped by rustfmt, and a key
+/// built inside a call rather than assigned to a `const`.
+#[test]
+fn the_scan_tells_a_bound_key_from_a_test_one() {
+    let bound = [
+        (
+            "a key below an early test-only item still binds",
+            r#"
+            #[cfg(test)]
+            const IDLE: u64 = 200;
+            const LANE: LaneSource =
+                LaneSource::Declared(LaneKey { module_id: "chat", name: "planted" });
+            "#,
+        ),
+        (
+            "a key whose fields wrapped across lines",
+            r#"
+            const LANE: LaneSource = LaneSource::Declared(LaneKey {
+                module_id: "chat",
+                name: "planted",
+            });
+            "#,
+        ),
+        (
+            "a brace inside a literal is not a brace",
+            r#"
+            #[cfg(test)]
+            mod tests {
+                const OPEN: &str = "{";
+            }
+            const LANE: LaneSource =
+                LaneSource::Declared(LaneKey { module_id: "chat", name: "planted" });
+            "#,
+        ),
+        (
+            "a key built inside a call is still bound",
+            r#"
+            pub fn bind(book: &OverlayBook) {
+                book.resolve(LaneKey { module_id: "chat", name: "planted" });
+            }
+            "#,
+        ),
+        (
+            "a raw string is still a name",
+            r##"
+            const LANE: LaneSource =
+                LaneSource::Declared(LaneKey { module_id: r#"chat"#, name: "planted" });
+            "##,
+        ),
+    ];
+    for (why, source) in bound {
+        let found = bound_keys(&syn::parse_file(source).unwrap_or_else(|e| panic!("{why}: {e}")));
+        assert_eq!(
+            found.keys,
+            vec![Key {
+                module_id: "chat".into(),
+                name: "planted".into()
+            }],
+            "should have been checked — {why}"
+        );
+        assert_eq!(found.unreadable, 0, "{why}");
+    }
+
+    let test_only = [
+        (
+            "a key under a test module, with production code after it",
+            r#"
+            pub fn run() {}
+            #[cfg(test)]
+            mod tests {
+                const ABSENT: LaneKey = LaneKey { module_id: "gateway", name: "voice" };
+            }
+            pub fn also_production() {}
+            "#,
+        ),
+        (
+            "a nested module under a test module is still a test",
+            r#"
+            #[cfg(test)]
+            mod tests {
+                mod fixtures {
+                    pub const ABSENT: LaneKey = LaneKey { module_id: "gateway", name: "voice" };
+                }
+            }
+            "#,
+        ),
+        (
+            "`all(test, …)` is a test",
+            r#"
+            #[cfg(all(test, feature = "slow"))]
+            const ABSENT: LaneKey = LaneKey { module_id: "gateway", name: "voice" };
+            "#,
+        ),
+        (
+            "a test-only item inside a function body",
+            r#"
+            pub fn run() {
+                #[cfg(test)]
+                const ABSENT: LaneKey = LaneKey { module_id: "gateway", name: "voice" };
+            }
+            "#,
+        ),
+    ];
+    for (why, source) in test_only {
+        let found = bound_keys(&syn::parse_file(source).unwrap_or_else(|e| panic!("{why}: {e}")));
+        assert_eq!(found.keys, Vec::new(), "should have been skipped — {why}");
+    }
+
+    // a key this cannot read is reported, not waved through: `cfg(not(test))`
+    // is production, so the constant below ships and its lane is unguarded.
+    let opaque = r#"
+        #[cfg(not(test))]
+        const LANE: LaneKey = LaneKey { module_id: CHAT, name: "presence" };
+    "#;
+    let found = bound_keys(&syn::parse_file(opaque).expect("parses"));
+    assert_eq!(found.unreadable, 1);
+    assert_eq!(found.keys, Vec::new());
 }

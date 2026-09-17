@@ -16,9 +16,13 @@
 //! semicolons in literals, and invocations split across lines are all free
 //! here, because `syn` has already done the tokenizing.
 //!
+//! The first judgement is [`source_lint`]'s, shared with node-bin's
+//! `lane_key_lint.rs`: this walks the file with every `#[cfg(test)]` item
+//! already removed, so there is no test-vs-shipped bookkeeping left here to get
+//! wrong. Only the `.wasm`-literal half is this file's own.
+//!
 //! Fixtures below are the cases that shell got wrong, kept as cases.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 
@@ -27,13 +31,8 @@ fn no_production_source_embeds_a_wasm() {
     let root = repo_root();
     let mut embeds = Vec::new();
     let mut parsed = 0usize;
-    for file in rust_sources(&root) {
-        let text = fs::read_to_string(&file)
-            .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
-        // A file this cannot parse is not silently skipped: the gate would then
-        // pass by failing, which is the failure mode it exists to prevent.
-        let ast = syn::parse_file(&text)
-            .unwrap_or_else(|error| panic!("parse {}: {error}", file.display()));
+    for file in source_lint::rust_sources(&root) {
+        let ast = source_lint::parse_source(&file);
         parsed += 1;
         let relative = file.strip_prefix(&root).unwrap_or(&file).display();
         embeds.extend(
@@ -180,33 +179,18 @@ fn the_scan_tells_test_bytes_from_shipped_ones() {
 /// Every `.wasm` an `include_bytes!`/`include_str!` pulls in outside a
 /// `#[cfg(test)]` item, in source order.
 fn embedded_wasm(file: &syn::File) -> Vec<String> {
-    let mut scan = Scan {
-        test_depth: 0,
-        found: Vec::new(),
-    };
-    scan.visit_file(file);
+    let mut scan = Scan { found: Vec::new() };
+    scan.visit_file(&source_lint::production_only(file));
     scan.found
 }
 
 struct Scan {
-    /// how many enclosing items are governed by a `#[cfg(test)]`. Nonzero means
-    /// everything here compiles only under `cargo test`.
-    test_depth: usize,
     found: Vec<String>,
 }
 
 impl<'ast> Visit<'ast> for Scan {
-    fn visit_item(&mut self, item: &'ast syn::Item) {
-        let test = item_attrs(item).is_some_and(|attrs| attrs.iter().any(is_cfg_test));
-        self.test_depth += usize::from(test);
-        syn::visit::visit_item(self, item);
-        self.test_depth -= usize::from(test);
-    }
-
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        if self.test_depth == 0
-            && let Some(path) = wasm_include(mac)
-        {
+        if let Some(path) = wasm_include(mac) {
             self.found.push(path);
         }
         syn::visit::visit_macro(self, mac);
@@ -226,94 +210,9 @@ fn wasm_include(mac: &syn::Macro) -> Option<String> {
     path.ends_with(".wasm").then_some(path)
 }
 
-/// `#[cfg(test)]`, and `#[cfg(all(test, …))]` with it.
-///
-/// `not(test)` is production, which is the case that matters: a constant shrunk
-/// under `cfg(test)` sits directly beneath its `cfg(not(test))` twin, and
-/// reading the pair as "this file is a test" is how 4,500 lines of
-/// `crates/services/broker/src/lib.rs` went unscanned. `any(test, …)` is NOT
-/// treated as a test: it compiles in production too, so an embed under one is
-/// reported rather than excused.
-fn is_cfg_test(attr: &syn::Attribute) -> bool {
-    attr.path().is_ident("cfg") && attr.parse_args().is_ok_and(|meta| names_test(&meta))
-}
-
-fn names_test(meta: &syn::Meta) -> bool {
-    match meta {
-        syn::Meta::Path(path) => path.is_ident("test"),
-        syn::Meta::List(list) if list.path.is_ident("all") => list
-            .parse_args_with(
-                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-            )
-            .is_ok_and(|inner| inner.iter().any(names_test)),
-        _ => false,
-    }
-}
-
-fn item_attrs(item: &syn::Item) -> Option<&Vec<syn::Attribute>> {
-    Some(match item {
-        syn::Item::Const(item) => &item.attrs,
-        syn::Item::Enum(item) => &item.attrs,
-        syn::Item::ExternCrate(item) => &item.attrs,
-        syn::Item::Fn(item) => &item.attrs,
-        syn::Item::ForeignMod(item) => &item.attrs,
-        syn::Item::Impl(item) => &item.attrs,
-        syn::Item::Macro(item) => &item.attrs,
-        syn::Item::Mod(item) => &item.attrs,
-        syn::Item::Static(item) => &item.attrs,
-        syn::Item::Struct(item) => &item.attrs,
-        syn::Item::Trait(item) => &item.attrs,
-        syn::Item::TraitAlias(item) => &item.attrs,
-        syn::Item::Type(item) => &item.attrs,
-        syn::Item::Union(item) => &item.attrs,
-        syn::Item::Use(item) => &item.attrs,
-        _ => return None,
-    })
-}
-
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .expect("the repository root sits two levels above crates/topology")
-}
-
-/// Every tracked-looking `.rs` in the tree except the ones a test may embed in:
-/// a file under a `tests/` directory or named `tests.rs`. Build outputs and the
-/// gitignored scratch directories are skipped by name rather than by asking git,
-/// so this needs no repository.
-fn rust_sources(root: &Path) -> Vec<PathBuf> {
-    const SKIP: &[&str] = &[
-        "target",
-        "target-shared",
-        ".git",
-        ".claude",
-        ".codex",
-        ".worktree",
-        "node_modules",
-    ];
-    let mut sources = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(directory) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if path.is_dir() {
-                let skipped = SKIP.contains(&name.as_ref()) || name == "tests";
-                if !skipped {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if name.ends_with(".rs") && name != "tests.rs" {
-                sources.push(path);
-            }
-        }
-    }
-    sources.sort();
-    sources
 }

@@ -14,5 +14,7 @@ version.workspace = true
 [dev-dependencies]
 # the repo-wide source lints in tests/ parse Rust rather than pattern-match it:
 # `wasm_embed.rs` has to tell a `#[cfg(test)]` item from production code, and a
-# `.wasm` literal from a brace inside a string.
+# `.wasm` literal from a brace inside a string. The first half is shared with
+# node-bin's `lane_key_lint.rs` (source-lint); the `.wasm` half is this file's.
 syn = { version = "2", features = ["full", "visit"] }
+source-lint = { workspace = true }

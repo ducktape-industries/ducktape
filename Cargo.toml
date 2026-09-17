@@ -76,7 +76,9 @@
 #                      tenant, in no genesis set), greeter (the types-only
 #                      composition example)
 #   crates/testing/  — dev-only shared test support (nettest: raw-http client,
-#                      port allocation, poll). [dev-dependencies] of the bin
+#                      port allocation, poll; source-lint: which files and items
+#                      hold shipped code, for the repo-wide source lints).
+#                      [dev-dependencies] of the bin
 #                      integration suites ONLY; no shipping crate depends on it
 #   crates/labs/     — quarantined experimental consensus modules (evm,
 #                      multisig): in-tree and tested but registered by NO
@@ -209,8 +211,9 @@ members = [
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
     # testing — dev-only shared harness helpers (raw-http client, ports,
-    # poll). NOT a Module Rule surface; no shipping crate depends on it.
-    "crates/testing/nettest",
+    # poll; and the source lints' shared "is this shipped code" judgement).
+    # NOT a Module Rule surface; no shipping crate depends on it.
+    "crates/testing/nettest", "crates/testing/source-lint",
     # topology — the module composition catalog every composer draws from
     "crates/topology",
     # view-wire — the host<->wasm-view format: the tree a view emits, the
@@ -460,6 +463,8 @@ app-update = { path = "crates/app-update" }
 ducktape-home = { path = "crates/ducktape-home" }
 # the module composition catalog (id universe + named genesis selections).
 topology = { path = "crates/topology" }
+# dev-only: the source lints' shared "is this shipped code" judgement.
+source-lint = { path = "crates/testing/source-lint" }
 duckfs-core = { path = "crates/duckfs/core" }
 duckfs-disk = { path = "crates/duckfs/disk" }
 duckfs-client = { path = "crates/duckfs/client" }

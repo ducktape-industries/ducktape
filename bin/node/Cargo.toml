@@ -261,6 +261,11 @@ keyscheme = { workspace = true, features = ["testkit"] }
 # commit-building op — this is how production gets them too (a stock git push).
 forge = { workspace = true, features = ["testkit"] }
 async-trait = { workspace = true }
+# `lane_key_lint.rs` parses `bin/node/src` rather than matching text in it: the
+# `#[cfg(test)]` half is shared with topology's `wasm_embed.rs` (source-lint),
+# the `LaneKey` half is the lint's own.
+syn = { version = "2", features = ["full", "visit", "parsing"] }
+source-lint = { workspace = true }
 # the mcp harness genesis has no commonware runtime context, so the agent
 # registry rides the in-memory MerkleStore test double.
 sdk-testkit = { workspace = true }
