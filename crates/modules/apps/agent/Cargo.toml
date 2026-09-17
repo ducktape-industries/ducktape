@@ -20,6 +20,9 @@ guest = ["dep:ducktape-module-sdk"]
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
 ducktape-module-sdk = { workspace = true, optional = true }
+# this module's own wire surface, re-exported at the crate root. a view or the
+# daemon links the wire alone; only the executor lives here.
+agent-wire = { path = "wire" }
 sdk = { workspace = true }
 # the three siblings whose wire surfaces cross this edge: identity (the
 # program account and its control record), attribution (the change that
