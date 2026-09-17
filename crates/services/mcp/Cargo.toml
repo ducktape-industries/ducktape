@@ -14,6 +14,10 @@ version.workspace = true
 # tools reach state over the node's `/v1` http routes, never in process.
 forge = { workspace = true }
 pages = { workspace = true }
+# duckfs's wire, which the `files` module speaks verbatim. the core crate, not
+# the `files` module crate that re-exports it: `files`'s default feature pulls
+# disk persistence and the SDK, and this plane wants the types alone.
+duckfs-core = { workspace = true }
 runs = { workspace = true }
 tasks = { workspace = true }
 base64 = { workspace = true }

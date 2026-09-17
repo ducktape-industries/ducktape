@@ -97,6 +97,10 @@ impl Harness {
                     Box::new(
                         forge::Forge::with_blobs("forge", forge_base, blobs).expect("forge module"),
                     ),
+                    // duckfs, the shared filesystem the read plane pages
+                    // through. in-memory like every other double here: the
+                    // module's odb is not what these tests are about.
+                    Box::new(files::Files::in_mem()),
                     Box::new(runs::RunsModule::new(
                         "runs",
                         "chat",
@@ -120,6 +124,7 @@ impl Harness {
                 "saga",
                 "dispatch",
                 "forge",
+                "files",
             ]
             .into_iter()
             .map(str::to_string)
@@ -147,6 +152,25 @@ impl Harness {
 
     pub fn node_url(&self) -> String {
         self.daemon.node_url()
+    }
+
+    /// duckfs's own client against this node, signing as the harness owner —
+    /// the lane a real member commits through. the read tools then page over
+    /// what consensus holds, never over something this fixture handed them.
+    pub fn files(&self) -> duckfs_client::http::HttpNode {
+        let signer = owner_key();
+        duckfs_client::http::HttpNode::new(self.node_url()).with_frame_signer(std::sync::Arc::new(
+            move |target, payload| {
+                node::encode_frame(
+                    &signer,
+                    FRAME_SEQ.fetch_add(1, Ordering::Relaxed),
+                    &sdk::Msg {
+                        target: target.into(),
+                        payload,
+                    },
+                )
+            },
+        ))
     }
 
     pub fn register_model(&self, id: &str, name: &str) -> u64 {
