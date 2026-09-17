@@ -43,7 +43,7 @@ async fn spawn(app: Router) -> String {
 }
 
 fn entitlements() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/packaging/entitlements.plist")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/entitlements.plist")
 }
 
 /// An attested gateway with the signing toolchain (`None` mounts no route).

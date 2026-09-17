@@ -361,8 +361,7 @@ fn init_accepts_a_module_absent_from_the_binary_catalog() {
     let source = tmp.path().join("supplied");
     std::fs::create_dir(&source).unwrap();
     std::fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../crates/examples/directory/component.wasm"),
+        common::module_verbs::fixture("directory"),
         workspace_config::component_path(&source, "directory"),
     )
     .unwrap();
@@ -585,8 +584,7 @@ fn init_refuses_a_zero_byte_component_and_writes_nothing() {
     let source = tmp.path().join("supplied");
     std::fs::create_dir(&source).unwrap();
     std::fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../crates/examples/directory/component.wasm"),
+        common::module_verbs::fixture("directory"),
         workspace_config::component_path(&source, "directory"),
     )
     .unwrap();

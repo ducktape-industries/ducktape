@@ -1,6 +1,6 @@
 ---
 name: sim-lane
-description: Use when any Rust #[test] in this workspace needs a deterministic in-process Ducktape node (no child processes, no fleet) — boot it with simnode::boot from bin/simnode, drive real submit → commit → query round-trips, and step commits deterministically. Covers the embedding harness and SimOpts. The desktop app has no simulator lane; its own suites run with cargo test -p ducktape-app.
+description: Use when any Rust #[test] in this workspace needs a deterministic in-process Ducktape node (no child processes, no fleet) — boot it with simnode::boot from bin/simnode, drive real submit → commit → query round-trips, and step commits deterministically. Covers the embedding harness and SimOpts.
 ---
 
 # Sim lane — deterministic in-process node
@@ -8,9 +8,7 @@ description: Use when any Rust #[test] in this workspace needs a deterministic i
 `simnode::boot` (`bin/simnode/src/lib.rs`) boots a deterministic Ducktape node
 in-process: the full noded `/v1` HTTP surface plus a synchronous control handle,
 no child processes and no timers. Any crate's `#[test]` can drive real
-transaction round-trips (submit → commit → query) against it. The desktop app
-(`app/`) has ordinary `#[cfg(test)]` suites (`cargo test -p ducktape-app`) and
-no simulator lane; only the node below is embeddable.
+transaction round-trips (submit → commit → query) against it.
 
 ## Where things live
 
@@ -64,9 +62,9 @@ seems to need a wait, the flow is broken, not slow.
 
 ## Wire shapes
 
-Every module's request/reply shapes are its crate-root `interface.rs`
-(`crates/modules/apps/chat/src/interface.rs` for chat: externally tagged
-snake_case enums, e.g. `{"messages":[..]}`). Listing and paging reads
+Every module's request/reply shapes are its wire crate (`chat-wire` for chat,
+from ducktape-sdk by git dependency): externally tagged snake_case enums,
+e.g. `{"messages":[..]}`. Listing and paging reads
 (channel lists, message pages, search) are index views, served at
 `POST /v1/index/{module}/view` from the module's `src/index.rs`, not
 canonical queries — the canonical `query` surface keeps only what dispatch

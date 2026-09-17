@@ -20,6 +20,16 @@ fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../kernel/host/tests/fixtures")
 }
 
+/// the object-storage tenant fixture, committed here rather than read out of
+/// the kernel fixture set: `declared_shapes` pins that directory to the set the
+/// host composes, and this guest is a test tenant no network founds.
+fn object_component() -> Vec<u8> {
+    std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/object.component.wasm"),
+    )
+    .unwrap()
+}
+
 /// one `SnapshotSource` call's future.
 type SnapshotFut<'a> = BoxFut<'a, Result<Option<(Vec<u8>, StateRoot)>, String>>;
 
@@ -381,11 +391,7 @@ fn admissions_build_through_the_one_wasm_path() {
     run(|context, dir| {
         Box::pin(async move {
             let hello = std::fs::read(fixtures().join("hello.component.wasm")).unwrap();
-            let object = std::fs::read(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../kernel/wasm-host/tests/fixtures/object.component.wasm"),
-            )
-            .unwrap();
+            let object = object_component();
             let substrates = substrates(&dir);
             let admissions = Admissions::new(&context, &substrates, &BINDINGS);
             let admitted = host::ModuleFactory::instantiate(
@@ -456,11 +462,7 @@ fn admissions_build_through_the_one_wasm_path() {
 fn an_odb_backed_module_reads_its_chain_id_from_genesis_config() {
     run(|context, dir| {
         Box::pin(async move {
-            let object = std::fs::read(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../kernel/wasm-host/tests/fixtures/object.component.wasm"),
-            )
-            .unwrap();
+            let object = object_component();
             let substrates = substrates(&dir);
             let mut stores = qmdb_stores(&context);
             let bindings = Bindings {

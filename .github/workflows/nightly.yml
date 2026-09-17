@@ -4,8 +4,7 @@
 # never per push — `ci.yml` is the per-push lane.
 #
 # Two jobs, each a single sequential chain over ONE `target/`, so nothing is
-# built twice: `make views` runs once and every suite that mounts it follows
-# in the same job, and the crates they share compile into one cache.
+# built twice and the crates they share compile into one cache.
 # Wall-clock is not the point of a nightly; runner time and cache reuse are.
 #
 # A `schedule` fires only from the repository's default branch and runs on
@@ -28,9 +27,7 @@ env:
   CARGO_BUILD_JOBS: 3
 
 jobs:
-  # The view bundle and everything that mounts it. `make views` once, then:
-  #   - `views-repro-check`: the bundle rebuilds byte-identical from an
-  #     isolated archive, with no builder-local path inside it
+  # The node proofs:
   #   - `simnode`: every scenario, booting the 15-module `topology::SIM_BASE`
   #     genesis. `topology_set.rs` pins the sim's composed module set against
   #     the topology selection and this is the only place it runs.
@@ -39,11 +36,10 @@ jobs:
   #     test binaries compile the shared genesis once instead of once each;
   #     a node never sets it, so production boot is unchanged. It lives
   #     under `target/` so rust-cache persists it.
-  #   - `ducktape-app`: its unit tests mount the staged views in
-  #     `module_view`; and the rpc client's blob round-trip
+  #   - the rpc client's blob round-trip
   #   - `host_state`: the production genesis composes `topology::PRODUCTION`
   #     and every module in it runs as wasm
-  views-and-node:
+  node:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -58,20 +54,11 @@ jobs:
         with:
           cache-directories: target/sim-wasm-cache
       - run: rustup show
-      - run: make views
-      - run: make views-repro-check
       - run: cargo test --locked -p simnode
       - run: cargo test --locked -p ducktape-rpc --test blob
-      - run: cargo test --locked -p ducktape-app
       - run: cargo test --locked -p node-bin host_state
 
-  # The guest artifacts against their source, and the host against the
-  # guests:
-  #   - `wasm-rebuild-check`: every component and index guest rebuilt from
-  #     HEAD and compared to the committed bytes. Comparing committed copies
-  #     alone (ci.yml's `wasm-modules-check`) cannot see a stale artifact; a
-  #     mismatch here means the guest source moved and its `component.wasm`
-  #     was not rebuilt with it.
+  # The host against the guests:
   #   - host parity (crates/kernel/host/tests/wasm_*_parity.rs): each op
   #     sequence commits the identical root, replies and rejection reasons on
   #     a native module and its wasm guest, block by block.
@@ -90,7 +77,5 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
       - run: rustup show
-      - run: cargo test --locked -p guest-builder
-      - run: make wasm-rebuild-check
       - run: cargo test --locked -p host --tests
       - run: cargo clippy --locked -p node-bin -p broker-host -p provider-host --tests --no-deps --features node-bin/verify,broker-host/verify,provider-host/verify -- -D warnings

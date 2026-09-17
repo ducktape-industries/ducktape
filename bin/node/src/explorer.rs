@@ -1189,10 +1189,11 @@ mod tests {
         indexer::IndexStore::open(dir, &[indexer::IndexModule::bare("chat")]).expect("open index")
     }
 
-    /// the reference mapper (`crates/kernel/index-guest/testmap`, refreshed by
-    /// `make wasm-modules`) — the same artifact the indexer's own fold tests
-    /// run, so a module here can have a REAL fold and a read model to check.
-    const TESTMAP: &[u8] = include_bytes!("../../../crates/kernel/index-guest/testmap/index.wasm");
+    /// the reference mapper (`crates/kernel/indexer/tests/fixtures`) — the same
+    /// artifact the indexer's own fold tests run, so a module here can have a
+    /// REAL fold and a read model to check.
+    const TESTMAP: &[u8] =
+        include_bytes!("../../../crates/kernel/indexer/tests/fixtures/testmap.index.wasm");
 
     fn mapped_store(dir: &std::path::Path) -> indexer::IndexStore {
         indexer::IndexStore::open(

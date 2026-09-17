@@ -1,5 +1,15 @@
 # Authoring wasm modules
 
+The module SDK, the guest builder and the kernel-fixture guest crates this
+document names now live in
+[ducktape-sdk](https://github.com/ducktape-industries/ducktape-sdk); the
+desktop views it references live in
+[ducktape-app](https://github.com/ducktape-industries/ducktape-app) and
+[ducktape-views](https://github.com/ducktape-industries/ducktape-views).
+Paths below are relative to those repositories unless the crate is one this
+repository still carries (a system module, `forge`, `files`, or
+`crates/kernel/host`, which consumes `wasm-host` from ducktape-sdk).
+
 How to write, build, and live-update a Ducktape wasm module. The runtime is
 `crates/kernel/wasm-host` (wasmtime, pinned `=46.0.3`); the authoring contract is
 the `ducktape:module` WIT world (`crates/module-sdk/wit/module.wit`, inside the

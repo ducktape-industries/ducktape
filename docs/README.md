@@ -32,9 +32,6 @@ document nothing cites is deleted, not archived.
 | Which operator scripts, units and harnesses live under `ops/` | [`../ops/README.md`](../ops/README.md) |
 | The coordinator's deploy artifacts (unit, env file, Dockerfile) | [`../ops/coordinator/README.md`](../ops/coordinator/README.md) |
 | The hosted WebAuthn auth page, its request/result shapes and its relay | [`../ops/auth-page/README.md`](../ops/auth-page/README.md) |
-| Verify independent module, view, and service replacement with fixed native binaries | [`../crates/examples/extension-probe/README.md`](../crates/examples/extension-probe/README.md) |
-| Build and register the shared canvas board | [`../crates/modules/apps/boards/README.md`](../crates/modules/apps/boards/README.md) |
-| Run the desktop app; which node it dials and which key it signs with | [`../app/README.md`](../app/README.md) |
 | Lend a credential to a sandbox through airlock, self-hosted or from an enclave | [`../crates/airlock/README.md`](../crates/airlock/README.md) |
 
 ## References code cites by path
@@ -42,11 +39,11 @@ document nothing cites is deleted, not archived.
 | Question | Read | Cited by |
 | --- | --- | --- |
 | The capability spec TOML that describes an executor | [`records/specs/capability-spec.md`](records/specs/capability-spec.md) | `crates/services/provider` |
-| The per-module index guest contract: fold rules, view rules, backfill | [`records/specs/indexable-spec.md`](records/specs/indexable-spec.md) | `crates/kernel/indexer`, the module-dev skill |
+| The per-module index guest contract: fold rules, view rules, backfill | [`records/specs/indexable-spec.md`](records/specs/indexable-spec.md) | `crates/kernel/indexer` |
 | The WireGuard tunnel upgrade protocol: records, mesh version, handshake, overlay addressing | [`records/protocols/wireguard-tunnel-upgrade.md`](records/protocols/wireguard-tunnel-upgrade.md) | `crates/networking/wireguard` |
 | The reachability plane: control mesh beside data tunnel, the tunnel-first invite and its fronts, cold restart, rendezvous | [`records/architecture/reachability.md`](records/architecture/reachability.md) | `crates/networking/reachability` |
 | The ordering contract agents get and the module architecture that keeps it | [`records/architecture/agent-collaboration-design.md`](records/architecture/agent-collaboration-design.md) | `saga` |
-| Writing, building and live-updating a wasm module | [`records/architecture/wasm-module-authoring.md`](records/architecture/wasm-module-authoring.md) | the module-dev skill |
+| Writing, building and live-updating a wasm module | [`records/architecture/wasm-module-authoring.md`](records/architecture/wasm-module-authoring.md) | `crates/kernel/wasm-host` (ducktape-sdk) |
 
 ## Proposed protocols
 
@@ -58,13 +55,7 @@ document nothing cites is deleted, not archived.
 
 | When | Skill |
 | --- | --- |
-| Verifying a running node, a cluster, the app, or a huddle | [`../skills/qa/SKILL.md`](../skills/qa/SKILL.md) |
+| Verifying a running node or a cluster | [`../skills/qa/SKILL.md`](../skills/qa/SKILL.md) |
 | A Rust test needs a deterministic in-process node | [`../skills/sim-lane/SKILL.md`](../skills/sim-lane/SKILL.md) |
-| Creating, porting, or registering a consensus module | [`../skills/module-dev/SKILL.md`](../skills/module-dev/SKILL.md) |
-
-## Vendored patches
-
-The wasm32 `blst` patch lives under
-`crates/module-sdk/stubs/blst/` and carries its own `PATCH.md`.
 
 `docs/superpowers/` is gitignored planning scratch; nothing under it ships.

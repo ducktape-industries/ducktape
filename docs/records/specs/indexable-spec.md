@@ -5,7 +5,7 @@ models (fluent31 changes-mode triggers), per-module view guests, boundary
 stamps, and the join-seam op-row backfill. This tier IS the human-facing read
 surface: canonical module queries serve dispatch alone (§5).
 Code: `crates/kernel/indexer` (the host store: feed writer + guest converge),
-`crates/kernel/index-guest` (the contract + authoring SDK; `testmap` is the
+`index-guest` in ducktape-sdk (the contract + authoring SDK; `testmap` is the
 reference mapper), the chat/tasks/pages/inbox/saga modules' `src/index.rs`
 (pure decision cores) + `src/index_guest.rs` (wasm shells, packaged by
 `guest-builder --index`), `crates/noded` (the feed, the HTTP lanes, the shared
@@ -109,10 +109,8 @@ A mapper is two files in the module crate:
 - `src/index_guest.rs` — the SHELL, behind the crate's `index-guest`
   feature: backs `StateRead` with the engine ABI (`EngineRead`), applies the
   decided writes, and exports the roles via `index_guest::fold!`/`view!`.
-  The whole file is ~15 lines; `guest-builder --index` packages it into the
-  committed `index.wasm` (`make wasm-modules` refreshes,
-  `wasm-modules-check` guards presence and `make wasm-rebuild-check` guards
-  the bytes against a rebuild of the source).
+  The whole file is ~15 lines; `guest-builder --index` (ducktape-sdk)
+  packages it into the committed `index.wasm`.
 
 Within one op a read never sees that op's own writes (they apply after the
 decision); across ops in one feed batch it sees everything earlier — the

@@ -1,4 +1,0 @@
-# standalone guest crate build artifacts (the componentized artifact is
-# committed beside this file as component.wasm).
-/target
-/out

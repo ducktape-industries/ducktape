@@ -6,6 +6,12 @@
 //! its artifact) or for a view-only id in `topology::VIEWS` (a `Kind::View`
 //! entry of its own). The desktop's own views (`members`, `node`, …) are
 //! neither and never stage: they ship with the app, not with a network.
+//!
+//! View crates live in ducktape-views and their build lives in ducktape-app,
+//! so no view is declared in THIS checkout and every pass here takes the
+//! undeclared branch: it stages nothing and clears whatever an earlier build
+//! of this checkout left in its own destination. The declaration path stays
+//! whole because it is what a checkout holding view crates runs.
 use std::path::Path;
 
 pub fn stage_view(checkout: &Path, dest: &Path, id: &str) -> Result<(), String> {

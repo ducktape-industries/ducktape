@@ -289,7 +289,7 @@ async fn boot_signing_gateway(
             sign: Some(airlock::sign::Tools {
                 rcodesign: airlock::sign::fixture::rcodesign(),
                 entitlements: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../app/packaging/entitlements.plist"),
+                    .join("../../crates/airlock/tests/fixtures/entitlements.plist"),
                 work_root: work_root.to_path_buf(),
                 notary: airlock::sign::Notary::Stub(notary),
             }),

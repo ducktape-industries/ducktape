@@ -140,14 +140,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 topology = { workspace = true }
 
 [dev-dependencies]
-# the NATIVE modules, which only the in-crate provision tests stand up
-# (`RunsModule::new`, `agent::AgentModule::new` in agent_provision's two
-# `#[cfg(test)]` files). The daemon itself speaks to them over the wire and
-# links `runs-wire`/`agent-wire` alone — which is the point of the split, and
-# what these two lines being DEV-only proves.
-agent = { path = "../modules/apps/agent" }
-runs = { path = "../modules/apps/runs" }
-pages = { path = "../modules/apps/pages" }
+# the run wire surface the in-crate provision tests speak under its bare name
+# (the daemon itself links `runs-wire`). The native module behind it ships from
+# ducktape-modules, so no suite here composes one.
+runs = { workspace = true }
 run-envelope = { workspace = true }
 wat = "1"
 # the native files module: the provisioning suites stand a native `Files` up.

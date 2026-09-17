@@ -25,12 +25,12 @@ On macOS, `xcode-select --install`. `make` checks the prerequisites up front.
 ```sh
 git clone https://github.com/ducktape-industries/ducktape.git
 cd ducktape
-make install
+make install-node
 ```
 
 This puts the `ducktape` CLI and the founding module set in `~/.cargo/bin`.
-On macOS it also builds the desktop app and installs `Ducktape.app` into
-`~/Applications`.
+The desktop app builds and installs from its own repository,
+[ducktape-app](https://github.com/ducktape-industries/ducktape-app).
 
 ## Quick start
 
@@ -65,24 +65,18 @@ make demo-seed
 
 ## Desktop app
 
-```sh
-make views && cargo run -p ducktape-app
-```
-
-The app is a native GPUI host whose tabs are Rust-authored wasm views loaded at
-runtime. [`app/README.md`](app/README.md) says which node it dials and which
-key it signs with.
+The desktop host and its wasm views live in
+[ducktape-app](https://github.com/ducktape-industries/ducktape-app).
 
 ## How it is built
 
 | Layer | Where | What |
 | --- | --- | --- |
-| Kernel | `crates/kernel/` | Module SDK, host execute loop, replication, Simplex BFT consensus, state sync, indexer, wasmtime runtime |
+| Kernel | `crates/kernel/` | Host execute loop, replication, Simplex BFT consensus, state sync, indexer. The module SDK and the wasmtime runtime come from [ducktape-sdk](https://github.com/ducktape-industries/ducktape-sdk) by git dependency |
 | Networking | `crates/networking/` | WireGuard mesh, NAT traversal, reachability, overlay data plane |
-| Modules | `crates/modules/` | Every consensus module: `system/` (validator set, governance, identity, module registry, ACL, gateway, ...) and `apps/` (chat, pages, tasks, forge, files, agent, runs, boards, ...) |
+| Modules | `crates/modules/` | The system modules (validator set, governance, identity, module registry, ACL, gateway, ...) plus `forge` and `files`; the other app modules ship from [ducktape-modules](https://github.com/ducktape-industries/ducktape-modules) and reach a genesis here as committed artifacts |
 | Services | `crates/services/` | Off-chain executors a module drives: compute pool, provider run loop, microVM sandbox, credential broker, airlock, media |
-| Binaries | `bin/` | The `ducktape` CLI and node, the coordinator, `guest-builder`, the sandbox PID 1, the dev daemon and its deterministic twin |
-| App | `app/`, `crates/views/` | The desktop host and its wasm views |
+| Binaries | `bin/` | The `ducktape` CLI and node, the coordinator, the sandbox PID 1, the dev daemon and its deterministic twin |
 
 The one rule modules obey: a module never links another module's crate. It
 depends on the SDK and on the types-only wire shapes a sibling publishes;
@@ -96,14 +90,11 @@ the module id universe and the genesis selections.
 cargo test --workspace                          # the Rust workspace
 cargo test -p node-bin --test cluster_e2e       # real node processes over localhost TCP
 make test                                       # everything the repo can verify locally
-make wasm-modules                               # rebuild every module component
-make wasm-modules-check                         # the committed components match the source
 ```
 
-Writing a module: [`skills/module-dev/SKILL.md`](skills/module-dev/SKILL.md)
-is the wiring runbook and
+Writing a module:
 [`docs/records/architecture/wasm-module-authoring.md`](docs/records/architecture/wasm-module-authoring.md)
-the recipe for a module authored in its own repository.
+is the recipe for a module authored in its own repository.
 [`AGENTS.md`](AGENTS.md) holds the rules that bind changes to this tree.
 
 ## Documentation

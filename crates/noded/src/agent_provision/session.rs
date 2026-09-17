@@ -38,10 +38,6 @@ use std::sync::Arc;
 #[path = "native.rs"]
 mod native;
 
-#[cfg(test)]
-#[path = "native_end_to_end_tests.rs"]
-mod native_end_to_end_tests;
-
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, Response, StatusCode};

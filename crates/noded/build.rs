@@ -27,8 +27,8 @@
 //! node is complete without an install step, and a second checkout sharing
 //! the target speaks only for its own set. The set is the checkout's committed
 //! artifacts (`make wasm-modules` refreshes them): one component per wasm
-//! module the topology names, plus one index guest per module whose crate
-//! declares one by carrying `src/index_guest.rs`. A declared artifact the
+//! module the topology names, plus one index guest per module that declares
+//! one by carrying a committed `index.wasm`. A declared artifact the
 //! checkout lacks fails the build here, naming the path, instead of `node
 //! init` later. Desktop view declarations instead leave a pending marker when
 //! output is missing: compilation succeeds and deployment preparation refuses
@@ -209,10 +209,10 @@ pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str], views: &[
         view_staging::stage_view(checkout, dest, id).expect("stage module view");
         stage_lane_declaration(&module_dir, dest, spec.id);
         let ships_guest = declares_index_guest(&module_dir);
-        // The catalog and source declaration must agree for build presets.
+        // The catalog and the committed artifacts must agree for build presets.
         assert_eq!(
             ships_guest, spec.has_index_guest,
-            "module {}: crates/noded/build.rs sees src/index_guest.rs = {ships_guest} but \
+            "module {}: crates/noded/build.rs sees a committed index.wasm = {ships_guest} but \
              topology::TOPOLOGY says has_index_guest = {} — update crates/topology/src/lib.rs \
              to match",
             spec.id, spec.has_index_guest
@@ -265,15 +265,16 @@ fn stage_lane_declaration(module_dir: &Path, dest: &Path, id: &str) {
     }
 }
 
-/// a module declares its index guest by carrying the guest's engine shell:
-/// `src/index_guest.rs` (built by `guest-builder --index` into the crate's
-/// committed `index.wasm`). the file is the declaration, so a module cannot
-/// ship a mapper the founding set omits or be declared to ship one it lacks.
-/// the file is a rerun trigger too: adding or removing the shell re-stages.
+/// a module declares its index guest by carrying the committed artifact:
+/// `index.wasm` beside its `component.wasm`. the artifact is the declaration
+/// because this repo holds artifacts, not module source — an app module's
+/// crate lives in ducktape-modules — so a module cannot ship a mapper the
+/// founding set omits or be declared to ship one it lacks. the file is a rerun
+/// trigger too: adding or removing the mapper re-stages.
 fn declares_index_guest(module_dir: &Path) -> bool {
-    let shell = module_dir.join("src/index_guest.rs");
-    println!("cargo:rerun-if-changed={}", shell.display());
-    shell.is_file()
+    let mapper = module_dir.join("index.wasm");
+    println!("cargo:rerun-if-changed={}", mapper.display());
+    mapper.is_file()
 }
 
 /// the checkout directory a module's committed artifacts live in: the
