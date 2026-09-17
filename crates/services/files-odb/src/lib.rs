@@ -1,18 +1,18 @@
 //! the host-side ODB substrate a wasm files tenant delegates its committed
 //! surface to: [`FilesOdbBacking`] implements [`wasm_host::OdbBacking`] over the
 //! SAME `duckfs_core::Fs<DiskStore>` + `DiskRefs` machinery the native
-//! [`Files`](crate::module::Files) module runs on. it is native files with the
+//! [`Files`](files::Files) module runs on. it is native files with the
 //! `sdk::Module` trait peeled off: the guest owns `execute` and `query`, the host owns the
 //! committed surface (`root`/`snapshot`/`install`/`serve_sync` + the
 //! object plane), and the block boundary is driven by the kernel through the two
 //! backing hooks in the duckfs durability order.
 //!
-//! ## why this is not a fork of [`Files`]
+//! ## why this is not a fork of [`Files`](files::Files)
 //!
 //! the crash-safety ordering is the load-bearing part, and it is SINGLE-SOURCED:
-//! both this backing and [`Files::commit_block`](crate::module) call the same
+//! both this backing and native `Files::commit_block` call the same
 //! [`persist_objects`] (objects → sync) and [`commit_refs`] (refs save → adopt →
-//! gc) from [`crate::module`]. the only thing this file adds is the SHAPE the
+//! gc) from [`files`]. the only thing this file adds is the SHAPE the
 //! kernel drives — the native module owns one block-spanning `pending` and
 //! flushes it in one `commit_block`, whereas the kernel accumulates the block's
 //! staged objects itself and hands them back one `stage_put` at a time, then
@@ -47,7 +47,7 @@ use duckfs_disk::{DiskRefs, DiskStore};
 use sdk::{Error, ModuleId};
 use wasm_host::{HostOdb, OdbBacking};
 
-use crate::module::{commit_refs, persist_objects};
+use files::{commit_refs, persist_objects};
 
 // the files object-read consensus cap is single-sourced in `duckfs-core` (the
 // guest runs that core), but "core rejects strictly before the kernel trap" only
@@ -61,7 +61,7 @@ const _: () = assert!(
 );
 
 /// the disk-backed ODB substrate for a wasm files tenant. holds exactly what
-/// native [`Files`](crate::module::Files) holds — the pure `Fs` over the disk
+/// native [`Files`](files::Files) holds — the pure `Fs` over the disk
 /// odb, the durable refs file, and the per-node recovery bookkeeping — plus the
 /// block-local buffer + height the kernel-driven commit shape needs.
 pub struct FilesOdbBacking {
@@ -71,7 +71,7 @@ pub struct FilesOdbBacking {
     refs_store: DiskRefs,
     /// last block height whose refs are durable; per-node recovery bookkeeping in
     /// the refs-file envelope, never in the root preimage. `None` until an
-    /// envelope exists (a fresh dir), exactly as native [`Files`] tracks it.
+    /// envelope exists (a fresh dir), exactly as native [`Files`](files::Files) tracks it.
     durable_height: Option<u64>,
     /// gc watermark (per-node bookkeeping); persisted in the refs envelope,
     /// threaded through [`commit_refs`] identically to native.
@@ -94,7 +94,7 @@ impl FilesOdbBacking {
     /// open (or create) the backing over its data dir — the disk odb at
     /// `<dir>/objects` and the durable refs file at `<dir>/refs`. a fresh dir
     /// yields empty refs; an existing one recovers committed refs, height, and gc
-    /// watermark from the envelope. this is native [`Files::open`](crate::module)
+    /// watermark from the envelope. this is native `Files::open`
     /// verbatim, minus the `sdk::Module` id (the wasm module carries that).
     pub fn open(id: impl Into<ModuleId>, dir: PathBuf) -> Result<Self, Error> {
         let id = id.into();

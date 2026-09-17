@@ -15,14 +15,15 @@ mod module;
 #[cfg(feature = "native")]
 pub use module::Files;
 
-// the host-side ODB substrate a wasm files tenant delegates its committed
-// surface to (`wasm_host::OdbBacking` over the SAME disk machinery as `Files`).
-// native-only: it depends on duckfs-disk + the kernel host, never the pure core.
+// the two halves of the duckfs durability ordering, public because they have
+// exactly two callers and one of them is in another crate: the native
+// `Files::commit_block` here, and `files_odb::FilesOdbBacking`'s
+// `publish_block`/`adopt_refs` — the host-side substrate a wasm files tenant
+// delegates its committed surface to. the crash-safety contract is
+// SINGLE-SOURCED across both, which is the whole reason they are named here
+// rather than forked there.
 #[cfg(feature = "native")]
-mod backing;
-
-#[cfg(feature = "native")]
-pub use backing::FilesOdbBacking;
+pub use module::{commit_refs, persist_objects};
 
 // the wasm-guest port. compiled for the `guest` feature (the wasm build) and
 // under `test` (so the native suite can drive the pure `dispatch` seam against

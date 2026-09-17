@@ -4371,6 +4371,22 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "files-odb"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "duckfs-core",
+ "duckfs-disk",
+ "files",
+ "futures",
+ "identity",
+ "sdk",
+ "sdk-testkit",
+ "sha2 0.10.9",
+ "tempfile",
  "wasm-host",
 ]
 
@@ -6130,6 +6146,7 @@ dependencies = [
  "dispatch 0.1.0",
  "duckdns",
  "files",
+ "files-odb",
  "forge",
  "futures",
  "gateway",
@@ -8058,6 +8075,7 @@ dependencies = [
  "duckfs-client",
  "duckfs-core",
  "files",
+ "files-odb",
  "forge",
  "futures",
  "gateway",

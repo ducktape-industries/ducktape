@@ -277,7 +277,7 @@ impl<S: ObjectStore> Fs<S> {
     }
 
     /// read-only access to the object store — the `&self` twin of
-    /// [`Fs::store_mut`]. the host-side odb backing ([`files::FilesOdbBacking`])
+    /// [`Fs::store_mut`]. the host-side odb backing (`files_odb::FilesOdbBacking`)
     /// serves its `HostOdb::stat`/`get` (a `&self` surface) by reading committed
     /// object bodies straight off the concrete `S`, reusing the store's verified
     /// read rather than forking the disk-read logic. glue/test plumbing, not the
