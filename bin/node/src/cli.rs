@@ -76,7 +76,7 @@ fn cmd_log_filter(args: crate::cli_args::LogFilterArgs) -> CommandResult {
     }
     let response = request
         .send()
-        .map_err(|error| crate::node_http::transport_failure(PATH, &error).to_string())?;
+        .map_err(|error| crate::node_http::transport_failure(&base, PATH, &error).to_string())?;
     let status_code = response.status();
     let text = response.text().unwrap_or_default();
     if !status_code.is_success() {
@@ -388,7 +388,7 @@ fn cmd_netstack_swap(args: crate::cli_args::NetstackSwapArgs) -> CommandResult {
         .header(noded::admin::ADMIN_TOKEN_HEADER, token)
         .json(&serde_json::json!({ "backend": backend }))
         .send()
-        .map_err(|error| crate::node_http::transport_failure(PATH, &error).to_string())?;
+        .map_err(|error| crate::node_http::transport_failure(&base, PATH, &error).to_string())?;
     let status_code = response.status();
     let text = response.text().unwrap_or_default();
     if !status_code.is_success() {
@@ -1025,9 +1025,15 @@ fn cmd_admit(args: AdmitArgs) -> Result<(), Box<dyn std::error::Error>> {
 pub(super) fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json::Value, String> {
     use std::io::{BufRead as _, BufReader, Write as _};
     // the same calm sentence the http lane gives, for the same condition: an
-    // `os error 111` with a port in it is a diagnosis nobody asked for.
+    // `os error 111` with a port in it is a diagnosis nobody asked for. It is
+    // reached the same way too — one renderer, asked which workspace this
+    // address is, so every verb on this lane names a launcher when there is
+    // one instead of recommending a second `node run` into its restart loop.
     let conn = std::net::TcpStream::connect(addr).map_err(|error| match error.kind() {
-        std::io::ErrorKind::ConnectionRefused => crate::node_http::NODE_NOT_RUNNING.to_string(),
+        std::io::ErrorKind::ConnectionRefused => {
+            let workspace = crate::cli_args::workspace_for_rpc(addr).ok();
+            crate::node_http::not_running_in(workspace.as_deref()).to_string()
+        }
         _ => format!("cannot reach this node's operator rpc on {addr}: {error}"),
     })?;
     conn.set_read_timeout(Some(std::time::Duration::from_secs(15)))

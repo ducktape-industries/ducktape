@@ -1329,6 +1329,15 @@ pub fn http_base_in(dir: &Path) -> Result<String, String> {
     Ok(http_base_of(&raw.http_listen))
 }
 
+/// the node's OPERATOR RPC address for a workspace DIRECTORY, verbatim — the
+/// twin of [`http_base_in`] for the other local lane. Not normalized to
+/// loopback the way an http base is: `rpc_listen` is dialed as written, so the
+/// string a caller compares against is the string the config holds.
+pub fn rpc_listen_in(dir: &Path) -> Result<String, String> {
+    let (raw, _) = node_toml::load_node_toml(&dir.join("node.toml"))?;
+    Ok(raw.rpc_listen)
+}
+
 /// `http://<loopback>:<port>` for a node.toml `http_listen`. ALWAYS loopback,
 /// whatever the operator bound: every caller of this is a same-box process
 /// dialing its OWN node, and the node's write gate admits a credentialed

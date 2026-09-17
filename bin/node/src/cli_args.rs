@@ -479,6 +479,33 @@ pub fn workspace_for_base(base: &str) -> Result<PathBuf, String> {
     workspace_serving(base)
 }
 
+/// The same reverse lookup for the OPERATOR RPC address rather than the http
+/// base — the lane `ducktape node status`, `join state` and the module verbs
+/// dial.
+///
+/// Those verbs hold an `rpc_listen` string and, several helper frames down, no
+/// longer hold the config they read it out of. Rather than thread a directory
+/// through every one of them, the registry answers the same question it
+/// already answers for a url: which workspace is this address?
+pub fn workspace_for_rpc(addr: &str) -> Result<PathBuf, String> {
+    workspace_for_rpc_in(&config::ducktape_home()?, addr)
+}
+
+/// Split from the home lookup for the same reason [`workspace_serving_in`] is:
+/// two workspaces sharing a default `rpc_listen` is the ordinary case, not an
+/// exotic one, and no registry-free test can reach it.
+fn workspace_for_rpc_in(root: &std::path::Path, addr: &str) -> Result<PathBuf, String> {
+    let matches = config::list_workspaces_in(root)?
+        .into_iter()
+        .filter_map(|(chain_id, node_toml)| {
+            let dir = node_toml.parent()?.to_path_buf();
+            let listen = config::rpc_listen_in(&dir).ok()?;
+            (listen == addr).then_some((chain_id, dir))
+        })
+        .collect::<Vec<_>>();
+    workspace_of_matches(addr, matches)
+}
+
 fn workspace_serving(base: &str) -> Result<PathBuf, String> {
     workspace_serving_in(&config::ducktape_home()?, base)
 }
@@ -968,12 +995,19 @@ mod tests {
     #[test]
     fn a_founder_and_its_resident_on_one_chain_each_answer_for_their_own_port() {
         let home = tempfile::tempdir().expect("temp home");
-        let founder = write_workspace(home.path(), "net", "dognet#d2a0ec8f", "127.0.0.1:32989");
+        let founder = write_workspace(
+            home.path(),
+            "net",
+            "dognet#d2a0ec8f",
+            "127.0.0.1:32989",
+            "127.0.0.1:36989",
+        );
         let resident = write_workspace(
             home.path(),
             "net-joiner",
             "dognet#d2a0ec8f",
             "127.0.0.1:32990",
+            "127.0.0.1:36990",
         );
 
         assert_eq!(
@@ -995,16 +1029,82 @@ mod tests {
 
         // And the collision the refusal exists for is untouched: two workspaces
         // that really do serve one base still refuse rather than pick.
-        write_workspace(home.path(), "other", "kitchen#99887766", "127.0.0.1:32989");
+        write_workspace(
+            home.path(),
+            "other",
+            "kitchen#99887766",
+            "127.0.0.1:32989",
+            "127.0.0.1:36991",
+        );
         let Err(why) = workspace_serving_in(home.path(), "http://127.0.0.1:32989") else {
             panic!("two workspaces on one base must refuse, not pick the first");
         };
         assert!(why.contains("several workspaces serve"), "{why}");
     }
 
+    /// The same reverse lookup for the OPERATOR RPC lane, which `node status`,
+    /// `join state` and the module verbs dial. They hold an `rpc_listen` and
+    /// never a url, so a refusal that wants to name the launcher supervising
+    /// this node has to reach the workspace from that address instead.
+    #[test]
+    fn the_rpc_lane_reaches_each_workspace_by_its_own_rpc_address() {
+        let home = tempfile::tempdir().expect("temp home");
+        let founder = write_workspace(
+            home.path(),
+            "net",
+            "dognet#d2a0ec8f",
+            "127.0.0.1:32989",
+            "127.0.0.1:36989",
+        );
+        let resident = write_workspace(
+            home.path(),
+            "net-joiner",
+            "dognet#d2a0ec8f",
+            "127.0.0.1:32990",
+            "127.0.0.1:36990",
+        );
+
+        assert_eq!(
+            workspace_for_rpc_in(home.path(), "127.0.0.1:36989"),
+            Ok(founder),
+            "the founder's own rpc port did not reach the founder"
+        );
+        assert_eq!(
+            workspace_for_rpc_in(home.path(), "127.0.0.1:36990"),
+            Ok(resident),
+            "the resident's own rpc port did not reach the resident"
+        );
+
+        let Err(why) = workspace_for_rpc_in(home.path(), "127.0.0.1:1") else {
+            panic!("an unserved rpc address resolved to a workspace");
+        };
+        assert!(why.contains("no registered workspace"), "{why}");
+
+        // Two networks BOTH left on the default `rpc_listen` is the ordinary
+        // case, and it is why the caller falls back to the plain sentence: a
+        // wrong launcher's log is worse than no launcher's.
+        write_workspace(
+            home.path(),
+            "other",
+            "kitchen#99887766",
+            "127.0.0.1:32991",
+            "127.0.0.1:36989",
+        );
+        let Err(why) = workspace_for_rpc_in(home.path(), "127.0.0.1:36989") else {
+            panic!("two workspaces on one rpc address must refuse, not pick the first");
+        };
+        assert!(why.contains("several workspaces serve"), "{why}");
+    }
+
     /// A workspace on disk, complete enough for the registry to list it and for
-    /// its own `http_listen` to be read back.
-    fn write_workspace(root: &std::path::Path, ws: &str, chain: &str, http: &str) -> PathBuf {
+    /// its own `http_listen` and `rpc_listen` to be read back.
+    fn write_workspace(
+        root: &std::path::Path,
+        ws: &str,
+        chain: &str,
+        http: &str,
+        rpc: &str,
+    ) -> PathBuf {
         let dir = root.join(ws);
         std::fs::create_dir_all(&dir).expect("mk workspace");
         config::NetworkDescriptor {
@@ -1023,7 +1123,7 @@ mod tests {
             "network = \"network.toml\"\nkey_file = \"identity.key\"\n\
              listen = \"127.0.0.1:0\"\nadvertised = \"127.0.0.1:9000\"\n\
              storage_dir = 'storage'\nhttp_listen = \"{http}\"\n\
-             gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"127.0.0.1:0\"\n\
+             gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"{rpc}\"\n\
              wireguard_listen = \"0.0.0.0:51820\"\ninvite_listen = \"0.0.0.0:51821\"\n\
              wireguard_advertised = \"auto\"\nprimary_coordinator = \"none\"\n\
              coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n"

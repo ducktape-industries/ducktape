@@ -75,7 +75,7 @@ pub(crate) fn submit_frame(base: &str, frame: &[u8]) -> Result<u64, Box<dyn std:
         .header("content-type", "application/octet-stream")
         .body(frame.to_vec())
         .send()
-        .map_err(|error| transport_failure(PATH, &error).to_string())?;
+        .map_err(|error| transport_failure(base, PATH, &error).to_string())?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
@@ -224,7 +224,7 @@ pub(crate) fn query_as_reader(
     }
     let resp = request
         .send()
-        .map_err(|error| transport_failure(QUERY_READER_PATH, &error).to_string())?;
+        .map_err(|error| transport_failure(base, QUERY_READER_PATH, &error).to_string())?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
@@ -315,8 +315,9 @@ fn pinned_node_key_in(
 /// something unexpected" must be surfaced. Collapsing both into one error is
 /// how a 404 or a changed body shape comes to look like "nothing is there".
 pub(crate) enum ReadFailure {
-    /// nothing is listening on the node's HTTP surface.
-    Unreachable,
+    /// nothing is listening on the node's HTTP surface, and what the operator
+    /// should do about that — which is not one answer, see [`NotRunning`].
+    Unreachable(NotRunning),
     /// the node was reached but the exchange failed (status or body).
     Rejected(String),
 }
@@ -324,17 +325,109 @@ pub(crate) enum ReadFailure {
 impl std::fmt::Display for ReadFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReadFailure::Unreachable => write!(f, "{NODE_NOT_RUNNING}"),
+            ReadFailure::Unreachable(next) => write!(f, "{next}"),
             ReadFailure::Rejected(detail) => write!(f, "{detail}"),
         }
     }
 }
 
-/// The one sentence for "nothing answered on this node's http surface" — and
-/// the command that fixes it, because a reader who sees this is usually one
-/// `node run` away from a working tool.
-pub(crate) const NODE_NOT_RUNNING: &str =
-    "the node is not running — start it with `ducktape node run`";
+/// What an operator should DO about a node that did not answer — the whole
+/// content of the sentence, and it is not one sentence.
+///
+/// "start it with `ducktape node run`" was right for exactly one of these
+/// three worlds. Under a launcher it is wrong twice over: that node is ALREADY
+/// being started, in a restart loop, so a hand-typed `node run` is a second
+/// process racing it for the port; and the reason the launcher's own attempt
+/// keeps failing is in the launcher's log, which nothing used to mention.
+pub(crate) enum NotRunning {
+    /// no launcher has ever installed against this workspace — starting the
+    /// node is the operator's own to do.
+    Unsupervised,
+    /// a launcher owns this workspace and its output is in a file that is
+    /// there right now.
+    Supervised(std::path::PathBuf),
+    /// a launcher owns this workspace, but its output was never redirected
+    /// into the workspace: it went wherever the unit that runs it sends stderr.
+    SupervisedElsewhere,
+}
+
+impl std::fmt::Display for NotRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Both supervised arms open the same way and differ only in WHERE the
+        // launcher's own reason can be read, so that clause is written once —
+        // two copies of a sentence are two things to keep in agreement.
+        const SUPERVISED: &str = "a launcher owns this workspace and is already restarting it, \
+                                  so do not start a second one; its own reason is ";
+        // Every arm opens on the same clause too: whatever follows it, the fact
+        // a reader came here for is that nothing answered.
+        write!(f, "the node is not running — ")?;
+        match self {
+            NotRunning::Unsupervised => write!(f, "start it with `ducktape node run`"),
+            NotRunning::Supervised(log) => {
+                write!(f, "{SUPERVISED}the last FATAL line in {}", log.display())
+            }
+            NotRunning::SupervisedElsewhere => write!(
+                f,
+                "{SUPERVISED}on the launcher's stderr, wherever the unit that runs it sends that"
+            ),
+        }
+    }
+}
+
+/// The launcher's own state file. `install` writes it and `run` refuses
+/// without it, so its presence IS the launcher saying it owns this workspace.
+///
+/// Spelled here because this binary does not link the launcher; the path it
+/// must agree with is `Layout::state_path` in `bin/node-launcher/src/layout.rs`,
+/// which its own test pins. A move there without a move here costs nothing
+/// worse than this sentence falling back to the unsupervised one.
+const LAUNCHER_STATE: &str = "updates/state.json";
+
+/// Where an operator conventionally tees the launcher's stderr. The launcher
+/// does not open this file itself, which is why its existence is checked and
+/// never assumed: naming a path that is not there sends a reader to an empty
+/// `cat` and costs more trust than saying less.
+const LAUNCHER_LOG: &str = "launcher.log";
+
+/// Classify a node that did not answer, by reading the launcher's OWN state on
+/// disk.
+///
+/// Never a process scan: a pattern match over the process table finds an
+/// editor with the word in its command line, and finds NOTHING at all in the
+/// window between a launcher's restarts — which is precisely the window in
+/// which someone is reading this sentence.
+///
+/// `None` is an address this CLI could not tie back to a registered
+/// workspace; there is then nothing to have a launcher, so it is the plain
+/// case.
+pub(crate) fn not_running_in(workspace: Option<&std::path::Path>) -> NotRunning {
+    let Some(workspace) = workspace else {
+        return NotRunning::Unsupervised;
+    };
+    let supervised = workspace.join(LAUNCHER_STATE).is_file();
+    if !supervised {
+        return NotRunning::Unsupervised;
+    }
+    let log = workspace.join(LAUNCHER_LOG);
+    match log.is_file() {
+        true => NotRunning::Supervised(log),
+        false => NotRunning::SupervisedElsewhere,
+    }
+}
+
+/// [`not_running_in`] for a caller holding the node's http base rather than
+/// its directory — every `/v1` lane, which dials a url and never knew the
+/// workspace behind it.
+///
+/// The registry can answer "none" (a `--node` url pointing off this box) or
+/// "several" (two networks both left on the default `http_listen`), and both
+/// fall back to the plain sentence: a wrong launcher's log is worse than no
+/// launcher's. A caller that HAS the directory should pass it to
+/// [`not_running_in`] and skip this — `services::catalog_now` does.
+fn not_running_at(base: &str) -> NotRunning {
+    let workspace = crate::cli_args::workspace_for_base(base).ok();
+    not_running_in(workspace.as_deref())
+}
 
 /// Why a request never produced a response — ONE discriminant over the only
 /// three things that can be wrong at this boundary, so the sentence a person
@@ -373,9 +466,14 @@ fn why_unanswered(error: &reqwest::Error) -> Unanswered {
 }
 
 /// Turn a failed `send()` into what to tell the operator. The one `match`.
-pub(crate) fn transport_failure(path: &str, error: &reqwest::Error) -> ReadFailure {
+///
+/// `base` is carried only to answer "and what do I do about it" — the url
+/// itself is never echoed (see below); it is the handle this CLI has on which
+/// workspace the caller was dialing, and therefore on whether a launcher is
+/// already doing the thing we would otherwise tell them to do.
+pub(crate) fn transport_failure(base: &str, path: &str, error: &reqwest::Error) -> ReadFailure {
     match why_unanswered(error) {
-        Unanswered::NoAnswer => ReadFailure::Unreachable,
+        Unanswered::NoAnswer => ReadFailure::Unreachable(not_running_at(base)),
         // the url is deliberately not echoed: it adds nothing a reader can act
         // on, and every base here is one this CLI resolved itself.
         Unanswered::Malformed => {
@@ -394,7 +492,7 @@ pub(crate) fn get_json(base: &str, path: &str) -> Result<serde_json::Value, Read
         .map_err(ReadFailure::Rejected)?
         .get(format!("{base}{path}"))
         .send()
-        .map_err(|error| transport_failure(path, &error))?;
+        .map_err(|error| transport_failure(base, path, &error))?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
@@ -445,7 +543,7 @@ fn post_with(
     }
     let resp = request
         .send()
-        .map_err(|error| transport_failure(path, &error).to_string())?;
+        .map_err(|error| transport_failure(base, path, &error).to_string())?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
@@ -481,17 +579,95 @@ mod tests {
 
         let read = get_json(&base, "/v1/status").expect_err("nothing listens");
         assert!(
-            matches!(read, ReadFailure::Unreachable),
+            matches!(read, ReadFailure::Unreachable(_)),
             "the read lane must classify a refused connect: {read}"
         );
 
         let write = post(&base, "/v1/query", &serde_json::json!({}))
             .expect_err("nothing listens")
             .to_string();
-        assert_eq!(write, NODE_NOT_RUNNING, "the submit lane must say it too");
+        assert_eq!(
+            write,
+            read.to_string(),
+            "the submit lane must say the same thing, not a near-miss of it"
+        );
+        assert!(
+            write.starts_with("the node is not running"),
+            "and it must say it first: {write}"
+        );
         assert!(
             !write.contains("http://"),
             "a person is not helped by the url they did not type: {write}"
+        );
+    }
+
+    /// A workspace nothing supervises, which is the world the old single
+    /// sentence was written for. Kept as a MUST-PASS case: without it the two
+    /// tests below would still pass against a renderer that had simply stopped
+    /// saying `node run` to everybody.
+    #[test]
+    fn an_unsupervised_workspace_is_still_told_to_start_the_node() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let said = not_running_in(Some(dir.path())).to_string();
+        assert_eq!(
+            said, "the node is not running — start it with `ducktape node run`",
+            "nothing here starts this node, so the operator must"
+        );
+    }
+
+    /// THE BUG (#2531). A launcher is already restarting this node in a loop,
+    /// so `node run` is a second process racing it for the port — and the
+    /// reason its own attempts keep failing is in a file nothing used to name.
+    #[test]
+    fn a_launcher_managed_workspace_is_never_told_to_run_a_second_node() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("updates")).expect("updates dir");
+        std::fs::write(dir.path().join(LAUNCHER_STATE), "{}").expect("state.json");
+        std::fs::write(dir.path().join(LAUNCHER_LOG), "FATAL: nope\n").expect("launcher.log");
+
+        let said = not_running_in(Some(dir.path())).to_string();
+        assert!(
+            !said.contains("ducktape node run"),
+            "a supervised node must not be handed a second `node run`: {said}"
+        );
+        assert!(
+            said.contains(&dir.path().join(LAUNCHER_LOG).display().to_string()),
+            "and it must name the log by a path the reader can open: {said}"
+        );
+    }
+
+    /// The launcher does not open `launcher.log` itself — an operator tees its
+    /// stderr there, and plenty do not. Naming a file that is not there sends
+    /// the reader to an empty `cat`, which costs more than saying less.
+    #[test]
+    fn a_launcher_whose_output_went_elsewhere_names_no_file_at_all() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("updates")).expect("updates dir");
+        std::fs::write(dir.path().join(LAUNCHER_STATE), "{}").expect("state.json");
+
+        let said = not_running_in(Some(dir.path())).to_string();
+        assert!(
+            !said.contains("ducktape node run"),
+            "it is still supervised: {said}"
+        );
+        assert!(
+            !said.contains(LAUNCHER_LOG),
+            "it must not invent a file it did not find: {said}"
+        );
+        assert!(
+            said.contains("stderr"),
+            "it must still say where to look instead: {said}"
+        );
+    }
+
+    /// An address this CLI cannot tie back to a workspace has nothing to have
+    /// a launcher — the plain sentence, never a guess.
+    #[test]
+    fn an_address_with_no_workspace_behind_it_gets_the_plain_sentence() {
+        let said = not_running_in(None).to_string();
+        assert_eq!(
+            said,
+            "the node is not running — start it with `ducktape node run`"
         );
     }
 
@@ -520,7 +696,7 @@ mod tests {
         let failure = get_json(&base, "/v1/status").expect_err("no response");
         draining.join().expect("the drain thread finishes");
         assert!(
-            matches!(failure, ReadFailure::Unreachable),
+            matches!(failure, ReadFailure::Unreachable(_)),
             "a hang-up during drain is the same operator condition: {failure}"
         );
     }
@@ -563,7 +739,7 @@ mod tests {
             "an unbuildable request is not a stopped node"
         );
         assert!(
-            !transport_failure("/v1/status", &malformed)
+            !transport_failure("http://127.0.0.1:1", "/v1/status", &malformed)
                 .to_string()
                 .contains("not running"),
             "and it must not say so"
