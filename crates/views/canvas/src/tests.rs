@@ -3801,6 +3801,7 @@ fn picking_a_shape_takes_up_the_whole_pen_it_was_drawn_with() {
             color: 3,
             fill: Fill::None,
             dash: Dash::Dashed,
+            weight: Weight::Heavy,
             ..Default::default()
         },
     });
@@ -3825,8 +3826,8 @@ fn picking_a_shape_takes_up_the_whole_pen_it_was_drawn_with() {
     // one that was picked — the whole reason to take a pen up at all.
     let next = view.creation_shape(Kind::Ellipse, [0., 0.], [100., 80.]);
     assert_eq!(
-        (next.color, next.fill, next.dash),
-        (3, Fill::None, Dash::Dashed)
+        (next.color, next.fill, next.dash, next.weight),
+        (3, Fill::None, Dash::Dashed, Weight::Heavy)
     );
 }
 /// The chip beside the board's name is the one piece of chrome whose whole job
@@ -3883,4 +3884,121 @@ fn the_zoom_readout_never_has_to_hold_more_than_four_digits() {
     view.on_release();
     view.on_fit_selection();
     assert_eq!(view.zoom_label(), "200%");
+}
+/// The weight a shape carries has to reach the line it is drawn with, and it
+/// has to keep the four steps apart at every zoom — the clamp that keeps a line
+/// sane across zoom is exactly what would collapse thick into heavy if the
+/// weight were folded in before it.
+#[test]
+fn a_shape_is_drawn_with_the_weight_it_carries_at_every_zoom() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            kind: Kind::Rectangle,
+            x: 100,
+            y: 100,
+            width: 200,
+            height: 140,
+            ..Default::default()
+        },
+    });
+    let width_now = |view: &BoardsView| {
+        body_of(view, "a")
+            .1
+            .expect("a rectangle draws an outline")
+            .width
+    };
+
+    // Medium is 1: a board drawn before a shape could carry a weight reads back
+    // at the width it was drawn at, so this is the number every other step is
+    // measured against rather than an arbitrary middle.
+    let medium = width_now(&view);
+    view.selected = ["a".into()].into();
+
+    view.on_weight(Weight::Thin);
+    let thin = width_now(&view);
+    view.on_weight(Weight::Thick);
+    let thick = width_now(&view);
+    view.on_weight(Weight::Heavy);
+    let heavy = width_now(&view);
+    assert!(
+        thin < medium && medium < thick && thick < heavy,
+        "the four steps did not come out in order: {thin} {medium} {thick} {heavy}"
+    );
+
+    // Zoomed in far enough that the clamp is doing its job, the steps must
+    // still be four steps. Folding the weight in before the clamp is what made
+    // the two heaviest come out identical exactly when you could see them.
+    view.zoom = 4.;
+    view.on_weight(Weight::Thick);
+    let thick_close = width_now(&view);
+    view.on_weight(Weight::Heavy);
+    let heavy_close = width_now(&view);
+    assert!(
+        thick_close < heavy_close,
+        "at 400% a thick line and a heavy one were drawn the same: \
+         {thick_close} and {heavy_close}"
+    );
+
+    // And the weight is remembered for the next shape, like the rest of the pen.
+    let next = view.creation_shape(Kind::Ellipse, [0., 0.], [100., 80.]);
+    assert_eq!(next.weight, Weight::Heavy);
+}
+/// The weight row goes wherever the dash row goes and nowhere else: both are
+/// about the line, and the one kind that draws no line has no use for either.
+/// A control that does nothing is worse than a missing one — it says the board
+/// can do something it cannot.
+#[test]
+fn the_weight_row_is_offered_to_everything_that_draws_a_line() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "card".into(),
+        shape: Shape {
+            kind: Kind::Rectangle,
+            ..Default::default()
+        },
+    });
+    view.edit(Change::Create {
+        id: "line".into(),
+        shape: Shape {
+            kind: Kind::Arrow,
+            points: vec![[0, 0], [120, 80]],
+            ..Default::default()
+        },
+    });
+    view.edit(Change::Create {
+        id: "words".into(),
+        shape: Shape {
+            kind: Kind::Text,
+            x: 600,
+            text: "words".into(),
+            ..Default::default()
+        },
+    });
+    let offered = |view: &BoardsView| {
+        serde_json::to_string(&view.view())
+            .unwrap()
+            .contains("boards/weight/")
+    };
+
+    // Nothing selected: the row describes the pen the next shape gets, and the
+    // next shape could be any of them.
+    view.selected = Default::default();
+    assert!(offered(&view), "the new-shape panel offered no weight");
+
+    for id in ["card", "line"] {
+        view.selected = [id.to_string()].into();
+        assert!(offered(&view), "a {id} draws a line but was offered no weight");
+    }
+
+    view.selected = ["words".into()].into();
+    assert!(
+        !offered(&view),
+        "a text shape draws no line, so a weight row on it sets nothing"
+    );
 }

@@ -4,7 +4,9 @@ mod host;
 mod interaction;
 mod markdown;
 mod presentation;
-use boards_wire::{Align, Board, Change, Dash, Fill, Kind, Operation, Shape, TextSize};
+use boards_wire::{
+    Align, Board, Change, Dash, Fill, Kind, Operation, Shape, TextSize, Weight,
+};
 use ducktape_view_guest::{Editor, wire};
 use ducktape_view_guest::{Subscription, Task};
 use serde::{Deserialize, Serialize};
@@ -171,15 +173,16 @@ struct History {
 /// going to look and then draw several of them, rather than drawing each one
 /// wrong and correcting it.
 ///
-/// One value and not three fields on the view, because every use of it is over
-/// the WHOLE pen — picking a shape takes all of it up, minting a shape lays all
-/// of it down — and three properties written in three places is exactly how two
-/// of them came to be forgotten at the pick-up.
+/// One value and not a field per property on the view, because every use of it
+/// is over the WHOLE pen — picking a shape takes all of it up, minting a shape
+/// lays all of it down — and properties written in three places is exactly how
+/// two of them came to be forgotten at the pick-up.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Pen {
     color: u8,
     fill: Fill,
     dash: Dash,
+    weight: Weight,
 }
 impl Pen {
     /// The pen this shape was drawn with.
@@ -188,6 +191,7 @@ impl Pen {
             color: shape.color,
             fill: shape.fill,
             dash: shape.dash,
+            weight: shape.weight,
         }
     }
     /// A shape in this pen with nothing else decided. Every gesture that mints
@@ -198,6 +202,7 @@ impl Pen {
             color: self.color,
             fill: self.fill,
             dash: self.dash,
+            weight: self.weight,
             ..Shape::default()
         }
     }
@@ -311,6 +316,7 @@ pub enum Message {
     Color(u8),
     Painting(Fill),
     Outline(Dash),
+    Stroke(Weight),
     Align(Align),
     Lettering(TextSize),
     Delete,
@@ -439,6 +445,7 @@ impl BoardsView {
             Message::Color(color) => self.on_color(color),
             Message::Painting(fill) => self.on_fill(fill),
             Message::Outline(dash) => self.on_dash(dash),
+            Message::Stroke(weight) => self.on_weight(weight),
             Message::Align(align) => self.on_align(align),
             Message::Lettering(text_size) => self.on_lettering(text_size),
             Message::Delete => self.on_delete(),
@@ -931,6 +938,16 @@ fn inverse(board: &Board, change: &Change) -> Vec<Change> {
                 vec![Change::Dash {
                     id: id.clone(),
                     dash: r.shape.dash,
+                }]
+            })
+            .unwrap_or_default(),
+        Change::Weight { id, .. } => board
+            .shapes
+            .get(id)
+            .map(|r| {
+                vec![Change::Weight {
+                    id: id.clone(),
+                    weight: r.shape.weight,
                 }]
             })
             .unwrap_or_default(),
