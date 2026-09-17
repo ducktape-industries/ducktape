@@ -290,6 +290,13 @@ pub const MAX_RETAINED_TERMINAL_BYTES: usize = 4 * 1024 * 1024;
 /// but an assignee exists — an assigned attempt must always be reclaimable.
 pub const DEFAULT_LEASE_VIEWS: u64 = 64;
 
+/// one renewable agent-attempt lease: the window a trigger asks for when the
+/// assignee is a long-lived CLI or microVM rather than a short worker. The
+/// default above expires before such a holder's first renewal, so every caller
+/// that dispatches agent work — the `ducktape agent`/`sched` verbs here and the
+/// `runs` module's own intake — names this window instead.
+pub const AGENT_RUN_LEASE_VIEWS: u64 = 1024;
+
 /// write-time cap on ONE stored record. the concrete store's codec bounds a
 /// stored value at 1 MiB AT DECODE TIME (`statesync::qmdb::store_config`): an
 /// oversized value would COMMIT fine and then panic every later read on every

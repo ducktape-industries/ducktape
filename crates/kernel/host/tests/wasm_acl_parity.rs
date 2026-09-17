@@ -11,7 +11,7 @@
 //! `PolicyFor` replies across the runtimes therefore ARE the gate-parity
 //! claim — the drain decides from nothing else.
 
-use acl::{
+use acl_module::{
     Acl, AclMsg, AclQuery, MAX_TARGET_LEN, Standing, WILDCARD_TARGET, encode_msg, encode_query,
 };
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};

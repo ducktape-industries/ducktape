@@ -19,7 +19,7 @@ use identity::{
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sdk_testkit::MemStore;
-use valset::Valset;
+use valset_module::Valset;
 
 fn key(seed: u8) -> Vec<u8> {
     let seed = [seed; 32];

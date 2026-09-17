@@ -442,13 +442,13 @@ fn an_expired_reclaim_fails_the_job_exactly_at_the_attempt_ceiling() {
     // walk claim/expiry cycles. each claim bumps `attempt`; the LOGICAL clock is
     // the lease clock, so dispatch nudges age the lease past its deadline.
     // claims 1..MAX requeue on expiry; the MAX-th claim's expiry fails the job.
-    for attempt in 1..=tasks::MAX_ATTEMPTS {
+    for attempt in 1..=tasks_module::MAX_ATTEMPTS {
         let claimed_at = sim.submit_ok("tasks", claim.clone(), Some("worker"))["height"]
             .as_u64()
             .expect("claim height");
         // lease_views clamps to MIN_LEASE_VIEWS (10), so deadline = claim + 10;
         // the reclaim must execute at a height strictly past it.
-        let deadline = claimed_at + tasks::MIN_LEASE_VIEWS;
+        let deadline = claimed_at + tasks_module::MIN_LEASE_VIEWS;
         while sim.status()["height"].as_u64().expect("height") < deadline {
             sim.submit_ok(
                 "dispatch",
@@ -468,7 +468,7 @@ fn an_expired_reclaim_fails_the_job_exactly_at_the_attempt_ceiling() {
             Some(attempt),
             "attempt tracks the claim count: {reply}"
         );
-        if attempt < tasks::MAX_ATTEMPTS {
+        if attempt < tasks_module::MAX_ATTEMPTS {
             assert_eq!(
                 job_view["job"]["status"], "pending",
                 "an expired reclaim below the ceiling requeues: {reply}"

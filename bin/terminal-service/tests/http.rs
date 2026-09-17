@@ -436,7 +436,7 @@ async fn remote_create_rereads_work_policy_before_resolving_credentials() {
                         }))
                     }
                     gateway::GatewayQuery::Registrations { from: 0, .. } => {
-                        gateway::GatewayReply::Registrations(vec![gateway::HandleRegistration {
+                        gateway::GatewayReply::Registrations(vec![duckdns::HandleRegistration {
                             account_id: 9,
                             handle: "lender".into(),
                         }])

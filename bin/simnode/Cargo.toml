@@ -86,6 +86,9 @@ gateway = { workspace = true }
 governance = { workspace = true }
 runs = { workspace = true }
 tasks = { workspace = true }
+# the job-board bounds the lease/attempt scenario walks. They are the tasks
+# MODULE's, not its wire's, so the module crate enters under its own name.
+tasks-module = { workspace = true }
 # the shared raw-http/port/poll harness helpers (was a local copy in harness/).
 nettest = { path = "../../crates/testing/nettest" }
 # the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).

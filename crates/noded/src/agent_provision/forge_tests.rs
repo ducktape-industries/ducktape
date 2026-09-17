@@ -13,6 +13,7 @@ use super::super::plane_tests::{
 use super::*;
 use crate::NodeHandle;
 use compute_service::WorkspaceProvisioner as _;
+use runs_wire as runs;
 
 /// write `body` to `path` as an executable script, through a child shell
 /// rather than this process: a file this process holds open for writing is

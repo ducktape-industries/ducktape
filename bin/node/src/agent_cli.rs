@@ -832,7 +832,7 @@ fn cmd_sched(args: SchedArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> AgentR
         deadline: None,
         max_attempts: 3,
         // Provisioning and running a microVM needs the model-work lease.
-        lease_views: Some(runs::RUN_LEASE_VIEWS),
+        lease_views: Some(saga::AGENT_RUN_LEASE_VIEWS),
         capability: Some(tag.to_string()),
         demands,
         pinned_assignee: Some(target),

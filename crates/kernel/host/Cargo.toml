@@ -52,6 +52,9 @@ wasm-host = { workspace = true }
 # the parity suites run the NATIVE modules against their guests, so the module
 # crates below are named by path: the workspace key resolves to a module's wire.
 kv = { path = "../../modules/system/kv" }
+# `acl` is a normal dep of the host (its wire), so the native module the gate
+# parity proof stands beside the guest enters under its own name.
+acl-module = { path = "../../modules/system/acl", package = "acl" }
 directory = { workspace = true }
 index_guest = { workspace = true }
 capability = { path = "../../modules/system/capability" }

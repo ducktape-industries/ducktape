@@ -505,7 +505,7 @@ fn submit_sched(
         max_attempts,
         // VM startup and broker setup need the same renewable lease as model
         // runs; Saga's short-worker default can expire before the first renewal.
-        lease_views: Some(runs::RUN_LEASE_VIEWS),
+        lease_views: Some(saga::AGENT_RUN_LEASE_VIEWS),
         capability: Some(TAG.into()),
         demands: BTreeMap::new(),
         pinned_assignee: Some(target.to_vec()),

@@ -8,7 +8,7 @@
 //! ops are driven through a REAL `Host` with a REAL `acl::Acl` module wired,
 //! exactly the composition a live network runs.
 
-use acl::{
+use acl_module::{
     Acl, AclQuery, AclReply, Standing, decode_reply as acl_decode, encode_query as acl_query,
 };
 use commonware_codec::DecodeExt as _;
@@ -22,7 +22,7 @@ use governance::{
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
-use valset::Valset;
+use valset_module::Valset;
 
 fn member_key(seed: u8) -> Vec<u8> {
     let seed = [seed; 32];
