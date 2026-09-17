@@ -151,6 +151,25 @@ pub fn build_identity_or_unknown() -> &'static str {
     build_identity().unwrap_or(UNKNOWN_BUILD)
 }
 
+/// What restages this checkout's founding set, verbatim, for the refusal below
+/// to print.
+///
+/// The stager only runs when its own `rerun-if-changed` fires, so a sibling
+/// build that moves the pointer does not re-trigger it — the `touch` is the
+/// whole remedy and it is not guessable. Deliberately NOT automated: on a
+/// shared target directory the binary beside the set belongs to the last
+/// builder too, so a silent reclaim would hide the same fact one layer down.
+/// The refusal is the place that fact gets said out loud.
+///
+/// It names the BINARIES and not `-p noded`, though the stager is noded's,
+/// because the stamp this is matched against is the one linked INTO a binary.
+/// `cargo build -p noded` restages the set without relinking anything, so a
+/// checkout whose sources moved since its binary was linked would restage
+/// under a build id that binary does not carry — a remedy that prints the same
+/// refusal back.
+pub const RESTAGE_COMMAND: &str =
+    "touch crates/noded/build.rs && cargo build -p node-bin -p noded-bin";
+
 /// The founding set THIS binary's build staged, refusing any other.
 ///
 /// `workspace_config::modules_dir` resolves a directory; this says whether it
@@ -198,8 +217,9 @@ fn staged_set_verdict(
     Err(format!(
         "reason=foreign_founding_set {} was staged by build {}, and this binary is build {} — \
          every checkout sharing a target directory writes into that one profile directory, so \
-         the set beside a binary is whichever build passed through last. Rebuild here, or name \
-         the set you mean with $DUCKTAPE_MODULES_DIR.",
+         the set beside a binary is whichever build passed through last.\n\
+         \x20   restage this checkout:    {RESTAGE_COMMAND}\n\
+         \x20   or name the set you mean: DUCKTAPE_MODULES_DIR=<dir>",
         dir.display(),
         staged_by.unwrap_or(UNKNOWN_BUILD),
         build.unwrap_or(UNKNOWN_BUILD),
@@ -633,6 +653,13 @@ mod tests {
         assert!(refused.contains("reason=foreign_founding_set"), "{refused}");
         assert!(
             refused.contains("abc1234") && refused.contains("def5678"),
+            "{refused}"
+        );
+        // the remedy is a command to run, not advice to act on: an operator
+        // who has to work out that the stager needs a `touch` before it will
+        // re-run has been handed a diagnosis instead of a fix.
+        assert!(
+            refused.contains(RESTAGE_COMMAND) && refused.contains("DUCKTAPE_MODULES_DIR="),
             "{refused}"
         );
 
