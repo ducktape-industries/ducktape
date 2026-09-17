@@ -1,7 +1,6 @@
 //! `ducktape module …` — the operator verbs for a live code swap.
 mod common;
 
-use std::process::Command;
 use std::time::Duration;
 
 use common::Cluster;
@@ -11,7 +10,7 @@ use common::module_verbs::{
 };
 
 fn ducktape(args: &[&str]) -> (bool, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let out = common::ducktape()
         .args(args)
         .output()
         .expect("run ducktape");
@@ -34,7 +33,7 @@ fn pack_prepares_the_deployment_offline_with_or_without_a_mapper() {
     let artifact = scratch.path().join("module.artifact");
     std::fs::write(&index, b"mapper bytes").unwrap();
     for mapper in [None, Some(index.as_path())] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        let mut command = common::ducktape();
         command
             .env("DUCKTAPE_HOME", scratch.path().join("no-node-workspace"))
             .args(["module", "pack", &component, "--out"])
