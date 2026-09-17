@@ -2099,6 +2099,127 @@ fn a_card_too_long_to_save_can_still_be_left() {
     assert_eq!(view.visible().unwrap().shapes["a"].shape.text, "kept");
 }
 
+/// A board holding one agreed card "a", with the words given.
+fn one_card_saying(words: &str) -> Board {
+    Board::new("Planning".into(), "owner".into())
+        .unwrap()
+        .changed(&Change::Create {
+            id: "a".into(),
+            shape: Shape {
+                text: words.into(),
+                ..Default::default()
+            },
+        })
+        .unwrap()
+}
+/// A view standing on that board with the editor open on the card.
+fn writing_in(board: &Board) -> BoardsView {
+    let mut view = view();
+    view.confirmed = Some(board.clone());
+    view.selected = ["a".into()].into();
+    view.begin_text();
+    view
+}
+/// Somebody else finishes their own sitting in the card while ours stands open,
+/// arriving the way any live update does.
+fn someone_else_writes(view: &mut BoardsView, board: &Board, words: &str) {
+    let theirs = board
+        .changed(&Change::Text {
+            id: "a".into(),
+            text: words.into(),
+        })
+        .unwrap();
+    view.on_read(
+        0,
+        "room".into(),
+        Ok(host::Reading {
+            catalog: BTreeMap::new(),
+            board: Some(theirs),
+        }),
+    );
+}
+
+/// Saving a card writes its WHOLE text, so a card somebody else has written in
+/// since this editor opened is one this save would rub out — their words, with
+/// no trace and no undo of ours standing behind them. The writer is told once
+/// and shown what is there before that can happen.
+#[test]
+fn a_card_written_in_under_an_open_editor_is_not_silently_replaced() {
+    let board = one_card_saying("BBB");
+    let mut clash = writing_in(&board);
+    clash.inline.as_mut().unwrap().document = Editor::new("TWO");
+    someone_else_writes(&mut clash, &board, "ONE");
+    clash.finish_text();
+    assert!(
+        clash.inline.is_some(),
+        "the editor closed straight over somebody else's words"
+    );
+    assert_eq!(
+        clash.visible().unwrap().shapes["a"].shape.text,
+        "ONE",
+        "the save went through and took their words with it"
+    );
+    assert!(
+        clash.error.contains("ONE"),
+        "the writer was not shown what they are about to replace: {}",
+        clash.error
+    );
+    // Nothing was kept, so nothing may claim to have been.
+    assert_ne!(clash.status(), "Saved");
+
+    // Closing it again is the writer saying they have read that and mean it.
+    clash.finish_text();
+    assert!(
+        clash.inline.is_none(),
+        "the second close was refused as well"
+    );
+    assert_eq!(clash.visible().unwrap().shapes["a"].shape.text, "TWO");
+    assert!(
+        clash.error.is_empty(),
+        "the banner outlived what it was about"
+    );
+    // And theirs is recoverable: replacing them is OUR edit, so our undo has it.
+    clash.on_undo();
+    assert_eq!(clash.visible().unwrap().shapes["a"].shape.text, "ONE");
+}
+
+/// The card nobody else touched saves in one press, and so does the one they
+/// happened to write the same words into. A warning that fires when no words
+/// are at stake is a warning people learn to click through.
+#[test]
+fn an_undisturbed_card_still_saves_in_one_press() {
+    let board = one_card_saying("BBB");
+    let mut alone = writing_in(&board);
+    alone.inline.as_mut().unwrap().document = Editor::new("TWO");
+    alone.finish_text();
+    assert!(alone.inline.is_none());
+    assert!(alone.error.is_empty());
+    assert_eq!(alone.visible().unwrap().shapes["a"].shape.text, "TWO");
+
+    // Somebody else reaching the same words loses nothing, so it is not a clash.
+    let mut agreed = writing_in(&board);
+    agreed.inline.as_mut().unwrap().document = Editor::new("TWO");
+    someone_else_writes(&mut agreed, &board, "TWO");
+    agreed.finish_text();
+    assert!(
+        agreed.inline.is_none(),
+        "writing the same words is not a clash"
+    );
+    assert!(agreed.error.is_empty());
+
+    // Neither does opening a card, writing nothing, and leaving: no text is
+    // sent at all, so the words that arrived meanwhile stand.
+    let mut untouched = writing_in(&board);
+    someone_else_writes(&mut untouched, &board, "ONE");
+    untouched.finish_text();
+    assert!(
+        untouched.inline.is_none(),
+        "an untouched card was held hostage"
+    );
+    assert!(untouched.error.is_empty());
+    assert_eq!(untouched.visible().unwrap().shapes["a"].shape.text, "ONE");
+}
+
 #[test]
 fn the_two_keys_that_leave_a_card_are_not_the_same_answer() {
     // The editor claims Escape and Command-Enter, and both arrive as one
