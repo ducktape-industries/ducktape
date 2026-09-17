@@ -26,6 +26,90 @@ use crate::{
     BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, hex_root,
 };
 
+/// the checkout this library was compiled out of — where its committed module
+/// artifacts live. `crates/noded` sits two levels under it.
+fn checkout() -> &'static std::path::Path {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("crates/noded sits two levels under the checkout root")
+}
+
+/// the committed guest for module `id`, read off the checkout AT RUN TIME.
+///
+/// The app modules' source ships from ducktape-modules; this repo carries only
+/// the `component.wasm` each of them produces, and `crates/noded/build.rs`
+/// stages the founding set out of exactly these files. A harness that loads
+/// them by path therefore runs the SAME bytes every composed genesis runs, and
+/// a later rebuild of the frozen set moves the harness with it — which a copy
+/// embedded in a test binary would not.
+pub fn committed_component(id: &str) -> Vec<u8> {
+    let modules = checkout().join("crates/modules");
+    for area in ["apps", "system"] {
+        let path = modules.join(area).join(id).join("component.wasm");
+        match std::fs::read(&path) {
+            Ok(bytes) => return bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("read {}: {error}", path.display()),
+        }
+    }
+    panic!(
+        "no committed component.wasm for module {id} under {}",
+        modules.display()
+    )
+}
+
+/// `id`'s committed guest over `store`, brought up the way the composer brings
+/// up a genesis tenant: through the ONE wasm path
+/// ([`crate::compose::wasm_module`]), so its `__config` record is seeded from
+/// the network bindings exactly as a founded module's is and `initialize` runs
+/// on the same parameters shape.
+///
+/// Every app guest declares [`wasm_host::Backing::Store`], which is why this
+/// takes a store and nothing else: the disk substrates a Git/Odb tenant opens
+/// (forge's repo, files' duckfs dir) are node services, still native in this
+/// repo, and a harness composes those directly.
+pub async fn committed_module(
+    id: &str,
+    store: Box<dyn sdk::MerkleStore>,
+    chain_id: &str,
+) -> wasm_host::WasmModule {
+    let artifact = module_artifact::Artifact::module(committed_component(id)).encode();
+    let mut store = Some(store);
+    let mut stores = move |_: &str| -> crate::compose::BoxFut<
+        'static,
+        Result<Box<dyn sdk::MerkleStore>, String>,
+    > {
+        let store = store
+            .take()
+            .expect("the composer opens one store per module");
+        Box::pin(async move { Ok(store) })
+    };
+    let substrates = crate::compose::Substrates {
+        // never read: a store-backed tenant opens no disk substrate.
+        directory: checkout().to_path_buf(),
+        bindings: Default::default(),
+        blobs: blobstore::BlobHandle::default(),
+    };
+    let bindings = crate::compose::Bindings {
+        invite: &[],
+        chain_id,
+        time_unit: sdk::genesis_config::TimeUnit::Height,
+    };
+    crate::compose::wasm_module(
+        id,
+        &artifact,
+        &mut stores,
+        &substrates,
+        &bindings,
+        crate::compose::Start::Fresh {
+            parameters: &sdk::genesis_config::encode_config(&[]),
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{id}'s committed guest composes: {error}"))
+}
+
 /// a running in-process node: an actor thread owning the host and a server
 /// thread serving the client surface, torn down cleanly on drop.
 pub struct InProcDaemon {

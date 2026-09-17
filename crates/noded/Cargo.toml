@@ -141,9 +141,13 @@ topology = { workspace = true }
 
 [dev-dependencies]
 # the run wire surface. The native module behind it ships from
-# ducktape-modules, so no suite here composes one; the tests that speak the
-# wire under the bare name `runs` alias it (`use runs_wire as runs;`).
+# ducktape-modules, so no suite here composes one: the provisioning suites
+# stand the COMMITTED guest up through `testkit::committed_module` and speak to
+# it over these types.
 run-envelope = { workspace = true }
+# the pages wire surface: the connected end-to-end provisioning run reads the
+# record page its agent published back out of the committed `pages` guest.
+pages = { workspace = true }
 wat = "1"
 # the native files module: the provisioning suites stand a native `Files` up.
 files = { path = "../modules/apps/files" }
