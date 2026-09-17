@@ -125,8 +125,7 @@
 //! belongs to the store.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+pub use attribution_wire::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 

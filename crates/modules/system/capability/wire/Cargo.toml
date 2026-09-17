@@ -1,0 +1,11 @@
+# The capability module's wire surface: types and codecs, no module — the
+# daemon, a service and a sibling module link THIS and not the module behind
+# it. No `native` feature, no kernel host, no disk.
+[package]
+name = "capability-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+serde = { workspace = true }

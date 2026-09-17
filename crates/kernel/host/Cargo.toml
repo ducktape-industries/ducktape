@@ -18,17 +18,17 @@ async-trait = { workspace = true }
 # `Advance` tick. host uses only the crate-root wire types — it never
 # constructs or registers the module impl (same shape as governance reading
 # valset's wire types).
-modules = { workspace = true }
-# WIRE-TYPES-ONLY dep, same shape: the drain's delivery injection reads
-# the dispatch module's committed mailbox count between blocks.
-dispatch = { workspace = true }
-# WIRE-TYPES-ONLY deps, same shape: the drain's acl dispatch gate reads the
-# acl module's policy table and resolves the submitting origin's principal
-# against the valset tiers and the identity ownership indexes. host uses only
-# the crate-root wire types — it never constructs or registers the impls.
+modules = { path = "../../modules/system/modules" }
+# the drain's delivery injection reads the dispatch module's committed
+# mailbox count between blocks.
+dispatch = { path = "../../modules/system/dispatch" }
+# the drain's acl dispatch gate reads the acl module's policy table and
+# resolves the submitting origin's principal against the valset tiers and the
+# identity ownership indexes. system modules are CORE-RESIDENT: the kernel
+# links the module crate itself (its workspace name resolves to the wire).
 acl = { workspace = true }
-valset = { workspace = true }
-identity = { workspace = true }
+valset = { path = "../../modules/system/valset" }
+identity = { path = "../../modules/system/identity" }
 # the journal codec for a block's prepared internal work (`PreparedWork`),
 # the uniform record codec every module already persists with.
 borsh = { workspace = true }
@@ -49,28 +49,30 @@ sdk-testkit = { workspace = true }
 wasm-host = { workspace = true }
 # the end-to-end test stands a real qmdb-backed module on the deterministic
 # runtime and drives it through the host.
-kv = { workspace = true }
+# the parity suites run the NATIVE modules against their guests, so the module
+# crates below are named by path: the workspace key resolves to a module's wire.
+kv = { path = "../../modules/system/kv" }
 directory = { workspace = true }
 # the STORE-BACKED parity proofs drive the SAME op matrix through the native
 # pages/chat modules over QmdbStore and their wasm ports over
 # `WasmModule::with_store(QmdbStore)`, pinning IDENTICAL roots block-by-block
 # (root-continuous cutover — revision stays 1).
-pages = { workspace = true }
-chat = { workspace = true }
+pages = { path = "../../modules/apps/pages" }
+chat = { path = "../../modules/apps/chat" }
 # the collaboration parity proof additionally pins the AUTHENTICATED read
 # lane across the runtimes: that module serves no unauthenticated read, so
 # equal replies prove the wasm port threads the dispatch origin into the
 # guest's query export the way native `query_with` reads it.
-collaboration = { workspace = true }
+collaboration = { path = "../../modules/apps/collaboration" }
 index_guest = { workspace = true }
-inbox = { workspace = true }
-tasks = { workspace = true }
-capability = { workspace = true }
+inbox = { path = "../../modules/apps/inbox" }
+tasks = { path = "../../modules/apps/tasks" }
+capability = { path = "../../modules/system/capability" }
 duckdns = { workspace = true }
 # the gateway/governance parity proofs stand the native modules (and their
 # native identity/valset/modules siblings) beside the wasm ports.
-gateway = { workspace = true }
-governance = { workspace = true }
+gateway = { path = "../../modules/system/gateway" }
+governance = { path = "../../modules/system/governance" }
 greeter = { workspace = true }
 # the identity parity proof mints member proofs through keyscheme's testkit
 # (deterministic RFC-6979 P-256 signatures — no OS randomness inside a
@@ -80,25 +82,25 @@ p256 = { workspace = true }
 base64 = { workspace = true }
 # the delivery drain-injection test stands the real dispatch + saga modules
 # next to a stub receiver.
-saga = { workspace = true }
+saga = { path = "../../modules/system/saga" }
 # the agent/automations adapter-port parity proofs stand the native modules
 # (and their native saga / chat+tasks+inbox siblings) beside the wasm ports.
-agent = { workspace = true }
-attribution = { workspace = true }
-automations = { workspace = true }
+agent = { path = "../../modules/apps/agent" }
+attribution = { path = "../../modules/system/attribution" }
+automations = { path = "../../modules/apps/automations" }
 # the runs adapter-port parity proof drives the REAL collaboration loop —
 # chat-over-QmdbStore, pages-over-QmdbStore, attribution, saga, dispatch (native
 # by design), agent, tasks, files — through the native runs module and
 # its wasm port side by side. files needs an on-disk odb dir (tempfile).
-runs = { workspace = true }
-files = { workspace = true }
+runs = { path = "../../modules/apps/runs" }
+files = { path = "../../modules/apps/files" }
 # the wasm files tenant commits through its host-side odb substrate, which is a
 # service crate now — `files` itself names no kernel host.
 files-odb = { workspace = true }
 # the forge root-continuity proof stands the native module beside its wasm port
 # over the git substrate; `testkit` builds the real git history + packs the
 # push ops need.
-forge = { workspace = true, features = ["testkit"] }
+forge = { path = "../../modules/apps/forge", features = ["testkit"] }
 # and the wasm side of that proof stands on forge's substrate, a service crate
 # for the same reason files' is.
 forge-odb = { workspace = true }

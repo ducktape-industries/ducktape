@@ -47,8 +47,8 @@
 //! serve surface.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+pub use chat_wire::*;
+use chat_wire::client::validate_channel_namespace;
 
 // the wasm-guest port: the dispatch shell that adapts this module to the
 // ducktape:module world. compiled only by the guest-builder's synthesized
@@ -60,18 +60,12 @@ mod guest;
 // wasm guest — so the consensus state machine above compiles for wasm32
 // without them. (The call media planes live in the `media-service` crate.)
 //
-// the derived-tier materialized view: the PURE decision core (fold + view
-// over index_guest::StateRead), compiled everywhere and unit-tested
-// natively. the engine shell that runs it inside the module's index
-// database is `index_guest` below.
-pub mod index;
-
-// the CLIENT view model: rendered row types, composer parsing, optimistic
-// merges, and the op-delta fold a feed-following UI splices state with.
-// module-owned beside the index fold (same feed, same vocabulary); pure
-// data-in/data-out, so the module-bundled-UI lane can compile it into the
-// shipped ui.wasm unchanged.
-pub mod client;
+// the derived-tier materialized view (`index`: the PURE fold + view over
+// index_guest::StateRead) and the CLIENT view model (`client`: rendered row
+// types, composer parsing, optimistic merges, the op-delta fold) are the
+// wire crate's — every reader of the feed links them without the module.
+// the engine shell that runs the fold inside the module's index database is
+// `index_guest` below.
 
 // the wasm index-mapper shell: wires the pure core into the fluent31 engine.
 // compiled only by `guest-builder --index`'s synthesized wasm32 workspace
@@ -793,41 +787,6 @@ impl Chat {
         Ok(ChannelAccess { may_read, may_post })
     }
 
-    /// enforce the reserved channel-id namespace: ids containing ':' belong
-    /// to modules, and a module may only mint ids under its own `"{module}:"`
-    /// prefix (e.g. forge's per-issue discussion channels `forge:<repo>:<n>`),
-    /// so no origin can squat another's namespace. system origin is
-    /// unrestricted. unconditional consensus rule — not version-gated.
-    fn validate_channel_namespace(party: &Party, channel_id: &str) -> Result<(), Error> {
-        // '/' is the read model's key-path separator: a channel id carrying
-        // one would bleed across the index tier's prefix scans ("a" vs
-        // "a/b"). unconditional consensus rule, mirroring the ':' gate.
-        if channel_id.contains('/') {
-            return Err(Error::Module(
-                "chat: channel ids may not contain '/'".into(),
-            ));
-        }
-        match party {
-            Party::Account(_) | Party::Key(_) => {
-                if channel_id.contains(':') {
-                    return Err(Error::Module(
-                        "chat: channel ids containing ':' are reserved for modules".into(),
-                    ));
-                }
-                Ok(())
-            }
-            Party::Module(module) => {
-                if !channel_id.starts_with(&format!("{module}:")) {
-                    return Err(Error::Module(format!(
-                        "chat: module '{module}' may only create channel ids prefixed '{module}:'"
-                    )));
-                }
-                Ok(())
-            }
-            Party::System => Ok(()),
-        }
-    }
-
     /// refuse channel creation once a person is at [`MAX_CHANNELS_PER_CREATOR`]
     /// — there is no `DeleteChannel` op, so this is the only thing bounding
     /// one party's share of the (permanent) channel set. trusted code is not
@@ -902,12 +861,12 @@ impl Chat {
     ) -> Result<Report, Error> {
         validate_object_id("channel_id", &channel_id)?;
         require_non_empty("name", &name)?;
-        Self::validate_channel_namespace(party, &channel_id)?;
+        validate_channel_namespace(party, &channel_id)?;
         // the `dm-` shape is reserved for `CreateDmChannel`, the only op that
         // derives the id from the creator's OWN account — a plain
         // `CreateChannel` naming that shape is exactly the squat this gate
         // closes (see the module doc on `CreateDmChannel`).
-        if client::is_derived_dm_channel(&channel_id) {
+        if chat_wire::client::is_derived_dm_channel(&channel_id) {
             return Err(Error::Module(
                 "chat: dm- channel ids are reserved; open a DM with CreateDmChannel".into(),
             ));
@@ -962,7 +921,7 @@ impl Chat {
                 "chat: a DM names no account: {counterpart}"
             )));
         }
-        let channel_id = client::dm_channel_id(&creator.to_string(), &counterpart.to_string());
+        let channel_id = chat_wire::client::dm_channel_id(&creator.to_string(), &counterpart.to_string());
         if self.channel(&channel_id).await?.is_some() {
             return Err(Error::Module(format!(
                 "channel already exists: {channel_id}"
@@ -1013,7 +972,7 @@ impl Chat {
         let party = &authority.party;
         require_non_empty("channel_id", channel_id)?;
         require_non_empty("name", &name)?;
-        Self::validate_channel_namespace(party, channel_id)?;
+        validate_channel_namespace(party, channel_id)?;
         let mut channel = self.require_channel(channel_id).await?;
         if channel.name == name {
             // idempotent: a same-name rename stages nothing, so the op log —
@@ -1037,7 +996,7 @@ impl Chat {
     ) -> Result<Option<Report>, Error> {
         let party = &authority.party;
         require_non_empty("channel_id", channel_id)?;
-        Self::validate_channel_namespace(party, channel_id)?;
+        validate_channel_namespace(party, channel_id)?;
         let mut channel = self.require_channel(channel_id).await?;
         if channel.archived == archived {
             return Ok(None);

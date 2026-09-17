@@ -1,0 +1,14 @@
+# The modules module's wire surface: the registry's kinds, codes, messages,
+# queries and replies with their codecs, no module — the kernel host, the
+# daemon, recovery and the CLI link THIS and not the module behind it. No
+# `native` feature, no kernel host, no disk.
+[package]
+name = "modules-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+module-artifact = { workspace = true }
+borsh = { workspace = true }
+serde = { workspace = true }

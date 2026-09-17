@@ -90,8 +90,7 @@
 //! configuration.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+pub use dispatch_wire::*;
 
 // the store key space and the per-record codecs.
 mod records;

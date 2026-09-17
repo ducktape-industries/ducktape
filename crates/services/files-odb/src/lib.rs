@@ -47,7 +47,7 @@ use duckfs_disk::{DiskRefs, DiskStore};
 use sdk::{Error, ModuleId};
 use wasm_host::{HostOdb, OdbBacking};
 
-use files::{commit_refs, persist_objects};
+use duckfs_disk::{commit_refs, persist_objects};
 
 // the files object-read consensus cap is single-sourced in `duckfs-core` (the
 // guest runs that core), but "core rejects strictly before the kernel trap" only

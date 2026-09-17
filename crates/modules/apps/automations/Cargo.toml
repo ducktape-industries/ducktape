@@ -13,6 +13,7 @@ version.workspace = true
 guest = ["dep:ducktape-module-sdk"]
 
 [dependencies]
+automations-wire = { workspace = true }
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
 ducktape-module-sdk = { workspace = true, optional = true }

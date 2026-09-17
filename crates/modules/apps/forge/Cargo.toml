@@ -23,6 +23,7 @@ guest = ["dep:ducktape-module-sdk"]
 testkit = ["native"]
 
 [dependencies]
+forge-wire = { workspace = true }
 base64 = { workspace = true }
 sdk = { workspace = true }
 serde = { workspace = true }
@@ -69,6 +70,10 @@ ducktape-module-sdk = { workspace = true, optional = true }
 # enable its own features for its test targets. This self dev-dependency is how
 # cargo lets them opt in, and it never reaches the production build.
 forge = { path = ".", features = ["testkit"] }
+# the NATIVE system modules the host suites register beside `Forge`; their
+# plain names resolve to the wire crates above.
+identity-module = { package = "identity", path = "../../system/identity" }
+attribution-module = { package = "attribution", path = "../../system/attribution" }
 # the SSH signer the signed-push tests mint certificates with.
 keyscheme = { workspace = true, features = ["testkit"] }
 # dev-only: prove forge's root composes into the global root-hash. not a

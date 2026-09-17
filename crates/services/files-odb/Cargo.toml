@@ -10,8 +10,8 @@ version.workspace = true
 
 [dependencies]
 # the durability ordering is single-sourced: this backing and the native
-# `Files::commit_block` call the same `files::{persist_objects, commit_refs}`.
-files = { workspace = true }
+# `Files::commit_block` call the same `duckfs_disk::{persist_objects, commit_refs}`,
+# so this crate names no module at all.
 duckfs-core = { workspace = true }
 duckfs-disk = { workspace = true }
 sdk = { workspace = true }
@@ -23,6 +23,8 @@ wasm-host = { workspace = true }
 # the crash-safety suite stands the DEPLOYED files guest on this backing, so it
 # needs the guest loader as well as the trait.
 base64 = { workspace = true }
+# the native files module the backing suite drives (its workspace name is the wire).
+files = { path = "../../modules/apps/files" }
 futures = "0.3"
 # `test_ctx` answers the identity query the native `Files` makes while building
 # the committed dir the backing is then opened on.

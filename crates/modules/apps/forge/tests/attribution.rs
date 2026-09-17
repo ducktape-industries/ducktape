@@ -1,12 +1,12 @@
 //! Real Host publication, ordinary program rights and durable source history.
-use attribution::{
-    Actor, AttributionModule, AttributionQuery, AttributionReply, ObjectRelations, Reason, Source,
-};
+use attribution::{Actor, AttributionQuery, AttributionReply, ObjectRelations, Reason, Source};
+use attribution_module::AttributionModule;
 use chat::Party;
 use forge::{Forge, ForgeMsg, ForgeQuery, ForgeReply, RefUpdate, ReviewVerdict};
 use futures::executor::block_on;
 use host::{BlockContext, Host};
-use identity::{Identity, IdentityMsg, KeyScheme};
+use identity::{IdentityMsg, KeyScheme};
+use identity_module::Identity;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sdk_testkit::{MemStore, TestCtx};
 use std::path::PathBuf;

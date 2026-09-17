@@ -1,0 +1,24 @@
+# The chat module's wire surface: channels, messages, access, its messages,
+# queries and replies, no module — the daemon, the CLI, the app, a view and a
+# sibling module link THIS and not the module behind it. It re-exports
+# `chat-message` (the block/mark/party vocabulary a message is written in),
+# which predates this crate and stays the leaf a view links alone. No `native`
+# feature, no kernel host, no disk.
+[package]
+name = "chat-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+chat-message = { path = "../message" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+borsh = { workspace = true }
+# `index`: the pure fold/view core over the index CONTRACT — the engine shell
+# stays in the module crate. `client`: the DM channel id derivation (sha256),
+# tag normalization (NFKC) and the account resolver's wire (`identity`).
+index_guest = { workspace = true }
+sha2 = { workspace = true }
+unicode-normalization = { workspace = true }
+identity = { workspace = true }

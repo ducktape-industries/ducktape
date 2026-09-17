@@ -45,8 +45,7 @@
 #[cfg(all(feature = "guest", target_arch = "wasm32"))]
 mod guest;
 
-mod interface;
-pub use interface::*;
+pub use modules_wire::*;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use sdk::{
@@ -54,10 +53,6 @@ use sdk::{
     StateRoot, StateSyncHandle,
 };
 
-/// the minimum lead (in blocks) between the scheduling block and a swap's
-/// `activation_height`, so `H` is strictly in every node's future — long enough
-/// to fetch + verify the out-of-band bytes before the boundary.
-pub const MIN_SWAP_LEAD: u64 = 3;
 
 /// registered modules retained at once (the roster count cap). the registry
 /// is governance/genesis-authored, so this sits far above any real set;

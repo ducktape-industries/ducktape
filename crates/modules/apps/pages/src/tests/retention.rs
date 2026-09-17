@@ -153,7 +153,7 @@ fn with_artifacts(request: &str, artifacts: Vec<String>) -> PageMsg {
 fn retention_query(request: &str, index: usize) -> files::FilesQuery {
     files::FilesQuery::Retention {
         module_id: "pages".into(),
-        key: crate::record_ops::artifact_retention_key("board", request, index),
+        key: crate::records::artifact_retention_key("board", request, index),
     }
 }
 

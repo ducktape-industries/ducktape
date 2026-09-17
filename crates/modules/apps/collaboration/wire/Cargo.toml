@@ -1,0 +1,14 @@
+# The collaboration module's wire surface: parties, deliveries, messages,
+# queries and replies, no module — the daemon, a view and a sibling module
+# link THIS and not the module behind it. It names `chat` (a party IS a chat
+# party) — that key resolves to `chat-message`. No `native` feature, no
+# kernel host, no disk.
+[package]
+name = "collaboration-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+chat = { workspace = true }
+serde = { workspace = true }

@@ -1,0 +1,14 @@
+# The tasks module's wire surface: tasks, jobs, boards, their messages,
+# queries and replies, no module — the daemon, the MCP host, a view and a
+# sibling module link THIS and not the module behind it. It names
+# `attribution` (a task's party IS an attribution actor) — that key resolves
+# to `attribution-wire`. No `native` feature, no kernel host, no disk.
+[package]
+name = "tasks-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+attribution = { workspace = true }
+serde = { workspace = true }

@@ -3,11 +3,15 @@ name = "duckfs-disk"
 edition.workspace = true
 version.workspace = true
 
-# Native disk persistence for duckfs. Depends on duckfs-core, but not sdk.
+# Native disk persistence for duckfs, and the durability ordering the native
+# `files` module and the wasm tenant's odb backing both commit through (the
+# one reason `sdk` is named: its `Error` is what a commit step answers with).
 
 [dependencies]
 duckfs-core = { workspace = true }
+sdk = { workspace = true }
 sha2 = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

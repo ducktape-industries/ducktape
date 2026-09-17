@@ -67,8 +67,7 @@
 //! merkle root, and sync belongs to the store (`QmdbStore::sync_from`).
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+pub use inbox_wire::*;
 
 // the derived-tier read model: the PURE decision core (fold + view over
 // index_guest::StateRead), compiled everywhere and unit-tested natively.

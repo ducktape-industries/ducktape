@@ -422,7 +422,7 @@ impl Pages {
         let root_ids: BTreeSet<_> = roots.values().map(|(root, _)| root).collect();
         let keys = root_ids
             .iter()
-            .map(|id| crate::record_ops::collection_key(id).into_bytes())
+            .map(|id| crate::records::collection_key(id).into_bytes())
             .collect();
         self.prefetch_relation_sources(keys, &mut work).await?;
         let mut writers = BTreeMap::new();

@@ -1,0 +1,17 @@
+# The forge module's wire surface: its messages, queries, replies and the
+# tracker's item and review shapes, no module — the daemon, the forge service,
+# the MCP host, a view and the CLI link THIS and not the git-backed module
+# behind it. It names `chat` (a review comment's party IS a chat party) — that
+# key resolves to `chat-message`. No `native` feature, no kernel host, no disk.
+[package]
+name = "forge-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+chat = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

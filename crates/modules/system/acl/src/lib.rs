@@ -31,8 +31,7 @@
 //! store (the qmdb resolver lane, like every store-backed sibling).
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+pub use acl_wire::*;
 
 // the wasm-guest port: the dispatch shell that adapts this module to the
 // ducktape:module world. compiled only by the guest-builder's synthesized
@@ -48,9 +47,6 @@ use sdk::{
 /// policy entries retained (the count cap). targets are module ids, so this
 /// sits far above any real composition; a set past it refuses loudly.
 pub const MAX_POLICY_ENTRIES: usize = 256;
-/// byte bound on one target id — module ids are short; anything longer is
-/// junk, refused before it can bloat the record.
-pub const MAX_TARGET_LEN: usize = 64;
 
 /// the committed policy table's record key: the strictly-target-sorted
 /// `(target, standing)` list, borsh-encoded. absent = empty table = open.

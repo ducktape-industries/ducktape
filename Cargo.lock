@@ -86,6 +86,7 @@ dependencies = [
 name = "acl"
 version = "0.1.0"
 dependencies = [
+ "acl-wire",
  "async-trait",
  "borsh",
  "commonware-cryptography",
@@ -98,6 +99,15 @@ dependencies = [
  "serde",
  "serde_json",
  "valset",
+]
+
+[[package]]
+name = "acl-wire"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -162,13 +172,13 @@ version = "0.1.0"
 dependencies = [
  "agent-wire",
  "async-trait",
- "attribution",
+ "attribution-wire",
  "borsh",
  "commonware-runtime",
- "dispatch 0.1.0",
+ "dispatch-wire",
  "ducktape-module-sdk",
  "futures",
- "identity",
+ "identity-wire",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -196,10 +206,10 @@ dependencies = [
 name = "agent-wire"
 version = "0.1.0"
 dependencies = [
- "attribution",
+ "attribution-wire",
  "borsh",
- "dispatch 0.1.0",
- "identity",
+ "dispatch-wire",
+ "identity-wire",
  "sdk",
  "serde",
  "serde_json",
@@ -814,11 +824,12 @@ name = "attribution"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution-wire",
  "borsh",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
- "identity",
+ "identity-wire",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -828,11 +839,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "attribution-wire"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "sdk",
+ "serde",
+]
+
+[[package]]
 name = "authpage"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "identity",
+ "identity-wire",
  "keyscheme",
  "node",
  "qrcode",
@@ -856,20 +876,30 @@ name = "automations"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "attribution",
+ "attribution-wire",
+ "automations-wire",
  "borsh",
  "chat",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
  "host",
- "identity",
+ "identity-wire",
  "sdk",
  "sdk-testkit",
  "serde",
  "serde_json",
  "statesync",
  "tasks",
+]
+
+[[package]]
+name = "automations-wire"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -1512,6 +1542,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
+ "capability-wire",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
@@ -1519,7 +1550,15 @@ dependencies = [
  "sdk-testkit",
  "serde",
  "statesync",
- "valset",
+ "valset-wire",
+]
+
+[[package]]
+name = "capability-wire"
+version = "0.1.0"
+dependencies = [
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -1685,18 +1724,19 @@ name = "chat"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "attribution",
+ "attribution-wire",
  "borsh",
  "chat-message",
+ "chat-wire",
  "commonware-cryptography",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
  "host",
- "identity",
+ "identity-wire",
  "index-guest",
  "keyscheme",
- "pages",
+ "pages-wire",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -1713,6 +1753,21 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "serde",
+]
+
+[[package]]
+name = "chat-wire"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "chat-message",
+ "identity-wire",
+ "index-guest",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -1943,17 +1998,27 @@ name = "collaboration"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "chat",
+ "chat-wire",
+ "collaboration-wire",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
  "host",
- "identity",
+ "identity-wire",
  "sdk",
  "sdk-testkit",
  "serde",
  "statesync",
- "tasks",
+ "tasks-wire",
+]
+
+[[package]]
+name = "collaboration-wire"
+version = "0.1.0"
+dependencies = [
+ "chat-wire",
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -2387,13 +2452,13 @@ name = "compute-service"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "dispatch 0.1.0",
+ "dispatch-wire",
  "futures",
  "host",
  "provider-host",
  "run-envelope",
- "runs",
- "saga",
+ "runs-wire",
+ "saga-wire",
  "sdk",
  "serde",
  "serde_json",
@@ -3614,11 +3679,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
- "capability",
+ "capability-wire",
  "commonware-runtime",
+ "dispatch-wire",
  "ducktape-module-sdk",
  "futures",
- "identity",
+ "identity-wire",
  "saga",
  "sdk",
  "sdk-testkit",
@@ -3633,6 +3699,17 @@ name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bd0c93bb4b0c6d9b77f4435b0ae98c24d17f1c45b2ff844c6151a07256ca923b"
+
+[[package]]
+name = "dispatch-wire"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "saga-wire",
+ "sdk",
+ "serde",
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "dispatch2"
@@ -3748,8 +3825,10 @@ name = "duckfs-disk"
 version = "0.1.0"
 dependencies = [
  "duckfs-core",
+ "sdk",
  "sha2 0.10.9",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -3760,21 +3839,21 @@ dependencies = [
  "authpage",
  "base64 0.22.1",
  "block2 0.5.1",
- "chat",
+ "chat-wire",
  "commonware-cryptography",
  "core-graphics 0.24.0",
  "cpal",
  "design",
  "ducktape-home",
  "ducktape-rpc",
- "forge",
+ "forge-wire",
  "futures",
- "gateway",
+ "gateway-wire",
  "gethostname",
  "git2",
  "gpui-kit",
  "gpui-notion",
- "identity",
+ "identity-wire",
  "image",
  "keystore",
  "media-service",
@@ -3856,7 +3935,7 @@ name = "ducktape-media"
 version = "0.1.0"
 dependencies = [
  "axum",
- "chat",
+ "chat-wire",
  "ducktape-rpc",
  "futures",
  "libc",
@@ -3903,7 +3982,7 @@ dependencies = [
  "base64 0.22.1",
  "ducktape-rpc",
  "futures",
- "gateway",
+ "gateway-wire",
  "libc",
  "provider-host",
  "rand 0.8.6",
@@ -4370,15 +4449,18 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "attribution",
+ "attribution-wire",
  "base64 0.22.1",
  "commonware-cryptography",
  "dispatch 0.1.0",
+ "dispatch-wire",
  "duckfs-core",
  "duckfs-disk",
  "ducktape-module-sdk",
  "futures",
  "host",
  "identity",
+ "identity-wire",
  "sdk",
  "sdk-testkit",
  "serde_json",
@@ -4396,12 +4478,19 @@ dependencies = [
  "duckfs-disk",
  "files",
  "futures",
- "identity",
+ "identity-wire",
  "sdk",
  "sdk-testkit",
  "sha2 0.10.9",
  "tempfile",
  "wasm-host",
+]
+
+[[package]]
+name = "files-wire"
+version = "0.1.0"
+dependencies = [
+ "duckfs-core",
 ]
 
 [[package]]
@@ -4635,16 +4724,19 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "attribution",
+ "attribution-wire",
  "base64 0.22.1",
  "blobstore",
- "chat",
+ "chat-wire",
  "ducktape-module-sdk",
  "forge",
+ "forge-wire",
  "futures",
  "git-primitives",
  "git2",
  "host",
  "identity",
+ "identity-wire",
  "keyscheme",
  "sdk",
  "sdk-testkit",
@@ -4674,6 +4766,16 @@ dependencies = [
  "ducktape-view-composer",
  "ducktape-view-guest",
  "futures",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "forge-wire"
+version = "0.1.0"
+dependencies = [
+ "chat-wire",
+ "sdk",
  "serde",
  "serde_json",
 ]
@@ -4883,13 +4985,26 @@ dependencies = [
  "duckdns",
  "ducktape-module-sdk",
  "futures",
- "identity",
+ "gateway-wire",
+ "identity-wire",
  "sdk",
  "sdk-testkit",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "statesync",
+]
+
+[[package]]
+name = "gateway-wire"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "duckdns",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -5095,7 +5210,7 @@ dependencies = [
 name = "governance"
 version = "0.1.0"
 dependencies = [
- "acl",
+ "acl-wire",
  "async-trait",
  "borsh",
  "commonware-codec",
@@ -5103,14 +5218,27 @@ dependencies = [
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
+ "governance-wire",
  "host",
- "identity",
- "modules",
+ "identity-wire",
+ "modules-wire",
  "sdk",
  "sdk-testkit",
  "serde",
  "statesync",
- "valset",
+ "valset-wire",
+]
+
+[[package]]
+name = "governance-wire"
+version = "0.1.0"
+dependencies = [
+ "acl-wire",
+ "borsh",
+ "commonware-cryptography",
+ "modules-wire",
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -5873,7 +6001,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "directory",
- "kv",
+ "kv-wire",
  "sdk",
 ]
 
@@ -6159,7 +6287,7 @@ dependencies = [
 name = "host"
 version = "0.1.0"
 dependencies = [
- "acl",
+ "acl-wire",
  "agent",
  "async-trait",
  "attribution",
@@ -6461,6 +6589,7 @@ dependencies = [
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
+ "identity-wire",
  "k256",
  "keyscheme",
  "p256 0.13.2",
@@ -6469,6 +6598,16 @@ dependencies = [
  "serde",
  "serde_json",
  "statesync",
+]
+
+[[package]]
+name = "identity-wire"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "keyscheme",
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -6575,13 +6714,14 @@ name = "inbox"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "attribution",
+ "attribution-wire",
  "borsh",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
- "identity",
+ "identity-wire",
  "inbox",
+ "inbox-wire",
  "index-guest",
  "sdk",
  "sdk-testkit",
@@ -6589,6 +6729,16 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
+]
+
+[[package]]
+name = "inbox-wire"
+version = "0.1.0"
+dependencies = [
+ "attribution-wire",
+ "borsh",
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -7103,11 +7253,20 @@ dependencies = [
  "commonware-runtime",
  "ducktape-module-sdk",
  "host",
+ "kv-wire",
  "sdk",
  "sdk-testkit",
  "serde",
  "sha2 0.10.9",
  "statesync",
+]
+
+[[package]]
+name = "kv-wire"
+version = "0.1.0"
+dependencies = [
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -7517,13 +7676,13 @@ dependencies = [
  "base64 0.22.1",
  "chat",
  "duckfs-core",
- "forge",
- "pages",
+ "forge-wire",
+ "pages-wire",
  "reqwest 0.12.28",
- "runs",
+ "runs-wire",
  "serde",
  "serde_json",
- "tasks",
+ "tasks-wire",
 ]
 
 [[package]]
@@ -7676,11 +7835,22 @@ dependencies = [
  "ducktape-module-sdk",
  "futures",
  "module-artifact",
+ "modules-wire",
  "sdk",
  "sdk-testkit",
  "serde",
  "statesync",
- "valset",
+ "valset-wire",
+]
+
+[[package]]
+name = "modules-wire"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "module-artifact",
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -7959,8 +8129,8 @@ dependencies = [
 name = "node-bin"
 version = "0.1.0"
 dependencies = [
- "agent",
  "agent-service",
+ "agent-wire",
  "airlock",
  "airlock-service",
  "anstream",
@@ -7979,9 +8149,9 @@ dependencies = [
  "bytes",
  "capability",
  "chacha20poly1305 0.10.1",
- "chat",
+ "chat-wire",
  "clap",
- "collaboration",
+ "collaboration-wire",
  "commonware-actor",
  "commonware-codec",
  "commonware-consensus",
@@ -8026,14 +8196,14 @@ dependencies = [
  "noded",
  "objc2-foundation 0.3.2",
  "overlay-net",
- "pages",
+ "pages-wire",
  "provider-host",
  "rand 0.8.6",
  "reachability",
  "recovery",
  "reqwest 0.12.28",
  "run-envelope",
- "runs",
+ "runs-wire",
  "saga",
  "sandbox-host",
  "sdk",
@@ -8045,7 +8215,7 @@ dependencies = [
  "statesync",
  "syn 2.0.119",
  "tar",
- "tasks",
+ "tasks-wire",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -8103,7 +8273,7 @@ dependencies = [
  "borsh",
  "bytes",
  "capability",
- "chat",
+ "chat-wire",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
@@ -8144,7 +8314,7 @@ dependencies = [
  "sha2 0.10.9",
  "statesync",
  "syn 2.0.119",
- "tasks",
+ "tasks-wire",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",
@@ -8165,9 +8335,9 @@ dependencies = [
 name = "noded-bin"
 version = "0.1.0"
 dependencies = [
- "agent",
+ "agent-wire",
  "async-trait",
- "attribution",
+ "attribution-wire",
  "base64 0.22.1",
  "commonware-cryptography",
  "commonware-runtime",
@@ -9208,13 +9378,15 @@ name = "pages"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "attribution",
+ "attribution-wire",
  "commonware-runtime",
  "ducktape-module-sdk",
  "files",
+ "files-wire",
  "host",
- "identity",
+ "identity-wire",
  "index-guest",
+ "pages-wire",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -9223,6 +9395,16 @@ dependencies = [
  "statesync",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "pages-wire"
+version = "0.1.0"
+dependencies = [
+ "index-guest",
+ "sdk",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -9912,7 +10094,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "broker-host",
- "capability",
+ "capability-wire",
  "futures",
  "libc",
  "mcp-host",
@@ -9921,7 +10103,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "run-envelope",
- "runs",
+ "runs-wire",
  "sandbox-host",
  "serde",
  "serde_json",
@@ -10752,25 +10934,25 @@ dependencies = [
 name = "runs"
 version = "0.1.0"
 dependencies = [
- "agent",
+ "agent-wire",
  "async-trait",
- "attribution",
+ "attribution-wire",
  "base64 0.22.1",
  "borsh",
- "capability",
+ "capability-wire",
  "chat",
- "collaboration",
+ "collaboration-wire",
  "commonware-runtime",
- "dispatch 0.1.0",
+ "dispatch-wire",
  "ducktape-module-sdk",
  "files",
- "forge",
+ "forge-wire",
  "futures",
- "governance",
+ "governance-wire",
  "host",
- "identity",
+ "identity-wire",
  "index-guest",
- "modules",
+ "modules-wire",
  "node-work",
  "pages",
  "run-envelope",
@@ -10785,7 +10967,7 @@ dependencies = [
  "syn 2.0.119",
  "tasks",
  "tempfile",
- "valset",
+ "valset-wire",
 ]
 
 [[package]]
@@ -10794,18 +10976,18 @@ version = "0.1.0"
 dependencies = [
  "agent-wire",
  "borsh",
- "chat",
- "collaboration",
- "dispatch 0.1.0",
- "governance",
+ "chat-wire",
+ "collaboration-wire",
+ "dispatch-wire",
+ "governance-wire",
  "node-work",
- "pages",
+ "pages-wire",
  "run-envelope",
  "sdk",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tasks",
+ "tasks-wire",
 ]
 
 [[package]]
@@ -11078,12 +11260,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
- "capability",
+ "capability-wire",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
  "host",
  "index-guest",
+ "saga-wire",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -11091,7 +11274,16 @@ dependencies = [
  "sha2 0.10.9",
  "statesync",
  "tempfile",
- "valset",
+ "valset-wire",
+]
+
+[[package]]
+name = "saga-wire"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -11680,24 +11872,24 @@ dependencies = [
  "blobstore",
  "commonware-cryptography",
  "commonware-runtime",
- "dispatch 0.1.0",
+ "dispatch-wire",
  "duckfs-core",
- "files",
+ "files-wire",
  "futures",
- "gateway",
- "governance",
+ "gateway-wire",
+ "governance-wire",
  "host",
  "identity",
  "indexer",
  "nettest",
  "node",
  "noded",
- "runs",
- "saga",
+ "runs-wire",
+ "saga-wire",
  "sdk",
  "serde",
  "serde_json",
- "tasks",
+ "tasks-wire",
  "tempfile",
  "tokio",
  "topology",
@@ -12292,12 +12484,12 @@ name = "tasks"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "attribution",
+ "attribution-wire",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
  "host",
- "identity",
+ "identity-wire",
  "index-guest",
  "sdk",
  "sdk-testkit",
@@ -12305,8 +12497,18 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
+ "tasks-wire",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "tasks-wire"
+version = "0.1.0"
+dependencies = [
+ "attribution-wire",
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -13775,6 +13977,15 @@ dependencies = [
  "serde",
  "serde_json",
  "statesync",
+ "valset-wire",
+]
+
+[[package]]
+name = "valset-wire"
+version = "0.1.0"
+dependencies = [
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -15760,8 +15971,8 @@ dependencies = [
  "commonware-utils",
  "duckfs-core",
  "ducktape-home",
- "governance",
- "identity",
+ "governance-wire",
+ "identity-wire",
  "module-artifact",
  "nat-traversal",
  "rand 0.8.6",

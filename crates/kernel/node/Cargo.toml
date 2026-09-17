@@ -56,13 +56,13 @@ directory = { workspace = true }
 futures = "0.3"
 # the agreed-order convergence test stands N validators, each a host with a
 # qmdb-backed kv module (order-DEPENDENT root), on the deterministic runtime.
-kv = { workspace = true }
+kv = { path = "../../modules/system/kv" }
 # the oracle-over-consensus test: a saga tracker module + a mock worker prove an
 # async saga settles to Done when the OracleResult op finalizes on every node.
-saga = { workspace = true }
+saga = { path = "../../modules/system/saga" }
 # the in-memory MerkleStore double the store-backed saga module is injected with.
 sdk-testkit = { workspace = true }
 # the code-swap stall test seeds the real code registry with a hash whose bytes
 # no source can serve — the fail-closed boundary the drain must PAUSE on.
-modules = { workspace = true }
+modules = { path = "../../modules/system/modules" }
 commonware-runtime = { workspace = true }

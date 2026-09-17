@@ -38,12 +38,12 @@ struct Stores {
 fn arena(dir: &tempfile::TempDir, stores: &Stores) -> Host {
     Host::genesis(vec![
         Box::new(files::Files::open("files", dir.path().into()).unwrap()),
-        Box::new(identity::Identity::new(
+        Box::new(identity_module::Identity::new(
             "identity",
             Box::new(stores.identity.clone()),
             "files-test".into(),
         )),
-        Box::new(attribution::AttributionModule::new(
+        Box::new(attribution_module::AttributionModule::new(
             "attribution",
             Box::new(stores.attribution.clone()),
         )),

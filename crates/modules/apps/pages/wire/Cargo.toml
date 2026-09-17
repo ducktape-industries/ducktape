@@ -1,0 +1,16 @@
+# The pages module's wire surface: blocks, pages, comments, their messages,
+# queries and replies, no module — the daemon, the MCP host and a view link
+# THIS and not the module behind it. No `native` feature, no kernel host, no
+# disk.
+[package]
+name = "pages-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `index`: the pure fold/view core over the index CONTRACT (op-row envelope +
+# StateRead/Writes kit) — the engine shell stays in the module crate.
+index_guest = { workspace = true }

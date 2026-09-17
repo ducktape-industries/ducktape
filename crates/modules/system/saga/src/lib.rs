@@ -158,8 +158,7 @@
 //! agree op for op, not just block for block.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+pub use saga_wire::*;
 
 // the usage ledger: the PURE decision core (fold + view over
 // index_guest::StateRead), compiled everywhere and unit-tested natively.
