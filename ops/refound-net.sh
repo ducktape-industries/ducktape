@@ -41,7 +41,19 @@ J_P2P=35630 J_HTTP=32990 J_GATEWAY=33990 J_RPC=34990 J_WG=46710 J_INVITE=46711
 
 LAUNCHER_EXE="ducktape-node-launcher"
 
-die() { printf '\nrefound-net: %s\n' "$*" >&2; exit 1; }
+# Once the archive has run, every failure below leaves the operator with no
+# network AND no obvious way back. Say where it went, every time.
+die() {
+    printf '\nrefound-net: %s\n' "$*" >&2
+    if [ -n "${ARCHIVED:-}" ]; then
+        printf '\n  the previous network was NOT deleted. it is at:\n' >&2
+        # shellcheck disable=SC2086 -- ARCHIVED is a space-separated path list
+        printf '    %s\n' $ARCHIVED >&2
+        printf '  to put it back: stop anything under the roots, then move each\n' >&2
+        printf '  archive back to the root it came from.\n' >&2
+    fi
+    exit 1
+}
 say() { printf '\n=== %s ===\n' "$*"; }
 
 usage() {
@@ -94,8 +106,23 @@ done
 
 [ -n "$ROOT" ] || usage
 case "$ROOT" in /*) :;; *) die "--root must be an absolute path";; esac
+# Shell completion appends a slash to a directory, so `--root ~/.ducktape/dognet/`
+# is what an operator actually types. Every match below compares "$root" and
+# "$root"/* against a path with no trailing slash, so one left here makes the
+# teardown find NOTHING, report "nothing running", and then move both roots out
+# from under a live network. Strip it before anything uses it.
+while [ "$ROOT" != "/" ] && [ "${ROOT%/}" != "$ROOT" ]; do ROOT=${ROOT%/}; done
+[ "$ROOT" != "/" ] || die "--root must not be /"
 [ -n "$JOINER_ROOT" ] || JOINER_ROOT="${ROOT}-joiner"
+while [ "$JOINER_ROOT" != "/" ] && [ "${JOINER_ROOT%/}" != "$JOINER_ROOT" ]; do
+    JOINER_ROOT=${JOINER_ROOT%/}
+done
 [ -n "$NAME" ] || NAME=$(basename "$ROOT")
+# Each root IS a workspace, so the ducktape home is the directory holding them.
+# Both roots live in it and share a chain id, which makes `-n` ambiguous — every
+# verb below names `--config` or `--node`, and `--node` resolves by the http port
+# each workspace actually serves, which is unique per root.
+HOME_DIR=$(dirname "$ROOT")
 CHECKOUT=$(cd "$(dirname "$0")/.." && pwd)
 STAMP=$(date +%Y%m%d-%H%M%S)
 
@@ -205,6 +232,10 @@ pids_under() {
     local root=$1 d exe cwd args base
     for d in /proc/[0-9]*; do
         exe=$(readlink "$d/exe" 2>/dev/null) || continue
+        # a binary that was replaced or renamed under a running process reads
+        # `<path> (deleted)`. Every match below is on the path, so the suffix
+        # has to come off first or a rebuild makes the process invisible.
+        exe=${exe% (deleted)}
         # the node: its executable lives under the workspace.
         case "$exe" in "$root"/*) printf '%s\n' "${d#/proc/}"; continue;; esac
         # a process started with a RELATIVE selector — `node run --config
@@ -213,20 +244,23 @@ pids_under() {
         # too. The only thing that places it is its working directory.
         # Narrowed to a ducktape executable so an operator's shell, editor or
         # `tail` sitting in the workspace is not swept up with the network.
+        #
+        # `ducktape*` and not an exact name: a rotated release directory keeps
+        # the previous binary beside the current one as `ducktape.prev`, and a
+        # process started before the rotation still points at it.
         base=${exe##*/}
+        case "$base" in ducktape*) ;; *) continue;; esac
         cwd=$(readlink "$d/cwd" 2>/dev/null) || cwd=
-        case "$base" in
-            ducktape | ducktape-*)
-                case "$cwd" in
-                    "$root" | "$root"/*) printf '%s\n' "${d#/proc/}"; continue;;
-                esac
-                ;;
+        case "$cwd" in
+            "$root" | "$root"/*) printf '%s\n' "${d#/proc/}"; continue;;
         esac
         # the launcher and the service daemons: both run a binary from
         # somewhere else and NAME this workspace in argv. Matching the absolute
-        # root path in argv catches every one of them without the
-        # false-positive risk of a loose `pkill -f` pattern.
-        args=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+        # root path in argv catches every one of them — and this arm is inside
+        # the `ducktape*` gate above for the same reason the cwd arm is: an
+        # argv match alone is a `pkill -f` pattern, and a `tail -f
+        # <root>/daemon.log` in another pane matches it exactly.
+        args=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
         case "$args" in
             *"$root"/*)
                 # do not match this script, or the shell that launched it.
@@ -243,7 +277,7 @@ pids_under() {
 service_pid() {
     local kind=$1 d args
     for d in /proc/[0-9]*; do
-        args=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+        args=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
         case "$args" in
             *"service run $kind "*"$FOUNDER_CFG"*) printf '%s\n' "${d#/proc/}"; return;;
         esac
@@ -251,11 +285,15 @@ service_pid() {
 }
 
 # ordered so a supervisor is signalled before the child it would restart.
+# The launcher is matched anywhere in the path, not as an anchored suffix: a
+# replaced binary reads `<path> (deleted)` and an anchored match would miss it,
+# which silently turns this into an undifferentiated kill and lets the
+# supervisor outlive its child and restart it under a pid nobody is waiting on.
 stop_pids() {
     local pids=$1 p
     for p in $pids; do
         case "$(readlink "/proc/$p/exe" 2>/dev/null)" in
-            *"/$LAUNCHER_EXE") kill "$p" 2>/dev/null || true;;
+            *"/$LAUNCHER_EXE"*) kill "$p" 2>/dev/null || true;;
         esac
     done
     sleep 1
@@ -279,6 +317,18 @@ if [ -n "$RUNNING" ]; then
         sleep 2
     done
     LEFT=$( { pids_under "$ROOT"; pids_under "$JOINER_ROOT"; } | sort -u )
+    # A validator answers SIGTERM from inside its consensus loop (graceful
+    # checkpoint), so one that is mid-compaction or select-starved — the usual
+    # reason anyone re-founds — does not exit inside 20 s. Without an
+    # escalation the run dies here with the network already down, nothing
+    # archived, and a survivor for the operator to find by hand. SIGKILL is no
+    # broader than the SIGTERM these same pids already took.
+    if [ -n "$LEFT" ]; then
+        echo "  still alive after 20s, escalating: $LEFT"
+        for p in $LEFT; do kill -9 "$p" 2>/dev/null || true; done
+        sleep 2
+        LEFT=$( { pids_under "$ROOT"; pids_under "$JOINER_ROOT"; } | sort -u )
+    fi
     [ -z "$LEFT" ] || die "processes still alive under the roots: $LEFT"
     echo "stopped."
 else
@@ -289,14 +339,28 @@ fi
 # 3. archive. MOVED ASIDE, NEVER DELETED — a re-found resets content by
 # design, and the only copy of what was there is the one this step keeps.
 # --------------------------------------------------------------------------
+# NOT `<root>.archived-<stamp>`: a workspace is `<home>/<dir>/network.toml` and
+# the home is scanned exactly one level deep, so an archive left beside the
+# root is still enumerated — the DEAD network would be offered by the app's
+# picker and by `-n`. One level down inside a directory that holds no
+# `network.toml` of its own, the scan skips it and the only way to reach it is
+# by the path this step prints.
 say "archive"
 ARCHIVED=""
+ARCHIVE_DIR="$(dirname "$ROOT")/archived-networks"
 for d in "$ROOT" "$JOINER_ROOT"; do
     if [ -e "$d" ]; then
         [ "$ASSUME_YES" = 1 ] || die "refusing to archive an existing $d without --yes"
-        mv "$d" "$d.archived-$STAMP"
-        ARCHIVED="$ARCHIVED $d.archived-$STAMP"
-        echo "archived $d -> $d.archived-$STAMP"
+        mkdir -p "$ARCHIVE_DIR"
+        dest="$ARCHIVE_DIR/$(basename "$d")-$STAMP"
+        # `if`, not `[ … ] && die`: a false test makes the compound non-zero,
+        # which under `set -e` exits the script on the HEALTHY path.
+        if [ -e "$dest" ]; then
+            die "archive target $dest already exists — refusing to overwrite"
+        fi
+        mv "$d" "$dest"
+        ARCHIVED="$ARCHIVED $dest"
+        echo "archived $d -> $dest"
     fi
 done
 [ -n "$ARCHIVED" ] || echo "nothing to archive"
@@ -316,21 +380,32 @@ for p in "$F_P2P" "$F_HTTP" "$F_GATEWAY" "$F_RPC" "$J_P2P" "$J_HTTP" "$J_GATEWAY
     fi
 done
 
+# --root IS the workspace, not a home containing one.
+#
+# `node init` writes `<home>/<name>#<chain>`, and the ducktape home is scanned
+# exactly ONE level deep for `<dir>/network.toml`
+# (`workspace_config::list_workspaces_in`). A workspace at
+# `<home>/<root>/<name>#<chain>/` is two levels down: invisible to the app's
+# network picker and to every `-n` resolution, reachable only by `--config`.
+# So it is founded into a staging home and moved to the root. Every path in
+# `node.toml` is workspace-relative, so the move costs nothing.
 say "found $NAME"
-mkdir -p "$ROOT" "$JOINER_ROOT"
-DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" node init --name "$NAME" \
+INIT_HOME="$STAGE/home"
+mkdir -p "$INIT_HOME" "$(dirname "$ROOT")"
+DUCKTAPE_HOME="$INIT_HOME" "$STAGED_BIN" node init --name "$NAME" \
     --modules "$STAGE/modules" \
     --listen "127.0.0.1:$F_P2P" --advertised "127.0.0.1:$F_P2P" \
     --http "127.0.0.1:$F_HTTP" --gateway "127.0.0.1:$F_GATEWAY" --rpc "127.0.0.1:$F_RPC" \
     --wireguard-listen "0.0.0.0:$F_WG" --invite-listen "0.0.0.0:$F_INVITE" \
     --primary-coordinator none
-CHAIN=$(ls "$ROOT")
-[ -n "$CHAIN" ] || die "node init left no workspace under $ROOT"
-FOUNDER_WS="$ROOT/$CHAIN"
+CHAIN=$(ls "$INIT_HOME")
+[ -n "$CHAIN" ] || die "node init left no workspace under $INIT_HOME"
+mv "$INIT_HOME/$CHAIN" "$ROOT"
+FOUNDER_WS="$ROOT"
 # Once two workspaces share a chain id, `-n <chain>` is AMBIGUOUS and resolves
 # to whichever registration it finds first. Every verb below names its config.
 FOUNDER_CFG="$FOUNDER_WS/node.toml"
-echo "founded $CHAIN"
+echo "founded $CHAIN at $FOUNDER_WS"
 
 # the guest image a run boots is the workspace's own, so it is installed here
 # rather than pointed at somewhere shared.
@@ -370,9 +445,25 @@ install_set() {
 }
 
 install_set "$FOUNDER_WS"
-"$LAUNCHER" install --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" --from "$STAGED_BIN"
+# The staging directory is under /tmp, which this host empties at boot. The
+# node itself survives that — the launcher installed its own copy — but
+# anything still EXECUTING the staged path does not, so the service daemons
+# below run a workspace-owned copy instead and a reboot leaves them
+# restartable. Everything after this point uses it.
+WS_BIN="$FOUNDER_WS/ducktape"
+cp "$STAGED_BIN" "$WS_BIN"
+# The supervisor gets a workspace-owned copy for the same reason, plus one of
+# its own: `$LAUNCHER` is resolved beside the node binary, which on this host
+# is a cargo target directory every checkout writes to. A sibling's rebuild
+# replaces that file, the running launcher's `/proc/<pid>/exe` starts reading
+# `<path> (deleted)`, and a teardown that matches its name stops recognising
+# the one process that must be signalled FIRST. Under the workspace it is
+# matched by path like the node itself.
+WS_LAUNCHER="$FOUNDER_WS/$LAUNCHER_EXE"
+cp "$LAUNCHER" "$WS_LAUNCHER"
+"$WS_LAUNCHER" install --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" --from "$STAGED_BIN"
 DUCKTAPE_MODULES_DIR="$FOUNDER_WS/modules" setsid nohup \
-    "$LAUNCHER" run --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" \
+    "$WS_LAUNCHER" run --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" \
     > "$FOUNDER_WS/launcher.log" 2>&1 < /dev/null &
 disown
 
@@ -390,15 +481,28 @@ echo "founder serving on :$F_HTTP"
 # 6. join the resident on its own port set.
 # --------------------------------------------------------------------------
 say "join the resident"
-DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" node invite --config "$FOUNDER_CFG" 2>/dev/null \
-    | grep -o '🦆[A-Za-z0-9_+/=-]*' > "/tmp/refound-$NAME-$STAMP.invite"
-[ -s "/tmp/refound-$NAME-$STAMP.invite" ] || die "node invite printed no invite blob"
-DUCKTAPE_HOME="$JOINER_ROOT" "$STAGED_BIN" node join \
+# Captured, not piped. As a pipeline under `pipefail` a failing `node invite`
+# takes the whole script down on the spot — with its stderr sent to /dev/null
+# and the `die` below never reached, so the operator gets a bare non-zero exit
+# and no reason at all.
+INVITE_FILE="/tmp/refound-$NAME-$STAMP.invite"
+INVITE_OUT=$(DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" node invite --config "$FOUNDER_CFG" 2>&1) \
+    || die "node invite failed: $INVITE_OUT"
+printf '%s\n' "$INVITE_OUT" | grep -o '🦆[A-Za-z0-9_+/=-]*' > "$INVITE_FILE" || true
+if [ ! -s "$INVITE_FILE" ]; then
+    die "node invite printed no invite blob. it said: $INVITE_OUT"
+fi
+JOIN_HOME="$STAGE/joiner-home"
+mkdir -p "$JOIN_HOME" "$(dirname "$JOINER_ROOT")"
+DUCKTAPE_HOME="$JOIN_HOME" "$STAGED_BIN" node join \
     --listen "127.0.0.1:$J_P2P" --advertised "127.0.0.1:$J_P2P" \
     --http "127.0.0.1:$J_HTTP" --gateway "127.0.0.1:$J_GATEWAY" --rpc "127.0.0.1:$J_RPC" \
     --wireguard-listen "0.0.0.0:$J_WG" --invite-listen "0.0.0.0:$J_INVITE" \
-    --primary-coordinator none < "/tmp/refound-$NAME-$STAMP.invite"
-JOINER_WS="$JOINER_ROOT/$CHAIN"
+    --primary-coordinator none < "$INVITE_FILE"
+# moved to its own root for the same reason the founder is — see `found`.
+[ -d "$JOIN_HOME/$CHAIN" ] || die "node join left no workspace under $JOIN_HOME"
+mv "$JOIN_HOME/$CHAIN" "$JOINER_ROOT"
+JOINER_WS="$JOINER_ROOT"
 JOINER_CFG="$JOINER_WS/node.toml"
 [ -f "$JOINER_CFG" ] || die "node join left no workspace at $JOINER_WS"
 
@@ -408,9 +512,12 @@ if [ -n "$GUEST_SRC" ]; then
 fi
 
 install_set "$JOINER_WS"
-"$LAUNCHER" install --workspace "$JOINER_WS" --config "$JOINER_CFG" --from "$STAGED_BIN"
+J_LAUNCHER="$JOINER_WS/$LAUNCHER_EXE"
+cp "$WS_BIN" "$JOINER_WS/ducktape"
+cp "$LAUNCHER" "$J_LAUNCHER"
+"$J_LAUNCHER" install --workspace "$JOINER_WS" --config "$JOINER_CFG" --from "$WS_BIN"
 DUCKTAPE_MODULES_DIR="$JOINER_WS/modules" setsid nohup \
-    "$LAUNCHER" run --workspace "$JOINER_WS" --config "$JOINER_CFG" \
+    "$J_LAUNCHER" run --workspace "$JOINER_WS" --config "$JOINER_CFG" \
     > "$JOINER_WS/launcher.log" 2>&1 < /dev/null &
 disown
 wait_http "$J_HTTP" "the resident"
@@ -437,7 +544,18 @@ echo "resident following on :$J_HTTP"
 say "executors"
 # naming the CLI is already the answer to the checklist `--yes` would skip, and
 # the two are mutually exclusive: `install claude --yes` is refused outright.
-DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" agent install claude \
+# `agent install` has no --config: it resolves the workspace from the home by
+# the http base it serves. That resolution re-looks-up each workspace BY CHAIN
+# ID instead of using the path it already has (`workspace_serving`,
+# bin/node/src/cli_args.rs), so two workspaces sharing a chain id both resolve
+# to whichever is found first and it refuses "several workspaces serve
+# <base>" — for a base only one of them serves. A founder and its resident
+# ALWAYS share a chain id, so this fires every time. Hand it a home holding
+# only the founder; the symlink makes the writes land in the real workspace.
+EXEC_HOME="$STAGE/founder-only"
+mkdir -p "$EXEC_HOME"
+ln -sfn "$FOUNDER_WS" "$EXEC_HOME/$(basename "$FOUNDER_WS")"
+DUCKTAPE_HOME="$EXEC_HOME" "$WS_BIN" agent install claude \
     --node "http://127.0.0.1:$F_HTTP" || die "agent install failed"
 
 # --------------------------------------------------------------------------
@@ -452,18 +570,18 @@ DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" agent install claude \
 # pastes around.
 # --------------------------------------------------------------------------
 say "wallet"
-if DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" wallet list --config "$FOUNDER_CFG" 2>/dev/null \
+if DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" wallet list --config "$FOUNDER_CFG" 2>/dev/null \
     | grep -q "$WALLET_NAME"; then
     echo "wallet $WALLET_NAME already exists"
 else
     SECRETS="$FOUNDER_WS/wallet-$WALLET_NAME.secret"
     ( umask 077; : > "$SECRETS" )
     if printf '%s\n' "$WALLET_PASSWORD" \
-        | DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" wallet new "$WALLET_NAME" \
+        | DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" wallet new "$WALLET_NAME" \
           --config "$FOUNDER_CFG" > "$SECRETS" 2>&1; then
         chmod 600 "$SECRETS"
         echo "minted wallet $WALLET_NAME — mnemonic in $SECRETS (0600), not echoed here"
-        DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" wallet use "$WALLET_NAME" --config "$FOUNDER_CFG" \
+        DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" wallet use "$WALLET_NAME" --config "$FOUNDER_CFG" \
             || echo "could not set $WALLET_NAME active (continuing)"
     else
         echo "wallet new failed — see $SECRETS"
@@ -477,10 +595,12 @@ fi
 # enables, announces, and THEN exits `FATAL: the active wallet key is on no
 # account`, which reads like a grant that worked.
 # `--node`, not `-n`: the two workspaces share a chain id from here on.
-if ! DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" account show \
+# $EXEC_HOME, not $HOME_DIR: `account` is addressed by --node and resolves its
+# workspace the same broken way `agent install` does — see the note there.
+if ! DUCKTAPE_HOME="$EXEC_HOME" "$WS_BIN" account show \
     --node "http://127.0.0.1:$F_HTTP" > /dev/null 2>&1; then
     printf '%s\n' "$WALLET_PASSWORD" \
-        | DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" account create --name "$WALLET_NAME" \
+        | DUCKTAPE_HOME="$EXEC_HOME" "$WS_BIN" account create --name "$WALLET_NAME" \
           --node "http://127.0.0.1:$F_HTTP" \
         || die "account create failed — the service daemons will not boot without one"
 fi
@@ -520,7 +640,7 @@ fi
 for svc in $SERVICES; do
     log="$FOUNDER_WS/service-$svc.log"
     DUCKTAPE_MODULES_DIR="$FOUNDER_WS/modules" setsid nohup \
-        "$STAGED_BIN" service run "$svc" --config "$FOUNDER_CFG" --enable \
+        "$WS_BIN" service run "$svc" --config "$FOUNDER_CFG" --enable \
         > "$log" 2>&1 < /dev/null &
     disown
     n=0
@@ -540,11 +660,11 @@ done
 # and the grants as the NODE reads them back, which is the only surface that
 # would have caught the clobber above.
 for svc in $SERVICES; do
-    DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" service status --config "$FOUNDER_CFG" 2>/dev/null \
+    DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" service status --config "$FOUNDER_CFG" 2>/dev/null \
         | grep -q "✓ $svc  enabled" \
         || die "service $svc is running but the node does not read it as enabled — see $FOUNDER_WS/service-$svc.log"
 done
-DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" service status --config "$FOUNDER_CFG" 2>&1 | head -20 || true
+DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" service status --config "$FOUNDER_CFG" 2>&1 | head -20 || true
 
 # --------------------------------------------------------------------------
 # 8. mirror a repo into the network's own forge, so a run clones from the
@@ -552,10 +672,15 @@ DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" service status --config "$FOUNDER_CFG" 2>&1 
 # --------------------------------------------------------------------------
 if [ -n "$MIRROR_REPO" ]; then
     say "forge mirror"
-    python3 "$CHECKOUT/ops/forge-import.py" push \
+    # `cd` FIRST: forge-import runs bare `git rev-parse`/`pack-objects` in the
+    # invoking shell's working directory and never looks at --repo as a path,
+    # so without this the forge is filled from wherever the operator happened
+    # to launch the script — under the name of the repo they asked for.
+    [ -d "$MIRROR_REPO/.git" ] || die "--mirror $MIRROR_REPO is not a git checkout"
+    ( cd "$MIRROR_REPO" && python3 "$CHECKOUT/ops/forge-import.py" push \
         --node-url "http://127.0.0.1:$F_HTTP" \
         --token-file "$FOUNDER_WS/admin.token" \
-        --repo "$(basename "$MIRROR_REPO")" --branch dev --tip HEAD \
+        --repo "$(basename "$MIRROR_REPO")" --branch dev --tip HEAD ) \
         || echo "forge import: failed (continuing)"
 fi
 
@@ -573,8 +698,13 @@ fi
 # 10. what the operator needs.
 # --------------------------------------------------------------------------
 say "up"
-CONTRACT=$(curl -fsS "http://127.0.0.1:$F_HTTP/v1/status" \
-    | python3 -c 'import json,sys;print(json.load(sys.stdin).get("contract","?"))')
+# `|| CONTRACT="?"`: this is the LAST step, after everything worked. A hiccup
+# on one status read must not take the script down under `pipefail` and swallow
+# the report — the paths below are the only record of where the old network
+# went and where the new one is.
+CONTRACT=$(curl -fsS "http://127.0.0.1:$F_HTTP/v1/status" 2>/dev/null \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin).get("contract","?"))' 2>/dev/null) \
+    || CONTRACT="?"
 cat <<REPORT
   network     $CHAIN
   contract    $CONTRACT
@@ -582,7 +712,10 @@ cat <<REPORT
   resident    http 127.0.0.1:$J_HTTP   rpc :$J_RPC   config $JOINER_CFG
   binary      $VOUCH
   set         $MODULES_SRC
+
+  the old content is not gone, it moved. these two lines are the whole story:
   archived   ${ARCHIVED:- (nothing)}
+  now at      $FOUNDER_WS $JOINER_WS
 
   both nodes are supervised by ducktape-node-launcher, so a core update flips
   through the release plane. Use --config, never -n: two workspaces now share
