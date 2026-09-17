@@ -1168,15 +1168,16 @@ async fn proxy_loopback(
         .as_ref()
         .expect("current route is live");
     let target = loopback_port(scope, caller_node, record.statement.account_id, head)?;
-    // Connect + per-read deadlines only: a TOTAL timeout would kill long
-    // streamed (SSE) bodies, but a silent-forever upstream must not pin its
-    // accept permit — the idle read timeout reclaims it. The head is still
-    // deadline-bound by serve_proxy_stream.
+    // Connect deadline only. NEITHER `timeout` NOR `read_timeout` belongs on
+    // a request that carries a body: both arm when the request starts, and
+    // nothing arrives to read while this node is still SENDING, so either one
+    // refuses a large push for being long rather than for being stalled.
+    // `upstream_made_no_progress` below is the progress bound that replaces
+    // them, and the response body is read frame by frame under the same one.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .connect_timeout(PROXY_IO_TIMEOUT)
-        .read_timeout(BODY_IDLE_TIMEOUT)
         .build()
         .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
     let method = reqwest::Method::from_bytes(head.method.as_http_str().as_bytes())
@@ -1228,17 +1229,25 @@ async fn proxy_loopback(
     // The upstream is fed from the same stream the caller is still sending on,
     // so the pack never lands in this process: `wrap_stream` pulls a frame,
     // writes it, and pulls the next. A method that carries no body sends none
-    // — reqwest would otherwise announce a chunked body on a GET.
+    // — reqwest would otherwise announce a chunked body on a GET. Every frame
+    // handed over is progress, so it resets the exchange's clock.
+    let progress = Arc::new(tokio::sync::Notify::new());
     if head.method.permits_body() {
-        let frames = tokio_stream::wrappers::ReceiverStream::new(body).map(|item| {
+        let handed = Arc::clone(&progress);
+        let frames = tokio_stream::wrappers::ReceiverStream::new(body).map(move |item| {
+            handed.notify_waiters();
             item.map_err(|failure| std::io::Error::other(failure.detail().to_string()))
         });
         upstream = upstream.body(reqwest::Body::wrap_stream(frames));
     }
-    let response = upstream
-        .send()
-        .await
-        .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
+    let response = tokio::select! {
+        sent = upstream.send() => sent.map_err(|error| GatewayFailure::Unavailable(error.to_string()))?,
+        () = upstream_made_no_progress(Arc::clone(&progress)) => {
+            return Err(GatewayFailure::Unavailable(
+                "loopback upstream neither took the request nor answered".into(),
+            ));
+        }
+    };
     let capped = route.policy.max_response_bytes != 0; // 0 = unbounded stream
     if capped
         && response
@@ -1315,7 +1324,21 @@ async fn proxy_loopback(
         }
         let mut chunks = response.bytes_stream();
         let mut total: u64 = 0;
-        while let Some(chunk) = chunks.next().await {
+        loop {
+            // Per-chunk, not per-body: a declared SSE stream is answered for as
+            // long as it likes, an upstream that goes quiet mid-body is not.
+            let chunk = match tokio::time::timeout(BODY_IDLE_TIMEOUT, chunks.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => return,
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(GatewayFailure::Unavailable(
+                            "loopback upstream stopped sending its response".into(),
+                        )))
+                        .await;
+                    return;
+                }
+            };
             let item = match chunk {
                 Ok(chunk) => {
                     let chunk_len = chunk.len() as u64;
@@ -1355,6 +1378,19 @@ async fn proxy_loopback(
         head: response_head,
         body: rx,
     })
+}
+
+/// Resolve once a loopback exchange has made no progress for
+/// [`BODY_IDLE_TIMEOUT`]: no further frame of the request handed to the
+/// upstream, and no response. A request body has no declared size, so the
+/// exchange can only be bounded on progress — the same shape as
+/// [`ws_idle_deadline`]. A request with no body never notifies, which makes
+/// this the plain "answer within [`BODY_IDLE_TIMEOUT`]" deadline it should be.
+async fn upstream_made_no_progress(progress: Arc<tokio::sync::Notify>) {
+    while tokio::time::timeout(BODY_IDLE_TIMEOUT, progress.notified())
+        .await
+        .is_ok()
+    {}
 }
 
 /// DuckFS reads are windowed at 1 MiB; a manifest (≤ 4 MiB) or a file
