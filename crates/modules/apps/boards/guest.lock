@@ -37,7 +37,7 @@ dependencies = [
 [[package]]
 name = "boards"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#5a57b69ce6267fea6b81c63cfd0d1c9b89da20ff"
+source = "git+https://github.com/orthory/ducktape#4a28883064d5bfbde141256a888af28fa1d8a9eb"
 dependencies = [
  "async-trait",
  "boards-wire",
@@ -57,7 +57,7 @@ dependencies = [
 [[package]]
 name = "boards-wire"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#5a57b69ce6267fea6b81c63cfd0d1c9b89da20ff"
+source = "git+https://github.com/orthory/ducktape#4a28883064d5bfbde141256a888af28fa1d8a9eb"
 dependencies = [
  "serde",
  "serde_json",
@@ -137,7 +137,7 @@ dependencies = [
 [[package]]
 name = "ducktape-module-sdk"
 version = "0.0.0"
-source = "git+https://github.com/orthory/ducktape#5a57b69ce6267fea6b81c63cfd0d1c9b89da20ff"
+source = "git+https://github.com/orthory/ducktape#4a28883064d5bfbde141256a888af28fa1d8a9eb"
 dependencies = [
  "async-trait",
  "sdk",
@@ -286,7 +286,7 @@ dependencies = [
 [[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#5a57b69ce6267fea6b81c63cfd0d1c9b89da20ff"
+source = "git+https://github.com/orthory/ducktape#4a28883064d5bfbde141256a888af28fa1d8a9eb"
 dependencies = [
  "async-trait",
  "borsh",
@@ -574,19 +574,19 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[patch.unused]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/orthory/ducktape#5a57b69ce6267fea6b81c63cfd0d1c9b89da20ff"
+source = "git+https://github.com/orthory/ducktape#4a28883064d5bfbde141256a888af28fa1d8a9eb"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/orthory/ducktape#5a57b69ce6267fea6b81c63cfd0d1c9b89da20ff"
+source = "git+https://github.com/orthory/ducktape#4a28883064d5bfbde141256a888af28fa1d8a9eb"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/orthory/ducktape#5a57b69ce6267fea6b81c63cfd0d1c9b89da20ff"
+source = "git+https://github.com/orthory/ducktape#4a28883064d5bfbde141256a888af28fa1d8a9eb"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/orthory/ducktape#5a57b69ce6267fea6b81c63cfd0d1c9b89da20ff"
+source = "git+https://github.com/orthory/ducktape#4a28883064d5bfbde141256a888af28fa1d8a9eb"
