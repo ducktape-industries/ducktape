@@ -4008,6 +4008,64 @@ fn the_weight_row_is_offered_to_everything_that_draws_a_line() {
         "a text shape draws no line, so a weight row on it sets nothing"
     );
 }
+/// The shortcuts card is the only place this board says what it can do — no
+/// menu bar, no docs, no tooltip that lists anything. So the things a hand
+/// reaches for have to be IN it, and the ones nobody guesses most of all: a
+/// modifier held during a drag is invisible until something names it.
+#[test]
+fn the_shortcuts_card_names_the_keys_a_hand_reaches_for() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.on_help();
+    let card = serde_json::to_string(&view.view()).unwrap();
+    for wanted in [
+        // the two that do something there is no other way to do
+        "Move along one axis",
+        "Keep the proportions",
+        // and the four a hand reaches for before it reads anything
+        "Delete / Backspace",
+        "Select everything",
+        "Zoom in / out",
+        "Menu for what is under it",
+    ] {
+        assert!(
+            card.contains(wanted),
+            "the shortcuts card never mentions {wanted:?}"
+        );
+    }
+}
+/// The sheet is read at a glance, so it is laid ACROSS and not down. One column
+/// grew taller than the window the moment six rows were added to it, and it
+/// cannot scroll — a shortcut list you have to scroll is one you close and go
+/// back to guessing at. This guards the two things that keep it readable: the
+/// columns are balanced, and neither is taller than the window can hold.
+#[test]
+fn the_shortcuts_sheet_is_laid_across_and_fits_the_window() {
+    /// Rows a column can hold on the 800-tall window this app opens: 24 of
+    /// modal inset at each end, about 90 for the heading, the two rules and
+    /// the way out, and about 26 a row. Past this the sheet needs a third
+    /// column, not a taller one.
+    const MOST: usize = 22;
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.on_help();
+    let tree = view.view();
+    let rows = |key: &str| {
+        let column = node_at(&tree, key).expect("the sheet is laid out in two columns");
+        column.children().len()
+    };
+    let (left, right) = (rows("boards/help-left"), rows("boards/help-right"));
+    assert!(
+        left.abs_diff(right) <= 1,
+        "the sheet's columns are lopsided: {left} against {right}"
+    );
+    assert!(
+        left.max(right) <= MOST,
+        "a column of {} rows is taller than the window; the sheet needs another \
+         column rather than a longer one",
+        left.max(right)
+    );
+}
 /// A card held against the edge carries the board under it. Without this,
 /// moving a shape further than one screen is four gestures — drop it, pan, pick
 /// it up, drop it again — for a one-step intention, and every other gesture

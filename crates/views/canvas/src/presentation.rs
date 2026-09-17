@@ -415,7 +415,13 @@ impl BoardsView {
             );
         }
         if self.help {
-            let card = kit::sized(self.help_card(), Some(Length::Fixed(440.)), None);
+            // Wide enough for the two columns the list needs without any row
+            // being shortened to fit, and never wider than the stage it stands
+            // on — on a narrow window the sheet gives up a few characters of
+            // the longest labels rather than hanging off the edge, because a
+            // key you cannot see is worse than a description you can guess.
+            let sheet = (w - 2. * 24.).min(700.);
+            let card = kit::sized(self.help_card(), Some(Length::Fixed(sheet)), None);
             stage = modal("boards/help-modal", stage, card, Message::Help);
         }
         stage
@@ -1019,7 +1025,7 @@ impl BoardsView {
             ("H / 2 · hold Space", "Pan"),
             ("N / 3", "Sticky note"),
             ("R / 4", "Rectangle"),
-            ("O / 5", "Ellipse"),
+            ("O / C / 5", "Ellipse"),
             ("D / 6", "Diamond"),
             ("A / 7", "Arrow"),
             ("L / 8", "Line"),
@@ -1028,24 +1034,34 @@ impl BoardsView {
             ("E", "Eraser"),
             ("Q", "Keep tool active"),
             ("Shift-click / drag", "Multiple selection"),
+            ("⌘ / Ctrl A", "Select everything"),
+            ("Right-click", "Menu for what is under it"),
             ("Enter / double-click", "Edit text"),
             ("⌘ / Ctrl Enter", "Finish text / next note"),
             ("⌘ / Ctrl C · X · V", "Copy / cut / paste at pointer"),
             ("⌘ / Ctrl D · Alt or ⌘⇧ drag", "Duplicate selection"),
+            ("Delete / Backspace", "Delete selection"),
             ("⌘ / Ctrl ] · [", "Bring to front / send to back"),
             ("⌘ / Ctrl G · Shift G", "Group / ungroup selection"),
-            ("⌘ / Ctrl Z · Shift Z", "Undo / redo"),
+            ("⌘ / Ctrl Z · Shift Z · Y", "Undo / redo"),
             ("Arrow · Shift Arrow", "Move 1 / 10 units"),
             ("⌘ / Ctrl + scroll", "Zoom at pointer"),
+            ("+ · −", "Zoom in / out"),
             ("F · Shift F · 0", "Fit board / selection / 100%"),
+            // The three modifiers held DURING a gesture, together: they are the
+            // ones nobody guesses, and two of them are the only way to do what
+            // they do.
+            ("Hold Shift · drag a card", "Move along one axis"),
+            ("Hold Shift · drag a handle", "Keep the proportions"),
             ("Hold Ctrl", "Ignore snapping while dragging"),
             ("Esc", "Cancel the current gesture"),
         ];
-        let mut rows = vec![
-            kit::heading("boards/help-title", "Keyboard shortcuts"),
-            kit::divider("boards/help-rule"),
-        ];
-        rows.extend(shortcuts.into_iter().enumerate().map(|(i, (key, label))| {
+        // Two columns, because one is taller than the window. The card cannot
+        // scroll — it is a sheet you read at a glance, and a shortcut list you
+        // have to scroll is one you close and go back to guessing at — so when
+        // it outgrew the stage the answer was to lay it across rather than
+        // down. Split at the halfway mark so both columns end together.
+        let row = |i: usize, (key, label): (&str, &str)| {
             kit::centered_row(
                 format!("boards/key/{i}"),
                 [
@@ -1057,18 +1073,54 @@ impl BoardsView {
                     kit::nowrap(kit::mono(format!("boards/key-combo/{i}"), key)),
                 ],
             )
-        }));
-        rows.push(kit::divider("boards/help-rule-b"));
-        rows.push(wide(action(
-            "boards/help-close",
-            "Got it",
-            "Close shortcuts",
-            Message::Help,
-            true,
-        )));
+        };
+        let split = shortcuts.len().div_ceil(2);
+        let column = |key: &str, from: usize, rows: &[(&str, &str)]| {
+            kit::sized(
+                kit::spaced(
+                    kit::column(
+                        key,
+                        rows.iter()
+                            .enumerate()
+                            .map(|(i, entry)| row(from + i, *entry)),
+                    ),
+                    6.,
+                ),
+                Some(Length::Fill),
+                None,
+            )
+        };
+        let columns = kit::spaced(
+            kit::row(
+                "boards/help-columns",
+                [
+                    column("boards/help-left", 0, &shortcuts[..split]),
+                    column("boards/help-right", split, &shortcuts[split..]),
+                ],
+            ),
+            24.,
+        );
         kit::card(
             "boards/help-panel",
-            kit::spaced(kit::column("boards/help-body", rows), 6.),
+            kit::spaced(
+                kit::column(
+                    "boards/help-body",
+                    [
+                        kit::heading("boards/help-title", "Keyboard shortcuts"),
+                        kit::divider("boards/help-rule"),
+                        columns,
+                        kit::divider("boards/help-rule-b"),
+                        wide(action(
+                            "boards/help-close",
+                            "Got it",
+                            "Close shortcuts",
+                            Message::Help,
+                            true,
+                        )),
+                    ],
+                ),
+                6.,
+            ),
         )
     }
     pub(super) fn canvas_color(&self) -> [f32; 4] {
