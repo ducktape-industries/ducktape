@@ -12,7 +12,13 @@ use noded::{
     AdminConfig, AdminExposure, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand,
     NodeHandle, NodeStatus,
 };
+use sdk::Module as _;
 use tower::ServiceExt as _;
+
+/// the REFERENCE wasm module, as the kernel fixtures commit it: its `query`
+/// answers the counter as eight little-endian bytes. A test pins bytes on
+/// purpose — nothing but a test may.
+const HELLO: &[u8] = include_bytes!("../../kernel/host/tests/fixtures/hello.component.wasm");
 
 /// a scripted actor: answers every command the same way, like a module host
 /// that always succeeds (or always fails, for the error-path tests).
@@ -992,8 +998,89 @@ async fn query_returns_the_decoded_module_reply() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/json",
+        "a json reply is still typed as json"
+    );
     let body = body_json(response).await;
     assert_eq!(body, serde_json::json!({ "tasks": [] }));
+}
+
+/// an actor that answers every read with bytes the test already holds. The
+/// wasm module stays OUT of the spawned task — `WasmModule` is `?Send` — while
+/// the route still carries a real module's real reply.
+fn spawn_replying_actor(cmd_rx: mpsc::Receiver<NodeCommand>, bytes: Vec<u8>) {
+    tokio::spawn(async move {
+        let mut cmds = cmd_rx;
+        while let Some(cmd) = cmds.next().await {
+            let NodeCommand::Query { reply, .. } = cmd else {
+                panic!("this actor serves reads only");
+            };
+            let _ = reply.send(Ok(bytes.clone()));
+        }
+    });
+}
+
+/// THE reason this route types its answer instead of insisting on json.
+///
+/// A module's `query` returns `Vec<u8>`, and the reference module — the one
+/// `docs/dogfood.md` deploys and the module-upgrade e2e swaps — answers its
+/// counter's raw little-endian bytes. A json-only route answered that with a
+/// 500 reading "module reply was not json", which blames the module for the
+/// route's limit and leaves the documented way to observe a module unable to
+/// read the documented example of one.
+#[tokio::test]
+async fn query_answers_the_reference_module_s_raw_bytes_as_octet_stream() {
+    let mut hello = wasm_host::WasmModule::from_bytes("hello", HELLO).expect("the fixture loads");
+    let mut ctx = sdk_testkit::TestCtx::with_env(sdk::Env {
+        height: 1,
+        consensus_time: 0,
+        origin: sdk::Origin::System,
+        me: "hello".into(),
+        cause: sdk::Cause::Direct,
+    });
+    hello
+        .execute(
+            &mut ctx,
+            &sdk::Msg {
+                target: "hello".into(),
+                payload: b"inc".to_vec(),
+            },
+        )
+        .await
+        .expect("the reference module counts");
+    hello.commit_block().await.expect("commit");
+    let counter = hello.query(b"").await.expect("hello answers its counter");
+    assert_eq!(
+        counter,
+        1u64.to_le_bytes(),
+        "the premise: one inc, read back as raw little-endian bytes"
+    );
+
+    let (handle, cmd_rx, _events) = local_node();
+    spawn_replying_actor(cmd_rx, counter.clone());
+
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/query",
+            serde_json::json!({ "target": "hello", "query": "" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a module answering in its own encoding is an answer, not a failure"
+    );
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/octet-stream",
+        "the content type is what tells the caller which encoding it got"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.to_vec(), counter, "the bytes come back verbatim");
 }
 
 // ============================================================================

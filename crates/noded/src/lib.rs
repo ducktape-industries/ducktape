@@ -1026,6 +1026,26 @@ async fn submit_frame(
     }
 }
 
+/// A module's reply, typed by what it actually is.
+///
+/// `query` returns `Vec<u8>`: json is a convention most modules speak, never
+/// the contract. The reference module (`crates/guests/hello-wasm`, the one
+/// `docs/dogfood.md` deploys) answers its counter's eight little-endian bytes,
+/// so "not json" is an ORDINARY module answering in its own encoding. The
+/// content type is the discriminant — `application/json` when the reply parses,
+/// `application/octet-stream` with the bytes verbatim when it does not — and
+/// neither is an error. A 500 here blamed the module for the route's limit, and
+/// left the documented way to observe a module unable to read the documented
+/// example of one.
+fn module_reply(bytes: Vec<u8>) -> Response {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response();
+    };
+    Json(value).into_response()
+}
+
+/// POST /v1/query — the OPEN read lane over committed module state. The reply
+/// comes back as [`module_reply`] types it.
 async fn query(State(handle): State<NodeHandle>, Json(req): Json<QueryRequest>) -> Response {
     let req_bytes = serde_json::to_vec(&req.query).expect("a decoded json value re-serializes");
     let (reply, rx) = oneshot::channel();
@@ -1040,13 +1060,7 @@ async fn query(State(handle): State<NodeHandle>, Json(req): Json<QueryRequest>) 
         return resp;
     }
     match rx.await {
-        Ok(Ok(bytes)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(value) => Json(value).into_response(),
-            Err(_) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "module reply was not json",
-            ),
-        },
+        Ok(Ok(bytes)) => module_reply(bytes),
         Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
         Err(_) => actor_gone(),
     }
@@ -1120,13 +1134,7 @@ async fn query_as_reader(
         return resp;
     }
     match rx.await {
-        Ok(Ok(bytes)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(value) => Json(value).into_response(),
-            Err(_) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "module reply was not json",
-            ),
-        },
+        Ok(Ok(bytes)) => module_reply(bytes),
         Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
         Err(_) => actor_gone(),
     }
