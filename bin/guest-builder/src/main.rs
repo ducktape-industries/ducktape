@@ -41,8 +41,15 @@
 //! * the shell lock is the module's `guest.lock`, committed beside its
 //!   artifacts: the record of the revision and the registry versions an
 //!   artifact came from, and the seed of the next build, so a crates.io
-//!   publish between two rebuilds does not move the bytes. a canonical build
-//!   writes artifact and lock together; `--out` writes the artifact alone.
+//!   publish between two rebuilds does not move the bytes. artifact and lock
+//!   are ALWAYS written together: a canonical build puts them in the module
+//!   directory, an `--out` build puts them side by side at the out path
+//!   (`<out>` and `<out>.lock`, so `runs.component.wasm` is joined by
+//!   `runs.component.lock`). the module directory stays untouched either way,
+//!   which is what lets the drift check rebuild every guest without dirtying
+//!   the tree — and what lets it hand the result back without a second build,
+//!   since a lock that does not describe the bytes beside it is worse than no
+//!   lock at all.
 //!
 //! the revision defaults to the checkout's HEAD and must be reachable at
 //! [`PLATFORM_GIT`]: push before building. uncommitted inputs anywhere in the
@@ -187,19 +194,22 @@ fn build_guest(args: BuildArgs) -> Result<(), String> {
     )?;
 
     let cdylib = cdylib_path(&scratch, &module.name, kind);
-    // the canonical artifact and its lock are written together: the lock is
-    // the record of THOSE bytes. a one-off `--out` build leaves the module
-    // directory untouched, so a check that rebuilds every guest keeps the
-    // tree clean.
+    // artifact and lock travel together, wherever they land: the lock is the
+    // record of THOSE bytes, and one without the other is a half-answer. a
+    // one-off `--out` build still leaves the MODULE DIRECTORY untouched — it
+    // writes the pair at the out path instead — so a check that rebuilds every
+    // guest keeps the tree clean AND can hand its result back without paying
+    // for the same build twice.
     let out = match args.out {
         Some(path) => {
             write_artifact(kind, &cdylib, &path)?;
+            write_lock(&scratch, &path.with_extension("lock"))?;
             path
         }
         None => {
             let canonical = module_dir.join(kind.artifact());
             write_artifact(kind, &cdylib, &canonical)?;
-            record_lock(&scratch, &module_dir)?;
+            write_lock(&scratch, &module_dir.join("guest.lock"))?;
             canonical
         }
     };
@@ -819,13 +829,14 @@ fn copy_cdylib(cdylib: &Path, out: &Path) -> Result<(), String> {
         .map_err(|e| format!("copying {} to {}: {e}", cdylib.display(), out.display()))
 }
 
-/// the shell lock, written back beside the module as its `guest.lock`: the
-/// record of what the artifact was built from, and the seed of the next build.
-fn record_lock(scratch: &Path, module_dir: &Path) -> Result<(), String> {
-    let lock = module_dir.join("guest.lock");
-    fs::copy(scratch.join("Cargo.lock"), &lock)
+/// the shell lock, written beside the artifact it describes: the record of what
+/// that artifact was built from, and the seed of the next build. `dest` is the
+/// module's `guest.lock` for a canonical build and `<out>.lock` for an `--out`
+/// one — the same bytes either way, since the shell workspace is the same.
+fn write_lock(scratch: &Path, dest: &Path) -> Result<(), String> {
+    fs::copy(scratch.join("Cargo.lock"), dest)
         .map(|_| ())
-        .map_err(|e| format!("recording the shell lock as {}: {e}", lock.display()))
+        .map_err(|e| format!("recording the shell lock as {}: {e}", dest.display()))
 }
 
 fn cdylib_path(scratch: &Path, name: &str, kind: GuestKind) -> PathBuf {
