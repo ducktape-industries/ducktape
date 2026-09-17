@@ -3,14 +3,13 @@
 version = 4
 
 [[package]]
-name = "acl"
+name = "acl-wire"
 version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
- "async-trait",
  "borsh",
  "sdk",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -922,14 +921,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "capability"
+name = "capability-wire"
 version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
- "async-trait",
- "borsh",
  "sdk",
  "serde",
- "valset",
 ]
 
 [[package]]
@@ -1835,11 +1832,27 @@ name = "dispatch"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "capability",
+ "borsh",
+ "capability-wire",
+ "dispatch-wire",
+ "identity-wire",
  "saga",
  "sdk",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "dispatch-wire"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+dependencies = [
+ "borsh",
+ "saga-wire",
+ "sdk",
+ "serde",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2458,8 +2471,9 @@ dependencies = [
 name = "host"
 version = "0.1.0"
 dependencies = [
- "acl",
+ "acl-wire",
  "async-trait",
+ "borsh",
  "dispatch",
  "identity",
  "modules",
@@ -2688,10 +2702,22 @@ dependencies = [
  "async-trait",
  "borsh",
  "commonware-cryptography",
+ "identity-wire",
  "keyscheme",
  "sdk",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "identity-wire"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+dependencies = [
+ "borsh",
+ "keyscheme",
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -2738,6 +2764,7 @@ dependencies = [
 [[package]]
 name = "index-guest"
 version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "borsh",
  "serde",
@@ -2881,6 +2908,7 @@ dependencies = [
 [[package]]
 name = "keyscheme"
 version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "base64",
  "borsh",
@@ -2916,9 +2944,19 @@ name = "kv"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "kv-wire",
  "sdk",
  "serde",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "kv-wire"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+dependencies = [
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -3030,14 +3068,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "module-artifact"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+dependencies = [
+ "borsh",
+ "serde",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "modules"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
+ "module-artifact",
+ "modules-wire",
  "sdk",
  "serde",
- "valset",
+ "valset-wire",
+]
+
+[[package]]
+name = "modules-wire"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+dependencies = [
+ "borsh",
+ "module-artifact",
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -4310,13 +4371,24 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
- "capability",
+ "capability-wire",
  "index-guest",
+ "saga-wire",
  "sdk",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "valset",
+ "valset-wire",
+]
+
+[[package]]
+name = "saga-wire"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+dependencies = [
+ "borsh",
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -4361,8 +4433,10 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "sdk"
 version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "async-trait",
+ "borsh",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4371,6 +4445,7 @@ dependencies = [
 [[package]]
 name = "sdk-testkit"
 version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
 dependencies = [
  "async-trait",
  "sdk",
@@ -4753,6 +4828,7 @@ dependencies = [
  "sdk",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5298,6 +5374,16 @@ dependencies = [
  "sdk",
  "serde",
  "serde_json",
+ "valset-wire",
+]
+
+[[package]]
+name = "valset-wire"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+dependencies = [
+ "sdk",
+ "serde",
 ]
 
 [[package]]
