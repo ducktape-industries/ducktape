@@ -423,7 +423,6 @@ native device resources. Opening another tab keeps a user-started session alive.
 
 ```sh
 cargo test -p ducktape-media
-cargo test --manifest-path crates/views/Cargo.toml -p call-view
 ```
 
 These checks cover authenticated fanout, membership withdrawal, source metadata,

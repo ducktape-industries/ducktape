@@ -1,4 +1,0 @@
-# standalone mapper crate build artifacts (the built index.wasm fixture IS
-# committed, beside this file — it is what the indexer tests install).
-/target
-/Cargo.lock

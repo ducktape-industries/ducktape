@@ -371,8 +371,8 @@ status. Every target still validates messages against its execution context.
 
 The standard Linux guest includes the Rust toolchain from `rust-toolchain.toml`,
 the wasm32 target, native build utilities, the `wasm-tools` CLI of the
-componentizer's release (the `wit-component` pin in
-`bin/guest-builder/Cargo.toml`), and the vendored registry at `/opt/duck/vendor`
+componentizer's release (the `wit-component` pin in guest-builder's
+`Cargo.toml`, in ducktape-sdk), and the vendored registry at `/opt/duck/vendor`
 that `guest-builder vendor` derives from every module's dependency closure.
 Build it at the default location with:
 

@@ -1,6 +1,0 @@
-# standalone guest workspace build artifacts (a library crate: nothing is
-# componentized or committed from here — downstream guest crates own the
-# canonical component.wasm artifacts).
-/target
-/out
-/Cargo.lock

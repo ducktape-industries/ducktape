@@ -1,4 +1,11 @@
-# Attestation fixtures
+# Test fixtures
+
+`entitlements.plist` — the entitlements a macOS bundle is signed with. The
+bundle itself is built in ducktape-app; the signing lane here only needs a real
+plist to hand `rcodesign`, so `src/sign.rs`'s tests and `tests/sign_route.rs`
+read this copy.
+
+## Attestation fixtures
 
 `tdx_quote` + `tdx_quote_collateral.json` — a real Intel-signed TDX quote and
 its PCS collateral, vendored from the `dcap-qvl` 0.5.2 crate's `sample/`

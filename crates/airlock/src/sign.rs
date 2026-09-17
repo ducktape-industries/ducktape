@@ -1193,7 +1193,7 @@ mod tests {
         Tools {
             rcodesign,
             entitlements: Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../app/packaging/entitlements.plist"),
+                .join("tests/fixtures/entitlements.plist"),
             work_root: work_root.to_path_buf(),
             notary,
         }

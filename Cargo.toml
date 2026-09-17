@@ -4,23 +4,18 @@
 # types and host-mediated queries, never another module's internals.
 # three layers: module / kernel / networking — the tree groups by function,
 # not mechanism ("system" always means system *modules*). layout:
-#   crates/kernel/   — the platform: sdk (the module contract + sdk::codec),
-#                      sdk-testkit (dev-only test doubles for the sdk boundary
-#                      traits), host (submit/execute loop, root-hash composition,
-#                      the host::worker seam), node (ordered replication),
-#                      consensus (BFT orderer), statesync, recovery, indexer,
-#                      blobstore (node-local receipt-lane byte store — like
-#                      indexer, never in any root), wasm-host (runs a
-#                      ducktape:module component as a native sdk::Module)
-#   crates/module-sdk/ — the module SDK, the one crate a wasm module pins by
-#                      git revision: the ducktape:module WIT world, the
-#                      bindings + adapter every port shares, `sdk` re-exported,
-#                      and the wasm32 patch crates (stubs/) a guest graph needs
-#   crates/git-primitives/ — the six git types of that WIT world as plain data,
-#                      dependency-free: the kernel host speaks them across
-#                      `OdbBacking` and converts at the import boundary, so a
-#                      module's read policy names the shape without naming the
-#                      host it must stay separable from
+#   crates/kernel/   — the platform: host (submit/execute loop, root-hash
+#                      composition, the host::worker seam), node (ordered
+#                      replication), consensus (BFT orderer), statesync,
+#                      recovery, indexer.
+#   THE MODULE CONTRACT IS ANOTHER REPO — sdk, sdk-testkit, keyscheme,
+#                      blobstore, wasm-host, module-artifact, node-work, the
+#                      module SDK a guest port compiles against, the guest
+#                      componentizer, every module's wire crate and the leaf
+#                      types they share (git-primitives, duckdns, duckfs core
+#                      and disk, run-envelope, view-wire, design) all live in
+#                      ducktape-industries/ducktape-sdk and reach this
+#                      workspace as git dependencies on its `dev` branch.
 #   crates/networking/ — the netstack: transport infra ONLY (wireguard,
 #                      nat-traversal, netstack-machine [the sans-I/O
 #                      reachability decision core, its ducktape:netstack
@@ -37,12 +32,16 @@
 #                      onchain, service = offchain.)
 #   crates/modules/system/ — system modules: consensus infrastructure (acl,
 #                      kv, valset, governance, identity, modules, saga,
-#                      capability, dispatch, attribution, gateway — which absorbed
-#                      the duckdns naming library it now consumes from
-#                      crates/duckdns)
-#   crates/modules/apps/   — application modules, the product features (forge,
-#                      chat, pages, agent, runs, tasks, automations, inbox,
-#                      files)
+#                      capability, dispatch, attribution, gateway — which
+#                      embeds the `duckdns` naming library it consumes from
+#                      ducktape-sdk)
+#   crates/modules/apps/   — application modules. core builds forge and files
+#                      from source; chat, pages, agent, runs, tasks, boards,
+#                      automations, inbox and collaboration ship from
+#                      ducktape-industries/ducktape-modules, and core keeps
+#                      only their committed `<id>.component.wasm` /
+#                      `index.wasm` / `guest.lock` under apps/<id>/, which
+#                      crates/noded/build.rs stages by path
 #   crates/services/ — off-chain service crates: the host-side executors that
 #                      serve a consensus module without being one (compute —
 #                      the dispatch WorkSpec pool/ledger/gate; sandbox — the
@@ -58,23 +57,8 @@
 #                      shape/config schema and the named genesis selections
 #                      every composer draws from (pure data, no deps)
 #   crates/airlock/  — the two-party execution/auth contract (see members below)
-#   crates/duckdns/  — the `.duck` account naming library: hostname grammar,
-#                      handle registry, wire types. NOT a module — the `gateway`
-#                      module embeds it and owns the onchain half, while the
-#                      four composing binaries parse/validate names host-side,
-#                      so it sits beside the other cross-plane libraries rather
-#                      than under the one module that happens to wrap it
-#   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
-#                      — the `files` module wraps it), disk, client (OS-side)
-#   crates/guests/   — the kernel-fixture test guests ONLY (hello,
-#                      hello-replacement, noop, sibling, object), standalone
-#                      workspaces over the raw WIT world. every module carries
-#                      its OWN port (src/guest.rs behind the `guest` feature)
-#                      and bin/guest-builder builds it out of this repository
-#                      at a revision — no per-module crate lives here
-#   crates/examples/ — reference modules: directory (the first wasm port; a test
-#                      tenant, in no genesis set), greeter (the types-only
-#                      composition example)
+#   crates/duckfs/client/ — the OS-side duckfs client. The engine it speaks to
+#                      (duckfs-core, duckfs-disk) ships from ducktape-sdk.
 #   crates/testing/  — dev-only shared test support (nettest: raw-http client,
 #                      port allocation, poll; source-lint: which files and items
 #                      hold shipped code, for the repo-wide source lints).
@@ -91,29 +75,21 @@
 #   bin/             — node (the `ducktape`
 #                      CLI: validator + fs verbs + mcp server), noded (the
 #                      app-facing daemon process), simnode (deterministic /v1
-#                      twin), coordinator (STUN rendezvous), guest-builder
-#                      (module → wasm component packaging tool)
+#                      twin), coordinator (STUN rendezvous), node-launcher
+#                      (the node's supervisor) and the service binaries
 # the host dispatches modules over BFT consensus and composes each authenticated
 # root into the global root-hash. cosmwasm's isolation *pattern*, native rust.
 
 [workspace]
 resolver = "2"
 members = [
-    # kernel — the platform (contract + dispatch + transport + BFT ordering)
-    "crates/kernel/sdk", "crates/kernel/sdk-testkit", "crates/kernel/host",
+    # kernel — the platform (contract + dispatch + transport + BFT ordering).
+    # The module contract itself (`sdk`, `sdk-testkit`, `index-guest`,
+    # `keyscheme`, `blobstore`, `wasm-host`, `module-artifact`, `node-work`)
+    # lives in ducktape-sdk and reaches this workspace as a git dependency.
+    "crates/kernel/host",
     "crates/kernel/node", "crates/kernel/consensus",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
-    "crates/kernel/index-guest",
-    # the closed signature-scheme set + ONE verifier: shared by the kernel
-    # frame codec (below modules) and the identity module (a module).
-    "crates/kernel/keyscheme",
-    # the node-local receipt-lane byte store. platform, not a module: it holds
-    # no consensus state and lands in no root — the same standing `indexer` has
-    # two lines up, and the reason it left crates/modules/system/.
-    "crates/kernel/blobstore",
-    "crates/kernel/wasm-host",
-    "crates/kernel/module-artifact",
-    "crates/kernel/node-work",
     # networking — the netstack (host-side infra + the modules that govern it)
     "crates/networking/wireguard",
     "crates/networking/nat-traversal",
@@ -124,28 +100,23 @@ members = [
     "crates/networking/data-plane",
     "crates/networking/overlay-net",
     # modules/system — system modules. every entry implements `sdk::Module`.
-    "crates/modules/system/acl", "crates/modules/system/acl/wire",
-    "crates/modules/system/kv", "crates/modules/system/kv/wire",
-    "crates/modules/system/valset", "crates/modules/system/valset/wire",
-    "crates/modules/system/governance", "crates/modules/system/governance/wire",
-    "crates/modules/system/identity", "crates/modules/system/identity/wire",
-    "crates/modules/system/modules", "crates/modules/system/modules/wire",
-    "crates/modules/system/saga", "crates/modules/system/saga/wire",
-    "crates/modules/system/capability", "crates/modules/system/capability/wire",
-    "crates/modules/system/dispatch", "crates/modules/system/dispatch/wire",
-    "crates/modules/system/attribution", "crates/modules/system/attribution/wire",
-    "crates/modules/system/gateway", "crates/modules/system/gateway/wire",
+    # Their wire crates live in ducktape-sdk (git dependency).
+    "crates/modules/system/acl",
+    "crates/modules/system/kv",
+    "crates/modules/system/valset",
+    "crates/modules/system/governance",
+    "crates/modules/system/identity",
+    "crates/modules/system/modules",
+    "crates/modules/system/saga",
+    "crates/modules/system/capability",
+    "crates/modules/system/dispatch",
+    "crates/modules/system/attribution",
+    "crates/modules/system/gateway",
     # airlock — the two-party execution/auth contract. NOT a consensus module
     # (no MODULE_ID, no guest wasm): a protocol shared by the lender service,
     # the borrower broker and the enclave binary, so it sits beside the other
     # cross-plane protocol families rather than under any one party.
     "crates/airlock",
-    # duckdns — the `.duck` naming library, same standing for the same reason.
-    # NOT a consensus module (no `sdk::Module`, no MODULE_ID, no guest wasm):
-    # `gateway` absorbed the onchain half and embeds this registry, while
-    # node/noded/simnode parse and validate `.duck` names host-side. Under
-    # crates/modules/system/ it made "modules = onchain" literally false.
-    "crates/duckdns",
     "crates/authpage",
     # keystore — the device keystore (`keys/<name>.key` + the active pointer)
     # and the argon2id/AEAD seal under it. Same standing, same reason: its two
@@ -154,13 +125,6 @@ members = [
     # `ducktape` over pipes, making "can the app find a binary?" a precondition
     # for opening your own key.
     "crates/keystore",
-    # The run envelope's schema, split from the service that READS one: the
-    # reader links provider-host and with it the microVM sandbox, which a GUI
-    # submitting a run must not.
-    "crates/run-envelope",
-    # The six git types the host surface speaks, as plain data with no deps, so
-    # a module's read policy can name the shape without naming the kernel host.
-    "crates/git-primitives",
     # A workspace on disk (identity, network.toml, node.toml, the invite codec)
     # and the join ceremony that writes one. Split from bin/node because
     # joining is the one node operation with no running node to ask.
@@ -168,35 +132,18 @@ members = [
     # THE ducktape home resolution, alone in a zero-dependency leaf so the
     # light services can read it without workspace-config's graph behind it.
     "crates/ducktape-home",
-    "crates/duckfs/core",
-    "crates/duckfs/disk",
     "crates/duckfs/client",
     "crates/rpc-client",
     # the desktop app's self-update state machine + release-manifest verify,
     # pure (no I/O): driven by the launcher at boot and by the app while running.
     "crates/app-update",
-    # the pages document editor: Notion-shaped blocks, marks, slash menu and
-    # toolbar on the same gpui-kit. It was a git dependency on a fork pinned to
-    # one revision, so a change to it never appeared in a ducktape diff. It is
-    # ducktape source now — edit it here like any other crate. There is no
-    # upstream to pull from and nothing to re-sync.
-    "crates/gpui-notion",
-    # apps — product feature modules
-    "crates/modules/apps/forge", "crates/modules/apps/forge/wire",
-    "crates/modules/apps/pages", "crates/modules/apps/pages/wire",
-    "crates/modules/apps/chat", "crates/modules/apps/chat/wire",
-    "crates/modules/apps/chat/message",
-    "crates/modules/apps/agent",
-    "crates/modules/apps/agent/wire",
-    "crates/modules/apps/runs",
-    "crates/modules/apps/runs/wire",
-    "crates/modules/apps/tasks", "crates/modules/apps/tasks/wire",
-    "crates/modules/apps/boards",
-    "crates/modules/apps/boards/wire",
-    "crates/modules/apps/automations", "crates/modules/apps/automations/wire",
-    "crates/modules/apps/inbox", "crates/modules/apps/inbox/wire",
-    "crates/modules/apps/files", "crates/modules/apps/files/wire",
-    "crates/modules/apps/collaboration", "crates/modules/apps/collaboration/wire",
+    # apps — the two product modules core still builds from source. The rest
+    # (chat, pages, agent, runs, tasks, boards, automations, inbox,
+    # collaboration) live in ducktape-modules; core keeps only their committed
+    # artifacts under crates/modules/apps/<id>/, which crates/noded/build.rs
+    # stages into the founding set by path.
+    "crates/modules/apps/forge",
+    "crates/modules/apps/files",
     # services — off-chain host-side executors
     "crates/services/agent",
     "crates/services/airlock",
@@ -208,23 +155,12 @@ members = [
     "crates/services/media",
     "crates/services/provider",
     "crates/services/sandbox",
-    # examples — demo / test scaffolding modules
-    "crates/examples/directory", "crates/examples/greeter",
     # testing — dev-only shared harness helpers (raw-http client, ports,
     # poll; and the source lints' shared "is this shipped code" judgement).
     # NOT a Module Rule surface; no shipping crate depends on it.
     "crates/testing/nettest", "crates/testing/source-lint",
     # topology — the module composition catalog every composer draws from
     "crates/topology",
-    # view-wire — the host<->wasm-view format: the tree a view emits, the
-    # events it takes back, and the manifest a host checks before running one.
-    # Built once here and shared with the views workspace by path.
-    "crates/view-wire",
-    # design — the palette, the type scale and the bundled faces. Beside
-    # view-wire and shared the same way: what a view draws with and what the
-    # shell framing it draws with have to be one answer, or the two halves of
-    # a window disagree about what the product looks like.
-    "crates/design",
     # noded — the daemon library behind the /v1 surface
     "crates/noded",
     # bin — runnable binaries
@@ -233,20 +169,15 @@ members = [
     "bin/media-service",
     "bin/forge-service",
     "bin/terminal-service",
-    "bin/guest-builder",
     "bin/duck-guest-init",
-    # the desktop app's boot-time executor (flip / rollback / exec)
-    "bin/app-launcher",
     # the node's supervisor: the same machine, holding the flip for the
     # network's governance-designated activation height
     "bin/node-launcher",
-    # native desktop client — intentionally only Chat + Pages
-    "app",
 ]
 # labs is a standalone crate (its own [workspace] + Cargo.lock), NOT a member:
 # its quarantined evm/multisig deps (revm, alloy) must never enter — or slow —
 # the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
-exclude = ["crates/labs", "crates/module-sdk", "crates/views/forge", "crates/views/support/guest", "crates/views/support/composer", "crates/views/support/files"]
+exclude = ["crates/labs"]
 
 [workspace.package]
 edition = "2024"
@@ -255,7 +186,8 @@ version = "0.1.0"
 [workspace.dependencies]
 # the host<->wasm-view wire. `manifest` is host-only (it pulls wasmparser to
 # read a built component's custom section); the guests take it bare.
-view-wire = { path = "crates/view-wire" }
+# It lives in ducktape-sdk now, with the rest of the module/view contract.
+view-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "view-wire" }
 # the ducktape CLI's argument grammar (derive). already in the graph
 # transitively, so this costs no new compilation unit.
 clap = { version = "4.6", features = ["derive"] }
@@ -270,8 +202,8 @@ lru = "0.18"
 libc = "0.2"
 smallvec = "1"
 sha2 = "0.10"
-# the desktop app's release archives (`.tar.zst`): app/src/backend/update.rs
-# extracts a staged release out of one.
+# release archives (`.tar.zst`): bin/node-launcher stages a node release out
+# of one, and airlock's `codesign` lane packs a signing request into one.
 tar = "0.4"
 zstd = "0.13"
 serde = { version = "1", features = ["derive"] }
@@ -287,7 +219,7 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 rand = "0.8"
 # Opus codec (voice) — pure Rust, no C toolchain. No FEC-decode / PLC in the
 # decoder (empty input errors), so the voice engine renders lost frames as
-# silence; see crates/modules/apps/chat/src/voice.
+# silence; see crates/services/media.
 opus-rs = "0.1"
 
 # commonware — one ecosystem, version-aligned (see auto-memory reference_qmdb_commonware).
@@ -337,7 +269,7 @@ sha3 = "0.10"
 unicode-normalization = "0.1"
 # tests only: isolated on-disk module data dirs.
 tempfile = "3"
-# user-key v1 at-rest custody (bin/node/src/userkey.rs only): BIP39
+# user-key v1 at-rest custody (crates/keystore/src/userkey.rs only): BIP39
 # wordlist + entropy checksum (the PBKDF2 `to_seed` path is deliberately
 # unused — see the identity-onboarding design doc's custody model),
 # argon2id KEK derivation, and XChaCha20-Poly1305 AEAD. zeroize scrubs the
@@ -377,29 +309,34 @@ wasmtime = "=46.0.3"
 wit-bindgen = "0.57"
 
 # internal — kernel crates (the platform)
-sdk = { path = "crates/kernel/sdk" }
+#
+# THE MODULE CONTRACT IS ANOTHER REPO. `sdk`, the module SDK a guest compiles
+# against, the wasm host that runs one, and the leaf types they share all live
+# in ducktape-industries/ducktape-sdk and reach this workspace as git
+# dependencies on its `dev` branch. Consumers keep `{ workspace = true }`.
+sdk = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "sdk" }
 # the module SDK a guest port compiles against. wasm-only: every module's
 # `guest` feature turns it on, and only guest-builder's shell workspace does.
-ducktape-module-sdk = { path = "crates/module-sdk" }
-keyscheme = { path = "crates/kernel/keyscheme" }
+ducktape-module-sdk = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "ducktape-module-sdk" }
+keyscheme = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "keyscheme" }
 # dev-only shared test doubles for the sdk boundary traits (TestCtx +
 # in-memory MerkleStore). MAY ONLY appear in `[dev-dependencies]` of consumers —
 # the Module Rule (modules link only sdk + wire surfaces) is untouched.
-sdk-testkit = { path = "crates/kernel/sdk-testkit" }
+sdk-testkit = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "sdk-testkit" }
 host = { path = "crates/kernel/host" }
 node = { path = "crates/kernel/node" }
 consensus = { path = "crates/kernel/consensus" }
 statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
 indexer = { path = "crates/kernel/indexer" }
-blobstore = { path = "crates/kernel/blobstore" }
+blobstore = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "blobstore" }
 # keyed with the underscore ON PURPOSE: module crates declare a feature named
 # `index-guest` (the guest-builder --index contract), and cargo refuses a
 # feature sharing its name with a non-optional dependency key.
-index_guest = { path = "crates/kernel/index-guest", package = "index-guest" }
-wasm-host = { path = "crates/kernel/wasm-host" }
-module-artifact = { path = "crates/kernel/module-artifact" }
-node-work = { path = "crates/kernel/node-work" }
+index_guest = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "index-guest" }
+wasm-host = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "wasm-host" }
+module-artifact = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "module-artifact" }
+node-work = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "node-work" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
 # internal — module impl crates
@@ -410,52 +347,55 @@ node-work = { path = "crates/kernel/node-work" }
 # links a module crate itself except a test that runs the native module (a
 # parity suite), and that names it by path, never through this table:
 # `crates/topology/tests/sdk_shaped.rs` holds the line.
-kv = { package = "kv-wire", path = "crates/modules/system/kv/wire" }
-kv-wire = { path = "crates/modules/system/kv/wire" }
-acl = { package = "acl-wire", path = "crates/modules/system/acl/wire" }
-acl-wire = { path = "crates/modules/system/acl/wire" }
-valset = { package = "valset-wire", path = "crates/modules/system/valset/wire" }
-valset-wire = { path = "crates/modules/system/valset/wire" }
-governance = { package = "governance-wire", path = "crates/modules/system/governance/wire" }
-governance-wire = { path = "crates/modules/system/governance/wire" }
-identity = { package = "identity-wire", path = "crates/modules/system/identity/wire" }
-identity-wire = { path = "crates/modules/system/identity/wire" }
-modules = { package = "modules-wire", path = "crates/modules/system/modules/wire" }
-modules-wire = { path = "crates/modules/system/modules/wire" }
-saga = { package = "saga-wire", path = "crates/modules/system/saga/wire" }
-saga-wire = { path = "crates/modules/system/saga/wire" }
-capability = { package = "capability-wire", path = "crates/modules/system/capability/wire" }
-capability-wire = { path = "crates/modules/system/capability/wire" }
-dispatch = { package = "dispatch-wire", path = "crates/modules/system/dispatch/wire" }
-dispatch-wire = { path = "crates/modules/system/dispatch/wire" }
-attribution = { package = "attribution-wire", path = "crates/modules/system/attribution/wire" }
-attribution-wire = { path = "crates/modules/system/attribution/wire" }
-gateway = { package = "gateway-wire", path = "crates/modules/system/gateway/wire" }
-gateway-wire = { path = "crates/modules/system/gateway/wire" }
-forge = { package = "forge-wire", path = "crates/modules/apps/forge/wire" }
-forge-wire = { path = "crates/modules/apps/forge/wire" }
-design = { path = "crates/design" }
-pages = { package = "pages-wire", path = "crates/modules/apps/pages/wire" }
-pages-wire = { path = "crates/modules/apps/pages/wire" }
-chat = { package = "chat-wire", path = "crates/modules/apps/chat/wire" }
-chat-wire = { path = "crates/modules/apps/chat/wire" }
-chat-message = { path = "crates/modules/apps/chat/message" }
-agent = { package = "agent-wire", path = "crates/modules/apps/agent/wire" }
-agent-wire = { path = "crates/modules/apps/agent/wire" }
-runs = { package = "runs-wire", path = "crates/modules/apps/runs/wire" }
-runs-wire = { path = "crates/modules/apps/runs/wire" }
-tasks = { package = "tasks-wire", path = "crates/modules/apps/tasks/wire" }
-tasks-wire = { path = "crates/modules/apps/tasks/wire" }
-boards = { package = "boards-wire", path = "crates/modules/apps/boards/wire" }
-boards-wire = { path = "crates/modules/apps/boards/wire" }
-automations = { package = "automations-wire", path = "crates/modules/apps/automations/wire" }
-automations-wire = { path = "crates/modules/apps/automations/wire" }
-inbox = { package = "inbox-wire", path = "crates/modules/apps/inbox/wire" }
-inbox-wire = { path = "crates/modules/apps/inbox/wire" }
-files = { package = "files-wire", path = "crates/modules/apps/files/wire" }
-files-wire = { path = "crates/modules/apps/files/wire" }
-collaboration = { package = "collaboration-wire", path = "crates/modules/apps/collaboration/wire" }
-collaboration-wire = { path = "crates/modules/apps/collaboration/wire" }
+# EVERY WIRE CRATE LIVES IN ducktape-sdk. The names below are unchanged, so a
+# consumer still writes `identity = { workspace = true }` and still links
+# `identity-wire`; only where the bytes come from moved.
+kv = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "kv-wire" }
+kv-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "kv-wire" }
+acl = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "acl-wire" }
+acl-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "acl-wire" }
+valset = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "valset-wire" }
+valset-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "valset-wire" }
+governance = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "governance-wire" }
+governance-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "governance-wire" }
+identity = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "identity-wire" }
+identity-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "identity-wire" }
+modules = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "modules-wire" }
+modules-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "modules-wire" }
+saga = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "saga-wire" }
+saga-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "saga-wire" }
+capability = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "capability-wire" }
+capability-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "capability-wire" }
+dispatch = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "dispatch-wire" }
+dispatch-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "dispatch-wire" }
+attribution = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "attribution-wire" }
+attribution-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "attribution-wire" }
+gateway = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "gateway-wire" }
+gateway-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "gateway-wire" }
+forge = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "forge-wire" }
+forge-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "forge-wire" }
+design = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "design" }
+pages = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "pages-wire" }
+pages-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "pages-wire" }
+chat = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "chat-wire" }
+chat-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "chat-wire" }
+chat-message = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "chat-message" }
+agent = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "agent-wire" }
+agent-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "agent-wire" }
+runs = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "runs-wire" }
+runs-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "runs-wire" }
+tasks = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "tasks-wire" }
+tasks-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "tasks-wire" }
+boards = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "boards-wire" }
+boards-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "boards-wire" }
+automations = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "automations-wire" }
+automations-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "automations-wire" }
+inbox = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "inbox-wire" }
+inbox-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "inbox-wire" }
+files = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "files-wire" }
+files-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "files-wire" }
+collaboration = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "collaboration-wire" }
+collaboration-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "collaboration-wire" }
 # internal — off-chain service crates
 agent-service = { path = "crates/services/agent" }
 airlock-service = { path = "crates/services/airlock" }
@@ -469,8 +409,8 @@ provider-host = { path = "crates/services/provider" }
 sandbox-host = { path = "crates/services/sandbox" }
 # internal — cross-plane libraries: neither a consensus module nor a service.
 # duckdns is the `.duck` naming library the `gateway` module embeds and the
-# composing binaries validate names through (see the members list).
-duckdns = { path = "crates/duckdns" }
+# composing binaries validate names through.
+duckdns = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "duckdns" }
 # the device keystore, linked by both the CLI and the desktop app.
 keystore = { path = "crates/keystore" }
 # the WebAuthn RP page client (ops/auth-page): request URL, loopback callback,
@@ -478,10 +418,10 @@ keystore = { path = "crates/keystore" }
 authpage = { path = "crates/authpage" }
 # the run envelope's magic + headless composer, linked by the CLI, the compute
 # service and the desktop app.
-run-envelope = { path = "crates/run-envelope" }
+run-envelope = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "run-envelope" }
 # the plain git read types `wasm_host::OdbBacking` speaks and `forge`'s read
 # policy names — a zero-dep leaf on purpose, so naming it drags in nothing.
-git-primitives = { path = "crates/git-primitives" }
+git-primitives = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "git-primitives" }
 # a ducktape workspace on disk + the join ceremony, linked by the CLI and the
 # desktop app.
 workspace-config = { path = "crates/workspace-config" }
@@ -494,12 +434,15 @@ ducktape-home = { path = "crates/ducktape-home" }
 topology = { path = "crates/topology" }
 # dev-only: the source lints' shared "is this shipped code" judgement.
 source-lint = { path = "crates/testing/source-lint" }
-duckfs-core = { path = "crates/duckfs/core" }
-duckfs-disk = { path = "crates/duckfs/disk" }
+duckfs-core = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "duckfs-core" }
+duckfs-disk = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "duckfs-disk" }
 duckfs-client = { path = "crates/duckfs/client" }
 ducktape-rpc = { path = "crates/rpc-client" }
-directory = { path = "crates/examples/directory" }
-greeter = { path = "crates/examples/greeter" }
+# the demo modules the kernel suites compose against — dev-only, and they
+# moved out with the rest of the example set. They are MODULES, so they ship
+# from ducktape-modules, not from the sdk repo the wire surfaces live in.
+directory = { git = "https://github.com/ducktape-industries/ducktape-modules", branch = "dev", package = "directory" }
+greeter = { git = "https://github.com/ducktape-industries/ducktape-modules", branch = "dev", package = "greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
 wireguard = { path = "crates/networking/wireguard" }
 # default-features off at the workspace level: the `runtime` feature (sockets,
@@ -528,28 +471,6 @@ rand_core = "0.10.1"
 # always built optimized. build-time only; artifacts and semantics unchanged.
 # Native build scripts are optimized independently from application code.
 [profile.dev.build-override]
-opt-level = 2
-
-[profile.dev.package.ducktape-app]
-debug = 0
-opt-level = 0
-
-# Keep native UI unit test code compact on the default test worker stack.
-[profile.test.package.ducktape-app]
-debug = 0
-opt-level = 1
-
-# Optimize the native render and text stack without slowing unrelated workspace crates.
-[profile.dev.package.gpui-pre]
-opt-level = 2
-
-[profile.dev.package.gpui-base]
-opt-level = 2
-
-[profile.dev.package.gpui-component]
-opt-level = 2
-
-[profile.dev.package.design]
 opt-level = 2
 
 [profile.dev.package.fontdb]
@@ -645,7 +566,7 @@ opt-level = 3
 opt-level = 3
 
 # The sign-in unlock, and every signed write after it, runs one argon2id pass
-# over a 64 MiB buffer (`bin/node/src/userkey.rs` DEFAULT_M_KIB) — the KDF is
+# over a 64 MiB buffer (`crates/keystore/src/userkey.rs` DEFAULT_M_KIB) — the KDF is
 # SUPPOSED to be expensive, but only at its release speed. Unoptimized it is
 # ~15x that: `target/debug/ducktape user key unlock` measured 1.85 s per
 # derivation on this box, against 0.00 s for the process spawn and 0.00 s for

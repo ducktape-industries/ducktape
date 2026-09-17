@@ -1,11 +1,13 @@
 # ducktape build + install entry points.
 #
 # `make node` / `make coordinator` build the runnable product surfaces (the
-# networked node daemon and the untrusted UDP coordinator). `make install`
-# installs the `ducktape` operator CLI and the desktop app — Ducktape.app on
-# macOS, the binary plus its `x-scheme-handler/duck` desktop entry on Linux.
-# `make test`
+# networked node daemon and the untrusted UDP coordinator). `make install-node`
+# installs the `ducktape` operator CLI beside its founding set. `make test`
 # is the full local verification gate — run it before every push.
+#
+# The desktop app, its launcher and the views it mounts live in
+# ducktape-industries/ducktape-app; their build and install targets went
+# with them.
 
 CARGO ?= cargo
 # every build/test recipe resolves against the COMMITTED lock: a guest's wasm
@@ -17,7 +19,7 @@ LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app app-release release-app publish-app airlock-gateway-image rcodesign views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check wasm-rebuild-refresh labs-gate audit
+.PHONY: all airlock-gateway-image rcodesign dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install-node install-coordinator test clean wasm-embed-check labs-gate audit
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -53,17 +55,15 @@ prereqs:
 all: prereqs
 	$(CARGO) build $(LOCKED) --workspace
 
-## the app dev loop: found the "demo" localnet anew (stopping and clearing
-## what a previous lap left) from the modules, index guests and views this
-## build staged, start its node and the local compute/agent/airlock services,
-## sync ducktape's own repo into that node's forge (dogfood-forge — non-fatal
-## when origin is unreachable), then run the desktop app against it in the
-## foreground. Ctrl-C quits the app and leaves the node and services up for
-## `cargo run -p ducktape-app`; the next `make dev` replaces them.
+## the dev loop: found the "demo" localnet anew (stopping and clearing what a
+## previous lap left) from the modules and index guests this build staged,
+## start its node and the local compute/agent/airlock services, and sync
+## ducktape's own repo into that node's forge (dogfood-forge — non-fatal when
+## origin is unreachable).
 ## `make dev-clear` stops that background runtime without deleting its state,
 ## while `make demo-clear` removes the workspace entirely. `make dev YES=1`
 ## installs every agent CLI the checklist would offer without asking.
-dev: views
+dev:
 	@bash ops/dev.sh
 
 ## stop the demo node and compute/agent/airlock services left by `make dev`.
@@ -137,159 +137,6 @@ coordinator:
 coordinator-smoke:
 	$(CARGO) test $(LOCKED) -p coordinator-bin
 
-# Pin wasm-tools to the component encoder used by guest-builder.
-WASM_TOOLS_VERSION = 1.$(shell sed -n 's/^wit-component = "=0\.\([0-9.]*\)".*/\1/p' bin/guest-builder/Cargo.toml | head -n1)
-WASM_TOOLS_ROOT = $(CURDIR)/target/wasm-tools/$(WASM_TOOLS_VERSION)
-WASM_TOOLS_BIN = $(WASM_TOOLS_ROOT)/bin/wasm-tools
-
-$(WASM_TOOLS_BIN):
-	CARGO_TARGET_DIR="$(WASM_TOOLS_ROOT)/build" $(CARGO) install wasm-tools \
-		--version "$(WASM_TOOLS_VERSION)" --locked --root "$(WASM_TOOLS_ROOT)"
-
-## Compile Rust-authored views and stage dynamically loaded WASM components.
-VIEW_PACKAGES = $(shell awk '/^\[/{ in_package = ($$0 == "[package]") } in_package && /^name *= *"/ { split($$0, part, "\""); printf "-p %s ", part[2] }' crates/views/*/Cargo.toml)
-
-views: $(WASM_TOOLS_BIN)
-	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" CARGO="$(CARGO)" bash ops/build-views.sh $(VIEW_PACKAGES)
-
-## Rebuild committed view sources in two isolated roots and compare bytes.
-views-repro-check: $(WASM_TOOLS_BIN)
-	bash ops/views-repro-check.sh "$(WASM_TOOLS_ROOT)"
-
-ifeq ($(UNAME_S),Darwin)
-## Build native Ducktape.app and DMG using Apple's packaging tools.
-## DUCKTAPE_CODESIGN_IDENTITY selects Developer ID; default is ad-hoc.
-## DUCKTAPE_NOTARY_KEY, DUCKTAPE_NOTARY_KEY_ID, DUCKTAPE_NOTARY_ISSUER
-## together submit and staple the signed image. See app/README.md.
-app: prereqs views
-	CARGO="$(CARGO)" bash ops/bundle-app-macos.sh
-
-app-release:
-	@test -n "$$DUCKTAPE_CODESIGN_IDENTITY" && test "$$DUCKTAPE_CODESIGN_IDENTITY" != "-" || \
-	  { echo "app-release requires DUCKTAPE_CODESIGN_IDENTITY (Developer ID Application)" >&2; exit 1; }
-	@$(MAKE) app
-
-## the archive a release offers: a Developer ID-signed, notarized bundle
-## (every offered release is), the ticket stapled to it, packed by
-## ops/release/archive.sh into
-## target/release-archive/Ducktape-<sha7>-macos-<arch>.tar.zst — the script
-## refuses an ad-hoc or unnotarized bundle by name, so it is the host-side
-## verifier on both paths below. Publish it with `make publish-app`.
-##
-## ONE signing path per environment, chosen by DUCKTAPE_SIGN_VIA:
-##   unset    the local Developer ID: `app-release` with the three
-##            DUCKTAPE_NOTARY_* required (not optional as for `app`).
-##   airlock  the airlock gateway signs: `app` stages Ducktape.app UNSIGNED,
-##            `ducktape release sign-bundle` sends it to the enclave holding
-##            the apple-codesign credential DUCKTAPE_SIGN_CREDENTIAL through
-##            NODE (the local node's http base) and unpacks the signed,
-##            notarized, stapled bundle back in place. Set together with
-##            DUCKTAPE_CODESIGN_IDENTITY or any DUCKTAPE_NOTARY_* it refuses
-##            (`sign_path_conflict`): there is no fallback from one to the other.
-##     DUCKTAPE_SIGN_VIA=airlock DUCKTAPE_SIGN_CREDENTIAL=release-sign NODE=http://127.0.0.1:8844 make release-app
-ifeq ($(DUCKTAPE_SIGN_VIA),airlock)
-release-app:
-	@test -z "$$DUCKTAPE_CODESIGN_IDENTITY" -a -z "$$DUCKTAPE_NOTARY_KEY" -a -z "$$DUCKTAPE_NOTARY_KEY_ID" -a -z "$$DUCKTAPE_NOTARY_ISSUER" || \
-	  { echo "release-app: sign_path_conflict: DUCKTAPE_SIGN_VIA=airlock with DUCKTAPE_CODESIGN_IDENTITY or DUCKTAPE_NOTARY_* set; one signing path per environment" >&2; exit 2; }
-	@test -n "$(DUCKTAPE_SIGN_CREDENTIAL)" -a -n "$(NODE)" || \
-	  { echo "release-app: DUCKTAPE_SIGN_VIA=airlock needs DUCKTAPE_SIGN_CREDENTIAL=<apple-codesign credential name> and NODE=<the local node's http base>" >&2; exit 2; }
-	@DUCKTAPE_SIGN_VIA=airlock $(MAKE) app
-	"$${DUCKTAPE_BIN:-$(CARGO_BIN)/ducktape}" release sign-bundle target/app-bundle/Ducktape.app \
-	  --credential "$(DUCKTAPE_SIGN_CREDENTIAL)" --node "$(NODE)" \
-	  --out target/app-bundle/Ducktape-signed.tar.zst --unpack-into target/app-bundle
-	bash ops/release/archive.sh --from target/app-bundle/Ducktape.app --out-dir "$(RELEASE_ARCHIVE_DIR)"
-else ifeq ($(DUCKTAPE_SIGN_VIA),)
-release-app:
-	@test -n "$$DUCKTAPE_NOTARY_KEY" -a -n "$$DUCKTAPE_NOTARY_KEY_ID" -a -n "$$DUCKTAPE_NOTARY_ISSUER" || \
-	  { echo "release-app requires DUCKTAPE_NOTARY_KEY, DUCKTAPE_NOTARY_KEY_ID and DUCKTAPE_NOTARY_ISSUER: a release is notarized" >&2; exit 1; }
-	@$(MAKE) app-release
-	bash ops/release/archive.sh --from target/app-bundle/Ducktape.app --out-dir "$(RELEASE_ARCHIVE_DIR)"
-else
-release-app:
-	@echo "release-app: DUCKTAPE_SIGN_VIA=$(DUCKTAPE_SIGN_VIA) is not a signing path (unset = local Developer ID, airlock = the airlock gateway)" >&2; exit 2
-endif
-
-## install the operator CLI and desktop app without requiring root
-install: install-node install-app
-
-## put the built bundle under the launcher: `ducktape-launcher install` seeds
-## it as a release, swaps it into /Applications (DUCKTAPE_INSTALL_DIR
-## overrides; the directory must be writable by this user) and writes the
-## update state the app and the launcher share. The bundle ships its own
-## launcher (Contents/MacOS/ducktape-launcher is its CFBundleExecutable),
-## signed with the rest of it, so nothing is added or re-sealed here.
-install-app: app
-	target/release/ducktape-launcher install --from target/app-bundle/Ducktape.app
-else
-## where the Linux desktop entry and its icon land — the XDG per-user roots,
-## so `make install-app` needs no root.
-DESKTOP_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/applications
-ICON_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/icons/hicolor/scalable/apps
-
-## install the ducktape operator CLI and the desktop app without requiring root
-install: install-node install-app
-
-## build the desktop app binary, its launcher, and the views it loads, and
-## stage them whole as one release under target/app-release:
-## `{ducktape-launcher, ducktape-app, views/*.wasm}` — what `ducktape-launcher
-## install --from` takes and what ops/release/archive.sh packs.
-app: prereqs views
-	$(CARGO) build $(LOCKED) --release -p ducktape-app -p app-launcher
-	rm -rf target/app-release
-	mkdir -p target/app-release/views
-	install -m 0755 target/release/ducktape-app target/release/ducktape-launcher target/app-release/
-	install -m 0644 target/views/*.wasm target/app-release/views/
-
-## the archive a release offers: the staged release packed by
-## ops/release/archive.sh into
-## target/release-archive/Ducktape-<sha7>-linux-<arch>.tar.zst. Publish it
-## with `make publish-app`.
-release-app: app
-	bash ops/release/archive.sh --from target/app-release --out-dir "$(RELEASE_ARCHIVE_DIR)"
-
-## install the desktop app under its launcher and REGISTER THE duck:// SCHEME
-## with the desktop. The release is staged whole (`ducktape-launcher`,
-## `ducktape-app`, `views/`) and `ducktape-launcher install` seeds it as
-## `$XDG_DATA_HOME/ducktape/releases/<sha>`, points `current` at it, writes
-## the update state, and installs the `.desktop` entry with `Exec=` at
-## `current/ducktape-launcher %u` — an absolute path, since a desktop
-## session inherits no shell PATH, and the launcher, since that is what
-## flips to a staged update and passes the URL on to the app. The entry's
-## `MimeType=x-scheme-handler/duck` is what makes
-## `xdg-open 'duck://forge/ducktape/1?net=<digest>'` reach the app; its
-## `%u` puts the URL in argv where the app reads it; its name is the app id
-## the window reports, so the running window associates with it (icon,
-## pinned-app identity).
-install-app: app
-	mkdir -p "$(ICON_DEST)"
-	install -m 0644 app/assets/icon.svg "$(ICON_DEST)/ducktape.svg"
-	target/release/ducktape-launcher install --from target/app-release
-	-update-desktop-database "$(DESKTOP_DEST)"
-endif
-
-## where `release-app` leaves its archives and `archives.txt` (one
-## `<os>-<arch>=<path>` line per platform; a rerun replaces its own line).
-RELEASE_ARCHIVE_DIR ?= target/release-archive
-
-## publish a built desktop-app release to a network's duckfs: compose +
-## seal the manifest, sign it with the release wallet, `fs put` the archives,
-## the manifest and its signature under /shared/releases. Runs
-## ops/release/publish.sh; every flag is a variable. ARCHIVES defaults to
-## what `make release-app` wrote to $(RELEASE_ARCHIVE_DIR)/archives.txt, so
-## after a `release-app` on this machine the archive list may be left out;
-## a release for several platforms names every archive explicitly:
-##   make publish-app NODE=http://127.0.0.1:8844 RELEASE_KEY=~/.ducktape/release/keys/release.key \
-##        SEQUENCE=18 DISPLAY="2026.09.2+9d71b254a" \
-##        ARCHIVES="macos-aarch64=target/Ducktape-macos-aarch64.tar.zst linux-x86_64=target/Ducktape-linux-x86_64.tar.zst"
-ARCHIVES ?= $(shell cat "$(RELEASE_ARCHIVE_DIR)/archives.txt" 2>/dev/null)
-publish-app:
-	@test -n "$(NODE)" -a -n "$(RELEASE_KEY)" -a -n "$(SEQUENCE)" -a -n "$(DISPLAY)" -a -n "$(ARCHIVES)" || \
-	  { echo "publish-app needs NODE, RELEASE_KEY, SEQUENCE, DISPLAY and ARCHIVES (see the comment above)" >&2; exit 2; }
-	DUCKTAPE_BIN="$${DUCKTAPE_BIN:-$(CARGO_BIN)/ducktape}" bash ops/release/publish.sh \
-	  --node "$(NODE)" --key "$(RELEASE_KEY)" --sequence "$(SEQUENCE)" --display "$(DISPLAY)" \
-	  $(if $(NOTES_URL),--notes-url "$(NOTES_URL)") \
-	  $(foreach archive,$(ARCHIVES),--archive "$(archive)")
-
 # where `cargo install` puts the binary, and so where the installed binary
 # looks for its founding set: workspace_config::modules_dir() reads
 # $DUCKTAPE_MODULES_DIR, else `modules/` beside the executable.
@@ -322,7 +169,7 @@ install-coordinator:
 	install -m 755 target/release/coordinator "$(BIN_DEST)/ducktape-coordinator"
 
 ## the full LOCAL verification gate (no hosted CI by design — run this before
-## every push): the wasm-artifact drift gate, the rust workspace including the
+## every push): the no-embedded-wasm lint, the rust workspace including the
 ## process-level e2e suites (bin/node spawns a real 4-node cluster over localhost
 ## TCP, bin/noded drives a real spawned daemon over http/ws), the consensus
 ## sim-feature suite, and a build of the noded + simnode binaries the test
@@ -342,7 +189,7 @@ install-coordinator:
 # is still a bug worth fixing in the harnesses — see #887.
 TEST_TMPDIR := $(CURDIR)/target/test-tmp
 
-test: wasm-modules-check wasm-embed-check
+test: wasm-embed-check
 # The reclaim may not fail the gate: a first run has nothing to clean.
 	-rm -rf "$(TEST_TMPDIR)" 2>/dev/null
 	mkdir -p "$(TEST_TMPDIR)"
@@ -384,213 +231,16 @@ test: wasm-modules-check wasm-embed-check
 # errors. Serial + its own invocation is the isolation. See #887.
 	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test $(LOCKED) -p node-bin --bin ducktape -- --ignored --test-threads=1
 	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test $(LOCKED) -p consensus --features sim
-# ducktape-app rides this line for a reason: `cargo test` builds the TEST
-# target, which links dev-dependencies, so a product path reaching for a
-# dev-only crate compiles under every test lane and breaks only the BINARY.
+# the bins ride this line for a reason: `cargo test` builds the TEST target,
+# which links dev-dependencies, so a product path reaching for a dev-only
+# crate compiles under every test lane and breaks only the BINARY.
 # That is not hypothetical — it shipped and sat on dev for 81 commits.
-	$(CARGO) build $(LOCKED) -p noded-bin -p simnode -p ducktape-app
+	$(CARGO) build $(LOCKED) -p noded-bin -p simnode
 
-## rebuild every wasm guest into its artifact and refresh EVERY committed copy
-## in one sweep (the canonical artifact in the module's own directory, which
-## the build stages into the founding set, + the kernel test fixtures), so the
-## copies can never drift apart. the componentizer is the `wit-component` crate
-## guest-builder links (pinned in bin/guest-builder/Cargo.toml); the wasm32
-## target uses rust-toolchain.toml. every guest is built ALONE, out of the
-## platform repository at this checkout's HEAD (bin/guest-builder), so HEAD must
-## be pushed first; each module's guest.lock records the revision and the
-## registry versions its artifact came from and seeds its next build, so a
-## crates.io publish never moves the bytes, and a revision that changes none of
-## what a module compiles leaves its bytes as they are. component bytes ARE
-## toolchain-dependent: a rebuild on a different rustc may legitimately differ
-## from the committed bytes — move the channel and the whole set together.
-## `wasm-modules-check` guards the copies' mutual consistency,
-## `wasm-rebuild-check` every artifact against a rebuild of its source, and
-## `wasm-repro-check` that nothing builder-local reaches the bytes.
-#
-# Every product/example module carries its own guest port (src/guest.rs behind
-# the `guest` feature); guest-builder builds it out of the repository and
-# writes the canonical component.wasm and guest.lock into the module directory
-# itself. The five kernel-fixture test guests (hello, hello-replacement, noop,
-# sibling, object) keep their standalone crates/guests workspaces below.
-BUILDER_MODULES := \
-  crates/examples/directory \
-  crates/modules/apps/inbox crates/modules/apps/pages crates/modules/apps/agent \
-  crates/modules/apps/automations crates/modules/apps/collaboration \
-  crates/modules/apps/runs \
-  crates/modules/apps/tasks crates/modules/apps/chat crates/modules/apps/files \
-  crates/modules/apps/forge crates/modules/apps/boards \
-  crates/modules/system/attribution crates/modules/system/dispatch \
-  crates/modules/system/capability crates/modules/system/identity \
-  crates/modules/system/gateway crates/modules/system/governance \
-  crates/modules/system/saga crates/modules/system/acl crates/modules/system/kv \
-  crates/modules/system/modules crates/modules/system/valset
-
-# Modules that additionally ship an INDEX guest (src/index_guest.rs behind the
-# `index-guest` feature): guest-builder --index writes the canonical
-# index.wasm (core wasm, no componentize) into the module directory; the
-# build stages it into the founding set as `<id>.index.wasm` and a genesis
-# carries it. The shell file IS the declaration: noded's build script stages
-# an index guest for exactly the module crates that carry src/index_guest.rs,
-# so this list must name exactly those. The reference testmap mapper is the
-# indexer crate's test fixture and rides the same sweep.
-INDEX_MODULES := \
-  crates/modules/apps/chat crates/modules/apps/tasks crates/modules/apps/pages \
-  crates/modules/apps/inbox crates/modules/apps/runs crates/modules/system/saga \
-  crates/kernel/index-guest/testmap
-
-# The netstack guest: the reachability machine as a `ducktape:netstack`
-# component (crates/networking/netstack-machine/src/guest.rs behind the same
-# `guest` feature convention). Not a consensus module, so no kernel fixture
-# copy and no place in a genesis: the build stages it into the founding set
-# as `netstack.component.wasm`, bin/node reads it from there at boot, and
-# the netstack-wasm scenario lane reads it from the crate directory.
-NETSTACK_GUEST := crates/networking/netstack-machine
-
-# guest-builder is built and run out of THIS CHECKOUT'S OWN target directory,
-# never the one a host config shares between worktrees.
-#
-# The binary bakes its platform root in at compile time, so the one sitting in
-# a shared target belongs to whichever worktree built it last. Run that one and
-# it refuses every module you own — "<module> is outside the platform checkout
-# <someone else's worktree>" — and it does so MID-SWEEP, because a sibling's
-# build can land between two guests of yours. `touch bin/guest-builder/src/main.rs`
-# only wins the race until the next session builds; a target directory of our
-# own ends it. It is a sibling of `target/guest-builder/<id>/`, where the
-# builder puts each module's ephemeral build tree, and never the same path.
-#
-# `ops/build-guest-rootfs.sh` and `ops/wasm-repro-check.sh` take the same
-# precaution for the same reason.
-GUEST_BUILDER_DIR := $(CURDIR)/target/guest-builder-bin
-GUEST_BUILDER := $(CARGO) run -q $(LOCKED) --target-dir $(GUEST_BUILDER_DIR) -p guest-builder --
-# the same command as a person would type it, for the advice a failing gate prints.
-GUEST_BUILDER_SHOWN := $(CARGO) run --target-dir $(GUEST_BUILDER_DIR) -p guest-builder --
-
-# The five standalone guests under `crates/guests`, whose components are kernel
-# test fixtures. They are not modules: each is its OWN workspace binding
-# `crates/module-sdk/wit` through `wit_bindgen::generate!`, built with plain
-# cargo and componentized, never through guest-builder's shell workspace. They
-# carry no `guest.lock`, so nothing here can be scoped by `CRATES`.
-#
-# One record per BUILD, `:`-separated, no spaces in any field:
-#
-#     <id>:<crate dir>:<cargo features>:<core wasm>:<artifact,artifact,…>
-#
-# The first artifact is the one the build writes; the rest are copies of it.
-# `object` appears twice because it builds again under its `replacement`
-# feature, and `hello` lists three artifacts because its component is pinned in
-# both fixture homes as well as beside the crate. That irregularity is why
-# these were once six hand-written stanzas — but two copies of the shapes is
-# how a gate comes to check something the build no longer produces, so there is
-# one copy now and both targets read it.
-FIXTURE_GUESTS := \
-  hello:crates/guests/hello-wasm::hello_wasm:crates/guests/hello-wasm/component.wasm,crates/kernel/wasm-host/tests/fixtures/hello.component.wasm,crates/kernel/host/tests/fixtures/hello.component.wasm \
-  noop:crates/guests/noop-wasm::noop_wasm:crates/guests/noop-wasm/component.wasm,crates/kernel/host/tests/fixtures/noop.component.wasm \
-  hello-replacement:crates/guests/hello-wasm-replacement::hello_wasm_replacement:crates/kernel/host/tests/fixtures/hello-replacement.component.wasm \
-  sibling:crates/guests/sibling-wasm::sibling_wasm:crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm \
-  object:crates/guests/object-wasm::object_wasm:crates/kernel/wasm-host/tests/fixtures/object.component.wasm \
-  object-replacement:crates/guests/object-wasm:replacement:object_wasm:crates/kernel/wasm-host/tests/fixtures/object-replacement.component.wasm
-
-# The WIT these five bind. Dirty here moves their bytes exactly as dirty source
-# in the crate itself does, so both are part of "their source at HEAD".
-FIXTURE_GUEST_WIT := crates/module-sdk/wit
-
-# ONE target directory for all five, named explicitly. Without `--target-dir`
-# the output path depends on the operator's cargo config: a `[build] target-dir`
-# in `~/.cargo/config.toml` applies to these standalone workspaces too, so cargo
-# writes to the shared directory while the componentize step reads
-# `<crate>/target/…` and fails with "No such file or directory". That is not
-# hypothetical — it is why a stale fixture could not be rebuilt with the command
-# the docs name. Sharing one directory between the five also means they compile
-# wit-bindgen's tree once (~140s cold) instead of five times; warm, each is ~1s.
-FIXTURE_TARGET_DIR := $(CURDIR)/target/fixture-guests
-
-# Parse one record and build it. Sourced by every recipe that walks
-# FIXTURE_GUESTS, so the parsing lives in one place too.
-# `cut` rather than `$${rec#*:}` on purpose: this is a variable definition, not a
-# recipe, and make reads `#` there as the start of a comment — a parameter
-# expansion silently truncates the function mid-body and the recipe dies with
-# "Syntax error: end of file unexpected". `make -n` does not catch it, because
-# it never runs the shell.
-FIXTURE_GUEST_SH = \
-  fixture_parse() { \
-    fg_id=$$(echo "$$1" | cut -d: -f1); \
-    fg_dir=$$(echo "$$1" | cut -d: -f2); \
-    fg_features=$$(echo "$$1" | cut -d: -f3); \
-    fg_core=$$(echo "$$1" | cut -d: -f4); \
-    fg_artifacts=$$(echo "$$1" | cut -d: -f5 | tr , ' '); \
-  }; \
-  fixture_build() { \
-    fixture_parse "$$1"; \
-    features=""; [ -z "$$fg_features" ] || features="--features $$fg_features"; \
-    ( cd "$$fg_dir" && $(CARGO) build $(LOCKED) --target-dir "$(FIXTURE_TARGET_DIR)" \
-        --target wasm32-unknown-unknown --release $$features ) || return 1; \
-    $(GUEST_BUILDER) componentize \
-      "$(FIXTURE_TARGET_DIR)/wasm32-unknown-unknown/release/$$fg_core.wasm" --out "$$2"; \
-  };
-
-wasm-modules:
-	@for m in $(BUILDER_MODULES); do \
-	  id=$$(basename $$m) && \
-	  $(GUEST_BUILDER) $$m && \
-	  cp $$m/component.wasm \
-	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
-	done
-	@for m in $(INDEX_MODULES); do \
-	  $(GUEST_BUILDER) --index $$m || exit 1; \
-	done
-	$(GUEST_BUILDER) $(NETSTACK_GUEST)
-	# The five standalone fixture guests, from the one description of them that
-	# wasm-rebuild-check reads too (FIXTURE_GUESTS). Each owns a committed lock,
-	# so $(LOCKED) applies same as everywhere else; their components are kernel
-	# test fixtures, nothing the genesis hash pins.
-	@$(FIXTURE_GUEST_SH) \
-	for rec in $(FIXTURE_GUESTS); do \
-	  fixture_parse "$$rec"; \
-	  canonical=$${fg_artifacts%% *}; \
-	  echo "$(GUEST_BUILDER_SHOWN) componentize -> $$canonical"; \
-	  fixture_build "$$rec" "$$canonical" || exit 1; \
-	  for a in $$fg_artifacts; do \
-	    [ "$$a" = "$$canonical" ] || cp "$$canonical" "$$a" || exit 1; \
-	  done; \
-	done
-
-## the drift gate for the committed component artifacts: every copy of the SAME
-## module must be byte-identical (`node init` hashes the bundle into the
-## descriptor; the kernel test fixtures pin the same bytes).
-## toolchain-independent, so it rides the pre-push `test` gate; run
-## `make wasm-modules` to refresh the set.
-wasm-modules-check:
-	cmp crates/guests/hello-wasm/component.wasm \
-	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
-	cmp crates/guests/hello-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/hello.component.wasm
-	cmp crates/guests/noop-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/noop.component.wasm
-	@for m in $(BUILDER_MODULES); do \
-	  id=$$(basename $$m) && \
-	  cmp $$m/component.wasm \
-	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
-	done
-	@for m in $(INDEX_MODULES); do \
-	  test -f $$m/index.wasm || { echo "missing $$m/index.wasm (make wasm-modules)"; exit 1; }; \
-	done
-	@test -f $(NETSTACK_GUEST)/component.wasm \
-	  || { echo "missing $(NETSTACK_GUEST)/component.wasm (make wasm-modules)"; exit 1; }
-# every built guest carries its lock: the record of the revision and the
-# registry versions the artifact came from, without which a rebuild cannot
-# reproduce it.
-	@for m in $(BUILDER_MODULES) $(INDEX_MODULES) $(NETSTACK_GUEST); do \
-	  test -f $$m/guest.lock || { echo "missing $$m/guest.lock (make wasm-modules)"; exit 1; }; \
-	done
-# and no committed artifact may carry a builder-local absolute path. guest-builder
-# remaps the checkout, CARGO_HOME and RUSTUP_HOME prefixes to stable tokens (see
-# `remap_flags`), so a `/home/...` or `/Users/...` in the bytes means an artifact
-# built without that remap — the state where every box disagrees on every module.
-	@leaks=$$(git ls-files -z '*.wasm' | xargs -0 grep -laE '/home/|/Users/' || true); \
-	  test -z "$$leaks" || { \
-	    echo "builder host paths embedded in: $$leaks"; \
-	    echo "rebuild with make wasm-modules (guest-builder --remap-path-prefix)"; exit 1; }
-	@echo "wasm module artifacts are mutually consistent"
+# The wasm guest builder, the module SDK, and the wasm-modules /
+# wasm-modules-check / wasm-repro-check / wasm-rebuild-check /
+# wasm-rebuild-refresh targets that drove them all ship in ducktape-sdk now;
+# no replacement machinery lives here.
 
 ## the binary embeds no wasm (AGENTS.md, "No Embedded Wasm"): an
 ## include_bytes!/include_str! of a `.wasm` is allowed only in a test — a file
@@ -601,257 +251,6 @@ wasm-modules-check:
 ## answered by the parser rather than guessed. Its own fixtures run beside it.
 wasm-embed-check:
 	$(CARGO) test $(LOCKED) -p topology --test wasm_embed
-
-## the reproducibility gate: one guest built twice, in two scratch directories,
-## must be byte-identical and carry no host path. Needs the wasm32 target
-## and a pushed HEAD (which `wasm-modules-check` deliberately does
-## not), so it stands apart from the pre-push `test` gate. See
-## ops/wasm-repro-check.sh.
-wasm-repro-check:
-	@bash ops/wasm-repro-check.sh
-
-REBUILD_CHECK_DIR := $(CURDIR)/target/wasm-rebuild-check
-
-## the drift gate between an artifact and its source: rebuild every guest out
-## of the repository at HEAD, seeded from its committed guest.lock, and compare
-## it with the committed bytes. `wasm-modules-check` only cmps committed copies
-## against each other, so an artifact could drift arbitrarily far from the
-## source beside it and stay green. A `--out` build leaves the module
-## directory (lock included) untouched, so the tree stays clean under the
-## check. Needs the wasm32 target and a pushed HEAD, so like
-## `wasm-repro-check` it stands apart from the pre-push `test` gate.
-# Every guest is rebuilt and compared before this reports, so ONE run names
-# every stale artifact. Stopping at the first turned a sweep into a queue: each
-# refresh had to be built, committed and re-run to learn whether another guest
-# was hiding behind it, and a guest whose dependency moved is rarely alone.
-# A build that cannot run at all still stops the target, because after it
-# nothing downstream would be comparing anything.
-#
-# SCOPE IT TO WHAT YOU CHANGED. The full sweep is 31 guest builds; on a loaded
-# box that is most of an hour, and a PR that moved one crate does not owe the
-# other twenty-eight. `CRATES` names the crates the change touched and the run
-# covers exactly the guests that compile them:
-#
-#     make wasm-rebuild-check CRATES="files duckfs-core"
-#
-# The guest list comes from each module's OWN `guest.lock`, which records what
-# it actually compiled, so the scope cannot drift from the graph the way a
-# hand-kept table would. One lock covers both members of a module that ships an
-# index guest — the builder's shell workspace holds every guest the module
-# declares, so the lock is their union. A crate no lock names is refused rather than quietly
-# checking nothing — a typo that reports success is worse than no gate. Omit
-# `CRATES` and every guest is swept, which is what a module-SDK or toolchain
-# move owes.
-#
-# `CRATES` does NOT scope the five `crates/guests` fixtures: they carry no
-# `guest.lock`, so there is nothing to scope them by, and they are checked on
-# every run. That is affordable — they share one target directory, so warm they
-# are about a second each against minutes for a 4 MB component — and it is the
-# only arrangement under which this target's success line cannot be a lie. They
-# were outside it before, and the line still said "committed guests match",
-# which is how a `module.wit` change left `object`/`sibling` stale while the
-# gate that exists to catch exactly that reported clean.
-wasm-rebuild-check:
-	@mkdir -p "$(REBUILD_CHECK_DIR)"
-	@stale=""; stale_fixtures=""; checked=0; \
-	head=$$(git rev-parse HEAD); \
-	$(FIXTURE_GUEST_SH) \
-	compiles() { \
-	  [ -z "$(CRATES)" ] && return 0; \
-	  for c in $(CRATES); do \
-	    grep -sqx "name = \"$$c\"" "$$1/guest.lock" && return 0; \
-	  done; \
-	  return 1; \
-	}; \
-	for c in $(CRATES); do \
-	  grep -sqx "name = \"$$c\"" \
-	    $(addsuffix /guest.lock,$(BUILDER_MODULES) $(NETSTACK_GUEST) $(INDEX_MODULES)) || { \
-	      echo "wasm-rebuild-check: no guest.lock names the crate \"$$c\" — check the spelling."; \
-	      echo "  A guest compiles what its lock records; nothing here compiles that."; \
-	      exit 1; }; \
-	done; \
-	for m in $(BUILDER_MODULES) $(NETSTACK_GUEST); do \
-	  compiles $$m || continue; \
-	  id=$$(basename $$m) && \
-	  $(GUEST_BUILDER) $$m \
-	    --out "$(REBUILD_CHECK_DIR)/$$id.component.wasm" >/dev/null || exit 1; \
-	  checked=$$((checked + 1)); \
-	  cmp -s $$m/component.wasm "$(REBUILD_CHECK_DIR)/$$id.component.wasm" || \
-	    stale="$$stale $$m"; \
-	done; \
-	for m in $(INDEX_MODULES); do \
-	  compiles $$m || continue; \
-	  id=$$(basename $$m) && \
-	  $(GUEST_BUILDER) --index $$m \
-	    --out "$(REBUILD_CHECK_DIR)/$$id.index.wasm" >/dev/null || exit 1; \
-	  checked=$$((checked + 1)); \
-	  cmp -s $$m/index.wasm "$(REBUILD_CHECK_DIR)/$$id.index.wasm" || \
-	    stale="$$stale --index $$m"; \
-	done; \
-	dirty=$$(git status --porcelain -- $(FIXTURE_GUEST_WIT) \
-	  $(foreach rec,$(FIXTURE_GUESTS),$(word 2,$(subst :, ,$(rec)))) 2>/dev/null); \
-	[ -z "$$dirty" ] || { \
-	  echo "wasm-rebuild-check: the crates/guests fixtures have uncommitted source."; \
-	  echo "$$dirty" | sed 's/^/    /'; \
-	  echo "  These five build from the WORKING TREE, not from the repository at HEAD"; \
-	  echo "  the way guest-builder resolves a module — so with these dirty there is no"; \
-	  echo "  \"their source at HEAD\" to compare against. Commit or stash them."; \
-	  exit 1; }; \
-	for rec in $(FIXTURE_GUESTS); do \
-	  fixture_parse "$$rec"; \
-	  built="$(REBUILD_CHECK_DIR)/$$fg_id.component.wasm"; \
-	  fixture_build "$$rec" "$$built" >/dev/null || exit 1; \
-	  printf 'source = "git+https://github.com/orthory/ducktape#%s"\n' "$$head" \
-	    > "$(REBUILD_CHECK_DIR)/$$fg_id.component.lock"; \
-	  for a in $$fg_artifacts; do \
-	    checked=$$((checked + 1)); \
-	    cmp -s "$$built" "$$a" || stale_fixtures="$$stale_fixtures $$a"; \
-	  done; \
-	done; \
-	if [ -z "$$stale$$stale_fixtures" ]; then \
-	  echo "$$checked committed guest artifacts match a rebuild of their source at HEAD"; \
-	  exit 0; \
-	fi; \
-	echo "these committed guests do not match a rebuild of their source:"; \
-	set -- $$stale; \
-	while [ $$# -gt 0 ]; do \
-	  if [ "$$1" = "--index" ]; then \
-	    echo "    $(GUEST_BUILDER_SHOWN) --index $$2"; shift 2; \
-	  else \
-	    echo "    $(GUEST_BUILDER_SHOWN) $$1"; shift; \
-	  fi; \
-	done; \
-	for a in $$stale_fixtures; do echo "    $$a"; done; \
-	echo "  make wasm-rebuild-refresh CRATES=\"$(CRATES)\" promotes what this run already built."; \
-	echo "  Then re-run this check, and commit the result with its kernel fixture copy."; \
-	exit 1
-
-## promote what `wasm-rebuild-check` just built, instead of building it again.
-##
-## The check rebuilds every guest in scope into `$(REBUILD_CHECK_DIR)` and then
-## tells you to rebuild the stale ones — so shipping three refreshed guests cost
-## six full builds, and a 4 MB component is minutes each. The builder now writes
-## the shell lock beside every artifact it emits (`<out>.lock`), so the check's
-## output directory already holds everything a refresh needs: the bytes, and the
-## record of what produced them. This target copies both into place.
-#
-# It REFUSES a pair whose lock names a revision other than HEAD. The check
-# directory is a build output, not a fact: it survives a rebase, a pull and a
-# branch switch, and promoting it afterwards would commit bytes built from
-# source that is no longer here — the one failure a guest artifact must never
-# have, because nothing downstream would notice. The lock records the exact
-# platform revision every guest compiled (`source = "git+…#<sha>"`), so the
-# mismatch is a refusal by name rather than a silent wrong answer.
-#
-# `CRATES` scopes this exactly as it scopes the check, through the same
-# `guest.lock` reading. That is not tidiness: the directory accumulates across
-# runs and branches, so without scoping a `CRATES="chat"` refresh reaches every
-# leftover in it — one with no lock aborts a run that had nothing to do with it,
-# and one whose lock happens to name HEAD is PROMOTED, overwriting a committed
-# artifact the run was never asked to touch and reporting success. A crate no
-# lock names is refused here for the same reason it is in the check.
-#
-# Validation runs over the whole scope BEFORE anything is copied. A refusal
-# midway through promotion would leave half the guests on new bytes and half on
-# old — a tree state nothing downstream would notice either.
-wasm-rebuild-refresh:
-	@head=$$(git rev-parse HEAD); \
-	ls "$(REBUILD_CHECK_DIR)"/*.wasm >/dev/null 2>&1 || { \
-	  echo "wasm-rebuild-refresh: $(REBUILD_CHECK_DIR) holds no build to promote."; \
-	  echo "  Run wasm-rebuild-check first; it builds what this promotes."; \
-	  exit 1; }; \
-	$(FIXTURE_GUEST_SH) \
-	compiles() { \
-	  [ -z "$(CRATES)" ] && return 0; \
-	  for c in $(CRATES); do \
-	    grep -sqx "name = \"$$c\"" "$$1/guest.lock" && return 0; \
-	  done; \
-	  return 1; \
-	}; \
-	for c in $(CRATES); do \
-	  grep -sqx "name = \"$$c\"" \
-	    $(addsuffix /guest.lock,$(BUILDER_MODULES) $(NETSTACK_GUEST) $(INDEX_MODULES)) || { \
-	      echo "wasm-rebuild-refresh: no guest.lock names the crate \"$$c\" — check the spelling."; \
-	      echo "  A guest compiles what its lock records; nothing here compiles that."; \
-	      exit 1; }; \
-	done; \
-	scope=""; \
-	for m in $(BUILDER_MODULES) $(NETSTACK_GUEST); do \
-	  compiles $$m && scope="$$scope $$m:component"; \
-	done; \
-	for m in $(INDEX_MODULES); do \
-	  compiles $$m && scope="$$scope $$m:index"; \
-	done; \
-	built_in_scope=""; \
-	for entry in $$scope; do \
-	  m=$${entry%:*}; kind=$${entry##*:}; id=$$(basename $$m); \
-	  built="$(REBUILD_CHECK_DIR)/$$id.$$kind.wasm"; \
-	  [ -f "$$built" ] || continue; \
-	  built_in_scope="yes"; \
-	  lock="$(REBUILD_CHECK_DIR)/$$id.$$kind.lock"; \
-	  [ -f "$$lock" ] || { \
-	    echo "wasm-rebuild-refresh: $$built has no $$id.$$kind.lock beside it."; \
-	    echo "  The builder writes the lock with the bytes, so this predates that."; \
-	    echo "  Re-run wasm-rebuild-check; promoting bytes with no provenance is the"; \
-	    echo "  one thing this target must not do."; \
-	    exit 1; }; \
-	  grep -sq "#$$head\"" "$$lock" || { \
-	    echo "wasm-rebuild-refresh: $$lock was built from another revision, not $$head."; \
-	    echo "  That build predates your HEAD. Re-run wasm-rebuild-check."; \
-	    exit 1; }; \
-	done; \
-	for rec in $(FIXTURE_GUESTS); do \
-	  fixture_parse "$$rec"; \
-	  built="$(REBUILD_CHECK_DIR)/$$fg_id.component.wasm"; \
-	  [ -f "$$built" ] || continue; \
-	  built_in_scope="yes"; \
-	  lock="$(REBUILD_CHECK_DIR)/$$fg_id.component.lock"; \
-	  [ -f "$$lock" ] || { \
-	    echo "wasm-rebuild-refresh: $$built has no $$fg_id.component.lock beside it."; \
-	    echo "  The check writes the lock with the bytes, so this predates that."; \
-	    echo "  Re-run wasm-rebuild-check; promoting bytes with no provenance is the"; \
-	    echo "  one thing this target must not do."; \
-	    exit 1; }; \
-	  grep -sq "#$$head\"" "$$lock" || { \
-	    echo "wasm-rebuild-refresh: $$lock was built from another revision, not $$head."; \
-	    echo "  That build predates your HEAD. Re-run wasm-rebuild-check."; \
-	    exit 1; }; \
-	done; \
-	if [ -z "$$built_in_scope" ]; then \
-	  echo "wasm-rebuild-refresh: $(REBUILD_CHECK_DIR) holds no build for CRATES=\"$(CRATES)\"."; \
-	  echo "  It holds builds for other guests; this run promotes none of them."; \
-	  echo "  Run wasm-rebuild-check with the same CRATES first."; \
-	  exit 1; \
-	fi; \
-	promoted=""; \
-	for entry in $$scope; do \
-	  m=$${entry%:*}; kind=$${entry##*:}; id=$$(basename $$m); \
-	  built="$(REBUILD_CHECK_DIR)/$$id.$$kind.wasm"; \
-	  [ -f "$$built" ] || continue; \
-	  artifact="$$m/$$kind.wasm"; \
-	  cmp -s "$$built" "$$artifact" && continue; \
-	  cp "$$built" "$$artifact"; \
-	  cp "$(REBUILD_CHECK_DIR)/$$id.$$kind.lock" "$$m/guest.lock"; \
-	  promoted="$$promoted $$artifact"; \
-	done; \
-	for rec in $(FIXTURE_GUESTS); do \
-	  fixture_parse "$$rec"; \
-	  built="$(REBUILD_CHECK_DIR)/$$fg_id.component.wasm"; \
-	  [ -f "$$built" ] || continue; \
-	  for a in $$fg_artifacts; do \
-	    cmp -s "$$built" "$$a" && continue; \
-	    cp "$$built" "$$a"; \
-	    promoted="$$promoted $$a"; \
-	  done; \
-	done; \
-	if [ -z "$$promoted" ]; then \
-	  echo "nothing to promote: every built guest already matches its committed bytes"; exit 0; \
-	fi; \
-	echo "promoted:"; \
-	for a in $$promoted; do echo "    $$a"; done; \
-	echo "  Copy each MODULE component into crates/kernel/host/tests/fixtures/, then"; \
-	echo "  re-run wasm-rebuild-check. The crates/guests fixtures above are already in"; \
-	echo "  every home they have — they carry no guest.lock and need no second copy."
 
 ## the supply-chain tripwire: RustSec advisories and yanked crates against the
 ## committed Cargo.lock, under `deny.toml` — where every carried advisory is

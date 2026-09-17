@@ -33,5 +33,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
-forge-view = { path = "../../crates/views/forge" }
-ducktape-view-guest = { path = "../../crates/views/support/guest" }

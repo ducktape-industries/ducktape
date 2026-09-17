@@ -271,8 +271,8 @@ residents.
   `bin/node/src/constants.rs`, the sentence is in
   `bin/node/src/validator/run/drain.rs`). The desktop app does **not** show that
   sentence — it rewrites any "timed out" to **`The node did not answer in time.
-  Retry in a moment.`** (`user_error`, `app/src/backend/rpc.rs`), so on the app
-  the halt looks like a slow node.
+  Retry in a moment.`** (`user_error`), so on the app the halt looks like a
+  slow node.
 - Reads keep answering from committed state, so every node still looks alive:
   `dt node status` prints a height, and that height simply stops advancing.
 - `curl 127.0.0.1:8844/v1/status | jq .operations.consensus` shows

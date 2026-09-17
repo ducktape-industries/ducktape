@@ -11,7 +11,7 @@
 //!
 //! When this test fails, the surface changed. The procedure is:
 //!   1. bump `NODE_CONTRACT` in `crates/noded/src/lib.rs`;
-//!   2. bump `EXPECTED_NODE_CONTRACT` in `app/src/backend/node.rs` to the same
+//!   2. bump the app's `EXPECTED_NODE_CONTRACT` (ducktape-app) to the same
 //!      value (the app is the only reader; an old app against the new node,
 //!      or the reverse, must refuse);
 //!   3. repin `NODE_CONTRACT_SURFACE` to the value the assertion prints.

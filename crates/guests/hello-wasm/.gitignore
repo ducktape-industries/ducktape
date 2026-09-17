@@ -1,4 +1,0 @@
-# standalone guest crate build artifacts (the componentized fixture is
-# committed under crates/kernel/wasm-host/tests/fixtures instead).
-/target
-/out

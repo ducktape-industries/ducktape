@@ -8,8 +8,8 @@
 question it answers. Load the document that answers the question, never the
 tree. It covers the operator runbooks (`docs/deploy/`, `docs/dogfood.md`,
 `docs/sandbox-macos.md`), the references code cites by path (`docs/records/`),
-the per-area READMEs (`ops/`, `app/`, `crates/airlock/`) and the agent runbooks
-in `skills/` (`qa`, `sim-lane`, `module-dev`).
+the per-area READMEs (`ops/`, `crates/airlock/`) and the agent runbooks
+in `skills/` (`qa`, `sim-lane`).
 
 ## No Legacy, No Compat (until a live network exists)
 
@@ -53,9 +53,9 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
 
 ## Internal Skills
 
-- Keep repo-specific operational runbooks in `skills/` (`qa`, `sim-lane`,
-  `module-dev`). Nothing else lives there: a prompt for an agent running
-  inside a network is product, not a runbook.
+- Keep repo-specific operational runbooks in `skills/` (`qa`, `sim-lane`).
+  Nothing else lives there: a prompt for an agent running inside a network is
+  product, not a runbook.
 - `.claude/skills` and `.codex/skills` both point to the shared `skills/` directory.
 - Keep assistant-facing repository guidance in this file; `CLAUDE.md` links here so both assistants read the same instructions.
 - Workflow helpers are user-global, not repo-tracked; the branching and
@@ -126,23 +126,21 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
   the PR merges. Then `git grep` your symbol on `origin/dev`: a sibling's
   merge commit can revert it.
 - **A module's bytes move with everything it compiles in.** A change to ANY
-  crate a guest compiles (a module crate's `src/`, the module SDK, a library a
-  module wraps such as `duckfs-core` or `files`) or to any shape a guest
-  decodes (`Seed`, a module's message or query enum, a `deny_unknown_fields`
-  record) ships the rebuilt `component.wasm`, `index.wasm` and kernel fixture
-  in the SAME PR, for EVERY guest it reached. Even a deletion moves bytes:
-  panic paths carry line numbers. `make wasm-rebuild-check` names the guests;
-  `grep -l 'name = "<crate>"' crates/modules/*/*/guest.lock` says which
-  guests compile a crate in. A lock names only what a guest COMPILES, so it
-  can never name the BUILDER: a change to `bin/guest-builder`, to the
+  crate a guest compiles (a module crate's `src/`, a library a module wraps
+  such as `files`) or to any shape a guest decodes (`Seed`, a module's message
+  or query enum, a `deny_unknown_fields` record) ships the rebuilt
+  `component.wasm`, `index.wasm` and kernel fixture in the SAME PR, for EVERY
+  guest it reached. Even a deletion moves bytes: panic paths carry line
+  numbers. `grep -l 'name = "<crate>"' crates/modules/*/*/guest.lock` says
+  which guests compile a crate in. A lock names only what a guest COMPILES, so
+  it can never name the BUILDER: a change to the builder, to the
   `[profile.release]` it synthesizes into the scratch workspace, to the
   vendored registry seed, to the module WIT or to the toolchain pin moves every
   guest at once and that grep finds nothing at all. Scope by the grep only after
   ruling that case out; in it, the scope is all of them.
-  `make wasm-rebuild-check` covers the five standalone fixture guests under
-  `crates/guests/` (hello, hello-replacement, noop, sibling, object) too, on
-  every run — they carry no `guest.lock`, so `CRATES` cannot scope them and
-  does not try. Its success line names the number of artifacts it compared.
+  The module SDK, the guest builder and the app modules' source live in
+  ducktape-sdk and ducktape-modules; this repo carries the committed artifacts
+  those repos produce, and a rebuild crosses repositories.
   The committed guest is what every composed genesis runs; a host that speaks a
   field the guest never learned fails closed on every network founded from
   that `dev`, and the failure surfaces as a stranger's red hours later.

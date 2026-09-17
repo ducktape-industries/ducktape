@@ -11,7 +11,7 @@
 pub struct ModuleSpec {
     /// The consensus-visible module id (the key in the host registry / root-hash).
     pub id: &'static str,
-    /// Whether this module's crate carries an index guest (`src/index_guest.rs`,
+    /// Whether this module ships an index guest (a committed `index.wasm`,
     /// staged by `crates/noded/build.rs` as `<id>.index.wasm`). This is a build
     /// consistency check; operator-supplied directories discover their own files.
     pub has_index_guest: bool,
@@ -324,8 +324,8 @@ mod tests {
         assert_eq!(TOPOLOGY.wasm_ids(SIM_VALSET), SIM_VALSET);
     }
 
-    /// pins today's index-guest-shipping set — the same 5 crates that carry
-    /// `src/index_guest.rs` and that `crates/noded/build.rs` cross-checks this
+    /// pins today's index-guest-shipping set — the same 6 modules that carry a
+    /// committed `index.wasm`, which `crates/noded/build.rs` cross-checks this
     /// flag against at every build.
     #[test]
     fn index_guest_ids_selects_only_the_declared_shippers() {

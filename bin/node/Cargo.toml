@@ -246,13 +246,9 @@ nettest = { path = "../../crates/testing/nettest" }
 # a scripted fixture lifts its guest shell out of the rootfs with the same
 # tool lookup the sandbox itself uses.
 sandbox-host = { workspace = true }
-# the network_joiner_full statesync proof composes the reference modules too —
-# a joiner must rebuild EVERY module shape, example ones included. (The test
-# moved here from bin/demo when that walkthrough crate was deleted.)
-greeter = { workspace = true }
 kv = { path = "../../crates/modules/system/kv" }
 # `directory` left the production genesis set; the example crate survives only
-# as a test tenant (the cfg(test) query codec in main.rs, network_joiner_full).
+# as a test tenant (the cfg(test) query codec in main.rs).
 directory = { workspace = true }
 # the fs/mcp e2e harnesses drive noded's in-proc daemon testkit (was: each
 # hand-mirrored the NodeCommand actor). dev-only feature keeps it
@@ -282,9 +278,6 @@ sdk-testkit = { workspace = true }
 # in milliseconds of wall time instead of minutes.
 tokio = { version = "1", features = ["test-util", "macros"] }
 tempfile = "3"
-# the componentizer: the self-heal e2e builds the seed repository's guest the
-# way the network's own modules are built.
-guest-builder = { path = "../guest-builder" }
 # airlock is also a runtime dependency (see [dependencies]) — same base
 # features here; airlock_gateway_e2e.rs is the one test that needs the
 # minted-chain testkit, and it rides in through this crate's own `verify`

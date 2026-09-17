@@ -262,7 +262,8 @@ fn file_entry(path: &str, bytes: &[u8]) -> EntryInfo {
 /// consensus, so a test that asserted the session bind carried THAT would pass
 /// on an id `runs` can never resolve — which is exactly how the write plane
 /// shipped dead. the end-to-end proof that these two ids stay distinct and the
-/// right one is bound lives in [`super::session_boundary_tests`].
+/// right one is bound stands the native runs module up, so it ships from
+/// ducktape-modules.
 fn consensus_run_id() -> String {
     runs::run_id_for("general", 1, "quackbot")
 }
