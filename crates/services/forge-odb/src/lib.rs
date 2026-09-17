@@ -38,7 +38,7 @@
 
 use forge::state::{REF_TARGET_KIND, RefTarget, decode_ref_target};
 use forge::Forge;
-use git_primitives::{GitDiff, GitDiffError, GitObject};
+use git_primitives::{GitDiff, GitDiffBudget, GitDiffError, GitObject};
 use sdk::{Error, Module as _, ModuleId, StateRoot, StateSyncHandle};
 use sha2::{Digest as _, Sha256};
 use wasm_host::{HostOdb, OdbBacking};
@@ -114,18 +114,11 @@ impl OdbBacking for ForgeOdbBacking {
         repository: &str,
         target: &[u8],
         source: &[u8],
-        max_bytes: u64,
-        max_files: u64,
-        max_blob_bytes: u64,
+        path: Option<&str>,
+        budget: GitDiffBudget,
     ) -> Result<GitDiff, GitDiffError> {
-        self.forge.git_diff_read(
-            repository,
-            target,
-            source,
-            max_bytes,
-            max_files,
-            max_blob_bytes,
-        )
+        self.forge
+            .git_diff_read(repository, target, source, path, budget)
     }
 
     fn refs_bytes(&self) -> Vec<u8> {

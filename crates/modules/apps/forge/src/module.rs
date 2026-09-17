@@ -679,19 +679,10 @@ impl Forge {
         repository: &str,
         target: &[u8],
         source: &[u8],
-        max_bytes: u64,
-        max_files: u64,
-        max_blob_bytes: u64,
+        path: Option<&str>,
+        budget: git_primitives::GitDiffBudget,
     ) -> Result<git_primitives::GitDiff, git_primitives::GitDiffError> {
-        crate::query::read_diff(
-            &self.base,
-            repository,
-            target,
-            source,
-            max_bytes,
-            max_files,
-            max_blob_bytes,
-        )
+        crate::query::read_diff(&self.base, repository, target, source, path, budget)
     }
 
     /// publish everything staged: packed head publications + materialization
@@ -969,18 +960,31 @@ mod tests {
         let base = tmp_base("pr-diff-callback-stop");
         let (_, source, target) = materialized_pr(&base, &[b'x'; 4096]);
         let repo = git::open(&base.join("demo")).unwrap();
-        let (patch, truncated, files_changed, additions, deletions) = git::bounded_diff(
+        let diff = git::bounded_diff(
             &repo,
-            target.into(),
+            Some(target.into()),
             source.into(),
             64,
             MAX_PR_DIFF_FILES,
             MAX_PR_DIFF_BLOB_BYTES,
         )
         .expect("the deliberate libgit2 callback abort is truncation, not an error");
-        assert!(truncated);
-        assert_eq!(patch.len(), 64);
-        assert_eq!((files_changed, additions, deletions), (1, 1, 0));
+        assert!(diff.truncated);
+        assert_eq!(diff.patch.len(), 64);
+        assert_eq!(
+            (diff.files_changed, diff.additions, diff.deletions),
+            (1, 1, 0)
+        );
+        // the counts survive the clipped patch -- they come from the file's own
+        // patch object, not from the text the byte ceiling cut.
+        let [file] = &diff.files[..] else {
+            panic!("one changed file, got {:?}", diff.files);
+        };
+        assert!(
+            file.truncated,
+            "the ceiling cut inside this file, so its row says so"
+        );
+        assert_eq!((file.additions, file.deletions), (Some(1), Some(0)));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -996,14 +1000,17 @@ mod tests {
 
         let result = git::bounded_diff(
             &repo,
-            target,
+            Some(target),
             source,
             MAX_PR_DIFF_BYTES,
             MAX_PR_DIFF_FILES,
             MAX_PR_DIFF_BLOB_BYTES,
         )
         .unwrap();
-        assert_eq!(result, (String::new(), false, 0, 0, 0));
+        assert_eq!(result.patch, "");
+        assert!(!result.truncated);
+        assert_eq!((result.files_changed, result.additions, result.deletions), (0, 0, 0));
+        assert!(result.files.is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1027,7 +1034,7 @@ mod tests {
 
         let result = git::bounded_diff(
             &repo,
-            target,
+            Some(target),
             source,
             MAX_PR_DIFF_BYTES,
             MAX_PR_DIFF_FILES,
@@ -1070,27 +1077,51 @@ mod tests {
         let new_tree = repo.find_tree(new_root.write().unwrap()).unwrap();
         let source = git::commit(&repo, &new_tree, Some(&target_commit), "source", 2).unwrap();
 
-        let (patch, truncated, files_changed, _, _) = git::bounded_diff(
+        let diff = git::bounded_diff(
             &repo,
-            target,
+            Some(target),
             source,
             MAX_PR_DIFF_BYTES,
             MAX_PR_DIFF_FILES,
             MAX_PR_DIFF_BLOB_BYTES,
         )
         .unwrap();
-        assert!(!truncated);
-        assert_eq!(files_changed, 6);
-        for path in [
+        let patch = &diff.patch;
+        assert!(!diff.truncated);
+        assert_eq!(diff.files_changed, 6);
+        let paths = [
             "added.txt",
             "mode.txt",
             "node",
             "node/one.txt",
             "node/two.txt",
             "removed.txt",
-        ] {
+        ];
+        for path in paths {
             assert!(patch.contains(path), "missing {path} from {patch}");
         }
+        // the index carries every one of them, ordered by path, and the
+        // preflight's shapes survive into it.
+        assert_eq!(
+            diff.files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            paths
+        );
+        let status_of = |path: &str| {
+            diff.files
+                .iter()
+                .find(|file| file.path == path)
+                .map(|file| file.status)
+        };
+        assert_eq!(status_of("added.txt"), Some(git_primitives::GitFileStatus::Added));
+        assert_eq!(
+            status_of("removed.txt"),
+            Some(git_primitives::GitFileStatus::Deleted)
+        );
+        assert_eq!(
+            status_of("node"),
+            Some(git_primitives::GitFileStatus::Added),
+            "a directory replaced by a file is an add at that path"
+        );
         assert!(patch.contains("old mode 100644"), "{patch}");
         assert!(patch.contains("new mode 100755"), "{patch}");
         let _ = std::fs::remove_dir_all(&base);
@@ -1121,7 +1152,7 @@ mod tests {
 
         let result = git::bounded_diff(
             &repo,
-            target,
+            Some(target),
             source,
             MAX_PR_DIFF_BYTES,
             MAX_PR_DIFF_FILES,
@@ -1160,7 +1191,7 @@ mod tests {
 
         let result = git::bounded_diff(
             &repo,
-            target,
+            Some(target),
             source,
             MAX_PR_DIFF_BYTES,
             MAX_PR_DIFF_FILES,
@@ -1197,7 +1228,7 @@ mod tests {
 
         let result = git::bounded_diff(
             &repo,
-            target,
+            Some(target),
             source,
             MAX_PR_DIFF_BYTES,
             MAX_PR_DIFF_FILES,
@@ -1232,24 +1263,394 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// a pull request that pairs one oversized blob with one ordinary source
+    /// file -- the shape that used to take the whole reply down with it.
+    fn pr_with_a_huge_blob(base: &std::path::Path) -> Forge {
+        let mut forge = Forge::init("forge", base.to_path_buf()).unwrap();
+        seed_materialized_commit(&mut forge, 1, "demo", "base.txt", "base\n", "base");
+        let repo = git::open(&base.join("demo")).unwrap();
+        let target = git_head_oid(base, "demo");
+        let target_commit = repo.find_commit(target.into()).unwrap();
+        let target_tree = target_commit.tree().unwrap();
+        let huge = repo.blob(&vec![b'x'; MAX_PR_DIFF_BLOB_BYTES + 1]).unwrap();
+        let small = repo.blob(b"one small line\n").unwrap();
+        let with_huge = git::build_tree(&repo, Some(&target_tree), "huge.bin", huge).unwrap();
+        let with_huge = repo.find_tree(with_huge).unwrap();
+        let source_tree = git::build_tree(&repo, Some(&with_huge), "small.txt", small).unwrap();
+        let source_tree = repo.find_tree(source_tree).unwrap();
+        let source = git::commit(&repo, &source_tree, Some(&target_commit), "feature", 2).unwrap();
+        git::update_ref(&repo, "refs/heads/dev", target.into()).unwrap();
+        git::update_ref(&repo, "refs/heads/feature", source).unwrap();
+        let state = forge.state.repos.get_mut("demo").unwrap();
+        state.refs.insert("dev".into(), target);
+        state.refs.insert("feature".into(), source.into());
+        let mut ctx = ctx_with_origin(3, user_origin(1));
+        exec_commit(
+            &mut forge,
+            &mut ctx,
+            &ForgeMsg::OpenPr {
+                repo: "demo".into(),
+                title: "review me".into(),
+                body: String::new(),
+                source_branch: "feature".into(),
+                target_branch: "dev".into(),
+            },
+        );
+        forge
+    }
+
     #[test]
-    fn pr_diff_rejects_excessive_materialized_blob_bytes() {
+    fn a_blob_past_the_budget_loses_its_hunks_and_not_the_whole_reply() {
         let base = tmp_base("pr-diff-large-blob");
-        let content = vec![b'x'; MAX_PR_DIFF_BLOB_BYTES + 1];
-        let (forge, source, target) = materialized_pr(&base, &content);
-        let err = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::PrDiff {
+        let forge = pr_with_a_huge_blob(&base);
+        let bytes = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::PrDiff {
             repo: "demo".into(),
             number: 1,
         })))
+        .expect("one oversized blob does not refuse the change it is part of");
+        let ForgeReply::PrDiff(diff) = decode_reply(&bytes).unwrap() else {
+            panic!("expected a PrDiff reply");
+        };
+        // the index is COMPLETE: both paths, ordered by path.
+        assert_eq!(
+            diff.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            ["huge.bin", "small.txt"]
+        );
+        assert_eq!(diff.files_changed, 2);
+
+        let huge = &diff.files[0];
+        assert!(huge.truncated, "the budget could not afford this file");
+        assert_eq!(
+            (huge.additions, huge.deletions),
+            (None, None),
+            "absent, not zero -- nothing counted its lines"
+        );
+        assert!(!diff.patch.contains("huge.bin"), "{}", diff.patch);
+
+        let small = &diff.files[1];
+        assert!(!small.truncated, "the readable file is fully here");
+        assert_eq!((small.additions, small.deletions), (Some(1), Some(0)));
+        assert!(diff.patch.contains("small.txt"), "{}", diff.patch);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_scoped_read_reaches_the_file_the_aggregate_budget_skipped() {
+        let base = tmp_base("pr-file-diff-large-blob");
+        let forge = pr_with_a_huge_blob(&base);
+        let bytes =
+            futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::PrFileDiff {
+                repo: "demo".into(),
+                number: 1,
+                path: "huge.bin".into(),
+            })))
+            .expect("a scoped read is priced by its own file");
+        let ForgeReply::PrFileDiff(diff) = decode_reply(&bytes).unwrap() else {
+            panic!("expected a PrFileDiff reply");
+        };
+        let [file] = &diff.files[..] else {
+            panic!("a scoped read answers about one file, got {:?}", diff.files);
+        };
+        assert_eq!(file.path, "huge.bin");
+        assert_eq!(file.status, FileStatus::Added);
+        assert_eq!(
+            file.additions,
+            Some(1),
+            "the file the whole-change read could not count"
+        );
+        assert!(diff.patch.contains("huge.bin"), "the hunks are here now");
+        assert!(diff.truncated, "8 MiB does not fit the scoped byte ceiling");
+        // the pinned pair travels on the scoped reply too, so a view can refuse
+        // a patch that no longer matches the branch it is rendering.
+        assert_eq!(diff.source_oid.len(), 40);
+        assert_eq!(diff.target_oid.len(), 40);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_blob_budget_is_spent_cheapest_file_first() {
+        let base = tmp_base("pr-diff-budget-order");
+        let mut forge = Forge::init("forge", base.to_path_buf()).unwrap();
+        seed_materialized_commit(&mut forge, 1, "demo", "base.txt", "base\n", "base");
+        let repo = git::open(&base.join("demo")).unwrap();
+        let target = git_head_oid(&base, "demo");
+        let target_commit = repo.find_commit(target.into()).unwrap();
+        // two files, each affordable alone, together over the budget. the
+        // cheaper one is the one a reader gets.
+        let big = repo
+            .blob(&vec![b'a'; MAX_PR_DIFF_BLOB_BYTES - 1024])
+            .unwrap();
+        let small = repo.blob(&vec![b'b'; 2048]).unwrap();
+        let tree = git::build_tree(&repo, Some(&target_commit.tree().unwrap()), "big.txt", big)
+            .and_then(|oid| {
+                let tree = repo.find_tree(oid)?;
+                git::build_tree(&repo, Some(&tree), "small.txt", small)
+            })
+            .unwrap();
+        let tree = repo.find_tree(tree).unwrap();
+        let source = git::commit(&repo, &tree, Some(&target_commit), "two files", 2).unwrap();
+
+        let diff = git::bounded_diff(
+            &repo,
+            Some(target.into()),
+            source,
+            MAX_PR_DIFF_BYTES,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        )
+        .unwrap();
+        let by_path = |path: &str| {
+            diff.files
+                .iter()
+                .find(|file| file.path == path)
+                .unwrap_or_else(|| panic!("{path} missing from the index"))
+        };
+        assert!(
+            !by_path("small.txt").truncated,
+            "the cheap file is the one the budget buys"
+        );
+        assert!(
+            by_path("big.txt").truncated,
+            "and the expensive one keeps its row without its hunks"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn history_of(forge: &Forge, path: &str, after: &str, limit: u64) -> CommitPage {
+        let bytes = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::ListCommits {
+                repo: "demo".into(),
+                rev: String::new(),
+                path: path.into(),
+                after: after.into(),
+                limit,
+            },
+        )))
+        .expect("a history page");
+        let ForgeReply::Commits(page) = decode_reply(&bytes).unwrap() else {
+            panic!("expected a Commits reply");
+        };
+        page
+    }
+
+    fn summaries(page: &CommitPage) -> Vec<&str> {
+        page.commits.iter().map(|c| c.summary.as_str()).collect()
+    }
+
+    /// five commits on `main`, each touching its own file plus `shared.txt`
+    /// every other time, so a path filter has something to filter.
+    fn five_commits(base: &std::path::Path) -> Forge {
+        let mut forge = Forge::init("forge", base.to_path_buf()).unwrap();
+        for n in 1..=5u64 {
+            let touches_shared = n % 2 == 1;
+            let path = if touches_shared {
+                "shared.txt".to_string()
+            } else {
+                format!("f{n}.txt")
+            };
+            seed_materialized_commit(
+                &mut forge,
+                n,
+                "demo",
+                &path,
+                &format!("body {n}\n"),
+                &format!("commit {n}\n\nthe body of {n}"),
+            );
+        }
+        forge
+    }
+
+    #[test]
+    fn history_pages_newest_first_and_the_cursor_resumes_where_it_stopped() {
+        let base = tmp_base("history-pages");
+        let forge = five_commits(&base);
+
+        let first = history_of(&forge, "", "", 2);
+        assert_eq!(summaries(&first), ["commit 5", "commit 4"]);
+        assert_eq!(first.rev.len(), 40, "the page names the head it walked");
+
+        let second = history_of(&forge, "", first.next.as_deref().unwrap(), 2);
+        assert_eq!(summaries(&second), ["commit 3", "commit 2"]);
+
+        let third = history_of(&forge, "", second.next.as_deref().unwrap(), 2);
+        assert_eq!(summaries(&third), ["commit 1"]);
+        assert!(
+            third.next.is_none(),
+            "the root commit has no parent to resume from"
+        );
+        // the summary is the message's FIRST LINE; the body stays behind.
+        assert_eq!(third.commits[0].summary, "commit 1");
+        assert!(third.commits[0].committed_at > 0);
+        assert!(third.commits[0].author.contains('<'), "an identity line");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_path_filter_keeps_only_the_commits_that_moved_it() {
+        let base = tmp_base("history-filter");
+        let forge = five_commits(&base);
+        let page = history_of(&forge, "shared.txt", "", 10);
+        assert_eq!(
+            summaries(&page),
+            ["commit 5", "commit 3", "commit 1"],
+            "commits 2 and 4 never touched shared.txt"
+        );
+        assert!(page.next.is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_filtered_page_resumes_at_the_commit_after_the_last_match() {
+        let base = tmp_base("history-filter-pages");
+        let forge = five_commits(&base);
+        // commits 5, 3 and 1 touch shared.txt; the cursor has to land on the
+        // commit AFTER the last match, not after the last commit scanned, or
+        // the skipped non-matching commits are walked twice or lost.
+        let mut seen = Vec::new();
+        let mut after = String::new();
+        loop {
+            let page = history_of(&forge, "shared.txt", &after, 1);
+            seen.extend(page.commits.iter().map(|c| c.summary.clone()));
+            let Some(next) = page.next else { break };
+            after = next;
+        }
+        assert_eq!(seen, ["commit 5", "commit 3", "commit 1"]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_cursor_off_the_walked_chain_is_refused_rather_than_read() {
+        let base = tmp_base("history-bad-cursor");
+        let forge = five_commits(&base);
+        let err = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::ListCommits {
+                repo: "demo".into(),
+                rev: String::new(),
+                path: String::new(),
+                // a syntactically valid oid that is not on this history.
+                after: "0".repeat(40),
+                limit: 2,
+            },
+        )))
         .unwrap_err()
         .to_string();
-        assert!(err.contains("diff is too large to serve"), "{err}");
-        assert!(
-            err.contains(&format!("{} materialized blob bytes", content.len())),
-            "{err}"
+        assert!(err.contains("is not on the first-parent chain"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn one_commit_carries_its_whole_message_and_its_patch_against_the_parent() {
+        let base = tmp_base("commit-detail");
+        let forge = five_commits(&base);
+        let head = history_of(&forge, "", "", 1).commits[0].oid.clone();
+        let bytes = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::Commit {
+            repo: "demo".into(),
+            rev: head.clone(),
+        })))
+        .expect("the head commit");
+        let ForgeReply::Commit(Some(commit)) = decode_reply(&bytes).unwrap() else {
+            panic!("expected a Commit reply");
+        };
+        assert_eq!(commit.oid, head);
+        assert_eq!(commit.message, "commit 5\n\nthe body of 5");
+        assert_eq!(commit.parents.len(), 1, "a linear history");
+        // the patch is pinned to (first parent, this commit), the same shape a
+        // pull request answers in.
+        assert_eq!(commit.diff.target_oid, commit.parents[0]);
+        assert_eq!(commit.diff.source_oid, head);
+        assert_eq!(
+            commit
+                .diff
+                .files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["shared.txt"]
         );
-        assert!(err.contains(&source.to_string()), "{err}");
-        assert!(err.contains(&target.to_string()), "{err}");
+        assert!(commit.diff.patch.contains("body 5"), "{}", commit.diff.patch);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A root commit has no parent to diff against, and diffing it against
+    /// ITSELF answers an empty diff -- which tells a reader the first commit
+    /// changed nothing, while it in fact introduced every file in the tree.
+    /// It diffs against nothing instead, the way `git show` does.
+    #[test]
+    fn the_root_commit_introduces_its_whole_tree_rather_than_diffing_against_itself() {
+        let base = tmp_base("commit-root");
+        let mut forge = Forge::init("forge", base.to_path_buf()).unwrap();
+        // the ROOT itself carries TWO files, so "every file is Added" is an
+        // assertion rather than an accident of there being one. Seeded by hand
+        // because `seed_materialized_commit` writes one path per commit, and a
+        // second commit would no longer be the root.
+        let name = norm_repo("demo").unwrap();
+        forge.state.repos.entry(name.clone()).or_default();
+        let git_repo = refs::open_or_init_repo(&forge.base, &name).unwrap();
+        let alpha = git_repo.blob(b"alpha\n").unwrap();
+        let beta = git_repo.blob(b"beta\n").unwrap();
+        let one = git_repo
+            .find_tree(git::build_tree(&git_repo, None, "a.txt", alpha).unwrap())
+            .unwrap();
+        let tree_oid = git::build_tree(&git_repo, Some(&one), "b.txt", beta).unwrap();
+        let tree = git_repo.find_tree(tree_oid).unwrap();
+        let oid = git::commit(&git_repo, &tree, None, "the first commit", 1).unwrap();
+        git::update_ref(&git_repo, &refs::full_ref(MAIN_BRANCH), oid).unwrap();
+        forge
+            .state
+            .repos
+            .get_mut(&name)
+            .unwrap()
+            .refs
+            .insert(MAIN_BRANCH.to_string(), oid.into());
+
+        let root = history_of(&forge, "", "", 10)
+            .commits
+            .pop()
+            .expect("the oldest commit on the page");
+        assert!(root.parents.is_empty(), "the fixture's only commit is a root");
+
+        let bytes = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::Commit {
+            repo: "demo".into(),
+            rev: root.oid.clone(),
+        })))
+        .expect("the root commit");
+        let ForgeReply::Commit(Some(commit)) = decode_reply(&bytes).unwrap() else {
+            panic!("expected a Commit reply");
+        };
+
+        assert_eq!(
+            commit.diff.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            ["a.txt", "b.txt"],
+            "the root commit's whole tree, not an empty diff"
+        );
+        assert!(
+            commit.diff.files.iter().all(|f| f.status == FileStatus::Added),
+            "against nothing, every path is an addition: {:?}",
+            commit.diff.files,
+        );
+        assert!(commit.diff.patch.contains("alpha"), "{}", commit.diff.patch);
+        assert!(commit.diff.patch.contains("beta"), "{}", commit.diff.patch);
+        assert_eq!(commit.diff.files_changed, 2);
+        assert_eq!(commit.diff.additions, 2);
+        assert_eq!(commit.diff.deletions, 0);
+        // there is no target to pin to, and an empty string is a pin no view
+        // can mistake for an oid.
+        assert_eq!(commit.diff.target_oid, "");
+        assert_eq!(commit.diff.source_oid, root.oid);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_commit_outside_the_committed_history_is_not_reachable() {
+        let base = tmp_base("commit-unreachable");
+        let forge = five_commits(&base);
+        let err = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::Commit {
+            repo: "demo".into(),
+            rev: "0".repeat(40),
+        })))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("is not reachable from any branch"), "{err}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

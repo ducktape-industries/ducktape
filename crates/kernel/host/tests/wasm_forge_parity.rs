@@ -1055,3 +1055,21 @@ fn a_push_certificate_checks_the_chain_id_identically_on_both_runtimes() {
         accepted
     ));
 }
+
+/// forge's history walk budgets itself against a COPY of the kernel host's
+/// per-dispatch object-read ceiling, because a module names no kernel host
+/// (#2303) and the WIT does not carry the number. This is the one place both
+/// crates are in scope, so it is the only place that copy can be held honest.
+///
+/// If the host's ceiling ever drops below forge's copy, a deep history page
+/// stops paging and starts TRAPPING the guest — which surfaces as a wasm trap
+/// on a validator rather than as a red anywhere. So it is held here.
+#[test]
+fn forges_history_budget_stays_under_the_hosts_object_read_ceiling() {
+    assert!(
+        forge::MAX_HISTORY_OBJECT_READS < wasm_host::MAX_OBJECT_READS,
+        "forge would spend {} object reads against the host's ceiling of {}",
+        forge::MAX_HISTORY_OBJECT_READS,
+        wasm_host::MAX_OBJECT_READS,
+    );
+}

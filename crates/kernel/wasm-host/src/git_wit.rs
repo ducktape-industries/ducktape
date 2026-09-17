@@ -23,6 +23,9 @@ fn object_data(data: git_primitives::GitObjectData) -> wit::GitObjectData {
         git_primitives::GitObjectData::Commit(commit) => wit::GitObjectData::Commit(wit::GitCommit {
             tree: commit.tree,
             parents: commit.parents,
+            author: commit.author,
+            committed_at: commit.committed_at,
+            message: commit.message,
         }),
         git_primitives::GitObjectData::Tree(entries) => wit::GitObjectData::Tree(
             entries
@@ -54,6 +57,25 @@ fn diff(diff: git_primitives::GitDiff) -> wit::GitDiff {
         files_changed: diff.files_changed,
         additions: diff.additions,
         deletions: diff.deletions,
+        files: diff.files.into_iter().map(diff_file).collect(),
+    }
+}
+
+fn diff_file(file: git_primitives::GitDiffFile) -> wit::GitDiffFile {
+    wit::GitDiffFile {
+        path: file.path,
+        previous_path: file.previous_path,
+        status: match file.status {
+            git_primitives::GitFileStatus::Added => wit::GitFileStatus::Added,
+            git_primitives::GitFileStatus::Modified => wit::GitFileStatus::Modified,
+            git_primitives::GitFileStatus::Deleted => wit::GitFileStatus::Deleted,
+            git_primitives::GitFileStatus::Renamed => wit::GitFileStatus::Renamed,
+            git_primitives::GitFileStatus::TypeChanged => wit::GitFileStatus::TypeChanged,
+        },
+        additions: file.additions,
+        deletions: file.deletions,
+        binary: file.binary,
+        truncated: file.truncated,
     }
 }
 
