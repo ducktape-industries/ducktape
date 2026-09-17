@@ -722,9 +722,9 @@ fn stacking_moves_a_shape_and_undo_puts_the_whole_stack_back() {
     card(&mut view, "c", 600);
     assert_eq!(stacking(&view), ["a", "b", "c"]);
     view.selected = ["a".into()].into();
-    view.on_stack(true);
+    view.on_stack(Stacking::Front);
     assert_eq!(stacking(&view), ["b", "c", "a"]);
-    view.on_stack(false);
+    view.on_stack(Stacking::Back);
     assert_eq!(stacking(&view), ["a", "b", "c"]);
     view.on_undo();
     assert_eq!(
@@ -733,12 +733,78 @@ fn stacking_moves_a_shape_and_undo_puts_the_whole_stack_back() {
         "undoing a re-stack restores the stack exactly, not approximately"
     );
     view.on_select_all();
-    view.on_stack(true);
+    view.on_stack(Stacking::Front);
     assert_eq!(
         stacking(&view),
         ["b", "c", "a"],
         "raising everything moves nothing"
     );
+}
+#[test]
+fn a_shape_moves_one_place_through_the_stack_and_stops_at_the_end() {
+    let mut view = view();
+    for id in ["a", "b", "c", "d"] {
+        card(&mut view, id, 0);
+    }
+    assert_eq!(stacking(&view), ["a", "b", "c", "d"]);
+    view.selected = ["a".into()].into();
+    view.on_stack(Stacking::Forward);
+    assert_eq!(stacking(&view), ["b", "a", "c", "d"], "one place, not all");
+    view.on_stack(Stacking::Forward);
+    assert_eq!(stacking(&view), ["b", "c", "a", "d"]);
+    view.on_stack(Stacking::Backward);
+    assert_eq!(stacking(&view), ["b", "a", "c", "d"], "and back one place");
+    // Walking off the end is a no-op, not an error and not a wrap-around.
+    view.selected = ["d".into()].into();
+    let before = stacking(&view);
+    view.on_stack(Stacking::Forward);
+    assert_eq!(stacking(&view), before, "the top card has nowhere to go");
+    view.selected = ["b".into()].into();
+    let before = stacking(&view);
+    view.on_stack(Stacking::Backward);
+    assert_eq!(stacking(&view), before, "nor has the bottom one");
+}
+/// The shifted bracket reaches a view as the brace it types, with the modifier
+/// already spent — both hosts fold Shift into a symbol and hand `shift` back
+/// cleared. A binding that asked for a bracket AND a shift would be dead on
+/// every platform the app runs on, and the four keys would collapse to two.
+#[test]
+fn the_shifted_bracket_goes_all_the_way_and_the_bare_one_goes_one_place() {
+    use wire::keyboard::{Key, Modifiers};
+    let mut view = view();
+    for id in ["a", "b", "c", "d"] {
+        card(&mut view, id, 0);
+    }
+    view.selected = ["a".into()].into();
+    let held = Modifiers {
+        control: true,
+        ..Default::default()
+    };
+    key(&mut view, Key::Character("]".into()), held, false);
+    assert_eq!(stacking(&view), ["b", "a", "c", "d"], "one place forward");
+    key(&mut view, Key::Character("}".into()), held, false);
+    assert_eq!(stacking(&view), ["b", "c", "d", "a"], "and all the way");
+    key(&mut view, Key::Character("[".into()), held, false);
+    assert_eq!(stacking(&view), ["b", "c", "a", "d"], "one place back");
+    key(&mut view, Key::Character("{".into()), held, false);
+    assert_eq!(
+        stacking(&view),
+        ["a", "b", "c", "d"],
+        "and all the way back"
+    );
+}
+#[test]
+fn a_many_card_selection_steps_together_and_keeps_its_own_order() {
+    let mut view = view();
+    for id in ["a", "b", "c", "d"] {
+        card(&mut view, id, 0);
+    }
+    // The two ends of the stack move as one, each past the card it meets.
+    view.selected = ["a".into(), "c".into()].into();
+    view.on_stack(Stacking::Forward);
+    assert_eq!(stacking(&view), ["b", "a", "d", "c"]);
+    view.on_stack(Stacking::Backward);
+    assert_eq!(stacking(&view), ["a", "b", "c", "d"]);
 }
 #[test]
 fn arranging_lines_a_selection_up_and_spreads_it_evenly() {
@@ -4611,7 +4677,16 @@ fn the_secondary_button_takes_what_it_landed_on_and_opens_over_it() {
     );
     assert_eq!(
         menu_rows(&view),
-        ["cut", "copy", "duplicate", "front", "back", "delete"],
+        [
+            "cut",
+            "copy",
+            "duplicate",
+            "front",
+            "forward",
+            "backward",
+            "back",
+            "delete"
+        ],
         "a lone shape was offered rows it cannot answer"
     );
 

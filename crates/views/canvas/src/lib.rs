@@ -40,6 +40,17 @@ pub enum Arrange {
     SpreadX,
     SpreadY,
 }
+/// Where a selection goes in the stack. Four and not a boolean, because a
+/// board where a shape can only reach the very front or the very back cannot
+/// put one card between two others — and overlap is the normal state of a
+/// whiteboard, not an edge case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Stacking {
+    Front,
+    Forward,
+    Backward,
+    Back,
+}
 /// What a press on the board's own menu asks for. One tagged value and not ten
 /// messages, because every row of a menu has to close the menu as well as act,
 /// and a menu that closed in ten handlers is a menu that one day stays open in
@@ -51,6 +62,8 @@ pub enum MenuItem {
     Paste,
     Duplicate,
     Front,
+    Forward,
+    Backward,
     Back,
     Group,
     Ungroup,
@@ -319,7 +332,7 @@ pub enum Message {
     OpenMenu,
     CloseMenu,
     Menu(MenuItem),
-    Stack(bool),
+    Stack(Stacking),
     Planted(
         u64,
         String,
@@ -475,7 +488,7 @@ impl BoardsView {
             Message::OpenMenu => self.on_open_menu(),
             Message::CloseMenu => self.on_close_menu(),
             Message::Menu(item) => self.on_menu_item(item),
-            Message::Stack(front) => self.on_stack(front),
+            Message::Stack(how) => self.on_stack(how),
             Message::Planted(epoch, board, shapes, offset, ids) => {
                 self.on_planted(epoch, board, shapes, offset, ids)
             }
