@@ -151,10 +151,13 @@ and the ports and archive paths are what the operator needs.
 ## After it runs
 
 Two workspaces now share one chain id, so `-n <chain>` is ambiguous and
-resolves to whichever registration it finds first. Name the config instead:
+resolves to whichever registration it finds first. Name the config instead —
+or, for a verb that takes one, the node's own url, which resolves by the port
+a workspace serves and so tells the pair apart:
 
 ```
 ducktape node log-filter 'info,ducktape::join=debug' --config <workspace>/node.toml
+ducktape account show --node http://127.0.0.1:<port>
 ```
 
 Both nodes run under `ducktape-node-launcher`, so a later core update flips

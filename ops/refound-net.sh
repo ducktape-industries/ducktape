@@ -550,18 +550,11 @@ echo "resident following on :$J_HTTP"
 say "executors"
 # naming the CLI is already the answer to the checklist `--yes` would skip, and
 # the two are mutually exclusive: `install claude --yes` is refused outright.
-# `agent install` has no --config: it resolves the workspace from the home by
-# the http base it serves. That resolution re-looks-up each workspace BY CHAIN
-# ID instead of using the path it already has (`workspace_serving`,
-# bin/node/src/cli_args.rs), so two workspaces sharing a chain id both resolve
-# to whichever is found first and it refuses "several workspaces serve
-# <base>" — for a base only one of them serves. A founder and its resident
-# ALWAYS share a chain id, so this fires every time. Hand it a home holding
-# only the founder; the symlink makes the writes land in the real workspace.
-EXEC_HOME="$STAGE/founder-only"
-mkdir -p "$EXEC_HOME"
-ln -sfn "$FOUNDER_WS" "$EXEC_HOME/$(basename "$FOUNDER_WS")"
-DUCKTAPE_HOME="$EXEC_HOME" "$WS_BIN" agent install claude \
+# `agent install` has no --config: it resolves the workspace out of the home by
+# the http base it serves, which is why --node is the selector here and -n
+# never is. The founder and the resident share a chain id, so a chain id names
+# both; only one of them serves this port.
+DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" agent install claude \
     --node "http://127.0.0.1:$F_HTTP" || die "agent install failed"
 
 # --------------------------------------------------------------------------
@@ -600,13 +593,12 @@ fi
 # A daemon does not stop at "no wallet": with a key that is on no account it
 # enables, announces, and THEN exits `FATAL: the active wallet key is on no
 # account`, which reads like a grant that worked.
-# `--node`, not `-n`: the two workspaces share a chain id from here on.
-# $EXEC_HOME, not $HOME_DIR: `account` is addressed by --node and resolves its
-# workspace the same broken way `agent install` does — see the note there.
-if ! DUCKTAPE_HOME="$EXEC_HOME" "$WS_BIN" account show \
+# `--node`, not `-n`: the two workspaces share a chain id from here on, so a
+# chain id names both and only the port tells them apart.
+if ! DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" account show \
     --node "http://127.0.0.1:$F_HTTP" > /dev/null 2>&1; then
     printf '%s\n' "$WALLET_PASSWORD" \
-        | DUCKTAPE_HOME="$EXEC_HOME" "$WS_BIN" account create --name "$WALLET_NAME" \
+        | DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" account create --name "$WALLET_NAME" \
           --node "http://127.0.0.1:$F_HTTP" \
         || die "account create failed — the service daemons will not boot without one"
 fi
