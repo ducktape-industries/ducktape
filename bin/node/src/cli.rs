@@ -795,10 +795,15 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
     // `config::{DEFAULT_INVITE_TTL_DAYS, INVITE_TTL_DAYS}` in clap (the same
     // numbers `/v1/invite` resolves), so the value arrives settled.
     let (blob, notes) = mint_invite_blob(&args.selector.config_path()?, args.ttl_days)?;
+    // the blob first, the notes after it: a note is not a refusal, and an
+    // operator who is handed one before the thing they asked for reads it as
+    // the reason they did not get it. stdout is flushed between the two so a
+    // redirected (block-buffered) stdout keeps that order too.
+    println!("{blob}");
+    std::io::Write::flush(&mut std::io::stdout())?;
     for note in notes {
         eprintln!("[invite] {note}");
     }
-    println!("{blob}");
     Ok(())
 }
 
@@ -817,6 +822,10 @@ pub(crate) enum InviteNote {
     NoMeshStateYet(std::path::PathBuf),
     /// mesh state is present and unreadable.
     MeshStateUnreadable(std::path::PathBuf, String),
+    /// nothing in this config names a dialable underlay host, and no
+    /// coordinator stands in for one: the blob admits a joiner on this
+    /// machine and nowhere else.
+    NotDialableOffBox,
 }
 
 impl InviteNote {
@@ -826,6 +835,7 @@ impl InviteNote {
             InviteNote::MeshHasNoOtherMembers(_) => "invite_mesh_has_no_other_members",
             InviteNote::NoMeshStateYet(_) => "invite_no_mesh_state",
             InviteNote::MeshStateUnreadable(_, _) => "invite_mesh_state_unreadable",
+            InviteNote::NotDialableOffBox => "invite_not_dialable_off_box",
         }
     }
 }
@@ -849,6 +859,11 @@ impl std::fmt::Display for InviteNote {
                 f,
                 "mesh state at {} unreadable ({why}) — the invite carries no member fronts",
                 path.display()
+            ),
+            InviteNote::NotDialableOffBox => write!(
+                f,
+                "this invite is reachable on this machine only — set `advertised` (or a \
+                 concrete wireguard_listen IP) and mint again to invite over the network"
             ),
         }
     }
@@ -906,34 +921,29 @@ pub(crate) fn mint_invite_blob(
             .parse::<std::net::SocketAddr>()
             .map(|a| a.port())
             .map_err(|e| format!("listen {:?}: {e}", raw.listen))?;
-        let host = match config::endpoint_host(
+        // a config that NAMES no dialable host mints an endpoint-less
+        // bootstrap — never a refusal. Only a config that is WRONG still
+        // aborts the mint (`endpoint_host`'s `Err`).
+        let host = config::endpoint_host(
             Some(&raw.advertised),
             &raw.listen,
             wg_listen,
             raw.wireguard_advertised_value(),
-        ) {
-            Ok(host) => Some(host),
-            Err(_) if has_coordinated_reach => {
-                // Coordinated reach gives the joiner a rendezvous path; there is
-                // deliberately no inviter-hosted underlay endpoint to bake in.
-                None
-            }
-            Err(err) => return Err(err.into()),
-        };
-        match host {
-            Some(host) => {
+        )?;
+        // the tunnel endpoint carries the FULL advertised host:port when
+        // `wireguard_advertised` is configured — the external port can
+        // differ from the bind port in the port-forwarded setup the key
+        // exists for. The intro stays host + intro port.
+        let endpoint = config::invite_wireguard_endpoint(
+            Some(&raw.advertised),
+            &raw.listen,
+            wg_listen,
+            raw.wireguard_advertised_value(),
+        )?;
+        match host.zip(endpoint) {
+            Some((host, endpoint)) => {
                 let intro_port =
                     config::resolved_invite_listen(Some(&raw.invite_listen), wg_listen)?.port();
-                // the tunnel endpoint carries the FULL advertised host:port when
-                // `wireguard_advertised` is configured — the external port can
-                // differ from the bind port in the port-forwarded setup the key
-                // exists for. The intro stays host + intro port.
-                let endpoint = config::invite_wireguard_endpoint(
-                    Some(&raw.advertised),
-                    &raw.listen,
-                    wg_listen,
-                    raw.wireguard_advertised_value(),
-                )?;
                 config::InviteWireGuard {
                     public_key: wg_keypair.public_key().0,
                     endpoint: Some(endpoint),
@@ -941,12 +951,21 @@ pub(crate) fn mint_invite_blob(
                     mesh_port,
                 }
             }
-            None => config::InviteWireGuard {
-                public_key: wg_keypair.public_key().0,
-                endpoint: None,
-                intro: None,
-                mesh_port,
-            },
+            None => {
+                // Coordinated reach gives the joiner a rendezvous path, so an
+                // endpoint-less blob is still a complete one; without it the
+                // joiner has nothing to dial from another machine, and that
+                // is what the operator has to be told.
+                if !has_coordinated_reach {
+                    notes.push(InviteNote::NotDialableOffBox);
+                }
+                config::InviteWireGuard {
+                    public_key: wg_keypair.public_key().0,
+                    endpoint: None,
+                    intro: None,
+                    mesh_port,
+                }
+            }
         }
     };
 
@@ -2681,5 +2700,79 @@ mod tests {
         );
         // empty rosters refuse rather than wave everything through.
         assert!(precheck_promotion(hex, &stranger, &[], &[]).is_err());
+    }
+
+    /// A founder workspace on disk, complete enough for `mint_invite_blob`:
+    /// node.toml, the descriptor it names, and an identity. `advertised` is
+    /// the one value under test; the rest is the shape `node init` writes on
+    /// a single box (unspecified binds, no coordinator).
+    fn founder_workspace(name: &str, advertised: &str) -> std::path::PathBuf {
+        use super::config;
+        use commonware_cryptography::Signer as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ducktape-invite-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        std::fs::write(
+            dir.join("node.toml"),
+            format!(
+                "network = \"network.toml\"\nkey_file = \"identity.key\"\n\
+                 listen = \"[::]:52330\"\nadvertised = {advertised:?}\n\
+                 storage_dir = \"storage\"\nhttp_listen = \"127.0.0.1:0\"\n\
+                 gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"127.0.0.1:0\"\n\
+                 wireguard_listen = \"0.0.0.0:52333\"\ninvite_listen = \"0.0.0.0:52334\"\n\
+                 wireguard_advertised = \"auto\"\nprimary_coordinator = \"none\"\n\
+                 coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n"
+            ),
+        )
+        .expect("write node.toml");
+        let (me, _) = config::load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        config::NetworkDescriptor {
+            chain_id: "net#25662566".into(),
+            validators: vec![super::hex_bytes(me.public_key().as_ref())],
+            bootstrap: Vec::new(),
+            reach: Vec::new(),
+            coordination: None,
+            block_time_ms: config::DEFAULT_BLOCK_TIME_MS,
+            modules: vec![config::ModuleCode {
+                id: "pages".into(),
+                code_hash: "11".repeat(32),
+            }],
+            genesis: "ab".repeat(32),
+        }
+        .save(&dir.join("network.toml"))
+        .expect("save descriptor");
+        dir
+    }
+
+    /// A single-box founder — `advertised = "overlay"`, unspecified binds, no
+    /// coordinator — has no dialable host to bake into an invite. That is a
+    /// NOTE beside a minted blob, never a refusal: the join over loopback
+    /// works, and an operator told "no dialable host" INSTEAD of being handed
+    /// the credential reads a working node as a broken one. Name a dialable
+    /// `advertised` and there is nothing to say.
+    #[test]
+    fn a_founder_naming_no_host_still_mints_and_is_told_what_the_blob_cannot_do() {
+        let reasons = |dir: &std::path::Path| -> Vec<&'static str> {
+            let (blob, notes) = super::mint_invite_blob(&dir.join("node.toml"), 7)
+                .expect("a founder always gets its invite");
+            assert!(!blob.is_empty(), "the blob is the whole point");
+            notes.iter().map(super::InviteNote::reason).collect()
+        };
+
+        let overlay = founder_workspace("overlay", "overlay");
+        assert!(
+            reasons(&overlay).contains(&"invite_not_dialable_off_box"),
+            "a blob that reaches this machine only says so"
+        );
+
+        let dialable = founder_workspace("dialable", "127.0.0.1:52330");
+        assert!(
+            !reasons(&dialable).contains(&"invite_not_dialable_off_box"),
+            "an advertised host IS the endpoint — nothing to note"
+        );
     }
 }

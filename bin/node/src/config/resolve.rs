@@ -614,7 +614,7 @@ fn resolved_wireguard_advertised(
     let Some(wg) = wireguard_listen else {
         return Ok(None);
     };
-    let Ok(derived) = invite_wireguard_endpoint(advertised, listen, wg, None) else {
+    let Ok(Some(derived)) = invite_wireguard_endpoint(advertised, listen, wg, None) else {
         return Ok(None);
     };
     // a derived value that is not dialable (a port-0 bind) is endpoint-less,
@@ -639,7 +639,11 @@ fn resolved_intro_listener(
     let Some(wg) = wireguard_listen else {
         return Ok(None);
     };
-    if endpoint_host(advertised, listen, wg, wireguard_advertised).is_err() {
+    let mints_a_direct_intro = matches!(
+        endpoint_host(advertised, listen, wg, wireguard_advertised),
+        Ok(Some(_))
+    );
+    if !mints_a_direct_intro {
         return Ok(None);
     }
     resolved_invite_listen(invite_listen, wg).map(Some)
@@ -671,30 +675,37 @@ pub fn resolved_invite_listen(
 /// host (an invite must hand the joiner an underlay address that reaches
 /// this machine — the usual listen is unspecified, so `advertised` is the
 /// truth).
+///
+/// `Ok(None)` = nothing in this config NAMES a dialable host (`advertised =
+/// "overlay"`, unspecified binds): endpoint-less, which every caller already
+/// handles — an invite drops its underlay endpoints and the intro listener
+/// stays unbound. Only a config that is WRONG (an `advertised` that can never
+/// be dialed, a malformed `wireguard_advertised`) is an `Err`; absence on the
+/// error channel is what turned a single-box founder's `invite` into a
+/// refusal.
 pub fn endpoint_host(
     advertised: Option<&str>,
     listen: &str,
     wireguard_listen: SocketAddr,
     wireguard_advertised: Option<&str>,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     if let Some(ingress) = parse_wireguard_advertised(wireguard_advertised)? {
-        return Ok(match ingress {
+        return Ok(Some(match ingress {
             Ingress::Socket(addr) => addr.ip().to_string(),
             Ingress::Dns { host, .. } => host.to_string(),
-        });
+        }));
     }
     if !wireguard_listen.ip().is_unspecified() {
-        return Ok(wireguard_listen.ip().to_string());
+        return Ok(Some(wireguard_listen.ip().to_string()));
     }
-    let dial = dialable(advertised, listen)?.ok_or(
-        "no dialable host for the WireGuard invite endpoints: set `advertised` (or a \
-         concrete wireguard_listen IP) so a joiner can reach this node's tunnel",
-    )?;
+    let Some(dial) = dialable(advertised, listen)? else {
+        return Ok(None);
+    };
     // strip the port: `host:port` or `[v6]:port`.
-    match dial.rsplit_once(':') {
-        Some((host, _)) => Ok(host.trim_matches(['[', ']']).to_string()),
-        None => Ok(dial),
-    }
+    Ok(Some(match dial.rsplit_once(':') {
+        Some((host, _)) => host.trim_matches(['[', ']']).to_string(),
+        None => dial,
+    }))
 }
 
 /// the FULL `host:port` a minted invite's WireGuard `endpoint` carries: an
@@ -703,21 +714,22 @@ pub fn endpoint_host(
 /// port can differ from the local bind port (`wireguard_listen`); baking the
 /// advertised host with the bind port would mint an invite whose endpoint is
 /// silently wrong. Absent, the endpoint is today's derivation exactly:
-/// [`endpoint_host`]'s host at the bind port.
+/// [`endpoint_host`]'s host at the bind port. `Ok(None)` carries that
+/// function's "no host is named here" answer through unchanged.
 pub fn invite_wireguard_endpoint(
     advertised: Option<&str>,
     listen: &str,
     wireguard_listen: SocketAddr,
     wireguard_advertised: Option<&str>,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     if let Some(ingress) = parse_wireguard_advertised(wireguard_advertised)? {
-        return Ok(match ingress {
+        return Ok(Some(match ingress {
             Ingress::Socket(addr) => addr.to_string(),
             Ingress::Dns { host, port } => format!("{host}:{port}"),
-        });
+        }));
     }
     let host = endpoint_host(advertised, listen, wireguard_listen, None)?;
-    Ok(format!("{host}:{}", wireguard_listen.port()))
+    Ok(host.map(|host| format!("{host}:{}", wireguard_listen.port())))
 }
 
 /// resolve the `advertised` config value into a dial ingress. the sentinel
@@ -2019,8 +2031,10 @@ mod tests {
         let concrete: SocketAddr = "10.0.0.5:51820".parse().unwrap();
 
         assert_eq!(
-            endpoint_host(None, "127.0.0.1:0", concrete, Some("203.0.113.9:9999")).unwrap(),
-            "203.0.113.9",
+            endpoint_host(None, "127.0.0.1:0", concrete, Some("203.0.113.9:9999"))
+                .unwrap()
+                .as_deref(),
+            Some("203.0.113.9"),
             "wireguard_advertised wins even over a concrete wireguard_listen IP"
         );
         assert_eq!(
@@ -2030,20 +2044,50 @@ mod tests {
                 unspecified,
                 Some("tunnel.example.com:9999")
             )
-            .unwrap(),
-            "tunnel.example.com",
+            .unwrap()
+            .as_deref(),
+            Some("tunnel.example.com"),
             "a hostname override stays a hostname"
         );
         assert_eq!(
-            endpoint_host(None, "127.0.0.1:0", concrete, None).unwrap(),
-            "10.0.0.5",
+            endpoint_host(None, "127.0.0.1:0", concrete, None)
+                .unwrap()
+                .as_deref(),
+            Some("10.0.0.5"),
             "absent: today's derivation — the concrete wireguard_listen IP wins"
         );
         assert_eq!(
-            endpoint_host(Some("203.0.113.1:443"), "127.0.0.1:0", unspecified, None).unwrap(),
-            "203.0.113.1",
+            endpoint_host(Some("203.0.113.1:443"), "127.0.0.1:0", unspecified, None)
+                .unwrap()
+                .as_deref(),
+            Some("203.0.113.1"),
             "absent + unspecified listen: falls back to `advertised`/`listen`, unchanged"
         );
+    }
+
+    /// A config that NAMES no dialable host is endpoint-less, not broken: the
+    /// single-box founder shape (`advertised = "overlay"`, unspecified binds)
+    /// answers `Ok(None)` so its `invite` keeps minting. A config that is
+    /// WRONG still refuses — absence and invalidity are different answers, and
+    /// collapsing them onto the error channel is what made a founder's own
+    /// invite read as a failure.
+    #[test]
+    fn a_config_that_names_no_host_is_endpoint_less_not_a_refusal() {
+        let unspecified: SocketAddr = "0.0.0.0:51820".parse().unwrap();
+
+        assert_eq!(
+            endpoint_host(Some("overlay"), "[::]:8846", unspecified, None).unwrap(),
+            None,
+            "the overlay shape names no underlay host — endpoint-less, not an error"
+        );
+        assert_eq!(
+            invite_wireguard_endpoint(Some("overlay"), "[::]:8846", unspecified, None).unwrap(),
+            None,
+            "and the minted endpoint carries that answer through"
+        );
+        let err = endpoint_host(Some("0.0.0.0:8846"), "[::]:8846", unspecified, None)
+            .expect_err("an advertised that can never be dialed is still a config error");
+        assert!(err.contains("not dialable"), "{err}");
     }
 
     /// The invite-mint endpoint (review fix, change 3): with
@@ -2060,8 +2104,9 @@ mod tests {
 
         assert_eq!(
             invite_wireguard_endpoint(None, "127.0.0.1:0", unspecified, Some("203.0.113.9:41820"))
-                .unwrap(),
-            "203.0.113.9:41820",
+                .unwrap()
+                .as_deref(),
+            Some("203.0.113.9:41820"),
             "the advertised endpoint rides verbatim — 41820, never the bind port 51820"
         );
         assert_eq!(
@@ -2071,19 +2116,23 @@ mod tests {
                 concrete,
                 Some("tunnel.example.com:41820")
             )
-            .unwrap(),
-            "tunnel.example.com:41820",
+            .unwrap()
+            .as_deref(),
+            Some("tunnel.example.com:41820"),
             "a hostname override stays a hostname, with ITS port — even over a concrete bind IP"
         );
         assert_eq!(
-            invite_wireguard_endpoint(None, "127.0.0.1:0", concrete, None).unwrap(),
-            "10.0.0.5:51820",
+            invite_wireguard_endpoint(None, "127.0.0.1:0", concrete, None)
+                .unwrap()
+                .as_deref(),
+            Some("10.0.0.5:51820"),
             "absent: today's derivation exactly — the wireguard_listen IP at the bind port"
         );
         assert_eq!(
             invite_wireguard_endpoint(Some("203.0.113.1:443"), "127.0.0.1:0", unspecified, None)
-                .unwrap(),
-            "203.0.113.1:51820",
+                .unwrap()
+                .as_deref(),
+            Some("203.0.113.1:51820"),
             "absent + unspecified listen: the advertised HOST at the WG bind port, unchanged"
         );
     }
