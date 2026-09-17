@@ -14,7 +14,7 @@ _ducktape() {
     local node_work=(list admit revoke)
     local node_join=(requests state)
     local node_netstack=(swap)
-    local node_flags=(--config -n --network --sync-only --json --yes --out --dir --name --modules --genesis --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --block-time-ms --ttl-days --node --key --component --trust-node)
+    local node_flags=(--config -n --network --sync-only --json --yes --out --dir --name --modules --genesis --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --block-time-ms --ttl-days --node --key --component --trust-node --compose-only)
 
     local user_key=(init restore unlock reveal status)
     local user_cred=(add list remove grant revoke inspect seal)
@@ -38,7 +38,7 @@ _ducktape() {
     local module_verbs=(pack update register status help)
     local module_flags=(--index --view --assets --lanes --out --after --config -n --network --json)
     local release_verbs=(sign-bundle manifest sign verify schedule status help)
-    local release_flags=(-n --unpack-into --node --network --config --credential --out --sequence --display --node-contract --notes-url --kind --archive --successor-key --successor-from --key --sig --pubkey --sha --at --json)
+    local release_flags=(-n --unpack-into --node --network --config --credential --out --sequence --display --node-contract --notes-url --kind --archive --successor-key --successor-from --key --sig --pubkey --sha --at --json --skip-preflight-i-know-the-wit-moved)
     local collab_verbs=(query key attach send ack help)
     local collab_flags=(--target --node -n --network --key --trust-node --channel --participant --existing-only --device --expect --to --kind --message-id --credential --seq --ttl-secs --state --reason)
 

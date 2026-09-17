@@ -172,8 +172,33 @@ pub(crate) struct ScheduleArgs {
     /// text they join each other by
     #[arg(long, value_name = "HEIGHT")]
     pub at: u64,
+    /// propose without asking the archive whether it can link the components
+    /// this network runs. The preflight is the only thing standing between a
+    /// WIT change and every validator stopping its node to learn the same
+    /// refusal, so say it out loud: the module swap that matches this binary
+    /// is already scheduled ahead of `--at`
+    #[arg(long)]
+    pub skip_preflight_i_know_the_wit_moved: bool,
     #[command(flatten)]
     pub selector: crate::cli_args::Selector,
+}
+
+impl ScheduleArgs {
+    fn preflight(&self) -> Preflight {
+        match self.skip_preflight_i_know_the_wit_moved {
+            true => Preflight::Skipped,
+            false => Preflight::Compose,
+        }
+    }
+}
+
+/// whether this designation is checked against the modules the network runs
+/// before it becomes a ballot.
+enum Preflight {
+    /// the default: the archive is fetched and asked to link them.
+    Compose,
+    /// the operator says the WIT moved on purpose.
+    Skipped,
 }
 
 /// `release status`: what the launcher asks a running node.
@@ -439,6 +464,10 @@ fn schedule(args: ScheduleArgs) -> CommandResult {
     let cfg_path = args.selector.config_path()?;
     let resolved = crate::config::resolve(&cfg_path)?;
     let node = crate::cli::DrivenNode::of(&resolved, "release schedule")?;
+    match args.preflight() {
+        Preflight::Compose => preflight(node.http_base(), &cfg_path, &args.sha)?,
+        Preflight::Skipped => {}
+    }
     let signer = crate::cli::gov_signer(node.rpc(), &cfg_path, &resolved)?;
     let pubkey_hex = crate::module_cli::signer_pubkey_hex(&signer);
     let wanted = governance::GovAction::Signal {
@@ -471,6 +500,106 @@ fn schedule(args: ScheduleArgs) -> CommandResult {
     }
 }
 
+/// Ask the archive being designated whether it can link the components this
+/// network RUNS — before a ballot exists.
+///
+/// A node binary carries the host half of the module WIT world; the
+/// components carry the other half, and only the code registry moves those.
+/// Nothing about publishing or designating a binary whose world moved says
+/// so: every launcher stages it, arms it at the activation height, STOPS its
+/// node, and only then hears its qualify refuse — on a designation that stays
+/// the network's until another one replaces it. The same answer costs a
+/// second here. The archive is read off the network's own duckfs, which is
+/// where every launcher will read it, so what is asked is the bytes that will
+/// actually run and not a local file that claims to be them; the executable
+/// it carries then reads the roster off this node's rpc and the components
+/// out of its blob files. Nothing is locked and the node is never stopped.
+fn preflight(base: &str, config: &Path, sha: &Sha) -> Result<(), Box<dyn std::error::Error>> {
+    let scratch = tempfile::tempdir()?;
+    let exe = node_exe(&archive(base, sha)?, scratch.path())?;
+    let said = std::process::Command::new(&exe)
+        .args(["node", "qualify", "--compose-only"])
+        .arg("--config")
+        .arg(config)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("run {}: {error}", exe.display()))?;
+    if said.status.success() {
+        return Ok(());
+    }
+    // the child's contract: the snake_case reason on stdout, the sentence on
+    // stderr. Both are the operator's answer here — there is no launcher
+    // between them and it.
+    let refusal = String::from_utf8_lossy(&said.stdout).trim().to_string();
+    let detail = String::from_utf8_lossy(&said.stderr).trim().to_string();
+    tracing::warn!(
+        target: "ducktape::update",
+        event = "release_schedule_refused",
+        reason = "preflight_compose_refused",
+        release = %sha,
+        refusal = %refusal,
+        "the release being designated cannot link the modules this network runs; nothing was proposed"
+    );
+    Err(format!(
+        "preflight_compose_refused: {sha} did not pass the compose preflight — nothing was \
+         proposed.\n{detail}\nA release that moves the module WIT ships AFTER the module swap \
+         that matches it (`ducktape module update <id> <component.wasm>`)."
+    )
+    .into())
+}
+
+/// the designated node archive, read off the network's duckfs at the path the
+/// launchers read, and checked against the sha it is named by.
+fn archive(base: &str, sha: &Sha) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use duckfs_client::api::NodeApi as _;
+    let path = app_update::Kind::Node.archive_path(sha, &app_update::Platform::HOST.key());
+    let node = duckfs_client::http::HttpNode::new(base.to_string());
+    let mut bytes = Vec::new();
+    loop {
+        let (page, eof) = node
+            .read(&path, None, bytes.len() as u64, duckfs_core::MAX_READ_BYTES)
+            .map_err(|error| format!("read {path}: {error}"))?;
+        let empty = page.is_empty();
+        bytes.extend_from_slice(&page);
+        if eof || empty {
+            break;
+        }
+    }
+    let landed = Sha::digest(&bytes);
+    let is_the_designation = landed == *sha;
+    if !is_the_designation {
+        return Err(format!("{path} hashes to {landed}, not {sha}").into());
+    }
+    Ok(bytes)
+}
+
+/// the one executable a node archive carries, unpacked into `scratch`. Every
+/// other entry is ignored rather than written: this is a scratch copy the
+/// preflight runs once and throws away, so `ducktape` at the root is the only
+/// thing it has any use for.
+fn node_exe(archive: &[u8], scratch: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let decoder = zstd::Decoder::new(archive)?;
+    let mut tar = tar::Archive::new(decoder);
+    tar.set_preserve_permissions(false);
+    tar.set_preserve_ownerships(false);
+    let out = scratch.join("ducktape");
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        let is_the_executable =
+            entry.header().entry_type().is_file() && entry.path()?.as_os_str() == "ducktape";
+        if !is_the_executable {
+            continue;
+        }
+        let mut file = std::fs::File::create(&out)?;
+        std::io::copy(&mut entry, &mut file)?;
+        drop(file);
+        #[cfg(unix)]
+        std::fs::set_permissions(&out, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+        return Ok(out);
+    }
+    Err("the node archive carries no `ducktape` executable at its root".into())
+}
+
 /// `release status [--json]` — what a RUNNING node's network designates, and
 /// where that node is. This is the whole interface `ducktape-node-launcher`
 /// has to the chain: the http base it reads duckfs through, the mesh identity
@@ -482,9 +611,10 @@ fn status(args: StatusArgs) -> CommandResult {
     // business opening the node's identity or rehashing the founding set to
     // find out where the node serves.
     let service = crate::config::resolve_service(&cfg_path)?;
-    let http_listen = service.http_listen.as_deref().ok_or(
-        "release status reads the node's app surface — set `http_listen` in node.toml",
-    )?;
+    let http_listen = service
+        .http_listen
+        .as_deref()
+        .ok_or("release status reads the node's app surface — set `http_listen` in node.toml")?;
     let base = crate::config::http_base_of(http_listen);
     let live = crate::node_http::get_json(&base, "/v1/status")
         .map_err(|error| format!("read this node's status: {error}"))?;
@@ -527,7 +657,9 @@ fn status(args: StatusArgs) -> CommandResult {
                 false => "pending",
             }
         ),
-        None => println!("designated\t(none — this network runs whatever each node was installed with)"),
+        None => {
+            println!("designated\t(none — this network runs whatever each node was installed with)")
+        }
     }
     Ok(())
 }

@@ -634,7 +634,7 @@ fn open_code_proposals(views: &[governance::ProposalView]) -> Vec<OpenCodePropos
 
 /// the modules registry over the generic query lane — the same shape
 /// `read_members` uses for governance.
-fn read_module_status(rpc_addr: &str) -> Result<Vec<modules::ModuleCode>, String> {
+pub(crate) fn read_module_status(rpc_addr: &str) -> Result<Vec<modules::ModuleCode>, String> {
     use modules::{ModulesQuery, ModulesReply, decode_reply, encode_query};
     let raw = rpc_query(
         rpc_addr,

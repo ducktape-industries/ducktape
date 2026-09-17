@@ -29,6 +29,14 @@ keeps producing — but each one paid a stop for an answer that could never be
 yes, and the refused designation stays the network's designation until another
 one replaces it.
 
+`release schedule` enforces this before it proposes anything: it fetches the
+archive it is about to designate off the network's own duckfs and asks its
+executable to link the components the registry says this network is running
+(`ducktape node qualify --compose-only`, which reads the roster over the rpc
+and the component bytes out of the blob files — no lock, no node stopped). A
+binary that cannot link them is refused locally, with the sentence above and
+no ballot; `--skip-preflight-i-know-the-wit-moved` proposes anyway.
+
 So a release that moves the module WIT ships AFTER the module swap that
 matches it, never before: swap each affected module first
 (`ducktape module update <id> <component.wasm> --after <blocks>`), wait for the

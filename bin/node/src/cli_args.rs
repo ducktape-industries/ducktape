@@ -39,7 +39,7 @@ pub enum OpCmd {
     /// can THIS binary run this workspace? reopens the checkpoint offline and
     /// recomposes its committed root hash — what a release launcher asks a
     /// staged binary before it flips. the node must be STOPPED
-    Qualify(SelectorArgs),
+    Qualify(QualifyArgs),
     /// the running node's direct peers: connection, traffic, sync heights
     Peers(StatusArgs),
     /// resident standing: the staged-admission tier
@@ -629,6 +629,19 @@ impl NodeAddr {
 pub struct SelectorArgs {
     #[command(flatten)]
     pub selector: Selector,
+}
+
+/// `node qualify [--compose-only]`.
+#[derive(Debug, clap::Args)]
+pub struct QualifyArgs {
+    #[command(flatten)]
+    pub selector: Selector,
+    /// ask only whether the components this network RUNS load against this
+    /// binary's wasm world, reading the roster off the node's rpc and the
+    /// bytes out of its blob files. takes no lock and opens no store, so it
+    /// runs beside a live node — and it says nothing about state layout
+    #[arg(long)]
+    pub compose_only: bool,
 }
 
 /// selector + the machine-readable output toggle.

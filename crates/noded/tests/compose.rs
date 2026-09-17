@@ -299,6 +299,46 @@ fn genesis_refuses_unsafe_ids() {
     });
 }
 
+/// a guest built against a `ducktape:module/host` world this build has moved
+/// past: the real forge component from before the host widened
+/// `git-object-read`'s commit record from two fields to five. The fault is in
+/// the fixture's own bytes — nothing here plants one.
+fn stale_host_wit() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stale-host-wit")
+}
+
+/// [`compose::load`] IS the linker gate, and it is the WHOLE of what a lock-free
+/// preflight can ask a binary: no store, no substrate, no byte of state — just
+/// whether the components a network runs still link. So a component whose
+/// imports this build's world no longer satisfies must be refused HERE, in the
+/// sentence a boot would print, or `release schedule`'s preflight has nothing
+/// to read and every launcher pays a node stop to learn the same answer.
+#[test]
+fn a_component_built_against_another_host_world_does_not_load() {
+    let stale = workspace_config::read_module_artifact(&stale_host_wit(), "forge")
+        .unwrap()
+        .encode();
+    let Err(refusal) = noded::compose::load("forge", &stale) else {
+        panic!("a component built against another host world must not load");
+    };
+    assert!(
+        refusal.starts_with("forge component loads: "),
+        "the compose sentence, verbatim: {refusal}"
+    );
+    assert!(
+        refusal.contains("a matching implementation was not found in the linker"),
+        "{refusal}"
+    );
+    assert!(refusal.contains("git-object-read"), "{refusal}");
+
+    // and the set this build DOES run links, so the gate is a gate and not a
+    // wall.
+    let current = workspace_config::read_module_artifact(&fixtures(), "forge")
+        .unwrap()
+        .encode();
+    assert!(noded::compose::load("forge", &current).is_ok());
+}
+
 /// a code source that answers EVERY hash with one fixed component's bytes.
 /// a `DirCodeSource` keys itself by what it hashed, so it cannot lie by
 /// construction — the composer's re-hash needs a source that can.
