@@ -42,7 +42,7 @@ use compute_service::{
     assemble_context_doc, parse_skill_md,
 };
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
-use runs::is_skill_mount_name;
+use runs_wire::is_skill_mount_name;
 
 use crate::node_link::NodeLink;
 use provider_host::OperatorCredential;
@@ -190,12 +190,12 @@ fn run_slug(run_id: &str) -> String {
 }
 
 /// a W6 skill mount subpath is consensus-supplied data used as ONE host
-/// directory name — never a path. `runs::validate_skills` now enforces this
+/// directory name — never a path. `runs_wire::validate_skills` now enforces this
 /// exact shape at consensus time too, so a bad name is refused before it is
 /// ever committed; this call stays as the trust boundary of last resort (an
 /// older committed record, or a bug in the consensus-side check, must not
 /// let a `..` or `a/b` name escape the ro root). ONE predicate,
-/// [`runs::is_skill_mount_name`], gates both sides so they cannot drift.
+/// [`runs_wire::is_skill_mount_name`], gates both sides so they cannot drift.
 fn mount_dir_name(subpath: &str) -> Result<(), String> {
     if is_skill_mount_name(subpath) {
         Ok(())
@@ -678,8 +678,8 @@ mod tests {
 
     #[test]
     fn mount_dir_name_agrees_with_the_consensus_side_predicate() {
-        // `runs::validate_skills` and this provisioner gate the SAME name
-        // shape through ONE function (`runs::is_skill_mount_name`) — this
+        // `runs_wire::validate_skills` and this provisioner gate the SAME name
+        // shape through ONE function (`runs_wire::is_skill_mount_name`) — this
         // pins that `mount_dir_name` is nothing but a call into it, so the
         // two can never drift apart again.
         for name in [

@@ -16,7 +16,7 @@ use duckfs_client::checkout::checkout;
 use duckfs_client::commit::{CommitError, commit};
 use futures::StreamExt as _;
 use provider_host::{NativeConversationContext, NativeConversationEvent, NativePackage};
-use runs::{ConversationHistory, ConversationStatus, ConversationTurnPhase, ConversationView};
+use runs_wire::{ConversationHistory, ConversationStatus, ConversationTurnPhase, ConversationView};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -89,7 +89,7 @@ pub(super) async fn prepare(
     let same_configuration = view.conversation_id == descriptor.conversation_id
         && view.agent_id == agent.agent_id
         && view.active_turn.as_ref().is_some_and(|turn| {
-            descriptor.turn_id == runs::conversation_turn_id(turn.from_cursor, turn.through_cursor)
+            descriptor.turn_id == runs_wire::conversation_turn_id(turn.from_cursor, turn.through_cursor)
         })
         && view.history_prefix == descriptor.history_prefix
         && view.session_path == descriptor.session_path
@@ -215,12 +215,12 @@ async fn conversation(node: &NodeLink, id: &str) -> Result<ConversationView, Str
     let bytes = node
         .query(
             RUNS_MODULE,
-            &runs::encode_query(&runs::RunsQuery::Conversation {
+            &runs_wire::encode_query(&runs_wire::RunsQuery::Conversation {
                 conversation_id: id.into(),
             }),
         )
         .await?;
-    let runs::RunsReply::Conversation(Some(view)) = runs::decode_reply(&bytes)? else {
+    let runs_wire::RunsReply::Conversation(Some(view)) = runs_wire::decode_reply(&bytes)? else {
         return Err("native conversation not found in committed Runs state".into());
     };
     Ok(view)
@@ -243,14 +243,14 @@ async fn frozen_events(
         let bytes = node
             .query(
                 RUNS_MODULE,
-                &runs::encode_query(&runs::RunsQuery::ConversationEvents {
+                &runs_wire::encode_query(&runs_wire::RunsQuery::ConversationEvents {
                     conversation_id: view.conversation_id.clone(),
                     from,
                     limit,
                 }),
             )
             .await?;
-        let runs::RunsReply::ConversationEvents(events) = runs::decode_reply(&bytes)? else {
+        let runs_wire::RunsReply::ConversationEvents(events) = runs_wire::decode_reply(&bytes)? else {
             return Err("unexpected native conversation events reply".into());
         };
         let contiguous = events.len() as u64 == limit
@@ -282,10 +282,10 @@ async fn require_lease(
     let bytes = node
         .query(
             RUNS_MODULE,
-            &runs::encode_query(&runs::RunsQuery::AgentSessions),
+            &runs_wire::encode_query(&runs_wire::RunsQuery::AgentSessions),
         )
         .await?;
-    let runs::RunsReply::AgentSessions(sessions) = runs::decode_reply(&bytes)? else {
+    let runs_wire::RunsReply::AgentSessions(sessions) = runs_wire::decode_reply(&bytes)? else {
         return Err("unexpected native session reply".into());
     };
     let Some(session) = sessions.iter().find(|session| session.run_id == run_id) else {
@@ -301,7 +301,7 @@ async fn require_lease(
             "dispatch",
             &dispatch::encode_query(&dispatch::DispatchQuery::Dispatch {
                 receiver: RUNS_MODULE.into(),
-                dispatch_id: runs::dispatch_id_for(run_id),
+                dispatch_id: runs_wire::dispatch_id_for(run_id),
             }),
         )
         .await?;
@@ -409,12 +409,12 @@ fn materialize(
         private,
         NativeConversationContext {
             conversation_id: view.conversation_id.clone(),
-            turn_id: runs::conversation_turn_id(turn.from_cursor, turn.through_cursor),
+            turn_id: runs_wire::conversation_turn_id(turn.from_cursor, turn.through_cursor),
             revision: latest_history(view).map_or(0, |history| history.revision),
             session_path,
             packages,
             events: Vec::new(),
-            job_reporting: matches!(view.source, runs::ConversationSource::Job { .. }),
+            job_reporting: matches!(view.source, runs_wire::ConversationSource::Job { .. }),
             system_prompt: String::new(),
         },
         receipts,
@@ -678,7 +678,7 @@ async fn checkpoint(
     if latest_history(&current) != latest_history(&view) {
         return Err("native history checkpoint lost its revision fence".into());
     }
-    let message = runs::RunsMsg::CheckpointConversation {
+    let message = runs_wire::RunsMsg::CheckpointConversation {
         conversation_id: native.context.conversation_id.clone(),
         run_id: state.run_id.clone(),
         attempt: native.attempt,
@@ -688,7 +688,7 @@ async fn checkpoint(
     };
     let message = sdk::Msg {
         target: RUNS_MODULE.into(),
-        payload: runs::encode_msg(&message),
+        payload: runs_wire::encode_msg(&message),
     };
     let frame = node::encode_frame(&state.signer, *seq, &message);
     *seq = seq

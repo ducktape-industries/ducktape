@@ -1,5 +1,5 @@
 //! The default model workflow is an ordinary program that the controller may replace.
-use agent::{Continuation, Decode, Predicate, Program, Step, Value};
+use agent_wire::{Continuation, Decode, Predicate, Program, Step, Value};
 use std::collections::BTreeMap;
 
 fn object(fields: impl IntoIterator<Item = (&'static str, Value)>) -> Value {

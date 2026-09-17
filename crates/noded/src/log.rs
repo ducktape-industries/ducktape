@@ -383,7 +383,7 @@ fn stuck_saga(height: u64, source: &str, bytes: usize, pending_blocks: u64) {
     }
 }
 
-/// a module payload is arbitrary bytes from a WASM guest, and `runs::note()`
+/// a module payload is arbitrary bytes from a WASM guest, and `runs_wire::note()`
 /// embeds free-form provider/LLM text. cap it and strip control characters before
 /// it reaches a terminal — and the webview, which the ring is streamed to.
 fn sanitize(payload: &[u8]) -> String {

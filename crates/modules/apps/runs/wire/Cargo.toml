@@ -1,0 +1,46 @@
+# The runs module's wire surface: the messages, queries and records the module
+# answers with, the action catalog a program's operations decode to, and the
+# programs it runs. Types and their codecs, no module — so a view or the daemon
+# links THIS and not the module behind it. Same standing as `agent-wire`,
+# `boards-wire` and `chat-message`, for the same reason.
+#
+# It names `sdk` (origins and ids) and `agent-wire` (a run's program IS an agent
+# program). Both are SDK-shaped: no `native` feature, no kernel host, no disk.
+[package]
+name = "runs-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+# a run's program IS an agent program.
+agent-wire = { workspace = true }
+# the siblings whose WIRE TYPES this surface is partly made of: a worker report
+# and a job's status (tasks), the message a conversation turn carries (chat),
+# the party a collaboration operation addresses (collaboration), the summary a
+# peer call completes with (dispatch), the directive a node-work unit returns,
+# the package a conversation is delivered in (run-envelope). Every one of them
+# is SDK-shaped: none declares a `native` feature and none reaches a kernel
+# host — `node-work` is serde and nothing else.
+chat = { workspace = true }
+collaboration = { workspace = true }
+dispatch = { workspace = true }
+governance = { workspace = true }
+node-work = { workspace = true }
+run-envelope = { workspace = true }
+tasks = { workspace = true }
+# the store-record codec: compact, canonical, deterministic. wire stays sdk::wire.
+borsh = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# the catalog hashes a job spec and derives run keys.
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# ONLY to pin the copy of `MAX_PAGE_TITLE_LEN` this crate carries against pages'
+# own (see `pages_title_limit_is_the_one_pages_enforces`). `pages` depends on
+# `files` with its `native` feature, so a real dependency here would put
+# duckfs-disk and `std::fs` into every consumer of this crate — which is the
+# graph the crate exists to keep out. `cargo build` never links a dev-dep, so
+# none of it reaches a component.
+pages = { workspace = true }

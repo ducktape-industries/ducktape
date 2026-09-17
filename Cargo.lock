@@ -8074,6 +8074,7 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "agent-service",
+ "agent-wire",
  "async-trait",
  "attribution",
  "axum",
@@ -8113,6 +8114,7 @@ dependencies = [
  "reqwest 0.12.28",
  "run-envelope",
  "runs",
+ "runs-wire",
  "saga",
  "sdk",
  "sdk-testkit",
@@ -10751,6 +10753,7 @@ dependencies = [
  "node-work",
  "pages",
  "run-envelope",
+ "runs-wire",
  "saga",
  "sdk",
  "sdk-testkit",
@@ -10762,6 +10765,26 @@ dependencies = [
  "tasks",
  "tempfile",
  "valset",
+]
+
+[[package]]
+name = "runs-wire"
+version = "0.1.0"
+dependencies = [
+ "agent-wire",
+ "borsh",
+ "chat",
+ "collaboration",
+ "dispatch 0.1.0",
+ "governance",
+ "node-work",
+ "pages",
+ "run-envelope",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tasks",
 ]
 
 [[package]]

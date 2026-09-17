@@ -33,22 +33,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent"
-version = "0.1.0"
-dependencies = [
- "agent-wire",
- "async-trait",
- "attribution",
- "borsh",
- "dispatch",
- "identity",
- "sdk",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "agent-wire"
 version = "0.1.0"
 dependencies = [
@@ -65,10 +49,10 @@ dependencies = [
 name = "agents-view"
 version = "0.1.0"
 dependencies = [
- "agent",
+ "agent-wire",
  "ducktape-view-guest",
  "futures",
- "runs",
+ "runs-wire",
  "serde",
  "serde_json",
  "view-wire",
@@ -1330,13 +1314,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
-name = "files"
-version = "0.1.0"
-dependencies = [
- "duckfs-core",
-]
-
-[[package]]
 name = "files-view"
 version = "0.1.0"
 dependencies = [
@@ -2071,21 +2048,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pages"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "attribution",
- "files",
- "identity",
- "index-guest",
- "sdk",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "pages-editor-binding-fixture"
 version = "0.1.0"
 dependencies = [
@@ -2550,33 +2512,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "runs"
+name = "runs-wire"
 version = "0.1.0"
 dependencies = [
- "agent",
- "async-trait",
- "attribution",
- "base64",
+ "agent-wire",
  "borsh",
- "capability",
  "chat",
  "collaboration",
  "dispatch",
- "files",
  "governance",
- "identity",
- "index-guest",
- "modules",
  "node-work",
- "pages",
  "run-envelope",
- "saga",
  "sdk",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tasks",
- "valset",
 ]
 
 [[package]]

@@ -2,16 +2,17 @@
 //! are consensus state; workers return data or propose session actions. A
 //! user's program chooses each source write and receives its actual dispatch
 //! outcome, under each target module's own rules.
-// the wire surface: this module's shared types, flattened at the crate root.
-mod model;
-pub use model::*;
-mod model_config;
-pub use model_config::{MAX_AGENT_ID_LEN, validate_agent_id};
+// the wire surface: this module's shared types, flattened at the crate root so
+// every `runs::`/`crate::` path reads exactly as it did when they lived here.
+// they live in `runs-wire` now — the messages, the records, the action catalog,
+// the programs and the id derivations — so a view or the daemon can link the
+// format without linking this module.
+pub use runs_wire::*;
+pub use runs_wire::catalog;
 
-mod interface;
-pub use interface::*;
-mod conversation_interface;
-pub use conversation_interface::*;
+mod model_config;
+
+
 mod conversations;
 // the derived-tier run journal: the PURE decision core (fold + view over
 // index_guest::StateRead), compiled everywhere and unit-tested natively.
@@ -23,17 +24,6 @@ pub mod index;
 // (feature `index-guest`), never by the native build.
 #[cfg(feature = "index-guest")]
 mod index_guest;
-
-// the module-owned action catalog: the envelope the host carries, the typed
-// operations it decodes to, and the views discovery answers.
-mod catalog;
-pub use catalog::{
-    ActionEnvelope, ContentPart, LaneKind, OP_AGENT_CALL, OP_CHAT_POST_MESSAGE,
-    OP_COLLABORATION_ACKNOWLEDGE, OP_COLLABORATION_DELIVER, OP_DUCKFS_WRITE_TEXT, OP_FORGE_OPEN_PR,
-    OP_JOBS_COMMENT, OP_MODULES_UPDATE, OP_PAGES_COMMENT, OP_PAGES_POST, OP_PAGES_SET_CHECKED,
-    OP_REACT, OP_REPLY, OP_SUBMIT, OP_TASKS_CREATE, OP_TASKS_UPDATE_STATUS, OP_UNREACT,
-    OperationView, catalog, content_blocks, operation_view, validate_request_id,
-};
 
 // dispatch payload composition: the structured run envelope.
 mod envelope;
@@ -103,9 +93,6 @@ const JOB_FINALIZE_PAYLOAD_BYTES: usize = 64 * 1024;
 /// the delivered-runs ring keeps this many terminal runs (newest evicts
 /// oldest). derived observability state — never part of `root()`/snapshot.
 const RUN_HISTORY_CAP: usize = 100;
-/// reserved delimiter separating run-key fields — the registry rejects agent
-/// ids carrying it ([`RESERVED_ID_SEPARATOR`]), so run keys stay unambiguous.
-const RUN_KEY_SEPARATOR: char = RESERVED_ID_SEPARATOR;
 
 /// The wasm host's per-dispatch bound on distinct sibling reads. Runs mirrors
 /// it at the module boundary so reference injection degrades before the host
@@ -145,12 +132,6 @@ impl SiblingReadBudget {
     }
 }
 
-/// the turn-claim key: first creation in consensus order wins.
-pub fn run_id_for(channel_id: &str, anchor_seq: u64, agent_id: &str) -> String {
-    format!(
-        "chat{RUN_KEY_SEPARATOR}{channel_id}{RUN_KEY_SEPARATOR}{anchor_seq}{RUN_KEY_SEPARATOR}{agent_id}"
-    )
-}
 
 /// Internal pending-state coordinates for Pages sources. The `runs:`
 /// chat namespace is reserved to this module, and Runs never mints chat
@@ -179,30 +160,6 @@ pub(crate) fn page_source(channel_id: &str) -> Option<PageSource<'_>> {
             .strip_prefix(PAGE_BLOCK_CHANNEL_PREFIX)
             .map(PageSource::Block),
     }
-}
-
-pub fn page_run_id_for(thread_id: &str, ordinal: u64, agent_id: &str) -> String {
-    format!(
-        "page{RUN_KEY_SEPARATOR}{thread_id}{RUN_KEY_SEPARATOR}{ordinal}{RUN_KEY_SEPARATOR}{agent_id}"
-    )
-}
-
-/// the turn-claim key for a job-backed run.
-pub fn job_run_id_for(job_id: &str, agent_id: &str, claim_height: u64) -> String {
-    format!(
-        "job{RUN_KEY_SEPARATOR}{job_id}{RUN_KEY_SEPARATOR}{agent_id}{RUN_KEY_SEPARATOR}{claim_height}"
-    )
-}
-
-/// canonical pin over submitted job-spec bytes — the jobs event's `spec_hash`.
-pub fn job_spec_hash(spec: &[u8]) -> Vec<u8> {
-    Sha256::digest(spec).to_vec()
-}
-
-/// The chat message id of a run's reply. Hash the internal run key so its
-/// reserved separators and arbitrary suffixes cannot enter the public id space.
-pub fn reply_message_id(run_id: &str) -> String {
-    format!("agent/{}", dispatch_id_for(run_id))
 }
 
 /// which lane an agent action is being applied from — and therefore how its
@@ -255,52 +212,10 @@ impl Lane {
     }
 }
 
-/// the chat message id of an agent's `chat.post_message` — distinct from
-/// [`reply_message_id`] (the run's ONE reply) and per-slot unique, so the id is
-/// free by construction unless a submitter squatted it (which the emit probe
-/// catches). the slot is the action's [`Lane`] slot: its index in the delivered
-/// response, or `s{n}` for the nth action of the run's session.
-pub fn post_message_id(run_id: &str, slot: &str) -> String {
-    format!("agent/{}/post/{slot}", dispatch_id_for(run_id))
-}
-
 /// the dispatch-plane recipe an agent's runs execute under — registered
 /// owned by runs and registered atomically with its model configuration.
 pub(crate) fn recipe_id_for(agent_id: &str) -> String {
     format!("agent/{agent_id}")
-}
-
-/// the dispatch-plane id of a run's dispatch. run ids carry the reserved
-/// `\x1f` separator the dispatch module rejects in caller-chosen ids, so the
-/// dispatch id is the run id's hex sha256 — fixed-width, always within the
-/// dispatch id cap; the pending map is keyed by it.
-pub fn dispatch_id_for(run_id: &str) -> String {
-    hex(&Sha256::digest(run_id.as_bytes()))
-}
-
-/// Stable idempotency key for one caller-scoped agent call.
-pub fn delegation_id_for(caller_run_id: &str, request_id: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"ducktape/delegation/v1\0");
-    digest.update(caller_run_id.as_bytes());
-    digest.update([0]);
-    digest.update(request_id.as_bytes());
-    hex(&digest.finalize())
-}
-
-/// A delegated run is not another chat turn. Give it a distinct run id keyed
-/// by the call edge so the same peer may be called more than once in one turn.
-pub fn delegated_run_id_for(delegation_id: &str, callee_agent_id: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"ducktape/delegated-run/v1\0");
-    digest.update(delegation_id.as_bytes());
-    digest.update([0]);
-    digest.update(callee_agent_id.as_bytes());
-    format!("delegate/{}", hex(&digest.finalize()))
-}
-
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// THE char-boundary truncator (one home for what was four hand-rolled
@@ -328,8 +243,6 @@ mod dispatch_flow;
 mod engagement;
 mod module_updates;
 mod receipts;
-mod workflow;
-pub use workflow::{conversation_program, model_program};
 mod facets;
 use facets::WireSink;
 // the forge compose lane (M1): forge:<repo>:<n> channel detection, committed

@@ -22,6 +22,9 @@ node-work = { workspace = true }
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
 ducktape-module-sdk = { workspace = true, optional = true }
+# this module's own wire surface, re-exported at the crate root. a view or the
+# daemon links the wire alone; only the module lives here.
+runs-wire = { workspace = true }
 sdk = { workspace = true }
 agent = { workspace = true }
 identity = { workspace = true }

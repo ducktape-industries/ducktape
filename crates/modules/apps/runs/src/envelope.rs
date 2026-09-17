@@ -612,7 +612,7 @@ mod tests {
     fn the_contract_states_the_live_call_bound_the_session_lane_enforces() {
         let stated = format!(
             "at most {} calls are live at once",
-            crate::model::MAX_DELEGATIONS_PER_RUN
+            crate::MAX_DELEGATIONS_PER_RUN
         );
         assert!(STRICT_OUTPUT_INSTRUCTION.contains(&stated), "{stated}");
     }

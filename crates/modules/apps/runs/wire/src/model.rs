@@ -303,7 +303,7 @@ pub struct AgentResponse {
 /// `reply` and built from an explicit operation's target otherwise.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum ReplyDestination {
+pub enum ReplyDestination {
     Chat {
         channel_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -323,7 +323,7 @@ pub(crate) enum ReplyDestination {
 impl ReplyDestination {
     /// The catalog operation an explicit destination is invoked through; a
     /// source-resolved reply is [`crate::OP_REPLY`] instead.
-    pub(crate) fn operation(&self) -> &'static str {
+    pub fn operation(&self) -> &'static str {
         match self {
             Self::Chat { .. } => crate::OP_CHAT_POST_MESSAGE,
             Self::Page { .. } | Self::PageThread { .. } => crate::OP_PAGES_COMMENT,

@@ -96,17 +96,17 @@ pub(super) fn validate_claims(ids: &[String], receipts: &HistoryReceipts) -> Res
 
 pub(super) async fn worker_controls(
     state: &ActionState,
-) -> Result<Option<runs::WorkerControls>, String> {
+) -> Result<Option<runs_wire::WorkerControls>, String> {
     let bytes = state
         .node
         .query(
             RUNS_MODULE,
-            &runs::encode_query(&runs::RunsQuery::WorkerControls {
+            &runs_wire::encode_query(&runs_wire::RunsQuery::WorkerControls {
                 run_id: state.run_id.clone(),
             }),
         )
         .await?;
-    let runs::RunsReply::WorkerControls(controls) = runs::decode_reply(&bytes)? else {
+    let runs_wire::RunsReply::WorkerControls(controls) = runs_wire::decode_reply(&bytes)? else {
         return Err("unexpected worker controls reply".into());
     };
     Ok(controls)
@@ -121,7 +121,7 @@ fn acknowledged(control: &tasks::JobControl, job_attempt: u64) -> bool {
 pub(super) fn plan(
     receipts: &HistoryReceipts,
     approved: &HistoryReceipts,
-    worker: Option<&runs::WorkerControls>,
+    worker: Option<&runs_wire::WorkerControls>,
 ) -> Result<Vec<Acknowledgement>, String> {
     let mut result = Vec::new();
     for (id, receipt) in &receipts.controls {
@@ -159,7 +159,7 @@ pub(super) fn plan(
 pub(super) fn cancellation_plan(
     receipts: &HistoryReceipts,
     approved: &HistoryReceipts,
-    worker: Option<&runs::WorkerControls>,
+    worker: Option<&runs_wire::WorkerControls>,
     context: &NativeConversationContext,
 ) -> Result<Option<Cancellation>, String> {
     let mut cancellations = Vec::new();
@@ -304,7 +304,7 @@ pub(super) async fn acknowledge(
         }
         let message = sdk::Msg {
             target: RUNS_MODULE.into(),
-            payload: runs::encode_msg(&runs::RunsMsg::AcknowledgeJobControl {
+            payload: runs_wire::encode_msg(&runs_wire::RunsMsg::AcknowledgeJobControl {
                 run_id: state.run_id.clone(),
                 attempt: native.attempt,
                 operation_id: acknowledgement.operation_id.clone(),
@@ -378,7 +378,7 @@ async fn settle_cancellation(
     }
     let message = sdk::Msg {
         target: RUNS_MODULE.into(),
-        payload: runs::encode_msg(&runs::RunsMsg::SettleJobCancellation {
+        payload: runs_wire::encode_msg(&runs_wire::RunsMsg::SettleJobCancellation {
             run_id: state.run_id.clone(),
             attempt: native.attempt,
             operation_id: cancellation.acknowledgement.operation_id.clone(),

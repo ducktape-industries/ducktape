@@ -58,8 +58,8 @@ chat = { workspace = true }
 tasks = { workspace = true }
 identity = { workspace = true }
 gateway = { workspace = true }
-agent = { workspace = true }
-runs = { workspace = true }
+agent-wire = { workspace = true }
+runs-wire = { workspace = true }
 dispatch = { workspace = true }
 attribution = { workspace = true }
 compute-service = { workspace = true }
@@ -136,6 +136,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 topology = { workspace = true }
 
 [dev-dependencies]
+# the NATIVE modules, which only the in-crate provision tests stand up
+# (`RunsModule::new`, `agent::AgentModule::new` in agent_provision's two
+# `#[cfg(test)]` files). The daemon itself speaks to them over the wire and
+# links `runs-wire`/`agent-wire` alone — which is the point of the split, and
+# what these two lines being DEV-only proves.
+agent = { workspace = true }
+runs = { workspace = true }
 pages = { workspace = true }
 run-envelope = { workspace = true }
 wat = "1"
