@@ -28,6 +28,7 @@ pub mod sha;
 pub mod state;
 pub mod step;
 pub mod verify;
+pub mod workspace;
 
 pub use designation::Designation;
 pub use layout::Kind;

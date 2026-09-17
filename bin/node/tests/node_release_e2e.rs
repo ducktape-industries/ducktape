@@ -120,7 +120,8 @@ impl Net {
 
     /// What the install path resolves to right now.
     fn running(&self) -> Sha {
-        let target = std::fs::read_link(self.workspace.join("current")).expect("current is a link");
+        let target = std::fs::read_link(app_update::workspace::current_link(&self.workspace))
+            .expect("current is a link");
         target
             .file_name()
             .expect("the link names a release")
@@ -130,8 +131,9 @@ impl Net {
     }
 
     fn phase(&self) -> Phase {
-        let text = std::fs::read_to_string(self.workspace.join("updates/state.json"))
-            .expect("read state.json");
+        let text =
+            std::fs::read_to_string(app_update::workspace::launcher_state_path(&self.workspace))
+                .expect("read state.json");
         state::decode(&text).expect("a phase")
     }
 
