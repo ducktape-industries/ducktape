@@ -297,7 +297,8 @@ enum Family {
     /// sandboxed provider sessions (pty attach, sched runs) and run control
     /// (cancel, reassign)
     Agent(agent_cli::AgentArgs),
-    /// cross-device agent collaboration: authenticated reads of a conversation
+    /// cross-device agent collaboration: authenticated reads of a
+    /// conversation, and signed writes into it
     Collab(collab_cli::CollabArgs),
     /// live code swaps: update, register, status
     #[command(subcommand)]
