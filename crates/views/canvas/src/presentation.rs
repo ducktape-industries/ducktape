@@ -231,6 +231,16 @@ pub(super) struct Lettering {
 const ISLAND: f32 = 12.;
 /// The side of an icon-only tool.
 const TOOL: f32 = 36.;
+/// The width of the zoom readout. Fixed on purpose — a readout that resized as
+/// you zoomed would shuffle the whole camera island sideways under the pointer
+/// that was zooming — which means it has to be wide enough for the WIDEST
+/// label the zoom can reach, not the ones that happened to be on screen when it
+/// was measured. Digits are not all one width: `1` is narrow, so `100%` fitted
+/// the old 52 and `200%` and `800%` did not, and those two are the ones a user
+/// asks for on purpose (Shift-F on a single shape lands on exactly 200%,
+/// holding zoom-in settles at exactly 800%). Measured on a live board at both.
+/// Widen it again if `zoom_at`'s clamp ever passes 8.
+const ZOOM_READOUT: f32 = 64.;
 impl BoardsView {
     /// The canvas edge to edge, and over it the islands a canvas app keeps
     /// at its corners: the board menu top-left, the tools top-centre, the
@@ -427,6 +437,13 @@ impl BoardsView {
             kit::spaced(kit::centered_row("boards/tools-row", tools), 2.),
         )
     }
+    /// What the readout says. Named because `ZOOM_READOUT` is sized to hold
+    /// its widest reading and nothing else states what that is: the zoom's own
+    /// clamp does, one call away, and a test that walks the zoom to both ends
+    /// is what keeps the two facts together.
+    pub(super) fn zoom_label(&self) -> String {
+        format!("{}%", (self.zoom * 100.).round())
+    }
     /// Bottom-left: the camera, then history, then snapping.
     fn camera_island(&self) -> Node {
         let controls = [
@@ -434,12 +451,12 @@ impl BoardsView {
             kit::sized(
                 action(
                     "boards/zoom",
-                    &format!("{}%", (self.zoom * 100.).round()),
+                    &self.zoom_label(),
                     "Reset zoom · 0",
                     Message::ResetZoom,
                     true,
                 ),
-                Some(Length::Fixed(52.)),
+                Some(Length::Fixed(ZOOM_READOUT)),
                 None,
             ),
             action("boards/zoom-in", "+", "Zoom in", Message::Zoom(1.25), true),
