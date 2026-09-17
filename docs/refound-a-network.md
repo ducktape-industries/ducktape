@@ -143,10 +143,10 @@ channel — which passes only if attribution, model registration, the capability
 announcement, the sandbox and the executor credential are all intact. A
 mention that reaches no provider is not rejected; it sits pending for hours,
 so the deadline is the assertion. The smoke costs one real agent run, runs
-only with `--guest` (without it no agent service is started at all), and its
-verdict is the script's exit code — the report still prints either way,
-because by then the network exists and the ports and archive paths are what
-the operator needs.
+only with `--guest` (without it neither compute nor agent is started, so
+nothing announces the capability at all), and its verdict is the script's exit
+code — the report still prints either way, because by then the network exists
+and the ports and archive paths are what the operator needs.
 
 ## After it runs
 

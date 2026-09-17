@@ -286,6 +286,11 @@ def main():
     ap.add_argument("--channel", default="smoke")
     args = ap.parse_args()
 
+    # The script's stdout is a log an operator tails, and the wait below is
+    # minutes long. Block-buffered, every line of it would arrive at once when
+    # the process exits — which is exactly when it stops being useful.
+    sys.stdout.reconfigure(line_buffering=True)
+
     password = sys.stdin.readline().rstrip("\n")
     if not password:
         die("no wallet password on stdin")
@@ -294,6 +299,7 @@ def main():
     account = seed(net, args.agent_id, args.name)
     seq = mention(net, account, args.agent_id, args.channel)
 
+    print(f"  waiting up to {RUN_DEADLINE}s for the run to settle…")
     run = await_run(net, args.agent_id, args.channel, seq)
     settled = run["state"]["settled"]
     outcome = settled.get("outcome")
