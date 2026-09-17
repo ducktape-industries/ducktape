@@ -341,6 +341,8 @@ pub enum Message {
     Position(f32, f32),
     Begin,
     Move(f32, f32),
+    /// The clock, while a gesture is held against an edge of the stage.
+    Drift,
     Release,
     Cancel,
     Wheel(f32, f32, bool),
@@ -417,14 +419,24 @@ impl BoardsView {
                 _ => None,
             }),
         ]);
-        if !self.session.connected {
-            return session;
+        let mut running = vec![session];
+        if self.session.connected {
+            running.push(
+                host::watch(self.current.clone(), self.epoch)
+                    .map(|(epoch, id, result)| Message::Read(epoch, id, result)),
+            );
         }
-        Subscription::batch([
-            session,
-            host::watch(self.current.clone(), self.epoch)
-                .map(|(epoch, id, result)| Message::Read(epoch, id, result)),
-        ])
+        // A clock, but only while a gesture is being held against an edge. The
+        // board is still the rest of the time, and a tick on a still board is a
+        // frame drawn to change nothing — sixty times a second, for as long as
+        // the tab is open.
+        if self.drift().is_some() {
+            running.push(
+                ducktape_view_guest::every(std::time::Duration::from_millis(16))
+                    .map(|()| Message::Drift),
+            );
+        }
+        Subscription::batch(running)
     }
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
@@ -476,6 +488,7 @@ impl BoardsView {
             Message::Position(x, y) => self.on_position(x, y),
             Message::Begin => self.on_begin(),
             Message::Move(x, y) => self.on_move(x, y),
+            Message::Drift => self.on_drift(),
             Message::Release => self.on_release(),
             Message::Cancel => self.on_cancel(),
             Message::Wheel(x, y, lines) => self.on_wheel(x, y, lines),

@@ -4008,6 +4008,145 @@ fn the_weight_row_is_offered_to_everything_that_draws_a_line() {
         "a text shape draws no line, so a weight row on it sets nothing"
     );
 }
+/// A card held against the edge carries the board under it. Without this,
+/// moving a shape further than one screen is four gestures — drop it, pan, pick
+/// it up, drop it again — for a one-step intention, and every other gesture
+/// that reaches past the edge simply stops there.
+#[test]
+fn a_gesture_held_at_the_edge_carries_the_board_under_it() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            kind: Kind::Rectangle,
+            x: 600,
+            y: 400,
+            width: 200,
+            height: 140,
+            ..Default::default()
+        },
+    });
+
+    // Nothing in hand: the board does not wander because the pointer is resting
+    // near an edge.
+    view.cursor = [1395., 450.];
+    assert!(view.drift().is_none(), "an idle board drifted");
+
+    // A card in hand, in the middle: still nothing.
+    view.selected = ["a".into()].into();
+    let middle = view.screen(700., 470.);
+    view.on_press(middle[0], middle[1]);
+    view.on_begin();
+    view.on_move(middle[0], middle[1]);
+    assert!(
+        view.drift().is_none(),
+        "a drag in the middle of the stage moved the board"
+    );
+
+    // Carried into the right margin: the board comes left to meet it, which is
+    // what shows more of the board on the side the pointer is reaching toward.
+    view.on_move(1396., 450.);
+    let step = view.drift().expect("a drag at the right edge drifts");
+    assert!(
+        step[0] < 0. && step[1] == 0.,
+        "a drag at the right edge moved the board {step:?}"
+    );
+
+    // And a tick of it moves the camera and leaves the card under the cursor,
+    // which is what makes it read as carrying the card rather than losing it.
+    let before = view.camera;
+    let under_before = view.world(view.cursor);
+    view.on_drift();
+    assert!(
+        view.camera[0] < before[0],
+        "the drift did not move the camera: {:?} then {:?}",
+        before,
+        view.camera
+    );
+    let under_after = view.world(view.cursor);
+    assert!(
+        under_after[0] > under_before[0],
+        "the board did not travel: the cursor was over {under_before:?} and is now over \
+         {under_after:?}"
+    );
+
+    // Let go and it stops, whatever the cursor is still sitting on.
+    view.on_release();
+    assert!(
+        view.drift().is_none(),
+        "the board kept drifting after the drop"
+    );
+}
+/// The ramp, on its own: still in the middle, still just inside the margin,
+/// and moving in the direction that shows more board on the side being reached
+/// toward. Squared and not linear, so placing a card near the edge on purpose
+/// does not drag the board out from under it.
+#[test]
+fn the_edge_ramp_is_still_in_the_middle_and_quickest_against_the_edge() {
+    let span = 1000.;
+    assert_eq!(super::interaction::edge_step(500., span), 0.);
+
+    // The camera moves the OPPOSITE way to the reach.
+    assert!(super::interaction::edge_step(2., span) > 0.);
+    assert!(super::interaction::edge_step(span - 2., span) < 0.);
+
+    // Just inside the margin is almost still; hard against the edge is not.
+    let toe = super::interaction::edge_step(span - 50., span).abs();
+    let pressed = super::interaction::edge_step(span - 1., span).abs();
+    assert!(
+        toe < pressed / 10.,
+        "the ramp starts too fast: {toe} just inside the margin against {pressed} at the edge"
+    );
+}
+/// The clock is asked for only while a gesture is held at an edge. A view that
+/// subscribed to it always would draw a frame sixty times a second, forever, to
+/// change nothing.
+#[test]
+fn the_drift_clock_is_only_asked_for_while_it_is_needed() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            kind: Kind::Rectangle,
+            x: 600,
+            y: 400,
+            width: 200,
+            height: 140,
+            ..Default::default()
+        },
+    });
+    view.cursor = [1396., 450.];
+    assert!(
+        view.drift().is_none(),
+        "the clock was asked for with nothing in hand"
+    );
+
+    view.selected = ["a".into()].into();
+    let middle = view.screen(700., 470.);
+    view.on_press(middle[0], middle[1]);
+    view.on_begin();
+    view.on_move(1396., 450.);
+    assert!(view.drift().is_some());
+
+    // The hand tool is already moving the camera; drifting too would move it
+    // twice, in the same direction, at whatever speed the pointer happens to
+    // be resting at.
+    view.on_release();
+    view.on_tool(Tool::Hand);
+    view.on_press(1396., 450.);
+    view.on_begin();
+    view.on_move(1396., 450.);
+    assert!(
+        view.drift().is_none(),
+        "the hand tool was given a drift on top of its own pan"
+    );
+}
 /// The rows the board's menu is showing, by their own keys.
 fn menu_rows(view: &BoardsView) -> Vec<String> {
     let tree = view.view();
