@@ -357,6 +357,72 @@ fn save(workspace: &Path, services: &Services) -> Result<(), String> {
     Ok(())
 }
 
+/// The exclusive lock a read-modify-write of the grants is taken under.
+///
+/// A READER needs none: [`save`] replaces the file by rename, so a reader sees
+/// the old grants or the new ones and never a torn file. What that atomicity
+/// cannot survive is two WRITERS, because each writes the whole file back. Two
+/// `service run --enable` processes read the same grants, and whichever saves
+/// second erases the other's — leaving a daemon that is enabled by its own log,
+/// absent from `services.toml`, and ungranted to the node, which answers every
+/// saga accept `accept_not_capability_provider` while its log says it is up.
+///
+/// The lock lives in a file BESIDE the grants, never on the grants themselves:
+/// `save` replaces that inode by rename, so a lock taken on it would be held on
+/// a file nothing reads any more the moment the first writer finished.
+struct GrantLock(std::fs::File);
+
+fn lock_grants(workspace: &Path) -> Result<GrantLock, String> {
+    use std::os::unix::io::AsRawFd as _;
+    std::fs::create_dir_all(workspace).map_err(|error| format!("create {workspace:?}: {error}"))?;
+    let path = workspace.join(format!(".{FILE_NAME}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("open {path:?}: {error}"))?;
+    // BLOCKING. The guarded section is a read and a rename, so a node bringing
+    // three daemons up at once waits microseconds; telling an operator to retry
+    // would be a worse answer than waiting.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "lock {path:?}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(GrantLock(file))
+}
+
+impl Drop for GrantLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd as _;
+        // Dropping the file would release it anyway; unlocking explicitly keeps
+        // the release at the end of the guarded section rather than at whatever
+        // point the descriptor happens to close.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+/// Read, change and write the grants as ONE step under [`lock_grants`]. Every
+/// writer of `services.toml` goes through here.
+///
+/// Anything derived FROM the grants is derived INSIDE the closure — the
+/// announced set above all — or it would describe a set the file no longer
+/// holds. Network I/O deliberately is not: the caller submits after the guard
+/// has dropped, because a `/v1/submit` waits on consensus and holding a
+/// cross-process file lock for that long would serialize the very daemons this
+/// exists to let start together.
+fn with_grants<T>(
+    workspace: &Path,
+    change: impl FnOnce(&mut Services) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = lock_grants(workspace)?;
+    let mut services = load(workspace)?;
+    let derived = change(&mut services)?;
+    save(workspace, &services)?;
+    Ok(derived)
+}
+
 // ============================================================================
 // list/status state derivation
 // ============================================================================
@@ -1223,29 +1289,29 @@ pub(crate) fn commit_enable(
     base: &str,
     plan: &EnablePlan,
 ) -> Result<u64, String> {
-    let mut services = load(workspace)?;
-    // REPLACE on a re-consent, insert on a first grant — one record per kind
-    // either way, which is what `Services::validate` enforces on the next load.
-    match services
-        .grants
-        .binary_search_by(|existing| existing.kind.as_str().cmp(&plan.kind))
-    {
-        Ok(standing) => services.grants[standing] = plan.grant.clone(),
-        Err(position) => services.grants.insert(position, plan.grant.clone()),
-    }
-    // derived HERE, from the grants as they stand now — not carried down from
-    // the plan. A human may have sat on the consent prompt for a while, and
-    // another `enable` on this node could have landed in the meantime;
-    // announcing a set decided before that pause would retract it. Cannot be
-    // refused at this point: `plan_enable` bounded the widest set these grants
-    // can produce, and this is a subset of it.
-    let announce = crate::announce::announced_set(
-        &services.grants,
-        &catalog_now(base).signaling,
-        &plan.capacity,
-    )
-    .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))?;
-    save(workspace, &services)?;
+    let announce = with_grants(workspace, |services| {
+        // REPLACE on a re-consent, insert on a first grant — one record per kind
+        // either way, which is what `Services::validate` enforces on the next load.
+        match services
+            .grants
+            .binary_search_by(|existing| existing.kind.as_str().cmp(&plan.kind))
+        {
+            Ok(standing) => services.grants[standing] = plan.grant.clone(),
+            Err(position) => services.grants.insert(position, plan.grant.clone()),
+        }
+        // derived HERE, from the grants as they stand now — not carried down from
+        // the plan. A human may have sat on the consent prompt for a while, and
+        // another `enable` on this node could have landed in the meantime;
+        // announcing a set decided before that pause would retract it. Cannot be
+        // refused at this point: `plan_enable` bounded the widest set these grants
+        // can produce, and this is a subset of it.
+        crate::announce::announced_set(
+            &services.grants,
+            &catalog_now(base).signaling,
+            &plan.capacity,
+        )
+        .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))
+    })?;
     let height = crate::announce::submit(base, workspace, &announce).map_err(|error| {
         format!(
             "{} is granted but NOT announced, so nothing will be placed on it yet — this node \
@@ -2040,29 +2106,29 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
              Revoking consent is a transaction now, so it needs a reachable node and a \
              finalizing chain — a grant cannot be revoked while the node is down",
         )?;
-    let mut services = load(&workspace)?;
-    let position = services
-        .grants
-        .iter()
-        .position(|grant| grant.kind == kind)
-        .ok_or_else(|| format!("{kind} is not enabled in {}", workspace.display()))?;
-    let retired = services.grants.remove(position);
     // PERSIST first, retract second — the same order `commit_enable` uses and
     // for the same reason: a watcher tick between the two must never read a
     // revoked grant off the chain and a live one off disk, and re-announce
     // consent the operator has just withdrawn. Revocation lands on disk first,
     // so the worst a concurrent tick can do is retract it slightly early.
-    //
-    // A refusal here cannot come from this removal (a disable only shrinks the
-    // set); it would mean the file already held something the registry refuses,
-    // which `Services::validate` prevents on load.
-    let announce = crate::announce::announced_set(
-        &services.grants,
-        &catalog_now(&base).signaling,
-        &service.sandbox_capacity,
-    )
-    .map_err(|refusal| format!("{kind} was not disabled: {refusal}"))?;
-    save(&workspace, &services)?;
+    let (retired, announce) = with_grants(&workspace, |services| {
+        let position = services
+            .grants
+            .iter()
+            .position(|grant| grant.kind == kind)
+            .ok_or_else(|| format!("{kind} is not enabled in {}", workspace.display()))?;
+        let retired = services.grants.remove(position);
+        // A refusal here cannot come from this removal (a disable only shrinks
+        // the set); it would mean the file already held something the registry
+        // refuses, which `Services::validate` prevents on load.
+        let announce = crate::announce::announced_set(
+            &services.grants,
+            &catalog_now(&base).signaling,
+            &service.sandbox_capacity,
+        )
+        .map_err(|refusal| format!("{kind} was not disabled: {refusal}"))?;
+        Ok((retired, announce))
+    })?;
     let height = crate::announce::submit(&base, &workspace, &announce).map_err(|error| {
         format!(
             "{kind}'s grant is revoked but the announce was NOT retracted — this node retries \
@@ -2645,6 +2711,61 @@ mod tests {
             .expect("63 executors + the kind tag is exactly the cap");
     }
 
+    /// Three daemons granting themselves at once keep all three grants.
+    ///
+    /// The real shape is a setup script or a supervisor starting `compute`,
+    /// `agent` and `airlock` in one loop: they land in the same millisecond,
+    /// every time, and each writes the WHOLE file back. Unlocked, the last
+    /// writer's copy is the one that survives and the others' grants are gone —
+    /// with no error anywhere, because each writer succeeded. The daemon then
+    /// runs enabled by its own log and ungranted to the node, refusing every
+    /// saga accept with `accept_not_capability_provider`.
+    ///
+    /// Threads rather than processes because `flock` is per open file
+    /// description: each call opens the lock file itself, so two threads
+    /// contend exactly as two processes do.
+    #[test]
+    fn concurrent_grants_all_survive() {
+        let home = tempfile::tempdir().expect("a workspace");
+        let workspace = home.path().to_path_buf();
+        let kinds = ["agent", "airlock", "compute"];
+        let start = std::sync::Barrier::new(kinds.len());
+        std::thread::scope(|scope| {
+            for (n, kind) in kinds.iter().enumerate() {
+                let workspace = workspace.clone();
+                let start = &start;
+                scope.spawn(move || {
+                    // every thread reaches the read-modify-write together
+                    start.wait();
+                    with_grants(&workspace, |services| {
+                        let fresh = grant(kind, [n as u8 + 1; 32]);
+                        match services
+                            .grants
+                            .binary_search_by(|existing| existing.kind.as_str().cmp(kind))
+                        {
+                            Ok(standing) => services.grants[standing] = fresh,
+                            Err(position) => services.grants.insert(position, fresh),
+                        }
+                        Ok(())
+                    })
+                    .expect("grant under the lock");
+                });
+            }
+        });
+
+        let survived = load(&workspace).expect("the grants");
+        let kept: Vec<&str> = survived
+            .grants
+            .iter()
+            .map(|grant| grant.kind.as_str())
+            .collect();
+        assert_eq!(
+            kept, kinds,
+            "a concurrent grant was lost: each writer rewrites the whole file, so without a \
+             lock across load..save the last one to save erases the others"
+        );
+    }
+
     /// Consent lands on DISK before it lands on chain, in both verbs.
     ///
     /// A source lint because the property is an ORDER between two writers, not
@@ -2668,8 +2789,12 @@ mod tests {
                 .nth(1)
                 .and_then(|rest| rest.split("\nfn ").next())
                 .unwrap_or_else(|| panic!("{verb} has a body"));
+            // `with_grants(` IS the persist: it is the only writer of the file
+            // (it holds the lock across load..save), so a verb that reaches
+            // `announce::submit(` without having gone through it has either
+            // announced before persisting or bypassed the lock.
             let saved = body
-                .find("save(")
+                .find("with_grants(")
                 .unwrap_or_else(|| panic!("{verb} persists"));
             let announced = body
                 .find("announce::submit(")
