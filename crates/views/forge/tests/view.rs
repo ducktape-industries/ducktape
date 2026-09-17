@@ -100,6 +100,21 @@ impl Drive {
         self.tick(vec![answer(id, payload)]);
     }
 
+    /// Answer the NEWEST outstanding read whose ask names `tag`. An item
+    /// left and opened again asks the same read twice, and the one its
+    /// screen is waiting on is the last.
+    fn answer_latest(&mut self, tag: &str, payload: &[u8]) {
+        let id = *self
+            .open
+            .iter()
+            .filter(|(_, named)| named == tag)
+            .map(|(id, _)| id)
+            .next_back()
+            .unwrap_or_else(|| panic!("no open `{tag}` read in {:?}", self.open));
+        self.open.retain(|(open, _)| *open != id);
+        self.tick(vec![answer(id, payload)]);
+    }
+
     /// Answer the newest outstanding tree read for `path` — the view opens
     /// one per (revision, directory), and a repo opens with a read at no
     /// revision whose subscription is gone by the time the head is known.
@@ -213,6 +228,37 @@ fn open_item(link: &str) -> Drive {
     drive
 }
 
+/// The open item's FILES screen: a pull request's changes, and the review
+/// composed over them, are one tab press from its conversation.
+fn open_files(link: &str) -> Drive {
+    let mut drive = open_item(link);
+    drive.tick(press(&drive.frame, "forge/item-tab/files"));
+    drive
+}
+
+fn issue_detail() -> Vec<u8> {
+    serde_json::json!({ "item": {
+        "number": 8, "kind": "issue", "state": "open", "title": "the pond is cold",
+        "author": { "account": 1 }, "body": "every morning",
+        "channel_id": "forge-core-8", "source_branch": "",
+        "target_branch": "", "merge_oid": "", "reviews": []
+    }})
+    .to_string()
+    .into_bytes()
+}
+
+/// An open ISSUE: no patch is read for one, so its screen is the detail and
+/// the roster its author is named through.
+fn open_issue(link: &str) -> Drive {
+    let (mut drive, _) = namespace(link);
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    drive.answer("get_item", &issue_detail());
+    drive.answer("all", &accounts());
+    drive
+}
+
 /// At boot the view asks the kernel for the session and nothing else; once
 /// connected it subscribes to the forge plane and reads the repo namespace
 /// itself.
@@ -305,11 +351,132 @@ fn a_refused_file_read_says_so_in_the_file_pane() {
     );
 }
 
+/// AN ITEM HAS TWO SCREENS AND OPENS ON THE FIRST. What a pull request says
+/// — its body, its merge box, its reviews and the discussion — is its
+/// conversation; the patch is a screen of its own, one press away, and the
+/// press is the only thing that moves between them. Nothing is read again:
+/// both screens are drawn from the reads the item already made.
+#[test]
+fn an_item_opens_on_its_conversation_with_its_files_one_press_away() {
+    let mut drive = open_item("duck://forge/core/7");
+    assert!(
+        has_text(&drive.frame, "why this lands"),
+        "the body is on the conversation: {:?}",
+        texts(&drive.frame)
+    );
+    assert!(
+        has_text(&drive.frame, "Discussion"),
+        "and so is the discussion: {:?}",
+        texts(&drive.frame)
+    );
+    assert!(
+        !has_text(&drive.frame, "@@ -1 +1 @@"),
+        "the patch is not: {:?}",
+        texts(&drive.frame)
+    );
+    // the strip wears the count the patch reported
+    assert!(
+        has_text(&drive.frame, "Files changed 1"),
+        "{:?}",
+        texts(&drive.frame)
+    );
+
+    drive.tick(press(&drive.frame, "forge/item-tab/files"));
+    assert!(
+        reads(&drive.frame).is_empty(),
+        "a tab press reads nothing: {:?}",
+        kinds(&drive.frame.requests)
+    );
+    assert!(
+        has_text(&drive.frame, "@@ -1 +1 @@"),
+        "the patch is on the files screen: {:?}",
+        texts(&drive.frame)
+    );
+    assert!(
+        !has_text(&drive.frame, "Discussion"),
+        "the conversation is not: {:?}",
+        texts(&drive.frame)
+    );
+    // the review is composed here, beside the lines it anchors to
+    assert!(
+        has_text(&drive.frame, "Submit review"),
+        "{:?}",
+        texts(&drive.frame)
+    );
+
+    drive.tick(press(&drive.frame, "forge/item-tab/conversation"));
+    assert!(
+        has_text(&drive.frame, "Discussion"),
+        "and the press goes back: {:?}",
+        texts(&drive.frame)
+    );
+}
+
+/// The merge box stays where a pull request is READ, not where its lines
+/// are: a reader deciding whether to merge is on the conversation.
+#[test]
+fn the_merge_box_and_the_reviews_stay_on_the_conversation() {
+    let drive = open_item("duck://forge/core/7");
+    for expected in ["Merge pull request", "Reviews"] {
+        assert!(
+            has_text(&drive.frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&drive.frame)
+        );
+    }
+    let files = open_files("duck://forge/core/7");
+    for absent in ["Merge pull request", "Reviews"] {
+        assert!(
+            !has_text(&files.frame, absent),
+            "{absent:?} followed the patch: {:?}",
+            texts(&files.frame)
+        );
+    }
+}
+
+/// An ISSUE has one screen. It changes no files, so it wears no strip —
+/// a tab that can only ever be empty is a tab that lies.
+#[test]
+fn an_issue_wears_no_files_tab() {
+    let drive = open_issue("duck://forge/core/8");
+    assert!(
+        has_text(&drive.frame, "the pond is cold"),
+        "the issue is open: {:?}",
+        texts(&drive.frame)
+    );
+    for absent in ["Conversation", "Files changed"] {
+        assert!(
+            !has_text(&drive.frame, absent),
+            "{absent:?} is on an issue: {:?}",
+            texts(&drive.frame)
+        );
+    }
+}
+
+/// The screen is not a preference that outlives the item. Leaving a pull
+/// request from its files and opening it again lands on the conversation,
+/// which is where a reader starts.
+#[test]
+fn leaving_an_item_forgets_which_screen_it_was_left_on() {
+    let mut drive = open_files("duck://forge/core/7");
+    assert!(has_text(&drive.frame, "@@ -1 +1 @@"));
+    drive.tick(press(&drive.frame, "Back to tracker"));
+    drive.tick(press(&drive.frame, "Bound every list"));
+    drive.answer_latest("get_item", &detail());
+    drive.answer_latest("pr_diff", &pr_diff());
+    drive.answer_latest("all", &accounts());
+    assert!(
+        has_text(&drive.frame, "Discussion"),
+        "the item opens on its conversation: {:?}",
+        texts(&drive.frame)
+    );
+}
+
 /// The patch is drawn per file — one row naming the file, then its hunks —
 /// never git's own `---`/`+++`/`index` bookkeeping lines.
 #[test]
 fn a_patch_opens_each_file_with_one_named_row() {
-    let drive = open_item("duck://forge/core/7");
+    let drive = open_files("duck://forge/core/7");
     let shown = texts(&drive.frame);
     assert!(shown.iter().any(|text| text == "main.rs"), "{shown:?}");
     assert!(
@@ -336,6 +503,7 @@ fn a_refused_patch_read_is_said_under_changes() {
     let diff = drive.take("pr_diff");
     drive.tick(vec![refuse(diff, "the pack is gone")]);
     drive.answer("all", &accounts());
+    drive.tick(press(&drive.frame, "forge/item-tab/files"));
     assert!(
         has_text(
             &drive.frame,
@@ -366,7 +534,7 @@ fn a_routed_link_opens_the_item_it_names() {
 /// the module's wire names, signed by the kernel with the seated key.
 #[test]
 fn a_review_leaves_as_a_signed_op() {
-    let mut drive = open_item("duck://forge/core/7");
+    let mut drive = open_files("duck://forge/core/7");
     let typed = type_into(&drive.frame, "Leave a review…", "reads well");
     drive.tick(typed);
     let events = press(&drive.frame, "Submit review");
@@ -591,7 +759,7 @@ fn a_file_link_unfolds_the_tree_down_to_it() {
 
 #[test]
 fn a_diff_line_comment_keeps_its_anchor_and_submits_without_a_review_body() {
-    let mut drive = open_item("duck://forge/core/7");
+    let mut drive = open_files("duck://forge/core/7");
     // the mark reads `+` and carries the line it belongs to as its name
     drive.tick(press(&drive.frame, "main.rs:1"));
     drive.tick(type_into(
@@ -1115,7 +1283,7 @@ fn focus_asks(drive: &Drive) -> Vec<String> {
 /// file leaves the others open.
 #[test]
 fn a_changed_file_folds_its_hunks_away_and_back() {
-    let mut drive = open_item("duck://forge/core/7");
+    let mut drive = open_files("duck://forge/core/7");
     let hunk = "@@ -1 +1 @@";
     assert!(has_text(&drive.frame, hunk), "{:?}", texts(&drive.frame));
     drive.tick(press(&drive.frame, "main.rs"));

@@ -32,6 +32,11 @@ pub struct ForgeView {
     pub(crate) item_side: String,
     /// What the reader typed into the tracker filter.
     pub(crate) item_filter: String,
+    /// Which of an open item's screens is being read: `conversation` or
+    /// `files`. Only a pull request has the second one, and the review
+    /// lives on it — a line comment is composed beside the line it names,
+    /// not on a screen that does not show the lines.
+    pub(crate) item_tab: String,
     pub(crate) forge_item_number: i64,
     pub(crate) item_phase: String,
     pub(crate) forge_item_kind: String,
@@ -134,6 +139,7 @@ pub enum Message {
     ForgeOpenItem(i64),
     ForgeCloseItem,
     SelectForgeTab(String),
+    SelectItemTab(String),
     SelectTrackerSide(String),
     TrackerFilterChanged(String),
     Key(wire::keyboard::Event, bool),
@@ -185,6 +191,7 @@ impl ForgeView {
             tab: "code".to_owned(),
             item_side: "open".to_owned(),
             item_filter: "".to_owned(),
+            item_tab: "conversation".to_owned(),
             forge_item_number: 0,
             item_phase: "idle".to_owned(),
             forge_item_kind: "".to_owned(),
@@ -261,7 +268,7 @@ impl ForgeView {
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     /// This state's layout, digested — `snapshot_schema` holds it here.
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "fba7d83f8bd8615cc26f4b967f334729cbe6a45ae3099286f4492b387fede5c7";
+        "33f740f13efc67ee77242c11be6709e3158e3312ca3512c2f2f68c60477a861d";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {

@@ -37,6 +37,23 @@ pub(super) fn section(key: &str, title: wire::Node, children: Vec<wire::Node>) -
     native::spaced(native::column(key, items), 10.)
 }
 
+/// One item screen's column: inset, held to a reading width, and scrolled
+/// as one. Both of an item's screens are drawn into it, so a tab press
+/// cannot change the page's measure.
+fn item_column(content: Vec<wire::Node>) -> wire::Node {
+    let mut column = native::spaced(
+        native::padded(
+            native::column("forge/item-content", content),
+            wire::Edges::all(INSET),
+        ),
+        16.,
+    );
+    if let wire::Node::Linear { max_width, .. } = &mut column {
+        *max_width = Some(920.);
+    }
+    native::scroll("forge/item-scroll", column)
+}
+
 fn picker(
     key: &str,
     options: Vec<String>,
@@ -535,12 +552,22 @@ impl ForgeView {
                     ),
                     6.,
                 ));
+                let reviewable = self.forge_item_kind == "pr";
+                if reviewable {
+                    content.push(self.item_tab_row());
+                }
+                // the files screen is the changes and the review over them;
+                // everything else an item says is its conversation
+                if reviewable && self.item_tab == "files" {
+                    content.push(self.diff_screen());
+                    content.push(self.review_compose());
+                    return item_column(content);
+                }
                 if !self.forge_item_body.is_empty() {
                     content
                         .push(self.item_body("forge/item-body".into(), Message::OpenMessageLink));
                 }
-                if self.forge_item_kind == "pr" {
-                    content.push(self.diff_screen());
+                if reviewable {
                     content.push(self.merge_screen());
                     content.push(self.review_screen());
                 }
@@ -587,17 +614,34 @@ impl ForgeView {
             }
             _ => {}
         }
-        let mut column = native::spaced(
-            native::padded(
-                native::column("forge/item-content", content),
-                wire::Edges::all(INSET),
-            ),
-            16.,
-        );
-        if let wire::Node::Linear { max_width, .. } = &mut column {
-            *max_width = Some(920.);
-        }
-        native::scroll("forge/item-scroll", column)
+        item_column(content)
+    }
+
+    /// An item's own tabs: what it says, and — for a pull request — the
+    /// files it changes, wearing their count. The review is composed on the
+    /// files screen, so a line comment is written beside the line it names;
+    /// an issue has one screen and wears no strip.
+    fn item_tab_row(&self) -> wire::Node {
+        let choices = [("conversation", "Conversation"), ("files", "Files changed")]
+            .into_iter()
+            .map(|(tab, label)| {
+                let counted = tab == "files" && self.forge_item_files_changed > 0;
+                let name = match counted {
+                    true => format!("{label} {}", self.forge_item_files_changed),
+                    false => label.to_owned(),
+                };
+                (
+                    tab.to_owned(),
+                    name,
+                    self.item_tab == tab,
+                    Some(slots::message(Message::SelectItemTab(tab.to_owned()))),
+                )
+            });
+        native::sized(
+            native::tabs("forge/item-tab", choices),
+            Some(wire::Length::Shrink),
+            None,
+        )
     }
 
     /// One note in the discussion: an avatar, then who wrote it and what it
