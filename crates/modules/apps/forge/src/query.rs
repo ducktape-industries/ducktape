@@ -12,13 +12,18 @@ use std::collections::{BTreeSet, VecDeque};
 #[cfg(all(feature = "guest", not(feature = "native")))]
 use ducktape_module_sdk::host::{
     GitDiff, GitDiffError as DiffError, GitDiffFile, GitFileStatus, GitObject as Object,
-    GitObjectData,
 };
 #[cfg(feature = "native")]
 use git_primitives::{
     GitDiff, GitDiffError as DiffError, GitDiffFile, GitFileStatus, GitObject as Object,
-    GitObjectData,
 };
+// an object crosses as its kind, its size and its raw body; what a commit or a
+// tree MEANS is decided here, on either arm, by the same two parsers.
+use git_primitives::{KIND_BLOB, KIND_COMMIT, KIND_TREE, parse_commit, parse_tree};
+// only the substrate ever names a tag: the read policy browses commits, trees
+// and blobs, and an annotated tag reaches it as a kind no read matches.
+#[cfg(feature = "native")]
+use git_primitives::KIND_TAG;
 
 pub(crate) trait GitRead {
     fn object(&self, repo: &str, oid: Oid, cap: usize) -> Result<Object, Error>;
@@ -130,11 +135,40 @@ pub(crate) struct Reader<'a, G> {
     pub git: G,
 }
 
-/// the git object kinds this reader names, as the host's `git-object` numbers
-/// them. Spelled once: a bare `2` in a tree walk reads as a depth, a count or a
-/// limit just as easily as it reads as "this entry is a directory".
-const KIND_TREE: u8 = 2;
-const KIND_BLOB: u8 = 3;
+/// a tree entry's octal-mode high nibble, which is what
+/// [`git_primitives::parse_tree`] reports and what git actually stores.
+const MODE_DIR: u8 = 4;
+const MODE_FILE: u8 = 8;
+const MODE_SYMLINK: u8 = 10;
+
+/// the KIND of object a tree entry points at, from the mode git stored it
+/// under. A symlink is a blob holding its target path, so it browses as a file;
+/// a submodule points at a commit this repository does not have, and everything
+/// else is nothing this reader knows how to show — both land on `0`, the kind
+/// no object read ever matches, and surface as a truncated listing.
+fn entry_kind(mode: u8) -> u8 {
+    match mode {
+        MODE_DIR => KIND_TREE,
+        MODE_FILE | MODE_SYMLINK => KIND_BLOB,
+        _ => 0,
+    }
+}
+
+/// one tree object's entries, in git's stored order, each carrying the kind of
+/// object it points at and its oid already validated.
+fn tree_entries(raw: &[u8]) -> Result<Vec<Entry>, Error> {
+    parse_tree(raw)
+        .map_err(|error| Error::module("bad_tree_object", format!("forge: {error}")))?
+        .into_iter()
+        .map(|entry| {
+            Ok(Entry {
+                kind: entry_kind(entry.kind),
+                name: entry.name,
+                oid: Oid::from_bytes(&entry.oid)?,
+            })
+        })
+        .collect()
+}
 
 const MAX_BROWSE_COMMITS: usize = 256;
 const MAX_BROWSE_COMMIT_BYTES: usize = 4 * 1024 * 1024;
@@ -212,7 +246,10 @@ enum Skipped {
 impl<G: GitRead> Reader<'_, G> {
     fn object(&self, repo: &str, oid: Oid, kind: u8, cap: usize) -> Result<Object, Error> {
         let object = self.git.object(repo, oid, cap)?;
-        let valid = object.kind == kind && object.size <= cap as u64 && object.data.is_some();
+        // the body is whole exactly when it is all there: `raw` comes back
+        // empty when max-bytes refused to materialize it.
+        let whole = object.raw.len() as u64 == object.size;
+        let valid = object.kind == kind && object.size <= cap as u64 && whole;
         if !valid {
             return Err(Error::module(
                 "object_read_bound",
@@ -223,10 +260,9 @@ impl<G: GitRead> Reader<'_, G> {
     }
 
     fn commit(&self, repo: &str, oid: Oid) -> Result<(Commit, usize), Error> {
-        let object = self.object(repo, oid, 1, MAX_PR_DIFF_COMMIT_BYTES)?;
-        let Some(GitObjectData::Commit(commit)) = object.data else {
-            return Err(Error::module("not_a_commit", "forge: expected a commit"));
-        };
+        let object = self.object(repo, oid, KIND_COMMIT, MAX_PR_DIFF_COMMIT_BYTES)?;
+        let commit = parse_commit(&object.raw)
+            .map_err(|error| Error::module("bad_commit_object", format!("forge: {error}")))?;
         let tree = Oid::from_bytes(&commit.tree)?;
         let parents = commit
             .parents
@@ -260,16 +296,13 @@ impl<G: GitRead> Reader<'_, G> {
         while let Some(segment) = segments.next() {
             let object = self.object(repo, oid, KIND_TREE, MAX_TREE_BYTES.saturating_sub(total))?;
             total += object.size as usize;
-            let Some(GitObjectData::Tree(entries)) = object.data else {
-                return Err(Error::module("not_a_tree", "forge: expected a tree"));
-            };
-            let Some(entry) = entries
+            let Some(entry) = tree_entries(&object.raw)?
                 .into_iter()
                 .find(|entry| entry.name == segment.as_bytes())
             else {
                 return Ok(None);
             };
-            let found = Oid::from_bytes(&entry.oid)?;
+            let found = entry.oid;
             if segments.peek().is_none() {
                 return Ok(Some(found));
             }
@@ -609,19 +642,7 @@ impl<G: GitRead> Reader<'_, G> {
         loop {
             let object = self.object(repo, oid, KIND_TREE, MAX_TREE_BYTES.saturating_sub(total))?;
             total += object.size as usize;
-            let Some(GitObjectData::Tree(entries)) = object.data else {
-                return Err(Error::module("not_a_tree", "forge: expected a tree"));
-            };
-            let entries = entries
-                .into_iter()
-                .map(|entry| {
-                    Ok(Entry {
-                        kind: entry.kind,
-                        name: entry.name,
-                        oid: Oid::from_bytes(&entry.oid)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
+            let entries = tree_entries(&object.raw)?;
             let Some(segment) = segments.next() else {
                 return Ok(entries);
             };
@@ -824,16 +845,14 @@ impl<G: GitRead> Reader<'_, G> {
                     Error::module("object_size_overflow", "forge: object size exceeds i64")
                 })?;
                 let truncated = object.size > MAX_BLOB_BYTES as u64;
-                let (text, binary) = match object.data {
-                    Some(GitObjectData::Blob(bytes)) => match String::from_utf8(bytes)
-                        .ok()
-                        .filter(|text| !text.contains('\0'))
-                    {
-                        Some(text) => (text, false),
-                        None => (String::new(), true),
-                    },
-                    None => (String::new(), false),
-                    Some(_) => return Err(Error::module("not_a_blob", "forge: expected a blob")),
+                // a refused body comes back empty, which reads as empty text —
+                // `truncated` is what says the file is not empty, just unread.
+                let (text, binary) = match String::from_utf8(object.raw)
+                    .ok()
+                    .filter(|text| !text.contains('\0'))
+                {
+                    Some(text) => (text, false),
+                    None => (String::new(), true),
                 };
                 ForgeReply::Blob(BlobReply {
                     rev: oid.to_string(),
@@ -858,11 +877,7 @@ impl<G: GitRead> Reader<'_, G> {
                 let size = i64::try_from(object.size).map_err(|_| {
                     Error::module("object_size_overflow", "forge: object size exceeds i64")
                 })?;
-                let data = match object.data {
-                    Some(GitObjectData::Blob(bytes)) => bytes,
-                    None => Vec::new(),
-                    Some(_) => return Err(Error::module("not_a_blob", "forge: expected a blob")),
-                };
+                let data = object.raw;
                 let start = usize::try_from(offset)
                     .unwrap_or(usize::MAX)
                     .min(data.len());
@@ -959,20 +974,8 @@ impl GitRead for NativeGit<'_> {
 }
 
 /// Storage confinement and allocation ceilings are host rules, independent of
-/// the guest's path/revision policy. No reference or product query is decoded.
-/// `Name <email>`, the raw identity line, with whatever git recorded. it is one
-/// string rather than two because that is what a signature IS on disk, and
-/// splitting it here would make the host decide what an author's name is.
-#[cfg(feature = "native")]
-fn identity_line(who: &git2::Signature<'_>) -> String {
-    let name = String::from_utf8_lossy(who.name_bytes());
-    let email = String::from_utf8_lossy(who.email_bytes());
-    if email.is_empty() {
-        return name.into_owned();
-    }
-    format!("{name} <{email}>")
-}
-
+/// the guest's path/revision policy. No reference or product query is decoded,
+/// and no object body is interpreted: the substrate hands back git's own bytes.
 #[cfg(feature = "native")]
 pub(crate) fn read_object(
     base: &std::path::Path,
@@ -996,82 +999,34 @@ pub(crate) fn read_object(
         git2::ObjectType::Tree => 4 * 1024 * 1024,
         _ => 16 * 1024 * 1024,
     };
-    let cap = max_bytes.min(engine_cap);
-    let data = if size as u64 > cap {
-        None
-    } else {
-        Some(match kind {
-            git2::ObjectType::Commit => {
-                let commit = repo
-                    .find_commit(oid)
-                    .map_err(|error| Error::module("git_find_commit", error.to_string()))?;
-                let committer = commit.committer();
-                GitObjectData::Commit(git_primitives::GitCommit {
-                    tree: commit.tree_id().as_bytes().to_vec(),
-                    parents: commit
-                        .parent_ids()
-                        .map(|oid| oid.as_bytes().to_vec())
-                        .collect(),
-                    // the AUTHOR line is what a log shows beside a commit; the
-                    // COMMITTER's time is what it is ordered by. a rebase moves
-                    // the second and not the first, and a reader wants the
-                    // order the branch was actually built in.
-                    author: identity_line(&commit.author()),
-                    committed_at: committer.when().seconds().max(0) as u64,
-                    // lossy: a commit message is bytes, and a non-UTF-8 one
-                    // must still be readable rather than fail the whole walk.
-                    message: String::from_utf8_lossy(commit.message_bytes()).into_owned(),
-                })
-            }
-            git2::ObjectType::Tree => {
-                let tree = repo
-                    .find_tree(oid)
-                    .map_err(|error| Error::module("git_find_tree", error.to_string()))?;
-                GitObjectData::Tree(
-                    tree.iter()
-                        .map(|entry| git_primitives::GitTreeEntry {
-                            kind: match entry.kind() {
-                                Some(git2::ObjectType::Tree) => 2,
-                                Some(git2::ObjectType::Blob) => 3,
-                                _ => 0,
-                            },
-                            name: entry.name_bytes().to_vec(),
-                            oid: entry.id().as_bytes().to_vec(),
-                        })
-                        .collect(),
-                )
-            }
-            git2::ObjectType::Blob => GitObjectData::Blob(
-                odb.read(oid)
-                    .map_err(|error| Error::module("git_odb_read", error.to_string()))?
-                    .data()
-                    .to_vec(),
-            ),
-            git2::ObjectType::Tag => GitObjectData::Tag(
-                odb.read(oid)
-                    .map_err(|error| Error::module("git_odb_read", error.to_string()))?
-                    .data()
-                    .to_vec(),
-            ),
-            git2::ObjectType::Any => {
-                return Err(Error::module(
-                    "unsupported_object_type",
-                    "forge: the odb holds no concrete type for this object",
-                ));
-            }
-        })
-    };
     let kind = match kind {
-        git2::ObjectType::Commit => 1,
-        git2::ObjectType::Tree => 2,
-        git2::ObjectType::Blob => 3,
-        git2::ObjectType::Tag => 4,
-        git2::ObjectType::Any => 0,
+        git2::ObjectType::Commit => KIND_COMMIT,
+        git2::ObjectType::Tree => KIND_TREE,
+        git2::ObjectType::Blob => KIND_BLOB,
+        git2::ObjectType::Tag => KIND_TAG,
+        git2::ObjectType::Any => {
+            return Err(Error::module(
+                "unsupported_object_type",
+                "forge: the odb holds no concrete type for this object",
+            ));
+        }
+    };
+    // an object that does not fit the ceiling answers with its size alone: the
+    // body stays unread and `raw` comes back empty, which is how the caller
+    // tells a refused read from a whole one (`raw.len() == size`).
+    let refused = size as u64 > max_bytes.min(engine_cap);
+    let raw = match refused {
+        true => Vec::new(),
+        false => odb
+            .read(oid)
+            .map_err(|error| Error::module("git_odb_read", error.to_string()))?
+            .data()
+            .to_vec(),
     };
     Ok(git_primitives::GitObject {
         kind,
         size: size as u64,
-        data,
+        raw,
     })
 }
 

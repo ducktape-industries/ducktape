@@ -12,7 +12,7 @@ default = ["native"]
 # the on-disk git substrate: the `Forge` module, snapshot packing, and
 # materialization. the wasm tenant's `OdbBacking` twin is NOT here — it is
 # `forge-odb`, so this crate names no kernel host (#2303).
-native = ["dep:git2", "dep:blobstore", "dep:tracing", "dep:git-primitives"]
+native = ["dep:git2", "dep:blobstore", "dep:tracing"]
 # the wasm-guest port: the pure `ForgeState` core over the host state lane +
 # object plane. non-default and wasm-only (the ducktape-module-sdk bindings compile
 # only for wasm32-unknown-unknown).
@@ -54,12 +54,14 @@ tracing = { workspace = true, optional = true }
 # vendored libgit2 (built via cmake + cc). default-features=false drops the
 # ssh/https transport (openssl/libssh2) — forge only touches local repos.
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"], optional = true }
-# the git read types the product read policy (`query.rs`) answers in, on its
-# NATIVE arm. a zero-dep leaf held outside the kernel on purpose: that arm used
-# to bind them out of `wasm-host`, which was the one thing keeping this module
-# from being lifted out of the repository. optional so it stays out of the guest
-# graph — the guest arm binds the same shapes from its own bindgen.
-git-primitives = { workspace = true, optional = true }
+# the git read types the product read policy (`query.rs`) answers in, and the
+# commit/tree parsers it turns a raw object into — on BOTH arms. a zero-dep leaf
+# held outside the kernel on purpose: the native arm used to bind these shapes
+# out of `wasm-host`, which was the one thing keeping this module from being
+# lifted out of the repository. not optional: the host hands over a raw object
+# and the guest parses it here, so `parse_commit`/`parse_tree` are the read
+# policy on the wasm arm too.
+git-primitives = { workspace = true }
 # wasm-only, behind `guest`: the port harness (WitCtx / host imports). a
 # standalone-workspace path crate, pulled only when the `guest` feature builds
 # for wasm32 — never by the native gate.

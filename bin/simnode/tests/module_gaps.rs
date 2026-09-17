@@ -424,10 +424,10 @@ fn the_jobs_authorization_matrix_gates_every_transition() {
 /// below MAX_ATTEMPTS and FAILS the job on the claim that reaches it.
 #[test]
 fn an_expired_reclaim_fails_the_job_exactly_at_the_attempt_ceiling() {
-    // the job board's own clamps, not part of its wire surface: this suite
-    // drives the module over the wire and restates them to walk the ceiling.
-    const MAX_ATTEMPTS: u64 = 8;
-    const MIN_LEASE_VIEWS: u64 = 10;
+    // the job board's own clamps, taken from its wire crate rather than
+    // restated here: a suite that copies a bound walks the ceiling it remembers
+    // instead of the one the module enforces.
+    use tasks::{MAX_ATTEMPTS, MIN_LEASE_VIEWS};
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
     // the job board now lives in the merged `tasks` module; ops and the `get`
