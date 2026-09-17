@@ -15,6 +15,12 @@ const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const BLOB_UPLOAD_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// The throughput floor a blob's bytes are budgeted at, on both legs they
+/// travel: up to the node ([`Client::put_blob_file`]) and out from it to every
+/// other validator before the submit's block can apply ([`submit_budget`]).
+/// One number, because it is one pack crossing one class of link — a second
+/// floor would be two answers to the same question.
+const BLOB_FLOOR_BYTES_PER_SEC: u64 = 64 * 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(7_500);
 
 /// A node response or transport failure safe to show to a client user.
@@ -43,6 +49,70 @@ impl From<Error> for String {
 
 /// Result returned by the RPC client.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Why [`Client::submit_frame`] answered no height — and, decisively, whether
+/// the op is DEAD or merely unaccounted for.
+///
+/// The submit lane is the one call where those differ. The node holds the
+/// response until the block that includes the frame commits, so a client that
+/// stops waiting has learned nothing: the op may be committing at that very
+/// moment. A caller that reports the two the same way tells its user a push
+/// was rejected while the refs are landing, and the retry then collides with
+/// the ref the "rejected" push installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitFailure {
+    /// The node answered, and its answer was no — a malformed frame, an
+    /// unknown module, a module that refused the op. This is a verdict, and
+    /// it is the only failure a caller may relay to a user as a refusal.
+    Refused(String),
+    /// The exchange never completed: the connection failed, the budget ran
+    /// out, or the receipt did not parse. The op's fate is UNKNOWN. Report it
+    /// as an error, never as a refusal, and re-read before retrying.
+    Unresolved(String),
+}
+
+impl fmt::Display for SubmitFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(detail) | Self::Unresolved(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for SubmitFailure {}
+
+/// How long to wait for a submit receipt over a frame carrying `blob_bytes`.
+///
+/// [`TIMEOUT`] is an RPC's budget and a submit is not an RPC: the node answers
+/// only once the block that includes the frame commits, and when the frame
+/// requires a blob, that block cannot apply until the node has fanned those
+/// bytes out to every other validator. So the wait scales with the blob,
+/// exactly as [`Client::put_blob_file`]'s upload does, and over the same links
+/// — which is why it reuses that floor rather than inventing a second one.
+///
+/// A flat budget here is a size limit wearing a clock: at the old 30 s, a
+/// repository-sized push was reported failed while it was committing, and
+/// landed half a minute later. The floor still fails a dead link; it just
+/// refuses to call a slow one dead.
+///
+/// The bar it has to clear is the NODE's own hold for the same frame:
+/// `SUBMIT_HOLD` plus `relay::blob_transfer_allowance(bytes, targets)` — the
+/// node budgets the fan-out at 1 MiB/s over hex-inflated bytes, once per
+/// target (`bin/node/src/relay.rs`). A client that gives up first turns a
+/// submit the node is still honestly working on into a reported failure. At
+/// 64 KiB/s this clears that hold up to EIGHT fan-out targets, since the node
+/// spends `2 * targets` of its floor against this one's 16.
+///
+/// ponytail: a constant that outlasts a formula it cannot read. The node knows
+/// its own deadline exactly — have it state the hold in the submit response
+/// (or a first-byte receipt) and wait for that instead, when a network grows
+/// past eight validators.
+fn submit_budget(blob_bytes: u64) -> Duration {
+    if blob_bytes == 0 {
+        return TIMEOUT;
+    }
+    TIMEOUT + Duration::from_secs(blob_bytes.div_ceil(BLOB_FLOOR_BYTES_PER_SEC))
+}
 
 /// The response header the index view lane stamps its fold watermark into.
 const FOLDED_HEADER: &str = "x-ducktape-folded";
@@ -628,11 +698,11 @@ impl Client {
 
         // this client's flat [`TIMEOUT`] is an RPC's budget, and a push is not
         // an RPC: its duration scales with the history it carries. The budget
-        // here is a floor on THROUGHPUT — 64 KiB/s over the bytes, on top of a
-        // five-minute base — so a big push is allowed to take long and a dead
-        // link still fails.
-        const UPLOAD_FLOOR_BYTES_PER_SEC: u64 = 64 * 1024;
-        let budget = Duration::from_secs(300 + total.div_ceil(UPLOAD_FLOOR_BYTES_PER_SEC));
+        // here is a floor on THROUGHPUT — [`BLOB_FLOOR_BYTES_PER_SEC`] over the
+        // bytes, on top of a five-minute base — so a big push is allowed to
+        // take long and a dead link still fails. The submit that follows this
+        // upload is budgeted off the same floor ([`submit_budget`]).
+        let budget = Duration::from_secs(300 + total.div_ceil(BLOB_FLOOR_BYTES_PER_SEC));
         let response = self
             .proven_digest(
                 self.http.post(self.url("v1/files/blob")?),
@@ -768,23 +838,42 @@ impl Client {
     /// read its own write had to guess. Acceptance is not application: the
     /// derived read models fold behind the block loop, so the height is the
     /// coordinate a follow-up read waits on ([`Client::view_folded`]).
-    pub async fn submit_frame(&self, frame: Vec<u8>) -> Result<u64> {
+    ///
+    /// `carried_blob_bytes` is the size of the blob this frame REQUIRES, or 0
+    /// for an ordinary op — see [`submit_budget`] for why the wait scales with
+    /// it. The caller uploaded those bytes ([`Client::put_blob_file`]), so the
+    /// caller is the one that knows.
+    pub async fn submit_frame(
+        &self,
+        frame: Vec<u8>,
+        carried_blob_bytes: u64,
+    ) -> std::result::Result<u64, SubmitFailure> {
         let response = self
             .http
-            .post(self.url("v1/submit/frame")?)
+            .post(
+                self.url("v1/submit/frame")
+                    .map_err(|error| SubmitFailure::Unresolved(error.to_string()))?,
+            )
             .header("content-type", "application/octet-stream")
+            .timeout(submit_budget(carried_blob_bytes))
             .body(frame)
             .send()
             .await
-            .map_err(|error| Error::new(format!("transaction submission failed: {error}")))?;
+            .map_err(|error| {
+                SubmitFailure::Unresolved(format!("transaction submission failed: {error}"))
+            })?;
         if !response.status().is_success() {
-            return Err(response_error(response).await);
+            return Err(SubmitFailure::Refused(
+                response_error(response).await.to_string(),
+            ));
         }
         #[derive(Deserialize)]
         struct Receipt {
             height: u64,
         }
-        let receipt: Receipt = decode_json(response).await?;
+        let receipt: Receipt = decode_json(response)
+            .await
+            .map_err(|error| SubmitFailure::Unresolved(error.to_string()))?;
         Ok(receipt.height)
     }
 
@@ -1340,6 +1429,49 @@ mod tests {
             serde_json::from_str::<Status>(r#"{"height":7}"#).is_err(),
             "a status without public_key must not receive a removed default"
         );
+    }
+
+    /// A submit's wait is the node's, not the network's: the node answers only
+    /// once the block commits, and a blob-bearing frame's block cannot apply
+    /// until the pack has reached every other validator. So the only budget
+    /// that is not a guess is one that outlasts the node's own hold.
+    #[test]
+    fn a_submit_budget_outlasts_the_node_still_fanning_the_pack_out() {
+        // the node's hold, from `bin/node/src/relay.rs`: a 10 s base plus the
+        // pack at 1 MiB/s, hex-inflated (2x) and counted once per target.
+        let node_hold = |bytes: u64, targets: u64| {
+            Duration::from_secs(10 + (bytes * 2 * targets).div_ceil(1024 * 1024))
+        };
+        // ducktape's own history, the pack that exposed this.
+        let repository = 133 * 1024 * 1024;
+
+        assert!(
+            submit_budget(repository) > Duration::from_secs(30),
+            "the flat budget is exactly what reported a committing push as failed"
+        );
+        for targets in 1..=8 {
+            assert!(
+                submit_budget(repository) > node_hold(repository, targets),
+                "at {targets} targets the client gives up before the node does"
+            );
+        }
+        // and an op that carries no pack is an ordinary RPC, budgeted as one.
+        assert_eq!(submit_budget(0), TIMEOUT);
+    }
+
+    /// The two failures a caller must never confuse. `Refused` is a verdict it
+    /// may relay; `Unresolved` means nobody said no and the op may be landing.
+    #[test]
+    fn only_an_answered_submit_reads_as_a_refusal() {
+        let refused = SubmitFailure::Refused("forge: non-fast-forward".into());
+        let unresolved = SubmitFailure::Unresolved("transaction submission failed".into());
+        assert_ne!(refused, unresolved);
+        assert!(matches!(refused, SubmitFailure::Refused(_)));
+        assert!(matches!(unresolved, SubmitFailure::Unresolved(_)));
+        // both render as their detail — the distinction is the variant, so a
+        // caller that only prints one cannot accidentally branch on prose.
+        assert_eq!(refused.to_string(), "forge: non-fast-forward");
+        assert_eq!(unresolved.to_string(), "transaction submission failed");
     }
 
     #[tokio::test(start_paused = true)]

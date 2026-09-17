@@ -1001,7 +1001,7 @@ pub(crate) async fn git_receive_pack(
         pack_digest: pack_digest.map(|digest| digest.to_vec()),
         cert,
     });
-    let submitted = handle.submit(payload, pack_digest).await;
+    let submitted = handle.submit(payload, pack_digest, pack_bytes).await;
     let refnames: Vec<String> = cmds.into_iter().map(|(_, _, r)| r).collect();
     match submitted {
         Ok(height) => {
@@ -1018,7 +1018,17 @@ pub(crate) async fn git_receive_pack(
                 refnames.into_iter().map(|r| (r, None)).collect();
             git_report_status(&results)
         }
-        Err(reason) => {
+        // NOT a refusal: nobody said no. The node holds the submit until the
+        // block commits, so an exchange that did not complete leaves the op's
+        // fate unknown — it may be committing right now. Answering git a
+        // per-ref `ng` here would report a landing push as rejected, and the
+        // operator's retry would then collide with the ref it installed. A
+        // 502 makes git say the transfer failed, which is what happened.
+        Err(ducktape_rpc::SubmitFailure::Unresolved(detail)) => {
+            push_refused(&repo, "unresolved", &detail);
+            error_response(StatusCode::BAD_GATEWAY, &detail)
+        }
+        Err(ducktape_rpc::SubmitFailure::Refused(reason)) => {
             push_refused(&repo, push_refusal_reason(&reason), &reason);
             // a CAS mismatch's rejection carries "non-fast-forward" — surface
             // exactly that token so git prints its standard "fetch first" hint.
@@ -1292,13 +1302,18 @@ mod receive_pack_tests {
     use super::*;
 
     /// the real `ssh-keygen -Y sign -n git` fixture keyscheme and forge pin,
-    /// framed exactly as `git push --signed` frames it.
-    const CERT: &str = "certificate version 0.1\npusher key::ssh-ed25519 AAAA 1756332000 +0000\npushee http://127.0.0.1:8844/forge/lab\nnonce chain-a/lab\n\n0000000000000000000000000000000000000000 ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 refs/heads/main\n";
+    /// framed exactly as `git push --signed` frames it. Its nonce is what
+    /// `forge::pushcert::nonce` makes of chain `chain-a` and repo `lab` — the
+    /// same bytes the forge crate's own fixture is signed over, because a
+    /// certificate this bridge parses and one consensus verifies are one
+    /// artifact. SPELLED, not computed, so a change to the nonce rule has to
+    /// re-mint a signature rather than quietly re-sign itself.
+    const CERT: &str = "certificate version 0.1\npusher key::ssh-ed25519 AAAA 1756332000 +0000\npushee http://127.0.0.1:8844/forge/lab\nnonce 594586ec8545839343436a12f8c85fe8ca603c2a050cb9130f31c78cabcdecd9/lab\n\n0000000000000000000000000000000000000000 ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 refs/heads/main\n";
     const ARMORED: &str = "-----BEGIN SSH SIGNATURE-----\n\
-U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJjhQt02r3vG8+pxaBdryKnexRC\n\
-cULQqMrrcadzt/2iEAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5\n\
-AAAAQAkqyuC4rshUkBgUVsgAqGxBltLKRLcwdq5LAQn+2lCUmiUJWTsYTykmuaNO+cntB2\n\
-ZYBzkWoVNWmNV5YTCuZwE=\n\
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgVMCTLbeHvqm1iVUMxR1FbRxp6L\n\
+/FUdZm0jg3wdq6tLMAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5\n\
+AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
+6Zl9YeToLeI+xpoeMG4Q4=\n\
 -----END SSH SIGNATURE-----\n";
 
     fn signed_commands() -> Vec<Vec<u8>> {
@@ -1315,7 +1330,8 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
 
     #[test]
     fn a_signed_push_yields_its_certificate_and_the_moves_inside_it() {
-        let parsed = parse_push_commands(&signed_commands(), Some("chain-a/lab")).unwrap();
+        let offered = forge::pushcert::nonce("chain-a", "lab");
+        let parsed = parse_push_commands(&signed_commands(), Some(&offered)).unwrap();
         assert_eq!(
             parsed.cmds,
             vec![(
@@ -1338,13 +1354,15 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
 
     #[test]
     fn a_certificate_must_echo_this_nodes_nonce_and_be_terminated() {
-        let wrong = parse_push_commands(&signed_commands(), Some("chain-b/lab")).unwrap_err();
+        let elsewhere = forge::pushcert::nonce("chain-b", "lab");
+        let wrong = parse_push_commands(&signed_commands(), Some(&elsewhere)).unwrap_err();
         assert!(wrong.contains("nonce"), "{wrong}");
         let unoffered = parse_push_commands(&signed_commands(), None).unwrap_err();
         assert!(unoffered.contains("offered no push-cert"), "{unoffered}");
         let mut cut = signed_commands();
         cut.pop();
-        let cut = parse_push_commands(&cut, Some("chain-a/lab")).unwrap_err();
+        let cut = parse_push_commands(&cut, Some(&forge::pushcert::nonce("chain-a", "lab")))
+            .unwrap_err();
         assert!(cut.contains("push-cert-end"), "{cut}");
     }
 

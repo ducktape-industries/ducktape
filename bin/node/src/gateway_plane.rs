@@ -3691,8 +3691,31 @@ mod tests {
 
     /// A request that carries nothing: an empty reader, framed like any other
     /// body so the bodyless path runs the code the real one does.
-    fn no_body() -> RequestBodySource<&'static [u8]> {
-        RequestBodySource::Frames(b"")
+    /// Encode `bytes` the way a caller's peer actually writes a request body:
+    /// `BodyChunk` frames, then `End` ([`proxy_remote`]). A test that hands RAW
+    /// bytes to `RequestBodySource::Frames` is handing the frame decoder
+    /// something no caller ever sends.
+    fn body_frames(bytes: &[u8]) -> std::io::Cursor<Vec<u8>> {
+        let mut frames = Vec::new();
+        for piece in bytes.chunks(gateway::MAX_CHUNK_BYTES) {
+            frames.extend(
+                gateway::encode_frame(&gateway::ProxyFrame::BodyChunk(piece.to_vec()))
+                    .expect("a body chunk encodes"),
+            );
+        }
+        frames.extend(
+            gateway::encode_frame(&gateway::ProxyFrame::End).expect("the End frame encodes"),
+        );
+        std::io::Cursor::new(frames)
+    }
+
+    /// A caller with no body still speaks the body protocol: it writes a lone
+    /// `End`, exactly as [`proxy_remote`] does for a GET whose `body.recv`
+    /// never yields. An empty READER is not an empty body — it is a stream that
+    /// closed before a frame arrived, which is what a truncated peer looks like
+    /// and what `request_body_frames` must go on refusing.
+    fn no_body() -> RequestBodySource<std::io::Cursor<Vec<u8>>> {
+        RequestBodySource::Frames(body_frames(b""))
     }
 
     /// a fresh user proof for `head`'s route/method/path, signed by `user`.
@@ -3743,9 +3766,22 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0u8; 4096];
-            let read = socket.read(&mut request).await.unwrap();
-            let request = String::from_utf8_lossy(&request[..read]);
+            // A forwarded body has no declared length — the head it arrived in
+            // no longer states one — so it crosses CHUNK FRAMED, and the
+            // terminating zero-length chunk is what says it is whole. One read
+            // returns the head and answers before the body is sent, which
+            // resets the connection under a client still writing.
+            let mut raw = Vec::new();
+            loop {
+                let mut chunk = [0u8; 4096];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "the caller closed before its body was whole");
+                raw.extend_from_slice(&chunk[..read]);
+                if raw.ends_with(b"0\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&raw);
             assert!(request.starts_with("POST /items?source=duck HTTP/1.1\r\n"));
             let lower = request.to_ascii_lowercase();
             // The mesh-verified caller NODE is injected; the caller ACCOUNT is
@@ -3761,7 +3797,10 @@ mod tests {
             assert!(lower.contains(&format!("x-duck-upstream-token: {}\r\n", "a".repeat(64))));
             assert!(lower.contains("content-type: application/json"));
             assert!(lower.contains("cookie: session=abc"));
-            assert!(request.ends_with("{\"name\":\"quack\"}"));
+            assert!(
+                request.contains("{\"name\":\"quack\"}") && request.ends_with("0\r\n\r\n"),
+                "the body arrives chunk framed and whole:\n{request}"
+            );
             socket
                 .write_all(
                     b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nSet-Cookie: sid=xyz\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
@@ -3843,7 +3882,7 @@ mod tests {
                 upgrade: false,
                 user_pop: None,
             },
-            RequestBodySource::Frames(&body[..]),
+            RequestBodySource::Frames(body_frames(&body[..])),
         )
         .await
         .unwrap();
@@ -4118,7 +4157,7 @@ mod tests {
                 upgrade: false,
                 user_pop: Some(pop),
             },
-            RequestBodySource::Frames(OVER_CAP),
+            RequestBodySource::Frames(body_frames(OVER_CAP)),
         )
         .await
         .unwrap_err();
