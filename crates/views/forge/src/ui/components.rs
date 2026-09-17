@@ -331,6 +331,38 @@ impl ForgeView {
         )
     }
 
+    /// A changed file's header with nothing under it to fold: the same strip,
+    /// drawn as text. A control that would do nothing when pressed is worse
+    /// than no control — a reader presses it once and learns not to trust the
+    /// carets on the other rows either.
+    fn static_header(&self, key: &str, text: &str) -> wire::Node {
+        let p = native::palette();
+        let line = native::sized(
+            native::nowrap(native::weighted(
+                native::mono(format!("{key}/text"), text),
+                wire::Weight::Medium,
+            )),
+            Some(wire::Length::Fill),
+            None,
+        );
+        let mut framed = native::row(format!("{key}/frame"), [line]);
+        if let wire::Node::Linear {
+            background,
+            padding,
+            ..
+        } = &mut framed
+        {
+            *background = Some(native::rgba(p.surface_raised));
+            *padding = Some(wire::Edges {
+                top: 4.,
+                right: 8.,
+                bottom: 4.,
+                left: 8.,
+            });
+        }
+        framed
+    }
+
     /// One changed file's header: the whole strip presses to fold the hunks
     /// under it, the way a forge lets you put a reviewed file away.
     fn file_header(&self, key: &str, text: &str) -> wire::Node {
@@ -388,24 +420,27 @@ impl ForgeView {
 
     pub(super) fn diff_screen(&self) -> wire::Node {
         let p = native::palette();
-        let title = native::centered_row(
-            "forge/diff-head",
-            [
-                native::sized(
-                    native::heading("forge/diff-title", "Changes"),
-                    Some(wire::Length::Fill),
-                    None,
+        // A REFUSED PATCH HAS NO STATISTICS. The zeroes a missing reply
+        // decodes to would read as "nothing changed" over a pull request
+        // that plainly changes files, so the tally is drawn only when a
+        // reply actually carried one.
+        let counted = self.forge_item_diff_error.is_empty();
+        let mut head = vec![native::sized(
+            native::heading("forge/diff-title", "Changes"),
+            Some(wire::Length::Fill),
+            None,
+        )];
+        if counted {
+            head.push(native::secondary(
+                "forge/diff-count",
+                host::forge_stats(
+                    self.forge_item_files_changed,
+                    self.forge_item_additions,
+                    self.forge_item_deletions,
                 ),
-                native::secondary(
-                    "forge/diff-count",
-                    host::forge_stats(
-                        self.forge_item_files_changed,
-                        self.forge_item_additions,
-                        self.forge_item_deletions,
-                    ),
-                ),
-            ],
-        );
+            ));
+        }
+        let title = native::centered_row("forge/diff-head", head);
         let number = |key: String, value: &str| {
             native::sized(
                 native::nowrap(native::colored(native::mono(key, value), p.faint)),
@@ -432,6 +467,9 @@ impl ForgeView {
                     },
                 ),
                 "file" => self.file_header(&key, &line.text),
+                // a binary has no lines: the same header, without the fold
+                // control, because there is nothing under it to put away
+                "binary" => self.static_header(&key, &line.text),
                 "hunk" => native::padded(
                     native::row(
                         &key,
@@ -501,11 +539,14 @@ impl ForgeView {
                 }
             }
         };
-        // one block per changed file: a `file` line opens the next one, and
-        // each block wears its own hairline.
+        // one block per changed file: either kind of file header opens the
+        // next one, and each block wears its own hairline. A binary's header
+        // must open one too, or it would ride inside the previous file's
+        // block and vanish when that file is folded.
         let mut blocks: Vec<Vec<&host::DiffLine>> = Vec::new();
         for line in &self.diff_rows {
-            let opens_a_block = line.kind == "file" || blocks.is_empty();
+            let heads_a_file = matches!(line.kind.as_str(), "file" | "binary");
+            let opens_a_block = heads_a_file || blocks.is_empty();
             if opens_a_block {
                 blocks.push(Vec::new());
             }
@@ -552,19 +593,36 @@ impl ForgeView {
                 "This diff is truncated; open the repository locally to see the rest.",
             ));
         }
-        // no rows: either the patch read was refused (then nothing pins a
-        // source head and the merge and review doors stay shut) or the two
-        // tips are identical
+        // No rows has three causes and they are not the same news: the
+        // module REFUSED the patch (its words say whether waiting can ever
+        // help — a diff over a size ceiling never becomes readable), the
+        // read has not answered yet, or the two tips are identical. In the
+        // first two the merge and review doors stay shut, because nothing
+        // pinned a source head.
         if content.is_empty() {
+            let refused = !self.forge_item_diff_error.is_empty();
             let unloaded = self.forge_item_source_oid.is_empty();
-            content.push(native::wrapping(native::secondary(
-                "forge/no-diff",
-                if unloaded {
-                    "The changes could not be loaded. Open the pull request again to retry."
-                } else {
-                    "No changes between the two branches."
-                },
-            )));
+            if refused {
+                content.push(native::notice(
+                    "forge/diff-refused",
+                    native::wrapping(native::text(
+                        "forge/no-diff",
+                        format!(
+                            "These changes cannot be shown: {}",
+                            &self.forge_item_diff_error
+                        ),
+                    )),
+                    Tone::Warning,
+                ));
+            } else {
+                content.push(native::wrapping(native::secondary(
+                    "forge/no-diff",
+                    match unloaded {
+                        true => "The changes have not loaded yet.",
+                        false => "No changes between the two branches.",
+                    },
+                )));
+            }
         }
         section("forge/diff", title, content)
     }

@@ -209,6 +209,35 @@ fn failure(doing: &str, error: &str) -> String {
     format!("{doing}: {error}")
 }
 
+/// The sentence a refusal actually says, out of the transport envelope the
+/// kernel hands back: `RPC returned 400 Bad Request: {"error":"Module(<the
+/// module's words>)"}`. A reader needs the words, not the status line, not
+/// the JSON, and not the two object ids the module names for an operator —
+/// nothing on the screen lets them act on an oid, and a message long enough
+/// to be clipped loses its own ending.
+///
+/// Whatever is left of the module's own text is kept verbatim: the view does
+/// not paraphrase a refusal it did not write.
+pub fn refusal_reason(error: &str) -> String {
+    let body = match error.split_once("{\"error\":\"") {
+        Some((_, rest)) => rest.trim_end_matches('}').trim_end_matches('"'),
+        None => error,
+    };
+    let inner = match body.strip_prefix("Module(") {
+        Some(rest) => rest.strip_suffix(')').unwrap_or(rest),
+        None => body,
+    };
+    // the operator's parenthetical: `(target <oid>, source <oid>)`
+    let said = match inner.split_once(" (target ") {
+        Some((head, rest)) => match rest.split_once(')') {
+            Some((_, tail)) => format!("{head}{tail}"),
+            None => head.to_owned(),
+        },
+        None => inner.to_owned(),
+    };
+    said.replace("\\\"", "\"").trim().to_owned()
+}
+
 /// The serial every read subscription is keyed by: it moves when the
 /// session comes up, so a reconnect reads the forge afresh.
 pub fn connection_serial_after(was_connected: bool, connected: bool, serial: i64) -> i64 {
@@ -507,6 +536,10 @@ pub struct ItemItem {
     pub merge_oid: String,
     pub diff_rows: Vec<DiffLine>,
     pub diff_truncated: bool,
+    /// Why the patch could not be read, in the module's own words, or "" —
+    /// a refusal the reader has to see, since it decides whether the
+    /// changes are unreachable or merely late.
+    pub diff_error: String,
     pub files_changed: i64,
     pub additions: i64,
     pub deletions: i64,
@@ -552,18 +585,28 @@ async fn read_item(repo: &str, number: i64) -> Result<ItemItem, String> {
         return Err("item was not found".to_owned());
     }
     let is_pr = detail["kind"].as_str() == Some("pr");
-    let diff = match is_pr {
-        false => serde_json::Value::Null,
+    // A REFUSED PATCH IS NOT A MISSING ONE. The item still reads — its
+    // conversation is worth showing — but the reason the changes cannot be
+    // drawn is the only thing that tells a reader whether waiting helps, so
+    // it is kept and shown where the lines would have been.
+    let (diff, diff_error) = match is_pr {
+        false => (serde_json::Value::Null, String::new()),
         true => {
             let ask = serde_json::json!({ "pr_diff": { "repo": repo, "number": number } });
-            query(FORGE, ask)
-                .await
-                .map(|reply| reply["pr_diff"].clone())
-                .unwrap_or(serde_json::Value::Null)
+            match query(FORGE, ask).await {
+                Ok(reply) => (reply["pr_diff"].clone(), String::new()),
+                Err(error) => (serde_json::Value::Null, refusal_reason(&error)),
+            }
         }
     };
     let names = read_names().await;
-    Ok(fold_item(repo.to_owned(), detail, &diff, &names))
+    Ok(fold_item(
+        repo.to_owned(),
+        detail,
+        &diff,
+        &diff_error,
+        &names,
+    ))
 }
 
 /// The item pane's model from the committed detail plus its pinned diff.
@@ -571,6 +614,7 @@ pub fn fold_item(
     repo: String,
     detail: &serde_json::Value,
     diff: &serde_json::Value,
+    diff_error: &str,
     names: &Names,
 ) -> ItemItem {
     let source_oid = diff["source_oid"].as_str().unwrap_or_default().to_owned();
@@ -606,6 +650,7 @@ pub fn fold_item(
         change_requests: tally(&reviews).1,
         reviews,
         source_oid,
+        diff_error: diff_error.to_owned(),
         error: String::new(),
     }
 }
@@ -1967,7 +2012,7 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
                 continue;
             }
             if let Some(name) = binary_file(line) {
-                rows.push(named_file_row(&format!("{name} (binary)")));
+                rows.push(binary_file_row(&name));
                 continue;
             }
             if let Some(span) = hunk_span(line) {
@@ -2070,6 +2115,22 @@ fn file_row(old_path: &str, new_path: &str) -> DiffLine {
 
 fn named_file_row(name: &str) -> DiffLine {
     diff_row("file", String::new(), String::new(), "", name, "", "")
+}
+
+/// A changed binary, as its own kind of row. A patch says only that the two
+/// sides differ, so the row has no lines under it: it must not wear the fold
+/// control a text file's header does (there is nothing to fold), and it
+/// carries no path, so no line comment can be anchored to it.
+fn binary_file_row(name: &str) -> DiffLine {
+    diff_row(
+        "binary",
+        String::new(),
+        String::new(),
+        "",
+        &format!("{name} (binary file, not shown)"),
+        "",
+        "",
+    )
 }
 
 /// The head-side path a `+++ b/<path>` header names. A pure deletion writes

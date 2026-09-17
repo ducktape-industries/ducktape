@@ -211,6 +211,7 @@ impl super::ForgeView {
         self.forge_item_merge_oid = next.merge_oid.to_owned();
         self.diff_rows = next.diff_rows.clone();
         self.forge_item_diff_truncated = next.diff_truncated;
+        self.forge_item_diff_error = next.diff_error.to_owned();
         self.forge_item_files_changed = next.files_changed;
         self.forge_item_additions = next.additions;
         self.forge_item_deletions = next.deletions;
@@ -370,6 +371,7 @@ impl super::ForgeView {
         self.linked_note = Vec::new();
         self.diff_rows = Vec::new();
         self.diff_folded = Vec::new();
+        self.forge_item_diff_error = "".to_owned();
         self.discussion = Vec::new();
         self.discussion_clipped = false;
         self.merge_conflicts = Vec::new();
@@ -403,6 +405,7 @@ impl super::ForgeView {
         self.focus_seq = 0;
         self.diff_rows = Vec::new();
         self.diff_folded = Vec::new();
+        self.forge_item_diff_error = "".to_owned();
         self.discussion = Vec::new();
         self.discussion_clipped = false;
         self.merge_conflicts = Vec::new();
@@ -540,6 +543,7 @@ impl super::ForgeView {
         self.merge_conflicts = Vec::new();
         self.diff_rows = Vec::new();
         self.diff_folded = Vec::new();
+        self.forge_item_diff_error = "".to_owned();
         self.discussion = Vec::new();
         self.discussion_clipped = false;
         self.take_the_keyboard()
@@ -553,6 +557,7 @@ impl super::ForgeView {
         self.focus_seq = 0;
         self.diff_rows = Vec::new();
         self.diff_folded = Vec::new();
+        self.forge_item_diff_error = "".to_owned();
         self.discussion = Vec::new();
         self.discussion_clipped = false;
         self.merge_conflicts = Vec::new();
