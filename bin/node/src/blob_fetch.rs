@@ -167,6 +167,12 @@ pub fn serve_blob_range(
 /// store one pack per request.
 pub type ServedPacks = Arc<Mutex<HashMap<String, [u8; 32]>>>;
 
+/// how many forge packs this node builds at once: ONE. See
+/// [`serve_forge_objects`] — the build is whole-repo libgit2 delta
+/// compression across every core it can find, so a second concurrent one
+/// buys nothing and costs the box.
+static PACK_BUILD: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 /// answer a peer's [`SyncRequest::ForgeObjects`]: build the pack that carries
 /// `head`'s objects (bounded by the `bases` the peer already holds), stage it,
 /// and hand back the digest so the peer pulls the bytes over the ranged lane.
@@ -180,7 +186,7 @@ pub type ServedPacks = Arc<Mutex<HashMap<String, [u8; 32]>>>;
 /// `None` is an honest miss — this node does not hold the head either. it
 /// never packs a walk it has not itself committed to (see
 /// [`forge::build_objects`]), so the lane cannot be turned into an amplifier.
-pub fn serve_forge_objects(
+pub async fn serve_forge_objects(
     forge_repo: &std::path::Path,
     blobs: &blobstore::BlobHandle,
     served: &ServedPacks,
@@ -196,10 +202,27 @@ pub fn serve_forge_objects(
         .iter()
         .filter_map(|base| forge::Oid::from_bytes(base).ok())
         .collect();
-    let built = match forge::build_objects(forge_repo, &name, head, &bases) {
-        Ok(Some(pack)) => pack,
-        Ok(None) => return miss,
-        Err(e) => {
+    // a joiner has no bases, so this is `pack_closure_many` over the whole
+    // repo: libgit2 delta compression, tens of seconds of SYNCHRONOUS CPU on
+    // a real mirror, across every worker `set_threads(0)` can find. Run on an
+    // async worker it does not merely block this lane — it blocks the runtime
+    // thread the consensus loop is scheduled on, and the chain stops beating
+    // (#2481: `block_beat_stalled` for 174s while one worker sat in
+    // `ll_find_deltas`). It leaves the runtime, always.
+    let build_dir = forge_repo.to_path_buf();
+    let build_repo = name.clone();
+    // ...and only ONE at a time: the serve lane now answers this off its own
+    // loop, so without a gate N peers asking at once would start N whole-repo
+    // packs on the blocking pool and take the box instead of the runtime.
+    let _one_at_a_time = PACK_BUILD.acquire().await;
+    let built = match tokio::task::spawn_blocking(move || {
+        forge::build_objects(&build_dir, &build_repo, head, &bases)
+    })
+    .await
+    {
+        Ok(Ok(Some(pack))) => pack,
+        Ok(Ok(None)) => return miss,
+        Ok(Err(e)) => {
             tracing::debug!(
                 target: "ducktape::forge",
                 reason = "objects_build_failed",
@@ -207,6 +230,17 @@ pub fn serve_forge_objects(
                 head = %head,
                 error = %e,
                 "could not build the objects a peer asked for"
+            );
+            return miss;
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "ducktape::forge",
+                reason = "objects_build_panicked",
+                repo = %name,
+                head = %head,
+                error = %e,
+                "the pack build for a peer's objects request died"
             );
             return miss;
         }
@@ -1234,6 +1268,74 @@ mod tests {
         assert_eq!(
             sweep_packs_once(&client, &blobstore::BlobHandle::default(), dir.path(), "n").await,
             0,
+        );
+    }
+}
+
+#[cfg(test)]
+mod forge_pack_shape_lint {
+    /// THE PACK BUILD NEVER RUNS ON AN ASYNC WORKER. A joiner sends no bases,
+    /// so [`super::serve_forge_objects`] reaches `pack_closure_many` — whole-
+    /// repo libgit2 delta compression, tens of seconds of synchronous CPU.
+    /// Called straight from the serve task it blocked the runtime thread the
+    /// consensus loop was scheduled on, and the chain stopped beating with it
+    /// (#2481: `block_beat_stalled ... stalled_ms=173873` while one
+    /// `tokio-rt-worker` sat in `ll_find_deltas`).
+    #[test]
+    fn the_pack_build_is_the_first_thing_inside_spawn_blocking() {
+        const OPEN: &str = "spawn_blocking(move || {";
+        // split so this needle does not match itself in the file it scans.
+        const CALL: &str = concat!("forge::", "build_objects(");
+        let src = include_str!("blob_fetch.rs");
+        let calls: Vec<usize> = src.match_indices(CALL).map(|(at, _)| at).collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "one call site, so one place to keep off the runtime: {calls:?}"
+        );
+        let at = calls[0];
+        let opened = src[..at]
+            .rfind(OPEN)
+            .expect("the pack build runs on the blocking pool");
+        let between = &src[opened + OPEN.len()..at];
+        assert!(
+            between.trim().is_empty(),
+            "the build must be the body of the `spawn_blocking`, not reached \
+             past {between:?}"
+        );
+    }
+
+    /// AND IT NEVER RUNS ON THE SERVE LOOP. `spawn_blocking` keeps the runtime
+    /// beating; it does not keep the statesync serve lane free, because the
+    /// loop would still await the join handle. Awaited inline, one whole-repo
+    /// pack is head-of-line blocking for every other kind a peer is waiting
+    /// on — which is why a resident's `tip_coords` and `frames` timed out too.
+    #[test]
+    fn the_serve_loop_hands_a_forge_answer_to_its_own_task() {
+        let src = include_str!("validator/wiring.rs");
+        let served: Vec<usize> = src
+            .match_indices("serve_forge_objects(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            served.len(),
+            1,
+            "the serve fn is called once, from the spawned answer: {served:?}"
+        );
+        let spawner = src
+            .find("fn spawn_forge_answer(")
+            .expect("forge answers have their own task");
+        assert!(
+            spawner < served[0],
+            "the only call must be inside `spawn_forge_answer`, not on the loop"
+        );
+        let arm_at = src
+            .find("SyncRequest::ForgeObjects { repo, head, bases } => {")
+            .expect("the serve loop routes ForgeObjects");
+        let arm = &src[arm_at..src.len().min(arm_at + 1200)];
+        assert!(
+            arm.contains("spawn_forge_answer(") && arm.contains("continue;"),
+            "the arm must delegate and leave the loop, not produce a response"
         );
     }
 }

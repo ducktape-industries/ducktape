@@ -28,14 +28,16 @@
 //! dead — a founder pushing tens of consensus blocks/s over the same overlay
 //! can starve a statesync request in flight for a few seconds without either
 //! side being wrong. [`send_request`](P2pSyncClient::send_request) therefore
-//! retries the SAME request against the SAME source, stepping the reaper
-//! window across [`RETRY_WINDOWS`] (3s → 6s → 12s) before it surfaces a
-//! timeout and lets [`Sources::advance_past`] rotate the caller onto the next
-//! candidate — a dead source is still abandoned within the bounded total (see
-//! [`RETRY_WINDOWS`]'s doc), it just survives a merely busy mesh first. every
-//! occurrence — each retried attempt and the final surfaced timeout alike —
-//! bumps that source's timeout counter and, latched, a `warn!` (see
-//! [`TIMEOUT_WARN_EVERY`]).
+//! retries the SAME request under the SAME rpc id against the SAME source,
+//! stepping the reaper window across [`RETRY_WINDOWS`] (3s → 6s → 12s) before
+//! it surfaces a timeout and lets [`Sources::advance_past`] rotate the caller
+//! onto the next candidate — a dead source is still abandoned within the
+//! bounded total (see [`RETRY_WINDOWS`]'s doc), it just survives a merely busy
+//! mesh first. The id is the load-bearing part: a server slower than one
+//! window answers the id it was asked, and only a stable id lets that answer
+//! complete the attempt that replaced the reaped one. every occurrence — each
+//! retried attempt and the final surfaced timeout alike — bumps that source's
+//! timeout counter and, latched, a `warn!` (see [`TIMEOUT_WARN_EVERY`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,6 +77,14 @@ pub const RETRY_WINDOWS: [Duration; 3] = [
 /// timeout under a sustained busy mesh (CLAUDE.md: a forever-retry loop logs
 /// attempt 1, then every Nth, carrying an `attempts` field).
 const TIMEOUT_WARN_EVERY: u64 = 20;
+
+/// answers that reached this process with no pending request to complete —
+/// the request was reaped before the source answered it. Latched on the same
+/// stride as [`TIMEOUT_WARN_EVERY`]. It exists because the silent version of
+/// this drop is indistinguishable, from both ends, from a mesh that never
+/// carried the request: the client says "unanswered", the server's serve
+/// counters say "answered", and nothing names the gap between them.
+static ANSWERS_AFTER_REAP: AtomicU64 = AtomicU64::new(0);
 
 /// a retry window's survival in whole reaper sweeps, rounded up so a window
 /// shorter than [`REAP_INTERVAL`] still survives at least one sweep.
@@ -404,6 +414,18 @@ where
                     let _ = entry.reply.send(body.to_vec());
                 } else if let Some(hook) = &unmatched {
                     hook(id, body);
+                } else {
+                    let occurrences = ANSWERS_AFTER_REAP.fetch_add(1, Ordering::Relaxed) + 1;
+                    if occurrences == 1 || occurrences.is_multiple_of(TIMEOUT_WARN_EVERY) {
+                        debug!(
+                            target: "ducktape::statesync",
+                            reason = "answer_after_reap",
+                            id,
+                            occurrences,
+                            "a statesync answer arrived with no request left to complete — \
+                             this source is slower than the retry window it was given",
+                        );
+                    }
                 }
             }
             // channel closed: drop every waiter so requests fail instead of
@@ -501,11 +523,19 @@ where
         let kind = req.kind_name();
         let body = encode_request(&req);
 
+        // ONE id for the whole logical request, re-filed by every attempt.
+        // A server slower than an attempt's window answers the id it was
+        // ASKED, which is this one — a fresh id per attempt would make that
+        // answer match nothing in `pending`, and the dispatch loop drops an
+        // unmatched frame. The caller then re-asks, which only lengthens the
+        // server's queue, which makes the next answer later still: the retry
+        // feeds the very lateness it is retrying, and a resident never
+        // converges while the validator answers every request it sends.
+        let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
         let mut attempt = 0usize;
         loop {
             let window = RETRY_WINDOWS[attempt];
             let mut sender = self.sender.clone();
-            let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = oneshot::channel();
             {
                 let mut pending = shared.pending.lock().expect("pending poisoned");
@@ -557,14 +587,14 @@ where
                             attempt = attempt + 1,
                             attempts_total = RETRY_WINDOWS.len(),
                             occurrences,
-                            "statesync request timed out (send dropped by the mesh or source dead)",
+                            "statesync request went unanswered within its window (the mesh ACCEPTED the send — the source is slow or dead)",
                         );
                     }
                     attempt += 1;
                     if attempt == RETRY_WINDOWS.len() {
                         sources.advance_past(at);
                         return Err(SyncError::Transport(format!(
-                            "request {id} timed out after {attempt} attempts (send dropped by the mesh or source dead)"
+                            "request {id} went unanswered after {attempt} attempts (the mesh accepted every send — the source is slow or dead)"
                         )));
                     }
                 }
@@ -902,6 +932,73 @@ mod tests {
             assert!(
                 elapsed <= budget,
                 "abandonment must stay bounded: took {elapsed:?}, budget {budget:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn one_late_answer_completes_the_attempt_that_replaced_the_reaped_one() {
+        use commonware_runtime::{
+            Clock as _, Runner as _, Spawner as _, Supervisor as _, deterministic,
+        };
+
+        // past the first attempt's survival (3s window = 2 sweeps = 6s) and
+        // inside the second's (6s window = 3 sweeps), so the answer lands
+        // while attempt 2 is the outstanding one.
+        const LATE: Duration = Duration::from_secs(9);
+
+        deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+            let (server, (mut server_tx, mut server_rx), (joiner_tx, joiner_rx)) =
+                mesh_pair(&context).await;
+
+            // a SLOW source, not a dead one: it answers the FIRST request it
+            // is asked, once, after that attempt has already been reaped —
+            // the shape of a validator whose serve lane is queued behind a
+            // busy consensus loop. It never answers the re-sends, so the only
+            // way this request can complete is if the re-sends carry the id
+            // the server was asked.
+            context.child("serve").spawn(move |ctx| async move {
+                let Ok((peer, msg)) = server_rx.recv().await else {
+                    return;
+                };
+                let bytes: Vec<u8> = msg.into();
+                let Ok((_requester, _proof, id, _body)) = decode_rpc(&bytes) else {
+                    return;
+                };
+                ctx.sleep(LATE).await;
+                let resp = crate::encode_response(&SyncResponse::TipCoords(zero_tip_coords()));
+                let _ = server_tx.send(
+                    Recipients::One(peer),
+                    IoBuf::from(encode_rpc(&[0u8; 32], &[0u8; 64], id, &resp)),
+                    false,
+                );
+            });
+
+            let client = P2pSyncClient::new(
+                context.child("client"),
+                joiner_tx,
+                joiner_rx,
+                server,
+                [0u8; 32],
+                [0u8; 64],
+            );
+            let started = context.current();
+            let result = client.request(SyncRequest::TipCoords).await;
+            let elapsed = context
+                .current()
+                .duration_since(started)
+                .unwrap_or_default();
+
+            assert!(
+                result.is_ok(),
+                "a source slower than one window still ANSWERED — the retry \
+                 must be able to consume that answer, not discard it and \
+                 re-ask forever: {result:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(RETRY_WINDOWS.iter().map(|w| w.as_secs()).sum()),
+                "the answer must complete the request when it lands, not \
+                 after the whole retry budget: took {elapsed:?}"
             );
         });
     }
