@@ -14,7 +14,13 @@ commentary in the app, with run outcomes available through the query API.
   `127.0.0.1`; `DEV_LISTEN=0.0.0.0 DEV_ADVERTISED=<this box's LAN ip>`
   widens the p2p mesh and HTTP API binds AND the dial hint peers actually
   use, so a second machine can join, huddle in, or point its app at this
-  node (the WireGuard plane is bound wide regardless).
+  node. The WireGuard and invite listeners are the exception: they bind
+  `0.0.0.0` regardless, on the FIXED ports `51820` and `51821`, so a second
+  workspace founded or joined on this host collides by construction unless you
+  give it its own with `--wireguard-listen`/`--invite-listen` (and `--rpc`,
+  whose default `127.0.0.1:8845` is just as fixed). A node whose WireGuard port
+  is taken refuses to start its reachability plane and says which process holds
+  it.
 - **Host `git` on `PATH`, with worktree support.** The provisioner probes
   once at construction (`git init` + `git worktree list` in a scratch dir,
   `crates/noded/src/agent_provision/forge.rs`); a failed probe makes the forge

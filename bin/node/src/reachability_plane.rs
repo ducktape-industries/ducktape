@@ -890,6 +890,121 @@ fn record_execution(generation: u64, status: reachability::BackendStatus) {
     execution().send_if_modified(|live| live.record(generation, status));
 }
 
+/// The plane's refusal in the terms an operator acts on: the snake_case token
+/// it refused with, and the sentence that says what to do about it. Kept
+/// beside the execution status so a caller ABOUT to blame something else can
+/// ask first — the join path otherwise sends the operator back to the inviter
+/// for a credential that was never the problem.
+static PLANE_FAILURE: std::sync::RwLock<Option<(&'static str, String)>> =
+    std::sync::RwLock::new(None);
+
+/// Refuse to start the plane, on the record. Every caller returns immediately
+/// after; the execution guard is the backstop for a path that does not.
+fn fail_plane(generation: u64, reason: &'static str, detail: String) {
+    *PLANE_FAILURE.write().expect("plane failure lock poisoned") = Some((reason, detail.clone()));
+    record_execution(generation, reachability::BackendStatus::Failed(detail));
+}
+
+/// Why the plane is not running, for a caller about to blame something else.
+/// `None` while it is starting, running or stopped. A failure no site named
+/// still answers — the execution guard marks EVERY early return failed — under
+/// the generic token, because "the plane never started" is already the fact
+/// that matters to the caller.
+pub(crate) fn plane_failure() -> Option<(&'static str, String)> {
+    let reachability::BackendStatus::Failed(detail) = execution().borrow().status.clone() else {
+        return None;
+    };
+    let named = PLANE_FAILURE
+        .read()
+        .expect("plane failure lock poisoned")
+        .clone();
+    Some(named.unwrap_or(("plane_startup_failed", detail)))
+}
+
+/// The socket inodes bound to `port` in one `/proc/net/udp{,6}` table. The
+/// columns are fixed and positional: `local_address` (hex address, hex port)
+/// is the second, `inode` the tenth — the header's `tx_queue rx_queue` and
+/// `tr tm->when` are single colon-joined fields in every data row.
+#[cfg(target_os = "linux")]
+fn udp_inodes_in(table: &str, port: u16) -> Vec<String> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let columns: Vec<&str> = line.split_whitespace().collect();
+            let local = columns.get(1)?;
+            let inode = columns.get(9)?;
+            let bound = u16::from_str_radix(local.rsplit_once(':')?.1, 16).ok()?;
+            (bound == port).then(|| (*inode).to_string())
+        })
+        .collect()
+}
+
+/// Who else holds this UDP port, as far as `/proc` will say. Best effort BY
+/// DESIGN: a port held by another user, or a kernel without `/proc`, answers
+/// `None`, and the caller still names the port and the flag that moves it.
+/// Two nodes on one dev box are the same user, which is the case this serves.
+#[cfg(target_os = "linux")]
+fn udp_port_owner(port: u16) -> Option<String> {
+    let mut wanted: Vec<String> = Vec::new();
+    for table in ["/proc/net/udp", "/proc/net/udp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        wanted.extend(
+            udp_inodes_in(&text, port)
+                .into_iter()
+                .map(|inode| format!("socket:[{inode}]")),
+        );
+    }
+    if wanted.is_empty() {
+        return None;
+    }
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let pid = entry.file_name().to_string_lossy().into_owned();
+        let is_process = !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit());
+        if !is_process {
+            continue;
+        }
+        let Ok(descriptors) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        let holds_the_port = descriptors.flatten().any(|fd| {
+            std::fs::read_link(fd.path())
+                .is_ok_and(|target| wanted.iter().any(|socket| target.as_os_str() == &**socket))
+        });
+        if holds_the_port {
+            return Some(describe_process(&pid));
+        }
+    }
+    None
+}
+
+/// One process in terms an operator can act on: what it was started as, and
+/// the directory it runs in — which for a node started in its workspace IS the
+/// workspace.
+#[cfg(target_os = "linux")]
+fn describe_process(pid: &str) -> String {
+    let command = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|raw| {
+            raw.split(|byte| *byte == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(String::from_utf8_lossy)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+        Ok(cwd) => format!("pid {pid} ({command}) running in {}", cwd.display()),
+        Err(_) => format!("pid {pid} ({command})"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn udp_port_owner(_port: u16) -> Option<String> {
+    None
+}
+
 /// What one swap attempt came to. THE distinction a retrying caller needs: a
 /// machine that answered has decided (the same bytes decide the same way
 /// forever), while a swap no machine ever saw has decided nothing.
@@ -1182,13 +1297,29 @@ async fn reachability_plane(
     ) {
         Ok(underlay) => underlay,
         Err(err) => {
+            // the port is only half the answer: what an operator needs is WHO
+            // has it, and the flag that moves this node off it. The join path
+            // reads this back and refuses with it, instead of sending them to
+            // the inviter for a credential that was never the problem.
+            let port = wireguard_listen.port();
+            let held_by = match udp_port_owner(port) {
+                Some(owner) => format!(" — held by {owner}"),
+                None => String::new(),
+            };
+            let detail = format!(
+                "the wireguard underlay could not bind udp port {port} ({err}){held_by}. \
+                 Two workspaces on one host cannot share it: give this one its own with \
+                 `--wireguard-listen 0.0.0.0:<free port>` on `node init`/`node join`, or \
+                 set `wireguard_listen` in its node.toml."
+            );
+            fail_plane(generation, "underlay_bind_failed", detail.clone());
             tracing::error!(
                 target: "ducktape::reachability",
                 node = %label,
-                port = wireguard_listen.port(),
+                port,
                 error = %err,
                 reason = "underlay_bind_failed",
-                "reachability plane NOT started"
+                "reachability plane NOT started: {detail}"
             );
             return;
         }
@@ -1703,6 +1834,69 @@ pub(crate) fn underlay_addr(
     addrs: impl IntoIterator<Item = std::net::SocketAddr>,
 ) -> Option<std::net::SocketAddr> {
     addrs.into_iter().find(std::net::SocketAddr::is_ipv4)
+}
+
+/// #2386: a join that blames the invite for a plane that never started costs
+/// the operator a credential AND the time to spend it, twice. These pin the
+/// two halves of the answer — who holds the port, and that the plane's refusal
+/// survives for the join path to read.
+#[cfg(test)]
+mod plane_failure_tests {
+    /// a real `/proc/net/udp`, trimmed to three rows: the port we want in hex
+    /// (`ca6c` = 51820), a DIFFERENT port on the same address, and a row whose
+    /// address half happens to contain the same hex — the rsplit is what keeps
+    /// the address out of the comparison.
+    #[cfg(target_os = "linux")]
+    const TABLE: &str = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+   0: 00000000:CA6C 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 918273 2 0000000000000000 0
+   1: 00000000:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 112233 2 0000000000000000 0
+   2: 0000CA6C:0043 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 445566 2 0000000000000000 0
+";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_port_column_names_its_socket_and_only_its_socket() {
+        assert_eq!(super::udp_inodes_in(TABLE, 51820), ["918273"]);
+        assert_eq!(super::udp_inodes_in(TABLE, 53), ["112233"]);
+        assert!(super::udp_inodes_in(TABLE, 9999).is_empty());
+    }
+
+    /// this process holds a port it just bound, so the scan must find ITSELF —
+    /// the only owner a test can assert without a second process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bound_port_names_the_process_holding_it() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a scratch udp port");
+        let port = socket.local_addr().expect("the socket has an address").port();
+        let owner = super::udp_port_owner(port).expect("this process holds it");
+        assert!(
+            owner.contains(&format!("pid {}", std::process::id())),
+            "the owner names the holding process: {owner}"
+        );
+    }
+
+    /// the join path asks `plane_failure()` BEFORE it blames the invite, so a
+    /// named refusal has to survive the plane thread that wrote it.
+    #[test]
+    fn a_named_refusal_reaches_the_caller_that_would_have_blamed_the_invite() {
+        // this generation owns the global execution cell for the test; nothing
+        // else in this binary publishes a plane.
+        super::execution().send_replace(super::PlaneExecution {
+            generation: 77,
+            revision: 0,
+            status: reachability::BackendStatus::Starting,
+        });
+        assert!(
+            super::plane_failure().is_none(),
+            "a starting plane has not failed"
+        );
+
+        super::fail_plane(77, "underlay_bind_failed", "port 51820 is taken".into());
+        let (reason, detail) = super::plane_failure().expect("the refusal is on the record");
+        assert_eq!(reason, "underlay_bind_failed");
+        assert_eq!(detail, "port 51820 is taken");
+    }
 }
 
 #[cfg(test)]

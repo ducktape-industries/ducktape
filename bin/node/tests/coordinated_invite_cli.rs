@@ -556,3 +556,185 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
          coordinator:\n{log}"
     );
 }
+
+/// #2386, end to end through the REAL binaries: a second workspace on a host
+/// whose WireGuard port is already taken used to die saying "ask the inviter
+/// for a fresh invite". The operator does that — it is not free, and the new
+/// invite fails identically — while the real cause was logged three lines
+/// earlier at boot and never reached the message the process died with.
+///
+/// Here the TEST holds the port, so the holder the node names is this very
+/// process: the join must refuse with the bind failure, name the port and the
+/// flag that moves it, and never send anyone back to the inviter.
+#[test]
+fn a_taken_wireguard_port_refuses_the_join_instead_of_blaming_the_invite() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let founder = dir.path().join("founder");
+    let friend = dir.path().join("friend");
+
+    // explicit ephemeral ports throughout: `init`/`join` default to the FIXED
+    // 8845/51820/51821, which is the very collision under test and would take
+    // a real node on this host with it.
+    let ports = alloc_ports(9);
+    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
+        .args([
+            "init",
+            "--name",
+            "port-collision",
+            "--modules",
+            common::founding_set(),
+            "--dir",
+            founder.to_str().expect("utf-8 founder dir"),
+            "--listen",
+            &format!("127.0.0.1:{}", ports[0]),
+            "--advertised",
+            &format!("127.0.0.1:{}", ports[0]),
+            "--http",
+            &format!("127.0.0.1:{}", ports[1]),
+            "--rpc",
+            &format!("127.0.0.1:{}", ports[2]),
+            "--wireguard-listen",
+            &format!("127.0.0.1:{}", ports[3]),
+        ])
+        .output()
+        .expect("run init");
+    assert!(
+        init.status.success(),
+        "init failed:\n{}",
+        command_output(&init)
+    );
+
+    // the invite must carry at least one front or the joiner never races at
+    // all and never reaches the terminal message under test. Seeded exactly as
+    // `invite_bundles_reachable_member_fronts_from_seeded_mesh_state` does; the
+    // front is unroutable on purpose, so the race exhausts.
+    let namespace = genesis_namespace(&founder);
+    let advert = direct_member_advert(&namespace, 7, 20);
+    let mesh = PersistedMesh::new(namespace, 1, vec![advert], vec![], vec![]);
+    let storage = founder.join("storage");
+    std::fs::create_dir_all(&storage).expect("create founder storage");
+    reachability::store::save(&storage.join("mesh-state.json"), &mesh)
+        .expect("seed mesh-state.json");
+
+    keygen(&friend);
+    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
+        .args(["invite", "--config"])
+        .arg(founder.join("node.toml"))
+        .output()
+        .expect("run invite");
+    assert!(
+        invite.status.success(),
+        "invite failed:\n{}",
+        command_output(&invite)
+    );
+    let blob = String::from_utf8_lossy(&invite.stdout).trim().to_string();
+
+    // THE collision: this process takes the joiner's WireGuard port and keeps
+    // it for the whole test. `UnderlaySocket::bind` binds `0.0.0.0:<port>` with
+    // no address reuse, so a loopback holder collides with it exactly as a
+    // second node would.
+    let joiner_wireguard = ports[7];
+    let _squatter = std::net::UdpSocket::bind(("0.0.0.0", joiner_wireguard))
+        .expect("hold the joiner's wireguard port");
+
+    let join = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
+        .args([
+            "join",
+            &blob,
+            "--dir",
+            friend.to_str().expect("utf-8 friend dir"),
+            "--genesis",
+            founder
+                .join("genesis")
+                .to_str()
+                .expect("utf-8 genesis path"),
+            "--listen",
+            &format!("127.0.0.1:{}", ports[4]),
+            "--advertised",
+            &format!("127.0.0.1:{}", ports[4]),
+            "--http",
+            &format!("127.0.0.1:{}", ports[5]),
+            "--rpc",
+            &format!("127.0.0.1:{}", ports[6]),
+            "--wireguard-listen",
+            &format!("127.0.0.1:{joiner_wireguard}"),
+            "--invite-listen",
+            &format!("127.0.0.1:{}", ports[8]),
+        ])
+        .output()
+        .expect("run join");
+    assert!(
+        join.status.success(),
+        "join failed:\n{}",
+        command_output(&join)
+    );
+
+    let log_path = dir.path().join("joiner-run.log");
+    let out = std::fs::File::create(&log_path).expect("create node log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
+        .arg("run")
+        .arg("--config")
+        .arg(friend.join("node.toml"))
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ducktape");
+    let stderr = NodeStderr::pipe(&mut child);
+
+    // the plane refuses at boot, long before the join window elapses.
+    let bind_refusal = stderr.wait_for_any(&["underlay_bind_failed"]);
+    assert!(
+        bind_refusal.is_ok(),
+        "the plane must refuse the taken port: {:?}\n{}",
+        bind_refusal,
+        stderr.transcript()
+    );
+
+    // and the join — one full `INVITE_JOIN_WINDOW_MS` later — must die saying
+    // THAT, not sending the operator back to the inviter.
+    let verdict = stderr.wait_for_any(&[
+        "no overlay to reach the mesh with",
+        "ask the inviter for a fresh invite",
+    ]);
+    // both markers are the last thing the node prints before exiting itself, so
+    // it is reaped, never killed — a SIGKILL here would race the exit and leave
+    // the status code below unreadable. The kill is for a wedged run only.
+    if verdict.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait().expect("reap the joiner");
+    let log = stderr.transcript();
+
+    assert_eq!(
+        verdict,
+        Ok(0),
+        "the join must refuse with the bind failure, never the invite:\n{log}"
+    );
+    assert!(
+        !log.contains("ask the inviter for a fresh invite"),
+        "a fresh invite cannot help and is not free — the message must never ask \
+         for one when the plane never started:\n{log}"
+    );
+    assert!(
+        log.contains(&format!("pid {}", std::process::id())),
+        "the refusal must name the process holding the port (this test):\n{log}"
+    );
+    assert!(
+        log.contains("--wireguard-listen"),
+        "the refusal must name the flag that moves this node off the port:\n{log}"
+    );
+    assert!(
+        log.contains(&joiner_wireguard.to_string()),
+        "the refusal must name the port itself:\n{log}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "a join that ran out of paths exits 3, and this one still does:\n{log}"
+    );
+}
