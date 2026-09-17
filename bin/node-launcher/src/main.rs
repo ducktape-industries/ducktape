@@ -221,6 +221,12 @@ impl Flags {
 /// it is how a flip, a rollback and an operator's `systemctl restart` all
 /// look, and the machine decides which one it was.
 fn supervise_node(layout: &Layout, args: &[OsString]) -> ExitCode {
+    // Before anything is read or written: this process is the workspace's one
+    // supervisor, or there already is one and this is not it.
+    let _claim = match writers::claim(&layout.lock_path()) {
+        Ok(claim) => claim,
+        Err(refusal) => return refuse(&refusal),
+    };
     let mut watch = Watch::default();
     let mut child_args = vec![OsString::from("node"), OsString::from("run")];
     child_args.extend_from_slice(args);
@@ -231,19 +237,23 @@ fn supervise_node(layout: &Layout, args: &[OsString]) -> ExitCode {
                 info!(target: TARGET, event = "node_update_stopped", "the node is stopped");
                 return ExitCode::SUCCESS;
             }
-            Err(refusal) => {
-                error!(
-                    target: TARGET,
-                    event = "node_update_refused",
-                    reason = refusal.reason,
-                    detail = %refusal.detail,
-                    "the launcher cannot run this workspace"
-                );
-                eprintln!("ducktape-node-launcher: {refusal}");
-                return ExitCode::FAILURE;
-            }
+            Err(refusal) => return refuse(&refusal),
         }
     }
+}
+
+/// Why this launcher will not run this workspace — to the log a dashboard
+/// counts, and to the terminal the operator is looking at.
+fn refuse(refusal: &Refusal) -> ExitCode {
+    error!(
+        target: TARGET,
+        event = "node_update_refused",
+        reason = refusal.reason,
+        detail = %refusal.detail,
+        "the launcher cannot run this workspace"
+    );
+    eprintln!("ducktape-node-launcher: {refusal}");
+    ExitCode::FAILURE
 }
 
 /// How one node life ended.

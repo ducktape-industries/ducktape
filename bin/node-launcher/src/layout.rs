@@ -6,6 +6,7 @@
 //! ```text
 //! <workspace>/node.toml                      the node's own config (or --config)
 //! <workspace>/updates/state.json             the update machine's phase
+//! <workspace>/updates/launcher.lock          the running `run`'s exclusive claim
 //! <workspace>/updates/keys/release.pub       the pinned release key
 //! <workspace>/updates/keys/successor.json    a key rotation this install saw
 //! <workspace>/updates/releases/<sha>/ducktape
@@ -33,6 +34,11 @@ pub const NODE_EXE: &str = "ducktape";
 /// The node's own config, which is this launcher's alone — the update tree is
 /// shared, a config file name is not.
 const CONFIG_FILE: &str = "node.toml";
+
+/// The supervisor's exclusive claim on the workspace. This launcher's alone:
+/// nothing on the node side reads it, so the name stays here rather than in
+/// the tree both binaries share.
+const LOCK_FILE: &str = "launcher.lock";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
@@ -72,6 +78,11 @@ impl Layout {
 
     pub fn state_path(&self) -> PathBuf {
         workspace::launcher_state_path(&self.workspace)
+    }
+
+    /// What a `run` holds for as long as it supervises this workspace.
+    pub fn lock_path(&self) -> PathBuf {
+        self.updates().join(LOCK_FILE)
     }
 
     /// The pinned release key, hex. Its absence is what "this node does not
@@ -137,6 +148,10 @@ mod tests {
         assert_eq!(
             layout.state_path(),
             PathBuf::from("/srv/net/updates/state.json")
+        );
+        assert_eq!(
+            layout.lock_path(),
+            PathBuf::from("/srv/net/updates/launcher.lock")
         );
         assert_eq!(
             layout.release_key_path(),
