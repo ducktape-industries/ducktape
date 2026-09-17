@@ -4,7 +4,7 @@ use futures::{Stream, StreamExt};
 
 pub type BoxStream<T> = futures::stream::LocalBoxStream<'static, T>;
 
-pub struct Task<T>(pub(crate) Option<BoxStream<T>>);
+pub struct Task<T>(Option<BoxStream<T>>);
 
 impl<T: 'static> Task<T> {
     pub fn none() -> Self { Self(None) }
@@ -38,6 +38,9 @@ impl<T: 'static> Task<T> {
     pub fn discard<U: 'static>(self) -> Task<U> {
         Task(self.0.map(|stream| stream.filter_map(|_| std::future::ready(None)).boxed_local()))
     }
+    /// The stream this task is, or nothing when it is [`Task::none`] — what
+    /// a driver spawns from, which must tell the two apart.
+    pub fn into_option(self) -> Option<BoxStream<T>> { self.0 }
     pub fn into_stream(self) -> BoxStream<T> {
         self.0.unwrap_or_else(|| futures::stream::empty().boxed_local())
     }

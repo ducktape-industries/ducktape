@@ -2,7 +2,7 @@
 //! async actions await the result, so opening a window never reports success
 //! before the platform has actually opened it.
 
-use ducktape_view_guest::Task;
+use view_wire::Task;
 use futures::{
     StreamExt as _,
     channel::{mpsc, oneshot},

@@ -92,9 +92,9 @@ pub fn connect(
     rpc: String,
     attempt: i64,
     generation: i64,
-) -> ducktape_view_guest::Task<crate::AppMessage> {
+) -> view_wire::Task<crate::AppMessage> {
     use crate::AppMessage;
-    use ducktape_view_guest::Task;
+    use view_wire::Task;
 
     let start = Task::perform(
         async move {

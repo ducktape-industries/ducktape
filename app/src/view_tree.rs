@@ -4855,9 +4855,9 @@ mod tests {
         }
         cx.update(gpui_kit::init);
         let menu = || {
-            ducktape_view_guest::kit::column(
+            view_wire::kit::column(
                 "menu",
-                [ducktape_view_guest::kit::text(
+                [view_wire::kit::text(
                     "label",
                     "A real menu, without an input",
                 )],
@@ -4924,7 +4924,7 @@ mod tests {
         assert_eq!(keys.get(), 2);
         native.update(|window, cx| {
             replacement.update(cx, |tree, cx| {
-                tree.replace(ducktape_view_guest::kit::text("closed", "menu closed"), cx);
+                tree.replace(view_wire::kit::text("closed", "menu closed"), cx);
                 assert!(tree.focus_targets.is_empty());
                 assert!(!tree.target_focused("menu", window, cx));
             })
@@ -5096,7 +5096,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn horizontal_overflow_scrollbar_reveals_offscreen_columns(cx: &mut gpui_kit::TestAppContext) {
-        use ducktape_view_guest::kit;
+        use view_wire::kit;
         use gpui_kit::InputEvent as _;
         cx.update(gpui_kit::init);
         let columns = kit::sized(

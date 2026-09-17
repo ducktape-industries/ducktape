@@ -34,6 +34,18 @@ pub use wit::WIT;
 mod sanitization;
 pub use sanitization::SanitizeReport;
 
+// What a view is WRITTEN in, beside the wire it writes. `kit` composes the
+// `Node` tree this crate defines, and `Task`/`Subscription` are the shapes an
+// app hands back from `update` and `subscription` — so the guest SDK and the
+// desktop that renders for it take one implementation from here rather than
+// one each. Nothing in the three names a host import: they are futures glue
+// and tree construction.
+pub mod kit;
+mod subscription;
+pub mod task;
+pub use subscription::{Observer, Recipe, Subscription};
+pub use task::Task;
+
 use serde::{Deserialize, Serialize};
 
 mod background;

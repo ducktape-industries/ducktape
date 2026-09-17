@@ -3,16 +3,17 @@ use std::any::TypeId;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use futures::{Stream, StreamExt};
-use crate::{task::BoxStream, wire};
+use crate as wire;
+use crate::task::BoxStream;
 
-pub(crate) type Observer<T> = Box<dyn Fn(&wire::Event) -> Option<T>>;
+pub type Observer<T> = Box<dyn Fn(&wire::Event) -> Option<T>>;
 pub struct Recipe<T> {
     pub key: u64,
     pub start: Box<dyn FnOnce() -> BoxStream<T>>,
 }
 pub struct Subscription<T> {
-    pub(crate) recipes: Vec<Recipe<T>>,
-    pub(crate) observers: Vec<Observer<T>>,
+    recipes: Vec<Recipe<T>>,
+    observers: Vec<Observer<T>>,
 }
 
 fn fingerprint(value: impl Hash) -> u64 {
@@ -23,6 +24,11 @@ fn fingerprint(value: impl Hash) -> u64 {
 
 impl<T: 'static> Subscription<T> {
     pub fn into_recipes(self) -> Vec<Recipe<T>> { self.recipes }
+    /// What a driver needs to run one: the streams to start, keyed, and the
+    /// event filters to ask on every observation.
+    pub fn into_parts(self) -> (Vec<Recipe<T>>, Vec<Observer<T>>) {
+        (self.recipes, self.observers)
+    }
     pub fn none() -> Self { Self { recipes: Vec::new(), observers: Vec::new() } }
     pub fn run<S: Stream<Item = T> + 'static>(make: fn() -> S) -> Self {
         Self {
