@@ -38,15 +38,15 @@ const ALLOWED: &[&str] = &[
     "dependencies boards-wire -> crates/modules/apps/boards/wire",
     "dependencies chat-message -> crates/modules/apps/chat/message",
     "dependencies duckfs-core -> crates/duckfs/core",
-    // DEV ONLY, and that is load-bearing: these two carry the whole module graph
-    // (sdk, dispatch, chat, tasks, pages, saga, commonware). The agents view's
-    // tests pin its encoded payloads against the real module codecs
-    // (`runs::model_program`, `agent::decode_msg`) — the point of the pin is that
-    // it breaks when a module's wire moves. `cargo build` links neither, so none
-    // of that graph reaches `agents_view.wasm`; moving either into
-    // `[dependencies]` would put all of it there.
-    "dev-dependencies runs -> crates/modules/apps/runs",
-    "dev-dependencies agent -> crates/modules/apps/agent",
+    // DEV ONLY, and that is still load-bearing. The agents view's tests pin its
+    // encoded payloads against the real codecs (`runs_wire::model_program`,
+    // `agent_wire::decode_msg`) — the point of the pin is that it breaks when a
+    // module's wire moves. Since #2303 wave 7f these are the WIRE crates rather
+    // than the modules, so what a dev-dep now carries is types and codecs
+    // instead of the whole module graph; `cargo build` still links neither, so
+    // none of it reaches `agents_view.wasm` either way.
+    "dev-dependencies runs-wire -> crates/modules/apps/runs/wire",
+    "dev-dependencies agent-wire -> crates/modules/apps/agent/wire",
 ];
 
 #[test]

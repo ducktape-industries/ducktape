@@ -330,7 +330,7 @@ pub enum RunsMsg {
         call: sdk::CallId,
         /// The program's decoded call binding. Output-derived links are
         /// accepted only when their bytes match dispatch's committed digest.
-        result: agent::CallResult,
+        result: agent_wire::CallResult,
     },
     RejectActionRequest {
         request_id: String,
@@ -553,7 +553,7 @@ pub enum RunsQuery {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsReply {
-    ModelProgram(agent::Program),
+    ModelProgram(agent_wire::Program),
     Conversation(Option<crate::ConversationView>),
     ConversationEvents(Vec<crate::ConversationEvent>),
     ConversationTurn(Option<crate::ConversationTurn>),
@@ -687,4 +687,42 @@ pub fn action_request_id(run_id: &str, request_id: &str) -> String {
         crate::dispatch_id_for(run_id),
         crate::dispatch_id_for(request_id)
     )
+}
+
+impl ModuleUpdateSpec {
+    pub fn digest(&self) -> Result<[u8; 32], String> {
+        let canonical = self.code_hash.len() == 64
+            && self
+                .code_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !canonical {
+            return Err("module update code_hash must be a lowercase SHA-256 hex digest".into());
+        }
+        let mut digest = [0; 32];
+        for (index, byte) in digest.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&self.code_hash[index * 2..index * 2 + 2], 16)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(digest)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.digest()?;
+        let valid_id =
+            node_work::relative_path(&self.module_id) && !self.module_id.contains(['/', '=', '\n']);
+        if !valid_id {
+            return Err("module update requires a bare module id".into());
+        }
+        let valid_paths = node_work::relative_path(&self.artifact);
+        if !valid_paths {
+            return Err("module artifacts must be relative paths within the output commit".into());
+        }
+        let valid_lead = (governance::MIN_ACTIVATION_LEAD..=governance::MAX_ACTIVATION_LEAD)
+            .contains(&self.after);
+        if !valid_lead {
+            return Err("module update after is outside governance's activation lead range".into());
+        }
+        Ok(())
+    }
 }

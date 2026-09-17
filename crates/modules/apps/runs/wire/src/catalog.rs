@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::sink::{FORGE_BODY_BYTE_CAP, FORGE_TITLE_BYTE_CAP};
+use crate::{FORGE_BODY_BYTE_CAP, FORGE_TITLE_BYTE_CAP};
 use crate::{MAX_DUCKFS_WRITE_TEXT_BYTES, MAX_REQUEST_ID_BYTES, ModuleUpdateSpec, ReplyBlock};
 
 // ---- the envelope ----------------------------------------------------------------
@@ -98,12 +98,12 @@ pub fn content_blocks(content: &[ContentPart]) -> Vec<ReplyBlock> {
         .iter()
         .map(|part| match part {
             ContentPart::Text { text } => ReplyBlock {
-                kind: crate::response::REPLY_KIND_PARAGRAPH.into(),
+                kind: crate::REPLY_KIND_PARAGRAPH.into(),
                 text: text.clone(),
                 lang: None,
             },
             ContentPart::Code { text, lang } => ReplyBlock {
-                kind: crate::response::REPLY_KIND_CODE.into(),
+                kind: crate::REPLY_KIND_CODE.into(),
                 text: text.clone(),
                 lang: lang.clone().filter(|lang| !lang.is_empty()),
             },
@@ -331,7 +331,7 @@ fn specs() -> Vec<Spec> {
             description: "Publish a new top-level page: a title and its body, whole in one write. The page id is minted by runs and returned in the result.",
             target: None,
             input: object(
-                json!({"title": {"type": "string", "minLength": 1, "maxLength": pages::MAX_PAGE_TITLE_LEN}, "content": content_schema()}),
+                json!({"title": {"type": "string", "minLength": 1, "maxLength": crate::MAX_PAGE_TITLE_LEN}, "content": content_schema()}),
                 &["title", "content"],
             ),
             result: object(
@@ -556,7 +556,7 @@ pub fn operation_view(name: &str) -> Option<OperationView> {
 
 /// Where a page comment lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PageAnchor {
+pub enum PageAnchor {
     /// A page or block id: the comment opens a new thread there.
     Target(String),
     /// An existing comment thread.
@@ -567,7 +567,7 @@ pub(crate) enum PageAnchor {
 /// this module owns. Everything downstream (probes, the prepared target
 /// message) works on this, never on the envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Operation {
+pub enum Operation {
     Reply {
         content: Vec<ContentPart>,
     },
@@ -659,7 +659,7 @@ struct SubmitTarget {
 
 /// The name a module message carries: the one key of its object form, or the
 /// string itself for a field-less message. An empty string names nothing.
-pub(crate) fn message_name(message: &Value) -> Option<&str> {
+pub fn message_name(message: &Value) -> Option<&str> {
     match message {
         Value::Object(fields) if fields.len() == 1 => fields.keys().next().map(String::as_str),
         Value::String(name) if !name.is_empty() => Some(name),
@@ -853,7 +853,7 @@ impl Operation {
     /// Decode one envelope against the catalog. An unknown operation, a
     /// missing or extra target, or an input outside its schema is refused by
     /// name so the caller can correct what it can see.
-    pub(crate) fn decode(envelope: &ActionEnvelope) -> Result<Self, String> {
+    pub fn decode(envelope: &ActionEnvelope) -> Result<Self, String> {
         match envelope.operation.as_str() {
             OP_REPLY => {
                 no_target(envelope)?;
@@ -1017,7 +1017,7 @@ impl Operation {
     }
 
     /// The catalog name this operation was decoded from.
-    pub(crate) fn name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             Self::Reply { .. } => OP_REPLY,
             Self::React { .. } => OP_REACT,
@@ -1040,7 +1040,7 @@ impl Operation {
     }
 
     /// The schema identity a proposal of this operation is pinned to.
-    pub(crate) fn schema_digest(&self) -> String {
+    pub fn schema_digest(&self) -> String {
         operation_view(self.name())
             .expect("every decoded operation is in the catalog")
             .schema_digest
@@ -1049,21 +1049,21 @@ impl Operation {
     /// Whether this operation belongs to the degrade lane on the settle path:
     /// pages annotations and duckfs writes fail alone with a breadcrumb rather
     /// than costing the response its reply.
-    pub(crate) fn is_pages(&self) -> bool {
+    pub fn is_pages(&self) -> bool {
         matches!(
             self,
             Self::PagesComment { .. } | Self::PagesSetChecked { .. } | Self::PagesPost { .. }
         )
     }
 
-    pub(crate) fn is_duckfs(&self) -> bool {
+    pub fn is_duckfs(&self) -> bool {
         matches!(self, Self::DuckfsWriteText { .. })
     }
 
     /// Whether this operation is a conversational or task write the response
     /// lane prepares (`emit_response`): a reply, a reaction, a chat post, a
     /// job comment, a task create or status update.
-    pub(crate) fn is_conversational(&self) -> bool {
+    pub fn is_conversational(&self) -> bool {
         matches!(
             self,
             Self::Reply { .. }
@@ -1077,7 +1077,7 @@ impl Operation {
     }
 
     /// Whether the operation may run in `lane`.
-    pub(crate) fn admits(&self, lane: LaneKind) -> bool {
+    pub fn admits(&self, lane: LaneKind) -> bool {
         operation_view(self.name())
             .expect("every decoded operation is in the catalog")
             .lanes

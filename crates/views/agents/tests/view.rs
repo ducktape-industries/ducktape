@@ -443,16 +443,16 @@ fn a_new_agent_registers_from_the_form_once_its_id_is_a_label() {
     );
     let frame = tick_native(vec![answer(
         program.id,
-        &serde_json::to_vec(&json!({"model_program":runs::model_program("chiefduck")})).unwrap(),
+        &serde_json::to_vec(&json!({"model_program":runs_wire::model_program("chiefduck")})).unwrap(),
     )]);
     let provision = request(&frame, "op.submit");
     let payload: Value = serde_json::from_slice(&provision.payload).unwrap();
     assert_eq!(payload["target"], "agent");
-    agent::decode_msg(&serde_json::to_vec(&payload["payload"]).unwrap()).unwrap();
+    agent_wire::decode_msg(&serde_json::to_vec(&payload["payload"]).unwrap()).unwrap();
     assert_eq!(payload["payload"]["provision"]["request_id"], "chiefduck");
     assert_eq!(
         payload["payload"]["provision"]["program"],
-        serde_json::to_value(runs::model_program("chiefduck")).unwrap()
+        serde_json::to_value(runs_wire::model_program("chiefduck")).unwrap()
     );
     assert!(
         !frame
@@ -466,8 +466,8 @@ fn a_new_agent_registers_from_the_form_once_its_id_is_a_label() {
         serde_json::from_slice::<Value>(&receipt.payload).unwrap(),
         json!({"target":"agent", "query":{"provision":{"controller":7, "request_id":"chiefduck"}}})
     );
-    let response = serde_json::to_vec(&agent::AgentReply::Provision(Some(
-        agent::ProvisionReceipt {
+    let response = serde_json::to_vec(&agent_wire::AgentReply::Provision(Some(
+        agent_wire::ProvisionReceipt {
             account: 77,
             request_digest: [3; 32],
         },
@@ -477,7 +477,7 @@ fn a_new_agent_registers_from_the_form_once_its_id_is_a_label() {
     let configure = request(&frame, "op.submit");
     let payload: Value = serde_json::from_slice(&configure.payload).unwrap();
     assert_eq!(payload["target"], "runs");
-    runs::decode_msg(&serde_json::to_vec(&payload["payload"]).unwrap()).unwrap();
+    runs_wire::decode_msg(&serde_json::to_vec(&payload["payload"]).unwrap()).unwrap();
     let record = &payload["payload"]["configure_model"]["operation"]["register_model"];
     assert_eq!(record["account"], 77);
     assert_eq!(record["agent_id"], "chiefduck");
@@ -1165,7 +1165,7 @@ fn begin_registration() -> (Frame, u64) {
     let program = request(&frame, "rpc.query").id;
     let frame = tick_native(vec![answer(
         program,
-        &serde_json::to_vec(&json!({"model_program":runs::model_program("new-agent")})).unwrap(),
+        &serde_json::to_vec(&json!({"model_program":runs_wire::model_program("new-agent")})).unwrap(),
     )]);
     (frame, props)
 }
@@ -1173,8 +1173,8 @@ fn begin_registration() -> (Frame, u64) {
 #[test]
 fn registration_refuses_missing_or_wrong_receipts_without_name_lookup() {
     for reply in [
-        agent::AgentReply::Provision(None),
-        agent::AgentReply::Binding(None),
+        agent_wire::AgentReply::Provision(None),
+        agent_wire::AgentReply::Binding(None),
     ] {
         let (frame, _) = begin_registration();
         let provision = request(&frame, "op.submit").id;
@@ -1219,7 +1219,7 @@ fn registration_does_not_continue_after_account_change_or_disconnect() {
         let frame = tick_native(vec![answer(provision, b"{}")]);
         let receipt = request(&frame, "rpc.query").id;
         let _ = tick_native(vec![item(props, &context)]);
-        let reply = agent::AgentReply::Provision(Some(agent::ProvisionReceipt {
+        let reply = agent_wire::AgentReply::Provision(Some(agent_wire::ProvisionReceipt {
             account: 77,
             request_digest: [3; 32],
         }));

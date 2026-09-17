@@ -54,7 +54,7 @@ use crate::node_link::NodeLink;
 /// the module that owns the session registry.
 const RUNS_MODULE: &str = "runs";
 const ACTION_HEADER: &str = "x-ducktape-run-action";
-const MAX_ACTION_REQUEST_BYTES: usize = runs::MAX_ACTIONS_BYTES + runs::MAX_DELEGATIONS_BYTES;
+const MAX_ACTION_REQUEST_BYTES: usize = runs_wire::MAX_ACTIONS_BYTES + runs_wire::MAX_DELEGATIONS_BYTES;
 
 pub(super) const ENV_ACTION_URL: &str = "DUCKTAPE_RUN_ACTION_URL";
 pub(super) const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
@@ -91,7 +91,7 @@ struct ActionState {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ActionRequest {
-    message: runs::RunsMsg,
+    message: runs_wire::RunsMsg,
 }
 
 /// Generate a host-private key and bind its public half to this execution.
@@ -107,7 +107,7 @@ pub(super) async fn open(
     let mut seed = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
     let key = ed25519::PrivateKey::decode(seed.as_slice()).expect("32 random bytes decode");
-    let payload = runs::encode_msg(&runs::RunsMsg::OpenAgentSession {
+    let payload = runs_wire::encode_msg(&runs_wire::RunsMsg::OpenAgentSession {
         run_id: agent.run_id.clone(),
         attempt: agent.attempt,
         session_key: key.public_key().as_ref().to_vec(),
@@ -208,7 +208,7 @@ async fn run_action(
         return action_response(StatusCode::UNAUTHORIZED, "action token rejected");
     }
     let names_bound_run = match &request.message {
-        runs::RunsMsg::AgentAction { run_id, .. } => run_id == &state.run_id,
+        runs_wire::RunsMsg::AgentAction { run_id, .. } => run_id == &state.run_id,
         _ => false,
     };
     if !names_bound_run {
@@ -268,25 +268,25 @@ async fn action_events(node: &NodeLink) -> Result<ActionEvents, String> {
 async fn action_result(
     node: &NodeLink,
     request_id: &str,
-) -> Result<Option<Result<runs::ActionRequestView, String>>, String> {
+) -> Result<Option<Result<runs_wire::ActionRequestView, String>>, String> {
     let bytes = node
         .query(
             RUNS_MODULE,
-            &runs::encode_query(&runs::RunsQuery::ActionRequest {
+            &runs_wire::encode_query(&runs_wire::RunsQuery::ActionRequest {
                 request_id: request_id.into(),
             }),
         )
         .await?;
-    let runs::RunsReply::ActionRequest(request) = runs::decode_reply(&bytes)? else {
+    let runs_wire::RunsReply::ActionRequest(request) = runs_wire::decode_reply(&bytes)? else {
         return Err("unexpected action request reply".into());
     };
     let Some(request) = request else {
         return Ok(None);
     };
     match &request.status {
-        runs::ActionStatus::AwaitingProgram | runs::ActionStatus::Claimed { .. } => Ok(None),
-        runs::ActionStatus::Rejected { reason } => Ok(Some(Err(reason.clone()))),
-        runs::ActionStatus::Completed { outcome, .. } => match outcome {
+        runs_wire::ActionStatus::AwaitingProgram | runs_wire::ActionStatus::Claimed { .. } => Ok(None),
+        runs_wire::ActionStatus::Rejected { reason } => Ok(Some(Err(reason.clone()))),
+        runs_wire::ActionStatus::Completed { outcome, .. } => match outcome {
             dispatch::CallOutcomeSummary::Applied { .. } => Ok(Some(Ok(request))),
             dispatch::CallOutcomeSummary::Rejected { reason } => Ok(Some(Err(reason.clone()))),
             dispatch::CallOutcomeSummary::Refused(reason) => {
@@ -303,7 +303,7 @@ async fn await_action_result(
     node: &NodeLink,
     request_id: &str,
     mut events: ActionEvents,
-) -> Result<runs::ActionRequestView, String> {
+) -> Result<runs_wire::ActionRequestView, String> {
     if let Some(result) = action_result(node, request_id).await? {
         return result;
     }
@@ -340,22 +340,22 @@ async fn await_action_result(
 /// response names it `receipt_id` beside the receipt itself.
 async fn submit_action(
     state: &ActionState,
-    message: runs::RunsMsg,
+    message: runs_wire::RunsMsg,
 ) -> Result<serde_json::Value, String> {
-    let runs::RunsMsg::AgentAction {
+    let runs_wire::RunsMsg::AgentAction {
         run_id, request_id, ..
     } = &message
     else {
         return Err("message is outside the run action scope".into());
     };
-    let receipt_id = runs::action_request_id(run_id, request_id);
+    let receipt_id = runs_wire::action_request_id(run_id, request_id);
     // Serialize admission and completion so a later action cannot overtake one
     // whose actual target write is still pending.
     let mut next_seq = state.seq.lock().await;
     let events = action_events(&state.node).await?;
     let msg = sdk::Msg {
         target: RUNS_MODULE.into(),
-        payload: runs::encode_msg(&message),
+        payload: runs_wire::encode_msg(&message),
     };
     let frame = node::encode_frame(&state.signer, *next_seq, &msg);
     *next_seq = next_seq

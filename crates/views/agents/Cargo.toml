@@ -19,5 +19,5 @@ ducktape-view-guest.workspace = true
 # the snapshot tag is a digest of this view's own state layout; the tracer
 # that derives it is host-only and never reaches the built component
 view-wire = { workspace = true, features = ["schema"] }
-runs = { path = "../../modules/apps/runs" }
-agent = { path = "../../modules/apps/agent" }
+runs-wire = { path = "../../modules/apps/runs/wire" }
+agent-wire = { path = "../../modules/apps/agent/wire" }

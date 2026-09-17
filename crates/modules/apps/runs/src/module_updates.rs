@@ -1,6 +1,7 @@
 //! Programs queue immutable forge deployments; module policy drives node work.
 use super::*;
 use crate::action_requests::Prepared;
+use node_work::relative_path;
 use crate::catalog::Operation;
 use crate::facets::{RunnerResult, WireSink};
 
@@ -19,44 +20,6 @@ fn request_key(request_id: &str) -> String {
     format!("module_updates/request/{request_id}")
 }
 
-use node_work::relative_path;
-
-impl ModuleUpdateSpec {
-    pub fn digest(&self) -> Result<[u8; 32], String> {
-        let canonical = self.code_hash.len() == 64
-            && self
-                .code_hash
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-        if !canonical {
-            return Err("module update code_hash must be a lowercase SHA-256 hex digest".into());
-        }
-        let mut digest = [0; 32];
-        for (index, byte) in digest.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&self.code_hash[index * 2..index * 2 + 2], 16)
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(digest)
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        self.digest()?;
-        let valid_id = relative_path(&self.module_id) && !self.module_id.contains(['/', '=', '\n']);
-        if !valid_id {
-            return Err("module update requires a bare module id".into());
-        }
-        let valid_paths = relative_path(&self.artifact);
-        if !valid_paths {
-            return Err("module artifacts must be relative paths within the output commit".into());
-        }
-        let valid_lead = (governance::MIN_ACTIVATION_LEAD..=governance::MAX_ACTIVATION_LEAD)
-            .contains(&self.after);
-        if !valid_lead {
-            return Err("module update after is outside governance's activation lead range".into());
-        }
-        Ok(())
-    }
-}
 
 impl RunsModule {
     async fn update_cursor(&self, key: &str) -> Result<u64, Error> {

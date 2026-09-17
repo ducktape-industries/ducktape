@@ -2,7 +2,7 @@
 use super::*;
 
 fn job_id(native: &NativeState) -> Result<&str, String> {
-    let runs::ConversationSource::Job { job_id } = &native.configuration.source else {
+    let runs_wire::ConversationSource::Job { job_id } = &native.configuration.source else {
         return Err("native conversation is not a worker".into());
     };
     if !native.context.job_reporting {
@@ -14,8 +14,8 @@ fn job_id(native: &NativeState) -> Result<&str, String> {
 async fn current_worker(
     state: &ActionState,
     native: &NativeState,
-    expected: Option<&runs::WorkerControls>,
-) -> Result<runs::WorkerControls, String> {
+    expected: Option<&runs_wire::WorkerControls>,
+) -> Result<runs_wire::WorkerControls, String> {
     let job_id = job_id(native)?;
     let view = conversation(&state.node, &native.context.conversation_id).await?;
     validate_active(&view, &native.configuration, &state.run_id)?;
@@ -42,7 +42,7 @@ async fn current_worker(
 }
 
 fn matching_report(
-    worker: &runs::WorkerControls,
+    worker: &runs_wire::WorkerControls,
     operation_id: &str,
     kind: &tasks::WorkerReportKind,
     payload: &str,
@@ -97,7 +97,7 @@ pub(super) async fn report(
     // Runs' durable operation receipt suppresses duplicate Tasks emits/charges.
     let message = sdk::Msg {
         target: RUNS_MODULE.into(),
-        payload: runs::encode_msg(&runs::RunsMsg::ReportJob {
+        payload: runs_wire::encode_msg(&runs_wire::RunsMsg::ReportJob {
             run_id: state.run_id.clone(),
             attempt: native.attempt,
             operation_id: operation_id.clone(),
