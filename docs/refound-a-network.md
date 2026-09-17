@@ -124,11 +124,22 @@ lost grant is visible.
 **A fresh workspace has no wallet, and a fresh chain has no account.** Every
 keyless verb signs with the active wallet and the service daemons refuse to
 boot without one. `wallet new` prints a mnemonic, so the script writes it to a
-`0600` file in the workspace and never to its own output. The account is the
-on-chain identity that key belongs to, and `account create` is a submitted
-transaction, so it runs against the serving founder rather than beside `node
-init`. Without it a daemon does not stop at the grant: it enables, announces,
-and then exits `FATAL: the active wallet key is on no account`.
+`0600` file in the workspace and never to its own output. The key is minted
+before anything runs, because the install below pins its public key; the
+account is the on-chain identity that key belongs to, and `account create` is
+a submitted transaction, so that half runs against the serving founder.
+Without it a daemon does not stop at the grant: it enables, announces, and
+then exits `FATAL: the active wallet key is on no account`.
+
+**A workspace that pins no release key follows no release channel.** The pin
+is `<workspace>/updates/keys/release.pub`, and its absence is what "this node
+does not self-update" looks like on disk: the launcher supervises and restarts
+the node forever, refuses every designation with `no_release_key`, and the
+only way to move that node onto a new binary is to found the network again.
+Nothing else reports it, so the report reads the file back and prints
+`release key  pinned <hex>` or names the node that has none. The key is read
+once per node life, so `ducktape-node-launcher install --release-key` runs
+before the first `run` — pinning it later costs a restart.
 
 **A grant line is not a live daemon.** `announced at height N` is printed
 before the daemon has finished booting, so the script waits out the exit

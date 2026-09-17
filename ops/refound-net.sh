@@ -413,6 +413,42 @@ FOUNDER_WS="$ROOT"
 FOUNDER_CFG="$FOUNDER_WS/node.toml"
 echo "founded $CHAIN at $FOUNDER_WS"
 
+# --------------------------------------------------------------------------
+# 4b. the workspace's active wallet — a KEY, minted locally, before anything
+# runs.
+#
+# Every keyless verb signs with it, and a service daemon refuses to boot
+# without one ("no active wallet in this workspace"). A freshly founded
+# workspace has none. It is minted HERE, and not beside the account it will
+# later be founded on, because the install below needs its public key: that
+# key is what the network's node releases are signed with, and a workspace
+# that pins none follows no release channel at all.
+#
+# `wallet new` PRINTS A MNEMONIC. It is written to a 0600 file in the
+# workspace and never to this script's stdout, which is a log an operator
+# pastes around.
+# --------------------------------------------------------------------------
+say "wallet"
+SECRETS="$FOUNDER_WS/wallet-$WALLET_NAME.secret"
+( umask 077; : > "$SECRETS" )
+if printf '%s\n' "$WALLET_PASSWORD" \
+    | DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" wallet new "$WALLET_NAME" \
+      --config "$FOUNDER_CFG" > "$SECRETS" 2>&1; then
+    chmod 600 "$SECRETS"
+    echo "minted wallet $WALLET_NAME — mnemonic in $SECRETS (0600), not echoed here"
+    DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" wallet use "$WALLET_NAME" --config "$FOUNDER_CFG" \
+        || echo "could not set $WALLET_NAME active (continuing)"
+else
+    die "wallet new failed — see $SECRETS"
+fi
+WALLET_KEY="$FOUNDER_WS/keys/$WALLET_NAME.key"
+RELEASE_PUB=$("$STAGED_BIN" user key status --key "$WALLET_KEY" | awk '{print $NF}') \
+    || die "could not read the wallet's public key"
+case "$RELEASE_PUB" in
+    [0-9a-f]*) [ ${#RELEASE_PUB} = 64 ] || die "the wallet's public key is not 64 hex characters: $RELEASE_PUB";;
+    *) die "the wallet's public key is not hex: $RELEASE_PUB";;
+esac
+
 # the guest image a run boots is the workspace's own, so it is installed here
 # rather than pointed at somewhere shared.
 if [ -n "$GUEST_SRC" ]; then
@@ -467,7 +503,14 @@ cp "$STAGED_BIN" "$WS_BIN"
 # matched by path like the node itself.
 WS_LAUNCHER="$FOUNDER_WS/$LAUNCHER_EXE"
 cp "$LAUNCHER" "$WS_LAUNCHER"
-"$WS_LAUNCHER" install --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" --from "$STAGED_BIN"
+# --release-key is what makes the release plane LIVE on this node. Without it
+# the launcher supervises and restarts and nothing more: `pinned_keys` refuses
+# with `no_release_key`, "this workspace pins no release key, so it follows no
+# node channel", and the only way to move the binary is to found again. The key
+# is read once per node life, so pinning it at the install — before the first
+# `run` — is the one point where it costs no restart.
+"$WS_LAUNCHER" install --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" \
+    --from "$STAGED_BIN" --release-key "$RELEASE_PUB"
 DUCKTAPE_MODULES_DIR="$FOUNDER_WS/modules" setsid nohup \
     "$WS_LAUNCHER" run --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" \
     > "$FOUNDER_WS/launcher.log" 2>&1 < /dev/null &
@@ -521,7 +564,10 @@ install_set "$JOINER_WS"
 J_LAUNCHER="$JOINER_WS/$LAUNCHER_EXE"
 cp "$WS_BIN" "$JOINER_WS/ducktape"
 cp "$LAUNCHER" "$J_LAUNCHER"
-"$J_LAUNCHER" install --workspace "$JOINER_WS" --config "$JOINER_CFG" --from "$WS_BIN"
+# the SAME release key: one flip moves the whole network, and a resident that
+# pins nothing would sit on the old binary while the validator moved.
+"$J_LAUNCHER" install --workspace "$JOINER_WS" --config "$JOINER_CFG" \
+    --from "$WS_BIN" --release-key "$RELEASE_PUB"
 DUCKTAPE_MODULES_DIR="$JOINER_WS/modules" setsid nohup \
     "$J_LAUNCHER" run --workspace "$JOINER_WS" --config "$JOINER_CFG" \
     > "$JOINER_WS/launcher.log" 2>&1 < /dev/null &
@@ -557,36 +603,7 @@ say "executors"
 DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" agent install claude \
     --node "http://127.0.0.1:$F_HTTP" || die "agent install failed"
 
-# --------------------------------------------------------------------------
-# 7b. the workspace's active wallet.
-#
-# Every keyless verb signs with it, and a service daemon refuses to boot
-# without one ("no active wallet in this workspace"). A freshly founded
-# workspace has none.
-#
-# `wallet new` PRINTS A MNEMONIC. It is written to a 0600 file in the
-# workspace and never to this script's stdout, which is a log an operator
-# pastes around.
-# --------------------------------------------------------------------------
-say "wallet"
-if DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" wallet list --config "$FOUNDER_CFG" 2>/dev/null \
-    | grep -q "$WALLET_NAME"; then
-    echo "wallet $WALLET_NAME already exists"
-else
-    SECRETS="$FOUNDER_WS/wallet-$WALLET_NAME.secret"
-    ( umask 077; : > "$SECRETS" )
-    if printf '%s\n' "$WALLET_PASSWORD" \
-        | DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" wallet new "$WALLET_NAME" \
-          --config "$FOUNDER_CFG" > "$SECRETS" 2>&1; then
-        chmod 600 "$SECRETS"
-        echo "minted wallet $WALLET_NAME — mnemonic in $SECRETS (0600), not echoed here"
-        DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" wallet use "$WALLET_NAME" --config "$FOUNDER_CFG" \
-            || echo "could not set $WALLET_NAME active (continuing)"
-    else
-        echo "wallet new failed — see $SECRETS"
-    fi
-fi
-
+say "account"
 # A wallet is a KEY; an account is the on-chain identity that key belongs to,
 # and founding one is a submitted, user-signed transaction — so it needs the
 # node already serving, which is why this is here and not beside `node init`.
@@ -706,6 +723,22 @@ fi
 # the archive paths whether or not a mention got through. The exit code carries
 # the verdict.
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# 9b. does this network follow a release channel at all.
+#
+# A workspace that pins no release key follows none: the launcher supervises
+# it forever and the only way to move its binary is to found again. That state
+# is silent on disk — the ABSENCE of a file — so it is read back here rather
+# than assumed from the flag that was passed.
+# --------------------------------------------------------------------------
+RELEASE_PINNED="pinned $RELEASE_PUB (both nodes)"
+for ws in "$FOUNDER_WS" "$JOINER_WS"; do
+    pin=$(cat "$ws/updates/keys/release.pub" 2>/dev/null) || pin=""
+    if [ "$pin" != "$RELEASE_PUB" ]; then
+        RELEASE_PINNED="NONE on $ws — that node follows no release channel"
+    fi
+done
+
 SMOKE="skipped (--no-smoke)"
 if [ "$SKIP_SMOKE" = 1 ]; then
     :
@@ -727,6 +760,30 @@ else
     fi
 fi
 
+# A resident that is not following is a one-node network wearing two hats, and
+# the founding step cannot see it: `node join` returns as soon as the workspace
+# is written, long before the first block arrives. This reads LAST, after the
+# smoke has put real work through the chain, so the two numbers it prints are
+# the ones the operator is about to walk away from.
+FOLLOWS="?"
+f_h=$(curl -fsS "http://127.0.0.1:$F_HTTP/v1/status" 2>/dev/null \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin).get("height",-1))' 2>/dev/null) || f_h=-1
+j_h=$(curl -fsS "http://127.0.0.1:$J_HTTP/v1/status" 2>/dev/null \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin).get("height",-1))' 2>/dev/null) || j_h=-1
+if [ "$f_h" -lt 0 ] || [ "$j_h" -lt 0 ]; then
+    FOLLOWS="UNKNOWN — a node did not answer /v1/status"
+else
+    gap=$((f_h - j_h))
+    # A resident is always a little behind a validator that is still producing;
+    # what matters is that it is not STOPPED. Anything past a few seconds of
+    # blocks is the wedge, not lag.
+    if [ "$gap" -le 50 ] && [ "$gap" -ge -50 ]; then
+        FOLLOWS="yes — founder h$f_h, resident h$j_h"
+    else
+        FOLLOWS="NO — founder h$f_h, resident h$j_h (gap $gap)"
+    fi
+fi
+
 # --------------------------------------------------------------------------
 # 11. what the operator needs.
 # --------------------------------------------------------------------------
@@ -745,6 +802,8 @@ cat <<REPORT
   resident    http 127.0.0.1:$J_HTTP   rpc :$J_RPC   config $JOINER_CFG
   binary      $VOUCH
   set         $MODULES_SRC
+  release key $RELEASE_PINNED
+  follows     $FOLLOWS
   smoke       $SMOKE
 
   the old content is not gone, it moved. these two lines are the whole story:
@@ -756,9 +815,29 @@ cat <<REPORT
   this chain id and -n resolves to whichever it finds first.
 REPORT
 
-# The network is founded either way — this is the verdict on whether it WORKS.
-[ "$SMOKE" != "RED" ] || {
+# The network is founded either way — these are the verdicts on whether it
+# WORKS. Each one names what is wrong; the exit code carries all of them.
+VERDICT=0
+case "$FOLLOWS" in
+    yes*) :;;
+    *)
+        printf '\nrefound-net: the resident is not following the founder.\n' >&2
+        printf '  %s\n' "$FOLLOWS" >&2
+        printf '  a network whose resident cannot follow is a one-node network.\n' >&2
+        VERDICT=1
+        ;;
+esac
+case "$RELEASE_PINNED" in
+    pinned*) :;;
+    *)
+        printf '\nrefound-net: %s\n' "$RELEASE_PINNED" >&2
+        printf '  the only way to move that node onto a new binary is to found again.\n' >&2
+        VERDICT=1
+        ;;
+esac
+if [ "$SMOKE" = "RED" ]; then
     printf '\nrefound-net: the network is up, but a mention does not reach an agent.\n' >&2
     printf '  the smoke output above says which link of the chain broke.\n' >&2
-    exit 1
-}
+    VERDICT=1
+fi
+exit "$VERDICT"
