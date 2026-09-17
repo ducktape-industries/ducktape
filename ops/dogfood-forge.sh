@@ -89,7 +89,12 @@ EOF
 
 BASE_URL="$(resolve_base_url)"
 WORKSPACE="$(resolve_workspace)"
-[ -n "$WORKSPACE" ] && [ -r "$WORKSPACE/admin.token" ] || die "a local node workspace and operator credential are required"
+# Two distinct failures, told apart. One message for both sent a reader hunting
+# for a missing credential file when the port had simply matched no workspace.
+[ -n "$WORKSPACE" ] ||
+  die "no workspace under the ducktape home serves port ${BASE_URL##*:}; the import reads that node's own forge store, so it must be a node this box runs"
+[ -r "$WORKSPACE/admin.token" ] ||
+  die "workspace $WORKSPACE has no readable admin.token; the import submits as the node operator"
 IMPORT_TOOL="$PWD/ops/forge-import.py"
 FORGE_STORE=$(python3 - "$WORKSPACE" <<'PYCONFIG'
 import pathlib, sys, tomllib
