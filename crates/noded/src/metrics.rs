@@ -655,11 +655,23 @@ impl NodeMetrics {
     /// Name the machine the reachability plane runs on — at boot, and again
     /// after every swap that took. A refused swap does NOT call this: the
     /// current machine keeps running, so the name must not move.
-    pub fn set_netstack_execution(&self, backend: impl Into<String>, code_hash: Option<String>) {
+    ///
+    /// `failure` is why this node has no overlay at all, and travels WITH the
+    /// name for the same reason a name without it is useless: `failed` alone
+    /// sends an operator back to the logs of a boot twelve minutes gone.
+    pub fn set_netstack_execution(
+        &self,
+        backend: impl Into<String>,
+        code_hash: Option<String>,
+        failure: Option<(&'static str, String)>,
+    ) {
+        let (reason, detail) = failure.unzip();
         let mut status = self.operations.write().expect("operations lock poisoned");
         let netstack = status.netstack.get_or_insert_with(Default::default);
         netstack.backend = backend.into();
         netstack.code_hash = code_hash;
+        netstack.failure_reason = reason.map(str::to_string);
+        netstack.failure_detail = detail;
     }
 
     /// Record one swap attempt's outcome against the height it landed at.
@@ -806,14 +818,15 @@ mod tests {
             let metrics = NodeMetrics::register(&context);
             assert!(metrics.operational_status().netstack.is_none());
 
-            metrics.set_netstack_execution("starting", None);
+            metrics.set_netstack_execution("starting", None, None);
             let netstack = metrics.operational_status().netstack.unwrap();
             assert_eq!(netstack.backend, "starting");
             assert_eq!(netstack.code_hash, None);
             assert!(netstack.last_swap.is_none());
+            assert!(netstack.failure_reason.is_none());
 
             metrics.record_height(7);
-            metrics.set_netstack_execution("guest", Some("abc".into()));
+            metrics.set_netstack_execution("guest", Some("abc".into()), None);
             metrics.record_netstack_swap(NetstackSwapOutcome::Swapped, None);
             let netstack = metrics.operational_status().netstack.unwrap();
             assert_eq!(netstack.backend, "guest");
@@ -834,10 +847,27 @@ mod tests {
             let netstack = metrics.operational_status().netstack.unwrap();
             assert_eq!(netstack.backend, "guest", "a refusal must not move backend");
             assert_eq!(netstack.code_hash.as_deref(), Some("abc"));
-            metrics.set_netstack_execution("failed", None);
+            // A PLANE THAT CANNOT START SAYS WHY, for as long as it is down: a
+            // node with no overlay keeps sealing blocks and keeps answering
+            // this route, so `failed` alone sends an operator back to the logs
+            // of a boot long since evicted from the ring.
+            metrics.set_netstack_execution(
+                "failed",
+                None,
+                Some((
+                    "netstack_guest_unreadable",
+                    "no founding set beside the binary".into(),
+                )),
+            );
+            let netstack = metrics.operational_status().netstack.unwrap();
+            assert_eq!(netstack.code_hash, None);
             assert_eq!(
-                metrics.operational_status().netstack.unwrap().code_hash,
-                None
+                netstack.failure_reason.as_deref(),
+                Some("netstack_guest_unreadable")
+            );
+            assert_eq!(
+                netstack.failure_detail.as_deref(),
+                Some("no founding set beside the binary")
             );
             assert_eq!(
                 netstack.last_swap,
@@ -847,6 +877,13 @@ mod tests {
                     at_height: 9,
                 })
             );
+
+            // and a plane that comes back clears it: the field is the mesh's
+            // standing NOW, never a scar from an earlier execution.
+            metrics.set_netstack_execution("guest", Some("abc".into()), None);
+            let netstack = metrics.operational_status().netstack.unwrap();
+            assert_eq!(netstack.failure_reason, None);
+            assert_eq!(netstack.failure_detail, None);
         });
     }
 

@@ -860,6 +860,7 @@ pub(crate) async fn observe_execution(metrics: noded::NodeMetrics) {
                 .status
                 .code_hash()
                 .map(|hash| crate::config::hex_bytes(&hash)),
+            plane_failure(),
         );
         if changes.changed().await.is_err() {
             return;
@@ -878,6 +879,9 @@ fn publish_live_plane(
         commands: cmds.downgrade(),
         startup: Some(startup),
     });
+    // a new plane owes the operator its OWN refusal: the previous one's reason
+    // would otherwise be read back against this generation's failure.
+    *PLANE_FAILURE.write().expect("plane failure lock poisoned") = None;
     execution().send_replace(PlaneExecution {
         generation,
         revision: 0,
@@ -898,11 +902,27 @@ fn record_execution(generation: u64, status: reachability::BackendStatus) {
 static PLANE_FAILURE: std::sync::RwLock<Option<(&'static str, String)>> =
     std::sync::RwLock::new(None);
 
-/// Refuse to start the plane, on the record. Every caller returns immediately
-/// after; the execution guard is the backstop for a path that does not.
-fn fail_plane(generation: u64, reason: &'static str, detail: String) {
+/// Refuse to start the plane, on the record AND in the log — one writer, so a
+/// site cannot say one thing to the operator reading stderr and another to
+/// `/v1/status`. Every caller returns immediately after; the execution guard is
+/// the backstop for a path that does not.
+///
+/// A plane that never starts leaves this node with NO overlay for the rest of
+/// the boot: no tunnels, no invite door, no join. It does not self-heal, so the
+/// refusal is `error` and it stands in the status projection until a plane runs.
+fn fail_plane(generation: u64, node: &str, reason: &'static str, detail: String) {
     *PLANE_FAILURE.write().expect("plane failure lock poisoned") = Some((reason, detail.clone()));
-    record_execution(generation, reachability::BackendStatus::Failed(detail));
+    record_execution(
+        generation,
+        reachability::BackendStatus::Failed(detail.clone()),
+    );
+    tracing::error!(
+        target: "ducktape::reachability",
+        node = %node,
+        reason,
+        detail = %detail,
+        "reachability plane NOT started — this node has no overlay for the rest of this boot"
+    );
 }
 
 /// Why the plane is not running, for a caller about to blame something else.
@@ -1152,11 +1172,7 @@ async fn reachability_plane(
     {
         Ok(backend) => backend,
         Err(error) => {
-            record_execution(
-                generation,
-                reachability::BackendStatus::Failed(error.clone()),
-            );
-            tracing::error!(target: "ducktape::reachability", reason = "netstack_guest_unreadable", error = %error, "reachability plane cannot start");
+            fail_plane(generation, &label, "netstack_guest_unreadable", error);
             return;
         }
     };
@@ -1184,16 +1200,14 @@ async fn reachability_plane(
             .and_then(underlay_addr),
     };
     let Some(control_addr) = resolve_ingress(&advertised) else {
-        // the plane never starts and the node runs on forever with NO overlay:
-        // no tunnels, no hub, every huddle failing with a string that names none
-        // of this. it does not self-heal and nothing else reports it.
-        tracing::error!(
-            target: "ducktape::reachability",
-            node = %label,
-            advertised = ?advertised,
-            reason = "advertised_unresolvable",
-            "reachability plane NOT started — this node has no overlay for the rest of \
-             this boot (set `advertised` to a resolvable address)"
+        fail_plane(
+            generation,
+            &label,
+            "advertised_unresolvable",
+            format!(
+                "advertised {advertised:?} resolves to no address — set `advertised` in \
+                 node.toml to a resolvable one"
+            ),
         );
         return;
     };
@@ -1205,13 +1219,14 @@ async fn reachability_plane(
     ) {
         Ok(endpoint) => endpoint,
         Err(err) => {
-            tracing::error!(
-                target: "ducktape::reachability",
-                node = %label,
-                error = ?err,
-                reason = "control_endpoint_rejected",
-                "reachability plane NOT started — this node has no overlay for the rest of \
-                 this boot (set `advertised` to a dialable address)"
+            fail_plane(
+                generation,
+                &label,
+                "control_endpoint_rejected",
+                format!(
+                    "the control endpoint {control_addr} was rejected ({err:?}) — set \
+                     `advertised` in node.toml to a dialable address"
+                ),
             );
             return;
         }
@@ -1224,11 +1239,11 @@ async fn reachability_plane(
     // without an endpoint and this node's own initiations complete it
     // (WireGuard roams to the authenticated source).
     if wireguard_listen.port() == 0 {
-        tracing::error!(
-            target: "ducktape::reachability",
-            node = %label,
-            reason = "wireguard_port_zero",
-            "reachability plane NOT started; wireguard_listen needs a concrete UDP port"
+        fail_plane(
+            generation,
+            &label,
+            "wireguard_port_zero",
+            "`wireguard_listen` needs a concrete UDP port, not 0".into(),
         );
         return;
     }
@@ -1246,23 +1261,21 @@ async fn reachability_plane(
             ) {
                 Ok(endpoint) => Some(endpoint),
                 Err(err) => {
-                    tracing::error!(
-                        target: "ducktape::reachability",
-                        node = %label,
-                        error = ?err,
-                        reason = "wireguard_advertised_rejected",
-                        "reachability plane NOT started"
+                    fail_plane(
+                        generation,
+                        &label,
+                        "wireguard_advertised_rejected",
+                        format!("`wireguard_advertised` {addr} was rejected ({err:?})"),
                     );
                     return;
                 }
             },
             None => {
-                tracing::error!(
-                    target: "ducktape::reachability",
-                    node = %label,
-                    advertised = ?ingress,
-                    reason = "wireguard_advertised_unresolvable",
-                    "reachability plane NOT started"
+                fail_plane(
+                    generation,
+                    &label,
+                    "wireguard_advertised_unresolvable",
+                    format!("`wireguard_advertised` {ingress:?} resolves to no address"),
                 );
                 return;
             }
@@ -1312,15 +1325,7 @@ async fn reachability_plane(
                  `--wireguard-listen 0.0.0.0:<free port>` on `node init`/`node join`, or \
                  set `wireguard_listen` in its node.toml."
             );
-            fail_plane(generation, "underlay_bind_failed", detail.clone());
-            tracing::error!(
-                target: "ducktape::reachability",
-                node = %label,
-                port,
-                error = %err,
-                reason = "underlay_bind_failed",
-                "reachability plane NOT started: {detail}"
-            );
+            fail_plane(generation, &label, "underlay_bind_failed", detail);
             return;
         }
     };
@@ -1660,12 +1665,14 @@ async fn reachability_plane(
         })
         .await
     {
-        tracing::error!(
-            target: "ducktape::reachability",
-            node = %label,
-            error = %err,
-            "reachability plane EXITED — this node has no overlay for the rest of \
-             this boot"
+        // an orchestrator that returns is as dead as one that never started,
+        // and the execution status still says `guest` — the one state that
+        // reads as healthy. Put the exit on the record under its own token.
+        fail_plane(
+            generation,
+            &label,
+            "plane_exited",
+            format!("the reachability orchestrator exited ({err})"),
         );
     }
 }
@@ -1892,10 +1899,49 @@ mod plane_failure_tests {
             "a starting plane has not failed"
         );
 
-        super::fail_plane(77, "underlay_bind_failed", "port 51820 is taken".into());
+        super::fail_plane(77, "node", "underlay_bind_failed", "port 51820 is taken".into());
         let (reason, detail) = super::plane_failure().expect("the refusal is on the record");
         assert_eq!(reason, "underlay_bind_failed");
         assert_eq!(detail, "port 51820 is taken");
+
+        // EVERY SITE'S TOKEN SURVIVES THE SAME WAY, not just this one — a
+        // founder that cannot read its netstack guest keeps sealing blocks and
+        // keeps answering `/v1/status`, so what `observe_execution` carries
+        // into `operations.netstack.failure_reason` is the only standing trace
+        // its dead mesh leaves. Asserted in the ONE test that owns the global
+        // execution cell: a second test publishing planes would race this.
+        for (generation, reason) in [
+            (78u64, "netstack_guest_unreadable"),
+            (79, "advertised_unresolvable"),
+            (80, "plane_exited"),
+        ] {
+            super::execution().send_replace(super::PlaneExecution {
+                generation,
+                revision: 0,
+                status: reachability::BackendStatus::Starting,
+            });
+            super::fail_plane(generation, "node", reason, format!("{reason} happened"));
+            let named = super::plane_failure().expect("the refusal is on the record");
+            assert_eq!(named, (reason, format!("{reason} happened")));
+        }
+
+        // and a NEW plane owes its own reason: the last one's must not be read
+        // back against this generation's failure.
+        let (commands, _rx) = tokio::sync::mpsc::channel(1);
+        let (startup, _selected) = tokio::sync::oneshot::channel();
+        let generation = super::publish_live_plane(&commands, startup);
+        assert!(
+            super::plane_failure().is_none(),
+            "a fresh plane inherits no refusal"
+        );
+        super::record_execution(
+            generation,
+            reachability::BackendStatus::Failed("no site named it".into()),
+        );
+        assert_eq!(
+            super::plane_failure(),
+            Some(("plane_startup_failed", "no site named it".into()))
+        );
     }
 }
 

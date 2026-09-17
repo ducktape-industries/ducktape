@@ -358,8 +358,17 @@ fn stalled_past_recovery(status: &serde_json::Value) -> Option<u64> {
 /// runs on, and — once this process has swapped at all — how the last swap
 /// went. `None` on a node with no plane, which prints nothing rather than a
 /// misleading `netstack=none`.
+///
+/// A PLANE THAT IS NOT RUNNING PREEMPTS THE SWAP HISTORY. This node has no
+/// overlay at all while that holds — no tunnels, no join door — so the swap it
+/// last answered is not what the reader needs; the reason it has no mesh is.
 fn netstack_line(netstack: &serde_json::Value) -> Option<String> {
     let backend = netstack["backend"].as_str()?;
+    if let Some((reason, detail)) = netstack_failure_in_section(netstack) {
+        return Some(format!(
+            "netstack={backend} NO MESH reason={reason} — {detail}"
+        ));
+    }
     let last_swap = &netstack["last_swap"];
     let Some(outcome) = last_swap["outcome"].as_str() else {
         return Some(format!("netstack={backend}"));
@@ -794,7 +803,14 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
     // sealed first-contact intro. `--ttl-days` defaults to and is bounded by
     // `config::{DEFAULT_INVITE_TTL_DAYS, INVITE_TTL_DAYS}` in clap (the same
     // numbers `/v1/invite` resolves), so the value arrives settled.
-    let (blob, notes) = mint_invite_blob(&args.selector.config_path()?, args.ttl_days)?;
+    let cfg_path = args.selector.config_path()?;
+    // the plane's standing lives in the RUNNING node, never in this process: a
+    // CLI mint reads the same files the node owns and can see none of its
+    // state. So ask it, before minting a credential nobody could redeem.
+    if let Some(refusal) = mesh_refusal(&cfg_path) {
+        return Err(refusal.into());
+    }
+    let (blob, notes) = mint_invite_blob(&cfg_path, args.ttl_days)?;
     // the blob first, the notes after it: a note is not a refusal, and an
     // operator who is handed one before the thing they asked for reads it as
     // the reason they did not get it. stdout is flushed between the two so a
@@ -805,6 +821,45 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[invite] {note}");
     }
     Ok(())
+}
+
+/// The refusal a dead reachability plane earns a mint, on either side of the
+/// node boundary: one sentence, so the daemon route and the CLI cannot say
+/// different things about the same fact.
+fn mesh_down_refusal(reason: &str, detail: &str) -> String {
+    format!(
+        "reason={reason} this node has no reachability plane, so an invite minted now could \
+         never be redeemed — every path it would carry is dead before a joiner tries it. {detail}"
+    )
+}
+
+/// Ask the node that owns `cfg_path` whether its mesh is up, over the same
+/// unauthenticated `/v1/status` the app reads.
+///
+/// `None` means MINT: either the plane is fine, or NOTHING ANSWERED — a node
+/// that is not running has no plane to be dead, and minting before boot is
+/// ordinary. Only a node that answers and names a netstack failure refuses.
+fn mesh_refusal(cfg_path: &std::path::Path) -> Option<String> {
+    let base = config::http_base_in(cfg_path.parent()?).ok()?;
+    let status = crate::node_http::get_json(&base, "/v1/status").ok()?;
+    let netstack = status.get("operations")?.get("netstack")?;
+    netstack_failure_in_section(netstack)
+        .map(|(reason, detail)| mesh_down_refusal(&reason, &detail))
+}
+
+/// Why this node has no overlay, as its `operations.netstack` section says it
+/// (`noded::NetstackOperationalStatus`) — `None` on a node whose plane is
+/// starting, running or stopped. THE one reader of those two fields: `node
+/// status` prints it and the invite mint refuses on it, and a second reader
+/// would be a second answer to one question.
+fn netstack_failure_in_section(netstack: &serde_json::Value) -> Option<(String, String)> {
+    let reason = netstack.get("failure_reason")?.as_str()?.to_string();
+    let detail = netstack
+        .get("failure_detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((reason, detail))
 }
 
 /// What the mint could not do, said once. A note is never a failure — an
@@ -879,6 +934,18 @@ pub(crate) fn mint_invite_blob(
     cfg_path: &std::path::Path,
     ttl_days: u64,
 ) -> Result<(String, Vec<InviteNote>), Box<dyn std::error::Error>> {
+    // A NOTE SAYS THE BLOB CARRIES FEWER PATHS; THIS SAYS IT CARRIES NONE. With
+    // no reachability plane this member has no overlay at all — no tunnel, no
+    // intro door — so every path the blob would offer is dead before a joiner
+    // tries one, and the joiner spends ninety seconds finding that out. An
+    // invite nobody can redeem is worse than a refusal.
+    //
+    // In-process only, which is exactly right: the daemon mints through
+    // `/v1/invite` and holds the plane, and a CLI mint in a second process
+    // asks the running node instead (`mesh_refusal`).
+    if let Some((reason, detail)) = crate::reachability_plane::plane_failure() {
+        return Err(mesh_down_refusal(reason, &detail).into());
+    }
     // the expiry is settled FIRST: a TTL outside the range is refused before
     // the descriptor below is rewritten for a mint that was never going to happen.
     let now = std::time::SystemTime::now()
@@ -2233,6 +2300,42 @@ mod tests {
                 "last_swap": { "outcome": "refused", "reason": "foreign contract", "at_height": 4 },
             })),
             Some("netstack=native last_swap=refused@4 reason=foreign contract".to_string())
+        );
+    }
+
+    /// A NODE WITH NO OVERLAY SAYS SO WHEREVER ITS STATUS IS READ. A founder
+    /// whose plane never started keeps sealing blocks and keeps answering
+    /// `/v1/status`, so the swap history is not the fact a reader needs — and
+    /// the same two fields refuse an invite mint that nobody could redeem.
+    #[test]
+    fn a_dead_mesh_preempts_the_swap_history_and_refuses_a_mint() {
+        let down = serde_json::json!({
+            "backend": "failed",
+            "failure_reason": "netstack_guest_unreadable",
+            "failure_detail": "no founding set beside the binary",
+            "last_swap": { "outcome": "swapped", "at_height": 12 },
+        });
+        assert_eq!(
+            super::netstack_line(&down),
+            Some(
+                "netstack=failed NO MESH reason=netstack_guest_unreadable — no founding set \
+                 beside the binary"
+                    .to_string()
+            )
+        );
+        let (reason, detail) =
+            super::netstack_failure_in_section(&down).expect("the section names its failure");
+        let refusal = super::mesh_down_refusal(&reason, &detail);
+        assert!(refusal.contains("reason=netstack_guest_unreadable"), "{refusal}");
+        assert!(refusal.contains("never be redeemed"), "{refusal}");
+
+        // a running plane names no failure, and nothing is refused.
+        assert_eq!(
+            super::netstack_failure_in_section(&serde_json::json!({
+                "backend": "guest",
+                "last_swap": null,
+            })),
+            None
         );
     }
 
