@@ -550,27 +550,43 @@ REBUILD_CHECK_DIR := $(CURDIR)/target/wasm-rebuild-check
 ## directory (lock included) untouched, so the tree stays clean under the
 ## check. Needs the wasm32 target and a pushed HEAD, so like
 ## `wasm-repro-check` it stands apart from the pre-push `test` gate.
+# Every guest is rebuilt and compared before this reports, so ONE run names
+# every stale artifact. Stopping at the first turned a sweep into a queue: each
+# refresh had to be built, committed and re-run to learn whether another guest
+# was hiding behind it, and a guest whose dependency moved is rarely alone.
+# A build that cannot run at all still stops the target, because after it
+# nothing downstream would be comparing anything.
 wasm-rebuild-check:
 	@mkdir -p "$(REBUILD_CHECK_DIR)"
-	@for m in $(BUILDER_MODULES) $(NETSTACK_GUEST); do \
+	@stale=""; \
+	for m in $(BUILDER_MODULES) $(NETSTACK_GUEST); do \
 	  id=$$(basename $$m) && \
 	  $(CARGO) run -q $(LOCKED) -p guest-builder -- $$m \
 	    --out "$(REBUILD_CHECK_DIR)/$$id.component.wasm" >/dev/null || exit 1; \
-	  cmp $$m/component.wasm "$(REBUILD_CHECK_DIR)/$$id.component.wasm" || { \
-	    echo "$$m/component.wasm does not match a rebuild of its source. Refresh it:"; \
-	    echo "    $(CARGO) run -p guest-builder -- $$m"; \
-	    echo "  and commit the result with its kernel fixture copy."; exit 1; }; \
-	done
-	@for m in $(INDEX_MODULES); do \
+	  cmp -s $$m/component.wasm "$(REBUILD_CHECK_DIR)/$$id.component.wasm" || \
+	    stale="$$stale $$m"; \
+	done; \
+	for m in $(INDEX_MODULES); do \
 	  id=$$(basename $$m) && \
 	  $(CARGO) run -q $(LOCKED) -p guest-builder -- --index $$m \
 	    --out "$(REBUILD_CHECK_DIR)/$$id.index.wasm" >/dev/null || exit 1; \
-	  cmp $$m/index.wasm "$(REBUILD_CHECK_DIR)/$$id.index.wasm" || { \
-	    echo "$$m/index.wasm does not match a rebuild of its source. Refresh it:"; \
-	    echo "    $(CARGO) run -p guest-builder -- --index $$m"; \
-	    echo "  and commit the result."; exit 1; }; \
-	done
-	@echo "committed guests match a rebuild of their source at HEAD"
+	  cmp -s $$m/index.wasm "$(REBUILD_CHECK_DIR)/$$id.index.wasm" || \
+	    stale="$$stale --index $$m"; \
+	done; \
+	if [ -z "$$stale" ]; then \
+	  echo "committed guests match a rebuild of their source at HEAD"; exit 0; \
+	fi; \
+	echo "these committed guests do not match a rebuild of their source:"; \
+	set -- $$stale; \
+	while [ $$# -gt 0 ]; do \
+	  if [ "$$1" = "--index" ]; then \
+	    echo "    $(CARGO) run -p guest-builder -- --index $$2"; shift 2; \
+	  else \
+	    echo "    $(CARGO) run -p guest-builder -- $$1"; shift; \
+	  fi; \
+	done; \
+	echo "  Run each, and commit the result with its kernel fixture copy."; \
+	exit 1
 
 ## the supply-chain tripwire: RustSec advisories and yanked crates against the
 ## committed Cargo.lock, under `deny.toml` — where every carried advisory is
