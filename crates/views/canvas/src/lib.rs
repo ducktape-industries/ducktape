@@ -656,10 +656,10 @@ impl BoardsView {
         // Clamped to what the board will take: a shape outside the limits is
         // refused whole, so a card fitted below the floor would not be fitted
         // at all rather than fitted as far as the floor.
-        let needed = grown
-            .ceil()
-            .clamp(presentation::MIN_CARD[1] as f32, boards_wire::MAX_SIZE as f32)
-            as i32;
+        let needed = grown.ceil().clamp(
+            presentation::MIN_CARD[1] as f32,
+            boards_wire::MAX_SIZE as f32,
+        ) as i32;
         let hugging = shape.kind == Kind::Text;
         let height = match hugging {
             true => needed,
@@ -834,9 +834,10 @@ impl BoardsView {
 }
 
 fn coordinate(value: f32) -> i32 {
-    value
-        .round()
-        .clamp(-(boards_wire::MAX_COORD as f32), boards_wire::MAX_COORD as f32) as i32
+    value.round().clamp(
+        -(boards_wire::MAX_COORD as f32),
+        boards_wire::MAX_COORD as f32,
+    ) as i32
 }
 fn inverse(board: &Board, change: &Change) -> Vec<Change> {
     match change {

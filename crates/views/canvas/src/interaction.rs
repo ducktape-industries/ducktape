@@ -75,7 +75,9 @@ impl BoardsView {
         ];
         if self.modifiers.shift && bounds[2] > 0. && bounds[3] > 0. {
             let ratio = bounds[2] / bounds[3];
-            size[0] = size[0].max(size[1] * ratio).min(boards_wire::MAX_SIZE as f32);
+            size[0] = size[0]
+                .max(size[1] * ratio)
+                .min(boards_wire::MAX_SIZE as f32);
             size[1] = (size[0] / ratio).clamp(least[1], boards_wire::MAX_SIZE as f32);
         }
         [
@@ -850,7 +852,8 @@ impl BoardsView {
         let to = carried(end == last, &shape.to);
         // both ends on one card is a loop the board cannot draw, so the end in
         // hand stands on its own point rather than stealing the other's card
-        let looped = boards_wire::held(&from).is_some() && boards_wire::held(&from) == boards_wire::held(&to);
+        let looped = boards_wire::held(&from).is_some()
+            && boards_wire::held(&from) == boards_wire::held(&to);
         let from = if looped && end == 0 { None } else { from };
         let to = if looped && end != 0 { None } else { to };
         let next = self.path_shape(shape.kind, &standing(board, &run, &from, &to));
