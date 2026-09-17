@@ -908,20 +908,27 @@ impl BoardsView {
     pub(super) fn canvas_color(&self) -> [f32; 4] {
         kit::palette().background
     }
-    fn status(&self) -> String {
+    pub(super) fn status(&self) -> String {
         if self.inline.is_some() {
             return "Editing text…".into();
         }
+        // "1 change", never "1 changes". One change is the common case — one
+        // shape drawn, one colour picked — so the broken reading was the one a
+        // user got most of the time, on the chip whose whole job is to say the
+        // work is being kept. Counted once here rather than at each arm, so
+        // the three states stay one family however they are worded.
+        let changes = match self.pending.len() {
+            1 => "1 change".to_owned(),
+            many => format!("{many} changes"),
+        };
+        let nothing_pending = self.pending.is_empty();
         match &self.delivery {
             Delivery::Failed(_) => "Not saved".into(),
-            Delivery::Sending => format!("Saving {} changes…", self.pending.len()),
-            Delivery::Idle => {
-                if self.pending.is_empty() {
-                    "Saved".into()
-                } else {
-                    format!("{} changes waiting", self.pending.len())
-                }
-            }
+            Delivery::Sending => format!("Saving {changes}…"),
+            Delivery::Idle => match nothing_pending {
+                true => "Saved".into(),
+                false => format!("{changes} waiting"),
+            },
         }
     }
     pub(super) fn screen(&self, x: f32, y: f32) -> [f32; 2] {
