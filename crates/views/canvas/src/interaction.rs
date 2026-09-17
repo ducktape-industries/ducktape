@@ -1445,27 +1445,38 @@ impl BoardsView {
     pub(super) fn on_reset_zoom(&mut self) -> Task<Message> {
         self.on_zoom(1. / self.zoom)
     }
+    /// The whole board, brought onto the stage.
     pub(super) fn on_fit(&mut self) -> Task<Message> {
-        self.fit(false)
-    }
-    pub(super) fn on_fit_selection(&mut self) -> Task<Message> {
-        self.fit(true)
-    }
-    fn fit(&mut self, selected: bool) -> Task<Message> {
         let Some(board) = self.visible() else {
             return Task::none();
         };
-        let shapes: Vec<_> = board
-            .shapes
-            .iter()
-            .filter(|(id, r)| free(&r.shape) && (!selected || self.selected.contains(*id)))
-            .map(|(_, r)| &r.shape)
-            .collect();
-        let Some(b) = bounds(shapes.into_iter()) else {
+        let Some(b) = framed(&board, &|_| true) else {
+            // A board with nothing on it has nothing to frame, and home is the
+            // only answer "show me everything" has left.
             self.camera = [80., 80.];
             self.zoom = 1.;
             return Task::none();
         };
+        self.frame(b)
+    }
+    /// The selection, brought onto the stage.
+    ///
+    /// Nothing to frame is NOT a reason to move. The board went home at 100%
+    /// when this was asked with an empty selection — and when it was asked of
+    /// a connector held at both ends, which stands nowhere of its own — so a
+    /// key pressed to look AT something threw away the place you were working
+    /// in, and the camera is the one thing here that undo cannot bring back.
+    pub(super) fn on_fit_selection(&mut self) -> Task<Message> {
+        let Some(board) = self.visible() else {
+            return Task::none();
+        };
+        let Some(b) = framed(&board, &|id| self.selected.contains(id)) else {
+            return Task::none();
+        };
+        self.frame(b)
+    }
+    /// Put a box of board onto the stage, with a margin around it.
+    fn frame(&mut self, b: [f32; 4]) -> Task<Message> {
         self.zoom = ((self.viewport[0] - 200.) / (b[2] - b[0]).max(1.))
             .min((self.viewport[1] - 200.) / (b[3] - b[1]).max(1.))
             .clamp(0.1, 2.);
@@ -2945,6 +2956,21 @@ pub(super) fn bounds<'a>(shapes: impl Iterator<Item = &'a Shape>) -> Option<[f32
             a[3].max(b[3]),
         ]
     })
+}
+/// The box around the shapes on a board that a predicate keeps, or `None` when
+/// it keeps nothing worth pointing a camera at.
+///
+/// A connector a card is holding at BOTH ends is never in it: what it stores is
+/// the box consensus last wrote for it, not where the cards have since carried
+/// it, so a stale box would aim the camera at empty board.
+fn framed(board: &Board, mine: &dyn Fn(&str) -> bool) -> Option<[f32; 4]> {
+    bounds(
+        board
+            .shapes
+            .iter()
+            .filter(|&(id, r)| free(&r.shape) && mine(id))
+            .map(|(_, r)| &r.shape),
+    )
 }
 pub(super) fn points_rect(a: [f32; 2], b: [f32; 2]) -> [f32; 4] {
     [
