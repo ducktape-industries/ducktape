@@ -15,6 +15,17 @@
 # until its parentheses balance, and the `.wasm` may appear on any line in
 # between.
 #
+# Structure is counted on the line with its string and char literals removed,
+# because a brace inside a literal skews the depth in BOTH directions: a `{` in
+# a test module holds the region open over the production code below it (a
+# false green, the thing this gate exists to prevent), and a `}` in production
+# closes a region early (a false refusal). Fixture 7 is the first of those.
+#
+# The remaining ceiling is a raw string with embedded quotes (`r#"…"#`), which
+# the literal stripper reads as ordinary quotes. That is where a tripwire stops
+# and a parser begins, and a parser means `syn` — a toolchain this gate exists
+# to not need.
+#
 # `--self-test` alone runs the fixtures below and scans nothing.
 set -euo pipefail
 
@@ -27,24 +38,35 @@ scan_file() {
       line = $0
       sub(/\/\/.*/, "", line)
 
-      nopen  = gsub(/\{/, "{", line)
-      nclose = gsub(/\}/, "}", line)
+      # read the macro and its path off the text, literals intact
+      starts_include = (line ~ /include_(bytes|str)!/)
+      names_wasm     = (line ~ /\.wasm"/)
+
+      # then drop the literals: a brace, paren or semicolon inside one is not
+      # structure, and counting it as structure is what moves a test region
+      # over production code
+      code = line
+      gsub(/"([^"\\]|\\.)*"/, "", code)
+      gsub(/\047([^\047\\]|\\.)\047/, "", code)   # \047 is the char-literal quote
+
+      nopen  = gsub(/\{/, "{", code)
+      nclose = gsub(/\}/, "}", code)
 
       # `#[cfg(not(test))]` is production and must not match.
-      if (line ~ /#\[cfg\(test\)\]/) pending = 1
+      if (code ~ /#\[cfg\(test\)\]/) pending = 1
 
       # what the attributes on this line govern
-      rest = line
+      rest = code
       gsub(/#\[[^]]*\]/, "", rest)
 
       is_test = (test_depth >= 0) || test_item || pending
 
-      if (!inc && line ~ /include_(bytes|str)!/) {
+      if (!inc && starts_include) {
         inc = 1; inc_line = NR; inc_text = $0; inc_wasm = 0; inc_test = is_test; paren = 0
       }
       if (inc) {
-        if (line ~ /\.wasm"/) inc_wasm = 1
-        paren += gsub(/\(/, "(", line) - gsub(/\)/, ")", line)
+        if (names_wasm) inc_wasm = 1
+        paren += gsub(/\(/, "(", code) - gsub(/\)/, ")", code)
         if (paren <= 0) {
           if (inc_wasm && !inc_test) { print file ":" inc_line ": " inc_text; found = 1 }
           inc = 0
@@ -68,7 +90,7 @@ scan_file() {
 
 # ---------------------------------------------------------------------------
 # The gate proves itself before it judges the tree. Each fixture names the
-# verdict it must get; a scanner that cannot tell these six apart is the
+# verdict it must get; a scanner that cannot tell these seven apart is the
 # false-green this check exists to prevent.
 # ---------------------------------------------------------------------------
 self_test() {
@@ -138,6 +160,23 @@ mod tests {
 }
 FIXTURE
 
+  # 7. a test module whose string literal holds an unbalanced brace, then a
+  #    production include. Counting that brace as structure holds the test
+  #    region open over the include and greens it.
+  cat >"$dir/brace-in-string.rs" <<'FIXTURE'
+#[cfg(test)]
+mod tests {
+    const OPEN: &str = "{";
+
+    #[test]
+    fn it_reads() {
+        assert_eq!(OPEN, "{");
+    }
+}
+
+pub static GUEST: &[u8] = include_bytes!("../modules/chat/component.wasm");
+FIXTURE
+
   local name want got
   while read -r name want; do
     got=refuses
@@ -153,14 +192,15 @@ same-line.rs refuses
 test-mod.rs accepts
 test-const-multiline.rs accepts
 not-a-guest.rs accepts
+brace-in-string.rs refuses
 CASES
 
-  [ "$failures" = 0 ] || { echo "wasm-embed-check: the scanner itself is broken, $failures of 6 fixtures misjudged" >&2; exit 1; }
+  [ "$failures" = 0 ] || { echo "wasm-embed-check: the scanner itself is broken, $failures of 7 fixtures misjudged" >&2; exit 1; }
 }
 
 self_test
 if [ "${1:-}" = --self-test ]; then
-  echo "wasm-embed-check: 6 of 6 fixtures judged correctly"
+  echo "wasm-embed-check: 7 of 7 fixtures judged correctly"
   exit 0
 fi
 
