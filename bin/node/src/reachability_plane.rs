@@ -1673,7 +1673,7 @@ async fn reachability_plane(
 /// The node always runs the staged WASM component. A joiner needs this file
 /// before it can reach the mesh and obtain genesis; no native fallback exists.
 pub(crate) fn netstack_backend() -> Result<reachability::NetstackBackend, String> {
-    let dir = workspace_config::modules_dir()?;
+    let dir = noded::services::founding_set()?;
     let path = workspace_config::netstack_component_path(&dir);
     load_netstack_backend(&path)
 }

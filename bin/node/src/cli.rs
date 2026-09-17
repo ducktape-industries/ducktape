@@ -520,7 +520,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     // holding a freshly minted `identity.key` behind on every attempt.
     let founding_set = match args.modules {
         Some(src) => src,
-        None => config::modules_dir()?,
+        None => noded::services::founding_set()?,
     };
     let genesis = config::Genesis::compose(&founding_set).map_err(|e| {
         format!("{e} — pass --modules <dir> holding every <id>.component.wasm and <id>.index.wasm")

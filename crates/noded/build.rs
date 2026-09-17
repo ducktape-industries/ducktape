@@ -78,12 +78,8 @@ fn stage_founding_set() {
         .expect("OUT_DIR sits three levels under the profile dir");
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let checkout = staged_key::checkout_of_crate(&manifest);
-    stage_preset(
-        &checkout,
-        &staged_dir(profile_dir, "modules", &checkout),
-        topology::PRODUCTION,
-        topology::VIEWS,
-    );
+    let modules = staged_dir(profile_dir, "modules", &checkout);
+    stage_preset(&checkout, &modules, topology::PRODUCTION, topology::VIEWS);
     let simulation: Vec<&str> = topology::TOPOLOGY
         .modules
         .iter()
@@ -95,6 +91,68 @@ fn stage_founding_set() {
         &simulation,
         &[],
     );
+    sweep_abandoned_sets(profile_dir);
+    name_the_staged_set(profile_dir, &modules);
+}
+
+/// Point the profile directory at the set this build just staged, and record
+/// in the set which build wrote it.
+///
+/// THE POINTER IS THE ANSWER TO A SHARED PROFILE DIRECTORY, and it has to be a
+/// file rather than a constant. Checkouts sharing a target dir share it
+/// BECAUSE their source is identical, so cargo shares the compiled unit — and
+/// a build script baking its own location into a shared unit gives every other
+/// checkout the first builder's answer, silently, for as long as nothing
+/// invalidates it. `target/<profile>/ducktape` is likewise whichever build ran
+/// last, so writing the name here, in the same invocation that links it, is
+/// what makes a binary and its set agree.
+///
+/// The owner record is the belt to that braces: a sibling's `cargo check -p
+/// noded` moves the pointer without relinking any binary, and only a stamp
+/// inside the set can catch that.
+fn name_the_staged_set(profile_dir: &Path, modules: &Path) {
+    let name = modules
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a staged set has a utf-8 directory name");
+    let pointer = profile_dir.join(staged_key::STAGED_POINTER);
+    std::fs::write(&pointer, name)
+        .unwrap_or_else(|e| panic!("name the staged set in {}: {e}", pointer.display()));
+    let owner = modules.join(staged_key::STAGED_OWNER);
+    let build = build_id().unwrap_or_else(|| staged_key::UNIDENTIFIED_BUILD.to_owned());
+    std::fs::write(&owner, &build)
+        .unwrap_or_else(|e| panic!("record the staging build in {}: {e}", owner.display()));
+}
+
+/// Remove keyed sets whose checkout is gone.
+///
+/// A worktree's life ends when its PR merges, and `ops/worktree-clean.sh`
+/// removes the tree — but not the set it staged into a SHARED profile
+/// directory. Those outlive it, and a reader that resolved the wrong name
+/// still found a real, frozen founding set instead of nothing, which is what
+/// made the whole failure quiet. A set nothing can own is swept here, by the
+/// next build that passes through.
+fn sweep_abandoned_sets(profile_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(profile_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let staged_set = name.starts_with("modules%") || name.starts_with("sim-modules%");
+        if !staged_set {
+            continue;
+        }
+        let abandoned = staged_key::checkout_of_set_name(name).is_some_and(|at| !at.is_dir());
+        if abandoned {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
 /// the directory THIS checkout stages `base` (`"modules"` / `"sim-modules"`)

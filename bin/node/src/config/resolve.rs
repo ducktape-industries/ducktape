@@ -871,7 +871,7 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     // a typo'd `listen` must be told about the typo, not about the bundle.
     let founding_set = match &raw.modules {
         Some(dir) => PathBuf::from(dir),
-        None => workspace_config::modules_dir()?,
+        None => noded::services::founding_set()?,
     };
     let genesis = GenesisModules {
         hashes: workspace_config::Genesis::compose(&founding_set)?.module_hashes(),

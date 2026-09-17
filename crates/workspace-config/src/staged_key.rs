@@ -24,13 +24,46 @@
 //! exactly what it was (see `staged_modules_dir`).
 //!
 //! This file is the ONE implementation: the library compiles it as a module,
-//! and `crates/noded/build.rs` and `crates/workspace-config/build.rs` include
-//! it by path so a build script and the code that reads its output can never
-//! disagree about the name.
+//! and `crates/noded/build.rs` includes it by path so the build script that
+//! writes a set and the code that reads one can never disagree about the name.
+//!
+//! This crate deliberately has NO build script. It used to stamp the name in
+//! as a constant, which is unsound on a shared target directory for the reason
+//! [`STAGED_POINTER`] gives: the crates that share a target share it because
+//! their source is identical, so cargo shares the compiled unit, and a unit
+//! that encodes where it was compiled speaks for whichever checkout got there
+//! first.
 
 /// A path component that cannot appear in a path, so the encoding is
 /// unambiguous: `/` becomes this and nothing else does.
 const SEPARATOR: char = '%';
+
+/// The file in the profile directory naming the set the LAST build staged.
+///
+/// The key cannot be a compile-time constant. Several checkouts share one
+/// target directory precisely because their SOURCE is identical, so cargo
+/// shares the compiled unit — and a build script that bakes its own location
+/// into a shared unit hands every other checkout the first builder's answer.
+/// Measured: forcing a rebuild from a second checkout FLIPS the stamp in the
+/// same `build/workspace-config-*/output`, leaving the first checkout reading
+/// a set it does not own.
+///
+/// So the name is written HERE, next to the binaries, by the same `cargo
+/// build` that links them. `target/<profile>/ducktape` is likewise whichever
+/// build ran last, so the binary and this pointer are written by one
+/// invocation and always agree.
+pub const STAGED_POINTER: &str = ".staged-modules";
+
+/// The file inside a staged set naming the build that wrote it, so a reader
+/// can refuse a set that is not its own ([`STAGED_POINTER`] can be moved by a
+/// sibling's `cargo check` without relinking any binary).
+pub const STAGED_OWNER: &str = ".staged-by";
+
+/// What [`STAGED_OWNER`] holds when the build had no git to identify itself
+/// with — a source tarball, a vendored build, Docker without `.git`. It never
+/// equals a real build id, so an unidentifiable set is refused rather than
+/// matched by accident.
+pub const UNIDENTIFIED_BUILD: &str = "unknown";
 
 /// The staged-set name for `base` (`"modules"` or `"sim-modules"`) in
 /// `checkout`: the base, then the checkout's absolute path with `/` written
@@ -57,6 +90,19 @@ pub fn staged_set_name(base: &str, checkout: &std::path::Path) -> String {
         name.push_str(part);
     }
     name
+}
+
+/// The checkout a set's name encodes, or `None` for the unkeyed (installed)
+/// name. The inverse of [`staged_set_name`], used to tell a set whose checkout
+/// still exists from one left behind by a worktree that was removed.
+pub fn checkout_of_set_name(name: &str) -> Option<std::path::PathBuf> {
+    let (_, encoded) = name.split_once(SEPARATOR)?;
+    let mut path = String::with_capacity(encoded.len() + 1);
+    for part in encoded.split(SEPARATOR) {
+        path.push('/');
+        path.push_str(part);
+    }
+    Some(std::path::PathBuf::from(path))
 }
 
 /// The checkout a crate under `crates/<name>` sits in: its manifest
