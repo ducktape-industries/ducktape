@@ -544,12 +544,10 @@ pub fn decode_work_spec(b: &[u8]) -> Result<WorkSpec, String> {
     }
     Ok(spec)
 }
-pub fn encode_result_event(e: &ResultEvent) -> Vec<u8> {
-    sdk::wire::encode(e)
-}
-pub fn decode_result_event(b: &[u8]) -> Result<ResultEvent, String> {
-    sdk::wire::decode(b)
-}
+// `ResultEvent` and `CallCompleted` have no codec of their own: both ride
+// INSIDE the mailbox envelope (`Delivery::Result`, `Delivery::CallCompleted`),
+// so the envelope's pair below is the only one on the path — every receiver
+// decodes a `Delivery`.
 pub fn encode_delivery(d: &Delivery) -> Vec<u8> {
     sdk::wire::encode(d)
 }
