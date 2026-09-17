@@ -71,10 +71,10 @@ pub(super) async fn report(
     kind: tasks::WorkerReportKind,
     payload: String,
 ) -> Result<Value, String> {
-    sdk::validate_id("operation_id", &operation_id, tasks_module::MAX_JOB_ID)
+    sdk::validate_id("operation_id", &operation_id, tasks::MAX_JOB_ID)
         .map_err(|error| format!("{error:?}"))?;
     let valid_payload =
-        !payload.trim().is_empty() && payload.len() <= tasks_module::MAX_WORKER_TEXT_BYTES;
+        !payload.trim().is_empty() && payload.len() <= tasks::MAX_WORKER_TEXT_BYTES;
     if !valid_payload {
         return Err("worker report requires bounded nonempty text".into());
     }

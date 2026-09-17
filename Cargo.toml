@@ -443,11 +443,6 @@ ducktape-rpc = { path = "crates/rpc-client" }
 # from ducktape-modules, not from the sdk repo the wire surfaces live in.
 directory = { git = "https://github.com/ducktape-industries/ducktape-modules", branch = "dev", package = "directory" }
 greeter = { git = "https://github.com/ducktape-industries/ducktape-modules", branch = "dev", package = "greeter" }
-# the tasks MODULE, for the job-board bounds alone (`MAX_JOB_ID`,
-# `MAX_WORKER_TEXT_BYTES`, `MAX_CONTROL_ACKNOWLEDGEMENTS`): the node's native
-# agent lane validates a worker report against the same numbers the module
-# enforces at apply, and they live in the module rather than `tasks-wire`.
-tasks-module = { git = "https://github.com/ducktape-industries/ducktape-modules", branch = "dev", package = "tasks" }
 # internal — types-only interface crates (the legal cross-module surface)
 wireguard = { path = "crates/networking/wireguard" }
 # default-features off at the workspace level: the `runtime` feature (sockets,
