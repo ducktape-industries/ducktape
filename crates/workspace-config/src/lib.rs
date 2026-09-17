@@ -1250,59 +1250,71 @@ fn is_workspace_dir_name(name: &str) -> bool {
     single && components.next().is_none()
 }
 
+/// THE "pick one" list. Every refusal that offers a choice between registered
+/// workspaces renders it through here, so no two of them can disagree about
+/// order or content.
+///
+/// Each line carries the CONFIG PATH beside the chain id, because the chain id
+/// alone does not name a row: a founder and the member that joined it share
+/// one, and a list that printed the id twice offered the operator two
+/// identical strings and no way to act on either. The path is what tells them
+/// apart and what `--config` takes. Same `<chain-id>\t<path>` shape as
+/// `ducktape node list`, indented as a choice.
+pub fn workspace_choices(rows: &[(String, PathBuf)]) -> String {
+    rows.iter()
+        .map(|(chain_id, node_toml)| format!("  {chain_id}\t{}", node_toml.display()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// resolve `--network <chain id>` to a workspace's node.toml: scan the
 /// ducktape home for descriptors whose chain-id matches `needle` — exact
-/// first, else a unique prefix (so `ducktape` finds `ducktape#a1b2c3d4`).
-/// ambiguity and absence are loud errors that name what WAS found.
+/// first, else a prefix (so `ducktape` finds `ducktape#a1b2c3d4`). the match
+/// must be UNIQUE either way; ambiguity and absence are loud errors that name
+/// what WAS found.
 pub fn find_workspace_config(needle: &str) -> Result<PathBuf, String> {
     find_workspace_config_in(&ducktape_home()?, needle)
 }
 
 fn find_workspace_config_in(root: &Path, needle: &str) -> Result<PathBuf, String> {
-    let entries = std::fs::read_dir(root)
-        .map_err(|e| format!("no workspaces under {root:?} ({e}) — pass --config <node.toml>"))?;
-    let mut matches: Vec<(String, PathBuf)> = Vec::new();
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        let descriptor_path = dir.join("network.toml");
-        if !descriptor_path.is_file() {
-            continue;
-        }
-        // an unreadable descriptor in one workspace must not break addressing
-        // the others — skip it, but say so: silence here reads as "no such
-        // workspace" when the real story is a torn network.toml.
-        let d = match NetworkDescriptor::load(&descriptor_path) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(
-                    target: "ducktape::node",
-                    reason = "descriptor_unreadable",
-                    dir = %dir.display(),
-                    error = %e,
-                    "skipping workspace with an unreadable network.toml"
-                );
-                continue;
-            }
-        };
-        if d.chain_id == needle {
-            return Ok(dir.join("node.toml"));
-        }
-        if d.chain_id.starts_with(needle) {
-            matches.push((d.chain_id, dir.join("node.toml")));
-        }
+    // an empty needle is not a prefix that matches everything, it is a missing
+    // value: `-n ''` used to "match" every workspace on the box and then refuse
+    // as ambiguous, naming the whole home for a flag the operator left blank.
+    if needle.is_empty() {
+        return Err(
+            "-n/--network was given an empty value — pass a chain id or a unique prefix of one \
+             (`ducktape node list`)"
+                .into(),
+        );
     }
-    match matches.len() {
-        0 => Err(format!(
-            "no workspace under {root:?} matches network {needle:?}"
+    // the same scan `node list` prints, so the resolver and every "pick one"
+    // list agree on which workspaces exist, in one order — sorted, not read_dir's.
+    let registered = list_workspaces_in(root)?;
+    let exact: Vec<(String, PathBuf)> = registered
+        .iter()
+        .filter(|(chain_id, _)| chain_id == needle)
+        .cloned()
+        .collect();
+    // an exact hit still outranks a prefix hit, but it no longer ENDS the scan:
+    // two workspaces of one network carry one chain id, and returning on the
+    // first made `-n <exact id>` a read_dir coin flip between them.
+    let matches = match exact.is_empty() {
+        false => exact,
+        true => registered
+            .into_iter()
+            .filter(|(chain_id, _)| chain_id.starts_with(needle))
+            .collect(),
+    };
+    match matches.as_slice() {
+        [] => Err(format!(
+            "no workspace under {root:?} matches network {needle:?} — pass --config <node.toml>"
         )),
-        1 => Ok(matches.swap_remove(0).1),
-        _ => Err(format!(
-            "network {needle:?} is ambiguous — matches: {}",
-            matches
-                .iter()
-                .map(|(c, _)| c.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+        [(_, node_toml)] => Ok(node_toml.clone()),
+        several => Err(format!(
+            "network {needle:?} is ambiguous — it matches {} registered workspaces, \
+             select one with --config <path>:\n{}",
+            several.len(),
+            workspace_choices(several)
         )),
     }
 }
@@ -1866,10 +1878,55 @@ mod tests {
             find_workspace_config_in(&root, "kitchen").expect("prefix"),
             root.join("b").join("node.toml")
         );
-        // absence and ambiguity are loud.
+        // absence is loud, and an empty value is refused as the missing value
+        // it is rather than treated as a prefix that matches the whole box.
         assert!(find_workspace_config_in(&root, "nope").is_err());
-        let err = find_workspace_config_in(&root, "").expect_err("ambiguous");
-        assert!(err.contains("ambiguous"), "{err}");
+        let ambiguous = find_workspace_config_in(&root, "").expect_err("empty");
+        assert!(
+            ambiguous.contains("empty value"),
+            "an empty -n is a missing value, not a prefix that matches the box: {ambiguous}"
+        );
+    }
+
+    /// Two workspaces of ONE network — a founder and the member that joined
+    /// it — is the ordinary shape (`ops/refound-net.sh` builds exactly that),
+    /// and the chain id they share cannot name either one. Returning the
+    /// first `read_dir` reached made `-n <exact chain id>` a coin flip that
+    /// read like an answer, for `node status`, `node peers`, `module update`
+    /// and every other verb carrying the selector.
+    #[test]
+    fn a_chain_id_two_workspaces_share_is_refused_with_both_config_paths() {
+        let root = tmp("shared-chain");
+        for ws in ["founder", "joiner"] {
+            let dir = root.join(ws);
+            std::fs::create_dir_all(&dir).expect("mk workspace");
+            NetworkDescriptor {
+                chain_id: "twinned#a1b2c3d4".into(),
+                validators: vec![],
+                bootstrap: vec![],
+                reach: vec![],
+                coordination: None,
+                block_time_ms: DEFAULT_BLOCK_TIME_MS,
+                genesis: String::new(),
+                modules: Vec::new(),
+            }
+            .save(&dir.join("network.toml"))
+            .expect("save");
+        }
+        // the EXACT id is the sharp case: it used to return on the first hit.
+        for needle in ["twinned#a1b2c3d4", "twinned"] {
+            let err = find_workspace_config_in(&root, needle)
+                .expect_err("a shared chain id names no single workspace");
+            for ws in ["founder", "joiner"] {
+                let path = root.join(ws).join("node.toml");
+                assert!(
+                    err.contains(&path.display().to_string()),
+                    "{needle:?} must name {}: {err}",
+                    path.display()
+                );
+            }
+            assert!(err.contains("--config"), "{needle:?}: {err}");
+        }
     }
 
     #[test]

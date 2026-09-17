@@ -197,6 +197,25 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// how fluent31 spells "another live process holds this directory's `flock`".
+/// The engine reports it as a plain `InvalidArgument`, so the wording is the
+/// only handle — and this crate owns the engine boundary, so the wording is
+/// known HERE and nowhere above.
+const LOCKED_BY_ANOTHER_PROCESS: &str = "is locked by another process";
+
+impl Error {
+    /// is this open failure another process holding the store's directory
+    /// lock? The tier is then HEALTHY and owned — a running node has it — so
+    /// the remedy is to stop that node, never the "delete the directory to
+    /// rebuild" every other open failure earns.
+    pub fn is_store_locked(&self) -> bool {
+        let Error::Engine(fluent31::Error::InvalidArgument(detail)) = self else {
+            return false;
+        };
+        detail.ends_with(LOCKED_BY_ANOTHER_PROCESS)
+    }
+}
+
 /// whether a converge failure is the GUEST's fault — bad bytes, or missing
 /// the role/memory export readiness requires — rather than the engine's.
 /// [`Error::View`] is `converge_guest`'s own readiness rejection;
