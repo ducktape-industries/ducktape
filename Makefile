@@ -668,41 +668,79 @@ wasm-rebuild-check:
 # have, because nothing downstream would notice. The lock records the exact
 # platform revision every guest compiled (`source = "git+…#<sha>"`), so the
 # mismatch is a refusal by name rather than a silent wrong answer.
+#
+# `CRATES` scopes this exactly as it scopes the check, through the same
+# `guest.lock` reading. That is not tidiness: the directory accumulates across
+# runs and branches, so without scoping a `CRATES="chat"` refresh reaches every
+# leftover in it — one with no lock aborts a run that had nothing to do with it,
+# and one whose lock happens to name HEAD is PROMOTED, overwriting a committed
+# artifact the run was never asked to touch and reporting success. A crate no
+# lock names is refused here for the same reason it is in the check.
+#
+# Validation runs over the whole scope BEFORE anything is copied. A refusal
+# midway through promotion would leave half the guests on new bytes and half on
+# old — a tree state nothing downstream would notice either.
 wasm-rebuild-refresh:
 	@head=$$(git rev-parse HEAD); \
 	ls "$(REBUILD_CHECK_DIR)"/*.wasm >/dev/null 2>&1 || { \
 	  echo "wasm-rebuild-refresh: $(REBUILD_CHECK_DIR) holds no build to promote."; \
 	  echo "  Run wasm-rebuild-check first; it builds what this promotes."; \
 	  exit 1; }; \
-	promoted=""; \
-	promote() { \
-	  built="$$1"; lock="$$2"; artifact="$$3"; module="$$4"; \
-	  [ -f "$$built" ] && [ -f "$$lock" ] || { \
-	    echo "wasm-rebuild-refresh: $$built has no build to promote."; \
-	    echo "  Run wasm-rebuild-check first; it builds what this promotes."; \
+	compiles() { \
+	  [ -z "$(CRATES)" ] && return 0; \
+	  for c in $(CRATES); do \
+	    grep -sqx "name = \"$$c\"" "$$1/guest.lock" && return 0; \
+	  done; \
+	  return 1; \
+	}; \
+	for c in $(CRATES); do \
+	  grep -sqx "name = \"$$c\"" \
+	    $(addsuffix /guest.lock,$(BUILDER_MODULES) $(NETSTACK_GUEST) $(INDEX_MODULES)) || { \
+	      echo "wasm-rebuild-refresh: no guest.lock names the crate \"$$c\" — check the spelling."; \
+	      echo "  A guest compiles what its lock records; nothing here compiles that."; \
+	      exit 1; }; \
+	done; \
+	scope=""; \
+	for m in $(BUILDER_MODULES) $(NETSTACK_GUEST); do \
+	  compiles $$m && scope="$$scope $$m:component"; \
+	done; \
+	for m in $(INDEX_MODULES); do \
+	  compiles $$m && scope="$$scope $$m:index"; \
+	done; \
+	built_in_scope=""; \
+	for entry in $$scope; do \
+	  m=$${entry%:*}; kind=$${entry##*:}; id=$$(basename $$m); \
+	  built="$(REBUILD_CHECK_DIR)/$$id.$$kind.wasm"; \
+	  [ -f "$$built" ] || continue; \
+	  built_in_scope="yes"; \
+	  lock="$(REBUILD_CHECK_DIR)/$$id.$$kind.lock"; \
+	  [ -f "$$lock" ] || { \
+	    echo "wasm-rebuild-refresh: $$built has no $$id.$$kind.lock beside it."; \
+	    echo "  The builder writes the lock with the bytes, so this predates that."; \
+	    echo "  Re-run wasm-rebuild-check; promoting bytes with no provenance is the"; \
+	    echo "  one thing this target must not do."; \
 	    exit 1; }; \
 	  grep -sq "#$$head\"" "$$lock" || { \
 	    echo "wasm-rebuild-refresh: $$lock was built from another revision, not $$head."; \
 	    echo "  That build predates your HEAD. Re-run wasm-rebuild-check."; \
 	    exit 1; }; \
-	  cmp -s "$$built" "$$artifact" && return 0; \
-	  cp "$$built" "$$artifact"; \
-	  cp "$$lock" "$$module/guest.lock"; \
-	  promoted="$$promoted $$artifact"; \
-	}; \
-	for m in $(BUILDER_MODULES) $(NETSTACK_GUEST); do \
-	  id=$$(basename $$m); \
-	  [ -f "$(REBUILD_CHECK_DIR)/$$id.component.wasm" ] || continue; \
-	  promote "$(REBUILD_CHECK_DIR)/$$id.component.wasm" \
-	          "$(REBUILD_CHECK_DIR)/$$id.component.lock" \
-	          "$$m/component.wasm" "$$m" || exit 1; \
 	done; \
-	for m in $(INDEX_MODULES); do \
-	  id=$$(basename $$m); \
-	  [ -f "$(REBUILD_CHECK_DIR)/$$id.index.wasm" ] || continue; \
-	  promote "$(REBUILD_CHECK_DIR)/$$id.index.wasm" \
-	          "$(REBUILD_CHECK_DIR)/$$id.index.lock" \
-	          "$$m/index.wasm" "$$m" || exit 1; \
+	if [ -z "$$built_in_scope" ]; then \
+	  echo "wasm-rebuild-refresh: $(REBUILD_CHECK_DIR) holds no build for CRATES=\"$(CRATES)\"."; \
+	  echo "  It holds builds for other guests; this run promotes none of them."; \
+	  echo "  Run wasm-rebuild-check with the same CRATES first."; \
+	  exit 1; \
+	fi; \
+	promoted=""; \
+	for entry in $$scope; do \
+	  m=$${entry%:*}; kind=$${entry##*:}; id=$$(basename $$m); \
+	  built="$(REBUILD_CHECK_DIR)/$$id.$$kind.wasm"; \
+	  [ -f "$$built" ] || continue; \
+	  artifact="$$m/$$kind.wasm"; \
+	  cmp -s "$$built" "$$artifact" && continue; \
+	  cp "$$built" "$$artifact"; \
+	  cp "$(REBUILD_CHECK_DIR)/$$id.$$kind.lock" "$$m/guest.lock"; \
+	  promoted="$$promoted $$artifact"; \
 	done; \
 	if [ -z "$$promoted" ]; then \
 	  echo "nothing to promote: every built guest already matches its committed bytes"; exit 0; \
