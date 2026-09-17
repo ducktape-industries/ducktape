@@ -537,19 +537,13 @@ wasm-modules-check:
 
 ## the binary embeds no wasm (AGENTS.md, "No Embedded Wasm"): an
 ## include_bytes!/include_str! of a `.wasm` is allowed only in a test — a file
-## under a `tests/` directory or named `tests.rs`, or below the file's first
-## `#[cfg(test)]`. Pure text, no toolchain: it runs in the per-push CI lane
-## beside `wasm-modules-check`.
+## under a `tests/` directory or named `tests.rs`, or an item a `#[cfg(test)]`
+## governs. Pure text, no toolchain: it runs in the per-push CI lane beside
+## `wasm-modules-check`. The scanner proves itself against six fixtures before
+## it scans the tree; `bash ops/wasm-embed-check.sh --self-test` runs those
+## alone. See ops/wasm-embed-check.sh.
 wasm-embed-check:
-	@bad=0; \
-	for f in $$(git ls-files '*.rs' | grep -v -e '/tests/' -e '/tests\.rs$$'); do \
-	  awk -v file="$$f" \
-	    '/#\[cfg\(test\)\]/ { exit } \
-	     /include_(bytes|str)!\(.*\.wasm"/ { print file ":" NR ": " $$0; found = 1 } \
-	     END { exit found }' "$$f" || bad=1; \
-	done; \
-	[ "$$bad" = 0 ] || { echo "a non-test source embeds a .wasm — the binary is not the module set (AGENTS.md)"; exit 1; }; \
-	echo "wasm-embed-check: no non-test include of a .wasm"
+	@bash ops/wasm-embed-check.sh
 
 ## the reproducibility gate: one guest built twice, in two scratch directories,
 ## must be byte-identical and carry no host path. Needs the wasm32 target
