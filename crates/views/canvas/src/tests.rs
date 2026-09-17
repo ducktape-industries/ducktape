@@ -4008,6 +4008,178 @@ fn the_weight_row_is_offered_to_everything_that_draws_a_line() {
         "a text shape draws no line, so a weight row on it sets nothing"
     );
 }
+/// Where this shape's arrowheads were drawn, one point per head: a head is two
+/// barbs and both start at the tip, so the tips are what the painter is asked
+/// about rather than the six numbers it worked them out of.
+fn head_tips(view: &BoardsView, id: &str) -> Vec<[f32; 2]> {
+    let tree = view.view();
+    let layer = node_at(&tree, &format!("boards/body/{id}")).expect("a shape is drawn in a layer");
+    let wire::Node::Canvas { commands, .. } = layer else {
+        panic!("a body layer is a canvas");
+    };
+    let mut tips: Vec<[f32; 2]> = Vec::new();
+    for command in commands {
+        let wire::CanvasCommand::Draw {
+            shape: wire::CanvasShape::Line { from, .. },
+            ..
+        } = command
+        else {
+            continue;
+        };
+        if !tips.contains(from) {
+            tips.push(*from);
+        }
+    }
+    tips
+}
+/// An arrow can be drawn pointing either way or both, and the head lands on the
+/// end it was asked for. Before this the kind decided it — one head, at the end
+/// you finished on, forever — so "A ↔ B" could only be faked with two arrows
+/// laid on top of each other that then moved and were deleted separately.
+#[test]
+fn an_arrow_carries_a_head_on_the_ends_it_is_asked_for() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            kind: Kind::Arrow,
+            x: 100,
+            y: 100,
+            width: 300,
+            height: 0,
+            points: vec![[0, 0], [300, 0]],
+            ..Default::default()
+        },
+    });
+    let start = view.screen(100., 100.);
+    let end = view.screen(400., 100.);
+
+    // The default is what every arrow drawn before this existed was, so a board
+    // saved then reads back pointing the same way.
+    assert_eq!(head_tips(&view, "a"), vec![end]);
+
+    view.selected = ["a".into()].into();
+    view.on_heads(Heads::Start);
+    assert_eq!(head_tips(&view, "a"), vec![start]);
+
+    view.on_heads(Heads::Both);
+    assert_eq!(
+        head_tips(&view, "a"),
+        vec![start, end],
+        "an arrow asked for both heads drew them somewhere other than its ends"
+    );
+
+    // And the heads ride the pen like the fill and the weight do, so a board
+    // drawn in double-headed arrows takes one press and not one per arrow.
+    let next = view.creation_shape(Kind::Arrow, [0., 0.], [100., 80.]);
+    assert_eq!(next.heads, Heads::Both);
+}
+/// A head points the way the line LEAVES the end it sits on. On a bent
+/// connector that is the way its control point lies, and the two ends lie
+/// opposite ways around the one control — which is the whole reason the start
+/// head could not be the end head's arithmetic with a sign flipped.
+#[test]
+fn a_bent_arrow_points_its_heads_away_from_the_bend() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            kind: Kind::Arrow,
+            x: 100,
+            y: 100,
+            width: 300,
+            height: 200,
+            // bent: one interior sample, which the painter treats as a handle
+            points: vec![[0, 0], [150, 200], [300, 0]],
+            heads: Heads::Both,
+            ..Default::default()
+        },
+    });
+    let tree = view.view();
+    let layer = node_at(&tree, "boards/body/a").expect("a shape is drawn in a layer");
+    let wire::Node::Canvas { commands, .. } = layer else {
+        panic!("a body layer is a canvas");
+    };
+    let barbs: Vec<_> = commands
+        .iter()
+        .filter_map(|command| match command {
+            wire::CanvasCommand::Draw {
+                shape: wire::CanvasShape::Line { from, to },
+                ..
+            } => Some((*from, *to)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(barbs.len(), 4, "two heads are four barbs: {barbs:?}");
+
+    // Every barb runs BACK from its tip, and the bend is below both ends, so a
+    // head that took its direction from the other end of the line would put its
+    // barbs above the tip instead.
+    for (from, to) in barbs {
+        assert!(
+            to[1] > from[1],
+            "a barb at {from:?} ran to {to:?}, which is not back along the curve"
+        );
+    }
+}
+/// The heads row is offered for the one kind that has heads. A line draws a
+/// line and a freehand stroke draws a line, and neither has an end to put a
+/// head on — a row on them would be a control that says the board can do
+/// something it cannot.
+#[test]
+fn the_heads_row_is_offered_to_an_arrow_and_to_nothing_else() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    for (id, kind) in [
+        ("arrow", Kind::Arrow),
+        ("line", Kind::Line),
+        ("card", Kind::Rectangle),
+    ] {
+        view.edit(Change::Create {
+            id: id.into(),
+            shape: Shape {
+                kind,
+                points: vec![[0, 0], [120, 80]],
+                ..Default::default()
+            },
+        });
+    }
+    let offered = |view: &BoardsView| {
+        serde_json::to_string(&view.view())
+            .unwrap()
+            .contains("boards/heads/")
+    };
+
+    view.selected = ["arrow".into()].into();
+    assert!(offered(&view), "an arrow was offered no heads row");
+    for id in ["line", "card"] {
+        view.selected = [id.to_string()].into();
+        assert!(
+            !offered(&view),
+            "a {id} has no head to draw, so a heads row on it sets nothing"
+        );
+    }
+
+    // With nothing picked the panel describes the next shape, so the row turns
+    // on the tool the way the rest of it turns on the selection.
+    view.selected = Default::default();
+    view.on_tool(Tool::Rectangle);
+    assert!(
+        !offered(&view),
+        "the rectangle tool was offered a row about arrowheads"
+    );
+    view.on_tool(Tool::Arrow);
+    assert!(
+        offered(&view),
+        "the arrow tool was offered no heads row before drawing one"
+    );
+}
 /// ⌘Enter out of a sticky finishes it AND opens the next one, in one press. It
 /// used to take the chord twice — once to finish, once to mint — with nothing
 /// to say so, which is the same as not having it: writing a column of stickies

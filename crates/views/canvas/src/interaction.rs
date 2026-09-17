@@ -1713,6 +1713,24 @@ impl BoardsView {
                 .collect(),
         )
     }
+    /// Which ends of the selection's arrows carry a head, and the next one's.
+    /// Written to every shape picked and not only the arrows among them, the
+    /// same way a fill is written to a line that will never paint one: the
+    /// property is stored for every shape and read by the kinds that have it,
+    /// so a mixed selection set to "both" and then drawn on comes out the way
+    /// you asked rather than the way the first arrow happened to be.
+    pub(super) fn on_heads(&mut self, heads: Heads) -> Task<Message> {
+        self.pen.heads = heads;
+        self.edit_many(
+            self.selected
+                .iter()
+                .map(|id| Change::Heads {
+                    id: id.clone(),
+                    heads,
+                })
+                .collect(),
+        )
+    }
     /// Where the selection's words sit across the boxes they are written in.
     /// It is not remembered for the NEXT shape the way a colour is: a colour
     /// is a choice about the board, and how a card's words are set is a choice
