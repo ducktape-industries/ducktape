@@ -314,6 +314,117 @@ fn two_rules_sharing_a_prefix_each_create_their_own_task() {
     }
 }
 
+/// the P2 contract over noded's real wire: a follow-up that FAILS at execute
+/// aborts the whole triggering block, and NOTHING from it survives in ANY
+/// module root. the failing follow-up is genuine: a rule posts into a channel
+/// that was archived after the rule was created — the pre-send probe checks
+/// only that the channel exists, and chat refuses the post as archived at
+/// apply. the triggering post, the rule's fire and its history entry all roll
+/// back together; the height still advances (a rejected op seals its own
+/// block, validator parity).
+#[test]
+fn a_follow_up_refused_at_execute_aborts_the_entire_triggering_block() {
+    let storage = tempfile::tempdir().expect("storage dir");
+    let sim = Sim::spawn(storage.path(), &["--auto"]);
+    let operator = harness::found_account(&sim, "operator", 40);
+    for (channel, name) in [("general", "General"), ("ops", "Ops")] {
+        sim.submit_ok("chat", create_channel(channel, name), Some(&operator));
+    }
+    sim.submit_ok(
+        "chat",
+        serde_json::json!({ "register_hook": { "channel_id": "general", "module_id": "automations" } }),
+        Some(&operator),
+    );
+    sim.submit_ok(
+        "automations",
+        serde_json::json!({ "create_rule": {
+            "rule_id": "r1",
+            "trigger": { "channel_id": "general", "mention": null, "text_contains": "deploy" },
+            "action": { "post_message": { "channel_id": "ops", "template": "deploy requested" } },
+        }}),
+        Some(&operator),
+    );
+    // the target channel outlives the rule's assumption: archived AFTER the
+    // rule was created, so the rule still composes and emits its post.
+    sim.submit_ok(
+        "chat",
+        serde_json::json!({ "set_channel_archived": { "channel_id": "ops", "archived": true } }),
+        Some(&operator),
+    );
+
+    // snapshot the chain tip BEFORE the doomed submit.
+    let before = sim.status();
+    let before_height = before["height"].as_u64().expect("height");
+    let before_hash = before["root_hash"].as_str().expect("root hash").to_string();
+
+    let (code, reply) = sim.submit(
+        "chat",
+        post_message("general", "trigger", "please deploy now"),
+        None,
+    );
+    assert_eq!(
+        code, 400,
+        "the refused follow-up must abort the triggering block: {reply}"
+    );
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("channel ops is archived"),
+        "the abort names chat's refusal: {reply}"
+    );
+
+    // NO STATE survives: the rejected op journals a block (validator parity — so
+    // the HEIGHT advances by one) but the atomic abort rolled back every write,
+    // so the root-hash is byte-identical, the triggering message never entered
+    // chat, nothing landed in the archived channel, and the rule recorded
+    // neither a fire nor a history entry.
+    let after = sim.status();
+    assert_eq!(
+        after["height"].as_u64(),
+        Some(before_height + 1),
+        "the rejected op sealed its own block (validator parity): {after}"
+    );
+    assert_eq!(
+        after["root_hash"].as_str(),
+        Some(before_hash.as_str()),
+        "root-hash unmoved (the rejected op rolled back): {after}"
+    );
+    let message = sim.query(
+        "chat",
+        serde_json::json!({ "message": { "message_id": "trigger" } }),
+    );
+    assert!(
+        message["message"].is_null(),
+        "the aborted post left no message: {message}"
+    );
+    let auto_post = sim.query(
+        "chat",
+        serde_json::json!({ "message": { "message_id": "auto-r1-general-1" } }),
+    );
+    assert!(
+        auto_post["message"].is_null(),
+        "the refused follow-up left no message: {auto_post}"
+    );
+    let rule = sim.query(
+        "automations",
+        serde_json::json!({ "get_rule": { "rule_id": "r1" } }),
+    );
+    assert_eq!(
+        rule["rule"]["fire_count"], 0,
+        "the aborted rule kept fire_count 0: {rule}"
+    );
+    let history = sim.query(
+        "automations",
+        serde_json::json!({ "run_history": { "rule_id": "r1", "limit": 10 } }),
+    );
+    assert_eq!(
+        history["history"].as_array().map(Vec::len),
+        Some(0),
+        "the aborted fire left no history: {history}"
+    );
+}
+
 // ── C5 — jobs: the authorization matrix + attempt ceiling ─
 
 /// every guarded transition rejects the wrong actor or state with its own
