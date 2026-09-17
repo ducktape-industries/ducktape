@@ -678,3 +678,154 @@ fn a_shape_carries_its_fill_and_its_dash_and_each_changes_alone() {
         .unwrap();
     assert_eq!(run.shapes["line"].shape.dash, Dash::Dashed);
 }
+
+/// What the picker lists.
+async fn catalogue(module: &Boards) -> std::collections::BTreeMap<String, String> {
+    let request = serde_json::to_vec(&Query::List).unwrap();
+    let Reply::List(catalog) =
+        serde_json::from_slice(&module.query(&request).await.unwrap()).unwrap()
+    else {
+        panic!("list reply")
+    };
+    catalog
+}
+/// The board itself, or nothing if the store no longer holds one.
+async fn opened(module: &Boards, id: &str) -> Option<Board> {
+    let request = serde_json::to_vec(&Query::Get { id: id.into() }).unwrap();
+    let Reply::Board(board) =
+        serde_json::from_slice(&module.query(&request).await.unwrap()).unwrap()
+    else {
+        panic!("board reply")
+    };
+    board
+}
+
+/// A board is renamed by anyone and removed only while nobody has drawn on it.
+///
+/// The rename is open because every shape edit already is — `Board::owner` is
+/// written once, read only to make a repeated create idempotent, and authorises
+/// nothing. The removal is closed to a board with work on it because there is
+/// no ownership rule in this module to say whose work would be thrown away.
+#[test]
+fn a_board_is_renamed_by_anyone_and_removed_only_while_nobody_has_drawn_on_it() {
+    futures::executor::block_on(async {
+        let mut module = Boards::new(Box::new(MemStore::new()));
+        let mut env = TestCtx::at_height(1).env().clone();
+        env.origin = Origin::External(vec![7; 32]);
+        let mut author = TestCtx::with_env(env);
+        let mut env = TestCtx::at_height(2).env().clone();
+        env.origin = Origin::External(vec![9; 32]);
+        let mut somebody_else = TestCtx::with_env(env);
+        let op = |operation| Msg {
+            target: "boards".into(),
+            payload: serde_json::to_vec(&operation).unwrap(),
+        };
+        module
+            .execute(
+                &mut author,
+                &op(Operation::Create {
+                    id: "room".into(),
+                    title: "Q3 plannign".into(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Somebody who did not make it renames it, because a board is shared.
+        module
+            .execute(
+                &mut somebody_else,
+                &op(Operation::Rename {
+                    board: "room".into(),
+                    title: "Q3 planning".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        let renamed = opened(&module, "room").await.unwrap();
+        assert_eq!(renamed.title, "Q3 planning");
+        assert_eq!(
+            catalogue(&module).await.get("room").map(String::as_str),
+            Some("Q3 planning"),
+            "the catalogue kept the old name, so the picker and the board disagree"
+        );
+
+        // A rename cannot leave a board in a state a create would have refused.
+        assert!(
+            module
+                .execute(
+                    &mut author,
+                    &op(Operation::Rename {
+                        board: "room".into(),
+                        title: "   ".into(),
+                    }),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(opened(&module, "room").await.unwrap().title, "Q3 planning");
+
+        // Draw on it and it can no longer be removed — by anyone, its author
+        // included.
+        module
+            .execute(
+                &mut author,
+                &op(Operation::Edit {
+                    board: "room".into(),
+                    change: create("a"),
+                }),
+            )
+            .await
+            .unwrap();
+        let drawn_on = op(Operation::Remove {
+            board: "room".into(),
+        });
+        assert!(
+            module.execute(&mut author, &drawn_on).await.is_err(),
+            "a board with work on it was thrown away"
+        );
+        assert!(opened(&module, "room").await.is_some());
+
+        // Clear it and it goes: out of the catalogue and out of the store.
+        module
+            .execute(
+                &mut author,
+                &op(Operation::Edit {
+                    board: "room".into(),
+                    change: Change::Delete { id: "a".into() },
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut somebody_else,
+                &op(Operation::Remove {
+                    board: "room".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            opened(&module, "room").await.is_none(),
+            "the board's state outlived it"
+        );
+        assert!(
+            catalogue(&module).await.is_empty(),
+            "the picker still lists a board that is gone"
+        );
+
+        // And it cannot be removed twice.
+        assert!(
+            module
+                .execute(
+                    &mut author,
+                    &op(Operation::Remove {
+                        board: "room".into(),
+                    }),
+                )
+                .await
+                .is_err()
+        );
+    });
+}

@@ -52,17 +52,51 @@ impl Boards {
         self.write(writes);
         Ok(())
     }
-    async fn edit(&mut self, board: String, changes: Vec<Change>) -> Result<(), Error> {
-        if !valid_id(&board) {
+    async fn rename(&mut self, id: String, title: String) -> Result<(), Error> {
+        let current = self.board(&id).await?;
+        let next = current.renamed(title.clone()).map_err(Error::Module)?;
+        let mut catalog: BTreeMap<String, String> =
+            self.read(b"catalog").await?.unwrap_or_default();
+        // The catalogue is what the picker lists, so a rename that reached only
+        // the board would be a board called one thing on the open board and
+        // another in everybody's list of them.
+        catalog.insert(id.clone(), title);
+        self.write([
+            (board_key(&id), sdk::wire::encode(&next)),
+            (b"catalog".to_vec(), sdk::wire::encode(&catalog)),
+        ]);
+        Ok(())
+    }
+    async fn remove(&mut self, id: String) -> Result<(), Error> {
+        let current = self.board(&id).await?;
+        // The whole of the rule. See `Operation::Remove`: a board with nothing
+        // on it holds nobody's work, so removing one takes nothing from anyone
+        // and needs no say in who may ask. A board with shapes on it does, and
+        // this module has no rule for whose they are.
+        if !current.shapes.is_empty() {
+            return Err(Error::Module("Clear the board before removing it.".into()));
+        }
+        let mut catalog: BTreeMap<String, String> =
+            self.read(b"catalog").await?.unwrap_or_default();
+        catalog.remove(&id);
+        self.staged.delete(board_key(&id));
+        self.write([(b"catalog".to_vec(), sdk::wire::encode(&catalog))]);
+        Ok(())
+    }
+    /// The board an operation names, or the error every board-level operation
+    /// gives for one that is not there.
+    async fn board(&self, id: &str) -> Result<Board, Error> {
+        if !valid_id(id) {
             return Err(Error::Module("Invalid board id.".into()));
         }
-        let key = board_key(&board);
-        let current: Board = self
-            .read(&key)
+        self.read(&board_key(id))
             .await?
-            .ok_or_else(|| Error::Module("Board no longer exists.".into()))?;
+            .ok_or_else(|| Error::Module("Board no longer exists.".into()))
+    }
+    async fn edit(&mut self, board: String, changes: Vec<Change>) -> Result<(), Error> {
+        let current = self.board(&board).await?;
         let next = current.changed_many(&changes).map_err(Error::Module)?;
-        self.write([(key, sdk::wire::encode(&next))]);
+        self.write([(board_key(&board), sdk::wire::encode(&next))]);
         Ok(())
     }
     fn write(&mut self, writes: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) {
@@ -111,6 +145,8 @@ impl Module for Boards {
         let operation: Operation = sdk::wire::decode(&msg.payload).map_err(Error::Module)?;
         match operation {
             Operation::Create { id, title } => self.create(id, title, owner).await,
+            Operation::Rename { board, title } => self.rename(board, title).await,
+            Operation::Remove { board } => self.remove(board).await,
             Operation::Edit { board, change } => self.edit(board, vec![change]).await,
             Operation::Batch { board, changes } => self.edit(board, changes).await,
         }

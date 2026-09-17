@@ -309,6 +309,14 @@ impl BoardsView {
     pub(super) fn on_board_picker(&mut self) -> Task<Message> {
         self.board_picker = !self.board_picker;
         if self.board_picker {
+            // The rename box says what the board is called, every time it is
+            // opened. Keeping a half-typed name across a close would offer to
+            // rename the board to something you walked away from.
+            self.rename = self
+                .confirmed
+                .as_ref()
+                .map(|board| board.title.clone())
+                .unwrap_or_default();
             return Task::none();
         }
         self.take_the_keyboard()
