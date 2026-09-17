@@ -223,7 +223,10 @@ fn a_refused_chord_claim_never_opens_the_palette() {
     let Seat { chord, .. } = seated();
     let frame = tick_native(vec![ducktape_view_guest::wire::Event::Response {
         id: chord,
-        result: Err("chat holds cmd-k".into()),
+        result: Err(ducktape_view_guest::wire::Refusal::new(
+            "chord_taken",
+            "chat holds cmd-k",
+        )),
         done: true,
     }]);
     assert!(texts(&frame).is_empty(), "{:?}", texts(&frame));
@@ -244,7 +247,10 @@ fn one_lane_refusing_still_answers_and_both_refusing_says_so() {
         answer(view_asking(&frame, "chat", "search").id, CHAT_HITS.as_bytes()),
         ducktape_view_guest::wire::Event::Response {
             id: view_asking(&frame, "pages", "search").id,
-            result: Err("the pages index is not up".into()),
+            result: Err(ducktape_view_guest::wire::Refusal::new(
+                "module",
+                "the pages index is not up",
+            )),
             done: true,
         },
     ]);

@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 use crate::Message;
 use crate::protocol::{self, Beacon, Effect, Event, Machine, Props};
 
-type Answer = Option<Result<Vec<u8>, String>>;
+/// One item off a host subscription, or `None` when the stream ended. The
+/// refusal is converted to its sentence at [`answer`], the one place this view
+/// leaves the host's shape — nothing below branches on a token.
+type Answer = Option<host::Answer>;
 
 enum Input {
     Props(Answer),
@@ -83,7 +86,9 @@ fn status_text(kind: &str, message: &str) -> String {
     }
 }
 fn answer(answer: Answer) -> Result<Vec<u8>, String> {
-    answer.ok_or_else(|| "session stream closed".to_owned())?
+    answer
+        .ok_or_else(|| "session stream closed".to_owned())?
+        .map_err(host::said)
 }
 
 fn properties(bytes: &[u8]) -> Result<Props, String> {
@@ -165,7 +170,8 @@ impl Session {
             "rpc.query",
             &bytes(&json!({"target": "chat", "query": {"channel": {"channel_id": props.channel}}})),
         )
-        .await?;
+        .await
+        .map_err(host::said)?;
         let channel: Value = serde_json::from_slice(&channel).map_err(|error| error.to_string())?;
         let owner = channel
             .get("channel")
@@ -460,7 +466,9 @@ impl Session {
                 image: u64,
                 key: String,
             }
-            let image = host::request("media.image", b"{}").await?;
+            let image = host::request("media.image", b"{}")
+                .await
+                .map_err(host::said)?;
             let image: Image = serde_json::from_slice(&image).map_err(|error| error.to_string())?;
             self.images.insert(peer.clone(), (image.image, image.key));
         }

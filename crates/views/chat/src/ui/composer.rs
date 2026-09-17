@@ -48,7 +48,7 @@ impl ChatView {
         ducktape_view_guest::Subscription::run_with(route, |route| {
             let route = route.clone();
             ducktape_view_guest::host::subscribe("fs.drops", b"{}").map(move |answer| {
-                let result = answer.and_then(|bytes| {
+                let result = answer.map_err(host::said).and_then(|bytes| {
                     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
                 });
                 Message::Composer(Box::new(ComposerMessage::Picked(route.clone(), result)))
@@ -155,10 +155,12 @@ impl ChatView {
                     return Task::none();
                 }
                 Task::perform(host::pick(), move |result| {
+                    let result = result.map_err(host::said);
                     Message::Composer(Box::new(ComposerMessage::Picked(route.clone(), result)))
                 })
             }
             "paste" => Task::perform(host::clipboard(), move |result| {
+                let result = result.map_err(host::said);
                 Message::Composer(Box::new(ComposerMessage::Clipboard(route.clone(), result)))
             }),
             "copy" | "cut" => {
@@ -172,7 +174,7 @@ impl ChatView {
                     return Task::none();
                 };
                 Task::future(async move {
-                    let result = host::copy(&text).await;
+                    let result = host::copy(&text).await.map_err(host::said);
                     Message::Composer(Box::new(ComposerMessage::Copied(route, result)))
                 })
             }
@@ -186,7 +188,7 @@ impl ChatView {
         };
         draft.in_flight.push(send.clone());
         Task::future(async move {
-            let result = host::id().await;
+            let result = host::id().await.map_err(host::said);
             Message::Composer(Box::new(ComposerMessage::Prepared(route, send, result)))
         })
     }
@@ -218,7 +220,9 @@ impl ChatView {
             self.refresh_pending();
         }
         Task::future(async move {
-            let result = host::submit(id.clone(), &send, &route.target).await;
+            let result = host::submit(id.clone(), &send, &route.target)
+                .await
+                .map_err(host::said);
             Message::Composer(Box::new(ComposerMessage::Sent(route, id, send, result)))
         })
     }
@@ -273,7 +277,7 @@ impl ChatView {
             let upload_token = file.token.clone();
             let (task, handle) = Task::future(async move {
                 let token = file.token.clone();
-                let result = host::upload(file).await;
+                let result = host::upload(file).await.map_err(host::said);
                 Message::Composer(Box::new(ComposerMessage::Uploaded(route, token, result)))
             })
             .abortable();

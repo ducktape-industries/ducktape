@@ -219,12 +219,48 @@ pub enum Event {
     /// `done`; a subscription gets many, the last one `done`.
     Response {
         id: u64,
-        result: Result<Vec<u8>, String>,
+        result: Result<Vec<u8>, Refusal>,
         done: bool,
     },
     /// The host no longer holds the tree the guest is patching — a patch it
     /// could not apply, a tree it dropped — and wants the next frame whole.
     Resync,
+}
+
+/// Why a request failed, as the guest gets it: a stable snake_case `reason` to
+/// branch on and the `sentence` to show.
+///
+/// The host owns the split, and that is the point of this type existing. A
+/// refusal used to cross as one flat string carrying its own transport
+/// envelope — `RPC returned 400 Bad Request: {"error":"Module(<the module's
+/// words>)"}` — so a view that wanted the sentence had to peel the envelope
+/// back off, and one that wanted to tell "never" from "not yet" had only prose
+/// to read. Every view doing that itself is the same code written as many times
+/// as there are views, drifting apart.
+///
+/// `sentence` is the refusing module's own words, verbatim. Nothing here
+/// paraphrases a refusal it did not write.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    pub reason: String,
+    pub sentence: String,
+}
+
+impl Refusal {
+    pub fn new(reason: impl Into<String>, sentence: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            sentence: sentence.into(),
+        }
+    }
+}
+
+/// So a view that only wants to SHOW the refusal writes `{refusal}` and is
+/// done — the token is for branching, not for reading.
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.sentence)
+    }
 }
 
 /// Something the guest asked the host for. The guest never blocks on it: a
@@ -2281,7 +2317,7 @@ mod tests {
             },
             Event::Response {
                 id: 1,
-                result: Err("nope".into()),
+                result: Err(Refusal::new("module", "nope")),
                 done: true,
             },
             Event::Resync,

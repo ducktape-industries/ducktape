@@ -412,12 +412,15 @@ fn run_actor(mut host: Host, status_modules: Vec<String>, io: ActorIo) {
                             )
                             .await
                         }
-                        Err(err) => Err(err.to_string()),
+                        Err(err) => Err(crate::Refused::new("malformed_frame", err.to_string())),
                     };
                     let _ = reply.send(result);
                 }
                 NodeCommand::Query { target, req, reply } => {
-                    let result = host.query(&target, &req).await.map_err(|e| e.to_string());
+                    let result = host
+                        .query(&target, &req)
+                        .await
+                        .map_err(|e| crate::Refused::of(&e));
                     let _ = reply.send(result);
                 }
                 NodeCommand::QueryAs {
@@ -429,7 +432,7 @@ fn run_actor(mut host: Host, status_modules: Vec<String>, io: ActorIo) {
                     let result = host
                         .query_as(&target, &req, sdk::Origin::External(reader))
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| crate::Refused::of(&e));
                     let _ = reply.send(result);
                 }
             }
@@ -482,7 +485,7 @@ async fn commit(
     status_modules: &[String],
     origin: Origin,
     msg: Msg,
-) -> Result<BlockSummary, String> {
+) -> Result<BlockSummary, crate::Refused> {
     let next = *height + 1;
     let ctx = BlockContext {
         height: next,
@@ -503,7 +506,7 @@ async fn commit(
                 root_hash: hex_root(&out.root_hash),
             })
         }
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(crate::Refused::of_submit(&err)),
     }
 }
 

@@ -146,7 +146,7 @@ pub struct SessionItem {
 pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("pages.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 let value: Value =
                     serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
                 match value.get("background") {
@@ -202,16 +202,24 @@ async fn view(ask: Value) -> Result<Value, String> {
     kernel_read("rpc.view", ask).await
 }
 
+/// Every read this view makes crosses here, so this is where a refusal becomes
+/// the one thing this view does with it: its sentence, shown. No screen in
+/// pages branches on WHY yet; when one does, it takes the `Refusal` from
+/// `host::request` instead of the string this returns.
 async fn kernel_read(kind: &'static str, ask: Value) -> Result<Value, String> {
     let request = json!({ "target": "pages", "query": ask });
-    let reply = host::request(kind, &encode(&request)).await?;
+    let reply = host::request(kind, &encode(&request))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&reply).map_err(|error| error.to_string())
 }
 
 /// One signed op onto the pages module, answered with the block that took it.
 async fn submit(message: Value) -> Result<i64, String> {
     let op = json!({ "target": "pages", "payload": message });
-    let reply = host::request("op.submit", &encode(&op)).await?;
+    let reply = host::request("op.submit", &encode(&op))
+        .await
+        .map_err(host::said)?;
     String::from_utf8_lossy(&reply)
         .trim()
         .parse()
@@ -221,7 +229,9 @@ async fn submit(message: Value) -> Result<i64, String> {
 /// A client-minted id, unique on this device: the pages module takes the id
 /// of every page, block, thread and comment from its writer.
 async fn mint(prefix: &str) -> Result<String, String> {
-    let reply = host::request("host.id", prefix.as_bytes()).await?;
+    let reply = host::request("host.id", prefix.as_bytes())
+        .await
+        .map_err(host::said)?;
     String::from_utf8(reply).map_err(|error| error.to_string())
 }
 
@@ -1743,7 +1753,7 @@ async fn picked_picture(page_id: String) -> Result<PictureItem, String> {
     if page_id.is_empty() {
         return Err("open a page before adding a picture".into());
     }
-    let chosen = host::request("fs.pick", b"{}").await?;
+    let chosen = host::request("fs.pick", b"{}").await.map_err(host::said)?;
     let files: Vec<ducktape_view_files::SelectedFile> =
         serde_json::from_slice(&chosen).map_err(|error| error.to_string())?;
     // The picker offers several; a document line holds one.
@@ -1755,7 +1765,9 @@ async fn picked_picture(page_id: String) -> Result<PictureItem, String> {
     // one page or in two, are two files.
     let id = mint("picture").await?;
     let path = format!("/shared/pages/{page_id}/{id}/{}", file_name(&file.name));
-    let uri = ducktape_view_files::upload(file, path).await?;
+    let uri = ducktape_view_files::upload(file, path)
+        .await
+        .map_err(host::said)?;
     Ok(PictureItem {
         uri,
         alt,

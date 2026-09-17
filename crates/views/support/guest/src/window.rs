@@ -7,10 +7,15 @@ pub fn perform<M: 'static>(command: wire::WindowCommand) -> crate::Task<M> {
     crate::Task::future(async move {
         let result = match command.validate() {
             Ok(()) => host::request("host.window", &wire::encode(&command)).await,
-            Err(error) => Err(error),
+            Err(error) => Err(host::Refusal::new("invalid_window_command", error)),
         };
-        if let Err(error) = result {
-            host::log(format!("host.window: {error}"));
+        // the token FIRST: a log line is exactly where a refusal's reason earns
+        // its keep, because that is what someone greps and counts.
+        if let Err(refusal) = result {
+            host::log(format!(
+                "host.window refused: reason={} {}",
+                refusal.reason, refusal.sentence
+            ));
         }
     })
     .discard()
@@ -55,7 +60,7 @@ mod tests {
         assert!(!driver.app.0, "the chain must wait for host submission");
         let frame = driver.tick(vec![wire::Event::Response {
             id: request.id,
-            result: Err("RequestError: guest closed".into()),
+            result: Err(wire::Refusal::new("request_closed", "guest closed")),
             done: true,
         }]);
         assert!(driver.app.0, "an explicit refusal must settle the task");
@@ -65,7 +70,7 @@ mod tests {
                 .iter()
                 .any(|request| request.kind == "host.log"
                     && String::from_utf8_lossy(&request.payload)
-                        .contains("RequestError: guest closed"))
+                        .contains("reason=request_closed guest closed"))
         );
     }
 }

@@ -871,11 +871,19 @@ pub(super) async fn park(
             source = "recovery"
         );
     }
-    let not_serving = |standing: bool| -> String {
+    // two refusals a caller must be able to tell apart without reading prose:
+    // one clears on its own in seconds, the other needs the join to land.
+    let not_serving = |standing: bool| -> noded::Refused {
         if standing {
-            "resident: no boundary pre-synced yet — retry shortly".into()
+            noded::Refused::new(
+                "no_boundary_yet",
+                "resident: no boundary pre-synced yet — retry shortly",
+            )
         } else {
-            "joining: redemption not landed yet — no state to serve".into()
+            noded::Refused::new(
+                "not_joined",
+                "joining: redemption not landed yet — no state to serve",
+            )
         }
     };
     // The relay runtime owns caller holds, Forge pack fanout, and the
@@ -987,7 +995,7 @@ pub(super) async fn park(
                             // un-standing / not-yet-serving cases.
                             RpcRequest::Submit { target, payload_hex } => {
                                 if !resident_standing || serving.is_none() {
-                                    RpcReply::err(not_serving(resident_standing))
+                                    RpcReply::err(not_serving(resident_standing).message)
                                 } else {
                                     match unhex(&payload_hex) {
                                         Ok(payload) => match resident_relay.submit(
@@ -1025,7 +1033,7 @@ pub(super) async fn park(
                                     }
                                     Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
                                 },
-                                None => RpcReply::err(not_serving(resident_standing)),
+                                None => RpcReply::err(not_serving(resident_standing).message),
                             },
                             RpcRequest::Status => match &serving {
                                 Some((height, node_r)) => {
@@ -1040,7 +1048,7 @@ pub(super) async fn park(
                                         ..RpcReply::ok()
                                     }
                                 }
-                                None => RpcReply::err(not_serving(resident_standing)),
+                                None => RpcReply::err(not_serving(resident_standing).message),
                             },
                             RpcRequest::JoinRequests => RpcReply::err(
                                 "this node is not a member — join requests queue on \
@@ -1131,7 +1139,9 @@ pub(super) async fn park(
                                         relay_runtime::ResidentHold::Http(reply),
                                     ) {
                                         Ok(_) => {}
-                                        Err((hold, e)) => hold.fail(e),
+                                        Err((hold, detail)) => {
+                                            hold.fail(noded::Refused::new("relay_refused", detail))
+                                        }
                                     }
                                 }
                             }
@@ -1155,7 +1165,9 @@ pub(super) async fn park(
                                         relay_runtime::ResidentHold::Http(reply),
                                     ) {
                                         Ok(_) => {}
-                                        Err((hold, e)) => hold.fail(e),
+                                        Err((hold, detail)) => {
+                                            hold.fail(noded::Refused::new("relay_refused", detail))
+                                        }
                                     }
                                 }
                             }
@@ -1165,7 +1177,7 @@ pub(super) async fn park(
                                         .host()
                                         .query(&target, &req)
                                         .await
-                                        .map_err(|e| e.to_string()),
+                                        .map_err(|error| noded::Refused::of(&error)),
                                     None => Err(not_serving(resident_standing)),
                                 };
                                 let _ = reply.send(result);
@@ -1181,7 +1193,7 @@ pub(super) async fn park(
                                         .host()
                                         .query_as(&target, &req, sdk::Origin::External(reader))
                                         .await
-                                        .map_err(|e| e.to_string()),
+                                        .map_err(|error| noded::Refused::of(&error)),
                                     None => Err(not_serving(resident_standing)),
                                 };
                                 let _ = reply.send(result);

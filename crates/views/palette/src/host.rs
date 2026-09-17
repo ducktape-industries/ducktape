@@ -45,7 +45,7 @@ pub struct SessionItem {
 pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("palette.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice::<Session>(&bytes).map_err(|error| error.to_string())
             });
             match read {
@@ -206,7 +206,8 @@ async fn view(target: &str, query: serde_json::Value) -> Result<serde_json::Valu
         "rpc.view",
         &serde_json::to_vec(&ask).expect("a request encodes"),
     )
-    .await?;
+    .await
+    .map_err(host::said)?;
     serde_json::from_slice(&reply).map_err(|error| error.to_string())
 }
 

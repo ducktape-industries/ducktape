@@ -119,7 +119,8 @@ pub fn notify_with(kind: &str, payload: &str) {
 async fn request(kind: &str, payload: serde_json::Value) -> Result<serde_json::Value, String> {
     let bytes =
         ducktape_view_guest::host::request(kind, &serde_json::to_vec(&payload).expect("query"))
-            .await?;
+            .await
+            .map_err(ducktape_view_guest::host::said)?;
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
@@ -258,7 +259,7 @@ pub async fn invite(channel: String, room: String, key: String) -> Result<(), St
         Some(account) => format!("<@{account}>"),
         None => format!("<@key:{key}>"),
     };
-    let id = composer::id().await?;
+    let id = composer::id().await.map_err(composer::said)?;
     composer::submit(
         id,
         &Send {
@@ -271,6 +272,7 @@ pub async fn invite(channel: String, room: String, key: String) -> Result<(), St
         },
     )
     .await
+    .map_err(composer::said)
 }
 
 fn button(key: &str, label: &str, action: Action, preset: wire::ButtonPreset) -> wire::Node {

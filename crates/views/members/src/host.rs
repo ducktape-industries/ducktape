@@ -66,7 +66,7 @@ pub struct SessionItem {
 pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("members.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
             });
             match read {
@@ -227,7 +227,9 @@ pub fn fold_live_keys(reply: &serde_json::Value) -> BTreeSet<String> {
 
 /// One kernel request, asked and answered as JSON.
 async fn ask(kind: &str, request: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let reply = host::request(kind, &serde_json::to_vec(request).expect("encodes")).await?;
+    let reply = host::request(kind, &serde_json::to_vec(request).expect("encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&reply).map_err(|error| error.to_string())
 }
 
@@ -415,7 +417,7 @@ impl Stream for ActStream {
             let (key, _) = acts.pending.remove(index);
             Poll::Ready(Some(ActItem {
                 key,
-                error: answer.err().unwrap_or_default(),
+                error: answer.err().map(host::said).unwrap_or_default(),
             }))
         })
     }

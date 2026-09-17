@@ -9,7 +9,7 @@ pub struct SelectedFile {
     pub name: String,
     pub bytes: u64,
 }
-async fn submit_bytes(target: &str, bytes: Vec<u8>) -> Result<(), String> {
+async fn submit_bytes(target: &str, bytes: Vec<u8>) -> Result<(), host::Refusal> {
     let ask = serde_json::json!({ "target": target, "body_b64": base64::engine::general_purpose::STANDARD.encode(bytes) });
     host::request(
         "op.submit_bytes",
@@ -19,7 +19,7 @@ async fn submit_bytes(target: &str, bytes: Vec<u8>) -> Result<(), String> {
     .map(|_| ())
 }
 
-pub async fn upload(file: SelectedFile, path: String) -> Result<String, String> {
+pub async fn upload(file: SelectedFile, path: String) -> Result<String, host::Refusal> {
     let result = upload_inner(&file, path).await;
     if result.is_ok() {
         release(&file.token).await;
@@ -31,17 +31,21 @@ pub async fn release(token: &str) {
     let _ = host::request("fs.release", token.as_bytes()).await;
 }
 
-async fn upload_inner(file: &SelectedFile, path: String) -> Result<String, String> {
+async fn upload_inner(file: &SelectedFile, path: String) -> Result<String, host::Refusal> {
     const MAX_UPLOAD: u64 = 64 << 20;
     if file.bytes > MAX_UPLOAD {
-        return Err("Files must be at most 64 MiB".into());
+        return Err(host::Refusal::new(
+            "too_large",
+            "Files must be at most 64 MiB",
+        ));
     }
-    duckfs_core::paths::canonical(&path)?;
+    duckfs_core::paths::canonical(&path)
+        .map_err(|said| host::Refusal::new("invalid_path", said))?;
     let ask = serde_json::json!({"target":"files", "query":{"refs":{}}});
     let refs: serde_json::Value = serde_json::from_slice(
         &host::request("rpc.query", &serde_json::to_vec(&ask).expect("refs query")).await?,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| host::malformed(error.to_string()))?;
     let mut chunks = Vec::new();
     let mut chunk = Vec::new();
     let mut offset = 0u64;
@@ -56,7 +60,10 @@ async fn upload_inner(file: &SelectedFile, path: String) -> Result<String, Strin
         .await?;
         let invalid_read = bytes.is_empty() || bytes.len() > len;
         if invalid_read {
-            return Err("The selected file changed during its upload".into());
+            return Err(host::Refusal::new(
+                "file_changed",
+                "The selected file changed during its upload",
+            ));
         }
         offset += bytes.len() as u64;
         chunk.extend_from_slice(&bytes);

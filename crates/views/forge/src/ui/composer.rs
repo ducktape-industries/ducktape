@@ -122,10 +122,12 @@ impl ForgeView {
                     return Task::none();
                 }
                 Task::perform(host::pick(), move |result| {
+                    let result = result.map_err(host::said);
                     Message::Composer(Box::new(ComposerMessage::Picked(route.clone(), result)))
                 })
             }
             "paste" => Task::perform(host::clipboard(), move |result| {
+                let result = result.map_err(host::said);
                 Message::Composer(Box::new(ComposerMessage::Clipboard(route.clone(), result)))
             }),
             "copy" | "cut" => {
@@ -139,7 +141,7 @@ impl ForgeView {
                     return Task::none();
                 };
                 Task::future(async move {
-                    let result = host::copy(&text).await;
+                    let result = host::copy(&text).await.map_err(host::said);
                     Message::Composer(Box::new(ComposerMessage::Copied(route, result)))
                 })
             }
@@ -169,7 +171,7 @@ impl ForgeView {
 
         draft.in_flight.push(send.clone());
         Task::future(async move {
-            let result = host::id().await;
+            let result = host::id().await.map_err(host::said);
             Message::Composer(Box::new(ComposerMessage::Prepared(route, send, result)))
         })
     }
@@ -195,7 +197,9 @@ impl ForgeView {
             Err(error) => return self.composer_sent(route, String::new(), send, Err(error)),
         };
         Task::future(async move {
-            let result = host::submit(id.clone(), &send, &route.target).await;
+            let result = host::submit(id.clone(), &send, &route.target)
+                .await
+                .map_err(host::said);
             Message::Composer(Box::new(ComposerMessage::Sent(route, id, send, result)))
         })
     }
@@ -227,7 +231,7 @@ impl ForgeView {
             let upload_token = file.token.clone();
             let (task, handle) = Task::future(async move {
                 let token = file.token.clone();
-                let result = host::upload(file).await;
+                let result = host::upload(file).await.map_err(host::said);
                 Message::Composer(Box::new(ComposerMessage::Uploaded(route, token, result)))
             })
             .abortable();

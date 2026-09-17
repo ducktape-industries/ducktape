@@ -113,7 +113,10 @@ fn spawn_session_actor(
                     seen.lock()
                         .unwrap()
                         .push(runs::decode_msg(&payload).expect("a runs op"));
-                    let _ = reply.send(bind.map(|()| committed_block()).map_err(Into::into));
+                    let _ = reply.send(
+                        bind.map(|()| committed_block())
+                            .map_err(|said| crate::Refused::new("module", said)),
+                    );
                 }
                 NodeCommand::Query {
                     target, req, reply, ..
@@ -206,7 +209,7 @@ pub(super) fn files_reply(
     tree: &BTreeMap<String, Vec<u8>>,
     reject_reads: bool,
     req: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, crate::Refused> {
     match decode_query(req).expect("a files query") {
         FilesQuery::Refs {} => Ok(encode_reply(&FilesReply::Refs(RefsInfo {
             head: None,
@@ -229,7 +232,10 @@ pub(super) fn files_reply(
             }))
         }
         // the verbatim module contract string the engine's taxonomy keys on.
-        FilesQuery::Read { .. } => Err("files: chunk not available".to_string()),
+        FilesQuery::Read { .. } => Err(crate::Refused::new(
+            "module",
+            "files: chunk not available",
+        )),
         other => panic!("the checkout asked for {other:?}"),
     }
 }

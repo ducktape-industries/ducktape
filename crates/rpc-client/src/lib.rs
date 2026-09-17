@@ -6,6 +6,9 @@ use std::time::Duration;
 
 use futures::{SinkExt as _, StreamExt as _};
 use reqwest::{Response, Url};
+/// Re-exported with [`refusal`], which takes one: a caller that reads a `/v1`
+/// route itself should not have to pin this client's reqwest to say so.
+pub use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -23,19 +26,54 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const BLOB_FLOOR_BYTES_PER_SEC: u64 = 64 * 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(7_500);
 
-/// A node response or transport failure safe to show to a client user.
+/// A node response or transport failure safe to show to a client user: a
+/// stable snake_case `reason` to branch on and the `message` to show.
+///
+/// The two are separate fields because they are BOUNDED separately. This client
+/// used to build one string — `RPC returned 400 Bad Request: {"error":"…"}` —
+/// and then clip the whole thing, so every character of framing was a character
+/// cut off the END of the module's own sentence, which is the half that says
+/// what to do about it.
 #[derive(Debug)]
-pub struct Error(String);
+pub struct Error {
+    reason: String,
+    message: String,
+}
 
 impl Error {
+    /// A failure of THIS CLIENT: it could not send the request, read the
+    /// response, or make sense of it. Never a refusal the node authored — those
+    /// come from [`Error::refusal`], which reads the node's own token.
     fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            reason: "rpc_client".into(),
+            message: message.into(),
+        }
+    }
+
+    /// The node's refusal, as the node classified it.
+    fn refused(reason: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            message: message.into(),
+        }
+    }
+
+    /// What kind of failure this is — the token a caller branches on.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// What it says. A refusal's message is the refusing module's own sentence,
+    /// verbatim: nothing here paraphrases it and nothing wraps it.
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -43,7 +81,42 @@ impl std::error::Error for Error {}
 
 impl From<Error> for String {
     fn from(error: Error) -> Self {
-        error.0
+        error.message
+    }
+}
+
+/// The node's error body on every non-2xx: the sentence in `error`, its token
+/// in `reason` (absent from a refusal no actor classified, and from anything
+/// that is not this node — a proxy, a gateway).
+#[derive(Deserialize)]
+struct NodeRefusal {
+    error: String,
+    reason: Option<String>,
+}
+
+/// Read a non-2xx body as the node's refusal. The sentence is bounded on its
+/// OWN budget here, which is the whole point: a long module sentence is cut
+/// only by its own length, never by a status line in front of it.
+///
+/// `pub` for the one caller that reaches a `/v1` route without this client —
+/// the app kernel's signed admin POST. It parses the node's refusal HERE
+/// rather than writing a second parser, so both lanes split the envelope the
+/// same way and no consumer downstream has to.
+pub fn refusal(status: StatusCode, body: &[u8]) -> Error {
+    match serde_json::from_slice::<NodeRefusal>(body) {
+        Ok(node) => Error::refused(
+            node.reason.unwrap_or_else(|| "refused".into()),
+            bounded_detail(&node.error),
+        ),
+        // not this node's envelope at all: the status IS the classification and
+        // the body is the only evidence there is.
+        Err(_) => Error::refused(
+            "http_error",
+            format!(
+                "{status}: {}",
+                bounded_detail(&String::from_utf8_lossy(body))
+            ),
+        ),
     }
 }
 
@@ -1122,10 +1195,7 @@ async fn decode_json<T: DeserializeOwned>(response: Response) -> Result<T> {
     let status = response.status();
     let bytes = read_bounded(response, MAX_JSON_BYTES).await?;
     if !status.is_success() {
-        return Err(Error::new(format!(
-            "RPC returned {status}: {}",
-            bounded_detail(&String::from_utf8_lossy(&bytes))
-        )));
+        return Err(refusal(status, &bytes));
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| Error::new(format!("RPC returned invalid JSON: {error}")))
@@ -1134,11 +1204,10 @@ async fn decode_json<T: DeserializeOwned>(response: Response) -> Result<T> {
 async fn response_error(response: Response) -> Error {
     let status = response.status();
     match read_bounded(response, MAX_ERROR_BYTES).await {
-        Ok(bytes) => Error::new(format!(
-            "transaction was rejected ({status}): {}",
-            bounded_detail(&String::from_utf8_lossy(&bytes))
-        )),
-        Err(error) => Error::new(format!("transaction was rejected ({status}): {error}")),
+        Ok(bytes) => refusal(status, &bytes),
+        // the body itself could not be read: that is this client's failure, not
+        // a refusal anyone authored.
+        Err(error) => Error::new(format!("a rejection ({status}) could not be read: {error}")),
     }
 }
 

@@ -25,7 +25,32 @@ use futures::Stream;
 use crate::wire::Request;
 
 /// What one answer carries; the host's refusal is the `Err`.
-pub type Answer = Result<Vec<u8>, String>;
+///
+/// A refusal arrives already split into a stable `reason` token and the
+/// refusing module's own `sentence` ([`Refusal`]), so no view parses a
+/// transport envelope to find out what happened. `Display` writes the
+/// sentence, which is what a screen shows.
+pub type Answer = Result<Vec<u8>, Refusal>;
+
+pub use crate::wire::Refusal;
+
+/// The host answered and the bytes are not what this view expected — a decode
+/// failure on OUR side, not a refusal anyone authored. One token in one place,
+/// so `.map_err(host::malformed)` reads the same in every view.
+pub fn malformed(error: String) -> Refusal {
+    Refusal::new("malformed_reply", error)
+}
+
+/// The sentence alone, for a view that only SHOWS a refusal.
+///
+/// It is a named function and not a `From<Refusal> for String` ON PURPOSE:
+/// with a `From`, a plain `?` would flatten a refusal to prose silently, and
+/// the next screen that needs to tell "never" from "not yet" would be back to
+/// reading the words. `.map_err(host::said)` says out loud that this path shows
+/// the refusal and branches on nothing.
+pub fn said(refused: Refusal) -> String {
+    refused.sentence
+}
 
 #[derive(Default)]
 struct Slot {
@@ -148,7 +173,10 @@ impl Future for Response {
         let mut slot = self.slot.lock().expect("response slot");
         match slot.answers.pop_front() {
             Some(answer) => Poll::Ready(answer),
-            None if slot.closed => Poll::Ready(Err("the host closed the request".into())),
+            None if slot.closed => Poll::Ready(Err(Refusal::new(
+                "request_closed",
+                "the host closed the request",
+            ))),
             None => {
                 slot.waker = Some(cx.waker().clone());
                 Poll::Pending

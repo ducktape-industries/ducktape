@@ -6,7 +6,7 @@
 
 use chat_view::host::{Channel, Session};
 use chat_view::boot_native;
-use ducktape_view_guest::testing::{answer, has_text, item, press, texts, type_into};
+use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts, type_into};
 use ducktape_view_guest::wire::{Frame, Node, Request, SurfaceValue};
 
 /// A native tick of this screen walks a deep tree; libtest's 2 MiB thread is
@@ -726,11 +726,7 @@ fn a_send_in_flight_paints_its_row_before_the_block() {
         );
         let submit_id = submit.id;
         let _ = tick_native(composer_commit(&frame, Some("new typing"), None));
-        let frame = tick_native(vec![ducktape_view_guest::wire::Event::Response {
-            id: submit_id,
-            result: Err("refused".into()),
-            done: true,
-        }]);
+        let frame = tick_native(vec![refuse(submit_id, "refused")]);
         assert!(!has_text(&frame, "third rail"));
         // the refusal is a notice that says what happened, with the way back
         // beside it — not a bare button carrying the whole sentence
@@ -985,11 +981,7 @@ fn a_live_run_opens_its_thread_and_stop_leaves_as_a_cancel() {
                 .iter()
                 .any(|request| request.kind == "chat.cancel_run")
         );
-        let frame = tick_native(vec![ducktape_view_guest::wire::Event::Response {
-            id: cancel.id,
-            result: Err("cancel refused".into()),
-            done: true,
-        }]);
+        let frame = tick_native(vec![refuse(cancel.id, "cancel refused")]);
         assert!(
             texts(&frame)
                 .iter()
@@ -1089,12 +1081,20 @@ fn a_refused_output_stream_falls_back_to_committed_progress() {
     on_a_deep_stack(|| {
         let (frame, stream, _) = room_with_a_pending_run();
         open_the_runs_thread(&frame);
-        // the node's own refusal, on the stream rather than in it
+        // The node's own refusal frame, in the shape the node sends it: the
+        // `code` is what says "who may read", so the view reads that and never
+        // the sentence beside it.
         let frame = tick_native(vec![item(
             stream,
-            serde_json::json!({ "type": "error", "detail": "401 Unauthorized" })
-                .to_string()
-                .as_bytes(),
+            serde_json::json!({
+                "type": "error",
+                "topic": "run-output:chief-run",
+                "code": "forbidden",
+                "detail": "run output requires the workspace token, the requester, or its \
+                           program controller",
+            })
+            .to_string()
+            .as_bytes(),
         )]);
 
         // refused, so the view reads the public facts of that run instead
@@ -1121,7 +1121,9 @@ fn a_refused_output_stream_falls_back_to_committed_progress() {
             "the refused card does not show committed progress: {shown:?}"
         );
         assert!(
-            !shown.iter().any(|text| text.contains("401")),
+            !shown
+                .iter()
+                .any(|text| text.contains("run output requires")),
             "the entitlement refusal was drawn as an error: {shown:?}"
         );
     });
@@ -1458,11 +1460,10 @@ fn dm_creation_refusal_does_not_navigate_and_can_be_retried() {
             request(&frame, "rpc.query").id,
             br#"{"account":{"number":8,"name":"Ada Lovelace"}}"#,
         )]);
-        let frame = tick_native(vec![ducktape_view_guest::wire::Event::Response {
-            id: request(&frame, "op.submit").id,
-            result: Err("create refused".into()),
-            done: true,
-        }]);
+        let frame = tick_native(vec![refuse(
+            request(&frame, "op.submit").id,
+            "create refused",
+        )]);
         assert!(
             !frame
                 .requests
@@ -1594,11 +1595,7 @@ fn refused_channel_creation_keeps_the_draft_and_reuses_its_id() {
             payload["payload"]["create_channel"]["post_policy"],
             "members_only"
         );
-        let frame = tick_native(vec![ducktape_view_guest::wire::Event::Response {
-            id: original.id,
-            result: Err("creation refused".into()),
-            done: true,
-        }]);
+        let frame = tick_native(vec![refuse(original.id, "creation refused")]);
         assert!(
             texts(&frame)
                 .iter()
@@ -1646,11 +1643,10 @@ fn a_lost_creation_reply_is_reconciled_before_retrying_the_write() {
             request(&frame, "rpc.view").id,
             br#"{"channel":null}"#,
         )]);
-        let frame = tick_native(vec![ducktape_view_guest::wire::Event::Response {
-            id: request(&frame, "op.submit").id,
-            result: Err("connection closed".into()),
-            done: true,
-        }]);
+        let frame = tick_native(vec![refuse(
+            request(&frame, "op.submit").id,
+            "connection closed",
+        )]);
         let frame = tick_native(press(&frame, "Create channel"));
         assert!(!kinds(&frame).contains(&"host.id"));
         let frame = tick_native(vec![answer(request(&frame, "rpc.view").id,

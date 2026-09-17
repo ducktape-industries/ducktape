@@ -757,6 +757,7 @@ pub async fn register_passkey(
             authpage::passkey_frame(preimage, &signed)?,
         )
         .await
+        .map_err(|failure| failure.to_string())
     }
     .await
     .map_err(app_error)?;
@@ -802,6 +803,7 @@ pub async fn link_wallet(
             authpage::wallet_frame(preimage, &touch)?,
         )
         .await
+        .map_err(|failure| failure.to_string())
     }
     .await
     .map_err(app_error)?;
@@ -1123,7 +1125,8 @@ async fn add_passkey_steps(
         "identity",
         authpage::passkey_frame(preimage, &signed)?,
     )
-    .await?;
+    .await
+    .map_err(|failure| failure.to_string())?;
     Ok(())
 }
 

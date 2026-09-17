@@ -178,13 +178,17 @@ impl Network {
                 .filter_map(|event| saga::decode_worker_request(&event.payload).ok()),
         );
     }
-    async fn commit(&mut self, origin: Origin, msg: Msg) -> Result<crate::BlockSummary, String> {
+    async fn commit(
+        &mut self,
+        origin: Origin,
+        msg: Msg,
+    ) -> Result<crate::BlockSummary, crate::Refused> {
         self.height += 1;
         let outcome = self
             .host
             .submit_at(at(self.height, origin), msg)
             .await
-            .map_err(|error| format!("{error:?}"))?;
+            .map_err(|error| crate::Refused::of_submit(&error))?;
         self.events(outcome.events);
         self.trace.extend(outcome.dispatches);
         self.drain().await;
@@ -246,13 +250,17 @@ impl Network {
                     .host
                     .query(&target, &req)
                     .await
-                    .map_err(|error| format!("{error:?}"));
+                    .map_err(|error| crate::Refused::of(&error));
                 let action_read = target == "runs"
                     && sdk::wire::decode::<Value>(&req)
                         .ok()
                         .is_some_and(|query| query.get("action_request").is_some());
                 if action_read || result.is_err() {
-                    writeln!(file, "{}", json!({"query_result":result.as_ref().map(|bytes| sdk::wire::decode::<Value>(bytes).ok())})).unwrap();
+                    let audited = result
+                        .as_ref()
+                        .map(|bytes| sdk::wire::decode::<Value>(bytes).ok())
+                        .map_err(|refused| refused.message.clone());
+                    writeln!(file, "{}", json!({"query_result":audited})).unwrap();
                 }
                 let _ = reply.send(result);
             }
@@ -266,14 +274,19 @@ impl Network {
                     .host
                     .query_as(&target, &req, Origin::External(reader))
                     .await
-                    .map_err(|error| format!("{error:?}"));
+                    .map_err(|error| crate::Refused::of(&error));
                 let _ = reply.send(result);
             }
             crate::NodeCommand::SubmitFrame { frame, reply } => {
                 let (origin, msg) = node::decode_frame(&frame).unwrap();
                 let result = self.commit(origin, msg).await;
-                if let Err(error) = &result {
-                    writeln!(file, "{}", json!({"error":error})).unwrap();
+                if let Err(refused) = &result {
+                    writeln!(
+                        file,
+                        "{}",
+                        json!({"error":refused.message, "reason":refused.reason})
+                    )
+                    .unwrap();
                 }
                 let _ = reply.send(result);
             }

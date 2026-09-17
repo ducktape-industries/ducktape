@@ -578,7 +578,7 @@ pub fn visibility() -> ducktape_view_guest::Subscription<bool> {
 pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("chat.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice::<serde_json::Value>(&bytes)
                     .map_err(|error| error.to_string())
             });
@@ -972,7 +972,9 @@ pub(crate) fn dm_channel_id(a: &str, b: &str) -> String {
 }
 
 pub async fn mint_channel() -> Result<String, String> {
-    let bytes = host::request("host.id", b"channel").await?;
+    let bytes = host::request("host.id", b"channel")
+        .await
+        .map_err(host::said)?;
     let id = String::from_utf8(bytes).map_err(|error| error.to_string())?;
     if id.is_empty() {
         return Err("the host returned no channel ID".into());
@@ -1068,7 +1070,9 @@ pub(crate) async fn ask(
     kind: &str,
     query: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let bytes = host::request(kind, &serde_json::to_vec(query).expect("encodes")).await?;
+    let bytes = host::request(kind, &serde_json::to_vec(query).expect("encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
@@ -1290,33 +1294,33 @@ pub fn live_output(
     })
 }
 
-/// Whether a refusal says WHO may read rather than that something broke.
+/// The tokens that say WHO may read rather than that something broke: the
+/// host has no seated key to sign the subscribe with, the node answered the
+/// upgrade `401`/`403`, or the socket opened and the node's own `error` frame
+/// says this caller may not hold the topic.
 ///
-/// Three shapes reach this view, all of them from the kernel's own words: no
-/// seated key to sign with, and the node's `401`/`403` for a key it does not
-/// admit as this run's reader. None is a failure the reader can act on — the
-/// card keeps its agent, room and anchor and shows public committed progress
-/// instead, which is the whole difference between "I may not look" and
-/// "something is wrong".
-fn entitlement_refusal(detail: &str) -> bool {
-    detail.contains("needs the session key unlocked")
-        || detail.contains("401")
-        || detail.contains("403")
-        || detail.contains("Unauthorized")
-        || detail.contains("Forbidden")
+/// None is a failure the reader can act on — the card keeps its agent, room
+/// and anchor and shows public committed progress instead, which is the whole
+/// difference between "I may not look" and "something is wrong".
+const UNREADABLE: [&str; 3] = ["session_locked", "unauthorized", "forbidden"];
+
+/// Whether a refusal says WHO may read. Keyed on the token, never on the
+/// sentence: the words are the refusing side's to reword.
+fn entitlement_refusal(reason: &str) -> bool {
+    UNREADABLE.contains(&reason)
 }
 
 /// One frame of a run's output stream, folded into the reading. A frame this
 /// view cannot read — another topic, or a shape with no line in it — leaves
 /// the reading as it was.
-fn fold_run_output(item: &mut LiveOutputItem, topic: &str, frame: Result<Vec<u8>, String>) {
+fn fold_run_output(item: &mut LiveOutputItem, topic: &str, frame: host::Answer) {
     let bytes = match frame {
         Ok(bytes) => bytes,
-        Err(error) => {
-            item.unavailable = entitlement_refusal(&error);
+        Err(refusal) => {
+            item.unavailable = entitlement_refusal(&refusal.reason);
             item.error = match item.unavailable {
                 true => String::new(),
-                false => error,
+                false => refusal.sentence,
             };
             return;
         }
@@ -1325,10 +1329,13 @@ fn fold_run_output(item: &mut LiveOutputItem, topic: &str, frame: Result<Vec<u8>
         return;
     };
     if value["type"] == "error" {
+        // An admitted socket's own refusal frame, which names its `code` —
+        // the node's token for the same question, so nothing here reads the
+        // sentence to decide.
         let detail = value["detail"]
             .as_str()
             .unwrap_or("The node refused this run output subscription.");
-        item.unavailable = entitlement_refusal(detail);
+        item.unavailable = entitlement_refusal(value["code"].as_str().unwrap_or_default());
         item.error = match item.unavailable {
             true => String::new(),
             false => detail.to_owned(),
@@ -2358,7 +2365,7 @@ impl Stream for ActStream {
             };
             acts.pending.remove(index);
             Poll::Ready(Some(ActItem {
-                error: answer.err().unwrap_or_default(),
+                error: answer.err().map(host::said).unwrap_or_default(),
             }))
         })
     }
@@ -2491,7 +2498,7 @@ pub async fn cancel_run(run_id: String) -> ActItem {
     let response =
         host::request("op.submit", &serde_json::to_vec(&request).expect("encodes")).await;
     ActItem {
-        error: response.err().unwrap_or_default(),
+        error: response.err().map(host::said).unwrap_or_default(),
     }
 }
 
@@ -2934,6 +2941,33 @@ pub fn message_target_key(messages: &[ChatMessage], target: i64, changed: bool) 
 mod tests {
     use super::*;
     use crate::CopySurface;
+
+    /// "I MAY NOT LOOK" AND "SOMETHING IS WRONG" ARE DIFFERENT CARDS, and the
+    /// token is what tells them apart. A refusal that names who may read leaves
+    /// the card on committed progress with no error text; anything else is the
+    /// error, in the refusing side's own words. Nothing here reads a sentence,
+    /// which is the property that used to be a list of substrings.
+    #[test]
+    fn who_may_read_is_decided_by_the_token_and_never_by_the_sentence() {
+        let folded = |refusal: host::Refusal| {
+            let mut item = LiveOutputItem::default();
+            fold_run_output(&mut item, "run-output:r1", Err(refusal));
+            item
+        };
+        for reason in UNREADABLE {
+            let item = folded(host::Refusal::new(reason, "words a view must not read"));
+            assert!(item.unavailable, "{reason} is an entitlement");
+            assert!(item.error.is_empty(), "{reason} drew an error: {:?}", item.error);
+        }
+        // the same prose the old substring list keyed on, under a token that
+        // says the stream broke: now an error, as it should always have been.
+        let broke = folded(host::Refusal::new(
+            "stream_open_failed",
+            "401 Unauthorized was in this sentence",
+        ));
+        assert!(!broke.unavailable);
+        assert_eq!(broke.error, "401 Unauthorized was in this sentence");
+    }
 
     /// A MENU OPENS AT THE POINTER AND FLIPS AWAY FROM THE EDGE IT WOULD
     /// CROSS: the "…" at a row's right end opens its menu to the left, a

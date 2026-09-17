@@ -513,13 +513,19 @@ impl ValidatorRuntime<'_> {
                     // apply several blocks).
                     root_hash: hex(&d.root_hash),
                 }),
-                node::Disposition::Rejected => Err(d.reason.clone().unwrap_or_else(|| {
+                // the two rejections were one string and are now two
+                // tokens, which is the difference between "the module
+                // said no" and "nothing was there to apply".
+                node::Disposition::Rejected => Err(match d.reason.clone() {
                     // the module's VERBATIM reason when the drain
                     // captured one (duckfs-client keys on the
-                    // "files: conflict:" prefix); generic wording
-                    // otherwise.
-                    "op finalized but rejected (deterministic no-op)".into()
-                })),
+                    // "files: conflict:" prefix).
+                    Some(said) => noded::Refused::new("module", said),
+                    None => noded::Refused::new(
+                        "deterministic_no_op",
+                        "op finalized but rejected (deterministic no-op)",
+                    ),
+                }),
                 // unreachable — filtered at the loop top — but
                 // stay total rather than panic.
                 node::Disposition::Discarded => continue,
@@ -545,9 +551,10 @@ impl ValidatorRuntime<'_> {
                     continue;
                 };
                 for reply in replies {
-                    let _ = reply.send(Err(
-                        "timed out awaiting finalization — re-query on the next block".into(),
-                    ));
+                    let _ = reply.send(Err(noded::Refused::new(
+                        "finalization_timeout",
+                        "timed out awaiting finalization — re-query on the next block",
+                    )));
                 }
             }
         }

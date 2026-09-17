@@ -318,7 +318,7 @@ async fn serve(host: &mut Host, height: u64, cmd: NodeCommand) -> Option<runs::R
             let _ = reply.send(
                 outcome
                     .map(|_| committed_block())
-                    .map_err(|e| format!("{e:?}")),
+                    .map_err(|error| crate::Refused::of_submit(&error)),
             );
             Some(op)
         }

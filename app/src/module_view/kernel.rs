@@ -106,6 +106,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use super::{Guest, ModuleViewEvent, Slot, wire};
+// A refusal the NODE authored, carried through with the token the node gave
+// it: the rpc client split the envelope off, so no door here parses text.
+use crate::backend::refused;
 
 /// The most blocks one `rpc.blocks` may ask for.
 const MAX_BLOCKS: usize = 1_000;
@@ -135,11 +138,59 @@ const MAX_REPLY_BYTES: usize = 32 << 20;
 const MAX_STREAM_BACKLOG_EVENTS: usize = MAX_REPLY_EVENTS / 2;
 const MAX_STREAM_BACKLOG_BYTES: usize = MAX_REPLY_BYTES / 2;
 
+/// One answer to a guest: the bytes it asked for, or the refusal that names
+/// why not. Every door in this file hands back exactly this.
+pub(super) type Answer = Result<Vec<u8>, wire::Refusal>;
+
+/// The host could not do its own half — encode an answer it already holds,
+/// reach a socket, decode a reply. Its own token, so a view never reports one
+/// of these as something the node decided.
+fn host_fault(error: impl std::fmt::Display) -> wire::Refusal {
+    wire::Refusal::new("host_fault", error.to_string())
+}
+
+/// The guest's own request is wrong: a shape, a name, a bound. Retrying it
+/// unchanged cannot help, which is what separates this from the two above.
+fn malformed(error: impl std::fmt::Display) -> wire::Refusal {
+    wire::Refusal::new("malformed_request", error.to_string())
+}
+
+/// A websocket upgrade the node refused, classified by what it answered.
+///
+/// A `401`/`403` is NOT a broken socket: it is the node saying who may read,
+/// and a view draws that differently — the card keeps its subject and shows
+/// what is public instead of an error. The HTTP status is the classification
+/// here because the upgrade is refused before any frame exists, and every gate
+/// that can refuse it (an unsigned request, a key the run does not admit)
+/// answers with one of those two; the node's finer token stays in the sentence,
+/// for the person reading it.
+fn upgrade_failed(error: tokio_tungstenite::tungstenite::Error) -> wire::Refusal {
+    use tokio_tungstenite::tungstenite::Error;
+    let Error::Http(response) = &error else {
+        return wire::Refusal::new(
+            "stream_open_failed",
+            format!("could not open the node stream: {error}"),
+        );
+    };
+    let body = response.body().clone().unwrap_or_default();
+    let node = refused(ducktape_rpc::refusal(response.status(), &body));
+    let who_may_read = matches!(
+        response.status(),
+        ducktape_rpc::StatusCode::UNAUTHORIZED | ducktape_rpc::StatusCode::FORBIDDEN
+    );
+    match who_may_read {
+        true => wire::Refusal::new("unauthorized", node.sentence),
+        false => node,
+    }
+}
+/// A door that answers off the kernel runtime.
+type Answered = std::pin::Pin<Box<dyn std::future::Future<Output = Answer> + Send>>;
+
 /// What one answer holds against the reply budget.
-fn result_bytes(result: &Result<Vec<u8>, String>) -> usize {
+fn result_bytes(result: &Answer) -> usize {
     match result {
         Ok(bytes) => bytes.len(),
-        Err(error) => error.len(),
+        Err(refusal) => refusal.reason.len() + refusal.sentence.len(),
     }
 }
 
@@ -221,7 +272,7 @@ impl Replies {
         &self,
         drained: &mut tokio::sync::watch::Receiver<()>,
         id: u64,
-        result: Result<Vec<u8>, String>,
+        result: Answer,
     ) -> bool {
         while self.backlogged() {
             if drained.changed().await.is_err() {
@@ -278,7 +329,7 @@ impl Replies {
     /// One item for a request the kernel is running; `done` ends it for the
     /// guest. The in-flight count is [`Replies::settled`]'s to give back —
     /// a subscription's last item and its count are not the same moment.
-    fn item(&self, id: u64, result: Result<Vec<u8>, String>, done: bool) {
+    fn item(&self, id: u64, result: Answer, done: bool) {
         let mut events = self.events.lock().expect("kernel replies");
         if self.fault().is_some() { return; }
         let queued = queued_bytes(&events);
@@ -305,12 +356,12 @@ impl Replies {
 
     /// A reply writer can outlive its guest; tests deliver to that exact queue.
     #[cfg(test)]
-    pub(super) fn inject_item(&self, id: u64, result: Result<Vec<u8>, String>) {
+    pub(super) fn inject_item(&self, id: u64, result: Answer) {
         self.item(id, result, true);
     }
 
     #[cfg(test)]
-    fn deliver(&self, id: u64, result: Result<Vec<u8>, String>) {
+    fn deliver(&self, id: u64, result: Answer) {
         self.item(id, result, true);
         self.settled();
     }
@@ -431,7 +482,11 @@ pub(super) fn answer(
     match (capability, operation) {
         ("host", "visible") => {
             if !payload.is_empty() {
-                guest.refuse(id, "visibility subscription takes no payload".into());
+                guest.refuse(
+                    id,
+                    "malformed_request",
+                    "visibility subscription takes no payload",
+                );
                 return true;
             }
             guest.visibility_subscriptions.push(id);
@@ -458,10 +513,10 @@ pub(super) fn answer(
             let plane = std::str::from_utf8(payload).unwrap_or_default().trim();
             let named = plane == BLOCK_PLANE || workspace_config::validate_module_id(plane).is_ok();
             let capacity = guest.live_subscriptions.len() < MAX_SUBSCRIPTIONS;
-            if !capacity { guest.refuse(id, "too many live subscriptions".into()); return true; }
+            if !capacity { guest.refuse(id, "subscription_limit", "too many live subscriptions"); return true; }
             match named {
                 true => guest.live_subscriptions.push((id, plane.to_owned())),
-                false => guest.refuse(id, "`rpc.live` names no plane".into()),
+                false => guest.refuse(id, "malformed_request", "`rpc.live` names no plane"),
             }
         }
         ("asset", "read") => asset_read(guest, id, payload),
@@ -488,7 +543,7 @@ pub(super) fn answer(
                     });
                     guest.reply(id, Ok(Vec::new()));
                 }
-                None => guest.refuse(id, "`host.open_link` names no link".into()),
+                None => guest.refuse(id, "malformed_request", "`host.open_link` names no link"),
             }
         }
         ("host", "badge") => {
@@ -503,7 +558,7 @@ pub(super) fn answer(
                     });
                     guest.reply(id, Ok(Vec::new()));
                 }
-                None => guest.refuse(id, "`host.badge` carries no count".into()),
+                None => guest.refuse(id, "malformed_request", "`host.badge` carries no count"),
             }
         }
         // A CHORD IS CLAIMED, NOT WIRED. The app has no table of which key
@@ -514,11 +569,15 @@ pub(super) fn answer(
         ("host", "chord") => {
             let chord = std::str::from_utf8(payload).unwrap_or_default().trim();
             if !is_chord(chord) {
-                guest.refuse(id, format!("`{chord}` is not a claimable chord"));
+                guest.refuse(
+                    id,
+                    "malformed_request",
+                    format!("`{chord}` is not a claimable chord"),
+                );
                 return true;
             }
             if guest.chords.len() >= MAX_SUBSCRIPTIONS {
-                guest.refuse(id, "too many chord claims".into());
+                guest.refuse(id, "subscription_limit", "too many chord claims");
                 return true;
             }
             match super::claim_chord(chord, guest.module) {
@@ -531,21 +590,21 @@ pub(super) fn answer(
                         holder = %holder,
                         "chord already claimed"
                     );
-                    guest.refuse(id, format!("`{chord}` is already {holder}'s"));
+                    guest.refuse(id, "chord_taken", format!("`{chord}` is already {holder}'s"));
                 }
             }
         }
         ("clock", "ticks") => {
             let period = tick_period(payload);
             let capacity = guest.clocks.len() < MAX_SUBSCRIPTIONS;
-            if !capacity { guest.refuse(id, "too many clock subscriptions".into()); return true; }
+            if !capacity { guest.refuse(id, "subscription_limit", "too many clock subscriptions"); return true; }
             match period {
                 Some(period) => guest.clocks.push(Clock {
                     id,
                     period,
                     due: std::time::Instant::now() + period,
                 }),
-                None => guest.refuse(id, "`clock.ticks` names no period".into()),
+                None => guest.refuse(id, "malformed_request", "`clock.ticks` names no period"),
             }
         }
         ("host", "id") => {
@@ -558,7 +617,7 @@ pub(super) fn answer(
                     id,
                     Ok(crate::backend::fresh_id(prefix).into_bytes()),
                 ),
-                false => guest.refuse(id, "`host.id` names no prefix".into()),
+                false => guest.refuse(id, "malformed_request", "`host.id` names no prefix"),
             }
         }
         _ => return false,
@@ -569,24 +628,29 @@ pub(super) fn answer(
 type Call = fn(
     ducktape_rpc::Client,
     serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>;
+) -> Answered;
 
 /// Runs one node call for a request: decoded here, answered on the kernel
 /// runtime, delivered at the guest's next redraw.
 fn asset_read(guest: &mut Guest, id: u64, payload: &[u8]) {
     const MAX_ASSET_READ_BYTES: usize = 1 << 20;
-    let result = std::str::from_utf8(payload)
-        .map_err(|_| "asset path is not UTF-8".to_owned())
-        .and_then(|path| {
-            module_artifact::validate_asset_path(path)?;
-            let bytes = super::artifact_asset(&guest.assets, path)
-                .ok_or_else(|| "asset is absent from this deployment".to_owned())?;
-            let oversized = bytes.len() > MAX_ASSET_READ_BYTES;
-            if oversized {
-                return Err("asset exceeds read byte limit".into());
-            }
-            Ok(bytes.to_vec())
-        });
+    let result = (|| {
+        let path = std::str::from_utf8(payload)
+            .map_err(|_| wire::Refusal::new("malformed_request", "asset path is not UTF-8"))?;
+        module_artifact::validate_asset_path(path)
+            .map_err(|error| wire::Refusal::new("invalid_path", error))?;
+        let bytes = super::artifact_asset(&guest.assets, path).ok_or_else(|| {
+            wire::Refusal::new("not_found", "asset is absent from this deployment")
+        })?;
+        let oversized = bytes.len() > MAX_ASSET_READ_BYTES;
+        if oversized {
+            return Err(wire::Refusal::new(
+                "too_large",
+                "asset exceeds read byte limit",
+            ));
+        }
+        Ok(bytes.to_vec())
+    })();
     guest.reply(id, result);
 }
 
@@ -594,20 +658,16 @@ fn spawn(guest: &mut Guest, id: u64, payload: &[u8], call: Call) {
     let ask: serde_json::Value = match serde_json::from_slice(payload) {
         Ok(ask) => ask,
         Err(error) => {
-            guest.refuse(id, format!("request is not JSON: {error}"));
+            guest.refuse(id, "malformed_request", format!("request is not JSON: {error}"));
             return;
         }
     };
-    let client = match node_client(guest) {
-        Ok(client) => client,
-        Err(error) => {
-            guest.refuse(id, error);
-            return;
-        }
+    let Some(client) = connected(guest, id) else {
+        return;
     };
     let replies = guest.replies.clone();
     let Some(counted) = replies.admit() else {
-        guest.refuse(id, "too many in-flight view requests".into());
+        guest.refuse(id, "in_flight_limit", "too many in-flight view requests");
         return;
     };
     let task = runtime().spawn(async move {
@@ -649,19 +709,27 @@ fn session_answer(guest: &mut Guest, operation: &str, id: u64, payload: &[u8]) {
                 .tasks
                 .retain(|(_, pending)| !pending.task.is_finished());
             if guest.user_activation.take().is_none() {
-                guest.refuse(id, "session.start requires a native button action".into());
+                guest.refuse(
+                    id,
+                    "needs_activation",
+                    "session.start requires a native button action",
+                );
                 return;
             }
             let ask: Start = match serde_json::from_slice(payload) {
                 Ok(ask) => ask,
                 Err(error) => {
-                    guest.refuse(id, error.to_string());
+                    guest.refuse(id, "malformed_request", error.to_string());
                     return;
                 }
             };
             let full = guest.sessions.len() >= 4;
             if full {
-                guest.refuse(id, "at most four companion sessions may run".into());
+                guest.refuse(
+                    id,
+                    "session_limit",
+                    "at most four companion sessions may run",
+                );
                 return;
             }
             let session = match super::background::start_at(
@@ -670,8 +738,8 @@ fn session_answer(guest: &mut Guest, operation: &str, id: u64, payload: &[u8]) {
                 guest.connection_rev,
             ) {
                 Ok(session) => session,
-                Err(error) => {
-                    guest.refuse(id, error);
+                Err(refusal) => {
+                    guest.reply(id, Err(refusal));
                     return;
                 }
             };
@@ -697,26 +765,28 @@ fn session_answer(guest: &mut Guest, operation: &str, id: u64, payload: &[u8]) {
             ));
         }
         "send" => {
-            let result = serde_json::from_slice::<Send>(payload)
-                .map_err(|error| error.to_string())
-                .and_then(|ask| {
-                    let session = guest
-                        .sessions
-                        .get(&ask.session)
-                        .ok_or("unknown session resource")?;
-                    let props =
-                        serde_json::to_vec(&ask.props).map_err(|error| error.to_string())?;
-                    if props.len() > 16 * 1024 {
-                        return Err("session properties exceed 16 KiB".into());
-                    }
-                    session
-                        .send(props)
-                        .map_err(|_| "session closed".to_owned())?;
-                    Ok(Vec::new())
-                });
+            let result = (|| {
+                let ask: Send = serde_json::from_slice(payload)
+                    .map_err(|error| wire::Refusal::new("malformed_request", error.to_string()))?;
+                let session = guest.sessions.get(&ask.session).ok_or_else(|| {
+                    wire::Refusal::new("unknown_session", "unknown session resource")
+                })?;
+                let props = serde_json::to_vec(&ask.props)
+                    .map_err(|error| wire::Refusal::new("malformed_request", error.to_string()))?;
+                if props.len() > 16 * 1024 {
+                    return Err(wire::Refusal::new(
+                        "too_large",
+                        "session properties exceed 16 KiB",
+                    ));
+                }
+                session
+                    .send(props)
+                    .map_err(|_| wire::Refusal::new("session_closed", "session closed"))?;
+                Ok(Vec::new())
+            })();
             guest.reply(id, result);
         }
-        _ => guest.refuse(id, "unknown session operation".into()),
+        _ => guest.refuse(id, "unknown_request", "unknown session operation"),
     }
 }
 
@@ -724,11 +794,11 @@ fn session_answer(guest: &mut Guest, operation: &str, id: u64, payload: &[u8]) {
 pub(super) fn spawn_device(
     guest: &mut Guest,
     id: u64,
-    future: impl std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'static,
+    future: impl std::future::Future<Output = Answer> + Send + 'static,
 ) {
     let replies = guest.replies.clone();
     let Some(counted) = replies.admit() else {
-        guest.refuse(id, "too many in-flight view requests".into());
+        guest.refuse(id, "in_flight_limit", "too many in-flight view requests");
         return;
     };
     let task = runtime().spawn(async move {
@@ -749,7 +819,7 @@ pub(super) fn spawn_device(
 
 type HostCall = fn(
     serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>;
+) -> Answered;
 
 /// [`spawn`] for a door the NODE is not part of — the app's own picture
 /// store. It takes no client, so it answers whether or not the app has a
@@ -759,13 +829,13 @@ fn spawn_host(guest: &mut Guest, id: u64, payload: &[u8], call: HostCall) {
     let ask: serde_json::Value = match serde_json::from_slice(payload) {
         Ok(ask) => ask,
         Err(error) => {
-            guest.refuse(id, format!("request is not JSON: {error}"));
+            guest.refuse(id, "malformed_request", format!("request is not JSON: {error}"));
             return;
         }
     };
     let replies = guest.replies.clone();
     let Some(counted) = replies.admit() else {
-        guest.refuse(id, "too many in-flight view requests".into());
+        guest.refuse(id, "in_flight_limit", "too many in-flight view requests");
         return;
     };
     let task = runtime().spawn(async move {
@@ -785,40 +855,50 @@ fn spawn_host(guest: &mut Guest, id: u64, payload: &[u8], call: HostCall) {
     ));
 }
 
-fn node_client(guest: &Guest) -> Result<ducktape_rpc::Client, String> {
+fn node_client(guest: &Guest) -> Result<ducktape_rpc::Client, wire::Refusal> {
     client_for_revision(guest.connection_rev)
 }
 
-fn client_for_revision(revision: u64) -> Result<ducktape_rpc::Client, String> {
+/// The connected client, or `None` with the refusal already answered — the
+/// guard every door that needs the node opens with.
+fn connected(guest: &mut Guest, id: u64) -> Option<ducktape_rpc::Client> {
+    match node_client(guest) {
+        Ok(client) => Some(client),
+        Err(refusal) => {
+            guest.reply(id, Err(refusal));
+            None
+        }
+    }
+}
+
+fn client_for_revision(revision: u64) -> Result<ducktape_rpc::Client, wire::Refusal> {
     let connection = super::connection().lock().expect("views rpc");
     let same_network = connection.rev == revision;
     if !same_network {
-        return Err("view belongs to a previous network connection".into());
+        return Err(wire::Refusal::new(
+            "stale_connection",
+            "view belongs to a previous network connection",
+        ));
     }
-    connection
-        .client
-        .clone()
-        .ok_or_else(|| "not connected to a node".into())
+    connection.client.clone().ok_or_else(|| {
+        wire::Refusal::new("not_connected", "not connected to a node")
+    })
 }
 
 type RawCall = fn(
     ducktape_rpc::Client,
     Vec<u8>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>;
+) -> Answered;
 
 /// [`spawn`] for a request whose payload is the bytes themselves.
 fn spawn_raw(guest: &mut Guest, id: u64, payload: &[u8], call: RawCall) {
-    let client = match node_client(guest) {
-        Ok(client) => client,
-        Err(error) => {
-            guest.refuse(id, error);
-            return;
-        }
+    let Some(client) = connected(guest, id) else {
+        return;
     };
     let bytes = payload.to_vec();
     let replies = guest.replies.clone();
     let Some(counted) = replies.admit() else {
-        guest.refuse(id, "too many in-flight view requests".into());
+        guest.refuse(id, "in_flight_limit", "too many in-flight view requests");
         return;
     };
     let task = runtime().spawn(async move {
@@ -960,14 +1040,20 @@ struct StreamSend {
     frame: OutboundFrame,
 }
 
-fn outbound(payload: &[u8]) -> Result<(u64, tokio_tungstenite::tungstenite::Message), String> {
+fn outbound(
+    payload: &[u8],
+) -> Result<(u64, tokio_tungstenite::tungstenite::Message), wire::Refusal> {
     use tokio_tungstenite::tungstenite::Message;
     // A JSON string can encode one byte as six bytes (\u0000).
     let oversized_request = payload.len() > MAX_STREAM_SEND_BYTES * 6 + 128;
     if oversized_request {
-        return Err("stream send request is too large".into());
+        return Err(wire::Refusal::new(
+            "too_large",
+            "stream send request is too large",
+        ));
     }
-    let ask: StreamSend = serde_json::from_slice(payload).map_err(|error| error.to_string())?;
+    let ask: StreamSend = serde_json::from_slice(payload)
+        .map_err(|error| wire::Refusal::new("malformed_request", error.to_string()))?;
     let frame = match ask.frame {
         OutboundFrame::Text(text) => Message::Text(text),
         OutboundFrame::Binary(bytes) => Message::Binary(bytes),
@@ -975,14 +1061,17 @@ fn outbound(payload: &[u8]) -> Result<(u64, tokio_tungstenite::tungstenite::Mess
     };
     let oversized_frame = frame.len() > MAX_STREAM_SEND_BYTES;
     if oversized_frame {
-        return Err("stream send frame is too large".into());
+        return Err(wire::Refusal::new(
+            "too_large",
+            "stream send frame is too large",
+        ));
     }
     Ok((ask.stream, frame))
 }
 
 fn stream_send(guest: &mut Guest, id: u64, payload: &[u8]) {
-    if let Err(error) = node_client(guest) {
-        guest.refuse(id, error);
+    if let Err(refusal) = node_client(guest) {
+        guest.reply(id, Err(refusal));
         return;
     }
     let result = outbound(payload).and_then(|(stream, frame)| {
@@ -990,15 +1079,23 @@ fn stream_send(guest: &mut Guest, id: u64, payload: &[u8]) {
             .tasks
             .iter()
             .find(|(owned, _)| *owned == stream)
-            .ok_or("stream is not open in this view instance")?;
+            .ok_or_else(|| {
+                wire::Refusal::new("unknown_stream", "stream is not open in this view instance")
+            })?;
         socket
             .outgoing
             .as_ref()
-            .ok_or("request is not a bidirectional stream")?
+            .ok_or_else(|| {
+                wire::Refusal::new("not_bidirectional", "request is not a bidirectional stream")
+            })?
             .try_send(frame)
             .map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => "stream send queue is full",
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => "stream is closed",
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    wire::Refusal::new("stream_queue_full", "stream send queue is full")
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    wire::Refusal::new("stream_closed", "stream is closed")
+                }
             })?;
         Ok(Vec::new())
     });
@@ -1028,8 +1125,15 @@ async fn exchange<S>(
             let closing = frame.is_close();
             tokio::time::timeout(std::time::Duration::from_secs(30), writer.send(frame))
                 .await
-                .map_err(|_| "application stream send timed out".to_owned())?
-                .map_err(|error| format!("node stream send failed: {error}"))?;
+                .map_err(|_| {
+                    wire::Refusal::new("stream_send_timeout", "application stream send timed out")
+                })?
+                .map_err(|error| {
+                    wire::Refusal::new(
+                        "stream_send_failed",
+                        format!("node stream send failed: {error}"),
+                    )
+                })?;
             if closing {
                 return Ok(Vec::new());
             }
@@ -1089,34 +1193,30 @@ fn stream_open(guest: &mut Guest, id: u64, payload: &[u8]) {
     let ask: serde_json::Value = match serde_json::from_slice(payload) {
         Ok(ask) => ask,
         Err(error) => {
-            guest.refuse(id, format!("request is not JSON: {error}"));
+            guest.refuse(id, "malformed_request", format!("request is not JSON: {error}"));
             return;
         }
     };
     let (topic, query) = match stream_ask(&ask) {
         Ok(named) => named,
-        Err(refusal) => {
-            guest.refuse(id, refusal);
+        Err(sentence) => {
+            guest.refuse(id, "malformed_request", sentence);
             return;
         }
     };
-    let client = match node_client(guest) {
-        Ok(client) => client,
-        Err(error) => {
-            guest.refuse(id, error);
-            return;
-        }
+    let Some(client) = connected(guest, id) else {
+        return;
     };
     let replies = guest.replies.clone();
     let Some(counted) = replies.admit() else {
-        guest.refuse(id, "too many in-flight view requests".into());
+        guest.refuse(id, "in_flight_limit", "too many in-flight view requests");
         return;
     };
     let handle = runtime().spawn(async move {
         let _counted = counted;
         match open_topic(client.origin(), &topic, &query).await {
             Ok(socket) => forward(&replies, id, socket, StreamEncoding::Bytes).await,
-            Err(error) => replies.item(id, Err(error), true),
+            Err(refusal) => replies.item(id, Err(refusal), true),
         }
     });
     guest.tasks.push((
@@ -1135,26 +1235,26 @@ fn application_stream(guest: &mut Guest, id: u64, payload: &[u8]) {
         .and_then(application_request)
     {
         Ok(request) => request,
-        Err(error) => {
-            guest.refuse(id, error);
+        Err(sentence) => {
+            guest.refuse(id, "malformed_request", sentence);
             return;
         }
     };
     let bodyless_get = request.method == gateway::RouteMethod::Get && request.body.is_empty();
     if !bodyless_get {
-        guest.refuse(id, "application stream requires a bodyless GET".into());
+        guest.refuse(
+            id,
+            "malformed_request",
+            "application stream requires a bodyless GET",
+        );
         return;
     }
-    let client = match node_client(guest) {
-        Ok(client) => client,
-        Err(error) => {
-            guest.refuse(id, error);
-            return;
-        }
+    let Some(client) = connected(guest, id) else {
+        return;
     };
     let replies = guest.replies.clone();
     let Some(counted) = replies.admit() else {
-        guest.refuse(id, "too many in-flight view requests".into());
+        guest.refuse(id, "in_flight_limit", "too many in-flight view requests");
         return;
     };
     let (outgoing, receiver) = tokio::sync::mpsc::channel(1);
@@ -1163,19 +1263,19 @@ fn application_stream(guest: &mut Guest, id: u64, payload: &[u8]) {
         let open = async {
             use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
             let head = application_head(&client, &request, true).await?;
-            let encoded = gateway::encode_proxy_request_head(&head)?;
+            let encoded = gateway::encode_proxy_request_head(&head).map_err(host_fault)?;
             let url = crate::backend::agent_ws_url(client.origin());
             let origin = url
                 .strip_suffix("/v1/ws")
-                .ok_or("invalid node websocket origin")?;
+                .ok_or_else(|| host_fault("invalid node websocket origin"))?;
             let mut request = format!("{origin}/v1/gateway/stream")
                 .into_client_request()
-                .map_err(|_| "invalid application stream destination")?;
+                .map_err(|_| host_fault("invalid application stream destination"))?;
             request.headers_mut().insert(
                 "x-ducktape-gateway-head",
                 encoded
                     .try_into()
-                    .map_err(|_| "invalid application stream head")?,
+                    .map_err(|_| host_fault("invalid application stream head"))?,
             );
             let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
                 max_message_size: Some(MAX_STREAM_FRAME_BYTES),
@@ -1191,13 +1291,20 @@ fn application_stream(guest: &mut Guest, id: u64, payload: &[u8]) {
             let (socket, _) =
                 tokio_tungstenite::connect_async_with_config(request, Some(config), true)
                     .await
-                    .map_err(|_| "application stream transport failed")?;
-            Ok::<_, String>(socket)
+                    .map_err(upgrade_failed)?;
+            Ok::<_, wire::Refusal>(socket)
         };
         match tokio::time::timeout(std::time::Duration::from_secs(30), open).await {
             Ok(Ok(socket)) => exchange(&replies, id, socket, receiver).await,
-            Ok(Err(error)) => replies.item(id, Err(error), true),
-            Err(_) => replies.item(id, Err("application stream open timed out".into()), true),
+            Ok(Err(refusal)) => replies.item(id, Err(refusal), true),
+            Err(_) => replies.item(
+                id,
+                Err(wire::Refusal::new(
+                    "stream_open_timeout",
+                    "application stream open timed out",
+                )),
+                true,
+            ),
         }
     });
     guest.tasks.push((
@@ -1220,7 +1327,7 @@ async fn open_topic(
     query: &str,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    String,
+    wire::Refusal,
 > {
     use futures::SinkExt as _;
     use tokio_tungstenite::tungstenite::Message;
@@ -1243,17 +1350,19 @@ async fn open_topic(
     if let Some(token) = workspace_token {
         return open_with_token(rpc, topic, &token).await;
     }
-    let node_key = crate::backend::node_public_key(rpc).await?;
+    let node_key = crate::backend::node_public_key(rpc)
+        .await
+        .map_err(host_fault)?;
     let signed =
         crate::backend::seated_request_headers("GET", &format!("/v1/ws{query}"), &node_key, b"")
             .await
-            .ok_or_else(|| "`rpc.stream` needs the session key unlocked".to_owned())?;
+            .ok_or_else(crate::backend::locked_seat)?;
     let mut request = format!("{}{query}", crate::backend::agent_ws_url(rpc))
         .into_client_request()
-        .map_err(|error| format!("could not address the node: {error}"))?;
+        .map_err(|error| host_fault(format!("could not address the node: {error}")))?;
     for (name, value) in signed {
         let value = HeaderValue::from_str(&value)
-            .map_err(|error| format!("the signature is not a header value: {error}"))?;
+            .map_err(|error| host_fault(format!("the signature is not a header value: {error}")))?;
         request
             .headers_mut()
             .insert(HeaderName::from_static(name), value);
@@ -1269,12 +1378,17 @@ async fn open_topic(
     // per event on an app pointed at a node that is not this machine's.
     let (mut socket, _) = tokio_tungstenite::connect_async_with_config(request, Some(config), true)
         .await
-        .map_err(|error| format!("could not open the node stream: {error}"))?;
+        .map_err(upgrade_failed)?;
     let subscribe = serde_json::json!({"op": "subscribe", "topics": [topic]});
     socket
         .send(Message::Text(subscribe.to_string()))
         .await
-        .map_err(|error| format!("could not subscribe to the node stream: {error}"))?;
+        .map_err(|error| {
+            wire::Refusal::new(
+                "stream_open_failed",
+                format!("could not subscribe to the node stream: {error}"),
+            )
+        })?;
     Ok(socket)
 }
 
@@ -1289,7 +1403,7 @@ async fn open_with_token(
     token: &str,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    String,
+    wire::Refusal,
 > {
     use futures::SinkExt as _;
     use tokio_tungstenite::tungstenite::Message;
@@ -1306,12 +1420,17 @@ async fn open_with_token(
         true,
     )
     .await
-    .map_err(|error| format!("could not open the node stream: {error}"))?;
+    .map_err(upgrade_failed)?;
     let subscribe = serde_json::json!({"op": "subscribe", "topics": [topic], "token": token});
     socket
         .send(Message::Text(subscribe.to_string()))
         .await
-        .map_err(|error| format!("could not subscribe to the node stream: {error}"))?;
+        .map_err(|error| {
+            wire::Refusal::new(
+                "stream_open_failed",
+                format!("could not subscribe to the node stream: {error}"),
+            )
+        })?;
     Ok(socket)
 }
 
@@ -1343,15 +1462,23 @@ where
             Ok(Message::Close(_)) => break,
             Ok(_) => continue,
             Err(error) => {
-                replies.item(id, Err(format!("the node stream failed: {error}")), true);
+                replies.item(
+                    id,
+                    Err(wire::Refusal::new(
+                        "stream_failed",
+                        format!("the node stream failed: {error}"),
+                    )),
+                    true,
+                );
                 return;
             }
         };
         if frame.len() > MAX_STREAM_FRAME_BYTES {
             replies.item(
                 id,
-                Err(format!(
-                    "a node stream frame carries more than {MAX_STREAM_FRAME_BYTES} bytes"
+                Err(wire::Refusal::new(
+                    "too_large",
+                    format!("a node stream frame carries more than {MAX_STREAM_FRAME_BYTES} bytes"),
                 )),
                 true,
             );
@@ -1383,7 +1510,7 @@ where
 fn query_as_reader(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
         let target = target_of(&ask)?;
         let signer = crate::backend::seated_data_plane_signer(&client).await?;
@@ -1391,8 +1518,8 @@ fn query_as_reader(
             .with_write_auth(signer)
             .query_as_reader(&target, &ask["query"])
             .await
-            .map_err(|error| error.to_string())?;
-        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+            .map_err(refused)?;
+        serde_json::to_vec(&reply).map_err(host_fault)
     })
 }
 
@@ -1420,37 +1547,47 @@ fn picture_surface(ask: &serde_json::Value) -> Option<&'static str> {
 fn picture_load(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     use crate::backend::{MAX_PICTURE_BYTES, store_picture};
     Box::pin(async move {
-        let surface = picture_surface(&ask).ok_or("`picture.load` names no surface")?;
+        let surface = picture_surface(&ask)
+            .ok_or_else(|| malformed("`picture.load` names no surface"))?;
         let path = ask["path"].as_str().unwrap_or_default().to_owned();
-        let Some(bytes) = crate::backend::files_read_all(&client, &path).await? else {
-            return Err(format!(
-                "picture larger than the {} MiB preview limit",
-                MAX_PICTURE_BYTES >> 20
+        let read = crate::backend::files_read_all(&client, &path)
+            .await
+            .map_err(|error| wire::Refusal::new("read_failed", error))?;
+        let Some(bytes) = read else {
+            return Err(wire::Refusal::new(
+                "too_large",
+                format!(
+                    "picture larger than the {} MiB preview limit",
+                    MAX_PICTURE_BYTES >> 20
+                ),
             ));
         };
         let size = bytes.len();
-        let (width, height) = store_picture(surface, path, bytes)
-            .await
-            .map_err(|reason| format!("{size} binary bytes · did not decode: {reason}"))?;
+        let (width, height) = store_picture(surface, path, bytes).await.map_err(|reason| {
+            wire::Refusal::new(
+                "undecodable",
+                format!("{size} binary bytes · did not decode: {reason}"),
+            )
+        })?;
         serde_json::to_vec(&serde_json::json!({ "width": width, "height": height }))
-            .map_err(|error| error.to_string())
+            .map_err(host_fault)
     })
 }
 
 fn blob_put(
     client: ducktape_rpc::Client,
     bytes: Vec<u8>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
         let signer = crate::backend::seated_data_plane_signer(&client).await?;
         let digest = client
             .with_write_auth(signer)
             .put_blob(bytes)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(refused)?;
         Ok(digest.into_bytes())
     })
 }
@@ -1458,24 +1595,25 @@ fn blob_put(
 fn blob_get(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
-        let digest = crate::backend::hex_decode(ask["digest"].as_str().unwrap_or_default())?;
+        let digest = crate::backend::hex_decode(ask["digest"].as_str().unwrap_or_default())
+            .map_err(malformed)?;
         let digest: [u8; 32] = digest
             .try_into()
-            .map_err(|_| "`blob.get` digest is not 32 bytes".to_owned())?;
+            .map_err(|_| malformed("`blob.get` digest is not 32 bytes"))?;
         let limit = ask["limit"].as_u64().unwrap_or(0) as usize;
         client
             .get_blob(&digest, limit.clamp(1, MAX_BLOB_BYTES))
             .await
-            .map_err(|error| error.to_string())
+            .map_err(refused)
     })
 }
 
-fn target_of(ask: &serde_json::Value) -> Result<String, String> {
+fn target_of(ask: &serde_json::Value) -> Result<String, wire::Refusal> {
     let target = ask["target"].as_str().unwrap_or_default();
     workspace_config::validate_module_id(target)
-        .map_err(|error| format!("request names no module target: {error}"))?;
+        .map_err(|error| malformed(format!("request names no module target: {error}")))?;
     Ok(target.to_owned())
 }
 
@@ -1517,7 +1655,7 @@ async fn application_head(
     client: &ducktape_rpc::Client,
     request: &ApplicationRequest,
     upgrade: bool,
-) -> Result<gateway::ProxyRequestHead, String> {
+) -> Result<gateway::ProxyRequestHead, wire::Refusal> {
     let name = gateway::RouteName {
         label: request.route.clone(),
     };
@@ -1530,14 +1668,19 @@ async fn application_head(
             },
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(refused)?;
     let gateway::GatewayReply::Route(record) = reply else {
-        return Err("gateway returned an unexpected route reply".into());
+        return Err(wire::Refusal::new(
+            "malformed_reply",
+            "gateway returned an unexpected route reply",
+        ));
     };
-    let record = record.ok_or("application route is not published")?;
+    let unpublished =
+        || wire::Refusal::new("route_unpublished", "application route is not published");
+    let record = record.ok_or_else(unpublished)?;
     let active = record.statement.route.is_some();
     if !active {
-        return Err("application route is not published".into());
+        return Err(unpublished());
     }
     let mut head = gateway::ProxyRequestHead {
         operator: false,
@@ -1557,7 +1700,7 @@ async fn application_head(
             &request.body,
         )
         .await
-        .ok_or("application request needs the session key unlocked")?,
+        .ok_or_else(crate::backend::locked_seat)?,
     );
     Ok(head)
 }
@@ -1565,10 +1708,10 @@ async fn application_head(
 fn application_call(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
         use base64::Engine as _;
-        let request = application_request(ask)?;
+        let request = application_request(ask).map_err(malformed)?;
         let head = application_head(&client, &request, false).await?;
         let body = serde_json::json!({"head":head,
             "body_b64":base64::engine::general_purpose::STANDARD.encode(request.body)});
@@ -1577,13 +1720,13 @@ fn application_call(
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|error| error.to_string())?;
+            .map_err(host_fault)?;
         let mut response = http
             .post(format!("{}/v1/gateway/proxy", client.origin()))
             .json(&body)
             .send()
             .await
-            .map_err(|_| "application request transport failed")?;
+            .map_err(|_| host_fault("application request transport failed"))?;
         let status = response.status();
         let mut bytes = Vec::new();
         // The proxy envelope base64-encodes the bounded upstream response.
@@ -1591,16 +1734,24 @@ fn application_call(
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| "application response transport failed")?
+            .map_err(|_| host_fault("application response transport failed"))?
         {
             let exceeds_limit = bytes.len().saturating_add(chunk.len()) > limit;
             if exceeds_limit {
-                return Err("application response exceeds the view limit".into());
+                return Err(wire::Refusal::new(
+                    "too_large",
+                    "application response exceeds the view limit",
+                ));
             }
             bytes.extend_from_slice(&chunk);
         }
         if !status.is_success() {
-            return Err(format!("application route refused request ({status})"));
+            // The application behind the route said no. Its status is the only
+            // token there is — the body belongs to someone else's server.
+            return Err(wire::Refusal::new(
+                "route_refused",
+                format!("application route refused request ({status})"),
+            ));
         }
         Ok(bytes)
     })
@@ -1609,14 +1760,14 @@ fn application_call(
 fn query(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
         let target = target_of(&ask)?;
         let reply: serde_json::Value = client
             .query(&target, &ask["query"])
             .await
-            .map_err(|error| error.to_string())?;
-        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+            .map_err(refused)?;
+        serde_json::to_vec(&reply).map_err(host_fault)
     })
 }
 
@@ -1635,52 +1786,52 @@ fn query(
 fn view(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
         let target = target_of(&ask)?;
         crate::backend::await_seen_fold(&client, &target, &ask["query"]).await;
         let reply: serde_json::Value = client
             .view(&target, &ask["query"])
             .await
-            .map_err(|error| error.to_string())?;
-        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+            .map_err(refused)?;
+        serde_json::to_vec(&reply).map_err(host_fault)
     })
 }
 
 fn status(
     client: ducktape_rpc::Client,
     _ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
         let reply = client
             .status_json()
             .await
-            .map_err(|error| error.to_string())?;
-        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+            .map_err(refused)?;
+        serde_json::to_vec(&reply).map_err(host_fault)
     })
 }
 
 fn peers(
     client: ducktape_rpc::Client,
     _ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
-        let reply = client.peers().await.map_err(|error| error.to_string())?;
-        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+        let reply = client.peers().await.map_err(refused)?;
+        serde_json::to_vec(&reply).map_err(host_fault)
     })
 }
 
 fn blocks(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
         let limit = ask["limit"].as_u64().unwrap_or(0) as usize;
         let blocks = client
             .blocks(limit.clamp(1, MAX_BLOCKS))
             .await
-            .map_err(|error| error.to_string())?;
-        serde_json::to_vec(&blocks).map_err(|error| error.to_string())
+            .map_err(refused)?;
+        serde_json::to_vec(&blocks).map_err(host_fault)
     })
 }
 
@@ -1711,16 +1862,16 @@ fn required_blob_of(ask: &serde_json::Value) -> Result<Option<[u8; 32]>, String>
 fn submit_bytes(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
         let target = target_of(&ask)?;
         let encoded = ask["body_b64"]
             .as_str()
-            .ok_or("body_b64 must be a string")?;
-        let payload = crate::backend::base64_decode(encoded).ok_or("invalid operation base64")?;
-        let height =
-            crate::backend::seated_write(&client, &target, payload, required_blob_of(&ask)?)
-                .await?;
+            .ok_or_else(|| malformed("body_b64 must be a string"))?;
+        let payload = crate::backend::base64_decode(encoded)
+            .ok_or_else(|| malformed("invalid operation base64"))?;
+        let required = required_blob_of(&ask).map_err(malformed)?;
+        let height = crate::backend::seated_write(&client, &target, payload, required).await?;
         Ok(height.to_string().into_bytes())
     })
 }
@@ -1728,13 +1879,12 @@ fn submit_bytes(
 fn submit(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
         let target = target_of(&ask)?;
-        let payload = serde_json::to_vec(&ask["payload"]).map_err(|error| error.to_string())?;
-        let height =
-            crate::backend::seated_write(&client, &target, payload, required_blob_of(&ask)?)
-                .await?;
+        let payload = serde_json::to_vec(&ask["payload"]).map_err(malformed)?;
+        let required = required_blob_of(&ask).map_err(malformed)?;
+        let height = crate::backend::seated_write(&client, &target, payload, required).await?;
         Ok(height.to_string().into_bytes())
     })
 }
@@ -1772,13 +1922,15 @@ fn admin_ask(ask: &serde_json::Value) -> Result<(String, Vec<u8>), String> {
 fn admin(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
-        let (route, body) = admin_ask(&ask)?;
-        let node_key = crate::backend::node_public_key(client.origin()).await?;
+        let (route, body) = admin_ask(&ask).map_err(malformed)?;
+        let node_key = crate::backend::node_public_key(client.origin())
+            .await
+            .map_err(host_fault)?;
         let signed = crate::backend::seated_request_headers("POST", &route, &node_key, &body)
             .await
-            .ok_or_else(|| "`rpc.admin` needs the session key unlocked".to_owned())?;
+            .ok_or_else(crate::backend::locked_seat)?;
         let content_type = match &ask["payload"] {
             serde_json::Value::String(_) => "text/plain; charset=utf-8",
             _ => "application/json",
@@ -1793,24 +1945,28 @@ fn admin(
         let response = request
             .send()
             .await
-            .map_err(|error| format!("could not reach the node: {error}"))?;
+            .map_err(|error| host_fault(format!("could not reach the node: {error}")))?;
         let code = response.status();
         let text = response.text().await.unwrap_or_default();
         match code.is_success() {
             true => Ok(text.into_bytes()),
-            false => Err(format!("{route} rejected ({code}): {text}")),
+            // The node's operator gate decided, and its refusal body carries
+            // its own token — read with the rpc client's reader, so this lane
+            // hands a view exactly what the query lane does.
+            false => Err(refused(ducktape_rpc::refusal(code, text.as_bytes()))),
         }
     })
 }
 
 fn picture_put(
     ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
-        let surface = picture_surface(&ask).ok_or("`picture.put` names no surface")?;
+        let surface =
+            picture_surface(&ask).ok_or_else(|| malformed("`picture.put` names no surface"))?;
         let path = ask["path"].as_str().unwrap_or_default().to_owned();
         if path.is_empty() {
-            return Err("`picture.put` names no path".into());
+            return Err(malformed("`picture.put` names no path"));
         }
         // Each page is padded base64 in its own right, so the runs are
         // decoded separately and the BYTES joined — concatenating the text
@@ -1818,26 +1974,28 @@ fn picture_put(
         let mut bytes = Vec::new();
         for page in ask["pages"].as_array().cloned().unwrap_or_default() {
             let page = crate::backend::base64_decode(page.as_str().unwrap_or_default())
-                .ok_or_else(|| "`picture.put` page is not valid base64".to_owned())?;
+                .ok_or_else(|| malformed("`picture.put` page is not valid base64"))?;
             bytes.extend_from_slice(&page);
         }
-        let (width, height) = crate::backend::store_picture(surface, path, bytes).await?;
+        let (width, height) = crate::backend::store_picture(surface, path, bytes)
+            .await
+            .map_err(|reason| wire::Refusal::new("undecodable", reason))?;
         let reply = serde_json::json!({ "width": width, "height": height });
-        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+        serde_json::to_vec(&reply).map_err(host_fault)
     })
 }
 
 fn picture_inline(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+) -> Answered {
     Box::pin(async move {
         let doc = ask["doc"].as_str().unwrap_or_default().to_owned();
         let source = ask["source"].as_str().unwrap_or_default().to_owned();
         let base = ask["base"].as_str().unwrap_or_default().to_owned();
         let net = ask["net"].as_str().unwrap_or_default().to_owned();
         if doc.is_empty() {
-            return Err("`picture.inline` names no document".into());
+            return Err(malformed("`picture.inline` names no document"));
         }
         crate::backend::load_inline_pictures(&client, doc, &source, base, net).await;
         Ok(Vec::new())
@@ -2017,7 +2175,7 @@ mod tests {
         replies.wait_idle();
         let mut landed = Vec::new();
         replies.drain_into(&mut landed).expect("reply budget");
-        let items: Vec<(u64, Result<Vec<u8>, String>, bool)> = landed
+        let items: Vec<(u64, Answer, bool)> = landed
             .into_iter()
             .map(|event| match event {
                 wire::Event::Response { id, result, done } => (id, result, done),
@@ -2245,7 +2403,7 @@ mod tests {
             landed,
             vec![wire::Event::Response {
                 id: 11,
-                result: Err("`rpc.admin` names no plain `/v1` route".into()),
+                result: Err(malformed("`rpc.admin` names no plain `/v1` route")),
                 done: true,
             }]
         );

@@ -1754,7 +1754,7 @@ async fn query(
         .map_err(|_| GatewayFailure::Unavailable("node actor is gone".into()))?;
     rx.await
         .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
-        .map_err(GatewayFailure::Unavailable)
+        .map_err(|refused| GatewayFailure::Unavailable(refused.message))
 }
 
 /// Authorize a WebSocket upgrade and resolve its loopback `ws://` target. Same

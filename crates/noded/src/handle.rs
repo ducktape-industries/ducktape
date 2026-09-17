@@ -23,8 +23,92 @@ pub(crate) const COMMAND_BUFFER: usize = 64;
 /// internal block wakeups buffered per lagging websocket subscriber.
 pub(crate) const EVENT_BUFFER: usize = 64;
 
+/// why the actor refused, in the two pieces a caller actually needs: a stable
+/// snake_case token to branch on, and the sentence whoever refused wrote.
+///
+/// they are separate because they are BOUNDED separately — a client that clips
+/// a long message must never clip the token with it — and because a screen that
+/// keys its behaviour off prose keys it off nothing. the token is a literal, so
+/// it is greppable and countable like every other `reason` in this tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refused {
+    pub reason: &'static str,
+    pub message: String,
+}
+
+impl Refused {
+    pub fn new(reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+        }
+    }
+
+    /// the kernel's own refusal, split. ONE match with no `_` arm: a new
+    /// [`sdk::Error`] variant fails this build until it is given a token and a
+    /// sentence, which is why the split lives here rather than in a `Display`
+    /// impl on the enum — `sdk` is the deterministic module ABI, compiled into
+    /// every module guest, and what a screen says is not its business.
+    ///
+    /// the sentence deliberately drops the variant's NAME. `sdk::Error`'s
+    /// `Display` is its `Debug`, so `to_string()` yields `Module(forge: …)` —
+    /// an envelope that then reaches a person, and that every reader
+    /// downstream has to peel back off.
+    pub fn of(error: &sdk::Error) -> Self {
+        let (reason, message) = match error {
+            sdk::Error::UnknownModule(id) => {
+                ("unknown_module", format!("no module is registered as {id}"))
+            }
+            sdk::Error::SelfQuery => (
+                "self_query",
+                "a module reads its own state through itself, not through a query".to_owned(),
+            ),
+            sdk::Error::QueryUnsupported => (
+                "query_unsupported",
+                "this module answers no queries".to_owned(),
+            ),
+            sdk::Error::SyncUnsupported => (
+                "sync_unsupported",
+                "this module serves no state sync".to_owned(),
+            ),
+            sdk::Error::SwapUnsupported => (
+                "swap_unsupported",
+                "this module's code is the node binary itself, so it cannot be swapped".to_owned(),
+            ),
+            sdk::Error::BudgetExceeded => (
+                "budget_exceeded",
+                "the follow-up drain exceeded its dispatch budget".to_owned(),
+            ),
+            // the module's own words, whole: nothing here paraphrases a
+            // refusal it did not write.
+            sdk::Error::Module(said) => ("module", said.clone()),
+        };
+        Self { reason, message }
+    }
+
+    /// a write's refusal. a deterministic rejection is the module's own, whole;
+    /// a boundary fault is THIS NODE's and says so — the two must not read
+    /// alike, because one is the caller's to fix and the other is not.
+    ///
+    /// `SubmitError`'s `Display` writes `op rejected: ` in front of the
+    /// sentence, which is the write lane's version of the same envelope.
+    pub fn of_submit(error: &host::SubmitError) -> Self {
+        match error {
+            host::SubmitError::Rejected(rejected) => Self::of(rejected),
+            host::SubmitError::Fatal(fault) => Self::new("boundary_fault", fault.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 /// a request to the actor that owns the host. replies cross the channel as
-/// wire-ready types so the http layer stays free of sdk conversions.
+/// wire-ready types so the http layer stays free of sdk conversions — the
+/// refusal included, which is what [`Refused`] is for.
 pub enum NodeCommand {
     Submit {
         target: String,
@@ -37,7 +121,7 @@ pub enum NodeCommand {
         /// `/v1/submit` lane only — the caller's CLAIMED string
         /// (see [`crate::SubmitRequest::origin`], an open finding).
         origin: Vec<u8>,
-        reply: oneshot::Sender<Result<BlockSummary, String>>,
+        reply: oneshot::Sender<Result<BlockSummary, Refused>>,
     },
     /// take custody of an ALREADY-SIGNED op frame (`POST /v1/submit/frame`).
     /// carries the RAW frame bytes: the origin rides INSIDE them as the
@@ -48,7 +132,7 @@ pub enum NodeCommand {
     /// every actor verifies again where it must.
     SubmitFrame {
         frame: Vec<u8>,
-        reply: oneshot::Sender<Result<BlockSummary, String>>,
+        reply: oneshot::Sender<Result<BlockSummary, Refused>>,
     },
     /// read committed module state as the NODE ITSELF (`host::Origin::System`)
     /// — the widest reader there is. Right for the node's own reads and for the
@@ -57,7 +141,7 @@ pub enum NodeCommand {
     Query {
         target: String,
         req: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+        reply: oneshot::Sender<Result<Vec<u8>, Refused>>,
     },
     /// read committed module state as an AUTHENTICATED reader
     /// (`POST /v1/query/reader`). `reader` is the ed25519 key a request's
@@ -76,7 +160,7 @@ pub enum NodeCommand {
         /// the VERIFIED signer ([`crate::signed_req::verify_signed_request`]).
         /// Never a caller-supplied identifier.
         reader: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+        reply: oneshot::Sender<Result<Vec<u8>, Refused>>,
     },
 }
 
@@ -617,7 +701,12 @@ pub(crate) async fn account_of_key(
         })
         .await
         .map_err(|_| "actor gone".to_string())?;
-    let bytes = rx.await.map_err(|_| "reply dropped".to_string())??;
+    // a node-internal read: the caller's own reason names this lookup, so the
+    // refusal's token would only be shadowed by it. the sentence still travels.
+    let bytes = rx
+        .await
+        .map_err(|_| "reply dropped".to_string())?
+        .map_err(|refused| refused.message)?;
     let identity::IdentityReply::Account(account) = identity::decode_reply(&bytes)? else {
         return Err("unexpected identity reply".into());
     };

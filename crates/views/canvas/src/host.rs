@@ -20,13 +20,16 @@ pub fn session() -> Subscription<Result<Session, String>> {
     Subscription::run(|| {
         host::subscribe("canvas.props", &[]).map(|answer| {
             answer
+                .map_err(host::said)
                 .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
         })
     })
 }
 async fn query(query: Query) -> Result<Reply, String> {
     let request = serde_json::json!({ "target": "boards", "query": query });
-    let bytes = host::request("rpc.query", &serde_json::to_vec(&request).unwrap()).await?;
+    let bytes = host::request("rpc.query", &serde_json::to_vec(&request).unwrap())
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 pub async fn read(id: &str) -> Result<Reading, String> {
@@ -56,7 +59,7 @@ pub fn watch(id: String, epoch: u64) -> Subscription<(u64, String, Result<Readin
                 async move {
                     let result = match hit {
                         Ok(_) => read(&id).await,
-                        Err(error) => Err(error),
+                        Err(refusal) => Err(host::said(refusal)),
                     };
                     (epoch, id, result)
                 }
@@ -64,11 +67,13 @@ pub fn watch(id: String, epoch: u64) -> Subscription<(u64, String, Result<Readin
     })
 }
 pub async fn mint() -> Result<String, String> {
-    let bytes = host::request("host.id", b"board").await?;
+    let bytes = host::request("host.id", b"board").await.map_err(host::said)?;
     String::from_utf8(bytes).map_err(|error| error.to_string())
 }
 pub async fn submit(operation: Operation) -> Result<(), String> {
     let request = serde_json::json!({ "target": "boards", "payload": operation });
-    host::request("op.submit", &serde_json::to_vec(&request).unwrap()).await?;
+    host::request("op.submit", &serde_json::to_vec(&request).unwrap())
+        .await
+        .map_err(host::said)?;
     Ok(())
 }

@@ -544,26 +544,37 @@ fn a_patch_opens_each_file_with_one_named_row() {
     );
 }
 
-/// A refusal reaches the view wrapped in the transport's own words. What the
-/// screen shows is the MODULE's sentence: no status line, no JSON, and not
-/// the object ids the module names for an operator — a reader cannot act on
-/// an oid, and the envelope is long enough to push the real ending off the
-/// end of the notice.
+/// The MODULE'S WHOLE SENTENCE REACHES THE SCREEN. The host hands a view a
+/// refusal already split — a token to branch on, the refusing module's own
+/// words to show — so there is no transport envelope to peel here and no
+/// clipping that could drop the ending. This is the real refusal a 9 MiB
+/// patch draws, ending included: if anything ever wraps a refusal in a status
+/// line and JSON again, this fails instead of the view quietly re-growing a
+/// parser for it.
 #[test]
-fn a_refusal_is_shown_as_the_module_s_own_sentence() {
-    use forge_view::host::refusal_reason;
-    assert_eq!(
-        refusal_reason(concat!(
-            r#"RPC returned 400 Bad Request: {"error":"Module(forge: pull request #5 diff is "#,
-            r#"too large to serve (target 8b4ba7efd7caa4e4f3d8106ff11579d26df4c0ab, source "#,
-            r#"564ea02b5b094f225ebab8fcf09a1a782d24fffb): diff is too large: 1 changed files "#,
-            r#"/ 8388609 materialized blob bytes)"}"#,
-        )),
-        "forge: pull request #5 diff is too large to serve: diff is too large: \
-         1 changed files / 8388609 materialized blob bytes",
+fn the_whole_sentence_of_a_long_refusal_reaches_the_screen() {
+    let said = concat!(
+        "forge: pull request #7 diff is too large to serve ",
+        "(target 8b4ba7efd7caa4e4f3d8106ff11579d26df4c0ab, ",
+        "source 564ea02b5b094f225ebab8fcf09a1a782d24fffb): ",
+        "diff is too large: 1 changed files / 8388609 materialized blob bytes",
     );
-    // a plain refusal passes through untouched
-    assert_eq!(refusal_reason("the pack is gone"), "the pack is gone");
+    let (mut drive, _) = namespace("duck://forge/core/7");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    drive.answer("get_item", &detail());
+    let diff = drive.take("pr_diff");
+    drive.tick(vec![refuse(diff, said)]);
+    drive.answer("all", &accounts());
+    drive.tick(press(&drive.frame, "forge/item-tab/files"));
+    let shown = texts(&drive.frame);
+    assert!(
+        shown
+            .iter()
+            .any(|text| text == &format!("These changes cannot be shown: {said}")),
+        "{shown:?}"
+    );
 }
 
 /// A CHANGED BINARY IS A ROW, NOT A CONTROL. The patch says only that the

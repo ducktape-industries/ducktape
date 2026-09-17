@@ -2240,7 +2240,7 @@ impl Guest {
         self.sessions.clear();
         self.filesystem = Default::default();
         for id in ids {
-            self.refuse(id, "network connection changed".into());
+            self.refuse(id, "stale_connection", "network connection changed");
         }
         self.connection_rev = revision;
     }
@@ -2880,7 +2880,7 @@ impl Guest {
         {
             match nth < MAX_REQUESTS_PER_TICK {
                 true => self.answer(request, props),
-                false => self.refuse(request.id, "too many requests this tick".into()),
+                false => self.refuse(request.id, "tick_limit", "too many requests this tick"),
             }
         }
         self.user_activation = None;
@@ -2931,7 +2931,7 @@ impl Guest {
             .as_ref()
             .is_some_and(|session| !session.active());
         if finished {
-            self.refuse(id, "session finished".into());
+            self.refuse(id, "session_closed", "session finished");
             return;
         }
         let payload_limit = match kind.as_str() {
@@ -2941,14 +2941,15 @@ impl Guest {
         if payload.len() > payload_limit {
             self.refuse(
                 id,
+                "too_large",
                 format!("`{kind}` carries more than {payload_limit} bytes"),
             );
             return;
         }
         // a test standing in for the node answers its own reads first
         #[cfg(test)]
-        if let Some(bytes) = tests::canned_read(&kind, &payload) {
-            self.reply(id, Ok(bytes));
+        if let Some(answer) = tests::canned_read(&kind, &payload) {
+            self.reply(id, answer);
             return;
         }
         let (capability, operation) = kind.split_once('.').unwrap_or((kind.as_str(), ""));
@@ -2980,12 +2981,14 @@ impl Guest {
                 );
                 self.reply(id, Ok(Vec::new()));
             }
-            _ => self.refuse(id, format!("unknown request `{kind}`")),
+            _ => self.refuse(id, "unknown_request", format!("unknown request `{kind}`")),
         }
     }
 
-    fn refuse(&mut self, id: u64, message: String) {
-        self.reply(id, Err(message));
+    /// The host's own refusal, in the shape a guest gets a node's: a stable
+    /// snake_case token it may branch on, and the sentence it may show.
+    fn refuse(&mut self, id: u64, reason: &'static str, message: impl Into<String>) {
+        self.reply(id, Err(wire::Refusal::new(reason, message)));
     }
 
     /// The key a command acts on, or `None` for the two that act on focus
@@ -3032,7 +3035,7 @@ impl Guest {
     }
 
     fn widget_request(&mut self, id: u64, payload: &[u8]) {
-        let admitted = (|| {
+        let admitted = (|| -> Result<wire::WidgetCommand, String> {
             let mut command: wire::WidgetCommand = wire::decode(payload)?;
             let exact_payload = wire::encoded_size(&command) == payload.len() as u64;
             if !exact_payload {
@@ -3050,7 +3053,7 @@ impl Guest {
         })();
         match admitted {
             Ok(command) => self.widget_commands.push((id, command)),
-            Err(error) => self.refuse(id, error),
+            Err(error) => self.refuse(id, "invalid_widget_command", error),
         }
     }
 
@@ -3062,16 +3065,19 @@ impl Guest {
         mut execute: impl FnMut(wire::WidgetCommand) -> Result<Vec<u8>, String>,
     ) {
         for (id, command) in std::mem::take(&mut self.widget_commands) {
-            let result = if self.target_is_mounted(&command) {
-                execute(command)
-            } else {
-                Err("widget target left the tree".into())
+            let result = match self.target_is_mounted(&command) {
+                true => execute(command)
+                    .map_err(|error| wire::Refusal::new("widget_command_failed", error)),
+                false => Err(wire::Refusal::new(
+                    "widget_unmounted",
+                    "widget target left the tree",
+                )),
             };
             self.reply(id, result);
         }
     }
 
-    fn reply(&mut self, id: u64, result: Result<Vec<u8>, String>) {
+    fn reply(&mut self, id: u64, result: kernel::Answer) {
         self.pending.push(wire::Event::Response {
             id,
             result,
@@ -3897,8 +3903,11 @@ pub(crate) mod tests {
         let mut node = Guest::load_from("node", &second).expect("the view loads");
         assert!(kernel::answer(&mut node, "host", "chord", 7, chord.as_bytes()));
         assert_eq!(
-            refusal(&mut node, 7).as_deref(),
-            Some("`cmd-shift-f8` is already members's")
+            refusal(&mut node, 7),
+            Some(wire::Refusal::new(
+                "chord_taken",
+                "`cmd-shift-f8` is already members's"
+            ))
         );
         assert!(!node.chord_pressed(chord), "a refused claim hears nothing");
 
@@ -4182,7 +4191,8 @@ pub(crate) mod tests {
         ] {
             let refusal = answered(&mut guest, 3, payload)
                 .expect_err("a prefix that is not one word is refused");
-            assert_eq!(refusal, "`host.id` names no prefix", "for {payload:?}");
+            assert_eq!(refusal.reason, "malformed_request", "for {payload:?}");
+            assert_eq!(refusal.sentence, "`host.id` names no prefix", "for {payload:?}");
         }
     }
 
@@ -4224,7 +4234,8 @@ pub(crate) mod tests {
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("the kernel refuses {payload:?}"));
-            assert_eq!(refusal, "`clock.ticks` names no period");
+            assert_eq!(refusal.reason, "malformed_request", "for {payload:?}");
+            assert_eq!(refusal.sentence, "`clock.ticks` names no period");
             assert!(guest.clocks.is_empty(), "for {payload:?}");
         }
 
@@ -4350,7 +4361,10 @@ pub(crate) mod tests {
             "`rpc.view` is the kernel's"
         );
         let refusal = answered(&mut guest, 7).expect_err("there is no node behind the kernel yet");
-        assert_eq!(refusal, "not connected to a node");
+        assert_eq!(
+            refusal,
+            wire::Refusal::new("not_connected", "not connected to a node")
+        );
 
         // A NODE: one request leaves, and the reply the guest gets back is
         // the index tier's own.
@@ -4377,7 +4391,8 @@ pub(crate) mod tests {
             &ask("../secrets")
         ));
         let refusal = answered(&mut guest, 9).expect_err("a target that is not a module id");
-        assert!(refusal.contains("module"), "{refusal}");
+        assert_eq!(refusal.reason, "malformed_request");
+        assert!(refusal.sentence.contains("module"), "{refusal}");
     }
 
     /// A stub node for the kernel's index reads: it answers every
@@ -5451,6 +5466,125 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
+    /// THE WHOLE SENTENCE A MODULE WROTE REACHES A READER'S SCREEN, DRAWN.
+    ///
+    /// This is the refusal a 9 MiB patch draws, verbatim — the one that used
+    /// to arrive wrapped as `RPC returned 400 Bad Request: {"error":"Module(…
+    /// and be clipped at 300 characters, so a view had to peel the envelope
+    /// back off and the ending fell off the end anyway. Nothing peels it now:
+    /// the host hands the guest a token and the module's own words, and the
+    /// words go on the screen as they were written.
+    ///
+    /// The staged Forge guest, the real native renderer, one window. Needs
+    /// `make views`. `DUCKTAPE_CANARY_PIXELS=1` writes the picture too, on
+    /// the one lane that can: gpui's headless renderer is macOS-only, so the
+    /// drawn text is the whole of the evidence everywhere else — same rule as
+    /// the canary captures.
+    #[test]
+    fn the_whole_refusal_sentence_of_an_oversized_diff_is_drawn() {
+        const SAID: &str = concat!(
+            "forge: pull request #7 diff is too large to serve ",
+            "(target 8b4ba7efd7caa4e4f3d8106ff11579d26df4c0ab, ",
+            "source 564ea02b5b094f225ebab8fcf09a1a782d24fffb): ",
+            "diff is too large: 1 changed files / 8388609 materialized blob bytes",
+        );
+        let Some(staged) = staged("forge") else {
+            return;
+        };
+        let _turn = blocking_connection_turn();
+        can_reads([
+            (
+                "list_repos",
+                serde_json::json!({ "repos": [{ "name": "core", "head": "1111222233334444" }] }),
+            ),
+            (
+                "list_refs",
+                serde_json::json!({ "refs": [{ "name": "main", "head": "1111222233334444" }] }),
+            ),
+            (
+                "list_items",
+                serde_json::json!({ "items": [{ "number": 7, "kind": "pr", "state": "open",
+                    "title": "Bound every list", "author": { "account": 1 } }]}),
+            ),
+            (
+                "get_item",
+                serde_json::json!({ "item": { "number": 7, "kind": "pr", "state": "open",
+                    "title": "Bound every list", "author": { "account": 1 },
+                    "body": "why this lands", "channel_id": "forge-core-7",
+                    "source_branch": "work", "target_branch": "main",
+                    "merge_oid": "", "reviews": [] }}),
+            ),
+            (
+                "all",
+                serde_json::json!({ "accounts": [{ "number": 1, "name": "Mallard",
+                    "control": "key", "keys": [{ "pubkey": "aa" }] }]}),
+            ),
+        ]);
+        // the one read the module says no to, in the shape the boundary hands
+        // a guest: the module's token, the module's sentence
+        can_refusal("pr_diff", "module", SAID);
+
+        let mut guest = Guest::load_from("forge", &staged).expect("the view loads");
+        let session = Some(
+            serde_json::json!({
+                "dark": false, "connected": true, "org": "duckhouse", "about": "a pond",
+                "network_chain_id": "mynet#d0cdf950",
+                "connected_rpc": "http://127.0.0.1:1",
+                "link": "duck://forge/core/7", "link_tick": 1
+            })
+            .to_string()
+            .into_bytes(),
+        );
+        while guest.redraw(&session) {
+            guest.replies.wait_idle();
+        }
+        // The diff is the FILES tab's panel, so the reader has to be there to
+        // be told anything: the conversation tab never mentions the patch.
+        guest
+            .pending
+            .push(wire::Event::Message(button_message(&guest, "Files changed")));
+        while guest.redraw(&session) {
+            guest.replies.wait_idle();
+        }
+        let notice = format!("These changes cannot be shown: {SAID}");
+        assert!(
+            texts(&guest).iter().any(|text| text == &notice),
+            "the module's whole sentence is the notice: {:?}",
+            texts(&guest)
+        );
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
+
+        // and the same tree through the real native renderer, with the app's
+        // own fonts: what a reader actually sees.
+        let root = guest.frame.root.clone().expect("a drawn tree");
+        let mut native = crate::frame_probe::headless_context();
+        let window = native
+            .open_window(
+                gpui_kit::size(gpui_kit::px(1200.), gpui_kit::px(900.)),
+                |window, cx| {
+                    let tree = cx.new(|_| crate::view_tree::ViewTree::new(root));
+                    cx.new(|cx| gpui_kit::component::Root::new(tree, window, cx))
+                },
+            )
+            .unwrap();
+        native
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        native.run_until_parked();
+        if std::env::var_os("DUCKTAPE_CANARY_PIXELS").is_some() {
+            let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../target/refusal-sentence.png");
+            native
+                .capture_screenshot(window.into())
+                .expect("requested real GPU screenshot unavailable")
+                .save(&out)
+                .unwrap();
+            println!("wrote {}", out.display());
+        }
+    }
+
     /// A deployment of `module` on the fake node: the staged governance
     /// component as its view, told apart by the one asset it ships.
     fn deployment(component: &[u8], asset: &str) -> module_artifact::Artifact {
@@ -5597,15 +5731,16 @@ pub(crate) mod tests {
         /// behind it. Per-thread, so one test's node is never another's, and
         /// empty everywhere else: an empty table leaves every request to the
         /// kernel exactly as production does.
-        static CANNED_READS: std::cell::RefCell<std::collections::BTreeMap<String, Vec<u8>>> =
-            const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+        static CANNED_READS: std::cell::RefCell<
+            std::collections::BTreeMap<String, kernel::Answer>,
+        > = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
     }
 
     /// The canned answer for one request, looked up by the NAME OF THE QUERY
     /// it asks (`roots`, `channel`, `thread`, …) — the one thing that tells a
     /// view's reads apart, since they all leave as `rpc.view`. A read that
     /// carries no query is looked up by its kind.
-    pub(super) fn canned_read(kind: &str, payload: &[u8]) -> Option<Vec<u8>> {
+    pub(super) fn canned_read(kind: &str, payload: &[u8]) -> Option<kernel::Answer> {
         CANNED_READS.with(|canned| {
             let canned = canned.borrow();
             if canned.is_empty() {
@@ -5625,8 +5760,21 @@ pub(crate) mod tests {
         CANNED_READS.with(|canned| {
             let mut canned = canned.borrow_mut();
             for (named, reply) in answers {
-                canned.insert(named.to_owned(), reply.to_string().into_bytes());
+                canned.insert(named.to_owned(), Ok(reply.to_string().into_bytes()));
             }
+        });
+    }
+
+    /// Cans a REFUSAL for one query, in the shape the boundary hands a guest:
+    /// a token and the refusing side's own sentence. The canned node can say no
+    /// as well as yes, which is the only way to drive a view's refused screen
+    /// with no node behind it.
+    pub(super) fn can_refusal(named: &'static str, reason: &str, sentence: &str) {
+        CANNED_READS.with(|canned| {
+            canned.borrow_mut().insert(
+                named.to_owned(),
+                Err(wire::Refusal::new(reason, sentence)),
+            );
         });
     }
 
@@ -6573,7 +6721,7 @@ pub(crate) mod tests {
         guest.execute_widget_commands(|_| panic!("a vanished target must not touch native state"));
         assert!(matches!(
             guest.pending.pop(),
-            Some(wire::Event::Response { result: Err(error), .. }) if error == "widget target left the tree"
+            Some(wire::Event::Response { result: Err(error), .. }) if error.reason == "widget_unmounted"
         ));
     }
 

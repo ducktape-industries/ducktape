@@ -510,10 +510,13 @@ pub fn item(id: u64, payload: &[u8]) -> Event {
     }
 }
 
+/// Refuse a request the way a MODULE refuses one: the reason a view keys on is
+/// `module`, and `message` is the sentence the module wrote. A test that needs
+/// another token builds the [`crate::wire::Refusal`] itself.
 pub fn refuse(id: u64, message: &str) -> Event {
     Event::Response {
         id,
-        result: Err(message.to_string()),
+        result: Err(crate::wire::Refusal::new("module", message)),
         done: true,
     }
 }

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 
-use super::{Guest, Replies, runtime};
+use super::{Guest, Replies, runtime, wire};
 
 static DEVICE_OWNER: AtomicBool = AtomicBool::new(false);
 
@@ -191,7 +191,14 @@ impl Devices {
                     false,
                 ),
                 Err(_) => {
-                    replies.item(id, Err("audio device thread failed".into()), true);
+                    replies.item(
+                        id,
+                        Err(wire::Refusal::new(
+                            "audio_device_failed",
+                            "audio device thread failed",
+                        )),
+                        true,
+                    );
                     return;
                 }
             }
@@ -202,7 +209,14 @@ impl Devices {
             let mut encoder = match media_service::voice::VoiceEncoder::new(VOICE_BITRATE) {
                 Ok(encoder) => encoder,
                 Err(error) => {
-                    replies.item(id, Err(format!("voice encoder: {error}")), true);
+                    replies.item(
+                        id,
+                        Err(wire::Refusal::new(
+                            "audio_device_failed",
+                            format!("voice encoder: {error}"),
+                        )),
+                        true,
+                    );
                     return;
                 }
             };
@@ -271,7 +285,7 @@ impl Devices {
                     }
                     error = failures.recv() => {
                         let Some(error) = error else { break; };
-                        replies.item(id, Err(error), false);
+                        replies.item(id, Err(wire::Refusal::new("video_device_failed", error)), false);
                     }
                 }
             }
@@ -326,7 +340,8 @@ pub(super) fn answer(guest: &mut Guest, operation: &str, id: u64, payload: &[u8]
     let Some(session) = guest.session.as_mut() else {
         guest.refuse(
             id,
-            "media requires a user-started background session".into(),
+            "needs_session",
+            "media requires a user-started background session",
         );
         return;
     };
@@ -340,7 +355,11 @@ pub(super) fn answer(guest: &mut Guest, operation: &str, id: u64, payload: &[u8]
     match result {
         Ok(None) => {}
         Ok(Some(bytes)) => guest.reply(id, Ok(bytes)),
-        Err(error) => guest.refuse(id, error),
+        // ONE token for every way a device request can be turned down: each
+        // one is the guest asking for a device state it cannot have here, and
+        // no view branches on which. The day one has to, that case earns its
+        // own token — not a sentence for the view to read.
+        Err(error) => guest.refuse(id, "media_refused", error),
     }
 }
 
