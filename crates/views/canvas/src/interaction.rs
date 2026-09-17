@@ -236,8 +236,16 @@ impl BoardsView {
             (true, "c") if !repeat => self.on_copy(),
             (true, "x") if !repeat => self.on_cut(),
             (true, "v") if !repeat => self.on_paste(),
-            (true, "]") if !repeat => self.on_stack(true),
-            (true, "[") if !repeat => self.on_stack(false),
+            // The unshifted key moves one place and the shifted one goes all
+            // the way, which is what every editor with four of these does.
+            // The shifted bracket is named as the brace it types, not as a
+            // bracket with a modifier: a host folds Shift into a symbol and
+            // hands the modifier back cleared, the same reason "?" is bound
+            // above rather than shift and "/".
+            (true, "}") if !repeat => self.on_stack(Stacking::Front),
+            (true, "]") if !repeat => self.on_stack(Stacking::Forward),
+            (true, "{") if !repeat => self.on_stack(Stacking::Back),
+            (true, "[") if !repeat => self.on_stack(Stacking::Backward),
             (true, "d") if !repeat => self.on_duplicate(),
             (true, "g") if shift && !repeat => self.on_group(false),
             (true, "g") if !repeat => self.on_group(true),
@@ -2203,8 +2211,10 @@ impl BoardsView {
             MenuItem::Copy => self.on_copy(),
             MenuItem::Paste => self.on_paste(),
             MenuItem::Duplicate => self.on_duplicate(),
-            MenuItem::Front => self.on_stack(true),
-            MenuItem::Back => self.on_stack(false),
+            MenuItem::Front => self.on_stack(Stacking::Front),
+            MenuItem::Forward => self.on_stack(Stacking::Forward),
+            MenuItem::Backward => self.on_stack(Stacking::Backward),
+            MenuItem::Back => self.on_stack(Stacking::Back),
             MenuItem::Group => self.on_group(true),
             MenuItem::Ungroup => self.on_group(false),
             MenuItem::SelectAll => self.on_select_all(),
@@ -2236,6 +2246,8 @@ impl BoardsView {
             MenuItem::Copy,
             MenuItem::Duplicate,
             MenuItem::Front,
+            MenuItem::Forward,
+            MenuItem::Backward,
             MenuItem::Back,
         ];
         if self.grouping_would_hold(true) {
@@ -2247,9 +2259,11 @@ impl BoardsView {
         items.push(MenuItem::Delete);
         items
     }
-    /// Stacking: raising the selection puts it on top, and sinking it is
-    /// raising everything else — one primitive, both directions.
-    pub(super) fn on_stack(&mut self, front: bool) -> Task<Message> {
+    /// Stacking, all four ways. The two ends are one primitive each — raising
+    /// the selection puts it on top, and sinking it is raising everything else
+    /// — and a single step is the whole stack restated with the selection one
+    /// place along.
+    pub(super) fn on_stack(&mut self, how: Stacking) -> Task<Message> {
         let Some(board) = self.visible() else {
             return Task::none();
         };
@@ -2258,13 +2272,24 @@ impl BoardsView {
             .into_iter()
             .map(|(id, _)| id.clone())
             .collect();
-        let ids: Vec<String> = order
-            .iter()
-            .filter(|id| self.selected.contains(*id) == front)
-            .cloned()
-            .collect();
-        let movable = !ids.is_empty() && ids.len() < order.len();
-        if !movable {
+        let mine = |id: &String| self.selected.contains(id);
+        let anything_to_move = order.iter().any(&mine) && !order.iter().all(&mine);
+        if !anything_to_move {
+            return Task::none();
+        }
+        // `Change::Order` puts the ids it names on top, in the order given, and
+        // leaves everything else in its own order underneath. The two ends say
+        // that in one word each — name the selection, or name everything but.
+        // A single step has to say the whole stack, because what changes is
+        // where the selection sits INSIDE it.
+        let ids = match how {
+            Stacking::Front => order.iter().filter(|id| mine(id)).cloned().collect(),
+            Stacking::Back => order.iter().filter(|id| !mine(id)).cloned().collect(),
+            Stacking::Forward => stepped(&order, &mine, true),
+            Stacking::Backward => stepped(&order, &mine, false),
+        };
+        let moved = ids != order && !ids.is_empty();
+        if !moved {
             return Task::none();
         }
         self.edit(Change::Order { ids })
@@ -2576,6 +2601,33 @@ pub(super) fn plate(run: &[[f32; 2]]) -> [f32; 4] {
         middle[0] + reach[0],
         middle[1] + reach[1],
     ]
+}
+/// The stack with the selection moved one place, bottom-to-top the way
+/// `Board::ordered` gives it.
+///
+/// Going up walks from the top down and going down walks from the bottom up,
+/// so a shape this pass has already moved is never carried a second time by
+/// the same pass. A run of selected shapes therefore travels together and
+/// keeps its own order, and a selection already at that end comes back
+/// unchanged — which the caller reads as nothing to send.
+fn stepped(order: &[String], mine: &dyn Fn(&String) -> bool, up: bool) -> Vec<String> {
+    let mut next = order.to_vec();
+    let walk: Vec<usize> = match up {
+        true => (0..next.len()).rev().collect(),
+        false => (0..next.len()).collect(),
+    };
+    for i in walk {
+        // usize::MAX out of the bottom, which the bound below refuses.
+        let neighbour = match up {
+            true => i + 1,
+            false => i.wrapping_sub(1),
+        };
+        let swappable = neighbour < next.len() && mine(&next[i]) && !mine(&next[neighbour]);
+        if swappable {
+            next.swap(i, neighbour);
+        }
+    }
+    next
 }
 /// A shape the pointer moves and resizes on its own. A bound connector has no
 /// geometry of its own to drag: it follows the cards its ends name.

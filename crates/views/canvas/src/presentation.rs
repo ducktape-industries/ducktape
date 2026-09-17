@@ -997,10 +997,27 @@ impl BoardsView {
                     tile(
                         "front",
                         "Bring to front",
-                        "⌘ / Ctrl ]",
-                        Message::Stack(true),
+                        "⌘ / Ctrl ⇧ ]",
+                        Message::Stack(Stacking::Front),
                     ),
-                    tile("back", "Send to back", "⌘ / Ctrl [", Message::Stack(false)),
+                    tile(
+                        "forward",
+                        "Bring forward",
+                        "⌘ / Ctrl ]",
+                        Message::Stack(Stacking::Forward),
+                    ),
+                    tile(
+                        "backward",
+                        "Send backward",
+                        "⌘ / Ctrl [",
+                        Message::Stack(Stacking::Backward),
+                    ),
+                    tile(
+                        "back",
+                        "Send to back",
+                        "⌘ / Ctrl ⇧ [",
+                        Message::Stack(Stacking::Back),
+                    ),
                     tile("copy", "Duplicate", "⌘ / Ctrl D", Message::Duplicate),
                 ],
             ),
@@ -1098,7 +1115,8 @@ impl BoardsView {
             ("⌘ / Ctrl C · X · V", "Copy / cut / paste at pointer"),
             ("⌘ / Ctrl D · Alt or ⌘⇧ drag", "Duplicate selection"),
             ("Delete / Backspace", "Delete selection"),
-            ("⌘ / Ctrl ] · [", "Bring to front / send to back"),
+            ("⌘ / Ctrl ] · [", "Bring forward / send backward"),
+            ("⌘ / Ctrl Shift ] · [", "Bring to front / send to back"),
             ("⌘ / Ctrl G · Shift G", "Group / ungroup selection"),
             ("⌘ / Ctrl Z · Shift Z · Y", "Undo / redo"),
             ("Arrow · Shift Arrow", "Move 1 / 10 units"),
@@ -2722,8 +2740,10 @@ fn menu_row(item: MenuItem) -> (&'static str, &'static str) {
         MenuItem::Copy => ("Copy", "⌘ / Ctrl C"),
         MenuItem::Paste => ("Paste", "⌘ / Ctrl V"),
         MenuItem::Duplicate => ("Duplicate", "⌘ / Ctrl D"),
-        MenuItem::Front => ("Bring to front", "⌘ / Ctrl ]"),
-        MenuItem::Back => ("Send to back", "⌘ / Ctrl ["),
+        MenuItem::Front => ("Bring to front", "⌘ / Ctrl ⇧ ]"),
+        MenuItem::Forward => ("Bring forward", "⌘ / Ctrl ]"),
+        MenuItem::Backward => ("Send backward", "⌘ / Ctrl ["),
+        MenuItem::Back => ("Send to back", "⌘ / Ctrl ⇧ ["),
         MenuItem::Group => ("Group", "⌘ / Ctrl G"),
         MenuItem::Ungroup => ("Ungroup", "⌘ / Ctrl ⇧ G"),
         MenuItem::SelectAll => ("Select all", "⌘ / Ctrl A"),
@@ -2739,6 +2759,8 @@ fn menu_key(item: MenuItem) -> &'static str {
         MenuItem::Paste => "paste",
         MenuItem::Duplicate => "duplicate",
         MenuItem::Front => "front",
+        MenuItem::Forward => "forward",
+        MenuItem::Backward => "backward",
         MenuItem::Back => "back",
         MenuItem::Group => "group",
         MenuItem::Ungroup => "ungroup",
@@ -2863,6 +2885,14 @@ fn icon(name: &str) -> Node {
         "spread-x" => "<path d='M3 3v18M21 3v18'/><rect x='10' y='7' width='4' height='10'/>",
         "spread-y" => "<path d='M3 3h18M3 21h18'/><rect x='7' y='10' width='10' height='4'/>",
         "front" => "<rect x='3' y='3' width='12' height='12' rx='2'/><path d='M9 21h12V9'/>",
+        // The ends show a card against the whole stack behind it; a step shows
+        // one card and the direction it is going, and nothing else.
+        "forward" => {
+            "<rect x='4' y='11' width='16' height='10' rx='2'/><path d='M12 8V2M9 5l3-3 3 3'/>"
+        }
+        "backward" => {
+            "<rect x='4' y='3' width='16' height='10' rx='2'/><path d='M12 16v6M9 19l3 3 3-3'/>"
+        }
         "back" => "<rect x='9' y='9' width='12' height='12' rx='2'/><path d='M15 3H3v12'/>",
         "copy" => "<rect x='9' y='9' width='12' height='12' rx='2'/><path d='M5 15H3V3h12v2'/>",
         "undo" => "<path d='M9 14 4 9l5-5'/><path d='M4 9h10a5 5 0 0 1 0 10h-3'/>",
