@@ -396,6 +396,11 @@ pub enum NodePhase {
     Syncing,
     Validating,
     Serving,
+    /// Serving, but below a tip a peer answered with, and not advancing.
+    /// A node stuck here answers `/v1` from state that is no longer the
+    /// network's, which `serving` alone cannot tell a reader; the gap and the
+    /// tip it was measured against ride in [`OperationalStatus::follow`].
+    Behind,
     Draining,
     Halted,
 }
@@ -409,6 +414,7 @@ impl NodePhase {
             Self::Syncing => "syncing",
             Self::Validating => "validating",
             Self::Serving => "serving",
+            Self::Behind => "behind",
             Self::Draining => "draining",
             Self::Halted => "halted",
         }
@@ -431,11 +437,41 @@ pub struct OperationalStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncOperationalStatus>,
     pub storage: StorageOperationalStatus,
+    /// What this node last heard about the network's tip, and how far its own
+    /// served height is from it. Absent until a peer answers a tip poll —
+    /// a node that has heard nothing reports nothing rather than a zero gap
+    /// it never measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow: Option<FollowOperationalStatus>,
     /// Which machine the reachability plane runs on, and how the last swap
     /// went. Absent on a node with no reachability plane at all (no
     /// `wireguard_listen`) — there is no backend to name there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub netstack: Option<NetstackOperationalStatus>,
+}
+
+/// This node's own lag, off the tip poll it already runs.
+///
+/// The numbers come from the `TipCoords` answer the validator's root-divergence
+/// watch and the parked resident's fallback poll already fetch every tick —
+/// no reader has to ask the mesh anything to learn that a node stopped
+/// following. Pair it with [`OperationalStatus::last_finalized_at`] for the
+/// other half of the sentence: how long it has been since this node's own
+/// height moved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FollowOperationalStatus {
+    /// the finalized height the peer this node LAST polled answered with —
+    /// the latest reading, never a high-water mark. The poll round-robins over
+    /// the current members, so a remembered maximum would pin this to whichever
+    /// peer was once furthest ahead long after it left.
+    pub network_height: u64,
+    /// `network_height` minus this node's own served height at the moment the
+    /// tip landed, floored at 0 — a node AHEAD of the peer it polled is not
+    /// behind by a negative amount, it is simply not behind.
+    pub behind_by: u64,
+    /// Unix seconds when that tip landed. A frozen `heard_at` means the poll
+    /// itself stopped answering, which is a different fault from a gap.
+    pub heard_at: u64,
 }
 
 /// The netstack plane's operator-visible standing: the backend name

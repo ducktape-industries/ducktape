@@ -326,6 +326,17 @@ fn standing_line(operations: &serde_json::Value) -> Option<String> {
     {
         line.push_str(&format!(" stalled_for={seconds}s"));
     }
+    // the gap to the tip a peer answered with. 0 is the following case and
+    // prints nothing, exactly like `stalled_for` above — but a `phase=behind`
+    // without the number is half a sentence, and the number is the half an
+    // operator acts on.
+    let follow = &operations["follow"];
+    if let Some(behind_by) = follow["behind_by"].as_u64().filter(|gap| *gap > 0) {
+        let network_height = follow["network_height"].as_u64().unwrap_or(0);
+        line.push_str(&format!(
+            " behind_by={behind_by} network_height={network_height}"
+        ));
+    }
     Some(line)
 }
 
@@ -2254,6 +2265,37 @@ mod tests {
             ]
         );
         assert_eq!(super::stalled_past_recovery(&beating), None);
+    }
+
+    /// A resident that stopped following prints WHY its screen is stale: the
+    /// phase names it and the gap sizes it. Height and root hash alone are the
+    /// same two numbers a healthy node prints.
+    #[test]
+    fn a_node_that_stopped_following_prints_the_gap_it_stopped_at() {
+        let frozen = serde_json::json!({
+            "height": 155, "root_hash": "2170",
+            "operations": {
+                "role": "resident", "phase": "behind",
+                "follow": { "network_height": 756, "behind_by": 601, "heard_at": 1_758_000_000u64 },
+            },
+        });
+        assert_eq!(
+            super::status_lines(&frozen)[1],
+            "role=resident phase=behind behind_by=601 network_height=756"
+        );
+
+        // and a node that IS following prints no gap at all.
+        let following = serde_json::json!({
+            "height": 756, "root_hash": "2171",
+            "operations": {
+                "role": "resident", "phase": "serving",
+                "follow": { "network_height": 756, "behind_by": 0, "heard_at": 1_758_000_000u64 },
+            },
+        });
+        assert_eq!(
+            super::status_lines(&following)[1],
+            "role=resident phase=serving"
+        );
     }
 
     /// A silence shorter than the point the chain recovers on its own is
