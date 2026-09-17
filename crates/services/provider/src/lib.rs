@@ -500,6 +500,13 @@ pub struct RunContext {
     /// admitted forge push. `None` (an embedder with no node behind it) refuses
     /// every push at the lane. Never consensus data, never guest env.
     pub operator_credential: Option<OperatorCredential>,
+    /// the ONE forge repo this run's COMMITTED workspace pinned
+    /// (`WorkspaceSource::Forge.repo`) — the only repo the lane lends
+    /// [`Self::operator_credential`] to a push on, and the whole of a run's
+    /// authority over repositories. `None` (a duckfs run, which pinned no
+    /// repo) refuses every push at the lane. Set by the provisioner from the
+    /// committed spec, never by the guest.
+    pub forge_repo: Option<String>,
 }
 
 /// which child stream produced one live output line.
@@ -932,6 +939,7 @@ impl CliProvider {
             &mut envs,
             ctx.agent_id.clone(),
             ctx.operator_credential.clone(),
+            ctx.forge_repo.clone(),
         )
         .await?;
         // the run's way off this host: an egress proxy on its own tunnel,
@@ -5800,6 +5808,7 @@ printf '%s\n' "$PATH"
             context_doc: None,
             airlock: None,
             operator_credential: None,
+            forge_repo: None,
         };
 
         let output = p.run("q", &ctx).await.unwrap();
