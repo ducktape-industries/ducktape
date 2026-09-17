@@ -1618,13 +1618,56 @@ fn cmd_invite_accept(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
     }
 }
 
+/// What `member promote` decides before it proposes anything.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Promotion {
+    /// the key already holds the seat — an idempotent re-run.
+    AlreadySeated,
+    /// it stands in the resident tier: propose the promotion.
+    Proceed,
+}
+
+/// Governance refuses a promotion of a key with no resident record, and it
+/// refuses it at APPLY — inside a block, long after `/v1/submit/frame`
+/// answered — so the refusal reaches the daemon log (`reason=not_a_resident`)
+/// and never the terminal: the ceremony just polls for a proposal that will
+/// never exist and reports its own deadline, thirty seconds later, saying
+/// nothing about why.
+///
+/// So read the rosters and say it here, before anything is submitted, the way
+/// [`crate::module_cli`]'s own precheck reads the registry before proposing.
+/// This is the SENTENCE and never the gate: a CLI check is walked past by the
+/// app, by a script and by `curl` on `/v1`, and consensus owns the safety
+/// property.
+pub(super) fn precheck_promotion(
+    pubkey_hex: &str,
+    key: &[u8],
+    members: &[Vec<u8>],
+    residents: &[Vec<u8>],
+) -> Result<Promotion, String> {
+    let already_seated = members.iter().any(|m| m == key);
+    if already_seated {
+        return Ok(Promotion::AlreadySeated);
+    }
+    let stands_for_promotion = residents.iter().any(|r| r == key);
+    if stands_for_promotion {
+        return Ok(Promotion::Proceed);
+    }
+    Err(format!(
+        "not_a_resident: {pubkey_hex} holds no resident standing, and a validator is promoted \
+         out of that tier — grant it first with `ducktape node resident accept {pubkey_hex}`, \
+         then promote it once its node is synced"
+    ))
+}
+
 /// `member promote <hex pubkey> [--config node.toml]` — seat a key in the
 /// consensus quorum: drive a governance AddValidator proposal through this
-/// account's own RUNNING node. the passing proposal's valset Join clears any
-/// resident standing in the same block and schedules the epoch cutover; a
+/// account's own RUNNING node. the passing proposal's valset Join clears the
+/// key's resident standing in the same block and schedules the epoch cutover; a
 /// pre-synced resident then catches up a small delta and reboots as a
-/// validator, so the quorum only ever gains a warm member. also serves DIRECT
-/// (un-staged) admission — exactly the pre-resident `resident accept` semantics.
+/// validator, so the quorum only ever gains a warm member. the resident tier is
+/// the only way in: consensus refuses a promotion of a key it has never met,
+/// and [`precheck_promotion`] says so before this verb submits anything.
 fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     use governance::GovAction;
 
@@ -1637,9 +1680,13 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     let signer = gov_signer(node.rpc(), &cfg_path, &resolved)?;
 
     let members = read_members(node.rpc())?;
-    if members.contains(&key_bytes) {
-        eprintln!("{pubkey_hex} is already a validator — nothing to do");
-        return Ok(());
+    let residents = read_residents(node.rpc())?;
+    match precheck_promotion(pubkey_hex, &key_bytes, &members, &residents)? {
+        Promotion::AlreadySeated => {
+            eprintln!("{pubkey_hex} is already a validator — nothing to do");
+            return Ok(());
+        }
+        Promotion::Proceed => {}
     }
     let wanted = GovAction::AddValidator { key: key_bytes };
     let same_action = {
@@ -2374,5 +2421,43 @@ mod tests {
         assert_eq!(human_duration(42), "42s");
         assert_eq!(human_duration(192), "3m12s");
         assert_eq!(human_duration(7500), "2h05m");
+    }
+
+    /// #2526: the node refuses a promotion of a key it has never met, but it
+    /// refuses it at APPLY, so the operator used to get thirty seconds of
+    /// silence and then `timed out waiting for the proposal to finalize`. The
+    /// precheck reads the same two rosters consensus reads and says it first.
+    #[test]
+    fn a_promotion_of_a_key_with_no_standing_is_refused_before_anything_is_submitted() {
+        use super::{Promotion, precheck_promotion};
+        let hex = "0000000000000000000000000000000000000000000000000000000000000000";
+        let stranger = vec![0u8; 32];
+        let seated = vec![1u8; 32];
+        let resident = vec![2u8; 32];
+        let members = vec![seated.clone()];
+        let residents = vec![resident.clone()];
+
+        let refusal = precheck_promotion(hex, &stranger, &members, &residents)
+            .expect_err("a key in neither tier has nothing to be promoted out of");
+        assert!(refusal.starts_with("not_a_resident: "), "{refusal}");
+        assert!(refusal.contains(hex), "the refusal names the key: {refusal}");
+        assert!(
+            refusal.contains("ducktape node resident accept"),
+            "and the command that fixes it: {refusal}"
+        );
+
+        // a resident is exactly what a promotion is for.
+        assert_eq!(
+            precheck_promotion(hex, &resident, &members, &residents),
+            Ok(Promotion::Proceed)
+        );
+        // an already-seated key stays the idempotent re-run it has always been,
+        // NOT a refusal — the desired state already holds.
+        assert_eq!(
+            precheck_promotion(hex, &seated, &members, &residents),
+            Ok(Promotion::AlreadySeated)
+        );
+        // empty rosters refuse rather than wave everything through.
+        assert!(precheck_promotion(hex, &stranger, &[], &[]).is_err());
     }
 }
