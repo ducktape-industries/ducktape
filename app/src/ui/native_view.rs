@@ -1,14 +1,25 @@
 use super::*;
 
 impl Ducktape {
+    /// The seated view's props and the route its events take home.
+    ///
+    /// ONE dispatch, on the tab's ID. Every arm below is a view that still
+    /// needs the app to hand it facts it does not read itself yet; the
+    /// fallthrough is the SESSION block — who is connected, to what, as whom —
+    /// which is all a view needs once its own reads live in the guest
+    /// (`#2303`). So an id this build has never heard of, listed by the
+    /// connected node's registry, seats and routes with no app change, and a
+    /// view that finishes its migration loses its arm here rather than
+    /// gaining one.
     pub(crate) fn native_view(
         &self,
     ) -> (
         crate::module_view::ViewSpec,
         fn(crate::module_view::ModuleViewEvent) -> AppMessage,
     ) {
-        match self.shell_tab {
-            ShellTab::Chat => (
+        let ShellTab::View(tab) = self.shell_tab;
+        match tab {
+            "chat" => (
                 crate::module_view::chat_view(
                     self.is_dark(),
                     self.connected,
@@ -39,7 +50,7 @@ impl Ducktape {
                 ),
                 AppMessage::ChatViewEvent,
             ),
-            ShellTab::Pages => (
+            "pages" => (
                 crate::module_view::pages_view(
                     self.is_dark(),
                     self.connected,
@@ -49,7 +60,7 @@ impl Ducktape {
                 ),
                 AppMessage::PagesViewEvent,
             ),
-            ShellTab::Forge => (
+            "forge" => (
                 crate::module_view::forge_view(
                     self.is_dark(),
                     self.connected,
@@ -62,7 +73,7 @@ impl Ducktape {
                 ),
                 AppMessage::ForgeViewEvent,
             ),
-            ShellTab::Agents => (
+            "agents" => (
                 crate::module_view::agents_view(
                     self.is_dark(),
                     self.connected,
@@ -72,7 +83,7 @@ impl Ducktape {
                 ),
                 AppMessage::AgentsViewEvent,
             ),
-            ShellTab::Files => (
+            "files" => (
                 crate::module_view::files_view(
                     self.is_dark(),
                     self.connected,
@@ -83,7 +94,7 @@ impl Ducktape {
                 ),
                 AppMessage::FilesViewEvent,
             ),
-            ShellTab::Explorer => (
+            "explorer" => (
                 crate::module_view::explorer_view(
                     self.is_dark(),
                     self.connected,
@@ -96,7 +107,7 @@ impl Ducktape {
                 ),
                 AppMessage::ExplorerViewEvent,
             ),
-            ShellTab::Node => (
+            "node" => (
                 crate::module_view::node_view(
                     self.is_dark(),
                     self.connected,
@@ -106,15 +117,15 @@ impl Ducktape {
                 ),
                 AppMessage::NodeViewEvent,
             ),
-            ShellTab::Members => (
+            "members" => (
                 crate::module_view::members_view(self.is_dark(), self.connected),
                 AppMessage::MembersViewEvent,
             ),
-            ShellTab::Governance => (
+            "governance" => (
                 crate::module_view::governance_view(self.is_dark(), self.connected),
                 AppMessage::GovernanceViewEvent,
             ),
-            ShellTab::Settings => (
+            "settings" => (
                 crate::module_view::settings_view(
                     self.is_dark(),
                     self.connected,
@@ -143,7 +154,10 @@ impl Ducktape {
                 ),
                 AppMessage::SettingsViewEvent,
             ),
-            ShellTab::Registered(module) => (
+            // the session block: every fact that is true of the connection
+            // rather than of one view. An id with no arm above — a view the
+            // registry lists and this build never heard of — lands here.
+            module => (
                 crate::module_view::registered_view(
                     module,
                     self.is_dark(),

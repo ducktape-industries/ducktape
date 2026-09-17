@@ -389,8 +389,8 @@ pub fn settings_intent(event: &ModuleViewEvent) -> crate::SettingsIntent {
 /// The rail tab a `tab` intent names; the two the settings cards link to.
 pub fn settings_event_tab(event: &ModuleViewEvent) -> crate::ShellTab {
     match event_text(event, "tab").as_str() {
-        "members" => crate::ShellTab::Members,
-        _ => crate::ShellTab::Node,
+        "members" => crate::ShellTab::View("members"),
+        _ => crate::ShellTab::View("node"),
     }
 }
 

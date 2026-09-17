@@ -100,7 +100,7 @@ async fn the_bell_overlay_seats_the_inbox_view_and_keeps_the_tab_s_own_seat(
     let (mut app, _) = Ducktape::boot();
     app.console_win = Some(crate::shell::WindowKey::unique());
     app.account_number = "4".into();
-    app.shell_tab = ShellTab::Chat;
+    app.shell_tab = ShellTab::View("chat");
     app.bell_open = true;
     cx.update(gpui_kit::init);
     let mut view = None;

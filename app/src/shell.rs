@@ -1586,39 +1586,7 @@ impl DesktopWindow {
         let label = |module: &'static str| {
             crate::module_view::tab_label(module, &crate::module_view::module_name(module))
         };
-        // the dashboard leads the rail, above every section: it is the
-        // network at a glance, not a workspace tool or a network tool
-        let registered = crate::module_view::registered_views();
-        let dashboard = registered
-            .iter()
-            .copied()
-            .filter(|module| *module == HOME_VIEW);
-        let mut navigation: Vec<(ShellTab, String)> = dashboard
-            .map(|module| (ShellTab::Registered(module), label(module)))
-            .collect();
-        navigation.extend([
-            (ShellTab::Chat, label("chat")),
-            (ShellTab::Pages, label("pages")),
-            (ShellTab::Forge, label("forge")),
-            (ShellTab::Agents, label("agents")),
-            (ShellTab::Files, label("files")),
-        ]);
-        // the other views the connected node's registry lists are workspace
-        // tools: they follow the built-in workspace tabs, in the registry's
-        // order, named by their manifests
-        navigation.extend(
-            registered
-                .into_iter()
-                .filter(|module| *module != HOME_VIEW && *module != "call")
-                .map(|module| (ShellTab::Registered(module), label(module))),
-        );
-        navigation.extend([
-            (ShellTab::Explorer, label("explorer")),
-            (ShellTab::Node, label("node")),
-            (ShellTab::Members, label("members")),
-            (ShellTab::Governance, label("governance")),
-        ]);
-        navigation.push((ShellTab::Settings, label("settings")));
+        let navigation = navigation_rows(&label);
         let (sidebar, popover) = {
             let theme = gpui_kit::component::Theme::global(cx);
             (theme.sidebar, theme.popover)
@@ -1805,16 +1773,11 @@ impl DesktopWindow {
             .child(div().h_2().flex_shrink_0())
             .child(search)
             .child(bell);
-        for (tab, label) in navigation {
-            let section = match tab {
-                ShellTab::Chat => Some("Workspace"),
-                ShellTab::Explorer => Some("Network"),
-                _ => None,
-            };
-            if tab == ShellTab::Settings {
+        for section in navigation {
+            if section.foot {
                 tabs = tabs.child(div().flex_1().min_h_4());
             }
-            if let Some(section) = section {
+            if let Some(heading) = section.heading {
                 tabs = tabs.child(
                     div()
                         .px_2()
@@ -1824,30 +1787,48 @@ impl DesktopWindow {
                         .text_size(px(11.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(ink_muted)
-                        .child(section),
+                        .child(heading),
                 );
             }
-            let selected = tab == selected_tab;
-            // a registered tab's element id is its registry id, not its
-            // manifest name: two views may share a name, never an id
-            let id: gpui_kit::SharedString = match tab {
-                ShellTab::Registered(module) => format!("view:{module}").into(),
-                _ => label.clone().into(),
-            };
-            let row = rail_row(id, nav_icon(tab), label, ink, selected, true).on_click(
-                cx.listener(move |this, _, _, cx| {
+            for NavRow { view, label, bytes } in section.rows {
+                let tab = ShellTab::View(view);
+                let selected = tab == selected_tab;
+                // a row's element id is the view's registry id, never its
+                // manifest name: two views may share a name, never an id
+                let row = rail_row(
+                    gpui_kit::SharedString::from(format!("view:{view}")),
+                    nav_icon(view),
+                    label,
+                    ink,
+                    selected,
+                    true,
+                )
+                .when(bytes == TabBytes::Desktop, |row| {
+                    // WHERE THE BYTES COME FROM, on the row. Every other tab
+                    // is served by the connected node's registry and changes
+                    // when a deployment does; these ship with this app build,
+                    // and a reader deciding whether a tab is the network's or
+                    // the app's should not have to know a list by heart.
+                    row.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(9.5))
+                            .text_color(ink.muted)
+                            .child("app"),
+                    )
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.model.update(cx, |model, cx| {
-                        model.dispatch(Message::SelectShellTab(tab), cx)
-                    });
-                }),
-            );
-            #[cfg(test)]
-            let row = {
-                use gpui_kit::test::TestSupportExt as _;
-                row.test_support()
-            };
-            tabs = tabs.child(row);
+                    this.model
+                        .update(cx, |model, cx| model.dispatch(Message::SelectShellTab(tab), cx));
+                }));
+                #[cfg(test)]
+                let row = {
+                    use gpui_kit::test::TestSupportExt as _;
+                    row.test_support()
+                };
+                tabs = tabs.child(row);
+            }
         }
         // The foot of the rail: who is signed in. Pressing it opens the
         // account screen — a sign-in when there is no account yet. The update
@@ -2233,7 +2214,7 @@ impl Render for DesktopWindow {
                     key: event.keystroke.key.clone(),
                     modifiers: event.keystroke.modifiers,
                 };
-                let copy = this.model.read(cx).state.shell_tab == ShellTab::Chat
+                let copy = this.model.read(cx).state.shell_tab == ShellTab::View("chat")
                     && crate::backend::is_copy_chord(key.key.clone(), key.modifiers);
                 if !copy {
                     return;
@@ -2547,7 +2528,7 @@ mod close_tests {
         let mut state = Ducktape::initial_state();
         state.connected = true;
         state.connected_rpc = "http://127.0.0.1:0".into();
-        state.shell_tab = ShellTab::Files;
+        state.shell_tab = ShellTab::View("files");
         state.error = "Could not complete the request".into();
         let mut view = None;
         let handle = cx
@@ -2630,7 +2611,7 @@ mod close_tests {
         // A real guest frame replaces interest; explicitly rearm this host-only
         // fixture before exercising the actual native presenter's release hook.
         queue_close_intent("closed");
-        model.update(cx, |model, _| model.state.shell_tab = ShellTab::Files);
+        model.update(cx, |model, _| model.state.shell_tab = ShellTab::View("files"));
         let weak = presenter.downgrade();
         drop(presenter);
         handle
@@ -2825,6 +2806,105 @@ impl DesktopWindow {
     }
 }
 
+/// WHO SERVES A TAB'S BYTES.
+///
+/// A tab is a seated view, and a view either comes off the connected node's
+/// registry — where a deployment changes it at a block — or ships with this
+/// app build (`backend::view_source::DESKTOP_OWNED`, which holds the
+/// credential doors and the node's own instruments). The rail says which, on
+/// the row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabBytes {
+    Network,
+    Desktop,
+}
+
+/// One row of the rail: the view it seats, the name it draws, and who serves
+/// it. No row names a `ShellTab` arm — there are none to name.
+struct NavRow {
+    view: &'static str,
+    label: String,
+    bytes: TabBytes,
+}
+
+/// A run of rows under one heading. `foot` pushes the run to the bottom of
+/// the rail instead of letting it follow the run above.
+struct NavSection {
+    heading: Option<&'static str>,
+    foot: bool,
+    rows: Vec<NavRow>,
+}
+
+/// The ids this build knows where to put, in the order it puts them.
+///
+/// THE SET IS THE CHAIN'S, THE ARRANGEMENT IS LOCAL (#2303). The registry's
+/// other entries follow the workspace rows below, so a view this build has
+/// never heard of still gets a tab; this list only says where the familiar
+/// ones sit, which is a local preference and never consensus state. A
+/// per-user arrangement (order, hidden, pinned) is the next step and reads
+/// from a local file, not from a block.
+const WORKSPACE_ARRANGEMENT: [&str; 5] = ["chat", "pages", "forge", "agents", "files"];
+const NETWORK_ARRANGEMENT: [&str; 4] = ["explorer", "node", "members", "governance"];
+
+/// The rail's rows, in sections: the dashboard, the workspace tools, the
+/// network's own instruments, and settings at the foot.
+fn navigation_rows(label: &dyn Fn(&'static str) -> String) -> Vec<NavSection> {
+    let registered = crate::module_view::registered_views();
+    let row = |view: &'static str| NavRow {
+        view,
+        label: label(view),
+        bytes: match crate::backend::view_source::desktop_owned(view) {
+            true => TabBytes::Desktop,
+            false => TabBytes::Network,
+        },
+    };
+    // the dashboard leads the rail, above every section: it is the network at
+    // a glance, not a workspace tool or a network tool
+    let dashboard = registered
+        .iter()
+        .copied()
+        .filter(|view| *view == HOME_VIEW)
+        .map(row)
+        .collect();
+    // the registry's other entries are workspace tools: they follow the ones
+    // this build arranges, in the registry's order, named by their manifests.
+    // `call` is seated by the huddle dock, not by a tab.
+    let arranged = |view: &&'static str| {
+        WORKSPACE_ARRANGEMENT.contains(view) || NETWORK_ARRANGEMENT.contains(view)
+    };
+    let workspace = WORKSPACE_ARRANGEMENT
+        .into_iter()
+        .chain(
+            registered
+                .into_iter()
+                .filter(|view| *view != HOME_VIEW && *view != "call" && !arranged(view)),
+        )
+        .map(row)
+        .collect();
+    vec![
+        NavSection {
+            heading: None,
+            foot: false,
+            rows: dashboard,
+        },
+        NavSection {
+            heading: Some("Workspace"),
+            foot: false,
+            rows: workspace,
+        },
+        NavSection {
+            heading: Some("Network"),
+            foot: false,
+            rows: NETWORK_ARRANGEMENT.into_iter().map(row).collect(),
+        },
+        NavSection {
+            heading: None,
+            foot: true,
+            rows: vec![row("settings")],
+        },
+    ]
+}
+
 fn rail_row(
     id: impl Into<gpui_kit::ElementId>,
     icon: gpui_kit::component::Icon,
@@ -2860,25 +2940,29 @@ fn rail_row(
         .child(div().flex_1().min_w_0().truncate().child(label.into()))
 }
 
-fn nav_icon(tab: ShellTab) -> gpui_kit::component::Icon {
+/// A row's icon: the view's OWN `icons/tab.svg` once it is seated, else the
+/// mark this build carries for a familiar id, else a plain one.
+///
+/// The view's asset wins on purpose — that is how a tab this build never
+/// heard of gets a face — and the table below is only for the ids whose views
+/// ship no tab icon yet.
+fn nav_icon(view: &'static str) -> gpui_kit::component::Icon {
     use gpui_kit::component::{Icon, IconName};
-    match tab {
-        // the view's own `icons/tab.svg`, once it is seated; a plain mark
-        // until then and for a view that ships none
-        ShellTab::Registered(module) => match crate::module_view::registered_view_icon(module) {
-            Some(bytes) => Icon::empty().data(&bytes),
-            None => Icon::new(IconName::LayoutDashboard),
-        },
-        ShellTab::Chat => Icon::empty().data(MESSAGE_SQUARE),
-        ShellTab::Pages => Icon::new(IconName::BookOpen),
-        ShellTab::Forge => Icon::empty().data(GIT_BRANCH),
-        ShellTab::Agents => Icon::new(IconName::Bot),
-        ShellTab::Files => Icon::new(IconName::Folder),
-        ShellTab::Explorer => Icon::new(IconName::Globe),
-        ShellTab::Node => Icon::new(IconName::HardDrive),
-        ShellTab::Members => Icon::empty().data(USERS),
-        ShellTab::Governance => Icon::empty().data(VOTE),
-        ShellTab::Settings => Icon::new(IconName::Settings),
+    if let Some(bytes) = crate::module_view::registered_view_icon(view) {
+        return Icon::empty().data(&bytes);
+    }
+    match view {
+        "chat" => Icon::empty().data(MESSAGE_SQUARE),
+        "pages" => Icon::new(IconName::BookOpen),
+        "forge" => Icon::empty().data(GIT_BRANCH),
+        "agents" => Icon::new(IconName::Bot),
+        "files" => Icon::new(IconName::Folder),
+        "explorer" => Icon::new(IconName::Globe),
+        "node" => Icon::new(IconName::HardDrive),
+        "members" => Icon::empty().data(USERS),
+        "governance" => Icon::empty().data(VOTE),
+        "settings" => Icon::new(IconName::Settings),
+        _ => Icon::new(IconName::LayoutDashboard),
     }
 }
 

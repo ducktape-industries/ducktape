@@ -114,7 +114,7 @@ fn shell_tab_switches_hide_and_restore_the_retained_guest() {
     let seat = seated(&[]);
     let mut cx = crate::frame_probe::headless_context();
     let mut state = crate::Ducktape::initial_state();
-    state.shell_tab = crate::ShellTab::Chat;
+    state.shell_tab = crate::ShellTab::View("chat");
     let mut presenter = None;
     let window = cx
         .open_window(gpui::size(gpui::px(1200.), gpui::px(800.)), |window, cx| {
@@ -137,7 +137,7 @@ fn shell_tab_switches_hide_and_restore_the_retained_guest() {
     assert!(visible());
     presenter.update(&mut cx, |view, cx| {
         view.test_dispatch(
-            crate::AppMessage::SelectShellTab(crate::ShellTab::Files),
+            crate::AppMessage::SelectShellTab(crate::ShellTab::View("files")),
             cx,
         )
     });
@@ -148,7 +148,7 @@ fn shell_tab_switches_hide_and_restore_the_retained_guest() {
         "the previous tab remains hidden while another tab is rendered"
     );
     presenter.update(&mut cx, |view, cx| {
-        view.test_dispatch(crate::AppMessage::SelectShellTab(crate::ShellTab::Chat), cx)
+        view.test_dispatch(crate::AppMessage::SelectShellTab(crate::ShellTab::View("chat")), cx)
     });
     cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
         .unwrap();

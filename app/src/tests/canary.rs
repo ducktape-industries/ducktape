@@ -49,15 +49,8 @@ fn capture(module: &'static str, path: &Path) -> Vec<u8> {
     let mut cx = crate::frame_probe::headless_context();
     let mut app = super::Ducktape::initial_state();
     app.connected = true;
-    app.shell_tab = match module {
-        "chat" => super::ShellTab::Chat,
-        "pages" => super::ShellTab::Pages,
-        "files" => super::ShellTab::Files,
-        "members" => super::ShellTab::Members,
-        "governance" => super::ShellTab::Governance,
-        "forge" => super::ShellTab::Forge,
-        _ => panic!("unknown canary module {module}"),
-    };
+    // a tab IS the view it seats, so the canary's module name is the tab
+    app.shell_tab = super::ShellTab::View(module);
     let (spec, _) = app.native_view();
     let window = cx
         .open_window(size(px(900.), px(600.)), |window, cx| {
@@ -245,7 +238,7 @@ fn canary_follows_a_live_node() {
     let mut app = super::Ducktape::initial_state();
     app.connected = true;
     app.connected_rpc = node;
-    app.shell_tab = super::ShellTab::Chat;
+    app.shell_tab = super::ShellTab::View("chat");
     let (spec, _) = app.native_view();
     let mut entity = None;
     let window = cx
