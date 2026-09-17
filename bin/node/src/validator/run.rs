@@ -38,6 +38,23 @@ type PendingSubmits = std::collections::HashMap<
     ),
 >;
 
+/// held rpc `submit` replies, the same shape as [`PendingSubmits`] over a
+/// different sink: the rpc lane answers with a json line, not a `BlockSummary`.
+///
+/// It exists because `node.submit` returns when the op is ACCEPTED, and the
+/// module that will refuse it has not run yet. The rpc handler used to answer
+/// `ok` there, so every op refused IN CONSENSUS — which is every governance
+/// door check — reached the daemon log and nothing else, and the verb that
+/// submitted it sat until its own unrelated deadline and blamed that (#2533).
+/// The http lane already waited; this is the rpc lane learning to.
+type PendingRpcSubmits = std::collections::HashMap<
+    node::FrameId,
+    (
+        Vec<std::sync::mpsc::Sender<crate::rpc::RpcReply>>,
+        std::time::SystemTime,
+    ),
+>;
+
 /// a join gate held open awaiting its `Redeem` frame's consensus fate. the
 /// member submitted the redemption and holds the joiner's outcome
 /// keyed by the frame id until `on_drain` resolves it into `gate_outcomes` —
@@ -227,6 +244,7 @@ struct ValidatorRuntime<'a> {
     applied: usize,
     converged: bool,
     pending_submits: PendingSubmits,
+    pending_rpc_submits: PendingRpcSubmits,
     pending_relays:
         std::collections::HashMap<node::FrameId, (Vec<ed25519::PublicKey>, std::time::SystemTime)>,
     /// join gates held open awaiting their `Redeem` frame's consensus fate,
@@ -374,6 +392,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // same id gets the same outcome, and the FIRST one's deadline governs.
     let mut http_ingress = http_cmds;
     let pending_submits: PendingSubmits = std::collections::HashMap::new();
+    let pending_rpc_submits: PendingRpcSubmits = std::collections::HashMap::new();
     // relayed submits held for a wire answer, keyed like pending_submits by
     // the frame's content address: resolved by the SAME drain that resolves
     // local holds, expired on the same SUBMIT_HOLD budget. the peers are where
@@ -571,6 +590,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         applied,
         converged,
         pending_submits,
+        pending_rpc_submits,
         pending_relays,
         pending_gates,
         gating,
