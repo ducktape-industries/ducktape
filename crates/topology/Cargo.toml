@@ -10,3 +10,9 @@ version.workspace = true
 # instantiates its selection itself.
 
 [dependencies]
+
+[dev-dependencies]
+# the repo-wide source lints in tests/ parse Rust rather than pattern-match it:
+# `wasm_embed.rs` has to tell a `#[cfg(test)]` item from production code, and a
+# `.wasm` literal from a brace inside a string.
+syn = { version = "2", features = ["full", "visit"] }

@@ -556,12 +556,12 @@ wasm-modules-check:
 ## the binary embeds no wasm (AGENTS.md, "No Embedded Wasm"): an
 ## include_bytes!/include_str! of a `.wasm` is allowed only in a test — a file
 ## under a `tests/` directory or named `tests.rs`, or an item a `#[cfg(test)]`
-## governs. Pure text, no toolchain: it runs in the per-push CI lane beside
-## `wasm-modules-check`. The scanner proves itself against six fixtures before
-## it scans the tree; `bash ops/wasm-embed-check.sh --self-test` runs those
-## alone. See ops/wasm-embed-check.sh.
+## governs. A source-parsing lint like `sdk_shaped` and `tracing_plane_lint`:
+## it parses every `.rs` in the tree with `syn`, so which items `#[cfg(test)]`
+## governs and whether a `.wasm` is an argument or text inside a literal are
+## answered by the parser rather than guessed. Its own fixtures run beside it.
 wasm-embed-check:
-	@bash ops/wasm-embed-check.sh
+	$(CARGO) test $(LOCKED) -p topology --test wasm_embed
 
 ## the reproducibility gate: one guest built twice, in two scratch directories,
 ## must be byte-identical and carry no host path. Needs the wasm32 target
