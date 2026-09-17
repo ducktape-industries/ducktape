@@ -1,6 +1,6 @@
 //! module-gap scenarios against the sim: the second wave of module semantics
 //! the app never surfaces — identity's single-use add-key consents and per-key
-//! generations, automations' cross-module abort atomicity (P2), the jobs
+//! generations, automations' id-squat defense and rule-named task ids, the jobs
 //! authorization matrix and its attempt ceiling, forge's per-branch
 //! compare-and-swap, and attribution's module-origin gate. like `core_scenarios`,
 //! every rejection asserted here is the REAL module refusing over noded's exact
@@ -12,7 +12,7 @@
 mod harness;
 
 use commonware_cryptography::Signer as _;
-use harness::{Sim, add_ed25519_key, create, create_channel, key_origin, post_message};
+use harness::{add_ed25519_key, create, create_channel, key_origin, post_message, Sim};
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
 
@@ -146,12 +146,11 @@ fn removing_the_last_member_key_is_refused() {
     );
 }
 
-// ── C3 — automations: id-squatting + P2 abort atomicity ──
+// ── C3 — automations: id-squatting + rule-named task ids ──
 
 /// a rival that pre-posts a rule's deterministic message id is DEFENDED by the
 /// probe, not an abort: the triggering post commits, the rule records a
-/// no-fire, and the user's block is protected. (this is the designed id-squat
-/// defense — see the abort test below for the path that is NOT catchable.)
+/// no-fire, and the user's block is protected.
 #[test]
 fn a_squatted_post_id_downgrades_the_rule_without_aborting_the_post() {
     let storage = tempfile::tempdir().expect("storage dir");
@@ -228,11 +227,13 @@ fn a_squatted_post_id_downgrades_the_rule_without_aborting_the_post() {
     );
 }
 
-/// the P2 contract: a post-probe follow-up collision — two rules composing the
-/// SAME task id in one event — aborts the whole triggering block, and NOTHING
-/// from it survives in ANY module root.
+/// two rules sharing a `task_id_prefix` on one event each create their OWN
+/// task: a composed id names its firing rule (`<prefix>-<rule_id>-<channel>-<seq>`),
+/// so sibling rules never collide at execute and a member's post is never
+/// vetoed by two independently configured rules. The whole unit commits —
+/// message, both tasks, both fires.
 #[test]
-fn a_task_id_collision_aborts_the_entire_triggering_block() {
+fn two_rules_sharing_a_prefix_each_create_their_own_task() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
     let operator = harness::found_account(&sim, "operator", 40);
@@ -248,10 +249,7 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
         Some(&operator),
     );
 
-    // two rules, SAME task_id_prefix, same trigger: their composed task ids both
-    // resolve to `auto-general-{seq}`. each probes tasks and sees no collision
-    // (the sibling's CreateTask is a queued follow-up, invisible to the probe),
-    // so both emit — and the second follow-up collides at execute.
+    // two rules, SAME task_id_prefix, same trigger.
     for rule_id in ["r1", "r2"] {
         sim.submit_ok(
             "automations",
@@ -264,62 +262,37 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
         );
     }
 
-    // snapshot the chain tip BEFORE the doomed submit.
-    let before = sim.status();
-    let before_height = before["height"].as_u64().expect("height");
-    let before_hash = before["root_hash"].as_str().expect("root hash").to_string();
-
-    // the triggering post fires both rules; the second CreateTask collides with
-    // the first's staged id, and the WHOLE block aborts (P2) — the op is rejected
-    // and moves no state (the atomic block rolled back).
-    let (code, reply) = sim.submit(
+    // the triggering post fires both rules in one dispatch; each follow-up
+    // creates a task under its own rule-named id, and the post commits.
+    sim.submit_ok(
         "chat",
         post_message("general", "trigger", "please deploy now"),
         None,
     );
-    assert_eq!(
-        code, 400,
-        "the collision must abort the triggering block: {reply}"
-    );
-    assert!(
-        reply["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("task already exists"),
-        "the abort names the duplicate id: {reply}"
-    );
 
-    // NO STATE survives: the rejected op journals a block (validator parity — so
-    // the HEIGHT advances by one) but the atomic abort rolled back every write,
-    // so the root-hash is byte-identical, the triggering message never entered
-    // chat, no task landed, and neither rule recorded a fire.
-    let after = sim.status();
-    assert_eq!(
-        after["height"].as_u64(),
-        Some(before_height + 1),
-        "the rejected op sealed its own block (validator parity): {after}"
-    );
-    assert_eq!(
-        after["root_hash"].as_str(),
-        Some(before_hash.as_str()),
-        "root-hash unmoved (the rejected op rolled back): {after}"
-    );
     let message = sim.query(
         "chat",
         serde_json::json!({ "message": { "message_id": "trigger" } }),
     );
-    assert!(
-        message["message"].is_null(),
-        "the aborted post left no message: {message}"
+    assert_eq!(
+        message["message"]["head"]["message_id"], "trigger",
+        "the triggering post committed: {message}"
     );
     let tasks = sim.query(
         "tasks",
         serde_json::json!({ "task": { "list": { "limit": 256 } } }),
     );
+    let mut task_ids: Vec<&str> = tasks["task"]["tasks"]
+        .as_array()
+        .expect("task list")
+        .iter()
+        .filter_map(|task| task["id"].as_str())
+        .collect();
+    task_ids.sort_unstable();
     assert_eq!(
-        tasks["task"]["tasks"].as_array().map(Vec::len),
-        Some(0),
-        "no task survived the abort: {tasks}"
+        task_ids,
+        ["auto-r1-general-1", "auto-r2-general-1"],
+        "each rule created its own task: {tasks}"
     );
     for rule_id in ["r1", "r2"] {
         let rule = sim.query(
@@ -327,8 +300,16 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
             serde_json::json!({ "get_rule": { "rule_id": rule_id } }),
         );
         assert_eq!(
-            rule["rule"]["fire_count"], 0,
-            "the aborted rule kept fire_count 0: {rule}"
+            rule["rule"]["fire_count"], 1,
+            "each rule recorded its fire: {rule}"
+        );
+        let history = sim.query(
+            "automations",
+            serde_json::json!({ "run_history": { "rule_id": rule_id, "limit": 10 } }),
+        );
+        assert_eq!(
+            history["history"][0]["action_ok"], true,
+            "the fire created its task: {history}"
         );
     }
 }
