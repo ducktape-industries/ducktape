@@ -168,6 +168,24 @@ impl PlayoutRing {
     }
 }
 
+/// Whether a captured frame carried sound rather than room noise: mean
+/// square over the frame, against a fixed floor.
+///
+/// This is a MEASUREMENT ON SAMPLES, so it belongs with the microphone — the
+/// samples do not leave this process. What the room does with the verdict
+/// (hangover, beacons, who is shown as speaking) is the call guest's, and it
+/// receives the verdict, never the audio.
+pub(crate) fn carries_sound(frame: &[i16]) -> bool {
+    if frame.is_empty() {
+        return false;
+    }
+    let energy: f64 = frame.iter().map(|sample| f64::from(*sample).powi(2)).sum();
+    energy / frame.len() as f64 >= SOUND_FLOOR * SOUND_FLOOR
+}
+
+/// The amplitude a frame's mean square must reach to count as speech.
+const SOUND_FLOOR: f64 = 400.0;
+
 /// Accumulates mono 48 kHz i16 samples into exact voice frames.
 #[derive(Default)]
 pub struct FrameAccumulator {
@@ -438,6 +456,28 @@ pub fn call_speaking_after(current: bool, event: &CallEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The verdict the call guest is handed instead of the samples. Silence
+    /// and a room's noise floor are not speech; an ordinary speaking level
+    /// is. The guest cannot compute this — it never sees a sample — so the
+    /// threshold has to hold here.
+    #[test]
+    fn sound_is_measured_at_the_microphone() {
+        assert!(!carries_sound(&[]));
+        assert!(!carries_sound(&[0; FRAME_SAMPLES]));
+        assert!(!carries_sound(&[399; FRAME_SAMPLES]));
+        assert!(carries_sound(&[400; FRAME_SAMPLES]));
+        assert!(
+            carries_sound(&[-8000; FRAME_SAMPLES]),
+            "sign does not matter"
+        );
+        // It is mean square over the frame, so energy can arrive concentrated:
+        // one full-scale click in an otherwise silent frame is over the floor.
+        // That is the threshold this moved unchanged, not a new judgement.
+        let mut quiet_with_a_click = [0i16; FRAME_SAMPLES];
+        quiet_with_a_click[0] = i16::MAX;
+        assert!(carries_sound(&quiet_with_a_click));
+    }
 
     #[test]
     fn frames_accumulate_to_exact_voice_frames() {

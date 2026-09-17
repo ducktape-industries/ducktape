@@ -31,7 +31,7 @@ pub mod engine;
 pub mod jitter;
 pub mod media;
 
-pub use codec::{CodecError, VoiceDecoder, VoiceEncoder};
+pub use codec::{CodecError, MAX_ENCODED, VoiceDecoder, VoiceEncoder};
 pub use engine::{SpeakerStats, VoiceConfig, VoiceEngine};
 pub use jitter::{JitterStats, MinimalJitter, PlayoutStep};
 pub use media::{MediaError, MediaHeader};

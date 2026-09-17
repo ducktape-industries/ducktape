@@ -48,16 +48,18 @@ const TELEMETRY_LANE: Service = Service::from_lane_id(5);
 const BULK_BYTES_PER_SEC: u64 = 24_000_000;
 const BULK_BURST_BYTES: u64 = 512 * 1024;
 
-/// What the deployed call puts on the wire today: one 20 ms frame of the
-/// shipped `voice::FRAME_SAMPLES` i16 PCM, uncompressed, plus the call wire's
-/// tag and peer header. It is larger than `MAX_DATAGRAM_PAYLOAD` (1363) — the
-/// datagram lane REFUSES it, which the harness reports rather than hides.
-const CALL_FRAME_BYTES: usize = 1961;
-/// A 20 ms compressed frame at 64 kbit/s. `VoiceConfig`'s shipped default is
-/// 32 kbit/s — 80 bytes a frame — so this is DOUBLE what the encoder the tree
-/// already carries would emit, chosen so the datagram lane is measured with no
-/// size advantage it would not really have. Both lanes carry this size, so the
-/// head-to-head compares lane CLASS rather than payload.
+/// One 20 ms frame of `voice::FRAME_SAMPLES` i16 PCM, uncompressed, plus the
+/// call wire's tag and peer header — the size a frame has at the microphone,
+/// before the encoder at the device boundary. It is larger than
+/// `MAX_DATAGRAM_PAYLOAD` (1363), so the datagram lane REFUSES it: the ceiling
+/// the encoder exists to stay under, reported rather than hidden.
+const PCM_FRAME_BYTES: usize = 1961;
+/// What the deployed call puts on the wire: one 20 ms encoded frame, at
+/// 64 kbit/s. `VoiceConfig`'s shipped default is 32 kbit/s — 80 bytes a
+/// frame — so this is DOUBLE what the encoder emits, chosen so the datagram
+/// lane is measured with no size advantage it would not really have. Both
+/// lanes carry this size, so the head-to-head compares lane CLASS rather than
+/// payload.
 const OPUS_FRAME_BYTES: usize = 160;
 const FRAME_PERIOD: Duration = Duration::from_millis(20);
 const MILLIS: u64 = 1_000_000;
@@ -510,22 +512,20 @@ async fn overlay_lane_classes_under_impairment() {
     stream_lane(trial, warmup, OPUS_FRAME_BYTES, false)
         .await
         .report(&label, "gateway_stream_opus", &load);
-    // What the deployed call actually sends today, on the lane it actually
-    // uses, alone and beside a bulk consumer drawing the same budget.
+    // The same frame unencoded, on the lane a call crosses a node boundary
+    // on, alone and beside a bulk consumer drawing the same budget.
     let load = load_average();
-    stream_lane(trial, warmup, CALL_FRAME_BYTES, false)
+    stream_lane(trial, warmup, PCM_FRAME_BYTES, false)
         .await
-        .report(&label, "gateway_stream_call", &load);
+        .report(&label, "gateway_stream_pcm", &load);
     let load = load_average();
-    stream_lane(trial, warmup, CALL_FRAME_BYTES, true)
+    stream_lane(trial, warmup, PCM_FRAME_BYTES, true)
         .await
-        .report(&label, "gateway_stream_call_bulk", &load);
-    // And the same payload offered to the lane built for media, which refuses
-    // it: the datagram class never fragments.
+        .report(&label, "gateway_stream_pcm_bulk", &load);
+    // And that payload offered to the lane built for media, which refuses it:
+    // the datagram class never fragments.
     let load = load_average();
-    datagram_lane(trial, warmup, CALL_FRAME_BYTES).await.report(
-        &label,
-        "voice_datagram_call",
-        &load,
-    );
+    datagram_lane(trial, warmup, PCM_FRAME_BYTES)
+        .await
+        .report(&label, "voice_datagram_pcm", &load);
 }

@@ -25,7 +25,77 @@ struct Audio {
     _device: crate::call::AudioThread,
     muted: Arc<AtomicBool>,
     playout: Arc<Mutex<crate::call::PlayoutRing>>,
+    /// one decoder per peer being heard, in first-heard order. A voice codec
+    /// carries state across a peer's frames, so a decoder belongs to a
+    /// stream, not to the device — and the device is where the codec lives,
+    /// beside the microphone and the playout ring.
+    decoders: Vec<(String, media_service::voice::VoiceDecoder)>,
     pump: tokio::task::JoinHandle<()>,
+}
+
+/// As many peers as the call guest seats. Reaching it means a call churned
+/// through more than this many distinct speakers, and the oldest decoder is
+/// dropped: that peer's next frame costs one frame of silence, where keeping
+/// every decoder ever seen would cost the call unbounded memory.
+const MAX_DECODERS: usize = 32;
+
+/// The capture bitrate: the voice engine's default, ~80 bytes per 20 ms
+/// frame against a 1 275-byte ceiling.
+const VOICE_BITRATE: i32 = 32_000;
+
+/// one peer's audio for one playout tick.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerFrame {
+    peer: String,
+    frame: Vec<u8>,
+}
+
+type Decoders = Vec<(String, media_service::voice::VoiceDecoder)>;
+
+/// This peer's decoder, created on its first frame.
+fn decoder_for<'a>(
+    decoders: &'a mut Decoders,
+    peer: &str,
+) -> Option<&'a mut media_service::voice::VoiceDecoder> {
+    let seated = decoders.iter().position(|(id, _)| id == peer);
+    let index = match seated {
+        Some(index) => index,
+        None => {
+            let decoder = media_service::voice::VoiceDecoder::new().ok()?;
+            if decoders.len() == MAX_DECODERS {
+                decoders.remove(0);
+            }
+            decoders.push((peer.to_owned(), decoder));
+            decoders.len() - 1
+        }
+    };
+    Some(&mut decoders[index].1)
+}
+
+/// Decode this tick's frames, each with the decoder belonging to the peer
+/// that sent it, and mix them into one playout frame.
+///
+/// A frame the codec refuses costs that peer this tick and nothing else:
+/// every byte here was chosen by a remote participant, and one bad packet
+/// must not silence the room or take the session down.
+fn mix_playout(decoders: &mut Decoders, frames: Vec<PeerFrame>) -> Vec<i16> {
+    let mut mixed = [0i32; crate::call::FRAME_SAMPLES];
+    for PeerFrame { peer, frame } in frames {
+        let Some(decoder) = decoder_for(decoders, &peer) else {
+            continue;
+        };
+        let Ok(samples) = decoder.decode(&frame) else {
+            continue;
+        };
+        for (mix, sample) in mixed.iter_mut().zip(samples) {
+            *mix += i32::from(sample);
+        }
+    }
+    mixed
+        .into_iter()
+        .map(|sample| sample.clamp(i16::MIN.into(), i16::MAX.into()) as i16)
+        .collect()
 }
 
 impl Drop for Audio {
@@ -125,11 +195,32 @@ impl Devices {
                     return;
                 }
             }
+            // The codec sits here, at the device: the guest is handed an
+            // ENCODED frame and the host's verdict on whether it carried
+            // sound, so PCM never reaches the guest, the node bridge or the
+            // hub — a room's audio crosses nodes as ~80 bytes, not 1 920.
+            let mut encoder = match media_service::voice::VoiceEncoder::new(VOICE_BITRATE) {
+                Ok(encoder) => encoder,
+                Err(error) => {
+                    replies.item(id, Err(format!("voice encoder: {error}")), true);
+                    return;
+                }
+            };
             while let Some(samples) = frames.recv().await {
+                let Ok(frame) = <&[i16; crate::call::FRAME_SAMPLES]>::try_from(&samples[..]) else {
+                    continue;
+                };
+                let sound = crate::call::carries_sound(&samples);
+                let Ok(encoded) = encoder.encode(frame) else {
+                    // one frame the codec refused, not a dead device
+                    continue;
+                };
                 replies.item(
                     id,
-                    Ok(serde_json::to_vec(&serde_json::json!({"samples": samples}))
-                        .expect("PCM samples")),
+                    Ok(
+                        serde_json::to_vec(&serde_json::json!({"frame": encoded, "sound": sound}))
+                            .expect("voice frame"),
+                    ),
                     false,
                 );
             }
@@ -140,6 +231,7 @@ impl Devices {
             _device: device,
             muted,
             playout,
+            decoders: Vec::new(),
             pump,
         });
         Ok(())
@@ -259,11 +351,13 @@ fn request(
     id: u64,
     payload: &[u8],
 ) -> Result<Option<Vec<u8>>, String> {
+    /// one playout tick: every peer that had a frame this tick, named, so
+    /// each is decoded by its own decoder before the mix.
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Play {
         audio: u64,
-        samples: Vec<i16>,
+        frames: Vec<PeerFrame>,
     }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -300,17 +394,18 @@ fn request(
             let ask: Play = decode(payload)?;
             let audio = devices
                 .audio
-                .as_ref()
+                .as_mut()
                 .filter(|audio| audio.id == ask.audio)
                 .ok_or("unknown audio resource")?;
-            if ask.samples.len() != crate::call::FRAME_SAMPLES {
-                return Err("playout requires one 960-sample PCM frame".into());
+            if ask.frames.len() > MAX_DECODERS {
+                return Err("playout carries at most one frame per seated peer".into());
             }
+            let frame = mix_playout(&mut audio.decoders, ask.frames);
             audio
                 .playout
                 .lock()
                 .expect("audio playout")
-                .push_frame(&ask.samples);
+                .push_frame(&frame);
             Vec::new()
         }
         "mute" => {
@@ -349,6 +444,99 @@ fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encoded(level: i16) -> Vec<u8> {
+        let mut encoder =
+            media_service::voice::VoiceEncoder::new(VOICE_BITRATE).expect("voice encoder");
+        let mut pcm = [0i16; crate::call::FRAME_SAMPLES];
+        for (index, sample) in pcm.iter_mut().enumerate() {
+            // a tone, so the decoder has something to reconstruct
+            *sample = if index % 48 < 24 { level } else { -level };
+        }
+        encoder.encode(&pcm).expect("one encoded frame")
+    }
+
+    /// The device decodes each peer with that peer's own decoder and mixes
+    /// the result. A codec carries state across a stream, so mixing before
+    /// decoding is not an option and the peer name is not decoration.
+    #[test]
+    fn playout_decodes_per_peer_and_mixes() {
+        let mut decoders = Decoders::new();
+        let one = mix_playout(
+            &mut decoders,
+            vec![PeerFrame {
+                peer: "a".into(),
+                frame: encoded(6_000),
+            }],
+        );
+        assert_eq!(one.len(), crate::call::FRAME_SAMPLES);
+        assert!(one.iter().any(|sample| *sample != 0), "a peer was heard");
+        assert_eq!(decoders.len(), 1, "one decoder, kept for the next frame");
+
+        let two = mix_playout(
+            &mut decoders,
+            vec![
+                PeerFrame {
+                    peer: "a".into(),
+                    frame: encoded(6_000),
+                },
+                PeerFrame {
+                    peer: "b".into(),
+                    frame: encoded(6_000),
+                },
+            ],
+        );
+        assert_eq!(decoders.len(), 2);
+        let loudest = |frame: &[i16]| frame.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        assert!(
+            loudest(&two) > loudest(&one),
+            "two talkers are louder than one: {} vs {}",
+            loudest(&two),
+            loudest(&one)
+        );
+
+        // silence is still a frame: the playout tick must not stall
+        assert_eq!(
+            mix_playout(&mut decoders, Vec::new()),
+            vec![0i16; crate::call::FRAME_SAMPLES]
+        );
+    }
+
+    /// These bytes come from a remote participant. A refused packet costs
+    /// that peer one tick — never the room, never the session.
+    #[test]
+    fn a_refused_packet_costs_one_peer_one_tick() {
+        let mut decoders = Decoders::new();
+        let mixed = mix_playout(
+            &mut decoders,
+            vec![
+                PeerFrame {
+                    peer: "bad".into(),
+                    frame: vec![0xff; 40],
+                },
+                PeerFrame {
+                    peer: "good".into(),
+                    frame: encoded(9_000),
+                },
+            ],
+        );
+        assert!(
+            mixed.iter().any(|sample| *sample != 0),
+            "the good peer was still heard"
+        );
+    }
+
+    /// A call that churns through more speakers than it can seat evicts the
+    /// oldest decoder rather than growing forever.
+    #[test]
+    fn decoders_are_bounded_by_the_seats() {
+        let mut decoders = Decoders::new();
+        for index in 0..MAX_DECODERS + 4 {
+            assert!(decoder_for(&mut decoders, &format!("peer-{index}")).is_some());
+        }
+        assert_eq!(decoders.len(), MAX_DECODERS);
+        assert_eq!(decoders[0].0, "peer-4", "the oldest went first");
+    }
 
     /// The lease is what makes "one microphone, one call" true: it is the only
     /// thing standing between a second panel, a replaced view or a switched

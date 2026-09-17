@@ -428,18 +428,21 @@ impl Hub {
             Message::Binary(bytes) => {
                 match bytes.first().copied() {
                     Some(1) => {
-                        let pcm = media_service::call_wire::decode_audio(&bytes)
+                        // one encoded voice frame, bounded here and read by
+                        // nothing short of the device that plays it — the hub
+                        // moves audio, it does not listen to it.
+                        let voice = media_service::call_wire::decode_audio(&bytes)
                             .ok_or("invalid audio frame")?;
                         if source.beacon.muted {
                             return Ok(());
                         }
                         // Audio is tagged with authenticated source identity;
                         // each guest owns its jitter buffer and playout mix.
-                        let mut outgoing = Vec::with_capacity(41 + pcm.len() * 2);
+                        let mut outgoing = Vec::with_capacity(41 + voice.len());
                         outgoing.push(4);
                         outgoing.extend_from_slice(&caller.account.to_be_bytes());
                         outgoing.extend_from_slice(&caller.node);
-                        outgoing.extend_from_slice(&bytes[1..]);
+                        outgoing.extend_from_slice(voice);
                         Message::Binary(outgoing.into())
                     }
                     Some(2) => {
@@ -1026,10 +1029,7 @@ mod tests {
         assert_eq!(beacon["account"], second.account);
         assert_eq!(beacon["peer"], peer(&second.node));
 
-        let audio = media_service::call_wire::encode_audio(&vec![
-                1200;
-                media_service::voice::FRAME_SAMPLES
-            ]);
+        let audio = media_service::call_wire::encode_audio(&voice_payload());
         right
             .send(ClientMessage::Binary(audio.clone()))
             .await
@@ -1107,11 +1107,18 @@ mod tests {
         (roster, callers, ids, queues)
     }
 
+    /// one encoded 20 ms voice frame, as the capturing device produces it.
+    /// The hub never decodes audio, so what this proves is the shape it
+    /// moves: an opaque payload two orders smaller than the samples behind it.
+    fn voice_payload() -> Vec<u8> {
+        let mut encoder = media_service::voice::VoiceEncoder::new(32_000).expect("voice encoder");
+        encoder
+            .encode(&[1200i16; media_service::voice::FRAME_SAMPLES])
+            .expect("one encoded frame")
+    }
+
     fn audio_frame() -> Message {
-        Message::Binary(
-            media_service::call_wire::encode_audio(&vec![1200; media_service::voice::FRAME_SAMPLES])
-                .into(),
-        )
+        Message::Binary(media_service::call_wire::encode_audio(&voice_payload()).into())
     }
 
     fn video_frame(bytes: usize, keyframe: bool) -> Message {
@@ -1280,10 +1287,7 @@ mod tests {
         let mut hub = Hub::default();
         let (first_id, mut output) = hub.join("room", first.clone(), &roster).unwrap();
         let (second_id, _other) = hub.join("room", second.clone(), &roster).unwrap();
-        let audio = Message::Binary(
-            media_service::call_wire::encode_audio(&vec![1; media_service::voice::FRAME_SAMPLES])
-                .into(),
-        );
+        let audio = audio_frame();
         for _ in 0..64 {
             hub.relay("room", &second, second_id, &roster, audio.clone())
                 .unwrap();
@@ -1308,15 +1312,15 @@ mod tests {
         );
     }
 
-    /// One audio frame this test can tell from every other.
+    /// One audio frame this test can tell from every other. The hub moves the
+    /// payload without reading it, so the marker IS the payload.
     fn numbered_audio(index: usize) -> Message {
-        let mut pcm = vec![0i16; media_service::voice::FRAME_SAMPLES];
-        pcm[0] = index as i16;
-        Message::Binary(media_service::call_wire::encode_audio(&pcm).into())
+        let marker = (index as i16).to_le_bytes();
+        Message::Binary(media_service::call_wire::encode_audio(&marker).into())
     }
 
     /// That number back out of a forwarded frame: tag, account, node, then
-    /// the sender's PCM verbatim.
+    /// the sender's payload verbatim.
     fn audio_number(message: &Message) -> i16 {
         let Message::Binary(bytes) = message else {
             panic!("a forwarded audio frame");
@@ -1603,10 +1607,7 @@ mod tests {
         // A message in another channel cannot have moved this room's huddle.
         // This frame arriving is the absence of a pause.
         authority.changes.send(posted("other-room")).unwrap();
-        let audio = media_service::call_wire::encode_audio(&vec![
-                1200;
-                media_service::voice::FRAME_SAMPLES
-            ]);
+        let audio = media_service::call_wire::encode_audio(&voice_payload());
         left.send(ClientMessage::Binary(audio.clone()))
             .await
             .unwrap();
@@ -1678,11 +1679,7 @@ mod tests {
     }
 
     fn stamped_audio(seq: u32, nanos: u64) -> Vec<u8> {
-        let mut pcm = vec![0i16; media_service::voice::FRAME_SAMPLES];
-        for (word, pair) in pcm.iter_mut().zip(stamp(seq, nanos).chunks_exact(2)) {
-            *word = i16::from_le_bytes([pair[0], pair[1]]);
-        }
-        media_service::call_wire::encode_audio(&pcm)
+        media_service::call_wire::encode_audio(&stamp(seq, nanos))
     }
 
     fn stamped_video(seq: u32, nanos: u64, bytes: usize) -> Vec<u8> {
