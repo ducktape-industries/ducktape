@@ -43,7 +43,7 @@ use std::process::ExitCode;
 use app_update::{Event, Idle, Phase, PublicKey, Sha, state};
 use tracing::{error, info, warn};
 
-use crate::layout::{Layout, NODE_EXE};
+use crate::layout::{Layout, MODULES_DIR, NODE_EXE};
 use crate::node::{Child, Ducktape, ReleaseStatus};
 use crate::refusal::Refusal;
 use crate::update::{Executor, Next, Settled, Watch};
@@ -619,6 +619,7 @@ fn seed(
         writers::unseal(&release_dir);
         let _ = std::fs::remove_file(&exe);
         std::fs::copy(from, &exe).map_err(|error| Refusal::io("install_failed", &exe, &error))?;
+        seed_founding_set(from, &release_dir)?;
     }
     writers::require_release(&release_dir)?;
     writers::seal(&release_dir);
@@ -636,6 +637,32 @@ fn seed(
     });
     writers::persist(&layout.state_path(), &state::encode(&idle))?;
     Ok(sha)
+}
+
+/// The founding set that shipped beside `from`, into the release this install
+/// seeds.
+///
+/// A NODE RELEASE IS THREE THINGS, and a seeded one has to be the same three
+/// as a downloaded one. No binary carries wasm: a node resolves its set as
+/// `modules/` beside its own executable, so a release seeded from a bare
+/// binary starts a node whose reachability plane never comes up
+/// (`netstack_guest_unreadable`) — no overlay, no peers, a height that never
+/// moves — and nothing in that chain names the directory that is missing. An
+/// unpacked node archive carries the set beside `ducktape`, and so does the
+/// staging directory an operator builds; when nothing is there this says so,
+/// because the node will not.
+fn seed_founding_set(from: &std::path::Path, release_dir: &std::path::Path) -> Result<(), Refusal> {
+    let shipped = from.parent().map(|beside| beside.join(MODULES_DIR));
+    let Some(set) = shipped.filter(|set| set.is_dir()) else {
+        warn!(
+            target: TARGET,
+            reason = "founding_set_missing",
+            "no `modules/` beside the binary this install seeds; the node it starts \
+             will find no founding set unless DUCKTAPE_MODULES_DIR names one"
+        );
+        return Ok(());
+    };
+    writers::copy_tree(&set, &release_dir.join(MODULES_DIR))
 }
 
 // --- process plumbing --------------------------------------------------------
@@ -839,6 +866,56 @@ mod tests {
         assert!(layout.exe().exists(), "current/ducktape resolves");
         // no release key pinned: this install follows no channel.
         assert_eq!(update::trusted_keys(&layout).unwrap(), None);
+    }
+
+    /// A NODE RELEASE IS THREE THINGS. An install from an unpacked archive —
+    /// `ducktape` with its founding set beside it — seeds a release that holds
+    /// both, because a node resolves its set beside its own executable and a
+    /// seeded release that holds only the binary starts a node with no mesh.
+    #[test]
+    fn install_carries_the_founding_set_that_shipped_with_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let unpacked = dir.path().join("unpacked");
+        let set = unpacked.join("modules");
+        std::fs::create_dir_all(&set).unwrap();
+        std::fs::write(set.join("netstack.component.wasm"), b"\0asm").unwrap();
+        std::fs::write(set.join(".staged-by"), b"abc1234").unwrap();
+        let binary = unpacked.join("ducktape");
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let layout = Layout::of(dir.path().join("workspace"));
+        let sha = seed(&layout, &binary, None).unwrap();
+
+        let release = layout.release_dir(sha);
+        assert!(release.join("ducktape").exists());
+        assert_eq!(
+            std::fs::read(release.join("modules/netstack.component.wasm")).unwrap(),
+            b"\0asm",
+            "the netstack guest a node needs to reach the mesh is beside the binary"
+        );
+        assert!(
+            release.join("modules/.staged-by").exists(),
+            "and the record the binary checks the set against rides along"
+        );
+    }
+
+    /// A binary with no set beside it still installs — `DUCKTAPE_MODULES_DIR`
+    /// is how the dev shape points a node at one, and a release whose payload
+    /// is a bare executable is what the release e2e publishes.
+    #[test]
+    fn install_from_a_bare_binary_still_seeds_a_runnable_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("ducktape-built");
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let layout = Layout::of(dir.path().join("workspace"));
+        let sha = seed(&layout, &binary, None).unwrap();
+        assert!(!layout.release_dir(sha).join("modules").exists());
+        writers::require_release(&layout.release_dir(sha)).expect("still a runnable release");
     }
 
     /// Pinning a key on a workspace that is already running one is this verb

@@ -171,6 +171,32 @@ pub fn digest_file(path: &Path) -> Result<Sha, Refusal> {
     Ok(Sha::from_bytes(hasher.finalize().into()))
 }
 
+/// Copy `from` into `to`, directories and regular files only — the founding
+/// set an install carries into the release it seeds. Anything else in the
+/// source (a link, a device) is skipped rather than followed: this launcher
+/// never follows a symlink it did not write.
+pub fn copy_tree(from: &Path, to: &Path) -> Result<(), Refusal> {
+    fs::create_dir_all(to).map_err(|error| Refusal::io("copy_failed", to, &error))?;
+    let entries = fs::read_dir(from).map_err(|error| Refusal::io("copy_failed", from, &error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| Refusal::io("copy_failed", from, &error))?;
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        let kind = entry
+            .file_type()
+            .map_err(|error| Refusal::io("copy_failed", &source, &error))?;
+        if kind.is_dir() {
+            copy_tree(&source, &target)?;
+            continue;
+        }
+        if !kind.is_file() {
+            continue;
+        }
+        fs::copy(&source, &target).map_err(|error| Refusal::io("copy_failed", &target, &error))?;
+    }
+    Ok(())
+}
+
 /// A release directory holds one executable `ducktape`, and it is a real
 /// directory this launcher extracted — never a link someone left there.
 pub fn require_release(dir: &Path) -> Result<(), Refusal> {
