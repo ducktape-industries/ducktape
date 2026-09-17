@@ -187,7 +187,8 @@ update its membership tests after rebuilding the artifacts.
 ```
 cargo test -p <id>                                        # 1. native logic
 git push                                                  # 2. the guest build reads HEAD out of the repository
-cargo run -p guest-builder -- crates/modules/<plane>/<id> # 3. catches native-dep leaks
+cargo run --target-dir target/guest-builder-bin \
+  -p guest-builder -- crates/modules/<plane>/<id>          # 3. catches native-dep leaks
 make wasm-modules                                         # 4. BEFORE the node pins run —
                                                           #    the fixtures dir needs the artifact
 cargo check --workspace --all-targets                     # 5. registry parity test gates
@@ -195,6 +196,52 @@ cargo clippy -p <id> --tests --no-deps                    #    topology↔compos
 make wasm-modules-check                                   # 6. committed copies byte-identical, locks present
 make wasm-rebuild-check                                   # 7. every guest matches a rebuild of its source (needs wasm32)
 ```
+
+Step 3 carries `--target-dir` and is not a bare `cargo run -p guest-builder`
+BECAUSE OF THE TARGET DIRECTORY. `guest-builder` bakes its platform root in at
+compile time, and a host config that points `CARGO_TARGET_DIR` at one directory
+for every worktree — this box does — leaves ONE binary at ONE path, owned by
+whichever checkout built it last. Running that one refuses every module you own
+by name:
+
+```
+guest-builder: crates/modules/apps/chat is outside the platform checkout <someone else's worktree>
+```
+
+and it can happen MID-SWEEP, when a sibling's build lands between two of your
+guests. `touch bin/guest-builder/src/main.rs` only wins that race until the next
+session builds. Every guest-builder invocation in the `Makefile`, in
+`ops/wasm-repro-check.sh` and in `ops/build-guest-rootfs.sh` builds into a
+directory of its own checkout: `target/guest-builder-bin`, a sibling of
+`target/guest-builder/<id>/` where the builder puts each module's ephemeral
+build tree. Reach for the bare `cargo run` and you are back in the race.
+
+Step 7 names EVERY stale guest in one run, not just the first — a guest is stale
+because something it compiles in moved, and that is rarely true of one guest
+alone.
+
+**Scope step 7 to what you changed.** The full sweep is 31 guest builds, most of
+an hour on a loaded box, and a PR that moved one crate does not owe the other
+twenty-eight:
+
+```
+make wasm-rebuild-check CRATES="files duckfs-core"    # the guests that compile those
+make wasm-rebuild-check                               # all 31 — what an SDK or toolchain move owes
+```
+
+`CRATES` is the crates the change touched, and the guest list is derived from
+each module's own `guest.lock`, which records what it actually compiled — the
+same answer as `grep -l 'name = "<crate>"' crates/modules/*/*/guest.lock`, which
+is also how you check the scope by hand before running anything. A module that
+ships an index guest has ONE lock covering both: the builder's shell workspace
+holds every guest the module declares, so the lock is their union. A crate no
+lock names is refused rather than quietly checking nothing.
+
+The rule this serves is in `AGENTS.md`: a guest's bytes move with EVERY crate it
+compiles in, a deletion included. `crates/duckfs/core` is not a module crate and
+is not the SDK, and it moves `files`, `pages` and `runs` — five deleted lines
+shift every panic-path line number below them. Reach for `CRATES` after any
+change and the check is cheap enough to actually run.
 
 ## Common mistakes
 
