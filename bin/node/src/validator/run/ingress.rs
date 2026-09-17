@@ -145,7 +145,7 @@ impl ValidatorRuntime<'_> {
                         height: node.finalized().map(|f| f.height),
                         root_hash: hex(&node.root_hash()),
                         modules,
-                        netstack: metrics.operational_status().netstack,
+                        operations: metrics.operational_status(),
                     }),
                     ..RpcReply::ok()
                 }

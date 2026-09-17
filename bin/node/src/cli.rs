@@ -258,16 +258,89 @@ fn cmd_node_status(args: StatusArgs) -> CommandResult {
         println!("{status}");
         return Ok(());
     }
+    for line in status_lines(status) {
+        println!("{line}");
+    }
+    let Some(seconds) = stalled_past_recovery(status) else {
+        return Ok(());
+    };
+    // NOT an `Err`: the verb did its job, and an `Err` here would print the
+    // node's own `FATAL:` marker — the string the desktop app classifies a
+    // dead node by — for a node that answered perfectly well. A distinct code
+    // says "answered, and the news is bad", which is the difference a script
+    // needs.
+    eprintln!(
+        "the chain has sealed nothing for {seconds}s, past the point it recovers on its own — \
+         compare reachable against quorum above, and check the other members"
+    );
+    std::process::exit(CHAIN_IS_STALLED);
+}
+
+/// `node status` exit code for a node that answered and reported a stalled
+/// chain. Distinct from 1, which every verb uses for "could not answer at all"
+/// — an operator's `ducktape node status || alert` must not treat a node that
+/// is merely unreachable as a wedged network, or the reverse.
+const CHAIN_IS_STALLED: i32 = 2;
+
+/// What `node status` prints, in order — one `key=value` line per subject, so
+/// the whole answer stays greppable.
+fn status_lines(status: &serde_json::Value) -> Vec<String> {
     let height = match status["height"].as_u64() {
         Some(h) => h.to_string(),
         None => "none".into(),
     };
     let root_hash = status["root_hash"].as_str().unwrap_or("");
-    println!("height={height} root_hash={root_hash}");
-    if let Some(line) = netstack_line(&status["netstack"]) {
-        println!("{line}");
+    let operations = &status["operations"];
+    let mut lines = vec![format!("height={height} root_hash={root_hash}")];
+    lines.extend(standing_line(operations));
+    lines.extend(netstack_line(&operations["netstack"]));
+    lines
+}
+
+/// the `role=`/`phase=` line: where this node stands, and — when it is in
+/// consensus — whether the chain under it is moving.
+///
+/// Height and root hash cannot answer that: on a wedged chain they are
+/// byte-identical six seconds and six minutes later, which is how a halted
+/// network read as a healthy one. `reachable` beside `quorum` is the diagnosis
+/// and `stalled_for` is how long it has been true, so both belong on the line
+/// an operator was told to run.
+///
+/// Consensus fields are absent, never zeroed, on a role that has no consensus
+/// section — `quorum=0 reachable=0` on a syncing resident reads as a dead
+/// chain, and it is not one.
+fn standing_line(operations: &serde_json::Value) -> Option<String> {
+    let role = operations["role"].as_str()?;
+    let phase = operations["phase"].as_str()?;
+    let mut line = format!("role={role} phase={phase}");
+    let consensus = &operations["consensus"];
+    if let Some(quorum) = consensus["quorum"].as_u64() {
+        let reachable = consensus["reachable_validators"].as_u64().unwrap_or(0);
+        line.push_str(&format!(" quorum={quorum} reachable={reachable}"));
     }
-    Ok(())
+    // 0 is the beating case and prints nothing: a field that is always there
+    // is a field nobody reads, and this one has to be noticed.
+    if let Some(seconds) = consensus["block_beat_stalled_seconds"]
+        .as_u64()
+        .filter(|seconds| *seconds > 0)
+    {
+        line.push_str(&format!(" stalled_for={seconds}s"));
+    }
+    Some(line)
+}
+
+/// How long the chain has been silent, once that is past the point it recovers
+/// on its own ([`crate::drain_actions::STALL_IS_AN_ERROR_AFTER`], the same
+/// threshold the node's own `block_beat_stalled` error fires on).
+///
+/// `None` is "nothing to report", which covers a beating chain, a brief
+/// silence, and a node with no consensus section to ask. The verb exits
+/// non-zero on `Some` — the whole point being that a script can tell a wedged
+/// chain from a healthy one without parsing anything.
+fn stalled_past_recovery(status: &serde_json::Value) -> Option<u64> {
+    let seconds = status["operations"]["consensus"]["block_beat_stalled_seconds"].as_u64()?;
+    let past_recovery = seconds >= crate::drain_actions::STALL_IS_AN_ERROR_AFTER.as_secs();
+    past_recovery.then_some(seconds)
 }
 
 /// the `netstack=` line of `node status`: which machine the reachability plane
@@ -2078,6 +2151,107 @@ mod tests {
             })),
             Some("netstack=native last_swap=refused@4 reason=foreign contract".to_string())
         );
+    }
+
+    /// A node answers `status` with everything an operator needs to tell a
+    /// wedged chain from a healthy one, so the verb prints it. Height and root
+    /// hash alone are identical on both, forever.
+    #[test]
+    fn a_stalled_chain_reads_as_stalled_and_a_beating_one_does_not() {
+        let stalled = serde_json::json!({
+            "height": 399,
+            "root_hash": "2170",
+            "operations": {
+                "role": "validator", "phase": "validating",
+                "consensus": {
+                    "epoch": 2, "view": 0, "validators": 2, "quorum": 2,
+                    "reachable_validators": 1, "pending_ops": 3,
+                    "block_beat_stalled_seconds": 116,
+                },
+            },
+        });
+        assert_eq!(
+            super::status_lines(&stalled),
+            [
+                "height=399 root_hash=2170",
+                // `reachable=1` under `quorum=2` IS the diagnosis, and the
+                // seconds say how long it has been true.
+                "role=validator phase=validating quorum=2 reachable=1 stalled_for=116s",
+            ]
+        );
+        assert_eq!(super::stalled_past_recovery(&stalled), Some(116));
+
+        let beating = serde_json::json!({
+            "height": 400,
+            "root_hash": "2171",
+            "operations": {
+                "role": "validator", "phase": "validating",
+                "consensus": {
+                    "epoch": 2, "view": 1, "validators": 2, "quorum": 2,
+                    "reachable_validators": 2, "pending_ops": 0,
+                    "block_beat_stalled_seconds": 0,
+                },
+            },
+        });
+        assert_eq!(
+            super::status_lines(&beating),
+            [
+                "height=400 root_hash=2171",
+                "role=validator phase=validating quorum=2 reachable=2",
+            ]
+        );
+        assert_eq!(super::stalled_past_recovery(&beating), None);
+    }
+
+    /// A silence shorter than the point the chain recovers on its own is
+    /// PRINTED and not exited on: a view change or a slow disk is not a dead
+    /// chain, and a verb that exits non-zero on one teaches an operator to
+    /// ignore it.
+    #[test]
+    fn a_brief_silence_is_reported_without_a_verdict() {
+        let blipping = serde_json::json!({
+            "height": 399, "root_hash": "2170",
+            "operations": {
+                "role": "validator", "phase": "validating",
+                "consensus": {
+                    "validators": 2, "quorum": 2, "reachable_validators": 2,
+                    "block_beat_stalled_seconds": 12,
+                },
+            },
+        });
+        assert_eq!(
+            super::status_lines(&blipping)[1],
+            "role=validator phase=validating quorum=2 reachable=2 stalled_for=12s"
+        );
+        assert_eq!(super::stalled_past_recovery(&blipping), None);
+    }
+
+    /// A role with no consensus section gets no consensus fields, rather than
+    /// zeroes that read as "quorum 0, nothing reachable" — the projection omits
+    /// what does not apply and so does the line.
+    #[test]
+    fn a_node_outside_consensus_prints_what_it_has() {
+        let syncing = serde_json::json!({
+            "height": 12, "root_hash": "aa",
+            "operations": {
+                "role": "resident", "phase": "syncing",
+                "netstack": { "backend": "native", "last_swap": null },
+            },
+        });
+        assert_eq!(
+            super::status_lines(&syncing),
+            [
+                "height=12 root_hash=aa",
+                "role=resident phase=syncing",
+                "netstack=native",
+            ]
+        );
+        assert_eq!(super::stalled_past_recovery(&syncing), None);
+
+        // a daemon that answers no operations at all still answers a tip.
+        let bare = serde_json::json!({ "height": 1, "root_hash": "bb" });
+        assert_eq!(super::status_lines(&bare), ["height=1 root_hash=bb"]);
+        assert_eq!(super::stalled_past_recovery(&bare), None);
     }
 
     #[test]
