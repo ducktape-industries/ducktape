@@ -72,6 +72,30 @@ pub enum Dash {
     Solid,
     Dashed,
 }
+/// How heavy a shape's line is. Width is how a drawing says what is structure
+/// and what is annotation — the box around the diagram drawn fat, the three
+/// boxes inside it drawn thin — and you read that grouping before you read a
+/// word of it. Without it a board has only colour to say it with, and colour
+/// is already saying which KIND of thing each shape is, so one channel carries
+/// two meanings and neither arrives.
+///
+/// Four steps and not a number, for the same reason [`TextSize`] is: a free
+/// number lets a board hold a hairline no zoom can find and a slab that eats
+/// the shape it outlines, and it makes "the same weight as that one" a thing
+/// you match by eye instead of by picking it up.
+///
+/// Called weight and not width because a shape already HAS a width — the
+/// geometric one, in board units, that a resize changes. This is the pen, not
+/// the box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Weight {
+    Thin,
+    #[default]
+    Medium,
+    Thick,
+    Heavy,
+}
 /// How big a shape's words are. Four steps and not a number: the size decides
 /// the box a text shape hugs and the column a card wraps in, so a free number
 /// would let a board hold writing that no zoom level can read and no box can
@@ -126,6 +150,10 @@ pub struct Shape {
     /// stroke are the same line as far as this is concerned.
     #[serde(default)]
     pub dash: Dash,
+    /// How heavy that line is. Stored for every shape and read by every one
+    /// that draws a line at all, which is every kind but text.
+    #[serde(default)]
+    pub weight: Weight,
     pub align: Align,
     pub text_size: TextSize,
     /// A path's samples, relative to `x`/`y` and spanning `width`/`height`,
@@ -154,6 +182,7 @@ impl Default for Shape {
             color: 0,
             fill: Fill::Solid,
             dash: Dash::Solid,
+            weight: Weight::Medium,
             align: Align::Middle,
             text_size: TextSize::Medium,
             points: Vec::new(),
@@ -218,6 +247,10 @@ pub enum Change {
     Dash {
         id: String,
         dash: Dash,
+    },
+    Weight {
+        id: String,
+        weight: Weight,
     },
     Align {
         id: String,
@@ -326,6 +359,7 @@ impl Board {
             Change::Color { id, color } => self.color(id, *color),
             Change::Fill { id, fill } => self.fill(id, *fill),
             Change::Dash { id, dash } => self.dash(id, *dash),
+            Change::Weight { id, weight } => self.weight(id, *weight),
             Change::Align { id, align } => self.align(id, *align),
             Change::TextSize { id, text_size } => self.text_size(id, *text_size),
             Change::Route {
@@ -476,6 +510,14 @@ impl Board {
         };
         let mut shape = record.shape.clone();
         shape.dash = dash;
+        self.replace(id, Some(shape))
+    }
+    fn weight(&mut self, id: &str, weight: Weight) -> Result<(), String> {
+        let Some(record) = self.shapes.get(id) else {
+            return Ok(());
+        };
+        let mut shape = record.shape.clone();
+        shape.weight = weight;
         self.replace(id, Some(shape))
     }
     fn align(&mut self, id: &str, align: Align) -> Result<(), String> {

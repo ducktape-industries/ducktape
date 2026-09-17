@@ -1665,6 +1665,18 @@ impl BoardsView {
                 .collect(),
         )
     }
+    pub(super) fn on_weight(&mut self, weight: Weight) -> Task<Message> {
+        self.pen.weight = weight;
+        self.edit_many(
+            self.selected
+                .iter()
+                .map(|id| Change::Weight {
+                    id: id.clone(),
+                    weight,
+                })
+                .collect(),
+        )
+    }
     /// Where the selection's words sit across the boxes they are written in.
     /// It is not remembered for the NEXT shape the way a colour is: a colour
     /// is a choice about the board, and how a card's words are set is a choice

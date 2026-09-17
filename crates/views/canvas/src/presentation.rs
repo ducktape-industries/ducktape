@@ -27,6 +27,33 @@ fn pen(color: Rgba, width: f32, dash: Dash) -> wire::CanvasStroke {
 /// The board's own chrome — rings, guides, previews — is never dashed and never
 /// hollow: a broken selection ring would read as a shape somebody drew.
 const CHROME: Dash = Dash::Solid;
+/// What the pen's weight does to a line — a multiplier, not a width. The width
+/// a shape is drawn at is already two facts: how big it reads at this zoom, and
+/// what KIND it is (a note's border is a hairline, a freehand nib is fat). The
+/// weight is a third, independent of both, so it multiplies what those two
+/// decided rather than replacing it.
+///
+/// Which is also why `Medium` is exactly 1: every board drawn before a shape
+/// could carry a weight reads back at the width it was drawn at, to the pixel.
+/// How a run is drawn, resolved: the colour it came out as, and the two pen
+/// properties the painter has still to apply. One value because every caller
+/// carries all three together and not one of them ever varies alone — and
+/// because a run's painter threading them as three arguments is how it ended up
+/// at eight.
+#[derive(Clone, Copy)]
+struct Ink {
+    color: Rgba,
+    dash: Dash,
+    weight: Weight,
+}
+fn heft(weight: Weight) -> f32 {
+    match weight {
+        Weight::Thin => 0.5,
+        Weight::Medium => 1.,
+        Weight::Thick => 2.,
+        Weight::Heavy => 3.5,
+    }
+}
 fn line(from: [f32; 2], to: [f32; 2], color: Rgba, width: f32) -> Draw {
     Draw::Draw {
         shape: Geometry::Line { from, to },
@@ -726,6 +753,7 @@ impl BoardsView {
                         // the same complaint the colour row was added for.
                         fill_row(self.pen.fill),
                         dash_row(self.pen.dash),
+                        weight_row(self.pen.weight),
                     ],
                 ),
                 6.,
@@ -758,6 +786,9 @@ impl BoardsView {
         }
         if any_outline {
             properties.push(dash_row(self.pen.dash));
+            // Same gate as the dash: both rows are about a line, and the one
+            // kind with no line has no use for either.
+            properties.push(weight_row(self.pen.weight));
         }
         properties.push(kit::divider("boards/properties-rule"));
         if let Some(shape) = writable {
@@ -1162,7 +1193,13 @@ impl BoardsView {
             Fill::None => None,
         };
         let edge = |strength: f32| Rgba(alpha(tint(s.color), strength * opacity));
-        let line_width = (1.5 * self.zoom).clamp(1., 8.);
+        // The weight multiplies AFTER the zoom clamp, not before it. Folded in
+        // first, a thick line at 300% would hit the ceiling the clamp is there
+        // to enforce and come out the same width as a heavy one — the two steps
+        // a user picked between collapsing into one exactly when the board is
+        // zoomed in far enough to tell them apart.
+        let heft = heft(s.weight);
+        let line_width = (1.5 * self.zoom).clamp(1., 8.) * heft;
         let radius = (6. * self.zoom).clamp(2., 20.);
         match s.kind {
             Kind::Note => out.push(rectangle(
@@ -1170,7 +1207,7 @@ impl BoardsView {
                 size,
                 body(1.),
                 edge(0.35),
-                1.,
+                heft,
                 radius,
                 s.dash,
             )),
@@ -1190,7 +1227,12 @@ impl BoardsView {
             Kind::Arrow | Kind::Line | Kind::Draw => {
                 let world = interaction::stroke(board, s);
                 let screen: Vec<_> = world.iter().map(|p| self.screen(p[0], p[1])).collect();
-                self.paint_stroke(s.kind, &screen, edge(1.), s.dash, budget, out);
+                let ink = Ink {
+                    color: edge(1.),
+                    dash: s.dash,
+                    weight: s.weight,
+                };
+                self.paint_stroke(s.kind, &screen, ink, budget, out);
             }
         }
     }
@@ -1198,8 +1240,7 @@ impl BoardsView {
         &self,
         kind: Kind,
         screen: &[[f32; 2]],
-        color: Rgba,
-        dash: Dash,
+        ink: Ink,
         budget: usize,
         out: &mut Vec<Draw>,
     ) {
@@ -1224,8 +1265,10 @@ impl BoardsView {
             false => decimate(&interaction::thin(screen, 0.75), limit),
         };
         let end = path[path.len() - 1];
-        let weight = if kind == Kind::Draw { 2.5 } else { 1.8 };
-        let width = (weight * self.zoom).clamp(1.2, 14.);
+        // A freehand nib is fatter than a ruled line before anybody chooses a
+        // weight; the weight scales whichever of the two this is.
+        let nib = if kind == Kind::Draw { 2.5 } else { 1.8 };
+        let width = (nib * self.zoom).clamp(1.2, 14.) * heft(ink.weight);
         out.push(Draw::Draw {
             shape: Geometry::Path(match bent {
                 true => through(&path),
@@ -1233,7 +1276,7 @@ impl BoardsView {
             }),
             fill: None,
             even_odd: false,
-            stroke: Some(pen(color, width, dash)),
+            stroke: Some(pen(ink.color, width, ink.dash)),
         });
         if kind != Kind::Arrow {
             // The head is the one part of a run that is never broken: a dashed
@@ -1256,7 +1299,7 @@ impl BoardsView {
                     end[0] - head * (angle + turn).cos(),
                     end[1] - head * (angle + turn).sin(),
                 ],
-                color,
+                ink.color,
                 width,
             ));
         }
@@ -1758,7 +1801,12 @@ impl BoardsView {
                         |bound| interaction::stroke(board, &bound),
                     );
                     let screen: Vec<_> = run.iter().map(|q| self.screen(q[0], q[1])).collect();
-                    self.paint_stroke(*kind, &screen, accent, shape.dash, 8, out);
+                    let ink = Ink {
+                        color: accent,
+                        dash: shape.dash,
+                        weight: shape.weight,
+                    };
+                    self.paint_stroke(*kind, &screen, ink, 8, out);
                     return;
                 }
                 // A card is drawn AS the card it will be, in the ink it will
@@ -1797,14 +1845,12 @@ impl BoardsView {
                 let screen: Vec<_> = points.iter().map(|q| self.screen(q[0], q[1])).collect();
                 // A stroke is drawn in the pen it will be kept in, and the pen
                 // a new shape gets is the board's current one.
-                self.paint_stroke(
-                    Kind::Draw,
-                    &screen,
-                    Rgba(tint(self.pen.color)),
-                    self.pen.dash,
-                    boards_wire::MAX_POINTS,
-                    out,
-                );
+                let ink = Ink {
+                    color: Rgba(tint(self.pen.color)),
+                    dash: self.pen.dash,
+                    weight: self.pen.weight,
+                };
+                self.paint_stroke(Kind::Draw, &screen, ink, boards_wire::MAX_POINTS, out);
             }
             // Only an end reaches for a card; a bend crossing one binds nothing
             // and must not say that it would.
@@ -2497,6 +2543,14 @@ fn icon(name: &str) -> Node {
         // whether the outline is unbroken
         "dash-solid" => "<path d='M3 12h18'/>",
         "dash-dashed" => "<path d='M3 12h4M10 12h4M17 12h4'/>",
+        // how heavy it is: the same line the dash row draws, four times, each
+        // overriding the sheet's stroke width with its own. The icon IS the
+        // thing it sets, which is the only way a weight control can be read
+        // without a label.
+        "weight-thin" => "<path d='M3 12h18' stroke-width='1'/>",
+        "weight-medium" => "<path d='M3 12h18' stroke-width='2'/>",
+        "weight-thick" => "<path d='M3 12h18' stroke-width='3.5'/>",
+        "weight-heavy" => "<path d='M3 12h18' stroke-width='5.5'/>",
         _ => "",
     };
     let bytes=format!("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='#222222' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'>{path}</svg>").into_bytes();
@@ -2740,6 +2794,34 @@ fn dash_row(current: Dash) -> Node {
                     Message::Outline(dash),
                     true,
                     dash == current,
+                )
+            }),
+        ),
+        4.,
+    )
+}
+/// How heavy the shape's line is, the one it is set to checked. Four steps in
+/// one row, like the lettering ladder, because they are the same kind of
+/// choice: a size picked off a scale rather than a state toggled.
+fn weight_row(current: Weight) -> Node {
+    kit::spaced(
+        kit::row(
+            "boards/weight",
+            [
+                (Weight::Thin, "weight-thin", "Thin line"),
+                (Weight::Medium, "weight-medium", "Medium line"),
+                (Weight::Thick, "weight-thick", "Thick line"),
+                (Weight::Heavy, "weight-heavy", "Heavy line"),
+            ]
+            .map(|(weight, name, label)| {
+                icon_button(
+                    &format!("boards/weight/{name}"),
+                    name,
+                    label,
+                    "How heavy the line is",
+                    Message::Stroke(weight),
+                    true,
+                    weight == current,
                 )
             }),
         ),
