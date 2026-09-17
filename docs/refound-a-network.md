@@ -24,9 +24,15 @@ needs.
 the directories named on the command line, and the script refuses to stop or
 archive anything without `--yes`.
 
-Processes are found by `/proc/<pid>/exe` and by the workspace path in their
-argv — never by a `pkill -f` pattern, which also matches an editor, a grep, or
-another network's node.
+Processes are found three ways, never by a `pkill -f` pattern — which also
+matches an editor, a grep, or another network's node. An executable under the
+workspace is the node itself. The workspace path in argv catches the launcher
+and the service daemons, whose binaries live elsewhere. A working directory
+under the workspace catches what names nothing absolute at all: `node run
+--config node.toml` and `service run agent --workspace .` are placed only by
+where they were started, and a network founded by hand looks exactly like
+that. The cwd match is narrowed to a `ducktape` executable, so a shell or a
+`tail` sitting in the workspace is not stopped with the network.
 
 Workspaces are ARCHIVED, never deleted: each is moved to
 `<path>.archived-<timestamp>` and every archived path is printed in the final
@@ -54,8 +60,11 @@ staging directory and the network is founded from the copies. A shared cargo
 target directory holds whichever checkout built it last, so a binary taken
 straight from one may belong to a sibling whose wire has already moved; the
 copy must prove its ancestry (`git merge-base --is-ancestor`) against this
-checkout's HEAD before anything is founded with it. The set is checked for
-`*.pending` markers, which are views whose staging was interrupted.
+checkout's HEAD before anything is founded with it. A binary built from a tree
+with tracked changes stamps `<short sha>-<diff digest>`; the digest is not a
+rev, so it comes off before the test and stays in the printed line. The set is
+checked for `*.pending` markers, which are views whose staging was
+interrupted, and the report names the set the genesis was composed from.
 
 **The launcher's child needs the set too.** `ducktape-node-launcher` runs
 `<workspace>/current/ducktape`, and a node resolves its founding set beside its
@@ -87,6 +96,15 @@ daemon that is already signalling; with nothing running it refuses. The script
 starts each daemon and grants it in one step. `compute` and `agent` open the
 sandbox at boot and exit without a microVM kernel, so they are started only
 when `--guest` is given.
+
+**One daemon granted at a time.** Granting rewrites the whole of
+`<workspace>/services.toml`, so daemons that grant themselves concurrently
+overwrite one another's records. The loser announces nothing and executes
+nothing while its own log says it enabled, and every saga accept on it is
+refused `accept_not_capability_provider`. Each daemon is started, granted and
+confirmed before the next one begins, and afterwards the node's own `service
+status` must read every kind back as `enabled` — the only surface on which a
+lost grant is visible.
 
 **A fresh workspace has no wallet, and a fresh chain has no account.** Every
 keyless verb signs with the active wallet and the service daemons refuse to

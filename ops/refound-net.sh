@@ -202,11 +202,26 @@ echo "staged founding set $MODULES_SRC (${#staged_entries[@]} entries)"
 # to go first. Matched on an exact path in argv, read from /proc, never a
 # `pkill -f` pattern that would also match an editor or a grep.
 pids_under() {
-    local root=$1 d exe args
+    local root=$1 d exe cwd args base
     for d in /proc/[0-9]*; do
         exe=$(readlink "$d/exe" 2>/dev/null) || continue
         # the node: its executable lives under the workspace.
         case "$exe" in "$root"/*) printf '%s\n' "${d#/proc/}"; continue;; esac
+        # a process started with a RELATIVE selector — `node run --config
+        # node.toml`, `service run agent --workspace .` — names nothing
+        # absolute anywhere, and its binary can live outside the workspace
+        # too. The only thing that places it is its working directory.
+        # Narrowed to a ducktape executable so an operator's shell, editor or
+        # `tail` sitting in the workspace is not swept up with the network.
+        base=${exe##*/}
+        cwd=$(readlink "$d/cwd" 2>/dev/null) || cwd=
+        case "$base" in
+            ducktape | ducktape-*)
+                case "$cwd" in
+                    "$root" | "$root"/*) printf '%s\n' "${d#/proc/}"; continue;;
+                esac
+                ;;
+        esac
         # the launcher and the service daemons: both run a binary from
         # somewhere else and NAME this workspace in argv. Matching the absolute
         # root path in argv catches every one of them without the
@@ -492,36 +507,45 @@ else
     echo "no --guest: starting airlock only (compute and agent need the microVM kernel)"
 fi
 
+# ONE AT A TIME, each grant confirmed before the next daemon starts.
+# `commit_enable` is a read-modify-write of `<workspace>/services.toml` with no
+# lock, so three daemons granting themselves at once clobber one another: the
+# first one's record is read by the second, which writes back a file without
+# it. The loser announces nothing, `service status` reads `· compute signaling`
+# with `instance -`, and every saga accept is refused
+# `accept_not_capability_provider` — with the daemon alive and its own log
+# saying it enabled. Starting them in sequence is the operator-side fix; the
+# missing lock is a node defect either way.
+#
+# The grant line is also NOT proof the daemon lives: it enables, prints
+# `announced at height N`, and can still exit on the next line. So each one
+# waits for its grant, then waits out the exit window and must still be there.
 for svc in $SERVICES; do
+    log="$FOUNDER_WS/service-$svc.log"
     DUCKTAPE_MODULES_DIR="$FOUNDER_WS/modules" setsid nohup \
         "$STAGED_BIN" service run "$svc" --config "$FOUNDER_CFG" --enable \
-        > "$FOUNDER_WS/service-$svc.log" 2>&1 < /dev/null &
+        > "$log" 2>&1 < /dev/null &
     disown
-done
-
-# A daemon that died on startup is worth naming here rather than at the first
-# run that cannot find a provider — and the grant line is NOT the proof. A
-# daemon enables, prints `announced at height N`, and can still exit on the
-# next line; the only thing that distinguishes the two is whether it is still
-# there afterwards. So: wait for the grant, then wait out the exit window and
-# require the process to be alive.
-for svc in $SERVICES; do
     n=0
-    until grep -qiE "granted|signaling|announced" "$FOUNDER_WS/service-$svc.log" 2>/dev/null; do
+    until grep -q "announced at height" "$log" 2>/dev/null; do
         n=$((n+1))
-        if [ "$n" -gt 30 ]; then
-            echo "service $svc: no grant after 60s — see $FOUNDER_WS/service-$svc.log"
-            break
-        fi
+        [ "$n" -le 30 ] || die "service $svc: no grant after 60s — see $log"
         sleep 2
     done
     sleep 2
-    if grep -q "boot_fatal" "$FOUNDER_WS/service-$svc.log" 2>/dev/null; then
-        die "service $svc enabled and then died: $(grep -m1 -o 'FATAL:.*' "$FOUNDER_WS/service-$svc.log")"
+    if grep -q "boot_fatal" "$log" 2>/dev/null; then
+        die "service $svc enabled and then died: $(grep -m1 -o 'FATAL:.*' "$log")"
     fi
-    if [ -z "$(service_pid "$svc")" ]; then
-        die "service $svc: enabled but no daemon is running — see $FOUNDER_WS/service-$svc.log"
-    fi
+    [ -n "$(service_pid "$svc")" ] \
+        || die "service $svc: enabled but no daemon is running — see $log"
+done
+
+# and the grants as the NODE reads them back, which is the only surface that
+# would have caught the clobber above.
+for svc in $SERVICES; do
+    DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" service status --config "$FOUNDER_CFG" 2>/dev/null \
+        | grep -q "✓ $svc  enabled" \
+        || die "service $svc is running but the node does not read it as enabled — see $FOUNDER_WS/service-$svc.log"
 done
 DUCKTAPE_HOME="$ROOT" "$STAGED_BIN" service status --config "$FOUNDER_CFG" 2>&1 | head -20 || true
 
@@ -560,6 +584,7 @@ cat <<REPORT
   founder     http 127.0.0.1:$F_HTTP   rpc :$F_RPC   config $FOUNDER_CFG
   resident    http 127.0.0.1:$J_HTTP   rpc :$J_RPC   config $JOINER_CFG
   binary      $VOUCH
+  set         $MODULES_SRC
   archived   ${ARCHIVED:- (nothing)}
 
   both nodes are supervised by ducktape-node-launcher, so a core update flips
