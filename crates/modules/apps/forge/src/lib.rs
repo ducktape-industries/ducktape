@@ -215,8 +215,8 @@ pub fn norm_repo(repo: &str) -> Result<String, Error> {
     Ok(repo.to_string())
 }
 
-/// lowercase-hex a byte slice — for human-readable log lines only.
-#[cfg(feature = "native")]
+/// lowercase-hex a byte slice. An oid has its own encoder ([`oid`]); this is
+/// for log lines and for the chain digest in [`pushcert::nonce`].
 pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(bytes.len() * 2);

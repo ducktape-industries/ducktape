@@ -485,7 +485,10 @@ impl GitService {
 /// the capability line for `service` on `repo`. receive-pack additionally
 /// offers `push-cert=<nonce>` — the invitation `git push --signed` needs
 /// (git refuses to sign a push the server did not offer a nonce for) — once
-/// this node knows its chain: the nonce is `<chain id>/<repo>`.
+/// this node knows its chain. The nonce is whatever `forge::pushcert::nonce`
+/// makes of that chain and repo, and it is git's to accept: it validates the
+/// value it is handed before signing, so the shape lives in that one function
+/// and is checked against git's rules by that module's own test.
 fn advertised_caps(handle: &ServiceState, repo: &str, service: GitService) -> String {
     let base = service.caps();
     let nonce = match service {
