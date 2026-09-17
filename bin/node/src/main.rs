@@ -95,6 +95,8 @@ mod netstack_governance;
 mod node_http;
 mod overlay_book;
 mod plane_metrics;
+mod presence;
+mod presence_plane;
 mod qualify;
 mod reachability_plane;
 #[cfg(test)]
@@ -113,8 +115,6 @@ mod tty;
 mod userkey_cli;
 mod util;
 mod validator;
-mod voice;
-mod voice_plane;
 mod wallet_cli;
 mod work_admission;
 use crate::util::fatal;

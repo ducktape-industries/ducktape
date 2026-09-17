@@ -1,4 +1,8 @@
 //! Bind the Pages presence overlay control plane.
+//!
+//! Huddle media is NOT here. It runs in the separately installed media
+//! process, reached through a gateway route — nothing on this plane carries
+//! a call.
 
 use std::sync::Arc;
 
@@ -10,28 +14,32 @@ use data_plane::{
 use crate::lane_table::lane_table;
 use crate::overlay_book::{BIND_RETRY, LaneKey, LaneSource, OverlayBook, OverlayPeers, Plane};
 
-/// Media runs no stream class, so the plane's bulk-pacing budget is inert —
+/// Presence runs no stream class, so the plane's bulk-pacing budget is inert —
 /// these values only need to exist. (The stream listeners the sockets bind are
 /// never dialled; see [`bind_service`].)
-const MEDIA_PLANE_CONFIG: PlaneConfig = PlaneConfig {
+const PRESENCE_PLANE_CONFIG: PlaneConfig = PlaneConfig {
     bulk_bytes_per_sec: 1 << 20,
     bulk_burst_bytes: 1 << 20,
 };
 
-/// The voice plane's tag for the shared [`OverlayBook`]: address resolution
-/// only — media admission is the hub's session-driven active-flow set, so the
-/// tag is a [`Plane`], never a stream plane.
-struct VoicePlane;
+/// The presence plane's tag for the shared [`OverlayBook`]: address resolution
+/// only — admission is the hub's session-driven active-flow set, so the tag is
+/// a [`Plane`], never a stream plane.
+struct PresencePlane;
 
 /// the lane this plane serves, re-exported so the hub that owns the sessions
 /// can watch the same key for a withdrawal.
-pub(crate) const VOICE_LANE: LaneSource = LaneSource::Declared(LaneKey {
+///
+/// It is `presence`, not `voice`, because presence is what crosses it. A lane
+/// name is committed state and the only thing that says what a lane carries;
+/// the one named `voice` belongs to the traffic that name promises.
+pub(crate) const PRESENCE_LANE: LaneSource = LaneSource::Declared(LaneKey {
     module_id: "chat",
-    name: "voice",
+    name: "presence",
 });
 
-impl Plane for VoicePlane {
-    const LANE: LaneSource = VOICE_LANE;
+impl Plane for PresencePlane {
+    const LANE: LaneSource = PRESENCE_LANE;
 }
 
 /// Bind presence on the runtime that owns its session pumps, answering with
@@ -44,14 +52,14 @@ pub async fn bind_presence_plane(
     admission: Arc<dyn AdmissionPolicy>,
     node: &str,
 ) -> (DataPlane<OverlaySockets>, Service) {
-    let (voice_sockets, service) = bind_service::<VoicePlane>(&factory, &peers, me, node).await;
+    let (sockets, service) = bind_service::<PresencePlane>(&factory, &peers, me, node).await;
     (
-        DataPlane::new(voice_sockets, admission, MEDIA_PLANE_CONFIG),
+        DataPlane::new(sockets, admission, PRESENCE_PLANE_CONFIG),
         service,
     )
 }
 
-/// Bind one media lane's overlay sockets on this node's `/128`.
+/// Bind one datagram-class lane's overlay sockets on this node's `/128`.
 ///
 /// TWO waits, in order, and neither is a timeout: first the committed lane
 /// table has to name `P::LANE` (before that there is no port to bind), then

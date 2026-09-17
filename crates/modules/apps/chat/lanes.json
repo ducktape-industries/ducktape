@@ -1,4 +1,5 @@
 [
   { "id": 2, "name": "voice", "stream": null },
-  { "id": 3, "name": "video", "stream": null }
+  { "id": 3, "name": "video", "stream": null },
+  { "id": 7, "name": "presence", "stream": null }
 ]

@@ -30,16 +30,16 @@ pub fn spawn_hub(
     node: String,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
-        .name("voice-hub".into())
+        .name("presence-hub".into())
         .spawn(move || {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
                 .build()
-                .expect("voice-hub tokio runtime")
+                .expect("presence-hub tokio runtime")
                 .block_on(hub_loop(requests, factory, peers, me, planes, node));
         })
-        .expect("spawn voice-hub thread")
+        .expect("spawn presence-hub thread")
 }
 
 type Roster = HashSet<[u8; 32]>;
@@ -118,7 +118,7 @@ async fn hub_loop(
     // the lane wait lives INSIDE this future on purpose: the grace/refuse
     // loop below already answers every join that arrives before the plane is
     // up, and an undeclared lane is just one more reason it is not up yet.
-    let binding = crate::voice_plane::bind_presence_plane(
+    let binding = crate::presence_plane::bind_presence_plane(
         factory,
         peers,
         me,
@@ -130,7 +130,7 @@ async fn hub_loop(
         bound = &mut binding => Some(bound),
         () = tokio::time::sleep(OVERLAY_GRACE) => None,
     };
-    let (voice_plane, service) = match bound {
+    let (presence_plane, service) = match bound {
         Some(bound) => bound,
         // The overlay is late (or never coming). Whatever queued during the
         // grace window is answered here, as is every join until the bind lands.
@@ -148,23 +148,26 @@ async fn hub_loop(
         },
     };
     tracing::info!(
-        target: "ducktape::voice",
+        target: "ducktape::presence",
+        // the dashboard key, and it names where this hub came from rather than
+        // what crosses it: presence is what crosses it. Renaming it would be a
+        // wire change for every operator keyed on the name.
         event = "voice_hub_bound",
         lane = service.lane_id(),
         "Pages presence plane bound"
     );
-    planes.register("pages", "voice", voice_plane.watch());
+    planes.register("pages", "presence", presence_plane.watch());
     crate::lane_table::serve_until_lane_changes(
-        crate::voice_plane::VOICE_LANE,
+        crate::presence_plane::PRESENCE_LANE,
         service,
         &node,
-        serve_sessions(requests, voice_plane, flows, service),
+        serve_sessions(requests, presence_plane, flows, service),
     )
     .await;
 }
 
 fn refuse_request(request: noded::PresenceSessionRequest) {
-    tracing::warn!(target: "ducktape::voice", reason = "overlay_not_bound", "Pages presence join refused");
+    tracing::warn!(target: "ducktape::presence", reason = "overlay_not_bound", "Pages presence join refused");
     let _ = request.reply.send(Err(PRESENCE_OVERLAY_DOWN.into()));
 }
 
@@ -222,14 +225,14 @@ async fn register_datagram_flow<T: DataPlaneTransport>(
 }
 
 async fn open_presence_session<T: DataPlaneTransport>(
-    voice_plane: &DataPlane<T>,
+    presence_plane: &DataPlane<T>,
     flows: &Arc<ActiveFlows>,
     page_id: &str,
     service: Service,
 ) -> Result<(noded::PresenceSession, SessionGuard), String> {
     let flow = presence_flow(page_id);
     let datagram = register_datagram_flow(
-        voice_plane,
+        presence_plane,
         service,
         flow,
         CTL_FLOW_QUEUE,

@@ -610,3 +610,26 @@ fn reachability_plane_converges_mesh_on_boot() {
         cluster.wait_marker(i, "tunnels applied (config accepted", Duration::from_secs(60));
     }
 }
+
+/// The presence plane's lane id comes from the committed table, which comes
+/// from the declaration `chat` ships in its frame — not from a constant in the
+/// binary. Asserting the ID and not merely the bind is the point: an absent
+/// key is a silent forever-wait, and a key resolving to the WRONG id would
+/// bind two overlay ports another lane owns.
+#[test]
+fn presence_binds_the_lane_its_module_declares() {
+    let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
+    cluster.wireguard = true;
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
+    cluster.spawn(1);
+    cluster.wait_marker(0, "mesh verified", Duration::from_secs(60));
+    // stripped, because the node colours every field name and its `=`
+    // separately — a `key=value` needle never matches the raw bytes.
+    let bound =
+        common::strip_ansi(&cluster.wait_marker(0, "voice_hub_bound", Duration::from_secs(90)));
+    assert!(
+        bound.contains("lane=7"),
+        "presence must bind the id chat/lanes.json declares for `presence`: {bound}"
+    );
+}
