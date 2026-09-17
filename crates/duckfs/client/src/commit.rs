@@ -23,8 +23,16 @@ use crate::status::{Status, status};
 
 /// the conflict strings the engine keys on — verbatim from the module (`fs.rs`),
 /// arriving through the http 400 envelope untouched.
+///
+/// these are SENTENCES rather than classes because the module has no class for
+/// them to be: every rejection out of its commit op, these three included,
+/// carries the one `files_commit` token. splitting them is the module's job —
+/// until it does, matching the words is the only thing that tells a CAS
+/// conflict from a GC'd base from an expired chunk, and those three demand
+/// three different recoveries.
 const CONFLICT_PREFIX: &str = "files: conflict:";
 const BASE_NOT_RESOLVABLE: &str = "files: base snapshot not resolvable";
+const CHUNK_NOT_AVAILABLE: &str = "files: chunk not available";
 
 /// bound the auto-rebase: after this many disjoint rebases the head is clearly
 /// churning under us, so stop and report rather than spin.
@@ -65,9 +73,10 @@ pub enum CommitError {
          the directory to resync the base"
     )]
     Landed { height: u64, reason: String },
-    /// a module rejection (the verbatim `"files: ..."` string).
-    #[error("{0}")]
-    Rejected(String),
+    /// a refusal, both halves: the class token beside the sentence its author
+    /// wrote (see [`ApiError::Rejected`]).
+    #[error("{reason}: {sentence}")]
+    Rejected { reason: String, sentence: String },
     #[error("duckfs: commit transport: {0}")]
     Transport(String),
     #[error("duckfs: commit io: {0}")]
@@ -77,7 +86,7 @@ pub enum CommitError {
 impl From<ApiError> for CommitError {
     fn from(e: ApiError) -> Self {
         match e {
-            ApiError::Rejected(m) => CommitError::Rejected(m),
+            ApiError::Rejected { reason, sentence } => CommitError::Rejected { reason, sentence },
             ApiError::NotFound => CommitError::Transport("not found".into()),
             ApiError::Transport(m) => CommitError::Transport(m),
         }
@@ -182,7 +191,9 @@ fn submit_with_rebase(
     for _ in 0..=MAX_REBASE_ATTEMPTS {
         match submit(api, base.as_deref(), message, planned) {
             Ok(receipt) => return Ok((receipt, rebased)),
-            Err(CommitError::Rejected(m)) if m.contains(BASE_NOT_RESOLVABLE) => {
+            Err(CommitError::Rejected { sentence, .. })
+                if sentence.contains(BASE_NOT_RESOLVABLE) =>
+            {
                 // the base fell out of the 1024-window: no rebase can recover it,
                 // the client must re-checkout onto the current head. a re-checkout
                 // overwrites the working copy, so the local work is copied aside
@@ -197,7 +208,7 @@ fn submit_with_rebase(
                     remedy: gc_d_base_remedy(dir, &index.prefix, dirty),
                 })));
             }
-            Err(CommitError::Rejected(m)) if m.contains(CONFLICT_PREFIX) => {
+            Err(CommitError::Rejected { sentence, .. }) if sentence.contains(CONFLICT_PREFIX) => {
                 let head = api.refs()?.head;
                 // without both a base to diff FROM and a head to diff TO, there is
                 // nothing to rebase against — a genuine conflict.
@@ -385,7 +396,7 @@ fn submit(
 ) -> Result<CommitReceipt, CommitError> {
     match api.commit(base, message, planned.changes.clone()) {
         Ok(receipt) => Ok(receipt),
-        Err(ApiError::Rejected(m)) if m.contains("files: chunk not available") => {
+        Err(ApiError::Rejected { sentence, .. }) if sentence.contains(CHUNK_NOT_AVAILABLE) => {
             for bytes in planned.blobs.values() {
                 api.stage_chunk(bytes)?;
             }

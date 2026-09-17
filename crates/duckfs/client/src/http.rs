@@ -75,10 +75,14 @@ impl HttpNode {
             return Err(ApiError::NotFound);
         }
         let text = response.text().unwrap_or_default();
-        let message = serde_json::from_str::<ErrorBody>(&text)
-            .map(|body| body.error)
-            .unwrap_or(text);
-        Err(ApiError::Rejected(message))
+        let body = serde_json::from_str::<ErrorBody>(&text).unwrap_or(ErrorBody {
+            error: text,
+            reason: None,
+        });
+        Err(ApiError::Rejected {
+            reason: body.reason.unwrap_or_else(|| UNCLASSIFIED.to_owned()),
+            sentence: body.error,
+        })
     }
 
     fn query(&self, query: FilesQuery) -> Result<FilesReply, ApiError> {
@@ -92,10 +96,9 @@ impl HttpNode {
     }
 
     fn submit(&self, payload: Vec<u8>) -> Result<CommitReceipt, ApiError> {
-        let writer = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| ApiError::Rejected("a write authority is required".into()))?;
+        let writer = self.writer.as_ref().ok_or_else(|| {
+            ApiError::refused("no_write_authority", "a write authority is required")
+        })?;
         let request = match writer {
             WriteAuthority::SignedFrame(signer) => self
                 .client
@@ -103,7 +106,10 @@ impl HttpNode {
                 .body(signer("files", payload)),
             WriteAuthority::NodeOperator(credential) => {
                 let token = credential().ok_or_else(|| {
-                    ApiError::Rejected("node operator credential unavailable".into())
+                    ApiError::refused(
+                        "no_operator_credential",
+                        "node operator credential unavailable",
+                    )
                 })?;
                 self.client
                     .post(format!("{}/v1/submit/raw/files", self.base))
@@ -117,9 +123,21 @@ impl HttpNode {
     }
 }
 
+/// the class a refusal that named none is filed under. the SAME word the node
+/// files an unframed refusal under, because it is the same fact: a refusal
+/// nobody classified. a token is never invented for one here — a made-up word
+/// is one every consumer would then have to tell apart from a word a module
+/// actually chose.
+const UNCLASSIFIED: &str = "unframed_refusal";
+
+/// the node's refusal envelope: the sentence a person reads, and the class a
+/// caller branches on. `reason` is absent only when the node refused before any
+/// module saw the request.
 #[derive(Deserialize)]
 struct ErrorBody {
     error: String,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 fn unexpected() -> ApiError {

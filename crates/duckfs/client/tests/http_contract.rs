@@ -4,9 +4,10 @@
 //! this pins the exact request lines/bodies the engine sends and the reply
 //! shapes it parses, WITHOUT a daemon: a stage POSTs raw bytes and reads
 //! `{digest}`, a commit POSTs the snake_case body and reads the CAMELCASE
-//! `BlockSummary`, and a module rejection arriving as a 400 `{"error": ...}`
-//! surfaces as `ApiError::Rejected` with the string VERBATIM (the conflict
-//! taxonomy depends on it). the real daemon round-trip lives in
+//! `BlockSummary`, and a module rejection arriving as a 400
+//! `{"error": ..., "reason": ...}` surfaces as `ApiError::Rejected` with BOTH
+//! halves verbatim (the conflict taxonomy depends on the sentence; the screen
+//! depends on the class). the real daemon round-trip lives in
 //! `bin/noded/tests/daemon_e2e.rs`.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -220,7 +221,10 @@ fn module_rejection_is_preserved_and_missing_signer_sends_nothing() {
     let stub = Stub::new(|_, _, _| {
         (
             400,
-            serde_json::json!({ "error": "files: conflict: /x changed since base" }),
+            serde_json::json!({
+                "error": "files: conflict: /x changed since base",
+                "reason": "files_commit",
+            }),
         )
     });
     let unsigned = HttpNode::new(stub.url());
@@ -229,7 +233,50 @@ fn module_rejection_is_preserved_and_missing_signer_sends_nothing() {
     let node = signing_node(&stub);
     assert_eq!(
         node.commit(None, "m", Vec::new()).unwrap_err(),
-        ApiError::Rejected("files: conflict: /x changed since base".into())
+        ApiError::Rejected {
+            reason: "files_commit".into(),
+            sentence: "files: conflict: /x changed since base".into(),
+        }
+    );
+}
+
+/// BOTH halves of the node's envelope survive the read lane, and the error a
+/// person ends up reading is `<reason>: <sentence>` — the class token in front,
+/// the module's own words after it, and no Rust type name anywhere in between.
+#[test]
+fn a_read_refusal_keeps_its_class_beside_its_sentence() {
+    let stub = Stub::new(|_, _, _| {
+        (
+            400,
+            serde_json::json!({ "error": "files: path not found", "reason": "files_query" }),
+        )
+    });
+    let node = HttpNode::new(stub.url());
+    let refused = node.stat("/nope", None).unwrap_err();
+    assert_eq!(
+        refused,
+        ApiError::Rejected {
+            reason: "files_query".into(),
+            sentence: "files: path not found".into(),
+        }
+    );
+    assert_eq!(refused.to_string(), "files_query: files: path not found");
+    assert!(!refused.to_string().contains("Module("));
+}
+
+/// an envelope with no class — the node refusing before any module saw the
+/// request — is filed under the unclassified one rather than given an invented
+/// token, and its sentence still reaches the reader whole.
+#[test]
+fn an_unclassified_refusal_is_not_given_a_made_up_class() {
+    let stub = Stub::new(|_, _, _| (400, serde_json::json!({ "error": "invalid module target" })));
+    let node = HttpNode::new(stub.url());
+    assert_eq!(
+        node.stat("/x", None).unwrap_err(),
+        ApiError::Rejected {
+            reason: "unframed_refusal".into(),
+            sentence: "invalid module target".into(),
+        }
     );
 }
 
