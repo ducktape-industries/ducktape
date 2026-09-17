@@ -465,6 +465,69 @@ GUEST_BUILDER := $(CARGO) run -q $(LOCKED) --target-dir $(GUEST_BUILDER_DIR) -p 
 # the same command as a person would type it, for the advice a failing gate prints.
 GUEST_BUILDER_SHOWN := $(CARGO) run --target-dir $(GUEST_BUILDER_DIR) -p guest-builder --
 
+# The five standalone guests under `crates/guests`, whose components are kernel
+# test fixtures. They are not modules: each is its OWN workspace binding
+# `crates/module-sdk/wit` through `wit_bindgen::generate!`, built with plain
+# cargo and componentized, never through guest-builder's shell workspace. They
+# carry no `guest.lock`, so nothing here can be scoped by `CRATES`.
+#
+# One record per BUILD, `:`-separated, no spaces in any field:
+#
+#     <id>:<crate dir>:<cargo features>:<core wasm>:<artifact,artifact,…>
+#
+# The first artifact is the one the build writes; the rest are copies of it.
+# `object` appears twice because it builds again under its `replacement`
+# feature, and `hello` lists three artifacts because its component is pinned in
+# both fixture homes as well as beside the crate. That irregularity is why
+# these were once six hand-written stanzas — but two copies of the shapes is
+# how a gate comes to check something the build no longer produces, so there is
+# one copy now and both targets read it.
+FIXTURE_GUESTS := \
+  hello:crates/guests/hello-wasm::hello_wasm:crates/guests/hello-wasm/component.wasm,crates/kernel/wasm-host/tests/fixtures/hello.component.wasm,crates/kernel/host/tests/fixtures/hello.component.wasm \
+  noop:crates/guests/noop-wasm::noop_wasm:crates/guests/noop-wasm/component.wasm,crates/kernel/host/tests/fixtures/noop.component.wasm \
+  hello-replacement:crates/guests/hello-wasm-replacement::hello_wasm_replacement:crates/kernel/host/tests/fixtures/hello-replacement.component.wasm \
+  sibling:crates/guests/sibling-wasm::sibling_wasm:crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm \
+  object:crates/guests/object-wasm::object_wasm:crates/kernel/wasm-host/tests/fixtures/object.component.wasm \
+  object-replacement:crates/guests/object-wasm:replacement:object_wasm:crates/kernel/wasm-host/tests/fixtures/object-replacement.component.wasm
+
+# The WIT these five bind. Dirty here moves their bytes exactly as dirty source
+# in the crate itself does, so both are part of "their source at HEAD".
+FIXTURE_GUEST_WIT := crates/module-sdk/wit
+
+# ONE target directory for all five, named explicitly. Without `--target-dir`
+# the output path depends on the operator's cargo config: a `[build] target-dir`
+# in `~/.cargo/config.toml` applies to these standalone workspaces too, so cargo
+# writes to the shared directory while the componentize step reads
+# `<crate>/target/…` and fails with "No such file or directory". That is not
+# hypothetical — it is why a stale fixture could not be rebuilt with the command
+# the docs name. Sharing one directory between the five also means they compile
+# wit-bindgen's tree once (~140s cold) instead of five times; warm, each is ~1s.
+FIXTURE_TARGET_DIR := $(CURDIR)/target/fixture-guests
+
+# Parse one record and build it. Sourced by every recipe that walks
+# FIXTURE_GUESTS, so the parsing lives in one place too.
+# `cut` rather than `$${rec#*:}` on purpose: this is a variable definition, not a
+# recipe, and make reads `#` there as the start of a comment — a parameter
+# expansion silently truncates the function mid-body and the recipe dies with
+# "Syntax error: end of file unexpected". `make -n` does not catch it, because
+# it never runs the shell.
+FIXTURE_GUEST_SH = \
+  fixture_parse() { \
+    fg_id=$$(echo "$$1" | cut -d: -f1); \
+    fg_dir=$$(echo "$$1" | cut -d: -f2); \
+    fg_features=$$(echo "$$1" | cut -d: -f3); \
+    fg_core=$$(echo "$$1" | cut -d: -f4); \
+    fg_artifacts=$$(echo "$$1" | cut -d: -f5 | tr , ' '); \
+  }; \
+  fixture_build() { \
+    fixture_parse "$$1"; \
+    features=""; [ -z "$$fg_features" ] || features="--features $$fg_features"; \
+    ( cd "$$fg_dir" && $(CARGO) build $(LOCKED) --target-dir "$(FIXTURE_TARGET_DIR)" \
+        --target wasm32-unknown-unknown --release $$features ) || return 1; \
+    $(GUEST_BUILDER) componentize \
+      "$(FIXTURE_TARGET_DIR)/wasm32-unknown-unknown/release/$$fg_core.wasm" --out "$$2"; \
+  };
+
 wasm-modules:
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
@@ -476,45 +539,20 @@ wasm-modules:
 	  $(GUEST_BUILDER) --index $$m || exit 1; \
 	done
 	$(GUEST_BUILDER) $(NETSTACK_GUEST)
-	# hello mirrors its component into BOTH fixture homes; sibling/object write
-	# straight to the wasm-host fixture with no guest copy; hello-replacement
-	# builds the replacement crate directly into the host fixture. Each shape is
-	# unique — kept explicit. These five ARE STANDALONE workspaces (each owns a
-	# committed lock, so $(LOCKED) applies same as everywhere else) — their
-	# components are kernel test fixtures, nothing the genesis hash pins.
-	cd crates/guests/hello-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	$(GUEST_BUILDER) componentize \
-	  crates/guests/hello-wasm/target/wasm32-unknown-unknown/release/hello_wasm.wasm \
-	  --out crates/guests/hello-wasm/component.wasm
-	cp crates/guests/hello-wasm/component.wasm \
-	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
-	cp crates/guests/hello-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/hello.component.wasm
-	# noop: the smallest compliant module, the admission fixture that touches
-	# nothing. Its component is committed beside the crate and pinned in the
-	# host fixtures, the hello shape.
-	cd crates/guests/noop-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	$(GUEST_BUILDER) componentize \
-	  crates/guests/noop-wasm/target/wasm32-unknown-unknown/release/noop_wasm.wasm \
-	  --out crates/guests/noop-wasm/component.wasm
-	cp crates/guests/noop-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/noop.component.wasm
-	cd crates/guests/hello-wasm-replacement && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	$(GUEST_BUILDER) componentize \
-	  crates/guests/hello-wasm-replacement/target/wasm32-unknown-unknown/release/hello_wasm_replacement.wasm \
-	  --out crates/kernel/host/tests/fixtures/hello-replacement.component.wasm
-	cd crates/guests/sibling-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	$(GUEST_BUILDER) componentize \
-	  crates/guests/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
-	  --out crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm
-	cd crates/guests/object-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	$(GUEST_BUILDER) componentize \
-	  crates/guests/object-wasm/target/wasm32-unknown-unknown/release/object_wasm.wasm \
-	  --out crates/kernel/wasm-host/tests/fixtures/object.component.wasm
-	cd crates/guests/object-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release --features replacement
-	$(GUEST_BUILDER) componentize \
-	  crates/guests/object-wasm/target/wasm32-unknown-unknown/release/object_wasm.wasm \
-	  --out crates/kernel/wasm-host/tests/fixtures/object-replacement.component.wasm
+	# The five standalone fixture guests, from the one description of them that
+	# wasm-rebuild-check reads too (FIXTURE_GUESTS). Each owns a committed lock,
+	# so $(LOCKED) applies same as everywhere else; their components are kernel
+	# test fixtures, nothing the genesis hash pins.
+	@$(FIXTURE_GUEST_SH) \
+	for rec in $(FIXTURE_GUESTS); do \
+	  fixture_parse "$$rec"; \
+	  canonical=$${fg_artifacts%% *}; \
+	  echo "$(GUEST_BUILDER_SHOWN) componentize -> $$canonical"; \
+	  fixture_build "$$rec" "$$canonical" || exit 1; \
+	  for a in $$fg_artifacts; do \
+	    [ "$$a" = "$$canonical" ] || cp "$$canonical" "$$a" || exit 1; \
+	  done; \
+	done
 
 ## the drift gate for the committed component artifacts: every copy of the SAME
 ## module must be byte-identical (`node init` hashes the bundle into the
@@ -604,9 +642,20 @@ REBUILD_CHECK_DIR := $(CURDIR)/target/wasm-rebuild-check
 # checking nothing — a typo that reports success is worse than no gate. Omit
 # `CRATES` and every guest is swept, which is what a module-SDK or toolchain
 # move owes.
+#
+# `CRATES` does NOT scope the five `crates/guests` fixtures: they carry no
+# `guest.lock`, so there is nothing to scope them by, and they are checked on
+# every run. That is affordable — they share one target directory, so warm they
+# are about a second each against minutes for a 4 MB component — and it is the
+# only arrangement under which this target's success line cannot be a lie. They
+# were outside it before, and the line still said "committed guests match",
+# which is how a `module.wit` change left `object`/`sibling` stale while the
+# gate that exists to catch exactly that reported clean.
 wasm-rebuild-check:
 	@mkdir -p "$(REBUILD_CHECK_DIR)"
-	@stale=""; \
+	@stale=""; stale_fixtures=""; checked=0; \
+	head=$$(git rev-parse HEAD); \
+	$(FIXTURE_GUEST_SH) \
 	compiles() { \
 	  [ -z "$(CRATES)" ] && return 0; \
 	  for c in $(CRATES); do \
@@ -626,6 +675,7 @@ wasm-rebuild-check:
 	  id=$$(basename $$m) && \
 	  $(GUEST_BUILDER) $$m \
 	    --out "$(REBUILD_CHECK_DIR)/$$id.component.wasm" >/dev/null || exit 1; \
+	  checked=$$((checked + 1)); \
 	  cmp -s $$m/component.wasm "$(REBUILD_CHECK_DIR)/$$id.component.wasm" || \
 	    stale="$$stale $$m"; \
 	done; \
@@ -634,11 +684,33 @@ wasm-rebuild-check:
 	  id=$$(basename $$m) && \
 	  $(GUEST_BUILDER) --index $$m \
 	    --out "$(REBUILD_CHECK_DIR)/$$id.index.wasm" >/dev/null || exit 1; \
+	  checked=$$((checked + 1)); \
 	  cmp -s $$m/index.wasm "$(REBUILD_CHECK_DIR)/$$id.index.wasm" || \
 	    stale="$$stale --index $$m"; \
 	done; \
-	if [ -z "$$stale" ]; then \
-	  echo "committed guests match a rebuild of their source at HEAD"; exit 0; \
+	dirty=$$(git status --porcelain -- $(FIXTURE_GUEST_WIT) \
+	  $(foreach rec,$(FIXTURE_GUESTS),$(word 2,$(subst :, ,$(rec)))) 2>/dev/null); \
+	[ -z "$$dirty" ] || { \
+	  echo "wasm-rebuild-check: the crates/guests fixtures have uncommitted source."; \
+	  echo "$$dirty" | sed 's/^/    /'; \
+	  echo "  These five build from the WORKING TREE, not from the repository at HEAD"; \
+	  echo "  the way guest-builder resolves a module — so with these dirty there is no"; \
+	  echo "  \"their source at HEAD\" to compare against. Commit or stash them."; \
+	  exit 1; }; \
+	for rec in $(FIXTURE_GUESTS); do \
+	  fixture_parse "$$rec"; \
+	  built="$(REBUILD_CHECK_DIR)/$$fg_id.component.wasm"; \
+	  fixture_build "$$rec" "$$built" >/dev/null || exit 1; \
+	  printf 'source = "git+https://github.com/orthory/ducktape#%s"\n' "$$head" \
+	    > "$(REBUILD_CHECK_DIR)/$$fg_id.component.lock"; \
+	  for a in $$fg_artifacts; do \
+	    checked=$$((checked + 1)); \
+	    cmp -s "$$built" "$$a" || stale_fixtures="$$stale_fixtures $$a"; \
+	  done; \
+	done; \
+	if [ -z "$$stale$$stale_fixtures" ]; then \
+	  echo "$$checked committed guest artifacts match a rebuild of their source at HEAD"; \
+	  exit 0; \
 	fi; \
 	echo "these committed guests do not match a rebuild of their source:"; \
 	set -- $$stale; \
@@ -649,6 +721,7 @@ wasm-rebuild-check:
 	    echo "    $(GUEST_BUILDER_SHOWN) $$1"; shift; \
 	  fi; \
 	done; \
+	for a in $$stale_fixtures; do echo "    $$a"; done; \
 	echo "  make wasm-rebuild-refresh CRATES=\"$(CRATES)\" promotes what this run already built."; \
 	echo "  Then re-run this check, and commit the result with its kernel fixture copy."; \
 	exit 1
@@ -687,6 +760,7 @@ wasm-rebuild-refresh:
 	  echo "wasm-rebuild-refresh: $(REBUILD_CHECK_DIR) holds no build to promote."; \
 	  echo "  Run wasm-rebuild-check first; it builds what this promotes."; \
 	  exit 1; }; \
+	$(FIXTURE_GUEST_SH) \
 	compiles() { \
 	  [ -z "$(CRATES)" ] && return 0; \
 	  for c in $(CRATES); do \
@@ -726,6 +800,23 @@ wasm-rebuild-refresh:
 	    echo "  That build predates your HEAD. Re-run wasm-rebuild-check."; \
 	    exit 1; }; \
 	done; \
+	for rec in $(FIXTURE_GUESTS); do \
+	  fixture_parse "$$rec"; \
+	  built="$(REBUILD_CHECK_DIR)/$$fg_id.component.wasm"; \
+	  [ -f "$$built" ] || continue; \
+	  built_in_scope="yes"; \
+	  lock="$(REBUILD_CHECK_DIR)/$$fg_id.component.lock"; \
+	  [ -f "$$lock" ] || { \
+	    echo "wasm-rebuild-refresh: $$built has no $$fg_id.component.lock beside it."; \
+	    echo "  The check writes the lock with the bytes, so this predates that."; \
+	    echo "  Re-run wasm-rebuild-check; promoting bytes with no provenance is the"; \
+	    echo "  one thing this target must not do."; \
+	    exit 1; }; \
+	  grep -sq "#$$head\"" "$$lock" || { \
+	    echo "wasm-rebuild-refresh: $$lock was built from another revision, not $$head."; \
+	    echo "  That build predates your HEAD. Re-run wasm-rebuild-check."; \
+	    exit 1; }; \
+	done; \
 	if [ -z "$$built_in_scope" ]; then \
 	  echo "wasm-rebuild-refresh: $(REBUILD_CHECK_DIR) holds no build for CRATES=\"$(CRATES)\"."; \
 	  echo "  It holds builds for other guests; this run promotes none of them."; \
@@ -743,12 +834,24 @@ wasm-rebuild-refresh:
 	  cp "$(REBUILD_CHECK_DIR)/$$id.$$kind.lock" "$$m/guest.lock"; \
 	  promoted="$$promoted $$artifact"; \
 	done; \
+	for rec in $(FIXTURE_GUESTS); do \
+	  fixture_parse "$$rec"; \
+	  built="$(REBUILD_CHECK_DIR)/$$fg_id.component.wasm"; \
+	  [ -f "$$built" ] || continue; \
+	  for a in $$fg_artifacts; do \
+	    cmp -s "$$built" "$$a" && continue; \
+	    cp "$$built" "$$a"; \
+	    promoted="$$promoted $$a"; \
+	  done; \
+	done; \
 	if [ -z "$$promoted" ]; then \
 	  echo "nothing to promote: every built guest already matches its committed bytes"; exit 0; \
 	fi; \
 	echo "promoted:"; \
 	for a in $$promoted; do echo "    $$a"; done; \
-	echo "  Copy each component into crates/kernel/host/tests/fixtures/, then re-run wasm-rebuild-check."
+	echo "  Copy each MODULE component into crates/kernel/host/tests/fixtures/, then"; \
+	echo "  re-run wasm-rebuild-check. The crates/guests fixtures above are already in"; \
+	echo "  every home they have — they carry no guest.lock and need no second copy."
 
 ## the supply-chain tripwire: RustSec advisories and yanked crates against the
 ## committed Cargo.lock, under `deny.toml` — where every carried advisory is
