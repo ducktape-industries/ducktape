@@ -271,7 +271,6 @@ impl BoardsView {
             (false, "t") if !repeat => self.on_tool(Tool::Text),
             (false, "e") if !repeat => self.on_tool(Tool::Eraser),
             (false, "q") if !repeat => self.on_lock_tool(),
-            (false, "?") if !repeat => self.on_help(),
             (false, "0") => self.on_reset_zoom(),
             (false, "f") if shift => self.on_fit_selection(),
             (false, "f") => self.on_fit(),
