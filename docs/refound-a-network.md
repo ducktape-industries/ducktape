@@ -15,8 +15,8 @@ ops/refound-net.sh --root ~/.ducktape/dognet --yes \
 It stops what is running, archives the workspaces, founds a validator, joins a
 resident, installs the agent executors, mints the workspace wallet and founds
 its account, starts the service daemons, mirrors a repo into the forge,
-rebuilds the app, and prints the ports, chain id and contract an operator
-needs.
+rebuilds the app, proves a mention still reaches an agent, and prints the
+ports, chain id and contract an operator needs.
 
 ## The target is explicit
 
@@ -65,6 +65,7 @@ enumerates it and the printed path is the only way back to it.
 | `--port-offset N` | add N to every port. |
 | `--wallet-name`, `--wallet-password` | the workspace's active wallet and the account founded for it. |
 | `--skip-app` | do not rebuild the desktop app. |
+| `--no-smoke` | do not seed an agent and mention it at the end. |
 | `--yes` | proceed past stopping and archiving an existing root. |
 
 ## What the script encodes, and why
@@ -134,6 +135,18 @@ before the daemon has finished booting, so the script waits out the exit
 window and then requires the process to still be there — found by the kind and
 config in its argv, since the pid `$!` returns belongs to the `setsid` wrapper
 and not to the daemon it execs.
+
+**A mention is the only whole-chain check.** Every other step proves one part.
+`ops/refound-smoke.py` seeds an agent account on the `claude` capability and
+mentions it, then waits for the run to settle and for the reply to land in the
+channel — which passes only if attribution, model registration, the capability
+announcement, the sandbox and the executor credential are all intact. A
+mention that reaches no provider is not rejected; it sits pending for hours,
+so the deadline is the assertion. The smoke costs one real agent run, runs
+only with `--guest` (without it no agent service is started at all), and its
+verdict is the script's exit code — the report still prints either way,
+because by then the network exists and the ports and archive paths are what
+the operator needs.
 
 ## After it runs
 

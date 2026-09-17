@@ -27,7 +27,9 @@ workspaces, founds a validator and joins a resident from this checkout's binary
 and founding set under `ducktape-node-launcher`, installs the agent executors,
 mints the workspace wallet and founds its account, grants the service daemons,
 and mirrors a repo into the new forge. The target is `--root` and has no default; workspaces are moved
-aside, never deleted. `docs/refound-a-network.md` is the recipe and says why
+aside, never deleted. It ends by running `refound-smoke.py`, which seeds an
+agent and mentions it: the one check that crosses the whole chain, and the
+script's exit code. `docs/refound-a-network.md` is the recipe and says why
 each step is ordered the way it is.
 
 ## Running a node as a service
