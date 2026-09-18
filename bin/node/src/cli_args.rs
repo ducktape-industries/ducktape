@@ -731,10 +731,20 @@ pub struct KeyArgs {
     pub dir: Option<PathBuf>,
 }
 
+/// `init --name`, refused at parse time — before any workspace file is written
+/// — when the `duck://` grammar cannot carry it as a chain id's label. The
+/// refusal names sdk's reason token.
+fn network_name(raw: &str) -> Result<String, String> {
+    config::validate_network_name(raw)
+        .map_err(|refused| format!("{} [{}]", refused.sentence, refused.reason))?;
+    Ok(raw.to_string())
+}
+
 #[derive(Debug, clap::Args)]
 pub struct InitArgs {
-    /// human-readable network name (the chain id becomes <name>#<salt>)
-    #[arg(long, value_name = "NAME")]
+    /// network name: the label of every duck:// address naming the network
+    /// (the chain id becomes <name>#<salt>)
+    #[arg(long, value_name = "NAME", value_parser = network_name)]
     pub name: String,
     /// found the network here instead of under the ducktape home
     #[arg(long, value_name = "DIR")]
@@ -964,6 +974,37 @@ mod tests {
         );
         assert!(parse(&["probe", "init", "--name", "demo", "--block-time-ms", "99"]).is_err());
         assert!(parse(&["probe", "init", "--name", "demo", "--block-time-ms", "0"]).is_err());
+    }
+
+    /// `init --name` is refused at parse time, by the address grammar's own
+    /// reason token, when no `duck://` address could name the network.
+    #[test]
+    fn init_name_is_a_label_the_address_grammar_carries() {
+        #[derive(clap::Parser)]
+        struct Probe {
+            #[command(subcommand)]
+            op: OpCmd,
+        }
+        let parse = |argv: &[&str]| <Probe as clap::Parser>::try_parse_from(argv);
+
+        let name = match parse(&["probe", "init", "--name", "my-team"])
+            .expect("parses")
+            .op
+        {
+            OpCmd::Init(args) => args.name,
+            other => panic!("not an init: {other:?}"),
+        };
+        assert_eq!(name, "my-team");
+        for (bad, reason) in [
+            ("My Team", "[uppercase]"),
+            ("my team", "[authority_incomplete]"),
+        ] {
+            let Err(refused) = parse(&["probe", "init", "--name", bad]) else {
+                panic!("{bad:?} parsed");
+            };
+            let refused = refused.to_string();
+            assert!(refused.contains(reason), "{bad:?}: {refused}");
+        }
     }
 
     /// the precedence, pinned rung by rung and hermetically: only the `Flag`,

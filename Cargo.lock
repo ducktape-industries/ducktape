@@ -8852,6 +8852,7 @@ dependencies = [
  "commonware-cryptography",
  "commonware-p2p",
  "commonware-utils",
+ "duck-address",
  "duckfs-core",
  "ducktape-home",
  "governance-wire",

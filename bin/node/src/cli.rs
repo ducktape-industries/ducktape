@@ -638,7 +638,7 @@ fn detect_platform_sandbox(workspace: &std::path::Path) -> Option<config::Sandbo
     Some(table)
 }
 
-/// `init --name <human name> [--dir <dir>] [--modules <dir>] [--listen a]
+/// `init --name <name> [--dir <dir>] [--modules <dir>] [--listen a]
 /// [--advertised a] [--http a] [--rpc a] [--primary-coordinator host:port|none]
 /// [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]`
 /// — found a network: mint the chain-id, write the descriptor + node config,
