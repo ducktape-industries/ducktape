@@ -37,6 +37,7 @@ use commonware_cryptography::ed25519;
 use commonware_p2p::{AddressableManager as _, AddressableTrackedPeers, authenticated::lookup};
 use commonware_utils::ordered::Set;
 
+use crate::constants::MAX_PEERS_PER_SET;
 use crate::mesh_book::MeshAddressBook;
 
 /// the genesis window index — generation 0.
@@ -99,14 +100,10 @@ impl MeshWindowTracker {
             return;
         }
         let primary: BTreeSet<ed25519::PublicKey> = descriptor_validators.iter().cloned().collect();
-        sink.track_set(
-            GENESIS_INDEX,
-            AddressableTrackedPeers::new(
-                book.addressed(&ordered_set(primary)),
-                book.addressed(&self.extras),
-            ),
-        );
         self.last_tracked = Some(GENESIS_INDEX);
+        if !self.track_one(sink, book, GENESIS_INDEX, &ordered_set(primary)) {
+            return;
+        }
         tracing::debug!(
             target: "ducktape::node",
             node = %self.label,
@@ -137,15 +134,10 @@ impl MeshWindowTracker {
             if already_tracked {
                 continue;
             }
-            let primary = snapshot_primary(entry);
-            sink.track_set(
-                entry.generation,
-                AddressableTrackedPeers::new(
-                    book.addressed(&primary),
-                    book.addressed(&self.extras),
-                ),
-            );
             self.last_tracked = Some(entry.generation);
+            if !self.track_one(sink, book, entry.generation, &snapshot_primary(entry)) {
+                continue;
+            }
             advanced = Some(entry);
         }
         let latest = advanced?;
@@ -173,6 +165,46 @@ impl MeshWindowTracker {
     pub(crate) fn hint_owes_committed_read(&self, hint: &[statesync::MeshWindowEntry]) -> bool {
         hint.iter()
             .any(|e| self.last_tracked.is_none_or(|last| e.generation > last))
+    }
+
+    /// hand one generation's set to the oracle, or refuse it by name: the
+    /// transport PANICS on a set wider than [`MAX_PEERS_PER_SET`], and a
+    /// membership that outgrew it must cost that generation's tracking, never
+    /// the process. `false` = refused; the caller moves past the generation
+    /// either way, so a refused one is named once, not every drain pass.
+    fn track_one(
+        &self,
+        sink: &mut impl TrackSink,
+        book: &MeshAddressBook,
+        index: u64,
+        primary: &Set<ed25519::PublicKey>,
+    ) -> bool {
+        // the transport also counts this node's own identity, which the
+        // tracker never learns — so it is counted as if outside the set.
+        let width = primary
+            .iter()
+            .chain(self.extras.iter())
+            .collect::<BTreeSet<_>>()
+            .len()
+            + 1;
+        let over_cap = width > MAX_PEERS_PER_SET.get();
+        if over_cap {
+            tracing::warn!(
+                target: "ducktape::node",
+                node = %self.label,
+                generation = index,
+                width,
+                cap = MAX_PEERS_PER_SET.get(),
+                reason = "peer_set_over_cap",
+                "mesh window generation REFUSED — wider than the transport admits"
+            );
+            return false;
+        }
+        sink.track_set(
+            index,
+            AddressableTrackedPeers::new(book.addressed(primary), book.addressed(&self.extras)),
+        );
+        true
     }
 
     #[cfg(test)]
@@ -325,6 +357,37 @@ mod tests {
         // a re-sync of the same window is a silent no-op.
         assert!(t.track_new(&mut sink, &book(), &window).is_none());
         assert_eq!(sink.tracked.len(), 3);
+    }
+
+    /// a generation wider than the transport admits is refused by name and
+    /// skipped — it never reaches the oracle, which would panic on it — and
+    /// the next generation that fits is tracked as usual.
+    #[test]
+    fn a_generation_wider_than_the_cap_is_refused_not_tracked() {
+        let mut t = MeshWindowTracker::new(&[], "n");
+        let mut sink = Recorder::default();
+        t.track_genesis(&mut sink, &book(), &[key(1)]);
+
+        // every seed is a distinct key: 256 members plus this node's own.
+        let wide: Vec<u8> = (0..=u8::MAX).collect();
+        assert!(wide.len() + 1 > MAX_PEERS_PER_SET.get());
+        let window = [snapshot(1, &wide, &[]), snapshot(2, &[1, 2], &[])];
+        let latest = t.track_new(&mut sink, &book(), &window).expect("advanced");
+        assert_eq!(latest.generation, 2);
+        let indices: Vec<u64> = sink.tracked.iter().map(|(i, _, _)| *i).collect();
+        assert_eq!(
+            indices,
+            vec![0, 2],
+            "the over-cap generation never reaches the oracle"
+        );
+
+        // an over-cap generation is refused once and left behind: the next
+        // pass over the same window is a no-op, not a second refusal.
+        let window = [snapshot(3, &wide, &[])];
+        assert!(t.track_new(&mut sink, &book(), &window).is_none());
+        assert_eq!(t.last_tracked(), Some(3));
+        assert!(t.track_new(&mut sink, &book(), &window).is_none());
+        assert_eq!(sink.tracked.len(), 2);
     }
 
     /// the trust boundary: a wire hint may only ask for a committed read.
