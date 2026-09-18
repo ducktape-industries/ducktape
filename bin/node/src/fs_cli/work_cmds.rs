@@ -61,8 +61,23 @@ fn signing_node(
     )
 }
 
+/// a node failure goes through [`api_err`], the mapping every other verb uses,
+/// so a checkout refusal keeps both halves; the rest are this side's own.
 fn checkout_err(e: CheckoutError) -> CliError {
-    CliError::failed(e.to_string())
+    match e {
+        CheckoutError::Api(e) => api_err(e),
+        other => CliError::failed(other.to_string()),
+    }
+}
+
+/// a commit failure other than the conflict report `commit` prints itself. a
+/// refusal keeps both halves, the same as [`api_err`].
+fn commit_err(e: CommitError) -> CliError {
+    match e {
+        CommitError::Nothing => CliError::failed("nothing to commit (the working copy is clean)"),
+        CommitError::Rejected { reason, sentence } => CliError::refused(reason, sentence),
+        other => CliError::failed(other.to_string()),
+    }
 }
 
 /// `checkout <prefix> <dir> [--snapshot S]` — materialize the subtree and write
@@ -150,10 +165,7 @@ pub fn commit(args: CommitArgs) -> Result<(), CliError> {
             }
             Err(CliError::silent(2))
         }
-        Err(CommitError::Nothing) => Err(CliError::failed(
-            "nothing to commit (the working copy is clean)",
-        )),
-        Err(e) => Err(CliError::failed(e.to_string())),
+        Err(e) => Err(commit_err(e)),
     }
 }
 
@@ -273,4 +285,55 @@ pub fn unpin(args: UnpinArgs) -> Result<(), CliError> {
     node.unpin(&args.name).map_err(api_err)?;
     println!("unpinned {}", args.name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use duckfs_client::api::ApiError;
+
+    use super::*;
+    use crate::fs_cli::args::Message;
+
+    fn refused(reason: &str, sentence: &str) -> ApiError {
+        ApiError::Rejected {
+            reason: reason.to_string(),
+            sentence: sentence.to_string(),
+        }
+    }
+
+    /// `checkout` and `commit` refuse in the line every other verb does, and
+    /// keep both halves on the way: neither flattens a refusal through its
+    /// error's `Display` into one string.
+    #[test]
+    fn checkout_and_commit_refusals_keep_both_halves() {
+        let rows = [
+            (
+                checkout_err(CheckoutError::Api(refused(
+                    "files_query",
+                    "files: path not found",
+                ))),
+                "files_query",
+                "files: path not found",
+            ),
+            (
+                commit_err(CommitError::from(refused(
+                    "files_commit",
+                    "files: path must be absolute (start with '/')",
+                ))),
+                "files_commit",
+                "files: path must be absolute (start with '/')",
+            ),
+        ];
+        for (error, reason, sentence) in rows {
+            assert_eq!(error.code, 1);
+            assert_eq!(
+                error.message,
+                Message::Refused {
+                    reason: reason.to_string(),
+                    sentence: sentence.to_string(),
+                }
+            );
+            assert_eq!(error.line(), Some(format!("{sentence} [{reason}]")));
+        }
+    }
 }

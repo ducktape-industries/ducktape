@@ -47,8 +47,8 @@ pub struct ConflictReport {
 /// `files_commit` class, so the class alone cannot tell them apart yet.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApiError {
-    /// a refusal: the class token beside the sentence.
-    #[error("{reason}: {sentence}")]
+    /// a refusal: the sentence, then its class token ([`refusal_line`]).
+    #[error("{}", refusal_line(.reason, .sentence))]
     Rejected { reason: String, sentence: String },
     /// a 404 (absent path / unresolvable snapshot over http).
     #[error("not found")]
@@ -68,6 +68,16 @@ impl ApiError {
             sentence: sentence.into(),
         }
     }
+}
+
+/// the ONE line a person reads for a refusal: the sentence first, the class
+/// token last in brackets — `no entry at /nope [no_entry]`. the sentence is
+/// what the reader acts on; the token stays a grep handle at the end of the
+/// line. every human rendering of a refusal goes through here (the `Display`
+/// of [`ApiError::Rejected`] and `CommitError::Rejected`, the `ducktape fs`
+/// stderr line), so none of them can put the token back in front.
+pub fn refusal_line(reason: &str, sentence: &str) -> String {
+    format!("{sentence} [{reason}]")
 }
 
 /// every node interaction the engine needs. all reads take an optional snapshot

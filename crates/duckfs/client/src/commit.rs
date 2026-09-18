@@ -73,9 +73,9 @@ pub enum CommitError {
          the directory to resync the base"
     )]
     Landed { height: u64, reason: String },
-    /// a refusal, both halves: the class token beside the sentence its author
-    /// wrote (see [`ApiError::Rejected`]).
-    #[error("{reason}: {sentence}")]
+    /// a refusal, both halves: the sentence its author wrote, then the class
+    /// token (see [`ApiError::Rejected`]).
+    #[error("{}", crate::api::refusal_line(.reason, .sentence))]
     Rejected { reason: String, sentence: String },
     #[error("duckfs: commit transport: {0}")]
     Transport(String),

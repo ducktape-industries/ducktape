@@ -231,18 +231,24 @@ fn module_rejection_is_preserved_and_missing_signer_sends_nothing() {
     assert!(unsigned.commit(None, "m", Vec::new()).is_err());
     assert!(stub.requests().is_empty());
     let node = signing_node(&stub);
+    let refused = node.commit(None, "m", Vec::new()).unwrap_err();
     assert_eq!(
-        node.commit(None, "m", Vec::new()).unwrap_err(),
+        refused,
         ApiError::Rejected {
             reason: "files_commit".into(),
             sentence: "files: conflict: /x changed since base".into(),
         }
     );
+    // the commit lane's own error reads the same line the read lane does.
+    assert_eq!(
+        duckfs_client::commit::CommitError::from(refused).to_string(),
+        "files: conflict: /x changed since base [files_commit]"
+    );
 }
 
 /// BOTH halves of the node's envelope survive the read lane, and the error a
-/// person ends up reading is `<reason>: <sentence>` — the class token in front,
-/// the module's own words after it, and no Rust type name anywhere in between.
+/// person ends up reading is `<sentence> [<reason>]` — the module's own words
+/// first, the class token last, and no Rust type name anywhere in between.
 #[test]
 fn a_read_refusal_keeps_its_class_beside_its_sentence() {
     let stub = Stub::new(|_, _, _| {
@@ -260,7 +266,7 @@ fn a_read_refusal_keeps_its_class_beside_its_sentence() {
             sentence: "files: path not found".into(),
         }
     );
-    assert_eq!(refused.to_string(), "files_query: files: path not found");
+    assert_eq!(refused.to_string(), "files: path not found [files_query]");
     assert!(!refused.to_string().contains("Module("));
 }
 

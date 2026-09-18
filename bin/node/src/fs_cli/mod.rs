@@ -245,9 +245,9 @@ pub(crate) fn install_log_sink(default_filter: &str) {
         .try_init();
 }
 
-/// dispatch a parsed verb and map its `CliError` to the process exit code. an
-/// EMPTY error message prints nothing — a dirty `status` and a commit conflict
-/// each wrote their own output and only carry the exit code here.
+/// dispatch a parsed verb and map its `CliError` to the process exit code. a
+/// silent error prints nothing — a dirty `status` and a commit conflict each
+/// wrote their own output and only carry the exit code here.
 pub(crate) fn run(cmd: FsCmd) -> u8 {
     install_log_sink("warn");
     let outcome = match cmd {
@@ -266,8 +266,8 @@ pub(crate) fn run(cmd: FsCmd) -> u8 {
     match outcome {
         Ok(()) => 0,
         Err(e) => {
-            if !e.message.is_empty() {
-                eprintln!("ducktape fs: {}", e.message);
+            if let Some(line) = e.line() {
+                eprintln!("ducktape fs: {line}");
             }
             e.code
         }
