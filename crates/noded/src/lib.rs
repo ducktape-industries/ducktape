@@ -1571,17 +1571,18 @@ struct WsParams {
 async fn ws(
     State(handle): State<NodeHandle>,
     OriginalUri(uri): OriginalUri,
+    extensions: axum::http::Extensions,
     headers: HeaderMap,
     Query(params): Query<WsParams>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    let path_and_query = uri.path_and_query().map_or(uri.path(), |pq| pq.as_str());
     // A RUN ASK IS PROVED BEFORE THE UPGRADE. An unadmitted caller gets an HTTP
     // refusal and no socket — it never reaches a state where a subscribe could
     // be tried, and it learns nothing about whether the run exists.
     let reader_of = match params.run {
         None => None,
         Some(run) => {
-            let path_and_query = uri.path_and_query().map_or(uri.path(), |pq| pq.as_str());
             if let Err(refused) =
                 stream::admit_run_reader(&handle, &run, &headers, path_and_query).await
             {
@@ -1590,13 +1591,18 @@ async fn ws(
             Some(run)
         }
     };
-    // unauthenticated surface: cap the frame/message tungstenite otherwise
-    // defaults to 64 MiB, so a single frame cannot force a large buffer before
-    // any handler gets to look at it (see `stream::MAX_WS_MESSAGE_BYTES`).
+    // so is the OPERATOR: the operator's topics (`logs`) are decided on what
+    // this upgrade carried, never on anything a frame can say later.
+    let on_box = admin::peer_is_loopback(&extensions);
+    let operator = signed_req::upgrade_is_operator(&handle, &headers, path_and_query, on_box);
+    // a surface any caller can open: cap the frame/message tungstenite
+    // otherwise defaults to 64 MiB, so a single frame cannot force a large
+    // buffer before any handler gets to look at it (see
+    // `stream::MAX_WS_MESSAGE_BYTES`).
     upgrade
         .max_message_size(stream::MAX_WS_MESSAGE_BYTES)
         .max_frame_size(stream::MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| stream::stream_session(socket, handle, reader_of))
+        .on_upgrade(move |socket| stream::stream_session(socket, handle, reader_of, operator))
 }
 
 #[cfg(test)]

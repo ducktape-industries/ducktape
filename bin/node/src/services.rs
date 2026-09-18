@@ -1461,7 +1461,7 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // the FIRST hello must land: a daemon that cannot signal has nothing to
     // offer and must not sit in a retry loop pretending otherwise. A down node
     // is a loud exit, not a silent spin.
-    let skew = send_hello(&base, &hello)?;
+    let skew = send_hello(&base, &service.workspace, &hello)?;
     write_err(&format!(
         "{} {} · signaling to {} · offering {}\n",
         paint(GREEN, "●"),
@@ -1781,11 +1781,22 @@ fn discover_hello(
 /// When either side cannot identify its build the answer is
 /// [`Skew::Unknown`] — which says nothing and warns about nothing, rather than
 /// inventing a disagreement out of two "unknown"s.
-fn send_hello(base: &str, hello: &noded::services::Hello) -> Result<Skew, String> {
+///
+/// The hello carries the node's service-link token, read out of `workspace`
+/// per call and never latched: a node restart mints a fresh one, and a
+/// heartbeat holding a stale token would be refused until the daemon
+/// restarted.
+fn send_hello(
+    base: &str,
+    workspace: &std::path::Path,
+    hello: &noded::services::Hello,
+) -> Result<Skew, String> {
+    let token = noded::services::read_link_token(workspace)?;
     let body = crate::node_http::post_json(
         base,
         "/v1/services/hello",
         &serde_json::to_value(hello).unwrap(),
+        (noded::services::LINK_TOKEN_HEADER, &token),
     )
     .map_err(|error| error.to_string())?;
     Ok(Skew::between(
@@ -2066,7 +2077,7 @@ fn heartbeat(
     loop {
         std::thread::sleep(HEARTBEAT);
         watch.refresh(&mut hello);
-        match send_hello(base, &hello) {
+        match send_hello(base, &watch.service.workspace, &hello) {
             Ok(observed) => {
                 if failures > 0 {
                     tracing::info!(target: "ducktape::service", kind = %hello.kind, "signal restored");

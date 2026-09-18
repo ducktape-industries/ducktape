@@ -6,8 +6,8 @@
 //! run's whole node surface, so it is deliberately a pass-through with two
 //! exceptions, both about the OPERATOR's authority rather than the run's:
 //!
-//! * `/v1/ws` is refused. It takes no credential of any kind and carries the
-//!   `logs` topic — this operator's log ring — to whoever opens it.
+//! * `/v1/ws` is refused. It carries the `logs` topic — this operator's log
+//!   ring — which is not a run's to read.
 //! * a git push under `/forge/{repo}/…` (`git-receive-pack`, and the ref
 //!   advertisement that asks for it) is forwarded carrying this node's
 //!   operator credential — the proof forge's receive-pack asks for, which the
@@ -24,9 +24,10 @@
 //! * everything else passes through byte-for-byte: every `/v1/*` read
 //!   (`query`, `status`, `peers`, `blocks`, `index/*`, the duckfs `files/*`
 //!   routes), a git fetch, `/metrics`, the self-authenticating
-//!   `/v1/submit/frame`, the volatile `/v1/services/hello`, the module-bound
-//!   mutations whose per-request signature IS their authority, and the gateway
-//!   routes runs use for egress.
+//!   `/v1/submit/frame`, the module-bound mutations whose per-request
+//!   signature IS their authority, and the gateway routes runs use for egress.
+//!   What the node itself gates (the service-link lane, the operator lanes)
+//!   it still gates: passing a request through presents no credential.
 //!
 //! One route is SERVED here rather than forwarded: [`MCP_PATH`], the agent tool
 //! plane ([`mcp_host`]) as a streamable-HTTP MCP endpoint. It is on this lane
@@ -194,8 +195,8 @@ fn classify(path: &str, query: &str, pushable: Option<&str>) -> Route {
         return classify_forge(rest, query, pushable);
     }
     match path {
-        // no credential of any kind, and it carries the `logs` topic: this
-        // operator's log ring is not a run's to read.
+        // it carries the `logs` topic: this operator's log ring is not a run's
+        // to read.
         "/v1/ws" => Route::Refuse("ws_refused"),
         MCP_PATH => Route::Mcp,
         _ => Route::Pass,

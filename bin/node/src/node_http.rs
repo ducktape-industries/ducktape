@@ -59,7 +59,9 @@ pub(crate) fn submit(
         base,
         "/v1/submit",
         &serde_json::json!({ "target": target, "payload": payload }),
-        operator.as_deref(),
+        operator
+            .as_deref()
+            .map(|token| (noded::admin::ADMIN_TOKEN_HEADER, token)),
     )?;
     receipt_height(&body)
 }
@@ -553,14 +555,22 @@ pub(crate) fn get_json(base: &str, path: &str) -> Result<serde_json::Value, Read
     })
 }
 
-/// POST one node-local JSON surface and return the decoded reply (the `/v1`
-/// routes that are not module submits, e.g. service signaling).
+/// POST one node-local JSON surface carrying `credential` — a header name and
+/// the secret it takes — and return the decoded reply (the `/v1` routes that
+/// are not module submits, e.g. service signaling under the service-link
+/// token).
 pub(crate) fn post_json(
     base: &str,
     path: &str,
     body: &serde_json::Value,
+    credential: (&str, &str),
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    Ok(serde_json::from_str(&post(base, path, body)?)?)
+    Ok(serde_json::from_str(&post_with(
+        base,
+        path,
+        body,
+        Some(credential),
+    )?)?)
 }
 
 /// One blocking POST of a JSON body, returning the response text or the node's
@@ -573,21 +583,22 @@ fn post(
     post_with(base, path, body, None)
 }
 
-/// [`post`] carrying the node's operator credential — what a MUTATING route
-/// wants from a caller that acts as the node rather than as a person.
+/// [`post`] carrying the credential a MUTATING route wants — a header name and
+/// its secret: the operator credential from a caller that acts as the node,
+/// the service-link token from a service daemon.
 fn post_with(
     base: &str,
     path: &str,
     body: &serde_json::Value,
-    operator_token: Option<&str>,
+    credential: Option<(&str, &str)>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // the SAME classifier the read lane uses: `submit`/`query` are how every
     // `user`/`agent`/`cred` verb reaches the node, and a down node used to
     // surface here as a raw `POST http://…: error sending request for url (…)`
     // while `service list` — one function away — said "the node is not running".
     let mut request = client()?.post(format!("{base}{path}")).json(body);
-    if let Some(token) = operator_token {
-        request = request.header(noded::admin::ADMIN_TOKEN_HEADER, token);
+    if let Some((header, secret)) = credential {
+        request = request.header(header, secret);
     }
     let resp = request
         .send()

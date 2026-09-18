@@ -1061,9 +1061,8 @@ impl CliProvider {
             // no tap: the guest has no NIC, so its whole reach is the vsock
             // tunnels above. That is not the same as "no egress" — the node
             // tunnel's read lane passes `/v1/gateway/proxy`, which dispatches a
-            // `GatewayJob::Http` over the overlay to a publisher node, and its
-            // only gate (`gateway_http::gateway_api_origin_allowed`) is a
-            // header check a plain `curl` passes by sending no headers. See
+            // `GatewayJob::Http` over the overlay to a publisher node for a
+            // caller that proves an Identity account key. See
             // [`wire_guest_tunnels`] for the full reach.
             tap: None,
         };
@@ -1973,14 +1972,15 @@ impl Drop for ContextGuard {
 ///   `/v1/blocks`, `/v1/index/*`, `/metrics`, the `/v1/files/*` duckfs reads;
 /// * `/v1/submit/frame` — self-authenticating: the frame's own signature IS
 ///   its origin, so a guest with no key can put nothing through it;
-/// * `/v1/services/hello`, volatile presence that ages out on its own TTL;
 /// * EGRESS OFF THIS HOST — `/v1/gateway/proxy` dispatches a `GatewayJob::Http`
-///   over the overlay to a publisher node, and its only gate,
-///   `gateway_http::gateway_api_origin_allowed`, is a header check a native
-///   caller passes by sending no headers. `/v1/gateway/browser` likewise.
+///   over the overlay to a publisher node, for a caller whose request head
+///   carries a proof by an Identity account key (`gateway_http::gateway_proxy`
+///   verifies it first): the publisher sees that account, never an anonymous
+///   caller. `/v1/gateway/browser` answers on its origin check alone.
 ///
 /// Out of reach: every other port and every other address on this host (no
-/// listener is bound for them, with or without a NIC); `/v1/admin/*`; and the
+/// listener is bound for them, with or without a NIC); `/v1/admin/*`;
+/// `/v1/services/hello`, which takes the node's service-link token; and the
 /// NODE-LEVEL mutations — `/v1/invite`, `/v1/log-filter`, `/v1/term/sessions`
 /// and `DELETE /v1/fs/workspaces/{id}` — which take either this node's
 /// operator credential (a 0600 file in a workspace the guest has no path to)

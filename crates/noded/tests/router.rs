@@ -675,6 +675,73 @@ async fn a_node_level_route_refuses_a_self_minted_key_and_admits_the_operator() 
     }
 }
 
+/// A service daemon's hello lands in the catalog the operator enables from, so
+/// it takes the credential the daemon already holds — this node's service-link
+/// token — and "can dial the port" is refused with a stable reason: bare, with
+/// a stale token, or signed by a self-minted key. The operator credential
+/// admits, as it does on every lane.
+#[tokio::test]
+async fn a_service_hello_takes_the_service_link_token() {
+    const LINK: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    let hello = serde_json::json!({
+        "kind": "compute",
+        "version": "0",
+        "build": "test",
+    });
+    let bytes = serde_json::to_vec(&hello).unwrap();
+    let from_the_box = |credential: Option<&str>| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/services/hello")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = credential {
+            request = request.header(noded::services::LINK_TOKEN_HEADER, token);
+        }
+        with_peer(
+            request.body(Body::from(bytes.clone())).unwrap(),
+            "127.0.0.1:40000",
+        )
+    };
+    let node = || {
+        let (handle, _cmds, _events) = local_node();
+        handle.with_service_link(noded::ServiceLink::new(Some(LINK.into())))
+    };
+    let signaling = |handle: &NodeHandle| handle.services().live(std::time::Instant::now());
+
+    for refused in [
+        from_the_box(None),
+        from_the_box(Some(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )),
+        signed("POST", "/v1/services/hello", hello.clone()),
+    ] {
+        let handle = node();
+        let response = noded::router(handle.clone())
+            .oneshot(refused)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(response).await["reason"], "service_link_missing");
+        assert!(
+            signaling(&handle).is_empty(),
+            "a refused hello signals nothing"
+        );
+    }
+
+    for admitted in [
+        from_the_box(Some(LINK)),
+        post("/v1/services/hello", hello.clone()),
+    ] {
+        let handle = node();
+        let response = noded::router(handle.clone())
+            .oneshot(admitted)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(signaling(&handle).len(), 1);
+    }
+}
+
 /// the OTHER half of the split: a module-bound route still takes any acting
 /// key, because the key becomes the op's origin and the module decides. A node
 /// that tightened these too would break every duckfs client.
@@ -2172,32 +2239,148 @@ fn spawn_duck_actor(mut cmds: mpsc::Receiver<NodeCommand>, queries: usize) {
     });
 }
 
-fn spawn_gateway_actor(mut cmds: mpsc::Receiver<NodeCommand>, replies: usize) {
+/// the key a signed gateway caller proves — the one account the gateway actor
+/// below knows.
+fn gateway_caller() -> commonware_cryptography::ed25519::PrivateKey {
+    commonware_cryptography::ed25519::PrivateKey::from_seed(79)
+}
+
+/// Answer every read a gateway call makes: the route `Get` ([`gateway_route`])
+/// and the Identity account behind a caller key — [`gateway_caller`]'s, and no
+/// other key's.
+fn spawn_gateway_actor(mut cmds: mpsc::Receiver<NodeCommand>) {
+    let caller = gateway_caller().public_key().as_ref().to_vec();
     tokio::spawn(async move {
-        for _ in 0..replies {
-            let NodeCommand::Query { target, req, reply } = cmds.next().await.unwrap() else {
-                panic!("gateway only queries route state");
+        while let Some(command) = cmds.next().await {
+            let NodeCommand::Query { target, req, reply } = command else {
+                panic!("gateway only queries");
             };
-            assert_eq!(target, "gateway");
-            assert_eq!(
-                gateway::decode_query(&req).unwrap(),
-                gateway::GatewayQuery::Get {
-                    account_id: 1,
-                    name: gateway::RouteName::named("app"),
+            let bytes = match target.as_str() {
+                "gateway" => {
+                    assert_eq!(
+                        gateway::decode_query(&req).unwrap(),
+                        gateway::GatewayQuery::Get {
+                            account_id: 1,
+                            name: gateway::RouteName::named("app"),
+                        }
+                    );
+                    gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(
+                        gateway_route(),
+                    ))))
                 }
-            );
-            let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
-                Box::new(Some(gateway_route())),
-            ))));
+                "identity" => {
+                    let identity::IdentityQuery::OfKey { key } =
+                        identity::decode_query(&req).unwrap()
+                    else {
+                        panic!("a caller proof reads its key's account");
+                    };
+                    let account = (key == caller).then(|| identity::AccountView {
+                        number: 9,
+                        name: "caller".into(),
+                        control: identity::Control::Keys,
+                        keys: vec![identity::KeyView {
+                            scheme: identity::KeyScheme::Ed25519,
+                            pubkey: key,
+                            label: None,
+                            added_at: 0,
+                        }],
+                        avatar: None,
+                        bio: None,
+                        updated_at: 0,
+                    });
+                    identity::encode_reply(&identity::IdentityReply::Account(account))
+                }
+                other => panic!("gateway does not query {other}"),
+            };
+            let _ = reply.send(Ok(bytes));
         }
     });
+}
+
+/// A `/v1/gateway/proxy` body whose head carries `signer`'s caller proof over
+/// that head and `body`, against [`gateway_route`]'s publisher — the proof the
+/// app stamps on every application call.
+fn signed_proxy(
+    signer: &commonware_cryptography::ed25519::PrivateKey,
+    head: serde_json::Value,
+    body: &[u8],
+) -> serde_json::Value {
+    use base64::Engine as _;
+    let mut head: gateway::ProxyRequestHead = serde_json::from_value(head).unwrap();
+    let ts = noded::signed_req::now_secs();
+    let preimage = gateway::caller_pop_preimage(
+        &gateway_route().statement.publisher_node,
+        &head,
+        &gateway::body_digest(body),
+        ts,
+    );
+    head.user_pop = Some(gateway::UserPop {
+        key: signer.public_key().as_ref().to_vec(),
+        ts,
+        sig: signer
+            .sign(gateway::GATEWAY_CALLER_NS, &preimage)
+            .as_ref()
+            .to_vec(),
+    });
+    serde_json::json!({
+        "head": head,
+        "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
+    })
+}
+
+/// The proxy door serves SIGNED callers only: a head with no caller proof is
+/// refused `caller_proof_missing`, and one whose key holds no account is
+/// refused too — both before any overlay work, so no job reaches the lane.
+#[tokio::test]
+async fn gateway_proxy_refuses_a_caller_that_proves_no_account() {
+    use base64::Engine as _;
+    let (handle, cmds, _events) = local_node();
+    spawn_gateway_actor(cmds);
+    let (lane, mut jobs) = tokio::sync::mpsc::channel::<noded::GatewayJob>(1);
+    let app = noded::router(handle.with_gateway(lane));
+    let head = serde_json::json!({
+        "account_id": 1,
+        "name": { "label": "app" },
+        "revision": 7,
+        "method": "get",
+        "path_and_query": "/api/items",
+        "headers": [],
+        "upgrade": false,
+    });
+
+    let bare = serde_json::json!({
+        "head": head,
+        "body_b64": base64::engine::general_purpose::STANDARD.encode(b""),
+    });
+    let response = app
+        .clone()
+        .oneshot(post("/v1/gateway/proxy", bare))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["reason"], "caller_proof_missing");
+
+    let no_account = commonware_cryptography::ed25519::PrivateKey::from_seed(80);
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/v1/gateway/proxy",
+            signed_proxy(&no_account, head, b""),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        jobs.try_recv().is_err(),
+        "a refused caller dispatched a job"
+    );
 }
 
 #[tokio::test]
 async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
     use base64::Engine as _;
     let (handle, cmds, _events) = local_node();
-    spawn_gateway_actor(cmds, 1);
+    spawn_gateway_actor(cmds);
     let (lane, mut jobs) = tokio::sync::mpsc::channel::<noded::GatewayJob>(1);
     tokio::spawn(async move {
         let job = jobs.recv().await.expect("one gateway job");
@@ -2215,6 +2398,11 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
         assert_eq!(head.name, gateway::RouteName::named("app"));
         assert_eq!(head.method, gateway::RouteMethod::Post);
         assert_eq!(head.path_and_query, "/api/items");
+        // the caller's proof rides on to the publisher, which checks it again.
+        assert_eq!(
+            head.user_pop.map(|pop| pop.key),
+            Some(gateway_caller().public_key().as_ref().to_vec())
+        );
         assert_eq!(request_body(body).await, br#"{"name":"duck"}"#);
         let _ = reply.send(Ok(noded::GatewayResponse {
             head: gateway::ProxyResponseHead {
@@ -2236,8 +2424,9 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
     let request_body = br#"{"name":"duck"}"#;
     let request = post(
         "/v1/gateway/proxy",
-        serde_json::json!({
-            "head": {
+        signed_proxy(
+            &gateway_caller(),
+            serde_json::json!({
                 "account_id": 1,
                 "name": { "label": "app" },
                 "revision": 7,
@@ -2245,9 +2434,9 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
                 "path_and_query": "/api/items",
                 "headers": [{ "name": "content-type", "value": "application/json" }],
                 "upgrade": false,
-            },
-            "body_b64": base64::engine::general_purpose::STANDARD.encode(request_body),
-        }),
+            }),
+            request_body,
+        ),
     );
     let response = noded::router(handle.with_gateway(lane))
         .oneshot(request)
@@ -2304,17 +2493,22 @@ async fn gateway_operator_forwards_existing_authentication_without_requiring_an_
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), status);
     }
-    let mut forged = body.clone();
-    forged["head"]["operator"] = true.into();
+    spawn_gateway_actor(cmds);
+    // a SIGNED caller asserting the operator on the proxy door is still
+    // refused: that door's only proof is the caller's.
+    let mut forged = body["head"].clone();
+    forged["operator"] = true.into();
     let response = app
         .clone()
-        .oneshot(post("/v1/gateway/proxy", forged))
+        .oneshot(post(
+            "/v1/gateway/proxy",
+            signed_proxy(&gateway_caller(), forged, b"{}"),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(jobs.try_recv().is_err());
 
-    spawn_gateway_actor(cmds, 2);
     let serving = tokio::spawn(async move {
         for _ in 0..2 {
             let noded::GatewayJob::Http {
