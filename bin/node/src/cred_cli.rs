@@ -34,7 +34,6 @@ use commonware_cryptography::Signer as _;
 use crate::account_cli::resolve_account_authority;
 use crate::cli_args::NodeAddr;
 use crate::config;
-use crate::userkey_cli::load_user_signer;
 
 pub(crate) type CredResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -308,7 +307,7 @@ impl ProviderArg {
     }
 }
 
-/// Dispatch one `cred` verb. `stdin` is threaded to [`load_user_signer`], which
+/// Dispatch one `cred` verb. `stdin` is threaded to [`VerbCtx::signer`], which
 /// reads the key password from it only when the key file is encrypted.
 pub(crate) fn run(args: CredArgs, stdin: &mut impl BufRead) -> CredResult {
     let CredArgs { cmd, addr, key } = args;
@@ -373,6 +372,16 @@ impl VerbCtx {
         Ok(path)
     }
 
+    /// the unlocked user key for a verb that signs for the node it dials —
+    /// asked for only once that node has answered
+    /// ([`crate::userkey_cli::load_user_signer_for`]).
+    pub(crate) fn signer(
+        &self,
+        stdin: &mut impl std::io::BufRead,
+    ) -> Result<commonware_cryptography::ed25519::PrivateKey, Box<dyn std::error::Error>> {
+        crate::userkey_cli::load_user_signer_for(&self.http_base()?, &self.key_path()?, stdin)
+    }
+
     /// the co-hosted workspace behind the node this verb dials: chain id, the
     /// node's consensus key, and its storage dir. Required by every verb that
     /// mints an owner-signed statement or writes the store.
@@ -421,7 +430,7 @@ fn cmd_list(ctx: &VerbCtx, json: bool) -> CredResult {
 fn cmd_grant(ctx: &VerbCtx, name: String, account: String, stdin: &mut impl BufRead) -> CredResult {
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
     let grantee = resolve_account_authority(&base, &account)?;
     let statement = gateway::CredentialGrantStatement {
@@ -452,7 +461,7 @@ fn cmd_revoke(
 ) -> CredResult {
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
     let grantee = resolve_account_authority(&base, &account)?;
     let statement = gateway::CredentialGrantStatement {
@@ -490,7 +499,7 @@ fn cmd_remove(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> CredResu
         return finish_local_removal_only(&resolved.service.storage_dir, &name);
     }
 
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
     let statement = gateway::RemoveCredentialStatement {
         chain_id: resolved.service.chain_id.clone(),
@@ -573,7 +582,7 @@ fn begin_enrolment(
 ) -> Result<Enrolment, Box<dyn std::error::Error>> {
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let user_pub = user.public_key().as_ref().to_vec();
 
     // owner account (membership check) + existing names (for the default's

@@ -3572,6 +3572,53 @@ mod tests {
         }
     }
 
+    /// #2511, end to end through both read verbs: a workspace whose node is
+    /// not running is refused in the not-running sentence at a non-zero exit
+    /// (an `Err` out of the verb), never rendered as a healthy node with
+    /// nothing enabled at exit 0.
+    #[test]
+    fn a_stopped_node_is_refused_by_both_read_verbs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // bound only to learn a port, then closed: the connect is REFUSED.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind loopback")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let config = dir.path().join("node.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "id = 7\nlisten = \"127.0.0.1:0\"\nnamespace = \"demo\"\npeer_seeds = [7]\n\
+                 storage_dir = {:?}\nhttp_listen = \"127.0.0.1:{port}\"\n",
+                dir.path().display().to_string()
+            ),
+        )
+        .expect("write node.toml");
+        for (name, verb) in [("list", list as fn(_) -> _), ("status", status)] {
+            let args = ReadArgs {
+                kind: None,
+                workspace: WorkspaceArgs {
+                    config: Some(config.clone()),
+                    workspace: None,
+                    network: None,
+                },
+                json: false,
+            };
+            let refused = verb(args)
+                .expect_err("a node that did not answer is not an answer")
+                .to_string();
+            assert!(
+                refused.contains("the node is not running"),
+                "service {name}: {refused}"
+            );
+            assert!(
+                !refused.contains("none enabled"),
+                "service {name}: {refused}"
+            );
+        }
+    }
+
     #[test]
     fn the_instance_id_survives_a_daemon_restart() {
         let dir = tempfile::tempdir().unwrap();

@@ -383,7 +383,7 @@ fn register_signing_credential(
     gateway::validate_credential_name(name)?;
     let base = ctx.http_base()?;
     let publisher = Publisher::of_node(&base)?;
-    let user = crate::userkey_cli::load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let owner = crate::cred_cli::query_owner_account_view(&base, user.public_key().as_ref())?;
     submit_credential_record(
         &base,

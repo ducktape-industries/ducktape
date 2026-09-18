@@ -63,7 +63,7 @@ fn cmd_log_filter(args: crate::cli_args::LogFilterArgs) -> CommandResult {
     let key_path = ctx.key_path()?;
     let node_key = crate::node_http::pinned_node_key(&key_path, &base, args.trust_node)?;
     let mut stdin = std::io::BufReader::new(std::io::stdin());
-    let signer = crate::userkey_cli::load_user_signer(&key_path, &mut stdin)?;
+    let signer = crate::userkey_cli::load_user_signer_for(&base, &key_path, &mut stdin)?;
 
     const PATH: &str = "/v1/log-filter";
     let body = args.filter.into_bytes();
@@ -1942,6 +1942,39 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// What `resident remove` decides before it proposes anything.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ResidentRemoval {
+    /// the key holds no resident standing — the desired state already holds.
+    NoStanding,
+    /// it stands in the resident tier: propose the revocation.
+    Proceed,
+}
+
+/// [`precheck_promotion`]'s mirror. A seated validator is REFUSED, not a no-op:
+/// nothing is removed and the operator is sent to another verb, so a script
+/// must not read success — unlike a key with no standing at all, where the
+/// state asked for already holds.
+pub(super) fn precheck_resident_removal(
+    pubkey_hex: &str,
+    key: &[u8],
+    members: &[Vec<u8>],
+    residents: &[Vec<u8>],
+) -> Result<ResidentRemoval, String> {
+    let seated = members.iter().any(|m| m == key);
+    if seated {
+        return Err(format!(
+            "{pubkey_hex} is a seated validator, not a resident — remove it with \
+             `ducktape node member remove {pubkey_hex}`"
+        ));
+    }
+    let resident = residents.iter().any(|r| r == key);
+    match resident {
+        true => Ok(ResidentRemoval::Proceed),
+        false => Ok(ResidentRemoval::NoStanding),
+    }
+}
+
 /// `resident remove <hex pubkey> [--config node.toml]` — revoke resident
 /// standing: drive a governance RemoveResident proposal through this account's
 /// own RUNNING node. the mirror of `resident accept` with inverted guards — a
@@ -1965,16 +1998,13 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
     let signer = gov_signer(node.rpc(), &cfg_path, &resolved)?;
 
     let members = read_members(node.rpc())?;
-    if members.contains(&key_bytes) {
-        eprintln!(
-            "{pubkey_hex} is a seated validator, not a resident — remove it with \
-             `ducktape node member remove {pubkey_hex}`"
-        );
-        return Ok(());
-    }
-    if !read_residents(node.rpc())?.contains(&key_bytes) {
-        eprintln!("{pubkey_hex} holds no resident standing — nothing to do");
-        return Ok(());
+    let residents = read_residents(node.rpc())?;
+    match precheck_resident_removal(pubkey_hex, &key_bytes, &members, &residents)? {
+        ResidentRemoval::NoStanding => {
+            eprintln!("{pubkey_hex} holds no resident standing — nothing to do");
+            return Ok(());
+        }
+        ResidentRemoval::Proceed => {}
     }
     let wanted = GovAction::RemoveResident { key: key_bytes };
     let same_action = {
@@ -2936,6 +2966,36 @@ mod tests {
         );
         // empty rosters refuse rather than wave everything through.
         assert!(precheck_promotion(hex, &stranger, &[], &[]).is_err());
+    }
+
+    /// #2512: `resident remove` of a seated validator printed its redirect
+    /// and exited 0, so a script read "removed". It is a refusal — an `Err`,
+    /// which `main` turns into exit 1 — while a key with no standing stays the
+    /// idempotent no-op it always was.
+    #[test]
+    fn removing_a_seated_validator_as_a_resident_is_refused_not_skipped() {
+        use super::{ResidentRemoval, precheck_resident_removal};
+        let hex = "0101010101010101010101010101010101010101010101010101010101010101";
+        let seated = vec![1u8; 32];
+        let resident = vec![2u8; 32];
+        let stranger = vec![3u8; 32];
+        let members = vec![seated.clone()];
+        let residents = vec![resident.clone()];
+
+        let refusal = precheck_resident_removal(hex, &seated, &members, &residents)
+            .expect_err("a seated key is not a resident to remove");
+        assert!(
+            refusal.contains(&format!("`ducktape node member remove {hex}`")),
+            "it names the verb that does remove it: {refusal}"
+        );
+        assert_eq!(
+            precheck_resident_removal(hex, &resident, &members, &residents),
+            Ok(ResidentRemoval::Proceed)
+        );
+        assert_eq!(
+            precheck_resident_removal(hex, &stranger, &members, &residents),
+            Ok(ResidentRemoval::NoStanding)
+        );
     }
 
     /// A founder workspace on disk, complete enough for `mint_invite_blob`:

@@ -52,7 +52,7 @@ fn signing_node(
     let _node_key = crate::node_http::pinned_node_key(&key_path, &url, trust_node)
         .map_err(|error| CliError::failed(error.to_string()))?;
     let mut stdin = std::io::BufReader::new(std::io::stdin());
-    let signer = crate::userkey_cli::load_user_signer(&key_path, &mut stdin)
+    let signer = crate::userkey_cli::load_user_signer_for(&url, &key_path, &mut stdin)
         .map_err(|e| CliError::failed(e.to_string()))?;
     Ok(
         HttpNode::new(url).with_frame_signer(Arc::new(move |target, payload| {

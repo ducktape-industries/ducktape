@@ -281,6 +281,18 @@ pub(crate) fn load_user_signer(
     Ok(userkey::open_user_key_at(key_path, &password)?)
 }
 
+/// [`load_user_signer`] for a verb that signs for the node at `base`, asked
+/// only once that node has answered: a password typed at 3am and then "the
+/// node is not running" is the wrong failure, reported one secret too late.
+pub(crate) fn load_user_signer_for(
+    base: &str,
+    key_path: &std::path::Path,
+    stdin: &mut impl std::io::BufRead,
+) -> Result<ed25519::PrivateKey, Box<dyn std::error::Error>> {
+    crate::node_http::require_answering(base)?;
+    load_user_signer(key_path, stdin)
+}
+
 /// `user-key init` core — see [`cmd_user_key_init`] for the print contract.
 /// returns `(mnemonic, pubkey-hex)` so tests can assert both independently.
 fn user_key_init(
