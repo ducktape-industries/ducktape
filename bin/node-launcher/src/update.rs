@@ -334,7 +334,7 @@ impl Executor<'_> {
                 );
                 Event::QualifyPassed(sha)
             }
-            Err(refusal) => refused(sha, refusal.reason, refusal.detail),
+            Err(unqualified) => refused(sha, &unqualified.reason, unqualified.detail),
         };
         Ok(Progress::Answer(answer))
     }
@@ -661,6 +661,68 @@ mod tests {
             pinned_sequence: 2,
         });
         assert_eq!(decide(&swapping, &armed, &pinned()), Next::Wait);
+    }
+
+    /// Ask a staged binary that is `script` whether it qualifies.
+    fn qualify_with(script: &str) -> Event {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::of(dir.path());
+        let target = sha("b");
+        let exe = layout.exe_of(target);
+        std::fs::create_dir_all(layout.release_dir(target)).unwrap();
+        std::fs::write(&exe, script).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ducktape = Ducktape::new(layout.exe(), layout.config());
+        let live = status(1200, "ab", designating("b", 1200));
+        let executor = Executor {
+            layout: &layout,
+            ducktape: &ducktape,
+            keys: None,
+            live: Some(&live),
+        };
+        let Ok(Progress::Answer(answer)) = executor.qualify(target) else {
+            panic!("a qualify always answers the machine");
+        };
+        answer
+    }
+
+    /// `node qualify` prints its own snake_case reason on its first stdout
+    /// line, and that token — not this launcher's class for it — is the
+    /// reason the refusal carries to the line an operator reads.
+    #[test]
+    fn a_qualify_refusal_carries_the_staged_binarys_own_reason() {
+        let said = qualify_with(
+            "#!/bin/sh\necho index_unopenable\necho 'index_unopenable: _blocks is locked' >&2\nexit 1\n",
+        );
+        assert_eq!(
+            said,
+            Event::QualifyFailed {
+                sha: sha("b"),
+                reason: "index_unopenable".into(),
+            }
+        );
+    }
+
+    /// A binary that gave no token — it died before printing one, or printed
+    /// prose — is refused under this launcher's own class: a `reason` is a
+    /// snake_case token, and prose never becomes one.
+    #[test]
+    fn a_qualify_refusal_without_a_token_keeps_the_launchers_class() {
+        let class = |said: Event| match said {
+            Event::QualifyFailed { reason, .. } => reason,
+            other => panic!("not a refusal: {other:?}"),
+        };
+        assert_eq!(
+            class(qualify_with("#!/bin/sh\nexit 101\n")),
+            "qualify_refused"
+        );
+        assert_eq!(
+            class(qualify_with(
+                "#!/bin/sh\necho 'thread main panicked'\nexit 101\n"
+            )),
+            "qualify_refused"
+        );
     }
 
     #[test]
