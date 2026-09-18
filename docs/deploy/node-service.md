@@ -8,23 +8,45 @@ the log rotation is `ops/node/ducktape-node.logrotate`, and every path below
 matches what those files set. macOS runs the node as a per-user LaunchAgent
 instead; that section names its two files and its commands.
 
+Every unit runs **`ducktape-node-launcher`**, never the node or a daemon
+directly (`bin/node-launcher/src/main.rs`). The node unit runs
+`ducktape-node-launcher run --workspace DIR --config FILE`: the launcher
+starts `<workspace>/current/ducktape node run`, asks it `ducktape release
+status` every poll, and follows the network's node releases — it stages a
+designated release, qualifies it against the workspace checkpoint, flips
+`current` at the activation height and rolls back a release that never comes
+up. A service unit runs the daemon through the launcher's service role,
+`ducktape-node-launcher service --workspace DIR --config FILE -- service run <kind> --enable`
+(`supervise_service`): the role starts `<workspace>/current/ducktape` and
+restarts the daemon when a release flip moves that link, so the node and its
+daemons change build together. A node started as a bare `ducktape node run`
+follows no release at all, and a daemon started as a bare `service run` keeps
+the binary it started from (`service status` shows the skew as
+`build X (this node: Y)`).
+
 The node is supervisor-ready: SIGTERM and SIGINT take the graceful
 checkpoint path on a validator and a resident alike (the same one the desktop
 shell uses on quit, `QuitSignals` in `bin/node/src/drain_actions.rs`) and end
 with one `node_shutdown` line naming the signal, the height and whether the
 final checkpoint was `written`, `already_current` or `skipped(<reason>)` — the
-next boot's recovery line names at least that height. It raises its own open-file
-soft limit to 65536 (`bin/node/src/resource_limits.rs`), and
-`ducktape service run` names systemd as its target (`bin/node/src/services.rs`,
-`RunArgs::enable`: "for scripts and systemd units"). A service unit runs the
-daemon through the launcher's service role,
-`ducktape-node-launcher service --workspace DIR --config FILE -- service run <kind> --enable`
-(`bin/node-launcher/src/main.rs`, `supervise_service`): the role starts
-`<workspace>/current/ducktape` and restarts the daemon when a release flip
-moves that link, so the node and its daemons change build together. A daemon
-started as a bare `service run` keeps the binary it started from, and
-`service status` shows the skew as `build X (this node: Y)` until it is
-restarted by hand.
+next boot's recovery line names at least that height. It raises its own
+open-file soft limit to 65536 (`bin/node/src/resource_limits.rs`). The
+launcher passes a stop to its child as SIGTERM and gives it 120 s
+(`STOP_BUDGET`, `bin/node-launcher/src/node.rs`) before SIGKILL.
+
+**The release key comes from the network.** A release is trusted under the key
+the workspace pins at `<workspace>/updates/keys/release.pub`. A workspace with
+no pin — every one `node join` writes — pins the node key the network's
+governance committed (`ducktape release key set --kind node --pubkey <hex>`,
+run by the network's validators) on the launcher's first reading that carries
+one, and logs `node_update_release_key_pinned` once. A pin already on disk is
+never overwritten: one that differs from the network's key is refused as
+`release_key_pinned_differs` (at attempt 1, then every 60th poll, both keys
+named) and stays the key followed; `ducktape-node-launcher install
+--release-key <hex>` is the explicit way to move it. Until the network commits
+a key, an unpinned launcher refuses each designated release as
+`no_release_key`. `ducktape release status` prints both sides:
+`release_key node` (the network's) and `pinned` (this workspace's).
 
 ## Where the workspace lives
 
@@ -53,9 +75,18 @@ owned by the `ducktape` user), so under them the layout is:
     daemon.log               `node run`'s tee (append-only)
     <kind>.log               `service run <kind>`'s tee (append-only)
     storage/                 consensus state, blobs, mesh-state.json, airlock-creds/
-/usr/local/lib/ducktape/
-  modules/                   the founding set (`<id>.component.wasm`, `<id>.index.wasm`, the netstack guest): program data the unit's DUCKTAPE_MODULES_DIR names, what `node init` composes a genesis from
+    updates/                 the launcher's: state.json, keys/release.pub (the pinned release key), releases/<sha>/
+    current -> updates/releases/<sha>   the release every unit runs: `ducktape` and its `modules/`
+/usr/local/lib/ducktape/     the installed program, in the shape of an unpacked node release
+  ducktape                   linked from /usr/local/bin/ducktape
+  ducktape-node-launcher     linked from /usr/local/bin/ducktape-node-launcher
+  modules/                   the founding set (`<id>.component.wasm`, `<id>.index.wasm`, the netstack guest): what `node init` composes a genesis from, and what `launcher install` copies into the first release
 ```
+
+A node reads its founding set beside its own binary, so under the launcher it
+reads `current/modules/`, and a release flip moves the binary and its set
+together. The units set no `DUCKTAPE_MODULES_DIR`: a directory named there
+would outrank the set each later release brings.
 
 ### What grows, and what nothing prunes
 
@@ -86,14 +117,20 @@ alias dt='sudo -u ducktape env DUCKTAPE_HOME=/var/lib/ducktape /usr/local/bin/du
 ## Install
 
 `ops/node/install.sh --workspace <name> (--init | --join <invite>)` runs
-steps 1-5 below end to end (`--dry-run` prints the commands without touching
+steps 1-7 below end to end (`--dry-run` prints the commands without touching
 the host); the steps are spelled out here for anyone auditing or adapting them.
+`<name>` is a chain id or a unique prefix of one; the script resolves it to
+the full chain id once the network is founded or joined.
 
 ```sh
-# 1. Build and install the CLI system-wide (make install-node puts it in
-#    ~/.cargo/bin and the founding set in ~/.cargo/bin/modules beside it).
+# 1. Build ducktape and its launcher (make install-node puts both in
+#    ~/.cargo/bin and the founding set in ~/.cargo/bin/modules beside them),
+#    install them as one program directory and link them onto PATH.
 make install-node
-sudo install -m 0755 ~/.cargo/bin/ducktape /usr/local/bin/ducktape
+sudo install -d -m 0755 /usr/local/lib/ducktape
+sudo install -m 0755 ~/.cargo/bin/ducktape ~/.cargo/bin/ducktape-node-launcher /usr/local/lib/ducktape/
+sudo ln -sfn /usr/local/lib/ducktape/ducktape /usr/local/bin/ducktape
+sudo ln -sfn /usr/local/lib/ducktape/ducktape-node-launcher /usr/local/bin/ducktape-node-launcher
 
 # 2. A dedicated user. The kvm group is for the service daemons: compute and
 #    agent open /dev/kvm per run; `node run` itself never does.
@@ -101,9 +138,8 @@ sudo useradd --system --home-dir /var/lib/ducktape --shell /usr/sbin/nologin duc
 sudo usermod -aG kvm ducktape
 sudo install -d -o ducktape -g ducktape -m 0700 /var/lib/ducktape
 
-# 3. The founding set: what `node init --modules` composes the genesis from,
-#    and where the unit's DUCKTAPE_MODULES_DIR has the netstack guest read.
-#    Program data beside the binary's prefix, never under the home.
+# 3. The founding set, beside the binary: what `node init --modules` composes
+#    the genesis from, and what the first release carries.
 sudo install -d -m 0755 /usr/local/lib/ducktape/modules
 sudo cp ~/.cargo/bin/modules/*.wasm /usr/local/lib/ducktape/modules/
 sudo chmod -R a+rX /usr/local/lib/ducktape/modules
@@ -121,7 +157,23 @@ dt node init --name mynet --modules /usr/local/lib/ducktape/modules   # founder
 dt node join '<invite blob>'                                    # ...or a resident
 dt node join '<invite blob>' --genesis /path/to/founders/genesis # ...or a member
 dt node list                              # the chain id the instance names
+
+# 6. Seed the first release under the launcher — ONCE: after this the
+#    launcher owns `current`. No --release-key: the launcher pins the key the
+#    network committed on its first read. Then name the workspace the service
+#    units run over.
+W='/var/lib/ducktape/mynet#d0cdf950'
+sudo -u ducktape env DUCKTAPE_HOME=/var/lib/ducktape ducktape-node-launcher install \
+  --workspace "$W" --config "$W/node.toml" --from /usr/local/lib/ducktape/ducktape
+sudo install -d -m 0755 /etc/ducktape
+echo "DUCKTAPE_WORKSPACE=\"$W\"" | sudo tee /etc/ducktape/workspace.env
+
+# 7. Enable and start (next section).
 ```
+
+`node join` ends on the same instruction for a hand-run node: the two
+`ducktape-node-launcher` commands above, with the real paths of the
+workspace it wrote and of the binary that wrote it.
 
 `node init`/`node join` probe the host and write the `[sandbox]` table when
 `/dev/kvm` opens; a host that gained KVM later runs `dt node sandbox` once.
@@ -137,55 +189,56 @@ refuses to boot without them (`sandbox.rs`, `required_tools`) — install
 
 ## Enable and start
 
-The instance name is the workspace selector `ducktape node run -n` takes:
-the chain id or any unique prefix. A chain id carries `#`, which a unit name
-cannot, so use the name half or escape it (the unit passes `%I`, the
-unescaped instance, to `-n`, so both forms select the workspace):
+The instance name is the workspace DIRECTORY under `/var/lib/ducktape`: the
+full chain id (`dt node list`). A chain id carries `#`, which a unit name
+cannot, so escape it; the unit hands `%I`, the unescaped instance, to the
+launcher as `--workspace /var/lib/ducktape/%I`:
 
 ```sh
-sudo systemctl enable --now ducktape-node@mynet
-# or, with the full id:
 sudo systemctl enable --now "ducktape-node@$(systemd-escape 'mynet#d0cdf950')"
 
 dt node status                            # height + root hash, once it serves
+dt release status                         # the designated release, the network's key, this pin
 ```
 
-Service daemons: the instance is the kind (`compute`, `agent`, `airlock`).
-A daemon needs the node up and publishing its mesh identity at ITS boot; it
-exits loudly otherwise and the unit's `Restart=always` retries every 5 s, so
-co-starting both at boot converges on its own (once serving, it rides out a
-node restart — see below). Consent is a separate act — the daemon
-signals and parks until you grant it, and it reads the grant at boot:
+Service daemons: the instance is the kind (`compute`, `agent`, `airlock`),
+and the workspace is `DUCKTAPE_WORKSPACE` from `/etc/ducktape/workspace.env`.
+The launcher's service role waits until the node has published its mesh
+identity before it starts the daemon, so co-starting both at boot converges on
+its own (once serving, a daemon rides out a node restart — see below).
+Enabling the unit is the consent: it runs `service run <kind> --enable`, which
+mints the daemon's grant without asking.
 
 ```sh
-sudo systemctl enable --now ducktape-service@compute   # signals, "not enabled"
-dt service enable compute                              # the consent screen; needs the node
-sudo systemctl restart ducktape-service@compute        # picks up the grant and serves
+sudo systemctl enable --now ducktape-service@compute
 dt service status
 ```
 
-For unattended hosts put `DUCKTAPE_SERVICE_ARGS=--enable` in
-`/etc/ducktape/node.env` and the daemon mints its own grant without asking.
-The same file may carry `DUCKTAPE_NODE_ARGS`, `RUST_LOG`, and a `TMPDIR` on
-a disk with room for run images (they are as large as a run's inputs, and
-the unit's private `/tmp` is whatever the host's `/tmp` is).
+`/etc/ducktape/node.env` may carry `DUCKTAPE_NODE_ARGS` (extra `node run`
+flags), `DUCKTAPE_SERVICE_ARGS` (extra `service run` flags — never a
+workspace selector: the launcher appends `--config` itself), `RUST_LOG`, and a
+`TMPDIR` on a disk with room for run images (they are as large as a run's
+inputs, and the unit's private `/tmp` is whatever the host's `/tmp` is).
 
 To pin a daemon to one node's lifecycle:
 
 ```sh
 sudo systemctl edit ducktape-service@compute
 # [Unit]
-# After=ducktape-node@mynet.service
-# BindsTo=ducktape-node@mynet.service
+# After=ducktape-node@mynet\x23d0cdf950.service
+# BindsTo=ducktape-node@mynet\x23d0cdf950.service
 ```
 
 ## Logs
 
 Two sinks, one filter: stderr (the journal) and the tee file in the
-workspace. They never disagree about what was recorded.
+workspace. They never disagree about what was recorded. The journal also
+carries the launcher's own `ducktape::update` lines — every release it
+stages, qualifies, flips or refuses, and the key it pins.
 
 ```sh
-journalctl -fu ducktape-node@mynet
+U='ducktape-node@mynet\x23d0cdf950'       # the escaped instance, as enabled above
+journalctl -fu "$U"
 tail -f /var/lib/ducktape/<chain-id>/daemon.log
 tail -f /var/lib/ducktape/<chain-id>/compute.log
 
@@ -202,7 +255,9 @@ The tee files are opened append-only once and never reopened, which is why
 the logrotate drop-in uses `copytruncate` (weekly, or at 256 MB, eight kept).
 
 A wedged node (no more progress, no crash) can dump every async task it is
-parked on: `kill -USR1 $(systemctl show -p MainPID --value ducktape-node@mynet)`
+parked on. The unit's main process is the launcher, so the signal goes to its
+`node run` child:
+`kill -USR1 "$(pgrep -P "$(systemctl show -p MainPID --value "$U")" -f ' node run ')"`
 writes `/var/lib/ducktape/<chain-id>/tasks.txt` (overwritten each
 time) and logs one `task_dump_written` line to `daemon.log`. Linux
 x86_64/aarch64 only; elsewhere the signal does nothing.
@@ -210,11 +265,17 @@ x86_64/aarch64 only; elsewhere the signal does nothing.
 ## Restart, stop, upgrade
 
 ```sh
-sudo systemctl restart ducktape-node@mynet      # SIGTERM → final checkpoint → exit → back up
-sudo systemctl stop ducktape-node@mynet         # stays down until started
-sudo install -m 0755 target/release/ducktape /usr/local/bin/ducktape && \
-  sudo systemctl restart ducktape-node@mynet ducktape-service@compute
+sudo systemctl restart "$U"      # the launcher stops its node (SIGTERM → final checkpoint), then boots it again
+sudo systemctl stop "$U"         # stays down until started
 ```
+
+A node's binary moves by a NODE RELEASE, not by a file copy: the network
+designates it (`ducktape release schedule`, `docs/roll-a-node-release.md`) and
+every launcher stages, qualifies and flips it at the activation height, then
+restarts the service daemons on it. Replacing `/usr/local/lib/ducktape/ducktape`
+changes nothing that runs — every unit runs `<workspace>/current/ducktape`.
+The launcher itself is the installed file: replace
+`/usr/local/lib/ducktape/ducktape-node-launcher` and restart the units.
 
 A running daemon survives a node restart, so do not restart it for one: its
 link task re-dials forever (`bin/node/src/compute/link.rs`,
@@ -222,10 +283,8 @@ link task re-dials forever (`bin/node/src/compute/link.rs`,
 on every attach, since a node restart mints a fresh one), and its hello
 heartbeat keeps signaling — `warn` `hello_failed` at attempt 1, then every
 30th, carrying `attempts` (`bin/node/src/services.rs`, `heartbeat`). Restart
-`ducktape-service@<kind>` only for a new binary or a new grant. The one
-daemon that exits is one that BOOTS while the node is down: the first hello
-must land (`services.rs`, `send_hello` in `run`), and `Restart=always`
-retries it until it does. Before stopping a validator, read the next section:
+`ducktape-service@<kind>` only for a new grant. Before stopping a validator,
+read the next section:
 on a three-validator network the restart halts the chain for its duration.
 
 `curl 127.0.0.1:8844/v1/status | jq .version` prints the build the node
@@ -303,7 +362,8 @@ residents.
 Nothing you can run on the surviving nodes repairs the chain. **The only fix is
 to bring the missing validator back**, and under these units that means starting its node
 again (a node that crashed on a supervised host is already being restarted
-every 3 s by `Restart=always`; a hand-run node has no supervisor at all):
+by its launcher, backing off up to about a minute while it keeps dying at
+boot; a hand-run node has no supervisor at all):
 
 ```sh
 dt node status                                   # height stopped advancing?
@@ -311,8 +371,8 @@ dt node member status                            # in-set=<bool> validators=<n>
 dt node peers                                    # which seat stopped talking
 
 # on the missing host:
-sudo systemctl start ducktape-node@mynet
-journalctl -fu ducktape-node@mynet               # watch it re-mesh and finalize
+sudo systemctl start "$U"
+journalctl -fu "$U"                              # watch it re-mesh and finalize
 
 dt node status                                   # the height moves again
 ```
@@ -336,8 +396,9 @@ key IS the seat. See `backup-and-keys.md`.
 
 There is no systemd on a Mac, so the node runs as a **per-user LaunchAgent**:
 as the logged-in user, out of that user's `~/.ducktape`, installable without
-root. `ops/node/dev.ducktape.node.plist` is the agent, and it is a template —
-a plist cannot expand `~` or a workspace selector — which
+root. The agent runs `ducktape-node-launcher run` over the workspace, exactly
+as the unit does. `ops/node/dev.ducktape.node.plist` is the agent, and it is a
+template — a plist cannot expand `~` or resolve a workspace selector — which
 `ops/node/install-macos.sh` renders and loads:
 
 ```sh
@@ -347,13 +408,17 @@ ops/node/install-macos.sh --workspace mynet             # write it and bootstrap
 ```
 
 The script resolves the binary with `command -v ducktape` (`--binary` overrides
-it), writes `~/Library/LaunchAgents/dev.ducktape.node.plist`, and runs
+it) and the launcher beside it, resolves the selector to the workspace
+directory (`ducktape node list`), seeds the first release from that binary
+with `ducktape-node-launcher install` when the workspace has none yet, writes
+`~/Library/LaunchAgents/dev.ducktape.node.plist`, and runs
 `launchctl bootstrap gui/$(id -u) <plist>`. It is idempotent: a re-run
 re-renders and re-loads, which is also how you change the workspace, the log
-filter (`--rust-log`) or `DUCKTAPE_HOME` (`--home`). A second network on the
-same Mac needs `--label <label>`, because the label is the agent's identity in
-the user's launchd domain. `--uninstall` boots the agent out and removes the
-plist, leaving the workspace alone.
+filter (`--rust-log`) or `DUCKTAPE_HOME` (`--home`); a workspace already under
+the launcher keeps the release it runs. A second network on the same Mac needs
+`--label <label>`, because the label is the agent's identity in the user's
+launchd domain. `--uninstall` boots the agent out and removes the plist,
+leaving the workspace alone.
 
 ```sh
 launchctl print gui/$(id -u)/dev.ducktape.node    # state and last exit status
@@ -366,9 +431,9 @@ What the plist carries, and why:
 
 - `RunAtLoad` + `KeepAlive` + `ThrottleInterval 3` — the unit's
   `Restart=always` / `RestartSec=3`.
-- `ExitTimeOut 120` — launchd's SIGTERM-to-SIGKILL gap, the unit's
-  `TimeoutStopSec`. A validator needs it: SIGTERM takes the graceful
-  checkpoint path.
+- `ExitTimeOut 150` — launchd's SIGTERM-to-SIGKILL gap, the unit's
+  `TimeoutStopSec`: longer than the 120 s the launcher gives its node to take
+  the graceful checkpoint path.
 - `SoftResourceLimits`/`HardResourceLimits` `NumberOfFiles` 10240 / 65536. A
   GUI-launched process inherits a soft limit of **256** (`launchctl limit
   maxfiles` says `256 unlimited`), which the module stores blow past into a

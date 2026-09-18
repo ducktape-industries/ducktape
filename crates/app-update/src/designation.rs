@@ -89,6 +89,18 @@ pub fn standing(passed: impl IntoIterator<Item = ReleaseSignal>) -> Vec<Designat
     standing
 }
 
+/// The proposal-id space a release signal (a designation, or a withdrawal of
+/// one) is minted in. It carries NO proposer key on purpose: a settled
+/// proposal leaves the open roster, so the only way a reader finds a passed
+/// signal again is to walk ids it can predict — `node-release:0`,
+/// `node-release:1`, … to the first id no record exists under.
+pub const PROPOSAL_PREFIX: &str = "node-release";
+
+/// The `nth` id of [`PROPOSAL_PREFIX`]'s space.
+pub fn proposal_id(nth: u64) -> String {
+    format!("{PROPOSAL_PREFIX}:{nth}")
+}
+
 /// The release a network runs, and the height it starts running it at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -978,6 +978,7 @@ mod tests {
         }
         let open: &[(Method, &str)] = &[
             (Method::GET, "/v1/status"),
+            (Method::GET, "/v1/release"),
             (Method::GET, "/v1/files/blob/aa"),
             (Method::POST, "/v1/query"),
             (Method::POST, "/v1/index/chat/view"),

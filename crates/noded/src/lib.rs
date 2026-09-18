@@ -116,6 +116,8 @@ pub use index::{
 };
 // the ducktape_* Prometheus series + GET /metrics.
 mod metrics;
+// GET /v1/release: the release plane's reading, for the launcher and the app.
+mod release;
 pub use metrics::{NodeMetrics, spawn_store_footprint_sampler};
 // the block-projection seam: RootOp assembly + explorer-row bytes, shared by
 // the validator drain, the replica park loop, and (as later tasks adopt it) the
@@ -819,6 +821,10 @@ pub fn router(handle: NodeHandle) -> Router {
         // a module can serve content it would refuse an anonymous reader.
         .route("/v1/query/reader", post(query_as_reader))
         .route("/v1/status", get(status))
+        // the release plane's reading: the designation and the release keys
+        // governance committed — what the node launcher and the desktop app
+        // follow.
+        .route("/v1/release", get(release::release))
         .route("/v1/peers", get(peers))
         .route("/v1/blocks", get(blocks))
         // the derived read-model tier: snapshot reads of the per-module

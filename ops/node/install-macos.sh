@@ -19,6 +19,11 @@
 # unique prefix of it (`ducktape node list`). Founding or joining the network is
 # NOT this script's job — run `ducktape node init` / `ducktape node join` as
 # yourself first, then install the agent over the workspace they wrote.
+#
+# The agent runs ducktape-node-launcher (beside the `ducktape` binary), which
+# follows the network's node releases. A workspace the launcher has never
+# owned gets its first release seeded from the binary here (`launcher
+# install`); after that the launcher owns `current` and a re-run leaves it.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -93,11 +98,27 @@ fi
 # exists at load time, not a name and not a symlink into a PATH entry.
 DUCKTAPE_BIN="$(cd "$(dirname "$DUCKTAPE_BIN")" && pwd)/$(basename "$DUCKTAPE_BIN")"
 [ -x "$DUCKTAPE_BIN" ] || die "$DUCKTAPE_BIN is not executable"
+# the launcher ships beside `ducktape` in every shape that ships it: a node
+# archive's root, a cargo target directory, `make install-node`'s ~/.cargo/bin.
+LAUNCHER_BIN="$(dirname "$DUCKTAPE_BIN")/ducktape-node-launcher"
+[ -x "$LAUNCHER_BIN" ] || die "no ducktape-node-launcher beside $DUCKTAPE_BIN — run 'make install-node'"
+
+# The launcher takes the workspace DIRECTORY: the one registered workspace the
+# selector is a prefix of, as `-n` resolves it.
+workspace_dir_of(){
+  local id config matches=()
+  while IFS=$'\t' read -r id config; do
+    case "$id" in "$WORKSPACE"*) matches+=("$(dirname "$config")") ;; esac
+  done < <(DUCKTAPE_HOME="$DUCK_HOME" "$DUCKTAPE_BIN" node list)
+  [ "${#matches[@]}" -eq 1 ] || die "--workspace $WORKSPACE matches ${#matches[@]} registered workspaces under $DUCK_HOME ('ducktape node list'); found or join first, or pass more of the chain id"
+  printf '%s' "${matches[0]}"
+}
+WORKSPACE_DIR="$(workspace_dir_of)"
 
 # Every rendered value lands inside an XML text node, so markup in one would
 # produce a plist launchd cannot parse, and `|` is the sed delimiter below. A
 # chain id's `#` is fine in both.
-for value in "$LABEL" "$WORKSPACE" "$DUCK_HOME" "$DUCKTAPE_BIN" "$RUST_LOG_FILTER" "$LOG_DIR"; do
+for value in "$LABEL" "$WORKSPACE_DIR" "$DUCK_HOME" "$LAUNCHER_BIN" "$RUST_LOG_FILTER" "$LOG_DIR"; do
   case "$value" in
     *'<'*|*'>'*|*'&'*|*'"'*) die "refusing: '$value' carries XML markup" ;;
     *'|'*) die "refusing: the '|' in '$value' would break the substitution" ;;
@@ -111,13 +132,24 @@ AGENT_PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:
 
 render(){
   sed -e "s|@LABEL@|$LABEL|g" \
-      -e "s|@DUCKTAPE_BIN@|$DUCKTAPE_BIN|g" \
-      -e "s|@WORKSPACE@|$WORKSPACE|g" \
+      -e "s|@LAUNCHER_BIN@|$LAUNCHER_BIN|g" \
+      -e "s|@WORKSPACE_DIR@|$WORKSPACE_DIR|g" \
       -e "s|@DUCKTAPE_HOME@|$DUCK_HOME|g" \
       -e "s|@RUST_LOG@|$RUST_LOG_FILTER|g" \
       -e "s|@PATH@|$AGENT_PATH|g" \
       -e "s|@LOG_DIR@|$LOG_DIR|g" \
       "$TEMPLATE"
+}
+
+# The FIRST release only: once the launcher's state is on disk it owns
+# `current`, and a re-seed would put back a release the network moved past.
+seed_once(){
+  if [ -f "$WORKSPACE_DIR/updates/state.json" ]; then
+    log "$WORKSPACE_DIR is already under the launcher; it owns current/ from here"
+    return
+  fi
+  run "$LAUNCHER_BIN" install --workspace "$WORKSPACE_DIR" \
+    --config "$WORKSPACE_DIR/node.toml" --from "$DUCKTAPE_BIN"
 }
 
 if [ "$DRY_RUN" = 1 ]; then
@@ -131,20 +163,24 @@ if [ "$DRY_RUN" = 1 ]; then
   render > "$scratch"
   plutil -lint "$scratch" >/dev/null || die "the rendered plist is not a valid property list"
   log "plutil -lint: OK"
+  seed_once
   printf '+ mkdir -p %s %s\n' "$AGENT_DIR" "$LOG_DIR"
   bootout_if_loaded
   printf '+ launchctl bootstrap %s %s\n' "$DOMAIN" "$PLIST"
   exit 0
 fi
 
-log "1/3 log directory + agent directory"
+log "1/4 seeding the first release under the launcher"
+seed_once
+
+log "2/4 log directory + agent directory"
 mkdir -p "$AGENT_DIR" "$LOG_DIR"
 
-log "2/3 rendering $PLIST"
+log "3/4 rendering $PLIST"
 render > "$PLIST"
 plutil -lint "$PLIST" >/dev/null || die "the rendered plist is not a valid property list: $PLIST"
 
-log "3/3 loading the agent into $DOMAIN"
+log "4/4 loading the agent into $DOMAIN"
 bootout_if_loaded
 launchctl bootstrap "$DOMAIN" "$PLIST"
 

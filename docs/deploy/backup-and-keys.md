@@ -99,8 +99,12 @@ disk:
 
 ```sh
 # 1. put the workspace files back (identity.key, node.toml, network.toml)
-# 2. start it
-ducktape node run -n <chain-id>
+# 2. seed its first release and start it under the launcher (or enable its
+#    unit, node-service.md) — the launcher pins the network's release key again
+W=<workspace>
+ducktape-node-launcher install --workspace "$W" --config "$W/node.toml" \
+    --from "$(readlink -f "$(command -v ducktape)")"   # the file, never a link: install refuses one
+ducktape-node-launcher run --workspace "$W" --config "$W/node.toml"
 ```
 
 With `identity.key` restored the node comes back under its old key, keeps

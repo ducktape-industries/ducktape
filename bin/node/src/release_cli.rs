@@ -14,7 +14,9 @@
 //! height), `release withdraw` one that takes a designation back, and
 //! `release status` reads back what a running node's committed state
 //! designates — which is the whole interface `ducktape-node-launcher` has to
-//! the chain.
+//! the chain. WHICH key signs each kind is the network's word too:
+//! `release key set` passes it on the same carrier, so a member that joined
+//! by invite learns the key from the chain it synced, never out of band.
 //!
 //! The manifest (`app_update::Manifest`, one JSON file per channel) names
 //! each platform's archive by sha256 and size and seals itself with
@@ -47,8 +49,8 @@ use airlock::client::Gateway;
 use airlock::wire::WorkRef;
 use airlock::{bodyseal, sign};
 use app_update::{
-    Artifact, Designation, Kind, Manifest, PublicKey, Release, ReleaseSignal, SCHEMA, Sha,
-    Signature, SuccessorKey,
+    Artifact, Designation, Kind, Manifest, PublicKey, Release, ReleaseKey, ReleaseSignal,
+    ReleaseStatus, SCHEMA, Sha, Signature, SuccessorKey,
 };
 
 use crate::cli_args::NodeAddr;
@@ -73,8 +75,12 @@ pub(crate) enum ReleaseCmd {
     /// designated node release — a refused one, say (every member passes the
     /// same --sha)
     Withdraw(WithdrawArgs),
-    /// what a RUNNING node's network designates, and where that node is —
-    /// the node launcher's whole view of the chain
+    /// the network's word on which key signs its releases
+    #[command(subcommand)]
+    Key(KeyCmd),
+    /// what a RUNNING node's network designates, the release keys it
+    /// commits, and where that node is — the node launcher's whole view of
+    /// the chain
     Status(StatusArgs),
     /// sign, notarize and staple an UNSIGNED `Ducktape.app` through the
     /// airlock gateway holding an `apple-codesign` credential; writes the
@@ -231,6 +237,27 @@ pub(crate) struct WithdrawArgs {
     pub selector: crate::cli_args::Selector,
 }
 
+#[derive(Debug, clap::Subcommand)]
+pub(crate) enum KeyCmd {
+    /// propose, vote and execute the governance decision that names the key
+    /// one kind's releases are signed with (every member passes the same
+    /// --kind and --pubkey). Each member's launcher pins it on first read.
+    Set(KeySetArgs),
+}
+
+/// `release key set --kind node|app --pubkey <hex>`.
+#[derive(Debug, clap::Args)]
+pub(crate) struct KeySetArgs {
+    /// which releases the key signs
+    #[arg(long, value_enum)]
+    pub kind: ArtifactKind,
+    /// the release public key, 64 hex characters (what `release sign` printed)
+    #[arg(long, value_name = "HEX")]
+    pub pubkey: PublicKey,
+    #[command(flatten)]
+    pub selector: crate::cli_args::Selector,
+}
+
 /// `release status`: what the launcher asks a running node.
 #[derive(Debug, clap::Args)]
 pub(crate) struct StatusArgs {
@@ -269,6 +296,7 @@ pub(crate) fn run(cmd: ReleaseCmd) -> CommandResult {
         ReleaseCmd::Verify(args) => verify(args),
         ReleaseCmd::Schedule(args) => schedule(args),
         ReleaseCmd::Withdraw(args) => withdraw(args),
+        ReleaseCmd::Key(KeyCmd::Set(args)) => key_set(args),
         ReleaseCmd::Status(args) => status(args),
         ReleaseCmd::SignBundle(args) => sign_bundle(args),
     }
@@ -460,21 +488,10 @@ fn verify(args: VerifyArgs) -> CommandResult {
 // the node channel's governance half: schedule, withdraw and status
 // ============================================================================
 
-/// The proposal-id space a node-release designation (and a withdrawal of one)
-/// is minted in. It carries NO proposer key on purpose: a settled proposal
-/// leaves the open roster, so the only way a launcher can read a passed
-/// designation back is to walk ids it can predict. `release status` walks
-/// `node-release:0`, `node-release:1`, … to the first id no record exists
-/// under.
-const DESIGNATION_PREFIX: &str = "node-release";
-
-/// How far that walk goes. A network that has designated this many node
-/// releases has outgrown a linear probe, not this plane.
+/// How far `release withdraw`'s walk of the designation id space goes. A
+/// network that has designated this many node releases has outgrown a linear
+/// probe, not this plane.
 const MAX_DESIGNATIONS: u64 = 1024;
-
-fn designation_id(nth: u64) -> String {
-    format!("{DESIGNATION_PREFIX}:{nth}")
-}
 
 /// `release schedule --sha <hex> --at <height>` — the network decides WHICH
 /// node release it runs and FROM WHEN.
@@ -525,12 +542,13 @@ fn schedule(args: ScheduleArgs) -> CommandResult {
         sha256: args.sha,
         activation_height: at,
     };
-    let outcome = propose_release_signal(
+    let outcome = pass_signal(
         &node,
         &cfg_path,
         &resolved,
         "release schedule",
-        ReleaseSignal::Designate(designation),
+        app_update::designation::PROPOSAL_PREFIX,
+        ReleaseSignal::Designate(designation).signal_text(),
     )?;
     match outcome {
         crate::cli::CeremonyOutcome::Passed => {
@@ -605,12 +623,13 @@ fn withdraw(args: WithdrawArgs) -> CommandResult {
         )
         .into());
     }
-    let outcome = propose_release_signal(
+    let outcome = pass_signal(
         &node,
         &cfg_path,
         &resolved,
         "release withdraw",
-        ReleaseSignal::Withdraw { withdraw: args.sha },
+        app_update::designation::PROPOSAL_PREFIX,
+        ReleaseSignal::Withdraw { withdraw: args.sha }.signal_text(),
     )?;
     match outcome {
         crate::cli::CeremonyOutcome::Passed => {
@@ -627,20 +646,68 @@ fn withdraw(args: WithdrawArgs) -> CommandResult {
     }
 }
 
-/// Drive the governance `Signal` carrying `signal` through this member's
-/// running node, joining an open proposal with the same text.
-fn propose_release_signal(
+/// `release key set --kind <kind> --pubkey <hex>` — the network names the key
+/// that signs one kind's releases, on the same carrier a designation rides.
+///
+/// A member that joined by invite has no other way to learn it: its launcher
+/// reads the passed signal back through `release status` and pins it on first
+/// read. An install that already pins a different key keeps its own and
+/// refuses by name — this verb never moves a pin.
+fn key_set(args: KeySetArgs) -> CommandResult {
+    let committed = ReleaseKey {
+        kind: args.kind.into(),
+        pubkey: args.pubkey,
+    };
+    let cfg_path = args.selector.config_path()?;
+    let resolved = crate::config::resolve(&cfg_path)?;
+    let node = crate::cli::DrivenNode::of(&resolved, "release key set")?;
+    let outcome = pass_signal(
+        &node,
+        &cfg_path,
+        &resolved,
+        "release key set",
+        app_update::release_key::PROPOSAL_PREFIX,
+        committed.signal_text(),
+    )?;
+    match outcome {
+        crate::cli::CeremonyOutcome::Passed => {
+            println!(
+                "committed {} as the {} release key; track with: ducktape release status",
+                committed.pubkey,
+                committed.kind.channel()
+            );
+            Ok(())
+        }
+        crate::cli::CeremonyOutcome::AwaitingBallots => {
+            println!(
+                "proposed {} as the {} release key; every other member co-signs with the same \
+                 --kind and --pubkey",
+                committed.pubkey,
+                committed.kind.channel()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Drive the governance `Signal` carrying `text` through this member's
+/// running node, in the keyless id space `prefix` names.
+///
+/// The carrier is deliberate: a `Signal` has no on-chain effect beyond its
+/// recorded outcome, so no module id, no registry entry and no new action is
+/// added to the consensus surface — a release decision can neither halt a
+/// block nor wedge a boundary.
+fn pass_signal(
     node: &crate::cli::DrivenNode,
     cfg_path: &Path,
     resolved: &crate::config::Resolved,
     verb: &str,
-    signal: ReleaseSignal,
+    prefix: &str,
+    text: String,
 ) -> Result<crate::cli::CeremonyOutcome, Box<dyn std::error::Error>> {
     let signer = crate::cli::gov_signer(node.rpc(), cfg_path, resolved)?;
     let pubkey_hex = crate::module_cli::signer_pubkey_hex(&signer);
-    let wanted = governance::GovAction::Signal {
-        text: signal.signal_text(),
-    };
+    let wanted = governance::GovAction::Signal { text };
     let same_action = {
         let wanted = wanted.clone();
         move |action: &governance::GovAction| *action == wanted
@@ -652,7 +719,7 @@ fn propose_release_signal(
         // EMPTY seed: this proposal must be findable by id from any node.
         "",
         verb,
-        DESIGNATION_PREFIX,
+        prefix,
         wanted,
         &same_action,
     )
@@ -759,11 +826,17 @@ fn node_exe(archive: &[u8], scratch: &Path) -> Result<PathBuf, Box<dyn std::erro
     Err("the node archive carries no `ducktape` executable at its root".into())
 }
 
-/// `release status [--json]` — what a RUNNING node's network designates, and
-/// where that node is. This is the whole interface `ducktape-node-launcher`
-/// has to the chain: the http base it reads duckfs through, the mesh identity
-/// whose absence kills a service daemon, the committed height an activation
-/// is measured against, and the designation itself.
+/// `release status [--json]` — what a RUNNING node's network designates, the
+/// release keys it commits, and where that node is. This is the whole
+/// interface `ducktape-node-launcher` has to the chain: the http base it reads
+/// duckfs through, the mesh identity whose absence kills a service daemon,
+/// the committed height an activation is measured against, the designation,
+/// and the key its first read pins.
+///
+/// The document is the node's own `GET /v1/release` ([`ReleaseStatus`]) with
+/// the base this verb read it from; `--json` adds `pinned`, the node release
+/// key THIS workspace pins, so a pin that disagrees with the network is
+/// visible beside the key it disagrees with.
 fn status(args: StatusArgs) -> CommandResult {
     let cfg_path = args.selector.config_path()?;
     // The KEYLESS read: a launcher asks this once a poll, and it has no
@@ -775,27 +848,28 @@ fn status(args: StatusArgs) -> CommandResult {
         .as_deref()
         .ok_or("release status reads the node's app surface — set `http_listen` in node.toml")?;
     let base = crate::config::http_base_of(http_listen);
-    let live = crate::node_http::get_json(&base, "/v1/status")
-        .map_err(|error| format!("read this node's status: {error}"))?;
-    let public_key = live["public_key"].as_str().unwrap_or_default().to_string();
-    let height = live["height"].as_u64().unwrap_or_default();
-    let root_hash = live["root_hash"].as_str().unwrap_or_default().to_string();
-    // A node that is up but whose governance module cannot answer yet is
-    // still a node the launcher must hear about: the identity seam is the
-    // half that matters first, so a designation read that fails reports as
-    // "none" rather than failing the whole verb.
-    let designation = designated(&base).unwrap_or(None);
+    let answer = crate::node_http::get_json(&base, "/v1/release")
+        .map_err(|error| format!("read this node's release status: {error}"))?;
+    let reading = ReleaseStatus {
+        base,
+        ..serde_json::from_value(answer)?
+    };
+    let workspace = cfg_path.parent().unwrap_or(Path::new("."));
+    let pinned = pinned_node_key(workspace);
     if args.json {
-        let reading = serde_json::json!({
-            "base": base,
-            "public_key": public_key,
-            "height": height,
-            "root_hash": root_hash,
-            "designation": designation,
-        });
-        println!("{reading}");
+        let mut json = serde_json::to_value(&reading)?;
+        json["pinned"] = serde_json::to_value(pinned)?;
+        println!("{json}");
         return Ok(());
     }
+    let ReleaseStatus {
+        base,
+        public_key,
+        height,
+        root_hash,
+        designation,
+        release_keys,
+    } = reading;
     println!("base\t{base}");
     println!(
         "node\t{}",
@@ -806,6 +880,14 @@ fn status(args: StatusArgs) -> CommandResult {
     );
     println!("height\t{height}");
     println!("root_hash\t{root_hash}");
+    for kind in [Kind::Node, Kind::App] {
+        let committed = release_keys
+            .of(kind)
+            .map_or_else(|| "(none committed)".to_string(), |key| key.to_string());
+        println!("release_key {}\t{committed}", kind.channel());
+    }
+    let pin = pinned.map_or_else(|| "(none)".to_string(), |key| key.to_string());
+    println!("pinned\t{pin}");
     match designation {
         Some(designation) => println!(
             "designated\t{} from height {} ({})",
@@ -823,19 +905,14 @@ fn status(args: StatusArgs) -> CommandResult {
     Ok(())
 }
 
-/// The designation this network's committed governance carries: the last one
-/// [`standing`] still stands behind.
-fn designated(base: &str) -> Result<Option<Designation>, Box<dyn std::error::Error>> {
-    Ok(standing(base)?.pop())
-}
-
 /// Every designation no later withdrawal took back, oldest first, out of the
 /// PASSED `node-release:<n>` signals in id order. The walk stops at the first
 /// id with no record, which is exactly where the ceremony's own mint stops.
 fn standing(base: &str) -> Result<Vec<Designation>, Box<dyn std::error::Error>> {
     let mut passed = Vec::new();
     for nth in 0..MAX_DESIGNATIONS {
-        let Some(view) = read_proposal(base, &designation_id(nth))? else {
+        let id = app_update::designation::proposal_id(nth);
+        let Some(view) = read_proposal(base, &id)? else {
             break;
         };
         passed.extend(passed_signal(&view));
@@ -868,6 +945,16 @@ fn passed_signal(view: &governance::ProposalView) -> Option<ReleaseSignal> {
         return None;
     };
     ReleaseSignal::from_signal_text(text)
+}
+
+/// The node release key `workspace` pins — the file the launcher writes on
+/// its first read of a committed key, or `install --release-key` wrote. `None`
+/// when there is none, or when what is there is not a key (the launcher
+/// refuses that one by name at boot).
+fn pinned_node_key(workspace: &Path) -> Option<PublicKey> {
+    let path =
+        app_update::workspace::keys_dir(workspace).join(app_update::workspace::RELEASE_KEY_FILE);
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 // ============================================================================

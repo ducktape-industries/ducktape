@@ -139,12 +139,13 @@ then exits `FATAL: the active wallet key is on no account`.
 **A workspace that pins no release key follows no release channel.** The pin
 is `<workspace>/updates/keys/release.pub`, and its absence is what "this node
 does not self-update" looks like on disk: the launcher supervises and restarts
-the node forever, refuses every designation with `no_release_key`, and the
-only way to move that node onto a new binary is to found the network again.
-Nothing else reports it, so the report reads the file back and prints
-`release key  pinned <hex>` or names the node that has none. The key is read
-once per node life, so `ducktape-node-launcher install --release-key` runs
-before the first `run` — pinning it later costs a restart.
+the node, and refuses every designation with `no_release_key` until the
+network commits a node key (`ducktape release key set --kind node`), which it
+then pins on its first read. The report reads the file back and prints
+`release key  pinned <hex>` or names the node that has none. A key pinned by
+`ducktape-node-launcher install --release-key` is read once per node life, so
+that install runs before the first `run` — pinning it that way later costs a
+restart.
 
 **A grant line is not a live daemon.** `announced at height N` is printed
 before the daemon has finished booting, so the script waits out the exit

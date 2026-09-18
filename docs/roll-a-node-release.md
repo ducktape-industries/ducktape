@@ -48,10 +48,29 @@ has no order to keep.
 ## Before anything: the node must follow the channel
 
 A workspace pins the release key it trusts at
-`<workspace>/updates/keys/release.pub`. Without that file the launcher
-supervises the node and nothing more — every designation is refused
-`no_release_key`, with `this workspace pins no release key, so it follows no
-node channel`.
+`<workspace>/updates/keys/release.pub`. The NETWORK names that key: a
+validator commits it through governance, on the carrier a designation rides —
+
+```
+ducktape release key set --kind node --pubkey <hex> --config <workspace>/node.toml
+```
+
+(every validator runs the same line until the ballot passes, as with
+`release schedule`) — and every launcher whose workspace pins nothing pins it
+on its first `release status` reading that carries it, logs
+`node_update_release_key_pinned` once, and follows the channel from that poll
+on. No member is touched, and nothing restarts. `ducktape release status`
+prints the network's key as `release_key node` and the workspace's as
+`pinned`.
+
+Until the network commits a key, an unpinned launcher supervises the node and
+nothing more: each designated release is refused `no_release_key`, with `this
+workspace pins no release key, so it follows no node channel`, once per
+release.
+
+A pin already on disk is NEVER overwritten by the network's word. One that
+differs from the committed key is refused `release_key_pinned_differs` (at
+attempt 1, then every 60th poll, both keys named) and stays the key followed.
 
 `ops/refound-net.sh` pins the workspace wallet's public key on both nodes as
 it founds them, and its report says so:
@@ -60,7 +79,8 @@ it founds them, and its report says so:
   release key pinned bb584d3b…dcc3bea9 (both nodes)
 ```
 
-A network founded before that, or by hand, is pinned in place — no re-found:
+An explicit pin — or the move of a differing one — is made in place, no
+re-found:
 
 ```
 PUB=$(<workspace>/current/ducktape user key status --key <workspace>/keys/operator.key | awk '{print $NF}')

@@ -21,17 +21,21 @@
   <key>Label</key>
   <string>@LABEL@</string>
 
-  <!-- The workspace selector `ducktape node run -n` takes: a chain id under
-       the ducktape home or any unique prefix of it (`ducktape node list`). Unlike a systemd
-       instance name this needs no escaping — the `#` in a chain id is an
-       ordinary character in an argument vector. -->
+  <!-- The LAUNCHER, never the node: `run` starts
+       <workspace>/current/ducktape node run, polls it, and follows the
+       network's node releases, pinning the release key the network commits
+       on its first read. A node started as a bare `ducktape node run`
+       follows no release. @WORKSPACE_DIR@ is the workspace directory
+       install-macos.sh resolved from the selector; the `#` in a chain id is
+       an ordinary character in an argument vector. -->
   <key>ProgramArguments</key>
   <array>
-    <string>@DUCKTAPE_BIN@</string>
-    <string>node</string>
+    <string>@LAUNCHER_BIN@</string>
     <string>run</string>
-    <string>-n</string>
-    <string>@WORKSPACE@</string>
+    <string>--workspace</string>
+    <string>@WORKSPACE_DIR@</string>
+    <string>--config</string>
+    <string>@WORKSPACE_DIR@/node.toml</string>
   </array>
 
   <key>EnvironmentVariables</key>
@@ -62,13 +66,14 @@
   <integer>3</integer>
 
   <!-- launchd stops a job with SIGTERM and escalates to SIGKILL after this
-       many seconds. On a validator SIGTERM takes the graceful path — a final
-       checkpoint plus a journal barrier (bin/node/src/validator/run.rs) — so
-       it is given the same 120 s the unit's TimeoutStopSec allows; a resident
-       installs no handler, dies by the default action, and re-syncs at its
-       next boot. A hard kill lands on WAL-forward recovery instead. -->
+       many seconds. The launcher passes SIGTERM to its node and gives it
+       120 s to checkpoint before its own SIGKILL, so launchd waits longer,
+       as the unit's TimeoutStopSec does. A validator and a resident alike
+       take the graceful path on SIGTERM — a final checkpoint, then one
+       `node_shutdown` line (bin/node/src/drain_actions.rs). A hard kill
+       lands on WAL-forward recovery instead. -->
   <key>ExitTimeOut</key>
-  <integer>120</integer>
+  <integer>150</integer>
 
   <!-- The node's own raise targets 65536 and is clamped to the lower of this
        hard limit and `kern.maxfilesperproc`

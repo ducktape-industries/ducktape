@@ -18,6 +18,12 @@
 //! daemon is stopped, waited on and started again on the new release — and the
 //! release it came back on is the one it prints.
 //!
+//! THE KEY COMES FROM THE NETWORK. Two more cases found a network and join a
+//! member by invite, started under its launcher exactly as `node join` says —
+//! with no release key. The founder commits one (`release key set`); the
+//! member pins it and flips to the next designated release, and a member that
+//! already pins another key keeps it and refuses the network's by name.
+//!
 //! WHAT A "RELEASE" IS HERE. Each published release's `ducktape` is a two-line
 //! `exec` wrapper over the binary this test was built with. The plane moves
 //! FILES: whether the file is the 1.2 GB debug node binary or a wrapper that
@@ -400,14 +406,34 @@ fn archive_of(body: &str) -> Vec<u8> {
 /// sealed manifest, sign it with the release wallet, land the archive, the
 /// manifest and its signature on the network's duckfs.
 fn publish(net: &Net, sequence: u64, display: &str, archive: &[u8]) -> Sha {
-    let path = net.dir.path().join(format!("release-{sequence}.tar.zst"));
+    publish_to(
+        net.dir.path(),
+        &net.base,
+        &net.key,
+        sequence,
+        display,
+        archive,
+    )
+}
+
+/// [`publish`] onto any node's duckfs: `root` holds the scratch files and the
+/// hermetic home, `key` is the release wallet that signs.
+fn publish_to(
+    root: &Path,
+    base: &str,
+    key: &Path,
+    sequence: u64,
+    display: &str,
+    archive: &[u8],
+) -> Sha {
+    let path = root.join(format!("release-{sequence}.tar.zst"));
     std::fs::write(&path, archive).expect("write the archive");
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../ops/release/publish.sh");
     let out = Command::new("bash")
         .arg(script)
-        .args(["--kind", "node", "--node", &net.base])
+        .args(["--kind", "node", "--node", base])
         .arg("--key")
-        .arg(&net.key)
+        .arg(key)
         .args(["--sequence", &sequence.to_string(), "--display", display])
         .arg("--archive")
         .arg(format!(
@@ -416,9 +442,9 @@ fn publish(net: &Net, sequence: u64, display: &str, archive: &[u8]) -> Sha {
             path.to_str().expect("utf-8 archive path")
         ))
         .arg("--out-dir")
-        .arg(net.dir.path().join(format!("publish-{sequence}")))
+        .arg(root.join(format!("publish-{sequence}")))
         .env("DUCKTAPE_BIN", ducktape())
-        .env("DUCKTAPE_HOME", net.dir.path())
+        .env("DUCKTAPE_HOME", root)
         .env("RELEASE_WALLET_PASSWORD", WALLET_PASSWORD)
         .output()
         .expect("publish.sh");
@@ -803,5 +829,278 @@ fn a_withdrawn_release_is_no_longer_designated() {
         after["designation"],
         serde_json::Value::Null,
         "a withdrawn release is no longer designated: {after}"
+    );
+}
+
+// --- the release key comes from the network ----------------------------------
+
+/// A founder, and a member that joined by invite and was started exactly the
+/// way `node join` says: `ducktape-node-launcher install --from <binary>` then
+/// `run`, with NO `--release-key` unless a case pins one on purpose. Nothing
+/// else ever reaches the member: every later step is the founder's.
+struct Joined {
+    cluster: NetworkShapeCluster,
+    dir: tempfile::TempDir,
+    /// The release wallet's key file, and the public key the founder commits.
+    key: PathBuf,
+    release_pubkey: String,
+    launcher: Option<NodeProc>,
+}
+
+/// Stop the member's supervisor the way `systemctl stop` does, then give the
+/// sealed release directories their write bit back so the tempdirs can go.
+impl Drop for Joined {
+    fn drop(&mut self) {
+        if let Some(launcher) = self.launcher.as_mut() {
+            launcher.terminate(Duration::from_secs(120));
+        }
+        let _ = Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&self.cluster.friend_dir)
+            .status();
+    }
+}
+
+impl Joined {
+    fn log(&self) -> &NodeProc {
+        self.launcher.as_ref().expect("the member's launcher runs")
+    }
+
+    /// The member's pin, as the launcher reads it.
+    fn pin(&self) -> Option<String> {
+        let path = app_update::workspace::keys_dir(&self.cluster.friend_dir)
+            .join(app_update::workspace::RELEASE_KEY_FILE);
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|text| text.trim().to_string())
+    }
+
+    fn running(&self) -> Sha {
+        let target = std::fs::read_link(app_update::workspace::current_link(
+            &self.cluster.friend_dir,
+        ))
+        .expect("current is a link");
+        target
+            .file_name()
+            .expect("the link names a release")
+            .to_string_lossy()
+            .parse()
+            .expect("a release directory is named by its sha")
+    }
+
+    /// The reading the member's launcher polls, through the same verb.
+    fn member_release_status(&self) -> serde_json::Value {
+        let out = common::ducktape()
+            .args(["release", "status", "--json", "--config"])
+            .arg(self.cluster.config_file(1))
+            .env("DUCKTAPE_HOME", self.dir.path())
+            .stdin(Stdio::null())
+            .output()
+            .expect("release status");
+        assert!(out.status.success(), "release status: {out:?}");
+        serde_json::from_slice(&out.stdout).expect("release status prints one json object")
+    }
+
+    /// A verb the FOUNDER runs against its own node, the wallet password on
+    /// stdin; what it printed.
+    fn founder(&self, args: &[&str]) -> String {
+        let password = std::fs::File::open(self.dir.path().join("wallet-password"))
+            .expect("open the password");
+        let out = common::ducktape()
+            .args(args)
+            .arg("--config")
+            .arg(self.cluster.config_file(0))
+            .env("DUCKTAPE_HOME", self.dir.path())
+            .stdin(Stdio::from(password))
+            .output()
+            .expect("run a founder verb");
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn founder_base(&self) -> String {
+        format!("http://127.0.0.1:{}", self.cluster.http_ports[0])
+    }
+}
+
+fn joined_under_launcher(release_key: Option<&str>) -> Joined {
+    let dir = e2e_tempdir("release-key");
+    let (key, release_pubkey) = mint_release_wallet(dir.path());
+    let mut cluster = NetworkShapeCluster::new();
+    cluster.init_founder("release-key");
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
+    let invite = cluster.invite();
+    cluster.join_friend(&invite);
+
+    let seed = dir.path().join("ducktape-v1");
+    write_executable(&seed, &release_binary("v1", false));
+    let mut install = Command::new(launcher_exe());
+    install
+        .args(["install", "--workspace"])
+        .arg(&cluster.friend_dir)
+        .arg("--config")
+        .arg(cluster.config_file(1))
+        .arg("--from")
+        .arg(&seed);
+    if let Some(hex) = release_key {
+        install.args(["--release-key", hex]);
+    }
+    let installed = install.output().expect("launcher install");
+    assert!(
+        installed.status.success(),
+        "launcher install: {installed:?}"
+    );
+
+    let mut run = Command::new(launcher_exe());
+    run.args(["run", "--workspace"])
+        .arg(&cluster.friend_dir)
+        .arg("--config")
+        .arg(cluster.config_file(1))
+        .env("DUCKTAPE_HOME", dir.path())
+        .env("DUCKTAPE_UPDATE_POLL_MS", POLL_MS)
+        .env("RUST_LOG", "info");
+    let launcher = NodeProc::spawn(2, dir.path().join("launcher.log"), run, "member launcher");
+    // admitted by its invite, and serving the network's committed state.
+    launcher.expect_line(&["resident: pre-synced boundary"], BUDGET);
+    Joined {
+        cluster,
+        dir,
+        key,
+        release_pubkey,
+        launcher: Some(launcher),
+    }
+}
+
+/// THE RELEASE-3 GAP, CLOSED. A member that joined by invite holds no release
+/// key; the founder commits one through governance; the member's launcher
+/// pins it on its next reading, with no one touching the member — and the
+/// channel it opens carries the member onto the next node release.
+#[test]
+fn a_joiner_pins_the_release_key_its_network_commits_and_follows_its_releases() {
+    let joined = joined_under_launcher(None);
+    assert_eq!(
+        joined.pin(),
+        None,
+        "node join delivers no key and install pinned none"
+    );
+    let before = joined.member_release_status();
+    assert_eq!(before["release_keys"]["node"], serde_json::Value::Null);
+    assert_eq!(before["pinned"], serde_json::Value::Null);
+
+    joined.founder(&[
+        "release",
+        "key",
+        "set",
+        "--kind",
+        "node",
+        "--pubkey",
+        &joined.release_pubkey,
+    ]);
+    joined.log().expect_line(
+        &["node_update_release_key_pinned", &joined.release_pubkey],
+        BUDGET,
+    );
+    assert_eq!(
+        joined.pin().as_deref(),
+        Some(joined.release_pubkey.as_str()),
+        "the member's pin is the key its network committed"
+    );
+    let after = joined.member_release_status();
+    let committed = serde_json::Value::String(joined.release_pubkey.clone());
+    assert_eq!(after["release_keys"]["node"], committed, "{after}");
+    assert_eq!(after["pinned"], committed, "{after}");
+
+    // ---- the channel the key opened ------------------------------------
+    let first = joined.running();
+    let second = archive_of(&release_binary("v2", false));
+    let second_sha = publish_to(
+        joined.dir.path(),
+        &joined.founder_base(),
+        &joined.key,
+        1,
+        "2026.09.3+v2",
+        &second,
+    );
+    let said = joined.founder(&[
+        "release",
+        "schedule",
+        "--sha",
+        &second_sha.to_string(),
+        "--lead",
+        &ACTIVATION_LEAD.to_string(),
+    ]);
+    let at = height_after(&said, " from height ");
+    joined
+        .log()
+        .expect_line(&["node_update_staged", &second_sha.to_string()], BUDGET);
+    let arming = joined.log().expect_line(&["node_update_arming"], BUDGET);
+    assert!(
+        armed_height(&arming) >= at,
+        "the member arms at the designated height, not before: {arming}"
+    );
+    joined.log().expect_line(&["node_update_flipped"], BUDGET);
+    assert_ne!(first, second_sha);
+    assert_eq!(
+        joined.running(),
+        second_sha,
+        "the member runs the release its network designated"
+    );
+    joined
+        .log()
+        .expect_line(&["node_update_healthy", &second_sha.to_string()], BUDGET);
+}
+
+/// A pin already on disk is the operator's, and the network's word never
+/// overwrites it: the member refuses by name, keeps following its own key,
+/// and shows both.
+#[test]
+fn a_joiner_pinned_to_another_key_keeps_it_and_refuses_the_networks() {
+    let own = "11".repeat(32);
+    let joined = joined_under_launcher(Some(&own));
+    assert_eq!(joined.pin().as_deref(), Some(own.as_str()));
+
+    joined.founder(&[
+        "release",
+        "key",
+        "set",
+        "--kind",
+        "node",
+        "--pubkey",
+        &joined.release_pubkey,
+    ]);
+    joined.log().expect_line(
+        &[
+            "release_key_pinned_differs",
+            &own,
+            &joined.release_pubkey,
+            "attempts=1",
+        ],
+        BUDGET,
+    );
+    assert_eq!(
+        joined.pin().as_deref(),
+        Some(own.as_str()),
+        "the pin is never overwritten"
+    );
+    let reading = joined.member_release_status();
+    assert_eq!(
+        reading["release_keys"]["node"],
+        serde_json::Value::String(joined.release_pubkey.clone()),
+        "{reading}"
+    );
+    assert_eq!(
+        reading["pinned"],
+        serde_json::Value::String(own),
+        "{reading}"
+    );
+    let log = std::fs::read_to_string(&joined.log().log).expect("read the launcher log");
+    assert!(
+        !log.contains("node_update_release_key_pinned"),
+        "a differing pin is never replaced"
     );
 }

@@ -12,8 +12,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use app_update::Designation;
-use serde::Deserialize;
+use app_update::ReleaseStatus;
 
 use crate::refusal::Refusal;
 
@@ -22,42 +21,6 @@ use crate::refusal::Refusal;
 /// into a journal replay on the way back up.
 const STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// What the running node answers `release status` with: where it serves, who
-/// it is, where the chain is, and what the network has designated.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct ReleaseStatus {
-    /// The node's own http base — what `fs cat` dials.
-    pub base: String,
-    /// Empty until the node has published its mesh identity. A service daemon
-    /// started before then exits fatal, so this is the service's wait seam.
-    #[serde(default)]
-    pub public_key: String,
-    /// The committed height the node serves; 0 until it has recovered or
-    /// synced any state.
-    #[serde(default)]
-    pub height: u64,
-    /// The release this network runs, and from which block. `None` until
-    /// governance has passed one.
-    #[serde(default)]
-    pub designation: Option<Designation>,
-}
-
-impl ReleaseStatus {
-    pub fn identity_published(&self) -> bool {
-        !self.public_key.is_empty()
-    }
-
-    /// The node came up: it serves committed state under its identity. The
-    /// identity alone is not that — a resident publishes it BEFORE it
-    /// recovers its journal, so one that dies in recovery answers with an
-    /// identity at height 0 until it does. This is the flipped release's
-    /// healthy signal and the line between a restart and a crash loop.
-    pub fn came_up(&self) -> bool {
-        let serving = self.height > 0;
-        self.identity_published() && serving
-    }
-}
 
 /// A `ducktape` binary, pointed at one workspace.
 #[derive(Debug, Clone)]
@@ -81,8 +44,10 @@ impl Ducktape {
         command
     }
 
-    /// The running node's answer, or a refusal naming how the ask failed —
-    /// which is also how "the node is not up yet" reads.
+    /// The running node's answer — where it serves, who it is, where the
+    /// chain is, and what the network has designated and keyed — or a refusal
+    /// naming how the ask failed, which is also how "the node is not up yet"
+    /// reads.
     pub fn status(&self) -> Result<ReleaseStatus, Refusal> {
         let output = self
             .verb(&["release", "status", "--json"])
@@ -279,5 +244,30 @@ mod tests {
         assert_eq!(designation.sha256, sha);
         assert!(!designation.armed_at(designated.height));
         assert!(designation.armed_at(1200));
+        assert_eq!(
+            designated.release_keys,
+            app_update::ReleaseKeys::default(),
+            "a reading without release keys commits none"
+        );
+    }
+
+    /// `release status --json` as a node that knows the network's release
+    /// keys answers it — `pinned` included, which this launcher reads off its
+    /// own disk instead and ignores here.
+    #[test]
+    fn a_status_answer_decodes_the_release_keys_the_network_committed() {
+        let node_key = "ab".repeat(32);
+        let reading: ReleaseStatus = serde_json::from_str(&format!(
+            r#"{{"base":"http://127.0.0.1:8844","public_key":"ab12","height":900,
+                 "root_hash":"00","designation":null,
+                 "release_keys":{{"node":"{node_key}","app":null}},
+                 "pinned":null}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            reading.release_keys.of(app_update::Kind::Node),
+            Some(node_key.parse().unwrap())
+        );
+        assert_eq!(reading.release_keys.of(app_update::Kind::App), None);
     }
 }
