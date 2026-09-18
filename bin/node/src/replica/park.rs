@@ -2382,6 +2382,10 @@ pub(super) async fn park(
                                 &namespace,
                                 founding_anchor,
                                 &replica_store,
+                                // the replay guard off the BOUNDARY this
+                                // seat synced, as a validator cold seat
+                                // takes it.
+                                m.applied_frames.clone(),
                             )
                             .await
                             {
@@ -2443,6 +2447,9 @@ pub(super) async fn park(
                                 m.view_base,
                             );
                             node_r.set_code_source(code_source.clone());
+                            // the replay guard the suffix fold held at `tip`
+                            // — the one a restart restores off this journal.
+                            node_r.seed_replay_window(caught.replay_window);
                             // the observation barrier — see the resume site
                             // above.
                             node_r.watch_module("valset");
