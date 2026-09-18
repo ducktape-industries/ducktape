@@ -184,6 +184,16 @@ pub enum Event {
     SwapResolved(SwapState),
     /// App: the channel manifest was fetched and its signature checked.
     ManifestFetched(Result<VerifiedManifest, Refusal>),
+    /// Node launcher: the network designates this release, and it is neither
+    /// what runs nor what is staged. A node offers what its network chose,
+    /// never merely the manifest's latest.
+    Designated(Sha),
+    /// Node launcher, answering `FetchDesignated`: the channel manifest,
+    /// fetched and checked, and the designated release it was fetched for.
+    DesignatedManifestFetched {
+        designated: Sha,
+        result: Result<VerifiedManifest, Refusal>,
+    },
     /// App: `releases/<sha>.partial` is complete.
     DownloadFinished { sha: Sha },
     /// App: the download could not complete; `reason` is a stable token.
@@ -236,6 +246,10 @@ pub enum Command {
     /// Read the channel manifest + `.sig` off the connected network's duckfs
     /// ([`crate::layout`]), verify, answer with `ManifestFetched`.
     Fetch,
+    /// Read and verify the channel manifest exactly as `Fetch` does, for the
+    /// release the network designates; answer with
+    /// `DesignatedManifestFetched` carrying this `Sha`.
+    FetchDesignated(Sha),
     /// Download the archive ([`crate::layout::archive_path`] of `sha` for
     /// the host platform) into `releases/<sha>.partial`, resumable by size,
     /// sha256-checked as it lands; answer with

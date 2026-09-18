@@ -15,14 +15,15 @@
 //! refusal a failed checkpoint reopen takes, and keeps running the release the
 //! network is on.
 
+use std::fmt;
 use std::path::Path;
 
 use app_update::{
     Command, Designation, Event, Kind, Phase, Platform, PublicKey, ReleaseStatus, Sha,
-    SignedManifest, SuccessorKey, SwapState, TrustedKeys, UpdateBanner, state, step,
-    verify_manifest,
+    SignedManifest, SuccessorKey, SwapState, TrustedKeys, UpdateBanner, VerifiedManifest, state,
+    step, verify_manifest,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::layout::Layout;
 use crate::node::Ducktape;
@@ -33,17 +34,185 @@ use crate::writers;
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 
 /// What this launcher has already settled about the release plane, carried
-/// between polls. Both fields exist to stop a loop: a release this launcher
-/// already answered for is not asked again — asking costs a node restart,
-/// and the answer would be the same — and a pin that disagrees with the
-/// network is said at attempt 1 and every Nth, not every poll.
+/// between polls. Every field exists to stop a loop: a release this launcher
+/// definitely answered for is not asked again — asking costs a download or a
+/// node restart, and the answer would be the same — one whose answer was
+/// transient is asked again only after a backoff, and a pin that disagrees
+/// with the network is said at attempt 1 and every Nth, not every poll.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Watch {
-    /// The release this launcher refused, or rolled back from.
+    /// The release this launcher refused definitely, or rolled back from:
+    /// spent for this launcher's life.
     pub refused: Option<Sha>,
+    /// The release whose last answer was [`Failure::Transient`].
+    pub retry: Option<Retry>,
     /// Polls on which the release-key step refused ([`KeyPin::Differs`], or
     /// a pin it could not write) — the pacing counter, and the diagnosis.
     pub key_refusals: u64,
+}
+
+/// A release whose answers have been transient: how many in a row, and how
+/// long until it is asked again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retry {
+    pub release: Sha,
+    /// Consecutive transient answers — the pacing counter, and the diagnosis.
+    pub attempts: u64,
+    /// Polls still to sit out before it is asked again.
+    pub polls_left: u64,
+}
+
+impl Watch {
+    /// One poll went by: a backoff is one poll shorter.
+    pub fn poll_elapsed(&mut self) {
+        if let Some(retry) = self.retry.as_mut() {
+            retry.polls_left = retry.polls_left.saturating_sub(1);
+        }
+    }
+
+    /// Which attempt at `release` the next ask is: 1, unless its answers have
+    /// been transient.
+    pub fn attempt_at(&self, release: Sha) -> u64 {
+        self.retry
+            .filter(|retry| retry.release == release)
+            .map_or(1, |retry| retry.attempts + 1)
+    }
+}
+
+/// Whether a no belongs to the release or to the moment — and so whether the
+/// release is asked again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// A read that did not complete: the link, the node or this host did not
+    /// deliver the whole file, or the manifest does not name the designated
+    /// release yet. A later poll may answer otherwise, so the release is asked
+    /// again after a backoff.
+    Transient,
+    /// The published bytes, their signature, this install's key or the staged
+    /// binary said no, and would say it again: the release is spent for this
+    /// launcher's life.
+    Definite,
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Failure::Transient => f.write_str("transient"),
+            Failure::Definite => f.write_str("definite"),
+        }
+    }
+}
+
+/// A no one drive heard — the refusal the machine decided on, or this
+/// launcher's own refusal to perform a command — for the supervisor to class,
+/// count and say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    /// The manifest was refused (`UpdateBanner::Refused`).
+    Manifest(app_update::Refusal),
+    /// The archive did not land (`UpdateBanner::DownloadFailed`).
+    Download(String),
+    /// The archive landed whole and did not stage (`UpdateBanner::VerifyRefused`).
+    Verify(String),
+    /// The staged binary refused (`UpdateBanner::QualifyFailed`).
+    Qualify(String),
+    /// This launcher could not perform a command.
+    Launcher(Refusal),
+}
+
+impl Refused {
+    /// The refusal `command` announces, if it announces one.
+    fn announced_by(command: &Command) -> Option<Refused> {
+        let Command::Banner(banner) = command else {
+            return None;
+        };
+        match banner {
+            UpdateBanner::Refused(refusal) => Some(Refused::Manifest(*refusal)),
+            UpdateBanner::DownloadFailed { reason, .. } => Some(Refused::Download(reason.clone())),
+            UpdateBanner::VerifyRefused { reason, .. } => Some(Refused::Verify(reason.clone())),
+            UpdateBanner::QualifyFailed { reason, .. } => Some(Refused::Qualify(reason.clone())),
+            UpdateBanner::Ready { .. } | UpdateBanner::UpToDate => None,
+        }
+    }
+
+    /// The stable token a dashboard counts.
+    pub fn reason(&self) -> String {
+        match self {
+            Refused::Manifest(refusal) => refusal.to_string(),
+            Refused::Download(reason) | Refused::Verify(reason) | Refused::Qualify(reason) => {
+                reason.clone()
+            }
+            Refused::Launcher(refusal) => refusal.reason.to_string(),
+        }
+    }
+
+    /// What was refused, for the operator's line.
+    pub fn sentence(&self) -> &'static str {
+        match self {
+            Refused::Manifest(_) => "the node manifest was refused",
+            Refused::Download(_) => "the node release could not be downloaded",
+            Refused::Verify(_) => "the node release did not verify",
+            Refused::Qualify(_) => {
+                "the staged node release did not qualify; staying on the current one"
+            }
+            Refused::Launcher(_) => "the release plane stalled; the node keeps running",
+        }
+    }
+
+    /// The launcher's own detail; a banner carries none.
+    pub fn detail(&self) -> &str {
+        match self {
+            Refused::Launcher(refusal) => &refusal.detail,
+            Refused::Manifest(_) | Refused::Download(_) | Refused::Verify(_) | Refused::Qualify(_) => {
+                ""
+            }
+        }
+    }
+}
+
+/// This launcher's own tokens for a read that did not complete: `fs cat`
+/// failing (for the manifest or the archive), a local read of what it wrote,
+/// and a download that `fs cat` finished short of the manifest's size.
+const UNFINISHED_READS: [&str; 3] = ["download_failed", "fetch_failed", "short_read"];
+
+/// THE CLASS DECISION. Reads nothing, writes nothing.
+///
+/// Transient is only what could not be read whole: a download that failed or
+/// came up short, and a manifest that does not name the designated release
+/// yet. Everything the bytes themselves answer is definite — a bad signature,
+/// a complete file of the wrong size or hash, a malformed archive, a refused
+/// qualify, no key to check with.
+pub fn failure(refused: &Refused) -> Failure {
+    match refused {
+        Refused::Manifest(refusal) => manifest_failure(*refusal),
+        Refused::Download(reason) => read_failure(reason),
+        Refused::Launcher(refusal) => read_failure(refusal.reason),
+        Refused::Verify(_) | Refused::Qualify(_) => Failure::Definite,
+    }
+}
+
+fn manifest_failure(refusal: app_update::Refusal) -> Failure {
+    use app_update::Refusal as Manifest;
+    match refusal {
+        Manifest::DesignatedReleaseUnpublished => Failure::Transient,
+        Manifest::MalformedSignature
+        | Manifest::MalformedManifest
+        | Manifest::SchemaUnsupported
+        | Manifest::ChannelMismatch
+        | Manifest::BadSignature
+        | Manifest::KeySuperseded
+        | Manifest::Sha256IdMismatch
+        | Manifest::SequenceNotNewer
+        | Manifest::NoArtifactForPlatform => Failure::Definite,
+    }
+}
+
+fn read_failure(reason: &str) -> Failure {
+    let unfinished = UNFINISHED_READS.contains(&reason);
+    match unfinished {
+        true => Failure::Transient,
+        false => Failure::Definite,
+    }
 }
 
 /// What the network's committed node release key means for this install's
@@ -89,8 +258,8 @@ pub enum Next {
     Healthy,
     /// The rolled-back release came up; clear the notice nobody else will.
     Dismiss,
-    /// Stage what the network designated: `Event::Tick`.
-    Offer,
+    /// Stage what the network designated: `Event::Designated`.
+    Offer(Sha),
     /// It is armed at the committed height: `Event::RestartToUpdate`.
     Flip,
 }
@@ -119,9 +288,15 @@ pub fn decide(phase: &Phase, status: &ReleaseStatus, watch: &Watch) -> Next {
     if already_answered {
         return Next::Wait;
     }
+    let backing_off = watch.retry.is_some_and(|retry| {
+        retry.release == designation.sha256 && retry.polls_left > 0
+    });
+    if backing_off {
+        return Next::Wait;
+    }
     match phase {
         Phase::Idle(idle) => offer_or_wait(designation, idle.current),
-        Phase::Staged(staged) => flip_or_wait(designation, staged.staged, status.height),
+        Phase::Staged(staged) => flip_or_offer(designation, staged.staged, status.height),
         Phase::Downloading(_)
         | Phase::Swapping(_)
         | Phase::PendingHealthy(_)
@@ -130,18 +305,26 @@ pub fn decide(phase: &Phase, status: &ReleaseStatus, watch: &Watch) -> Next {
 }
 
 /// A designation naming what already runs is this node being up to date.
+/// Any other is offered, whether it is still on disk or has to be fetched:
+/// that is the machine's to tell.
 fn offer_or_wait(designation: Designation, current: Sha) -> Next {
     let running_it = designation.sha256 == current;
     match running_it {
         true => Next::Wait,
-        false => Next::Offer,
+        false => Next::Offer(designation.sha256),
     }
 }
 
-fn flip_or_wait(designation: Designation, staged: Sha, height: u64) -> Next {
+/// The staged release flips once the network designates it and it is armed.
+/// A designation of any other release is offered — the network moved on, and
+/// the staged bytes are no longer the ones to run.
+fn flip_or_offer(designation: Designation, staged: Sha, height: u64) -> Next {
     let ours = designation.sha256 == staged;
+    if !ours {
+        return Next::Offer(designation.sha256);
+    }
     let armed = designation.armed_at(height);
-    match ours && armed {
+    match armed {
         true => Next::Flip,
         false => Next::Wait,
     }
@@ -154,18 +337,19 @@ impl Next {
             Next::Wait => None,
             Next::Healthy => Some(Event::Rendered),
             Next::Dismiss => Some(Event::DismissRollbackNotice),
-            Next::Offer => Some(Event::Tick),
+            Next::Offer(designated) => Some(Event::Designated(designated)),
             Next::Flip => Some(Event::RestartToUpdate),
         }
     }
 }
 
-/// Where a drive ended: the phase now on disk, and the release to run when the
-/// machine asked for one.
+/// Where a drive ended: the phase now on disk, the release to run when the
+/// machine asked for one, and the last refusal the machine decided on.
 #[derive(Debug)]
 pub struct Settled {
     pub phase: Phase,
     pub run: Option<Sha>,
+    pub refused: Option<Refused>,
 }
 
 /// What performing one command produced.
@@ -186,6 +370,9 @@ pub struct Executor<'a> {
     pub ducktape: &'a Ducktape,
     pub keys: Option<&'a TrustedKeys>,
     pub live: Option<&'a ReleaseStatus>,
+    /// Which attempt at its release this drive is ([`Watch::attempt_at`]): a
+    /// line every attempt repeats is said at attempt 1 and every Nth.
+    pub attempt: u64,
 }
 
 impl Executor<'_> {
@@ -193,18 +380,27 @@ impl Executor<'_> {
     /// runs out of commands, performing each command in order and feeding the
     /// answers back in.
     pub fn drive(&self, mut phase: Phase, mut event: Event) -> Result<Settled, Refusal> {
+        let mut refused = None;
         loop {
             let (next, commands) = step(phase, event);
             phase = next;
+            refused = commands.iter().find_map(Refused::announced_by).or(refused);
             match self.perform_all(commands)? {
                 Progress::Answer(answer) => event = answer,
                 Progress::Run(sha) => {
                     return Ok(Settled {
                         phase,
                         run: Some(sha),
+                        refused,
                     });
                 }
-                Progress::Done => return Ok(Settled { phase, run: None }),
+                Progress::Done => {
+                    return Ok(Settled {
+                        phase,
+                        run: None,
+                        refused,
+                    });
+                }
             }
         }
     }
@@ -235,6 +431,7 @@ impl Executor<'_> {
         match command {
             Command::Persist(phase) => self.persist(phase),
             Command::Fetch => self.fetch(),
+            Command::FetchDesignated(sha) => self.fetch_designated(sha),
             Command::Download { sha, size } => self.download(sha, size),
             Command::Verify(sha) => self.verify(sha),
             Command::SealImmutable(sha) => self.seal(sha),
@@ -253,9 +450,23 @@ impl Executor<'_> {
         Ok(Progress::Done)
     }
 
+    fn fetch(&self) -> Result<Progress, Refusal> {
+        let answer = self.read_manifest()?;
+        Ok(Progress::Answer(Event::ManifestFetched(answer)))
+    }
+
+    fn fetch_designated(&self, designated: Sha) -> Result<Progress, Refusal> {
+        let result = self.read_manifest()?;
+        Ok(Progress::Answer(Event::DesignatedManifestFetched {
+            designated,
+            result,
+        }))
+    }
+
     /// The node's own duckfs, read as files: the manifest and its signature,
     /// verified under the pinned key before anything about them is believed.
-    fn fetch(&self) -> Result<Progress, Refusal> {
+    /// Only the channel's latest manifest has a path; an older one is not read.
+    fn read_manifest(&self) -> Result<Result<VerifiedManifest, app_update::Refusal>, Refusal> {
         let live = self.live()?;
         let keys = self.pinned_keys()?;
         let scratch = self.layout.updates().join("fetch");
@@ -268,25 +479,27 @@ impl Executor<'_> {
         let bytes = read_small(&manifest)?;
         let signature_text = String::from_utf8(read_small(&signature)?)
             .map_err(|_| Refusal::new("malformed_signature", "the .sig file is not text"))?;
-        // A refusal is narrated once, by the banner the machine decides on —
-        // after the phase it settles on is on disk. Narrating it here too
-        // would announce a refusal before the state that refused it exists.
-        let answer = SignedManifest::from_files(bytes, signature_text.trim())
-            .and_then(|signed| verify_manifest(&signed, Kind::Node.channel(), keys));
-        Ok(Progress::Answer(Event::ManifestFetched(answer)))
+        // A refusal is narrated once, by the supervisor, after the phase the
+        // machine settles on is on disk. Narrating it here too would announce
+        // a refusal before the state that refused it exists.
+        Ok(SignedManifest::from_files(bytes, signature_text.trim())
+            .and_then(|signed| verify_manifest(&signed, Kind::Node.channel(), keys)))
     }
 
     fn download(&self, sha: Sha, size: u64) -> Result<Progress, Refusal> {
         let live = self.live()?;
         let partial = self.layout.partial(sha);
         let path = Kind::Node.archive_path(&sha, &Platform::HOST.key());
-        info!(
-            target: crate::TARGET,
-            event = "node_update_downloading",
-            release = %sha,
-            size,
-            "reading the designated node release off the network"
-        );
+        if crate::worth_saying(self.attempt) {
+            info!(
+                target: crate::TARGET,
+                event = "node_update_downloading",
+                release = %sha,
+                size,
+                attempts = self.attempt,
+                "reading the designated node release off the network"
+            );
+        }
         if let Err(refusal) = self.ducktape.cat(&live.base, &path, &partial) {
             return Ok(Progress::Answer(Event::DownloadFailed {
                 sha,
@@ -297,16 +510,22 @@ impl Executor<'_> {
             .map(|meta| meta.len())
             .unwrap_or(0);
         let whole = landed == size;
-        match whole {
-            true => Ok(Progress::Answer(Event::DownloadFinished { sha })),
-            false => {
-                let _ = std::fs::remove_file(&partial);
-                Ok(Progress::Answer(Event::DownloadFailed {
-                    sha,
-                    reason: "size_mismatch".into(),
-                }))
-            }
+        if whole {
+            return Ok(Progress::Answer(Event::DownloadFinished { sha }));
         }
+        let _ = std::fs::remove_file(&partial);
+        // `fs cat` finished, so this is the file as the network served it:
+        // fewer bytes than the manifest names is a read that came up short,
+        // more is a file that is not the artifact at all.
+        let short = landed < size;
+        let reason = match short {
+            true => "short_read",
+            false => "size_mismatch",
+        };
+        Ok(Progress::Answer(Event::DownloadFailed {
+            sha,
+            reason: reason.into(),
+        }))
     }
 
     fn verify(&self, sha: Sha) -> Result<Progress, Refusal> {
@@ -317,7 +536,7 @@ impl Executor<'_> {
                 Event::Verified(sha)
             }
             Err(refusal) => {
-                // The refusal itself is the banner's to announce, once the
+                // The refusal itself is the supervisor's to announce, once the
                 // machine has settled; this is the detail no event carries.
                 debug!(
                     target: crate::TARGET,
@@ -430,8 +649,10 @@ impl Executor<'_> {
     }
 
     /// The node has no banner. The same readings are log lines, at the level
-    /// their frequency earns: a staged release is a lifecycle fact, a refusal
-    /// is a refusal, and "nothing newer" is per-check noise.
+    /// their frequency earns: a staged release is a lifecycle fact and "nothing
+    /// newer" is per-check noise. A refusal is the supervisor's to say, from
+    /// [`Settled::refused`]: only it knows whether the release is spent or asked
+    /// again, and how many times it has been asked.
     fn report(&self, banner: UpdateBanner) -> Result<Progress, Refusal> {
         match banner {
             UpdateBanner::Ready {
@@ -448,33 +669,10 @@ impl Executor<'_> {
             UpdateBanner::UpToDate => {
                 debug!(target: crate::TARGET, "the node manifest names nothing newer")
             }
-            UpdateBanner::Refused(refusal) => warn!(
-                target: crate::TARGET,
-                event = "node_update_refused",
-                reason = %refusal,
-                "the node manifest was refused"
-            ),
-            UpdateBanner::DownloadFailed { target, reason } => warn!(
-                target: crate::TARGET,
-                event = "node_update_refused",
-                release = %target,
-                reason = %reason,
-                "the node release could not be downloaded"
-            ),
-            UpdateBanner::VerifyRefused { target, reason } => warn!(
-                target: crate::TARGET,
-                event = "node_update_refused",
-                release = %target,
-                reason = %reason,
-                "the node release did not verify"
-            ),
-            UpdateBanner::QualifyFailed { staged, reason } => warn!(
-                target: crate::TARGET,
-                event = "node_update_refused",
-                release = %staged,
-                reason = %reason,
-                "the staged node release did not qualify; staying on the current one"
-            ),
+            UpdateBanner::Refused(_)
+            | UpdateBanner::DownloadFailed { .. }
+            | UpdateBanner::VerifyRefused { .. }
+            | UpdateBanner::QualifyFailed { .. } => {}
         }
         Ok(Progress::Done)
     }
@@ -503,8 +701,8 @@ impl Executor<'_> {
     }
 }
 
-/// The refusal itself is `UpdateBanner::QualifyFailed`'s to announce, once the
-/// machine has decided on it; this is the detail no event carries.
+/// The refusal itself is the supervisor's to announce, once the machine has
+/// decided on it; this is the detail no event carries.
 fn refused(sha: Sha, reason: &str, detail: String) -> Event {
     debug!(
         target: crate::TARGET,
@@ -612,7 +810,8 @@ mod tests {
     #[test]
     fn an_unpinned_node_is_offered_the_designation_and_refuses_it_by_name() {
         let live = status(900, "ab", designating("b", 100));
-        assert_eq!(decide(&idle("a"), &live, &fresh()), Next::Offer);
+        let next = decide(&idle("a"), &live, &fresh());
+        assert_eq!(next, Next::Offer(sha("b")));
 
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::of(dir.path());
@@ -622,11 +821,17 @@ mod tests {
             ducktape: &ducktape,
             keys: None,
             live: Some(&live),
+            attempt: 1,
         };
         let refusal = unpinned
-            .drive(idle("a"), Event::Tick)
+            .drive(idle("a"), next.event().expect("an offer feeds the machine"))
             .expect_err("an unpinned fetch is refused");
         assert_eq!(refusal.reason, "no_release_key");
+        assert_eq!(
+            failure(&Refused::Launcher(refusal)),
+            Failure::Definite,
+            "no key to check with is the install's answer, not the moment's"
+        );
     }
 
     /// THE PIN DECISION TABLE: pin a committed key on first read, keep one
@@ -661,17 +866,172 @@ mod tests {
     #[test]
     fn a_designated_release_stages_before_its_height_and_flips_at_it() {
         let unarmed = status(900, "ab", designating("b", 1200));
-        assert_eq!(decide(&idle("a"), &unarmed, &fresh()), Next::Offer);
+        assert_eq!(decide(&idle("a"), &unarmed, &fresh()), Next::Offer(sha("b")));
         assert_eq!(decide(&staged("a", "b"), &unarmed, &fresh()), Next::Wait);
         let armed = status(1200, "ab", designating("b", 1200));
         assert_eq!(decide(&staged("a", "b"), &armed, &fresh()), Next::Flip);
     }
 
-    /// A staged release the network has moved on from is never flipped to.
+    /// A staged release the network has moved on from is never flipped to:
+    /// the release the network names now is offered in its place, armed or
+    /// not — a second designation while one is staged is not a silent wait.
     #[test]
-    fn a_staged_release_the_network_no_longer_names_is_not_flipped_to() {
+    fn a_staged_release_the_network_no_longer_names_gives_way_to_the_one_it_does() {
         let armed = status(1200, "ab", designating("c", 1200));
-        assert_eq!(decide(&staged("a", "b"), &armed, &fresh()), Next::Wait);
+        assert_eq!(decide(&staged("a", "b"), &armed, &fresh()), Next::Offer(sha("c")));
+        let unarmed = status(900, "ab", designating("c", 1200));
+        assert_eq!(decide(&staged("a", "b"), &unarmed, &fresh()), Next::Offer(sha("c")));
+    }
+
+    /// Designating the release kept as `previous` again is how a network takes
+    /// a release back: it is offered (the machine stages it from disk), then
+    /// flipped to at its height like any staged release.
+    #[test]
+    fn the_previous_release_designated_again_is_offered_then_flipped_to_when_armed() {
+        let flipped = Phase::Idle(Idle {
+            current: sha("b"),
+            previous: Some(sha("a")),
+            pinned_sequence: 2,
+        });
+        let unarmed = status(900, "ab", designating("a", 1200));
+        assert_eq!(decide(&flipped, &unarmed, &fresh()), Next::Offer(sha("a")));
+        let restaged = Phase::Staged(Staged {
+            current: sha("b"),
+            previous: Some(sha("a")),
+            pinned_sequence: 2,
+            staged: sha("a"),
+            sequence: 2,
+            display: sha("a").short(),
+            node_contract: 0,
+            refused: None,
+        });
+        assert_eq!(decide(&restaged, &unarmed, &fresh()), Next::Wait);
+        let armed = status(1200, "ab", designating("a", 1200));
+        assert_eq!(decide(&restaged, &armed, &fresh()), Next::Flip);
+    }
+
+    /// A release whose last answer was transient sits out its backoff, then
+    /// is asked again; a backoff for another release holds nothing up.
+    #[test]
+    fn a_transient_answer_is_asked_again_once_its_backoff_has_passed() {
+        let live = status(900, "ab", designating("b", 1200));
+        let mut watch = Watch {
+            retry: Some(Retry {
+                release: sha("b"),
+                attempts: 2,
+                polls_left: 2,
+            }),
+            ..Watch::default()
+        };
+        assert_eq!(decide(&idle("a"), &live, &watch), Next::Wait);
+        watch.poll_elapsed();
+        assert_eq!(decide(&idle("a"), &live, &watch), Next::Wait);
+        watch.poll_elapsed();
+        assert_eq!(decide(&idle("a"), &live, &watch), Next::Offer(sha("b")));
+        watch.poll_elapsed();
+        assert_eq!(watch.retry.map(|retry| retry.polls_left), Some(0));
+
+        let other = status(900, "ab", designating("c", 1200));
+        let backing_off_b = Watch {
+            retry: Some(Retry {
+                release: sha("b"),
+                attempts: 5,
+                polls_left: 16,
+            }),
+            ..Watch::default()
+        };
+        assert_eq!(decide(&idle("a"), &other, &backing_off_b), Next::Offer(sha("c")));
+    }
+
+    /// THE CLASS TABLE. Only a read that did not complete is transient; what
+    /// the bytes, their signature, the key or the staged binary answer is
+    /// definite — whatever token a staged binary happens to print.
+    #[test]
+    fn only_an_unfinished_read_is_transient() {
+        let launcher = |reason| Refused::Launcher(Refusal::new(reason, "detail"));
+        let transient = [
+            Refused::Download("download_failed".into()),
+            Refused::Download("short_read".into()),
+            launcher("download_failed"),
+            launcher("fetch_failed"),
+            Refused::Manifest(app_update::Refusal::DesignatedReleaseUnpublished),
+        ];
+        for refused in transient {
+            assert_eq!(failure(&refused), Failure::Transient, "{refused:?}");
+        }
+        let definite = [
+            Refused::Download("size_mismatch".into()),
+            Refused::Verify("sha256_mismatch".into()),
+            Refused::Verify("archive_entry_refused".into()),
+            Refused::Qualify("wit_world_mismatch".into()),
+            Refused::Qualify("download_failed".into()),
+            Refused::Manifest(app_update::Refusal::BadSignature),
+            Refused::Manifest(app_update::Refusal::SequenceNotNewer),
+            launcher("no_release_key"),
+            launcher("manifest_too_large"),
+        ];
+        for refused in definite {
+            assert_eq!(failure(&refused), Failure::Definite, "{refused:?}");
+        }
+    }
+
+    /// Download `size` bytes of a duckfs file whose `fs cat` is `script`.
+    fn download_with(script: &str, size: u64) -> Event {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::of(dir.path());
+        let exe = dir.path().join("fake-ducktape");
+        std::fs::write(&exe, script).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ducktape = Ducktape::new(exe, layout.config());
+        let live = status(1200, "ab", designating("b", 1200));
+        let executor = Executor {
+            layout: &layout,
+            ducktape: &ducktape,
+            keys: None,
+            live: Some(&live),
+            attempt: 1,
+        };
+        let Ok(Progress::Answer(answer)) = executor.download(sha("b"), size) else {
+            panic!("a download always answers the machine");
+        };
+        answer
+    }
+
+    /// Where the transient/definite line falls on a download: a read that
+    /// failed or finished short of the manifest's size may go otherwise next
+    /// time; a file that is longer than the manifest says is not the artifact.
+    #[test]
+    fn a_download_names_a_short_read_apart_from_a_size_mismatch() {
+        let four_bytes = "#!/bin/sh\nprintf abcd\n";
+        let class = |said: Event| match said {
+            Event::DownloadFailed { reason, .. } => failure(&Refused::Download(reason)),
+            other => panic!("not a failed download: {other:?}"),
+        };
+        assert_eq!(
+            download_with(four_bytes, 4),
+            Event::DownloadFinished { sha: sha("b") }
+        );
+        assert_eq!(class(download_with(four_bytes, 6)), Failure::Transient);
+        assert_eq!(class(download_with(four_bytes, 2)), Failure::Definite);
+        assert_eq!(
+            class(download_with("#!/bin/sh\necho unreachable >&2\nexit 1\n", 4)),
+            Failure::Transient
+        );
+        assert_eq!(
+            download_with(four_bytes, 6),
+            Event::DownloadFailed {
+                sha: sha("b"),
+                reason: "short_read".into(),
+            }
+        );
+        assert_eq!(
+            download_with(four_bytes, 2),
+            Event::DownloadFailed {
+                sha: sha("b"),
+                reason: "size_mismatch".into(),
+            }
+        );
     }
 
     /// One answer per release: a refusal (or a rollback) is not re-asked,
@@ -773,6 +1133,7 @@ mod tests {
             ducktape: &ducktape,
             keys: None,
             live: Some(&live),
+            attempt: 1,
         };
         let Ok(Progress::Answer(answer)) = executor.qualify(target) else {
             panic!("a qualify always answers the machine");
@@ -823,7 +1184,10 @@ mod tests {
         assert_eq!(Next::Wait.event(), None);
         assert_eq!(Next::Healthy.event(), Some(Event::Rendered));
         assert_eq!(Next::Dismiss.event(), Some(Event::DismissRollbackNotice));
-        assert_eq!(Next::Offer.event(), Some(Event::Tick));
+        assert_eq!(
+            Next::Offer(sha("b")).event(),
+            Some(Event::Designated(sha("b")))
+        );
         assert_eq!(Next::Flip.event(), Some(Event::RestartToUpdate));
     }
 }
