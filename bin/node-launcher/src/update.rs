@@ -18,13 +18,14 @@
 use std::path::Path;
 
 use app_update::{
-    Command, Designation, Event, Kind, Phase, Platform, PublicKey, Sha, SignedManifest,
-    SuccessorKey, SwapState, TrustedKeys, UpdateBanner, state, step, verify_manifest,
+    Command, Designation, Event, Kind, Phase, Platform, PublicKey, ReleaseStatus, Sha,
+    SignedManifest, SuccessorKey, SwapState, TrustedKeys, UpdateBanner, state, step,
+    verify_manifest,
 };
 use tracing::{debug, info, warn};
 
 use crate::layout::Layout;
-use crate::node::{Ducktape, ReleaseStatus};
+use crate::node::Ducktape;
 use crate::refusal::Refusal;
 use crate::writers;
 
@@ -32,15 +33,51 @@ use crate::writers;
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 
 /// What this launcher has already settled about the release plane, carried
-/// between polls. Both fields exist to stop a loop: an unpinned node never
-/// fetches, and a release this launcher already answered for is not asked
-/// again — asking costs a node restart, and the answer would be the same.
+/// between polls. Both fields exist to stop a loop: a release this launcher
+/// already answered for is not asked again — asking costs a node restart,
+/// and the answer would be the same — and a pin that disagrees with the
+/// network is said at attempt 1 and every Nth, not every poll.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Watch {
-    /// A release key is pinned. Without one this node does not self-update.
-    pub pinned: bool,
     /// The release this launcher refused, or rolled back from.
     pub refused: Option<Sha>,
+    /// Polls on which the release-key step refused ([`KeyPin::Differs`], or
+    /// a pin it could not write) — the pacing counter, and the diagnosis.
+    pub key_refusals: u64,
+}
+
+/// What the network's committed node release key means for this install's
+/// pin — the network's word against the file on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyPin {
+    /// Nothing to write: the pin agrees with the network, or the network
+    /// commits no node key and the pin (or its absence) stands.
+    Keep,
+    /// No pin, and the network commits a key: pin it. Trust on first read of
+    /// state this node just verified by syncing to the network's root.
+    Pin(PublicKey),
+    /// The pin differs from the key the network committed. NEVER overwritten:
+    /// refused by name, and the pinned key stays the one followed. The way
+    /// out is the operator's explicit `install --release-key`.
+    Differs {
+        pinned: PublicKey,
+        committed: PublicKey,
+    },
+}
+
+/// THE PIN DECISION. Reads nothing, writes nothing.
+pub fn key_pin(pinned: Option<PublicKey>, committed: Option<PublicKey>) -> KeyPin {
+    let Some(committed) = committed else {
+        return KeyPin::Keep;
+    };
+    let Some(pinned) = pinned else {
+        return KeyPin::Pin(committed);
+    };
+    let agrees = pinned == committed;
+    match agrees {
+        true => KeyPin::Keep,
+        false => KeyPin::Differs { pinned, committed },
+    }
 }
 
 /// What the supervisor owes the machine on one poll of a live node.
@@ -72,9 +109,9 @@ pub fn decide(phase: &Phase, status: &ReleaseStatus, watch: &Watch) -> Next {
     if notice_standing && came_up {
         return Next::Dismiss;
     }
-    if !watch.pinned {
-        return Next::Wait;
-    }
+    // An UNPINNED node is offered like any other: the executor's fetch
+    // refuses it by name (`no_release_key`), once per designated release, so a
+    // node that follows no channel says so the moment the network moves.
     let Some(designation) = status.designation else {
         return Next::Wait;
     };
@@ -531,6 +568,7 @@ mod tests {
             public_key: public_key.into(),
             height,
             designation,
+            ..ReleaseStatus::default()
         }
     }
 
@@ -562,29 +600,60 @@ mod tests {
         })
     }
 
-    fn pinned() -> Watch {
-        Watch {
-            pinned: true,
-            refused: None,
-        }
+    /// A launcher that has answered for nothing yet.
+    fn fresh() -> Watch {
+        Watch::default()
     }
 
+    /// An unpinned node is OFFERED what the network designates, and the fetch
+    /// is where it is refused — by name, before anything is read off the
+    /// network — so the operator hears `no_release_key` the moment the
+    /// network moves on without this node.
     #[test]
-    fn an_unpinned_node_never_follows_the_channel() {
-        let watch = Watch {
-            pinned: false,
-            refused: None,
-        };
+    fn an_unpinned_node_is_offered_the_designation_and_refuses_it_by_name() {
         let live = status(900, "ab", designating("b", 100));
-        assert_eq!(decide(&idle("a"), &live, &watch), Next::Wait);
+        assert_eq!(decide(&idle("a"), &live, &fresh()), Next::Offer);
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::of(dir.path());
+        let ducktape = Ducktape::new(layout.exe(), layout.config());
+        let unpinned = Executor {
+            layout: &layout,
+            ducktape: &ducktape,
+            keys: None,
+            live: Some(&live),
+        };
+        let refusal = unpinned
+            .drive(idle("a"), Event::Tick)
+            .expect_err("an unpinned fetch is refused");
+        assert_eq!(refusal.reason, "no_release_key");
+    }
+
+    /// THE PIN DECISION TABLE: pin a committed key on first read, keep one
+    /// that agrees, refuse — never overwrite — one that differs, and leave
+    /// the pin alone while the network commits none.
+    #[test]
+    fn the_network_key_is_pinned_once_and_a_differing_pin_is_never_overwritten() {
+        let key = |byte: u8| PublicKey::from_bytes([byte; 32]);
+        assert_eq!(key_pin(None, Some(key(1))), KeyPin::Pin(key(1)));
+        assert_eq!(key_pin(Some(key(1)), Some(key(1))), KeyPin::Keep);
+        assert_eq!(
+            key_pin(Some(key(2)), Some(key(1))),
+            KeyPin::Differs {
+                pinned: key(2),
+                committed: key(1),
+            }
+        );
+        assert_eq!(key_pin(Some(key(2)), None), KeyPin::Keep);
+        assert_eq!(key_pin(None, None), KeyPin::Keep);
     }
 
     #[test]
     fn nothing_happens_without_a_designation_or_when_it_names_what_runs() {
         let live = status(900, "ab", None);
-        assert_eq!(decide(&idle("a"), &live, &pinned()), Next::Wait);
+        assert_eq!(decide(&idle("a"), &live, &fresh()), Next::Wait);
         let same = status(900, "ab", designating("a", 100));
-        assert_eq!(decide(&idle("a"), &same, &pinned()), Next::Wait);
+        assert_eq!(decide(&idle("a"), &same, &fresh()), Next::Wait);
     }
 
     /// Staging is EARLY — the bytes land while the designation is still
@@ -592,17 +661,17 @@ mod tests {
     #[test]
     fn a_designated_release_stages_before_its_height_and_flips_at_it() {
         let unarmed = status(900, "ab", designating("b", 1200));
-        assert_eq!(decide(&idle("a"), &unarmed, &pinned()), Next::Offer);
-        assert_eq!(decide(&staged("a", "b"), &unarmed, &pinned()), Next::Wait);
+        assert_eq!(decide(&idle("a"), &unarmed, &fresh()), Next::Offer);
+        assert_eq!(decide(&staged("a", "b"), &unarmed, &fresh()), Next::Wait);
         let armed = status(1200, "ab", designating("b", 1200));
-        assert_eq!(decide(&staged("a", "b"), &armed, &pinned()), Next::Flip);
+        assert_eq!(decide(&staged("a", "b"), &armed, &fresh()), Next::Flip);
     }
 
     /// A staged release the network has moved on from is never flipped to.
     #[test]
     fn a_staged_release_the_network_no_longer_names_is_not_flipped_to() {
         let armed = status(1200, "ab", designating("c", 1200));
-        assert_eq!(decide(&staged("a", "b"), &armed, &pinned()), Next::Wait);
+        assert_eq!(decide(&staged("a", "b"), &armed, &fresh()), Next::Wait);
     }
 
     /// One answer per release: a refusal (or a rollback) is not re-asked,
@@ -611,8 +680,8 @@ mod tests {
     fn an_answered_release_is_not_asked_again() {
         let armed = status(1200, "ab", designating("b", 1200));
         let spent = Watch {
-            pinned: true,
             refused: Some(sha("b")),
+            ..Watch::default()
         };
         assert_eq!(decide(&staged("a", "b"), &armed, &spent), Next::Wait);
         assert_eq!(decide(&idle("a"), &armed, &spent), Next::Wait);
@@ -630,9 +699,9 @@ mod tests {
             pinned_sequence: 2,
         });
         let silent = status(1200, "", designating("b", 1200));
-        assert_eq!(decide(&pending, &silent, &pinned()), Next::Wait);
+        assert_eq!(decide(&pending, &silent, &fresh()), Next::Wait);
         let published = status(1201, "ab", designating("b", 1200));
-        assert_eq!(decide(&pending, &published, &pinned()), Next::Healthy);
+        assert_eq!(decide(&pending, &published, &fresh()), Next::Healthy);
     }
 
     /// A resident publishes its identity BEFORE it recovers its journal, so a
@@ -648,14 +717,14 @@ mod tests {
             pinned_sequence: 2,
         });
         let recovering = status(0, "ab", designating("b", 1200));
-        assert_eq!(decide(&pending, &recovering, &pinned()), Next::Wait);
+        assert_eq!(decide(&pending, &recovering, &fresh()), Next::Wait);
         let rolled_back = Phase::RolledBack(RolledBack {
             current: sha("a"),
             failed: sha("b"),
             reason: RollbackReason::NeverRendered,
             pinned_sequence: 2,
         });
-        assert_eq!(decide(&rolled_back, &recovering, &pinned()), Next::Wait);
+        assert_eq!(decide(&rolled_back, &recovering, &fresh()), Next::Wait);
     }
 
     /// Nobody dismisses a node's rollback notice, so the supervisor does —
@@ -669,9 +738,9 @@ mod tests {
             pinned_sequence: 2,
         });
         let silent = status(1200, "", None);
-        assert_eq!(decide(&rolled_back, &silent, &pinned()), Next::Wait);
+        assert_eq!(decide(&rolled_back, &silent, &fresh()), Next::Wait);
         let published = status(1201, "ab", designating("b", 1200));
-        assert_eq!(decide(&rolled_back, &published, &pinned()), Next::Dismiss);
+        assert_eq!(decide(&rolled_back, &published, &fresh()), Next::Dismiss);
     }
 
     /// The phases in flight owe nothing: a drive is running, or a flip is
@@ -684,7 +753,7 @@ mod tests {
             to: sha("b"),
             pinned_sequence: 2,
         });
-        assert_eq!(decide(&swapping, &armed, &pinned()), Next::Wait);
+        assert_eq!(decide(&swapping, &armed, &fresh()), Next::Wait);
     }
 
     /// Ask a staged binary that is `script` whether it qualifies.

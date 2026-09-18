@@ -35,9 +35,11 @@ each step is ordered the way it is.
 
 ## Running a node as a service
 
-- `node/` — `ducktape-node@.service` (instance = workspace selector for
-  `ducktape node run -n`), `ducktape-service@.service` (instance = kind for
-  `ducktape service run compute|agent|airlock`) and the `copytruncate`
+- `node/` — `ducktape-node@.service` (instance = the workspace's escaped
+  chain id; runs `ducktape-node-launcher run` over it),
+  `ducktape-service@.service` (instance = kind; runs
+  `ducktape-node-launcher service … -- service run compute|agent|airlock`
+  over `DUCKTAPE_WORKSPACE`) and the `copytruncate`
   logrotate drop-in for `daemon.log` / `<kind>.log`. `install.sh` runs the
   Linux install end to end (`--dry-run` prints it). The install, port and
   log recipe is `docs/deploy/node-service.md`; what to back up is

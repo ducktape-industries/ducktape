@@ -4714,6 +4714,7 @@ version = "0.1.0"
 dependencies = [
  "agent-service",
  "agent-wire",
+ "app-update",
  "async-trait",
  "attribution",
  "axum",
@@ -4737,6 +4738,7 @@ dependencies = [
  "futures",
  "gateway",
  "git2",
+ "governance-wire",
  "host",
  "http-body-util",
  "identity",

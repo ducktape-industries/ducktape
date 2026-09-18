@@ -60,6 +60,11 @@ chat = { workspace = true }
 # the `/v1/call/ws` framing (the webview leg of a huddle) and the voice frame size.
 tasks = { workspace = true }
 identity = { path = "../modules/system/identity" }
+# `GET /v1/release` walks the passed governance signals the release plane
+# rides (wire types only) and answers in the document the launcher and the
+# desktop app both decode.
+governance = { workspace = true }
+app-update = { workspace = true }
 gateway = { path = "../modules/system/gateway" }
 agent-wire = { workspace = true }
 runs-wire = { workspace = true }

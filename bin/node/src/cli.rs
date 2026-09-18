@@ -788,10 +788,33 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         true => format!("--config {}/node.toml", dir.display()),
         false => format!("-n '{chain_id}'"),
     };
-    eprintln!("start:  ducktape node run {selector}");
+    eprintln!("start:  {}", launcher_start(&dir));
     eprintln!("invite: ducktape node invite {selector}");
     println!("{chain_id}");
     Ok(())
+}
+
+/// How every verb that brings a workspace into existence says to start it:
+/// UNDER `ducktape-node-launcher`, which seeds the first release from this
+/// very binary and then follows the network's node releases — the key they
+/// are signed with included, which it pins from the network on first read. A
+/// bare `ducktape node run` is the verb the launcher execs; started by hand it
+/// follows no release, and no later node release can reach it.
+///
+/// Real paths: the launcher ships beside `ducktape` in every shape that ships
+/// it (the node archive's root, a cargo target directory, an install), so it
+/// is named there.
+fn launcher_start(workspace: &std::path::Path) -> String {
+    let this = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ducktape"));
+    let launcher = this.with_file_name("ducktape-node-launcher");
+    let (launcher, this) = (launcher.display(), this.display());
+    let ws = workspace.display();
+    let config = workspace.join("node.toml");
+    let config = config.display();
+    format!(
+        "`'{launcher}' install --workspace '{ws}' --config '{config}' --from '{this}'` then \
+         `'{launcher}' run --workspace '{ws}' --config '{config}'`"
+    )
 }
 
 /// stamp the binary that just materialized `dir` into the workspace's founding
@@ -2317,23 +2340,19 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
         joined.chain_id,
         joined.dir.display()
     );
-    // a workspace put where the operator asked is addressed by its file; one
-    // that landed in the registry is addressed by its chain id.
-    let selector = match &args.dir {
-        Some(_) => format!("--config {}/node.toml", joined.dir.display()),
-        None => format!("-n '{}'", joined.chain_id),
-    };
+    let start = launcher_start(&joined.dir);
     if joined.is_member {
-        eprintln!("this identity is a member — start: ducktape node run {selector}");
+        eprintln!("this identity is a member — start it under the launcher: {start}");
     } else {
         eprintln!(
             "NOT yet a member. this wrote a workspace; nothing was checked with the network. \
-             start now — `ducktape node run {selector}` presents the invite on first contact: \
-             an invite admits exactly one node, so if it was already used or has expired the \
-             node refuses within seconds (`invite already redeemed`) and you need a fresh one \
-             from the inviter; otherwise it joins the network's VPN, syncs state, and comes up \
-             as a full node. no approval step follows (minting the invite WAS the approval); a \
-             member can later promote it into the quorum with `ducktape node member promote {}`.",
+             start now, under the launcher that follows the network's node releases — {start}. \
+             the node presents the invite on first contact: an invite admits exactly one node, \
+             so if it was already used or has expired the node refuses within seconds \
+             (`invite already redeemed`) and you need a fresh one from the inviter; otherwise \
+             it joins the network's VPN, syncs state, and comes up as a full node. no approval \
+             step follows (minting the invite WAS the approval); a member can later promote it \
+             into the quorum with `ducktape node member promote {}`.",
             joined.identity
         );
     }

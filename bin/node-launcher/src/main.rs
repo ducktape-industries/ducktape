@@ -25,10 +25,19 @@
 //!
 //! WHAT IT ASKS AND WHAT IT READS. `ducktape release status --json` is the
 //! whole chain interface: the node's http base, its published identity, the
-//! committed height, and the release the network designated. Every file it
-//! takes off the network it reads with `ducktape fs cat` — the node serves the
-//! duckfs it downloads its successor from, and that is a file read like any
-//! other, not a side channel.
+//! committed height, the release the network designated, and the key the
+//! network says its node releases are signed with. Every file it takes off
+//! the network it reads with `ducktape fs cat` — the node serves the duckfs it
+//! downloads its successor from, and that is a file read like any other, not
+//! a side channel.
+//!
+//! THE KEY COMES FROM THE NETWORK. A workspace with no
+//! `updates/keys/release.pub` pins the node key governance committed
+//! (`ducktape release key set`) on the first reading that carries one, and
+//! follows it from that poll on. A pin already on disk is never overwritten:
+//! one that differs from the network's is refused by name
+//! (`release_key_pinned_differs`) and still followed. `install --release-key`
+//! is the operator's explicit pin, and the only thing that moves one.
 
 mod layout;
 mod node;
@@ -40,13 +49,13 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use app_update::{Event, Idle, Phase, PublicKey, Sha, state};
+use app_update::{Event, Idle, Phase, PublicKey, ReleaseStatus, Sha, TrustedKeys, state};
 use tracing::{error, info, warn};
 
 use crate::layout::{Layout, MODULES_DIR, NODE_EXE};
-use crate::node::{Child, Ducktape, ReleaseStatus};
+use crate::node::{Child, Ducktape};
 use crate::refusal::Refusal;
-use crate::update::{Executor, Next, Settled, Watch};
+use crate::update::{Executor, KeyPin, Next, Settled, Watch};
 
 pub const TARGET: &str = "ducktape::update";
 
@@ -355,8 +364,7 @@ fn one_node_life(
     failed_boots: &mut u64,
 ) -> Result<Life, Refusal> {
     let ducktape = Ducktape::new(layout.exe(), layout.config());
-    let keys = update::trusted_keys(layout)?;
-    watch.pinned = keys.is_some();
+    let mut keys = update::trusted_keys(layout)?;
     let mut phase = read_phase(layout)?;
 
     // The boot drive: resolve an interrupted flip, count a boot that never
@@ -401,6 +409,9 @@ fn one_node_life(
             reached = Boot::Up;
             *failed_boots = 0;
         }
+        // The key first: a node that pins the network's key on this poll
+        // follows the designation it reads on this poll.
+        keys = follow_release_key(layout, keys, &status, watch);
         let next = update::decide(&phase, &status, watch);
         let Some(event) = next.event() else {
             sleep_poll();
@@ -416,6 +427,7 @@ fn one_node_life(
             child.stop();
         }
         let before = phase.clone();
+        let designated = status.designation.map(|designation| designation.sha256);
         let driven = Executor {
             layout,
             ducktape: &ducktape,
@@ -427,12 +439,14 @@ fn one_node_life(
             Ok(settled) => settled,
             // A refusal mid-poll is this launcher's, not the node's: say it
             // and put the node back. Only the boot drive is fatal, because
-            // nothing is running to put back.
+            // nothing is running to put back. It is said once per designated
+            // release: the answer spends that release (`spent`).
             Err(refusal) => {
                 warn!(
                     target: TARGET,
                     event = "node_update_refused",
                     reason = refusal.reason,
+                    release = designated.map(tracing::field::display),
                     detail = %refusal.detail,
                     "the release plane stalled; the node keeps running"
                 );
@@ -442,7 +456,6 @@ fn one_node_life(
                 }
             }
         };
-        let designated = status.designation.map(|designation| designation.sha256);
         phase = settled.phase;
         // What the drive DID, after the writers that did it: `report` above
         // says what this launcher decided, and a decision is not yet a fact.
@@ -463,6 +476,95 @@ fn one_node_life(
         child = ducktape.spawn(child_args)?;
         reached = Boot::Starting;
     }
+}
+
+/// The network's word on the node release key, against this install's pin —
+/// the keys this life follows from here on.
+///
+/// A committed key with no pin on disk is PINNED, said once, and followed at
+/// once: the node syncs the chain before it can answer, so the key is as
+/// trusted as the state it read it from. Every release this launcher answered
+/// for without a key was refused for the want of one, so those answers are
+/// spent no longer. A pin that differs is never overwritten: it is refused by
+/// name at attempt 1 and every [`REPORT_EVERY`]th, both keys named, and
+/// followed as before. A pin that cannot be written is refused the same way,
+/// and tried again next poll.
+fn follow_release_key(
+    layout: &Layout,
+    keys: Option<TrustedKeys>,
+    status: &ReleaseStatus,
+    watch: &mut Watch,
+) -> Option<TrustedKeys> {
+    let pinned = keys.as_ref().map(|keys| keys.pinned);
+    match update::key_pin(pinned, status.release_keys.node) {
+        KeyPin::Keep => keys,
+        KeyPin::Pin(key) => pin_committed_key(layout, key, keys, watch),
+        KeyPin::Differs { pinned, committed } => {
+            refuse_differing_key(pinned, committed, watch);
+            keys
+        }
+    }
+}
+
+fn pin_committed_key(
+    layout: &Layout,
+    key: PublicKey,
+    keys: Option<TrustedKeys>,
+    watch: &mut Watch,
+) -> Option<TrustedKeys> {
+    let refusal = match pin_release_key(layout, key) {
+        Ok(pinned) => {
+            info!(
+                target: TARGET,
+                event = "node_update_release_key_pinned",
+                key = %key,
+                "pinned the node release key the network committed; following its channel"
+            );
+            watch.refused = None;
+            return Some(pinned);
+        }
+        Err(refusal) => refusal,
+    };
+    watch.key_refusals += 1;
+    if worth_saying(watch.key_refusals) {
+        warn!(
+            target: TARGET,
+            event = "node_update_refused",
+            reason = refusal.reason,
+            attempts = watch.key_refusals,
+            detail = %refusal.detail,
+            "the network's node release key could not be pinned; trying again next poll"
+        );
+    }
+    keys
+}
+
+fn refuse_differing_key(pinned: PublicKey, committed: PublicKey, watch: &mut Watch) {
+    watch.key_refusals += 1;
+    if worth_saying(watch.key_refusals) {
+        warn!(
+            target: TARGET,
+            event = "node_update_refused",
+            reason = "release_key_pinned_differs",
+            %pinned,
+            %committed,
+            attempts = watch.key_refusals,
+            "this workspace pins a release key the network does not commit; following the pin \
+             — `ducktape-node-launcher install --release-key` moves it"
+        );
+    }
+}
+
+/// Write `key` as this workspace's pin and read the trusted set back — the
+/// file on disk, not the value in hand, is what every later life follows.
+fn pin_release_key(layout: &Layout, key: PublicKey) -> Result<TrustedKeys, Refusal> {
+    writers::persist(&layout.release_key_path(), &format!("{key}\n"))?;
+    update::trusted_keys(layout)?.ok_or_else(|| {
+        Refusal::new(
+            "release_key_unreadable",
+            format!("{} vanished after it was written", layout.release_key_path().display()),
+        )
+    })
 }
 
 /// One line per answer that changes what this node runs. `Wait` says nothing:
@@ -960,6 +1062,66 @@ mod tests {
             spent(Next::Offer, Some(target), &idle("a"), &idle("a"), None),
             Some(target)
         );
+    }
+
+    fn committing(node: Option<PublicKey>) -> ReleaseStatus {
+        ReleaseStatus {
+            base: "http://127.0.0.1:8844".into(),
+            public_key: "ab".into(),
+            height: 900,
+            release_keys: app_update::ReleaseKeys { node, app: None },
+            ..ReleaseStatus::default()
+        }
+    }
+
+    fn pin_on_disk(layout: &Layout) -> Option<String> {
+        std::fs::read_to_string(layout.release_key_path()).ok()
+    }
+
+    /// An unpinned install pins the key the network committed, follows it in
+    /// the same life, and forgets the releases it refused for the want of
+    /// one.
+    #[test]
+    fn the_first_committed_key_is_pinned_and_followed_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::of(dir.path());
+        let key = PublicKey::from_bytes([7; 32]);
+        let mut watch = Watch {
+            refused: Some(Sha::digest(b"refused without a key")),
+            ..Watch::default()
+        };
+
+        let unkeyed = follow_release_key(&layout, None, &committing(None), &mut watch);
+        assert_eq!(unkeyed, None, "nothing committed, nothing pinned");
+        assert_eq!(pin_on_disk(&layout), None);
+
+        let keys = follow_release_key(&layout, None, &committing(Some(key)), &mut watch)
+            .expect("the committed key is followed");
+        assert_eq!(keys.pinned, key);
+        assert_eq!(pin_on_disk(&layout), Some(format!("{key}\n")));
+        assert_eq!(watch.refused, None, "answers given without a key are spent no longer");
+        assert_eq!(watch.key_refusals, 0);
+    }
+
+    /// A pin that differs from the network's word is NEVER overwritten: it is
+    /// refused, counted, and still the key followed.
+    #[test]
+    fn a_differing_pin_is_refused_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::of(dir.path());
+        let ours = PublicKey::from_bytes([1; 32]);
+        let theirs = PublicKey::from_bytes([2; 32]);
+        writers::persist(&layout.release_key_path(), &format!("{ours}\n")).unwrap();
+        let keys = update::trusted_keys(&layout).unwrap();
+        let mut watch = Watch::default();
+
+        for poll in 1..=3 {
+            let followed =
+                follow_release_key(&layout, keys.clone(), &committing(Some(theirs)), &mut watch);
+            assert_eq!(followed.map(|keys| keys.pinned), Some(ours));
+            assert_eq!(watch.key_refusals, poll);
+        }
+        assert_eq!(pin_on_disk(&layout), Some(format!("{ours}\n")), "the pin is unchanged");
     }
 
     /// `install` lays out exactly what a boot expects to find.

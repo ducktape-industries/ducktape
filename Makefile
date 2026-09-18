@@ -151,11 +151,13 @@ CARGO_BIN = $${CARGO_HOME:-$$HOME/.cargo}/bin
 ## needs no second implementation). Installing the node copies that set beside
 ## the installed binary under the plain, unkeyed name an installed layout
 ## reads. `--target-dir target` keeps the install build in the checkout's
-## target dir, which is where the staged set lands.
+## target dir, which is where the staged set lands. The node's supervisor,
+## `ducktape-node-launcher`, installs beside it: a node runs under it.
 STAGED_MODULES = modules$(subst /,%,$(CURDIR))
 STAGED_SIM_MODULES = sim-modules$(subst /,%,$(CURDIR))
 install-node: prereqs
 	$(CARGO) install --path bin/node --locked --target-dir target
+	$(CARGO) install --path bin/node-launcher --locked --target-dir target
 	rm -rf "$(CARGO_BIN)/modules"
 	cp -r "target/release/$(STAGED_MODULES)" "$(CARGO_BIN)/modules"
 	rm -rf "$(CARGO_BIN)/sim-modules"
