@@ -21,7 +21,7 @@ activation height, STOPS its node, and only then hears the qualify refuse:
 checkpoint_unrestorable: restore compose: forge component loads: Module(component
 imports instance `ducktape:module/host@0.1.0`, but a matching implementation was
 not found in the linker: instance export `git-object-read` has the wrong type…)
-node_update_refused      reason=qualify_refused
+node_update_refused      reason=checkpoint_unrestorable
 ```
 
 Every node comes back on the release it was already running, so the network

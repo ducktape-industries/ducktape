@@ -613,8 +613,10 @@ fn a_node_publishes_stages_qualifies_and_flips_its_successor_at_a_height() {
         armed_height(&arming) >= fourth_at,
         "the launcher asks at the designated height, not before: {arming}"
     );
+    // the refusal names the staged binary's own token, not the launcher's
+    // class for it.
     net.log()
-        .expect_line(&["node_update_refused", "qualify_refused"], BUDGET);
+        .expect_line(&["node_update_refused", "wit_world_mismatch"], BUDGET);
     assert_eq!(
         net.running(),
         second_sha,
