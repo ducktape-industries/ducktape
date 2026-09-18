@@ -146,7 +146,11 @@ is no longer the admin namespace's alone (below).
 
 **The DATA plane wants a credential too, in two strengths.** Every MUTATING
 `/v1` route takes EITHER a per-request signature or that same operator
-credential, in the same `x-ducktape-admin-token` header. Reads stay open.
+credential, in the same `x-ducktape-admin-token` header. Reads stay open,
+except the ws `logs` topic: the log ring is the operator's, so the `/v1/ws`
+upgrade carries the operator credential (on-box) or a request signature by the
+operator key over `GET /v1/ws` — otherwise subscribing to `logs` answers an
+error frame `forbidden`.
 
 - USER OPERATIONS — `/v1/submit/frame` verifies the operation's signed frame;
   Files clients send module queries through `/v1/query` and writes through this
@@ -157,6 +161,12 @@ credential, in the same `x-ducktape-admin-token` header. Reads stay open.
   `/v1/gateway/operator`, `DELETE /v1/fs/workspaces/{id}` — take the operator credential or a signature
   by the node's own operator key (its active wallet key at boot). A signature by
   any other key is `403 not_operator`.
+- SERVICE LINK — `POST /v1/services/hello` is a local service daemon's: it
+  takes `x-ducktape-service-link` with `$WORKSPACE/service-link.token` (or the
+  operator credential); anything else is `401 service_link_missing`. A ws
+  `run_output` frame is honored only after `compute_attach` with that same token.
+- SIGNED CALLER — `/v1/gateway/proxy` wants the head's `user_pop`, signed by a
+  key on an Identity account; none is `401 caller_proof_missing`.
 
 So a QA `curl` that writes carries
 `-H "x-ducktape-admin-token: $(cat "$WORKSPACE/admin.token")"`, a `401

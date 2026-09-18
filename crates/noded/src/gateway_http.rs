@@ -434,6 +434,14 @@ async fn proxy_authorized(
     Ok(response)
 }
 
+/// `POST /v1/gateway/proxy` — the node API's application door, for SIGNED
+/// callers only: the head must carry its caller's proof ([`gateway::UserPop`],
+/// the one the app stamps on every application call) and that proof must
+/// resolve to an Identity account here, before any overlay work — the bar
+/// `/v1/gateway/stream` already sets for an upgrade. A request that proves no
+/// caller would otherwise leave this node over the overlay as this node's own,
+/// for anyone who can reach the port; a browser page reaches routes through
+/// the dedicated browser-gateway listener instead.
 pub(crate) async fn gateway_proxy(
     State(handle): State<NodeHandle>,
     headers: HeaderMap,
@@ -443,13 +451,51 @@ pub(crate) async fn gateway_proxy(
     if let Some(response) = gateway_api_origin_guard(&headers) {
         return response;
     }
+    if request.head.user_pop.is_none() {
+        return crate::refused_response(
+            StatusCode::UNAUTHORIZED,
+            &crate::handle::Refused::new(
+                "caller_proof_missing",
+                "the gateway proxy requires a signed caller — stamp the head's user_pop \
+                 with an Identity account key",
+            ),
+        );
+    }
     let body = match base64::engine::general_purpose::STANDARD.decode(request.body_b64) {
         Ok(body) => body,
         Err(error) => {
             return error_response(StatusCode::BAD_REQUEST, &format!("body_b64: {error}"));
         }
     };
+    if let Err(failure) = signed_caller(&handle, &request.head, &body).await {
+        return gateway_failure_response(failure);
+    }
     buffered_proxy_reply(proxy_current(&handle, request.head, one_shot_body(body)).await).await
+}
+
+/// Verify the caller proof a `/v1/gateway/proxy` head carries, against the
+/// route it names and the exact body it came with — the SAME check the
+/// publisher repeats before any upstream I/O ([`gateway_caller_account`]).
+/// A proof that resolves to no account is refused, never proxied anonymously.
+async fn signed_caller(
+    handle: &NodeHandle,
+    head: &gateway::ProxyRequestHead,
+    body: &[u8],
+) -> Result<(), GatewayFailure> {
+    let record = current_route(handle, head.account_id, &head.name).await?;
+    let caller = gateway_caller_account(
+        &handle.cmds,
+        head,
+        &record.statement,
+        &gateway::body_digest(body),
+    )
+    .await?;
+    match caller {
+        Some(_account) => Ok(()),
+        None => Err(GatewayFailure::Forbidden(
+            "gateway caller proof is missing".into(),
+        )),
+    }
 }
 
 /// The signed-write guard admits exactly the existing node operator credentials.

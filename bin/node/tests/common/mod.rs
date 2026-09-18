@@ -1231,12 +1231,13 @@ impl NetworkShapeCluster {
             scopes: Vec::new(),
             needs: Vec::new(),
         };
-        let body = serde_json::to_value(&hello).expect("a hello serializes");
+        let body = serde_json::to_vec(&hello).expect("a hello serializes");
         let port = self.http_ports[idx];
+        let workspace = self.workspace(idx);
         // a hello lands once the node has published its mesh identity — the
         // fact the real daemon waits on before its own first POST.
         self.wait_marker(idx, "mesh identity published", Duration::from_secs(60));
-        let reply = nettest::try_http_json(port, "POST", "/v1/services/hello", Some(&body));
+        let reply = send_hello(port, &workspace, &body);
         assert!(
             matches!(reply, Ok((200, _))),
             "node idx {idx} refused a {kind:?} hello ({reply:?});\n{}",
@@ -1250,7 +1251,7 @@ impl NetworkShapeCluster {
             .spawn(move || {
                 loop {
                     std::thread::sleep(noded::services::HELLO_TTL / 3);
-                    let _ = nettest::try_http_json(port, "POST", "/v1/services/hello", Some(&body));
+                    let _ = send_hello(port, &workspace, &body);
                 }
             })
             .expect("spawn the hello heartbeat");
@@ -2508,6 +2509,21 @@ fn clone_forge_at(port: u16, workspace: &Path, name: &str, destination: &Path) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// one `POST /v1/services/hello` the way the real daemon sends it: under the
+/// node's service-link token, re-read per call because a node restart mints a
+/// fresh one.
+fn send_hello(port: u16, workspace: &Path, body: &[u8]) -> std::io::Result<(u16, Vec<u8>)> {
+    let token = noded::services::read_link_token(workspace).map_err(std::io::Error::other)?;
+    nettest::try_http_bytes_with(
+        port,
+        "POST",
+        "/v1/services/hello",
+        "application/json",
+        &[(noded::services::LINK_TOKEN_HEADER, &token)],
+        body,
+    )
 }
 
 fn command_output(out: &std::process::Output) -> String {

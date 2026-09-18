@@ -240,6 +240,12 @@ fn staged_set_verdict(
 /// the file a node writes its service-link secret into, next to `node.toml`.
 pub const LINK_TOKEN_FILE: &str = "service-link.token";
 
+/// the HTTP header a local service daemon presents that secret in, on the
+/// routes that are its own (`crate::signed_req`'s service-link lane:
+/// `POST /v1/services/hello`). The ws link carries the same secret in its
+/// attach frame instead.
+pub const LINK_TOKEN_HEADER: &str = "x-ducktape-service-link";
+
 /// Mint this node's service-link secret and write it 0600 next to `node.toml`.
 ///
 /// Holding the link means BECOMING this node's interactive plane: the holder
@@ -368,7 +374,7 @@ impl HelloRefusal {
 
     /// the operator-facing sentence. It describes only what the CALLER sent or
     /// what this node's capacity is — never a fact about this node the caller
-    /// did not already have, since the route is unauthenticated.
+    /// did not already have.
     pub fn message(self) -> String {
         match self {
             HelloRefusal::Malformed(detail) => detail.to_string(),
@@ -557,34 +563,26 @@ fn expire(entries: &mut HashMap<String, Entry>, now: Instant) {
     });
 }
 
-// AUTH: a hello is DELIBERATELY the one write-shaped route with no credential —
-// it is not in the signed-write table (`crate::signed_req`) that `/v1/submit`
-// and `/v1/term/sessions` are, and it should not be. An entry grants NOTHING
-// (it is volatile presence that ages out on its own TTL; consent happens in
-// `ducktape service enable`), so the weakest gate on the surface is the right
-// one, and a daemon that has not yet read the node's workspace must still be
-// able to say it is up. What DOES run in front of it is the browser
-// `origin_guard` + CORS allowlist: the CLI sends no `Origin` and is allowed, a
-// browser must present an allowlisted one.
-//
-// NOTE the transport assumption: unlike `/v1/submit`, which carries a signed
-// frame and is therefore safe wherever it is reachable, a hello is
-// UNAUTHENTICATED — it is trusted only because `http_listen` is expected to
-// stay on loopback or a private tailnet. Binding the node's HTTP surface to a
-// public interface would let any reachable host occupy a kind in this catalog
-// (and so appear in `service list` for a user to enable). The cap and TTL
-// bound the damage; they do not replace keeping the surface private.
+// AUTH: a hello takes this node's SERVICE-LINK token, on the signed-write
+// table's service-link lane (`crate::signed_req`), and the handler below reads
+// nothing more: the lane is the whole gate. An entry grants nothing by itself
+// (volatile presence that ages out on its own TTL; consent happens in
+// `ducktape service enable`), but it lands in the catalog `service list` puts
+// in front of the operator to enable from, so "can dial the port" — any host
+// that reaches `http_listen` — must not be able to occupy a kind in it. The
+// daemon already holds the token: it reads the same 0600 file beside
+// `node.toml` to take its ws link. The browser `origin_guard` + CORS allowlist
+// still run in front of it.
 
 /// POST /v1/services/hello — a local service daemon declares (or refreshes)
 /// its presence. Returns the TTL it must re-signal within, and this node's own
 /// build so the daemon can name any skew between them.
 ///
-/// The build rides the OK body and never a refusal body — and NOT because a
-/// 200 authenticates anyone. It does not: this route is unauthenticated (see
-/// the AUTH note above), so any local process reads the stamp by posting a
-/// hello, exactly as it used to read it out of the old gate's 409. Nothing was
-/// closed by moving it, and nothing needed to be: a stamp is compiled into a
-/// binary any local process can already read.
+/// The build rides the OK body and never a refusal body, and a 200 is not what
+/// authenticates the caller: the service-link lane did that before this ran
+/// (see the AUTH note above). A stamp is compiled into a binary any local
+/// process can already read, so answering it to a daemon that holds the token
+/// closes nothing and opens nothing.
 ///
 /// The reason is that a body must answer the request it is on. A refusal
 /// describes what the CALLER sent or what this node's capacity is, and adding
@@ -885,11 +883,9 @@ mod build_is_metadata_not_a_gate {
 
     #[test]
     fn no_refusal_message_leaks_this_node_s_build() {
-        // the deleted `BuildMismatch` interpolated `build_identity()` into a
-        // message that `hello()` returned verbatim in the 409 body — handing
-        // an unauthenticated caller the correct stamp on its first wrong
-        // guess. Every surviving refusal describes the CALLER's input or this
-        // node's capacity, and nothing else.
+        // a refusal body answers the request it is on: every refusal describes
+        // the CALLER's input or this node's capacity, and never this node's
+        // own build stamp.
         let messages = [
             HelloRefusal::Malformed("kind must be 1..32 chars of [a-z0-9-]").message(),
             HelloRefusal::CatalogFull.message(),
