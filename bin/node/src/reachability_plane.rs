@@ -405,7 +405,7 @@ pub(crate) fn wire_reachability_plane<S, R>(
     wireguard_advertised: Option<Ingress>,
     coordinators: Vec<Ingress>,
     intro_listen: Option<std::net::SocketAddr>,
-    // the genesis-issued admission capability presented on every coordinator
+    // the validator-issued admission capability presented on every coordinator
     // request (private coordination); `None` for a genesis validator, a public
     // coordinator, or the dev shape.
     coord_cap: Option<nat_traversal::CoordCap>,
@@ -1234,7 +1234,7 @@ async fn reachability_plane(
     // the invite intro listener: where a fresh joiner announces its keys
     // (token-authenticated) so its tunnel exists before any p2p.
     intro_listen: Option<std::net::SocketAddr>,
-    // the genesis-issued admission capability presented on every coordinator
+    // the validator-issued admission capability presented on every coordinator
     // request (private coordination); `None` for a genesis validator, a public
     // coordinator, or the dev shape.
     coord_cap: Option<nat_traversal::CoordCap>,
@@ -1437,7 +1437,7 @@ async fn reachability_plane(
     let (invite_intro_tx, mut invite_intro_rx) = (Some(invite_intro_tx), Some(invite_intro_rx));
     // authenticate every coordinator request: the node signs a
     // proof-of-possession with its identity key and, in private coordination,
-    // carries the genesis-issued cap. A fully-open coordinator ignores the
+    // carries the validator-issued cap. A fully-open coordinator ignores the
     // authenticator; a public/private one requires it. With no coordinators
     // configured `bind` short-circuits to pass-through and never touches this.
     let resolver = match &socket_underlay {

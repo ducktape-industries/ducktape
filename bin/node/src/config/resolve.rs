@@ -101,12 +101,12 @@ pub struct Resolved {
     /// Empty for the dev shape and for members.
     pub invite_fronts: Vec<Front>,
     /// the reachability plane's coordination privacy (per-network operational
-    /// policy). `Private` (the default) requires a genesis-issued `CoordCap`
-    /// for a node outside the genesis validator set; `Public` accepts any
+    /// policy). `Private` (the default) requires a validator-issued `CoordCap`
+    /// for a node outside the validator set; `Public` accepts any
     /// proof-of-possession. The dev shape is always `Private` (it never uses a
     /// real coordinator).
     pub coordination: Coordination,
-    /// the genesis-issued admission capability this node presents on every
+    /// the validator-issued admission capability this node presents on every
     /// coordinator request (loaded from `coord.cap` beside the identity).
     /// `None` for a genesis validator (admitted by membership), the dev shape,
     /// or a node that has not been issued one.

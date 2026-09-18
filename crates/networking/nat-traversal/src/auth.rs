@@ -1,10 +1,12 @@
 //! Coordinator authorization: a per-request authenticator
-//! (proof-of-possession plus an optional genesis-issued capability) verified
-//! statelessly against a PUBLIC pin. The coordinator holds no secret; every
-//! check here is a clock read plus one or two ed25519 verifications against
-//! public keys.
+//! (proof-of-possession plus an optional validator-issued capability) verified
+//! statelessly against PUBLIC keys: the genesis set pinned at boot and the live
+//! validator set the coordinator's node reports. The coordinator holds no
+//! secret; every check here is a clock read plus one or two ed25519
+//! verifications against public keys.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonware_cryptography::{Signer as _, Verifier as _, ed25519};
@@ -79,7 +81,13 @@ pub const DEFAULT_FRESHNESS_WINDOW_SECS: u64 = 30;
 /// TTL should shrink to match the rotation cadence.
 pub const COORD_CAP_TTL_SECS: u64 = 365 * 24 * 3600;
 
-/// A signed admission capability. A genesis validator (`issuer`) vouches that
+/// How long a reading of the live validator set admits after it was taken, in
+/// seconds. The coordinator re-reads its node well inside this; a reading older
+/// than it describes a set that may have moved on without the coordinator
+/// hearing, so a key known ONLY from it no longer admits.
+pub const LIVE_VALSET_TTL_SECS: u64 = 60;
+
+/// A signed admission capability. A validator (`issuer`) vouches that
 /// `subject` (implied — the request's key) is authorized until `not_after`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CoordCap {
@@ -102,10 +110,76 @@ pub enum AuthPolicy {
     /// Public coordination: every request proves possession of its node key.
     #[default]
     Public,
-    /// Private coordination: PoP + admission against the pinned genesis set.
+    /// Private coordination: PoP + admission against the network's validators —
+    /// the genesis set pinned at boot, which always admits, plus the `live` set
+    /// the coordinator's node last reported, which admits inside
+    /// [`LIVE_VALSET_TTL_SECS`].
     Private {
         genesis_set: Vec<ed25519::PublicKey>,
+        live: LiveValset,
     },
+}
+
+/// The network's CURRENT validator set as the node a private coordinator is
+/// configured to follow last reported it, and when. It is what lets a cap
+/// signed by a validator promoted after genesis admit. Empty until the first
+/// reading; one task records readings, every verifier reads them.
+#[derive(Clone, Debug, Default)]
+pub struct LiveValset(Arc<RwLock<Option<ValsetReading>>>);
+
+#[derive(Debug)]
+struct ValsetReading {
+    validators: Vec<ed25519::PublicKey>,
+    read_at: u64,
+}
+
+/// What the admission set says about one key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Standing {
+    /// Neither a genesis validator nor named by any live reading.
+    Stranger,
+    /// Named ONLY by a live reading past its TTL: the node that vouched for it
+    /// has not answered since, so it admits nothing.
+    Stale,
+    /// A genesis validator, or one a live reading names inside its TTL.
+    Validator,
+}
+
+impl LiveValset {
+    /// Replace the reading with `validators`, read at `read_at` (unix seconds).
+    pub fn record(&self, validators: Vec<ed25519::PublicKey>, read_at: u64) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Some(ValsetReading {
+            validators,
+            read_at,
+        });
+    }
+
+    /// Is there no reading inside its TTL at `now`?
+    pub fn expired(&self, now: u64) -> bool {
+        let reading = self.0.read().unwrap_or_else(PoisonError::into_inner);
+        reading
+            .as_ref()
+            .is_none_or(|reading| !reading.fresh_at(now))
+    }
+
+    fn standing(&self, key: &[u8], now: u64) -> Standing {
+        let reading = self.0.read().unwrap_or_else(PoisonError::into_inner);
+        let Some(reading) = reading.as_ref() else {
+            return Standing::Stranger;
+        };
+        let named = reading.validators.iter().any(|v| v.as_ref() == key);
+        match (named, reading.fresh_at(now)) {
+            (false, _) => Standing::Stranger,
+            (true, false) => Standing::Stale,
+            (true, true) => Standing::Validator,
+        }
+    }
+}
+
+impl ValsetReading {
+    fn fresh_at(&self, now: u64) -> bool {
+        now < self.read_at.saturating_add(LIVE_VALSET_TTL_SECS)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -114,8 +188,13 @@ pub enum AuthError {
     Stale,
     /// Proof-of-possession signature did not verify against the subject key.
     BadPop,
-    /// Private mode: subject is neither a genesis member nor holds a valid cap.
+    /// Private mode: subject is neither a validator nor holds a valid cap one
+    /// signed.
     NotAdmitted,
+    /// Private mode: the key that would admit (the subject, or its cap's
+    /// issuer) is a validator only by a live reading past its TTL — the
+    /// coordinator's node has not answered since, so it fails closed.
+    ValsetStale,
     /// The request's NodeKey is not a valid ed25519 public key.
     BadSubjectKey,
 }
@@ -150,7 +229,7 @@ fn subject_pubkey(subject: NodeKey) -> Option<ed25519::PublicKey> {
 }
 
 /// Mint a capability binding `subject` (a node's ed25519 key) to `not_after`,
-/// signed by `issuer` (a genesis validator's private key).
+/// signed by `issuer` (a current validator's private key).
 pub fn mint_coord_cap(issuer: &ed25519::PrivateKey, subject: NodeKey, not_after: u64) -> CoordCap {
     CoordCap {
         issuer: issuer.public_key(),
@@ -174,18 +253,43 @@ pub fn sign_authenticator(
     }
 }
 
-fn cap_admits(
-    cap: &CoordCap,
-    subject: NodeKey,
+/// Private-mode admission: the subject IS a validator, or presents an
+/// unexpired cap a validator signed for it. The genesis set always admits; the
+/// live set admits inside its TTL, and a key only a lapsed reading names is
+/// refused by name ([`AuthError::ValsetStale`]) rather than as a stranger.
+fn admit(
     genesis_set: &[ed25519::PublicKey],
+    live: &LiveValset,
+    subject: NodeKey,
+    cap: Option<&CoordCap>,
     now: u64,
-) -> bool {
-    if cap.not_after <= now {
-        return false;
+) -> Result<(), AuthError> {
+    let standing = |key: &[u8]| match genesis_set.iter().any(|g| g.as_ref() == key) {
+        true => Standing::Validator,
+        false => live.standing(key, now),
+    };
+    let member = standing(subject.0.as_slice());
+    if member == Standing::Validator {
+        return Ok(());
     }
-    if !genesis_set.iter().any(|g| g == &cap.issuer) {
-        return false;
+    let unexpired_cap = cap.filter(|cap| cap.not_after > now);
+    let issuer = unexpired_cap.map_or(Standing::Stranger, |cap| standing(cap.issuer.as_ref()));
+    // the signature is checked only for an issuer the set knows: a stranger's
+    // cap is refused without paying for an ed25519 verification.
+    let issuer_known = issuer != Standing::Stranger;
+    let vouched = issuer_known && unexpired_cap.is_some_and(|cap| cap_signed_for(cap, subject));
+    let issuer = match vouched {
+        true => issuer,
+        false => Standing::Stranger,
+    };
+    match member.max(issuer) {
+        Standing::Validator => Ok(()),
+        Standing::Stale => Err(AuthError::ValsetStale),
+        Standing::Stranger => Err(AuthError::NotAdmitted),
     }
+}
+
+fn cap_signed_for(cap: &CoordCap, subject: NodeKey) -> bool {
     cap.issuer.verify(
         COORD_CAP_NS,
         &cap_msg(subject, cap.not_after),
@@ -243,20 +347,12 @@ pub(crate) fn verify_request_using(
     }
 
     // 3. Admission (private mode only).
-    if let AuthPolicy::Private { genesis_set } = policy {
-        let is_member = genesis_set
-            .iter()
-            .any(|g| g.as_ref() == subject.0.as_slice());
-        let by_cap = auth
-            .cap
-            .as_ref()
-            .is_some_and(|cap| cap_admits(cap, subject, genesis_set, now));
-        if !is_member && !by_cap {
-            return Err(AuthError::NotAdmitted);
+    match policy {
+        AuthPolicy::Public => Ok(()),
+        AuthPolicy::Private { genesis_set, live } => {
+            admit(genesis_set, live, subject, auth.cap.as_ref(), now)
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -321,12 +417,144 @@ mod tests {
         );
     }
 
+    /// A private policy pinned to `genesis`, following `live`.
+    fn private(genesis: &ed25519::PrivateKey, live: &LiveValset) -> AuthPolicy {
+        AuthPolicy::Private {
+            genesis_set: vec![genesis.public_key()],
+            live: live.clone(),
+        }
+    }
+
+    /// The request a `joiner` carrying a cap `issuer` minted sends at `now`.
+    fn capped(
+        joiner: &ed25519::PrivateKey,
+        issuer: &ed25519::PrivateKey,
+        now: u64,
+    ) -> (NodeKey, Authenticator) {
+        let subject = nk(&joiner.public_key());
+        let cap = mint_coord_cap(issuer, subject, now + 3600);
+        (subject, sign_authenticator(joiner, INNER, now, Some(cap)))
+    }
+
+    #[test]
+    fn a_cap_minted_by_a_live_validator_admits() {
+        let (genesis, promoted, joiner) = (key(10), key(11), key(20));
+        let live = LiveValset::default();
+        let policy = private(&genesis, &live);
+        let now = 2_000_000;
+        let (subject, auth) = capped(&joiner, &promoted, now);
+
+        live.record(vec![genesis.public_key(), promoted.public_key()], now);
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &auth),
+            Ok(())
+        );
+        // the promoted validator itself needs no cap either.
+        let own = sign_authenticator(&promoted, INNER, now, None);
+        assert_eq!(
+            verify_request(&policy, now, 30, nk(&promoted.public_key()), INNER, &own),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_genesis_set_admits_without_any_reading() {
+        let (genesis, joiner) = (key(10), key(20));
+        let live = LiveValset::default();
+        let policy = private(&genesis, &live);
+        let now = 2_000_000;
+        let (subject, auth) = capped(&joiner, &genesis, now);
+
+        // never read, then read long ago, then read without the founder: the
+        // genesis set is the floor under all three.
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &auth),
+            Ok(())
+        );
+        live.record(vec![genesis.public_key()], now - 10 * LIVE_VALSET_TTL_SECS);
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &auth),
+            Ok(())
+        );
+        live.record(vec![key(11).public_key()], now);
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &auth),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_cap_minted_outside_both_sets_is_not_admitted() {
+        let (genesis, promoted, outsider, joiner) = (key(10), key(11), key(12), key(20));
+        let live = LiveValset::default();
+        let policy = private(&genesis, &live);
+        let now = 2_000_000;
+        live.record(vec![genesis.public_key(), promoted.public_key()], now);
+
+        let (subject, auth) = capped(&joiner, &outsider, now);
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &auth),
+            Err(AuthError::NotAdmitted)
+        );
+        // a live validator's name on a cap it never signed buys nothing.
+        let (subject, mut forged) = capped(&joiner, &outsider, now);
+        forged.cap.as_mut().expect("capped").issuer = promoted.public_key();
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &forged),
+            Err(AuthError::NotAdmitted)
+        );
+    }
+
+    #[test]
+    fn a_lapsed_reading_fails_closed_by_name() {
+        let (genesis, promoted, joiner) = (key(10), key(11), key(20));
+        let live = LiveValset::default();
+        let policy = private(&genesis, &live);
+        let read_at = 2_000_000;
+        live.record(vec![genesis.public_key(), promoted.public_key()], read_at);
+
+        // the node stopped answering: no reading replaces this one, and the
+        // clock runs past its TTL.
+        let now = read_at + LIVE_VALSET_TTL_SECS;
+        assert!(live.expired(now));
+        let (subject, auth) = capped(&joiner, &promoted, now);
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &auth),
+            Err(AuthError::ValsetStale)
+        );
+        let own = sign_authenticator(&promoted, INNER, now, None);
+        assert_eq!(
+            verify_request(&policy, now, 30, nk(&promoted.public_key()), INNER, &own),
+            Err(AuthError::ValsetStale)
+        );
+    }
+
+    #[test]
+    fn a_reading_admits_for_its_whole_window_without_a_new_one() {
+        let (genesis, promoted, joiner) = (key(10), key(11), key(20));
+        let live = LiveValset::default();
+        let policy = private(&genesis, &live);
+        let read_at = 2_000_000;
+        live.record(vec![genesis.public_key(), promoted.public_key()], read_at);
+
+        // every read since failed; the last good one still stands until the
+        // final second of its window.
+        let now = read_at + LIVE_VALSET_TTL_SECS - 1;
+        assert!(!live.expired(now));
+        let (subject, auth) = capped(&joiner, &promoted, now);
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &auth),
+            Ok(())
+        );
+    }
+
     #[test]
     fn private_admits_genesis_member_without_cap() {
         let g = key(10);
         let subject = nk(&g.public_key());
         let policy = AuthPolicy::Private {
             genesis_set: vec![g.public_key()],
+            live: LiveValset::default(),
         };
         let now = 2_000_000;
         let auth = sign_authenticator(&g, INNER, now, None);
@@ -343,6 +571,7 @@ mod tests {
         let subject = nk(&outsider.public_key());
         let policy = AuthPolicy::Private {
             genesis_set: vec![g.public_key()],
+            live: LiveValset::default(),
         };
         let now = 2_000_000;
         let auth = sign_authenticator(&outsider, INNER, now, None); // valid PoP, but not admitted
@@ -359,6 +588,7 @@ mod tests {
         let subject = nk(&joiner.public_key());
         let policy = AuthPolicy::Private {
             genesis_set: vec![g.public_key()],
+            live: LiveValset::default(),
         };
         let now = 2_000_000;
         let cap = mint_coord_cap(&g, subject, now + 3600);
@@ -377,6 +607,7 @@ mod tests {
         let subject = nk(&joiner.public_key());
         let policy = AuthPolicy::Private {
             genesis_set: vec![g.public_key()],
+            live: LiveValset::default(),
         };
         let now = 2_000_000;
 
