@@ -119,6 +119,10 @@ pub enum AttemptResult {
         code: join_gate::RejectCode,
         detail: String,
     },
+    /// a member ANSWERED and refused this intro before its gate (an expired
+    /// invite, a clock too far off, a full join window): the race fails over
+    /// like `Failed`, but this is an answer, and the one that names the fix.
+    Refused(String),
     /// the attempt exhausted its window, was refused non-terminally, or the
     /// plane went away — the race fails over to the next candidate.
     Failed(String),
@@ -147,8 +151,14 @@ pub enum FirstContactOutcome {
         detail: String,
     },
     /// every offered path was exhausted. HONEST: the caller must surface this
-    /// and exit non-zero rather than proceed as if joined.
-    Terminal { tried: usize, reason: String },
+    /// and exit non-zero rather than proceed as if joined. `refused` is the
+    /// last refusal a member answered with, if any did — then the mesh was
+    /// reached, and it is the refusal that says what to fix.
+    Terminal {
+        tried: usize,
+        reason: String,
+        refused: Option<String>,
+    },
 }
 
 /// the inviter as a first-contact candidate (its own WireGuard bootstrap).
@@ -285,9 +295,15 @@ fn is_v4_shared_address(ip: Ipv4Addr) -> bool {
 /// cancelled (their futures are dropped). Exhaustion ⇒ an honest
 /// [`FirstContactOutcome::Terminal`]. Pure over the attempt function so the
 /// selection logic is unit-testable without a live plane.
+///
+/// Every refusal a member answers with is logged as it lands and written to
+/// `refused` — an out-slot, not the return value, because the caller's window
+/// may drop this race mid-flight and the refusal must outlive it.
 pub async fn race_first_contact<F, Fut>(
     candidates: Vec<Candidate>,
     attempt: F,
+    label: &str,
+    refused: &mut Option<String>,
 ) -> FirstContactOutcome
 where
     F: Fn(Candidate) -> Fut,
@@ -300,6 +316,7 @@ where
             reason: "no reachable first-contact paths in the invite (inviter + fronts all \
                      filtered out for this effect mode)"
                 .into(),
+            refused: refused.clone(),
         };
     }
     let mut inflight = futures::stream::FuturesUnordered::new();
@@ -327,12 +344,32 @@ where
             AttemptResult::Rejected { code, detail } => {
                 return FirstContactOutcome::Rejected { code, detail };
             }
+            AttemptResult::Refused(detail) => {
+                // once per candidate per race, but a joiner that already
+                // holds standing re-races forever: latched.
+                static REFUSED: noded::log::Latch = noded::log::Latch::new(10);
+                if let Some(attempts) = REFUSED.hit("first_contact_refused") {
+                    tracing::warn!(
+                        target: "ducktape::join",
+                        node = %label,
+                        peer = %noded::hex_bytes(&key.as_ref()[..4]),
+                        via = %via,
+                        reason = "first_contact_refused",
+                        detail = %detail,
+                        attempts,
+                        "a member REFUSED this join — failing over to the next path"
+                    );
+                }
+                last_reason = detail.clone();
+                *refused = Some(detail);
+            }
             AttemptResult::Failed(reason) => last_reason = reason,
         }
     }
     FirstContactOutcome::Terminal {
         tried,
         reason: last_reason,
+        refused: refused.clone(),
     }
 }
 
@@ -407,26 +444,33 @@ pub async fn drive_first_contact(
             }
         }
     };
+    // what any member refused, across BOTH lanes and past either window.
+    let mut refused = None;
     // The window is a HARD bound, not just loop pacing: an attempt parked on
     // a reply the plane never sends (its command loop stalled) would
     // otherwise hang the race forever — no Terminal, no exit, no log line.
-    let udp_outcome =
-        match tokio::time::timeout(window, race_first_contact(candidates.clone(), attempt)).await {
-            Ok(outcome) => outcome,
-            Err(_elapsed) => FirstContactOutcome::Terminal {
-                tried,
-                reason: format!(
-                    "join window ({}s) elapsed with no candidate acked — every path stayed dark \
-                     (reachability plane unresponsive or peers unreachable)",
-                    window.as_secs()
-                ),
-            },
-        };
+    let udp_outcome = match tokio::time::timeout(
+        window,
+        race_first_contact(candidates.clone(), attempt, &label, &mut refused),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => FirstContactOutcome::Terminal {
+            tried,
+            reason: format!(
+                "join window ({}s) elapsed with no candidate acked — every path stayed dark \
+                 (reachability plane unresponsive or peers unreachable)",
+                window.as_secs()
+            ),
+            refused: None,
+        },
+    };
     // the gate SETTLED over UDP (admitted, or terminally refused): the relay
     // lane exists only for the exhausted case, never to second-guess an
     // authoritative answer.
     let (udp_tried, udp_reason) = match udp_outcome {
-        FirstContactOutcome::Terminal { tried, reason } => (tried, reason),
+        FirstContactOutcome::Terminal { tried, reason, .. } => (tried, reason),
         settled => return settled,
     };
     // an empty candidate set gives the relay nothing to reach either.
@@ -434,6 +478,7 @@ pub async fn drive_first_contact(
         return FirstContactOutcome::Terminal {
             tried: udp_tried,
             reason: udp_reason,
+            refused,
         };
     };
     // once-per-race lifecycle fact: the join changed lanes.
@@ -464,7 +509,7 @@ pub async fn drive_first_contact(
     // ever comes back) must not hang the join past its window.
     let fallback_outcome = match tokio::time::timeout(
         RELAY_WINDOW,
-        race_first_contact(candidates, relay_attempt_of),
+        race_first_contact(candidates, relay_attempt_of, &label, &mut refused),
     )
     .await
     {
@@ -475,6 +520,7 @@ pub async fn drive_first_contact(
                 "relay window ({}s) elapsed with no candidate acked through any relay",
                 RELAY_WINDOW.as_secs()
             ),
+            refused: None,
         },
     };
     match fallback_outcome {
@@ -492,6 +538,7 @@ pub async fn drive_first_contact(
             FirstContactOutcome::Terminal {
                 tried,
                 reason: format!("udp: {udp_reason}; relay: {reason}"),
+                refused,
             }
         }
         settled => settled,
@@ -536,7 +583,7 @@ fn ack_resolution(reply: join_gate::IntroReply) -> Option<AttemptResult> {
             detail,
             terminal: false,
         } => Some(AttemptResult::Failed(format!("{code:?}: {detail}"))),
-        join_gate::IntroReply::Refused { detail } => Some(AttemptResult::Failed(detail)),
+        join_gate::IntroReply::Refused { detail } => Some(AttemptResult::Refused(detail)),
     }
 }
 
@@ -1090,16 +1137,21 @@ mod tests {
                 intro: None,
             },
         ];
-        let outcome = race_first_contact(candidates, |c| async move {
-            match c.endpoint.as_deref() {
-                Some("win") => AttemptResult::Admitted {
-                    height: 7,
-                    cap: Some(vec![1, 2, 3]),
-                },
-                // the loser never resolves; the race must not wait on it.
-                _ => std::future::pending::<AttemptResult>().await,
-            }
-        })
+        let outcome = race_first_contact(
+            candidates,
+            |c| async move {
+                match c.endpoint.as_deref() {
+                    Some("win") => AttemptResult::Admitted {
+                        height: 7,
+                        cap: Some(vec![1, 2, 3]),
+                    },
+                    // the loser never resolves; the race must not wait on it.
+                    _ => std::future::pending::<AttemptResult>().await,
+                }
+            },
+            "test",
+            &mut None,
+        )
         .await;
         match outcome {
             FirstContactOutcome::Admitted {
@@ -1138,15 +1190,20 @@ mod tests {
                 intro: None,
             },
         ];
-        let outcome = race_first_contact(candidates, |c| async move {
-            match c.endpoint.as_deref() {
-                Some("reject") => AttemptResult::Rejected {
-                    code: join_gate::RejectCode::Spent,
-                    detail: "invite already redeemed".into(),
-                },
-                _ => std::future::pending::<AttemptResult>().await,
-            }
-        })
+        let outcome = race_first_contact(
+            candidates,
+            |c| async move {
+                match c.endpoint.as_deref() {
+                    Some("reject") => AttemptResult::Rejected {
+                        code: join_gate::RejectCode::Spent,
+                        detail: "invite already redeemed".into(),
+                    },
+                    _ => std::future::pending::<AttemptResult>().await,
+                }
+            },
+            "test",
+            &mut None,
+        )
         .await;
         match outcome {
             FirstContactOutcome::Rejected { code, detail } => {
@@ -1196,7 +1253,7 @@ mod tests {
             ack_resolution(join_gate::IntroReply::Refused {
                 detail: "no".into()
             }),
-            Some(AttemptResult::Failed(_))
+            Some(AttemptResult::Refused(_))
         ));
     }
 
@@ -1246,20 +1303,69 @@ mod tests {
                 intro: None,
             },
         ];
-        let outcome = race_first_contact(candidates, |_c| async move {
-            AttemptResult::Failed("nope".into())
-        })
+        let outcome = race_first_contact(
+            candidates,
+            |_c| async move { AttemptResult::Failed("nope".into()) },
+            "test",
+            &mut None,
+        )
         .await;
         match outcome {
-            FirstContactOutcome::Terminal { tried, reason } => {
+            FirstContactOutcome::Terminal {
+                tried,
+                reason,
+                refused,
+            } => {
                 assert_eq!(tried, 2);
                 assert!(
                     reason.contains("nope"),
                     "reason names the failure: {reason}"
                 );
+                assert_eq!(refused, None, "no member answered, so none refused");
             }
             other => panic!("expected Terminal, got {other:?}"),
         }
+    }
+
+    /// a member that answers with a refusal fails its candidate over, but the
+    /// refusal is what reaches the terminal — and it survives a caller's
+    /// window cutting the race while a dark twin is still waiting.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_reaches_the_terminal_and_outlives_a_cut_race() {
+        let attempt = |c: Candidate| async move {
+            match c.endpoint.as_deref() {
+                Some("refuse") => AttemptResult::Refused("invite expired".into()),
+                Some("fail") => AttemptResult::Failed("no ack".into()),
+                _ => std::future::pending::<AttemptResult>().await,
+            }
+        };
+        let answered = vec![
+            direct_candidate("refuse", None),
+            direct_candidate("fail", None),
+        ];
+        let mut refused = None;
+        match race_first_contact(answered, attempt, "test", &mut refused).await {
+            FirstContactOutcome::Terminal { refused, .. } => {
+                assert_eq!(refused.as_deref(), Some("invite expired"));
+            }
+            other => panic!("expected Terminal, got {other:?}"),
+        }
+
+        let with_dark_twin = vec![
+            direct_candidate("refuse", None),
+            direct_candidate("dark", None),
+        ];
+        let mut refused = None;
+        let cut = tokio::time::timeout(
+            Duration::from_secs(90),
+            race_first_contact(with_dark_twin, attempt, "test", &mut refused),
+        )
+        .await;
+        assert!(
+            cut.is_err(),
+            "the dark twin holds the race open past the window"
+        );
+        assert_eq!(refused.as_deref(), Some("invite expired"));
     }
 
     fn direct_candidate(endpoint: &str, intro: Option<&str>) -> Candidate {
@@ -1367,12 +1473,17 @@ mod tests {
     async fn empty_candidate_set_is_terminal_not_a_hang() {
         // an invite that offers no contactable candidate leaves nothing to
         // race — an immediate honest terminal, never a hang.
-        let outcome = race_first_contact(Vec::new(), |_c| async move {
-            AttemptResult::Admitted {
-                height: 1,
-                cap: None,
-            }
-        })
+        let outcome = race_first_contact(
+            Vec::new(),
+            |_c| async move {
+                AttemptResult::Admitted {
+                    height: 1,
+                    cap: None,
+                }
+            },
+            "test",
+            &mut None,
+        )
         .await;
         assert!(matches!(
             outcome,
@@ -1643,7 +1754,7 @@ mod tests {
         )
         .await;
         match outcome {
-            FirstContactOutcome::Terminal { tried, reason } => {
+            FirstContactOutcome::Terminal { tried, reason, .. } => {
                 assert_eq!(tried, 1);
                 assert!(
                     reason.contains("target_unregistered"),

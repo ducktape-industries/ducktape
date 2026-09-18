@@ -152,6 +152,8 @@ async fn junk_neither_installs_nor_acks() {
 #[tokio::test]
 async fn a_failed_verification_stays_silent() {
     // a well-formed intro minted for ANOTHER network: decodes, fails verify.
+    // Its WG key is unproven, so the refusal is the member's log line alone —
+    // nothing goes back on the wire.
     let (bytes, _, _) = intro_bytes();
     for path in [IntroPath::Direct, IntroPath::Coordinated] {
         let (cmd_tx, mut cmd_rx) =
@@ -180,6 +182,45 @@ async fn a_failed_verification_stays_silent() {
     }
 }
 
+/// drive one intro through `handle_intro` with no gate and report what it
+/// did: whether it installed a tunnel peer, and every ack it sent.
+async fn refusal_of(bytes: &[u8], path: IntroPath) -> (bool, Vec<Vec<u8>>) {
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(8);
+    let weak = cmd_tx.downgrade();
+    let acked: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let store = acked.clone();
+    let alive = handle_intro(
+        bytes,
+        src(),
+        BINDING,
+        "test",
+        path,
+        &weak,
+        open_identity,
+        None,
+        |b| {
+            store.lock().unwrap().push(b);
+            async {}
+        },
+    )
+    .await;
+    assert!(alive);
+    let installed = cmd_rx.try_recv().is_ok();
+    let acks = acked.lock().unwrap().clone();
+    (installed, acks)
+}
+
+/// the one ack a refused intro earns, opened with the joiner's WG secret.
+fn refused_detail(wg: &reachability::WireGuardKeypair, acks: &[Vec<u8>]) -> String {
+    let [ack] = acks else {
+        panic!("expected exactly one ack, got {}", acks.len());
+    };
+    match open_sealed_ack(wg, ack).reply {
+        join_gate::IntroReply::Refused { detail } => detail,
+        other => panic!("expected Refused, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn an_expired_token_neither_installs_nor_tunnels() {
     // a cryptographically VALID intro whose token expired: verify passes (the
@@ -198,38 +239,41 @@ async fn an_expired_token_neither_installs_nor_tunnels() {
         wg.public_key().0,
         nat_traversal::now_secs(),
     ));
+    // BOTH doorbells owe the joiner the reason: a coordinated joiner that
+    // hears nothing waits out its whole window and blames the mesh.
+    for path in [IntroPath::Direct, IntroPath::Coordinated] {
+        let (installed, acks) = refusal_of(&bytes, path).await;
+        assert!(!installed, "no tunnel install for an expired token");
+        // the expiry gate runs POST-verify, so its refusal is sealed.
+        let detail = refused_detail(&wg, &acks);
+        assert!(detail.contains("expired"), "{detail}");
+    }
+}
 
-    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(8);
-    let weak = cmd_tx.downgrade();
-    let acked: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
-    let store = acked.clone();
-    let alive = handle_intro(
-        &bytes,
-        src(),
+#[tokio::test]
+async fn a_stale_intro_is_told_its_clock_is_off() {
+    // every signature verifies and only the signed issued-at is out of the
+    // freshness bound: the WG key is proven, so the refusal is sealed to it
+    // and names the clock — the one thing a fresh invite cannot fix.
+    let issuer = ed25519::PrivateKey::from_seed(1);
+    let joiner = ed25519::PrivateKey::from_seed(2);
+    let token = mint_invite_token(&issuer, BINDING, u64::MAX);
+    let wg = joiner_wg_keypair();
+    let skew = join_gate::INTRO_FRESHNESS_SECS + 600;
+    let bytes = join_gate::encode_intro(&join_gate::intro_request(
+        &joiner,
         BINDING,
-        "test",
-        IntroPath::Direct,
-        &weak,
-        open_identity,
-        None,
-        |b| {
-            store.lock().unwrap().push(b);
-            async {}
-        },
-    )
-    .await;
-    assert!(alive);
-    assert!(
-        cmd_rx.try_recv().is_err(),
-        "no tunnel install for an expired token"
-    );
-    let acked = acked.lock().unwrap();
-    // the expiry gate runs POST-verify, so its refusal is sealed.
-    let ack = open_sealed_ack(&wg, &acked[0]);
-    let join_gate::IntroReply::Refused { detail } = ack.reply else {
-        panic!("expected Refused, got {:?}", ack.reply);
-    };
-    assert!(detail.contains("expired"), "{detail}");
+        &token,
+        wg.public_key().0,
+        nat_traversal::now_secs() - skew,
+    ));
+    for path in [IntroPath::Direct, IntroPath::Coordinated] {
+        let (installed, acks) = refusal_of(&bytes, path).await;
+        assert!(!installed, "no tunnel install for a stale intro");
+        let detail = refused_detail(&wg, &acks);
+        assert!(detail.starts_with(join_gate::INTRO_STALE), "{detail}");
+        assert!(detail.contains("clock"), "{detail}");
+    }
 }
 
 #[test]

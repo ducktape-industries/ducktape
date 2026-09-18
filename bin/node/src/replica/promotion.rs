@@ -28,25 +28,38 @@ pub(crate) struct ManifestFetchRetry {
     pub(crate) announce: bool,
 }
 
+/// the line for a parked node's `failures`-th failed boundary fetch, or `None`
+/// when this one stays silent: a sync that never starts must say why at
+/// `warn`, but the loop retries forever — so the first failure speaks, then
+/// every [`BOUNDARY_FETCH_WARN_EVERY`]th, and the count rides along as
+/// `attempts`.
+///
+/// [`BOUNDARY_FETCH_WARN_EVERY`]: crate::constants::BOUNDARY_FETCH_WARN_EVERY
 pub(crate) fn joiner_manifest_fetch_retry(
     label: &str,
     resident_standing: bool,
+    failures: u64,
     error: impl std::fmt::Display,
-) -> ManifestFetchRetry {
+) -> Option<ManifestFetchRetry> {
+    let speaks =
+        failures == 1 || failures.is_multiple_of(crate::constants::BOUNDARY_FETCH_WARN_EVERY);
+    if !speaks {
+        return None;
+    }
     if resident_standing {
-        return ManifestFetchRetry {
+        return Some(ManifestFetchRetry {
             log_line: format!("[node {label}] resident: boundary fetch retrying ({error})"),
             announce: false,
-        };
+        });
     }
-    ManifestFetchRetry {
+    Some(ManifestFetchRetry {
         log_line: format!(
             "[node {label}] joining: redemption not landed yet (or the mesh is unreachable) — \
              the announce keeps retrying and a member node redeems it automatically. retrying \
              ({error})"
         ),
         announce: true,
-    }
+    })
 }
 
 /// a boundary is promotable with its finalization floor on the wire, or bare

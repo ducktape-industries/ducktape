@@ -78,6 +78,29 @@ async fn peers_sample(
         .with_builds(builds)
 }
 
+/// Count one failed boundary fetch and warn on the cadence
+/// [`joiner_manifest_fetch_retry`] sets — every lane that fetches a boundary
+/// shares the one count, so a stalled sync is one climbing `attempts`.
+fn note_boundary_fetch_failure(
+    label: &str,
+    resident_standing: bool,
+    failures: &mut u64,
+    error: impl std::fmt::Display,
+) {
+    *failures += 1;
+    let Some(retry) = joiner_manifest_fetch_retry(label, resident_standing, *failures, error)
+    else {
+        return;
+    };
+    tracing::warn!(
+        target: "ducktape::statesync",
+        reason = "boundary_fetch_failed",
+        attempts = *failures,
+        announce = retry.announce,
+        "{}", retry.log_line
+    );
+}
+
 /// Record the build stamp a polled sync source just reported, and name a
 /// disagreement ONCE.
 ///
@@ -678,6 +701,8 @@ pub(super) async fn park(
     // role) — one Retarget per observed epoch.
     let mut last_plane_epoch: Option<u64> = None;
     let mut attempt = 0usize;
+    // failed boundary fetches, all lanes: the count paces their warn.
+    let mut boundary_fetch_failures = 0u64;
     // once resident standing is seen, parking is the STEADY state
     // (awaiting a deliberate promote) — the not-admitted bail below
     // must never fire.
@@ -2211,13 +2236,12 @@ pub(super) async fn park(
                 // standing, or this is the manual/restore path); a fetch miss
                 // just retries on the next tick — no re-announce, the gate is
                 // done.
-                let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
                 metrics.record_sync_retry(e.to_string());
-                tracing::debug!(
-                    target: "ducktape::statesync",
-                    attempts = attempt,
-                    announce = retry.announce,
-                    "{}", retry.log_line
+                note_boundary_fetch_failure(
+                    &label,
+                    resident_standing,
+                    &mut boundary_fetch_failures,
+                    &e,
                 );
                 continue;
             }
@@ -2391,12 +2415,11 @@ pub(super) async fn park(
                         Ok(m) => m,
                         Err(e) => {
                             metrics.record_sync_retry(e.to_string());
-                            let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
-                            tracing::debug!(
-                                target: "ducktape::statesync",
-                                attempts = attempt,
-                                announce = retry.announce,
-                                "{}", retry.log_line
+                            note_boundary_fetch_failure(
+                                &label,
+                                resident_standing,
+                                &mut boundary_fetch_failures,
+                                &e,
                             );
                             continue;
                         }
@@ -2709,12 +2732,11 @@ pub(super) async fn park(
             Ok(m) => m,
             Err(e) => {
                 metrics.record_sync_retry(e.to_string());
-                let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
-                tracing::debug!(
-                    target: "ducktape::statesync",
-                    attempts = attempt,
-                    announce = retry.announce,
-                    "{}", retry.log_line
+                note_boundary_fetch_failure(
+                    &label,
+                    resident_standing,
+                    &mut boundary_fetch_failures,
+                    &e,
                 );
                 continue;
             }

@@ -438,6 +438,7 @@ pub(super) async fn wire(
                                 first_contact_join::FirstContactOutcome::Terminal {
                                     tried,
                                     reason,
+                                    refused,
                                 } => {
                                     if !restart_with_standing {
                                         // THE INVITE IS THE LAST THING TO SUSPECT. A
@@ -460,6 +461,24 @@ pub(super) async fn wire(
                                                  started, so every offered path was \
                                                  dead before it was tried. A fresh \
                                                  invite cannot help."
+                                            );
+                                            std::process::exit(3);
+                                        }
+                                        // a member that ANSWERED is not a dark mesh:
+                                        // "never answered" would send the operator to
+                                        // the wrong machine, while the refusal names
+                                        // the fix.
+                                        if let Some(refusal) = refused {
+                                            tracing::error!(
+                                                target: "ducktape::join",
+                                                node = %race_label,
+                                                tried,
+                                                reason = "first_contact_refused",
+                                                detail = %refusal,
+                                                "FATAL: first contact failed across all \
+                                                 offered path(s) — the network was reached: \
+                                                 a member ANSWERED, and refused this join. \
+                                                 `detail` is its reason and names the fix."
                                             );
                                             std::process::exit(3);
                                         }
