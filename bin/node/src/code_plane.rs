@@ -272,7 +272,10 @@ async fn accept_loop<T: DataPlaneTransport>(
     // the process-wide staging byte budget.
     let inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>> = Default::default();
     let budget = Arc::new(AtomicU64::new(0));
-    let per_peer = PeerPushes::default();
+    // the staging byte budget is this plane's shared ceiling, so the seat
+    // ledger bounds only each peer's share.
+    let per_peer = PeerSeats::new(MAX_INBOUND_PUSHES_PER_PEER, usize::MAX);
+    static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
     while let Some((peer, hello, stream)) = service.accept().await {
         match hello.intent {
             INTENT_PUSH => {
@@ -282,13 +285,16 @@ async fn accept_loop<T: DataPlaneTransport>(
                 // the peer's concurrency slot is taken HERE, before a task
                 // exists to hold: a member opening streams in a loop must not
                 // be able to spawn one apiece.
-                let Some(seat) = per_peer.admit(peer) else {
-                    tracing::warn!(
-                        target: "ducktape::modules",
-                        peer = %crate::config::hex_bytes(&peer.0),
-                        reason = "peer_push_cap",
-                        "module-code push REFUSED"
-                    );
+                let Ok(seat) = per_peer.admit(peer) else {
+                    if let Some(attempts) = REFUSED.hit("peer_push_cap") {
+                        tracing::warn!(
+                            target: "ducktape::modules",
+                            peer = %crate::config::hex_bytes(&peer.0),
+                            attempts,
+                            reason = "peer_push_cap",
+                            "module-code push REFUSED"
+                        );
+                    }
                     continue;
                 };
                 let blobs = blobs.clone();
@@ -316,42 +322,62 @@ async fn accept_loop<T: DataPlaneTransport>(
     }
 }
 
-/// how many pushes each peer holds admitted right now — the per-peer
-/// concurrency ledger [`MAX_INBOUND_PUSHES_PER_PEER`] bounds.
-#[derive(Clone, Default)]
-struct PeerPushes(Arc<std::sync::Mutex<std::collections::HashMap<PeerId, usize>>>);
-
-/// one peer's seat, released by `Drop` when its push task ends however it ends.
-struct PeerPushSeat {
-    pushes: PeerPushes,
-    peer: PeerId,
+/// how many seats each peer holds right now, under a per-peer cap and a cap
+/// on every peer together: the ledger a network-facing plane counts its
+/// per-peer work through, so one peer can never hold every seat.
+#[derive(Clone)]
+pub(crate) struct PeerSeats<P> {
+    live: Arc<std::sync::Mutex<std::collections::HashMap<P, usize>>>,
+    per_peer: usize,
+    total: usize,
 }
 
-impl PeerPushes {
-    /// `None` when this peer already holds its cap.
-    fn admit(&self, peer: PeerId) -> Option<PeerPushSeat> {
-        let mut live = self.0.lock().expect("peer push lock");
-        let held = live.entry(peer).or_default();
-        if *held >= MAX_INBOUND_PUSHES_PER_PEER {
-            return None;
+/// one peer's seat, released by `Drop` when the work holding it ends however
+/// it ends.
+pub(crate) struct PeerSeat<P: Eq + std::hash::Hash> {
+    seats: PeerSeats<P>,
+    peer: P,
+}
+
+impl<P: Eq + std::hash::Hash + Clone> PeerSeats<P> {
+    pub(crate) fn new(per_peer: usize, total: usize) -> Self {
+        Self {
+            live: Default::default(),
+            per_peer,
+            total,
         }
-        *held += 1;
-        Some(PeerPushSeat {
-            pushes: self.clone(),
+    }
+
+    /// the seat, or why not: `peer_cap` when this peer already holds its
+    /// share, `total_cap` when every seat is taken.
+    pub(crate) fn admit(&self, peer: P) -> Result<PeerSeat<P>, &'static str> {
+        let mut live = self.live.lock().expect("peer seat lock");
+        let held = live.get(&peer).copied().unwrap_or(0);
+        if held >= self.per_peer {
+            return Err("peer_cap");
+        }
+        // bounded by `total` itself: every row holds at least one seat.
+        let taken: usize = live.values().sum();
+        if taken >= self.total {
+            return Err("total_cap");
+        }
+        live.insert(peer.clone(), held + 1);
+        Ok(PeerSeat {
+            seats: self.clone(),
             peer,
         })
     }
 }
 
-impl Drop for PeerPushSeat {
+impl<P: Eq + std::hash::Hash> Drop for PeerSeat<P> {
     fn drop(&mut self) {
-        let mut live = self.pushes.0.lock().expect("peer push lock");
+        let mut live = self.seats.live.lock().expect("peer seat lock");
         let Some(held) = live.get_mut(&self.peer) else {
             return;
         };
         *held -= 1;
-        // an idle peer keeps no row: the map is bounded by live pushes, not by
-        // how many peers have ever pushed.
+        // an idle peer keeps no row: the map is bounded by live seats, not by
+        // how many peers have ever held one.
         if *held == 0 {
             live.remove(&self.peer);
         }
@@ -1229,14 +1255,15 @@ mod tests {
     /// counted per peer and returned when the task ends.
     #[test]
     fn a_peers_concurrent_pushes_are_capped() {
-        let per_peer = PeerPushes::default();
+        let per_peer = PeerSeats::new(MAX_INBOUND_PUSHES_PER_PEER, usize::MAX);
         let (noisy, quiet) = (PeerId([1u8; 32]), PeerId([2u8; 32]));
 
         let seats: Vec<_> = (0..MAX_INBOUND_PUSHES_PER_PEER)
             .map(|_| per_peer.admit(noisy).expect("under the cap"))
             .collect();
-        assert!(
-            per_peer.admit(noisy).is_none(),
+        assert_eq!(
+            per_peer.admit(noisy).err(),
+            Some("peer_cap"),
             "a peer past its cap was admitted anyway"
         );
         // the cap is per peer, not global.
@@ -1248,15 +1275,32 @@ mod tests {
             .expect("a finished push returns its seat");
         assert!(
             per_peer
-                .0
+                .live
                 .lock()
-                .expect("peer push lock")
+                .expect("peer seat lock")
                 .contains_key(&noisy),
             "a peer holding a live push keeps its row"
         );
         // an idle peer keeps no row at all.
         drop((reused, elsewhere));
-        assert!(per_peer.0.lock().expect("peer push lock").is_empty());
+        assert!(per_peer.live.lock().expect("peer seat lock").is_empty());
+    }
+
+    /// the total cap binds across peers: once every seat is taken a peer
+    /// still under its own share is refused, and a released seat serves it.
+    #[test]
+    fn every_peer_together_is_capped() {
+        let seats = PeerSeats::new(2, 3);
+        let (a, b) = (PeerId([1u8; 32]), PeerId([2u8; 32]));
+        let held = [
+            seats.admit(a).expect("a under its share"),
+            seats.admit(a).expect("a at its share"),
+            seats.admit(b).expect("b under its share"),
+        ];
+        assert_eq!(seats.admit(b).err(), Some("total_cap"));
+        let [first, ..] = held;
+        drop(first);
+        seats.admit(b).expect("a released seat serves another peer");
     }
 
     /// a stream that accepts writes and never delivers a byte — the shape of a

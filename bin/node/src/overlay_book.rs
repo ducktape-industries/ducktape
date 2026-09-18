@@ -114,12 +114,10 @@ impl OverlayPeers {
             .copied()
     }
 
+    /// one map lookup, not a walk: a peer's `/128` is a pure function of its
+    /// identity, so it is tracked iff its own address resolves back to it.
     pub(crate) fn contains(&self, peer: PeerId) -> bool {
-        self.reverse
-            .read()
-            .expect("overlay peers lock")
-            .values()
-            .any(|known| *known == peer)
+        self.peer_at(self.overlay_ip(&peer.0)) == Some(peer)
     }
 
     pub(crate) fn peer_ids(&self) -> Vec<PeerId> {
@@ -280,5 +278,26 @@ impl<P: StreamPlane> AdmissionPolicy for OverlayBook<P> {
     fn permits(&self, peer: PeerId, service: Service, flow: FlowId) -> bool {
         let on_our_lane = self.lane() == Some(service);
         on_our_lane && flow == P::flow() && self.peers.contains(peer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_cryptography::Signer as _;
+
+    #[test]
+    fn membership_follows_the_tracked_set() {
+        let [a, b] = [1u64, 2].map(|seed| ed25519::PrivateKey::from_seed(seed).public_key());
+        let id = |key: &ed25519::PublicKey| PeerId(key.as_ref().try_into().expect("32 bytes"));
+        let peers = OverlayPeers::new("test#chain".into());
+
+        peers.set_peers([a.clone()].iter());
+        assert!(peers.contains(id(&a)));
+        assert!(!peers.contains(id(&b)), "an untracked peer is not a member");
+
+        peers.set_peers([b.clone()].iter());
+        assert!(!peers.contains(id(&a)), "a re-track drops the old set");
+        assert!(peers.contains(id(&b)));
     }
 }
