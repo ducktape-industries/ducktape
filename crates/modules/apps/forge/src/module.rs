@@ -1340,8 +1340,10 @@ mod tests {
             err.contains(&format!("{} changed files", MAX_PR_DIFF_FILES + 1)),
             "{err}"
         );
-        assert!(err.contains(&source.to_string()), "{err}");
-        assert!(err.contains(&target.to_string()), "{err}");
+        // the sentence names the change a reader asked for, never its oid pair.
+        assert!(err.contains("(pull request #1)"), "{err}");
+        assert!(!err.contains(&source.to_string()), "{err}");
+        assert!(!err.contains(&target.to_string()), "{err}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1812,8 +1814,10 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("not fully materialized"), "{err}");
-        assert!(err.contains(&missing.to_string()), "{err}");
-        assert!(err.contains(&target.to_string()), "{err}");
+        // the sentence names the change a reader asked for, never its oid pair.
+        assert!(err.contains("(pull request #1)"), "{err}");
+        assert!(!err.contains(&missing.to_string()), "{err}");
+        assert!(!err.contains(&target.to_string()), "{err}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

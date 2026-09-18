@@ -41,27 +41,35 @@ pub(crate) trait GitRead {
     ) -> Result<GitDiff, DiffError>;
 }
 
+/// the failure-class token of a refused diff read: the refusal's reason and the
+/// substrate's debug line key on the same word.
+fn diff_reason(error: &DiffError) -> &'static str {
+    match error {
+        DiffError::Unavailable(_) => "diff_unavailable",
+        DiffError::Unsupported => "diff_unsupported",
+        DiffError::Limit(_) => "diff_too_large",
+    }
+}
+
 /// one sentence for a refused diff read, shaped so the DIAGNOSIS leads and the
-/// `pins` trail.
+/// `subject` trails.
 ///
 /// A module refusal reaches a view as one flat sentence clipped from the END,
-/// so the ceiling that fired has to be in the first clause; the oid pair is the
-/// part a caller that asked for this diff already knows. The failure class a
-/// caller branches on rides the refusal's token instead, and both diff readers
-/// route through here so the two stay one decision.
-fn diff_refusal(error: DiffError, pins: &str) -> Error {
-    let (token, detail) = match error {
-        DiffError::Unavailable(reason) => (
-            "diff_unavailable",
-            format!("{reason} -- objects are not fully materialized ({pins})"),
-        ),
-        DiffError::Unsupported => ("diff_unsupported", "git diff unsupported".to_string()),
-        DiffError::Limit(reason) => (
-            "diff_too_large",
-            format!("{reason} -- diff is too large to serve ({pins})"),
-        ),
+/// so the ceiling that fired has to be in the first clause. The sentence holds
+/// only what a reader can act on: the subject names the change they asked for,
+/// never its oid pair, and an unavailable read says no more than that the
+/// objects are not here yet -- the substrate's own words for it name the missing
+/// oid. Both go to `read_diff`'s debug line instead. The failure class a caller
+/// branches on rides the refusal's token, and both diff readers route through
+/// here so the two stay one decision.
+fn diff_refusal(error: DiffError, subject: &str) -> Error {
+    let reason = diff_reason(&error);
+    let detail = match error {
+        DiffError::Unavailable(_) => format!("objects are not fully materialized ({subject})"),
+        DiffError::Unsupported => "git diff unsupported".to_string(),
+        DiffError::Limit(why) => format!("{why} -- diff is too large to serve ({subject})"),
     };
-    Error::module(token, format!("forge: {detail}"))
+    Error::module(reason, format!("forge: {detail}"))
 }
 
 /// a host diff wearing the oid pair it was taken at.
@@ -438,10 +446,7 @@ impl<G: GitRead> Reader<'_, G> {
             .diff(repo, Some(target), source, path)
             .map_err(|error| {
                 let scope = path.map_or(String::new(), |path| format!(", path {path:?}"));
-                diff_refusal(
-                    error,
-                    &format!("pull request #{number}, target {target}, source {source}{scope}"),
-                )
+                diff_refusal(error, &format!("pull request #{number}{scope}"))
             })?;
         Ok(pinned_diff(Some(target), source, diff))
     }
@@ -455,11 +460,10 @@ impl<G: GitRead> Reader<'_, G> {
         // against nothing, and every path comes out Added -- what `git show`
         // does for the same commit.
         let parent = commit.parents.first().copied();
-        let diff = self.git.diff(repo, parent, oid, None).map_err(|error| {
-            let against =
-                parent.map_or_else(|| "no parent".into(), |parent| format!("parent {parent}"));
-            diff_refusal(error, &format!("commit {oid}, {against}"))
-        })?;
+        let diff = self
+            .git
+            .diff(repo, parent, oid, None)
+            .map_err(|error| diff_refusal(error, "commit"))?;
         Ok(CommitDetail {
             oid: oid.to_string(),
             author: commit.author,
@@ -1030,8 +1034,37 @@ pub(crate) fn read_object(
     })
 }
 
+/// one bounded diff read, and the oid pair of every refused one at `debug`.
+///
+/// The native adapter and the host import a guest's diff read crosses both land
+/// here, so this is the one place the pair a refusal was taken at is logged on
+/// either arm; the refusal sentence itself names only the change.
 #[cfg(feature = "native")]
 pub(crate) fn read_diff(
+    base: &std::path::Path,
+    repository: &str,
+    target: &[u8],
+    source: &[u8],
+    path: Option<&str>,
+    budget: git_primitives::GitDiffBudget,
+) -> Result<git_primitives::GitDiff, git_primitives::GitDiffError> {
+    bounded_read_diff(base, repository, target, source, path, budget).inspect_err(|error| {
+        tracing::debug!(
+            target: "ducktape::forge",
+            reason = diff_reason(error),
+            repo = %repository,
+            // empty for a root commit's read, which diffs against nothing.
+            target_oid = %crate::hex(target),
+            source_oid = %crate::hex(source),
+            path = ?path,
+            error = ?error,
+            "diff read refused"
+        );
+    })
+}
+
+#[cfg(feature = "native")]
+fn bounded_read_diff(
     base: &std::path::Path,
     repository: &str,
     target: &[u8],
