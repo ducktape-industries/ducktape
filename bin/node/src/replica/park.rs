@@ -50,6 +50,15 @@ use statesync::fetch_manifest;
 use statesync::p2p::P2pSyncClient;
 use std::time::Duration;
 
+/// how long a promotion waits, twice, on the standby reachability plane:
+/// once for it to close after `Shutdown`, once for its pumps to hand the lane
+/// back. a wedged plane then keeps its lane and the seat proceeds without a
+/// member plane, rather than holding the promotion open behind it.
+const REACH_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// how often the promotion looks for the standby plane to have closed within
+/// [`REACH_SHUTDOWN_GRACE`].
+const REACH_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
+
 /// one direct-peer sample off this lane's registry: the exposition parse
 /// plus whatever standing the lane can attest — the serving host's valset
 /// when one exists, else the announce-target member set alone (a parked
@@ -210,15 +219,15 @@ async fn shutdown_reach_plane(
 ) -> Option<crate::validator::MeshChannel> {
     let Some(cmd) = reach_cmd else { return None };
     let _ = cmd.try_send(reachability::ReachabilityCommand::Shutdown);
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + REACH_SHUTDOWN_GRACE;
     while !cmd.is_closed() && std::time::Instant::now() < deadline {
-        context.sleep(Duration::from_millis(20)).await;
+        context.sleep(REACH_SHUTDOWN_POLL).await;
     }
     let (tx_handback, rx_handback) = reach_reclaim?;
     // the pumps hand their halves back as they observe the dead plane;
-    // the same 2s grace bounds the wait.
+    // the same grace bounds the wait.
     let lanes = futures::future::join(tx_handback, rx_handback).fuse();
-    let grace = context.sleep(Duration::from_secs(2)).fuse();
+    let grace = context.sleep(REACH_SHUTDOWN_GRACE).fuse();
     futures::pin_mut!(lanes, grace);
     futures::select_biased! {
         halves = lanes => match halves {

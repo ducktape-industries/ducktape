@@ -761,6 +761,10 @@ fn download_to(
 }
 
 const METER_CELLS: u64 = 24;
+/// the meter's redraw period: ten a second reads as live motion, while a
+/// redraw per 8 KiB chunk would spend more time on the terminal than on the
+/// socket.
+const METER_REDRAW_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// A `Read` that draws a one-line meter as the bytes go past, so a
 /// quarter-gigabyte download does not look like a hung terminal.
@@ -831,7 +835,7 @@ impl<R: std::io::Read> std::io::Read for Metered<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let read = self.inner.read(buf)?;
         self.done += read as u64;
-        if self.drawn.elapsed() >= std::time::Duration::from_millis(100) {
+        if self.drawn.elapsed() >= METER_REDRAW_EVERY {
             self.drawn = std::time::Instant::now();
             self.draw();
         }

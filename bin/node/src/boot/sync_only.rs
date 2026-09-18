@@ -12,6 +12,12 @@ use crate::constants::*;
 use crate::host_state::{NetworkBindings, NodeSubstrates, sync_all_modules};
 use crate::util::hex;
 
+/// the pause between manifest fetches while no source serves one yet (the mesh
+/// still forming). short, because a sync-only run does nothing else until the
+/// manifest lands; the retry warn fires every 20th attempt, so once per ten
+/// seconds at this pace.
+const MANIFEST_RETRY: Duration = Duration::from_millis(500);
+
 /// `run_node`'s terminal `--sync-only` branch (phase P4): registers every
 /// channel a mesh member must answer (black-holing everything a joiner with
 /// no engine and no votes does not itself consume), starts the mesh, pulls
@@ -155,7 +161,7 @@ pub(crate) async fn run(
                         "manifest not ready; retrying"
                     );
                 }
-                context.sleep(Duration::from_millis(500)).await;
+                context.sleep(MANIFEST_RETRY).await;
             }
         }
     };

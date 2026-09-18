@@ -25,6 +25,12 @@ use crate::util::fatal;
 
 use super::OverlayCtx;
 
+/// the pause between first-contact rounds for a restarting member whose every
+/// offered path failed. it holds standing, so it never gives up: this paces a
+/// forever-retry against an inviter that may be down for minutes, and the
+/// every-10th retry warn then lands once per five minutes.
+const FIRST_CONTACT_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// phase 6a's output: every channel/handle phase 6b–6d needs, handed to
 /// [`super::park::park`] as one bundle. `network.start()` has already run by
 /// the time this exists — no further registration is legal on this mesh.
@@ -492,11 +498,11 @@ pub(super) async fn wire(
                                             reason = "first_contact_retry",
                                             detail = %reason,
                                             "first contact failed across all offered paths; \
-                                             retrying in 30s"
+                                             retrying in {}s",
+                                            FIRST_CONTACT_RETRY.as_secs()
                                         );
                                     }
-                                    tokio::time::sleep(std::time::Duration::from_secs(30))
-                                        .await;
+                                    tokio::time::sleep(FIRST_CONTACT_RETRY).await;
                                 }
                             }
                         }

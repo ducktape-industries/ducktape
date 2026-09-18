@@ -20,6 +20,12 @@ use crate::config::{self, hex_bytes};
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
 
+/// how long a stage waits on the node's answer. the node answers only once its
+/// fan-out to every validator settles and sets no deadline of its own, so this
+/// is the one bound on a wedged push; it has to cover a full-size component
+/// reaching the slowest validator.
+const STAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// the `module` family's verbs.
 #[derive(Debug, clap::Subcommand)]
 pub enum ModuleCmd {
@@ -684,7 +690,7 @@ fn stage_component(
     // the node answers only once the fan-out settles, and it awaits that with
     // no deadline of its own; a wedged push must surface here, not hang.
     let resp = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(STAGE_TIMEOUT)
         .build()
         .map_err(|e| format!("stage client: {e}"))?
         .post(format!("{http_base}{PATH}?fanout=true"))

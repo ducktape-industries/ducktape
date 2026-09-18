@@ -38,11 +38,26 @@ use dispatch::{AdmissionPolicy, RESOURCE_UNAVAILABLE_RESULT};
 /// `DUCKTAPE_MAX_CONCURRENT_RUNS` says otherwise.
 pub const DEFAULT_MAX_CONCURRENT_RUNS: usize = 4;
 
+/// how often a running attempt renews its saga lease (one `RenewLease` op per
+/// running attempt per beat). a recipe sets its lease in views, so this must
+/// land well inside the shortest lease a recipe asks for; shorter only spends
+/// more ops.
+const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+/// the unit tests' renew beat, so a renewal is observable in milliseconds.
+const TEST_LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(25);
+/// how long a provision or commit may block before the attempt gives up its
+/// provider slot (see [`workspace_step_timeout`]). shorter frees slots sooner
+/// but turns more merely slow steps into late ones held for cleanup.
+const WORKSPACE_STEP_TIMEOUT: Duration = Duration::from_secs(60);
+/// the unit tests' threshold, so a late step is observable without a
+/// wall-clock minute.
+const TEST_WORKSPACE_STEP_TIMEOUT: Duration = Duration::from_millis(250);
+
 fn lease_renew_interval() -> Duration {
     if cfg!(test) {
-        Duration::from_millis(25)
+        TEST_LEASE_RENEW_INTERVAL
     } else {
-        Duration::from_secs(10)
+        LEASE_RENEW_INTERVAL
     }
 }
 
@@ -623,9 +638,9 @@ async fn settle_attempt(
 /// observable without a wall-clock minute.
 fn workspace_step_timeout() -> Duration {
     if cfg!(test) {
-        Duration::from_millis(250)
+        TEST_WORKSPACE_STEP_TIMEOUT
     } else {
-        Duration::from_secs(60)
+        WORKSPACE_STEP_TIMEOUT
     }
 }
 

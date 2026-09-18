@@ -14,6 +14,15 @@ use tokio::sync::{mpsc, watch};
 const CTL_FLOW_QUEUE: usize = 32;
 const CTL_LANE: usize = 32;
 const OVERLAY_GRACE: Duration = Duration::from_secs(8);
+/// the pause between claims of a session's datagram flow while the data plane
+/// still holds it registered (`AlreadyRegistered`, a torn-down session not yet
+/// released). with [`FLOW_CLAIM_ATTEMPTS`] this waits one second before the
+/// join is refused.
+const FLOW_CLAIM_RETRY: Duration = Duration::from_millis(25);
+const FLOW_CLAIM_ATTEMPTS: u32 = 40;
+/// how often a session re-sends its page cursor to every recipient. the
+/// cursor rides lossy datagrams, so this is how long a lost one goes stale.
+const CURSOR_RESEND: Duration = Duration::from_secs(1);
 const PRESENCE_OVERLAY_DOWN: &str =
     "the mesh overlay is not up on this node yet; Pages presence is unavailable";
 
@@ -213,12 +222,12 @@ async fn register_datagram_flow<T: DataPlaneTransport>(
     loop {
         match plane.datagram_flow(service, flow, DatagramPolicy { max_queued }) {
             Ok(handle) => return Ok(handle),
-            Err(e) if attempts >= 40 => {
+            Err(e) if attempts >= FLOW_CLAIM_ATTEMPTS => {
                 return Err(format!("{label} flow unavailable for {channel_id}: {e}"));
             }
             Err(_) => {
                 attempts += 1;
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                tokio::time::sleep(FLOW_CLAIM_RETRY).await;
             }
         }
     }
@@ -339,7 +348,7 @@ async fn run_presence_session<T: DataPlaneTransport>(
         anchor: 0,
         head: 0,
     };
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut tick = tokio::time::interval(CURSOR_RESEND);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {

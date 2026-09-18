@@ -17,6 +17,11 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+/// how long a run-control input waits on the executing worker's
+/// acknowledgement. past it the input may or may not have landed, so the
+/// caller is told to read the trace rather than retry blind.
+const INPUT_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Command {
     pub id: u64,
@@ -97,14 +102,14 @@ impl Hub {
             id,
         };
         match sender.try_send(Command { id, run, input }) {
-            Ok(()) => {
-                match tokio::time::timeout(std::time::Duration::from_secs(30), response).await {
-                    Ok(Ok(answer)) => answer,
-                    _ => Err(
-                        "Input acknowledgement is unknown. Check the trace before retrying.".into(),
-                    ),
-                }
-            }
+            Ok(()) => match tokio::time::timeout(INPUT_ACK_WAIT, response).await {
+                Ok(Ok(answer)) => answer,
+                _ => Err(format!(
+                    "No input acknowledgement within {} s; its outcome is unknown. \
+                     Check the trace before retrying.",
+                    INPUT_ACK_WAIT.as_secs()
+                )),
+            },
             Err(_) => Err("Executing worker is busy or disconnected.".into()),
         }
     }

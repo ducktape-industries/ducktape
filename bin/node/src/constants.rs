@@ -217,3 +217,14 @@ pub(crate) const BOOT_PROBE_BUDGET: Duration = Duration::from_secs(30);
 
 /// the pause between boot catch-up probes (see [`BOOT_PROBE_BUDGET`]).
 pub(crate) const BOOT_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// how long the operator rpc server waits on the run loop's answer before it
+/// replies `node unresponsive` itself. the loop answers within a drain tick, so
+/// this long is a wedged node, and an operator's console must not park on one
+/// forever.
+pub(crate) const RPC_REPLY_WAIT: Duration = Duration::from_secs(10);
+/// how long a CLI verb waits on the operator rpc's reply line. it outlasts
+/// [`RPC_REPLY_WAIT`] so a slow node still answers in its own words
+/// (`node unresponsive`) before the client gives up on the socket.
+pub(crate) const RPC_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const _: () = assert!(RPC_CLIENT_READ_TIMEOUT.as_millis() > RPC_REPLY_WAIT.as_millis());

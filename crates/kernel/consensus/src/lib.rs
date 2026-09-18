@@ -275,6 +275,18 @@ mod sim_carrier {
 /// through module state sync, not per-op fetch.
 pub const PAYLOAD_CACHE_CAP: usize = 16_384;
 
+/// how long the payload resolver waits on one peer for a finalized op's bytes
+/// before it blames that peer and asks another. short on purpose: a starved
+/// node's apply prefix waits on every miss, so a dead peer must cost little.
+const PAYLOAD_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+/// how long a payload fetch that found no peer to ask sits in the resolver's
+/// pending queue before it is tried again.
+const PAYLOAD_FETCH_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+/// how long simplex waits on one peer to answer a backfill request for a
+/// missed view's certificates before it asks another. fixed, not a
+/// [`Cadence`] multiple: it bounds a peer's round trip, not a block.
+const CERTIFICATE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// digest->bytes map: resolves the opaque digests simplex finalizes back into
 /// the frame bytes the host applies. cloning shares the backing store (`Arc`),
 /// so the automaton, reporter, and submit handle all hold the SAME content — the
@@ -966,7 +978,6 @@ where
     FR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
 {
     use commonware_utils::NZUsize;
-    use std::time::Duration;
 
     let fetch_cfg = ResolverConfig {
         peer_provider: provider,
@@ -978,8 +989,8 @@ where
         producer: PayloadProducer { store },
         mailbox_size: NZUsize!(1024),
         me: Some(me),
-        timeout: Duration::from_millis(400),
-        fetch_retry_timeout: Duration::from_millis(100),
+        timeout: PAYLOAD_FETCH_TIMEOUT,
+        fetch_retry_timeout: PAYLOAD_FETCH_RETRY,
         priority_requests: false,
         priority_responses: false,
     };
@@ -1580,7 +1591,6 @@ impl SimplexOrderer {
         use commonware_parallel::Sequential;
         use commonware_runtime::buffer::paged::CacheRef;
         use commonware_utils::{NZU16, NZUsize};
-        use std::time::Duration;
 
         // this validator's consensus triple over the ONE shared store: the
         // automaton peeks the FIFO, the submit handle pushes onto it, the reporter
@@ -1625,7 +1635,7 @@ impl SimplexOrderer {
             leader_timeout: cadence.leader_timeout(),
             certification_timeout: cadence.certification_timeout(),
             timeout_retry: cadence.timeout_retry(),
-            fetch_timeout: Duration::from_secs(1),
+            fetch_timeout: CERTIFICATE_FETCH_TIMEOUT,
             view_retention: ViewDelta::new(10),
             skip: SkipPolicy::Enabled {
                 timeout: cadence.skip_timeout(),
