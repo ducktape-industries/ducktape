@@ -14,6 +14,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use recovery::Manifest;
 
 use crate::constants::{DRAIN_TICK, WORKSPACE_CHECK_INTERVAL};
+use crate::drain_actions::{QuitSignals, ShutdownCause, ShutdownCheckpoint, finish_shutdown};
 use crate::reachability_plane::{GateOutcomes, insert_gate_outcome};
 use crate::rpc::{JoinRequestRecord, RpcJob};
 use crate::sync::serve::SyncStateRequest;
@@ -467,46 +468,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let code_signaller =
         super::code_announce::CodeReadinessSignaller::new(signer.public_key().as_ref().to_vec());
     let (fetch_done_tx, fetch_done_rx) = tokio::sync::mpsc::unbounded_channel();
-    // graceful checkpoint on process signals (SIGTERM/SIGINT): the desktop
-    // shell SIGTERMs the daemon on quit, so it must take the SAME safe path
-    // as an rpc `Shutdown` — a best-effort final manifest + journal barrier
-    // — instead of tearing down mid-block and leaving the disk ahead of the
-    // last in-memory checkpoint (the recovery brick). the streams are made
-    // INSIDE the tokio async context so the signal driver is live; a
-    // failure to install them is non-fatal: log and carry on WITHOUT the
-    // graceful-quit arm rather than aborting daemon boot — a hard SIGKILL /
-    // power loss already lands on the same WAL-forward recovery, so the
-    // worst case of a missing handler is the pre-fix behavior, not a brick.
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::warn!(
-                target: "ducktape::node",
-                node = %label,
-                signal = "SIGTERM",
-                error = %e,
-                reason = "signal_handler_install_failed",
-                "graceful-quit checkpoint disabled"
-            );
-            None
-        }
-    };
-    let mut sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-    {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::warn!(
-                target: "ducktape::node",
-                node = %label,
-                signal = "SIGINT",
-                error = %e,
-                reason = "signal_handler_install_failed",
-                "graceful-quit checkpoint disabled"
-            );
-            None
-        }
-    };
+    // graceful checkpoint on SIGTERM/SIGINT — see `QuitSignals`.
+    let mut quit = QuitSignals::install(&label);
     // the diagnostic task dump (#1386): SIGUSR1 never checkpoints or exits —
     // it just writes tokio's taskdump to `<workspace>/tasks.txt` so a wedged
     // node can say which task it is parked on. only where tokio's unstable
@@ -627,31 +590,12 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     runtime.publish_status().await;
 
     loop {
-        // Resolve on whichever signal stream installed. If neither did,
-        // this arm remains pending forever.
-        let signalled = async {
-            match (sigterm.as_mut(), sigint.as_mut()) {
-                (Some(t), Some(i)) => {
-                    let t = t.recv();
-                    let i = i.recv();
-                    futures::pin_mut!(t, i);
-                    futures::future::select(t, i).await;
-                }
-                (Some(t), None) => {
-                    t.recv().await;
-                }
-                (None, Some(i)) => {
-                    i.recv().await;
-                }
-                (None, None) => futures::future::pending::<()>().await,
-            }
-        }
-        .fuse();
+        let signalled = quit.recv().fuse();
         futures::pin_mut!(signalled);
 
         // the SIGUSR1 task dump: a separate arm from `signalled` above —
         // unlike SIGTERM/SIGINT it never checkpoints or exits, so it must
-        // not share `on_signal`'s terminal path.
+        // not share `shut_down`'s terminal path.
         #[cfg(all(
             tokio_unstable,
             target_os = "linux",
@@ -683,7 +627,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         // deadline must outrank every ingress lane.
         let next_drain = runtime.next_drain;
         futures::select_biased! {
-            _ = signalled => runtime.on_signal().await,
+            signal = signalled => runtime.shut_down(ShutdownCause::Signal(signal)).await,
             _ = dumped => {
                 #[cfg(all(
                     tokio_unstable,
@@ -758,50 +702,52 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
 }
 
 impl ValidatorRuntime<'_> {
-    async fn on_signal(&mut self) -> ! {
-        tracing::info!(
-            target: "ducktape::node",
-            node = %self.label,
-            "SIGTERM/SIGINT — graceful checkpoint then exit"
-        );
-        self.graceful_checkpoint().await;
-        std::process::exit(0);
-    }
-
-    async fn graceful_checkpoint(&mut self) {
-        graceful_checkpoint(&mut self.node, &self.orchestrator, self.next_seq).await;
+    /// the validator's ONE shutdown path, SIGTERM/SIGINT and rpc `Shutdown`
+    /// alike: a final manifest at the finalized tip so the restart replays a
+    /// minimal suffix, then the shared terminal step.
+    pub(super) async fn shut_down(&mut self, cause: ShutdownCause) -> ! {
+        let height = self.node.finalized().map(|f| f.height);
+        let checkpoint =
+            graceful_checkpoint(&mut self.node, &self.orchestrator, self.next_seq).await;
+        finish_shutdown(&self.label, cause, height, checkpoint).await
     }
 }
 
+/// best-effort: a failure here is just the crash path, which also recovers.
 async fn graceful_checkpoint(
     node: &mut ValidatorNode,
     orchestrator: &consensus::ValsetOrchestrator<ed25519::PublicKey>,
     next_seq: u64,
-) {
-    if let Some(f) = node.finalized() {
-        let pos = node.sink_mut().oplog_pos().await;
-        let captured = Manifest::capture(
-            node.host(),
-            Some(f.height),
-            orchestrator.epoch(),
-            orchestrator.epoch_base(),
-            participant_bytes(orchestrator),
-            resident_bytes(orchestrator),
-            orchestrator
-                .pending_cutover()
-                .map(|cutover| cutover.cutover_view()),
-            pos,
-            next_seq,
-        );
-        // the replay guard rides the checkpoint: the journal suffix a
-        // checkpoint leaves is shallower than the protocol window, so a
-        // restart that rebuilt from the suffix alone would refuse fewer
-        // replayed batches than its peers.
-        if let Ok(manifest) = captured.map(|m| m.with_replay_window(node.replay_window())) {
-            let _ = node.sink_mut().write_manifest(&manifest).await;
-        }
-    }
+) -> ShutdownCheckpoint {
+    let Some(f) = node.finalized() else {
+        return ShutdownCheckpoint::Skipped("nothing_finalized");
+    };
+    let pos = node.sink_mut().oplog_pos().await;
+    let captured = Manifest::capture(
+        node.host(),
+        Some(f.height),
+        orchestrator.epoch(),
+        orchestrator.epoch_base(),
+        participant_bytes(orchestrator),
+        resident_bytes(orchestrator),
+        orchestrator
+            .pending_cutover()
+            .map(|cutover| cutover.cutover_view()),
+        pos,
+        next_seq,
+    );
+    // the replay guard rides the checkpoint: the journal suffix a
+    // checkpoint leaves is shallower than the protocol window, so a
+    // restart that rebuilt from the suffix alone would refuse fewer
+    // replayed batches than its peers.
+    let Ok(manifest) = captured.map(|m| m.with_replay_window(node.replay_window())) else {
+        return ShutdownCheckpoint::Skipped("capture_failed");
+    };
     // no trailing sync: every record the sink writes — pin, pre_apply, seal,
     // cutover — fsyncs where it is written, and `write_manifest` syncs the
     // journal before it puts. there is nothing buffered left to barrier.
+    match node.sink_mut().write_manifest(&manifest).await {
+        Ok(()) => ShutdownCheckpoint::Written,
+        Err(_) => ShutdownCheckpoint::Skipped("write_failed"),
+    }
 }

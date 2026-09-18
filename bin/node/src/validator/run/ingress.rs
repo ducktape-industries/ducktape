@@ -6,9 +6,10 @@ use commonware_runtime::{Clock as _, Metrics as _};
 
 use sdk::Msg;
 
-use super::{ValidatorRuntime, graceful_checkpoint};
+use super::ValidatorRuntime;
 use crate::config::{hex_bytes, unhex};
 use crate::constants::{GATE_SETTLE_TIMEOUT, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
+use crate::drain_actions::ShutdownCause;
 use crate::host_reads::{read_redemption_from_host, read_valset_members, read_valset_residents};
 use crate::rpc::{JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus};
 use crate::util::{hex, unix_ms};
@@ -107,10 +108,8 @@ impl ValidatorRuntime<'_> {
         let now = self.context.current();
         let Self {
             node,
-            orchestrator,
             next_seq,
             signer,
-            label,
             join_requests,
             metrics,
             pending_rpc_submits,
@@ -205,24 +204,7 @@ impl ValidatorRuntime<'_> {
                 peers: Some(self.peers_sample().await),
                 ..RpcReply::ok()
             },
-            RpcRequest::Shutdown => {
-                // best-effort final checkpoint + journal barrier so
-                // the restart replays a minimal suffix; a failure
-                // here is just the crash path, which also recovers.
-                // SAME sequence as the signal arm (shared macro).
-                graceful_checkpoint(node, orchestrator, *next_seq).await;
-                let _ = reply.send(RpcReply::ok());
-                // the send only queues the reply on the rpc thread; exiting
-                // here would race its write and close the socket on a caller
-                // that never saw a reply line.
-                let _ = written.await;
-                tracing::info!(
-                    target: "ducktape::node",
-                    node = %label,
-                    "shutdown requested via rpc; exiting"
-                );
-                std::process::exit(0);
-            }
+            RpcRequest::Shutdown => self.shut_down(ShutdownCause::Rpc { reply, written }).await,
         };
         let _ = reply.send(resp);
     }

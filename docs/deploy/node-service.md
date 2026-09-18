@@ -8,9 +8,12 @@ the log rotation is `ops/node/ducktape-node.logrotate`, and every path below
 matches what those files set. macOS runs the node as a per-user LaunchAgent
 instead; that section names its two files and its commands.
 
-The node is supervisor-ready: on a validator SIGTERM takes the graceful
-checkpoint path (the same one the desktop shell uses on quit; a resident
-installs no handler and simply re-syncs at its next boot), it raises its own open-file
+The node is supervisor-ready: SIGTERM and SIGINT take the graceful
+checkpoint path on a validator and a resident alike (the same one the desktop
+shell uses on quit, `QuitSignals` in `bin/node/src/drain_actions.rs`) and end
+with one `node_shutdown` line naming the signal, the height and whether the
+final checkpoint was `written`, `already_current` or `skipped(<reason>)` — the
+next boot's recovery line names at least that height. It raises its own open-file
 soft limit to 65536 (`bin/node/src/resource_limits.rs`), and
 `ducktape service run` names systemd as its target (`bin/node/src/services.rs`,
 `RunArgs::enable`: "for scripts and systemd units"). A service unit runs the
