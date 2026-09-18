@@ -2248,11 +2248,13 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("this identity is a member — start: ducktape node run {selector}");
     } else {
         eprintln!(
-            "NOT yet a member. start now — `ducktape node run {selector}` redeems \
-             this invite automatically: the node joins the network's VPN, syncs state, and \
-             comes up as a full node. no approval step follows (minting the invite WAS the \
-             approval); a member can later promote it into the quorum with \
-             `ducktape node member promote {}`.",
+            "NOT yet a member. this wrote a workspace; nothing was checked with the network. \
+             start now — `ducktape node run {selector}` presents the invite on first contact: \
+             an invite admits exactly one node, so if it was already used or has expired the \
+             node refuses within seconds (`invite already redeemed`) and you need a fresh one \
+             from the inviter; otherwise it joins the network's VPN, syncs state, and comes up \
+             as a full node. no approval step follows (minting the invite WAS the approval); a \
+             member can later promote it into the quorum with `ducktape node member promote {}`.",
             joined.identity
         );
     }
