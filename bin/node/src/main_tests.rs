@@ -523,6 +523,7 @@ fn suffix_installer_rejects_mismatched_served_seal() {
             prepared,
             &host::NoCodeSource,
             &mut host::NoWitness,
+            &[],
         )
         .await
         .expect_err("served seal mismatch must abort");
@@ -530,6 +531,114 @@ fn suffix_installer_rejects_mismatched_served_seal() {
             err.contains("served seal"),
             "unexpected mismatch error: {err}"
         );
+    });
+}
+
+/// a batch served at a height its source REFUSED (`batch_replayed`): the
+/// catching-up host already applied it inside the window it seated with, so it
+/// lands Rejected with nothing applied — and only the window makes it so.
+#[test]
+fn suffix_installer_refuses_a_batch_its_boundary_window_holds() {
+    commonware_runtime::deterministic::Runner::default().start(|_| async move {
+        let signer = ed25519::PrivateKey::from_seed(84);
+        let mut host = fresh_directory_host();
+        let applied = served_directory_frame(&mut host, &signer, 1, 0, dir_set("a", "1")).await;
+        let roots = host.module_roots();
+        let root_hash = host.root_hash();
+        let served = statesync::FinalizedFrame {
+            height: 2,
+            disposition: statesync::FrameDisposition::Rejected,
+            ..applied.clone()
+        };
+        let window = [(1, node::frame_id(&applied.frame))];
+
+        let prepared = host.prepare_work(served.height).await.unwrap();
+        let dispatches = apply_verified_suffix_frame(
+            &mut host,
+            &served,
+            prepared,
+            &host::NoCodeSource,
+            &mut host::NoWitness,
+            &window,
+        )
+        .await
+        .expect("a replayed batch lands Rejected, as its source sealed it");
+        assert!(dispatches.is_empty());
+        assert_eq!(host.module_roots(), roots);
+        assert_eq!(host.root_hash(), root_hash);
+
+        // the window is the whole verdict: without it the batch re-applies.
+        let prepared = host.prepare_work(served.height).await.unwrap();
+        let err = apply_verified_suffix_frame(
+            &mut host,
+            &served,
+            prepared,
+            &host::NoCodeSource,
+            &mut host::NoWitness,
+            &[],
+        )
+        .await
+        .expect_err("outside the window the replayed batch re-applies");
+        assert!(err.contains("served seal mismatch"), "{err}");
+    });
+}
+
+/// the suffix's own frames enter the window as they seal, so a batch replayed
+/// WITHIN one catch-up run is refused too — and the window the run ends with
+/// is the one a restart restores off the same journal.
+#[test]
+fn suffix_catchup_refuses_a_batch_it_sealed_earlier_in_the_run() {
+    commonware_runtime::deterministic::Runner::default().start(|context| async move {
+        let signer = ed25519::PrivateKey::from_seed(85);
+        let mut expected = fresh_directory_host();
+        let applied = served_directory_frame(&mut expected, &signer, 1, 0, dir_set("a", "1")).await;
+        let replayed = statesync::FinalizedFrame {
+            height: 2,
+            disposition: statesync::FrameDisposition::Rejected,
+            ..applied.clone()
+        };
+
+        let mut host = fresh_directory_host();
+        let base = Manifest::capture(&host, None, 0, 0, vec![test_me()], vec![], None, 0, 1)
+            .expect("base manifest");
+        let mut recovery = Recovery::open(context.child("catchup_replayed"))
+            .await
+            .expect("open recovery");
+        recovery.write_manifest(&base).await.unwrap();
+        let store = consensus::ContentStore::new();
+        let mut window = Vec::new();
+        let caught = apply_suffix_frames(
+            &mut recovery,
+            &mut host,
+            0,
+            2,
+            vec![applied.clone(), replayed],
+            None,
+            &store,
+            &mut window,
+        )
+        .await
+        .expect("a replayed height must not stop catch-up");
+        assert_eq!(caught.applied, 2);
+        assert_eq!(host.root_hash(), expected.root_hash());
+        let batch = node::frame_id(&applied.frame);
+        assert_eq!(window, vec![(1, batch), (2, batch)]);
+        let journaled = recovery
+            .read_finalized_frames(0, 2, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(journaled[1].disposition, node::Disposition::Rejected);
+        drop(host);
+        drop(recovery);
+
+        let mut reopened = Recovery::open(context.child("reopen_catchup_replayed"))
+            .await
+            .unwrap();
+        let mut restarted = fresh_directory_host();
+        let recovered = reopened.recover(&mut restarted, &base).await.unwrap();
+        assert_eq!(recovered.height, Some(2));
+        assert_eq!(recovered.root_hash, expected.root_hash());
+        assert_eq!(recovered.applied_frames, window);
     });
 }
 
@@ -574,6 +683,7 @@ fn suffix_catchup_refuses_to_commit_without_its_execution_witness() {
             prepared,
             &host::NoCodeSource,
             &mut RefuseWitness,
+            &[],
         )
         .await
         .expect_err("an unjournaled execution must not commit");
@@ -598,10 +708,18 @@ fn suffix_catchup_applies_verifies_and_journals_served_frames() {
             .await
             .expect("open recovery");
         let store = consensus::ContentStore::new();
-        let applied =
-            apply_suffix_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None, &store)
-                .await
-                .expect("catch up");
+        let applied = apply_suffix_frames(
+            &mut recovery,
+            &mut host,
+            0,
+            2,
+            frames.clone(),
+            None,
+            &store,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("catch up");
 
         assert_eq!(applied.applied, 2);
         assert_eq!(host.root_hash(), expected.root_hash());
@@ -651,6 +769,7 @@ fn suffix_catchup_recovers_a_matching_unsealed_execution() {
             prepared,
             &host::NoCodeSource,
             &mut recovery,
+            &[],
         )
         .await
         .unwrap();
@@ -709,10 +828,18 @@ fn suffix_catchup_reconciles_mixed_durability_state() {
             .await
             .expect("write base manifest");
         let store = consensus::ContentStore::new();
-        let applied =
-            apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None, &store)
-                .await
-                .expect("catch up");
+        let applied = apply_suffix_frames(
+            &mut recovery,
+            &mut host,
+            0,
+            1,
+            vec![served],
+            None,
+            &store,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("catch up");
 
         assert_eq!(applied.applied, 1);
         assert_eq!(
@@ -768,10 +895,18 @@ fn suffix_catchup_aborts_on_mismatched_served_seal() {
                 .expect("open recovery");
             recovery.write_manifest(&base).await.unwrap();
             let store = consensus::ContentStore::new();
-            let err =
-                apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None, &store)
-                    .await
-                    .expect_err("seal mismatch must abort");
+            let err = apply_suffix_frames(
+                &mut recovery,
+                &mut host,
+                0,
+                1,
+                vec![served],
+                None,
+                &store,
+                &mut Vec::new(),
+            )
+            .await
+            .expect_err("seal mismatch must abort");
             assert!(err.contains("served seal"), "{err}");
             assert_eq!(dir_value(&host, "a").await.as_deref(), Some("1"));
             drop(host);
@@ -805,9 +940,18 @@ fn suffix_catchup_is_noop_when_there_is_no_gap() {
             .await
             .expect("open recovery");
         let store = consensus::ContentStore::new();
-        let applied = apply_suffix_frames(&mut recovery, &mut host, 5, 5, Vec::new(), None, &store)
-            .await
-            .expect("noop catch up");
+        let applied = apply_suffix_frames(
+            &mut recovery,
+            &mut host,
+            5,
+            5,
+            Vec::new(),
+            None,
+            &store,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("noop catch up");
 
         assert_eq!(applied.applied, 0);
         assert_eq!(host.root_hash(), before);
@@ -850,6 +994,7 @@ fn suffix_catchup_accepts_a_height_gap_from_a_discarded_view() {
             vec![served_1, served_3],
             None,
             &store,
+            &mut Vec::new(),
         )
         .await
         .expect("a skipped-view gap must not be refused");
@@ -916,6 +1061,7 @@ fn catch_up_suffix_frames_refuses_an_unanchored_tip_and_rotates_source() {
             b"ns",
             anchor,
             &store,
+            Vec::new(),
         )
         .await
         .expect_err("a tip naming an unanchored participant set must be refused");
