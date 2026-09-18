@@ -154,6 +154,17 @@ pub type FrameId = [u8; 32];
 /// per-origin check would refuse its every subsequent op.
 pub const REPLAY_WINDOW_HEIGHTS: usize = 4096;
 
+/// THE replay-window verdict: `batch` already sealed at a height `window`
+/// remembers. one rule, read by the live drain and by recovery's trailing
+/// roll-forward over the same restored window — two copies could disagree on
+/// a replayed batch, and that disagreement is a fork.
+pub fn in_replay_window<'a>(
+    window: impl IntoIterator<Item = &'a (u64, FrameId)>,
+    batch: &FrameId,
+) -> bool {
+    window.into_iter().any(|(_, sealed)| sealed == batch)
+}
+
 /// how often a standing code-swap stall re-warns: attempt 1, then every Nth.
 /// the drain retries every tick, so an unconditional warn would evict the
 /// 4096-line ring in minutes — taking the evidence around the stall with it.
@@ -1884,12 +1895,17 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // the refusal lives HERE, in the apply path, keyed on a protocol
             // constant, so every validator reaches it at the same block with
             // the same verdict. journaled Rejected like any other deterministic
-            // whole-batch no-op, so the height still seals.
-            let replayed = self
-                .replay_window
-                .iter()
-                .any(|(_, applied)| *applied == batch_id);
+            // whole-batch no-op, so the height still seals: its block record
+            // first, carrying no work (the refusal runs none), then the seal
+            // — recovery replays a seal only against the record it seals. the
+            // refusal precedes code-swap realization on purpose: a refused
+            // height realizes nothing, since an admission realized here would
+            // move the roots of a block that applies nothing.
+            let replayed = in_replay_window(&self.replay_window, &batch_id);
             if replayed {
+                self.sink
+                    .pre_apply(height, &frame, &host::PreparedWork::default())
+                    .await?;
                 self.drained.push(DrainedFrame {
                     id: batch_id,
                     height,

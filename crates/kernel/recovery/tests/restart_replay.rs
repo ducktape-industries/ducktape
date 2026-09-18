@@ -672,6 +672,199 @@ fn recovery_restores_the_checkpoint_window_and_extends_it_with_the_suffix() {
     });
 }
 
+/// a scripted agreed order: the SAME batch bytes can finalize twice, the
+/// replay a proposer stages out of any peer's payload cache.
+struct ScriptedOrderer {
+    script: Vec<(u64, Vec<u8>)>,
+}
+
+impl node::Orderer for ScriptedOrderer {
+    async fn submit(&mut self, _frame: Vec<u8>) -> Result<(), node::Error> {
+        Ok(())
+    }
+
+    fn poll_delivered(&mut self) -> Vec<(u64, Vec<u8>)> {
+        std::mem::take(&mut self.script)
+    }
+}
+
+/// every block a replay walks, with the disposition it sealed under
+/// (`None` = an applied block replay could not re-execute).
+#[derive(Default)]
+struct Walked(Vec<(u64, Option<Disposition>)>);
+
+impl recovery::ReplaySink for Walked {
+    fn folded_block(&mut self, block: &recovery::FoldedBlock<'_>) {
+        self.0.push((block.height, Some(block.disposition)));
+    }
+
+    fn opaque_block(&mut self, height: u64) {
+        self.0.push((height, None));
+    }
+}
+
+/// a batch super-frame carrying one signed directory `Set`.
+fn signed_batch(seq: u64, key: &str, value: &str) -> Vec<u8> {
+    node::encode_batch(&[node::encode_frame(&sk(1), seq, &set(key, value))])
+}
+
+/// A REFUSED REPLAY IS A JOURNALED BLOCK. the live drain seals a re-finalized
+/// batch Rejected, and a node stopped before its next checkpoint boots over
+/// that seal: recovery must walk it as the sealed no-op it is — not refuse
+/// the journal as corrupt and brick the node until a checkpoint it can no
+/// longer write.
+#[test]
+fn a_refused_replay_survives_a_restart_without_a_checkpoint() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let mut recovery = Recovery::open(context.child("rr1"))
+            .await
+            .expect("open recovery");
+        let host = fresh_host();
+        let manifest =
+            Manifest::capture(&host, None, 0, 0, vec![], vec![], None, 0, 1).expect("capture");
+        recovery
+            .write_manifest(&manifest)
+            .await
+            .expect("write manifest");
+
+        let replayed = signed_batch(0, "k", "first");
+        let script = vec![
+            (1, replayed.clone()),
+            (2, signed_batch(1, "k", "second")),
+            (3, replayed.clone()),
+        ];
+        let mut node = OrderedNode::with_sink(host, ScriptedOrderer { script }, recovery);
+        assert_eq!(node.drain_delivered().await.expect("drain"), 3);
+        let refused = node
+            .take_drained()
+            .into_iter()
+            .find(|d| d.height == 3)
+            .expect("the replayed height seals");
+        assert_eq!(refused.reason.as_deref(), Some("batch replayed"));
+        let tip = node.finalized().expect("boundary");
+        let tip_hash = node.root_hash();
+        let live_window = node.replay_window();
+        // stopped with no checkpoint past the refusal.
+        drop(node);
+
+        let mut recovery = Recovery::open(context.child("rr2"))
+            .await
+            .expect("reopen recovery");
+        let manifest = recovery.manifest().expect("decodes").expect("present");
+        let mut host = fresh_host();
+        let recovered = recovery
+            .recover(&mut host, &manifest)
+            .await
+            .expect("the refused height replays as a sealed no-op");
+        assert_eq!(recovered.height, Some(tip.height));
+        assert_eq!(recovered.root_hash, tip_hash);
+        assert_eq!(recovered.applied, 2, "the two applied blocks re-applied");
+        assert_eq!(recovered.skipped, 1, "the refusal has nothing to redo");
+        assert_eq!(get(&host, "k").await.as_deref(), Some("second"));
+        assert_eq!(
+            recovered.applied_frames, live_window,
+            "the restored window is the live one, the refused height included"
+        );
+    });
+}
+
+/// A STOP BETWEEN A REFUSAL'S BLOCK RECORD AND ITS SEAL. the replay window is
+/// the one Rejected cause the frame alone does not carry: re-executing the
+/// trailing frame would run every member's signed op a second time and seal
+/// a state no peer holds. recovery reaches the live drain's verdict from the
+/// window it restores, and seals the height Rejected with nothing applied.
+#[test]
+fn a_stop_before_a_refused_replay_seals_rolls_it_forward_refused() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let mut recovery = Recovery::open(context.child("rs1"))
+            .await
+            .expect("open recovery");
+        let host = fresh_host();
+        let manifest =
+            Manifest::capture(&host, None, 0, 0, vec![], vec![], None, 0, 1).expect("capture");
+        recovery
+            .write_manifest(&manifest)
+            .await
+            .expect("write manifest");
+
+        let replayed = signed_batch(0, "k", "first");
+        let script = vec![(1, replayed.clone()), (2, signed_batch(1, "k", "second"))];
+        let mut node = OrderedNode::with_sink(host, ScriptedOrderer { script }, recovery);
+        assert_eq!(node.drain_delivered().await.expect("drain"), 2);
+        let sealed_hash = node.root_hash();
+        let sealed_roots = node.host().module_roots();
+        // the replay re-finalizes at height 3 and the process stops after its
+        // block record is durable and before its seal is.
+        {
+            use node::BlockSink as _;
+            node.sink_mut()
+                .pre_apply(3, &replayed, &host::PreparedWork::default())
+                .await
+                .expect("wal record");
+        }
+        drop(node);
+
+        let mut recovery = Recovery::open(context.child("rs2"))
+            .await
+            .expect("reopen recovery");
+        let manifest = recovery.manifest().expect("decodes").expect("present");
+        let mut host = fresh_host();
+        let mut walked = Walked::default();
+        let recovered = recovery
+            .recover_with_sink(&mut host, &manifest, Some(&mut walked))
+            .await
+            .expect("recover");
+        assert!(recovered.rolled_forward, "the trailing block was sealed");
+        assert_eq!(recovered.height, Some(3));
+        assert_eq!(
+            walked.0.last(),
+            Some(&(3, Some(Disposition::Rejected))),
+            "the trailing refusal seals Rejected"
+        );
+        assert_eq!(
+            get(&host, "k").await.as_deref(),
+            Some("second"),
+            "the replayed batch must not apply a second time"
+        );
+        assert_eq!(
+            host.module_roots(),
+            sealed_roots,
+            "a refusal moves no module root"
+        );
+        assert_eq!(recovered.root_hash, sealed_hash);
+        assert_eq!(
+            recovered.applied_frames.last(),
+            Some(&(3, node::frame_id(&replayed))),
+            "the refused height is remembered like any sealed one"
+        );
+
+        // a SECOND boot walks the roll-forward's seal as the sealed no-op.
+        drop(recovery);
+        let mut recovery = Recovery::open(context.child("rs3"))
+            .await
+            .expect("reopen again");
+        let manifest = recovery.manifest().expect("decodes").expect("present");
+        let mut host = fresh_host();
+        let mut walked = Walked::default();
+        let again = recovery
+            .recover_with_sink(&mut host, &manifest, Some(&mut walked))
+            .await
+            .expect("recover again");
+        assert!(!again.rolled_forward);
+        assert_eq!(again.height, Some(3));
+        assert_eq!(
+            walked.0.last(),
+            Some(&(3, Some(Disposition::Rejected))),
+            "the journal holds the height sealed Rejected"
+        );
+        assert_eq!(host.module_roots(), sealed_roots);
+        assert_eq!(again.root_hash, sealed_hash);
+        assert_eq!(get(&host, "k").await.as_deref(), Some("second"));
+    });
+}
+
 /// A CAPTURE COMPUTES A ROOT, IT DOES NOT VERIFY ONE. The host can sit AHEAD of
 /// the last sealed boundary — a module realization that seated a component for a
 /// block the node then failed to apply moves the registry root off any block —
