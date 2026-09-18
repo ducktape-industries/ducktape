@@ -377,9 +377,6 @@ pub struct Status {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct MintedInvite {
     pub invite: String,
-    /// A mint with nothing to say sends no notes; an answer without the
-    /// field reads as that, not as a malformed invite.
-    #[serde(default)]
     pub notes: Vec<InviteNote>,
 }
 
@@ -1410,14 +1407,6 @@ mod tests {
                 }],
             }
         );
-    }
-
-    #[test]
-    fn a_minted_invite_without_notes_decodes_as_no_notes() {
-        let body = r#"{"invite":"duck-invite-for-7-days"}"#;
-        let minted: MintedInvite = serde_json::from_str(body).expect("decodes");
-        assert_eq!(minted.invite, "duck-invite-for-7-days");
-        assert!(minted.notes.is_empty());
     }
 
     #[tokio::test]

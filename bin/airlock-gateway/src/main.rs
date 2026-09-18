@@ -100,7 +100,8 @@ async fn serve() -> Result<()> {
         }),
     };
     let (app, vendor) = airlock::server::build(cfg)?;
-    let listener = tokio::net::TcpListener::bind(arg_or("--listen", "127.0.0.1:9100")).await?;
+    let listener =
+        tokio::net::TcpListener::bind(arg_or("--listen", airlock::server::DEFAULT_LISTEN)).await?;
     eprintln!(
         "[gateway] attest={vendor} listening on {}",
         listener.local_addr()?

@@ -34,6 +34,11 @@ use crate::wire::{
     SessionResponse, WorkRef,
 };
 
+/// Where `airlock-gateway serve` binds when `--listen` is absent: loopback,
+/// so nothing outside the confidential VM reaches the gateway unless the
+/// operator binds it wider on purpose.
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:9100";
+
 /// How the gateway proves its seal key to the broker.
 #[derive(Clone)]
 pub enum AttestMode {
