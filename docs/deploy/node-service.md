@@ -122,7 +122,12 @@ alias dt='sudo -u ducktape env DUCKTAPE_HOME=/var/lib/ducktape /usr/local/bin/du
 steps 1-7 below end to end (`--dry-run` prints the commands without touching
 the host); the steps are spelled out here for anyone auditing or adapting them.
 `<name>` is a chain id or a unique prefix of one; the script resolves it to
-the full chain id once the network is founded or joined.
+the full chain id once the network is founded or joined. `--archive <file>`
+takes the program from a node release archive (`ducktape-<sha7>-linux-<arch>.tar.zst`,
+which carries `ducktape`, `ducktape-node-launcher`, `modules/` and
+`release.json`) instead of step 1's build: it unpacks it with `zstd`, installs
+both binaries and `release.json` into `/usr/local/lib/ducktape`, and step 3
+copies the archive's `modules/`.
 
 ```sh
 # 1. Build ducktape and its launcher (make install-node puts both in
