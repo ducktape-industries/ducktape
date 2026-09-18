@@ -1,7 +1,9 @@
 //! The node supervisor's restart loop, driven through the real binary over a
 //! `ducktape` that is a shell script: a node that dies at boot is said at
 //! attempt 1 and then only every Nth, carrying the count, and a node that
-//! came up before it exited starts that count over.
+//! came up before it exited starts that count over. "Came up" is a published
+//! identity AT a committed height: a resident publishes its identity before
+//! it recovers, and one that dies in recovery never served.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -9,10 +11,12 @@ use std::process::{Command, Stdio};
 
 const LAUNCHER: &str = env!("CARGO_BIN_EXE_ducktape-node-launcher");
 
-/// A `ducktape` that never comes up, except on its third boot: then it
-/// answers `release status` with a published identity once and exits right
-/// after. Its fifth boot stops the launcher, the way `systemctl stop` does.
-/// Every boot is counted in `<scratch>/boots`.
+/// A `ducktape` that never comes up, except on its third boot. Its second
+/// boot answers `release status` once with a published identity at height 0
+/// — a resident still recovering — and dies; its third answers once at a
+/// committed height and exits right after. Its fifth boot stops the launcher,
+/// the way `systemctl stop` does. Every boot is counted in `<scratch>/boots`;
+/// an answer is claimed by one `release status` with an atomic `mv`.
 fn fake_node(scratch: &Path) -> PathBuf {
     let dir = scratch.display();
     let script = format!(
@@ -22,18 +26,21 @@ case "$1 $2" in
 "node run")
     n=$(( $(cat "$d/boots" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$d/boots"
-    if [ "$n" -eq 3 ]; then
-        touch "$d/serving"
+    case "$n" in
+    2|3)
+        echo $(( n - 2 )) > "$d/height.tmp"
+        mv "$d/height.tmp" "$d/height"
         read _ < "$d/asked"
-    fi
-    if [ "$n" -eq 5 ]; then
+        ;;
+    5)
         kill -TERM "$PPID"
-    fi
+        ;;
+    esac
     exit 1
     ;;
 "release status")
-    if rm "$d/serving" 2>/dev/null; then
-        echo '{{"base":"http://127.0.0.1:1","public_key":"ab12","height":1,"designation":null}}'
+    if mv "$d/height" "$d/answered" 2>/dev/null; then
+        echo "{{\"base\":\"http://127.0.0.1:1\",\"public_key\":\"ab12\",\"height\":$(cat "$d/answered"),\"designation\":null}}"
         echo > "$d/asked"
         exit 0
     fi
@@ -125,7 +132,8 @@ fn a_node_that_dies_at_boot_is_said_at_attempt_one_and_the_count_restarts_once_i
     assert_eq!(
         exits.len(),
         3,
-        "boots 1, 3 and 4 are said; 2 and 5 are the second of a run:\n{log}"
+        "boots 1, 3 and 4 are said; 2 (an identity at height 0) and 5 are the second \
+         of a run:\n{log}"
     );
     assert_eq!(field(exits[0], "attempts"), Some("1"), "{}", exits[0]);
     assert!(

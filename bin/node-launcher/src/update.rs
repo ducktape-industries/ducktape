@@ -63,7 +63,7 @@ pub fn decide(phase: &Phase, status: &ReleaseStatus, watch: &Watch) -> Next {
     // The two lifecycle answers come first: they are about the release that is
     // RUNNING, not about the one the network designates, and a node whose
     // `PendingHealthy` is never cleared rolls back at its next restart.
-    let came_up = status.identity_published();
+    let came_up = status.came_up();
     let awaiting_health = matches!(phase, Phase::PendingHealthy(_));
     if awaiting_health && came_up {
         return Next::Healthy;
@@ -617,11 +617,11 @@ mod tests {
         assert_eq!(decide(&idle("a"), &armed, &spent), Next::Wait);
     }
 
-    /// The healthy signal is the node's published identity, and it outranks
-    /// everything: a `PendingHealthy` nobody clears rolls the release back at
-    /// the next restart.
+    /// The healthy signal is the node serving committed state under its
+    /// identity, and it outranks everything: a `PendingHealthy` nobody clears
+    /// rolls the release back at the next restart.
     #[test]
-    fn a_flipped_release_is_healthy_once_it_publishes_an_identity() {
+    fn a_flipped_release_is_healthy_once_it_serves_under_its_identity() {
         let pending = Phase::PendingHealthy(PendingHealthy {
             current: sha("b"),
             previous: sha("a"),
@@ -632,6 +632,29 @@ mod tests {
         assert_eq!(decide(&pending, &silent, &pinned()), Next::Wait);
         let published = status(1201, "ab", designating("b", 1200));
         assert_eq!(decide(&pending, &published, &pinned()), Next::Healthy);
+    }
+
+    /// A resident publishes its identity BEFORE it recovers its journal, so a
+    /// release that dies in recovery answers with an identity at height 0
+    /// until it does. That is not a release that came up: marking it healthy
+    /// clears the boot count that would have rolled it back.
+    #[test]
+    fn a_release_that_has_not_reached_a_committed_height_has_not_come_up() {
+        let pending = Phase::PendingHealthy(PendingHealthy {
+            current: sha("b"),
+            previous: sha("a"),
+            boots: 0,
+            pinned_sequence: 2,
+        });
+        let recovering = status(0, "ab", designating("b", 1200));
+        assert_eq!(decide(&pending, &recovering, &pinned()), Next::Wait);
+        let rolled_back = Phase::RolledBack(RolledBack {
+            current: sha("a"),
+            failed: sha("b"),
+            reason: RollbackReason::NeverRendered,
+            pinned_sequence: 2,
+        });
+        assert_eq!(decide(&rolled_back, &recovering, &pinned()), Next::Wait);
     }
 
     /// Nobody dismisses a node's rollback notice, so the supervisor does —
