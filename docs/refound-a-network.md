@@ -143,9 +143,10 @@ the node, and refuses every designation with `no_release_key` until the
 network commits a node key (`ducktape release key set --kind node`), which it
 then pins on its first read. The report reads the file back and prints
 `release key  pinned <hex>` or names the node that has none. A key pinned by
-`ducktape-node-launcher install --release-key` is read once per node life, so
-that install runs before the first `run` — pinning it that way later costs a
-restart.
+`ducktape-node-launcher install --release-key` is read once per node life, and
+an install refuses a workspace a running launcher holds (`workspace_locked`),
+so that install runs before the first `run` — pinning it that way later means
+stopping the launcher first.
 
 **A grant line is not a live daemon.** `announced at height N` is printed
 before the daemon has finished booting, so the script waits out the exit

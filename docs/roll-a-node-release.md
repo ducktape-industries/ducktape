@@ -80,35 +80,23 @@ it founds them, and its report says so:
 ```
 
 An explicit pin — or the move of a differing one — is made in place, no
-re-found:
+re-found, with the workspace's launcher stopped: `install` writes the
+workspace like `run` does, and refuses one a running launcher holds
+(`workspace_locked`). A stopped launcher stops its node first.
 
 ```
+U="ducktape-node@$(systemd-escape '<chain id>')"
+sudo systemctl stop "$U"
 PUB=$(<workspace>/current/ducktape user key status --key <workspace>/keys/operator.key | awk '{print $NF}')
 ducktape-node-launcher install --workspace <workspace> --config <workspace>/node.toml \
     --from <workspace>/current/ducktape --release-key "$PUB"
+sudo systemctl start "$U"
 ```
 
 `--from` names the release the workspace is already running, so nothing is
-copied and `current` does not move; the only new file is the pin. The key is
-read once per node life, so the node child is restarted afterwards — stop it
-and its supervisor boots it again.
-
-Find it by what it is EXECUTING, never by a pattern over command lines: a
-`-f` match hits the editor, the grep and the shell that happen to name the
-same path.
-
-```
-for p in /proc/[0-9]*; do
-    case "$(readlink "$p/exe" 2>/dev/null)" in
-        <workspace>/updates/releases/*/ducktape) echo "stopping ${p#/proc/}"; kill "${p#/proc/}";;
-    esac
-done
-```
-
-`/proc/<pid>/exe` resolves THROUGH the `current` symlink, so a node child's
-executable path names its release directory, never `current/` — a scan looking
-for `current/` matches nothing at all and looks exactly like "nothing is
-running".
+copied and `current` does not move; `state.json` starts over at idle on that
+release, and the pin is the one new file. The launcher reads it when it
+starts.
 
 ## 1. Archive the release
 
@@ -189,8 +177,9 @@ ducktape release status --json --config <workspace>/node.toml
 
 ## 4. Watch it land
 
-The launcher's events are in `<workspace>/launcher.log`, under
-`ducktape::update`, and they are the whole story in order:
+The launcher logs to its stderr — under the unit, the journal
+(`journalctl -u "ducktape-node@$(systemd-escape '<chain id>')"`) — under
+`ducktape::update`, and its events are the whole story in order:
 
 ```
 node_update_offered      the network designates a release this node is not running
