@@ -188,8 +188,18 @@ node_update_staged       staged, waiting for its height    display="0.1.0+97b4ef
 node_update_arming       armed at the committed height; stopping the node to qualify it
 node_update_qualified    the staged binary reopened the workspace checkpoint at the committed root
 node_update_flipped      from=<old sha> to=<new sha>
+node_update_launcher_exec release=<new sha> from=<short> to=<short>  only when the release ships another launcher
 node_update_exec         starting the node
 ```
+
+After a flip the supervisor runs the launcher the release shipped: with the
+old node stopped, it `exec`s `<workspace>/current/ducktape-node-launcher` in
+its own pid when those bytes differ from its own, and that image starts the
+node. A supervisor whose image never logs `node_update_launcher_exec` cannot
+take this step, and restarting it runs the same image again: on such a node,
+install the release's launcher over the path the unit runs
+(`install -m 0755 <workspace>/current/ducktape-node-launcher <ExecStart path>`)
+and restart the unit once; every later flip moves the launcher by itself.
 
 Staging is early and the flip is late: the bytes land while the designation is
 still in the future, and the node is stopped only once, to qualify the binary

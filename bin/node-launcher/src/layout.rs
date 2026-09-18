@@ -37,6 +37,9 @@ pub const NODE_EXE: &str = "ducktape";
 /// that cannot reach the mesh at all.
 pub const MODULES_DIR: &str = "modules";
 
+/// This launcher, as a node release archive ships it beside the binary.
+pub const LAUNCHER_EXE: &str = "ducktape-node-launcher";
+
 /// The node's own config, which is this launcher's alone — the update tree is
 /// shared, a config file name is not.
 const CONFIG_FILE: &str = "node.toml";
@@ -141,6 +144,12 @@ impl Layout {
     pub fn exe(&self) -> PathBuf {
         self.current_link().join(NODE_EXE)
     }
+
+    /// The launcher the install path's release ships — the image a `run`
+    /// becomes before it starts that release's node.
+    pub fn launcher(&self) -> PathBuf {
+        self.current_link().join(LAUNCHER_EXE)
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +178,10 @@ mod tests {
             PathBuf::from(format!("/srv/net/updates/releases/{sha}/ducktape"))
         );
         assert_eq!(layout.exe(), PathBuf::from("/srv/net/current/ducktape"));
+        assert_eq!(
+            layout.launcher(),
+            PathBuf::from("/srv/net/current/ducktape-node-launcher")
+        );
         assert_eq!(
             Layout::link_target(sha),
             PathBuf::from(format!("updates/releases/{sha}"))

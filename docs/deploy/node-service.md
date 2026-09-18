@@ -15,7 +15,13 @@ starts `<workspace>/current/ducktape node run`, asks it `ducktape release
 status` every poll, and follows the network's node releases — it stages a
 designated release, qualifies it against the workspace checkpoint, flips
 `current` at the activation height and rolls back a release that never comes
-up. A service unit runs the daemon through the launcher's service role,
+up. Whenever it holds no node — at start, and after a flip stopped the old
+one — a `run` launcher whose bytes differ from
+`<workspace>/current/ducktape-node-launcher` `exec`s that file in its own pid
+(`node_update_launcher_exec`), so after a flip the unit's main process runs the
+launcher the release shipped; the unit's `ExecStart` copy is never written, and
+it is what counts a boot and rolls back a release whose launcher cannot start.
+A service unit runs the daemon through the launcher's service role,
 `ducktape-node-launcher service --workspace DIR --config FILE -- service run <kind> --enable`
 (`supervise_service`): the role starts `<workspace>/current/ducktape` and
 restarts the daemon when a release flip moves that link, so the node and its

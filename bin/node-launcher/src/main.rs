@@ -9,6 +9,16 @@
 //! needs a live node to ask where the chain is, and a process that replaced
 //! itself with the node could not ask.
 //!
+//! IT MOVES WITH ITS RELEASE. A node archive ships this launcher beside
+//! `ducktape`. Wherever no child runs — after the boot drive, and after a
+//! flip stopped the node — a `run` whose image differs from
+//! `<workspace>/current/ducktape-node-launcher` `exec`s that file with its own
+//! argv (same pid, so the service manager sees one process), and the image it
+//! becomes starts the node. The installed copy is never written: it is what
+//! the service manager starts again, and it counts the boot before it
+//! considers the exec, so a shipped launcher that cannot start rolls back like
+//! a node that cannot.
+//!
 //! ```text
 //! ducktape-node-launcher run     --workspace DIR [--config FILE] [-- ARGS...]
 //! ducktape-node-launcher service --workspace DIR [--config FILE] -- ARGS...
@@ -57,7 +67,9 @@ use tracing::{debug, error, info, warn};
 use crate::layout::{Layout, MODULES_DIR, NODE_EXE};
 use crate::node::{Child, Ducktape};
 use crate::refusal::Refusal;
-use crate::update::{Executor, Failure, Heard, KeyPin, Next, Refused, Retry, Settled, Watch};
+use crate::update::{
+    Executor, Failure, Heard, KeyPin, Next, Refused, Relaunch, Retry, Settled, Watch,
+};
 
 pub const TARGET: &str = "ducktape::update";
 
@@ -74,6 +86,12 @@ usage: ducktape-node-launcher run     --workspace DIR [--config FILE] [-- ARGS..
 /// deadline: nothing here times out, and a node that never answers simply
 /// keeps running.
 const POLL_ENV: &str = "DUCKTAPE_UPDATE_POLL_MS";
+
+/// Set by a `run` on the launcher it execs, to the sha of that image: the
+/// machine is already driven, and the image that lands says so by matching it.
+/// A start that finds it naming another image (or finds none) is a process
+/// start, and drives the boot — so a stray value can never skip a boot count.
+pub const RELAUNCHED_ENV: &str = "DUCKTAPE_NODE_LAUNCHER_RELAUNCHED";
 
 /// A forever-retry loop says its first attempt, then every this-many-th,
 /// carrying the count: the counter IS the diagnosis, and a line per attempt
@@ -266,6 +284,11 @@ fn supervise_node(layout: &Layout, args: &[OsString]) -> ExitCode {
         Ok(claim) => claim,
         Err(refusal) => return refuse(&refusal),
     };
+    let image = match writers::running_image() {
+        Ok(image) => image,
+        Err(refusal) => return refuse(&refusal),
+    };
+    let mut entry = entry_of(image);
     let mut watch = Watch::default();
     let mut child_args = vec![OsString::from("node"), OsString::from("run")];
     child_args.extend_from_slice(args);
@@ -273,7 +296,17 @@ fn supervise_node(layout: &Layout, args: &[OsString]) -> ExitCode {
     // ends the run (`one_node_life` zeroes it).
     let mut failed_boots = 0u64;
     loop {
-        let life = match one_node_life(layout, &child_args, &mut watch, &mut failed_boots) {
+        // Only the first life can be a relaunch: every later one follows a
+        // child that exited, and boots.
+        let this_entry = std::mem::replace(&mut entry, Entry::Boot);
+        let life = match one_node_life(
+            layout,
+            image,
+            this_entry,
+            &child_args,
+            &mut watch,
+            &mut failed_boots,
+        ) {
             Ok(life) => life,
             Err(refusal) => return refuse(&refusal),
         };
@@ -394,40 +427,47 @@ enum Boot {
     Up,
 }
 
+/// How a life of the supervisor begins.
+enum Entry {
+    /// A process start: drive the machine on `Boot` first.
+    Boot,
+    /// This image was exec'd by a `run` that had already driven the machine
+    /// over this `state.json`; driving `Boot` again would count one boot twice.
+    Relaunched,
+}
+
+/// Read [`RELAUNCHED_ENV`] once, and take it out of this process's
+/// environment so no child or later exec inherits it.
+fn entry_of(image: Sha) -> Entry {
+    let marker = std::env::var(RELAUNCHED_ENV).ok();
+    // SAFETY: called before this process starts any thread or child; the
+    // launcher never spawns a thread at all.
+    unsafe { std::env::remove_var(RELAUNCHED_ENV) };
+    let landed = marker.and_then(|text| text.parse::<Sha>().ok()) == Some(image);
+    match landed {
+        true => Entry::Relaunched,
+        false => Entry::Boot,
+    }
+}
+
 /// One boot, one child, and the polls in between.
 fn one_node_life(
     layout: &Layout,
+    image: Sha,
+    entry: Entry,
     child_args: &[OsString],
     watch: &mut Watch,
     failed_boots: &mut u64,
 ) -> Result<Life, Refusal> {
     let ducktape = Ducktape::new(layout.exe(), layout.config());
     let mut keys = update::trusted_keys(layout)?;
-    let mut phase = read_phase(layout)?;
-
-    // The boot drive: resolve an interrupted flip, count a boot that never
-    // came up, roll back the release that did not. It runs with no live node,
-    // so a `Staged` boot refuses its own qualify (`no_committed_height`) and
-    // starts the release the network is already on — the flip belongs to the
-    // poll loop, where a node can say what the committed height is.
-    let boot = Executor {
-        layout,
-        ducktape: &ducktape,
-        keys: keys.as_ref(),
-        live: None,
-        attempt: 1,
-    }
-    .drive(phase, Event::Boot)?;
-    if let Heard::Refused(refused) = &boot.heard {
-        // A staged release's boot qualify is refused for want of a height
-        // (`no_committed_height`): not an answer about the release, which the
-        // poll loop asks once a live node can say where the chain is.
-        debug!(target: TARGET, reason = %refused.reason(), "the boot drive flips nothing");
-    }
-    phase = boot.phase;
-    let running = boot.run.unwrap_or_else(|| phase.current());
-    info!(target: TARGET, event = "node_update_exec", release = %running, "starting the node");
-    let mut child = ducktape.spawn(child_args)?;
+    let read = read_phase(layout)?;
+    let (mut phase, run) = match entry {
+        Entry::Boot => boot_drive(layout, &ducktape, keys.as_ref(), read)?,
+        Entry::Relaunched => (read, None),
+    };
+    let running = run.unwrap_or_else(|| phase.current());
+    let mut child = start_node(layout, image, &ducktape, child_args, running)?;
     let mut reached = Boot::Starting;
     // Consecutive polls the node did not answer; an answer starts it over.
     let mut unanswered = 0u64;
@@ -519,10 +559,83 @@ fn one_node_life(
             continue;
         }
         let running = settled.run.unwrap_or_else(|| phase.current());
-        info!(target: TARGET, event = "node_update_exec", release = %running, "starting the node");
-        child = ducktape.spawn(child_args)?;
+        child = start_node(layout, image, &ducktape, child_args, running)?;
         reached = Boot::Starting;
     }
+}
+
+/// The boot drive: resolve an interrupted flip, count a boot that never came
+/// up, roll back the release that did not. It runs with no live node, so a
+/// `Staged` boot refuses its own qualify (`no_committed_height`) and starts
+/// the release the network is already on — the flip belongs to the poll loop,
+/// where a node can say what the committed height is.
+fn boot_drive(
+    layout: &Layout,
+    ducktape: &Ducktape,
+    keys: Option<&TrustedKeys>,
+    phase: Phase,
+) -> Result<(Phase, Option<Sha>), Refusal> {
+    let boot = Executor {
+        layout,
+        ducktape,
+        keys,
+        live: None,
+        attempt: 1,
+    }
+    .drive(phase, Event::Boot)?;
+    if let Heard::Refused(refused) = &boot.heard {
+        // A staged release's boot qualify is refused for want of a height
+        // (`no_committed_height`): not an answer about the release, which the
+        // poll loop asks once a live node can say where the chain is.
+        debug!(target: TARGET, reason = %refused.reason(), "the boot drive flips nothing");
+    }
+    Ok((boot.phase, boot.run))
+}
+
+/// The launcher that starts the node: this image, or the one `current` ships.
+fn relaunch_of(layout: &Layout, image: Sha) -> Result<Relaunch, Refusal> {
+    let shipped = writers::shipped_image(&layout.launcher())?;
+    Ok(update::relaunch(image, shipped))
+}
+
+/// Start `release`'s node, once no child runs — under the launcher its
+/// release ships, which this process becomes first when the bytes differ.
+fn start_node(
+    layout: &Layout,
+    image: Sha,
+    ducktape: &Ducktape,
+    child_args: &[OsString],
+    release: Sha,
+) -> Result<Child, Refusal> {
+    match relaunch_of(layout, image)? {
+        Relaunch::Stay => spawn_node(ducktape, child_args, release),
+        Relaunch::Exec { from, to } => Err(become_launcher(layout, release, from, to)),
+    }
+}
+
+fn spawn_node(
+    ducktape: &Ducktape,
+    child_args: &[OsString],
+    release: Sha,
+) -> Result<Child, Refusal> {
+    info!(target: TARGET, event = "node_update_exec", release = %release, "starting the node");
+    ducktape.spawn(child_args)
+}
+
+/// Exec `current`'s launcher; back here only when the exec failed, which ends
+/// this process like any launcher that cannot start — the service manager
+/// starts the installed one again, and the boot it counts rolls back a release
+/// whose launcher never runs.
+fn become_launcher(layout: &Layout, release: Sha, from: Sha, to: Sha) -> Refusal {
+    info!(
+        target: TARGET,
+        event = "node_update_launcher_exec",
+        release = %release,
+        from = %from.short(),
+        to = %to.short(),
+        "the release ships another launcher; becoming it before the node starts"
+    );
+    writers::exec_launcher(&layout.launcher(), to)
 }
 
 /// A `release status` that did not answer: a node still binding its listeners
@@ -1416,6 +1529,68 @@ mod tests {
         assert!(!layout.current_link().exists(), "current was not moved");
         assert!(!layout.state_path().exists(), "no state was written");
         assert!(!layout.release_key_path().exists(), "no key was pinned");
+    }
+
+    /// COUNT THE BOOT, DECIDE THE ROLLBACK, THEN CONSIDER THE LAUNCHER — the
+    /// order that rolls back a shipped launcher which cannot start the way it
+    /// rolls back a node that cannot. The first boot after a flip is on disk
+    /// before the shipped launcher is become; the next finds the budget spent
+    /// and flips back, and the release it lands on names the launcher, not the
+    /// one it rolled back from.
+    #[test]
+    fn a_boot_is_counted_and_a_spent_budget_rolled_back_before_a_launcher_is_considered() {
+        use crate::layout::LAUNCHER_EXE;
+        use app_update::PendingHealthy;
+        let dir = tempfile::tempdir().unwrap();
+        let layout = node_workspace(dir.path());
+        let ducktape = Ducktape::new(layout.exe(), layout.config());
+        let (old, new) = (Sha::digest(b"old"), Sha::digest(b"new"));
+        release_source(&layout.exe_of(old));
+        release_source(&layout.exe_of(new));
+        let shipped = b"a launcher with other bytes";
+        std::fs::write(layout.release_dir(new).join(LAUNCHER_EXE), shipped).unwrap();
+        writers::replace_symlink(&layout.current_link(), &Layout::link_target(new)).unwrap();
+        let pending = |boots| {
+            Phase::PendingHealthy(PendingHealthy {
+                current: new,
+                previous: old,
+                boots,
+                pinned_sequence: 1,
+            })
+        };
+        let installed = b"the installed launcher";
+        let image = Sha::digest(installed);
+
+        let (phase, run) = boot_drive(&layout, &ducktape, None, pending(0)).unwrap();
+        assert_eq!(phase, pending(1));
+        assert_eq!(
+            read_phase(&layout).unwrap(),
+            pending(1),
+            "the boot is counted on disk before any launcher is considered"
+        );
+        assert_eq!(run.unwrap_or_else(|| phase.current()), new);
+        assert_eq!(
+            relaunch_of(&layout, image).unwrap(),
+            Relaunch::Exec {
+                from: image,
+                to: Sha::digest(shipped),
+            }
+        );
+
+        // The shipped launcher died; the service manager starts the installed
+        // one again, and its boot spends the budget.
+        let (phase, run) = boot_drive(&layout, &ducktape, None, phase).unwrap();
+        assert!(matches!(phase, Phase::RolledBack(_)), "{phase:?}");
+        assert_eq!(run, Some(old));
+        assert_eq!(
+            relaunch_of(&layout, image).unwrap(),
+            Relaunch::Stay,
+            "the release rolled back to ships no launcher, so nothing is exec'd"
+        );
+
+        // A release that ships this very image is started by it.
+        std::fs::write(layout.release_dir(old).join(LAUNCHER_EXE), installed).unwrap();
+        assert_eq!(relaunch_of(&layout, image).unwrap(), Relaunch::Stay);
     }
 
     /// `install` lays out exactly what a boot expects to find.

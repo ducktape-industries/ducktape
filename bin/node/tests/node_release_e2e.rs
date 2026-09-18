@@ -390,14 +390,21 @@ fn write_executable(path: &Path, body: &str) {
 /// `<mark>.tar.zst` holding one executable `ducktape` — the archive shape a
 /// node release ships in.
 fn archive_of(body: &str) -> Vec<u8> {
+    archive_with(&[("ducktape", body.as_bytes())])
+}
+
+/// A node archive of executable `(name, bytes)` entries at its root.
+fn archive_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut builder = tar::Builder::new(Vec::new());
-    let mut header = tar::Header::new_gnu();
-    header.set_size(body.len() as u64);
-    header.set_mode(0o755);
-    header.set_cksum();
-    builder
-        .append_data(&mut header, "ducktape", body.as_bytes())
-        .expect("append the release binary");
+    for (name, bytes) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, *bytes)
+            .expect("append a release file");
+    }
     let tar = builder.into_inner().expect("finish the tar");
     zstd::encode_all(tar.as_slice(), 3).expect("compress the archive")
 }
@@ -926,6 +933,87 @@ fn a_release_is_taken_back_by_designating_the_previous_one_again() {
         "v2 was downloaded once, and v1 never: it was staged from disk"
     );
     net.daemon().expect_line_nth(&["daemon on release v1"], 2, BUDGET);
+
+    net.service
+        .as_mut()
+        .expect("the service launcher runs")
+        .terminate(Duration::from_secs(120));
+    net.launcher
+        .as_mut()
+        .expect("the launcher runs")
+        .terminate(Duration::from_secs(120));
+}
+
+/// A NODE RELEASE MOVES THE LAUNCHER THAT APPLIES IT. The archive ships its
+/// own `ducktape-node-launcher` — the launcher under test, stripped, so its
+/// bytes differ from the copy that was started. Once the flip has stopped the
+/// node, the supervisor `exec`s the release's launcher: the pid a service
+/// manager watches is unchanged and now runs the release's image, which starts
+/// the node and sees it healthy — without exec'ing again.
+#[test]
+fn a_release_that_ships_another_launcher_is_run_by_it() {
+    let (mut net, _first) = start(&release_binary("v1", false));
+    let shipped = net.dir.path().join("launcher-v2");
+    let stripped = Command::new("strip")
+        .arg("-o")
+        .arg(&shipped)
+        .arg(launcher_exe())
+        .status()
+        .expect("strip");
+    assert!(stripped.success(), "strip the launcher under test");
+    let shipped = std::fs::read(&shipped).expect("read the release's launcher");
+    let second = archive_with(&[
+        ("ducktape", release_binary("v2", false).as_bytes()),
+        ("ducktape-node-launcher", &shipped),
+    ]);
+    let second_sha = publish(&net, 1, "2026.09.3+v2", &second);
+    let pid = net.launcher.as_ref().expect("the launcher runs").pid();
+
+    designate(&net, second_sha, &[]);
+    let exec = net.log().expect_line(
+        &["node_update_launcher_exec", &second_sha.to_string()],
+        BUDGET,
+    );
+    let to = format!("to={}", Sha::digest(&shipped).short());
+    assert!(
+        exec.contains(&to),
+        "the release's launcher is become: {exec}"
+    );
+    net.log()
+        .expect_line(&["node_update_healthy", &second_sha.to_string()], BUDGET);
+
+    let image = std::fs::read_link(format!("/proc/{pid}/exe")).expect("the supervisor's image");
+    let release_launcher = net
+        .workspace
+        .join("updates/releases")
+        .join(second_sha.to_string())
+        .join("ducktape-node-launcher")
+        .canonicalize()
+        .expect("the release's launcher is on disk");
+    assert_eq!(
+        image, release_launcher,
+        "the same pid runs the launcher the release shipped"
+    );
+    // The launcher's other children are short `release status` polls; the
+    // node is the one `node run`. One means the flip stopped the old node
+    // before the exec, and the image it became started the new one.
+    let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .expect("the supervisor's children");
+    let nodes = children
+        .split_whitespace()
+        .filter(|child| {
+            std::fs::read(format!("/proc/{child}/cmdline"))
+                .is_ok_and(|cmdline| cmdline.windows(9).any(|w| w == b"node\0run\0"))
+        })
+        .count();
+    assert_eq!(nodes, 1, "one node runs under the supervisor: {children}");
+    let log = std::fs::read_to_string(net.dir.path().join("launcher.log"))
+        .expect("read the launcher's log");
+    assert_eq!(
+        log.matches("node_update_launcher_exec").count(),
+        1,
+        "the image it became runs the node itself"
+    );
 
     net.service
         .as_mut()
