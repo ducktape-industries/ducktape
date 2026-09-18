@@ -1446,6 +1446,200 @@ pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String>
     Ok(out)
 }
 
+/// the file that makes a directory under the ducktape home a REMOTE
+/// workspace: a network this machine reaches through a node it does not run.
+/// A directory holding a `network.toml` is a local workspace and its
+/// `remote.toml`, if any, is never read.
+pub const REMOTE_WORKSPACE_FILE: &str = "remote.toml";
+
+/// a remote workspace: the chain id the node reported on `/v1/status`, and the
+/// node's http base. No credential: nothing this machine sends that node is
+/// authorized by a file here.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteWorkspace {
+    pub chain_id: String,
+    pub node: String,
+}
+
+impl RemoteWorkspace {
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
+        toml::from_str(&text).map_err(|e| format!("{path:?}: {e}"))
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let text = toml::to_string(self).expect("a remote workspace serializes");
+        genesis::write_atomic(path, text.as_bytes())
+    }
+}
+
+/// where a registered network's node answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Registered {
+    /// a workspace this machine runs: its node.toml.
+    Local(PathBuf),
+    /// a remote workspace: its `remote.toml`, and the node's http base.
+    Remote { file: PathBuf, node: String },
+}
+
+impl Registered {
+    /// the file that registered it — what a "pick one" list shows.
+    pub fn file(&self) -> &Path {
+        match self {
+            Registered::Local(node_toml) => node_toml,
+            Registered::Remote { file, .. } => file,
+        }
+    }
+
+    /// the node's http base: [`http_base_of`] a local node.toml's
+    /// `http_listen`, a remote workspace's `node` as registered.
+    pub fn node_base(&self) -> Result<String, String> {
+        match self {
+            Registered::Local(node_toml) => {
+                let (raw, _) = node_toml::load_node_toml(node_toml)?;
+                Ok(http_base_of(&raw.http_listen))
+            }
+            Registered::Remote { node, .. } => Ok(node.clone()),
+        }
+    }
+}
+
+/// every registered network — the local workspaces [`list_workspaces_in`]
+/// finds, then the remote ones — as `(chain id, where its node answers)`.
+pub fn registered_networks() -> Result<Vec<(String, Registered)>, String> {
+    registered_networks_in(&ducktape_home()?)
+}
+
+pub fn registered_networks_in(root: &Path) -> Result<Vec<(String, Registered)>, String> {
+    let mut out: Vec<(String, Registered)> = list_workspaces_in(root)?
+        .into_iter()
+        .map(|(chain_id, node_toml)| (chain_id, Registered::Local(node_toml)))
+        .collect();
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(format!("read {root:?}: {e}")),
+    };
+    let mut remote = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let file = dir.join(REMOTE_WORKSPACE_FILE);
+        let is_remote = !dir.join("network.toml").exists() && file.is_file();
+        if !is_remote {
+            continue;
+        }
+        match RemoteWorkspace::load(&file) {
+            Ok(workspace) => remote.push((
+                workspace.chain_id,
+                Registered::Remote {
+                    file,
+                    node: workspace.node,
+                },
+            )),
+            Err(e) => warn!(
+                target: "ducktape::node",
+                reason = "remote_workspace_unreadable",
+                dir = %dir.display(),
+                error = %e,
+                "skipping an unreadable remote workspace"
+            ),
+        }
+    }
+    remote.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.file().cmp(b.1.file())));
+    out.extend(remote);
+    Ok(out)
+}
+
+/// the registered networks whose chain id carries `wanted`'s salt — the match
+/// key; the label is display and is checked by [`resolve_chain_in`]. A
+/// registry id that is not an address's chain id (a `node init --name` the
+/// address grammar cannot spell) matches nothing.
+pub fn registered_on(
+    root: &Path,
+    wanted: &duck_address::ChainId,
+) -> Result<Vec<(String, Registered)>, String> {
+    Ok(registered_networks_in(root)?
+        .into_iter()
+        .filter(|(chain_id, _)| {
+            chain_id
+                .parse::<duck_address::ChainId>()
+                .is_ok_and(|registered| registered.salt_hex() == wanted.salt_hex())
+        })
+        .collect())
+}
+
+/// the ONE registered network a `duck://` address names, found by its chain
+/// id and nothing else: no active workspace, no lone-workspace default, no
+/// `./node.toml`, no environment variable. The salt matches, the label must
+/// agree, and none or several matches are refused with the registry listed.
+pub fn resolve_chain_in(
+    root: &Path,
+    wanted: &duck_address::ChainId,
+) -> Result<(String, Registered), duck_address::Refused> {
+    let unreadable = |e: String| duck_address::Refused::new("registry_unreadable", e);
+    let matching = registered_on(root, wanted).map_err(unreadable)?;
+    let listed = || -> Result<String, duck_address::Refused> {
+        let rows: Vec<(String, PathBuf)> = registered_networks_in(root)
+            .map_err(unreadable)?
+            .into_iter()
+            .map(|(chain_id, registered)| (chain_id, registered.file().to_path_buf()))
+            .collect();
+        match rows.is_empty() {
+            true => Ok(format!(
+                "  (nothing is registered under {})",
+                root.display()
+            )),
+            false => Ok(workspace_choices(&rows)),
+        }
+    };
+    let authority = wanted.authority();
+    match matching.as_slice() {
+        [] => Err(duck_address::Refused::new(
+            "network_unknown",
+            format!(
+                "No workspace registered on this machine is on network {authority}. Redeem an \
+                 invite to it (`ducktape node join <invite>`), or register a node that serves it \
+                 (`ducktape forge setup --node <url>`). Registered:\n{}",
+                listed()?
+            ),
+        )),
+        [(chain_id, registered)] => {
+            let agrees = chain_id
+                .parse::<duck_address::ChainId>()
+                .is_ok_and(|registered| registered.label == wanted.label);
+            if !agrees {
+                return Err(duck_address::Refused::new(
+                    "label_mismatch",
+                    format!(
+                        "The address names network {authority}, but this machine's registry \
+                         knows {} as {chain_id} ({}).",
+                        wanted.salt_hex(),
+                        registered.file().display()
+                    ),
+                ));
+            }
+            Ok((chain_id.clone(), registered.clone()))
+        }
+        several => Err(duck_address::Refused::new(
+            "network_ambiguous",
+            format!(
+                "{} registered workspaces are on network {authority}, and an address names a \
+                 network, not a workspace — keep one of them registered:\n{}",
+                several.len(),
+                workspace_choices(
+                    &several
+                        .iter()
+                        .map(|(chain_id, registered)| {
+                            (chain_id.clone(), registered.file().to_path_buf())
+                        })
+                        .collect::<Vec<_>>()
+                )
+            ),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2067,6 +2261,162 @@ mod tests {
         );
         std::fs::write(dir.join("node.toml"), node_toml).expect("write node.toml");
         dir
+    }
+
+    fn write_remote(root: &Path, ws: &str, chain: &str, node: &str) -> PathBuf {
+        let dir = root.join(ws);
+        std::fs::create_dir_all(&dir).expect("mk remote workspace");
+        let file = dir.join(REMOTE_WORKSPACE_FILE);
+        RemoteWorkspace {
+            chain_id: chain.into(),
+            node: node.into(),
+        }
+        .save(&file)
+        .expect("save remote workspace");
+        file
+    }
+
+    fn chain(authority: &str) -> duck_address::ChainId {
+        authority.parse().expect("an address chain id")
+    }
+
+    fn refused(root: &Path, authority: &str) -> duck_address::Refused {
+        resolve_chain_in(root, &chain(authority)).expect_err("refused")
+    }
+
+    /// An address resolves by its chain id and by nothing else. The lone
+    /// registered workspace — the bottom rung every `-n`-less verb stands on —
+    /// is of ANOTHER network here, and it is not chosen: the refusal lists it.
+    #[test]
+    fn an_address_on_no_registered_network_is_refused_and_the_lone_workspace_is_not_chosen() {
+        let root = tmp("resolve-unknown");
+        let empty = refused(&root, "dognet-b5b6ea90");
+        assert_eq!(empty.reason, "network_unknown");
+        assert!(empty.sentence.contains("nothing is registered"), "{empty}");
+
+        let other = write_workspace(
+            &root,
+            "a",
+            "kitchen#99887766",
+            "0.0.0.0:9000",
+            "0.0.0.0:8844",
+        );
+        let unknown = refused(&root, "dognet-b5b6ea90");
+        assert_eq!(unknown.reason, "network_unknown");
+        assert!(unknown.sentence.contains("dognet-b5b6ea90"), "{unknown}");
+        assert!(unknown.sentence.contains("redeem") || unknown.sentence.contains("Redeem"));
+        assert!(
+            unknown
+                .sentence
+                .contains(&other.join("node.toml").display().to_string()),
+            "the refusal lists the registry: {unknown}"
+        );
+    }
+
+    /// One match — local or remote, the same kind of entry with a different
+    /// node base — is the answer, whatever else is registered.
+    #[test]
+    fn one_registered_network_resolves_to_its_node_base_local_or_remote() {
+        let root = tmp("resolve-one");
+        write_workspace(
+            &root,
+            "a",
+            "kitchen#99887766",
+            "0.0.0.0:9000",
+            "0.0.0.0:8844",
+        );
+        let local = write_workspace(
+            &root,
+            "b",
+            "dognet#b5b6ea90",
+            "0.0.0.0:9001",
+            "0.0.0.0:18844",
+        );
+        let (chain_id, registered) =
+            resolve_chain_in(&root, &chain("dognet-b5b6ea90")).expect("resolves");
+        assert_eq!(chain_id, "dognet#b5b6ea90");
+        assert_eq!(registered, Registered::Local(local.join("node.toml")));
+        assert_eq!(registered.node_base().unwrap(), "http://127.0.0.1:18844");
+
+        let file = write_remote(&root, "c", "far#0badf00d", "http://10.0.0.5:8844");
+        let (chain_id, registered) =
+            resolve_chain_in(&root, &chain("far-0badf00d")).expect("resolves");
+        assert_eq!(chain_id, "far#0badf00d");
+        assert_eq!(
+            registered,
+            Registered::Remote {
+                file,
+                node: "http://10.0.0.5:8844".into()
+            }
+        );
+        assert_eq!(registered.node_base().unwrap(), "http://10.0.0.5:8844");
+    }
+
+    /// Two entries on one network — a local workspace and a remote one, or a
+    /// founder and its joiner — cannot be told apart by an address, so the
+    /// address picks neither and names both.
+    #[test]
+    fn several_registered_workspaces_on_one_network_are_refused_by_name() {
+        let root = tmp("resolve-several");
+        let local = write_workspace(
+            &root,
+            "a",
+            "dognet#b5b6ea90",
+            "0.0.0.0:9000",
+            "0.0.0.0:8844",
+        );
+        let remote = write_remote(&root, "b", "dognet#b5b6ea90", "http://10.0.0.5:8844");
+        let ambiguous = refused(&root, "dognet-b5b6ea90");
+        assert_eq!(ambiguous.reason, "network_ambiguous");
+        for path in [local.join("node.toml"), remote] {
+            assert!(
+                ambiguous.sentence.contains(&path.display().to_string()),
+                "{ambiguous}"
+            );
+        }
+    }
+
+    /// The salt is the match key and the label must agree: a label that does
+    /// not is refused naming both spellings, never resolved on the salt alone.
+    #[test]
+    fn a_label_the_registry_does_not_know_the_network_by_is_refused() {
+        let root = tmp("resolve-label");
+        write_workspace(
+            &root,
+            "a",
+            "dognet-mainnet#b5b6ea90",
+            "0.0.0.0:9000",
+            "0.0.0.0:8844",
+        );
+        let mismatch = refused(&root, "dognet-b5b6ea90");
+        assert_eq!(mismatch.reason, "label_mismatch");
+        assert!(mismatch.sentence.contains("dognet-b5b6ea90"), "{mismatch}");
+        assert!(
+            mismatch.sentence.contains("dognet-mainnet#b5b6ea90"),
+            "{mismatch}"
+        );
+    }
+
+    /// A directory with a `network.toml` is a local workspace; a stray
+    /// `remote.toml` beside it does not register the network twice.
+    #[test]
+    fn a_local_workspace_is_never_also_a_remote_one() {
+        let root = tmp("resolve-local-wins");
+        let local = write_workspace(
+            &root,
+            "a",
+            "dognet#b5b6ea90",
+            "0.0.0.0:9000",
+            "0.0.0.0:8844",
+        );
+        write_remote(&root, "a", "dognet#b5b6ea90", "http://10.0.0.5:8844");
+        assert_eq!(
+            registered_networks_in(&root).unwrap(),
+            [(
+                "dognet#b5b6ea90".to_string(),
+                Registered::Local(local.join("node.toml"))
+            )]
+        );
     }
 
     #[test]

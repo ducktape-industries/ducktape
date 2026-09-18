@@ -22,6 +22,8 @@ module-artifact = { workspace = true }
 # THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
 # zero-dependency leaf so every reader of that root agrees about it.
 ducktape-home = { workspace = true }
+# the chain id a `duck://` address carries — the registry resolves it here.
+duck-address = { workspace = true }
 base64 = "0.22"
 # the genesis file's record codec — the workspace's one binary artifact.
 borsh = { workspace = true }

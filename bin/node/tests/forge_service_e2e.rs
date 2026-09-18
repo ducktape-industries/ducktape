@@ -201,6 +201,7 @@ fn stock_git_uses_browser_gateway_and_signed_route_for_all_protocol_flows() {
     git_fetch_and_pull_into_nonempty_checkout_complete_negotiation(&daemon);
     libgit2_mirror_fetch_completes_incremental_sync(&daemon);
     git_push_larger_than_post_buffer_uses_the_probe_path(&daemon);
+    git_remote_duck_resolves_through_the_registry(&daemon);
 }
 
 fn skip_without_git(test: &str) -> Option<()> {
@@ -634,6 +635,461 @@ fn git_push_larger_than_post_buffer_uses_the_probe_path(daemon: &GatewayGit) {
         Some(rev_parse_head(wd)),
         "forge HEAD must equal the pushed commit after a probed push"
     );
+}
+
+/// A stock git that knows nothing about Ducktape: no Gateway header, no url
+/// rewrite, no port — only `git-remote-duck` on its PATH and the ducktape home
+/// the helper resolves a `duck://` address through.
+struct DuckGit<'a> {
+    daemon: &'a GatewayGit,
+    bin: &'a Path,
+    home: PathBuf,
+}
+
+impl DuckGit<'_> {
+    fn cmd(&self, dir: &Path, args: &[&str]) -> Command {
+        let path = format!(
+            "{}:{}",
+            self.bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir)
+            .env("PATH", path)
+            .env("DUCKTAPE_HOME", &self.home)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args([
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "user.name=Ducktape Test",
+                "-c",
+                "user.email=test@ducktape.local",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args);
+        cmd
+    }
+
+    fn run(&self, dir: &Path, args: &[&str]) -> std::process::Output {
+        self.cmd(dir, args).output().expect("spawn git")
+    }
+
+    fn ok(&self, dir: &Path, args: &[&str]) -> std::process::Output {
+        let out = self.run(dir, args);
+        assert!(out.status.success(), "git {args:?}:\n{}", render(&out));
+        out
+    }
+
+    /// `git push --signed`, the certificate signed with the fixture's key.
+    fn signed_push(&self, dir: &Path, url: &str, refspec: &str) -> std::process::Output {
+        self.cmd(dir, &["push", "--signed", url, refspec])
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "gpg.format")
+            .env("GIT_CONFIG_VALUE_0", "ssh")
+            .env("GIT_CONFIG_KEY_1", "user.signingkey")
+            .env("GIT_CONFIG_VALUE_1", &self.daemon.signing_key)
+            .output()
+            .expect("spawn signed git push")
+    }
+}
+
+/// `ducktape <args>` run as `<bin>/ducktape` against the ducktape home `home`.
+fn ducktape_in(bin: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(bin.join("ducktape"))
+        .env("DUCKTAPE_HOME", home)
+        .args(args)
+        .output()
+        .expect("spawn ducktape")
+}
+
+/// Register the node serving `http_base` as a LOCAL workspace of `home`: the
+/// `network.toml` + network-shape `node.toml` pair `node join` writes, of
+/// which the helper reads the chain id and `http_listen`.
+fn register_local_workspace(home: &Path, chain_id: &str, http_base: &str) {
+    let dir = home.join("member");
+    std::fs::create_dir_all(&dir).unwrap();
+    workspace_config::NetworkDescriptor {
+        chain_id: chain_id.into(),
+        validators: vec![],
+        bootstrap: vec![],
+        reach: vec![],
+        coordination: None,
+        block_time_ms: workspace_config::DEFAULT_BLOCK_TIME_MS,
+        genesis: String::new(),
+        modules: Vec::new(),
+    }
+    .save(&dir.join("network.toml"))
+    .unwrap();
+    let http_listen = http_base.trim_start_matches("http://");
+    std::fs::write(
+        dir.join("node.toml"),
+        format!(
+            "network = \"network.toml\"\nkey_file = \"identity.key\"\n\
+             listen = \"127.0.0.1:0\"\nadvertised = \"127.0.0.1:0\"\n\
+             storage_dir = \"storage\"\nhttp_listen = \"{http_listen}\"\n\
+             gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"127.0.0.1:0\"\n\
+             wireguard_listen = \"127.0.0.1:0\"\ninvite_listen = \"127.0.0.1:0\"\n\
+             wireguard_advertised = \"auto\"\nprimary_coordinator = \"none\"\n\
+             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn text(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// `git-remote-duck` end to end. `ducktape forge setup` links the helper
+/// beside the `ducktape` it ran as; then a real `git push --signed`,
+/// `git clone` and `git fetch` of `duck://<chain>/forge/alice/<repo>` resolve
+/// through the registry alone — a remote workspace `forge setup --node`
+/// registered, then a local one — with no header, url or port handed to git.
+/// Each refusal names its cause, and no credential reaches a url or an output.
+fn git_remote_duck_resolves_through_the_registry(daemon: &GatewayGit) {
+    if skip_without_git("git_remote_duck_resolves_through_the_registry").is_some() {
+        return;
+    }
+    let scratch = tempfile::TempDir::new().unwrap();
+    let bin = scratch.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ducktape"), bin.join("ducktape")).unwrap();
+    let chain_id = daemon.cluster.namespace.clone();
+    let chain: duck_address::ChainId = chain_id.parse().expect("the cluster's chain id");
+    let address = |authority: &str, repo: &str| format!("duck://{authority}/forge/alice/{repo}");
+    let url = address(&chain.authority(), "duckrepo");
+    let node = daemon.cluster.http_base(1);
+    let mut outputs = Vec::new();
+
+    // setup: nothing registered is refused and changes nothing; `--node`
+    // registers a remote workspace off the node's status; a rerun changes
+    // nothing and says so.
+    let remote_home = scratch.path().join("remote-home");
+    let empty = ducktape_in(&bin, &remote_home, &["forge", "setup"]);
+    assert!(!empty.status.success(), "{}", render(&empty));
+    assert!(
+        text(&empty).contains("redeem an invite first"),
+        "{}",
+        render(&empty)
+    );
+    assert!(
+        !bin.join("git-remote-duck").exists(),
+        "a refusal links nothing"
+    );
+    let first = ducktape_in(&bin, &remote_home, &["forge", "setup", "--node", &node]);
+    assert!(first.status.success(), "{}", render(&first));
+    assert!(
+        text(&first).contains(&format!(
+            "registered remote workspace {chain_id}: node {node}"
+        )),
+        "{}",
+        render(&first)
+    );
+    assert!(text(&first).contains("linked "), "{}", render(&first));
+    let again = ducktape_in(&bin, &remote_home, &["forge", "setup", "--node", &node]);
+    assert!(again.status.success(), "{}", render(&again));
+    assert!(
+        text(&again).contains("already registered"),
+        "{}",
+        render(&again)
+    );
+    assert!(
+        text(&again).contains("already links to ducktape"),
+        "{}",
+        render(&again)
+    );
+    eprintln!(
+        "[duck] setup:\n{}{}{}",
+        text(&empty),
+        text(&first),
+        text(&again)
+    );
+
+    // the remote workspace: a signed push creates the repository, a clone
+    // reads it back.
+    let remote = DuckGit {
+        daemon,
+        bin: &bin,
+        home: remote_home,
+    };
+    let work = tempfile::TempDir::new().unwrap();
+    let wd = work.path();
+    remote.ok(wd, &["init"]);
+    std::fs::write(wd.join("lib.rs"), "pub fn duck() {}\n").unwrap();
+    remote.ok(wd, &["add", "lib.rs"]);
+    remote.ok(wd, &["commit", "-m", "first through the helper"]);
+    let push = remote.signed_push(wd, &url, "HEAD:main");
+    assert!(push.status.success(), "{}", render(&push));
+    let head = rev_parse_head(wd);
+    assert_eq!(forge_head(daemon, "duckrepo"), Some(head.clone()));
+    let clones = tempfile::TempDir::new().unwrap();
+    let clone = remote.ok(clones.path(), &["clone", &url, "remote-clone"]);
+    let checkout = clones.path().join("remote-clone");
+    assert_eq!(rev_parse_head(&checkout), head);
+    let origin = remote.ok(&checkout, &["remote", "get-url", "origin"]);
+    assert_eq!(String::from_utf8_lossy(&origin.stdout).trim(), url);
+    eprintln!(
+        "[duck] remote workspace push + clone:\n{}{}",
+        text(&push),
+        text(&clone)
+    );
+    outputs.extend([push, clone]);
+
+    // a local workspace resolves the same address the same way.
+    let local_home = scratch.path().join("local-home");
+    register_local_workspace(&local_home, &chain_id, &node);
+    let local = DuckGit {
+        daemon,
+        bin: &bin,
+        home: local_home,
+    };
+    std::fs::write(wd.join("lib.rs"), "pub fn duck() -> u8 { 2 }\n").unwrap();
+    remote.ok(wd, &["commit", "-am", "second, through a local workspace"]);
+    let push = local.signed_push(wd, &url, "HEAD:main");
+    assert!(push.status.success(), "{}", render(&push));
+    let head = rev_parse_head(wd);
+    assert_eq!(forge_head(daemon, "duckrepo"), Some(head.clone()));
+    let clone = local.ok(clones.path(), &["clone", &url, "local-clone"]);
+    assert_eq!(rev_parse_head(&clones.path().join("local-clone")), head);
+    let fetch = remote.ok(&checkout, &["fetch", "origin"]);
+    let fetched = remote.ok(&checkout, &["rev-parse", "origin/main"]);
+    assert_eq!(String::from_utf8_lossy(&fetched.stdout).trim(), head);
+    eprintln!(
+        "[duck] local workspace push + clone:\n{}{}",
+        text(&push),
+        text(&clone)
+    );
+    outputs.extend([push, clone, fetch]);
+
+    // each refusal by name.
+    let salt = chain.salt_hex();
+    let refusals = [
+        (
+            &remote,
+            address(&format!("elsewhere-{}", "0badf00d"), "duckrepo"),
+            "No workspace registered on this machine is on network elsewhere-0badf00d".to_string(),
+        ),
+        (
+            &remote,
+            address(&format!("wrong-label-{salt}"), "duckrepo"),
+            format!("knows {salt} as {chain_id}"),
+        ),
+    ];
+    for (git, address, says) in refusals {
+        let refused = git.run(clones.path(), &["clone", &address, "refused"]);
+        assert!(!refused.status.success(), "{}", render(&refused));
+        assert!(
+            text(&refused).contains(&says),
+            "{says:?}:\n{}",
+            render(&refused)
+        );
+        eprintln!("[duck] refused {address}:\n{}", text(&refused));
+        outputs.push(refused);
+    }
+    let ambiguous_home = scratch.path().join("ambiguous-home");
+    register_local_workspace(&ambiguous_home, &chain_id, &node);
+    let far = ambiguous_home.join("far");
+    std::fs::create_dir_all(&far).unwrap();
+    workspace_config::RemoteWorkspace {
+        chain_id: chain_id.clone(),
+        node: node.clone(),
+    }
+    .save(&far.join(workspace_config::REMOTE_WORKSPACE_FILE))
+    .unwrap();
+    let ambiguous = DuckGit {
+        daemon,
+        bin: &bin,
+        home: ambiguous_home,
+    }
+    .run(clones.path(), &["clone", &url, "refused"]);
+    assert!(!ambiguous.status.success(), "{}", render(&ambiguous));
+    assert!(
+        text(&ambiguous).contains("2 registered workspaces are on network"),
+        "{}",
+        render(&ambiguous)
+    );
+    eprintln!("[duck] refused (ambiguous):\n{}", text(&ambiguous));
+    let missing = remote.run(
+        &checkout,
+        &[
+            "fetch",
+            "origin",
+            "1234567890123456789012345678901234567890",
+        ],
+    );
+    assert!(!missing.status.success(), "{}", render(&missing));
+    assert!(
+        text(&missing).contains("is not reachable"),
+        "{}",
+        render(&missing)
+    );
+    eprintln!("[duck] refused (missing revision):\n{}", text(&missing));
+    std::fs::write(wd.join("lib.rs"), "pub fn duck() -> u8 { 3 }\n").unwrap();
+    remote.ok(wd, &["commit", "-am", "unsigned"]);
+    let unsigned = remote.run(wd, &["push", &url, "HEAD:main"]);
+    assert!(!unsigned.status.success(), "{}", render(&unsigned));
+    assert!(
+        text(&unsigned).contains("this push carries no proof"),
+        "{}",
+        render(&unsigned)
+    );
+    assert_eq!(
+        forge_head(daemon, "duckrepo"),
+        Some(head),
+        "a refused push moves nothing"
+    );
+    eprintln!("[duck] refused (unsigned push):\n{}", text(&unsigned));
+    outputs.extend([ambiguous, missing, unsigned]);
+
+    // the service's upstream credential never reaches git's side of the door.
+    for out in &outputs {
+        let said = text(out);
+        assert!(!said.contains(&"a".repeat(64)), "{said}");
+        assert!(!said.contains("x-duck-upstream-token"), "{said}");
+    }
+}
+
+/// the repository a first Forge flip moves, and the commit a consumer pins in
+/// it: the one that added `duck-address`, a crate with no dependencies.
+const SDK_GITHUB: &str = "https://github.com/ducktape-industries/ducktape-sdk";
+const SDK_PIN: &str = "5fa05decd8b1b22edbfb1ea0c57f4fd7f26cc7a2";
+
+/// Cargo over `duck://`, GitHub on the other side of the flip. The sdk's real
+/// `dev` is fetched from GitHub and pushed through the helper; a consumer
+/// pinning `duck-address` at an exact commit, with `git-fetch-with-cli` in its
+/// own `.cargo/config.toml`, then builds `--locked` from a fresh `CARGO_HOME`
+/// under either spelling of its source. A flip moves the url in `Cargo.toml`
+/// and in the `source` line of `Cargo.lock` — Cargo's own re-resolution
+/// agrees — and never the `#<sha>`. Reaches GitHub, so it runs by hand:
+/// `cargo test -p node-bin --test forge_service_e2e cargo_ -- --ignored --nocapture`
+#[test]
+#[ignore = "fetches ducktape-sdk from GitHub"]
+fn cargo_builds_a_duck_dependency_locked_and_flips_to_github_and_back() {
+    if skip_without_git("cargo_builds_a_duck_dependency_locked").is_some() {
+        return;
+    }
+    let daemon = GatewayGit::start();
+    let scratch = tempfile::TempDir::new().unwrap();
+    let bin = scratch.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ducktape"), bin.join("ducktape")).unwrap();
+    let home = scratch.path().join("home");
+    let node = daemon.cluster.http_base(1);
+    let setup = ducktape_in(&bin, &home, &["forge", "setup", "--node", &node]);
+    assert!(setup.status.success(), "{}", render(&setup));
+    let chain: duck_address::ChainId = daemon.cluster.namespace.parse().unwrap();
+    let duck_url = format!("duck://{}/forge/alice/ducktape-sdk", chain.authority());
+    let git = DuckGit {
+        daemon: &daemon,
+        bin: &bin,
+        home: home.clone(),
+    };
+
+    // the mirror: GitHub's dev, pushed through the helper.
+    git.ok(scratch.path(), &["clone", "--bare", SDK_GITHUB, "sdk"]);
+    let push = git.signed_push(
+        &scratch.path().join("sdk"),
+        &duck_url,
+        "refs/heads/dev:refs/heads/dev",
+    );
+    assert!(push.status.success(), "{}", render(&push));
+    eprintln!("[cargo] mirror push:\n{}", text(&push));
+
+    let consumer = scratch.path().join("consumer");
+    std::fs::create_dir_all(consumer.join("src")).unwrap();
+    std::fs::create_dir_all(consumer.join(".cargo")).unwrap();
+    std::fs::write(
+        consumer.join(".cargo/config.toml"),
+        "[net]\ngit-fetch-with-cli = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        consumer.join("src/main.rs"),
+        "fn main() {\n    let address = duck_address::Address::parse(\
+         \"duck://dognet-b5b6ea90/forge/alice/crate\").unwrap();\n    \
+         println!(\"{}\", address.chain);\n}\n",
+    )
+    .unwrap();
+    let manifest = |url: &str| {
+        format!(
+            "[package]\nname = \"duck-consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nduck-address = {{ git = \"{url}\", rev = \"{SDK_PIN}\" }}\n"
+        )
+    };
+    let lock = || std::fs::read_to_string(consumer.join("Cargo.lock")).unwrap();
+    // every step from its OWN empty CARGO_HOME: nothing is served from a
+    // cache an earlier step filled.
+    let cargo = |step: &str, args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO"));
+        cmd.current_dir(&consumer)
+            .env_clear()
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("HOME", std::env::var("HOME").unwrap())
+            .env(
+                "CARGO_HOME",
+                scratch.path().join(format!("cargo-home-{step}")),
+            )
+            .env("DUCKTAPE_HOME", &home)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(args);
+        for name in ["RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
+            if let Ok(value) = std::env::var(name) {
+                cmd.env(name, value);
+            }
+        }
+        let out = cmd.output().expect("spawn cargo");
+        eprintln!("[cargo] {step}: cargo {}\n{}", args.join(" "), text(&out));
+        assert!(out.status.success(), "{step}:\n{}", render(&out));
+        out
+    };
+    cargo("version", &["--version"]);
+
+    // GitHub: resolve, then build --locked from a fresh home.
+    std::fs::write(consumer.join("Cargo.toml"), manifest(SDK_GITHUB)).unwrap();
+    cargo("github-resolve", &["build"]);
+    let github_lock = lock();
+    let pinned = |url: &str| format!("source = \"git+{url}?rev={SDK_PIN}#{SDK_PIN}\"");
+    assert!(github_lock.contains(&pinned(SDK_GITHUB)), "{github_lock}");
+    cargo("github-locked", &["build", "--locked"]);
+
+    // flip to duck://: Cargo's own re-resolution moves the url and nothing
+    // else, and a fresh home builds it --locked through the helper.
+    std::fs::write(consumer.join("Cargo.toml"), manifest(&duck_url)).unwrap();
+    cargo("duck-resolve", &["build"]);
+    let duck_lock = lock();
+    assert!(duck_lock.contains(&pinned(&duck_url)), "{duck_lock}");
+    assert_eq!(
+        duck_lock.replace(&duck_url, SDK_GITHUB),
+        github_lock,
+        "a flip moves the source url and nothing else"
+    );
+    let run = cargo("duck-locked", &["run", "--locked", "--quiet"]);
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "dognet#b5b6ea90"
+    );
+
+    // and back: the mirror-image two-file edit, --locked from a fresh home.
+    std::fs::write(consumer.join("Cargo.toml"), manifest(SDK_GITHUB)).unwrap();
+    std::fs::write(
+        consumer.join("Cargo.lock"),
+        duck_lock.replace(&duck_url, SDK_GITHUB),
+    )
+    .unwrap();
+    cargo("github-again-locked", &["build", "--locked"]);
+    assert_eq!(lock(), github_lock);
 }
 
 /// Uses the app test binary's native window and compiled Forge WASM against
