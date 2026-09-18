@@ -85,8 +85,8 @@ pub use gateway_http::{
 // the node-actor command lane and the router's shared state handle.
 mod handle;
 pub use handle::{
-    NetstackSwapRequest, NetstackSwapper, NodeCommand, NodeHandle, PeersStanding, Refused,
-    StatusCell,
+    InviteNote, MintedInvite, NetstackSwapRequest, NetstackSwapper, NodeCommand, NodeHandle,
+    PeersStanding, Refused, StatusCell,
 };
 
 mod module_code;
@@ -1355,7 +1355,9 @@ async fn huddle_node_proof(
 }
 
 /// POST /v1/invite `{"ttl_days": N}` — mint one bearer invite and answer
-/// `{"invite": "🦆…"}`. `ttl_days` defaults to and is bounded by the ONE
+/// `{"invite": "🦆…", "notes": [{"reason", "sentence"}]}` ([`MintedInvite`]),
+/// the notes being what `ducktape node invite` prints on stderr after the
+/// blob. `ttl_days` defaults to and is bounded by the ONE
 /// policy every door shares (`workspace_config::{DEFAULT_INVITE_TTL_DAYS,
 /// INVITE_TTL_DAYS}`), so this route and `ducktape node invite` mint the same
 /// invite for the same request.
@@ -1406,11 +1408,7 @@ async fn mint_invite(
         return no_invite_minter(handle.status_cell().current().operations.phase);
     };
     match minted {
-        Ok(invite) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "invite": invite })),
-        )
-            .into_response(),
+        Ok(minted) => (StatusCode::OK, Json(minted)).into_response(),
         Err(why) => error_response(StatusCode::BAD_REQUEST, &why),
     }
 }

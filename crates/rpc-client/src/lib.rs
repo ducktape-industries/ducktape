@@ -372,6 +372,25 @@ pub struct Status {
     pub public_key: String,
 }
 
+/// `POST /v1/invite`'s answer: the paste blob, and every note the mint left on
+/// it (empty when it could do everything).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct MintedInvite {
+    pub invite: String,
+    pub notes: Vec<InviteNote>,
+}
+
+/// One thing a mint could not do. Never a refusal — the blob still admits a
+/// joiner — but it changes what the blob can do, so it belongs beside the
+/// blob wherever the blob is shown: `reason` is a stable snake_case token
+/// (`invite_not_dialable_off_box`, `invite_no_mesh_state`, …), `sentence` what
+/// to do about it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct InviteNote {
+    pub reason: String,
+    pub sentence: String,
+}
+
 /// An HTTP(S) origin serving Ducktape's `/v1` endpoints.
 #[derive(Clone)]
 pub struct Client {
@@ -982,14 +1001,16 @@ impl Client {
         Ok(receipt.height)
     }
 
-    /// Mint one bearer invite valid for `ttl_days` and answer the paste blob.
+    /// Mint one bearer invite valid for `ttl_days` and answer the paste blob
+    /// with the notes the mint left on it.
     ///
     /// The NODE mints it, not the caller: minting folds this member's dial hint
     /// into the network descriptor and SAVES it, and reads the persisted mesh
     /// state for the member fronts a joiner can bring its tunnel up against —
-    /// both files the running daemon owns. A daemon with no workspace (an
-    /// embedder that wired no minter) answers 503.
-    pub async fn mint_invite(&self, ttl_days: u64) -> Result<String> {
+    /// both files the running daemon owns. A node still starting answers 503
+    /// with reason `node_starting`; a daemon with no workspace (an embedder
+    /// that wired no minter) answers 503.
+    pub async fn mint_invite(&self, ttl_days: u64) -> Result<MintedInvite> {
         let response = self
             .credentialed(self.http.post(self.url("v1/invite")?))
             .json(&serde_json::json!({ "ttl_days": ttl_days }))
@@ -999,12 +1020,7 @@ impl Client {
         if !response.status().is_success() {
             return Err(response_error(response).await);
         }
-        #[derive(Deserialize)]
-        struct Minted {
-            invite: String,
-        }
-        let minted: Minted = decode_json(response).await?;
-        Ok(minted.invite)
+        decode_json(response).await
     }
 
     /// Mint this node's `node_proof` for a `JoinHuddle`: its own mesh-identity
@@ -1371,6 +1387,26 @@ mod tests {
         ] {
             assert!(Client::new(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    /// THE NOTES RIDE BESIDE THE BLOB. The body is the node's own, verbatim:
+    /// noded's `the_invite_route_mints_refuses_and_says_when_it_cannot` pins
+    /// that `/v1/invite` serves exactly these fields, so this fails if either
+    /// side moves.
+    #[test]
+    fn a_minted_invite_decodes_with_its_notes() {
+        let body = r#"{"invite":"duck-invite-for-7-days","notes":[{"reason":"invite_not_dialable_off_box","sentence":"this invite is reachable on this machine only"}]}"#;
+        let minted: MintedInvite = serde_json::from_str(body).expect("the node's body");
+        assert_eq!(
+            minted,
+            MintedInvite {
+                invite: "duck-invite-for-7-days".into(),
+                notes: vec![InviteNote {
+                    reason: "invite_not_dialable_off_box".into(),
+                    sentence: "this invite is reachable on this machine only".into(),
+                }],
+            }
+        );
     }
 
     #[tokio::test]

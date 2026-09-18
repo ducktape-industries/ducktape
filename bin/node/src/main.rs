@@ -715,19 +715,30 @@ fn run_node(
         // member's dial hint into the network descriptor and saves it, and
         // reads the persisted mesh for the fronts the blob carries: both are
         // this process's files, so a second process doing it races us over
-        // them. The route hands the work to a blocking thread.
+        // them. The route hands the work to a blocking thread, and answers
+        // every note beside the blob — the app says them next to its Copy
+        // button the way the CLI prints them after the blob.
         let invite_config = cfg_path.clone();
         status.wire_invite_minter(move |ttl_days| {
             let (blob, notes) =
                 cli::mint_invite_blob(&invite_config, ttl_days).map_err(|why| why.to_string())?;
-            for note in notes {
+            for note in &notes {
                 tracing::warn!(
                     target: "ducktape::join",
                     reason = note.reason(),
                     "the minted invite carries fewer paths than a full mesh would give it"
                 );
             }
-            Ok(blob)
+            Ok(noded::MintedInvite {
+                invite: blob,
+                notes: notes
+                    .iter()
+                    .map(|note| noded::InviteNote {
+                        reason: note.reason().to_string(),
+                        sentence: note.to_string(),
+                    })
+                    .collect(),
+            })
         });
         // the netstack plane's operator trigger and its status field. Both
         // exist only where a reachability plane will: `wireguard_listen` is
