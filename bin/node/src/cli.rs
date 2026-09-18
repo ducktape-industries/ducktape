@@ -967,6 +967,13 @@ pub(crate) enum InviteNote {
     /// coordinator stands in for one: the blob admits a joiner on this
     /// machine and nowhere else.
     NotDialableOffBox,
+    /// some carried paths only route inside the LAN or tailnet of the member
+    /// they name; `outside` is what is left for a joiner anywhere else, and
+    /// may be empty.
+    LanOnlyPaths {
+        lan_only: Vec<String>,
+        outside: Vec<String>,
+    },
 }
 
 impl InviteNote {
@@ -977,6 +984,7 @@ impl InviteNote {
             InviteNote::NoMeshStateYet(_) => "invite_no_mesh_state",
             InviteNote::MeshStateUnreadable(_, _) => "invite_mesh_state_unreadable",
             InviteNote::NotDialableOffBox => "invite_not_dialable_off_box",
+            InviteNote::LanOnlyPaths { .. } => "invite_lan_only_paths",
         }
     }
 }
@@ -1006,8 +1014,63 @@ impl std::fmt::Display for InviteNote {
                 "this invite is reachable on this machine only — set `advertised` (or a \
                  concrete wireguard_listen IP) and mint again to invite over the network"
             ),
+            InviteNote::LanOnlyPaths { lan_only, outside } => {
+                let lan_only = lan_only.join(", ");
+                let reaches_from_outside = !outside.is_empty();
+                match reaches_from_outside {
+                    true => write!(
+                        f,
+                        "{lan_only} only work(s) from the same LAN or tailnet; from outside \
+                         it, a joiner gets in through {}",
+                        outside.join(", ")
+                    ),
+                    false => write!(
+                        f,
+                        "{lan_only} only work(s) from the same LAN or tailnet, and nothing in \
+                         this invite reaches this network from outside it — a joiner anywhere \
+                         else cannot get in; set `wireguard_advertised` to a public host:port \
+                         and mint again to invite over the internet"
+                    ),
+                }
+            }
         }
     }
+}
+
+/// Which of the paths an invite carries route only inside one LAN or
+/// tailnet — said once, so an operator handing the blob to a stranger
+/// elsewhere knows before the stranger fails. `endpoints` are the direct
+/// `host:port` paths (the inviter's tunnel endpoint, every direct front); the
+/// coordinator is the rendezvous a joiner anywhere reaches a registered member
+/// through. `None` when no path is LAN-only: minting never refuses, because a
+/// LAN invite is a legitimate one.
+fn lan_only_note(endpoints: &[&str], coordinator: Option<&str>) -> Option<InviteNote> {
+    let coordinator = coordinator.map(|c| format!("coordinator {c}"));
+    let paths = endpoints.iter().map(|e| e.to_string()).chain(coordinator);
+    let (lan_only, outside): (Vec<String>, Vec<String>) =
+        paths.partition(|path| path_is_lan_only(path));
+    let every_path_routes = lan_only.is_empty();
+    if every_path_routes {
+        return None;
+    }
+    Some(InviteNote::LanOnlyPaths { lan_only, outside })
+}
+
+/// Does this `host:port` (optionally after a `coordinator ` label) route only
+/// inside one network? An IP literal in a private, CGNAT/tailnet, loopback,
+/// link-local or ULA range, or an mDNS `.local` name — which only the LAN it
+/// is announced on resolves.
+fn path_is_lan_only(path: &str) -> bool {
+    let host_port = path.rsplit(' ').next().unwrap_or(path);
+    if let Ok(addr) = host_port.parse::<std::net::SocketAddr>() {
+        return crate::first_contact_join::ip_is_unroutable_offnet(addr.ip());
+    }
+    let host = host_port
+        .rsplit_once(':')
+        .map_or(host_port, |(host, _)| host);
+    host.trim_end_matches('.')
+        .to_ascii_lowercase()
+        .ends_with(".local")
 }
 
 /// Mint one bearer invite from the workspace `cfg_path` names, answering the
@@ -1172,6 +1235,14 @@ pub(crate) fn mint_invite_blob(
 
     // the expiry lives INSIDE the token (signed), not as a separate blob field.
     // every invite is bearer.
+    let direct_paths: Vec<&str> = wireguard
+        .endpoint
+        .iter()
+        .chain(fronts.iter().filter_map(|front| front.endpoint.as_ref()))
+        .map(String::as_str)
+        .collect();
+    notes.extend(lan_only_note(&direct_paths, coordinator.as_deref()));
+
     let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes(), expires);
     let blob_string = config::encode_invite(
         &invite_descriptor,
@@ -2409,6 +2480,57 @@ mod json_output_tests {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    /// Minting never refuses a LAN invite, but it says which paths only work
+    /// from the same LAN or tailnet, and whether anything reaches from outside:
+    /// a LAN-only invite says nobody elsewhere gets in, a mixed one names the
+    /// way in, and an invite whose every path routes says nothing.
+    #[test]
+    fn an_invite_names_its_lan_only_paths_and_whether_anything_reaches_from_outside() {
+        let lan_only = super::lan_only_note(
+            &[
+                "192.168.0.70:51820",
+                "100.101.102.103:51820",
+                "10.0.0.2:51820",
+            ],
+            Some("box.local:7777"),
+        )
+        .expect("every path is LAN-only");
+        assert_eq!(lan_only.reason(), "invite_lan_only_paths");
+        let said = lan_only.to_string();
+        for path in [
+            "192.168.0.70:51820",
+            "100.101.102.103:51820",
+            "10.0.0.2:51820",
+            "coordinator box.local:7777",
+        ] {
+            assert!(said.contains(path), "{said}");
+        }
+        assert!(
+            said.contains("a joiner anywhere else cannot get in"),
+            "{said}"
+        );
+
+        let mixed = super::lan_only_note(
+            &["172.16.4.4:51820", "203.0.113.7:51820"],
+            Some("coord.example.org:443"),
+        )
+        .expect("one path is LAN-only")
+        .to_string();
+        assert!(mixed.contains("172.16.4.4:51820 only work(s)"), "{mixed}");
+        assert!(
+            mixed.contains(
+                "a joiner gets in through 203.0.113.7:51820, coordinator coord.example.org:443"
+            ),
+            "{mixed}"
+        );
+        assert!(!mixed.contains("cannot get in"), "{mixed}");
+
+        assert!(
+            super::lan_only_note(&["203.0.113.7:51820"], Some("coord.example.org:443")).is_none(),
+            "every path routes: nothing to say"
+        );
+    }
 
     /// `node status`'s netstack line: nothing at all on a node with no plane,
     /// the backend alone before the first swap, and the outcome with the height
