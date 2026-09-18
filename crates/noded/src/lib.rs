@@ -416,6 +416,11 @@ pub enum NodePhase {
     /// network's, which `serving` alone cannot tell a reader; the gap and the
     /// tip it was measured against ride in [`OperationalStatus::follow`].
     Behind,
+    /// Serving, with NO overlay: the reachability plane refused to start or
+    /// exited, so this node answers `/v1` from a copy it can no longer follow,
+    /// reaches no peer and admits no joiner — and it does not self-heal this
+    /// boot. Why rides in [`OperationalStatus::netstack`]'s `failure_reason`.
+    Isolated,
     Draining,
     Halted,
 }
@@ -430,6 +435,7 @@ impl NodePhase {
             Self::Validating => "validating",
             Self::Serving => "serving",
             Self::Behind => "behind",
+            Self::Isolated => "isolated",
             Self::Draining => "draining",
             Self::Halted => "halted",
         }

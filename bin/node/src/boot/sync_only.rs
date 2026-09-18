@@ -195,12 +195,13 @@ pub(crate) async fn run(
         Ok(host) => {
             metrics.begin_sync(Some(client.current_source().to_string()), manifest.height);
             metrics.record_sync_progress(manifest.height);
-            metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Serving);
+            let phase =
+                metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Serving);
             tracing::info!(
                 target: "ducktape::statesync",
                 event = "node_phase_transition",
                 role = "sync_only",
-                phase = "serving",
+                phase = phase.as_str(),
                 node = %label,
                 height = manifest.height
             );

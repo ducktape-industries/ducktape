@@ -850,7 +850,7 @@ pub(super) async fn park(
         backfill_debt.absorb(heal_and_backfill_index(&index, &client, tip, &label).await);
         last_indexed_root = Some(root);
         serving = Some((tip, node_r));
-        metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
+        let phase = metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
         publish_replica_status(
             &status,
             &metrics,
@@ -865,7 +865,7 @@ pub(super) async fn park(
         tracing::info!(
             event = "node_phase_transition",
             role = "resident",
-            phase = "serving",
+            phase = phase.as_str(),
             node = %label,
             height = tip,
             source = "recovery"
@@ -2525,7 +2525,7 @@ pub(super) async fn park(
                                 last_indexed_root = Some(root);
                             }
                             serving = Some((tip, node_r));
-                            metrics.set_role_phase(
+                            let phase = metrics.set_role_phase(
                                 noded::NodeRole::Resident,
                                 noded::NodePhase::Serving,
                             );
@@ -2543,7 +2543,7 @@ pub(super) async fn park(
                             tracing::info!(
                                 event = "node_phase_transition",
                                 role = "resident",
-                                phase = "serving",
+                                phase = phase.as_str(),
                                 node = %label,
                                 height = tip
                             );
