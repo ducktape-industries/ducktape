@@ -199,15 +199,32 @@ still in the future, and the node is stopped only once, to qualify the binary
 against its own checkpoint. A release that cannot reopen the checkpoint does
 not flip — the node starts the one it was already running.
 
+What is staged is the release the network DESIGNATES, looked up in the
+channel's manifest (`/shared/releases/node.json` — only the latest publish has
+a path, so a designation is published when that manifest names its sha for the
+node's platform). One it does not name is refused
+`designated_release_unpublished` rather than waited on; publishing it lets the
+next attempt stage it. A designation that moves while a release is staged
+discards the staged one and stages the new one.
+
+A refusal line carries `class`. `class=transient` is a read that did not
+complete — `fs cat` failing (`download_failed`), an archive served short of
+its size (`short_read`), a manifest not naming the designation yet: the
+launcher asks again after a backoff (the next poll, doubling to 32 polls) and
+says so at attempt 1 and every 60th, with `attempts`. `class=definite` is the
+release's own answer — a bad signature, an archive longer than the manifest
+says or of another hash, a qualify that refused, no key: said once, and not
+asked again until the launcher restarts.
+
 Afterwards `/v1/status` carries the new `version`, and the node spends its
 recovery window reporting `phase: "recovering"` before it resumes producing.
 
 ### Withdraw a refused release
 
-A launcher that refused a release does not ask again until it restarts, but
-the designation stays the network's: a restarted launcher or a node joining
-later fetches it and refuses it again. Take it back with the same ceremony,
-every member passing the same sha:
+A launcher that refused a release definitely does not ask again until it
+restarts, but the designation stays the network's: a restarted launcher or a
+node joining later fetches it and refuses it again. Take it back with the same
+ceremony, every member passing the same sha:
 
 ```
 ducktape release withdraw --sha <the archive's sha256> --config <workspace>/node.toml
@@ -217,6 +234,48 @@ It fetches and runs nothing (there is no preflight), and it refuses a sha the
 network does not designate. A withdrawal names one release: once it passes,
 `release status` answers with the latest designation of any OTHER release
 that no withdrawal has taken back, or with none.
+
+### Take a release back
+
+A release that flipped and came up healthy, then misbehaves, is taken back by
+withdrawing it and designating the release before it again — two ceremonies,
+in this order, every member passing the same shas:
+
+```
+ducktape release withdraw --sha <the misbehaving release's sha256> --config <workspace>/node.toml
+ducktape release schedule --sha <the previous release's sha256> --lead <blocks> --config <workspace>/node.toml
+```
+
+The withdrawal alone moves no node: the misbehaving binary is what `current`
+names, and a network that designates nothing asks nothing of its launchers.
+Withdrawing it first keeps it out of the standing designations, so no later
+withdrawal can hand the network back to it.
+
+Each launcher keeps the release it flipped away from as `previous`, sealed
+under `updates/releases/<sha>`; its sha is the directory `previous` names:
+
+```
+basename "$(readlink <workspace>/previous)"
+```
+
+A designation naming it is staged from there — nothing is downloaded, and it
+need not be the release the manifest names — then qualified and flipped at the
+activation height like any other:
+
+```
+node_update_offered      release=<previous sha>
+node_update_staged       release=<previous sha> display=<its short sha>
+node_update_arming       armed at the committed height; stopping the node to qualify it
+node_update_qualified    the staged binary reopened the workspace checkpoint at the committed root
+node_update_flipped      from=<misbehaving sha> to=<previous sha>
+```
+
+Afterwards the release taken back is the one kept as `previous`. The verb's
+preflight reads the designated archive off duckfs, so it runs for a release
+that was published; one that never was (the binary `install` seeded) has no
+archive there, and only `--skip-preflight-i-know-the-wit-moved` designates it.
+A release two flips back is no longer on any node's disk: designating it is an
+ordinary designation, staged only if the channel's manifest names it.
 
 ## 5. Check it
 

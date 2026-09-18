@@ -464,8 +464,13 @@ fn corrupt_published_archive(net: &Net, sha: Sha, archive: &[u8]) {
     let last = broken.len() - 1;
     broken[last] ^= 0xff;
     assert_eq!(broken.len(), archive.len(), "the size still matches");
-    let path = net.dir.path().join("corrupt.tar.zst");
-    std::fs::write(&path, &broken).expect("write the corrupted archive");
+    overwrite_published_archive(net, sha, &broken, "a stranger replaces the archive");
+}
+
+/// Put `bytes` at the duckfs path the manifest names for `sha`.
+fn overwrite_published_archive(net: &Net, sha: Sha, bytes: &[u8], message: &str) {
+    let path = net.dir.path().join("overwrite.tar.zst");
+    std::fs::write(&path, bytes).expect("write the replacement archive");
     let duckfs = Kind::Node.archive_path(&sha, &Platform::HOST.key());
     let out = Command::new(ducktape())
         .args(["fs", "put"])
@@ -474,7 +479,7 @@ fn corrupt_published_archive(net: &Net, sha: Sha, archive: &[u8]) {
         .args(["--node", &net.base])
         .arg("--key")
         .arg(&net.key)
-        .args(["--message", "a stranger replaces the archive"])
+        .args(["--message", message])
         .env("DUCKTAPE_HOME", net.dir.path())
         .stdin(Stdio::from(net.password()))
         .output()
@@ -749,6 +754,179 @@ fn a_node_publishes_stages_qualifies_and_flips_its_successor_at_a_height() {
 
     // stop the way `systemctl stop` does, so the node checkpoints and nothing
     // is left running over the tempdir this test is about to remove.
+    net.service
+        .as_mut()
+        .expect("the service launcher runs")
+        .terminate(Duration::from_secs(120));
+    net.launcher
+        .as_mut()
+        .expect("the launcher runs")
+        .terminate(Duration::from_secs(120));
+}
+
+/// A READ THAT COMES UP SHORT IS THE MOMENT'S, NOT THE RELEASE'S. The archive
+/// the manifest names is served short of its size — a read the link cut, as
+/// far as this launcher can tell — so the download is refused as transient,
+/// and asked again after a backoff by the same launcher, with no restart. Once
+/// the whole file is served again, the release stages and flips like any
+/// other.
+#[test]
+fn a_download_that_comes_up_short_is_retried_until_the_release_stages() {
+    let (mut net, _first) = start(&release_binary("v1", false));
+    let second = archive_of(&release_binary("v2", false));
+    let second_sha = publish(&net, 1, "2026.09.3+v2", &second);
+
+    // ---- the fault: duckfs serves half the archive ----------------------
+    // The verb's preflight would read the short archive and refuse it; the
+    // launcher's own handling is what this leg is here for.
+    overwrite_published_archive(
+        &net,
+        second_sha,
+        &second[..second.len() / 2],
+        "the archive is served short",
+    );
+    designate(&net, second_sha, &[SKIP_PREFLIGHT]);
+    net.log().expect_line(
+        &[
+            "node_update_refused",
+            "reason=short_read",
+            "class=transient",
+            "attempts=1",
+            &second_sha.to_string(),
+        ],
+        BUDGET,
+    );
+    assert!(
+        !matches!(net.phase(), Phase::Staged(_)),
+        "a short read stages nothing: {:?}",
+        net.phase()
+    );
+
+    // ---- healed: the next retry lands the whole file -------------------
+    overwrite_published_archive(&net, second_sha, &second, "the archive is whole again");
+    net.log()
+        .expect_line(&["node_update_staged", &second_sha.to_string()], BUDGET);
+    net.log().expect_line(&["node_update_flipped"], BUDGET);
+    assert_eq!(
+        net.running(),
+        second_sha,
+        "the release a transient read held up is the one that runs"
+    );
+    net.log()
+        .expect_line(&["node_update_healthy", &second_sha.to_string()], BUDGET);
+    let log = std::fs::read_to_string(net.dir.path().join("launcher.log"))
+        .expect("read the launcher's log");
+    assert!(
+        !log.contains("class=definite"),
+        "nothing about a short read spends the release"
+    );
+
+    net.service
+        .as_mut()
+        .expect("the service launcher runs")
+        .terminate(Duration::from_secs(120));
+    net.launcher
+        .as_mut()
+        .expect("the launcher runs")
+        .terminate(Duration::from_secs(120));
+}
+
+/// A RELEASE THAT BOOTS HEALTHY BUT MISBEHAVES IS TAKEN BACK by withdrawing it
+/// and designating the release before it again. Withdrawing alone moves no
+/// node: the misbehaving binary is what `current` names and nothing is
+/// designated. The previous release is still sealed on disk, so it is staged
+/// from there — never downloaded, and it need not be published at all (here
+/// it is the binary the install seeded) — then qualified and flipped at its
+/// height like any other; the daemon follows the set back.
+#[test]
+fn a_release_is_taken_back_by_designating_the_previous_one_again() {
+    let (mut net, first) = start(&release_binary("v1", false));
+    let second = archive_of(&release_binary("v2", false));
+    let second_sha = publish(&net, 1, "2026.09.3+v2", &second);
+    designate(&net, second_sha, &[]);
+    net.log().expect_line(&["node_update_flipped"], BUDGET);
+    net.log()
+        .expect_line(&["node_update_healthy", &second_sha.to_string()], BUDGET);
+    net.log().expect_line(
+        &[
+            "node_update_settled",
+            "phase=idle",
+            &second_sha.to_string(),
+        ],
+        BUDGET,
+    );
+    net.daemon().expect_line(&["daemon on release v2"], BUDGET);
+
+    // ---- withdraw: the network no longer stands behind v2 ---------------
+    let withdrawn = net
+        .verb(&["release", "withdraw", "--sha", &second_sha.to_string()])
+        .output()
+        .expect("release withdraw");
+    assert!(
+        withdrawn.status.success(),
+        "release withdraw: {}",
+        String::from_utf8_lossy(&withdrawn.stderr)
+    );
+    assert_eq!(
+        net.release_status()["designation"],
+        serde_json::Value::Null,
+        "nothing is designated once v2 is withdrawn"
+    );
+    assert_eq!(
+        net.running(),
+        second_sha,
+        "a withdrawal alone leaves the misbehaving release running"
+    );
+
+    // ---- designate v1 again: the rollback ------------------------------
+    // v1 is the seeded binary, so there is no archive for the preflight to
+    // fetch; the launcher needs none either.
+    let back_at = designate(&net, first, &[SKIP_PREFLIGHT]);
+    net.log()
+        .expect_line(&["node_update_staged", &first.to_string()], BUDGET);
+    let arming = net
+        .log()
+        .expect_line_nth(&["node_update_arming"], 2, BUDGET);
+    assert!(
+        armed_height(&arming) >= back_at,
+        "the rollback flips at its designated height, not before: {arming}"
+    );
+    net.log().expect_line(
+        &[
+            "node_update_qualified",
+            "reopened the workspace checkpoint",
+            &first.to_string(),
+        ],
+        BUDGET,
+    );
+    net.log().expect_line_nth(&["node_update_flipped"], 2, BUDGET);
+    assert_eq!(net.running(), first, "the install path names v1 again");
+    net.log()
+        .expect_line(&["node_update_healthy", &first.to_string()], BUDGET);
+    net.log().expect_line(
+        &["node_update_settled", "phase=idle", &first.to_string()],
+        BUDGET,
+    );
+    match net.phase() {
+        Phase::Idle(idle) => {
+            assert_eq!(idle.current, first);
+            assert_eq!(
+                idle.previous,
+                Some(second_sha),
+                "the release taken back is kept, so it can be designated again"
+            );
+        }
+        other => panic!("expected idle after the rollback, got {other:?}"),
+    }
+    let log = std::fs::read_to_string(net.dir.path().join("launcher.log"))
+        .expect("read the launcher's log");
+    assert_eq!(
+        log.matches("node_update_downloading").count(),
+        1,
+        "v2 was downloaded once, and v1 never: it was staged from disk"
+    );
+    net.daemon().expect_line_nth(&["daemon on release v1"], 2, BUDGET);
+
     net.service
         .as_mut()
         .expect("the service launcher runs")

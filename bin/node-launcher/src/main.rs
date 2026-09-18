@@ -50,12 +50,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use app_update::{Event, Idle, Phase, PublicKey, ReleaseStatus, Sha, TrustedKeys, state};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::layout::{Layout, MODULES_DIR, NODE_EXE};
 use crate::node::{Child, Ducktape};
 use crate::refusal::Refusal;
-use crate::update::{Executor, KeyPin, Next, Settled, Watch};
+use crate::update::{Executor, Failure, KeyPin, Next, Refused, Retry, Settled, Watch};
 
 pub const TARGET: &str = "ducktape::update";
 
@@ -78,9 +78,10 @@ const POLL_ENV: &str = "DUCKTAPE_UPDATE_POLL_MS";
 /// would evict the ring the answer is in.
 const REPORT_EVERY: u64 = 60;
 
-/// The longest a node that keeps dying at boot waits for its next start, in
-/// polls — about a minute at the default poll.
-const RESTART_BACKOFF_CAP_POLLS: u64 = 32;
+/// The longest a forever-retry waits between attempts, in polls — about a
+/// minute at the default poll: a node that keeps dying at boot, and a release
+/// whose reads keep failing.
+const BACKOFF_CAP_POLLS: u64 = 32;
 
 /// Every way the launcher can be invoked; one match in `main`.
 #[derive(Debug, PartialEq, Eq)]
@@ -284,7 +285,7 @@ fn supervise_node(layout: &Layout, args: &[OsString]) -> ExitCode {
                 code,
             } => {
                 failed_boots += 1;
-                let polls = restart_polls(failed_boots);
+                let polls = backoff_polls(failed_boots);
                 if worth_saying(failed_boots) {
                     warn!(
                         target: TARGET,
@@ -307,14 +308,13 @@ fn supervise_node(layout: &Layout, args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// How many polls to wait before booting a node that has died at boot
-/// `failed_boots` times in a row: one after the first, doubling up to
-/// [`RESTART_BACKOFF_CAP_POLLS`]. A single crash still restarts on the next
-/// poll, which is what a flipped release's boot count needs to roll back.
-fn restart_polls(failed_boots: u64) -> u64 {
-    let doublings = u32::try_from(failed_boots.saturating_sub(1)).unwrap_or(u32::MAX);
-    2u64.saturating_pow(doublings)
-        .min(RESTART_BACKOFF_CAP_POLLS)
+/// How many polls to wait after the `attempts`th failure in a row: one after
+/// the first, doubling up to [`BACKOFF_CAP_POLLS`]. A single crash still
+/// restarts on the next poll, which is what a flipped release's boot count
+/// needs to roll back; a single failed read is retried on the next poll.
+fn backoff_polls(attempts: u64) -> u64 {
+    let doublings = u32::try_from(attempts.saturating_sub(1)).unwrap_or(u32::MAX);
+    2u64.saturating_pow(doublings).min(BACKOFF_CAP_POLLS)
 }
 
 /// Attempt 1, then every [`REPORT_EVERY`]th.
@@ -377,8 +377,15 @@ fn one_node_life(
         ducktape: &ducktape,
         keys: keys.as_ref(),
         live: None,
+        attempt: 1,
     }
     .drive(phase, Event::Boot)?;
+    if let Some(refused) = &boot.refused {
+        // A staged release's boot qualify is refused for want of a height
+        // (`no_committed_height`): not an answer about the release, which the
+        // poll loop asks once a live node can say where the chain is.
+        debug!(target: TARGET, reason = %refused.reason(), "the boot drive flips nothing");
+    }
     phase = boot.phase;
     let running = boot.run.unwrap_or_else(|| phase.current());
     info!(target: TARGET, event = "node_update_exec", release = %running, "starting the node");
@@ -412,12 +419,14 @@ fn one_node_life(
         // The key first: a node that pins the network's key on this poll
         // follows the designation it reads on this poll.
         keys = follow_release_key(layout, keys, &status, watch);
+        watch.poll_elapsed();
         let next = update::decide(&phase, &status, watch);
         let Some(event) = next.event() else {
             sleep_poll();
             continue;
         };
-        report(next, &phase, &status);
+        let attempt = attempt_of(watch, next);
+        report(next, &phase, &status, attempt);
         // A flip qualifies the staged binary against the workspace checkpoint,
         // which the running node holds open: stop it first, and start whatever
         // the machine settles on — the new release when it flipped, the
@@ -427,47 +436,39 @@ fn one_node_life(
             child.stop();
         }
         let before = phase.clone();
-        let designated = status.designation.map(|designation| designation.sha256);
         let driven = Executor {
             layout,
             ducktape: &ducktape,
             keys: keys.as_ref(),
             live: Some(&status),
+            attempt,
         }
         .drive(phase, event);
-        let settled = match driven {
-            Ok(settled) => settled,
-            // A refusal mid-poll is this launcher's, not the node's: say it
-            // and put the node back. Only the boot drive is fatal, because
-            // nothing is running to put back. It is said once per designated
-            // release: the answer spends that release (`spent`).
-            Err(refusal) => {
-                warn!(
-                    target: TARGET,
-                    event = "node_update_refused",
-                    reason = refusal.reason,
-                    release = designated.map(tracing::field::display),
-                    detail = %refusal.detail,
-                    "the release plane stalled; the node keeps running"
-                );
-                Settled {
-                    phase: before.clone(),
-                    run: None,
-                }
-            }
-        };
+        // A refusal mid-poll is this launcher's, not the node's: put the node
+        // back, and answer for it like any other no (`answered`). Only the
+        // boot drive is fatal, because nothing is running to put back.
+        let settled = driven.unwrap_or_else(|refusal| Settled {
+            phase: before.clone(),
+            run: None,
+            refused: Some(Refused::Launcher(refusal)),
+        });
         phase = settled.phase;
         // What the drive DID, after the writers that did it: `report` above
         // says what this launcher decided, and a decision is not yet a fact.
-        // Bounded by designations, like every other line of this plane.
-        info!(
-            target: TARGET,
-            event = "node_update_settled",
-            phase = %phase.name(),
-            release = %phase.current(),
-            "the update machine settled"
-        );
-        watch.refused = spent(next, designated, &before, &phase, settled.run).or(watch.refused);
+        // A drive that left the phase as it found it — a refusal, a retry —
+        // did nothing to say here; its refusal is said by `answered`. So the
+        // line is bounded by designations, like every other line of this plane.
+        let moved = phase != before;
+        if moved {
+            info!(
+                target: TARGET,
+                event = "node_update_settled",
+                phase = %phase.name(),
+                release = %phase.current(),
+                "the update machine settled"
+            );
+        }
+        answered(watch, next, &before, settled.refused.as_ref());
         if !flipping {
             continue;
         }
@@ -567,10 +568,24 @@ fn pin_release_key(layout: &Layout, key: PublicKey) -> Result<TrustedKeys, Refus
     })
 }
 
+/// Which attempt at its release this poll's answer is: an offer is asked again
+/// while its answers are transient, and nothing else is.
+fn attempt_of(watch: &Watch, next: Next) -> u64 {
+    match next {
+        Next::Offer(designated) => watch.attempt_at(designated),
+        Next::Flip | Next::Healthy | Next::Dismiss | Next::Wait => 1,
+    }
+}
+
 /// One line per answer that changes what this node runs. `Wait` says nothing:
 /// it is every poll, and a line per poll would evict the ring holding the
-/// answer an operator came looking for.
-fn report(next: Next, phase: &Phase, status: &ReleaseStatus) {
+/// answer an operator came looking for. An offer asked again after a transient
+/// no is said at attempt 1 and every [`REPORT_EVERY`]th, for the same reason.
+fn report(next: Next, phase: &Phase, status: &ReleaseStatus, attempt: u64) {
+    let paced_out = !worth_saying(attempt);
+    if paced_out {
+        return;
+    }
     match next {
         Next::Healthy => info!(
             target: TARGET,
@@ -584,9 +599,11 @@ fn report(next: Next, phase: &Phase, status: &ReleaseStatus) {
             release = %phase.current(),
             "running the release this node rolled back to"
         ),
-        Next::Offer => info!(
+        Next::Offer(designated) => info!(
             target: TARGET,
             event = "node_update_offered",
+            release = %designated,
+            attempts = attempt,
             "the network designates a node release this node is not running"
         ),
         Next::Flip => info!(
@@ -600,59 +617,98 @@ fn report(next: Next, phase: &Phase, status: &ReleaseStatus) {
     }
 }
 
-/// ONE ANSWER PER RELEASE — what this poll SPENT, if anything.
+/// ONE ANSWER PER RELEASE — unless the answer was the moment's, not the
+/// release's.
 ///
 /// The designation stands until governance replaces it, so every answer this
 /// launcher gives would otherwise be asked again on the very next poll: a bad
 /// archive re-downloaded forever, a refused qualify restarting the node
-/// forever, a rolled-back release re-offered forever. A spent release is one
-/// this launcher has answered for; it is asked again when the launcher is
-/// restarted, which is exactly what an operator does after fixing what was
-/// published.
-fn spent(
-    next: Next,
-    designated: Option<Sha>,
-    before: &Phase,
-    after: &Phase,
-    ran: Option<Sha>,
-) -> Option<Sha> {
+/// forever, a rolled-back release re-offered forever. A [`Failure::Definite`]
+/// no SPENDS its release: it is asked again when the launcher is restarted,
+/// which is exactly what an operator does after fixing what was published. A
+/// [`Failure::Transient`] one is asked again after a backoff — the next poll,
+/// then doubling to [`BACKOFF_CAP_POLLS`] — and said at attempt 1 then every
+/// [`REPORT_EVERY`]th. An answer with no refusal ends any retry.
+fn answered(watch: &mut Watch, next: Next, before: &Phase, refused: Option<&Refused>) {
     match next {
-        Next::Offer => spent_offer(designated, after),
-        Next::Flip => spent_flip(before, ran),
-        Next::Dismiss => spent_rollback(before),
-        Next::Wait | Next::Healthy => None,
+        Next::Offer(designated) => settle(watch, designated, refused),
+        Next::Flip => settle_flip(watch, before, refused),
+        Next::Dismiss => spend_rollback(watch, before),
+        Next::Wait | Next::Healthy => {}
     }
 }
 
-/// An offer that did not end `Staged` was refused: a manifest that did not
-/// verify, a download that did not land, an archive that is not what the
-/// manifest names. The executor already said which.
-fn spent_offer(designated: Option<Sha>, after: &Phase) -> Option<Sha> {
-    let staged = matches!(after, Phase::Staged(_));
-    match staged {
-        true => None,
-        false => designated,
-    }
-}
-
-/// A flip that produced no release to run was refused — by the qualify, or by
-/// the network not naming these bytes any more.
-fn spent_flip(before: &Phase, ran: Option<Sha>) -> Option<Sha> {
-    let flipped = ran.is_some();
-    if flipped {
-        return None;
-    }
+/// A flip asks about the release it staged: a refused qualify spends it.
+fn settle_flip(watch: &mut Watch, before: &Phase, refused: Option<&Refused>) {
     let Phase::Staged(staged) = before else {
-        return None;
+        return;
     };
-    Some(staged.staged)
+    settle(watch, staged.staged, refused);
 }
 
-fn spent_rollback(before: &Phase) -> Option<Sha> {
+/// The release a rollback flipped away from never came up: it is spent.
+fn spend_rollback(watch: &mut Watch, before: &Phase) {
     let Phase::RolledBack(rolled_back) = before else {
-        return None;
+        return;
     };
-    Some(rolled_back.failed)
+    watch.refused = Some(rolled_back.failed);
+}
+
+/// Record what one drive answered about `release`, and say a no at its cadence.
+fn settle(watch: &mut Watch, release: Sha, refused: Option<&Refused>) {
+    let Some(refused) = refused else {
+        watch.retry = None;
+        return;
+    };
+    let attempts = watch.attempt_at(release);
+    let failure = update::failure(refused);
+    say_refused(refused, release, failure, attempts);
+    match failure {
+        Failure::Definite => {
+            watch.refused = Some(release);
+            watch.retry = None;
+        }
+        Failure::Transient => {
+            watch.retry = Some(Retry {
+                release,
+                attempts,
+                polls_left: backoff_polls(attempts),
+            })
+        }
+    }
+}
+
+/// A definite no is said once: it is never asked again. A transient one is
+/// said at attempt 1 and every [`REPORT_EVERY`]th, carrying the count.
+fn say_refused(refused: &Refused, release: Sha, failure: Failure, attempts: u64) {
+    let paced_out = failure == Failure::Transient && !worth_saying(attempts);
+    if paced_out {
+        return;
+    }
+    match failure {
+        Failure::Definite => warn!(
+            target: TARGET,
+            event = "node_update_refused",
+            release = %release,
+            reason = %refused.reason(),
+            class = %failure,
+            attempts,
+            detail = %refused.detail(),
+            "{}; not asked again until this launcher restarts",
+            refused.sentence()
+        ),
+        Failure::Transient => warn!(
+            target: TARGET,
+            event = "node_update_refused",
+            release = %release,
+            reason = %refused.reason(),
+            class = %failure,
+            attempts,
+            detail = %refused.detail(),
+            "{}; asking again after a backoff",
+            refused.sentence()
+        ),
+    }
 }
 
 fn read_phase(layout: &Layout) -> Result<Phase, Refusal> {
@@ -968,9 +1024,9 @@ mod tests {
     /// time, up to the cap — and never past it, however long the run.
     #[test]
     fn a_crash_loop_backs_off_doubling_up_to_the_cap() {
-        let waits: Vec<u64> = (1..=8).map(restart_polls).collect();
+        let waits: Vec<u64> = (1..=8).map(backoff_polls).collect();
         assert_eq!(waits, [1, 2, 4, 8, 16, 32, 32, 32]);
-        assert_eq!(restart_polls(u64::MAX), RESTART_BACKOFF_CAP_POLLS);
+        assert_eq!(backoff_polls(u64::MAX), BACKOFF_CAP_POLLS);
     }
 
     #[test]
@@ -1015,14 +1071,11 @@ mod tests {
             reason: RollbackReason::NeverRendered,
             pinned_sequence: 2,
         });
-        assert_eq!(
-            spent(Next::Wait, None, &rolled_back, &rolled_back, None),
-            None
-        );
-        assert_eq!(
-            spent(Next::Dismiss, None, &rolled_back, &idle("a"), None),
-            Some(failed)
-        );
+        let mut watch = Watch::default();
+        answered(&mut watch, Next::Wait, &rolled_back, None);
+        assert_eq!(watch, Watch::default());
+        answered(&mut watch, Next::Dismiss, &rolled_back, None);
+        assert_eq!(watch.refused, Some(failed));
     }
 
     /// A flip that never ran anything was refused, and is not retried — every
@@ -1031,37 +1084,61 @@ mod tests {
     fn a_refused_flip_spends_its_staged_release() {
         let target = Sha::digest(b"b");
         let staged = staged("a", target);
-        assert_eq!(
-            spent(Next::Flip, Some(target), &staged, &staged, Some(target)),
-            None,
-            "a flip that ran is not spent"
-        );
-        assert_eq!(
-            spent(Next::Flip, Some(target), &staged, &staged, None),
-            Some(target)
-        );
+        let mut watch = Watch::default();
+        answered(&mut watch, Next::Flip, &staged, None);
+        assert_eq!(watch, Watch::default(), "a flip that ran is not spent");
+        let refused = Refused::Qualify("wit_world_mismatch".into());
+        answered(&mut watch, Next::Flip, &staged, Some(&refused));
+        assert_eq!(watch.refused, Some(target));
     }
 
-    /// An offer that did not end `Staged` was refused: without spending it,
-    /// the same archive is downloaded again on every poll, forever.
+    /// A DEFINITE no spends the offered release: without spending it, the same
+    /// archive is downloaded again on every poll, forever.
     #[test]
-    fn an_offer_that_did_not_stage_spends_its_designation() {
+    fn an_offer_refused_definitely_spends_its_designation() {
         let target = Sha::digest(b"b");
-        assert_eq!(
-            spent(
-                Next::Offer,
-                Some(target),
-                &idle("a"),
-                &staged("a", target),
-                None
-            ),
-            None,
-            "an offer that staged is not spent"
-        );
-        assert_eq!(
-            spent(Next::Offer, Some(target), &idle("a"), &idle("a"), None),
-            Some(target)
-        );
+        let mut watch = Watch::default();
+        answered(&mut watch, Next::Offer(target), &idle("a"), None);
+        assert_eq!(watch, Watch::default(), "an offer that staged is not spent");
+        let refused = Refused::Verify("sha256_mismatch".into());
+        answered(&mut watch, Next::Offer(target), &idle("a"), Some(&refused));
+        assert_eq!(watch.refused, Some(target));
+        assert_eq!(watch.retry, None);
+    }
+
+    /// A TRANSIENT no never spends the release: it is asked again after a
+    /// backoff that doubles with each attempt, and the first answer that is
+    /// not a no ends the retry.
+    #[test]
+    fn an_offer_refused_transiently_is_asked_again_after_a_growing_backoff() {
+        let target = Sha::digest(b"b");
+        let refused = Refused::Download("short_read".into());
+        let mut watch = Watch::default();
+        for attempts in 1..=4 {
+            answered(&mut watch, Next::Offer(target), &idle("a"), Some(&refused));
+            assert_eq!(watch.refused, None, "a transient no spends nothing");
+            assert_eq!(
+                watch.retry,
+                Some(Retry {
+                    release: target,
+                    attempts,
+                    polls_left: backoff_polls(attempts),
+                })
+            );
+        }
+        // another release starts its own count
+        let other = Sha::digest(b"c");
+        answered(&mut watch, Next::Offer(other), &idle("a"), Some(&refused));
+        assert_eq!(watch.retry.map(|retry| (retry.release, retry.attempts)), Some((other, 1)));
+        // and a transient run that turns definite is spent after all
+        let forged = Refused::Manifest(app_update::Refusal::BadSignature);
+        answered(&mut watch, Next::Offer(other), &idle("a"), Some(&forged));
+        assert_eq!((watch.refused, watch.retry), (Some(other), None));
+
+        let mut watch = Watch::default();
+        answered(&mut watch, Next::Offer(target), &idle("a"), Some(&refused));
+        answered(&mut watch, Next::Offer(target), &idle("a"), None);
+        assert_eq!(watch, Watch::default(), "the read that landed ends the retry");
     }
 
     fn committing(node: Option<PublicKey>) -> ReleaseStatus {
