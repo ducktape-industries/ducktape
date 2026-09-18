@@ -307,7 +307,7 @@ mod tests {
 
     /// `--node` binds through the shared addressing group. The PRECEDENCE it
     /// sits at the top of is pinned once, in
-    /// `cli_args::tests::the_node_address_ladder_ranks_flag_network_env_context_registry`
+    /// `cli_args::tests::the_node_address_ladder_ranks_flag_config_network_env_context_registry`
     /// — not re-asserted per family, which is how four of them drifted apart.
     #[test]
     fn dash_dash_node_binds_its_url() {

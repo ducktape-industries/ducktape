@@ -377,12 +377,11 @@ impl VerbCtx {
     /// node's consensus key, and its storage dir. Required by every verb that
     /// mints an owner-signed statement or writes the store.
     ///
-    /// [`NodeAddr::workspace`] is the ONE ladder that answers this, `--node`
+    /// [`NodeAddr::config_file`] is the ONE ladder that answers this, `--node`
     /// included: a bare url names no directory, so it is resolved backwards
     /// through the registry to the workspace that serves it.
     pub(crate) fn workspace(&self) -> Result<config::Resolved, Box<dyn std::error::Error>> {
-        let dir = self.addr.workspace()?;
-        Ok(config::resolve(&dir.join("node.toml"))?)
+        Ok(config::resolve(&self.addr.config_file()?)?)
     }
 }
 
