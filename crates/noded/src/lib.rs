@@ -307,7 +307,7 @@ pub fn block_row(record: &BlockRecord) -> Vec<u8> {
 /// EQUALITY: never a tolerance window, never "N-1 still works" — that would be
 /// the compat the repository forbids. Nothing on the node reads it, no peer
 /// sees it, and no code branches on its value; the app alone compares.
-pub const NODE_CONTRACT: u32 = 6;
+pub const NODE_CONTRACT: u32 = 7;
 
 /// The surface [`NODE_CONTRACT`] names, fingerprinted: FNV-1a over the sorted
 /// `/v1` route paths of `lib.rs` + `admin.rs` and the ws topic/prefix names
@@ -316,7 +316,7 @@ pub const NODE_CONTRACT: u32 = 6;
 /// `EXPECTED_NODE_CONTRACT` together, then repin this to the value the
 /// failing assertion prints. Repinning WITHOUT the bump is the defect the
 /// test exists to catch.
-pub const NODE_CONTRACT_SURFACE: u64 = 0x3ab4_2d02_809c_f369;
+pub const NODE_CONTRACT_SURFACE: u64 = 0x58f1_ce29_a683_9115;
 
 /// the status projection: daemon build version, global root-hash, and each
 /// registered module's root. `Default` is the pre-first-publish snapshot in
