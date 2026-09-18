@@ -1,17 +1,20 @@
 //! `ducktape node qualify` — can THIS binary run THIS workspace?
 //!
 //! The question a release launcher asks a staged binary before it flips to
-//! it, and the only honest way to ask it: reopen the workspace's checkpoint
-//! and recompose the state it committed, which is exactly the restart path a
-//! live node takes. A binary whose module set, WIT world or state layout
-//! disagrees with what the network committed cannot reach the same root, and
-//! it says so here — with the old binary still installed and the node still
-//! runnable — instead of at the boot after a flip, where the only way out is
-//! a rollback.
+//! it, and the only honest way to ask it: reopen the workspace's checkpoint,
+//! roll it forward through the journal suffix and verify the root consensus
+//! sealed at the tip, which is exactly the restart path a live node takes. A
+//! binary whose module set, WIT world or state layout disagrees with what the
+//! network committed cannot reach the same root, and it says so here — with
+//! the old binary still installed and the node still runnable — instead of at
+//! the boot after a flip, where the only way out is a rollback.
 //!
 //! It opens no listener, joins no mesh and runs no consensus. It DOES open
 //! the workspace's stores, so the node must be stopped: a launcher runs this
-//! between stopping the node and flipping.
+//! between stopping the node and flipping. And it DOES what that restart does
+//! to them: a torn journal tail is rewound, and a block the stop caught
+//! mid-apply is re-applied and sealed — the same writes the next boot of
+//! either binary makes first.
 //!
 //! `--compose-only` asks the LINKER half of that question and nothing else:
 //! do the components this network is running load against this binary's
@@ -34,15 +37,16 @@ use sha2::Digest as _;
 
 use crate::cli_args::QualifyArgs;
 use crate::config;
-use crate::host_state::{NetworkBindings, NodeSubstrates, restore_host};
+use crate::host_state::{BlobCodeSource, NetworkBindings, NodeSubstrates, restore_host};
 use crate::util::hex;
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
 
 /// which question this run asks of the binary running it.
 enum Question {
-    /// the whole restart path: reopen the workspace's checkpoint and
-    /// recompose its committed root. needs the node STOPPED.
+    /// the whole restart path: reopen the workspace's checkpoint, roll it
+    /// forward through the journal and verify the sealed tip. needs the node
+    /// STOPPED.
     Checkpoint,
     /// the linker alone, over the module set the network is running. lock-free
     /// and answerable beside a live node.
@@ -112,9 +116,15 @@ fn reopen(resolved: config::Resolved) -> Result<String, Unqualified> {
     let config = commonware_runtime::tokio::Config::default().with_storage_directory(&storage);
     let runner = commonware_runtime::tokio::Runner::new(config);
     runner.start(|context| async move {
-        let recovery = Recovery::open(context.child("recovery"))
+        let mut recovery = Recovery::open(context.child("recovery"))
             .await
             .map_err(|error| Unqualified::new("recovery_unopenable", error.to_string()))?;
+        // the source the node's own boot replays through: a code swap in the
+        // journal suffix realizes from this workspace's content-addressed
+        // store.
+        recovery.set_code_source(std::sync::Arc::new(BlobCodeSource(std::sync::Arc::new(
+            blobs.clone(),
+        ))));
         let manifest = recovery
             .manifest()
             .map_err(|error| Unqualified::new("checkpoint_damaged", error.to_string()))?;
@@ -127,8 +137,7 @@ fn reopen(resolved: config::Resolved) -> Result<String, Unqualified> {
                 format!("{} holds no checkpoint to reopen", storage.display()),
             )
         })?;
-        let committed = manifest.root_hash;
-        let host = restore_host(
+        let mut host = restore_host(
             &context,
             &manifest,
             NetworkBindings {
@@ -145,20 +154,33 @@ fn reopen(resolved: config::Resolved) -> Result<String, Unqualified> {
         )
         .await
         .map_err(|error| Unqualified::new("checkpoint_unrestorable", error))?;
-        let reached = host.root_hash();
-        let agrees = reached == committed;
-        if !agrees {
-            return Err(Unqualified::new(
-                "root_hash_diverged",
-                format!(
-                    "this binary recomposed {} where the checkpoint committed {}",
-                    hex(&reached),
-                    hex(&committed)
-                ),
-            ));
-        }
-        Ok(hex(&reached))
+        // the rest of the restart path: roll forward through the journal
+        // suffix. a per-block-durable module commits to its own disk every
+        // block while the checkpoint persists on a cadence, so a node stopped
+        // with no final checkpoint — a resident on SIGTERM, any node killed —
+        // leaves those modules ahead of the manifest's root. comparing the
+        // restore to that root refuses every such workspace; recovery floors
+        // them, re-applies the rest, and verifies the tip's sealed root.
+        let recovered = recovery
+            .recover(&mut host, &manifest)
+            .await
+            .map_err(unrecovered)?;
+        Ok(hex(&recovered.root_hash))
     })
+}
+
+/// Recovery's refusal as a qualify reason. `Verify` is this binary reaching a
+/// state consensus never sealed; every other arm is about the workspace.
+fn unrecovered(error: recovery::Error) -> Unqualified {
+    let reason = match &error {
+        recovery::Error::Verify(_) => "root_hash_diverged",
+        recovery::Error::Storage(_)
+        | recovery::Error::Corrupt(_)
+        | recovery::Error::Torn(_)
+        | recovery::Error::FieldOverCap(_)
+        | recovery::Error::RangePruned { .. } => "journal_unrecoverable",
+    };
+    Unqualified::new(reason, error.to_string())
 }
 
 /// Load the module set the network is RUNNING against this binary's wasm
