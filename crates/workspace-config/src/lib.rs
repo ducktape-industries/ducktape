@@ -1201,15 +1201,29 @@ impl FoundingBinary {
     }
 }
 
-/// refuse a boot whose module world is not the one `dir` was founded with.
+/// how a workspace came to hold its network — which decides what a
+/// module-world refusal can tell its operator to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceRole {
+    /// its identity is a genesis validator: the network was founded here.
+    Founder,
+    /// it joined a network founded elsewhere.
+    Member,
+}
+
+/// refuse a boot whose module world is not the one `dir` was founded or
+/// joined with.
 ///
 /// Up front and by name, because the alternative is a node that comes up,
 /// replays, and dies inside component instantiation naming a `shape` export.
-/// There is no tolerance window and no migration: the operator rebuilds the
-/// binary from the founding commit, or re-founds the network.
+/// There is no tolerance window and no migration. What the operator can do
+/// depends on `role`: a founder re-founds the network with this binary, and a
+/// member — who installed a release and can rebuild nothing — runs the node
+/// release its network runs, or joins the re-founded network afresh.
 pub fn guard_founding_binary(
     dir: &Path,
     chain_id: &str,
+    role: WorkspaceRole,
     build: &str,
     module_world: &str,
 ) -> Result<(), String> {
@@ -1220,10 +1234,22 @@ pub fn guard_founding_binary(
     if speaks_the_founding_world {
         return Ok(());
     }
+    let recorded = &founding.build;
+    let remedy = match role {
+        WorkspaceRole::Founder => format!(
+            "this network was founded here by {recorded}, and a module world moves only by a \
+             re-found: re-found the network with this binary, or run the release it was founded \
+             with"
+        ),
+        WorkspaceRole::Member => format!(
+            "this workspace joined it with {recorded}, and this binary cannot run the network's \
+             components: run the node release the network runs, or — if the network was \
+             re-founded — join the new one with a fresh invite from a current member"
+        ),
+    };
     Err(format!(
-        "refusing to boot {chain_id}: founded by {}, running {build} (module world differs) — \
-         rebuild this binary from the founding commit, or re-found the network",
-        founding.build
+        "refusing to boot {chain_id}: running {build}, whose module world is not the one this \
+         workspace holds — {remedy}"
     ))
 }
 
@@ -1665,6 +1691,54 @@ mod tests {
         }
         let key = ed25519::PrivateKey::from_seed(7).public_key();
         assert_eq!(decode_key(&hex_bytes(key.as_ref())), Ok(key));
+    }
+
+    /// A member installed a release and can rebuild nothing, so the refusal
+    /// never tells anybody to rebuild: a founder is sent to re-found, a member
+    /// to the release its network runs or a fresh invite. The binary that
+    /// speaks the recorded world still boots (the must-pass case).
+    #[test]
+    fn a_module_world_refusal_names_each_roles_own_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        FoundingBinary {
+            build: "0.1.0+aaaa".into(),
+            module_world: "world-a".into(),
+        }
+        .save(dir.path())
+        .unwrap();
+        let refuse = |role| {
+            guard_founding_binary(dir.path(), "net#1", role, "0.1.0+bbbb", "world-b")
+                .expect_err("module world differs")
+        };
+
+        let founder = refuse(WorkspaceRole::Founder);
+        assert!(
+            founder.contains("re-found the network with this binary"),
+            "{founder}"
+        );
+        let member = refuse(WorkspaceRole::Member);
+        assert!(
+            member.contains("run the node release the network runs"),
+            "{member}"
+        );
+        assert!(member.contains("fresh invite"), "{member}");
+        assert!(!member.contains("re-found the network with"), "{member}");
+        for said in [&founder, &member] {
+            assert!(!said.contains("rebuild"), "{said}");
+            assert!(
+                said.contains("0.1.0+aaaa") && said.contains("0.1.0+bbbb"),
+                "{said}"
+            );
+        }
+
+        let same = guard_founding_binary(
+            dir.path(),
+            "net#1",
+            WorkspaceRole::Member,
+            "0.1.0+cccc",
+            "world-a",
+        );
+        assert_eq!(same, Ok(()));
     }
 
     /// A binary resolves the set its build staged, by the name that build
