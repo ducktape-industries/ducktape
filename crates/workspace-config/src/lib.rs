@@ -94,18 +94,23 @@ pub fn capability_dir(workspace: &Path) -> PathBuf {
 /// files `node init` composes a genesis from, and the daemons that run no
 /// network (noded, simnode, the dev shape) compose directly from:
 /// `$DUCKTAPE_MODULES_DIR`, else the set the build staged beside this
-/// executable ([`staged_modules_dir`]).
+/// executable under `staged` ([`staged_modules_dir`]).
+///
+/// `staged` is the name the build that linked this binary staged its set
+/// under — `noded::services::STAGED_SET`, baked in by the stager's own run.
+/// It is an argument because this crate has no build script to bake it with
+/// (see `staged_key`).
 ///
 /// This is the only place bare wasm files are read. A network's own wasm
 /// lives in its workspace genesis, never under the ducktape home: two
 /// networks carry two sets, and no directory outside a workspace decides
 /// what its network runs.
-pub fn modules_dir() -> Result<PathBuf, String> {
+pub fn modules_dir(staged: &str) -> Result<PathBuf, String> {
     if let Some(dir) = std::env::var_os("DUCKTAPE_MODULES_DIR") {
         return Ok(PathBuf::from(dir));
     }
     let exe = std::env::current_exe().map_err(|e| format!("current executable: {e}"))?;
-    staged_modules_dir(&exe).ok_or_else(|| no_founding_set(&exe))
+    staged_modules_dir(&exe, staged).ok_or_else(|| no_founding_set(&exe))
 }
 
 /// What a binary with no set beside it says. It names the ARTIFACT that is
@@ -119,20 +124,19 @@ fn no_founding_set(exe: &Path) -> String {
          again if only the binary was copied); `ops/release/archive.sh --kind node` packs one \
          and `ducktape-node-launcher` unpacks it into <workspace>/updates/releases/<sha>/. In a \
          checkout, `cargo build` stages this checkout's own set beside the binaries it links \
-         (target/<profile>/modules%<checkout>, named by its `{}`).",
+         (target/<profile>/modules%<checkout>).",
         exe.display(),
-        staged_key::STAGED_POINTER,
     )
 }
 
 /// The simulator's packaged preset also includes its small KV test module.
 /// An explicit modules directory remains the caller's complete artifact set.
-pub fn sim_modules_dir() -> Result<PathBuf, String> {
+pub fn sim_modules_dir(staged: &str) -> Result<PathBuf, String> {
     let configured = std::env::var_os("DUCKTAPE_MODULES_DIR");
     if let Some(dir) = configured {
         return Ok(PathBuf::from(dir));
     }
-    Ok(sim_twin(&modules_dir()?))
+    Ok(sim_twin(&modules_dir(staged)?))
 }
 
 /// the simulation set beside a resolved founding set: this checkout's keyed
@@ -147,26 +151,23 @@ fn sim_twin(modules: &Path) -> PathBuf {
     modules.with_file_name(sim)
 }
 
-/// the founding set the build staged beside `exe`: `<exe dir>/modules` (a
-/// `cargo build` binary in `target/<profile>/`, or an installed one), else
-/// `<exe dir>/../modules` (a test executable cargo runs from
-/// `target/<profile>/deps/`). `None` when neither directory exists.
-pub fn staged_modules_dir(exe: &Path) -> Option<PathBuf> {
-    // The set the LAST build staged, named by the pointer that build wrote
-    // beside the binaries — then the unkeyed one. The pointer is read at
-    // RUNTIME and never baked: several checkouts share a profile directory
-    // because their source is identical, which is exactly why cargo shares the
-    // compiled unit a baked key would live in (see `STAGED_POINTER`). Unkeyed
-    // is the INSTALLED layout, which `make install-node` and the pinned dognet
-    // binaries use, and where nothing else writes.
+/// the founding set the build staged beside `exe` under the name `staged`:
+/// `<exe dir>/<staged>` (a `cargo build` binary in `target/<profile>/`), else
+/// `<exe dir>/../<staged>` (a test executable cargo runs from
+/// `target/<profile>/deps/`) — then the unkeyed `modules` in the same two
+/// places, the INSTALLED layout `make install-node`, a release archive and the
+/// pinned dognet binaries have, where nothing else writes. `None` when none of
+/// the four exists.
+///
+/// Nothing here reads a file to learn the name: the profile directory is
+/// written by every checkout building into the target, so a name read from it
+/// at boot is the last builder's, not this binary's.
+pub fn staged_modules_dir(exe: &Path, staged: &str) -> Option<PathBuf> {
     let exe_dir = exe.parent()?;
     let deps_parent = exe_dir.parent();
-    let staged = [Some(exe_dir), deps_parent]
-        .into_iter()
-        .flatten()
-        .find_map(|dir| Some(dir.join(staged_pointer_target(dir)?)));
     let candidates = [
-        staged,
+        Some(exe_dir.join(staged)),
+        deps_parent.map(|dir| dir.join(staged)),
         Some(exe_dir.join("modules")),
         deps_parent.map(|dir| dir.join("modules")),
     ];
@@ -174,17 +175,6 @@ pub fn staged_modules_dir(exe: &Path) -> Option<PathBuf> {
         .into_iter()
         .flatten()
         .find(|candidate| candidate.is_dir())
-}
-
-/// The set name `dir`'s pointer names, if it has one.
-fn staged_pointer_target(dir: &Path) -> Option<String> {
-    let name = std::fs::read_to_string(dir.join(staged_key::STAGED_POINTER)).ok()?;
-    let name = name.trim();
-    // a pointer naming anything but a plain directory name is not one this
-    // build wrote; refuse it rather than following it out of the profile dir.
-    let names_one_directory =
-        !name.is_empty() && !name.contains('/') && name != ".." && name != ".";
-    names_one_directory.then(|| name.to_owned())
 }
 
 /// The build that staged `set`, as `crates/noded/build.rs` recorded it, or
@@ -1426,32 +1416,35 @@ pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String>
 mod tests {
     use super::*;
 
-    /// A binary resolves the set THE POINTER BESIDE IT names, before the
-    /// unkeyed one, from the profile directory and from `deps/` where cargo
-    /// runs tests — and an installed layout (a plain `modules` beside the
-    /// binary, which is what `make install-node` and the pinned dognet
-    /// binaries have) resolves exactly as it did before any keying.
+    /// A binary resolves the set its build staged, by the name that build
+    /// baked in, before the unkeyed one, from the profile directory and from
+    /// `deps/` where cargo runs tests — and an installed layout (a plain
+    /// `modules` beside the binary, which is what `make install-node` and the
+    /// pinned dognet binaries have) resolves exactly as it did before any
+    /// keying.
     #[test]
-    fn a_binary_resolves_the_set_its_pointer_names_before_the_installed_one() {
+    fn a_binary_resolves_the_set_its_build_named_before_the_installed_one() {
         let scratch = tempfile::tempdir().unwrap();
         let profile = scratch.path().join("debug");
         let exe = profile.join("ducktape");
         std::fs::create_dir_all(profile.join("deps")).unwrap();
+        let ours = "modules%home%someone%checkout";
 
         std::fs::create_dir(profile.join("modules")).unwrap();
-        assert_eq!(staged_modules_dir(&exe).unwrap(), profile.join("modules"));
-
-        let ours = "modules%home%someone%checkout";
-        std::fs::create_dir(profile.join(ours)).unwrap();
-        std::fs::write(profile.join(staged_key::STAGED_POINTER), ours).unwrap();
         assert_eq!(
-            staged_modules_dir(&exe).unwrap(),
+            staged_modules_dir(&exe, ours).unwrap(),
+            profile.join("modules")
+        );
+
+        std::fs::create_dir(profile.join(ours)).unwrap();
+        assert_eq!(
+            staged_modules_dir(&exe, ours).unwrap(),
             profile.join(ours),
-            "another checkout's `modules` must not outrank the one we were pointed at"
+            "another checkout's `modules` must not outrank the one we were built with"
         );
         let test_exe = profile.join("deps/noded-1234");
         assert_eq!(
-            staged_modules_dir(&test_exe).unwrap(),
+            staged_modules_dir(&test_exe, ours).unwrap(),
             profile.join(ours),
             "a test binary runs from deps/"
         );
@@ -1460,7 +1453,7 @@ mod tests {
         let installed = scratch.path().join("bin");
         std::fs::create_dir_all(installed.join("modules")).unwrap();
         assert_eq!(
-            staged_modules_dir(&installed.join("ducktape")).unwrap(),
+            staged_modules_dir(&installed.join("ducktape"), ours).unwrap(),
             installed.join("modules")
         );
         assert_eq!(
@@ -1482,8 +1475,9 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let release = scratch.path().join("updates/releases/deadbeef");
         std::fs::create_dir_all(release.join("modules")).unwrap();
+        let built_as = "modules%home%release%checkout";
         assert_eq!(
-            staged_modules_dir(&release.join("ducktape")).unwrap(),
+            staged_modules_dir(&release.join("ducktape"), built_as).unwrap(),
             release.join("modules")
         );
 
@@ -1491,7 +1485,7 @@ mod tests {
         // reach a release host with no set — is told which ARTIFACT is
         // missing, never an environment variable it has no way to fill.
         let alone = scratch.path().join("bin/ducktape");
-        assert!(staged_modules_dir(&alone).is_none());
+        assert!(staged_modules_dir(&alone, built_as).is_none());
         let refusal = no_founding_set(&alone);
         assert!(refusal.contains("release archive"), "{refusal}");
         assert!(refusal.contains("modules/"), "{refusal}");
@@ -1501,25 +1495,48 @@ mod tests {
         );
     }
 
-    /// A pointer is a NAME, never a path: a profile directory is written by
-    /// every checkout sharing the target, so one that could carry `..` would
-    /// be a way to aim a node at any directory on the box.
+    /// What a binary resolves depends on nothing a sibling checkout writes.
+    ///
+    /// Every checkout building into a shared target writes into one profile
+    /// directory: its own keyed set, and — at an older revision — a pointer
+    /// file naming it. A binary that read the name from there at boot followed
+    /// the LAST build, so a suite already running composed another revision's
+    /// wasm the moment a sibling built. Here a sibling has staged its set and
+    /// named it in every file it could, and the binary still resolves its own.
     #[test]
-    fn a_pointer_that_is_not_a_plain_name_is_refused() {
+    fn a_siblings_build_cannot_redirect_the_set_a_binary_resolves() {
         let scratch = tempfile::tempdir().unwrap();
         let profile = scratch.path().join("debug");
-        let exe = profile.join("ducktape");
-        std::fs::create_dir_all(&profile).unwrap();
-        std::fs::create_dir(profile.join("modules")).unwrap();
-
-        for refused in ["../elsewhere", "/etc", "..", ".", "", "  "] {
-            std::fs::write(profile.join(staged_key::STAGED_POINTER), refused).unwrap();
-            assert_eq!(
-                staged_modules_dir(&exe).unwrap(),
-                profile.join("modules"),
-                "{refused:?} must not resolve"
-            );
+        std::fs::create_dir_all(profile.join("deps")).unwrap();
+        let ours = "modules%home%someone%ours";
+        let theirs = "modules%home%someone%theirs";
+        for set in [ours, theirs] {
+            std::fs::create_dir(profile.join(set)).unwrap();
         }
+        let exe = profile.join("ducktape");
+        let test_exe = profile.join("deps/simnode-1234");
+        let before = [&exe, &test_exe].map(|exe| staged_modules_dir(exe, ours));
+
+        for dir in [&profile, &profile.join("deps")] {
+            std::fs::write(dir.join(".staged-modules"), theirs).unwrap();
+        }
+        std::fs::write(
+            profile.join(theirs).join(staged_key::STAGED_OWNER),
+            "def5678",
+        )
+        .unwrap();
+
+        let after = [&exe, &test_exe].map(|exe| staged_modules_dir(exe, ours));
+        assert_eq!(
+            after, before,
+            "a sibling's build moved what this binary resolves"
+        );
+        assert_eq!(after, [Some(profile.join(ours)), Some(profile.join(ours))]);
+        assert_eq!(
+            sim_twin(&profile.join(ours)),
+            profile.join("sim-modules%home%someone%ours"),
+            "and the simulator's twin is ours too"
+        );
     }
 
     /// The record inside a set says which build wrote it. Reading it back is

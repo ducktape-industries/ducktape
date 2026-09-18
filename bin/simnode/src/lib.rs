@@ -383,7 +383,7 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     // checkout that built it has that set.
     let modules_dir = match modules_dir {
         Some(dir) => dir,
-        None => workspace_config::sim_modules_dir()?,
+        None => workspace_config::sim_modules_dir(noded::services::STAGED_SET)?,
     };
 
     // the status module list and the index tier both extend only under valset

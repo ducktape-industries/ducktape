@@ -55,7 +55,7 @@ impl Daemon {
             // cannot redirect it.
             .arg("--modules")
             .arg(
-                workspace_config::modules_dir()
+                workspace_config::modules_dir(noded::services::STAGED_SET)
                     .expect("cargo build stages the founding set beside the test executable"),
             )
             .stdout(Stdio::null())

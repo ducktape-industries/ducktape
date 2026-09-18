@@ -10,8 +10,8 @@
 //!
 //! So the stager writes a temporary beside the target and renames over it,
 //! which swings the directory entry onto a new inode and leaves the pinned one
-//! whole. `stage` did that for artifacts from the start; the pointer and owner
-//! records #2490 added did not, and this is what holds all of them to it.
+//! whole. `stage` did that for artifacts from the start; the owner record did
+//! not at first, and this is what holds both to it.
 
 #[allow(dead_code)]
 #[path = "../build.rs"]
@@ -21,39 +21,35 @@ use std::path::Path;
 
 /// Restaging must not reach inside a copy something else already linked.
 ///
-/// The pointer is what this asserts on because its content is a function of
-/// the set being staged, so two calls can be told apart — which is exactly the
-/// hazard in one line: a pin that linked the pointer while it named its own
-/// set must not find that name replaced by a sibling's.
+/// An artifact is what this asserts on because it is what the pin links, and
+/// its staged content is a function of the committed source, so two stagings
+/// can be told apart — which is exactly the hazard in one line: a pin that
+/// linked a component while it held one build's bytes must not find them
+/// replaced by the next build's.
 #[test]
 fn a_restage_leaves_an_already_linked_copy_holding_its_own_bytes() {
     let scratch = scratch_dir("linked-copy");
-    let profile = scratch.join("debug");
-    let first = profile.join("modules%checkout%one");
-    let second = profile.join("modules%checkout%two");
-    for dir in [&first, &second] {
-        std::fs::create_dir_all(dir).expect("scratch set");
-    }
+    let set = scratch.join("debug/modules%checkout%one");
+    std::fs::create_dir_all(&set).expect("scratch set");
+    let committed = scratch.join("component.wasm");
+    let staged = set.join("chat.component.wasm");
 
-    build_script::name_the_staged_set(&profile, &first);
-    let pointer = profile.join(workspace_config::staged_key::STAGED_POINTER);
-    assert_eq!(read(&pointer), "modules%checkout%one");
+    std::fs::write(&committed, "the first build").expect("a committed artifact");
+    build_script::stage(&committed, &staged);
+    assert_eq!(read(&staged), "the first build");
 
     // what the e2e pin does to the set it pins.
-    let pinned = scratch.join("pinned-pointer");
-    std::fs::hard_link(&pointer, &pinned).expect("pin the pointer");
-    assert_eq!(read(&pinned), "modules%checkout%one");
+    let pinned = scratch.join("pinned-component");
+    std::fs::hard_link(&staged, &pinned).expect("pin the artifact");
+    assert_eq!(read(&pinned), "the first build");
 
-    build_script::name_the_staged_set(&profile, &second);
-    assert_eq!(
-        read(&pointer),
-        "modules%checkout%two",
-        "the live pointer moves"
-    );
+    std::fs::write(&committed, "the next build").expect("the artifact moves");
+    build_script::stage(&committed, &staged);
+    assert_eq!(read(&staged), "the next build", "the live set moves");
     assert_eq!(
         read(&pinned),
-        "modules%checkout%one",
-        "the pinned copy keeps the set it was pinned to — a write in place would \
+        "the first build",
+        "the pinned copy keeps the bytes it was pinned to — a write in place would \
          have rewritten it through the inode they share"
     );
 
@@ -69,16 +65,15 @@ fn a_restage_leaves_an_already_linked_copy_holding_its_own_bytes() {
 #[test]
 fn the_owner_record_is_never_left_empty() {
     let scratch = scratch_dir("owner-record");
-    let profile = scratch.join("debug");
-    let set = profile.join("modules%checkout%one");
+    let set = scratch.join("debug/modules%checkout%one");
     std::fs::create_dir_all(&set).expect("scratch set");
 
-    build_script::name_the_staged_set(&profile, &set);
+    build_script::record_the_staging_build(&set);
     let owner = set.join(workspace_config::staged_key::STAGED_OWNER);
     let first = read(&owner);
     assert!(!first.is_empty(), "a staged set records who staged it");
 
-    build_script::name_the_staged_set(&profile, &set);
+    build_script::record_the_staging_build(&set);
     assert_eq!(read(&owner), first, "restaging rewrites it whole");
 
     // nothing is left behind beside it: a stray temporary in a staged set is a

@@ -151,12 +151,23 @@ pub fn build_identity_or_unknown() -> &'static str {
     build_identity().unwrap_or(UNKNOWN_BUILD)
 }
 
+/// The name `crates/noded/build.rs` staged this build's founding set under
+/// (`modules%<checkout path>`), baked in by the same run that staged it, so
+/// the set a binary resolves ([`workspace_config::modules_dir`]) is fixed at
+/// link time and no later build, in this checkout or a sibling sharing the
+/// target, can move it.
+pub const STAGED_SET: &str = env!(
+    "DUCKTAPE_STAGED_SET",
+    "no staged set name: a build script compiled from another checkout's source ran for this \
+     one (a shared target directory) — touch crates/noded/build.rs and rebuild"
+);
+
 /// What restages this checkout's founding set, verbatim, for the refusal below
 /// to print.
 ///
-/// The stager only runs when its own `rerun-if-changed` fires, so a sibling
-/// build that moves the pointer does not re-trigger it — the `touch` is the
-/// whole remedy and it is not guessable. Deliberately NOT automated: on a
+/// The stager only runs when its own `rerun-if-changed` fires, so a build
+/// that reuses a unit another run produced does not re-trigger it — the
+/// `touch` is the whole remedy and it is not guessable. Deliberately NOT automated: on a
 /// shared target directory the binary beside the set belongs to the last
 /// builder too, so a silent reclaim would hide the same fact one layer down.
 /// The refusal is the place that fact gets said out loud.
@@ -173,20 +184,20 @@ pub const RESTAGE_COMMAND: &str =
 /// The founding set THIS binary's build staged, refusing any other.
 ///
 /// `workspace_config::modules_dir` resolves a directory; this says whether it
-/// is ours. The distinction matters because a profile directory is shared by
-/// every checkout that shares the target: the pointer beside the binaries
-/// names one set, and a sibling's `cargo check -p noded` can move that pointer
-/// without relinking any binary. The set then belongs to a build this one is
-/// not, and founding from it means founding from another checkout's wasm —
-/// which reads as a stale guest three weeks after the fact, not as a mistake
-/// anyone made today.
+/// is ours. The distinction matters because a set is restaged without
+/// relinking every binary that reads it: this checkout's `cargo check -p
+/// noded` after a commit rewrites the set under the same name, and a binary
+/// linked before it then finds bytes a later build staged. Founding from
+/// them means founding from wasm this binary was never built with — which
+/// reads as a stale guest three weeks after the fact, not as a mistake anyone
+/// made today.
 ///
 /// It is a HARD refusal with no second door. `$DUCKTAPE_MODULES_DIR` is the
 /// one way to name a set deliberately, it is checked first and is not subject
 /// to this, and it is what an operator composing from someone else's artifacts
 /// already uses.
 pub fn founding_set() -> Result<std::path::PathBuf, String> {
-    let dir = workspace_config::modules_dir()?;
+    let dir = workspace_config::modules_dir(STAGED_SET)?;
     let named = std::env::var_os("DUCKTAPE_MODULES_DIR").is_some();
     let staged_by = workspace_config::staged_by(&dir);
     staged_set_verdict(&dir, named, staged_by.as_deref(), build_identity())?;
@@ -216,8 +227,8 @@ fn staged_set_verdict(
     }
     Err(format!(
         "reason=foreign_founding_set {} was staged by build {}, and this binary is build {} — \
-         every checkout sharing a target directory writes into that one profile directory, so \
-         the set beside a binary is whichever build passed through last.\n\
+         a build restaged the set after this binary was linked, so its wasm is not what this \
+         binary was built with.\n\
          \x20   restage this checkout:    {RESTAGE_COMMAND}\n\
          \x20   or name the set you mean: DUCKTAPE_MODULES_DIR=<dir>",
         dir.display(),

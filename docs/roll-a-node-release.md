@@ -101,7 +101,8 @@ ops/release/archive.sh --kind node --from target/release
 ```
 
 `--from` is the profile directory that build wrote: it holds both binaries and
-the founding set the same build staged beside them, and the script packs that
+the founding set the same build staged beside them under the name of the
+checkout it ran in, so run the script from that checkout. It packs that
 set under `modules/`, the one name `workspace_config::modules_dir()` resolves
 beside an executable. That is what lets a host with nothing but this archive
 run `ducktape node init` — a binary carries no wasm, so a release without the

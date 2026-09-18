@@ -23,9 +23,11 @@
 //! that run no network compose directly from). `cargo build` is what puts
 //! that set where a freshly built binary looks — beside the binary, under the
 //! name THIS checkout owns (`target/<profile>/modules%<checkout path>`, see
-//! `staged_key.rs`; `workspace_config::modules_dir` resolves it) — so a built
-//! node is complete without an install step, and a second checkout sharing
-//! the target speaks only for its own set. The set is the checkout's committed
+//! `staged_key.rs`), a name this same run bakes into noded as
+//! `DUCKTAPE_STAGED_SET` (`noded::services::STAGED_SET`, which
+//! `workspace_config::modules_dir` resolves beside the executable) — so a
+//! built node is complete without an install step, and a second checkout
+//! sharing the target speaks only for its own set. The set is the checkout's committed
 //! artifacts (`make wasm-modules`, `make modules-sync` and `make views-sync`
 //! refresh them): one component per wasm module the topology names, plus one
 //! index guest per module that declares one by carrying a committed
@@ -91,31 +93,41 @@ fn stage_founding_set() {
         &[],
     );
     sweep_abandoned_sets(profile_dir);
-    name_the_staged_set(profile_dir, &modules);
+    record_the_staging_build(&modules);
+    println!("cargo:rustc-env={}", staged_set_env(&modules));
 }
 
-/// Point the profile directory at the set this build just staged, and record
-/// in the set which build wrote it.
+/// The `rustc-env` that names the set this run staged, baked into noded.
 ///
-/// THE POINTER IS THE ANSWER TO A SHARED PROFILE DIRECTORY, and it has to be a
-/// file rather than a constant. Checkouts sharing a target dir share it
-/// BECAUSE their source is identical, so cargo shares the compiled unit — and
-/// a build script baking its own location into a shared unit gives every other
-/// checkout the first builder's answer, silently, for as long as nothing
-/// invalidates it. `target/<profile>/ducktape` is likewise whichever build ran
-/// last, so writing the name here, in the same invocation that links it, is
-/// what makes a binary and its set agree.
+/// The name reaches a binary COMPILED IN, by the same build-script run that
+/// staged the set, and never through a file in the profile directory: that
+/// directory is shared by every checkout building into the target, so a file
+/// there is rewritten by whichever of them builds next — and a binary reading
+/// it at boot, a test suite already running included, follows the rewrite
+/// onto another checkout's set.
 ///
-/// The owner record is the belt to that braces: a sibling's `cargo check -p
-/// noded` moves the pointer without relinking any binary, and only a stamp
-/// inside the set can catch that.
-pub(crate) fn name_the_staged_set(profile_dir: &Path, modules: &Path) {
+/// One run writes the set's bytes, its owner record, this name and
+/// `DUCKTAPE_BUILD`, so the four cannot disagree. A checkout whose build
+/// reuses a noded unit another checkout's run produced links that checkout's
+/// noded, name and stamp together: the set it resolves is the one its noded
+/// was staged beside, which is cargo's shared-unit freshness to fix
+/// (`noded::services::RESTAGE_COMMAND`), not a resolution a sibling can move
+/// after the link.
+pub(crate) fn staged_set_env(modules: &Path) -> String {
     let name = modules
         .file_name()
         .and_then(|name| name.to_str())
         .expect("a staged set has a utf-8 directory name");
-    let pointer = profile_dir.join(staged_key::STAGED_POINTER);
-    write_without_truncating(&pointer, name.as_bytes());
+    format!("DUCKTAPE_STAGED_SET={name}")
+}
+
+/// Record in the set which build wrote it.
+///
+/// A checkout restages its OWN set without relinking every binary that reads
+/// it (`cargo check -p noded` after a commit), so a binary linked earlier can
+/// find newer bytes under its name; only a stamp inside the set can catch
+/// that, and `noded::services::founding_set` refuses on it.
+pub(crate) fn record_the_staging_build(modules: &Path) {
     let owner = modules.join(staged_key::STAGED_OWNER);
     let build = build_id().unwrap_or_else(|| staged_key::UNIDENTIFIED_BUILD.to_owned());
     write_without_truncating(&owner, build.as_bytes());
@@ -311,7 +323,7 @@ fn module_dir(checkout: &Path, id: &str) -> PathBuf {
 /// give `dest` the source's mtime so a staged file never reads as newer than
 /// this run to cargo's rerun check. Both paths are rerun triggers: a changed
 /// artifact re-stages, and so does a deleted staged copy.
-fn stage(src: &Path, dest: &Path) {
+pub(crate) fn stage(src: &Path, dest: &Path) {
     println!("cargo:rerun-if-changed={}", src.display());
     println!("cargo:rerun-if-changed={}", dest.display());
     let bytes = std::fs::read(src)
@@ -343,7 +355,7 @@ fn stage(src: &Path, dest: &Path) {
 /// Same reason inside one build: `stage` is called for forty artifacts while
 /// another checkout may be reading the same directory.
 fn write_without_truncating(path: &Path, bytes: &[u8]) {
-    // `.staged-by` and `.staged-modules` carry no extension, so this appends
+    // `.staged-by` carries no extension, so this appends
     // rather than replaces — and the pid keeps two builds passing through one
     // profile directory off each other's temporaries.
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));

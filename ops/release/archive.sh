@@ -23,10 +23,10 @@
 # FOUNDING SET of wasm files it reads at runtime — no binary carries one — and
 # `workspace_config::modules_dir()` resolves that set as `modules/` beside the
 # executable. `--from` is the profile directory `cargo build --release` wrote,
-# which holds both binaries and the set that build staged (the name its
-# `.staged-modules` pointer holds); the set is packed under the one name the
-# resolver looks for. A release that shipped the binary alone leaves a
-# stranger with a `node init` that cannot found anything.
+# which holds both binaries and the set that build staged under this
+# checkout's name (`modules%<checkout path>`); the set is packed under the one
+# name the resolver looks for. A release that shipped the binary alone leaves
+# a stranger with a `node init` that cannot found anything.
 #
 # macOS REFUSES to pack a bundle that is not fit to leave this machine: an
 # ad-hoc signature (`adhoc_bundle_refused` — Gatekeeper rejects it anywhere
@@ -99,14 +99,18 @@ require_views() {
   ls "$1"/*.wasm >/dev/null 2>&1 || { echo "archive.sh: views_missing: $1 holds no .wasm" >&2; exit 1; }
 }
 
-# The founding set the build that linked the binaries in $1 staged beside
-# them: the directory that profile's `.staged-modules` pointer names (several
-# checkouts share one target directory, so the set carries its checkout in its
-# name), else the unkeyed `modules` an install leaves. Sets FOUNDING_SET.
+# The founding set THIS checkout's build staged beside the binaries in $1:
+# the directory named for the checkout this script sits in (several checkouts
+# share one target directory, so a set carries its checkout in its name —
+# `/` written `%`, as crates/workspace-config/src/staged_key.rs encodes it and
+# as the Makefile spells it), else the unkeyed `modules` an install leaves.
+# Nothing in the profile directory is read to choose it: every checkout's
+# build writes there. Sets FOUNDING_SET.
 resolve_founding_set() {
-  local from="$1" pointed
-  pointed=$(cat "$from/.staged-modules" 2>/dev/null || true)
-  FOUNDING_SET="$from/${pointed:-modules}"
+  local from="$1" checkout
+  checkout=$(cd "$(dirname "$0")/../.." && pwd -P)
+  FOUNDING_SET="$from/modules$(printf '%s' "$checkout" | tr / %)"
+  [ -d "$FOUNDING_SET" ] || FOUNDING_SET="$from/modules"
   [ -d "$FOUNDING_SET" ] \
     || refuse founding_set_missing "$FOUNDING_SET is not a directory; 'cargo build --release' stages the set beside the binaries it links"
   ls "$FOUNDING_SET"/*.component.wasm >/dev/null 2>&1 \
