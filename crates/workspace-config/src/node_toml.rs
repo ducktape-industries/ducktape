@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize as _;
 
 use super::DEFAULT_CHECKPOINT_BLOCKS;
-use super::DEFAULT_PRIMARY_COORDINATOR;
 use super::PlumbingOverrides;
+use super::default_primary_coordinator;
 
 /// the generated defaults: a fresh init/join with no flags yields a node
 /// with every surface up. Loopback for the operator surfaces (HTTP app
@@ -50,6 +50,21 @@ pub const DEFAULT_GATEWAY_LISTEN: &str = "127.0.0.1:0";
 /// bind failure with a logged retry rather than a panic — so the trade the mesh
 /// port made does not apply here.
 pub const DEFAULT_WIREGUARD_LISTEN: &str = "0.0.0.0:51820";
+/// `ducktape-noded`'s bind when `--listen` is absent: the node's HTTP port on
+/// loopback only. The desktop shell spawns that daemon and dials it where it
+/// dials a node, [`DEFAULT_APP_RPC`], so the two ports are one.
+pub const DEFAULT_NODED_LISTEN: &str = "127.0.0.1:8844";
+/// `ducktape-simnode`'s bind when `--listen` is absent. It sits outside the
+/// node's operator block (HTTP, admin RPC, mesh) on purpose, and that is a
+/// correctness property rather than tidiness: the sim is a dev tool run BESIDE
+/// a node, so a shared port makes the second process to boot die on its bind,
+/// and makes a client on that port reach whichever daemon won, answering an
+/// admin-RPC caller with `/v1` http.
+pub const DEFAULT_SIMNODE_LISTEN: &str = "127.0.0.1:8850";
+/// where a client on this machine (the desktop app) finds a node started with
+/// the defaults: [`DEFAULT_HTTP_LISTEN`] as a co-located process dials it
+/// (`http_base_of`). A CLIENT default: no node.toml key reads it.
+pub const DEFAULT_APP_RPC: &str = "http://127.0.0.1:8844";
 
 /// The bottom of Linux's default `ip_local_port_range` (32768–60999). A
 /// listener whose default port sits above this is racing every outbound
@@ -289,7 +304,7 @@ pub fn merged_plumbing(dir: &Path, overrides: &PlumbingOverrides) -> Result<Plum
     let primary_coordinator = primary_coordinator
         .map(str::to_string)
         .or_else(|| e.map(|r| r.primary_coordinator.clone()))
-        .unwrap_or_else(|| DEFAULT_PRIMARY_COORDINATOR.into());
+        .unwrap_or_else(default_primary_coordinator);
     let derived_relay = derive_coordinator_relay(&primary_coordinator);
     Ok(Plumbing {
         advertised: advertised
@@ -345,8 +360,9 @@ fn derive_invite_listen(wireguard_listen: &str) -> Result<String, String> {
     Ok(format!("0.0.0.0:{intro_port}"))
 }
 
-/// the relay default: the coordinator's host on TCP/443, or `"none"` when
-/// coordination itself is off — computed at GENERATION time.
+/// the relay default: the coordinator's host on the relay port
+/// ([`nat_traversal::RELAY_PORT`]), or `"none"` when coordination itself is
+/// off — computed at GENERATION time.
 fn derive_coordinator_relay(primary_coordinator: &str) -> String {
     let coordination_off = matches!(primary_coordinator, "none" | "off" | "direct");
     if coordination_off {
@@ -356,7 +372,7 @@ fn derive_coordinator_relay(primary_coordinator: &str) -> String {
         .rsplit_once(':')
         .map(|(host, _)| host)
         .unwrap_or(primary_coordinator);
-    format!("{host}:443")
+    format!("{host}:{}", nat_traversal::RELAY_PORT)
 }
 
 /// one entry: a `# note` line ABOVE its live `key = value` line, blank-line
@@ -649,6 +665,32 @@ mod tests {
         assert!(DEFAULT_GATEWAY_LISTEN.ends_with(":0"));
     }
 
+    /// the sim binary and a real node are run side by side all day, so their
+    /// eagerly-bound defaults must not overlap. A sim default back inside the
+    /// node's operator block means the second process to boot dies on its
+    /// bind, and a client on that port reaches whichever daemon won, speaking
+    /// the wrong protocol.
+    #[test]
+    fn the_sim_default_avoids_the_nodes_operator_ports() {
+        let port = |addr: &str| addr.parse::<std::net::SocketAddr>().expect("parses").port();
+        let node_operator_ports =
+            [DEFAULT_HTTP_LISTEN, DEFAULT_RPC_LISTEN, DEFAULT_MESH_LISTEN].map(port);
+        let sim = port(DEFAULT_SIMNODE_LISTEN);
+        assert!(
+            !node_operator_ports.contains(&sim),
+            "the sim default {DEFAULT_SIMNODE_LISTEN} is inside the node's operator block \
+             {node_operator_ports:?}: it will fight a real node for the bind"
+        );
+    }
+
+    /// the app's default reaches a node started with the defaults, and the
+    /// local daemon the app spawns in its place serves that same port.
+    #[test]
+    fn the_client_defaults_name_the_nodes_http_port() {
+        assert_eq!(DEFAULT_APP_RPC, crate::http_base_of(DEFAULT_HTTP_LISTEN));
+        assert_eq!(DEFAULT_APP_RPC, crate::http_base_of(DEFAULT_NODED_LISTEN));
+    }
+
     /// flagless defaults are a WORKING node: every surface up, every
     /// derivation materialized concretely.
     #[test]
@@ -665,10 +707,10 @@ mod tests {
         assert_eq!(raw.wireguard_listen, DEFAULT_WIREGUARD_LISTEN);
         assert_eq!(raw.invite_listen, "0.0.0.0:51821");
         assert_eq!(raw.wireguard_advertised, "auto");
-        assert_eq!(raw.primary_coordinator, DEFAULT_PRIMARY_COORDINATOR);
+        assert_eq!(raw.primary_coordinator, default_primary_coordinator());
         assert_eq!(
             raw.coordinator_relay,
-            derive_coordinator_relay(DEFAULT_PRIMARY_COORDINATOR)
+            derive_coordinator_relay(&default_primary_coordinator())
         );
         assert_eq!(raw.checkpoint_blocks, DEFAULT_CHECKPOINT_BLOCKS);
         // no [sandbox] table by default: a fresh node is consensus-only, and

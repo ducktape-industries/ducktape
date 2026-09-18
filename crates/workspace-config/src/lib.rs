@@ -679,9 +679,19 @@ pub enum Coordination {
     Private,
 }
 
+/// the host of the shared public rendezvous coordinator (see
+/// [`default_primary_coordinator`]).
+const DEFAULT_COORDINATOR_HOST: &str = "relay.ducktape.industries";
+
 /// Shared public rendezvous coordinator used when a network is created without
-/// an explicit direct-only override.
-pub const DEFAULT_PRIMARY_COORDINATOR: &str = "relay.ducktape.industries:3478";
+/// an explicit direct-only override: its host, on the port every coordinator
+/// binds by default ([`nat_traversal::COORDINATOR_PORT`]).
+pub fn default_primary_coordinator() -> String {
+    format!(
+        "{DEFAULT_COORDINATOR_HOST}:{}",
+        nat_traversal::COORDINATOR_PORT
+    )
+}
 
 /// The typed invite format still carries a coordinator key, but the deployed
 /// coordinator is intentionally keyless. Keep one stable valid key in the
@@ -693,10 +703,11 @@ pub fn keyless_coordinator_placeholder_key() -> ed25519::PublicKey {
 /// Resolve the primary coordinator option. `None` means "use the product
 /// default"; `"none"`/`"off"` keeps the old direct-only posture.
 pub fn primary_coordinator_or_default(raw: Option<&str>) -> Result<Option<String>, String> {
+    let default = default_primary_coordinator();
     let coord = raw
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_PRIMARY_COORDINATOR);
+        .unwrap_or(&default);
     if matches!(coord, "none" | "off" | "direct") {
         return Ok(None);
     }

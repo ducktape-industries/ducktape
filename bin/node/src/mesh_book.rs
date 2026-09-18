@@ -82,8 +82,8 @@ pub(crate) struct MeshAddressBook {
     /// this chain's overlay ULA /48 — the `is_overlay` mask.
     ula_prefix: [u8; 6],
     /// the port the derived-ULA fallthrough dials (the shipped
-    /// `[::]:8846` default; a peer on a custom port is reached through a
-    /// hint or an advert instead).
+    /// `workspace_config::DEFAULT_MESH_LISTEN` port; a peer on a custom port is
+    /// reached through a hint or an advert instead).
     default_mesh_port: u16,
     entries: RwLock<BTreeMap<ed25519::PublicKey, Sourced>>,
 }

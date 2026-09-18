@@ -54,6 +54,15 @@ pub use simnat::SimNat;
 pub use simnet::{SimHandle, SimNetwork, SimSocket};
 pub use wire::{AuthRequest, Msg, NodeKey, WireError};
 
+/// the coordinator's rendezvous port (UDP, the STUN port): where a coordinator
+/// binds by default and where a node dials the shipped default coordinator.
+/// one number for both ends.
+pub const COORDINATOR_PORT: u16 = 3478;
+/// the relay lane's port (TCP): where a coordinator's relay listener binds by
+/// default and what a node derives from its coordinator's host. 443 is the one
+/// port every network forwards, which is the whole reason the lane exists.
+pub const RELAY_PORT: u16 = 443;
+
 /// a first-and-every-Nth counter for a refusal a STRANGER can drive: the first
 /// occurrence logs immediately, then every [`Latch::EVERY`]th, carrying the
 /// count. everything this crate refuses is peer-driven and unauthenticated by

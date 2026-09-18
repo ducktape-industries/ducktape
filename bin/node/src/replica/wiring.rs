@@ -545,19 +545,15 @@ pub(super) async fn wire(
     }
 }
 
-/// TCP/443: the relay lane's deployed port — the one port every network
-/// forwards, which is the whole reason the lane exists.
-const RELAY_FALLBACK_PORT: u16 = 443;
-
-/// the relay endpoint derived from one coordinator ingress: SAME host,
-/// TCP/443. `SocketAddr`'s Display brackets an IPv6 ip, so the derived string
-/// stays `to_socket_addrs`-parseable.
+/// the relay endpoint derived from one coordinator ingress: SAME host, on the
+/// relay port ([`nat_traversal::RELAY_PORT`]). `SocketAddr`'s Display brackets
+/// an IPv6 ip, so the derived string stays `to_socket_addrs`-parseable.
 fn relay_endpoint_of(ingress: &Ingress) -> String {
     match ingress {
         Ingress::Socket(addr) => {
-            std::net::SocketAddr::new(addr.ip(), RELAY_FALLBACK_PORT).to_string()
+            std::net::SocketAddr::new(addr.ip(), nat_traversal::RELAY_PORT).to_string()
         }
-        Ingress::Dns { host, .. } => format!("{host}:{RELAY_FALLBACK_PORT}"),
+        Ingress::Dns { host, .. } => format!("{host}:{}", nat_traversal::RELAY_PORT),
     }
 }
 
@@ -565,7 +561,7 @@ fn relay_endpoint_of(ingress: &Ingress) -> String {
 /// REPLACES the derived list outright; its disable sentinels mirror
 /// `primary_coordinator`'s exactly (`"none"`/`"off"`/`"direct"`, and
 /// blank = absent); absent derives one relay per ambient coordinator at
-/// [`RELAY_FALLBACK_PORT`].
+/// [`nat_traversal::RELAY_PORT`].
 fn coordinator_relays(override_raw: Option<&str>, coordinators: &[Ingress]) -> Vec<String> {
     match override_raw.map(str::trim).filter(|s| !s.is_empty()) {
         Some("none" | "off" | "direct") => Vec::new(),
