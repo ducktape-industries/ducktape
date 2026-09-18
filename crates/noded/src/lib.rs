@@ -85,8 +85,8 @@ pub use gateway_http::{
 // the node-actor command lane and the router's shared state handle.
 mod handle;
 pub use handle::{
-    NetstackSwapRequest, NetstackSwapper, NodeCommand, NodeHandle, PeersStanding, Refused,
-    StatusCell,
+    InviteNote, MintedInvite, NetstackSwapRequest, NetstackSwapper, NodeCommand, NodeHandle,
+    PeersStanding, Refused, StatusCell,
 };
 
 mod module_code;
@@ -416,6 +416,11 @@ pub enum NodePhase {
     /// network's, which `serving` alone cannot tell a reader; the gap and the
     /// tip it was measured against ride in [`OperationalStatus::follow`].
     Behind,
+    /// Serving, with NO overlay: the reachability plane refused to start or
+    /// exited, so this node answers `/v1` from a copy it can no longer follow,
+    /// reaches no peer and admits no joiner — and it does not self-heal this
+    /// boot. Why rides in [`OperationalStatus::netstack`]'s `failure_reason`.
+    Isolated,
     Draining,
     Halted,
 }
@@ -430,6 +435,7 @@ impl NodePhase {
             Self::Validating => "validating",
             Self::Serving => "serving",
             Self::Behind => "behind",
+            Self::Isolated => "isolated",
             Self::Draining => "draining",
             Self::Halted => "halted",
         }
@@ -1355,7 +1361,9 @@ async fn huddle_node_proof(
 }
 
 /// POST /v1/invite `{"ttl_days": N}` — mint one bearer invite and answer
-/// `{"invite": "🦆…"}`. `ttl_days` defaults to and is bounded by the ONE
+/// `{"invite": "🦆…", "notes": [{"reason", "sentence"}]}` ([`MintedInvite`]),
+/// the notes being what `ducktape node invite` prints on stderr after the
+/// blob. `ttl_days` defaults to and is bounded by the ONE
 /// policy every door shares (`workspace_config::{DEFAULT_INVITE_TTL_DAYS,
 /// INVITE_TTL_DAYS}`), so this route and `ducktape node invite` mint the same
 /// invite for the same request.
@@ -1366,8 +1374,7 @@ async fn huddle_node_proof(
 /// joiner brings its tunnel up against. Doing that from a second process races
 /// the daemon over both.
 ///
-/// 503 when the embedder wired no minter — a daemon with no workspace has no
-/// descriptor to fold a hint into.
+/// 503 when no minter is wired: see [`no_invite_minter`].
 ///
 /// AUTH: a bearer invite is a real capability — a right to join this mesh for
 /// up to 365 days — and this handler reads no acting identity, so possession of
@@ -1404,19 +1411,38 @@ async fn mint_invite(
         );
     };
     let Some(minted) = minted else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no invite minter is wired on this daemon",
-        );
+        return no_invite_minter(handle.status_cell().current().operations.phase);
     };
     match minted {
-        Ok(invite) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "invite": invite })),
-        )
-            .into_response(),
+        Ok(minted) => (StatusCode::OK, Json(minted)).into_response(),
         Err(why) => error_response(StatusCode::BAD_REQUEST, &why),
     }
+}
+
+/// The 503 `/v1/invite` answers with no minter to call, in the node's terms.
+///
+/// The full node wires its minter with its mesh identity, well after its http
+/// surface binds, and `/v1/status` answers `starting` all the way through that
+/// window — so a caller that saw the node answer is told it is starting, as a
+/// `node_starting` token beside the sentence, not how the daemon is wired
+/// inside. Past `starting` nothing wires one any more: that is an embedder
+/// with no workspace to mint from (the embedded daemon, simnode).
+fn no_invite_minter(phase: NodePhase) -> Response {
+    let still_starting = phase == NodePhase::Starting;
+    if still_starting {
+        return refused_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &Refused::new(
+                "node_starting",
+                "this node is still starting and mints invites once its mesh identity is up — \
+                 ask again when /v1/status no longer says starting",
+            ),
+        );
+    }
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no invite minter is wired on this daemon",
+    )
 }
 
 /// body cap for the op-receipt blob lane. a receipt-lane bound only —

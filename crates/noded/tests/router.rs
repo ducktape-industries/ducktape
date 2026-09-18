@@ -2833,22 +2833,60 @@ async fn the_invite_route_mints_refuses_and_says_when_it_cannot() {
         .expect("a response")
     };
 
-    // no minter wired: the honest answer is "this daemon does not do that".
+    // no minter wired YET: the full node binds its http surface before it
+    // wires the minter, and `/v1/status` already answers `starting` in
+    // between. The refusal names that phase, as a token beside the sentence,
+    // rather than how the daemon is wired inside.
     let (handle, _cmds, _events) = local_node();
+    let starting = post(noded::router(handle), r#"{"ttl_days":7}"#).await;
+    assert_eq!(starting.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let refusal: serde_json::Value =
+        serde_json::from_str(&body_of(starting).await).expect("a json refusal");
+    assert_eq!(refusal["reason"], "node_starting", "{refusal}");
+
+    // no minter wired, EVER: an embedder that serves with no workspace to mint
+    // from (the embedded daemon, simnode) says "this daemon does not do that".
+    let (handle, _cmds, _events) = local_node();
+    handle.status_cell().publish(noded::NodeStatus {
+        operations: noded::OperationalStatus {
+            phase: noded::NodePhase::Serving,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     let unwired = post(noded::router(handle), r#"{"ttl_days":7}"#).await;
     assert_eq!(unwired.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(body_of(unwired).await.contains("no invite minter"));
 
-    // wired: the TTL reaches the minter, and the blob comes back whole.
+    // wired: the TTL reaches the minter, and the blob comes back whole, with
+    // every note the mint left on it beside it — a note changes what the blob
+    // can do, so the app that shows the Copy button has to be able to say it.
     let (handle, _cmds, _events) = local_node();
-    handle
-        .status_cell()
-        .wire_invite_minter(|ttl_days| Ok(format!("duck-invite-for-{ttl_days}-days")));
+    handle.status_cell().wire_invite_minter(|ttl_days| {
+        Ok(noded::MintedInvite {
+            invite: format!("duck-invite-for-{ttl_days}-days"),
+            notes: vec![noded::InviteNote {
+                reason: "invite_not_dialable_off_box".into(),
+                sentence: "this invite is reachable on this machine only".into(),
+            }],
+        })
+    });
     let app = noded::router(handle);
 
     let minted = post(app.clone(), r#"{"ttl_days":7}"#).await;
     assert_eq!(minted.status(), StatusCode::OK);
-    assert!(body_of(minted).await.contains("duck-invite-for-7-days"));
+    let minted: serde_json::Value =
+        serde_json::from_str(&body_of(minted).await).expect("a json body");
+    assert_eq!(
+        minted,
+        serde_json::json!({
+            "invite": "duck-invite-for-7-days",
+            "notes": [{
+                "reason": "invite_not_dialable_off_box",
+                "sentence": "this invite is reachable on this machine only",
+            }],
+        })
+    );
 
     // a TTL outside the bounds never reaches the minter — which means the
     // descriptor is never rewritten for a request that was going to be refused.

@@ -273,8 +273,27 @@ pub type NetstackSwapper = dyn Fn(NetstackSwapRequest) -> futures::future::BoxFu
     + Send
     + Sync;
 
-/// Mint one bearer invite valid for `ttl_days`, answering the paste blob.
-pub type InviteMinter = dyn Fn(u64) -> Result<String, String> + Send + Sync;
+/// Mint one bearer invite valid for `ttl_days`, answering the paste blob and
+/// the notes the mint left on it.
+pub type InviteMinter = dyn Fn(u64) -> Result<MintedInvite, String> + Send + Sync;
+
+/// A minted invite as `POST /v1/invite` answers it: the paste blob, and every
+/// thing the mint could not do, empty when it could do everything.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MintedInvite {
+    pub invite: String,
+    pub notes: Vec<InviteNote>,
+}
+
+/// One thing a mint could not do. Never a refusal — the blob still admits a
+/// joiner — but it changes what the blob can do (fewer paths, or none off this
+/// machine), so it rides beside the blob for whoever hands the blob on:
+/// `reason` is the stable snake_case token, `sentence` what to do about it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct InviteNote {
+    pub reason: String,
+    pub sentence: String,
+}
 
 impl StatusCell {
     /// publish a complete snapshot — one whole-struct swap.
@@ -358,20 +377,21 @@ impl StatusCell {
     /// programming error.
     pub fn wire_invite_minter(
         &self,
-        mint: impl Fn(u64) -> Result<String, String> + Send + Sync + 'static,
+        mint: impl Fn(u64) -> Result<MintedInvite, String> + Send + Sync + 'static,
     ) {
         if self.inner.invite_minter.set(Arc::new(mint)).is_err() {
             panic!("status cell invite minter wired twice");
         }
     }
 
-    /// One freshly minted invite blob, or `None` when no minter is wired (an
-    /// embedder with no workspace to mint from — the route answers 503).
+    /// One freshly minted invite, or `None` when no minter is wired (a node
+    /// still starting, or an embedder with no workspace to mint from — the
+    /// route answers 503).
     ///
     /// Blocking: the mint reads and REWRITES the descriptor and reads the
     /// persisted mesh state, so a caller on an async runtime owes this a
     /// blocking thread.
-    pub fn mint_invite(&self, ttl_days: u64) -> Option<Result<String, String>> {
+    pub fn mint_invite(&self, ttl_days: u64) -> Option<Result<MintedInvite, String>> {
         self.inner.invite_minter.get().map(|mint| mint(ttl_days))
     }
 
