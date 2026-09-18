@@ -2555,20 +2555,6 @@ mod tests {
     mod dispatch_shape {
         use syn::{Expr, ImplItem, Item, Pat, Stmt};
 
-        /// the variants of `pub enum AttributionMsg`, in declaration order.
-        pub fn declared_msg_variants(interface: &syn::File) -> Vec<String> {
-            let declaration = interface.items.iter().find_map(|item| match item {
-                Item::Enum(declared) if declared.ident == "AttributionMsg" => Some(declared),
-                _ => None,
-            });
-            let declared = declaration.expect("the interface declares AttributionMsg");
-            declared
-                .variants
-                .iter()
-                .map(|variant| variant.ident.to_string())
-                .collect()
-        }
-
         /// the inherent `dispatch` method of `AttributionModule`.
         pub fn dispatch_fn(lib: &syn::File) -> syn::ImplItemFn {
             let inherent_impls = lib.items.iter().filter_map(|item| match item {
@@ -2590,11 +2576,12 @@ mod tests {
                 .clone()
         }
 
-        /// the shape: the body is one `match msg` and nothing else; one arm
-        /// per variant in declaration order; no guard, no wildcard; each arm
-        /// is one awaited `self.on_<variant>(..)` call, bare or as a block's
-        /// only statement.
-        pub fn check(func: &syn::ImplItemFn, variants: &[String]) -> Result<(), String> {
+        /// the shape: the body is one `match msg` and nothing else; every arm
+        /// names one `AttributionMsg` variant, with no guard and no wildcard,
+        /// which leaves the compiler's exhaustiveness check proving one arm
+        /// per variant; each arm is one awaited `self.on_<variant>(..)` call,
+        /// bare or as a block's only statement.
+        pub fn check(func: &syn::ImplItemFn) -> Result<(), String> {
             let [Stmt::Expr(Expr::Match(dispatch), None)] = func.block.stmts.as_slice() else {
                 return Err("the body is one match expression and nothing else".into());
             };
@@ -2603,38 +2590,32 @@ mod tests {
             if !matches_on_msg {
                 return Err("the match is over `msg`".into());
             }
-            let arms = dispatch.arms.len();
-            if arms != variants.len() {
-                return Err(format!("{arms} arms, {} variants", variants.len()));
-            }
-            for (arm, variant) in dispatch.arms.iter().zip(variants) {
-                check_arm(arm, variant)?;
-            }
-            Ok(())
+            dispatch.arms.iter().try_for_each(check_arm)
         }
 
-        fn check_arm(arm: &syn::Arm, variant: &str) -> Result<(), String> {
-            if arm.guard.is_some() {
-                return Err(format!("arm {variant} has a guard"));
-            }
+        fn check_arm(arm: &syn::Arm) -> Result<(), String> {
             let pattern = match &arm.pat {
                 Pat::Struct(pat) => &pat.path,
                 Pat::TupleStruct(pat) => &pat.path,
                 Pat::Path(pat) => &pat.path,
-                Pat::Wild(_) => return Err(format!("wildcard arm where {variant} belongs")),
-                _ => return Err(format!("arm {variant} does not match a variant path")),
+                Pat::Wild(_) => return Err("wildcard arm where a variant belongs".into()),
+                _ => return Err("an arm that does not match a variant path".into()),
             };
             let segments: Vec<String> = pattern
                 .segments
                 .iter()
                 .map(|segment| segment.ident.to_string())
                 .collect();
-            let names_variant = segments == ["AttributionMsg", variant];
-            if !names_variant {
-                return Err(format!(
-                    "arm {} sits where {variant} belongs",
-                    segments.join("::")
-                ));
+            let named = segments.join("::");
+            let [msg, variant] = segments.as_slice() else {
+                return Err(format!("arm {named} is not one AttributionMsg variant"));
+            };
+            let names_a_variant = msg == "AttributionMsg";
+            if !names_a_variant {
+                return Err(format!("arm {named} is not one AttributionMsg variant"));
+            }
+            if arm.guard.is_some() {
+                return Err(format!("arm {variant} has a guard"));
             }
             check_body(&arm.body, &format!("on_{}", snake_case(variant)))
         }
@@ -2683,18 +2664,14 @@ mod tests {
         }
     }
 
-    /// the real `dispatch` and the real `AttributionMsg`, parsed from source.
-    fn parsed_dispatch() -> (syn::ImplItemFn, Vec<String>) {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let lib = std::fs::read_to_string(dir.join("lib.rs")).expect("read lib.rs");
-        let interface =
-            std::fs::read_to_string(dir.join("interface.rs")).expect("read interface.rs");
+    /// the real `dispatch`, parsed from this crate's own source. `AttributionMsg`
+    /// is declared by the wire crate in another repository: the lint reads
+    /// only the dispatch, and the compiler holds the dispatch to that enum.
+    fn parsed_dispatch() -> syn::ImplItemFn {
+        let lib = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+        let lib = std::fs::read_to_string(lib).expect("read lib.rs");
         let lib = syn::parse_file(&lib).expect("lib.rs parses");
-        let interface = syn::parse_file(&interface).expect("interface.rs parses");
-        (
-            dispatch_shape::dispatch_fn(&lib),
-            dispatch_shape::declared_msg_variants(&interface),
-        )
+        dispatch_shape::dispatch_fn(&lib)
     }
 
     #[test]
@@ -2765,9 +2742,7 @@ mod tests {
 
     #[test]
     fn dispatch_shape_is_one_arm_per_variant() {
-        let (dispatch, variants) = parsed_dispatch();
-        assert!(!variants.is_empty());
-        assert_eq!(dispatch_shape::check(&dispatch, &variants), Ok(()));
+        assert_eq!(dispatch_shape::check(&parsed_dispatch()), Ok(()));
     }
 
     /// the lint's teeth: each forbidden mutation of the real dispatch AST is
@@ -2826,6 +2801,11 @@ mod tests {
             let arm: syn::Arm = syn::parse_str("_ => Ok(()),").expect("arm parses");
             dispatch_match(func).arms.push(arm);
         }
+        fn foreign_variant(func: &mut syn::ImplItemFn) {
+            let arm: syn::Arm =
+                syn::parse_str("Other::Attribute { .. } => Ok(()),").expect("arm parses");
+            dispatch_match(func).arms[0].pat = arm.pat;
+        }
         fn guarded_arm(func: &mut syn::ImplItemFn) {
             dispatch_match(func).arms[0].guard =
                 Some((Default::default(), Box::new(expression("true"))));
@@ -2837,10 +2817,10 @@ mod tests {
             *dispatch_match(func).arms[0].body = expression("Ok(())");
         }
 
-        let (dispatch, variants) = parsed_dispatch();
-        assert_eq!(dispatch_shape::check(&dispatch, &variants), Ok(()));
+        let dispatch = parsed_dispatch();
+        assert_eq!(dispatch_shape::check(&dispatch), Ok(()));
 
-        let refused: [Refused; 8] = [
+        let refused: [Refused; 9] = [
             (
                 "a statement before the match",
                 pre_match_statement,
@@ -2859,9 +2839,18 @@ mod tests {
             (
                 "a wildcard pattern",
                 wildcard_pattern,
-                "wildcard arm where Attribute belongs",
+                "wildcard arm where a variant belongs",
             ),
-            ("a catch-all arm", catch_all_arm, "4 arms, 3 variants"),
+            (
+                "a catch-all arm",
+                catch_all_arm,
+                "wildcard arm where a variant belongs",
+            ),
+            (
+                "another enum's variant",
+                foreign_variant,
+                "arm Other::Attribute is not one AttributionMsg variant",
+            ),
             ("a guard", guarded_arm, "arm Attribute has a guard"),
             (
                 "a mis-named handler",
@@ -2878,7 +2867,7 @@ mod tests {
             let mut mutated = dispatch.clone();
             mutate(&mut mutated);
             assert_eq!(
-                dispatch_shape::check(&mutated, &variants),
+                dispatch_shape::check(&mutated),
                 Err(verdict.to_string()),
                 "{name} is refused"
             );
