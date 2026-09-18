@@ -232,11 +232,13 @@ fn cmd_list() -> CommandResult {
 }
 
 /// `status [--config <path> | -n <chain-id>] [--json]` — read the RUNNING
-/// node's tip off its local rpc and print one machine-parseable line to
-/// stdout:
+/// node's tip off its local rpc and print it to stdout, one line per subject
+/// ([`status_lines`]):
 ///
 /// ```text
 /// height=<h> root_hash=<hex>
+/// role=<role> phase=<phase> …
+/// follow: behind_by=<n> network_height=<h> (heard <age> ago)
 /// ```
 ///
 /// `height=none` means no block has finalized yet. `--json` emits the rpc's
@@ -258,7 +260,11 @@ fn cmd_node_status(args: StatusArgs) -> CommandResult {
         println!("{status}");
         return Ok(());
     }
-    for line in status_lines(status) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is past the epoch")
+        .as_secs();
+    for line in status_lines(status, now) {
         println!("{line}");
     }
     let Some(seconds) = stalled_past_recovery(status) else {
@@ -284,7 +290,7 @@ const CHAIN_IS_STALLED: i32 = 2;
 
 /// What `node status` prints, in order — one `key=value` line per subject, so
 /// the whole answer stays greppable.
-fn status_lines(status: &serde_json::Value) -> Vec<String> {
+fn status_lines(status: &serde_json::Value, now: u64) -> Vec<String> {
     let height = match status["height"].as_u64() {
         Some(h) => h.to_string(),
         None => "none".into(),
@@ -293,8 +299,29 @@ fn status_lines(status: &serde_json::Value) -> Vec<String> {
     let operations = &status["operations"];
     let mut lines = vec![format!("height={height} root_hash={root_hash}")];
     lines.extend(standing_line(operations));
+    lines.push(follow_line(&operations["follow"], now));
     lines.extend(netstack_line(&operations["netstack"]));
     lines
+}
+
+/// the `follow:` line: how far this node's height is from the tip a peer last
+/// answered with, and how long ago that answer landed — the one comparison
+/// that tells a joiner whether `height=` is the tip or far below it. It reads
+/// the same [`noded::FollowOperationalStatus`] `--json` serializes, and
+/// `behind_by=0` prints like any other gap: "caught up" is an answer too.
+///
+/// A node no peer has answered yet says so, rather than a zero gap it never
+/// measured.
+fn follow_line(follow: &serde_json::Value, now: u64) -> String {
+    let Ok(follow) = serde_json::from_value::<noded::FollowOperationalStatus>(follow.clone())
+    else {
+        return "follow: none yet".to_string();
+    };
+    let heard = human_duration(now.saturating_sub(follow.heard_at));
+    format!(
+        "follow: behind_by={} network_height={} (heard {heard} ago)",
+        follow.behind_by, follow.network_height
+    )
 }
 
 /// the `role=`/`phase=` line: where this node stands, and — when it is in
@@ -326,17 +353,7 @@ fn standing_line(operations: &serde_json::Value) -> Option<String> {
     {
         line.push_str(&format!(" stalled_for={seconds}s"));
     }
-    // the gap to the tip a peer answered with. 0 is the following case and
-    // prints nothing, exactly like `stalled_for` above — but a `phase=behind`
-    // without the number is half a sentence, and the number is the half an
-    // operator acts on.
-    let follow = &operations["follow"];
-    if let Some(behind_by) = follow["behind_by"].as_u64().filter(|gap| *gap > 0) {
-        let network_height = follow["network_height"].as_u64().unwrap_or(0);
-        line.push_str(&format!(
-            " behind_by={behind_by} network_height={network_height}"
-        ));
-    }
+    // the gap that sizes a `phase=behind` is the next line's: [`follow_line`].
     Some(line)
 }
 
@@ -420,7 +437,8 @@ fn cmd_netstack_swap(args: crate::cli_args::NetstackSwapArgs) -> CommandResult {
 }
 
 /// `peers [--config <path> | -n <chain-id>] [--json]` — the RUNNING node's
-/// direct-peer sample off its local rpc: one `key=value` line per peer.
+/// direct-peer sample off its local rpc: its own height, then one
+/// `key=value` line per peer ([`peers_lines`]).
 /// `--json` emits one raw [`noded::peers::PeersView`] sample (cumulative
 /// counters — consumers derive rates from deltas); the prose form takes a
 /// second sample after one second so the line can carry live `…/s` rates.
@@ -439,19 +457,50 @@ fn cmd_node_peers(args: StatusArgs) -> CommandResult {
         );
         return Ok(());
     }
-    if first.peers.is_empty() {
-        println!("no direct peers");
-        return Ok(());
-    }
     // cumulative counters only become rates as a delta over time: hold one
     // second, sample again, and let the SECOND sample carry the truth.
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    let second = peers_rpc(&rpc_addr)?;
-    for peer in &second.peers {
-        let baseline = first.peers.iter().find(|p| p.peer == peer.peer);
-        println!("{}", peer_line(peer, baseline, &first, &second));
+    let second = match first.peers.is_empty() {
+        true => None,
+        false => {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            Some(peers_rpc(&rpc_addr)?)
+        }
+    };
+    for line in peers_lines(&first, second.as_ref()) {
+        println!("{line}");
     }
     Ok(())
+}
+
+/// What `node peers` prints: the answering node's own position first — the
+/// `height` (and `epoch`) the sample stamps beside the table, the same
+/// figures `--json` carries — then one line per peer. `second` is the rate
+/// sample, absent when the first one found no peer to rate.
+///
+/// The mesh gossips no per-peer head, so no row carries a peer's height; the
+/// `sync_height=`/`sync_boundary=` a row may carry are what THIS node served
+/// that peer over state sync.
+fn peers_lines(
+    first: &noded::peers::PeersView,
+    second: Option<&noded::peers::PeersView>,
+) -> Vec<String> {
+    let Some(second) = second else {
+        return vec![position_line(first), "no direct peers".to_string()];
+    };
+    let rows = second.peers.iter().map(|peer| {
+        let baseline = first.peers.iter().find(|p| p.peer == peer.peer);
+        peer_line(peer, baseline, first, second)
+    });
+    std::iter::once(position_line(second)).chain(rows).collect()
+}
+
+/// `height=<h>[ epoch=<e>]` — the sampler's coordinates; a lane with no
+/// consensus has no epoch to name.
+fn position_line(view: &noded::peers::PeersView) -> String {
+    match view.epoch {
+        Some(epoch) => format!("height={} epoch={epoch}", view.height),
+        None => format!("height={}", view.height),
+    }
 }
 
 /// one `peers` rpc round-trip, decoded to the shared view.
@@ -2359,12 +2408,13 @@ mod tests {
             },
         });
         assert_eq!(
-            super::status_lines(&stalled),
+            super::status_lines(&stalled, HEARD_AT),
             [
                 "height=399 root_hash=2170",
                 // `reachable=1` under `quorum=2` IS the diagnosis, and the
                 // seconds say how long it has been true.
                 "role=validator phase=validating quorum=2 reachable=1 stalled_for=116s",
+                "follow: none yet",
             ]
         );
         assert_eq!(super::stalled_past_recovery(&stalled), Some(116));
@@ -2382,10 +2432,11 @@ mod tests {
             },
         });
         assert_eq!(
-            super::status_lines(&beating),
+            super::status_lines(&beating, HEARD_AT),
             [
                 "height=400 root_hash=2171",
                 "role=validator phase=validating quorum=2 reachable=2",
+                "follow: none yet",
             ]
         );
         assert_eq!(super::stalled_past_recovery(&beating), None);
@@ -2400,27 +2451,61 @@ mod tests {
             "height": 155, "root_hash": "2170",
             "operations": {
                 "role": "resident", "phase": "behind",
-                "follow": { "network_height": 756, "behind_by": 601, "heard_at": 1_758_000_000u64 },
+                "follow": { "network_height": 756, "behind_by": 601, "heard_at": HEARD_AT },
             },
         });
         assert_eq!(
-            super::status_lines(&frozen)[1],
-            "role=resident phase=behind behind_by=601 network_height=756"
-        );
-
-        // and a node that IS following prints no gap at all.
-        let following = serde_json::json!({
-            "height": 756, "root_hash": "2171",
-            "operations": {
-                "role": "resident", "phase": "serving",
-                "follow": { "network_height": 756, "behind_by": 0, "heard_at": 1_758_000_000u64 },
-            },
-        });
-        assert_eq!(
-            super::status_lines(&following)[1],
-            "role=resident phase=serving"
+            super::status_lines(&frozen, HEARD_AT + 12)[1..],
+            [
+                "role=resident phase=behind",
+                "follow: behind_by=601 network_height=756 (heard 12s ago)",
+            ]
         );
     }
+
+    /// A joiner's first question is "have I caught up?", and `height=` alone
+    /// cannot answer it: the follow line prints the gap `--json` carries —
+    /// while it is catching up, once it has, and before any peer answered.
+    #[test]
+    fn a_joiner_reads_whether_it_has_caught_up() {
+        let joiner = |phase: &str, height: u64, follow: serde_json::Value| {
+            serde_json::json!({
+                "height": height, "root_hash": "2171",
+                "operations": { "role": "resident", "phase": phase, "follow": follow },
+            })
+        };
+        let catching_up = joiner(
+            "syncing",
+            155,
+            serde_json::json!({ "network_height": 756, "behind_by": 601, "heard_at": HEARD_AT }),
+        );
+        assert_eq!(
+            super::status_lines(&catching_up, HEARD_AT + 3)[2],
+            "follow: behind_by=601 network_height=756 (heard 3s ago)"
+        );
+
+        let caught_up = joiner(
+            "serving",
+            756,
+            serde_json::json!({ "network_height": 756, "behind_by": 0, "heard_at": HEARD_AT }),
+        );
+        assert_eq!(
+            super::status_lines(&caught_up, HEARD_AT + 185)[1..],
+            [
+                "role=resident phase=serving",
+                "follow: behind_by=0 network_height=756 (heard 3m05s ago)",
+            ]
+        );
+
+        let unheard = joiner("syncing", 0, serde_json::Value::Null);
+        assert_eq!(
+            super::status_lines(&unheard, HEARD_AT)[2],
+            "follow: none yet"
+        );
+    }
+
+    /// the unix second the fixtures' tip landed at.
+    const HEARD_AT: u64 = 1_758_000_000;
 
     /// A silence shorter than the point the chain recovers on its own is
     /// PRINTED and not exited on: a view change or a slow disk is not a dead
@@ -2439,7 +2524,7 @@ mod tests {
             },
         });
         assert_eq!(
-            super::status_lines(&blipping)[1],
+            super::status_lines(&blipping, HEARD_AT)[1],
             "role=validator phase=validating quorum=2 reachable=2 stalled_for=12s"
         );
         assert_eq!(super::stalled_past_recovery(&blipping), None);
@@ -2458,18 +2543,23 @@ mod tests {
             },
         });
         assert_eq!(
-            super::status_lines(&syncing),
+            super::status_lines(&syncing, HEARD_AT),
             [
                 "height=12 root_hash=aa",
                 "role=resident phase=syncing",
+                "follow: none yet",
                 "netstack=native",
             ]
         );
         assert_eq!(super::stalled_past_recovery(&syncing), None);
 
-        // a daemon that answers no operations at all still answers a tip.
+        // a daemon that answers no operations at all still answers a tip,
+        // and has heard none.
         let bare = serde_json::json!({ "height": 1, "root_hash": "bb" });
-        assert_eq!(super::status_lines(&bare), ["height=1 root_hash=bb"]);
+        assert_eq!(
+            super::status_lines(&bare, HEARD_AT),
+            ["height=1 root_hash=bb", "follow: none yet"]
+        );
         assert_eq!(super::stalled_past_recovery(&bare), None);
     }
 
@@ -2759,6 +2849,47 @@ mod tests {
         assert!(
             peer_line(&unstamped, None, &first, &second).contains("build=unknown"),
             "an unreported stamp renders as unknown"
+        );
+    }
+
+    /// `node peers` opens with the node's OWN position — the `height` (and
+    /// `epoch`) its `--json` carries beside the peer table — whether or not a
+    /// peer answered, so the rows below are anchored to a block.
+    #[test]
+    fn peers_prose_opens_with_the_height_its_json_carries() {
+        let view = |height, epoch, peers| noded::peers::PeersView {
+            sampled_at_ms: 10_000,
+            height,
+            epoch,
+            peers,
+        };
+        let peer = noded::peers::PeerView {
+            peer: "cd".repeat(32),
+            connected: false,
+            connected_since_ms: None,
+            role: None,
+            build: None,
+            msgs_sent: 0,
+            msgs_received: 0,
+            statesync: None,
+        };
+
+        let first = view(5, Some(1), vec![peer.clone()]);
+        let second = view(6, Some(1), vec![peer]);
+        let lines = super::peers_lines(&first, Some(&second));
+        assert_eq!(
+            lines[0], "height=6 epoch=1",
+            "the rate sample's own position"
+        );
+        assert!(lines[1].starts_with("peer=cdcd"), "{lines:?}");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+
+        // no peer to rate: the height still leads, and a lane with no
+        // consensus has no epoch to name.
+        let alone = view(5, None, Vec::new());
+        assert_eq!(
+            super::peers_lines(&alone, None),
+            ["height=5", "no direct peers"]
         );
     }
 

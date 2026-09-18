@@ -42,7 +42,7 @@ ducktape node join <invite>         # ...or join someone else's
 ducktape node run                   # start it (^C checkpoints and exits)
 ducktape wallet new <you>           # mint your user key
 ducktape account create --name <you>   # found your account on it
-ducktape node status                # height + root hash of the running node
+ducktape node status                # its height, and how far behind the network
 ```
 
 Then, to run agents on it:
