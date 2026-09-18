@@ -290,6 +290,14 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
             return Ok(());
         }
     }
+    let bindings = crate::host_state::NetworkBindings {
+        invite: &resolved.namespace,
+        identity_chain_id: &resolved.service.chain_id,
+    }
+    .compose();
+    check_start(verb, kind, &args.id, || {
+        noded::compose::check_admission(&args.id, &bytes, &bindings)
+    })?;
 
     // 2. the ceremony, BEFORE the bytes move: join an open proposal for the
     //    same (verb, id, hash, lead) or propose; cast yes; execute when
@@ -497,6 +505,30 @@ fn registry_precheck(
         (Verb::Update, Some(true)) => Err(format!(
             "module {id} already has a pending swap (cancel it first)"
         )),
+    }
+}
+
+/// `register` runs the admission its activation will run, here and before
+/// anything is proposed — `start` is that run over scratch state
+/// (`noded::compose::check_admission`). A module that does not start is
+/// refused ready by every validator and could never activate. `update` asks
+/// nothing: a swap keeps the running module's state and never initializes it
+/// (whether the running module takes the bytes is each validator's readiness
+/// question), and a view entry seats no core.
+fn check_start(
+    verb: Verb,
+    kind: modules::Kind,
+    id: &str,
+    start: impl FnOnce() -> Result<(), sdk::Error>,
+) -> Result<(), String> {
+    match (verb, kind) {
+        (Verb::Update, _) | (Verb::Register, modules::Kind::View) => Ok(()),
+        (Verb::Register, modules::Kind::Module) => start().map_err(|refusal| {
+            format!(
+                "module {id} does not start ({refusal}): every validator would refuse it ready, \
+                 so it could never activate — nothing was proposed"
+            )
+        }),
     }
 }
 
@@ -1052,6 +1084,41 @@ mod tests {
         ]);
         let members = vec![me.clone(), other_validator];
         assert!(holdout_rows(&reply, &members, &hex_bytes(&me)).is_empty());
+    }
+
+    #[test]
+    fn a_register_whose_module_does_not_start_is_refused_before_anything_is_proposed() {
+        let refused = || {
+            Err(sdk::Error::module(
+                "module_seat",
+                "kanban initializes: not_configured: no board to start from",
+            ))
+        };
+        let err = check_start(Verb::Register, modules::Kind::Module, "kanban", refused)
+            .expect_err("a module that does not start is refused");
+        assert!(err.contains("module kanban does not start"), "{err}");
+        assert!(
+            err.contains("kanban initializes"),
+            "the admission's own words: {err}"
+        );
+        assert!(err.contains("nothing was proposed"), "{err}");
+
+        let started = || Ok(());
+        assert_eq!(
+            check_start(Verb::Register, modules::Kind::Module, "kanban", started),
+            Ok(())
+        );
+        // only an admission is started: a swap never initializes, and a view
+        // entry seats no core.
+        let never = || -> Result<(), sdk::Error> { panic!("only an admission is started") };
+        assert_eq!(
+            check_start(Verb::Update, modules::Kind::Module, "kanban", never),
+            Ok(())
+        );
+        assert_eq!(
+            check_start(Verb::Register, modules::Kind::View, "kanban", never),
+            Ok(())
+        );
     }
 
     #[test]

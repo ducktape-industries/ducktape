@@ -198,6 +198,12 @@ pub trait ModuleFactory: Send + Sync {
     /// against the committed code hash — or [`Admitted::ForeignAbi`] for bytes
     /// that are no module at all.
     async fn instantiate(&self, id: &str, component_bytes: &[u8]) -> Result<Admitted, Error>;
+
+    /// the whole admission [`ModuleFactory::instantiate`] would run for `id`
+    /// — `initialize` included — over SCRATCH state, dropped once it answers:
+    /// nothing the node runs or stores is touched. `Ok` for bytes that are no
+    /// module at all, which the boundary skips.
+    fn check(&self, id: &str, component_bytes: &[u8]) -> Result<(), Error>;
 }
 
 /// what a [`ModuleFactory`] made of one admission's verified bytes.
@@ -221,6 +227,14 @@ pub enum Admitted {
 fn sha256(bytes: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).to_vec()
+}
+
+/// an admission on a host no [`ModuleFactory`] is wired into — fail-closed.
+fn no_module_factory(id: &str) -> Error {
+    Error::module(
+        "no_module_factory",
+        format!("module {id} admitted but no module factory is wired — fail-closed"),
+    )
 }
 
 /// lowercase hex of a hash, for fail-closed error messages.
@@ -1929,15 +1943,23 @@ impl Host {
         (cached_at == identity).then(|| modules.clone())
     }
 
-    /// Check that an existing module can retain its state under a replacement.
-    /// Preparing and dropping the action leaves the running deployment intact.
-    /// An admission has no previous state shape to preserve.
+    /// Check that `bytes` can take `id`'s seat at its activation boundary,
+    /// touching nothing the node runs — the question a validator answers
+    /// before it signals ready. A replacement must retain the running module's
+    /// state: preparing and dropping the action leaves the running deployment
+    /// intact, and no guest code runs in a swap. An admission is seated fresh
+    /// and INITIALIZED at the boundary, identically on every node, so a guest
+    /// that refuses there would stop every node at that height: it is asked
+    /// the whole admission over scratch state ([`ModuleFactory::check`]).
     pub fn check_module_replacement(&mut self, id: &str, bytes: &[u8]) -> Result<(), Error> {
-        let Some(module) = self.registry.get_mut(id) else {
+        if let Some(module) = self.registry.get_mut(id) {
+            drop(module.prepare_swap(bytes)?);
             return Ok(());
+        }
+        let Some(factory) = &self.module_factory else {
+            return Err(no_module_factory(id));
         };
-        drop(module.prepare_swap(bytes)?);
-        Ok(())
+        factory.check(id, bytes)
     }
 
     /// reconcile every hot-swappable module's RUNNING code against the code
@@ -2076,13 +2098,7 @@ impl Host {
                     // readiness/height gate as a swap and realizes at one
                     // deterministic boundary on every validator.
                     let Some(factory) = &self.module_factory else {
-                        return Err(Error::module(
-                            "no_module_factory",
-                            format!(
-                                "module {} admitted but no module factory is wired — fail-closed",
-                                m.module_id,
-                            ),
-                        ));
+                        return Err(no_module_factory(&m.module_id));
                     };
                     let Admitted::Module(module) =
                         factory.instantiate(&m.module_id, &bytes).await?

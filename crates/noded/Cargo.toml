@@ -127,6 +127,9 @@ reqwest = { workspace = true }
 rand = "0.8"
 async-trait = { workspace = true }
 futures = "0.3"
+# the scratch substrate an admission check starts over (and the isolated
+# storage roots of the admin-token, git-lane and testkit tests).
+tempfile = "3"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors"] }
 # Local automation worktree and pack construction primitives.
@@ -168,6 +171,4 @@ nettest = { path = "../testing/nettest" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio = { version = "1", features = ["test-util"] }
-# isolated storage roots for the admin-token, git-lane and testkit tests.
-tempfile = "3"
 syn = { version = "2", features = ["full"] }
