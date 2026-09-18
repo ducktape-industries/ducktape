@@ -2,8 +2,9 @@
 //!
 //! The concrete loops still own drain timing and side-effect order. This seam
 //! holds what both roles must decide identically — the observe -> ceiling ->
-//! cutover actions, the checkpoint cadence, and the one log format that reports
-//! what a checkpoint cost. The block-projection half (RootOp assembly +
+//! cutover actions, the checkpoint cadence, the one log format that reports
+//! what a checkpoint cost, and the quit signals + `node_shutdown` line that
+//! end either loop. The block-projection half (RootOp assembly +
 //! explorer rows) now lives in [`noded::projection`], consumed by both loops.
 
 use commonware_cryptography::ed25519;
@@ -99,6 +100,143 @@ pub(crate) fn capture_breakdown(cost: &[(sdk::ModuleId, std::time::Duration)]) -
         .map(|(id, spent)| format!("{id}={}", spent.as_millis()))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+// ============================================================================
+// shutdown — the quit signals both loops arm, and the one line both print.
+// ============================================================================
+
+/// SIGTERM and SIGINT as one arm of a role loop's select. The desktop shell
+/// SIGTERMs the daemon on quit and an operator ^Cs it; either must take the
+/// SAME path as an rpc `Shutdown` — a final manifest, then a line naming it —
+/// instead of dying mid-block with the disk ahead of the last checkpoint and
+/// nothing in the log. The streams are made INSIDE the tokio async context so
+/// the signal driver is live. A failure to install one is non-fatal: warn and
+/// carry on WITHOUT that arm rather than abort boot — a SIGKILL / power loss
+/// already lands on the same WAL-forward recovery, so the worst case of a
+/// missing handler is a silent exit, not a brick.
+pub(crate) struct QuitSignals {
+    term: Option<tokio::signal::unix::Signal>,
+    int: Option<tokio::signal::unix::Signal>,
+}
+
+impl QuitSignals {
+    pub(crate) fn install(label: &str) -> Self {
+        use tokio::signal::unix::SignalKind;
+        Self {
+            term: install_quit_signal(SignalKind::terminate(), "SIGTERM", label),
+            int: install_quit_signal(SignalKind::interrupt(), "SIGINT", label),
+        }
+    }
+
+    /// the name of the next quit signal to arrive; pending forever when
+    /// neither stream installed. Cancel-safe (`Signal::recv` is), so a select
+    /// may rebuild it every turn.
+    pub(crate) async fn recv(&mut self) -> &'static str {
+        let Self { term, int } = self;
+        let term = async {
+            next_quit(term.as_mut()).await;
+            "SIGTERM"
+        };
+        let int = async {
+            next_quit(int.as_mut()).await;
+            "SIGINT"
+        };
+        futures::pin_mut!(term, int);
+        futures::future::select(term, int).await.factor_first().0
+    }
+}
+
+fn install_quit_signal(
+    kind: tokio::signal::unix::SignalKind,
+    name: &'static str,
+    label: &str,
+) -> Option<tokio::signal::unix::Signal> {
+    match tokio::signal::unix::signal(kind) {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            tracing::warn!(
+                target: "ducktape::node",
+                node = %label,
+                signal = name,
+                error = %e,
+                reason = "signal_handler_install_failed",
+                "graceful-quit checkpoint disabled"
+            );
+            None
+        }
+    }
+}
+
+async fn next_quit(stream: Option<&mut tokio::signal::unix::Signal>) {
+    match stream {
+        Some(stream) => {
+            stream.recv().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// what asked the node to stop: a quit signal by name, or an rpc `Shutdown`
+/// whose caller is still owed its reply.
+pub(crate) enum ShutdownCause {
+    Signal(&'static str),
+    Rpc {
+        reply: std::sync::mpsc::Sender<crate::rpc::RpcReply>,
+        written: futures::channel::oneshot::Receiver<()>,
+    },
+}
+
+/// what a shutdown did about the final checkpoint — the `checkpoint` field of
+/// the `node_shutdown` line.
+pub(crate) enum ShutdownCheckpoint {
+    /// a final manifest landed at the shutdown height.
+    Written,
+    /// the last manifest this loop wrote already holds the shutdown state.
+    AlreadyCurrent,
+    /// no manifest was written, for a stable snake_case reason.
+    Skipped(&'static str),
+}
+
+impl std::fmt::Display for ShutdownCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Written => f.write_str("written"),
+            Self::AlreadyCurrent => f.write_str("already_current"),
+            Self::Skipped(reason) => write!(f, "skipped({reason})"),
+        }
+    }
+}
+
+/// the terminal step of EVERY shutdown, once the role has settled its final
+/// checkpoint: answer an rpc caller and wait until the reply is WRITTEN (the
+/// exit would otherwise race the write and close the socket on a caller that
+/// never saw a line), print the one `node_shutdown` line, exit 0. `height` is
+/// the folded tip the checkpoint covers — what the next boot recovers to.
+pub(crate) async fn finish_shutdown(
+    label: &str,
+    cause: ShutdownCause,
+    height: Option<u64>,
+    checkpoint: ShutdownCheckpoint,
+) -> ! {
+    let (signal, sentence) = match cause {
+        ShutdownCause::Signal(name) => (name, "SIGTERM/SIGINT — graceful checkpoint then exit"),
+        ShutdownCause::Rpc { reply, written } => {
+            let _ = reply.send(crate::rpc::RpcReply::ok());
+            let _ = written.await;
+            ("rpc", "shutdown requested via rpc; exiting")
+        }
+    };
+    tracing::info!(
+        target: "ducktape::node",
+        event = "node_shutdown",
+        node = %label,
+        signal,
+        height,
+        checkpoint = %checkpoint,
+        "{sentence}"
+    );
+    std::process::exit(0);
 }
 
 #[derive(Debug, PartialEq, Eq)]

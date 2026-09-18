@@ -20,7 +20,9 @@ use recovery::{Manifest, Recovery};
 use crate::blob_fetch::SourceRotate as _;
 use crate::config::{hex_bytes, unhex};
 use crate::constants::*;
-use crate::drain_actions::{CutoverTrigger, EpochActions};
+use crate::drain_actions::{
+    CutoverTrigger, EpochActions, QuitSignals, ShutdownCause, ShutdownCheckpoint, finish_shutdown,
+};
 use crate::explorer::{
     boundary_block_row, heal_and_backfill_index, heal_index, retry_owed_backfill,
 };
@@ -299,6 +301,178 @@ async fn publish_replica_status(
     });
 }
 
+type ReplicaNode =
+    node::OrderedNode<consensus::FollowerOrderer, Recovery<commonware_runtime::tokio::Context>>;
+
+/// capture and write one resident checkpoint at the folded tip `f`, then prune
+/// the journal below the PREVIOUS one — the periodic cadence and the shutdown
+/// path both write through here, so both print `node_checkpoint_written`. A
+/// failure is logged here and returned as its stable reason, leaving
+/// `prev_ckpt`/`written_root` as they were.
+#[allow(clippy::too_many_arguments)]
+async fn write_replica_checkpoint(
+    node_r: &mut ReplicaNode,
+    f: host::FinalizedBlock,
+    epoch: u64,
+    view_base: u64,
+    prev_ckpt: &mut (Option<u64>, u64),
+    written_root: &mut Option<StateRoot>,
+    context: &commonware_runtime::tokio::Context,
+    label: &str,
+) -> Result<(), &'static str> {
+    let pos = node_r.sink_mut().oplog_pos().await;
+    let members = read_valset_members(node_r.host()).await.unwrap_or_default();
+    let residents = read_valset_residents(node_r.host()).await;
+    // the capture's OWN window: the two valset reads above are host queries
+    // that run module execution, and charging them to `capture_ms` would put
+    // time in the stage that the per-module breakdown cannot account for.
+    let capture_started = context.current();
+    // TIMED, exactly like the validator's periodic checkpoint: this capture
+    // blocks the replica's own select loop, so its per-module cost is the same
+    // diagnosis (#1018) and must not be visible in only one of the two roles.
+    let captured = Manifest::capture_timed(
+        node_r.host(),
+        Some(f.height),
+        epoch,
+        view_base,
+        members,
+        residents,
+        None,
+        pos,
+        1,
+        // the root `f.height` SEALED: a manifest labelled with this height
+        // must carry it, never whatever the live host has moved to since
+        // (recovery fatals on the difference).
+        Some(f.root_hash),
+        || {
+            context
+                .current()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+        },
+    )
+    // the replay guard rides every checkpoint (see
+    // `recovery::Manifest::applied_frames`).
+    .map(|(m, cost)| (m.with_replay_window(node_r.replay_window()), cost));
+    let captured_at = context.current();
+    let (ckpt, capture_cost) = match captured {
+        Ok(captured) => captured,
+        Err(e) => {
+            tracing::warn!(
+                target: "ducktape::recovery",
+                node = %label,
+                error = %e,
+                reason = "capture_failed",
+                "replica checkpoint capture failed"
+            );
+            return Err("capture_failed");
+        }
+    };
+    if let Err(e) = node_r.sink_mut().write_manifest(&ckpt).await {
+        tracing::warn!(
+            target: "ducktape::recovery",
+            node = %label,
+            error = %e,
+            reason = "write_failed",
+            "replica checkpoint write failed"
+        );
+        return Err("write_failed");
+    }
+    let written_at = context.current();
+    // prune the journal below the PREVIOUS checkpoint once the persisted floor
+    // passed it — the validator's exact prune discipline. without this a
+    // long-lived replica's journal grows without bound (pruned frames must
+    // never be needed to resolve a re-reported finalization; the floor gate
+    // guarantees it).
+    let floor_passed = matches!(
+        node_r.sink_mut().floor_cert(),
+        Ok(Some(fc)) if prev_ckpt.0.is_none_or(|h| fc.height >= h)
+    );
+    if floor_passed && let Err(e) = node_r.sink_mut().prune_oplog(prev_ckpt.1).await {
+        tracing::warn!(
+            target: "ducktape::recovery",
+            node = %label,
+            error = %e,
+            "replica oplog prune failed"
+        );
+    }
+    *prev_ckpt = (ckpt.height, pos);
+    *written_root = Some(ckpt.root_hash);
+    let since = |a: std::time::SystemTime, b: std::time::SystemTime| {
+        b.duration_since(a).unwrap_or_default().as_millis()
+    };
+    let done_at = context.current();
+    tracing::info!(
+        target: "ducktape::recovery",
+        event = "node_checkpoint_written",
+        node = %label,
+        height = ckpt.height.unwrap_or_default(),
+        capture_ms = since(capture_started, captured_at),
+        write_ms = since(captured_at, written_at),
+        prune_ms = since(written_at, done_at),
+        capture_modules = %crate::drain_actions::capture_breakdown(&capture_cost)
+    );
+    Ok(())
+}
+
+/// the resident's ONE shutdown path, SIGTERM/SIGINT and rpc `Shutdown` alike:
+/// a final checkpoint through the cadence's own writer — unless the last
+/// manifest this loop wrote already holds the folded tip's state, which the
+/// next boot's journal replay carries forward to that tip — then the shared
+/// terminal step. A resident not yet serving has no state of its own; its next
+/// boot syncs a boundary exactly as this one would have.
+#[allow(clippy::too_many_arguments)]
+async fn shut_down(
+    serving: Option<&mut ReplicaNode>,
+    epoch: u64,
+    view_base: u64,
+    prev_ckpt: &mut (Option<u64>, u64),
+    written_root: &mut Option<StateRoot>,
+    context: &commonware_runtime::tokio::Context,
+    label: &str,
+    cause: ShutdownCause,
+) -> ! {
+    let Some(node_r) = serving else {
+        finish_shutdown(
+            label,
+            cause,
+            None,
+            ShutdownCheckpoint::Skipped("not_serving"),
+        )
+        .await
+    };
+    let Some(f) = node_r.finalized() else {
+        finish_shutdown(
+            label,
+            cause,
+            None,
+            ShutdownCheckpoint::Skipped("nothing_finalized"),
+        )
+        .await
+    };
+    let manifest_holds_tip = *written_root == Some(f.root_hash);
+    let checkpoint = if manifest_holds_tip {
+        ShutdownCheckpoint::AlreadyCurrent
+    } else {
+        match write_replica_checkpoint(
+            node_r,
+            f,
+            epoch,
+            view_base,
+            prev_ckpt,
+            written_root,
+            context,
+            label,
+        )
+        .await
+        {
+            Ok(()) => ShutdownCheckpoint::Written,
+            Err(reason) => ShutdownCheckpoint::Skipped(reason),
+        }
+    };
+    finish_shutdown(label, cause, Some(f.height), checkpoint).await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn park(
     channels: ReplicaChannels,
@@ -551,10 +725,7 @@ pub(super) async fn park(
     // journal as the sink. None while knocking / bootstrapping; Some
     // from ascension on. reads serve from `.1.host()` through the
     // serve window; the fold driver feeds `.1.orderer_mut()`.
-    let mut serving: Option<(
-        u64,
-        node::OrderedNode<consensus::FollowerOrderer, Recovery<commonware_runtime::tokio::Context>>,
-    )> = None;
+    let mut serving: Option<(u64, ReplicaNode)> = None;
     // the joiner's recovery journal, slot-shaped: ascension moves it
     // into the replica node (it IS the node's block sink); a descend
     // (epoch cutover / promotion) reopens a fresh handle after the
@@ -942,6 +1113,14 @@ pub(super) async fn park(
     // loop below just picks the flag up; the RESTORE path (persisted
     // standing) and the token-less MANUAL path (out-of-band pubkey, admitted
     // by `node resident accept`/`node member promote`) keep their existing detection.
+    //
+    // SIGTERM/SIGINT take `shut_down`, answered in the serve window below.
+    // ponytail: a signal is only heard at the window — one landing mid-sync
+    // waits for that sync, and one landing during the promotion seat (this
+    // loop gone, the validator loop not yet armed) goes unanswered until the
+    // validator installs its own; hand `quit` through the baton if that
+    // window ever matters.
+    let mut quit = QuitSignals::install(&label);
     let (boundary, host, floor) = loop {
         attempt += 1;
         if !resident_standing && admitted.load(std::sync::atomic::Ordering::Acquire) {
@@ -984,6 +1163,16 @@ pub(super) async fn park(
             futures::pin_mut!(tick);
             loop {
                 futures::select_biased! {
+                    signal = quit.recv().fuse() => shut_down(
+                        serving.as_mut().map(|(_, node_r)| node_r),
+                        replica_epoch,
+                        replica_view_base,
+                        &mut replica_prev_ckpt,
+                        &mut replica_written_root,
+                        &context,
+                        &label,
+                        ShutdownCause::Signal(signal),
+                    ).await,
                     job = rpc_ingress.next() => {
                         let Some(RpcJob { req, reply, written }) = job else { continue };
                         let resp = match req {
@@ -1093,20 +1282,17 @@ pub(super) async fn park(
                                 ),
                                 ..RpcReply::ok()
                             },
-                            RpcRequest::Shutdown => {
-                                // a resident writes no checkpoint — nothing to
-                                // flush; a restart parks straight back here.
-                                let _ = reply.send(RpcReply::ok());
-                                // wait for the rpc thread to WRITE it: the
-                                // exit below would otherwise race the write.
-                                let _ = written.await;
-                                tracing::info!(
-                                    target: "ducktape::node",
-                                    node = %label,
-                                    "shutdown requested via rpc; exiting"
-                                );
-                                std::process::exit(0);
-                            }
+                            RpcRequest::Shutdown => shut_down(
+                                serving.as_mut().map(|(_, node_r)| node_r),
+                                replica_epoch,
+                                replica_view_base,
+                                &mut replica_prev_ckpt,
+                                &mut replica_written_root,
+                                &context,
+                                &label,
+                                ShutdownCause::Rpc { reply, written },
+                            )
+                            .await,
                         };
                         let _ = reply.send(resp);
                     }
@@ -1830,114 +2016,26 @@ pub(super) async fn park(
                     replica_written_root,
                 )
             {
-                let pos = node_r.sink_mut().oplog_pos().await;
                 let checkpoint_started = context.current();
-                let members = read_valset_members(node_r.host()).await.unwrap_or_default();
-                let residents = read_valset_residents(node_r.host()).await;
-                // the capture's OWN window: the two valset reads above are host
-                // queries that run module execution, and charging them to
-                // `capture_ms` would put time in the stage that the per-module
-                // breakdown cannot account for. `checkpoint_started` still spans
-                // them for the cooldown — they block the loop too.
-                let capture_started = context.current();
-                // TIMED, exactly like the validator's periodic checkpoint: this
-                // capture blocks the replica's own select loop, so its per-module
-                // cost is the same diagnosis (#1018) and must not be visible in
-                // only one of the two roles.
-                let captured = Manifest::capture_timed(
-                    node_r.host(),
-                    Some(f.height),
+                let written = write_replica_checkpoint(
+                    node_r,
+                    f,
                     replica_epoch,
                     replica_view_base,
-                    members,
-                    residents,
-                    None,
-                    pos,
-                    1,
-                    // the root `f.height` SEALED: a manifest labelled with this
-                    // height must carry it, never whatever the live host has
-                    // moved to since (recovery fatals on the difference).
-                    Some(f.root_hash),
-                    || {
-                        context
-                            .current()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                    },
+                    &mut replica_prev_ckpt,
+                    &mut replica_written_root,
+                    &context,
+                    &label,
                 )
-                // the replay guard rides every checkpoint (see
-                // `recovery::Manifest::applied_frames`).
-                .map(|(m, cost)| (m.with_replay_window(node_r.replay_window()), cost));
-                let captured_at = context.current();
-                match captured {
-                    Ok((ckpt, capture_cost)) => match node_r.sink_mut().write_manifest(&ckpt).await
-                    {
-                        Ok(()) => {
-                            let written_at = context.current();
-                            // prune the journal below the PREVIOUS
-                            // checkpoint once the persisted floor
-                            // passed it — the validator's exact
-                            // prune discipline. without this a
-                            // long-lived replica's journal grows
-                            // without bound (pruned frames must
-                            // never be needed to resolve a
-                            // re-reported finalization; the floor
-                            // gate guarantees it).
-                            let floor_passed = matches!(
-                                node_r.sink_mut().floor_cert(),
-                                Ok(Some(fc))
-                                    if replica_prev_ckpt
-                                        .0
-                                        .is_none_or(|h| fc.height >= h)
-                            );
-                            if floor_passed
-                                && let Err(e) =
-                                    node_r.sink_mut().prune_oplog(replica_prev_ckpt.1).await
-                            {
-                                tracing::warn!(
-                                    target: "ducktape::recovery",
-                                    node = %label,
-                                    error = %e,
-                                    "replica oplog prune failed"
-                                );
-                            }
-                            replica_prev_ckpt = (ckpt.height, pos);
-                            replica_written_root = Some(ckpt.root_hash);
-                            blocks_since_checkpoint = 0;
-                            let since = |a: std::time::SystemTime, b: std::time::SystemTime| {
-                                b.duration_since(a).unwrap_or_default().as_millis()
-                            };
-                            let done_at = context.current();
-                            tracing::info!(
-                                target: "ducktape::recovery",
-                                event = "node_checkpoint_written",
-                                node = %label,
-                                height = ckpt.height.unwrap_or_default(),
-                                capture_ms = since(capture_started, captured_at),
-                                write_ms = since(captured_at, written_at),
-                                prune_ms = since(written_at, done_at),
-                                capture_modules = %crate::drain_actions::capture_breakdown(&capture_cost)
-                            );
-                        }
-                        Err(e) => tracing::warn!(
-                            target: "ducktape::recovery",
-                            node = %label,
-                            error = %e,
-                            "replica checkpoint write failed; retrying"
-                        ),
-                    },
-                    Err(e) => tracing::warn!(
-                        target: "ducktape::recovery",
-                        node = %label,
-                        error = %e,
-                        "replica checkpoint capture failed; retrying"
-                    ),
+                .await;
+                if written.is_ok() {
+                    blocks_since_checkpoint = 0;
                 }
-                // OUTSIDE THE MATCH: a capture that fails costs this loop
-                // everything a successful one does, and neither failure arm
-                // resets `blocks_since_checkpoint` — so without the cooldown
-                // the retry is immediate and the node re-pays the full cost on
-                // every pass, forever.
+                // EITHER WAY: a capture that fails costs this loop everything
+                // a successful one does, and a failure does not reset
+                // `blocks_since_checkpoint` — so without the cooldown the retry
+                // is immediate and the node re-pays the full cost on every
+                // pass, forever.
                 let attempt = context
                     .current()
                     .duration_since(checkpoint_started)
