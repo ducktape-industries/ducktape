@@ -941,22 +941,48 @@ pub(crate) fn plane_failure() -> Option<(&'static str, String)> {
     Some(named.unwrap_or(("plane_startup_failed", detail)))
 }
 
-/// The socket inodes bound to `port` in one `/proc/net/udp{,6}` table. The
-/// columns are fixed and positional: `local_address` (hex address, hex port)
-/// is the second, `inode` the tenth — the header's `tx_queue rx_queue` and
-/// `tr tm->when` are single colon-joined fields in every data row.
+/// One socket bound to the port asked about, as a `/proc/net/{tcp,udp}{,6}`
+/// row names it.
 #[cfg(target_os = "linux")]
-fn udp_inodes_in(table: &str, port: u16) -> Vec<String> {
+#[derive(Debug, PartialEq)]
+struct BoundSocket {
+    /// `socket:[<inode>]` — what the holding process's fd links to.
+    link: String,
+    /// `st` is `0A`, a TCP listener. Never in a udp table.
+    listening: bool,
+}
+
+/// The sockets bound to `port` in one `/proc/net/{tcp,udp}{,6}` table. The
+/// columns are fixed and positional: `local_address` (hex address, hex port)
+/// is the second, `st` the fourth, `inode` the tenth — the header's
+/// `tx_queue rx_queue` and `tr tm->when` are single colon-joined fields in
+/// every data row.
+#[cfg(target_os = "linux")]
+fn sockets_in(table: &str, port: u16) -> Vec<BoundSocket> {
     table
         .lines()
         .skip(1)
         .filter_map(|line| {
             let columns: Vec<&str> = line.split_whitespace().collect();
             let local = columns.get(1)?;
+            let state = columns.get(3)?;
             let inode = columns.get(9)?;
             let bound = u16::from_str_radix(local.rsplit_once(':')?.1, 16).ok()?;
-            (bound == port).then(|| (*inode).to_string())
+            (bound == port).then(|| BoundSocket {
+                link: format!("socket:[{inode}]"),
+                listening: *state == "0A",
+            })
         })
+        .collect()
+}
+
+/// The sockets bound to `port` across a transport's v4 and v6 tables.
+#[cfg(target_os = "linux")]
+fn bound_sockets(tables: [&str; 2], port: u16) -> Vec<BoundSocket> {
+    tables
+        .into_iter()
+        .filter_map(|table| std::fs::read_to_string(table).ok())
+        .flat_map(|text| sockets_in(&text, port))
         .collect()
 }
 
@@ -966,20 +992,51 @@ fn udp_inodes_in(table: &str, port: u16) -> Vec<String> {
 /// Two nodes on one dev box are the same user, which is the case this serves.
 #[cfg(target_os = "linux")]
 fn udp_port_owner(port: u16) -> Option<String> {
-    let mut wanted: Vec<String> = Vec::new();
-    for table in ["/proc/net/udp", "/proc/net/udp6"] {
-        let Ok(text) = std::fs::read_to_string(table) else {
-            continue;
-        };
-        wanted.extend(
-            udp_inodes_in(&text, port)
-                .into_iter()
-                .map(|inode| format!("socket:[{inode}]")),
-        );
+    process_holding(&bound_sockets(["/proc/net/udp", "/proc/net/udp6"], port))
+}
+
+/// What holds a TCP port a listener could not bind.
+pub(crate) enum PortHolder {
+    /// another server's listening socket.
+    Listener(Option<String>),
+    /// one end of a connection: an outbound one drew the port from the
+    /// kernel's ephemeral range as its source port, and it frees when that
+    /// connection closes. `None` is another user's, or a closed one waiting
+    /// out TIME_WAIT, which no process holds.
+    Connection(Option<String>),
+}
+
+/// What holds this TCP port, as far as `/proc` will say — the socket's state
+/// is world-readable, the process behind it only when it is this user's. A
+/// listener wins over a connection: two sockets on one port is a server with
+/// its accepted peers, and the server is the answer.
+#[cfg(target_os = "linux")]
+pub(crate) fn tcp_port_holder(port: u16) -> Option<PortHolder> {
+    let (listeners, connections): (Vec<_>, Vec<_>) =
+        bound_sockets(["/proc/net/tcp", "/proc/net/tcp6"], port)
+            .into_iter()
+            .partition(|socket| socket.listening);
+    if !listeners.is_empty() {
+        return Some(PortHolder::Listener(process_holding(&listeners)));
     }
-    if wanted.is_empty() {
+    if !connections.is_empty() {
+        return Some(PortHolder::Connection(process_holding(&connections)));
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn tcp_port_holder(_port: u16) -> Option<PortHolder> {
+    None
+}
+
+/// The first process with an fd on one of `sockets`, described.
+#[cfg(target_os = "linux")]
+fn process_holding(sockets: &[BoundSocket]) -> Option<String> {
+    if sockets.is_empty() {
         return None;
     }
+    let wanted: Vec<&str> = sockets.iter().map(|socket| socket.link.as_str()).collect();
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let pid = entry.file_name().to_string_lossy().into_owned();
         let is_process = !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit());
@@ -1000,20 +1057,15 @@ fn udp_port_owner(port: u16) -> Option<String> {
     None
 }
 
-/// One process in terms an operator can act on: what it was started as, and
-/// the directory it runs in — which for a node started in its workspace IS the
-/// workspace.
+/// One process in terms an operator can act on: its name, and the directory it
+/// runs in — which for a node started in its workspace IS the workspace. The
+/// name and never the argv: the holder may be a `curl` or a CLI whose
+/// arguments carry a URL path, a token or an invite blob, and this sentence
+/// lands in the log ring.
 #[cfg(target_os = "linux")]
 fn describe_process(pid: &str) -> String {
-    let command = std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|raw| {
-            raw.split(|byte| *byte == 0)
-                .filter(|arg| !arg.is_empty())
-                .map(String::from_utf8_lossy)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default();
+    let command = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    let command = command.trim_end();
     match std::fs::read_link(format!("/proc/{pid}/cwd")) {
         Ok(cwd) => format!("pid {pid} ({command}) running in {}", cwd.display()),
         Err(_) => format!("pid {pid} ({command})"),
@@ -1861,12 +1913,47 @@ mod plane_failure_tests {
    2: 0000CA6C:0043 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 445566 2 0000000000000000 0
 ";
 
+    /// a real `/proc/net/tcp`, trimmed: a listener on `7080` (28800), the
+    /// connection it accepted, and that connection's client end, whose SOURCE
+    /// port `d431` (54321) is the one an outbound socket holds.
+    #[cfg(target_os = "linux")]
+    const TCP_TABLE: &str = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:7080 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 700001 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:7080 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 700002 1 0000000000000000 20 4 30 10 -1
+   2: 0100007F:D431 0100007F:7080 01 00000000:00000000 00:00000000 00000000  1000        0 700003 1 0000000000000000 20 4 30 10 -1
+";
+
+    #[cfg(target_os = "linux")]
+    fn socket(inode: &str, listening: bool) -> super::BoundSocket {
+        super::BoundSocket {
+            link: format!("socket:[{inode}]"),
+            listening,
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn the_port_column_names_its_socket_and_only_its_socket() {
-        assert_eq!(super::udp_inodes_in(TABLE, 51820), ["918273"]);
-        assert_eq!(super::udp_inodes_in(TABLE, 53), ["112233"]);
-        assert!(super::udp_inodes_in(TABLE, 9999).is_empty());
+        assert_eq!(super::sockets_in(TABLE, 51820), [socket("918273", false)]);
+        assert_eq!(super::sockets_in(TABLE, 53), [socket("112233", false)]);
+        assert!(super::sockets_in(TABLE, 9999).is_empty());
+    }
+
+    /// `st` `0A` is the listener; the accepted end shares its port and is not.
+    /// The client end is found by its LOCAL port only — the remote column
+    /// naming 54321 on the accepted row does not count.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_state_column_tells_a_listener_from_a_connection() {
+        assert_eq!(
+            super::sockets_in(TCP_TABLE, 28800),
+            [socket("700001", true), socket("700002", false)]
+        );
+        assert_eq!(
+            super::sockets_in(TCP_TABLE, 54321),
+            [socket("700003", false)]
+        );
     }
 
     /// this process holds a port it just bound, so the scan must find ITSELF —

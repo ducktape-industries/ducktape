@@ -69,13 +69,44 @@ pub(crate) fn bind_listener(
     addr: &str,
 ) -> Result<std::net::TcpListener, String> {
     std::net::TcpListener::bind(addr).map_err(|error| match error.kind() {
-        std::io::ErrorKind::AddrInUse => format!(
-            "the {surface} address {addr} is already taken — a node for this workspace is \
-             probably already running (`ducktape node list`, `ducktape node status`); \
-             otherwise change `{key}` in node.toml"
-        ),
+        std::io::ErrorKind::AddrInUse => {
+            let holder = address_holder(addr);
+            format!(
+                "the {surface} address {addr} is already taken: {holder}; otherwise change \
+                 `{key}` in node.toml"
+            )
+        }
         _ => format!("cannot bind the {surface} on {addr}: {error} (`{key}` in node.toml)"),
     })
+}
+
+/// Who holds a taken address, said as far as it is known. A second node is
+/// only the answer when a LISTENER holds it: the port can equally be the
+/// source port of an outbound connection — a `curl`, a peer dial — when it
+/// sits in the kernel's ephemeral range, and blaming a node that is not
+/// running sends the operator looking for nothing.
+fn address_holder(addr: &str) -> String {
+    use crate::reachability_plane::{PortHolder, tcp_port_holder};
+    let port = addr
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok());
+    match port.and_then(tcp_port_holder) {
+        Some(PortHolder::Listener(process)) => format!(
+            "{} is listening on it — if that is this workspace's node, it is already running \
+             (`ducktape node list`, `ducktape node status`)",
+            process.as_deref().unwrap_or("another user's process")
+        ),
+        Some(PortHolder::Connection(process)) => format!(
+            "{} holds it as the source port of an outbound connection, until that connection \
+             closes — the kernel hands ports in its ephemeral range (32768–60999 by default) \
+             to outbound connections, so a listener there can lose this race at any restart",
+            process.as_deref().unwrap_or(
+                "a connection no process of this user owns (another user's, or one closed and \
+                 waiting out TIME_WAIT)"
+            )
+        ),
+        None => "another process or a transient connection holds it".to_string(),
+    }
 }
 
 /// the operator's active wallet PUBLIC key, if this workspace has a keystore —
@@ -373,6 +404,13 @@ mod tests {
             !why.contains("os error"),
             "the errno is noise once the sentence exists: {why}"
         );
+        // a listener holds it, and on linux `/proc` says whose: this process.
+        assert!(why.contains("is listening on it"), "{why}");
+        #[cfg(target_os = "linux")]
+        assert!(
+            why.contains(&format!("pid {}", std::process::id())),
+            "which process: {why}"
+        );
         drop(held);
 
         // a DIFFERENT failure must not borrow that explanation.
@@ -383,5 +421,40 @@ mod tests {
             "an unassignable address is not a second node: {refused}"
         );
         assert!(refused.contains("http_listen"), "{refused}");
+    }
+
+    /// The race the issue measured: a port in the ephemeral range handed to an
+    /// outbound connection as its source port. The kernel refuses the node's
+    /// bind exactly as it does for a second node, and the sentence blamed one —
+    /// an operator went looking for a node that was not running. This process
+    /// dials itself, so its own client end holds the port.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_port_held_by_an_outbound_connection_does_not_blame_a_node() {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let client = std::net::TcpStream::connect(server.local_addr().expect("server addr"))
+            .expect("dial the server");
+        let addr = client
+            .local_addr()
+            .expect("the client's source address")
+            .to_string();
+
+        let why = bind_listener("node HTTP API", "http_listen", &addr)
+            .expect_err("the client's source port is held for the length of this test");
+        assert!(why.contains(&addr), "which address: {why}");
+        assert!(why.contains("http_listen"), "what to edit: {why}");
+        assert!(
+            !why.contains("already running"),
+            "no node holds it, so the sentence must not blame one: {why}"
+        );
+        assert!(
+            why.contains("source port of an outbound connection"),
+            "what does hold it: {why}"
+        );
+        assert!(
+            why.contains(&format!("pid {}", std::process::id())),
+            "whose connection: {why}"
+        );
+        drop(client);
     }
 }

@@ -62,7 +62,7 @@ enumerates it and the printed path is the only way back to it.
 | `--binary PATH` | a node binary. Default: build one from this checkout. |
 | `--guest DIR` | a guest image (`vmlinux`, `rootfs.ext4`) installed as the workspace's own. |
 | `--mirror REPO` | a git checkout to import into the network's forge. |
-| `--port-offset N` | add N to every port. |
+| `--port-offset N` | add N to every port. The TCP block (28800–28831) plus N must stay below 32768, where the kernel starts handing ports to outbound connections. |
 | `--wallet-name` | the workspace's active wallet and the account founded for it. |
 | `--wallet-password` | its password. No default — left out, one is generated and written `0600` to `<workspace>/wallet-<name>.password`. |
 | `--skip-app` | do not rebuild the desktop app. |

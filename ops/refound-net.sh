@@ -37,13 +37,20 @@ WALLET_PASSWORD=""
 # fixed defaults, and the join then fails with a message that blames the invite
 # rather than the address already in use.
 #
-# These defaults are the LIVE network's, so proving this script on a scratch
-# pair while that network is up needs `--port-offset` — otherwise the scratch
-# founder binds the real one's http port and the rehearsal takes down the thing
-# it was rehearsing for.
+# These defaults are the set a network founded by this script runs on, so
+# proving it on a scratch pair beside a live network needs `--port-offset` —
+# otherwise the scratch founder binds the real one's http port and the
+# rehearsal takes down the thing it was rehearsing for.
+#
+# The TCP block is 28800–28831: the tens digit is the surface (http 0, gateway
+# 1, rpc 2, p2p 3), the ones digit the node (founder 0, resident 1). It sits
+# BELOW 32768, the bottom of Linux's ephemeral range: the kernel hands a port
+# above that to any outbound connection as its source port, and a node that
+# restarts while one holds its listener's port cannot bind it. WireGuard and
+# the invite door are UDP and keep their own set.
 PORT_OFFSET=0
-F_P2P=35620 F_HTTP=32989 F_GATEWAY=33989 F_RPC=34989 F_WG=46700 F_INVITE=46701
-J_P2P=35630 J_HTTP=32990 J_GATEWAY=33990 J_RPC=34990 J_WG=46710 J_INVITE=46711
+F_HTTP=28800 F_GATEWAY=28810 F_RPC=28820 F_P2P=28830 F_WG=46700 F_INVITE=46701
+J_HTTP=28801 J_GATEWAY=28811 J_RPC=28821 J_P2P=28831 J_WG=46710 J_INVITE=46711
 
 LAUNCHER_EXE="ducktape-node-launcher"
 
@@ -80,8 +87,11 @@ usage: ops/refound-net.sh --root DIR [options]
   --guest DIR         a guest image directory (vmlinux + rootfs.ext4) to install
                       as the workspace's own. runs boot what is here.
   --mirror REPO       a git checkout to import into the network's forge.
-  --port-offset N     add N to every port. the defaults are the live network's,
-                      so a scratch run alongside it needs an offset.
+  --port-offset N     add N to every port. the defaults are what a network
+                      founded by this script runs on, so a scratch run beside
+                      one needs an offset. keep the tcp block (28800–28831)
+                      plus N below 32768, where the kernel's ephemeral range
+                      starts.
   --wallet-name NAME  the workspace's active wallet, and the display name of
                       the account founded for it (default: operator). the
                       service daemons refuse to boot without both.
