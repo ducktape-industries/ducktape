@@ -363,8 +363,9 @@ static CLUSTER_SEQ: AtomicU64 = AtomicU64::new(0);
 /// stdout and stderr share ONE pipe. a reader thread drains it into the feed
 /// every wait rides AND into the log file on disk (what a post-mortem opens).
 /// a line arriving, or the pipe closing behind an exit, is the event a wait
-/// wakes on; a deadline only names the failure. killed (and reaped) on drop so
-/// an assertion failure never leaks a validator into the host system.
+/// wakes on; a deadline only names the failure. killed on drop with every
+/// process under it, and reaped, so an assertion failure never leaks a
+/// validator — or the node a supervisor started — into the host system.
 pub struct NodeProc {
     pub id: u64,
     child: Child,
@@ -534,14 +535,13 @@ impl NodeProc {
 }
 
 impl NodeProc {
-    /// SIGTERM this process and wait for it to go, SIGKILLing only if it
-    /// outlives `budget`.
+    /// SIGTERM this process and wait for it to go, SIGKILLing its whole tree
+    /// only if it outlives `budget`.
     ///
     /// `Drop` SIGKILLs, which is right for a node (a crash is a case under
-    /// test) and wrong for a SUPERVISOR: a killed supervisor leaves the node
-    /// it started running, orphaned, over a tempdir the test is about to
-    /// remove. A stop signal is also what `systemctl stop` sends, so this is
-    /// the shutdown the supervisor is built for.
+    /// test) and blunt for a SUPERVISOR: its node dies uncheckpointed. A stop
+    /// signal is what `systemctl stop` sends, so this is the shutdown the
+    /// supervisor is built for.
     pub fn terminate(&mut self, budget: Duration) {
         // SAFETY: our own child, not yet reaped — `Drop` is the only other
         // reaper and it runs after this.
@@ -553,16 +553,77 @@ impl NodeProc {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let _ = self.child.kill();
+        self.kill_tree();
+    }
+
+    /// SIGKILL this process AND everything it started, then reap it.
+    ///
+    /// A supervisor's children — a launcher's node and the daemon beside it —
+    /// are not this handle's to wait on, and a signal to the supervisor never
+    /// reaches them: killing it alone leaves them running, reparented to init,
+    /// on ports and a workspace the next run trips over.
+    fn kill_tree(&mut self) {
+        // a reaped child's pid is the kernel's to hand out again; only one not
+        // yet reaped still owns the number the walk starts from.
+        let reaped = !matches!(self.child.try_wait(), Ok(None));
+        if reaped {
+            return;
+        }
+        for pid in frozen_tree(self.child.id() as libc::pid_t) {
+            // SAFETY: a signal to a process the walk found under our own
+            // unreaped child and stopped; stopped, it cannot exit and free
+            // its pid before this lands.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
         let _ = self.child.wait();
     }
 }
 
 impl Drop for NodeProc {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.kill_tree();
     }
+}
+
+/// `root` and every process descended from it, each stopped (SIGSTOP) BEFORE
+/// its children are listed: a fork racing a pending signal is restarted by the
+/// kernel, so no child can appear under a process the walk has passed.
+///
+/// Read from `/proc`; where there is none the walk finds `root` alone.
+fn frozen_tree(root: libc::pid_t) -> Vec<libc::pid_t> {
+    let mut tree = vec![root];
+    let mut next = 0;
+    while let Some(&pid) = tree.get(next) {
+        // SAFETY: SIGSTOP to `root` (our unreaped child) or to a process found
+        // under it; stopping delivers nothing a handler runs.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        tree.extend(children_of(pid));
+        next += 1;
+    }
+    tree
+}
+
+/// Every process whose parent is `parent`, off `/proc/<pid>/stat`.
+fn children_of(parent: libc::pid_t) -> Vec<libc::pid_t> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<libc::pid_t>().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            // `pid (comm) state ppid …` — `comm` may hold spaces and parens,
+            // so the fields are read from after its LAST `)`.
+            let (_, fields) = stat.rsplit_once(')')?;
+            let ppid = fields
+                .split_whitespace()
+                .nth(1)?
+                .parse::<libc::pid_t>()
+                .ok()?;
+            (ppid == parent).then_some(pid)
+        })
+        .collect()
 }
 
 /// one process's output: everything it wrote so far, and whether it still can.

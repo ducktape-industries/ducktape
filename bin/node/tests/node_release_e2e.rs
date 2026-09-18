@@ -50,10 +50,15 @@ const WALLET_PASSWORD: &str = "node-release-e2e";
 /// every wait below is on a line the launcher printed, never on time.
 const POLL_MS: &str = "400";
 
-/// Blocks between a designation passing and its activation. Wide on purpose —
-/// the leg it exists for is "the release is STAGED while the designation is
-/// still unarmed", so the staging has to finish well inside it.
+/// Blocks between the height a designation is proposed at and its activation
+/// — `release schedule --lead`, counted by the verb after its preflight. Wide
+/// on purpose: the leg it exists for is "the release is STAGED while the
+/// designation is still unarmed", so the staging has to finish well inside it.
 const ACTIVATION_LEAD: u64 = 150;
+
+/// `release schedule`'s way past its own preflight. The launcher's refusals
+/// are what stand behind it, and they are what the legs passing it test.
+const SKIP_PREFLIGHT: &str = "--skip-preflight-i-know-the-wit-moved";
 
 /// Every wait's budget. A node boot, a checkpointing stop and a duckfs commit
 /// all ride inside one.
@@ -103,9 +108,13 @@ struct Net {
 /// A staged release is SEALED read-only, directories included, and nothing
 /// can be removed from a directory it cannot write. Give the write bit back
 /// before the tempdir tries — this runs before the `TempDir` field drops, on
-/// the way out of a pass and of a panic alike.
+/// the way out of a pass and of a panic alike. The launchers go first, with
+/// everything under them: `dir` is the first field, so it would otherwise be
+/// removed while the node is still writing into it.
 impl Drop for Net {
     fn drop(&mut self) {
+        drop(self.service.take());
+        drop(self.launcher.take());
         let _ = Command::new("chmod")
             .args(["-R", "u+w"])
             .arg(&self.workspace)
@@ -458,19 +467,16 @@ fn armed_height(line: &str) -> u64 {
         .expect("the arming line's height is a number")
 }
 
-/// The network's decision: this release, from this height. One ballot on a
-/// network of one.
-fn designate(net: &Net, sha: Sha) -> u64 {
-    let at = net.height() + ACTIVATION_LEAD;
+/// The network's decision: this release, `ACTIVATION_LEAD` blocks past the
+/// height the verb proposes at — which it measures AFTER its preflight, so the
+/// preflight's time is never spent out of the lead. One ballot on a network of
+/// one. `flags` go to the verb as they are; the height returned is the one it
+/// says it designated.
+fn designate(net: &Net, sha: Sha, flags: &[&str]) -> u64 {
     let out = net
-        .verb(&[
-            "release",
-            "schedule",
-            "--sha",
-            &sha.to_string(),
-            "--at",
-            &at.to_string(),
-        ])
+        .verb(&["release", "schedule", "--sha", &sha.to_string()])
+        .args(["--lead", &ACTIVATION_LEAD.to_string()])
+        .args(flags)
         .output()
         .expect("release schedule");
     assert!(
@@ -478,7 +484,34 @@ fn designate(net: &Net, sha: Sha) -> u64 {
         "release schedule: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    at
+    let said = String::from_utf8_lossy(&out.stdout);
+    height_after(&said, " from height ")
+}
+
+/// What `release schedule` said refusing — and it must refuse.
+fn schedule_refusal(net: &Net, sha: Sha, flags: &[&str]) -> String {
+    let out = net
+        .verb(&["release", "schedule", "--sha", &sha.to_string()])
+        .args(flags)
+        .output()
+        .expect("release schedule");
+    assert!(
+        !out.status.success(),
+        "release schedule should refuse: {out:?}"
+    );
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// The height a verb printed right after `marker`.
+fn height_after(said: &str, marker: &str) -> u64 {
+    said.split_once(marker)
+        .and_then(|(_, rest)| {
+            let digits = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            rest[..digits].parse().ok()
+        })
+        .unwrap_or_else(|| panic!("no height after {marker:?} in: {said}"))
 }
 
 // --- the proof ---------------------------------------------------------------
@@ -498,8 +531,42 @@ fn a_node_publishes_stages_qualifies_and_flips_its_successor_at_a_height() {
     let second = archive_of(&release_binary("v2", false));
     let second_sha = publish(&net, 1, "2026.09.3+v2", &second);
 
+    // ---- a lead no launcher can honour is refused -----------------------
+    // Measured from the height the verb PROPOSES at, after its preflight: the
+    // height right now is inside one launcher poll of that, whatever the
+    // preflight took.
+    let now = net.height();
+    let refusal = schedule_refusal(&net, second_sha, &["--at", &now.to_string()]);
+    assert!(
+        refusal.contains("activation_lead_too_short"),
+        "refused by name: {refusal}"
+    );
+    let proposed_at = height_after(&refusal, "leads height ");
+    assert!(
+        proposed_at >= now,
+        "the lead is measured after the preflight: {refusal}"
+    );
+    let min_lead = app_update::Designation::min_lead(common::TEST_BLOCK_TIME_MS);
+    for named in [
+        format!("activation height {now}"),
+        format!(
+            "{min_lead} blocks at this network's {} ms beat",
+            common::TEST_BLOCK_TIME_MS
+        ),
+    ] {
+        assert!(
+            refusal.contains(&named),
+            "{named:?} missing from: {refusal}"
+        );
+    }
+    assert_eq!(
+        net.release_status()["designation"],
+        serde_json::Value::Null,
+        "a refused schedule designates nothing"
+    );
+
     // ---- designate -----------------------------------------------------
-    let at = designate(&net, second_sha);
+    let at = designate(&net, second_sha, &[]);
     let reading = net.release_status();
     assert_eq!(
         reading["designation"]["sha256"],
@@ -582,11 +649,19 @@ fn a_node_publishes_stages_qualifies_and_flips_its_successor_at_a_height() {
     // ---- a broken artifact never becomes what runs ----------------------
     // The manifest is signed and its sequence is newer; the ARCHIVE at the
     // path it names is not what it names. `/shared/**` is open-write, so this
-    // is the one thing a stranger can do to a published release.
+    // is the one thing a stranger can do to a published release. The verb's
+    // preflight reads the archive before any ballot and refuses it; the
+    // launcher's own check is what stands once an operator skips that.
     let third = archive_of(&release_binary("v3", false));
     let third_sha = publish(&net, 2, "2026.09.3+v3", &third);
     corrupt_published_archive(&net, third_sha, &third);
-    designate(&net, third_sha);
+    let lead = ACTIVATION_LEAD.to_string();
+    let refusal = schedule_refusal(&net, third_sha, &["--lead", &lead]);
+    assert!(
+        refusal.contains("hashes to") && refusal.contains(&third_sha.to_string()),
+        "the preflight reads the archive it designates: {refusal}"
+    );
+    designate(&net, third_sha, &[SKIP_PREFLIGHT]);
     net.log()
         .expect_line(&["node_update_refused", "sha256_mismatch"], BUDGET);
     assert_eq!(
@@ -603,7 +678,12 @@ fn a_node_publishes_stages_qualifies_and_flips_its_successor_at_a_height() {
     // ---- a binary that cannot qualify never becomes what runs -----------
     let fourth = archive_of(&release_binary("v4", true));
     let fourth_sha = publish(&net, 3, "2026.09.3+v4", &fourth);
-    let fourth_at = designate(&net, fourth_sha);
+    let refusal = schedule_refusal(&net, fourth_sha, &["--lead", &lead]);
+    assert!(
+        refusal.contains("preflight_compose_refused"),
+        "the preflight asks the archive before any ballot: {refusal}"
+    );
+    let fourth_at = designate(&net, fourth_sha, &[SKIP_PREFLIGHT]);
     net.log()
         .expect_line(&["node_update_staged", &fourth_sha.to_string()], BUDGET);
     let arming = net

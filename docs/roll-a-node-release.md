@@ -134,11 +134,23 @@ Publishing puts the bytes on the network. WHEN to run them is a separate
 governance decision, and every member co-signing it passes the same numbers:
 
 ```
-ducktape release schedule --sha <the archive's sha256> --at <height> --config <workspace>/node.toml
+ducktape release schedule --sha <the archive's sha256> --lead <blocks> --config <workspace>/node.toml
 ```
 
-Pick a height a little ahead of the committed one. `release status` is what
-the launcher reads and what an operator watches:
+The member who proposes passes `--lead`: the activation height is that many
+blocks past the committed height the verb reads AFTER its preflight — which
+fetches and links the archive, and takes as long as that takes — and the verb
+prints the height it designated. Every other member co-signs with that
+`--at <height>`.
+
+Either way, a height that leads the proposal by less than one launcher poll
+(`LAUNCHER_POLL_MS`, 2000 ms) of blocks at the network's beat is refused as
+`activation_lead_too_short`, with both heights and the minimum, and nothing is
+proposed. That is the floor, not a margin: each launcher stages the release in
+the poll that first sees it, so leave room for the archive's download on the
+slowest validator's link.
+
+`release status` is what the launcher reads and what an operator watches:
 
 ```
 ducktape release status --json --config <workspace>/node.toml
