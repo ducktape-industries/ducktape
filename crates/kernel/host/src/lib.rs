@@ -3389,30 +3389,50 @@ impl Host {
     /// ran) that never holds a validator or node seat. deterministic on every
     /// node, because the drain order and the sibling state are. FAIL-OPEN on
     /// an ABSENT acl module (a net without the module is an open network,
-    /// byte-identical to an empty table); FAIL-CLOSED on a set policy whose
-    /// standing set cannot be read (a net that demands validator standing but
-    /// composes no valset grants nobody that standing).
+    /// byte-identical to an empty table); FAIL-CLOSED on a registered acl
+    /// whose policy read errs or answers anything but a decodable
+    /// `PolicyFor`, and on a set policy whose standing set cannot be read (a
+    /// net that demands validator standing but composes no valset grants
+    /// nobody that standing).
     async fn require_submit_standing(
         &self,
         observer: &Observer,
         origin: &Origin,
         target: &str,
     ) -> Result<(), Error> {
-        let Ok(reply) = self
-            .observed_query(
-                observer,
-                ACL_MODULE_ID,
-                &acl::encode_query(&acl::AclQuery::PolicyFor {
-                    target: target.into(),
-                }),
-            )
-            .await
-        else {
+        // absence is the registry's fact, never read off a query error: a
+        // registered acl can answer `UnknownModule` for a sibling it read,
+        // and that is a failed policy read, not an open network.
+        let acl_composed = self.registry.contains_key(ACL_MODULE_ID);
+        if !acl_composed {
             return Ok(()); // no acl module composed — open network.
-        };
+        }
+        let request = acl::encode_query(&acl::AclQuery::PolicyFor {
+            target: target.into(),
+        });
+        let reply = self
+            .observed_query(observer, ACL_MODULE_ID, &request)
+            .await
+            .map_err(|e| {
+                Error::module(
+                    "acl_query_failed",
+                    format!("acl: policy read for {target} failed: {e}"),
+                )
+            })?;
         let policy = match acl::decode_reply(&reply) {
             Ok(acl::AclReply::PolicyFor(policy)) => policy,
-            Ok(_) | Err(_) => return Ok(()),
+            Ok(other) => {
+                return Err(Error::module(
+                    "acl_reply_unexpected",
+                    format!("acl: policy read for {target} answered {other:?}"),
+                ));
+            }
+            Err(e) => {
+                return Err(Error::module(
+                    "acl_reply_malformed",
+                    format!("acl: policy read for {target} is unreadable: {e}"),
+                ));
+            }
         };
         let Some(required) = policy else {
             return Ok(()); // no entry, no "*" fallback — open by default.
