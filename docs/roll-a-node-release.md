@@ -118,8 +118,16 @@ absolute paths and `..` are refused by the launcher rather than unpacked.
 
 ```
 cargo build --release -p node-bin -p node-launcher
-ops/release/archive.sh --kind node --from target/release
+ops/release/archive.sh --kind node --from target/release \
+    --sequence 1 --display "0.1.0+97b4ef7bc"
 ```
+
+`--sequence` and `--display` write `release.json` at the archive root, so a
+host that runs `ducktape-node-launcher install --from` over the extracted
+`ducktape` pins that sequence and reads the channel publishing it as up to
+date instead of downloading it again; pass the same two values to
+`publish.sh`, which refuses an archive whose `release.json` says otherwise
+(`release_identity_mismatch`).
 
 `--from` is the profile directory that build wrote: it holds both binaries and
 the founding set the same build staged beside them under the name of the

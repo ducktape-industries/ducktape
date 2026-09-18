@@ -27,6 +27,12 @@
 # its public key (what `ducktape release sign` prints) is what an install
 # pins. Its password is read ONCE here and fed to each verb on stdin.
 #
+# An archive `ops/release/archive.sh --sequence --display` packed carries
+# `release.json` at its root, and an install made from it takes that sequence
+# as its pin. One that says another sequence or display than this publish is
+# refused by name (`release_identity_mismatch`) before anything is signed or
+# landed; an archive without one publishes as it is.
+#
 # Order: archives first, then the manifest, then the signature — a reader
 # never sees a manifest naming an archive that is not there yet. Between the
 # manifest and the signature landing a reader sees bad_signature once and
@@ -46,7 +52,7 @@ EXTRA=()
 KIND="app"
 
 usage() {
-  sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
@@ -80,6 +86,20 @@ case "$KIND" in
   node) CHANNEL="node" ;;
   *) echo "publish.sh: --kind takes app or node, not $KIND" >&2; exit 2 ;;
 esac
+
+# Each archive's own identity, if it carries one, is this publish's: the text
+# `archive.sh` writes for the same --sequence/--display, byte for byte.
+IDENTITY=$(printf '{"sequence":%s,"display":"%s"}' "$SEQUENCE" "$DISPLAY_TEXT")
+for archive in "${ARCHIVES[@]}"; do
+  path="${archive#*=}"
+  members=$(zstd -dcq "$path" | tar -tf -)
+  grep -qx release.json <<<"$members" || continue
+  carried=$(zstd -dcq "$path" | tar -xOf - release.json)
+  [ "$carried" = "$IDENTITY" ] || {
+    echo "publish.sh: release_identity_mismatch: $path carries $carried, this publish is $IDENTITY" >&2
+    exit 1
+  }
+done
 
 mkdir -p "$OUT_DIR"
 # The manifest's duckfs name IS its channel — `app_update::layout::Kind`.

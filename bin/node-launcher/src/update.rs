@@ -41,8 +41,8 @@ const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 /// with the network is said at attempt 1 and every Nth, not every poll.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Watch {
-    /// The release this launcher refused definitely, or rolled back from:
-    /// spent for this launcher's life.
+    /// The release this launcher refused definitely, rolled back from, or
+    /// found to be the sequence it runs: spent for this launcher's life.
     pub refused: Option<Sha>,
     /// The release whose last answer was [`Failure::Transient`].
     pub retry: Option<Retry>,
@@ -120,21 +120,44 @@ pub enum Refused {
     Launcher(Refusal),
 }
 
-impl Refused {
-    /// The refusal `command` announces, if it announces one.
-    fn announced_by(command: &Command) -> Option<Refused> {
+/// What one drive heard about the release it asked after — the last answer
+/// its commands announced — for the supervisor to settle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Heard {
+    /// Nothing that settles the release: it staged, it flipped, or nothing
+    /// was asked.
+    Nothing,
+    /// The release is the sequence this install already runs: asked again,
+    /// it would answer the same.
+    UpToDate,
+    /// A no, to class, count and say.
+    Refused(Refused),
+}
+
+impl Heard {
+    /// The answer `command` announces, if it announces one.
+    fn announced_by(command: &Command) -> Option<Heard> {
         let Command::Banner(banner) = command else {
             return None;
         };
         match banner {
-            UpdateBanner::Refused(refusal) => Some(Refused::Manifest(*refusal)),
-            UpdateBanner::DownloadFailed { reason, .. } => Some(Refused::Download(reason.clone())),
-            UpdateBanner::VerifyRefused { reason, .. } => Some(Refused::Verify(reason.clone())),
-            UpdateBanner::QualifyFailed { reason, .. } => Some(Refused::Qualify(reason.clone())),
-            UpdateBanner::Ready { .. } | UpdateBanner::UpToDate => None,
+            UpdateBanner::Refused(refusal) => Some(Heard::Refused(Refused::Manifest(*refusal))),
+            UpdateBanner::DownloadFailed { reason, .. } => {
+                Some(Heard::Refused(Refused::Download(reason.clone())))
+            }
+            UpdateBanner::VerifyRefused { reason, .. } => {
+                Some(Heard::Refused(Refused::Verify(reason.clone())))
+            }
+            UpdateBanner::QualifyFailed { reason, .. } => {
+                Some(Heard::Refused(Refused::Qualify(reason.clone())))
+            }
+            UpdateBanner::UpToDate => Some(Heard::UpToDate),
+            UpdateBanner::Ready { .. } => None,
         }
     }
+}
 
+impl Refused {
     /// The stable token a dashboard counts.
     pub fn reason(&self) -> String {
         match self {
@@ -344,12 +367,12 @@ impl Next {
 }
 
 /// Where a drive ended: the phase now on disk, the release to run when the
-/// machine asked for one, and the last refusal the machine decided on.
+/// machine asked for one, and the last answer the machine decided on.
 #[derive(Debug)]
 pub struct Settled {
     pub phase: Phase,
     pub run: Option<Sha>,
-    pub refused: Option<Refused>,
+    pub heard: Heard,
 }
 
 /// What performing one command produced.
@@ -380,25 +403,28 @@ impl Executor<'_> {
     /// runs out of commands, performing each command in order and feeding the
     /// answers back in.
     pub fn drive(&self, mut phase: Phase, mut event: Event) -> Result<Settled, Refusal> {
-        let mut refused = None;
+        let mut heard = Heard::Nothing;
         loop {
             let (next, commands) = step(phase, event);
             phase = next;
-            refused = commands.iter().find_map(Refused::announced_by).or(refused);
+            heard = commands
+                .iter()
+                .find_map(Heard::announced_by)
+                .unwrap_or(heard);
             match self.perform_all(commands)? {
                 Progress::Answer(answer) => event = answer,
                 Progress::Run(sha) => {
                     return Ok(Settled {
                         phase,
                         run: Some(sha),
-                        refused,
+                        heard,
                     });
                 }
                 Progress::Done => {
                     return Ok(Settled {
                         phase,
                         run: None,
-                        refused,
+                        heard,
                     });
                 }
             }
@@ -651,7 +677,7 @@ impl Executor<'_> {
     /// The node has no banner. The same readings are log lines, at the level
     /// their frequency earns: a staged release is a lifecycle fact and "nothing
     /// newer" is per-check noise. A refusal is the supervisor's to say, from
-    /// [`Settled::refused`]: only it knows whether the release is spent or asked
+    /// [`Settled::heard`]: only it knows whether the release is spent or asked
     /// again, and how many times it has been asked.
     fn report(&self, banner: UpdateBanner) -> Result<Progress, Refusal> {
         match banner {

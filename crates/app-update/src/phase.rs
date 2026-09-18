@@ -20,7 +20,8 @@ use crate::verify::{Refusal, VerifiedManifest};
 /// Each variant wraps a named struct so a `step` handler receives the whole
 /// variant by value; on the wire it is one flat object tagged `"phase"`.
 /// `pinned_sequence` rides in every variant: it is the downgrade guard, it
-/// advances only when a download verifies, and a rollback never lowers it.
+/// advances only at the flip to a staged release, and a rollback never
+/// lowers it — so an equal sequence is a release this install ran.
 // `Downloading` carries the manifest's strings; a `Phase` is built once per
 // transition and persisted, never held in bulk, so the size gap is nothing.
 #[allow(clippy::large_enum_variant)]
