@@ -34,13 +34,18 @@ pub enum OpCmd {
     Join(JoinCmd),
     /// list registered workspaces (chain-id + config path)
     List,
-    /// the running node's tip: height + root hash (reads the local rpc)
+    /// the running node's tip, and how far behind the network it is (reads
+    /// the local rpc)
     Status(StatusArgs),
     /// can THIS binary run this workspace? reopens the checkpoint offline and
     /// recomposes its committed root hash — what a release launcher asks a
     /// staged binary before it flips. the node must be STOPPED
     Qualify(QualifyArgs),
-    /// the running node's direct peers: connection, traffic, sync heights
+    /// the running node's height and direct peers: connection, traffic, and
+    /// the heights this node served each over state sync
+    ///
+    /// no row carries a peer's own height: the mesh gossips none. how far
+    /// behind the network this node is: `ducktape node status`
     Peers(StatusArgs),
     /// resident standing: the staged-admission tier
     #[command(subcommand)]

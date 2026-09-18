@@ -753,6 +753,7 @@ async fn resolver_datagram_roundtrip_over_loopback() {
         client,
         reachability::RENDEZVOUS_KEEPALIVE,
         Some(sink_tx),
+        reachability::CarryingPeers::default(),
     );
     established(&resolver).await;
 

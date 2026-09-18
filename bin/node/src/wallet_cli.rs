@@ -60,11 +60,41 @@ pub(crate) fn run(args: WalletArgs) -> CommandResult {
 }
 
 fn cmd_new(workspace: &Path, name: &str, stdin: &mut impl std::io::BufRead) -> CommandResult {
-    let (words, pubkey, activated) = wallet_new(workspace, name, stdin)?;
-    println!("{words}");
-    println!("{pubkey}");
+    let minted = wallet_new(workspace, name, stdin)?;
+    write_new(
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+        name,
+        &minted,
+    )?;
+    Ok(())
+}
+
+/// What `wallet new` prints. stdout is data a script reads: the mnemonic
+/// line, then the pubkey line LAST, so `wallet new … | tail -1` is the
+/// pubkey on every path. Everything said to the person goes to stderr — the
+/// notice BEFORE the phrase it is about, since the phrase is the one secret
+/// this product hands anyone and a bare line of words says nothing of that.
+fn write_new(
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+    name: &str,
+    (words, pubkey, activated): &(String, String, bool),
+) -> std::io::Result<()> {
+    writeln!(
+        err,
+        "recovery phrase for wallet {name} below — write it down now: \
+         `wallet new` never shows it again.\n\
+         it is this wallet's only backup (it restores the key if the key file or its \
+         password is lost), and whoever holds it holds this identity."
+    )?;
+    writeln!(out, "{words}")?;
+    writeln!(out, "{pubkey}")?;
     if !activated {
-        println!("wallet minted but not activated — run `ducktape wallet use {name}`");
+        writeln!(
+            err,
+            "wallet minted but not activated — run `ducktape wallet use {name}`"
+        )?;
     }
     Ok(())
 }
@@ -200,5 +230,40 @@ mod tests {
         assert_eq!(names, ["alice", "alice2", "bob"]);
         assert_eq!(rows[2]["active"], serde_json::Value::Bool(true));
         assert_eq!(rows[0]["state"], "encrypted");
+    }
+
+    /// The recovery phrase is the one secret this product hands a person, so
+    /// stderr says what it is before it prints — and stdout stays the two
+    /// lines a script reads, the pubkey last.
+    #[test]
+    fn new_names_the_phrase_on_stderr_and_keeps_stdout_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stdin = Cursor::new("password-123\n");
+        let minted = wallet_new(dir.path(), "alice", &mut stdin).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        write_new(&mut out, &mut err, "alice", &minted).unwrap();
+        let (words, pubkey, _) = &minted;
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{words}\n{pubkey}\n")
+        );
+        let err = String::from_utf8(err).unwrap();
+        for says in [
+            "recovery phrase for wallet alice",
+            "never shows it again",
+            "only backup",
+            "whoever holds it holds this identity",
+        ] {
+            assert!(err.contains(says), "stderr lacks {says:?}: {err}");
+        }
+
+        // a mint whose `active` pointer did not land still ends stdout on the
+        // pubkey: the hint is for the person, so it rides stderr.
+        let unactivated = ("w1 w2".to_string(), "ab".to_string(), false);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        write_new(&mut out, &mut err, "bob", &unactivated).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "w1 w2\nab\n");
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("ducktape wallet use bob"), "stderr: {err}");
     }
 }
