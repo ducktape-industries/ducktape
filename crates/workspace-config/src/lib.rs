@@ -718,8 +718,9 @@ pub fn primary_coordinator_or_default(raw: Option<&str>) -> Result<Option<String
 }
 
 /// Resolve the ambient coordinator to a dial [`Ingress`] — the AMBIENT source
-/// a joiner's NAT resolver binds (config/default), never one carried in an
-/// invite. `None` when coordination is disabled (`"none"`/`"off"`/`"direct"`).
+/// a joiner's NAT resolver binds (its node.toml, which a join seeds from the
+/// invite; else the default). `None` when coordination is disabled
+/// (`"none"`/`"off"`/`"direct"`).
 pub fn coordinator_ingress(raw: Option<&str>) -> Result<Option<Ingress>, String> {
     match primary_coordinator_or_default(raw)? {
         Some(addr) => ingress_of(&addr),
@@ -753,13 +754,6 @@ impl NetworkDescriptor {
             }),
         });
         Ok(())
-    }
-
-    pub fn has_coordinated_reach(&self) -> Result<bool, String> {
-        Ok(self
-            .reach_hints()?
-            .iter()
-            .any(|h| matches!(h.reach, Reach::Coordinated(_))))
     }
 }
 
@@ -850,11 +844,27 @@ pub fn save_coord_cap(dir: &Path, cap: &nat_traversal::CoordCap) -> Result<(), S
         .map_err(|e| format!("write {path:?}: {e}"))
 }
 
-pub fn load_coord_cap(dir: &Path) -> Option<nat_traversal::CoordCap> {
+/// the cap this workspace was issued. `Ok(None)` means none was ever issued
+/// (no file). A file that is present but unreadable is `coord_cap_unreadable`,
+/// never "never issued": reading it as absent would boot the node cap-less and
+/// hide that the one cap it was ever delivered is lost.
+pub fn load_coord_cap(dir: &Path) -> Result<Option<nat_traversal::CoordCap>, String> {
     let path = dir.join(COORD_CAP_FILE);
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let bytes = unhex(raw.trim()).ok()?;
-    unpack_coord_cap(&bytes).ok()
+    if !path.exists() {
+        return Ok(None);
+    }
+    let unreadable = |why: String| {
+        format!(
+            "coord_cap_unreadable: {} ({why}) — the coordinator capability this node was \
+             issued at admission cannot be read, and no path re-issues it; move the file \
+             aside to run without one (a private coordinator then refuses this node's \
+             rendezvous)",
+            path.display()
+        )
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| unreadable(e.to_string()))?;
+    let bytes = unhex(text.trim()).map_err(unreadable)?;
+    unpack_coord_cap(&bytes).map(Some).map_err(unreadable)
 }
 
 /// guard a join against clobbering a DIFFERENT network's descriptor: a
@@ -1633,9 +1643,22 @@ mod tests {
         assert_eq!(unpack_coord_cap(&bytes).unwrap(), cap);
 
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_coord_cap(dir.path()).is_none());
+        assert_eq!(load_coord_cap(dir.path()).unwrap(), None);
         save_coord_cap(dir.path(), &cap).unwrap();
-        assert_eq!(load_coord_cap(dir.path()).unwrap(), cap);
+        assert_eq!(load_coord_cap(dir.path()).unwrap(), Some(cap));
+    }
+
+    /// A cap file that does not decode is a named refusal, not "never issued":
+    /// both a torn write and non-hex garbage refuse by name.
+    #[test]
+    fn a_corrupt_coord_cap_refuses_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(COORD_CAP_FILE);
+        for corrupt in ["abcd\n", "not hex at all\n"] {
+            std::fs::write(&path, corrupt).unwrap();
+            let err = load_coord_cap(dir.path()).expect_err("a corrupt cap is not absent");
+            assert!(err.starts_with("coord_cap_unreadable:"), "{err}");
+        }
     }
 
     #[test]

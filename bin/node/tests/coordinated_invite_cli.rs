@@ -253,6 +253,74 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
     );
 }
 
+/// The founder's coordinator rides its invite into the joiner's node.toml. A
+/// founder with coordination off (the stranger lane's `--primary-coordinator
+/// none`) and one on its own coordinator each hand the joiner exactly that,
+/// never the compiled public default — which would point a NAT'd joiner at a
+/// relay none of the network's members register with.
+#[test]
+fn a_joiner_takes_the_founders_coordinator() {
+    let _serial = serial();
+    for founding in ["none", "coord.example.net:3478"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let founder = dir.path().join("founder");
+        let friend = dir.path().join("friend");
+
+        let init = common::ducktape()
+            .arg("node")
+            .args([
+                "init",
+                "--name",
+                "own-coordinator",
+                "--modules",
+                common::founding_set(),
+                "--primary-coordinator",
+                founding,
+                "--dir",
+                founder.to_str().expect("utf-8 founder dir"),
+            ])
+            .output()
+            .expect("run init");
+        assert!(
+            init.status.success(),
+            "init failed:\n{}",
+            command_output(&init)
+        );
+
+        let invite = common::ducktape()
+            .arg("node")
+            .args(["invite", "--config"])
+            .arg(founder.join("node.toml"))
+            .output()
+            .expect("run invite");
+        assert!(
+            invite.status.success(),
+            "invite failed:\n{}",
+            command_output(&invite)
+        );
+        let blob = String::from_utf8_lossy(&invite.stdout).trim().to_string();
+
+        let join = common::ducktape()
+            .arg("node")
+            .args(["join", &blob, "--dir"])
+            .arg(&friend)
+            .output()
+            .expect("run join");
+        assert!(
+            join.status.success(),
+            "join failed:\n{}",
+            command_output(&join)
+        );
+
+        let (joined, _) =
+            workspace_config::load_node_toml(&friend.join("node.toml")).expect("joined node.toml");
+        assert_eq!(
+            joined.primary_coordinator, founding,
+            "the joiner must rendezvous where its founder does"
+        );
+    }
+}
+
 /// The unified all-paths invite bundles the inviter's reachable MEMBERS as
 /// `fronts`: seed a founder's persisted `mesh-state.json` with one member that
 /// has a routable WireGuard underlay endpoint, mint an invite, and prove the

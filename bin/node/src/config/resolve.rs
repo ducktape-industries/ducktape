@@ -556,7 +556,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         // the reachability plane presents this on every coordinator request; a
         // genesis validator needs none (admitted by membership), a joiner is
         // issued one beside its identity.
-        coord_cap: load_coord_cap(base),
+        coord_cap: load_coord_cap(base)?,
         primary_coordinator: Some(raw.primary_coordinator),
         coordinator_relay: Some(raw.coordinator_relay),
         wireguard_advertised,
