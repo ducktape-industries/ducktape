@@ -40,7 +40,7 @@ _ducktape() {
     local agent_flags="-n --network --node --config --key --host-node --account --route --cred --cpu --mem --attempt --package --worker --channel --retry-initialization --installed-by --yes -y"
     local module_verbs="pack update register status help"
     local module_flags="--index --view --assets --lanes --out --after --config -n --network --json"
-    local release_verbs="sign-bundle manifest sign verify schedule status help"
+    local release_verbs="sign-bundle manifest sign verify schedule withdraw status help"
     local release_flags="-n --unpack-into --node --network --config --credential --out --sequence --display --node-contract --notes-url --kind --archive --successor-key --successor-from --key --sig --pubkey --sha --at --lead --json --skip-preflight-i-know-the-wit-moved"
     local collab_verbs="query key attach send ack help"
     local collab_flags="--target --node --config -n --network --key --trust-node --channel --participant --existing-only --device --expect --to --kind --message-id --credential --seq --ttl-secs --state --reason"

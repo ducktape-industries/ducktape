@@ -27,7 +27,8 @@ node_update_refused      reason=checkpoint_unrestorable
 Every node comes back on the release it was already running, so the network
 keeps producing — but each one paid a stop for an answer that could never be
 yes, and the refused designation stays the network's designation until another
-one replaces it.
+one replaces it or the network withdraws it (see "Withdraw a refused release"
+below).
 
 `release schedule` enforces this before it proposes anything: it fetches the
 archive it is about to designate off the network's own duckfs and asks its
@@ -180,6 +181,22 @@ not flip — the node starts the one it was already running.
 
 Afterwards `/v1/status` carries the new `version`, and the node spends its
 recovery window reporting `phase: "recovering"` before it resumes producing.
+
+### Withdraw a refused release
+
+A launcher that refused a release does not ask again until it restarts, but
+the designation stays the network's: a restarted launcher or a node joining
+later fetches it and refuses it again. Take it back with the same ceremony,
+every member passing the same sha:
+
+```
+ducktape release withdraw --sha <the archive's sha256> --config <workspace>/node.toml
+```
+
+It fetches and runs nothing (there is no preflight), and it refuses a sha the
+network does not designate. A withdrawal names one release: once it passes,
+`release status` answers with the latest designation of any OTHER release
+that no withdrawal has taken back, or with none.
 
 ## 5. Check it
 
