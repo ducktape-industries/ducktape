@@ -26,7 +26,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use commonware_codec::{DecodeExt as _, Encode as _};
+use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
 use commonware_utils::Hostname;
@@ -791,41 +791,19 @@ pub fn decode_key(hex: &str) -> Result<ed25519::PublicKey, String> {
 // ============================================================================
 // coordinator capability — the private-mode admission token a node presents on
 // each rendezvous request. Minted by the validator that seats the node
-// (`mint_coord_cap`), persisted 0600 beside the descriptor like
-// `invite.token`. Genesis validators need none (the coordinator's pinned set
-// covers them).
+// (`mint_coord_cap`, or `delegate_coord_cap` under the seating node's own
+// cap), persisted 0600 beside the descriptor like `invite.token`. Genesis
+// validators need none (the coordinator's pinned set covers them).
 // ============================================================================
 
 const COORD_CAP_FILE: &str = "coord.cap";
-const COORD_CAP_LEN: usize = 32 + 8 + 64;
 
 pub fn pack_coord_cap(cap: &nat_traversal::CoordCap) -> Vec<u8> {
-    let mut out = Vec::with_capacity(COORD_CAP_LEN);
-    out.extend_from_slice(cap.issuer.as_ref());
-    out.extend_from_slice(&cap.not_after.to_be_bytes());
-    out.extend_from_slice(cap.issuer_sig.encode().as_ref());
-    out
+    cap.encode()
 }
 
 pub fn unpack_coord_cap(bytes: &[u8]) -> Result<nat_traversal::CoordCap, String> {
-    if bytes.len() != COORD_CAP_LEN {
-        return Err(format!(
-            "coord cap must be {COORD_CAP_LEN} bytes, got {}",
-            bytes.len()
-        ));
-    }
-    let issuer =
-        ed25519::PublicKey::decode(&bytes[..32]).map_err(|e| format!("coord cap issuer: {e}"))?;
-    let mut na = [0u8; 8];
-    na.copy_from_slice(&bytes[32..40]);
-    let not_after = u64::from_be_bytes(na);
-    let issuer_sig =
-        ed25519::Signature::decode(&bytes[40..]).map_err(|e| format!("coord cap sig: {e}"))?;
-    Ok(nat_traversal::CoordCap {
-        issuer,
-        not_after,
-        issuer_sig,
-    })
+    nat_traversal::CoordCap::decode(bytes).map_err(|e| format!("coord cap: {e}"))
 }
 
 pub fn save_coord_cap(dir: &Path, cap: &nat_traversal::CoordCap) -> Result<(), String> {
@@ -1834,8 +1812,14 @@ mod tests {
         let subject = NodeKey([0x11; 32]);
         let cap = mint_coord_cap(&g, subject, 4_000_000);
         let bytes = pack_coord_cap(&cap);
-        assert_eq!(bytes.len(), 32 + 8 + 64);
+        assert_eq!(bytes.len(), 1 + 32 + 8 + 64);
         assert_eq!(unpack_coord_cap(&bytes).unwrap(), cap);
+        // a delegated cap persists with its whole chain.
+        let delegate = ed25519::PrivateKey::from_seed(8);
+        let child =
+            nat_traversal::delegate_coord_cap(&cap, &delegate, NodeKey([0x22; 32]), 4_000_000)
+                .expect("one link under the bound");
+        assert_eq!(unpack_coord_cap(&pack_coord_cap(&child)).unwrap(), child);
 
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load_coord_cap(dir.path()).unwrap(), None);
@@ -2097,7 +2081,6 @@ mod tests {
         // the coordinator, pinned to this genesis key, admits the joiner.
         let policy = AuthPolicy::Private {
             genesis_set: vec![genesis.public_key()],
-            live: Default::default(),
         };
         assert_eq!(
             verify_request(

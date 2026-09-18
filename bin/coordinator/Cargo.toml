@@ -16,16 +16,12 @@ nat-traversal = { workspace = true, features = ["runtime"] }
 # the host readings in the metrics line: `getrusage` for CPU time on every
 # host, `proc_pidinfo` for the resident set on macOS
 libc = { workspace = true }
-# io-util: the one plain HTTP/1.0 read of a node's validator set off its
-# /v1/query lane (--valset-node) — no HTTP client crate for a single small read.
-tokio = { workspace = true, features = ["net", "rt", "macros", "time", "io-util"] }
+tokio = { workspace = true, features = ["net", "rt", "macros", "time"] }
 # reading the PUBLIC genesis valset out of network.toml (--genesis-set). No
 # secret, no node-crate dependency: a local GenesisPin struct + hex decode.
 commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
 serde = { workspace = true }
-# the valset module's reply body
-serde_json = { workspace = true }
 toml = "0.8"
 # The coordinator's whole log sink. It has no LogRing and no node-crate
 # dependency, so it installs its own stderr subscriber rather than inverting

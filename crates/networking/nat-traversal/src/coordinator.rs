@@ -12,9 +12,7 @@ use crate::advert::{
     Admission, AdmitEvent, AdvertBook, AdvertOutcome, MAX_ADVERTS, MAX_ADVERTS_PER_SOURCE_IP,
     SharedAdverts,
 };
-use crate::auth::{
-    AuthError, AuthPolicy, CookieKey, DEFAULT_FRESHNESS_WINDOW_SECS, verify_request_using,
-};
+use crate::auth::{AuthPolicy, CookieKey, DEFAULT_FRESHNESS_WINDOW_SECS, verify_request_using};
 use crate::{Latch, Msg, NodeKey, short_key};
 
 const AUTH_KEY_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(64).unwrap();
@@ -66,24 +64,6 @@ fn log_admit_event(event: Option<AdmitEvent>) {
     }
 }
 
-/// A member the coordinator would admit if its live validator set were fresh.
-/// Only a genuine key or cap reaches this refusal (proof-of-possession passed),
-/// so it names an outage of the coordinator's node, not a stranger — and it is
-/// latched all the same, because every such member retries.
-fn log_valset_stale(caller: NodeKey) {
-    static STALE: Latch = Latch::new();
-    if let Some(occurrences) = STALE.hit("valset_stale") {
-        tracing::warn!(
-            target: "ducktape::reachability",
-            event = "coordinator_request_refused",
-            reason = "valset_stale",
-            caller = short_key(caller),
-            occurrences,
-            "admission rests on a validator the live set named, and that reading has lapsed"
-        );
-    }
-}
-
 pub type CoordinatorReply = (SocketAddr, Msg);
 
 /// Allocation-free output from the coordinator's bounded request handler.
@@ -131,7 +111,7 @@ impl AuthVerifier {
 
         let inner_bytes = req.inner.encode_inline();
         // Authenticate the caller, never the peer named by Lookup.
-        let verdict = verify_request_using(
+        verify_request_using(
             &self.policy,
             now,
             self.window,
@@ -139,11 +119,8 @@ impl AuthVerifier {
             &inner_bytes,
             &req.auth,
             |caller| resolve_auth_key(&mut self.auth_keys, caller),
-        );
-        if verdict == Err(AuthError::ValsetStale) {
-            log_valset_stale(req.caller);
-        }
-        verdict.ok()?;
+        )
+        .ok()?;
         Some(VerifiedRequest {
             caller: req.caller,
             inner: req.inner,
@@ -853,7 +830,6 @@ mod tests {
 
         let mut c = Coordinator::with_policy(AuthPolicy::Private {
             genesis_set: vec![g.public_key()],
-            live: Default::default(),
         });
         let src = addr(1, 1111);
 
@@ -1015,7 +991,6 @@ mod tests {
 
         let mut c = Coordinator::with_policy(AuthPolicy::Private {
             genesis_set: vec![g.public_key()],
-            live: Default::default(),
         });
         let a_src = addr(1, 1111);
         let b_src = addr(2, 2222);
@@ -1129,7 +1104,6 @@ mod tests {
 
         let mut c = Coordinator::with_policy(AuthPolicy::Private {
             genesis_set: vec![g.public_key()],
-            live: Default::default(),
         });
         let src = addr(1, 1111);
         let before = c.rejects();

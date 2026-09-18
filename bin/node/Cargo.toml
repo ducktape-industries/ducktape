@@ -128,8 +128,9 @@ borsh = { workspace = true }
 # endpoint types and the phase-A fake effect it drives.
 reachability = { workspace = true }
 # the coordinator-auth credential types: `coord.cap` is the private-mode
-# admission token a node persists beside its descriptor (minted by a current
-# validator via `mint_coord_cap`, presented on each rendezvous request).
+# admission token a node persists beside its descriptor (minted by the
+# validator that seats it, `mint_coord_cap` or `delegate_coord_cap`, presented
+# on each rendezvous request).
 nat-traversal = { workspace = true, features = ["runtime"] }
 wireguard = { workspace = true }
 # the voice hub's transport seam: huddle media rides data-plane datagrams over

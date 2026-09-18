@@ -227,7 +227,9 @@ impl ValidatorRuntime<'_> {
             next_seq,
             signer,
             label,
+            genesis_validators,
             coordination,
+            coord_cap,
             join_requests,
             gating,
             pending_gates,
@@ -298,7 +300,14 @@ impl ValidatorRuntime<'_> {
         // the first Admitted it accepts, so a cap-less one is unrecoverable.
         if members.contains(&joiner_bytes) || residents_now.contains(&joiner_bytes) {
             let height = node.finalized().map(|f| f.height).unwrap_or(0);
-            let cap = mint_joiner_cap(coordination, &members, signer, &joiner_bytes);
+            let cap = mint_joiner_cap(
+                coordination,
+                &members,
+                genesis_validators,
+                coord_cap.as_ref(),
+                signer,
+                &joiner_bytes,
+            );
             super::settle_gate(
                 gate_outcomes,
                 joiner_bytes,
@@ -327,7 +336,14 @@ impl ValidatorRuntime<'_> {
             return;
         }
 
-        let minted_cap = mint_joiner_cap(coordination, &members, signer, &joiner_bytes);
+        let minted_cap = mint_joiner_cap(
+            coordination,
+            &members,
+            genesis_validators,
+            coord_cap.as_ref(),
+            signer,
+            &joiner_bytes,
+        );
 
         // SETTLE-THEN-ANSWER: submit the Redeem and hold the joiner's
         // outcome against the frame id. `submit` returns the FrameId; the drain
@@ -628,16 +644,18 @@ impl ValidatorRuntime<'_> {
 }
 
 /// MINT the coordinator capability for a joiner (private coordination only).
-/// A private coordinator admits a cap whose issuer is a CURRENT validator —
-/// the rule redemption applies to an invite's issuer — so every validator seat
-/// mints, genesis or promoted, and a signer the committed set (`members`) no
-/// longer names mints nothing. Additive and side-effect-free — a pure ed25519
-/// sign. The cap cannot ride the invite (the joiner's key did not exist at
-/// invite-mint time), so the sealed `Admitted` ack is its only delivery
-/// channel; EVERY arm that answers Admitted mints through here.
+/// A private coordinator admits a cap chain a genesis validator roots, so a
+/// validator in the `genesis` set mints a root cap and any other validator
+/// mints under the cap that admits it (`own_cap`); a signer the committed set
+/// (`members`) no longer names mints nothing. Additive and side-effect-free —
+/// a pure ed25519 sign. The cap cannot ride the invite (the joiner's key did
+/// not exist at invite-mint time), so the sealed `Admitted` ack is its only
+/// delivery channel; EVERY arm that answers Admitted mints through here.
 fn mint_joiner_cap(
     coordination: &config::Coordination,
     members: &[Vec<u8>],
+    genesis: &[ed25519::PublicKey],
+    own_cap: Option<&nat_traversal::CoordCap>,
     signer: &ed25519::PrivateKey,
     joiner: &[u8],
 ) -> Option<Vec<u8>> {
@@ -649,13 +667,29 @@ fn mint_joiner_cap(
     }
     // `verify_intro` decoded this key upstream — a non-32-byte joiner cannot
     // reach the loop; mint nothing rather than panic.
-    let subj = <[u8; 32]>::try_from(joiner).ok()?;
-    let cap = nat_traversal::mint_coord_cap(
-        signer,
-        nat_traversal::NodeKey(subj),
-        nat_traversal::now_secs() + nat_traversal::COORD_CAP_TTL_SECS,
-    );
-    Some(config::pack_coord_cap(&cap))
+    let subject = nat_traversal::NodeKey(<[u8; 32]>::try_from(joiner).ok()?);
+    let not_after = nat_traversal::now_secs() + nat_traversal::COORD_CAP_TTL_SECS;
+    let signer_is_genesis = genesis.contains(&me);
+    let minted = match (signer_is_genesis, own_cap) {
+        (true, _) => Ok(nat_traversal::mint_coord_cap(signer, subject, not_after)),
+        (false, Some(parent)) => {
+            nat_traversal::delegate_coord_cap(parent, signer, subject, not_after)
+                .ok_or("coord_cap_chain_full")
+        }
+        (false, None) => Err("coord_cap_missing"),
+    };
+    match minted {
+        Ok(cap) => Some(config::pack_coord_cap(&cap)),
+        Err(reason) => {
+            tracing::warn!(
+                target: "ducktape::join",
+                reason,
+                "admitting a joiner without a coordinator capability: this validator holds \
+                 no cap it can extend"
+            );
+            None
+        }
+    }
 }
 
 /// Commonware owns the detailed peer series. This bounded adapter counts only
@@ -710,44 +744,55 @@ mod tests {
     }
 
     #[test]
-    fn private_coordination_any_current_validator_mints_a_cap_for_the_joiner() {
-        // the committed set names a founder and a validator promoted later;
-        // the signer is the promoted one — no genesis seat is involved.
+    fn private_coordination_a_genesis_validator_roots_a_cap_and_a_promoted_one_extends_its_own() {
+        // the committed set names a founder and a validator promoted later.
         let founder = ed25519::PrivateKey::from_seed(1);
-        let signer = ed25519::PrivateKey::from_seed(2);
+        let promoted = ed25519::PrivateKey::from_seed(2);
         let members = vec![
             founder.public_key().as_ref().to_vec(),
-            signer.public_key().as_ref().to_vec(),
+            promoted.public_key().as_ref().to_vec(),
         ];
+        let genesis = [founder.public_key()];
         let joiner = ed25519::PrivateKey::from_seed(9).public_key();
+        let private = config::Coordination::Private;
+        let mint = |members: &[Vec<u8>],
+                    own_cap: Option<&nat_traversal::CoordCap>,
+                    signer: &ed25519::PrivateKey| {
+            mint_joiner_cap(
+                &private,
+                members,
+                &genesis,
+                own_cap,
+                signer,
+                joiner.as_ref(),
+            )
+        };
 
-        let packed = mint_joiner_cap(
-            &config::Coordination::Private,
-            &members,
-            &signer,
-            joiner.as_ref(),
-        )
-        .expect("a current validator on a private network mints a cap");
+        let packed = mint(&members, None, &founder).expect("a genesis validator mints");
+        let root = config::unpack_coord_cap(&packed).expect("the packed cap round-trips");
+        assert_eq!(root.issuer, founder.public_key());
+        assert_eq!(root.parent, None);
+
+        // the promoted validator mints under the cap that admits it.
+        let promoted_key =
+            nat_traversal::NodeKey(promoted.public_key().as_ref().try_into().unwrap());
+        let own = nat_traversal::mint_coord_cap(&founder, promoted_key, u64::MAX);
+        let packed = mint(&members, Some(&own), &promoted).expect("a capped validator mints");
         let cap = config::unpack_coord_cap(&packed).expect("the packed cap round-trips");
-        assert_eq!(cap.issuer, signer.public_key());
+        assert_eq!(cap.issuer, promoted.public_key());
+        assert_eq!(cap.parent.as_deref(), Some(&own));
 
-        // public coordination needs none, and a signer the committed set no
-        // longer names is no validator a coordinator follows — both mint
-        // nothing.
+        // a non-genesis validator holding no cap, and a signer the committed
+        // set no longer names, mint nothing; public coordination needs none.
+        assert!(mint(&members, None, &promoted).is_none());
+        assert!(mint(&[], None, &founder).is_none());
         assert!(
             mint_joiner_cap(
                 &config::Coordination::Public,
                 &members,
-                &signer,
-                joiner.as_ref()
-            )
-            .is_none()
-        );
-        assert!(
-            mint_joiner_cap(
-                &config::Coordination::Private,
-                &[],
-                &signer,
+                &genesis,
+                Some(&own),
+                &promoted,
                 joiner.as_ref()
             )
             .is_none()

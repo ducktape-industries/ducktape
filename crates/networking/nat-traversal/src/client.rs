@@ -1216,7 +1216,6 @@ mod tests {
         let g = ed25519::PrivateKey::from_seed(100);
         let policy = AuthPolicy::Private {
             genesis_set: vec![g.public_key()],
-            live: Default::default(),
         };
 
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1291,7 +1290,6 @@ mod tests {
         let g = ed25519::PrivateKey::from_seed(700);
         let policy = AuthPolicy::Private {
             genesis_set: vec![g.public_key()],
-            live: Default::default(),
         };
 
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
