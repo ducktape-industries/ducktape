@@ -2833,8 +2833,27 @@ async fn the_invite_route_mints_refuses_and_says_when_it_cannot() {
         .expect("a response")
     };
 
-    // no minter wired: the honest answer is "this daemon does not do that".
+    // no minter wired YET: the full node binds its http surface before it
+    // wires the minter, and `/v1/status` already answers `starting` in
+    // between. The refusal names that phase, as a token beside the sentence,
+    // rather than how the daemon is wired inside.
     let (handle, _cmds, _events) = local_node();
+    let starting = post(noded::router(handle), r#"{"ttl_days":7}"#).await;
+    assert_eq!(starting.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let refusal: serde_json::Value =
+        serde_json::from_str(&body_of(starting).await).expect("a json refusal");
+    assert_eq!(refusal["reason"], "node_starting", "{refusal}");
+
+    // no minter wired, EVER: an embedder that serves with no workspace to mint
+    // from (the embedded daemon, simnode) says "this daemon does not do that".
+    let (handle, _cmds, _events) = local_node();
+    handle.status_cell().publish(noded::NodeStatus {
+        operations: noded::OperationalStatus {
+            phase: noded::NodePhase::Serving,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     let unwired = post(noded::router(handle), r#"{"ttl_days":7}"#).await;
     assert_eq!(unwired.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(body_of(unwired).await.contains("no invite minter"));

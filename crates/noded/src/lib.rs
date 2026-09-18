@@ -1366,8 +1366,7 @@ async fn huddle_node_proof(
 /// joiner brings its tunnel up against. Doing that from a second process races
 /// the daemon over both.
 ///
-/// 503 when the embedder wired no minter — a daemon with no workspace has no
-/// descriptor to fold a hint into.
+/// 503 when no minter is wired: see [`no_invite_minter`].
 ///
 /// AUTH: a bearer invite is a real capability — a right to join this mesh for
 /// up to 365 days — and this handler reads no acting identity, so possession of
@@ -1404,10 +1403,7 @@ async fn mint_invite(
         );
     };
     let Some(minted) = minted else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no invite minter is wired on this daemon",
-        );
+        return no_invite_minter(handle.status_cell().current().operations.phase);
     };
     match minted {
         Ok(invite) => (
@@ -1417,6 +1413,32 @@ async fn mint_invite(
             .into_response(),
         Err(why) => error_response(StatusCode::BAD_REQUEST, &why),
     }
+}
+
+/// The 503 `/v1/invite` answers with no minter to call, in the node's terms.
+///
+/// The full node wires its minter with its mesh identity, well after its http
+/// surface binds, and `/v1/status` answers `starting` all the way through that
+/// window — so a caller that saw the node answer is told it is starting, as a
+/// `node_starting` token beside the sentence, not how the daemon is wired
+/// inside. Past `starting` nothing wires one any more: that is an embedder
+/// with no workspace to mint from (the embedded daemon, simnode).
+fn no_invite_minter(phase: NodePhase) -> Response {
+    let still_starting = phase == NodePhase::Starting;
+    if still_starting {
+        return refused_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &Refused::new(
+                "node_starting",
+                "this node is still starting and mints invites once its mesh identity is up — \
+                 ask again when /v1/status no longer says starting",
+            ),
+        );
+    }
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no invite minter is wired on this daemon",
+    )
 }
 
 /// body cap for the op-receipt blob lane. a receipt-lane bound only —
