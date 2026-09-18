@@ -284,8 +284,10 @@ fn resident_manifest_fetch_retry_stays_resident_and_does_not_reannounce() {
     let retry = joiner_manifest_fetch_retry(
         "9f7bae44",
         true,
+        1,
         "server error: no finalized boundary to serve yet",
-    );
+    )
+    .expect("the first failure speaks");
 
     assert!(
         !retry.announce,
@@ -312,7 +314,8 @@ fn resident_manifest_fetch_retry_stays_resident_and_does_not_reannounce() {
 
 #[test]
 fn parked_manifest_fetch_retry_keeps_join_announce() {
-    let retry = joiner_manifest_fetch_retry("9f7bae44", false, "server error: bouncer rejected");
+    let retry = joiner_manifest_fetch_retry("9f7bae44", false, 1, "server error: bouncer rejected")
+        .expect("the first failure speaks");
 
     assert!(retry.announce, "a parked joiner must keep re-announcing");
     assert!(
@@ -322,6 +325,25 @@ fn parked_manifest_fetch_retry_keeps_join_announce() {
         "parked retry should keep the invite wording and source detail: {}",
         retry.log_line
     );
+}
+
+/// the boundary fetch retries forever, so its warn is paced: the first
+/// failure speaks at once (a sync that never starts says why), then every
+/// Nth — for a joiner and a resident alike.
+#[test]
+fn a_failing_boundary_fetch_warns_first_then_every_nth() {
+    let every = crate::constants::BOUNDARY_FETCH_WARN_EVERY;
+    for resident_standing in [false, true] {
+        let speaks =
+            |failures| joiner_manifest_fetch_retry("n", resident_standing, failures, "e").is_some();
+        assert!(speaks(1), "the first failure must be visible immediately");
+        for failures in 2..every {
+            assert!(!speaks(failures), "failure {failures} stays silent");
+        }
+        assert!(speaks(every));
+        assert!(!speaks(every + 1));
+        assert!(speaks(2 * every));
+    }
 }
 
 async fn served_directory_frame(
@@ -1140,6 +1162,86 @@ fn sync_only_boot_adopts_only_a_manifest_tied_to_its_founding_anchor() {
             client.rotations.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "an unanchored boundary must rotate away from the source that served it"
+        );
+    });
+}
+
+/// a source that serves an anchored tip but has pruned the frames below it.
+#[derive(Clone)]
+struct PrunedSourceClient {
+    manifest: statesync::Manifest,
+    rotations: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl statesync::SyncClient for PrunedSourceClient {
+    fn request(
+        &self,
+        req: statesync::SyncRequest,
+    ) -> impl std::future::Future<Output = Result<statesync::SyncResponse, statesync::SyncError>> + Send
+    {
+        let reply = match req {
+            statesync::SyncRequest::Manifest => {
+                statesync::SyncResponse::Manifest(self.manifest.clone())
+            }
+            _ => statesync::SyncResponse::RangePruned {
+                requested_after: 0,
+                retained_from: self.manifest.height,
+            },
+        };
+        async move { Ok(reply) }
+    }
+}
+
+impl crate::blob_fetch::SourceRotate for PrunedSourceClient {
+    fn rotate_source(&self) {
+        self.rotations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn catch_up_suffix_frames_rotates_away_from_a_source_that_pruned_past_us() {
+    let executor = commonware_runtime::deterministic::Runner::default();
+    executor.start(|context| async move {
+        let mut host = fresh_directory_host();
+        let mut recovery = Recovery::open(context.child("catchup_range_pruned"))
+            .await
+            .expect("open recovery");
+        let rotations = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let client = PrunedSourceClient {
+            // anchored (the founding set) and bare at its own epoch base, so
+            // the tip passes the trust gate and the frame fetch is reached.
+            manifest: test_manifest_with_base(5, 5, test_root(5), None),
+            rotations: rotations.clone(),
+        };
+        let founding_participants = vec![test_me()];
+        let anchor = crate::sync::serve::TrustAnchor {
+            epoch: 0,
+            participants: &founding_participants,
+        };
+        let store = consensus::ContentStore::new();
+        let err = crate::sync::catchup::catch_up_suffix_frames(
+            &client,
+            &mut recovery,
+            &mut host,
+            None,
+            0,
+            1,
+            b"ns",
+            anchor,
+            &store,
+            Vec::new(),
+        )
+        .await
+        .expect_err("a source that pruned past us cannot serve the suffix");
+        assert!(
+            matches!(err, crate::sync::catchup::SuffixCatchupError::Retry(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            rotations.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the retry must ask another source: this one can only prune further"
         );
     });
 }

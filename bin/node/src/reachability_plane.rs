@@ -15,10 +15,46 @@ use crate::join_gate;
 
 /// Which doorbell an intro arrived on: the DIRECT UDP listener or the
 /// COORDINATED (rendezvous-punched, resolver-socket) receiver.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy)]
 pub(crate) enum IntroPath {
     Direct,
     Coordinated,
+}
+
+impl IntroPath {
+    fn as_str(self) -> &'static str {
+        match self {
+            IntroPath::Direct => "direct",
+            IntroPath::Coordinated => "coordinated",
+        }
+    }
+}
+
+/// an intro this member refused before installing anything, on its record.
+/// An honest joiner re-sends every poll, so the warn is latched per `reason`:
+/// the count IS the diagnosis. Not per joiner — an intro may name any key it
+/// likes, so a per-key latch would hand a flood one fresh line per datagram.
+fn log_intro_refused(
+    label: &str,
+    path: IntroPath,
+    joiner: &[u8],
+    reason: &'static str,
+    detail: &dyn std::fmt::Display,
+) {
+    static INTRO_REFUSED: noded::log::Latch = noded::log::Latch::new(100);
+    let Some(attempts) = INTRO_REFUSED.hit(reason) else {
+        return;
+    };
+    tracing::warn!(
+        target: "ducktape::join",
+        node = %label,
+        peer = %config::hex_bytes(&joiner[..joiner.len().min(4)]),
+        via = path.as_str(),
+        reason,
+        detail = %detail,
+        attempts,
+        "invite intro REFUSED before its gate"
+    );
 }
 
 /// One inviter-side intro datagram, shared by BOTH doorbells: OPEN → decode →
@@ -177,29 +213,51 @@ where
         return true;
     };
     let nonce = msg.nonce.clone();
-    let verified = match join_gate::verify_intro(&msg, binding, nat_traversal::now_secs()) {
-        Ok(v) => v,
-        Err(_) => return true,
-    };
-    // past verification we hold the joiner's WG key: every reply from here is
-    // SEALED to it, so an `Admitted`'s coordinator capability never crosses the
-    // wire in the clear.
-    let joiner_wg = verified.wg_public_key;
-    let sealed_reply = |reply: join_gate::IntroReply| {
+    // every reply is SEALED to a WG key the joiner PROVED it holds, so an
+    // `Admitted`'s coordinator capability never crosses the wire in the clear.
+    let seal_reply = |wg: &[u8; 32], reply: join_gate::IntroReply| {
         let bytes = join_gate::encode_intro_ack(&join_gate::IntroAck {
             nonce: nonce.clone(),
             reply,
         });
-        reachability::seal(&joiner_wg, &bytes)
+        reachability::seal(wg, &bytes)
     };
-    // V4 expiry, on this member's wall clock (signature-covered field).
-    if nat_traversal::now_secs() >= msg.expires_unix_secs {
-        if path == IntroPath::Direct {
-            ack(sealed_reply(join_gate::IntroReply::Refused {
-                detail: "invite expired — ask the inviter for a fresh one".into(),
-            }))
-            .await;
+    let now = nat_traversal::now_secs();
+    let verified = match join_gate::verify_intro(&msg, binding, now) {
+        Ok(v) => v,
+        Err(refusal) => {
+            log_intro_refused(label, path, &msg.joiner, refusal.reason(), &refusal);
+            // every signature verified and only the clock did not: the key is
+            // proven, and the joiner is owed the one fix a new invite cannot make.
+            if let join_gate::IntroRefusal::Stale { wg_public_key } = refusal {
+                let detail = format!(
+                    "{}: your clock and this member's differ by {} s (the limit is {} s) — \
+                     set this machine's clock and join again",
+                    join_gate::INTRO_STALE,
+                    now.abs_diff(msg.issued_unix_secs),
+                    join_gate::INTRO_FRESHNESS_SECS
+                );
+                ack(seal_reply(
+                    &wg_public_key,
+                    join_gate::IntroReply::Refused { detail },
+                ))
+                .await;
+            }
+            return true;
         }
+    };
+    let joiner_wg = verified.wg_public_key;
+    let sealed_reply = |reply: join_gate::IntroReply| seal_reply(&joiner_wg, reply);
+    // V4 expiry, on this member's wall clock (signature-covered field). Both
+    // doorbells answer it: a coordinated joiner is as owed the reason as a
+    // direct one.
+    if now >= msg.expires_unix_secs {
+        let detail = "invite expired — ask the inviter for a fresh one";
+        log_intro_refused(label, path, &msg.joiner, "intro_invite_expired", &detail);
+        ack(sealed_reply(join_gate::IntroReply::Refused {
+            detail: detail.into(),
+        }))
+        .await;
         return true;
     }
     // V6/V7 need committed state — those run at the loop (`on_gate_forward`).
@@ -223,16 +281,12 @@ where
     static INSTALL_REFUSED: noded::log::Latch = noded::log::Latch::new(100);
     match reply_rx.await {
         Ok(Ok(())) => {
-            let via = match path {
-                IntroPath::Direct => "direct",
-                IntroPath::Coordinated => "coordinated",
-            };
             // per intro, and a racing joiner re-sends one every poll: debug.
             tracing::debug!(
                 target: "ducktape::join",
                 node = %label,
                 peer = %config::hex_bytes(&verified.joiner.as_ref()[..4]),
-                via,
+                via = path.as_str(),
                 "invite intro tunnel peer installed"
             );
             // THE GATE: the sealed intro IS the gate request. Forward it to

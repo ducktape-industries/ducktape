@@ -366,7 +366,8 @@ where
                     // indistinguishable from healthy catch-up — and so it read as boot
                     // noise for days. `permanent` is the word that ends the guessing: this
                     // does not heal by waiting, because the source can only prune FURTHER
-                    // ahead of us.
+                    // ahead of us — so the retry asks the next source, not this one.
+                    client.rotate_source();
                     tracing::error!(
                         target: "ducktape::statesync",
                         requested_after,

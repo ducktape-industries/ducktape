@@ -82,6 +82,54 @@ pub struct VerifiedJoinRequest {
     pub expires_unix_secs: u64,
 }
 
+/// why [`verify_intro`] refused an intro: [`IntroRefusal::reason`] is the
+/// stable snake_case token a member logs it under, `Display` the prose.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IntroRefusal {
+    /// a key, nonce or signature field does not decode; carries which, and why.
+    Malformed(String),
+    /// the token signature does not verify for this network's binding.
+    BadToken,
+    /// the joiner's proof-of-possession does not verify.
+    BadProof,
+    /// the WireGuard-key binding signature does not verify.
+    BadWgBinding,
+    /// the signed `issued_unix_secs` is more than [`INTRO_FRESHNESS_SECS`] off
+    /// the member's clock. Every signature verified first, so the joiner's
+    /// WireGuard key is PROVEN: the member can seal it a refusal naming its
+    /// clock as the thing to fix.
+    Stale { wg_public_key: [u8; 32] },
+}
+
+impl IntroRefusal {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Malformed(_) => "intro_malformed",
+            Self::BadToken => "intro_bad_token",
+            Self::BadProof => "intro_bad_proof",
+            Self::BadWgBinding => "intro_bad_wg_binding",
+            Self::Stale { .. } => INTRO_STALE,
+        }
+    }
+}
+
+impl std::fmt::Display for IntroRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(what) => f.write_str(what),
+            Self::BadToken => {
+                f.write_str("invite token signature does not verify for this network")
+            }
+            Self::BadProof => f.write_str("joiner proof-of-possession does not verify"),
+            Self::BadWgBinding => f.write_str("wireguard key binding does not verify"),
+            Self::Stale { .. } => write!(
+                f,
+                "intro signed more than {INTRO_FRESHNESS_SECS} s away from this member's clock"
+            ),
+        }
+    }
+}
+
 /// verify an intro's join-request half against this network's binding: token
 /// issuer signature and the joiner's proof-of-possession (the WireGuard-key
 /// binding is [`verify_intro`]'s). membership checks (issuer still a member?
@@ -90,7 +138,7 @@ pub struct VerifiedJoinRequest {
 pub fn verify_join_request(
     msg: &IntroRequest,
     binding: &[u8],
-) -> Result<VerifiedJoinRequest, String> {
+) -> Result<VerifiedJoinRequest, IntroRefusal> {
     let IntroRequest {
         issuer,
         nonce,
@@ -100,19 +148,23 @@ pub fn verify_join_request(
         expires_unix_secs,
         ..
     } = msg;
+    let malformed =
+        |what: &str, e: commonware_codec::Error| IntroRefusal::Malformed(format!("{what}: {e}"));
     let issuer =
-        ed25519::PublicKey::decode(issuer.as_slice()).map_err(|e| format!("issuer key: {e}"))?;
+        ed25519::PublicKey::decode(issuer.as_slice()).map_err(|e| malformed("issuer key", e))?;
     let joiner =
-        ed25519::PublicKey::decode(joiner.as_slice()).map_err(|e| format!("joiner key: {e}"))?;
+        ed25519::PublicKey::decode(joiner.as_slice()).map_err(|e| malformed("joiner key", e))?;
     if nonce.len() != INVITE_NONCE_LEN {
-        return Err(format!("nonce must be {INVITE_NONCE_LEN} bytes"));
+        return Err(IntroRefusal::Malformed(format!(
+            "nonce must be {INVITE_NONCE_LEN} bytes"
+        )));
     }
     let mut nonce_arr = [0u8; INVITE_NONCE_LEN];
     nonce_arr.copy_from_slice(nonce);
     let sig = ed25519::Signature::decode(token_sig.as_slice())
-        .map_err(|e| format!("token signature: {e}"))?;
+        .map_err(|e| malformed("token signature", e))?;
     let proof =
-        ed25519::Signature::decode(proof.as_slice()).map_err(|e| format!("join proof: {e}"))?;
+        ed25519::Signature::decode(proof.as_slice()).map_err(|e| malformed("join proof", e))?;
 
     let token = InviteToken {
         issuer: issuer.clone(),
@@ -124,13 +176,13 @@ pub fn verify_join_request(
     // Every invite is bearer — no target lock — the join proof binds the
     // announcing key, and the sealed intro keeps the token off the wire.
     if !crate::config::verify_invite_token(&token, binding) {
-        return Err("invite token signature does not verify for this network".into());
+        return Err(IntroRefusal::BadToken);
     }
     // NO expiry check here: this fn stays pure crypto (same division as
     // the membership checks) — decode enforces wall-clock expiry, consensus
     // enforces block-time expiry.
     if !crate::config::verify_join_proof(&joiner, binding, &token, &proof) {
-        return Err("joiner proof-of-possession does not verify".into());
+        return Err(IntroRefusal::BadProof);
     }
     Ok(VerifiedJoinRequest {
         joiner,
@@ -319,16 +371,16 @@ pub fn verify_intro(
     msg: &IntroRequest,
     binding: &[u8],
     now_unix_secs: u64,
-) -> Result<VerifiedIntro, String> {
+) -> Result<VerifiedIntro, IntroRefusal> {
     use commonware_cryptography::Verifier as _;
     let verified = verify_join_request(msg, binding)?;
     let wg_public_key: [u8; 32] = msg
         .wg_public_key
         .as_slice()
         .try_into()
-        .map_err(|_| "wireguard key must be 32 bytes".to_string())?;
+        .map_err(|_| IntroRefusal::Malformed("wireguard key must be 32 bytes".into()))?;
     let wg_sig = ed25519::Signature::decode(msg.wg_sig.as_slice())
-        .map_err(|e| format!("wireguard key signature: {e}"))?;
+        .map_err(|e| IntroRefusal::Malformed(format!("wireguard key signature: {e}")))?;
     let wg_msg = [
         binding,
         verified.nonce.as_slice(),
@@ -337,12 +389,12 @@ pub fn verify_intro(
     ]
     .concat();
     if !verified.joiner.verify(INTRO_WG_NAMESPACE, &wg_msg, &wg_sig) {
-        return Err("wireguard key binding does not verify".into());
+        return Err(IntroRefusal::BadWgBinding);
     }
     let too_old = now_unix_secs.saturating_sub(msg.issued_unix_secs) > INTRO_FRESHNESS_SECS;
     let too_new = msg.issued_unix_secs.saturating_sub(now_unix_secs) > INTRO_FRESHNESS_SECS;
     if too_old || too_new {
-        return Err(INTRO_STALE.into());
+        return Err(IntroRefusal::Stale { wg_public_key });
     }
     Ok(VerifiedIntro {
         joiner: verified.joiner,
@@ -417,12 +469,48 @@ mod tests {
         let bad_proof =
             crate::config::sign_join_proof(&ed25519::PrivateKey::from_seed(3), BINDING, &token);
         use commonware_codec::Encode as _;
+        assert_eq!(
+            verify_join_request(&msg, b"other-net").expect_err("refused"),
+            IntroRefusal::BadToken
+        );
         let forged = IntroRequest {
             proof: bad_proof.encode().as_ref().to_vec(),
             ..msg
         };
         let err = verify_join_request(&forged, BINDING).expect_err("refused");
-        assert!(err.contains("proof-of-possession"), "{err}");
+        assert_eq!(err, IntroRefusal::BadProof);
+    }
+
+    /// each refusal logs under its own stable token: pin the strings, since
+    /// an operator's grep (and a dashboard) keys on them.
+    #[test]
+    fn intro_refusal_reasons_are_stable_tokens() {
+        let cases = [
+            (
+                IntroRefusal::Malformed("joiner key: short".into()),
+                "intro_malformed",
+            ),
+            (IntroRefusal::BadToken, "intro_bad_token"),
+            (IntroRefusal::BadProof, "intro_bad_proof"),
+            (IntroRefusal::BadWgBinding, "intro_bad_wg_binding"),
+            (
+                IntroRefusal::Stale {
+                    wg_public_key: WG_KEY,
+                },
+                "intro_stale",
+            ),
+        ];
+        for (refusal, token) in cases {
+            assert_eq!(refusal.reason(), token, "{refusal:?}");
+        }
+        // a field that does not decode names WHICH field in its prose.
+        let issuer = ed25519::PrivateKey::from_seed(1);
+        let joiner = ed25519::PrivateKey::from_seed(2);
+        let mut msg = intro_request(&joiner, BINDING, &mint_for(&issuer), WG_KEY, NOW);
+        msg.joiner.truncate(3);
+        let err = verify_intro(&msg, BINDING, NOW).expect_err("refused");
+        assert_eq!(err.reason(), "intro_malformed");
+        assert!(err.to_string().starts_with("joiner key: "), "{err}");
     }
 
     #[test]
@@ -507,7 +595,7 @@ mod tests {
         let mut forged = msg.clone();
         forged.wg_public_key = vec![8u8; 32];
         let err = verify_intro(&forged, BINDING, NOW).expect_err("refused");
-        assert!(err.contains("wireguard key binding"), "{err}");
+        assert_eq!(err, IntroRefusal::BadWgBinding);
 
         // another network refuses the same intro.
         assert!(verify_intro(&msg, b"other-net", NOW).is_err());
@@ -516,8 +604,9 @@ mod tests {
     /// a captured intro cannot be replayed indefinitely: past
     /// [`INTRO_FRESHNESS_SECS`] the gating member refuses it with the
     /// stable [`INTRO_STALE`] reason, in either direction (stale in the
-    /// past, or implausibly signed in the future); a fresh one still
-    /// verifies at the same wall clock.
+    /// past, or implausibly signed in the future), carrying the proven
+    /// WireGuard key its refusal is sealed to; a fresh one still verifies at
+    /// the same wall clock.
     #[test]
     fn a_stale_or_future_intro_is_refused_a_fresh_one_verifies() {
         let issuer = ed25519::PrivateKey::from_seed(1);
@@ -527,11 +616,22 @@ mod tests {
         let beyond = INTRO_FRESHNESS_SECS + 1;
         let stale = intro_request(&joiner, BINDING, &token, WG_KEY, NOW - beyond);
         let err = verify_intro(&stale, BINDING, NOW).expect_err("refused");
-        assert_eq!(err, INTRO_STALE);
+        assert_eq!(
+            err,
+            IntroRefusal::Stale {
+                wg_public_key: WG_KEY
+            }
+        );
+        assert_eq!(err.reason(), INTRO_STALE);
 
         let future = intro_request(&joiner, BINDING, &token, WG_KEY, NOW + beyond);
         let err = verify_intro(&future, BINDING, NOW).expect_err("refused");
-        assert_eq!(err, INTRO_STALE);
+        assert_eq!(
+            err,
+            IntroRefusal::Stale {
+                wg_public_key: WG_KEY
+            }
+        );
 
         // inside the bound (e.g. a retransmit late in the join race) still
         // verifies — this is exactly what makes the window wide enough for

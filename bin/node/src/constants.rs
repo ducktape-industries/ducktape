@@ -22,6 +22,10 @@ pub(crate) const MAX_GENESIS_BYTES: u64 = 8 * MAX_MODULE_CODE_BYTES;
 /// many further drain passes, for a host query that keeps erroring (#1820).
 /// shared by the validator drain and the replica park loop.
 pub(crate) const VALSET_READ_WARN_EVERY: u64 = 600;
+/// one warning when a parked node's boundary fetch first fails, then one per
+/// this many further failures: about a minute apart at the joiner's
+/// [`JOINER_POLL`], so a sync that never starts says why in the log.
+pub(crate) const BOUNDARY_FETCH_WARN_EVERY: u64 = 30;
 /// how many source conversations a code-blob fetch tries before reporting
 /// the miss (each conversation resumes the staged prefix, so retries only
 /// ever pay for bytes not yet landed).
