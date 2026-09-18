@@ -307,6 +307,41 @@ mod tests {
         }
     }
 
+    /// THE BUG (#2660): the fs read verbs answered a stopped node with
+    /// `cannot reach the node: error sending request for url (http://…)` while
+    /// every other family said "the node is not running". Driven through the
+    /// real `ls` verb against a port nothing is on, it must say exactly what
+    /// the node's own read lane says, at exit 1.
+    #[test]
+    fn a_stopped_node_is_told_in_the_sentence_every_family_uses() {
+        // bound only to learn a port nothing is on: the connect is REFUSED.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        drop(listener);
+
+        let failed = ls(LsArgs {
+            path: "/".into(),
+            snapshot: None,
+            limit: None,
+            json: false,
+            addr: NodeAddr {
+                node: Some(base.clone()),
+                config: None,
+                network: None,
+            },
+        })
+        .expect_err("nothing listens");
+        let every_family = crate::node_http::get_json(&base, "/v1/status")
+            .expect_err("nothing listens")
+            .to_string();
+        assert!(
+            every_family.starts_with("the node is not running"),
+            "{every_family}"
+        );
+        assert_eq!(failed.line(), Some(every_family));
+        assert_eq!(failed.code, 1);
+    }
+
     /// the ls row JSON carries the SAME three facts the text columns do — and
     /// `kind` is the `kind_tag` spelling, not the wire enum's.
     #[test]

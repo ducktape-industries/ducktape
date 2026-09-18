@@ -97,10 +97,14 @@ impl CliError {
 /// map a transport failure to a CLI failure — the ONE mapping every `ducktape
 /// fs` verb uses. a refusal keeps both halves it arrived in; a connection
 /// failure is THIS side's and says so, because the two are not the caller's to
-/// fix in the same way.
+/// fix in the same way. a node nothing answered for is told in the sentence
+/// every other family uses for it.
 pub fn api_err(e: ApiError) -> CliError {
     match e {
         ApiError::Rejected { reason, sentence } => CliError::refused(reason, sentence),
+        ApiError::Unreachable { base } => {
+            CliError::failed(crate::node_http::not_running_at(&base).to_string())
+        }
         ApiError::NotFound => CliError::refused("not_found", "the node has no such route"),
         ApiError::Transport(m) => CliError::failed(format!("cannot reach the node: {m}")),
     }

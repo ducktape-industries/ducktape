@@ -412,15 +412,15 @@ pub(crate) fn not_running_in(workspace: Option<&std::path::Path>) -> NotRunning 
 }
 
 /// [`not_running_in`] for a caller holding the node's http base rather than
-/// its directory — every `/v1` lane, which dials a url and never knew the
-/// workspace behind it.
+/// its directory — every `/v1` lane and the `fs` verbs' duckfs client, which
+/// dial a url and never knew the workspace behind it.
 ///
 /// The registry can answer "none" (a `--node` url pointing off this box) or
 /// "several" (two networks both left on the default `http_listen`), and both
 /// fall back to the plain sentence: a wrong launcher's log is worse than no
 /// launcher's. A caller that HAS the directory should pass it to
 /// [`not_running_in`] and skip this — `services::catalog_now` does.
-fn not_running_at(base: &str) -> NotRunning {
+pub(crate) fn not_running_at(base: &str) -> NotRunning {
     let workspace = crate::cli_args::workspace_for_base(base).ok();
     not_running_in(workspace.as_deref())
 }
@@ -741,6 +741,7 @@ mod tests {
             ("ducktape node status -n demo", "-n demo"),
             ("ducktape node log-filter info --network demo", "-n demo"),
             ("ducktape service list -n demo", "-n demo"),
+            ("ducktape fs ls / -n demo", "-n demo"),
             (
                 "ducktape service status --config /w/node.toml",
                 "--config /w/node.toml",

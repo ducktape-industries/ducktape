@@ -77,6 +77,9 @@ pub enum CommitError {
     /// token (see [`ApiError::Rejected`]).
     #[error("{}", crate::api::refusal_line(.reason, .sentence))]
     Rejected { reason: String, sentence: String },
+    /// nothing answered at `base` (see [`ApiError::Unreachable`]).
+    #[error("duckfs: commit: nothing answered at {base}")]
+    Unreachable { base: String },
     #[error("duckfs: commit transport: {0}")]
     Transport(String),
     #[error("duckfs: commit io: {0}")]
@@ -87,6 +90,7 @@ impl From<ApiError> for CommitError {
     fn from(e: ApiError) -> Self {
         match e {
             ApiError::Rejected { reason, sentence } => CommitError::Rejected { reason, sentence },
+            ApiError::Unreachable { base } => CommitError::Unreachable { base },
             ApiError::NotFound => CommitError::Transport("not found".into()),
             ApiError::Transport(m) => CommitError::Transport(m),
         }

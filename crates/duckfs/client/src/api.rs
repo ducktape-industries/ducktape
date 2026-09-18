@@ -53,7 +53,14 @@ pub enum ApiError {
     /// a 404 (absent path / unresolvable snapshot over http).
     #[error("not found")]
     NotFound,
-    /// a transport-layer failure (connection, decode, non-error non-2xx).
+    /// nothing answered at `base`: the connect was refused, or the connection
+    /// was reset or hung up before a response — a node that is not running,
+    /// not one that refused. the base is carried so a caller can name what to
+    /// do about THAT node; a timeout is not this (something is there, wedged).
+    #[error("nothing answered at {base}")]
+    Unreachable { base: String },
+    /// any other transport-layer failure (a timeout, a decode, an unbuildable
+    /// request, a non-error non-2xx).
     #[error("transport: {0}")]
     Transport(String),
 }
