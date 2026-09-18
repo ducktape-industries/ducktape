@@ -104,6 +104,13 @@ pub type CoordinatorAuth = (
     Option<nat_traversal::CoordCap>,
 );
 
+/// The plane's handshake sampler's knowledge: peer ULAs whose WireGuard
+/// tunnel is carrying traffic at the last sample. The sampler writes it once
+/// per tick; a reader learns from it whether the overlay is up in fact, not
+/// merely configured.
+pub type CarryingPeers =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<std::net::Ipv6Addr>>>;
+
 /// The production resolver: a handle to the rendezvous PUMP task that owns
 /// the `NatClient`'s receive side. The pump answers unsolicited `PunchSync`
 /// fan-outs while this node is otherwise idle (the passive half of somebody
@@ -201,15 +208,18 @@ impl NatResolver {
     /// mode's path, where the client rides the WireGuard underlay socket
     /// (`nat_traversal::NatSocket::Shared`) so the punch originates from the
     /// tunnel's own 5-tuple. Establishment happens in the spawned task,
-    /// exactly like [`Self::bind`].
+    /// exactly like [`Self::bind`]. A resolver with no plane behind it has no
+    /// handshake sampler, so no tunnel is known to carry.
     pub fn from_client(client: NatClient, keepalive: Duration) -> Self {
-        Self::from_client_with_datagram_sink(client, keepalive, None)
+        Self::from_client_with_datagram_sink(client, keepalive, None, CarryingPeers::default())
     }
 
     /// [`Self::from_client`] plus an explicit datagram sink. Non-rendezvous
     /// datagrams received on the socket are forwarded to `datagrams`, which
     /// lets invite-intro bootstrap share the WireGuard underlay socket without
-    /// changing the default rendezvous-only event stream.
+    /// changing the default rendezvous-only event stream. `carrying` is the
+    /// plane's [`CarryingPeers`]: what an unreachable coordinator costs this
+    /// node depends on whether a tunnel already carries traffic.
     ///
     /// Infallible: reflexive discovery and registration are the spawned
     /// task's job, retried with backoff until a coordinator answers — a
@@ -220,11 +230,12 @@ impl NatResolver {
         client: NatClient,
         keepalive: Duration,
         datagrams: Option<tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+        carrying: CarryingPeers,
     ) -> Self {
         let (status_tx, status_rx) = tokio::sync::watch::channel(RendezvousStatus::Establishing);
         let (commands, rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(establish_then_pump(
-            client, rx, datagrams, status_tx, keepalive,
+            client, rx, datagrams, status_tx, keepalive, carrying,
         ));
         Self {
             commands: Some(commands),
@@ -284,6 +295,7 @@ async fn establish_then_pump(
     datagrams: Option<tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>>,
     status: tokio::sync::watch::Sender<RendezvousStatus>,
     keepalive: Duration,
+    carrying: CarryingPeers,
 ) {
     let mut attempts = 0u32;
     let mut backoff = ESTABLISH_RETRY_MIN;
@@ -323,13 +335,13 @@ async fn establish_then_pump(
                 // retry evicts the whole ring. `attempts` IS the diagnosis — it is what
                 // separates "flaky, healing" from "wedged since boot".
                 if attempts == 1 || attempts.is_multiple_of(10) {
+                    let consequence = unavailable_consequence(&carrying);
                     tracing::warn!(
                         target: "ducktape::reachability",
                         error = %unreachable,
                         attempts,
                         backoff_ms = backoff.as_millis() as u64,
-                        "coordinator rendezvous UNAVAILABLE — the overlay cannot come up \
-                         until this succeeds"
+                        "coordinator rendezvous UNAVAILABLE — {consequence}"
                     );
                 }
                 let _ = status.send(RendezvousStatus::Unavailable { attempts });
@@ -366,6 +378,22 @@ async fn establish_then_pump(
         keepalive,
     ));
     rendezvous_pump(client, commands, datagrams, status).await
+}
+
+/// What an unreachable coordinator costs this node right now, by the plane's
+/// own knowledge. A tunnel carrying traffic proves the overlay came up
+/// without the coordinator (a direct or LAN path), so what is lost is the
+/// reflexive address: a peer that cannot dial this node directly has nowhere
+/// to find it. With nothing carrying, the overlay may be waiting on exactly
+/// the rendezvous that failed.
+fn unavailable_consequence(carrying: &CarryingPeers) -> &'static str {
+    let tunnel_carrying = carrying.lock().is_ok_and(|carrying| !carrying.is_empty());
+    match tunnel_carrying {
+        true => {
+            "no reflexive address — peers that cannot reach this node directly will not find it"
+        }
+        false => "the overlay cannot come up until this succeeds",
+    }
 }
 
 /// Publish a coordinator observation of this node's own reflexive, ONLY when
@@ -1032,6 +1060,25 @@ mod tests {
         assert_eq!(
             *rx.borrow_and_update(),
             RendezvousStatus::Ready { reflexive: moved }
+        );
+    }
+
+    /// The WARN's consequence must be true on the path its reader is on. A
+    /// tunnel already carrying traffic (a direct or LAN join) proves the
+    /// overlay came up without the coordinator, so what is lost is the
+    /// reflexive address; with none carrying, the overlay waits on it.
+    #[test]
+    fn an_unreachable_coordinator_costs_a_carrying_node_only_its_reflexive() {
+        let carrying = CarryingPeers::default();
+        assert_eq!(
+            unavailable_consequence(&carrying),
+            "the overlay cannot come up until this succeeds"
+        );
+
+        carrying.lock().unwrap().insert("fdd7::1".parse().unwrap());
+        assert_eq!(
+            unavailable_consequence(&carrying),
+            "no reflexive address — peers that cannot reach this node directly will not find it"
         );
     }
 }

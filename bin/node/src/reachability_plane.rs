@@ -7,6 +7,7 @@ use commonware_p2p::{
     AddressableManager as _, Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender,
 };
 use commonware_runtime::{IoBuf, Spawner, Supervisor};
+use reachability::CarryingPeers;
 
 use crate::config::{self, hex_bytes};
 use crate::constants::NUDGE_INTERVAL;
@@ -129,13 +130,6 @@ pub(crate) fn sweep_gate_outcomes(
 ) {
     map.retain(|_, entry| now.duration_since(entry.settled_at).unwrap_or_default() <= window);
 }
-
-/// The handshake sampler's knowledge, published for the event pump: peer
-/// ULAs whose WireGuard tunnel is carrying traffic at the last sample. The
-/// sampler writes it once per tick; the pump reads it to keep a failed
-/// endpoint RESOLUTION from being reported as an unreachable peer.
-pub(crate) type CarryingPeers =
-    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<std::net::Ipv6Addr>>>;
 
 /// the caller-side halves of the plane's lane-reclaim seam (see
 /// `wire_reachability_plane`'s `lane_reclaim`): each resolves with its half
@@ -397,9 +391,9 @@ where
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityEvent>(256);
 
     // the sampler (inside the plane's own runtime) writes it; the out pump
-    // (on the node runtime) reads it. one allocation, shared across both.
-    let carrying: CarryingPeers =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    // (on the node runtime) and the rendezvous establish loop read it. one
+    // allocation, shared across all three.
+    let carrying = CarryingPeers::default();
     let thread_label = label.to_string();
     let reach_carrying = carrying.clone();
     let reach_signer = signer.clone();
@@ -1417,6 +1411,7 @@ async fn reachability_plane(
                     client,
                     reachability::RENDEZVOUS_KEEPALIVE,
                     invite_intro_tx,
+                    carrying.clone(),
                 ),
                 // A LOCAL wiring failure of the shared-socket seam itself —
                 // not a network condition. Rendezvous cannot exist on this
