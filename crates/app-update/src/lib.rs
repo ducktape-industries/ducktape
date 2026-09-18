@@ -12,7 +12,8 @@
 //!
 //! This crate holds the vocabulary ([`Phase`], [`Event`], [`Command`]), the
 //! decision ([`step`]), the signed release manifest ([`Manifest`],
-//! [`verify_manifest`]), its signature ([`release`]), the duckfs layout each
+//! [`verify_manifest`]), its signature ([`release`]), the identity an archive
+//! carries at its root ([`ReleaseIdentity`]), the duckfs layout each
 //! [`layout::Kind`] is published under ([`layout`]), the governance
 //! designation that says when a node cuts over ([`designation`]), the
 //! governance signal that says which key signs each kind ([`release_key`]),
@@ -36,7 +37,7 @@ pub mod workspace;
 
 pub use designation::{Designation, ReleaseSignal};
 pub use layout::Kind;
-pub use manifest::{Artifact, Manifest, Platform, Release, SCHEMA, SuccessorKey};
+pub use manifest::{Artifact, Manifest, Platform, Release, ReleaseIdentity, SCHEMA, SuccessorKey};
 pub use phase::{
     Command, Downloading, Event, Idle, PendingHealthy, Phase, RollbackReason, RolledBack, Staged,
     SwapState, Swapping, UpdateBanner,

@@ -9,26 +9,31 @@
 //! perform an effect. The executor performs the commands in order.
 //!
 //! The flows, as the executor sees them:
-//! - `Idle` + `Tick` → `Fetch`; `ManifestFetched(Ok)` newer-or-equal to the
-//!   pin with a host artifact that is not `current` → `Downloading` +
-//!   `Download`; `DownloadFinished` → `Verify`; `Verified` →
+//! - `Idle` + `Tick` → `Fetch`; `ManifestFetched(Ok)` newer than the pin
+//!   with a host artifact that is not `current` → `Downloading` +
+//!   `Download`; equal to the pin → `Banner(UpToDate)`; older →
+//!   `Refused(SequenceNotNewer)`. `DownloadFinished` → `Verify`; `Verified` →
 //!   `SealImmutable` (+ `PinSuccessor`) → `Staged` + `Banner(Ready)`.
 //! - `RestartToUpdate`, or `Boot` while `Staged` → `Qualify`;
 //!   `QualifyPassed` → `Persist(Swapping)` → `Flip` →
-//!   `Persist(PendingHealthy{boots: 0})` → `Exec`; `QualifyFailed` → stay
+//!   `Persist(PendingHealthy{boots: 0})` → `Exec`, the swap adopting the
+//!   staged sequence as the pin; `QualifyFailed` → stay
 //!   `Staged` with the reason persisted as `refused`, `Banner` names it.
 //! - A staged release does not close the channel: `Staged` + `Tick` →
 //!   `Fetch`. A newer sequence discards the staged release (`Persist(Idle)`,
 //!   `Gc`) and is offered as `Idle` offers it. The staged sequence, or a
 //!   lower one, changes nothing and repeats no banner. `UserRollback`
-//!   discards the staged release.
+//!   discards the staged release. A discarded release never ran, so the pin
+//!   never took its sequence and it is offered again like any newer one.
 //! - `PendingHealthy` + `Rendered` → `Idle` + `Gc`. `Boot` with `boots == 0`
 //!   → `boots: 1`; `Boot` with `boots ≥ 1` → flip back → `RolledBack` →
 //!   `Exec`. `Boot` while `Swapping` → `ResolveSwap`; `SwapResolved` finishes
 //!   the swap from whichever side landed.
 //! - `UserRollback` while `Idle` with a `previous` → the same swap into
 //!   `previous`, `current` becoming the new `previous`. `pinned_sequence`
-//!   never lowers: the next `Tick` re-offers the same release.
+//!   never lowers, so the release rolled back from is not downloaded again:
+//!   it is still `previous`, one more rollback away, and a newer sequence
+//!   supersedes it.
 //! - The node offers what its network designates, not the manifest's latest:
 //!   `Designated(sha)` while `Idle` → `FetchDesignated(sha)`;
 //!   `DesignatedManifestFetched` whose host artifact is `sha` → `Downloading`
@@ -38,6 +43,8 @@
 //!   to date. `Designated` while `Staged` with another `sha` discards the
 //!   staged release and offers the designated one.
 //! - A boot whose command list carries no `Exec` execs [`Phase::current`].
+
+use std::cmp::Ordering;
 
 use crate::manifest::Platform;
 use crate::phase::{
@@ -220,18 +227,27 @@ fn idle_manifest_fetched(
     }
 }
 
-/// A verified manifest: take it if it is not a downgrade, ships this
-/// platform, and names something other than what runs. Equal to the pin is
-/// re-offered on purpose — that is how a rolled-back release comes back.
+/// A verified manifest, against the pin. The pin is the sequence of the
+/// release this install last flipped to (or was installed from), and it
+/// never lowers — so an EQUAL sequence is the release that runs, or the one a
+/// rollback left as `previous`, which a rollback reaches from disk and a newer
+/// sequence supersedes. Neither is downloaded again. An older sequence is a
+/// downgrade; a newer one is offered.
 fn idle_offer(idle: Idle, verified: VerifiedManifest) -> (Phase, Vec<Command>) {
-    let manifest = verified.manifest;
-    let is_downgrade = manifest.sequence < idle.pinned_sequence;
-    if is_downgrade {
-        return banner_only(
+    match verified.manifest.sequence.cmp(&idle.pinned_sequence) {
+        Ordering::Less => banner_only(
             Phase::Idle(idle),
             UpdateBanner::Refused(Refusal::SequenceNotNewer),
-        );
+        ),
+        Ordering::Equal => banner_only(Phase::Idle(idle), UpdateBanner::UpToDate),
+        Ordering::Greater => offer_newer(idle, verified),
     }
+}
+
+/// A newer sequence: take it if it ships this platform and names something
+/// other than what runs.
+fn offer_newer(idle: Idle, verified: VerifiedManifest) -> (Phase, Vec<Command>) {
+    let manifest = verified.manifest;
     let Some(artifact) = manifest.artifact_for(Platform::HOST) else {
         return banner_only(
             Phase::Idle(idle),
@@ -410,18 +426,17 @@ fn downloading_download_failed(
     abandon_download(downloading, banner)
 }
 
-/// Verified: seal the extracted dir, record any announced successor key,
-/// advance the pin, and offer the restart.
+/// Verified: seal the extracted dir, record any announced successor key, and
+/// offer the restart. The pin stays: it advances at the flip.
 fn downloading_verified(downloading: Downloading, sha: Sha) -> (Phase, Vec<Command>) {
     let is_stale = sha != downloading.target;
     if is_stale {
         return unchanged(Phase::Downloading(downloading));
     }
-    let pinned_sequence = downloading.pinned_sequence.max(downloading.sequence);
     let staged = Phase::Staged(Staged {
         current: downloading.current,
         previous: downloading.previous,
-        pinned_sequence,
+        pinned_sequence: downloading.pinned_sequence,
         staged: downloading.target,
         sequence: downloading.sequence,
         display: downloading.display.clone(),
@@ -476,12 +491,15 @@ fn staged_restart(staged: Staged) -> (Phase, Vec<Command>) {
     (Phase::Staged(staged), vec![qualify])
 }
 
+/// The flip adopts the staged sequence as the pin; one staged from disk
+/// carries the pin as its sequence, which never lowers it.
 fn staged_qualify_passed(staged: Staged, sha: Sha) -> (Phase, Vec<Command>) {
     let is_stale = sha != staged.staged;
     if is_stale {
         return unchanged(Phase::Staged(staged));
     }
-    swap_into(staged.current, staged.staged, staged.pinned_sequence)
+    let adopted = staged.pinned_sequence.max(staged.sequence);
+    swap_into(staged.current, staged.staged, adopted)
 }
 
 /// Refused by its own self-check: keep running `current` and keep the release
@@ -697,7 +715,7 @@ mod tests {
         Staged {
             current: sha(current),
             previous: Some(sha("z")),
-            pinned_sequence: 18,
+            pinned_sequence: 17,
             staged: sha(staged),
             sequence: 18,
             display: "2026.09.2+b".into(),
@@ -815,7 +833,7 @@ mod tests {
         let staged_ready = Phase::Staged(Staged {
             current: sha("a"),
             previous: Some(sha("z")),
-            pinned_sequence: 18,
+            pinned_sequence: 17,
             staged: sha("b"),
             sequence: 18,
             display: "2026.09.2+b".into(),
@@ -857,26 +875,21 @@ mod tests {
                 ),
             },
             Case {
-                name: "idle equal sequence after rollback re-offers",
+                name: "idle equal sequence is the release installed from its archive's directory",
+                phase: idle("binary", None, 18),
+                event: fetched(18, &host(), "b"),
+                expect: (
+                    idle("binary", None, 18),
+                    vec![Command::Banner(UpdateBanner::UpToDate)],
+                ),
+            },
+            Case {
+                name: "idle equal sequence after a rollback is not downloaded again",
                 phase: idle("a", Some("b"), 18),
                 event: fetched(18, &host(), "b"),
                 expect: (
-                    Phase::Downloading(Downloading {
-                        pinned_sequence: 18,
-                        previous: Some(sha("b")),
-                        ..accepted.clone()
-                    }),
-                    vec![
-                        Command::Persist(Phase::Downloading(Downloading {
-                            pinned_sequence: 18,
-                            previous: Some(sha("b")),
-                            ..accepted.clone()
-                        })),
-                        Command::Download {
-                            sha: sha("b"),
-                            size: 42,
-                        },
-                    ],
+                    idle("a", Some("b"), 18),
+                    vec![Command::Banner(UpdateBanner::UpToDate)],
                 ),
             },
             Case {
@@ -995,6 +1008,26 @@ mod tests {
                 ),
             },
             Case {
+                name: "idle designated release at the pinned sequence is up to date",
+                phase: idle("binary", None, 18),
+                event: fetched_for("b", 18, &host(), "b"),
+                expect: (
+                    idle("binary", None, 18),
+                    vec![Command::Banner(UpdateBanner::UpToDate)],
+                ),
+            },
+            Case {
+                name: "idle designated release below the pinned sequence is a downgrade",
+                phase: idle("binary", None, 18),
+                event: fetched_for("b", 17, &host(), "b"),
+                expect: (
+                    idle("binary", None, 18),
+                    vec![Command::Banner(UpdateBanner::Refused(
+                        Refusal::SequenceNotNewer,
+                    ))],
+                ),
+            },
+            Case {
                 name: "idle designated what runs is up to date",
                 phase: idle("a", Some("z"), 17),
                 event: Event::Designated(sha("a")),
@@ -1062,7 +1095,7 @@ mod tests {
                 ),
             },
             Case {
-                name: "downloading verified seals, pins the sequence and stages",
+                name: "downloading verified seals and stages, the pin kept for the flip",
                 phase: Phase::Downloading(downloading("b", 18)),
                 event: Event::Verified(sha("b")),
                 expect: (
@@ -1196,18 +1229,16 @@ mod tests {
                 event: fetched(19, &host(), "c"),
                 expect: (
                     Phase::Downloading(Downloading {
-                        pinned_sequence: 18,
                         target: sha("c"),
                         sequence: 19,
                         ..accepted.clone()
                     }),
                     vec![
-                        Command::Persist(idle("a", Some("z"), 18)),
+                        Command::Persist(idle("a", Some("z"), 17)),
                         Command::Gc {
                             keep: vec![sha("a"), sha("z")],
                         },
                         Command::Persist(Phase::Downloading(Downloading {
-                            pinned_sequence: 18,
                             target: sha("c"),
                             sequence: 19,
                             ..accepted.clone()
@@ -1224,9 +1255,9 @@ mod tests {
                 phase: Phase::Staged(staged("a", "b")),
                 event: fetched(19, &host(), "a"),
                 expect: (
-                    idle("a", Some("z"), 18),
+                    idle("a", Some("z"), 17),
                     vec![
-                        Command::Persist(idle("a", Some("z"), 18)),
+                        Command::Persist(idle("a", Some("z"), 17)),
                         Command::Gc {
                             keep: vec![sha("a"), sha("z")],
                         },
@@ -1268,9 +1299,9 @@ mod tests {
                 phase: refused("a", "b", "codesign_invalid"),
                 event: Event::UserRollback,
                 expect: (
-                    idle("a", Some("z"), 18),
+                    idle("a", Some("z"), 17),
                     vec![
-                        Command::Persist(idle("a", Some("z"), 18)),
+                        Command::Persist(idle("a", Some("z"), 17)),
                         Command::Gc {
                             keep: vec![sha("a"), sha("z")],
                         },
@@ -1288,9 +1319,9 @@ mod tests {
                 phase: refused("a", "b", "not_armed"),
                 event: Event::Designated(sha("c")),
                 expect: (
-                    idle("a", Some("z"), 18),
+                    idle("a", Some("z"), 17),
                     vec![
-                        Command::Persist(idle("a", Some("z"), 18)),
+                        Command::Persist(idle("a", Some("z"), 17)),
                         Command::Gc {
                             keep: vec![sha("a"), sha("z")],
                         },
@@ -1303,13 +1334,13 @@ mod tests {
                 phase: Phase::Staged(staged("a", "b")),
                 event: Event::Designated(sha("z")),
                 expect: (
-                    restaged("a", "z", 18),
+                    restaged("a", "z", 17),
                     vec![
-                        Command::Persist(idle("a", Some("z"), 18)),
+                        Command::Persist(idle("a", Some("z"), 17)),
                         Command::Gc {
                             keep: vec![sha("a"), sha("z")],
                         },
-                        Command::Persist(restaged("a", "z", 18)),
+                        Command::Persist(restaged("a", "z", 17)),
                         restaged_banner("z"),
                     ],
                 ),
@@ -1319,9 +1350,9 @@ mod tests {
                 phase: Phase::Staged(staged("a", "b")),
                 event: Event::Designated(sha("a")),
                 expect: (
-                    idle("a", Some("z"), 18),
+                    idle("a", Some("z"), 17),
                     vec![
-                        Command::Persist(idle("a", Some("z"), 18)),
+                        Command::Persist(idle("a", Some("z"), 17)),
                         Command::Gc {
                             keep: vec![sha("a"), sha("z")],
                         },
@@ -1624,10 +1655,30 @@ mod tests {
 
         // the user can discard it
         let (discarded, commands) = step(refused, Event::UserRollback);
-        assert_eq!(discarded, idle("a", Some("z"), 18));
+        assert_eq!(discarded, idle("a", Some("z"), 17));
         assert_eq!(
             commands,
-            vec![Command::Persist(idle("a", Some("z"), 18)), collected]
+            vec![Command::Persist(idle("a", Some("z"), 17)), collected]
+        );
+    }
+
+    /// A release that staged but never ran leaves the pin where it was: the
+    /// network designating another turns it away, and designating it again
+    /// offers it at its own sequence — never read as the release that runs.
+    #[test]
+    fn a_discarded_stage_is_offered_again_at_its_own_sequence() {
+        let (turned_away, _) = step(Phase::Staged(staged("a", "b")), Event::Designated(sha("a")));
+        assert_eq!(turned_away, idle("a", Some("z"), 17));
+        let (asked, commands) = step(turned_away, Event::Designated(sha("b")));
+        assert_eq!(commands, vec![Command::FetchDesignated(sha("b"))]);
+        let (offered, commands) = step(asked, fetched_for("b", 18, &host(), "b"));
+        assert!(matches!(offered, Phase::Downloading(_)), "{offered:?}");
+        assert_eq!(
+            commands.last(),
+            Some(&Command::Download {
+                sha: sha("b"),
+                size: 42
+            })
         );
     }
 

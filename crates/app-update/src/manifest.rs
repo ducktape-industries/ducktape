@@ -96,6 +96,36 @@ impl Manifest {
     }
 }
 
+/// Which release an archive is, in its own words: `release.json` at the
+/// archive root, which `ops/release/archive.sh --sequence --display` writes
+/// and a launcher extracts into `releases/<sha>/` with everything else.
+///
+/// ```json
+/// {"sequence":18,"display":"2026.09.2+9d71b254a"}
+/// ```
+///
+/// An archive is named by its own sha256, so it can never carry that sha; it
+/// carries its sequence instead. An install seeded from an extracted archive
+/// takes that sequence as its pin, so the channel publishing the same sequence
+/// reads as the release it already runs. A directory without the file (a
+/// developer's build) knows no sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseIdentity {
+    pub sequence: u64,
+    pub display: String,
+}
+
+impl ReleaseIdentity {
+    /// The file's name, at the archive root.
+    pub const FILE: &'static str = "release.json";
+
+    /// The file's text; anything but exactly these two fields is refused.
+    pub fn decode(text: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(text)
+    }
+}
+
 /// An (os, arch) pair, the artifact map's key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Platform {
@@ -193,6 +223,25 @@ mod tests {
         assert!(json.contains("\"macos-aarch64\""));
         let back: Manifest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, manifest);
+    }
+
+    /// The exact text `ops/release/archive.sh` writes decodes, and a file
+    /// with a field missing or one more is refused, not read as sequence 0.
+    #[test]
+    fn release_identity_reads_what_archive_sh_writes_and_nothing_else() {
+        let written = "{\"sequence\":18,\"display\":\"2026.09.2+9d71b254a\"}\n";
+        assert_eq!(
+            ReleaseIdentity::decode(written).unwrap(),
+            ReleaseIdentity {
+                sequence: 18,
+                display: "2026.09.2+9d71b254a".into(),
+            }
+        );
+        assert!(ReleaseIdentity::decode("{\"display\":\"x\"}").is_err());
+        assert!(
+            ReleaseIdentity::decode("{\"sequence\":1,\"display\":\"x\",\"sha256\":\"y\"}").is_err()
+        );
+        assert!(ReleaseIdentity::decode("{\"sequence\":-1,\"display\":\"x\"}").is_err());
     }
 
     #[test]

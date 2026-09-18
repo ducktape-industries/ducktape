@@ -12,12 +12,23 @@
 #   ops/release/archive.sh --from target/app-bundle/Ducktape.app   # macOS app
 #   ops/release/archive.sh --from target/app-release               # Linux app
 #   ops/release/archive.sh --kind node --from target/release       # the node
+#   ops/release/archive.sh --kind node --from target/release \
+#       --sequence 3 --display "2026.09.3+e6352411a"
 #
 # What the archive holds, at its root, is what the launcher on that side
 # extracts into `releases/<sha>/`:
 #   app, macOS   Ducktape.app/                             (the whole bundle)
 #   app, Linux   ducktape-launcher, ducktape-app, views/*.wasm
 #   node         ducktape, ducktape-node-launcher, modules/
+#   with --sequence and --display, also `release.json`:
+#                {"sequence":3,"display":"2026.09.3+e6352411a"}
+#
+# `release.json` is the archive's identity (`app_update::ReleaseIdentity`):
+# an archive is named by its own sha256 and so can never carry it, but it can
+# carry its sequence, and an install made from the extracted directory takes
+# that sequence as its pin — the channel publishing that same sequence is then
+# the release it already runs. `ops/release/publish.sh` refuses an archive
+# whose `release.json` disagrees with its own --sequence/--display.
 #
 # THE NODE ARCHIVE IS NOT JUST THE BINARY. A node founds and joins from a
 # FOUNDING SET of wasm files it reads at runtime — no binary carries one — and
@@ -46,9 +57,11 @@ set -euo pipefail
 FROM=""
 KIND="app"
 OUT_DIR="${RELEASE_ARCHIVE_DIR:-target/release-archive}"
+SEQUENCE=""
+DISPLAY_TEXT=""
 
 usage() {
-  sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,54p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
@@ -57,6 +70,8 @@ while [ $# -gt 0 ]; do
     --from) FROM="$2"; shift 2 ;;
     --kind) KIND="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
+    --sequence) SEQUENCE="$2"; shift 2 ;;
+    --display) DISPLAY_TEXT="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) echo "archive.sh: unknown argument $1" >&2; usage ;;
   esac
@@ -68,6 +83,19 @@ esac
 [ -n "$FROM" ] || { echo "archive.sh: --from <built release> is required" >&2; exit 2; }
 [ -d "$FROM" ] || { echo "archive.sh: $FROM is not a directory" >&2; exit 1; }
 command -v zstd >/dev/null || { echo "archive.sh: zstd is not installed (brew install zstd / apt install zstd)" >&2; exit 1; }
+# The identity is both fields or none: the reader refuses half of one. The
+# sequence is written as a JSON number and the display as a JSON string, so
+# only what needs no escaping in either is taken.
+if [ -n "$SEQUENCE$DISPLAY_TEXT" ]; then
+  { [ -n "$SEQUENCE" ] && [ -n "$DISPLAY_TEXT" ]; } \
+    || { echo "archive.sh: --sequence and --display are given together or not at all" >&2; exit 2; }
+  case "$SEQUENCE" in
+    *[!0-9]*|0?*) echo "archive.sh: --sequence takes a number without leading zeros, not $SEQUENCE" >&2; exit 2 ;;
+  esac
+  case "$DISPLAY_TEXT" in
+    *[\"\\]*|*[[:cntrl:]]*) echo "archive.sh: --display takes no quote, backslash or control character: $DISPLAY_TEXT" >&2; exit 2 ;;
+  esac
+fi
 
 case "$(uname -s)" in
   Darwin) OS=macos ;;
@@ -172,8 +200,8 @@ pack_node() {
   require_executable "$FROM/ducktape" node_missing
   require_executable "$FROM/ducktape-node-launcher" launcher_missing
   resolve_founding_set "$FROM"
-  STAGE=$(mktemp -d)
-  trap 'rm -rf "$STAGE"' EXIT
+  STAGE="$SCRATCH/node"
+  mkdir "$STAGE"
   cp "$FROM/ducktape" "$FROM/ducktape-node-launcher" "$STAGE/"
   cp -R "$FOUNDING_SET" "$STAGE/modules"
   PARENT="$STAGE"
@@ -181,10 +209,18 @@ pack_node() {
   echo "founding set: $FOUNDING_SET (staged by $(cat "$FOUNDING_SET/.staged-by"))" >&2
 }
 
+SCRATCH=$(mktemp -d)
+trap 'rm -rf "$SCRATCH"' EXIT
 case "$KIND" in
   app) pack_app ;;
   node) pack_node ;;
 esac
+# The identity rides at the root beside the members, written here rather
+# than into --from.
+if [ -n "$SEQUENCE" ]; then
+  printf '{"sequence":%s,"display":"%s"}\n' "$SEQUENCE" "$DISPLAY_TEXT" >"$SCRATCH/release.json"
+  MEMBERS+=(-C "$SCRATCH" release.json)
+fi
 
 mkdir -p "$OUT_DIR"
 OUT_DIR=$(cd "$OUT_DIR" && pwd -P)

@@ -49,13 +49,15 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use app_update::{Event, Idle, Phase, PublicKey, ReleaseStatus, Sha, TrustedKeys, state};
+use app_update::{
+    Event, Idle, Phase, PublicKey, ReleaseIdentity, ReleaseStatus, Sha, TrustedKeys, state,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::layout::{Layout, MODULES_DIR, NODE_EXE};
 use crate::node::{Child, Ducktape};
 use crate::refusal::Refusal;
-use crate::update::{Executor, Failure, KeyPin, Next, Refused, Retry, Settled, Watch};
+use crate::update::{Executor, Failure, Heard, KeyPin, Next, Refused, Retry, Settled, Watch};
 
 pub const TARGET: &str = "ducktape::update";
 
@@ -380,7 +382,7 @@ fn one_node_life(
         attempt: 1,
     }
     .drive(phase, Event::Boot)?;
-    if let Some(refused) = &boot.refused {
+    if let Heard::Refused(refused) = &boot.heard {
         // A staged release's boot qualify is refused for want of a height
         // (`no_committed_height`): not an answer about the release, which the
         // poll loop asks once a live node can say where the chain is.
@@ -450,7 +452,7 @@ fn one_node_life(
         let settled = driven.unwrap_or_else(|refusal| Settled {
             phase: before.clone(),
             run: None,
-            refused: Some(Refused::Launcher(refusal)),
+            heard: Heard::Refused(Refused::Launcher(refusal)),
         });
         phase = settled.phase;
         // What the drive DID, after the writers that did it: `report` above
@@ -468,7 +470,7 @@ fn one_node_life(
                 "the update machine settled"
             );
         }
-        answered(watch, next, &before, settled.refused.as_ref());
+        answered(watch, next, &before, &settled.heard);
         if !flipping {
             continue;
         }
@@ -629,21 +631,26 @@ fn report(next: Next, phase: &Phase, status: &ReleaseStatus, attempt: u64) {
 /// [`Failure::Transient`] one is asked again after a backoff — the next poll,
 /// then doubling to [`BACKOFF_CAP_POLLS`] — and said at attempt 1 then every
 /// [`REPORT_EVERY`]th. An answer with no refusal ends any retry.
-fn answered(watch: &mut Watch, next: Next, before: &Phase, refused: Option<&Refused>) {
+///
+/// An UP-TO-DATE answer spends its release too: a node installed from the
+/// designated archive's directory runs it under the sha of its binary, not of
+/// the archive, so the designation never names what runs and would otherwise
+/// be offered, fetched and answered the same on every poll.
+fn answered(watch: &mut Watch, next: Next, before: &Phase, heard: &Heard) {
     match next {
-        Next::Offer(designated) => settle(watch, designated, refused),
-        Next::Flip => settle_flip(watch, before, refused),
+        Next::Offer(designated) => settle(watch, designated, heard),
+        Next::Flip => settle_flip(watch, before, heard),
         Next::Dismiss => spend_rollback(watch, before),
         Next::Wait | Next::Healthy => {}
     }
 }
 
 /// A flip asks about the release it staged: a refused qualify spends it.
-fn settle_flip(watch: &mut Watch, before: &Phase, refused: Option<&Refused>) {
+fn settle_flip(watch: &mut Watch, before: &Phase, heard: &Heard) {
     let Phase::Staged(staged) = before else {
         return;
     };
-    settle(watch, staged.staged, refused);
+    settle(watch, staged.staged, heard);
 }
 
 /// The release a rollback flipped away from never came up: it is spent.
@@ -654,20 +661,28 @@ fn spend_rollback(watch: &mut Watch, before: &Phase) {
     watch.refused = Some(rolled_back.failed);
 }
 
-/// Record what one drive answered about `release`, and say a no at its cadence.
-fn settle(watch: &mut Watch, release: Sha, refused: Option<&Refused>) {
-    let Some(refused) = refused else {
-        watch.retry = None;
-        return;
-    };
+/// Record what one drive answered about `release`.
+fn settle(watch: &mut Watch, release: Sha, heard: &Heard) {
+    match heard {
+        Heard::Nothing => watch.retry = None,
+        Heard::UpToDate => spend(watch, release),
+        Heard::Refused(refused) => settle_refused(watch, release, refused),
+    }
+}
+
+/// Asked again, `release` would answer the same: not asked again this life.
+fn spend(watch: &mut Watch, release: Sha) {
+    watch.refused = Some(release);
+    watch.retry = None;
+}
+
+/// Class a no about `release`, and say it at its cadence.
+fn settle_refused(watch: &mut Watch, release: Sha, refused: &Refused) {
     let attempts = watch.attempt_at(release);
     let failure = update::failure(refused);
     say_refused(refused, release, failure, attempts);
     match failure {
-        Failure::Definite => {
-            watch.refused = Some(release);
-            watch.retry = None;
-        }
+        Failure::Definite => spend(watch, release),
         Failure::Transient => {
             watch.retry = Some(Retry {
                 release,
@@ -822,7 +837,10 @@ fn await_identity(ducktape: &Ducktape) -> bool {
 /// Seed the first release: the binary becomes `releases/<sha of it>/ducktape`,
 /// `current` names it, and `state.json` starts at `Idle`. Every release after
 /// this one is named by its ARCHIVE's sha, which is what the signed manifest
-/// carries; this one has no archive, so it is named by its own bytes.
+/// carries; this one has no archive, so it is named by its own bytes. What
+/// it knows of the archive it came out of is the `release.json` beside it:
+/// that sequence is the pin, so the channel publishing it again is up to
+/// date. Without one (a developer's build) the pin is 0.
 fn install(layout: &Layout, from: &std::path::Path, release_key: Option<&str>) -> ExitCode {
     match seed(layout, from, release_key) {
         Ok(sha) => {
@@ -843,6 +861,8 @@ fn seed(
     release_key: Option<&str>,
 ) -> Result<Sha, Refusal> {
     let sha = writers::digest_file(from)?;
+    let shipped_identity = from.with_file_name(ReleaseIdentity::FILE);
+    let identity = read_identity(&shipped_identity)?;
     let release_dir = layout.release_dir(sha);
     std::fs::create_dir_all(&release_dir)
         .map_err(|error| Refusal::io("install_failed", &release_dir, &error))?;
@@ -865,6 +885,7 @@ fn seed(
         let _ = std::fs::remove_file(&exe);
         std::fs::copy(from, &exe).map_err(|error| Refusal::io("install_failed", &exe, &error))?;
         seed_founding_set(from, &release_dir)?;
+        seed_identity(&shipped_identity, &release_dir)?;
     }
     writers::require_release(&release_dir)?;
     writers::seal(&release_dir);
@@ -878,10 +899,38 @@ fn seed(
     let idle = Phase::Idle(Idle {
         current: sha,
         previous: None,
-        pinned_sequence: 0,
+        pinned_sequence: identity.map_or(0, |identity| identity.sequence),
     });
     writers::persist(&layout.state_path(), &state::encode(&idle))?;
     Ok(sha)
+}
+
+/// The identity at `path`, or `None` when there is no file. One that does not
+/// decode is refused: read as sequence 0, it would take whatever the channel
+/// publishes.
+fn read_identity(path: &std::path::Path) -> Result<Option<ReleaseIdentity>, Refusal> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Refusal::io("release_identity_unreadable", path, &error)),
+    };
+    ReleaseIdentity::decode(&text).map(Some).map_err(|error| {
+        Refusal::new("release_identity_invalid", format!("{}: {error}", path.display()))
+    })
+}
+
+/// The identity that shipped beside the binary, into the release this install
+/// seeds — so installing again from `<workspace>/current/ducktape` keeps the
+/// sequence — and never one a former install of the same bytes left there.
+fn seed_identity(shipped: &std::path::Path, release_dir: &std::path::Path) -> Result<(), Refusal> {
+    let seeded = release_dir.join(ReleaseIdentity::FILE);
+    let _ = std::fs::remove_file(&seeded);
+    if !shipped.is_file() {
+        return Ok(());
+    }
+    std::fs::copy(shipped, &seeded)
+        .map(drop)
+        .map_err(|error| Refusal::io("install_failed", &seeded, &error))
 }
 
 /// The founding set that shipped beside `from`, into the release this install
@@ -1072,9 +1121,9 @@ mod tests {
             pinned_sequence: 2,
         });
         let mut watch = Watch::default();
-        answered(&mut watch, Next::Wait, &rolled_back, None);
+        answered(&mut watch, Next::Wait, &rolled_back, &Heard::Nothing);
         assert_eq!(watch, Watch::default());
-        answered(&mut watch, Next::Dismiss, &rolled_back, None);
+        answered(&mut watch, Next::Dismiss, &rolled_back, &Heard::Nothing);
         assert_eq!(watch.refused, Some(failed));
     }
 
@@ -1085,10 +1134,10 @@ mod tests {
         let target = Sha::digest(b"b");
         let staged = staged("a", target);
         let mut watch = Watch::default();
-        answered(&mut watch, Next::Flip, &staged, None);
+        answered(&mut watch, Next::Flip, &staged, &Heard::Nothing);
         assert_eq!(watch, Watch::default(), "a flip that ran is not spent");
-        let refused = Refused::Qualify("wit_world_mismatch".into());
-        answered(&mut watch, Next::Flip, &staged, Some(&refused));
+        let refused = Heard::Refused(Refused::Qualify("wit_world_mismatch".into()));
+        answered(&mut watch, Next::Flip, &staged, &refused);
         assert_eq!(watch.refused, Some(target));
     }
 
@@ -1098,12 +1147,41 @@ mod tests {
     fn an_offer_refused_definitely_spends_its_designation() {
         let target = Sha::digest(b"b");
         let mut watch = Watch::default();
-        answered(&mut watch, Next::Offer(target), &idle("a"), None);
+        answered(&mut watch, Next::Offer(target), &idle("a"), &Heard::Nothing);
         assert_eq!(watch, Watch::default(), "an offer that staged is not spent");
-        let refused = Refused::Verify("sha256_mismatch".into());
-        answered(&mut watch, Next::Offer(target), &idle("a"), Some(&refused));
+        let refused = Heard::Refused(Refused::Verify("sha256_mismatch".into()));
+        answered(&mut watch, Next::Offer(target), &idle("a"), &refused);
         assert_eq!(watch.refused, Some(target));
         assert_eq!(watch.retry, None);
+    }
+
+    /// An offer answered UP TO DATE spends its designation: a node installed
+    /// from the designated archive's directory runs it under its binary's sha,
+    /// so the designation never names what runs, and without spending it every
+    /// poll offers it, reads the manifest and says so again.
+    #[test]
+    fn an_offer_answered_up_to_date_spends_its_designation() {
+        let designated = Sha::digest(b"archive");
+        let mut watch = Watch {
+            retry: Some(Retry {
+                release: designated,
+                attempts: 3,
+                polls_left: 0,
+            }),
+            ..Watch::default()
+        };
+        answered(&mut watch, Next::Offer(designated), &idle("binary"), &Heard::UpToDate);
+        assert_eq!((watch.refused, watch.retry), (Some(designated), None));
+
+        let status = ReleaseStatus {
+            designation: Some(app_update::Designation {
+                sha256: designated,
+                activation_height: 1,
+            }),
+            height: 900,
+            ..committing(None)
+        };
+        assert_eq!(update::decide(&idle("binary"), &status, &watch), Next::Wait);
     }
 
     /// A TRANSIENT no never spends the release: it is asked again after a
@@ -1112,10 +1190,10 @@ mod tests {
     #[test]
     fn an_offer_refused_transiently_is_asked_again_after_a_growing_backoff() {
         let target = Sha::digest(b"b");
-        let refused = Refused::Download("short_read".into());
+        let refused = Heard::Refused(Refused::Download("short_read".into()));
         let mut watch = Watch::default();
         for attempts in 1..=4 {
-            answered(&mut watch, Next::Offer(target), &idle("a"), Some(&refused));
+            answered(&mut watch, Next::Offer(target), &idle("a"), &refused);
             assert_eq!(watch.refused, None, "a transient no spends nothing");
             assert_eq!(
                 watch.retry,
@@ -1128,16 +1206,16 @@ mod tests {
         }
         // another release starts its own count
         let other = Sha::digest(b"c");
-        answered(&mut watch, Next::Offer(other), &idle("a"), Some(&refused));
+        answered(&mut watch, Next::Offer(other), &idle("a"), &refused);
         assert_eq!(watch.retry.map(|retry| (retry.release, retry.attempts)), Some((other, 1)));
         // and a transient run that turns definite is spent after all
-        let forged = Refused::Manifest(app_update::Refusal::BadSignature);
-        answered(&mut watch, Next::Offer(other), &idle("a"), Some(&forged));
+        let forged = Heard::Refused(Refused::Manifest(app_update::Refusal::BadSignature));
+        answered(&mut watch, Next::Offer(other), &idle("a"), &forged);
         assert_eq!((watch.refused, watch.retry), (Some(other), None));
 
         let mut watch = Watch::default();
-        answered(&mut watch, Next::Offer(target), &idle("a"), Some(&refused));
-        answered(&mut watch, Next::Offer(target), &idle("a"), None);
+        answered(&mut watch, Next::Offer(target), &idle("a"), &refused);
+        answered(&mut watch, Next::Offer(target), &idle("a"), &Heard::Nothing);
         assert_eq!(watch, Watch::default(), "the read that landed ends the retry");
     }
 
@@ -1275,6 +1353,112 @@ mod tests {
         let sha = seed(&layout, &binary, None).unwrap();
         assert!(!layout.release_dir(sha).join("modules").exists());
         writers::require_release(&layout.release_dir(sha)).expect("still a runnable release");
+    }
+
+    /// The node manifest a launcher fetched for the release its network
+    /// designates, publishing `archive` for this host at `sequence`.
+    fn designated_manifest(archive: Sha, sequence: u64) -> Event {
+        let manifest = app_update::Manifest {
+            schema: app_update::SCHEMA,
+            channel: app_update::Kind::Node.channel().into(),
+            sequence,
+            published_at: "2026-09-18T00:00:00Z".into(),
+            release: app_update::Release {
+                sha256_id: Sha::ZERO,
+                display: format!("0.1.0+{sequence}"),
+                node_contract: 0,
+                notes_url: String::new(),
+            },
+            artifacts: [(
+                app_update::Platform::HOST.key(),
+                app_update::Artifact {
+                    sha256: archive,
+                    size: 42,
+                },
+            )]
+            .into(),
+            successor_key: None,
+        }
+        .sealed();
+        Event::DesignatedManifestFetched {
+            designated: archive,
+            result: Ok(app_update::VerifiedManifest { manifest }),
+        }
+    }
+
+    /// AN INSTALL FROM AN EXTRACTED ARCHIVE KNOWS ITS SEQUENCE: the
+    /// `release.json` beside the binary is its pin. The network designating
+    /// that archive at the same sequence downloads nothing — the install runs
+    /// it under its binary's sha, never the archive's — a lower sequence is a
+    /// downgrade, and a higher one is offered. Installing again over
+    /// `current/ducktape` keeps the sequence.
+    #[test]
+    fn an_install_from_an_extracted_archive_is_up_to_date_at_its_own_sequence() {
+        use app_update::{Command, Refusal as Manifest, UpdateBanner};
+        let dir = tempfile::tempdir().unwrap();
+        let unpacked = dir.path().join("unpacked");
+        std::fs::create_dir_all(&unpacked).unwrap();
+        let binary = unpacked.join("ducktape");
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            unpacked.join("release.json"),
+            "{\"sequence\":7,\"display\":\"0.1.0+abc1234\"}\n",
+        )
+        .unwrap();
+        let layout = Layout::of(dir.path().join("workspace"));
+        seed(&layout, &binary, None).unwrap();
+        let installed = writers::read_state(&layout.state_path()).unwrap().unwrap();
+        assert_eq!(installed.pinned_sequence(), 7);
+
+        let archive = Sha::digest(b"the archive it was unpacked out of");
+        let offered_at = |sequence| {
+            let (asked, commands) = app_update::step(installed.clone(), Event::Designated(archive));
+            assert_eq!(commands, vec![Command::FetchDesignated(archive)]);
+            app_update::step(asked, designated_manifest(archive, sequence))
+        };
+        assert_eq!(
+            offered_at(7),
+            (installed.clone(), vec![Command::Banner(UpdateBanner::UpToDate)]),
+            "the release it was installed from is not downloaded again"
+        );
+        assert_eq!(
+            offered_at(6),
+            (
+                installed.clone(),
+                vec![Command::Banner(UpdateBanner::Refused(Manifest::SequenceNotNewer))]
+            )
+        );
+        let (newer, commands) = offered_at(8);
+        assert!(matches!(newer, Phase::Downloading(_)), "{newer:?}");
+        assert_eq!(
+            commands.last(),
+            Some(&Command::Download {
+                sha: archive,
+                size: 42
+            })
+        );
+
+        seed(&layout, &layout.exe(), Some(&"11".repeat(32))).unwrap();
+        let again = writers::read_state(&layout.state_path()).unwrap().unwrap();
+        assert_eq!(again.pinned_sequence(), 7, "installing over current keeps the sequence");
+    }
+
+    /// A `release.json` that does not decode refuses the install by name
+    /// before anything is written: read as sequence 0 it would take whatever
+    /// the channel publishes.
+    #[test]
+    fn an_identity_that_does_not_decode_refuses_the_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("ducktape");
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(dir.path().join("release.json"), "{\"sequence\":\"seven\"}").unwrap();
+        let layout = Layout::of(dir.path().join("workspace"));
+
+        let refused = seed(&layout, &binary, None).unwrap_err();
+        assert_eq!(refused.reason, "release_identity_invalid");
+        assert!(!layout.state_path().exists(), "nothing was installed");
     }
 
     /// Pinning a key on a workspace that is already running one is this verb
