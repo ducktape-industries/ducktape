@@ -6,7 +6,7 @@
 //! ```text
 //! <workspace>/node.toml                      the node's own config (or --config)
 //! <workspace>/updates/state.json             the update machine's phase
-//! <workspace>/updates/launcher.lock          the running `run`'s exclusive claim
+//! <workspace>/updates/launcher.lock          the one writer's claim: a `run`, an `install`
 //! <workspace>/updates/keys/release.pub       the pinned release key
 //! <workspace>/updates/keys/successor.json    a key rotation this install saw
 //! <workspace>/updates/releases/<sha>/ducktape
@@ -86,7 +86,8 @@ impl Layout {
         workspace::launcher_state_path(&self.workspace)
     }
 
-    /// What a `run` holds for as long as it supervises this workspace.
+    /// What a `run` holds for as long as it supervises this workspace, and an
+    /// `install` for as long as it writes.
     pub fn lock_path(&self) -> PathBuf {
         self.updates().join(LOCK_FILE)
     }

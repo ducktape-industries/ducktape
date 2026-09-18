@@ -430,10 +430,20 @@ pub(super) async fn wire(
                                     // R2: a terminal refusal means this invite can
                                     // NEVER redeem — stop loudly instead of
                                     // spinning candidates toward the same answer.
-                                    fatal!(race_label, "join gate refused \
-                                         ({code:?}): {detail} — this invite cannot be \
-                                         redeemed. ask the inviter for a fresh invite and \
-                                         re-join with the new blob.");
+                                    // NOT `fatal!`: its exit status is the one a
+                                    // supervisor reads as "do not start me again",
+                                    // because every restart asks the same question.
+                                    tracing::error!(
+                                        target: "ducktape::join",
+                                        node = %race_label,
+                                        reason = "invite_unredeemable",
+                                        "FATAL: join gate refused ({code:?}): {detail} — this \
+                                         invite cannot be redeemed. ask the inviter for a \
+                                         fresh invite and re-join with the new blob."
+                                    );
+                                    std::process::exit(i32::from(
+                                        app_update::release_status::EXIT_INVITE_UNREDEEMABLE,
+                                    ));
                                 }
                                 first_contact_join::FirstContactOutcome::Terminal {
                                     tried,

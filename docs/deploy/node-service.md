@@ -43,7 +43,9 @@ one, and logs `node_update_release_key_pinned` once. A pin already on disk is
 never overwritten: one that differs from the network's key is refused as
 `release_key_pinned_differs` (at attempt 1, then every 60th poll, both keys
 named) and stays the key followed; `ducktape-node-launcher install
---release-key <hex>` is the explicit way to move it. Until the network commits
+--release-key <hex>`, with the unit stopped, is the explicit way to move it
+(an install refuses a workspace a running launcher holds:
+`workspace_locked`). Until the network commits
 a key, an unpinned launcher refuses each designated release as
 `no_release_key`. `ducktape release status` prints both sides:
 `release_key node` (the network's) and `pinned` (this workspace's).
@@ -160,8 +162,10 @@ dt node list                              # the chain id the instance names
 
 # 6. Seed the first release under the launcher — ONCE: after this the
 #    launcher owns `current`. No --release-key: the launcher pins the key the
-#    network committed on its first read. Then name the workspace the service
-#    units run over.
+#    network committed on its first read. Before it writes anything, the
+#    install refuses a directory with no node.toml (`node_config_missing`)
+#    and a binary with no `modules/` beside it (`founding_set_missing`).
+#    Then name the workspace the service units run over.
 W='/var/lib/ducktape/mynet#d0cdf950'
 sudo -u ducktape env DUCKTAPE_HOME=/var/lib/ducktape ducktape-node-launcher install \
   --workspace "$W" --config "$W/node.toml" --from /usr/local/lib/ducktape/ducktape
@@ -200,6 +204,12 @@ sudo systemctl enable --now "ducktape-node@$(systemd-escape 'mynet#d0cdf950')"
 dt node status                            # height + root hash, once it serves
 dt release status                         # the designated release, the network's key, this pin
 ```
+
+A joiner whose invite the network refused exits 77 and so does its launcher,
+which the unit does not restart (`RestartPreventExitStatus=77`): every restart
+would ask the same question and hear the same no. `systemctl status` shows the
+unit failed and the journal carries the refusal; join again with a fresh
+invite, then start the unit.
 
 Service daemons: the instance is the kind (`compute`, `agent`, `airlock`),
 and the workspace is `DUCKTAPE_WORKSPACE` from `/etc/ducktape/workspace.env`.

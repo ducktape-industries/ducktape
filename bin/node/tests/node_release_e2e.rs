@@ -1115,6 +1115,9 @@ fn joined_under_launcher(release_key: Option<&str>) -> Joined {
     let invite = cluster.invite();
     cluster.join_friend(&invite);
 
+    // the founding set beside the seed, as in every shape a node ships in:
+    // the install carries it into the release it seeds.
+    private_modules(dir.path());
     let seed = dir.path().join("ducktape-v1");
     write_executable(&seed, &release_binary("v1", false));
     let mut install = Command::new(launcher_exe());
