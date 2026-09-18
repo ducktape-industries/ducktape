@@ -915,7 +915,7 @@ mod tests {
     /// the genesis code set the pins compose over: the founding set the build
     /// staged beside this test executable — the committed components (the
     /// kernel fixtures pin the same bytes) and the founding views
-    /// (`topology::VIEWS`, staged out of `make views`), read and hashed at
+    /// (`topology::VIEWS`, staged out of `crates/views`), read and hashed at
     /// test time, never embedded. The same set `node init` composes.
     fn fixture_genesis() -> GenesisModules {
         // `{why}`, not `expect`: the refusal carries its remedy on its own

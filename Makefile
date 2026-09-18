@@ -19,7 +19,7 @@ LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all airlock-gateway-image rcodesign dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install-node install-coordinator test clean wasm-modules wasm-modules-check modules-sync wasm-embed-check labs-gate audit
+.PHONY: all airlock-gateway-image rcodesign dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install-node install-coordinator test clean wasm-modules wasm-modules-check modules-sync views-sync wasm-embed-check labs-gate audit
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -371,6 +371,46 @@ modules-sync:
 	  cp "$$src" crates/noded/tests/fixtures/$$id.component.wasm || exit 1; \
 	done
 	@echo "synced the guests core does not build"
+
+# where the founding views are built: core commits their bytes, not their
+# source, and names the commit they were built at.
+VIEWS_DIR ?= ../ducktape-views
+VIEWS_REV ?= HEAD
+# the founding ids that carry a view: the topology::PRODUCTION modules with a
+# view crate in ducktape-views, then the view-only topology::VIEWS.
+SYNC_VIEWS := chat files forge governance inbox pages home canvas
+
+## commit each founding view as crates/views/<id>/view.wasm (+ its crate's
+## assets/ as crates/views/<id>/assets/) and write crates/views/views.lock:
+## the ducktape-views commit and each view's sha256. The views are built out
+## of a `git archive` of VIEWS_REV by ducktape-views' own ops/build-views.sh,
+## so neither a working-tree edit nor a stale target/views over there reaches
+## the bytes — the lock's commit is the source of every byte beside it, and a
+## second run at the same commit changes nothing (ducktape-views'
+## ops/views-repro-check.sh holds that build reproducible).
+views-sync:
+	@rev=$$(git -C "$(VIEWS_DIR)" rev-parse --verify --quiet "$(VIEWS_REV)^{commit}") \
+	  || { echo "views-sync: views_rev_unknown: no commit $(VIEWS_REV) in $(VIEWS_DIR) (set VIEWS_DIR, VIEWS_REV)"; exit 1; }; \
+	src="$(CURDIR)/target/views-sync/$$rev"; \
+	mkdir -p "$$src" crates/views && git -C "$(VIEWS_DIR)" archive "$$rev" | tar -x -C "$$src" || exit 1; \
+	packages=; \
+	for id in $(SYNC_VIEWS); do \
+	  test -f "$$src/$$id/Cargo.toml" || { echo "views-sync: view_missing: ducktape-views $$rev has no $$id view crate"; exit 1; }; \
+	  packages="$$packages -p $$id-view"; \
+	done; \
+	(cd "$$src" && CARGO_TARGET_DIR="$(CURDIR)/target/views-sync/cargo" bash ops/build-views.sh $$packages) || exit 1; \
+	lock=crates/views/views.lock; \
+	{ echo "# written by make views-sync: the ducktape-views commit the views beside"; \
+	  echo "# this file were built at, and the sha256 of each <id>/view.wasm"; \
+	  echo "rev $$rev"; } > "$$lock" || exit 1; \
+	for id in $(SYNC_VIEWS); do \
+	  out="crates/views/$$id"; \
+	  rm -rf "$$out" && mkdir "$$out" || exit 1; \
+	  cp "$$src/target/views/$${id}_view.wasm" "$$out/view.wasm" || exit 1; \
+	  ! test -d "$$src/$$id/assets" || cp -R "$$src/$$id/assets" "$$out/assets" || exit 1; \
+	  echo "$$id $$(shasum -a 256 < "$$out/view.wasm" | cut -d' ' -f1)" >> "$$lock" || exit 1; \
+	done
+	@echo "synced the founding views"
 
 ## the binary embeds no wasm (AGENTS.md, "No Embedded Wasm"): an
 ## include_bytes!/include_str! of a `.wasm` is allowed only in a test — a file

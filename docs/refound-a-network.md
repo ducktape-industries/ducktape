@@ -78,9 +78,8 @@ straight from one may belong to a sibling whose wire has already moved; the
 copy must prove its ancestry (`git merge-base --is-ancestor`) against this
 checkout's HEAD before anything is founded with it. A binary built from a tree
 with tracked changes stamps `<short sha>-<diff digest>`; the digest is not a
-rev, so it comes off before the test and stays in the printed line. The set is
-checked for `*.pending` markers, which are views whose staging was
-interrupted, and the report names the set the genesis was composed from.
+rev, so it comes off before the test and stays in the printed line. The
+report names the set the genesis was composed from.
 
 **The launcher's child needs the set too.** `ducktape-node-launcher` runs
 `<workspace>/current/ducktape`, and a node resolves its founding set beside its

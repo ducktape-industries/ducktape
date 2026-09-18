@@ -128,8 +128,8 @@ pub const PRODUCTION: &[&str] = &[
 
 /// The founding VIEW-ONLY entries: registry entries of `Kind::View` with no
 /// consensus code, staged beside the production set as `<id>.view.wasm` +
-/// `<id>.assets` out of `target/views` (built by `make views` from
-/// `crates/views/<id>`), and composed by `node init` into the same genesis.
+/// `<id>.assets` out of the committed `crates/views/<id>` (`make views-sync`
+/// refreshes it), and composed by `node init` into the same genesis.
 /// A view here draws a tab in the app off the registry alone; it must not
 /// also be a module id.
 pub const VIEWS: &[&str] = &["home", "canvas"];
