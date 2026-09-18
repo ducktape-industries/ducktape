@@ -593,7 +593,6 @@ mod tests {
         merged_plumbing(dir, &PlumbingOverrides::default()).expect("fresh merge")
     }
 
-    /// the generated file round-trips through the strict parser and its
     /// No TCP listener a node binds EAGERLY may default into the ephemeral
     /// range, because the kernel hands those ports out to outbound connections
     /// and the loser of that race is a node that will not start.
@@ -607,17 +606,38 @@ mod tests {
     /// 51820 that firewalls and NAT forwards are written against, and answers a
     /// failed bind with a logged retry rather than a panic — so it is named
     /// here as a deliberate exclusion instead of quietly not being checked.
+    ///
+    /// The re-found routine's set is a default too — every network it founds
+    /// runs on it, and it names its ports explicitly, so the constants never
+    /// reach that node.toml. It sat at 32989+, and a resident restarting there
+    /// lost its http port to an outbound socket for 25 s.
     #[test]
     fn no_tcp_default_sits_in_the_ephemeral_range() {
-        for (key, value) in [
+        let flagless = [
             ("listen", DEFAULT_MESH_LISTEN),
             ("http_listen", DEFAULT_HTTP_LISTEN),
             ("rpc_listen", DEFAULT_RPC_LISTEN),
-        ] {
+        ]
+        .map(|(key, value)| (key, value.rsplit_once(':').map_or(value, |(_, port)| port)));
+        // `F_HTTP=28800 F_GATEWAY=…`: the founder's (F_) and the resident's
+        // (J_) tcp surfaces. WG and INVITE are the UDP exclusion above.
+        let routine: Vec<(&str, &str)> = include_str!("../../../ops/refound-net.sh")
+            .split_whitespace()
+            .filter_map(|word| word.split_once('='))
+            .filter(|(key, _)| {
+                let surface = key.strip_prefix("F_").or_else(|| key.strip_prefix("J_"));
+                surface.is_some_and(|surface| ["HTTP", "GATEWAY", "RPC", "P2P"].contains(&surface))
+            })
+            .collect();
+        assert_eq!(
+            routine.len(),
+            8,
+            "four tcp surfaces each for the founder and the resident: {routine:?}"
+        );
+        for (key, value) in flagless.into_iter().chain(routine) {
             let port = value
-                .rsplit_once(':')
-                .and_then(|(_, port)| port.parse::<u16>().ok())
-                .unwrap_or_else(|| panic!("{key} default {value:?} names a port"));
+                .parse::<u16>()
+                .unwrap_or_else(|_| panic!("{key} default {value:?} names a port"));
             assert!(
                 port < EPHEMERAL_FLOOR,
                 "{key} defaults to {port}, inside the kernel's ephemeral range \

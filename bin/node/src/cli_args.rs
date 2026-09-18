@@ -1008,24 +1008,24 @@ mod tests {
             home.path(),
             "net",
             "dognet#d2a0ec8f",
-            "127.0.0.1:32989",
-            "127.0.0.1:36989",
+            "127.0.0.1:28800",
+            "127.0.0.1:28820",
         );
         let resident = write_workspace(
             home.path(),
             "net-joiner",
             "dognet#d2a0ec8f",
-            "127.0.0.1:32990",
-            "127.0.0.1:36990",
+            "127.0.0.1:28801",
+            "127.0.0.1:28821",
         );
 
         assert_eq!(
-            workspace_serving_in(home.path(), "http://127.0.0.1:32989"),
+            workspace_serving_in(home.path(), "http://127.0.0.1:28800"),
             Ok(founder),
             "the founder's own port did not reach the founder"
         );
         assert_eq!(
-            workspace_serving_in(home.path(), "http://127.0.0.1:32990"),
+            workspace_serving_in(home.path(), "http://127.0.0.1:28801"),
             Ok(resident),
             "the resident's own port did not reach the resident"
         );
@@ -1042,10 +1042,10 @@ mod tests {
             home.path(),
             "other",
             "kitchen#99887766",
-            "127.0.0.1:32989",
-            "127.0.0.1:36991",
+            "127.0.0.1:28800",
+            "127.0.0.1:28822",
         );
-        let Err(why) = workspace_serving_in(home.path(), "http://127.0.0.1:32989") else {
+        let Err(why) = workspace_serving_in(home.path(), "http://127.0.0.1:28800") else {
             panic!("two workspaces on one base must refuse, not pick the first");
         };
         assert!(why.contains("several workspaces serve"), "{why}");
@@ -1062,24 +1062,24 @@ mod tests {
             home.path(),
             "net",
             "dognet#d2a0ec8f",
-            "127.0.0.1:32989",
-            "127.0.0.1:36989",
+            "127.0.0.1:28800",
+            "127.0.0.1:28820",
         );
         let resident = write_workspace(
             home.path(),
             "net-joiner",
             "dognet#d2a0ec8f",
-            "127.0.0.1:32990",
-            "127.0.0.1:36990",
+            "127.0.0.1:28801",
+            "127.0.0.1:28821",
         );
 
         assert_eq!(
-            workspace_for_rpc_in(home.path(), "127.0.0.1:36989"),
+            workspace_for_rpc_in(home.path(), "127.0.0.1:28820"),
             Ok(founder),
             "the founder's own rpc port did not reach the founder"
         );
         assert_eq!(
-            workspace_for_rpc_in(home.path(), "127.0.0.1:36990"),
+            workspace_for_rpc_in(home.path(), "127.0.0.1:28821"),
             Ok(resident),
             "the resident's own rpc port did not reach the resident"
         );
@@ -1096,10 +1096,10 @@ mod tests {
             home.path(),
             "other",
             "kitchen#99887766",
-            "127.0.0.1:32991",
-            "127.0.0.1:36989",
+            "127.0.0.1:28802",
+            "127.0.0.1:28820",
         );
-        let Err(why) = workspace_for_rpc_in(home.path(), "127.0.0.1:36989") else {
+        let Err(why) = workspace_for_rpc_in(home.path(), "127.0.0.1:28820") else {
             panic!("two workspaces on one rpc address must refuse, not pick the first");
         };
         assert!(why.contains("several workspaces serve"), "{why}");

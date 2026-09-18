@@ -141,7 +141,7 @@ the launcher reads and what an operator watches:
 
 ```
 ducktape release status --json --config <workspace>/node.toml
-{"base":"http://127.0.0.1:36989","height":6454,
+{"base":"http://127.0.0.1:28800","height":6454,
  "designation":{"activation_height":6468,"sha256":"619b38a3…"}, …}
 ```
 
