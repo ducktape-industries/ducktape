@@ -2455,6 +2455,7 @@ fn seed_forge_at(port: u16, workspace: &Path, source: &Path, name: &str, branch:
             prev_oid: previous,
             new_oid: Some(head.as_bytes().to_vec()),
         }],
+        tags: Vec::new(),
         pack_digest: Some(duckfs_core::from_hex_32(&digest).unwrap().to_vec()),
         cert: None,
     });

@@ -316,7 +316,7 @@ impl<G: GitRead> Reader<'_, G> {
     }
 
     fn revision(&self, repo: &str, rev: &str) -> Result<Option<Oid>, Error> {
-        let Some(refs) = self.image.repos.get(repo) else {
+        let Some(refs) = self.image.repos.get(repo).map(|refs| &refs.branches) else {
             return Ok(None);
         };
         let Some(head) = refs
@@ -401,6 +401,7 @@ impl<G: GitRead> Reader<'_, G> {
             .image
             .repos
             .get(repo)
+            .map(|refs| &refs.branches)
             .ok_or_else(|| Error::module("unknown_repo", format!("forge: no repo {repo:?}")))?;
         let source = refs.get(&source_branch).copied().ok_or_else(|| {
             Error::module(
@@ -706,14 +707,14 @@ impl<G: GitRead> Reader<'_, G> {
                 self.image
                     .repos
                     .get(DEFAULT_REPO)
-                    .and_then(|refs| refs.get(MAIN_BRANCH))
+                    .and_then(|refs| refs.branches.get(MAIN_BRANCH))
                     .map(ToString::to_string),
             ),
             ForgeQuery::HeadOf { repo } => ForgeReply::Head(
                 self.image
                     .repos
                     .get(&norm_repo(&repo)?)
-                    .and_then(|refs| refs.get(MAIN_BRANCH))
+                    .and_then(|refs| refs.branches.get(MAIN_BRANCH))
                     .map(ToString::to_string),
             ),
             ForgeQuery::ListRepos => ForgeReply::Repos(
@@ -723,8 +724,9 @@ impl<G: GitRead> Reader<'_, G> {
                     .map(|(name, refs)| RepoHead {
                         name: name.clone(),
                         head: refs
+                            .branches
                             .get(INTEGRATION_BRANCH)
-                            .or_else(|| refs.get(MAIN_BRANCH))
+                            .or_else(|| refs.branches.get(MAIN_BRANCH))
                             .map(ToString::to_string),
                     })
                     .collect(),
@@ -734,10 +736,26 @@ impl<G: GitRead> Reader<'_, G> {
                     .repos
                     .get(&norm_repo(&repo)?)
                     .map(|refs| {
-                        refs.iter()
+                        refs.branches
+                            .iter()
                             .map(|(name, oid)| RefHead {
                                 name: name.clone(),
                                 head: oid.to_string(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ),
+            ForgeQuery::ListTags { repo } => ForgeReply::Tags(
+                self.image
+                    .repos
+                    .get(&norm_repo(&repo)?)
+                    .map(|refs| {
+                        refs.tags
+                            .iter()
+                            .map(|(name, oid)| TagRef {
+                                name: name.clone(),
+                                oid: oid.to_string(),
                             })
                             .collect()
                     })

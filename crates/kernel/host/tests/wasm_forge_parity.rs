@@ -223,6 +223,7 @@ fn push(updates: Vec<RefUpdate>, pack: Option<[u8; 32]>) -> Msg {
     op(&ForgeMsg::PushRefs {
         repo: REPO.into(),
         updates,
+        tags: Vec::new(),
         pack_digest: pack.map(|d| d.to_vec()),
         cert: None,
     })
@@ -817,10 +818,11 @@ fn a_push_certificate_checks_the_chain_id_identically_on_both_runtimes() {
             new_oid: Some(vec![7u8; 20]),
         }];
         let cert_text =
-            forge::pushcert::certificate(&forge::pushcert::nonce(chain_id, REPO), &updates);
+            forge::pushcert::certificate(&forge::pushcert::nonce(chain_id, REPO), &updates, &[]);
         op(&ForgeMsg::PushRefs {
             repo: REPO.into(),
             updates,
+            tags: Vec::new(),
             pack_digest: Some(vec![9u8; 32]),
             cert: Some(PushCert {
                 sshsig: sshsig(&sk, GIT_SSH_NS, &cert_text),

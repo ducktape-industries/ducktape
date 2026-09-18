@@ -20,6 +20,8 @@ use git2::{
     Buf, Commit, DiffFormat, DiffOptions, ErrorCode, ObjectType, Oid, Repository,
     RepositoryInitOptions, Tree,
 };
+
+use crate::refs::{HEADS_PREFIX, TAGS_PREFIX};
 #[cfg(test)]
 use git2::{Signature, Time};
 
@@ -113,28 +115,66 @@ pub fn update_ref(repo: &Repository, name: &str, target: Oid) -> Result<(), git2
     Ok(())
 }
 
-/// the ref namespace forge manages — every branch lives under it and the wire
-/// carries SHORT names ("main", "feature/x"); this prefix is a local detail.
-pub const HEADS_PREFIX: &str = "refs/heads/";
-
 /// every born branch as `(short_name, oid)`, sorted by name (glob iteration is
 /// alphabetical in libgit2, but sort explicitly — the caller composes state
 /// from this). the multi-ref analogue of `resolve_ref(MAIN_REF)` for restart
 /// re-adopt.
 pub fn list_branches(repo: &Repository) -> Result<Vec<(String, Oid)>, git2::Error> {
+    list_under(repo, HEADS_PREFIX)
+}
+
+/// every tag as `(short_name, oid)`, sorted by name — the oid the ref names,
+/// which is the tag OBJECT for an annotated tag.
+pub fn list_tags(repo: &Repository) -> Result<Vec<(String, Oid)>, git2::Error> {
+    list_under(repo, TAGS_PREFIX)
+}
+
+/// every direct ref under `prefix` as `(short_name, oid)`, sorted by name.
+fn list_under(repo: &Repository, prefix: &str) -> Result<Vec<(String, Oid)>, git2::Error> {
     let mut out = Vec::new();
-    for r in repo.references_glob(&format!("{HEADS_PREFIX}*"))? {
+    for r in repo.references_glob(&format!("{prefix}*"))? {
         let r = r?;
         let (Some(name), Some(oid)) = (r.name(), r.target()) else {
             continue; // symbolic or non-utf8 ref — not one forge writes
         };
-        let Some(short) = name.strip_prefix(HEADS_PREFIX) else {
+        let Some(short) = name.strip_prefix(prefix) else {
             continue;
         };
         out.push((short.to_string(), oid));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
+}
+
+/// every ref tip on disk, branches and tags — what a pack of "everything this
+/// repo holds" starts from.
+pub fn ref_tips(repo: &Repository) -> Result<Vec<Oid>, git2::Error> {
+    let branches = list_branches(repo)?;
+    let tags = list_tags(repo)?;
+    Ok(branches
+        .into_iter()
+        .chain(tags)
+        .map(|(_, oid)| oid)
+        .collect())
+}
+
+/// put the annotated-tag objects a head names into `pb`. a revwalk PEELS a
+/// tag to its commit, so the walk alone packs the commit's closure and drops
+/// the tag object itself — and a receiver's closure check of that head then
+/// fails on the one object it never got. a commit head adds nothing here.
+fn insert_tag_objects(
+    repo: &Repository,
+    pb: &mut git2::PackBuilder<'_>,
+    heads: &[Oid],
+) -> Result<(), git2::Error> {
+    for head in heads {
+        let mut oid = *head;
+        while let Ok(tag) = repo.find_tag(oid) {
+            pb.insert_object(oid, None)?;
+            oid = tag.target_id();
+        }
+    }
+    Ok(())
 }
 
 /// pack the FULL object closure reachable from EVERY head into one
@@ -151,6 +191,7 @@ pub fn pack_closure_many(repo: &Repository, heads: &[Oid]) -> Result<Vec<u8>, gi
     for oid in walk {
         pb.insert_commit(oid?)?;
     }
+    insert_tag_objects(repo, &mut pb, heads)?;
     let mut buf = Buf::new();
     pb.write_buf(&mut buf)?;
     Ok(buf.to_vec())
@@ -173,6 +214,7 @@ pub fn pack_delta(repo: &Repository, heads: &[Oid], bases: &[Oid]) -> Result<Vec
         walk.hide(*base)?;
     }
     pb.insert_walk(&mut walk)?;
+    insert_tag_objects(repo, &mut pb, heads)?;
     let mut buf = Buf::new();
     pb.write_buf(&mut buf)?;
     Ok(buf.to_vec())
@@ -214,7 +256,7 @@ fn pack_files(dir: &Path) -> Result<BTreeSet<PathBuf>, git2::Error> {
 }
 
 /// collapse a repo holding MORE than `min_packs` packfiles into ONE carrying
-/// the closure of every on-disk branch head, and return how many packs that
+/// the closure of every on-disk branch and tag, and return how many packs that
 /// reclaimed (`0` = left alone).
 ///
 /// [`install_pack`] adds one pack per materialized push and libgit2 implements
@@ -240,10 +282,7 @@ fn pack_files(dir: &Path) -> Result<BTreeSet<PathBuf>, git2::Error> {
 pub fn compact(repo: &Repository, min_packs: usize) -> Result<usize, git2::Error> {
     let pack_dir = repo.path().join("objects").join("pack");
     let before = pack_files(&pack_dir)?;
-    let heads: Vec<Oid> = list_branches(repo)?
-        .into_iter()
-        .map(|(_, oid)| oid)
-        .collect();
+    let heads = ref_tips(repo)?;
     let worth_compacting = before.len() > min_packs && !heads.is_empty();
     if !worth_compacting {
         return Ok(0);

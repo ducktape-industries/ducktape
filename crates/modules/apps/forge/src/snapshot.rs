@@ -7,15 +7,18 @@
 //! ```text
 //! "FGv1"                                    # 4-byte magic
 //! u32-LE(repo_count)
-//! per BORN repo, sorted by name:            # born == at least one branch
+//! per BORN repo, sorted by name:            # born == at least one ref
 //!   u32-LE(name_len) name
-//!   u32-LE(ref_count)
+//!   u32-LE(branch_count)
 //!   per branch, sorted by short name:
 //!     u32-LE(branch_len) branch  [20-byte head oid]
-//!   u32-LE(pending_count)                   # branches whose objects are absent
-//!   per pending branch, sorted:
-//!     u32-LE(branch_len) branch  [20-byte head oid] [32-byte pack digest]
-//!   u32-LE(pack_len) pack                   # closure of the NON-pending heads
+//!   u32-LE(tag_count)
+//!   per tag, sorted by short name:
+//!     u32-LE(tag_len) tag  [20-byte oid]
+//!   u32-LE(pending_count)                   # refs whose objects are absent
+//!   per pending ref, sorted:
+//!     u32-LE(refname_len) FULL refname  [20-byte head oid] [32-byte pack digest]
+//!   u32-LE(pack_len) pack                   # closure of the NON-pending refs
 //! u32-LE(tracker_len) tracker-canonical-bytes
 //! ```
 //!
@@ -39,9 +42,8 @@ use crate::codec::{self, Reader};
 use crate::git;
 use crate::module::{CachedPack, FORGE_SNAPSHOT_MAGIC, Forge, SNAPSHOT_CACHE_FILE, SnapshotCache};
 use crate::norm_repo;
-use crate::oid::{OID_RAW_LEN, Oid};
-use crate::refs::{RepoState, full_ref, norm_branch, open_or_init_repo};
-use crate::state::compose_state_root;
+use crate::refs::{RepoRefs, RepoState, open_or_init_repo};
+use crate::state::{compose_state_root, put_ref_map, take_ref_map};
 use crate::tracker::Tracker;
 
 /// Latest-only node-local pack memo:
@@ -73,7 +75,7 @@ impl SnapshotCache {
 
 impl Forge {
     /// serialize the COMMITTED state into self-contained snapshot bytes (see
-    /// the container layout above). only born branches are carried — they are
+    /// the container layout above). only born refs are carried — they are
     /// exactly what contributes to `root()` — plus the tracker's canonical
     /// bytes. staged (this-block) state is deliberately excluded.
     pub fn snapshot(&self) -> Result<Vec<u8>, Error> {
@@ -84,7 +86,7 @@ impl Forge {
             .state
             .repos
             .iter()
-            .filter(|(_, s)| !s.refs.is_empty())
+            .filter(|(_, s)| s.is_born())
             .map(|(n, s)| (n.as_str(), s))
             .collect();
         let mut cache_slot = self.snapshot_cache.borrow_mut();
@@ -95,7 +97,7 @@ impl Forge {
         codec::put_u32(&mut out, born.len() as u32);
         for (name, state) in born {
             // pack the closure of the heads this node actually holds objects
-            // for. a PENDING branch is by definition one whose objects never
+            // for. a PENDING ref is by definition one whose objects never
             // arrived, so it contributes nothing to the pack and travels in
             // the pending section instead — packing it would fail, and that
             // failure used to abort the whole host capture (killing this
@@ -117,20 +119,14 @@ impl Forge {
                 }),
             };
             codec::put_str(&mut out, name);
-            codec::put_u32(&mut out, state.refs.len() as u32);
-            for (branch, oid) in &state.refs {
-                codec::put_str(&mut out, branch);
-                out.extend_from_slice(oid.as_bytes());
-            }
+            put_ref_map(&mut out, &state.refs);
+            put_ref_map(&mut out, &state.tags);
             crate::refs::put_pending(&mut out, state.pending());
             codec::put_bytes(&mut out, &pack.bytes);
         }
-        cache.packs.retain(|name, _| {
-            self.state
-                .repos
-                .get(name)
-                .is_some_and(|state| !state.refs.is_empty())
-        });
+        cache
+            .packs
+            .retain(|name, _| self.state.repos.get(name).is_some_and(RepoState::is_born));
         codec::put_bytes(&mut out, &self.state.tracker.canonical_bytes());
 
         let current_keys = cache.keys();
@@ -155,11 +151,8 @@ impl Forge {
     /// which of those heads this node is still waiting to materialize.
     fn repo_pack_key(state: &RepoState) -> [u8; 32] {
         let mut encoded = Vec::new();
-        codec::put_u32(&mut encoded, state.refs.len() as u32);
-        for (branch, oid) in &state.refs {
-            codec::put_str(&mut encoded, branch);
-            encoded.extend_from_slice(oid.as_bytes());
-        }
+        put_ref_map(&mut encoded, &state.refs);
+        put_ref_map(&mut encoded, &state.tags);
         crate::refs::put_pending(&mut encoded, state.pending());
         Sha256::digest(encoded).into()
     }
@@ -170,10 +163,10 @@ impl Forge {
 
         let repo = open_or_init_repo(&self.base, name)?;
         let heads: Vec<git2::Oid> = state
-            .refs
+            .committed()
             .iter()
-            .filter(|(branch, _)| !state.pending().contains_key(*branch))
-            .map(|(_, oid)| git2::Oid::from(*oid))
+            .filter(|(refname, _)| !state.pending().contains_key(refname))
+            .map(|(_, oid)| git2::Oid::from(oid))
             .collect();
         git::pack_closure_many(&repo, &heads)
             .map_err(|error| Error::module("git_pack_closure", error.to_string()))
@@ -213,7 +206,7 @@ impl Forge {
                 .state
                 .repos
                 .get(&name)
-                .filter(|state| !state.refs.is_empty())
+                .filter(|state| state.is_born())
                 .map(Self::repo_pack_key);
             if current_key != Some(key) {
                 continue;
@@ -233,7 +226,7 @@ impl Forge {
             .state
             .repos
             .iter()
-            .filter(|(_, state)| !state.refs.is_empty())
+            .filter(|(_, state)| state.is_born())
             .map(|(name, state)| (name.clone(), Self::repo_pack_key(state)))
             .collect();
         let persisted_keys = (disk_keys == current_keys).then_some(disk_keys);
@@ -284,17 +277,17 @@ impl Forge {
     /// the order is verify-then-mutate:
     ///
     /// 1. PARSE the entire container with a bounds-checked reader — no write.
-    /// 2. ROOT GATE: the composed root of the parsed branches + tracker must
+    /// 2. ROOT GATE: the composed root of the parsed refs + tracker must
     ///    equal `expected` before any byte reaches an odb.
     /// 3. INSTALL each repo's pack (libgit2 re-hashes every object) and
     ///    require the full closure of every head the pack CLAIMS to cover —
-    ///    i.e. every non-pending branch — still moving no ref.
-    /// 4. PUBLISH: full replacement — unbind every on-disk branch the snapshot
-    ///    drops, move every branch whose objects arrived, rebuild the map with
-    ///    the pending branches re-adopted as catch-up targets, swap the tracker
+    ///    i.e. every non-pending branch and tag — still moving no ref.
+    /// 4. PUBLISH: full replacement — unbind every on-disk ref the snapshot
+    ///    drops, move every ref whose objects arrived, rebuild the maps with
+    ///    the pending refs re-adopted as catch-up targets, swap the tracker
     ///    in and persist both.
     ///
-    /// a PENDING branch is committed state (it is in the root gate of step 2)
+    /// a PENDING ref is committed state (it is in the root gate of step 2)
     /// whose objects the sender did not hold either. its ref is deliberately
     /// left unmoved and its digest recorded, so this node retries materialize
     /// exactly as the sender does — never trusted content, just a target.
@@ -316,45 +309,31 @@ impl Forge {
         let mut parsed: BTreeMap<String, ParsedRepo> = BTreeMap::new();
         for _ in 0..count {
             let name = norm_repo(&r.str_()?)?;
-            let ref_count = r.u32()?;
-            if ref_count == 0 {
+            let refs = RepoRefs {
+                branches: take_ref_map(&mut r, "snapshot_decode", &name)?,
+                tags: take_ref_map(&mut r, "snapshot_decode", &name)?,
+            };
+            if refs.is_empty() {
                 return Err(Error::module(
                     "snapshot_decode",
                     format!(
-                        "forge snapshot: repo {name} carries no branches \
+                        "forge snapshot: repo {name} carries no refs \
                          (unborn repos are not serialized)"
                     ),
                 ));
             }
-            let mut refs = BTreeMap::new();
-            for _ in 0..ref_count {
-                let branch = r.str_()?;
-                norm_branch(&branch)?;
-                let oid = Oid::from_bytes(r.take(OID_RAW_LEN)?)?;
-                if oid.is_zero() {
-                    return Err(Error::module(
-                        "snapshot_decode",
-                        format!("forge snapshot: branch {branch} of {name} carries a zero oid"),
-                    ));
-                }
-                if refs.insert(branch, oid).is_some() {
-                    return Err(Error::module(
-                        "snapshot_decode",
-                        format!("forge snapshot: duplicate branch in repo {name}"),
-                    ));
-                }
-            }
             let pending = crate::refs::take_pending(&mut r)?;
-            // a catch-up target for a branch this snapshot does not commit, or
+            // a catch-up target for a ref this snapshot does not commit, or
             // for a different head than it commits, would leave the receiver
             // materializing toward state no root ever gated.
-            for (branch, (head, _)) in &pending {
-                if refs.get(branch) != Some(head) {
+            for (pending_ref, (head, _)) in &pending {
+                if refs.head(pending_ref) != Some(*head) {
                     return Err(Error::module(
                         "snapshot_decode",
                         format!(
-                            "forge snapshot: pending branch {branch} of {name} does not \
-                             match the committed head"
+                            "forge snapshot: pending {} of {name} does not \
+                             match the committed head",
+                            pending_ref.full()
                         ),
                     ));
                 }
@@ -383,7 +362,9 @@ impl Forge {
         }
 
         // ---- PHASE 2: root gate BEFORE any byte reaches an odb --------------
-        let entries = parsed.iter().map(|(n, repo)| (n.as_str(), &repo.refs));
+        let entries = parsed
+            .iter()
+            .map(|(n, repo)| (n.as_str(), &repo.refs.branches, &repo.refs.tags));
         let composed = compose_state_root(entries, &tracker);
         if composed != expected {
             return Err(Error::module(
@@ -397,28 +378,28 @@ impl Forge {
             let repo = open_or_init_repo(&self.base, name)?;
             git::install_pack(&repo, parsed_repo.pack)
                 .map_err(|e| Error::module("git_install_pack", e.to_string()))?;
-            for (branch, oid) in &parsed_repo.refs {
-                if parsed_repo.pending.contains_key(branch) {
+            for (refname, oid) in parsed_repo.refs.iter() {
+                if parsed_repo.pending.contains_key(&refname) {
                     continue;
                 }
-                git::verify_closure(&repo, (*oid).into())
+                git::verify_closure(&repo, oid.into())
                     .map_err(|e| Error::module("git_verify_closure", e.to_string()))?;
             }
         }
 
         // ---- PHASE 4: publish (full replacement) ----------------------------
-        // unbind every currently-committed branch the snapshot drops (durably,
+        // unbind every currently-committed ref the snapshot drops (durably,
         // so a restart re-adopt can't resurrect it) — dropped repos AND dropped
-        // branches of surviving repos.
+        // refs of surviving repos.
         for (name, state) in &self.state.repos {
-            if state.refs.is_empty() {
+            if !state.is_born() {
                 continue;
             }
             let keep = parsed.get(name).map(|repo| &repo.refs);
             let repo = open_or_init_repo(&self.base, name)?;
-            for branch in state.refs.keys() {
-                if keep.is_none_or(|refs| !refs.contains_key(branch)) {
-                    git::delete_ref(&repo, &full_ref(branch))
+            for (refname, _) in state.committed().iter() {
+                if keep.is_none_or(|refs| refs.head(&refname).is_none()) {
+                    git::delete_ref(&repo, &refname.full())
                         .map_err(|e| Error::module("git_delete_ref", e.to_string()))?;
                 }
             }
@@ -427,16 +408,16 @@ impl Forge {
         let mut new_repos = BTreeMap::new();
         for (name, parsed_repo) in parsed {
             let repo = open_or_init_repo(&self.base, &name)?;
-            for (branch, oid) in &parsed_repo.refs {
-                // a pending branch's objects are absent: moving its ref would
+            for (refname, oid) in parsed_repo.refs.iter() {
+                // a pending ref's objects are absent: moving its ref would
                 // dangle. `materialize` moves it once the pack arrives.
-                if parsed_repo.pending.contains_key(branch) {
+                if parsed_repo.pending.contains_key(&refname) {
                     continue;
                 }
-                git::update_ref(&repo, &full_ref(branch), (*oid).into())
+                git::update_ref(&repo, &refname.full(), oid.into())
                     .map_err(|e| Error::module("git_update_ref", e.to_string()))?;
             }
-            let mut state = RepoState::with_refs(parsed_repo.refs);
+            let mut state = RepoState::with_committed(parsed_repo.refs);
             state.adopt_pending(parsed_repo.pending);
             new_repos.insert(name, state);
         }
@@ -451,7 +432,7 @@ impl Forge {
 
 /// one repo's parsed container section, before any byte reaches an odb.
 struct ParsedRepo<'a> {
-    refs: BTreeMap<String, Oid>,
+    refs: RepoRefs,
     pending: crate::refs::PendingMap,
     pack: &'a [u8],
 }
