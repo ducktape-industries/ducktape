@@ -125,7 +125,7 @@ impl Ducktape {
     /// checkpoint and recomposes the committed root hash, which is exactly the
     /// restart path a live node takes. Its first stdout line is the reason
     /// when it cannot.
-    pub fn qualify(staged: &Path, config: &Path) -> Result<(), Refusal> {
+    pub fn qualify(staged: &Path, config: &Path) -> Result<(), Unqualified> {
         let output = Command::new(staged)
             .args(["node", "qualify"])
             .arg("--config")
@@ -134,21 +134,31 @@ impl Ducktape {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|error| Refusal::io("qualify_spawn_failed", staged, &error))?;
+            .map_err(|error| {
+                Unqualified::from(Refusal::io("qualify_spawn_failed", staged, &error))
+            })?;
         if output.status.success() {
             return Ok(());
         }
-        let printed = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string);
-        let detail = printed.unwrap_or_else(|| match output.status.code() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let printed = stdout.lines().next().map(str::trim).unwrap_or_default();
+        let ended = match output.status.code() {
             Some(code) => format!("exited {code}"),
             None => "killed".to_string(),
-        });
-        Err(Refusal::new("qualify_refused", detail))
+        };
+        // The binary's stderr already reached this launcher's log; its token
+        // is the part only it can name.
+        let gave_a_token = is_token(printed);
+        match gave_a_token {
+            true => Err(Unqualified {
+                reason: printed.to_string(),
+                detail: ended,
+            }),
+            false => Err(Unqualified {
+                reason: "qualify_refused".to_string(),
+                detail: format!("{ended}; printed {printed:?}"),
+            }),
+        }
     }
 
     /// Start the child this launcher supervises: the install path's binary,
@@ -162,6 +172,33 @@ impl Ducktape {
             .map_err(|error| Refusal::io("spawn_failed", &self.exe, &error))?;
         Ok(Child { inner })
     }
+}
+
+/// Why a staged binary will not run this workspace. `reason` is the binary's
+/// OWN snake_case token — `node qualify` prints one on its first stdout line,
+/// by contract — or this launcher's `qualify_refused` when it gave none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unqualified {
+    pub reason: String,
+    pub detail: String,
+}
+
+impl From<Refusal> for Unqualified {
+    fn from(refusal: Refusal) -> Self {
+        Unqualified {
+            reason: refusal.reason.to_string(),
+            detail: refusal.detail,
+        }
+    }
+}
+
+/// A `reason` field is a stable snake_case token, never prose: what a staged
+/// binary prints is trusted as one only when it is one.
+fn is_token(line: &str) -> bool {
+    let token_bytes = line
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    !line.is_empty() && token_bytes
 }
 
 /// The supervised process.
