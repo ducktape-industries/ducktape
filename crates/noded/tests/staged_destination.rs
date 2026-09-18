@@ -1,9 +1,8 @@
 //! A staged destination is always keyed to the checkout that wrote it.
 //!
-//! The views this file used to cover ship from ducktape-app now, and their
-//! staging suite went with them. This lint stayed: it is the one that keeps
-//! several worktrees sharing one `CARGO_TARGET_DIR` from reading each other's
-//! founding set.
+//! This lint is the one that keeps several worktrees sharing one
+//! `CARGO_TARGET_DIR` from reading each other's founding set; the views the
+//! set carries are held by `tests/founding_views.rs`.
 
 #[allow(dead_code)]
 #[path = "../build.rs"]

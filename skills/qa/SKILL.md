@@ -44,7 +44,7 @@ artifacts under an iteration. `workspace_config::modules_dir()` honours
 through it, so a private snapshot holds one set still for the whole run:
 
 ```bash
-touch crates/noded/build.rs && cargo check -p noded    # restage; expect 0 *.pending
+touch crates/noded/build.rs && cargo check -p noded    # restage
 cp -a "$CARGO_TARGET_DIR/debug/modules$(pwd | tr / %)/." target/pin-modules/
 export DUCKTAPE_MODULES_DIR=$PWD/target/pin-modules
 ```

@@ -5,10 +5,8 @@
 //! `CARGO_TARGET_DIR` (that is the point of a shared target: one dependency
 //! build for every worktree), and then that profile directory is a directory
 //! several builds write. A set is not a shared thing: it says which wasm a
-//! `node init` from THIS checkout founds with, and a checkout that has not
-//! built its views says so by leaving `<id>.view.pending` in it — a statement
-//! about one build, sitting in a directory every build reads. One worktree's
-//! `cargo check` then made every other worktree's founding set refuse.
+//! `node init` from THIS checkout founds with — a statement about one
+//! checkout's committed artifacts, sitting in a directory every build reads.
 //!
 //! So the directory carries the checkout in its NAME: `modules-<key>` and
 //! `sim-modules-<key>`, where the key is the checkout's own path. Two

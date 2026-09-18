@@ -113,8 +113,6 @@ resolve_founding_set() {
     || refuse founding_set_incomplete "$FOUNDING_SET holds no <id>.component.wasm"
   [ -f "$FOUNDING_SET/netstack.component.wasm" ] \
     || refuse founding_set_incomplete "$FOUNDING_SET holds no netstack.component.wasm, so a node unpacking this release could not reach the mesh"
-  ! ls "$FOUNDING_SET"/*.view.pending >/dev/null 2>&1 \
-    || refuse views_pending "$FOUNDING_SET carries a .view.pending marker; a genesis cannot be composed from it (run 'make views' and rebuild)"
   # The set records which build staged it, and the binary beside it refuses a
   # set another build wrote (noded::services::founding_set). Packing a set
   # with no record ships a release that refuses itself on first use.

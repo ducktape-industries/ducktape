@@ -227,19 +227,18 @@ phase, and retain its block lead. Record both timestamps and activation heights.
 
 ### Preparing the actual view ceremony
 
-After the aggregate UI pin and view/assets staging CLI are integrated, build
-the views in [ducktape-views](https://github.com/ducktape-industries/ducktape-views)
-and stage its output into this checkout's `target/views` before rebuilding
-the node:
+The founding views are committed under `crates/views/`; to move them to a
+[ducktape-views](https://github.com/ducktape-industries/ducktape-views)
+commit, sync and commit them, then rebuild the node:
 
 ```sh
+make views-sync VIEWS_DIR=../ducktape-views VIEWS_REV=<commit>
 CARGO_TARGET_DIR="$PWD/target" cargo build --locked -p node-bin --bin ducktape
 ```
 
-The subsequent noded build stages `governance`, `files`, `pages`, `chat`, and
-`forge` views into the node profile's `modules` directory. Require all five
-`<id>.view.wasm` files and no
-`<id>.view.pending` markers before founding or rollout. Preserve
+The noded build stages every committed view into the node profile's founding
+set. Require the `governance`, `files`, `pages`, `chat`, and `forge`
+`<id>.view.wasm` files before founding or rollout. Preserve
 `pages.index.wasm` and `chat.index.wasm` in every ceremony; the other three
 owners have no mapper. Pass `--assets` only for an existing asset directory.
 Do not edit founding files to perform a live swap.

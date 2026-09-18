@@ -206,24 +206,12 @@ fi
 [ -n "$MODULES_SRC" ] && [ -d "$MODULES_SRC" ] \
     || die "no founding set found. build in this checkout, or set \$DUCKTAPE_MODULES_DIR."
 
-# A `*.pending` marker is a view whose staging was interrupted; founding on one
-# fails at genesis with that file named. Catch it here rather than three steps
-# in, and say what fixes it.
-#
 # Counted with a nullglob array, NOT `ls glob | wc -l`: under `pipefail` a glob
 # that matches nothing makes `ls` exit 2, the pipeline inherits it, and `set -e`
-# kills the script on the assignment — so the HEALTHY case is the one that
-# aborts the run.
+# kills the script on the assignment.
 shopt -s nullglob
-pending_views=( "$MODULES_SRC"/*.pending )
 staged_entries=( "$MODULES_SRC"/* )
 shopt -u nullglob
-if [ "${#pending_views[@]}" -ne 0 ]; then
-    printf 'refound-net: the founding set at %s has %d pending view(s):\n' \
-        "$MODULES_SRC" "${#pending_views[@]}" >&2
-    printf '  %s\n' "${pending_views[@]}" >&2
-    die "run \`make views\` in $CHECKOUT and build again."
-fi
 
 cp -r "$MODULES_SRC" "$STAGE/modules"
 echo "staged founding set $MODULES_SRC (${#staged_entries[@]} entries)"

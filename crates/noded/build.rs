@@ -26,13 +26,12 @@
 //! `staged_key.rs`; `workspace_config::modules_dir` resolves it) — so a built
 //! node is complete without an install step, and a second checkout sharing
 //! the target speaks only for its own set. The set is the checkout's committed
-//! artifacts (`make wasm-modules` refreshes them): one component per wasm
-//! module the topology names, plus one index guest per module that declares
-//! one by carrying a committed `index.wasm`. A declared artifact the
-//! checkout lacks fails the build here, naming the path, instead of `node
-//! init` later. Desktop view declarations instead leave a pending marker when
-//! output is missing: compilation succeeds and deployment preparation refuses
-//! the incomplete set until `make views` and restaging complete.
+//! artifacts (`make wasm-modules`, `make modules-sync` and `make views-sync`
+//! refresh them): one component per wasm module the topology names, plus one
+//! index guest per module that declares one by carrying a committed
+//! `index.wasm`, plus one view per founding id that declares one by carrying
+//! a committed `crates/views/<id>/view.wasm`. A declared artifact the checkout
+//! lacks fails the build here, naming the path, instead of `node init` later.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -160,7 +159,7 @@ fn sweep_abandoned_sets(profile_dir: &Path) {
 /// is the poisoning path this keying removed — one checkout writing a set
 /// every other checkout reads — and
 /// `a_staging_destination_is_always_keyed_to_the_checkout` (in
-/// `tests/view_staging.rs`) reads this file and fails if one comes back.
+/// `tests/staged_destination.rs`) reads this file and fails if one comes back.
 pub(crate) fn staged_dir(profile_dir: &Path, base: &str, checkout: &Path) -> PathBuf {
     profile_dir.join(staged_key::staged_set_name(base, checkout))
 }
@@ -181,7 +180,6 @@ pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str], views: &[
             .strip_suffix(".component.wasm")
             .or_else(|| name.strip_suffix(".index.wasm"))
             .or_else(|| name.strip_suffix(".view.wasm"))
-            .or_else(|| name.strip_suffix(".view.pending"))
             .or_else(|| name.strip_suffix(".assets"))
             .or_else(|| name.strip_suffix(".lanes"));
         let obsolete = artifact_id
@@ -232,6 +230,15 @@ pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str], views: &[
         assert!(
             topology::TOPOLOGY.spec(id).is_none(),
             "view {id} is also a module in the topology"
+        );
+        // a view-only entry has nothing but its view: topology::VIEWS declares
+        // it, so a checkout lacking the artifact fails here like a missing
+        // component, rather than founding a network without it.
+        let view = view_staging::committed_view(checkout, id);
+        assert!(
+            view.is_file(),
+            "view {id} is in topology::VIEWS but {} is not committed (run `make views-sync`)",
+            view.display()
         );
         view_staging::stage_view(checkout, dest, id).expect("stage founding view");
     }

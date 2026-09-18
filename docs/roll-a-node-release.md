@@ -106,8 +106,7 @@ set under `modules/`, the one name `workspace_config::modules_dir()` resolves
 beside an executable. That is what lets a host with nothing but this archive
 run `ducktape node init` — a binary carries no wasm, so a release without the
 set founds nothing. The script refuses a set that holds no components, holds
-no `netstack.component.wasm`, carries a `.view.pending` marker, or carries no
-`.staged-by` record for the binary beside it to match.
+no `netstack.component.wasm`, or carries no `.staged-by` record for the binary beside it to match.
 
 The printed file name is for the eye. The published name is derived from the
 archive's own sha256 by `app_update::layout`.

@@ -384,7 +384,8 @@ manifest memory limit for pack construction, not for the pack.
 ## Media service
 
 Build the process with `cargo build --release -p ducktape-media` and the
-companion view with `bash ops/build-views.sh -p call-view`. Deploy
+companion view in a ducktape-views checkout with
+`bash ops/build-views.sh -p call-view`. Deploy that checkout's
 `target/views/call_view.wasm` as the registry's `call` view. The desktop loads
 that artifact at runtime; its session owns call framing, mute/source controls,
 speaking state, and bounded audio playout. A separate instance of the same view
