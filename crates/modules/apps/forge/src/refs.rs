@@ -21,7 +21,7 @@ use std::path::Path;
 
 #[cfg(feature = "native")]
 use git2::Repository;
-use sdk::Error;
+use sdk::{Error, refusal};
 
 use crate::codec::{self, Reader};
 #[cfg(feature = "native")]
@@ -211,7 +211,7 @@ pub enum StagedRef {
     /// `materialize`.
     Packed(Oid, [u8; 32]),
     /// the branch is deleted (object-free — the ref just unbinds). a tag is
-    /// never staged for deletion: [`RepoState::stage_tag`] refuses it.
+    /// never staged for deletion: [`RepoState::stage_tag`] only creates.
     Delete,
 }
 
@@ -458,27 +458,24 @@ impl RepoState {
     }
 
     /// stage one tag creation — a tag's whole consensus gate. a tag is created
-    /// once and never moves: `prev` must be unborn, `new` must be set, and no
-    /// committed tag nor one staged earlier this block may hold the name.
-    /// anything else — a move, a delete, a second create — is refused as
-    /// `tag_immutable`. the objects ride the push's pack like a branch head's.
+    /// once and never moves, and `TagCreate` cannot spell a move or a delete:
+    /// what is left to refuse is a name a committed tag, or one staged earlier
+    /// this block, already holds (`already_exists`). the objects ride the
+    /// push's pack like a branch head's.
     pub fn stage_tag(
         &mut self,
         tag: &str,
-        prev: Option<Oid>,
-        new: Option<Oid>,
+        oid: Oid,
         digest: Option<[u8; 32]>,
     ) -> Result<(), Error> {
         let name = RefName::Tag(tag.to_string());
         let name_taken = self.tags.contains_key(tag) || self.staged.contains_key(&name);
-        let (None, Some(oid), false) = (prev, new, name_taken) else {
+        if name_taken {
             return Err(Error::module(
-                "tag_immutable",
-                format!(
-                    "forge: tag {tag:?} exists or would move; a tag is created once and never moves"
-                ),
+                refusal::ALREADY_EXISTS,
+                format!("Tag {tag:?} already exists; a tag is created once and never moves."),
             ));
-        };
+        }
         let digest = digest.ok_or_else(|| {
             Error::module("missing_pack_digest", "forge: a tag needs a pack digest")
         })?;
@@ -785,38 +782,26 @@ mod tests {
         let digest = Some([7u8; 32]);
 
         let mut st = RepoState::default();
-        st.stage_tag("v1", None, Some(a), digest).unwrap();
-        let again = st.stage_tag("v1", None, Some(b), digest).unwrap_err();
+        st.stage_tag("v1", a, digest).unwrap();
+        let again = st.stage_tag("v1", b, digest).unwrap_err();
         assert_eq!(
             reason(&again),
-            "tag_immutable",
+            refusal::ALREADY_EXISTS,
             "one create per name per block"
         );
         assert_eq!(st.published().tags.get("v1"), Some(&a));
         assert!(st.published().branches.is_empty(), "a tag is not a branch");
 
-        // against a COMMITTED tag every command is refused by name: a move, a
-        // delete, a re-create at another oid, and a re-create at the same one.
+        // against a COMMITTED tag a re-create is refused by name, at another
+        // oid (what a move would be) and at the same one.
         let mut committed = RepoState::default();
         committed.tags.insert("v1".into(), a);
-        for (prev, new) in [
-            (Some(a), Some(b)),
-            (Some(a), None),
-            (None, Some(b)),
-            (None, Some(a)),
-        ] {
-            let refused = committed.stage_tag("v1", prev, new, digest).unwrap_err();
-            assert_eq!(reason(&refused), "tag_immutable", "{prev:?} -> {new:?}");
+        for oid in [b, a] {
+            let refused = committed.stage_tag("v1", oid, digest).unwrap_err();
+            assert_eq!(reason(&refused), refusal::ALREADY_EXISTS, "{oid:?}");
         }
         assert!(committed.staged.is_empty(), "a refusal stages nothing");
-        // a delete of an unborn tag is no create either.
-        let deleted = RepoState::default()
-            .stage_tag("v2", None, None, None)
-            .unwrap_err();
-        assert_eq!(reason(&deleted), "tag_immutable");
-        let unpacked = RepoState::default()
-            .stage_tag("v2", None, Some(a), None)
-            .unwrap_err();
+        let unpacked = RepoState::default().stage_tag("v2", a, None).unwrap_err();
         assert_eq!(reason(&unpacked), "missing_pack_digest");
 
         // a branch and a tag may share a short name: they are different refs.

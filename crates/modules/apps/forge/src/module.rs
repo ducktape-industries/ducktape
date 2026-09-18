@@ -2091,7 +2091,11 @@ mod tests {
             prev_oid: prev.map(|c| oid(c).as_bytes().to_vec()),
             new_oid: new.map(|c| oid(c).as_bytes().to_vec()),
         };
-        let push = |updates: Vec<RefUpdate>, tags: Vec<RefUpdate>| ForgeMsg::PushRefs {
+        let create = |name: &str, c: char| TagCreate {
+            name: name.into(),
+            oid: oid(c).as_bytes().to_vec(),
+        };
+        let push = |updates: Vec<RefUpdate>, tags: Vec<TagCreate>| ForgeMsg::PushRefs {
             repo: "demo".into(),
             updates,
             tags,
@@ -2104,7 +2108,7 @@ mod tests {
             &mut ctx_at(1),
             &push(
                 vec![update("main", None, Some('a'))],
-                vec![update("v1", None, Some('a'))],
+                vec![create("v1", 'a')],
             ),
         );
         let tagged = forge.root();
@@ -2151,22 +2155,18 @@ mod tests {
         };
         assert!(none.is_empty(), "an unknown repo has no tags");
 
-        for (t, prev, new) in [
-            (2, Some('a'), Some('b')),
-            (3, Some('a'), None),
-            (4, None, Some('b')),
-            (5, None, Some('a')),
-        ] {
+        // a re-create at another oid (what a move would be) and at the same one.
+        for (t, c) in [(2, 'b'), (3, 'a')] {
             let err = exec(
                 &mut forge,
                 &mut ctx_at(t),
-                &push(Vec::new(), vec![update("v1", prev, new)]),
+                &push(Vec::new(), vec![create("v1", c)]),
             )
             .unwrap_err();
             futures::executor::block_on(forge.abort_block()).unwrap();
             assert!(
-                matches!(&err, Error::Module { reason, .. } if reason == "tag_immutable"),
-                "{prev:?} -> {new:?}: {err:?}"
+                matches!(&err, Error::Module { reason, .. } if reason == sdk::refusal::ALREADY_EXISTS),
+                "{c}: {err:?}"
             );
         }
         assert_eq!(forge.root(), tagged, "no refusal moved the root");
@@ -2180,7 +2180,8 @@ mod tests {
     }
 
     /// one certificate can sign a branch move and a tag creation together:
-    /// both apply. a signed tag MOVE is refused by name like any other.
+    /// both apply. a signed re-create of a held tag is refused by name like
+    /// any other.
     #[test]
     fn a_signed_push_creates_a_tag_beside_a_branch() {
         use crate::pushcert;
@@ -2194,7 +2195,11 @@ mod tests {
             prev_oid: prev.map(|c| oid(c).as_bytes().to_vec()),
             new_oid: Some(oid(new).as_bytes().to_vec()),
         };
-        let signed = |updates: Vec<RefUpdate>, tags: Vec<RefUpdate>| {
+        let create = |name: &str, c: char| TagCreate {
+            name: name.into(),
+            oid: oid(c).as_bytes().to_vec(),
+        };
+        let signed = |updates: Vec<RefUpdate>, tags: Vec<TagCreate>| {
             let cert = pushcert::certificate(&pushcert::nonce("chain-a", "lab"), &updates, &tags);
             ForgeMsg::PushRefs {
                 repo: "lab".into(),
@@ -2210,10 +2215,7 @@ mod tests {
         exec_commit(
             &mut forge,
             &mut ctx_at(1),
-            &signed(
-                vec![update("main", None, 'a')],
-                vec![update("v1", None, 'a')],
-            ),
+            &signed(vec![update("main", None, 'a')], vec![create("v1", 'a')]),
         );
         let lab = &forge.state.repos["lab"];
         assert_eq!(lab.refs["main"], oid('a'));
@@ -2222,11 +2224,11 @@ mod tests {
         let moved = exec(
             &mut forge,
             &mut ctx_at(2),
-            &signed(Vec::new(), vec![update("v1", Some('a'), 'b')]),
+            &signed(Vec::new(), vec![create("v1", 'b')]),
         )
         .unwrap_err();
         assert!(
-            matches!(&moved, Error::Module { reason, .. } if reason == "tag_immutable"),
+            matches!(&moved, Error::Module { reason, .. } if reason == sdk::refusal::ALREADY_EXISTS),
             "{moved:?}"
         );
     }

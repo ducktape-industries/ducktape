@@ -401,24 +401,21 @@ fn parse_push_commands(
         ));
     }
     use forge::refs::RefName;
-    let branches = certificate
-        .updates
-        .iter()
-        .map(|u| (RefName::Branch(u.ref_name.clone()), u));
-    let tags = certificate
-        .tags
-        .iter()
-        .map(|u| (RefName::Tag(u.ref_name.clone()), u));
-    let cmds = branches
-        .chain(tags)
-        .map(|(name, u)| {
-            (
-                oid_hex(u.prev_oid.as_deref()),
-                oid_hex(u.new_oid.as_deref()),
-                name.full(),
-            )
-        })
-        .collect();
+    let branches = certificate.updates.iter().map(|u| {
+        (
+            oid_hex(u.prev_oid.as_deref()),
+            oid_hex(u.new_oid.as_deref()),
+            RefName::Branch(u.ref_name.clone()).full(),
+        )
+    });
+    let tags = certificate.tags.iter().map(|t| {
+        (
+            oid_hex(None),
+            oid_hex(Some(&t.oid)),
+            RefName::Tag(t.name.clone()).full(),
+        )
+    });
+    let cmds = branches.chain(tags).collect();
     Ok(PushCommands {
         cmds,
         cert: Some(forge::PushCert {
@@ -473,6 +470,9 @@ enum CommandRefusal {
     OutsideHeadsOrTags,
     /// an `old` or `new` oid that is neither the null oid nor 40 hex.
     MalformedOid(&'static str),
+    /// a command that moves or deletes a tag. a tag is created once and never
+    /// moves, and `TagCreate` has no way to say anything else.
+    TagImmutable,
 }
 
 /// split a push's `(old, new, refname)` commands into the op's branch moves
@@ -480,11 +480,11 @@ enum CommandRefusal {
 /// [`forge::refs::RefName::classify`] — the same namespace rule consensus
 /// reads a certificate by — and that one answer both refuses the push and
 /// picks the list a command lands in. the null oid means "create"
-/// (`prev_oid` None) / "delete" (`new_oid` None); name validation and the
-/// create-only rule for tags stay with consensus.
+/// (`prev_oid` None) / "delete" (`new_oid` None); a tag command must create,
+/// and name validation and a tag name already taken stay with consensus.
 fn push_updates(
     cmds: &[(String, String, String)],
-) -> Result<(Vec<forge::RefUpdate>, Vec<forge::RefUpdate>), CommandRefusal> {
+) -> Result<(Vec<forge::RefUpdate>, Vec<forge::TagCreate>), CommandRefusal> {
     use forge::refs::RefName;
     let classified: Option<Vec<RefName>> = cmds
         .iter()
@@ -494,14 +494,16 @@ fn push_updates(
     let mut updates = Vec::new();
     let mut tags = Vec::new();
     for ((old, new, _), name) in cmds.iter().zip(names) {
-        let update = forge::RefUpdate {
-            ref_name: name.short().to_string(),
-            prev_oid: command_oid(old).ok_or(CommandRefusal::MalformedOid("old"))?,
-            new_oid: command_oid(new).ok_or(CommandRefusal::MalformedOid("new"))?,
-        };
-        match name {
-            RefName::Branch(_) => updates.push(update),
-            RefName::Tag(_) => tags.push(update),
+        let prev_oid = command_oid(old).ok_or(CommandRefusal::MalformedOid("old"))?;
+        let new_oid = command_oid(new).ok_or(CommandRefusal::MalformedOid("new"))?;
+        match (name, prev_oid, new_oid) {
+            (RefName::Branch(ref_name), prev_oid, new_oid) => updates.push(forge::RefUpdate {
+                ref_name,
+                prev_oid,
+                new_oid,
+            }),
+            (RefName::Tag(name), None, Some(oid)) => tags.push(forge::TagCreate { name, oid }),
+            (RefName::Tag(_), _, _) => return Err(CommandRefusal::TagImmutable),
         }
     }
     Ok((updates, tags))
@@ -906,6 +908,7 @@ fn push_refused(_repo: &str, reason: &str, _detail: &str) {
 /// so they sit ahead of that catch-all.
 fn push_refusal_reason(message: &str) -> &'static str {
     const KNOWN: &[(&str, &str)] = &[
+        ("moves or deletes a tag", "tag_immutable"),
         ("non-fast-forward", "non_fast_forward"),
         ("requires an authenticated external origin", "unsigned"),
         ("offered no push-cert", "push_cert_unoffered"),
@@ -1042,6 +1045,15 @@ pub(crate) async fn git_receive_pack(
             push_refused(&repo, "malformed_oid", &reason);
             return error_response(StatusCode::BAD_REQUEST, &reason);
         }
+        Err(CommandRefusal::TagImmutable) => {
+            const REASON: &str = "a tag is created once and never moves or is deleted";
+            push_refused(&repo, "tag_immutable", REASON);
+            let results: Vec<(String, Option<String>)> = cmds
+                .into_iter()
+                .map(|(_, _, r)| (r, Some(REASON.to_string())))
+                .collect();
+            return git_report_status(&results);
+        }
     };
 
     // a signed push is refused HERE with the reason consensus would give — a
@@ -1064,7 +1076,7 @@ pub(crate) async fn git_receive_pack(
     // stream from the spool file straight into the node's store — neither end
     // ever holds the pack.
     let pack_bytes = spooled.len.saturating_sub(pack_offset);
-    let carries_objects = updates.iter().chain(&tags).any(|u| u.new_oid.is_some());
+    let carries_objects = !tags.is_empty() || updates.iter().any(|u| u.new_oid.is_some());
     let pack_digest = if carries_objects {
         match handle
             .client
@@ -1504,7 +1516,7 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
         assert_eq!(parsed.cmds[0].2, "refs/tags/v1");
         let (updates, tags) = push_updates(&parsed.cmds).unwrap();
         assert!(updates.is_empty());
-        assert_eq!(tags[0].ref_name, "v1");
+        assert_eq!(tags[0].name, "v1");
         // the fixture signature is over the branch certificate, not this one.
         let refused =
             forge::pushcert::signer(&parsed.cert.unwrap(), "chain-a", "lab", &updates, &tags)
@@ -1518,7 +1530,8 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
 
     /// one classification refuses a push and splits it: a branch and a tag in
     /// one push land in their own lists, and a push naming anything outside
-    /// `refs/heads/*` and `refs/tags/*` is refused whole.
+    /// `refs/heads/*` and `refs/tags/*`, or moving or deleting a tag, is
+    /// refused whole.
     #[test]
     fn a_push_splits_into_branch_moves_and_tag_creations_and_refuses_the_rest() {
         const TIP: &str = "ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2";
@@ -1546,12 +1559,23 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
         );
         assert_eq!(
             tags,
-            vec![forge::RefUpdate {
-                ref_name: "v1".into(),
-                prev_oid: None,
-                new_oid: Some(tip),
+            vec![forge::TagCreate {
+                name: "v1".into(),
+                oid: tip,
             }]
         );
+        const NEXT: &str = "0000000000000000000000000000000000000001";
+        for (old, new) in [(TIP, NEXT), (TIP, GIT_ZERO_OID)] {
+            let refused = push_updates(&[
+                cmd(GIT_ZERO_OID, TIP, "refs/heads/main"),
+                cmd(old, new, "refs/tags/v1"),
+            ]);
+            assert_eq!(
+                refused.unwrap_err(),
+                CommandRefusal::TagImmutable,
+                "{old} -> {new}"
+            );
+        }
         for outside in ["refs/notes/commits", "refs/remotes/origin/main", "HEAD"] {
             let refused = push_updates(&[
                 cmd(GIT_ZERO_OID, TIP, "refs/heads/main"),

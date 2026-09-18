@@ -316,7 +316,7 @@ fn pin_quota_follows_the_account_share_and_exact_key_admission() {
     let before = core.pending_refs().clone();
     assert_eq!(
         core.pin(&admitted, 2, head.clone(), "over-quota".into()),
-        Err("files: pin quota exceeded".into())
+        Err("pin quota exceeded".into())
     );
     assert_eq!(core.pending_refs(), &before);
 
@@ -328,7 +328,7 @@ fn pin_quota_follows_the_account_share_and_exact_key_admission() {
     let before = core.pending_refs().clone();
     assert_eq!(
         core.pin(&sibling, 2, head.clone(), "account-over-quota".into()),
-        Err("files: pin quota exceeded".into())
+        Err("pin quota exceeded".into())
     );
     assert_eq!(core.pending_refs(), &before);
     core.unpin(&sibling, 2, "before-admission".into()).unwrap();
@@ -343,7 +343,7 @@ fn pin_quota_follows_the_account_share_and_exact_key_admission() {
     let before = core.pending_refs().clone();
     assert_eq!(
         core.pin(&program, 2, head.clone(), "program-over-quota".into()),
-        Err("files: pin quota exceeded".into())
+        Err("pin quota exceeded".into())
     );
     assert_eq!(core.pending_refs(), &before);
     core.unpin(&program, 2, "program-0".into()).unwrap();

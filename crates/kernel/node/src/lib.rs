@@ -901,9 +901,9 @@ pub struct DrainedFrame {
     /// decoding) or one whose decode/signature check failed.
     pub op: Option<DrainedOp>,
     /// node-local, NON-CONSENSUS: why a [`Disposition::Rejected`] frame was
-    /// rejected — the module's VERBATIM error string (so a submitter's held
-    /// reply can string-match it, e.g. duckfs-client keys on the module's
-    /// `"files: conflict:"` prefix), or a short reason for a decode/signature
+    /// rejected — the module's refusal framed `<token>: <sentence>`
+    /// ([`host::carried_refusal`]), so a submitter's held reply splits the
+    /// module's own token back off, or a short reason for a decode/signature
     /// failure. `None` for an applied or discarded frame. this rides ONLY the
     /// in-memory record: a rejection is a deterministic no-op that every honest
     /// validator computes identically, but the reason is pure observability and
@@ -911,17 +911,6 @@ pub struct DrainedFrame {
     pub reason: Option<String>,
 }
 
-/// the verbatim, submitter-facing string for a deterministic rejection.
-///
-/// on the batch path the host has ALREADY stringified the reject error with its
-/// WRAPPED `Display` (`Module(<verbatim>)` for a module rejection, since
-/// [`sdk::Error`]'s `Display` renders like its `Debug`). the duckfs-client
-/// engine string-matches the module's `"files: conflict:"` prefix on the FRONT
-/// of the reply detail, so no `Module(..)` wrapper may precede it — reverse
-/// exactly that one wrapper. the strip is an EXACT inverse (`Debug` for `Module`
-/// is `write!("Module({m})")`, no escaping), and it correctly leaves any other
-/// kind (e.g. `UnknownModule(..)`) untouched. node-local observability only:
-/// this string is never journaled, sealed, or hashed.
 /// hex for a log line — a state root as a raw byte array is unreadable, and
 /// hand-rolling this beats pulling a hex dependency into the kernel for one line.
 fn hex_root(root: &StateRoot) -> String {
@@ -935,18 +924,6 @@ fn custody_refused(reason: &str, bound: usize) -> Error {
         reason,
         format!("this node's op mempool is at its {bound} bound — retry shortly"),
     ))
-}
-
-/// unwrap the host's `Module(<reason>: <sentence>)` Display back to the FRAMED
-/// refusal, so the receipt lane can split it into a token and a sentence.
-fn member_reason(reason: String) -> String {
-    match reason
-        .strip_prefix("Module(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        Some(inner) => inner.to_string(),
-        None => reason,
-    }
 }
 
 /// the decoded contents of one drained frame: authenticated authorship, the
@@ -2094,7 +2071,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         disposition: Disposition::Rejected,
                         root_hash: self.host.root_hash(),
                         op: None,
-                        reason: Some(member_reason(e.to_string())),
+                        reason: Some(host::carried_refusal(&e)),
                     });
                     self.seal(height, Disposition::Rejected).await?;
                     self.remember_applied(height, batch_id);
@@ -2145,21 +2122,16 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         applied_count += 1;
                         (Disposition::Applied, dispatches, None)
                     }
-                    // the host stringifies the reject error with its WRAPPED
-                    // Display (`Module(<reason>: <sentence>)`); unwrap it to the
-                    // framed refusal so the receipt lane can split it into the
-                    // module's own token and sentence. node-local only.
+                    // the host carries the reject error FRAMED
+                    // (`host::carried_refusal`), so the receipt lane splits it
+                    // into the module's own token and sentence. node-local only.
                     MemberOutcome::Rejected { reason } => {
                         if is_heartbeat_nop {
                             nop_count += 1;
                         } else {
                             rejected_count += 1;
                         }
-                        (
-                            Disposition::Rejected,
-                            Vec::new(),
-                            Some(member_reason(reason)),
-                        )
+                        (Disposition::Rejected, Vec::new(), Some(reason))
                     }
                 };
                 self.drained.push(DrainedFrame {

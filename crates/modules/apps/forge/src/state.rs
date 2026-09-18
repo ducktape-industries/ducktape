@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use attribution::{Actor, AttributionMsg, AttributionUpdate, ObjectRef, Reason, Relation};
 use chat::Party;
 use identity::{IdentityQuery, IdentityReply};
-use sdk::{Ctx, Error, Origin, StateRoot};
+use sdk::{Ctx, Error, Origin, StateRoot, refusal};
 use sha2::{Digest, Sha256};
 
 use crate::codec::{self, Reader};
@@ -35,7 +35,7 @@ use crate::refs::{INTEGRATION_BRANCH, RefName, RepoRefs, RepoState, StagedRef, n
 use crate::tracker::{self, Tracker, parse_hex_oid};
 use crate::{
     ForgeMsg, ItemKind, MAX_BRANCHES_PER_REPO, MAX_REFS_PER_PUSH, MAX_TAGS_PER_REPO, PushCert,
-    RefUpdate, ReviewVerdict, decode_msg, norm_repo,
+    RefUpdate, ReviewVerdict, TagCreate, decode_msg, norm_repo,
 };
 
 /// one repo's committed branch or tag map, `short_name -> oid`.
@@ -180,7 +180,7 @@ fn update_oids(u: &RefUpdate) -> Result<(Option<Oid>, Option<Oid>), Error> {
 fn stage_updates(
     state: &mut RepoState,
     updates: &[RefUpdate],
-    tags: &[RefUpdate],
+    tags: &[TagCreate],
     digest: Option<[u8; 32]>,
 ) -> Result<(), Error> {
     for u in updates {
@@ -192,9 +192,8 @@ fn stage_updates(
             new.is_some().then(|| digest.unwrap()),
         )?;
     }
-    for u in tags {
-        let (prev, new) = update_oids(u)?;
-        state.stage_tag(&u.ref_name, prev, new, digest)?;
+    for t in tags {
+        state.stage_tag(&t.name, parse_oid(&t.oid, "tag oid")?, digest)?;
     }
     // the ceilings read the maps this push would PUBLISH, so a delete always
     // passes and a push that both deletes and creates is judged on its net
@@ -211,8 +210,11 @@ fn stage_updates(
     }
     if published.tags.len() > MAX_TAGS_PER_REPO {
         return Err(Error::module(
-            "tag_cap",
-            format!("forge: repo holds its most tags ({MAX_TAGS_PER_REPO})"),
+            refusal::EXHAUSTED,
+            format!(
+                "The repository holds its most tags ({MAX_TAGS_PER_REPO}); a tag is never \
+                 deleted, so no more can be created."
+            ),
         ));
     }
     Ok(())
@@ -620,7 +622,7 @@ impl ForgeState {
         repo: &str,
         cert: Option<&PushCert>,
         updates: &[RefUpdate],
-        tags: &[RefUpdate],
+        tags: &[TagCreate],
     ) -> Result<Party, Error> {
         let Some(cert) = cert else {
             return Self::ref_party(ctx).await;
@@ -645,7 +647,7 @@ impl ForgeState {
         &mut self,
         name: &str,
         updates: Vec<RefUpdate>,
-        tags: Vec<RefUpdate>,
+        tags: Vec<TagCreate>,
         pack_digest: Option<Vec<u8>>,
     ) -> Result<(), Error> {
         let ref_count = updates.len() + tags.len();
@@ -662,7 +664,7 @@ impl ForgeState {
             ));
         }
         let branches = updates.iter().map(|u| RefName::Branch(u.ref_name.clone()));
-        let tag_names = tags.iter().map(|u| RefName::Tag(u.ref_name.clone()));
+        let tag_names = tags.iter().map(|t| RefName::Tag(t.name.clone()));
         let mut seen = BTreeSet::new();
         for refname in branches.chain(tag_names) {
             norm_branch(refname.short())?;
@@ -675,7 +677,7 @@ impl ForgeState {
             }
         }
         let digest = pack_digest.as_deref().map(parse_digest).transpose()?;
-        let sets_a_head = updates.iter().chain(&tags).any(|u| u.new_oid.is_some());
+        let sets_a_head = !tags.is_empty() || updates.iter().any(|u| u.new_oid.is_some());
         if sets_a_head && digest.is_none() {
             return Err(Error::module(
                 "missing_pack_digest",
@@ -1290,6 +1292,21 @@ mod tests {
         RefName::Tag(name.into())
     }
 
+    /// a single-tag create, the shape the tag tests drive.
+    fn create(name: &str, oid: Oid) -> Vec<TagCreate> {
+        vec![TagCreate {
+            name: name.into(),
+            oid: oid.as_bytes().to_vec(),
+        }]
+    }
+
+    fn reason(error: &Error) -> &str {
+        match error {
+            Error::Module { reason, .. } => reason,
+            other => panic!("not a module refusal: {other:?}"),
+        }
+    }
+
     fn refs(branches: &[(&str, Oid)], tags: &[(&str, Oid)]) -> RepoRefs {
         let map = |pairs: &[(&str, Oid)]| pairs.iter().map(|(n, o)| (n.to_string(), *o)).collect();
         RepoRefs {
@@ -1572,7 +1589,7 @@ mod tests {
             .stage_push_refs(
                 "alpha",
                 update("main", Some(oid('a')), Some(oid('b'))),
-                update("v1", None, Some(oid('b'))),
+                create("v1", oid('b')),
                 Some(vec![5; 32]),
             )
             .unwrap();
@@ -1598,58 +1615,46 @@ mod tests {
             .stage_push_refs(
                 "alpha",
                 Vec::new(),
-                update("v1", None, Some(oid('c'))),
+                create("v1", oid('c')),
                 Some(vec![6; 32]),
             )
             .unwrap_err();
-        assert!(again.to_string().contains("tag_immutable"), "{again}");
+        assert_eq!(reason(&again), refusal::ALREADY_EXISTS, "{again:?}");
     }
 
     #[test]
     fn a_push_names_each_ref_once_and_counts_tags_against_its_cap() {
         let mut state = ForgeState::default();
         let digest = Some(vec![7u8; 32]);
-        let twice = [
-            update("v1", None, Some(oid('a'))),
-            update("v1", None, Some(oid('b'))),
-        ]
-        .concat();
+        let twice = [create("v1", oid('a')), create("v1", oid('b'))].concat();
         let refused = state
             .stage_push_refs("alpha", Vec::new(), twice, digest.clone())
             .unwrap_err();
-        assert!(
-            refused.to_string().contains("duplicate_ref_update"),
-            "{refused}"
-        );
+        assert_eq!(reason(&refused), "duplicate_ref_update", "{refused:?}");
         // a branch and a tag of the same name are two refs, not a duplicate.
         state
             .stage_push_refs(
                 "alpha",
                 update("v1", None, Some(oid('a'))),
-                update("v1", None, Some(oid('a'))),
+                create("v1", oid('a')),
                 digest.clone(),
             )
             .unwrap();
         let no_pack = ForgeState::default()
-            .stage_push_refs(
-                "alpha",
-                Vec::new(),
-                update("v2", None, Some(oid('a'))),
-                None,
-            )
+            .stage_push_refs("alpha", Vec::new(), create("v2", oid('a')), None)
             .unwrap_err();
-        assert!(
-            no_pack.to_string().contains("missing_pack_digest"),
-            "{no_pack}"
-        );
+        assert_eq!(reason(&no_pack), "missing_pack_digest", "{no_pack:?}");
 
         let over: Vec<RefUpdate> = (0..=MAX_REFS_PER_PUSH / 2)
             .flat_map(|i| update(&format!("r{i}"), None, Some(oid('a'))))
             .collect();
+        let over_tags: Vec<TagCreate> = (0..=MAX_REFS_PER_PUSH / 2)
+            .flat_map(|i| create(&format!("r{i}"), oid('a')))
+            .collect();
         let refused = ForgeState::default()
-            .stage_push_refs("alpha", over.clone(), over, digest.clone())
+            .stage_push_refs("alpha", over, over_tags, digest.clone())
             .unwrap_err();
-        assert!(refused.to_string().contains("push_cap"), "{refused}");
+        assert_eq!(reason(&refused), "push_cap", "{refused:?}");
 
         let full: BTreeMap<String, Oid> = (0..MAX_TAGS_PER_REPO)
             .map(|i| (format!("t{i}"), oid('a')))
@@ -1663,14 +1668,9 @@ mod tests {
             }),
         );
         let refused = capped
-            .stage_push_refs(
-                "alpha",
-                Vec::new(),
-                update("new", None, Some(oid('c'))),
-                digest,
-            )
+            .stage_push_refs("alpha", Vec::new(), create("new", oid('c')), digest)
             .unwrap_err();
-        assert!(refused.to_string().contains("tag_cap"), "{refused}");
+        assert_eq!(reason(&refused), refusal::EXHAUSTED, "{refused:?}");
     }
 
     /// a single-branch create/delete push, the shape both cap tests drive.

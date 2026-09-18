@@ -15,7 +15,9 @@
 use std::path::{Path, PathBuf};
 
 use forge::Forge;
-use forge::{ForgeMsg, ForgeQuery, ForgeReply, RefUpdate, decode_reply, encode_msg, encode_query};
+use forge::{
+    ForgeMsg, ForgeQuery, ForgeReply, RefUpdate, TagCreate, decode_reply, encode_msg, encode_query,
+};
 use sdk::{Error, Module, Msg, StateRoot};
 
 /// the module's canonical branch — the ref a materialized push moves.
@@ -895,7 +897,10 @@ fn an_annotated_tag_pushes_materializes_and_syncs() {
         payload: encode_msg(&ForgeMsg::PushRefs {
             repo: String::new(),
             updates: vec![born(commit, "main")],
-            tags: vec![born(tag, "v1")],
+            tags: vec![TagCreate {
+                name: "v1".into(),
+                oid: tag.as_bytes().to_vec(),
+            }],
             pack_digest: Some(digest),
             cert: None,
         }),

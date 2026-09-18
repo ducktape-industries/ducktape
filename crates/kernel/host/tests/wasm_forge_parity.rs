@@ -265,14 +265,8 @@ fn reason_of(err: host::SubmitError) -> String {
 
 fn assert_reason_contained(native: &str, wasm: &str, height: u64) {
     // the wit rendering is a debug-escaped string: undo the quote escaping so
-    // a reason that names a repo (`"demo"`) is comparable; a batch member's
-    // reason additionally carries the `Module(..)` rendering on both sides,
-    // so the native needle is its inner text.
+    // a reason that names a repo (`"demo"`) is comparable.
     let wasm = wasm.replace("\\\"", "\"");
-    let native = native
-        .strip_prefix("Module(")
-        .and_then(|inner| inner.strip_suffix(')'))
-        .unwrap_or(native);
     assert!(
         wasm.contains(native),
         "rejections diverge at block {height}: native {native:?} vs wasm {wasm:?}"

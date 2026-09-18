@@ -46,47 +46,22 @@ impl Refused {
     }
 
     /// the kernel's own refusal, split. ONE match with no `_` arm: a new
-    /// [`sdk::Error`] variant fails this build until it is given a token and a
-    /// sentence, which is why the split lives here rather than in a `Display`
-    /// impl on the enum — `sdk` is the deterministic module ABI, compiled into
-    /// every module guest, and what a screen says is not its business.
-    ///
-    /// the sentence deliberately drops the variant's NAME. `sdk::Error`'s
-    /// `Display` is its `Debug`, so `to_string()` yields
-    /// `Module(<reason>: <sentence>)` — an envelope that then reaches a person,
-    /// and that every reader downstream has to peel back off.
+    /// [`sdk::Error`] variant fails this build until it is given a token. the
+    /// sentence is the error's `Display`, which is the sentence alone — a
+    /// module refusal's own words, whole, never the variant's name.
     pub fn of(error: &sdk::Error) -> Self {
-        let (reason, message): (String, String) = match error {
-            sdk::Error::UnknownModule(id) => (
-                "unknown_module".into(),
-                format!("no module is registered as {id}"),
-            ),
-            sdk::Error::SelfQuery => (
-                "self_query".into(),
-                "a module reads its own state through itself, not through a query".to_owned(),
-            ),
-            sdk::Error::QueryUnsupported => (
-                "query_unsupported".into(),
-                "this module answers no queries".to_owned(),
-            ),
-            sdk::Error::SyncUnsupported => (
-                "sync_unsupported".into(),
-                "this module serves no state sync".to_owned(),
-            ),
-            sdk::Error::SwapUnsupported => (
-                "swap_unsupported".into(),
-                "this module's code is the node binary itself, so it cannot be swapped".to_owned(),
-            ),
-            sdk::Error::BudgetExceeded => (
-                "budget_exceeded".into(),
-                "the follow-up drain exceeded its dispatch budget".to_owned(),
-            ),
-            // the module's own words, whole — and its own TOKEN: nothing here
-            // paraphrases a refusal it did not write, and nothing re-classifies
-            // one it did.
-            sdk::Error::Module { reason, sentence } => (reason.clone(), sentence.clone()),
+        let reason: &str = match error {
+            sdk::Error::UnknownModule(_) => "unknown_module",
+            sdk::Error::SelfQuery => "self_query",
+            sdk::Error::QueryUnsupported => "query_unsupported",
+            sdk::Error::SyncUnsupported => "sync_unsupported",
+            sdk::Error::SwapUnsupported => "swap_unsupported",
+            sdk::Error::BudgetExceeded => "budget_exceeded",
+            // the module's own TOKEN: nothing here re-classifies a refusal it
+            // did not write.
+            sdk::Error::Module { reason, .. } => reason,
         };
-        Self { reason, message }
+        Self::new(reason, error.to_string())
     }
 
     /// a refusal that reached this node as ONE framed string
@@ -99,7 +74,7 @@ impl Refused {
     pub fn framed(said: &str) -> Self {
         match sdk::refusal::decode(said) {
             Some((reason, sentence)) => Self::new(reason, sentence),
-            None => Self::new("unframed_refusal", said),
+            None => Self::new(sdk::refusal::UNFRAMED_REFUSAL, said),
         }
     }
 
@@ -779,10 +754,10 @@ mod refused_tests {
     #[test]
     fn a_module_refusal_carries_its_own_token_into_the_receipt() {
         let refused = Refused::of(&sdk::Error::module(
-            "non_fast_forward",
+            sdk::refusal::STALE,
             "forge HEAD moved; fetch and retry",
         ));
-        assert_eq!(refused.reason, "non_fast_forward");
+        assert_eq!(refused.reason, sdk::refusal::STALE);
         assert_eq!(refused.message, "forge HEAD moved; fetch and retry");
 
         // a kernel refusal keeps its own class, unchanged by the module lane.
@@ -796,9 +771,9 @@ mod refused_tests {
     #[test]
     fn a_framed_refusal_splits_back_into_its_token_and_sentence() {
         let sentence = "store-backed state keys: got 7 bytes";
-        let framed = sdk::refusal::encode("state_key_shape", sentence);
+        let framed = sdk::refusal::encode(sdk::refusal::INVALID_INPUT, sentence);
         let refused = Refused::framed(&framed);
-        assert_eq!(refused.reason, "state_key_shape");
+        assert_eq!(refused.reason, sdk::refusal::INVALID_INPUT);
         assert_eq!(refused.message, sentence);
     }
 
@@ -809,7 +784,11 @@ mod refused_tests {
     fn an_unframed_refusal_is_not_given_a_token() {
         for unframed in ["nobody framed this", "Not_Snake_Case: sentence"] {
             let refused = Refused::framed(unframed);
-            assert_eq!(refused.reason, "unframed_refusal", "{unframed:?}");
+            assert_eq!(
+                refused.reason,
+                sdk::refusal::UNFRAMED_REFUSAL,
+                "{unframed:?}"
+            );
             assert_eq!(refused.message, unframed);
         }
     }

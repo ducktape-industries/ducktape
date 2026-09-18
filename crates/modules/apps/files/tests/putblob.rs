@@ -326,11 +326,10 @@ fn restart_recovers_staged_bytes_and_table() {
     );
 }
 
-/// hygiene: every user-facing rejection out of the staging path carries the
-/// uniform `files: ` module prefix (putblob's cap neighbors already did; the
-/// empty/oversized/quota strings were the stragglers).
+/// hygiene: every user-facing rejection out of the staging path says what was
+/// refused, never which module refused it — the route already names the module.
 #[test]
-fn staging_rejections_carry_the_files_prefix() {
+fn staging_rejections_name_what_was_refused_not_the_module() {
     let mut f = files::Fs::new(files::MemStore::new(), files::Refs::default());
     let err = f
         .putblob(
@@ -342,7 +341,7 @@ fn staging_rejections_carry_the_files_prefix() {
             &[],
         )
         .unwrap_err();
-    assert!(err.starts_with("files: "), "empty chunk: {err}");
+    assert_eq!(err, "chunk must not be empty", "empty chunk");
     let big = vec![0u8; CHUNK_SIZE as usize + 1];
     let err = f
         .putblob(
@@ -354,7 +353,7 @@ fn staging_rejections_carry_the_files_prefix() {
             &big,
         )
         .unwrap_err();
-    assert!(err.starts_with("files: "), "oversized chunk: {err}");
+    assert_eq!(err, "chunk exceeds CHUNK_SIZE", "oversized chunk");
     f.set_staging_quota_for_tests(4);
     let err = f
         .putblob(
@@ -366,5 +365,5 @@ fn staging_rejections_carry_the_files_prefix() {
             b"hello",
         )
         .unwrap_err();
-    assert!(err.starts_with("files: "), "quota breach: {err}");
+    assert_eq!(err, "staging quota exceeded", "quota breach");
 }

@@ -42,8 +42,8 @@ pub struct ConflictReport {
 ///
 /// the sentence passes through verbatim — never reworded — because the engine's
 /// conflict taxonomy still keys on it: the commit lane's three classes
-/// (`"files: conflict:"`, `"files: base snapshot not resolvable"`,
-/// `"files: chunk not available"`) all reach here under the module's single
+/// (`"conflict:"`, `"base snapshot not resolvable"`,
+/// `"chunk not available"`) all reach here under the module's single
 /// `files_commit` class, so the class alone cannot tell them apart yet.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApiError {

@@ -323,6 +323,9 @@ wit-bindgen = "0.57"
 # in ducktape-industries/ducktape-sdk and reach this workspace as git
 # dependencies on its `dev` branch. Consumers keep `{ workspace = true }`.
 sdk = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "sdk" }
+# the refusal classes (`sdk::refusal`'s words) with no dependencies, for a crate
+# that branches on a refusal token without linking sdk.
+refusal-class = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "refusal-class" }
 # the module SDK a guest port compiles against. wasm-only: every module's
 # `guest` feature turns it on, and only guest-builder's shell workspace does.
 ducktape-module-sdk = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "ducktape-module-sdk" }
