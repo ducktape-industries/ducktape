@@ -30,7 +30,7 @@ pub mod step;
 pub mod verify;
 pub mod workspace;
 
-pub use designation::Designation;
+pub use designation::{Designation, ReleaseSignal};
 pub use layout::Kind;
 pub use manifest::{Artifact, Manifest, Platform, Release, SCHEMA, SuccessorKey};
 pub use phase::{

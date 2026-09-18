@@ -11,9 +11,10 @@
 //! WHAT a release is, the release key says. WHEN a network runs a node
 //! release is a network decision: `release schedule` drives a governance
 //! proposal carrying an `app_update::Designation` (artifact sha + activation
-//! height) and `release status` reads back what a running node's committed
-//! state designates — which is the whole interface `ducktape-node-launcher`
-//! has to the chain.
+//! height), `release withdraw` one that takes a designation back, and
+//! `release status` reads back what a running node's committed state
+//! designates — which is the whole interface `ducktape-node-launcher` has to
+//! the chain.
 //!
 //! The manifest (`app_update::Manifest`, one JSON file per channel) names
 //! each platform's archive by sha256 and size and seals itself with
@@ -46,7 +47,8 @@ use airlock::client::Gateway;
 use airlock::wire::WorkRef;
 use airlock::{bodyseal, sign};
 use app_update::{
-    Artifact, Designation, Kind, Manifest, PublicKey, Release, SCHEMA, Sha, Signature, SuccessorKey,
+    Artifact, Designation, Kind, Manifest, PublicKey, Release, ReleaseSignal, SCHEMA, Sha,
+    Signature, SuccessorKey,
 };
 
 use crate::cli_args::NodeAddr;
@@ -67,6 +69,10 @@ pub(crate) enum ReleaseCmd {
     /// propose, vote and execute the governance decision that runs a node
     /// release from a height (every member passes the same --sha and --at)
     Schedule(ScheduleArgs),
+    /// propose, vote and execute the governance decision that takes back a
+    /// designated node release — a refused one, say (every member passes the
+    /// same --sha)
+    Withdraw(WithdrawArgs),
     /// what a RUNNING node's network designates, and where that node is —
     /// the node launcher's whole view of the chain
     Status(StatusArgs),
@@ -214,6 +220,17 @@ enum Preflight {
     Skipped,
 }
 
+/// `release withdraw --sha <hex>`: the governance half, taken back.
+#[derive(Debug, clap::Args)]
+pub(crate) struct WithdrawArgs {
+    /// the designated node archive's sha256 — the `--sha` it was scheduled
+    /// with
+    #[arg(long, value_name = "HEX")]
+    pub sha: Sha,
+    #[command(flatten)]
+    pub selector: crate::cli_args::Selector,
+}
+
 /// `release status`: what the launcher asks a running node.
 #[derive(Debug, clap::Args)]
 pub(crate) struct StatusArgs {
@@ -251,6 +268,7 @@ pub(crate) fn run(cmd: ReleaseCmd) -> CommandResult {
         ReleaseCmd::Sign(args) => sign(args, &mut stdin),
         ReleaseCmd::Verify(args) => verify(args),
         ReleaseCmd::Schedule(args) => schedule(args),
+        ReleaseCmd::Withdraw(args) => withdraw(args),
         ReleaseCmd::Status(args) => status(args),
         ReleaseCmd::SignBundle(args) => sign_bundle(args),
     }
@@ -439,14 +457,15 @@ fn verify(args: VerifyArgs) -> CommandResult {
 }
 
 // ============================================================================
-// the node channel's governance half: schedule and status
+// the node channel's governance half: schedule, withdraw and status
 // ============================================================================
 
-/// The proposal-id space a node-release designation is minted in. It carries
-/// NO proposer key on purpose: a settled proposal leaves the open roster, so
-/// the only way a launcher can read a passed designation back is to walk ids
-/// it can predict. `release status` walks `node-release:0`, `node-release:1`,
-/// … to the first id no record exists under.
+/// The proposal-id space a node-release designation (and a withdrawal of one)
+/// is minted in. It carries NO proposer key on purpose: a settled proposal
+/// leaves the open roster, so the only way a launcher can read a passed
+/// designation back is to walk ids it can predict. `release status` walks
+/// `node-release:0`, `node-release:1`, … to the first id no record exists
+/// under.
 const DESIGNATION_PREFIX: &str = "node-release";
 
 /// How far that walk goes. A network that has designated this many node
@@ -506,25 +525,12 @@ fn schedule(args: ScheduleArgs) -> CommandResult {
         sha256: args.sha,
         activation_height: at,
     };
-    let signer = crate::cli::gov_signer(node.rpc(), &cfg_path, &resolved)?;
-    let pubkey_hex = crate::module_cli::signer_pubkey_hex(&signer);
-    let wanted = governance::GovAction::Signal {
-        text: designation.signal_text(),
-    };
-    let same_action = {
-        let wanted = wanted.clone();
-        move |action: &governance::GovAction| *action == wanted
-    };
-    let outcome = crate::cli::drive_proposal_ceremony(
+    let outcome = propose_release_signal(
         &node,
-        &signer,
-        &pubkey_hex,
-        // EMPTY seed: this proposal must be findable by id from any node.
-        "",
+        &cfg_path,
+        &resolved,
         "release schedule",
-        DESIGNATION_PREFIX,
-        wanted,
-        &same_action,
+        ReleaseSignal::Designate(designation),
     )?;
     match outcome {
         crate::cli::CeremonyOutcome::Passed => {
@@ -574,6 +580,84 @@ fn check_lead(proposed_at: u64, at: u64, block_time_ms: u64) -> Result<(), Strin
     ))
 }
 
+/// `release withdraw --sha <hex>` — the network takes back a release it
+/// designated: every launcher refused it at qualify, say, and a joiner would
+/// otherwise fetch it and refuse it again. The same ceremony `schedule` runs,
+/// under the same id walk, carrying the withdrawal document; once it passes,
+/// `release status` no longer answers with that release (it answers with the
+/// designation before it that nothing withdrew, or with none).
+///
+/// There is no preflight: nothing is linked or run. What is checked is that
+/// the network designates `--sha` at all, so a mistyped sha is refused before
+/// it becomes a ballot rather than passing as a signal that changes nothing.
+fn withdraw(args: WithdrawArgs) -> CommandResult {
+    let cfg_path = args.selector.config_path()?;
+    let resolved = crate::config::resolve(&cfg_path)?;
+    let node = crate::cli::DrivenNode::of(&resolved, "release withdraw")?;
+    let designated_now = standing(node.http_base())?
+        .iter()
+        .any(|designation| designation.sha256 == args.sha);
+    if !designated_now {
+        return Err(format!(
+            "not_designated: this network designates no release {} — nothing was proposed \
+             (`ducktape release status` names the one it does)",
+            args.sha
+        )
+        .into());
+    }
+    let outcome = propose_release_signal(
+        &node,
+        &cfg_path,
+        &resolved,
+        "release withdraw",
+        ReleaseSignal::Withdraw { withdraw: args.sha },
+    )?;
+    match outcome {
+        crate::cli::CeremonyOutcome::Passed => {
+            println!("withdrew {}; track with: ducktape release status", args.sha);
+            Ok(())
+        }
+        crate::cli::CeremonyOutcome::AwaitingBallots => {
+            println!(
+                "proposed withdrawing {}; every other member co-signs with --sha {}",
+                args.sha, args.sha
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Drive the governance `Signal` carrying `signal` through this member's
+/// running node, joining an open proposal with the same text.
+fn propose_release_signal(
+    node: &crate::cli::DrivenNode,
+    cfg_path: &Path,
+    resolved: &crate::config::Resolved,
+    verb: &str,
+    signal: ReleaseSignal,
+) -> Result<crate::cli::CeremonyOutcome, Box<dyn std::error::Error>> {
+    let signer = crate::cli::gov_signer(node.rpc(), cfg_path, resolved)?;
+    let pubkey_hex = crate::module_cli::signer_pubkey_hex(&signer);
+    let wanted = governance::GovAction::Signal {
+        text: signal.signal_text(),
+    };
+    let same_action = {
+        let wanted = wanted.clone();
+        move |action: &governance::GovAction| *action == wanted
+    };
+    crate::cli::drive_proposal_ceremony(
+        node,
+        &signer,
+        &pubkey_hex,
+        // EMPTY seed: this proposal must be findable by id from any node.
+        "",
+        verb,
+        DESIGNATION_PREFIX,
+        wanted,
+        &same_action,
+    )
+}
+
 /// Ask the archive being designated whether it can link the components this
 /// network RUNS — before a ballot exists.
 ///
@@ -582,12 +666,13 @@ fn check_lead(proposed_at: u64, at: u64, block_time_ms: u64) -> Result<(), Strin
 /// Nothing about publishing or designating a binary whose world moved says
 /// so: every launcher stages it, arms it at the activation height, STOPS its
 /// node, and only then hears its qualify refuse — on a designation that stays
-/// the network's until another one replaces it. The same answer costs a
-/// second here. The archive is read off the network's own duckfs, which is
-/// where every launcher will read it, so what is asked is the bytes that will
-/// actually run and not a local file that claims to be them; the executable
-/// it carries then reads the roster off this node's rpc and the components
-/// out of its blob files. Nothing is locked and the node is never stopped.
+/// the network's until another one replaces it or `release withdraw` takes it
+/// back. The same answer costs a second here. The archive is read off the
+/// network's own duckfs, which is where every launcher will read it, so what
+/// is asked is the bytes that will actually run and not a local file that
+/// claims to be them; the executable it carries then reads the roster off
+/// this node's rpc and the components out of its blob files. Nothing is
+/// locked and the node is never stopped.
 fn preflight(base: &str, config: &Path, sha: &Sha) -> Result<(), Box<dyn std::error::Error>> {
     let scratch = tempfile::tempdir()?;
     let exe = node_exe(&archive(base, sha)?, scratch.path())?;
@@ -738,21 +823,24 @@ fn status(args: StatusArgs) -> CommandResult {
     Ok(())
 }
 
-/// The designation this network's committed governance carries: the LAST
-/// passed `node-release:<n>` whose signal text decodes. The walk stops at the
-/// first id with no record, which is exactly where the ceremony's own mint
-/// stops.
+/// The designation this network's committed governance carries: the last one
+/// [`standing`] still stands behind.
 fn designated(base: &str) -> Result<Option<Designation>, Box<dyn std::error::Error>> {
-    let mut latest = None;
+    Ok(standing(base)?.pop())
+}
+
+/// Every designation no later withdrawal took back, oldest first, out of the
+/// PASSED `node-release:<n>` signals in id order. The walk stops at the first
+/// id with no record, which is exactly where the ceremony's own mint stops.
+fn standing(base: &str) -> Result<Vec<Designation>, Box<dyn std::error::Error>> {
+    let mut passed = Vec::new();
     for nth in 0..MAX_DESIGNATIONS {
         let Some(view) = read_proposal(base, &designation_id(nth))? else {
             break;
         };
-        if let Some(designation) = passed_designation(&view) {
-            latest = Some(designation);
-        }
+        passed.extend(passed_signal(&view));
     }
-    Ok(latest)
+    Ok(app_update::designation::standing(passed))
 }
 
 fn read_proposal(
@@ -769,9 +857,9 @@ fn read_proposal(
     }
 }
 
-/// A settled proposal's designation — `None` for everything that is not a
+/// A settled proposal's release signal — `None` for everything that is not a
 /// PASSED node-release signal, including one still being voted on.
-fn passed_designation(view: &governance::ProposalView) -> Option<Designation> {
+fn passed_signal(view: &governance::ProposalView) -> Option<ReleaseSignal> {
     let decided = view.status == governance::ProposalStatus::Passed;
     if !decided {
         return None;
@@ -779,7 +867,7 @@ fn passed_designation(view: &governance::ProposalView) -> Option<Designation> {
     let governance::GovAction::Signal { text } = &view.action else {
         return None;
     };
-    Designation::from_signal_text(text)
+    ReleaseSignal::from_signal_text(text)
 }
 
 // ============================================================================
@@ -1274,6 +1362,29 @@ mod tests {
         assert!(parse(&["--at", "9"]).is_ok());
         assert!(parse(&[]).is_err(), "one of the two is required");
         assert!(parse(&["--at", "9", "--lead", "150"]).is_err());
+    }
+
+    #[test]
+    fn withdraw_parses_the_sha_it_takes_back() {
+        let sha = Sha::digest(b"a refused node archive");
+        let cli = Cli::try_parse_from([
+            "release",
+            "withdraw",
+            "--sha",
+            &sha.to_string(),
+            "--config",
+            "ws/node.toml",
+        ])
+        .unwrap();
+        let ReleaseCmd::Withdraw(args) = cli.cmd else {
+            panic!("parsed another verb");
+        };
+        assert_eq!(args.sha, sha);
+        assert_eq!(args.selector.config, Some(PathBuf::from("ws/node.toml")));
+        assert!(
+            Cli::try_parse_from(["release", "withdraw", "-n", "chain-1"]).is_err(),
+            "--sha is required"
+        );
     }
 
     #[test]

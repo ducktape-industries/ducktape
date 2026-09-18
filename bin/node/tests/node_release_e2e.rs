@@ -41,7 +41,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use app_update::{Kind, Phase, Platform, Sha, state};
-use common::{NodeProc, e2e_tempdir, founding_set};
+use common::{NetworkShapeCluster, NodeProc, e2e_tempdir, founding_set};
 
 /// The release wallet's password, fed to every verb that signs.
 const WALLET_PASSWORD: &str = "node-release-e2e";
@@ -731,4 +731,77 @@ fn a_node_publishes_stages_qualifies_and_flips_its_successor_at_a_height() {
         .as_mut()
         .expect("the launcher runs")
         .terminate(Duration::from_secs(120));
+}
+
+/// A designation the network takes back is no longer the network's: once
+/// `release withdraw` passes, the reading every launcher polls names no
+/// release, so no launcher offers it and no joiner fetches it. The founder is
+/// the whole quorum, so each ceremony passes on its one ballot, and no
+/// launcher runs: nothing is published, the schedule skips the preflight that
+/// would fetch the archive, and a withdrawal fetches and runs nothing.
+#[test]
+fn a_withdrawn_release_is_no_longer_designated() {
+    let mut cluster = NetworkShapeCluster::new();
+    cluster.init_founder("release-withdraw");
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", BUDGET);
+    let release = |args: &[&str]| {
+        Command::new(ducktape())
+            .arg("release")
+            .args(args)
+            .arg("--config")
+            .arg(cluster.config_file(0))
+            .output()
+            .expect("run a release verb")
+    };
+    let reading = || -> serde_json::Value {
+        let out = release(&["status", "--json"]);
+        assert!(out.status.success(), "release status: {out:?}");
+        serde_json::from_slice(&out.stdout).expect("release status prints one json object")
+    };
+
+    let refused = Sha::digest(b"a release every launcher refused").to_string();
+    let at = reading()["height"].as_u64().expect("a committed height") + 1_000;
+    let scheduled = release(&[
+        "schedule",
+        "--sha",
+        &refused,
+        "--at",
+        &at.to_string(),
+        "--skip-preflight-i-know-the-wit-moved",
+    ]);
+    assert!(
+        scheduled.status.success(),
+        "release schedule: {}",
+        String::from_utf8_lossy(&scheduled.stderr)
+    );
+    assert_eq!(reading()["designation"]["sha256"], refused.as_str());
+
+    // a withdrawal names a release the network designates, or it never
+    // becomes a ballot.
+    let never = Sha::digest(b"a release nobody designated").to_string();
+    let stray = release(&["withdraw", "--sha", &never]);
+    let stray_said = String::from_utf8_lossy(&stray.stderr);
+    assert!(
+        !stray.status.success() && stray_said.contains("not_designated"),
+        "withdrawing an undesignated release is refused by name: {stray_said}"
+    );
+    assert_eq!(
+        reading()["designation"]["sha256"],
+        refused.as_str(),
+        "the refused withdrawal changed nothing"
+    );
+
+    let withdrawn = release(&["withdraw", "--sha", &refused]);
+    assert!(
+        withdrawn.status.success(),
+        "release withdraw: {}",
+        String::from_utf8_lossy(&withdrawn.stderr)
+    );
+    let after = reading();
+    assert_eq!(
+        after["designation"],
+        serde_json::Value::Null,
+        "a withdrawn release is no longer designated: {after}"
+    );
 }
