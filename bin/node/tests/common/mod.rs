@@ -125,22 +125,9 @@ fn pinned_build() -> &'static PinnedBuild {
 
         let staged = workspace_config::modules_dir(noded::services::STAGED_SET)
             .expect("cargo build stages the founding set beside the test executable");
-        // keep the set's OWN name: it is the name the build baked into the
-        // pinned binary too, so a spawned node finds this copy beside itself.
-        let staged_name = staged
-            .file_name()
-            .expect("a resolved founding set has a directory name");
-        let modules = dir.join(staged_name);
-        link_tree(&staged, &modules);
-        // the simulator's twin rides along when the build staged one. No node
-        // e2e composes from it today; a pin that silently dropped it would be a
-        // trap for the first one that does.
         let sim = workspace_config::sim_modules_dir(noded::services::STAGED_SET)
             .expect("the twin of a resolved set");
-        if sim.is_dir() {
-            let sim_name = sim.file_name().expect("a twin has a directory name");
-            link_tree(&sim, &dir.join(sim_name));
-        }
+        let modules = pin_sets(&staged, &sim, &dir);
 
         PinnedBuild {
             binary,
@@ -208,15 +195,85 @@ fn commit_is_ours(commit: &str) -> bool {
     answered.status.code() != Some(1)
 }
 
+/// Pin the founding set into `dir`, and the simulator's twin beside it when the
+/// build staged one; returns where the set landed.
+///
+/// The set lands under the name the build baked into the pinned binary
+/// (`STAGED_SET`), wherever it was resolved from, so a spawned node finds this
+/// copy beside itself. `$DUCKTAPE_MODULES_DIR`'s own basename is a name no
+/// binary looks for: a node resolving beside itself would walk one directory up
+/// to the live set instead. The twin keeps its own name and rides along because
+/// no node e2e composes from it today, and a pin that silently dropped it would
+/// be a trap for the first one that does.
+///
+/// Each distinct SOURCE is pinned once. Under `$DUCKTAPE_MODULES_DIR` the set
+/// and its twin both resolve to that one directory, and it is the set.
+fn pin_sets(staged: &Path, sim: &Path, dir: &Path) -> PathBuf {
+    let modules = dir.join(noded::services::STAGED_SET);
+    link_tree(staged, &modules);
+    let sim_is_another_set = sim.is_dir() && !same_inode(sim, staged);
+    if sim_is_another_set {
+        let sim_name = sim.file_name().expect("a twin has a directory name");
+        link_tree(sim, &dir.join(sim_name));
+    }
+    modules
+}
+
+/// Do `a` and `b` name one inode — one directory under two names, or a pin
+/// that already links its source?
+fn same_inode(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    (a.dev(), a.ino()) == (b.dev(), b.ino())
+}
+
 /// Link `src` to `dest`, copying only where the filesystem has no links. The
 /// link is the point — it pins the INODE, which a rename over the name cannot
 /// reach.
+///
+/// It never writes onto a name that exists. That name can already be a link of
+/// `src`, and a copy opens its destination truncating: it would zero the one
+/// inode the pin and the SOURCE share, emptying the staged set itself. A `dest`
+/// holding `src`'s inode is already pinned; any other file there is refused.
 fn link_or_copy(src: &Path, dest: &Path) {
-    if std::fs::hard_link(src, dest).is_ok() {
+    let Err(refused) = std::fs::hard_link(src, dest) else {
+        return;
+    };
+    match refused.kind() {
+        std::io::ErrorKind::AlreadyExists => keep_an_existing_pin(src, dest),
+        _ => copy_to_a_new_file(src, dest)
+            .unwrap_or_else(|e| panic!("pin {} -> {}: {e}", src.display(), dest.display())),
+    }
+}
+
+/// `dest` exists: `src` pinned already, or a different file under the name —
+/// two sources colliding in one pin, refused with both named rather than
+/// settled by writing over either.
+fn keep_an_existing_pin(src: &Path, dest: &Path) {
+    if same_inode(src, dest) {
         return;
     }
-    std::fs::copy(src, dest)
-        .unwrap_or_else(|e| panic!("pin {} -> {}: {e}", src.display(), dest.display()));
+    panic!(
+        "pin {} -> {}: the destination already holds a different file; two sources \
+         collide in one pin and neither is written over",
+        src.display(),
+        dest.display()
+    );
+}
+
+/// The copy for a filesystem with no links: into a NEW file only, so it cannot
+/// truncate a name anything else holds. It carries the source's permissions,
+/// which a pinned binary needs to run.
+fn copy_to_a_new_file(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let mut from = std::fs::File::open(src)?;
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
+    std::io::copy(&mut from, &mut to)?;
+    to.set_permissions(from.metadata()?.permissions())
 }
 
 /// The same, for a directory. RECURSIVE, because the staged set is not flat: a
@@ -3273,6 +3330,65 @@ mod pin_tests {
             std::fs::read(pinned.join("home.assets/icons/tab.svg")).expect("the view's asset"),
             b"<svg/>",
             "a view's assets live one level down"
+        );
+    }
+
+    /// `$DUCKTAPE_MODULES_DIR` resolves the set AND its simulator twin to one
+    /// directory. Pinning it under both names once emptied the set at its
+    /// source: the second pass found every name linked, fell back to a copy,
+    /// and the copy truncated the inode the pin and the source share. Pinned
+    /// through `pin_sets` and then linked over again, every file keeps its
+    /// bytes and exactly one extra link.
+    #[test]
+    fn a_set_reached_by_two_names_keeps_its_bytes_and_one_pin() {
+        use std::os::unix::fs::MetadataExt as _;
+        let scratch = e2e_tempdir("pin-alias");
+        let set = scratch.path().join("modules");
+        std::fs::create_dir_all(set.join("home.assets/icons")).expect("stand up a staged set");
+        std::fs::write(set.join("acl.component.wasm"), b"component").expect("write");
+        std::fs::write(set.join("home.assets/icons/tab.svg"), b"<svg/>").expect("write");
+
+        let modules = pin_sets(&set, &set, &scratch.path().join("pin"));
+        // the guard beneath the dedupe: a second pass onto names already linked.
+        link_tree(&set, &modules);
+
+        let files = [
+            ("acl.component.wasm", &b"component"[..]),
+            ("home.assets/icons/tab.svg", &b"<svg/>"[..]),
+        ];
+        for (file, bytes) in files {
+            for path in [set.join(file), modules.join(file)] {
+                let held = std::fs::read(&path).expect("read a pinned file");
+                assert_eq!(held, bytes, "{} kept its bytes", path.display());
+                let links = std::fs::metadata(&path).expect("stat").nlink();
+                assert_eq!(links, 2, "{} is the source plus one pin", path.display());
+            }
+        }
+    }
+
+    /// A pin name that already holds a DIFFERENT file is two sources colliding:
+    /// refused with both paths named, and neither file is written.
+    #[test]
+    fn a_pin_name_holding_another_file_is_refused_not_overwritten() {
+        let scratch = e2e_tempdir("pin-collide");
+        let src = scratch.path().join("acl.component.wasm");
+        let dest = scratch.path().join("pinned.component.wasm");
+        std::fs::write(&src, b"this set's component").expect("write");
+        std::fs::write(&dest, b"another set's component").expect("write");
+
+        let refused = std::panic::catch_unwind(|| link_or_copy(&src, &dest))
+            .expect_err("a collision is refused");
+        let verdict = refused
+            .downcast_ref::<String>()
+            .expect("a formatted refusal");
+        assert!(
+            verdict.contains("already holds a different file"),
+            "{verdict}"
+        );
+        assert_eq!(std::fs::read(&src).expect("src"), b"this set's component");
+        assert_eq!(
+            std::fs::read(&dest).expect("dest"),
+            b"another set's component"
         );
     }
 }
