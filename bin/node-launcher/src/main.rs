@@ -63,6 +63,15 @@ usage: ducktape-node-launcher run     --workspace DIR [--config FILE] [-- ARGS..
 const DEFAULT_POLL_MS: u64 = 2000;
 const POLL_ENV: &str = "DUCKTAPE_UPDATE_POLL_MS";
 
+/// A forever-retry loop says its first attempt, then every this-many-th,
+/// carrying the count: the counter IS the diagnosis, and a line per attempt
+/// would evict the ring the answer is in.
+const REPORT_EVERY: u64 = 60;
+
+/// The longest a node that keeps dying at boot waits for its next start, in
+/// polls — about a minute at the default poll.
+const RESTART_BACKOFF_CAP_POLLS: u64 = 32;
+
 /// Every way the launcher can be invoked; one match in `main`.
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
@@ -220,6 +229,12 @@ impl Flags {
 /// until it exits — then boot again. A node that exits is not an error here:
 /// it is how a flip, a rollback and an operator's `systemctl restart` all
 /// look, and the machine decides which one it was.
+///
+/// A node that exits before it ever came up is the one exception: booting it
+/// again at once is a loop that restarts it every poll forever, each boot
+/// saying the same failure. Those boots are counted, backed off and said at
+/// attempt 1 then every [`REPORT_EVERY`]th; a node that came up starts the
+/// count over.
 fn supervise_node(layout: &Layout, args: &[OsString]) -> ExitCode {
     // Before anything is read or written: this process is the workspace's one
     // supervisor, or there already is one and this is not it.
@@ -230,16 +245,71 @@ fn supervise_node(layout: &Layout, args: &[OsString]) -> ExitCode {
     let mut watch = Watch::default();
     let mut child_args = vec![OsString::from("node"), OsString::from("run")];
     child_args.extend_from_slice(args);
+    // Consecutive boots that produced no live node; any child that comes up
+    // ends the run (`one_node_life` zeroes it).
+    let mut failed_boots = 0u64;
     loop {
-        match one_node_life(layout, &child_args, &mut watch) {
-            Ok(Life::Reboot) => {}
-            Ok(Life::Stopped) => {
-                info!(target: TARGET, event = "node_update_stopped", "the node is stopped");
-                return ExitCode::SUCCESS;
-            }
+        let life = match one_node_life(layout, &child_args, &mut watch, &mut failed_boots) {
+            Ok(life) => life,
             Err(refusal) => return refuse(&refusal),
+        };
+        match life {
+            Life::Stopped => break,
+            Life::Exited {
+                reached: Boot::Up,
+                release,
+                code,
+            } => {
+                warn!(
+                    target: TARGET,
+                    event = "node_update_child_exited",
+                    release = %release,
+                    code,
+                    "the node exited; booting the update machine again"
+                );
+            }
+            Life::Exited {
+                reached: Boot::Starting,
+                release,
+                code,
+            } => {
+                failed_boots += 1;
+                let polls = restart_polls(failed_boots);
+                if worth_saying(failed_boots) {
+                    warn!(
+                        target: TARGET,
+                        event = "node_update_child_exited",
+                        release = %release,
+                        code,
+                        attempts = failed_boots,
+                        backoff_ms = polls.saturating_mul(poll_millis()),
+                        "the node exited before it came up; booting it again after a backoff"
+                    );
+                }
+                let still_running = sleep_polls(polls);
+                if !still_running {
+                    break;
+                }
+            }
         }
     }
+    info!(target: TARGET, event = "node_update_stopped", "the node is stopped");
+    ExitCode::SUCCESS
+}
+
+/// How many polls to wait before booting a node that has died at boot
+/// `failed_boots` times in a row: one after the first, doubling up to
+/// [`RESTART_BACKOFF_CAP_POLLS`]. A single crash still restarts on the next
+/// poll, which is what a flipped release's boot count needs to roll back.
+fn restart_polls(failed_boots: u64) -> u64 {
+    let doublings = u32::try_from(failed_boots.saturating_sub(1)).unwrap_or(u32::MAX);
+    2u64.saturating_pow(doublings)
+        .min(RESTART_BACKOFF_CAP_POLLS)
+}
+
+/// Attempt 1, then every [`REPORT_EVERY`]th.
+fn worth_saying(attempts: u64) -> bool {
+    attempts == 1 || attempts.is_multiple_of(REPORT_EVERY)
 }
 
 /// Why this launcher will not run this workspace — to the log a dashboard
@@ -259,9 +329,21 @@ fn refuse(refusal: &Refusal) -> ExitCode {
 /// How one node life ended.
 enum Life {
     /// The node exited on its own; boot the machine again.
-    Reboot,
+    Exited {
+        reached: Boot,
+        release: Sha,
+        code: Option<i32>,
+    },
     /// This launcher was told to stop, and stopped the node.
     Stopped,
+}
+
+/// How far the running child got: whether it published its mesh identity,
+/// the one "it came up" the machine itself knows (`Next::Healthy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boot {
+    Starting,
+    Up,
 }
 
 /// One boot, one child, and the polls in between.
@@ -269,6 +351,7 @@ fn one_node_life(
     layout: &Layout,
     child_args: &[OsString],
     watch: &mut Watch,
+    failed_boots: &mut u64,
 ) -> Result<Life, Refusal> {
     let ducktape = Ducktape::new(layout.exe(), layout.config());
     let keys = update::trusted_keys(layout)?;
@@ -291,6 +374,7 @@ fn one_node_life(
     let running = boot.run.unwrap_or_else(|| phase.current());
     info!(target: TARGET, event = "node_update_exec", release = %running, "starting the node");
     let mut child = ducktape.spawn(child_args)?;
+    let mut reached = Boot::Starting;
 
     loop {
         if stopping() {
@@ -298,19 +382,24 @@ fn one_node_life(
             return Ok(Life::Stopped);
         }
         if let Some(code) = child.exited() {
-            warn!(
-                target: TARGET,
-                event = "node_update_child_exited",
-                release = %phase.current(),
+            return Ok(Life::Exited {
+                reached,
+                release: phase.current(),
                 code,
-                "the node exited; booting the update machine again"
-            );
-            return Ok(Life::Reboot);
+            });
         }
         let Ok(status) = ducktape.status() else {
             sleep_poll();
             continue;
         };
+        // Every child counts, the one a flip starts included: a flipped
+        // release that dies at boot is a first failure, not the tail of a
+        // run the child before it ended by coming up.
+        let came_up = status.identity_published();
+        if came_up {
+            reached = Boot::Up;
+            *failed_boots = 0;
+        }
         let next = update::decide(&phase, &status, watch);
         let Some(event) = next.event() else {
             sleep_poll();
@@ -371,6 +460,7 @@ fn one_node_life(
         let running = settled.run.unwrap_or_else(|| phase.current());
         info!(target: TARGET, event = "node_update_exec", release = %running, "starting the node");
         child = ducktape.spawn(child_args)?;
+        reached = Boot::Starting;
     }
 }
 
@@ -544,11 +634,8 @@ fn follow_install_path(layout: &Layout, mut child: Child, running: Option<&std::
 }
 
 /// Block until the node says it has published a mesh identity. A forever-retry
-/// loop: the first attempt is said, then every 60th, carrying the count — the
-/// counter IS the diagnosis, and an unconditional line per poll would evict
-/// the ring the answer is in.
+/// loop, said at attempt 1 then every [`REPORT_EVERY`]th.
 fn await_identity(ducktape: &Ducktape) -> bool {
-    const REPORT_EVERY: u64 = 60;
     let mut attempts = 0u64;
     loop {
         if stopping() {
@@ -559,8 +646,7 @@ fn await_identity(ducktape: &Ducktape) -> bool {
             Ok(status) if status.identity_published() => return true,
             Ok(_) | Err(_) => {}
         }
-        let say = attempts == 1 || attempts.is_multiple_of(REPORT_EVERY);
-        if say {
+        if worth_saying(attempts) {
             info!(
                 target: TARGET,
                 event = "node_update_awaiting_identity",
@@ -667,12 +753,27 @@ fn seed_founding_set(from: &std::path::Path, release_dir: &std::path::Path) -> R
 
 // --- process plumbing --------------------------------------------------------
 
-fn sleep_poll() {
-    let millis = std::env::var(POLL_ENV)
+fn poll_millis() -> u64 {
+    std::env::var(POLL_ENV)
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_POLL_MS);
-    std::thread::sleep(std::time::Duration::from_millis(millis));
+        .unwrap_or(DEFAULT_POLL_MS)
+}
+
+fn sleep_poll() {
+    std::thread::sleep(std::time::Duration::from_millis(poll_millis()));
+}
+
+/// Sleep `polls` polls, or until this launcher is told to stop — `false` when
+/// it was, so a backoff never holds up `systemctl stop`.
+fn sleep_polls(polls: u64) -> bool {
+    for _ in 0..polls {
+        if stopping() {
+            return false;
+        }
+        sleep_poll();
+    }
+    !stopping()
 }
 
 /// stderr only; `RUST_LOG` filters, default `info`. The node's own subscriber
@@ -758,6 +859,23 @@ mod tests {
         assert!(parse(vec!["install".into(), "--workspace".into(), "/w".into()]).is_err());
         assert!(parse(vec!["fly".into(), "--workspace".into(), "/w".into()]).is_err());
         assert!(parse(vec!["run".into(), "--workspace".into()]).is_err());
+    }
+
+    /// A node that keeps dying at boot waits one poll, then twice as long each
+    /// time, up to the cap — and never past it, however long the run.
+    #[test]
+    fn a_crash_loop_backs_off_doubling_up_to_the_cap() {
+        let waits: Vec<u64> = (1..=8).map(restart_polls).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 32, 32]);
+        assert_eq!(restart_polls(u64::MAX), RESTART_BACKOFF_CAP_POLLS);
+    }
+
+    #[test]
+    fn a_forever_retry_is_said_at_attempt_one_then_every_nth() {
+        let said: Vec<u64> = (1..=3 * REPORT_EVERY)
+            .filter(|attempts| worth_saying(*attempts))
+            .collect();
+        assert_eq!(said, [1, REPORT_EVERY, 2 * REPORT_EVERY, 3 * REPORT_EVERY]);
     }
 
     fn idle(name: &str) -> Phase {
