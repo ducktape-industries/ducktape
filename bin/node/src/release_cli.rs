@@ -169,9 +169,22 @@ pub(crate) struct ScheduleArgs {
     pub sha: Sha,
     /// the block from which every validator runs it. ABSOLUTE, and the same
     /// number for every member co-signing this proposal — it is inside the
-    /// text they join each other by
-    #[arg(long, value_name = "HEIGHT")]
-    pub at: u64,
+    /// text they join each other by. Refused (`activation_lead_too_short`)
+    /// when it leads the height this proposal is made at — after the
+    /// preflight — by less than one launcher poll of blocks
+    #[arg(
+        long,
+        value_name = "HEIGHT",
+        required_unless_present = "lead",
+        conflicts_with = "lead"
+    )]
+    pub at: Option<u64>,
+    /// propose `--at` as BLOCKS past the height this proposal is made at,
+    /// measured after the preflight so its time is not spent out of the lead.
+    /// For the member who proposes: every other member co-signs with the
+    /// `--at` this prints
+    #[arg(long, value_name = "BLOCKS")]
+    pub lead: Option<u64>,
     /// propose without asking the archive whether it can link the components
     /// this network runs. The preflight is the only thing standing between a
     /// WIT change and every validator stopping its node to learn the same
@@ -456,11 +469,11 @@ fn designation_id(nth: u64) -> String {
 ///
 /// `--at` is ABSOLUTE and the same number for every member: it is inside the
 /// text they join each other's proposal by.
+///
+/// The lead is measured from the committed height AFTER the preflight: the
+/// preflight takes as long as fetching and linking the archive takes, and a
+/// lead counted from before it is spent while it runs.
 fn schedule(args: ScheduleArgs) -> CommandResult {
-    let designation = Designation {
-        sha256: args.sha,
-        activation_height: args.at,
-    };
     let cfg_path = args.selector.config_path()?;
     let resolved = crate::config::resolve(&cfg_path)?;
     let node = crate::cli::DrivenNode::of(&resolved, "release schedule")?;
@@ -468,6 +481,31 @@ fn schedule(args: ScheduleArgs) -> CommandResult {
         Preflight::Compose => preflight(node.http_base(), &cfg_path, &args.sha)?,
         Preflight::Skipped => {}
     }
+    let proposed_at = committed_height(node.http_base())?;
+    let at = match (args.at, args.lead) {
+        (Some(at), _) => at,
+        (None, Some(lead)) => proposed_at.saturating_add(lead),
+        (None, None) => {
+            return Err("release schedule needs --at <HEIGHT> or --lead <BLOCKS>".into());
+        }
+    };
+    let block_time_ms = u64::try_from(resolved.cadence.block_time.as_millis()).unwrap_or(u64::MAX);
+    if let Err(refusal) = check_lead(proposed_at, at, block_time_ms) {
+        tracing::warn!(
+            target: "ducktape::update",
+            event = "release_schedule_refused",
+            reason = "activation_lead_too_short",
+            release = %args.sha,
+            proposed_at,
+            at,
+            "the activation height is inside one launcher poll of the proposal; nothing was proposed"
+        );
+        return Err(refusal.into());
+    }
+    let designation = Designation {
+        sha256: args.sha,
+        activation_height: at,
+    };
     let signer = crate::cli::gov_signer(node.rpc(), &cfg_path, &resolved)?;
     let pubkey_hex = crate::module_cli::signer_pubkey_hex(&signer);
     let wanted = governance::GovAction::Signal {
@@ -491,13 +529,49 @@ fn schedule(args: ScheduleArgs) -> CommandResult {
     match outcome {
         crate::cli::CeremonyOutcome::Passed => {
             println!(
-                "designated {} from height {}; track with: ducktape release status",
-                args.sha, args.at
+                "designated {} from height {at}; track with: ducktape release status",
+                args.sha
             );
             Ok(())
         }
-        crate::cli::CeremonyOutcome::AwaitingBallots => Ok(()),
+        crate::cli::CeremonyOutcome::AwaitingBallots => {
+            println!(
+                "proposed {} from height {at}; every other member co-signs with --at {at}",
+                args.sha
+            );
+            Ok(())
+        }
     }
+}
+
+/// The committed height this node reports — where a designation's lead is
+/// measured from.
+fn committed_height(base: &str) -> Result<u64, String> {
+    let status = crate::node_http::get_json(base, "/v1/status")
+        .map_err(|error| format!("read this node's status: {error}"))?;
+    status["height"]
+        .as_u64()
+        .ok_or_else(|| "this node's status carries no height".to_string())
+}
+
+/// Refuse an activation height that leads `proposed_at` by less than
+/// [`Designation::min_lead`]: a designation no launcher polling at its default
+/// can be counted on to stage before the height, so a validator would run the
+/// release from whenever it happened to notice rather than from `at`.
+fn check_lead(proposed_at: u64, at: u64, block_time_ms: u64) -> Result<(), String> {
+    let min = Designation::min_lead(block_time_ms);
+    let lead = at.saturating_sub(proposed_at);
+    if lead >= min {
+        return Ok(());
+    }
+    Err(format!(
+        "activation_lead_too_short: activation height {at} leads height {proposed_at}, where \
+         this proposal is made, by {lead} blocks — a launcher polls every {poll} ms, which is {min} blocks at \
+         this network's {block_time_ms} ms beat, so nothing was proposed. Pass --at {earliest} \
+         or later, or --lead <BLOCKS> to count from the proposal height.",
+        poll = app_update::designation::LAUNCHER_POLL_MS,
+        earliest = proposed_at.saturating_add(min),
+    ))
 }
 
 /// Ask the archive being designated whether it can link the components this
@@ -1151,6 +1225,55 @@ mod tests {
     struct Cli {
         #[command(subcommand)]
         cmd: ReleaseCmd,
+    }
+
+    /// A lead of one launcher poll is the floor; a block less is refused by
+    /// name, with the three numbers an operator needs to pick again.
+    #[test]
+    fn a_lead_inside_one_launcher_poll_is_refused_with_its_heights() {
+        // 100 ms beat: one 2000 ms poll is 20 blocks.
+        assert_eq!(check_lead(1000, 1020, 100), Ok(()));
+        let refusal = check_lead(1000, 1019, 100).expect_err("19 blocks is inside the poll");
+        assert!(
+            refusal.starts_with("activation_lead_too_short:"),
+            "{refusal}"
+        );
+        for number in [
+            "activation height 1019",
+            "leads height 1000",
+            "by 19 blocks",
+            "20 blocks",
+            "--at 1020",
+        ] {
+            assert!(
+                refusal.contains(number),
+                "{number:?} missing from: {refusal}"
+            );
+        }
+        // a height already passed leads by nothing, not by a wrapped u64.
+        let passed = check_lead(1000, 900, 100).expect_err("a passed height");
+        assert!(passed.contains("by 0 blocks"), "{passed}");
+    }
+
+    /// `--at` and `--lead` name one height two ways: exactly one is taken.
+    #[test]
+    fn schedule_takes_at_or_lead_never_both() {
+        let sha = "ab".repeat(32);
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["release", "schedule", "--sha", sha.as_str()];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let Ok(Cli {
+            cmd: ReleaseCmd::Schedule(lead),
+        }) = parse(&["--lead", "150"])
+        else {
+            panic!("--lead alone parses");
+        };
+        assert_eq!((lead.at, lead.lead), (None, Some(150)));
+        assert!(parse(&["--at", "9"]).is_ok());
+        assert!(parse(&[]).is_err(), "one of the two is required");
+        assert!(parse(&["--at", "9", "--lead", "150"]).is_err());
     }
 
     #[test]

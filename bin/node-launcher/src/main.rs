@@ -57,10 +57,11 @@ usage: ducktape-node-launcher run     --workspace DIR [--config FILE] [-- ARGS..
                                       [--release-key HEX]
 ";
 
-/// How often the supervisor asks the node where the chain is. A poll, not a
+/// Overrides how often the supervisor asks the node where the chain is — by
+/// default `app_update::designation::LAUNCHER_POLL_MS`, the poll
+/// `release schedule` refuses a shorter activation lead than. A poll, not a
 /// deadline: nothing here times out, and a node that never answers simply
 /// keeps running.
-const DEFAULT_POLL_MS: u64 = 2000;
 const POLL_ENV: &str = "DUCKTAPE_UPDATE_POLL_MS";
 
 /// A forever-retry loop says its first attempt, then every this-many-th,
@@ -757,7 +758,7 @@ fn poll_millis() -> u64 {
     std::env::var(POLL_ENV)
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_POLL_MS)
+        .unwrap_or(app_update::designation::LAUNCHER_POLL_MS)
 }
 
 fn sleep_poll() {

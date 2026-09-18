@@ -32,6 +32,12 @@ use crate::sha::Sha;
 /// Everything after it is this document as compact JSON.
 pub const SIGNAL_TAG: &str = "node-release ";
 
+/// How often a node's launcher asks its node what the network designates, by
+/// default — so the longest a passed designation can go unseen. The launcher
+/// stages a release in the poll that first sees it, and that download is as
+/// long as the archive and the link make it: nothing bounds it.
+pub const LAUNCHER_POLL_MS: u64 = 2000;
+
 /// The release a network runs, and the height it starts running it at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Designation {
@@ -59,6 +65,15 @@ impl Designation {
     /// Is this release the one to run at `height`?
     pub fn armed_at(&self, height: u64) -> bool {
         self.activation_height <= height
+    }
+
+    /// The fewest blocks a designation may lead its activation height by, on a
+    /// network whose beat is `block_time_ms`: one [`LAUNCHER_POLL_MS`]. A
+    /// shorter lead is a release a launcher polling at its default cannot be
+    /// counted on even to SEE before the height, let alone stage — a floor, not
+    /// a margin: a large archive on a slow link needs more.
+    pub fn min_lead(block_time_ms: u64) -> u64 {
+        LAUNCHER_POLL_MS.div_ceil(block_time_ms.max(1))
     }
 }
 
@@ -106,5 +121,15 @@ mod tests {
         assert!(!designation.armed_at(1199));
         assert!(designation.armed_at(1200));
         assert!(designation.armed_at(1201));
+    }
+
+    /// One launcher poll, in whole blocks, rounded up: a lead a block short of
+    /// a poll is still inside it.
+    #[test]
+    fn the_minimum_lead_is_one_launcher_poll_of_blocks() {
+        assert_eq!(Designation::min_lead(1000), 2);
+        assert_eq!(Designation::min_lead(100), 20);
+        assert_eq!(Designation::min_lead(300), 7);
+        assert_eq!(Designation::min_lead(LAUNCHER_POLL_MS), 1);
     }
 }
