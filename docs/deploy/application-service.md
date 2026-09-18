@@ -363,7 +363,9 @@ default) with `Transfer-Encoding: chunked`. The Gateway counts a request body
 as it streams rather than holding it, so an uncapped route costs the node one
 frame, not one repository. Who may push is this service's own gate — the Git
 SSH push certificate and the module's ref rules — not a byte count on the
-transport. Stock Git can supply the route authority through its HTTP header
+transport. Set `max_response_bytes` to `0` (unbounded) for the same reason the
+other way: a clone is the whole history, and a capped route refuses any
+repository whose pack outgrows the cap. Stock Git can supply the route authority through its HTTP header
 configuration when dialing the node's browser Gateway:
 
 ```sh

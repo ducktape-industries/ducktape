@@ -137,7 +137,9 @@ impl GatewayGit {
                     // push is forge's own gate — the push certificate and its
                     // ref rules — not a byte count on this hop.
                     max_request_bytes: None,
-                    max_response_bytes: gateway::MAX_RESPONSE_BODY_BYTES,
+                    // 0 = unbounded, for the same reason the other way: a
+                    // clone is the whole history, and the Gateway streams it.
+                    max_response_bytes: 0,
                     allow_authorization: false,
                     allow_upgrade: false,
                 },

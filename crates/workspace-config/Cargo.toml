@@ -22,8 +22,6 @@ module-artifact = { workspace = true }
 # THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
 # zero-dependency leaf so every reader of that root agrees about it.
 ducktape-home = { workspace = true }
-# the chain id a `duck://` address carries — the registry resolves it here.
-duck-address = { workspace = true }
 base64 = "0.22"
 # the genesis file's record codec — the workspace's one binary artifact.
 borsh = { workspace = true }
@@ -36,7 +34,8 @@ commonware-utils = { workspace = true }
 # hex codecs for keys, roots and pasted blobs — the shared home.
 duckfs-core = { workspace = true }
 # the `duck://` grammar's chain id: the ONE rule a network name must satisfy
-# (`validate_network_name`), never a second copy of its charset here.
+# (`validate_network_name`), never a second copy of its charset here — and
+# the chain id a `duck://` address carries, which the registry resolves.
 duck-address = { workspace = true }
 # the invite token's mint/verify, shared verbatim with the validator that
 # admits a redemption (`governance::invite`).
