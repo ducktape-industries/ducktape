@@ -123,28 +123,20 @@ fn pinned_build() -> &'static PinnedBuild {
             link_or_copy(&launcher, &dir.join("ducktape-node-launcher"));
         }
 
-        let staged = workspace_config::modules_dir()
+        let staged = workspace_config::modules_dir(noded::services::STAGED_SET)
             .expect("cargo build stages the founding set beside the test executable");
-        // keep the set's OWN name: `staged_modules_dir` reads the pointer the
-        // build wrote, and the pin copies the set that pointer named.
+        // keep the set's OWN name: it is the name the build baked into the
+        // pinned binary too, so a spawned node finds this copy beside itself.
         let staged_name = staged
             .file_name()
             .expect("a resolved founding set has a directory name");
         let modules = dir.join(staged_name);
         link_tree(&staged, &modules);
-        // and the pointer that names it, because that is what a spawned node
-        // reads. Without one the pin would hold a set nothing resolves and the
-        // node would walk back out to the live profile directory — the very
-        // set being pinned away from.
-        std::fs::write(
-            dir.join(workspace_config::staged_key::STAGED_POINTER),
-            staged_name.to_str().expect("utf-8 founding set name"),
-        )
-        .expect("name the pinned founding set");
         // the simulator's twin rides along when the build staged one. No node
         // e2e composes from it today; a pin that silently dropped it would be a
         // trap for the first one that does.
-        let sim = workspace_config::sim_modules_dir().expect("the twin of a resolved set");
+        let sim = workspace_config::sim_modules_dir(noded::services::STAGED_SET)
+            .expect("the twin of a resolved set");
         if sim.is_dir() {
             let sim_name = sim.file_name().expect("a twin has a directory name");
             link_tree(&sim, &dir.join(sim_name));
@@ -3186,7 +3178,7 @@ mod pin_tests {
             "the pin is the same build, linked — not some other one"
         );
         assert_eq!(
-            workspace_config::staged_modules_dir(pinned)
+            workspace_config::staged_modules_dir(pinned, noded::services::STAGED_SET)
                 .expect("a founding set resolves beside the pinned binary"),
             Path::new(founding_set()),
             "a spawned node must find the PINNED set beside itself, not the live one"
