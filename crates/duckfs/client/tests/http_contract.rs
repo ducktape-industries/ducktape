@@ -246,6 +246,30 @@ fn module_rejection_is_preserved_and_missing_signer_sends_nothing() {
     );
 }
 
+/// a node nothing answers for is its OWN case, carrying the base it was dialed
+/// at — not reqwest's sentence and the url folded into a transport string,
+/// which left the CLI nothing to classify (#2660). a hang-up before any
+/// response is the same condition: it is what a draining node does to a read.
+#[test]
+fn nothing_answering_is_unreachable_not_a_transport_string() {
+    // bound only to learn a port nothing is on: the connect is REFUSED.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let refused = format!("http://{}", listener.local_addr().expect("addr"));
+    drop(listener);
+    assert_eq!(
+        HttpNode::new(&refused).ls("/", None, None, 10).unwrap_err(),
+        ApiError::Unreachable { base: refused }
+    );
+
+    // accept, then hang up without writing a byte.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let draining = format!("http://{}", listener.local_addr().expect("addr"));
+    let drain = std::thread::spawn(move || drop(listener.accept().expect("the client connects")));
+    let failure = HttpNode::new(&draining).ls("/", None, None, 10).unwrap_err();
+    drain.join().expect("the drain thread finishes");
+    assert_eq!(failure, ApiError::Unreachable { base: draining });
+}
+
 /// BOTH halves of the node's envelope survive the read lane, and the error a
 /// person ends up reading is `<sentence> [<reason>]` — the module's own words
 /// first, the class token last, and no Rust type name anywhere in between.

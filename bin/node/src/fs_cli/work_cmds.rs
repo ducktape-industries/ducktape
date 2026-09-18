@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use duckfs_client::api::ApiError;
 use duckfs_client::checkout::{CheckoutError, CheckoutOptions, checkout_with};
 use duckfs_client::commit::{CommitError, CommitOptions, commit_with};
 use duckfs_client::http::HttpNode;
@@ -71,11 +72,13 @@ fn checkout_err(e: CheckoutError) -> CliError {
 }
 
 /// a commit failure other than the conflict report `commit` prints itself. a
-/// refusal keeps both halves, the same as [`api_err`].
+/// refusal keeps both halves, and a node that stopped answering mid-commit is
+/// told in the same sentence, as [`api_err`] does.
 fn commit_err(e: CommitError) -> CliError {
     match e {
         CommitError::Nothing => CliError::failed("nothing to commit (the working copy is clean)"),
         CommitError::Rejected { reason, sentence } => CliError::refused(reason, sentence),
+        CommitError::Unreachable { base } => api_err(ApiError::Unreachable { base }),
         other => CliError::failed(other.to_string()),
     }
 }
@@ -289,8 +292,6 @@ pub fn unpin(args: UnpinArgs) -> Result<(), CliError> {
 
 #[cfg(test)]
 mod tests {
-    use duckfs_client::api::ApiError;
-
     use super::*;
     use crate::fs_cli::args::Message;
 

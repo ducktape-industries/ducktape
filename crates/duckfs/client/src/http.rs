@@ -64,9 +64,7 @@ impl HttpNode {
         &self,
         request: reqwest::blocking::RequestBuilder,
     ) -> Result<reqwest::blocking::Response, ApiError> {
-        let response = request
-            .send()
-            .map_err(|error| ApiError::Transport(error.to_string()))?;
+        let response = request.send().map_err(|error| self.unanswered(error))?;
         let status = response.status();
         if status.is_success() {
             return Ok(response);
@@ -83,6 +81,22 @@ impl HttpNode {
             reason: body.reason.unwrap_or_else(|| UNCLASSIFIED.to_owned()),
             sentence: body.error,
         })
+    }
+
+    /// a failed `send()`: we never heard back. only a request we built wrong
+    /// or one that timed out (something IS on the port — a wedged node is not
+    /// a stopped one) keeps reqwest's words; every other failure — refused,
+    /// reset, hung up mid-exchange, which is what a draining node does — is
+    /// nothing answering at the base.
+    fn unanswered(&self, error: reqwest::Error) -> ApiError {
+        let we_built_it_wrong = error.is_builder() || error.is_redirect();
+        let something_is_there = error.is_timeout();
+        if we_built_it_wrong || something_is_there {
+            return ApiError::Transport(error.to_string());
+        }
+        ApiError::Unreachable {
+            base: self.base.clone(),
+        }
     }
 
     fn query(&self, query: FilesQuery) -> Result<FilesReply, ApiError> {
