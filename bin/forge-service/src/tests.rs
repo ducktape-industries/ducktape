@@ -280,3 +280,46 @@ async fn a_repo_with_no_default_branch_advertises_no_head() {
     assert!(!body.contains("symref=HEAD"), "{body}");
     assert!(!body.contains(" HEAD\n"), "{body}");
 }
+
+/// A PINNED COMMIT IS FETCHABLE BY SHA. upload-pack advertises
+/// `allow-reachable-sha1-in-want` — without it stock git never sends a want
+/// for a commit that is not a tip — and a want no ref reaches is refused as a
+/// git `ERR` line naming the commit and the repo, which git prints as
+/// `fatal: remote error: …` (an HTTP error status would reach the user as a
+/// bare "HTTP 400").
+#[tokio::test]
+async fn upload_pack_admits_reachable_wants_and_refuses_the_rest_by_name() {
+    let (directory, router) = application();
+    seed_repo(directory.path(), "lab", &["dev"]);
+    let body = advertisement(router.clone(), "lab").await;
+    assert!(body.contains("allow-reachable-sha1-in-want"), "{body}");
+
+    let unknown = "11".repeat(20);
+    let request_body = format!(
+        "{}0000{}",
+        pkt(&format!("want {unknown} side-band-64k\n")),
+        pkt("done\n")
+    );
+    let response = router
+        .oneshot(authenticated(
+            Request::builder()
+                .method("POST")
+                .uri("/lab/git-upload-pack")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/x-git-upload-pack-request",
+                )
+                .body(Body::from(request_body))
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        String::from_utf8_lossy(&bytes),
+        pkt(&format!(
+            "ERR commit {unknown} is not reachable from any ref of lab\n"
+        ))
+    );
+}

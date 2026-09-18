@@ -23,10 +23,14 @@ const GIT_RECEIVE_PACK_CAPS: &str =
 /// the capabilities forge's upload-pack (fetch/clone) advertises. `side-band-64k`
 /// muxes the packfile onto band 1 of the reply — git clients request it by
 /// default; `multi_ack_detailed` is the modern negotiation, `thin-pack`/
-/// `ofs-delta` are standard pack encodings. no fetch-side extras (shallow /
-/// filter): the answer is either the full closure or a have-bounded delta.
-const GIT_UPLOAD_PACK_CAPS: &str =
-    "multi_ack_detailed side-band-64k thin-pack ofs-delta agent=ducktape-forge/0.1";
+/// `ofs-delta` are standard pack encodings. `allow-reachable-sha1-in-want`
+/// lets a client want any commit a ref reaches, not only a tip — without it
+/// stock git refuses to even send `git fetch <url> <sha>` for a pinned commit
+/// (see [`build_upload_pack`] for the admission rule). no other fetch-side
+/// extras (shallow / filter): the answer is either the full closure or a
+/// have-bounded delta.
+const GIT_UPLOAD_PACK_CAPS: &str = "multi_ack_detailed side-band-64k thin-pack ofs-delta \
+     allow-reachable-sha1-in-want agent=ducktape-forge/0.1";
 /// what a git request that is NOT a push may carry: a fetch's want/have
 /// negotiation and a merge request are lists of oids, not content. A push has
 /// no limit at all — see the receive-pack route.
@@ -1134,11 +1138,21 @@ pub(crate) async fn git_upload_pack(
                 );
                 return error_response(StatusCode::NOT_FOUND, "no such repo");
             }
-            Ok(Err(UploadPackError::WantNotAdvertised(hex))) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    &format!("want {hex} is not one of this repo's advertised refs"),
-                );
+            // git's own upload-pack refusal shape (`ERR upload-pack: not our
+            // ref`): an `ERR` pkt-line in a 200 answer is what git prints as
+            // `fatal: remote error: <reason>`. An HTTP error status here reaches
+            // the user as a bare "HTTP 400", with the reason lost.
+            Ok(Err(UploadPackError::WantUnreachable(hex))) => {
+                let refusal = format!("ERR commit {hex} is not reachable from any ref of {repo}\n");
+                return (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "application/x-git-upload-pack-result"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                    ],
+                    pkt_line(refusal.as_bytes()),
+                )
+                    .into_response();
             }
             Ok(Err(UploadPackError::Other(msg))) => {
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg);
@@ -1199,14 +1213,15 @@ pub(crate) async fn git_upload_pack(
 /// message (`repository.c`'s "could not find repository at '%s'"), so it is
 /// NEVER surfaced to the client or put in the log ring's warn line; the
 /// handler answers a fixed 404 and logs this variant's detail at `debug`
-/// only. `WantNotAdvertised` is a refusal, not a server error: the client
-/// asked for an oid this node does not currently advertise as a branch tip.
+/// only. `WantUnreachable` is a refusal, not a server error: the client asked
+/// for an oid that is not a commit any of this node's branches reaches, and
+/// the handler answers it as a git `ERR` line naming that oid.
 /// `Other` covers everything past those two (a bad want oid, a pack-write
 /// failure) and is not path-bearing.
 #[derive(Debug)]
 enum UploadPackError {
     RepoUnavailable(git2::Error),
-    WantNotAdvertised(String),
+    WantUnreachable(String),
     Other(String),
 }
 
@@ -1218,11 +1233,13 @@ enum UploadPackError {
 /// module's snapshot pack and this fetch lane). returns the pack plus the
 /// first usable common base, which the handler ACKs.
 ///
-/// every want must equal one of this repo's current branch tips — the same
-/// anti-amplifier `forge::build_objects` enforces on the peer lane ("that
-/// guard is the whole anti-amplifier"): a caller may only ask for history
-/// this node still advertises, never an arbitrary walk of its object
-/// database by oid.
+/// every want must be a commit reachable from one of this repo's current
+/// branch tips — git's `uploadpack.allowReachableSHA1InWant`, so a client can
+/// fetch the exact commit a `Cargo.lock` pins. that is still only history this
+/// node advertises: a want's closure lies inside some tip's closure, which a
+/// clone of that tip ships anyway. an arbitrary walk of the object database by
+/// oid stays refused — an unknown oid, a tree or blob, or a commit only a
+/// deleted or force-pushed-away branch reached.
 fn build_upload_pack(
     repo_dir: &std::path::Path,
     want_hexes: &[String],
@@ -1238,10 +1255,12 @@ fn build_upload_pack(
     for hex in want_hexes {
         let oid = git2::Oid::from_str(hex)
             .map_err(|e| UploadPackError::Other(format!("bad want oid {hex}: {e}")))?;
-        if !tips.contains(&oid) {
-            return Err(UploadPackError::WantNotAdvertised(hex.clone()));
-        }
         oids.push(oid);
+    }
+    let unreachable = first_unreachable(&repo, &tips, &oids)
+        .map_err(|e| UploadPackError::Other(format!("walk refs: {e}")))?;
+    if let Some(oid) = unreachable {
+        return Err(UploadPackError::WantUnreachable(oid.to_string()));
     }
     // only haves this repo KNOWS as commits can bound the walk — a have from
     // history this node never saw simply doesn't help (and never errors).
@@ -1263,6 +1282,39 @@ fn build_upload_pack(
     forge::pack_delta(&repo, &oids, &common)
         .map(|pack| (pack, Some(ack)))
         .map_err(|e| UploadPackError::Other(format!("build delta pack: {e}")))
+}
+
+/// the first of `wants`, in request order, that no revwalk from `tips` visits;
+/// `None` admits them all. a tip is admitted without walking (every want of a
+/// plain clone). the rest share ONE walk from every tip that stops at the last
+/// outstanding want: each commit the refs reach is visited at most once,
+/// whatever the number of wants or tips — `graph_descendant_of` per
+/// (tip, want) pair would repeat a merge-base walk per pair instead. the walk
+/// yields only commits, so a tree or blob oid is never admitted.
+fn first_unreachable(
+    repo: &git2::Repository,
+    tips: &[git2::Oid],
+    wants: &[git2::Oid],
+) -> Result<Option<git2::Oid>, git2::Error> {
+    let mut pending: std::collections::HashSet<git2::Oid> = wants
+        .iter()
+        .filter(|want| !tips.contains(want))
+        .copied()
+        .collect();
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    let mut walk = repo.revwalk()?;
+    for tip in tips {
+        walk.push(*tip)?;
+    }
+    for seen in walk {
+        pending.remove(&seen?);
+        if pending.is_empty() {
+            return Ok(None);
+        }
+    }
+    Ok(wants.iter().copied().find(|want| pending.contains(want)))
 }
 
 #[cfg(test)]
@@ -1493,11 +1545,6 @@ mod upload_pack_tests {
         let first = origin
             .commit(Some("refs/heads/dev"), &sig, &sig, "one", &tree1, &[])
             .unwrap();
-        // keep `first` an advertised tip (a second branch) after `dev` moves
-        // to `second` below — the want-guard only packs an advertised tip.
-        origin
-            .reference("refs/heads/base", first, true, "test")
-            .unwrap();
 
         let blob_b = origin.blob(b"two").unwrap();
         let mut tb = origin.treebuilder(Some(&tree1)).unwrap();
@@ -1578,42 +1625,87 @@ mod upload_pack_tests {
         assert!(over.contains("too many pkt-lines in request"), "{over}");
     }
 
-    /// a want naming an oid still in the ODB but no longer any branch's tip
-    /// (the branch moved past it, or was force-pushed away) is refused, not
-    /// packed — the anti-amplifier guard `build_upload_pack` shares with the
-    /// peer lane's `forge::build_objects`. the current tip still packs fine.
-    #[test]
-    fn a_want_off_every_advertised_tip_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init(dir.path()).unwrap();
+    /// `main`: root ← pinned ← tip, plus a commit `gone` that only the deleted
+    /// branch `scratch` ever reached (it stays in the ODB, as after a real
+    /// branch delete or force-push). returns `(root, pinned, tip, gone)`.
+    fn history_with_a_deleted_branch(
+        dir: &std::path::Path,
+    ) -> (git2::Oid, git2::Oid, git2::Oid, git2::Oid) {
+        let repo = git2::Repository::init(dir).unwrap();
         let sig = git2::Signature::now("test", "test@example.com").unwrap();
-
-        let blob = repo.blob(b"one").unwrap();
-        let mut tb = repo.treebuilder(None).unwrap();
-        tb.insert("a.txt", blob, 0o100644).unwrap();
-        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
-        let orphaned = repo
-            .commit(Some("refs/heads/main"), &sig, &sig, "one", &tree, &[])
+        let commit_on = |branch: &str, file: &str, parent: Option<git2::Oid>| {
+            let blob = repo.blob(file.as_bytes()).unwrap();
+            let mut tb = repo.treebuilder(None).unwrap();
+            tb.insert(file, blob, 0o100644).unwrap();
+            let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = parent
+                .map(|p| repo.find_commit(p).unwrap())
+                .into_iter()
+                .collect();
+            let parents: Vec<&git2::Commit> = parents.iter().collect();
+            repo.commit(Some(branch), &sig, &sig, file, &tree, &parents)
+                .unwrap()
+        };
+        let root = commit_on("refs/heads/main", "root", None);
+        let pinned = commit_on("refs/heads/main", "pinned", Some(root));
+        let tip = commit_on("refs/heads/main", "tip", Some(pinned));
+        let gone = commit_on("refs/heads/scratch", "gone", Some(root));
+        repo.find_reference("refs/heads/scratch")
+            .unwrap()
+            .delete()
             .unwrap();
-        let orphaned_commit = repo.find_commit(orphaned).unwrap();
-        let tip = repo
-            .commit(
-                Some("refs/heads/main"),
-                &sig,
-                &sig,
-                "two",
-                &tree,
-                &[&orphaned_commit],
-            )
-            .unwrap();
+        (root, pinned, tip, gone)
+    }
 
-        let err = build_upload_pack(dir.path(), &[orphaned.to_string()], &[]).unwrap_err();
-        assert!(
-            matches!(err, UploadPackError::WantNotAdvertised(hex) if hex == orphaned.to_string())
-        );
+    /// a commit behind a tip — the one a `Cargo.lock` pins — packs its own
+    /// closure, and the tip still packs as before.
+    #[test]
+    fn a_want_reachable_from_a_ref_is_packed_tip_or_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, pinned, tip, _) = history_with_a_deleted_branch(dir.path());
 
-        build_upload_pack(dir.path(), &[tip.to_string()], &[])
-            .expect("a want for the current tip still packs");
+        for want in [pinned, tip] {
+            let (pack, ack) = build_upload_pack(dir.path(), &[want.to_string()], &[])
+                .unwrap_or_else(|e| panic!("want {want} must pack: {e:?}"));
+            assert_eq!(ack, None);
+            let clone_dir = tempfile::tempdir().unwrap();
+            let clone = git2::Repository::init_bare(clone_dir.path()).unwrap();
+            let odb = clone.odb().unwrap();
+            let mut pw = odb.packwriter().unwrap();
+            std::io::Write::write_all(&mut pw, &pack).unwrap();
+            pw.commit().unwrap();
+            assert!(clone.find_commit(want).is_ok(), "the pack carries {want}");
+        }
+    }
+
+    /// no ref reaches an unknown oid or a commit only a deleted branch held:
+    /// both are refused by name, and a request mixing one with a reachable
+    /// want is refused whole.
+    #[test]
+    fn a_want_no_ref_reaches_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, pinned, _, gone) = history_with_a_deleted_branch(dir.path());
+
+        for want in [gone.to_string(), WANT.to_string()] {
+            let wants = [pinned.to_string(), want.clone()];
+            let err = build_upload_pack(dir.path(), &wants, &[]).unwrap_err();
+            assert!(
+                matches!(&err, UploadPackError::WantUnreachable(hex) if *hex == want),
+                "{want}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_want_oid_is_refused() {
+        let mut body = pkt_line(b"want not-an-oid side-band-64k\n");
+        body.extend_from_slice(GIT_FLUSH_PKT);
+
+        let err = parse_upload_pack_request(&body)
+            .err()
+            .expect("a non-oid want must fail");
+
+        assert!(err.contains("want line carried an invalid oid"), "{err}");
     }
 
     /// an absent repo dir maps to the path-bearing git2 error variant, not
