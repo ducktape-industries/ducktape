@@ -175,6 +175,41 @@ pub fn digest_file(path: &Path) -> Result<Sha, Refusal> {
     Ok(Sha::from_bytes(hasher.finalize().into()))
 }
 
+/// The sha256 of the image this process runs. Read once, at start: the file an
+/// operator installed may be replaced on disk later, and the image running is
+/// still the one that started.
+pub fn running_image() -> Result<Sha, Refusal> {
+    let path = std::env::current_exe()
+        .map_err(|error| Refusal::new("launcher_image_unreadable", error.to_string()))?;
+    digest_file(&path)
+}
+
+/// The sha256 of the launcher a release ships, or `None` when it ships none.
+pub fn shipped_image(path: &Path) -> Result<Option<Sha>, Refusal> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Refusal::io("digest_failed", path, &error)),
+        Ok(_) => digest_file(path).map(Some),
+    }
+}
+
+/// Replace this process's image with the launcher at `path` — same pid, same
+/// argv — telling it through [`crate::RELAUNCHED_ENV`] that `image` is what
+/// this one exec'd. Returns only when the exec failed.
+pub fn exec_launcher(path: &Path, image: Sha) -> Refusal {
+    use std::os::unix::process::CommandExt as _;
+    let mut argv = std::env::args_os();
+    let mut command = std::process::Command::new(path);
+    if let Some(arg0) = argv.next() {
+        command.arg0(arg0);
+    }
+    let error = command
+        .args(argv)
+        .env(crate::RELAUNCHED_ENV, image.to_string())
+        .exec();
+    Refusal::io("launcher_exec_failed", path, &error)
+}
+
 /// Copy `from` into `to`, directories and regular files only — the founding
 /// set an install carries into the release it seeds. Anything else in the
 /// source (a link, a device) is skipped rather than followed: this launcher

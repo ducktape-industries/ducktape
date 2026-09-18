@@ -464,6 +464,11 @@ impl NodeProc {
         }
     }
 
+    /// the pid this handle started — which an `exec` keeps.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// the rest of the first line containing `marker`.
     fn wait_marker(&self, marker: &str, deadline: Instant) -> Result<String, Unanswered> {
         self.feed
