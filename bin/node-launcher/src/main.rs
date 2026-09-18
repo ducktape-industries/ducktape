@@ -338,8 +338,8 @@ enum Life {
     Stopped,
 }
 
-/// How far the running child got: whether it published its mesh identity,
-/// the one "it came up" the machine itself knows (`Next::Healthy`).
+/// How far the running child got: whether it came up (`ReleaseStatus::came_up`),
+/// the same signal the machine's `Next::Healthy` reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Boot {
     Starting,
@@ -395,7 +395,7 @@ fn one_node_life(
         // Every child counts, the one a flip starts included: a flipped
         // release that dies at boot is a first failure, not the tail of a
         // run the child before it ended by coming up.
-        let came_up = status.identity_published();
+        let came_up = status.came_up();
         if came_up {
             reached = Boot::Up;
             *failed_boots = 0;
@@ -473,7 +473,7 @@ fn report(next: Next, phase: &Phase, status: &ReleaseStatus) {
             target: TARGET,
             event = "node_update_healthy",
             release = %phase.current(),
-            "the release this node flipped to published its mesh identity"
+            "the release this node flipped to serves committed state under its identity"
         ),
         Next::Dismiss => info!(
             target: TARGET,

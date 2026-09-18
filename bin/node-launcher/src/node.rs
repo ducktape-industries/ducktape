@@ -30,10 +30,11 @@ pub struct ReleaseStatus {
     /// The node's own http base — what `fs cat` dials.
     pub base: String,
     /// Empty until the node has published its mesh identity. A service daemon
-    /// started before then exits fatal, so this is the supervisor's wait seam
-    /// and the flipped release's healthy signal alike.
+    /// started before then exits fatal, so this is the service's wait seam.
     #[serde(default)]
     pub public_key: String,
+    /// The committed height the node serves; 0 until it has recovered or
+    /// synced any state.
     #[serde(default)]
     pub height: u64,
     /// The release this network runs, and from which block. `None` until
@@ -45,6 +46,16 @@ pub struct ReleaseStatus {
 impl ReleaseStatus {
     pub fn identity_published(&self) -> bool {
         !self.public_key.is_empty()
+    }
+
+    /// The node came up: it serves committed state under its identity. The
+    /// identity alone is not that — a resident publishes it BEFORE it
+    /// recovers its journal, so one that dies in recovery answers with an
+    /// identity at height 0 until it does. This is the flipped release's
+    /// healthy signal and the line between a restart and a crash loop.
+    pub fn came_up(&self) -> bool {
+        let serving = self.height > 0;
+        self.identity_published() && serving
     }
 }
 
