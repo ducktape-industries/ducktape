@@ -25,9 +25,10 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::SystemTime;
 
 use commonware_cryptography::ed25519;
-use commonware_p2p::{Recipients, Sender as P2pSender};
+use commonware_p2p::Sender as P2pSender;
 use commonware_runtime::IoBuf;
 use statesync::{SyncClient, SyncError, SyncRequest, SyncResponse};
 
@@ -718,12 +719,18 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> ServeLaneBlobClient<S> {
             },
         );
         let frame = statesync::encode_rpc(&requester, &proof, id, &statesync::encode_request(&req));
-        let attempted = sender.send(Recipients::One(peer), IoBuf::from(frame), false);
-        if attempted.is_empty() {
+        // the limiter's "admits at" is on the commonware tokio runtime's
+        // clock, which is the wall clock.
+        let sent = statesync::p2p::send_within_quota(&mut sender, peer, IoBuf::from(frame), |at| {
+            tokio::time::sleep(at.duration_since(SystemTime::now()).unwrap_or_default())
+        })
+        .await;
+        if let Err(refused) = sent {
             pending.lock().expect("pending blob lock").remove(&id);
-            return Err(SyncError::Transport(
-                "blob source unreachable (send attempted no recipients)".into(),
-            ));
+            return Err(SyncError::Transport(format!(
+                "the local mesh refused the blob request ({})",
+                refused.reason()
+            )));
         }
         match tokio::time::timeout(COCLIENT_TIMEOUT, rx).await {
             Ok(Ok(resp)) => Ok(resp),
