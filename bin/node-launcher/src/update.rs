@@ -558,6 +558,7 @@ mod tests {
             sequence: 2,
             display: "2026.09.3+b".into(),
             node_contract: 4,
+            refused: None,
         })
     }
 
