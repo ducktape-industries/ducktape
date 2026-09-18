@@ -327,6 +327,8 @@ sdk = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "d
 # `guest` feature turns it on, and only guest-builder's shell workspace does.
 ducktape-module-sdk = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "ducktape-module-sdk" }
 keyscheme = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "keyscheme" }
+# the one parser of `duck://<label>-<salt>/<module>/…`.
+duck-address = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "duck-address" }
 # dev-only shared test doubles for the sdk boundary traits (TestCtx +
 # in-memory MerkleStore). MAY ONLY appear in `[dev-dependencies]` of consumers —
 # the Module Rule (modules link only sdk + wire surfaces) is untouched.
