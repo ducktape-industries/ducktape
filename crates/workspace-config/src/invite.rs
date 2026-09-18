@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     CoordRef, Coordination, ModuleCode, NetworkDescriptor, Reach, ReachHint, decode_key, hex_bytes,
-    unhex, validate_block_time_ms, validate_module_id,
+    ingress_of, unhex, validate_block_time_ms, validate_module_id,
 };
 
 /// the invite blob prefix. UNVERSIONED on purpose (bootstrapping posture): the
@@ -426,23 +426,31 @@ pub struct Invite {
     /// members). Empty when the inviter has no persisted mesh state. Never part
     /// of `genesis_namespace`.
     pub fronts: Vec<Front>,
+    /// the coordinator the inviter rendezvouses through, `host:port` — its
+    /// resolved `primary_coordinator`. `None` means the inviter runs with
+    /// coordination off. A joiner's fresh node.toml takes this in place of the
+    /// compiled default, so a NAT'd joiner registers with the same coordinator
+    /// as the inviter instead of an unrelated public relay.
+    pub coordinator: Option<String>,
     pub expires_unix_secs: u64,
 }
 
 /// encode an invite blob, signing the envelope as the token's issuer (the
-/// caller must pass the same identity that minted `token`).
+/// caller must pass the same identity that minted `token`). `coordinator` is
+/// the inviter's resolved primary coordinator (`None` = coordination off).
 pub fn encode_invite(
     descriptor: &NetworkDescriptor,
     token: &InviteToken,
     wireguard: &InviteWireGuard,
     fronts: &[Front],
+    coordinator: Option<&str>,
     signer: &ed25519::PrivateKey,
 ) -> Result<String, String> {
     use base64::Engine as _;
     if signer.public_key() != token.issuer {
         return Err("invite envelope must be signed by the token's issuer".into());
     }
-    let mut out = pack_invite(descriptor, token, wireguard, fronts)?;
+    let mut out = pack_invite(descriptor, token, wireguard, fronts, coordinator)?;
     let sig = signer.sign(INVITE_ENVELOPE_NAMESPACE, &out);
     out.extend_from_slice(sig.encode().as_ref());
     Ok(format!("{INVITE_PREFIX}{}", INVITE_B64.encode(out)))
@@ -513,6 +521,7 @@ fn pack_invite(
     token: &InviteToken,
     wireguard: &InviteWireGuard,
     fronts: &[Front],
+    coordinator: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
 
@@ -599,6 +608,17 @@ fn pack_invite(
         Coordination::Public => 0,
         Coordination::Private => 1,
     });
+
+    // the inviter's coordinator: flag 0 = coordination off, flag 1 = its
+    // `host:port`. Inside the signed envelope and outside the fingerprint —
+    // it is where members rendezvous, not who they are.
+    match coordinator {
+        None => out.push(0),
+        Some(addr) => {
+            out.push(1);
+            put_str_u8(&mut out, addr)?;
+        }
+    }
 
     // the token now carries its OWN expiry (no separate blob-level field) —
     // decode enforces it from `token.expires_unix_secs`.
@@ -745,6 +765,22 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         other => return Err(format!("unknown coordination mode {other} in invite")),
     };
 
+    // the inviter's coordinator. The joiner writes it into node.toml and dials
+    // it, and a blob is untrusted input: it must name a dialable host:port.
+    let coordinator = match r.u8()? {
+        0 => None,
+        1 => {
+            let addr = r.take_str_u8()?;
+            if ingress_of(&addr)?.is_none() {
+                return Err(format!(
+                    "invite names coordinator {addr:?}, which is not dialable"
+                ));
+            }
+            Some(addr)
+        }
+        other => return Err(format!("unknown coordinator flag {other} in invite")),
+    };
+
     // the token carries its own expiry now (no separate blob-level field);
     // enforce it against the injected clock right after unpacking.
     let tok_len = r.u8()? as usize;
@@ -793,6 +829,7 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         token,
         wireguard,
         fronts,
+        coordinator,
         expires_unix_secs,
     })
 }
@@ -905,7 +942,7 @@ mod tests {
         let token = mint_invite_token(issuer, d.genesis_namespace().as_bytes(), u64::MAX);
         let default_wg = coordinated_test_wg();
         let wg = wireguard.unwrap_or(&default_wg);
-        encode_invite(d, &token, wg, &[], issuer).expect("encode")
+        encode_invite(d, &token, wg, &[], None, issuer).expect("encode")
     }
 
     /// a two-module genesis set, deliberately NOT in id order so the codec's
@@ -1016,7 +1053,7 @@ mod tests {
             }],
         };
         let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), u64::MAX);
-        let err = encode_invite(&d, &token, &coordinated_test_wg(), &[], &issuer)
+        let err = encode_invite(&d, &token, &coordinated_test_wg(), &[], None, &issuer)
             .expect_err("a short hash never ships");
         assert!(err.contains("pages"), "{err}");
     }
@@ -1038,7 +1075,7 @@ mod tests {
             }],
         };
         let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), u64::MAX);
-        let mut bytes = pack_invite(&d, &token, &coordinated_test_wg(), &[]).unwrap();
+        let mut bytes = pack_invite(&d, &token, &coordinated_test_wg(), &[], None).unwrap();
         // rewrite the packed id "pages" -> "p=ges" in place: same length, so
         // the framing stays intact and only the id turns hostile. a blob is
         // untrusted input — the encoder's guard is not the decoder's.
@@ -1179,7 +1216,8 @@ mod tests {
         assert_eq!(load_invite_token(&dir).expect("load"), Some(token.clone()));
 
         // full blob roundtrip: the variable-width token rides length-prefixed.
-        let blob = encode_invite(&d, &token, &coordinated_test_wg(), &[], &issuer).expect("encode");
+        let blob =
+            encode_invite(&d, &token, &coordinated_test_wg(), &[], None, &issuer).expect("encode");
         let invite = decode_invite(&blob).expect("decode");
         assert_eq!(invite.token, token);
 
@@ -1222,6 +1260,29 @@ mod tests {
         assert!(invite.fronts.is_empty());
     }
 
+    /// The inviter's coordinator rides the signed envelope both ways: a named
+    /// `host:port` and coordination off. A blob naming a coordinator nobody
+    /// can dial is refused at decode, before a joiner writes it anywhere.
+    #[test]
+    fn invite_blob_carries_the_inviters_coordinator() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_descriptor(&issuer);
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), u64::MAX);
+        let wg = coordinated_test_wg();
+        let decoded = |coordinator: Option<&str>| {
+            let blob = encode_invite(&d, &token, &wg, &[], coordinator, &issuer).expect("encode");
+            decode_invite(&blob)
+        };
+
+        let named = decoded(Some("coord.example.net:3478")).expect("decode");
+        assert_eq!(named.coordinator.as_deref(), Some("coord.example.net:3478"));
+        let off = decoded(None).expect("decode");
+        assert_eq!(off.coordinator, None);
+
+        let err = decoded(Some("coord.example.net:0")).expect_err("an undialable coordinator");
+        assert!(err.contains("not dialable"), "{err}");
+    }
+
     #[test]
     fn invite_without_the_front_count_is_rejected() {
         let issuer = ed25519::PrivateKey::from_seed(7);
@@ -1236,7 +1297,7 @@ mod tests {
             modules: Vec::new(),
         };
         let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), u64::MAX);
-        let mut bytes = pack_invite(&d, &token, &coordinated_test_wg(), &[]).unwrap();
+        let mut bytes = pack_invite(&d, &token, &coordinated_test_wg(), &[], None).unwrap();
         bytes.pop();
         assert!(unpack_invite(&bytes, 0).is_err());
     }
@@ -1252,7 +1313,7 @@ mod tests {
         let token = mint_invite_token(issuer, d.genesis_namespace().as_bytes(), u64::MAX);
         let default_wg = coordinated_test_wg();
         let wg = wireguard.unwrap_or(&default_wg);
-        encode_invite(d, &token, wg, fronts, issuer).expect("encode")
+        encode_invite(d, &token, wg, fronts, None, issuer).expect("encode")
     }
 
     fn front_descriptor(issuer: &ed25519::PrivateKey) -> NetworkDescriptor {
@@ -1422,7 +1483,8 @@ mod tests {
         let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), 1_000);
 
         // expiry is enforced at decode, deterministically via the injected clock.
-        let blob = encode_invite(&d, &token, &coordinated_test_wg(), &[], &issuer).expect("encode");
+        let blob =
+            encode_invite(&d, &token, &coordinated_test_wg(), &[], None, &issuer).expect("encode");
         assert!(decode_invite_at(&blob, 999).is_ok());
         let err = decode_invite_at(&blob, 1_000).expect_err("expired");
         assert!(err.contains("expired"), "{err}");
@@ -1442,7 +1504,7 @@ mod tests {
         // an envelope signed by someone other than the token's issuer is
         // refused at encode (and would fail decode's issuer verify anyway).
         let outsider = ed25519::PrivateKey::from_seed(8);
-        assert!(encode_invite(&d, &token, &coordinated_test_wg(), &[], &outsider).is_err());
+        assert!(encode_invite(&d, &token, &coordinated_test_wg(), &[], None, &outsider).is_err());
 
         // a non-invite paste fails loudly with re-mint guidance.
         let err = decode_invite_at("not-an-invite:AAAA", 0).expect_err("bad prefix");
@@ -1520,8 +1582,8 @@ mod tests {
                 endpoint: None,
             },
         ];
-        let blob =
-            encode_invite(&d, &token, &coordinated_test_wg(), &fronts, &issuer).expect("encode");
+        let blob = encode_invite(&d, &token, &coordinated_test_wg(), &fronts, None, &issuer)
+            .expect("encode");
         let invite = decode_invite(&blob).expect("decode");
         assert_eq!(
             invite.fronts, fronts,

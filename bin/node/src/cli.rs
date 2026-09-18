@@ -1037,7 +1037,10 @@ pub(crate) fn mint_invite_blob(
     let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
     let key = config::load_identity(&base.join(&raw.key_file))?;
     let dial_hint = config::dialable(Some(&raw.advertised), &raw.listen)?;
-    let has_coordinated_reach = descriptor.has_coordinated_reach()?;
+    // the coordinator this member rendezvouses through rides the invite, so a
+    // joiner registers where the network's members do — its own coordinator,
+    // or none — instead of falling back to the compiled public default.
+    let coordinator = config::primary_coordinator_or_default(Some(&raw.primary_coordinator))?;
     let descriptor_changed = match &dial_hint {
         Some(addr) => descriptor.add_bootstrap(&key.public_key(), addr),
         None => false,
@@ -1096,11 +1099,12 @@ pub(crate) fn mint_invite_blob(
                 }
             }
             None => {
-                // Coordinated reach gives the joiner a rendezvous path, so an
-                // endpoint-less blob is still a complete one; without it the
-                // joiner has nothing to dial from another machine, and that
-                // is what the operator has to be told.
-                if !has_coordinated_reach {
+                // the coordinator the blob carries gives the joiner a
+                // rendezvous path, so an endpoint-less blob is still a
+                // complete one; without it the joiner has nothing to dial from
+                // another machine, and that is what the operator has to be
+                // told.
+                if coordinator.is_none() {
                     notes.push(InviteNote::NotDialableOffBox);
                 }
                 config::InviteWireGuard {
@@ -1147,11 +1151,11 @@ pub(crate) fn mint_invite_blob(
         }
     };
 
-    // stop embedding a coordinator address in the invite: the joiner reaches
-    // every path through its OWN ambient coordinator (config/default), never a
-    // coordinator baked into the blob. The inviter still registers with its own
-    // coordinator via its own config; here we only strip Coordinated reach
-    // hints from the ENCODED copy — the on-disk descriptor keeps its config.
+    // the joiner reaches every path through ONE coordinator — its node.toml's,
+    // seeded from the `coordinator` this blob carries — never a per-member
+    // coordinator baked into the descriptor. Here we only strip Coordinated
+    // reach hints from the ENCODED copy — the on-disk descriptor keeps its
+    // config.
     let mut invite_descriptor = descriptor.clone();
     invite_descriptor
         .reach
@@ -1160,7 +1164,14 @@ pub(crate) fn mint_invite_blob(
     // the expiry lives INSIDE the token (signed), not as a separate blob field.
     // every invite is bearer.
     let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes(), expires);
-    let blob_string = config::encode_invite(&invite_descriptor, &token, &wireguard, &fronts, &key)?;
+    let blob_string = config::encode_invite(
+        &invite_descriptor,
+        &token,
+        &wireguard,
+        &fronts,
+        coordinator.as_deref(),
+        &key,
+    )?;
     Ok((blob_string, notes))
 }
 
@@ -2293,8 +2304,9 @@ fn collect_blob_lines(reader: impl std::io::BufRead) -> std::io::Result<String> 
 /// `--genesis` is the founder's `<workspace>/genesis`: required for a member
 /// (it boots into genesis with no peer to fetch from), optional for a
 /// resident (its first boot fetches the file off the mesh otherwise).
-/// `--primary-coordinator` is node-local plumbing ONLY — it never touches
-/// the invite or the joined descriptor (the coordinator is always ambient).
+/// `--primary-coordinator` overrides the coordinator the invite names for a
+/// fresh workspace (the inviter's own, or "none"); it never touches the
+/// joined descriptor.
 fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     // read BEFORE anything lands on disk: a mistyped path is refused with
     // nothing written, like a bad blob.
