@@ -995,7 +995,8 @@ fn udp_port_owner(port: u16) -> Option<String> {
     process_holding(&bound_sockets(["/proc/net/udp", "/proc/net/udp6"], port))
 }
 
-/// What holds a TCP port a listener could not bind.
+/// What holds a TCP port a listener could not bind, and the process behind it
+/// when `/proc` names one this user may inspect.
 pub(crate) enum PortHolder {
     /// another server's listening socket.
     Listener(Option<String>),

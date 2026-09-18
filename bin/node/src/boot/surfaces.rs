@@ -90,20 +90,24 @@ fn address_holder(addr: &str) -> String {
     let port = addr
         .rsplit_once(':')
         .and_then(|(_, port)| port.parse().ok());
+    const EPHEMERAL_RACE: &str = "the kernel hands ports in its ephemeral range (32768–60999 \
+         by default) to outbound connections, so a listener there can lose this race at any \
+         restart";
     match port.and_then(tcp_port_holder) {
-        Some(PortHolder::Listener(process)) => format!(
-            "{} is listening on it — if that is this workspace's node, it is already running \
-             (`ducktape node list`, `ducktape node status`)",
-            process.as_deref().unwrap_or("another user's process")
+        Some(PortHolder::Listener(Some(process))) => format!(
+            "{process} is listening on it — if that is this workspace's node, it is already \
+             running (`ducktape node list`, `ducktape node status`)"
         ),
-        Some(PortHolder::Connection(process)) => format!(
-            "{} holds it as the source port of an outbound connection, until that connection \
-             closes — the kernel hands ports in its ephemeral range (32768–60999 by default) \
-             to outbound connections, so a listener there can lose this race at any restart",
-            process.as_deref().unwrap_or(
-                "a connection no process of this user owns (another user's, or one closed and \
-                 waiting out TIME_WAIT)"
-            )
+        Some(PortHolder::Listener(None)) => {
+            "a process this user cannot inspect is listening on it".to_string()
+        }
+        Some(PortHolder::Connection(Some(process))) => format!(
+            "{process} holds it as the source port of an outbound connection, until that \
+             connection closes — {EPHEMERAL_RACE}"
+        ),
+        Some(PortHolder::Connection(None)) => format!(
+            "an outbound connection holds it as its source port — another user's, or one \
+             already closed and waiting out TIME_WAIT — {EPHEMERAL_RACE}"
         ),
         None => "another process or a transient connection holds it".to_string(),
     }
