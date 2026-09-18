@@ -59,7 +59,7 @@ pub(super) struct NetworkBindings<'a> {
 }
 
 impl<'a> NetworkBindings<'a> {
-    fn compose(&self) -> Bindings<'a> {
+    pub(super) fn compose(&self) -> Bindings<'a> {
         Bindings {
             invite: self.invite,
             chain_id: self.identity_chain_id,
