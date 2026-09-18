@@ -8,22 +8,25 @@ use commonware_utils::ordered::Set;
 use statesync::fetch_manifest;
 use statesync::p2p::P2pSyncClient;
 
+use crate::blob_fetch::SourceRotate;
 use crate::constants::*;
 use crate::host_state::{NetworkBindings, NodeSubstrates, sync_all_modules};
+use crate::sync::serve::{TrustAnchor, verify_manifest_floor};
 use crate::util::hex;
 
-/// the pause between manifest fetches while no source serves one yet (the mesh
-/// still forming). short, because a sync-only run does nothing else until the
-/// manifest lands; the retry warn fires every 20th attempt, so once per ten
-/// seconds at this pace.
+/// the pause between manifest fetches while no source serves one this node
+/// can adopt yet (the mesh still forming). short, because a sync-only run
+/// does nothing else until the manifest lands; the retry warn fires every
+/// 20th attempt, so once per ten seconds at this pace.
 const MANIFEST_RETRY: Duration = Duration::from_millis(500);
 
 /// `run_node`'s terminal `--sync-only` branch (phase P4): registers every
 /// channel a mesh member must answer (black-holing everything a joiner with
 /// no engine and no votes does not itself consume), starts the mesh, pulls
-/// the served manifest, runs boot preflight, and rebuilds every module once
-/// via [`sync_all_modules`] before the process is done. Never returns to a
-/// validator path — the caller `return`s right after this call.
+/// the served manifest once it verifies against the founding set, runs boot
+/// preflight, and rebuilds every module once via [`sync_all_modules`] before
+/// the process is done. Never returns to a validator path — the caller
+/// `return`s right after this call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     context: commonware_runtime::tokio::Context,
@@ -142,29 +145,24 @@ pub(crate) async fn run(
         None,
     );
 
-    // the mesh takes a moment to connect, and the server only serves
-    // once it has a finalized boundary — retry until the manifest lands.
-    let mut manifest_attempts = 0u64;
-    let manifest = loop {
-        match fetch_manifest(&client).await {
-            Ok(m) => break m,
-            Err(e) => {
-                manifest_attempts += 1;
-                metrics.record_sync_retry(e.to_string());
-                let should_log = manifest_attempts == 1 || manifest_attempts.is_multiple_of(20);
-                if should_log {
-                    tracing::warn!(
-                        target: "ducktape::statesync",
-                        node = %label,
-                        attempts = manifest_attempts,
-                        error = %e,
-                        "manifest not ready; retrying"
-                    );
-                }
-                context.sleep(MANIFEST_RETRY).await;
-            }
-        }
+    // THE LOCAL TRUST ROOT, as for every joiner: this node has seated
+    // nothing, so it anchors on the descriptor's FOUNDING set at epoch 0 —
+    // the one set the genesis fingerprint covers.
+    let founding_participants: Vec<Vec<u8>> =
+        validators.iter().map(|k| k.as_ref().to_vec()).collect();
+    let founding_anchor = TrustAnchor {
+        epoch: 0,
+        participants: &founding_participants,
     };
+    let manifest = fetch_anchored_manifest(
+        &context,
+        &client,
+        &namespace,
+        founding_anchor,
+        &metrics,
+        label,
+    )
+    .await;
     metrics.begin_sync(Some(client.current_source().to_string()), manifest.height);
     tracing::info!(
         target: "ducktape::statesync",
@@ -229,5 +227,62 @@ pub(crate) async fn run(
             );
             std::process::exit(1);
         }
+    }
+}
+
+/// the boundary a sync-only run adopts. the mesh takes a moment to connect,
+/// and a server only serves once it has a finalized boundary — so retry until
+/// one lands. a served boundary is adopted only once `verify_manifest_floor`
+/// ties it to `anchor`; one that does not is never adopted: rotate away from
+/// the source that served it and retry, at the same pace.
+pub(crate) async fn fetch_anchored_manifest<C>(
+    clock: &impl Clock,
+    client: &C,
+    namespace: &[u8],
+    anchor: TrustAnchor<'_>,
+    metrics: &noded::NodeMetrics,
+    label: &str,
+) -> statesync::Manifest
+where
+    C: statesync::SyncClient + SourceRotate,
+{
+    let mut attempts = 0u64;
+    loop {
+        attempts += 1;
+        let should_log = attempts == 1 || attempts.is_multiple_of(20);
+        match fetch_manifest(client).await {
+            Err(e) => {
+                metrics.record_sync_retry(e.to_string());
+                if should_log {
+                    tracing::warn!(
+                        target: "ducktape::statesync",
+                        node = %label,
+                        attempts,
+                        error = %e,
+                        "manifest not ready; retrying"
+                    );
+                }
+            }
+            Ok(m) => match verify_manifest_floor(namespace, anchor, &m) {
+                Ok(_) => return m,
+                Err(e) => {
+                    client.rotate_source();
+                    metrics.record_sync_retry(e.clone());
+                    if should_log {
+                        tracing::warn!(
+                            target: "ducktape::statesync",
+                            node = %label,
+                            attempts,
+                            height = m.height,
+                            epoch = m.epoch,
+                            reason = "manifest_unanchored",
+                            error = %e,
+                            "served manifest refused; rotating source"
+                        );
+                    }
+                }
+            },
+        }
+        clock.sleep(MANIFEST_RETRY).await;
     }
 }

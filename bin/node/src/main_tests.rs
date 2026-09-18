@@ -1077,6 +1077,73 @@ fn catch_up_suffix_frames_refuses_an_unanchored_tip_and_rotates_source() {
     });
 }
 
+/// serves `manifests` in order, one per request, repeating the last.
+#[derive(Clone)]
+struct SequencedManifestClient {
+    manifests: Vec<statesync::Manifest>,
+    served: Arc<std::sync::atomic::AtomicUsize>,
+    rotations: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl statesync::SyncClient for SequencedManifestClient {
+    fn request(
+        &self,
+        _req: statesync::SyncRequest,
+    ) -> impl std::future::Future<Output = Result<statesync::SyncResponse, statesync::SyncError>> + Send
+    {
+        let next = self
+            .served
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .min(self.manifests.len() - 1);
+        let manifest = self.manifests[next].clone();
+        async move { Ok(statesync::SyncResponse::Manifest(manifest)) }
+    }
+}
+
+impl crate::blob_fetch::SourceRotate for SequencedManifestClient {
+    fn rotate_source(&self) {
+        self.rotations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn sync_only_boot_adopts_only_a_manifest_tied_to_its_founding_anchor() {
+    let executor = commonware_runtime::deterministic::Runner::default();
+    executor.start(|context| async move {
+        // served bare, as a boundary at its epoch base is.
+        let anchored = test_manifest_with_base(2, 2, test_root(2), None);
+        let client = SequencedManifestClient {
+            manifests: vec![
+                // a boundary naming a participant set this node never trusted.
+                test_manifest_with_participants(1, test_root(1), None, vec![vec![9u8; 32]]),
+                anchored.clone(),
+            ],
+            served: Default::default(),
+            rotations: Default::default(),
+        };
+        let founding_participants = vec![test_me()];
+        let anchor = crate::sync::serve::TrustAnchor {
+            epoch: 0,
+            participants: &founding_participants,
+        };
+        let metrics = noded::NodeMetrics::register(&context);
+        let adopted = crate::boot::sync_only::fetch_anchored_manifest(
+            &context, &client, b"ns", anchor, &metrics, "test",
+        )
+        .await;
+        assert_eq!(
+            adopted.root_hash, anchored.root_hash,
+            "the sync-only boot must skip the unanchored boundary and adopt the anchored one"
+        );
+        assert_eq!(
+            client.rotations.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "an unanchored boundary must rotate away from the source that served it"
+        );
+    });
+}
+
 // ---- explorer-row rebuild (boot fold == live drain) ---------------------
 
 fn row_dispatches(payload: &[u8], origin: &sdk::Origin) -> Vec<host::DispatchRecord> {
