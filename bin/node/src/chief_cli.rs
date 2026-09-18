@@ -90,7 +90,7 @@ struct Progress {
 
 pub(crate) fn run(args: ChiefArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> Result<()> {
     let base = ctx.http_base()?;
-    let user = crate::userkey_cli::load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let controller = crate::account_cli::own_account(&base, user.public_key().as_ref())?.number;
     match args.command {
         ChiefCommand::Add {

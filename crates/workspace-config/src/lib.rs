@@ -766,9 +766,21 @@ pub enum ReachDial {
 }
 
 pub fn decode_key(hex: &str) -> Result<ed25519::PublicKey, String> {
-    let raw = unhex(hex.trim())?;
+    let digits = hex.trim();
+    let not_a_key = |why: String| format!("{hex:?} is not an ed25519 public key: {why}");
+    // Every way this fails is said here, in this CLI's words: the codec's own
+    // refusal of a short buffer ("Unexpected End-of-Buffer") is written for
+    // its author, not for someone who typed 8 characters where 64 belong.
+    let expected = 2 * <ed25519::PublicKey as commonware_codec::FixedSize>::SIZE;
+    let typed = digits.chars().count();
+    if typed != expected {
+        return Err(not_a_key(format!(
+            "expected {expected} hex characters, got {typed}"
+        )));
+    }
+    let raw = unhex(digits).map_err(not_a_key)?;
     ed25519::PublicKey::decode(raw.as_slice())
-        .map_err(|e| format!("{hex:?} is not an ed25519 public key: {e}"))
+        .map_err(|_| not_a_key("not a valid ed25519 point".into()))
 }
 
 // ============================================================================
@@ -1415,6 +1427,29 @@ pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE BUG (#2512): `node admit deadbeef` answered with the codec's
+    /// "Unexpected End-of-Buffer: Not enough bytes remaining to read data".
+    /// A person who typed the wrong thing is told what the right thing is, and
+    /// a key that IS right still decodes (the must-pass case).
+    #[test]
+    fn a_bad_pubkey_is_refused_in_the_clis_own_words() {
+        for (typed, why) in [
+            ("deadbeef", "expected 64 hex characters, got 8"),
+            (&"ab".repeat(33), "expected 64 hex characters, got 66"),
+            (&"zz".repeat(32), ""),
+        ] {
+            let said = decode_key(typed).expect_err("not a key");
+            assert!(
+                said.starts_with(&format!("{typed:?} is not an ed25519 public key: ")),
+                "{said}"
+            );
+            assert!(said.ends_with(why), "{said}");
+            assert!(!said.contains("Buffer"), "no codec text: {said}");
+        }
+        let key = ed25519::PrivateKey::from_seed(7).public_key();
+        assert_eq!(decode_key(&hex_bytes(key.as_ref())), Ok(key));
+    }
 
     /// A binary resolves the set its build staged, by the name that build
     /// baked in, before the unkeyed one, from the profile directory and from

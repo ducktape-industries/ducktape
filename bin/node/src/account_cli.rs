@@ -38,7 +38,7 @@ use crate::cli_args::NodeAddr;
 use crate::config::{self, hex_bytes};
 use crate::cred_cli::VerbCtx;
 use crate::node_http;
-use crate::userkey_cli::{frame_seq, load_user_signer, user_frame};
+use crate::userkey_cli::{frame_seq, user_frame};
 
 type AccountResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -279,7 +279,7 @@ pub(crate) fn run(args: AccountArgs) -> AccountResult {
 
 fn cmd_create(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> AccountResult {
     let base = ctx.http_base()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let height = submit_identity(&base, &user, &create_msg(name))?;
     let account = account_of_key(&base, user.public_key().as_ref())?.ok_or_else(|| {
         format!("committed at height {height}, but the key resolves to no account")
@@ -365,7 +365,7 @@ fn cmd_key_add_ssh(
     let pubkey = keyscheme::sshsig::authorized_key(&line)?;
     let base = ctx.http_base()?;
     let chain_id = ctx.workspace()?.service.chain_id;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     own_account(&base, user.public_key().as_ref())?;
     let msg = consented_add_key(&base, &user, &chain_id, KeyScheme::Ed25519, &pubkey, label)?;
     let preimage = node::frame_preimage(
@@ -439,7 +439,7 @@ fn cmd_key_add_hex(
     }
     let base = ctx.http_base()?;
     let chain_id = ctx.workspace()?.service.chain_id;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let msg = consented_add_key(&base, &user, &chain_id, scheme, &new_key, label)?;
     let ticket = String::from_utf8(identity::encode_msg(&msg)).expect("json is utf-8");
     println!("{ticket}");
@@ -458,7 +458,7 @@ fn cmd_key_add_passkey(
 ) -> AccountResult {
     let base = ctx.http_base()?;
     let chain_id = ctx.workspace()?.service.chain_id;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let account = own_account(&base, user.public_key().as_ref())?;
     let registered = ceremony(
         auth,
@@ -502,7 +502,7 @@ fn cmd_key_add_wallet(
 ) -> AccountResult {
     let base = ctx.http_base()?;
     let chain_id = ctx.workspace()?.service.chain_id;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     own_account(&base, user.public_key().as_ref())?;
     let pubkey = reveal_wallet(auth)?;
     let msg = consented_add_key(
@@ -550,7 +550,7 @@ fn cmd_login(
 ) -> AccountResult {
     let base = ctx.http_base()?;
     let chain_id = ctx.workspace()?.service.chain_id;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let device_key = user.public_key().as_ref().to_vec();
     let generation = gen_reply(query_identity(
         &base,
@@ -763,7 +763,7 @@ fn identity_msg(msg: &IdentityMsg) -> sdk::Msg {
 
 fn cmd_key_join(ctx: &VerbCtx, ticket: String, stdin: &mut impl BufRead) -> AccountResult {
     let base = ctx.http_base()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let height = node_http::submit_frame(&base, &join_frame(&user, &ticket)?)?;
     let account = own_account(&base, user.public_key().as_ref())?;
     println!("joined account {} at height {height}", account.number);
@@ -774,7 +774,7 @@ fn cmd_key_join(ctx: &VerbCtx, ticket: String, stdin: &mut impl BufRead) -> Acco
 fn cmd_key_remove(ctx: &VerbCtx, pubkey: String, stdin: &mut impl BufRead) -> AccountResult {
     let key = config::unhex(&pubkey).map_err(|e| format!("--pubkey hex: {e}"))?;
     let base = ctx.http_base()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let height = submit_identity(&base, &user, &IdentityMsg::RemoveKey { key })?;
     println!("removed at height {height}");
     Ok(())
@@ -782,7 +782,7 @@ fn cmd_key_remove(ctx: &VerbCtx, pubkey: String, stdin: &mut impl BufRead) -> Ac
 
 fn cmd_set_name(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> AccountResult {
     let base = ctx.http_base()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let height = submit_identity(&base, &user, &IdentityMsg::SetName { name })?;
     println!("renamed at height {height}");
     Ok(())
@@ -795,7 +795,7 @@ fn cmd_set_profile(
     stdin: &mut impl BufRead,
 ) -> AccountResult {
     let base = ctx.http_base()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let height = submit_identity(&base, &user, &IdentityMsg::SetProfile { avatar, bio })?;
     println!("profile set at height {height}");
     Ok(())
