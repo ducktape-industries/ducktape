@@ -17,6 +17,11 @@ use config::{hex_bytes, unhex};
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
 
+/// how long `node peers` holds between its two samples. rates divide by the
+/// measured gap, so this only trades the verb's latency against how many
+/// messages a rate averages over.
+const PEER_RATE_SAMPLE_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// route one operator verb to its handler — ONE visible dispatch, nothing in
 /// the arms but delegation. (`run` never reaches here; `main.rs` owns the
 /// node-boot path.) the grammar itself lives in `cli_args.rs`.
@@ -462,7 +467,7 @@ fn cmd_node_peers(args: StatusArgs) -> CommandResult {
     let second = match first.peers.is_empty() {
         true => None,
         false => {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(PEER_RATE_SAMPLE_GAP);
             Some(peers_rpc(&rpc_addr)?)
         }
     };
@@ -1182,7 +1187,8 @@ pub(super) fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json
         }
         _ => format!("cannot reach this node's operator rpc on {addr}: {error}"),
     })?;
-    conn.set_read_timeout(Some(std::time::Duration::from_secs(15)))
+    let read_timeout = crate::constants::RPC_CLIENT_READ_TIMEOUT;
+    conn.set_read_timeout(Some(read_timeout))
         .map_err(|e| format!("rpc timeout: {e}"))?;
     let mut writer = conn.try_clone().map_err(|e| format!("rpc clone: {e}"))?;
     let mut line = serde_json::to_string(req).expect("rpc request serializes");
@@ -1193,7 +1199,13 @@ pub(super) fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json
     let mut reply = String::new();
     BufReader::new(conn)
         .read_line(&mut reply)
-        .map_err(|e| format!("rpc read: {e}"))?;
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => format!(
+                "no answer from this node's operator rpc on {addr} in {} s",
+                read_timeout.as_secs()
+            ),
+            _ => format!("rpc read: {error}"),
+        })?;
     serde_json::from_str(reply.trim()).map_err(|e| format!("rpc reply: {e}"))
 }
 

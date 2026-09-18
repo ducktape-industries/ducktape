@@ -219,9 +219,7 @@ pub(crate) const PACK_BUILD_LOST: &str = "forge_pack_build_lost";
 /// in the budget is refused by the clock, which calibrates itself to the box;
 /// a byte ceiling would have to be guessed, and guessed low it makes a large
 /// repo permanently unsyncable rather than slow.
-const PACK_BUDGET: std::time::Duration = std::time::Duration::from_secs(
-    statesync::p2p::RETRY_WINDOWS[0].as_secs() + statesync::p2p::RETRY_WINDOWS[1].as_secs(),
-);
+const PACK_BUDGET: std::time::Duration = statesync::p2p::WINDOWS_BEFORE_LAST_ATTEMPT;
 
 /// answer a peer's [`SyncRequest::ForgeObjects`]: build the pack that carries
 /// `head`'s objects (bounded by the `bases` the peer already holds), stage it,

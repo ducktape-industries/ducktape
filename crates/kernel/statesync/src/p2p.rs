@@ -84,6 +84,13 @@ pub const RETRY_WINDOWS: [Duration; 3] = [
     Duration::from_secs(12),
 ];
 
+/// the windows a request spends on every attempt but its last (3s + 6s). a
+/// server whose answer must land before the requester's final attempt, such as
+/// the forge pack budget, reads this rather than indexing [`RETRY_WINDOWS`],
+/// so a change to the windows moves it here, beside them.
+pub const WINDOWS_BEFORE_LAST_ATTEMPT: Duration =
+    Duration::from_secs(RETRY_WINDOWS[0].as_secs() + RETRY_WINDOWS[1].as_secs());
+
 /// how many reaper-timeout occurrences a source must accumulate before the
 /// latched `warn!` fires again after its first line — never one line per
 /// timeout under a sustained busy mesh (CLAUDE.md: a forever-retry loop logs

@@ -37,6 +37,11 @@ use crate::config;
 
 pub(crate) type CredResult = Result<(), Box<dyn std::error::Error>>;
 
+/// how often a login re-reads its credentials artifact. the login ends when
+/// two reads in a row see the same non-zero size, so this is also how long a
+/// size must hold still to count as fully written.
+const ARTIFACT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// `ducktape user cred <verb>` — the credential subfamily. `--node`/`-n` are the
 /// shared [`NodeAddr`] group every family carries, `global` so they attach in
 /// any position (`cred add claude -n net` reads naturally).
@@ -1063,7 +1068,7 @@ async fn pump_login(command: tokio::process::Command, artifact: &Path) -> CredRe
                 return;
             }
             last = size;
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(ARTIFACT_POLL).await;
         }
     };
 

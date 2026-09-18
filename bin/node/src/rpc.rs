@@ -212,8 +212,13 @@ pub(crate) fn spawn_rpc_listener(
                             } else {
                                 // the pump answers within a tick; a stuck node
                                 // must not park the operator's console forever.
-                                rx.recv_timeout(std::time::Duration::from_secs(10))
-                                    .unwrap_or_else(|_| RpcReply::err("node unresponsive"))
+                                let wait = crate::constants::RPC_REPLY_WAIT;
+                                rx.recv_timeout(wait).unwrap_or_else(|_| {
+                                    RpcReply::err(format!(
+                                        "node unresponsive: no answer in {} s",
+                                        wait.as_secs()
+                                    ))
+                                })
                             }
                         }
                         Err(e) => RpcReply::err(format!("bad request: {e}")),

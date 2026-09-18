@@ -159,6 +159,10 @@ pub fn one_shot_body(body: Vec<u8>) -> GatewayRequestBody {
 /// alone is not enough: a saturated plane stops draining the lane, and an
 /// un-deadlined `send` there hangs the axum handler with no response at all.
 const LANE_ADMIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a gateway request waits on the node actor to answer one query (an
+/// authorization read, a `.duck` resolve). A page load sits behind it, so a
+/// stalled actor turns into `Unavailable` within this, not a hung page.
+const GATEWAY_QUERY_DEADLINE: Duration = Duration::from_secs(5);
 /// How long a SILENT publisher may stay silent before its caller gives up on
 /// the response head. It is a ceiling on silence, never on duration: a request
 /// body has no declared size any more, so the head cannot arrive until the
@@ -304,7 +308,7 @@ async fn gateway_query(
 ) -> Result<Vec<u8>, GatewayFailure> {
     let (reply, rx) = oneshot::channel();
     let mut commands = commands.clone();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(GATEWAY_QUERY_DEADLINE, async {
         commands
             .send(NodeCommand::Query {
                 target: target.into(),
@@ -760,7 +764,7 @@ async fn resolve_duck_authority(
         })
         .await
         .map_err(|_| GatewayFailure::Unavailable("node actor is gone".into()))?;
-    let bytes = tokio::time::timeout(Duration::from_secs(5), rx)
+    let bytes = tokio::time::timeout(GATEWAY_QUERY_DEADLINE, rx)
         .await
         .map_err(|_| GatewayFailure::Unavailable("gateway resolve timed out".into()))?
         .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
