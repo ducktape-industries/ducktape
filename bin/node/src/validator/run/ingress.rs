@@ -112,7 +112,7 @@ impl ValidatorRuntime<'_> {
             signer,
             join_requests,
             metrics,
-            pending_rpc_submits,
+            pending_submits,
             ..
         } = self;
 
@@ -131,11 +131,11 @@ impl ValidatorRuntime<'_> {
                         // against the frame's own id and let `on_drain` answer
                         // with its fate (#2533).
                         Ok(frame_id) => {
-                            pending_rpc_submits
+                            pending_submits
                                 .entry(frame_id)
-                                .or_insert_with(|| (Vec::new(), now + crate::constants::SUBMIT_HOLD))
+                                .or_insert_with(|| (Vec::new(), now + SUBMIT_HOLD))
                                 .0
-                                .push(reply);
+                                .push(super::SubmitReply::Rpc(reply));
                             return;
                         }
                         Err(e) => RpcReply::err(format!("submit failed: {e}")),
@@ -483,7 +483,7 @@ impl ValidatorRuntime<'_> {
                         .entry(id)
                         .or_insert_with(|| (Vec::new(), deadline))
                         .0
-                        .push(reply);
+                        .push(super::SubmitReply::Http(reply));
                 }
                 Err(e) => {
                     // the "submit failed" framing IS the token now, so the
@@ -546,7 +546,7 @@ impl ValidatorRuntime<'_> {
                         .entry(id)
                         .or_insert_with(|| (Vec::new(), deadline))
                         .0
-                        .push(reply);
+                        .push(super::SubmitReply::Http(reply));
                 }
                 Err(e) => {
                     // the "submit failed" framing IS the token now, so the

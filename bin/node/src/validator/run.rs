@@ -26,35 +26,70 @@ pub(super) type ValidatorNode = node::OrderedNode<
     recovery::Recovery<commonware_runtime::tokio::Context>,
 >;
 
-/// held app-surface submit replies, keyed by the submitted frame's content
-/// address: every caller that submitted THIS frame, and the instant the first
-/// of them stops waiting. a list because one FrameId is one consensus unit
-/// however many callers submitted it — replacing the entry would drop the
-/// first caller's reply for an op that finalized.
-type PendingSubmits = std::collections::HashMap<
-    node::FrameId,
-    (
-        Vec<futures::channel::oneshot::Sender<Result<noded::BlockSummary, noded::Refused>>>,
-        std::time::SystemTime,
-    ),
->;
+/// held submit replies, keyed by the submitted frame's content address: every
+/// caller that submitted THIS frame, from either lane, and the instant the
+/// first of them stops waiting. a list because one FrameId is one consensus
+/// unit however many callers submitted it — replacing the entry would drop the
+/// first caller's reply for an op that finalized. settled once in `on_drain`,
+/// expired by one sweep.
+type PendingSubmits =
+    std::collections::HashMap<node::FrameId, (Vec<SubmitReply>, std::time::SystemTime)>;
 
-/// held rpc `submit` replies, the same shape as [`PendingSubmits`] over a
-/// different sink: the rpc lane answers with a json line, not a `BlockSummary`.
+/// one caller parked against a submitted frame, by the lane it asked on: the
+/// http lane answers with a `BlockSummary`, the rpc lane with a json line.
 ///
-/// It exists because `node.submit` returns when the op is ACCEPTED, and the
-/// module that will refuse it has not run yet. The rpc handler used to answer
-/// `ok` there, so every op refused IN CONSENSUS — which is every governance
-/// door check — reached the daemon log and nothing else, and the verb that
-/// submitted it sat until its own unrelated deadline and blamed that (#2533).
-/// The http lane already waited; this is the rpc lane learning to.
-type PendingRpcSubmits = std::collections::HashMap<
-    node::FrameId,
-    (
-        Vec<std::sync::mpsc::Sender<crate::rpc::RpcReply>>,
-        std::time::SystemTime,
-    ),
->;
+/// The rpc lane parks at all because `node.submit` returns when the op is
+/// ACCEPTED, and the module that will refuse it has not run yet. The rpc
+/// handler used to answer `ok` there, so every op refused IN CONSENSUS — which
+/// is every governance door check — reached the daemon log and nothing else,
+/// and the verb that submitted it sat until its own unrelated deadline and
+/// blamed that (#2533).
+enum SubmitReply {
+    Http(futures::channel::oneshot::Sender<Result<noded::BlockSummary, noded::Refused>>),
+    Rpc(std::sync::mpsc::Sender<crate::rpc::RpcReply>),
+}
+
+impl SubmitReply {
+    /// answer with the frame's settled fate, spelled for this caller's lane:
+    /// `http` is the receipt, `rpc` is [`crate::drain_actions::settled_submit`].
+    fn settle(self, http: &Result<noded::BlockSummary, noded::Refused>, rpc: &Result<(), String>) {
+        match self {
+            Self::Http(tx) => {
+                let _ = tx.send(http.clone());
+            }
+            Self::Rpc(tx) => {
+                let line = match rpc {
+                    Ok(()) => crate::rpc::RpcReply::ok(),
+                    Err(reason) => crate::rpc::RpcReply::err(reason.clone()),
+                };
+                let _ = tx.send(line);
+            }
+        }
+    }
+
+    /// the hold ran out before the frame finalized. the op may still land
+    /// later — clients re-query on block events.
+    fn expire(self) {
+        match self {
+            Self::Http(tx) => {
+                let _ = tx.send(Err(noded::Refused::new(
+                    "finalization_timeout",
+                    "timed out awaiting finalization — re-query on the next block",
+                )));
+            }
+            // now that a refusal comes back by itself, a timeout here means
+            // ONLY that the op has not finalized yet — which is what the
+            // sentence has to say (#2533).
+            Self::Rpc(tx) => {
+                let _ = tx.send(crate::rpc::RpcReply::err(
+                    "finalization_timeout: submitted, not finalized yet — re-query on the next \
+                     block"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+}
 
 /// a join gate held open awaiting its `Redeem` frame's consensus fate. the
 /// member submitted the redemption and holds the joiner's outcome
@@ -245,7 +280,6 @@ struct ValidatorRuntime<'a> {
     applied: usize,
     converged: bool,
     pending_submits: PendingSubmits,
-    pending_rpc_submits: PendingRpcSubmits,
     pending_relays:
         std::collections::HashMap<node::FrameId, (Vec<ed25519::PublicKey>, std::time::SystemTime)>,
     /// join gates held open awaiting their `Redeem` frame's consensus fate,
@@ -381,8 +415,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let expected = validators.len();
     let applied = 0usize;
     let converged = false;
-    // the app-surface lane: held submit replies keyed by the submitted
-    // frame's content address, resolved when the frame drains (or expired
+    // the app-surface and rpc lanes: held submit replies keyed by the
+    // submitted frame's content address, resolved when the frame drains (or expired
     // after SUBMIT_HOLD), plus the last block height published to ws
     // subscribers.
     //
@@ -393,7 +427,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // same id gets the same outcome, and the FIRST one's deadline governs.
     let mut http_ingress = http_cmds;
     let pending_submits: PendingSubmits = std::collections::HashMap::new();
-    let pending_rpc_submits: PendingRpcSubmits = std::collections::HashMap::new();
     // relayed submits held for a wire answer, keyed like pending_submits by
     // the frame's content address: resolved by the SAME drain that resolves
     // local holds, expired on the same SUBMIT_HOLD budget. the peers are where
@@ -553,7 +586,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         applied,
         converged,
         pending_submits,
-        pending_rpc_submits,
         pending_relays,
         pending_gates,
         gating,

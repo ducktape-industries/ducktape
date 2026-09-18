@@ -191,7 +191,6 @@ impl ValidatorRuntime<'_> {
             metrics,
             applied,
             pending_submits,
-            pending_rpc_submits,
             pending_relays,
             pending_gates,
             gating,
@@ -503,23 +502,13 @@ impl ValidatorRuntime<'_> {
                     "op rejected in consensus"
                 );
             }
-            // the rpc lane's parked callers, answered from the same
-            // disposition and at the same moment as the http lane's (#2533).
-            // A refusal reaches the person who typed the verb, carrying the
-            // module's own reason token — the one the warn above logs.
-            if let Some((rpc_replies, _)) = pending_rpc_submits.remove(&d.id) {
-                let settled = crate::drain_actions::settled_submit(rejected, d.reason.as_deref());
-                for rpc_reply in rpc_replies {
-                    let line = match &settled {
-                        Ok(()) => crate::rpc::RpcReply::ok(),
-                        Err(reason) => crate::rpc::RpcReply::err(reason.clone()),
-                    };
-                    let _ = rpc_reply.send(line);
-                }
-            }
             let Some((replies, _)) = pending_submits.remove(&d.id) else {
                 continue;
             };
+            // the rpc lane's answer (#2533): a refusal reaches the person who
+            // typed the verb, carrying the module's own reason token — the one
+            // the warn above logs.
+            let settled = crate::drain_actions::settled_submit(rejected, d.reason.as_deref());
             let outcome = match d.disposition {
                 node::Disposition::Applied => Ok(noded::BlockSummary {
                     height: d.height,
@@ -545,15 +534,15 @@ impl ValidatorRuntime<'_> {
                 // stay total rather than panic.
                 node::Disposition::Discarded => continue,
             };
-            // every caller that submitted this frame gets the SAME outcome:
-            // one FrameId is one consensus unit, however many asked for it.
+            // every caller that submitted this frame gets the SAME outcome,
+            // spelled for its lane: one FrameId is one consensus unit, however
+            // many asked for it.
             for reply in replies {
-                let _ = reply.send(outcome.clone());
+                reply.settle(&outcome, &settled);
             }
         }
         validator_relay.expire(context.current(), relay_tx);
-        // expire holds the mesh never finalized in time. the op may
-        // still land later — clients re-query on block events.
+        // expire holds the mesh never finalized in time.
         if !pending_submits.is_empty() {
             let now = context.current();
             let expired: Vec<node::FrameId> = pending_submits
@@ -566,33 +555,7 @@ impl ValidatorRuntime<'_> {
                     continue;
                 };
                 for reply in replies {
-                    let _ = reply.send(Err(noded::Refused::new(
-                        "finalization_timeout",
-                        "timed out awaiting finalization — re-query on the next block",
-                    )));
-                }
-            }
-        }
-        // the same contract for the rpc lane's parked callers: now that a
-        // refusal comes back by itself, a timeout here means ONLY that the op
-        // has not finalized yet — which is what the sentence has to say (#2533).
-        if !pending_rpc_submits.is_empty() {
-            let now = context.current();
-            let expired: Vec<node::FrameId> = pending_rpc_submits
-                .iter()
-                .filter(|(_, (_, deadline))| *deadline <= now)
-                .map(|(k, _)| *k)
-                .collect();
-            for k in expired {
-                let Some((replies, _)) = pending_rpc_submits.remove(&k) else {
-                    continue;
-                };
-                for reply in replies {
-                    let _ = reply.send(crate::rpc::RpcReply::err(
-                        "finalization_timeout: submitted, not finalized yet — re-query on the \
-                         next block"
-                            .to_string(),
-                    ));
+                    reply.expire();
                 }
             }
         }
