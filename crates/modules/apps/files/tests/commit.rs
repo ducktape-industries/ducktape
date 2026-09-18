@@ -778,8 +778,12 @@ fn stat_by_snapshot_resolves_root_none_and_bad_snapshot_errs() {
     let head = f.committed_head_for_test().unwrap();
     // an explicit, resolvable committed snapshot works.
     assert!(stat(&f, "/shared/x", Some(&head)).is_some());
-    // the filesystem root is a directory, not a tree entry.
-    assert!(stat(&f, "/", None).is_none());
+    // the filesystem root answers as the directory `ls /` resolves: one
+    // child (/shared) and no exec bit.
+    let root = stat(&f, "/", None).expect("the root every filesystem has");
+    assert_eq!(root.kind, EntryKindWire::Dir);
+    assert_eq!(root.size, 1, "/shared is the root's only child");
+    assert!(!root.exec);
     // an unresolvable snapshot errors.
     let bad = "cc".repeat(32);
     let reply = stat_query(&f, "/shared/x", Some(&bad));
