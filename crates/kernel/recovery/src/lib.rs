@@ -2401,12 +2401,21 @@ where
                     .await
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
+            // THE REPLAY WINDOW, read as the live drain read it: a frame the
+            // restored window already holds was REFUSED live — journaled,
+            // never applied — and the window is the one Rejected cause the
+            // frame alone does not carry. re-executing it would run every
+            // member's signed op a second time and seal a state no peer holds.
+            bound_replay_window(&mut applied_frames);
+            let replayed = node::in_replay_window(&applied_frames, &node::frame_id(&frame));
             let mut no_witness = host::NoWitness;
             let hook: &mut dyn host::CommitWitness = match &witness {
                 Some(_) => &mut no_witness,
                 None => self,
             };
-            let (disposition, dispatches) = if moved.is_empty() {
+            let (disposition, dispatches) = if replayed {
+                (Disposition::Rejected, Vec::new())
+            } else if moved.is_empty() {
                 let (disposition, dispatches) = apply_block(
                     host,
                     height,
@@ -2534,18 +2543,7 @@ where
             )));
         }
 
-        // the checkpoint's window and the journal suffix overlap wherever the
-        // retained journal reaches back below the checkpoint height (a
-        // root-idempotent block is walked and skipped, but still remembered).
-        // one entry per height, newest last, bounded to the protocol depth —
-        // a duplicate would cost a window slot and shorten this node's reach
-        // against a peer's.
-        applied_frames.sort_by_key(|(height, _)| *height);
-        applied_frames.dedup_by_key(|(height, _)| *height);
-        let over = applied_frames
-            .len()
-            .saturating_sub(node::REPLAY_WINDOW_HEIGHTS);
-        applied_frames.drain(..over);
+        bound_replay_window(&mut applied_frames);
 
         Ok(Recovered {
             height: tip_height,
@@ -2771,6 +2769,19 @@ impl PendingBlock {
             Schedule::Open => Trailing::Unscheduled { frame: self.frame },
         }
     }
+}
+
+/// the replay window exactly as the live drain holds it. the checkpoint's
+/// window and the journal suffix overlap wherever the retained journal reaches
+/// back below the checkpoint height (a root-idempotent block is walked and
+/// skipped, but still remembered). one entry per height, newest last, bounded
+/// to the protocol depth — a duplicate would cost a window slot and shorten
+/// this node's reach against a peer's.
+fn bound_replay_window(window: &mut Vec<(u64, node::FrameId)>) {
+    window.sort_by_key(|(height, _)| *height);
+    window.dedup_by_key(|(height, _)| *height);
+    let over = window.len().saturating_sub(node::REPLAY_WINDOW_HEIGHTS);
+    window.drain(..over);
 }
 
 /// the open WAL block a follow-on record (`what`) at `height` belongs to.
