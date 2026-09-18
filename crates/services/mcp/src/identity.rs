@@ -154,18 +154,17 @@ impl Run {
         control.request(request_id, requested_secs)
     }
 
-    /// the agent's COMMITTED record.
+    /// the agent's COMMITTED record, or `None` when this server acts for no
+    /// agent (`DUCKTAPE_RUN_AGENT` unset). having no identity is an answer,
+    /// not a failure: it is a read, and reads are not gated.
     ///
     /// fetched per call rather than cached at startup: an owner can pause or
     /// reconfigure an agent mid-run, and a cached record would keep reporting
     /// what consensus has already changed.
-    pub fn record(&self) -> Result<ModelRecord> {
-        let agent_id = self.agent_id.as_deref().ok_or_else(|| {
-            NodeError::Rejected(format!(
-                "this MCP server was started without {ENV_AGENT}, so it is not acting for any \
-                 agent and cannot write"
-            ))
-        })?;
+    pub fn record(&self) -> Result<Option<ModelRecord>> {
+        let Some(agent_id) = self.agent_id.as_deref() else {
+            return Ok(None);
+        };
         let reply = self.node.query(
             TARGET_MODEL,
             json!({"model": {"query": {"agent": {"agent_id": agent_id}}}}),
@@ -187,6 +186,7 @@ impl Run {
             )));
         }
         serde_json::from_value(record.clone())
+            .map(Some)
             .map_err(|e| NodeError::Transport(format!("the Runs model record did not decode: {e}")))
     }
 }
@@ -349,12 +349,12 @@ mod provider_control_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// a node that answers `/v1/query` from a canned table. one thread, `n`
     /// requests, no framework.
-    fn fake_node(replies: Vec<serde_json::Value>) -> String {
+    pub(crate) fn fake_node(replies: Vec<serde_json::Value>) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -376,7 +376,7 @@ mod tests {
         format!("http://127.0.0.1:{port}")
     }
 
-    fn standing_record() -> ModelRecord {
+    pub(crate) fn standing_record() -> ModelRecord {
         runs::ModelRecord {
             account: 2,
             agent_id: "worker".into(),
@@ -412,11 +412,15 @@ mod tests {
         );
         assert_eq!(
             run.record().expect("the registry answers"),
-            standing_record()
+            Some(standing_record())
         );
 
         let gone = bound_run("run-1".into(), vec![json!({"model": {"agent": null}})]);
         assert!(matches!(gone.record(), Err(NodeError::Rejected(_))));
+
+        // no agent identity is an answer, not a refusal — and it asks no node.
+        let unbound = Run::from_vars(&|_| None);
+        assert_eq!(unbound.record().expect("an unbound read answers"), None);
     }
 
     #[test]

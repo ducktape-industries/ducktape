@@ -307,6 +307,11 @@ enum Family {
     #[command(subcommand)]
     Release(release_cli::ReleaseCmd),
     /// the agent tool plane over stdio, for driving it by hand
+    ///
+    /// It reads who it is from the environment. DUCKTAPE_NODE is the http
+    /// base url of the node its tools read and write through, e.g.
+    /// http://127.0.0.1:8844. DUCKTAPE_RUN_AGENT is the agent id it acts for;
+    /// unset, it acts for no agent: reads work and ducktape_whoami says so.
     Mcp,
 }
 
