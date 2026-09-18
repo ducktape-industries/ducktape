@@ -16,7 +16,12 @@
 //! - `RestartToUpdate`, or `Boot` while `Staged` → `Qualify`;
 //!   `QualifyPassed` → `Persist(Swapping)` → `Flip` →
 //!   `Persist(PendingHealthy{boots: 0})` → `Exec`; `QualifyFailed` → stay
-//!   `Staged`, `Banner` names the reason.
+//!   `Staged` with the reason persisted as `refused`, `Banner` names it.
+//! - A staged release does not close the channel: `Staged` + `Tick` →
+//!   `Fetch`. A newer sequence discards the staged release (`Persist(Idle)`,
+//!   `Gc`) and is offered as `Idle` offers it. The staged sequence, or a
+//!   lower one, changes nothing and repeats no banner. `UserRollback`
+//!   discards the staged release.
 //! - `PendingHealthy` + `Rendered` → `Idle` + `Gc`. `Boot` with `boots == 0`
 //!   → `boots: 1`; `Boot` with `boots ≥ 1` → flip back → `RolledBack` →
 //!   `Exec`. `Boot` while `Swapping` → `ResolveSwap`; `SwapResolved` finishes
@@ -83,24 +88,27 @@ pub fn step(phase: Phase, event: Event) -> (Phase, Vec<Command>) {
             | Event::Tick,
         ) => unchanged(phase),
 
-        // Staged: a verified release waits for the restart.
+        // Staged: a verified release waits for the restart; a newer one
+        // supersedes it.
         (Phase::Staged(staged), Event::Boot | Event::RestartToUpdate) => staged_restart(staged),
         (Phase::Staged(staged), Event::QualifyPassed(sha)) => staged_qualify_passed(staged, sha),
         (Phase::Staged(staged), Event::QualifyFailed { sha, reason }) => {
             staged_qualify_failed(staged, sha, reason)
         }
+        (Phase::Staged(staged), Event::Tick) => staged_tick(staged),
+        (Phase::Staged(staged), Event::ManifestFetched(result)) => {
+            staged_manifest_fetched(staged, result)
+        }
+        (Phase::Staged(staged), Event::UserRollback) => staged_user_rollback(staged),
         (
             phase @ Phase::Staged(_),
             Event::SwapResolved(_)
-            | Event::ManifestFetched(_)
             | Event::DownloadFinished { .. }
             | Event::DownloadFailed { .. }
             | Event::Verified(_)
             | Event::VerifyRefused { .. }
-            | Event::UserRollback
             | Event::DismissRollbackNotice
-            | Event::Rendered
-            | Event::Tick,
+            | Event::Rendered,
         ) => unchanged(phase),
 
         // Swapping: only a boot ever sees it (a crash mid-flip).
@@ -320,6 +328,7 @@ fn downloading_verified(downloading: Downloading, sha: Sha) -> (Phase, Vec<Comma
         sequence: downloading.sequence,
         display: downloading.display.clone(),
         node_contract: downloading.node_contract,
+        refused: None,
     });
     let banner = UpdateBanner::Ready {
         staged: downloading.target,
@@ -377,16 +386,79 @@ fn staged_qualify_passed(staged: Staged, sha: Sha) -> (Phase, Vec<Command>) {
     swap_into(staged.current, staged.staged, staged.pinned_sequence)
 }
 
+/// Refused by its own self-check: keep running `current` and keep the release
+/// staged, because a node's `not_armed` is this same answer and flips later.
+/// The reason is persisted: the launcher qualifies, then execs the app, and
+/// only the app can show it. The refusal does not close the channel.
 fn staged_qualify_failed(staged: Staged, sha: Sha, reason: String) -> (Phase, Vec<Command>) {
     let is_stale = sha != staged.staged;
     if is_stale {
         return unchanged(Phase::Staged(staged));
     }
+    let refused = Phase::Staged(Staged {
+        refused: Some(reason.clone()),
+        ..staged
+    });
     let banner = UpdateBanner::QualifyFailed {
         staged: sha,
         reason,
     };
-    banner_only(Phase::Staged(staged), banner)
+    (
+        refused.clone(),
+        vec![Command::Persist(refused), Command::Banner(banner)],
+    )
+}
+
+fn staged_tick(staged: Staged) -> (Phase, Vec<Command>) {
+    (Phase::Staged(staged), vec![Command::Fetch])
+}
+
+fn staged_manifest_fetched(
+    staged: Staged,
+    result: Result<VerifiedManifest, Refusal>,
+) -> (Phase, Vec<Command>) {
+    match result {
+        Ok(verified) => staged_offer(staged, verified),
+        Err(refusal) => banner_only(Phase::Staged(staged), UpdateBanner::Refused(refusal)),
+    }
+}
+
+/// A newer sequence supersedes the staged release: discard it, then offer the
+/// manifest as `Idle` would. The staged sequence, or a lower one, changes
+/// nothing and says nothing: a check repeats every few seconds for as long as
+/// the release waits, `Ready` was said once when it staged, and a refusal is
+/// read from `Staged::refused`, not re-announced.
+fn staged_offer(staged: Staged, verified: VerifiedManifest) -> (Phase, Vec<Command>) {
+    let supersedes = verified.manifest.sequence > staged.sequence;
+    if !supersedes {
+        return unchanged(Phase::Staged(staged));
+    }
+    let (idle, mut commands) = discard_staged(staged);
+    let (phase, offer) = idle_offer(idle, verified);
+    commands.extend(offer);
+    (phase, commands)
+}
+
+fn staged_user_rollback(staged: Staged) -> (Phase, Vec<Command>) {
+    let (idle, commands) = discard_staged(staged);
+    (Phase::Idle(idle), commands)
+}
+
+/// Back to `Idle` on what runs, the pin kept, the staged directory collected.
+/// `Persist` comes before `Gc`, so a crash between them leaves `Idle` and an
+/// orphan directory, never a `Staged` phase with no release on disk.
+fn discard_staged(staged: Staged) -> (Idle, Vec<Command>) {
+    let idle = Idle {
+        current: staged.current,
+        previous: staged.previous,
+        pinned_sequence: staged.pinned_sequence,
+    };
+    let keep = std::iter::once(idle.current).chain(idle.previous).collect();
+    let commands = vec![
+        Command::Persist(Phase::Idle(idle.clone())),
+        Command::Gc { keep },
+    ];
+    (idle, commands)
 }
 
 // --- Swapping --------------------------------------------------------------
@@ -518,7 +590,15 @@ mod tests {
             sequence: 18,
             display: "2026.09.2+b".into(),
             node_contract: 3,
+            refused: None,
         }
+    }
+
+    fn refused(current: &str, staged_sha: &str, reason: &str) -> Phase {
+        Phase::Staged(Staged {
+            refused: Some(reason.into()),
+            ..staged(current, staged_sha)
+        })
     }
 
     fn swapping(from: &str, to: &str) -> Swapping {
@@ -596,6 +676,7 @@ mod tests {
             sequence: 18,
             display: "2026.09.2+b".into(),
             node_contract: 3,
+            refused: None,
         });
         let accepted = Downloading {
             current: sha("a"),
@@ -836,25 +917,133 @@ mod tests {
                 expect: (Phase::Staged(staged("a", "b")), vec![]),
             },
             Case {
-                name: "staged qualify failed stays staged and names the reason",
+                name: "staged qualify failed stays staged, persists and names the reason",
                 phase: Phase::Staged(staged("a", "b")),
                 event: Event::QualifyFailed {
                     sha: sha("b"),
                     reason: "codesign_invalid".into(),
                 },
                 expect: (
-                    Phase::Staged(staged("a", "b")),
-                    vec![Command::Banner(UpdateBanner::QualifyFailed {
-                        staged: sha("b"),
-                        reason: "codesign_invalid".into(),
-                    })],
+                    refused("a", "b", "codesign_invalid"),
+                    vec![
+                        Command::Persist(refused("a", "b", "codesign_invalid")),
+                        Command::Banner(UpdateBanner::QualifyFailed {
+                            staged: sha("b"),
+                            reason: "codesign_invalid".into(),
+                        }),
+                    ],
                 ),
             },
             Case {
-                name: "staged tick does not fetch",
+                name: "staged qualify failed for another sha is stale",
+                phase: Phase::Staged(staged("a", "b")),
+                event: Event::QualifyFailed {
+                    sha: sha("q"),
+                    reason: "codesign_invalid".into(),
+                },
+                expect: (Phase::Staged(staged("a", "b")), vec![]),
+            },
+            Case {
+                name: "staged boot of a refused release qualifies it again",
+                phase: refused("a", "b", "codesign_invalid"),
+                event: Event::Boot,
+                expect: (
+                    refused("a", "b", "codesign_invalid"),
+                    vec![Command::Qualify(sha("b"))],
+                ),
+            },
+            Case {
+                name: "staged tick fetches",
                 phase: Phase::Staged(staged("a", "b")),
                 event: Event::Tick,
+                expect: (Phase::Staged(staged("a", "b")), vec![Command::Fetch]),
+            },
+            Case {
+                name: "staged newer manifest discards the staged release and downloads",
+                phase: refused("a", "b", "codesign_invalid"),
+                event: fetched(19, &host(), "c"),
+                expect: (
+                    Phase::Downloading(Downloading {
+                        pinned_sequence: 18,
+                        target: sha("c"),
+                        sequence: 19,
+                        ..accepted.clone()
+                    }),
+                    vec![
+                        Command::Persist(idle("a", Some("z"), 18)),
+                        Command::Gc {
+                            keep: vec![sha("a"), sha("z")],
+                        },
+                        Command::Persist(Phase::Downloading(Downloading {
+                            pinned_sequence: 18,
+                            target: sha("c"),
+                            sequence: 19,
+                            ..accepted.clone()
+                        })),
+                        Command::Download {
+                            sha: sha("c"),
+                            size: 42,
+                        },
+                    ],
+                ),
+            },
+            Case {
+                name: "staged newer manifest naming what runs discards the staged release",
+                phase: Phase::Staged(staged("a", "b")),
+                event: fetched(19, &host(), "a"),
+                expect: (
+                    idle("a", Some("z"), 18),
+                    vec![
+                        Command::Persist(idle("a", Some("z"), 18)),
+                        Command::Gc {
+                            keep: vec![sha("a"), sha("z")],
+                        },
+                        Command::Banner(UpdateBanner::UpToDate),
+                    ],
+                ),
+            },
+            Case {
+                name: "staged same sequence downloads nothing and repeats no banner",
+                phase: Phase::Staged(staged("a", "b")),
+                event: fetched(18, &host(), "b"),
                 expect: (Phase::Staged(staged("a", "b")), vec![]),
+            },
+            Case {
+                name: "staged same sequence of a refused release repeats no banner",
+                phase: refused("a", "b", "codesign_invalid"),
+                event: fetched(18, &host(), "b"),
+                expect: (refused("a", "b", "codesign_invalid"), vec![]),
+            },
+            Case {
+                name: "staged lower sequence changes nothing and repeats no banner",
+                phase: Phase::Staged(staged("a", "b")),
+                event: fetched(17, &host(), "c"),
+                expect: (Phase::Staged(staged("a", "b")), vec![]),
+            },
+            Case {
+                name: "staged refused manifest is a banner",
+                phase: Phase::Staged(staged("a", "b")),
+                event: Event::ManifestFetched(Err(Refusal::BadSignature)),
+                expect: (
+                    Phase::Staged(staged("a", "b")),
+                    vec![Command::Banner(UpdateBanner::Refused(
+                        Refusal::BadSignature,
+                    ))],
+                ),
+            },
+            Case {
+                name: "staged user rollback discards the staged release",
+                phase: refused("a", "b", "codesign_invalid"),
+                event: Event::UserRollback,
+                expect: (
+                    idle("a", Some("z"), 18),
+                    vec![
+                        Command::Persist(idle("a", Some("z"), 18)),
+                        Command::Gc {
+                            keep: vec![sha("a"), sha("z")],
+                        },
+                    ],
+                ),
             },
             // ---- Swapping
             Case {
@@ -1054,8 +1243,8 @@ mod tests {
         assert!(matches!(staged, Phase::Staged(_)));
 
         // 2. a launcher restart before the height asks the staged release to
-        //    qualify, and the unarmed refusal leaves the phase untouched: no
-        //    flip, and the reason is carried, not swallowed.
+        //    qualify, and the unarmed refusal keeps it staged: no flip, and
+        //    the reason is carried, not swallowed.
         let (after_boot, commands) = step(staged.clone(), Event::Boot);
         assert_eq!(commands, vec![Command::Qualify(sha("b"))]);
         let (after_refusal, commands) = step(
@@ -1065,13 +1254,26 @@ mod tests {
                 reason: "not_armed".into(),
             },
         );
-        assert_eq!(after_refusal, staged, "an unarmed node stays on its release");
+        let Phase::Staged(staged) = staged else {
+            panic!("staged, not {staged:?}");
+        };
+        let unarmed = Phase::Staged(Staged {
+            refused: Some("not_armed".into()),
+            ..staged
+        });
+        assert_eq!(
+            after_refusal, unarmed,
+            "an unarmed node stays on its release"
+        );
         assert_eq!(
             commands,
-            vec![Command::Banner(UpdateBanner::QualifyFailed {
-                staged: sha("b"),
-                reason: "not_armed".into(),
-            })]
+            vec![
+                Command::Persist(unarmed.clone()),
+                Command::Banner(UpdateBanner::QualifyFailed {
+                    staged: sha("b"),
+                    reason: "not_armed".into(),
+                }),
+            ]
         );
 
         // 3. at the activation height the same staged phase flips, crash-safely.
@@ -1079,6 +1281,98 @@ mod tests {
         assert_eq!(commands, vec![Command::Qualify(sha("b"))]);
         let flipped = step(after_refusal, Event::QualifyPassed(sha("b")));
         assert_eq!(flipped, flip_commands("a", "b", 18));
+    }
+
+    /// ducktape-app#57: a staged release whose own qualify refuses it does not
+    /// spend the channel. It stays staged — a node's `not_armed` is the same
+    /// answer, and flips later — but a check still fetches, a newer sequence
+    /// supersedes it, its own sequence is not downloaded again, and the user
+    /// can discard it.
+    #[test]
+    fn a_refused_staged_release_does_not_freeze_the_channel() {
+        let refusal = Event::QualifyFailed {
+            sha: sha("d"),
+            reason: "qualify_exit_3".into(),
+        };
+        let (refused, _) = step(Phase::Staged(staged("a", "d")), refusal);
+
+        let (refused, commands) = step(refused, Event::Tick);
+        assert_eq!(
+            commands,
+            vec![Command::Fetch],
+            "a refused release still checks"
+        );
+
+        // a newer good release supersedes it: the staged one is collected,
+        // the newer one downloaded
+        let (next, commands) = step(refused.clone(), fetched(19, &host(), "e"));
+        let Phase::Downloading(downloading) = &next else {
+            panic!("a newer sequence is downloaded, not {next:?}");
+        };
+        assert_eq!((downloading.target, downloading.sequence), (sha("e"), 19));
+        let collected = Command::Gc {
+            keep: vec![sha("a"), sha("z")],
+        };
+        assert!(commands.contains(&collected), "{commands:?}");
+        assert_eq!(
+            commands.last(),
+            Some(&Command::Download {
+                sha: sha("e"),
+                size: 42
+            })
+        );
+
+        // its own sequence again: no download and no repeated banner; why it
+        // waits is read from the phase
+        let (same, commands) = step(refused.clone(), fetched(18, &host(), "d"));
+        assert_eq!(same, refused);
+        assert_eq!(commands, vec![], "a standing release repeats nothing");
+        let Phase::Staged(standing) = &same else {
+            panic!("staged, not {same:?}");
+        };
+        assert_eq!(standing.refused.as_deref(), Some("qualify_exit_3"));
+
+        // the user can discard it
+        let (discarded, commands) = step(refused, Event::UserRollback);
+        assert_eq!(discarded, idle("a", Some("z"), 18));
+        assert_eq!(
+            commands,
+            vec![Command::Persist(idle("a", Some("z"), 18)), collected]
+        );
+    }
+
+    /// The refusal happens in the launcher, which then execs the app: the
+    /// reason rides `state.json`, so the app reads it from the phase. The
+    /// launcher's qualify banners it once; the app's checks repeat nothing.
+    #[test]
+    fn a_qualify_refusal_reaches_the_app_through_state_json() {
+        let (booted, commands) = step(Phase::Staged(staged("a", "d")), Event::Boot);
+        assert_eq!(commands, vec![Command::Qualify(sha("d"))]);
+        let refusal = Event::QualifyFailed {
+            sha: sha("d"),
+            reason: "qualify_exit_3".into(),
+        };
+        let (_, commands) = step(booted, refusal);
+        let Some(Command::Persist(written)) = commands.first() else {
+            panic!("the launcher persists the refusal: {commands:?}");
+        };
+        let banners = commands
+            .iter()
+            .filter(|command| matches!(command, Command::Banner(_)))
+            .count();
+        assert_eq!(banners, 1, "the qualify says it once: {commands:?}");
+
+        let read = crate::state::decode(&crate::state::encode(written)).unwrap();
+        let Phase::Staged(app_sees) = &read else {
+            panic!("the app reads a staged phase, not {read:?}");
+        };
+        assert_eq!(app_sees.refused.as_deref(), Some("qualify_exit_3"));
+
+        let (read, commands) = step(read, Event::Tick);
+        assert_eq!(commands, vec![Command::Fetch]);
+        let (read, commands) = step(read, fetched(18, &host(), "d"));
+        assert_eq!(commands, vec![], "the app's check repeats no banner");
+        assert_eq!(read, *written, "and the reason stays readable");
     }
 
     /// The node's rollback: the flipped binary never publishes an identity, so

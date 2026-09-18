@@ -33,6 +33,7 @@ pub enum Phase {
     /// verified — the machine stays here until `Verified`/`VerifyRefused`).
     Downloading(Downloading),
     /// `staged` is verified, extracted, sealed immutable and ready to flip.
+    /// The channel stays open: a newer release supersedes it.
     Staged(Staged),
     /// The crash-safe swap bit: persisted before `Flip`, replaced after.
     /// A boot that finds it asks the executor which side landed.
@@ -73,6 +74,9 @@ pub struct Staged {
     pub sequence: u64,
     pub display: String,
     pub node_contract: u32,
+    /// Why the staged release's own qualify last refused it, if it did. It is
+    /// persisted because the launcher qualifies and the app reports it.
+    pub refused: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

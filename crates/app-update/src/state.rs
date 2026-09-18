@@ -73,6 +73,17 @@ mod tests {
                 sequence: 18,
                 display: "2026.09.2+abc".into(),
                 node_contract: 4,
+                refused: None,
+            }),
+            Phase::Staged(Staged {
+                current: a,
+                previous: Some(b),
+                pinned_sequence: 4,
+                staged: Sha::digest(b"d"),
+                sequence: 4,
+                display: "0.1.0+qualify-fail".into(),
+                node_contract: 6,
+                refused: Some("qualify_exit_3".into()),
             }),
             Phase::Swapping(Swapping {
                 from: a,
@@ -116,6 +127,22 @@ mod tests {
         assert_eq!(value["from"], a.to_string());
         assert_eq!(value["pinned_sequence"], 3);
         assert!(value.get("version").is_none());
+    }
+
+    /// A staged file written before a qualify ever refused it names no
+    /// `refused`, and reads as not refused.
+    #[test]
+    fn a_staged_file_without_a_refusal_reads_as_not_refused() {
+        let a = Sha::digest(b"a");
+        let d = Sha::digest(b"d");
+        let text = format!(
+            r#"{{"phase":"staged","current":"{a}","previous":null,"pinned_sequence":4,
+                "staged":"{d}","sequence":4,"display":"0.1.0+qualify-fail","node_contract":6}}"#
+        );
+        let Phase::Staged(staged) = decode(&text).unwrap() else {
+            panic!("a staged file reads as staged");
+        };
+        assert_eq!(staged.refused, None);
     }
 
     #[test]
