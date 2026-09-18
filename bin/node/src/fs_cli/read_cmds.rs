@@ -246,6 +246,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::fs_cli::args::Message;
 
     fn entry() -> EntryInfo {
         EntryInfo {
@@ -258,31 +259,51 @@ mod tests {
         }
     }
 
-    /// every read verb refuses in ONE shape: `<reason>: <sentence>`, with no
+    /// every read verb refuses in ONE shape: `<sentence> [<reason>]`, with no
     /// Rust type name wrapped around the words. `cat` and `ls` get the module's
     /// refusal; `stat` gets a successful `None` and refuses for itself — and the
     /// two must not read differently.
     #[test]
-    fn every_refusal_is_a_class_then_a_sentence() {
+    fn every_refusal_is_a_sentence_then_its_class() {
         let from_module = api_err(duckfs_client::api::ApiError::Rejected {
             reason: "files_query".to_string(),
             sentence: "files: path not found".to_string(),
         });
         let from_cli = no_entry("/nope");
-        assert_eq!(from_module.message, "files_query: files: path not found");
-        assert_eq!(from_cli.message, "no_entry: no entry at /nope");
+        assert_eq!(
+            from_module.line().as_deref(),
+            Some("files: path not found [files_query]")
+        );
+        assert_eq!(
+            from_cli.line().as_deref(),
+            Some("no entry at /nope [no_entry]")
+        );
+        // the module's sentence carries a `: ` of its own and still arrives
+        // whole: the halves are fields, never split back out of a line.
+        assert_eq!(
+            from_module.message,
+            Message::Refused {
+                reason: "files_query".to_string(),
+                sentence: "files: path not found".to_string(),
+            }
+        );
 
         let refusals = [&from_module, &from_cli];
         for refusal in refusals {
             assert_eq!(refusal.code, 1);
-            assert!(!refusal.message.contains("Module("), "{}", refusal.message);
-            let (reason, sentence) = refusal.message.split_once(": ").expect("framed");
+            let line = refusal.line().expect("a refusal prints a line");
+            assert!(!line.contains("Module("), "{line}");
+            let Message::Refused { reason, sentence } = &refusal.message else {
+                panic!("{:?} is not a refusal", refusal.message);
+            };
             let is_class_token = !reason.is_empty()
                 && reason
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
             assert!(is_class_token, "{reason:?} is not a class token");
-            assert!(!sentence.is_empty(), "{}", refusal.message);
+            assert!(!sentence.is_empty(), "{line}");
+            // the token a script greps is the LAST thing on the line.
+            assert!(line.ends_with(&format!(" [{reason}]")), "{line}");
         }
     }
 
