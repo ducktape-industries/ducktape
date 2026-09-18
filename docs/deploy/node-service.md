@@ -13,7 +13,15 @@ checkpoint path (the same one the desktop shell uses on quit; a resident
 installs no handler and simply re-syncs at its next boot), it raises its own open-file
 soft limit to 65536 (`bin/node/src/resource_limits.rs`), and
 `ducktape service run` names systemd as its target (`bin/node/src/services.rs`,
-`RunArgs::enable`: "for scripts and systemd units").
+`RunArgs::enable`: "for scripts and systemd units"). A service unit runs the
+daemon through the launcher's service role,
+`ducktape-node-launcher service --workspace DIR --config FILE -- service run <kind> --enable`
+(`bin/node-launcher/src/main.rs`, `supervise_service`): the role starts
+`<workspace>/current/ducktape` and restarts the daemon when a release flip
+moves that link, so the node and its daemons change build together. A daemon
+started as a bare `service run` keeps the binary it started from, and
+`service status` shows the skew as `build X (this node: Y)` until it is
+restarted by hand.
 
 ## Where the workspace lives
 

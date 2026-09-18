@@ -664,10 +664,19 @@ fi
 # The grant line is also NOT proof the daemon lives: it enables, prints
 # `announced at height N`, and can still exit on the next line. So each one
 # waits for its grant, then waits out the exit window and must still be there.
+#
+# Each daemon runs under the launcher's `service` role, never as a bare
+# `service run`: the role starts `<workspace>/current/ducktape` and restarts
+# its child when a release flip moves that link, so a node release carries
+# its daemons with it. A bare daemon keeps the binary it started from until
+# someone with a shell restarts it, and `service status` shows the skew
+# (`build X (this node: Y)`) for as long as that takes. The role appends
+# `--config` itself; passing it again is refused as a duplicate.
 for svc in $SERVICES; do
     log="$FOUNDER_WS/service-$svc.log"
     DUCKTAPE_MODULES_DIR="$FOUNDER_WS/modules" setsid nohup \
-        "$WS_BIN" service run "$svc" --config "$FOUNDER_CFG" --enable \
+        "$WS_LAUNCHER" service --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" \
+        -- service run "$svc" --enable \
         > "$log" 2>&1 < /dev/null &
     disown
     n=0
