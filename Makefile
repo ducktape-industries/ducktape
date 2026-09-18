@@ -218,6 +218,7 @@ test: wasm-embed-check
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/proxmox-view-lane-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/worktree-clean-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/dogfood-forge-test.py && \
+	  PYTHONDONTWRITEBYTECODE=1 python3 ops/forge-mirror-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/refound-smoke-test.py; \
 	else echo "[test] skipped the ops/ script tests — they need python 3.11 (tomllib)" >&2; fi
 # demo-clear's refusal line against a stub admin surface (the reason token it

@@ -76,6 +76,7 @@ mod drain_actions;
 mod executors;
 mod explorer;
 mod first_contact_join;
+mod forge_cli;
 mod fs_cli;
 mod gateway_plane;
 mod gateway_routes;
@@ -306,6 +307,10 @@ enum Family {
     /// the desktop app's release: manifest sign/verify, bundle signing through the airlock gateway
     #[command(subcommand)]
     Release(release_cli::ReleaseCmd),
+    /// git over `duck://<network>/forge/<owner>/<repo>` addresses: put the
+    /// `git-remote-duck` helper on PATH
+    #[command(subcommand)]
+    Forge(forge_cli::ForgeCmd),
     /// the agent tool plane over stdio, for driving it by hand
     ///
     /// It reads who it is from the environment. DUCKTAPE_NODE is the http
@@ -316,6 +321,11 @@ enum Family {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // git runs this binary as `git-remote-duck <remote> <url>` for a
+    // `duck://` remote: a mode of the one binary, with git's argv, not ours.
+    if forge_cli::invoked_as_helper() {
+        return forge_cli::run_helper();
+    }
     let cli = <Cli as clap::Parser>::parse();
     match cli.family {
         // `fs` owns a 0/1/2 exit-code contract, so it exits directly (after
@@ -347,6 +357,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Family::Service(cmd) => services::run(cmd),
         Family::Module(cmd) => module_cli::run(cmd),
         Family::Release(cmd) => release_cli::run(cmd),
+        Family::Forge(cmd) => forge_cli::run(cmd),
         Family::Node(cli_args::NodeCmd::Run(args)) => run_node_verb(args),
         Family::Node(cli_args::NodeCmd::Op(op)) => cli::run(op),
     }

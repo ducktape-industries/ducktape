@@ -225,13 +225,22 @@ fn dispatch_join(cmd: JoinCmd) -> CommandResult {
 /// prints a friendly notice on stderr and exits 0 (no workspace yet is not
 /// an error).
 fn cmd_list() -> CommandResult {
-    let workspaces = config::list_workspaces()?;
+    let workspaces = config::registered_networks()?;
     if workspaces.is_empty() {
         eprintln!("no workspaces under {}", config::ducktape_home()?.display());
         return Ok(());
     }
-    for (chain_id, config_path) in workspaces {
-        println!("{chain_id}\t{}", config_path.display());
+    // a remote workspace (`ducktape forge setup --node`) names the node it
+    // dials: its file is not a node.toml, and `--config` takes no such file.
+    for (chain_id, registered) in workspaces {
+        match registered {
+            config::Registered::Local(node_toml) => {
+                println!("{chain_id}\t{}", node_toml.display())
+            }
+            config::Registered::Remote { file, node } => {
+                println!("{chain_id}\t{}\tremote node {node}", file.display())
+            }
+        }
     }
     Ok(())
 }

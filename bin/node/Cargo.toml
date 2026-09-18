@@ -112,6 +112,10 @@ keystore = { workspace = true }
 # and the join ceremony. `config/resolve.rs` — turning those files into a
 # runnable daemon — is what stayed in this binary.
 workspace-config = { workspace = true }
+# `git-remote-duck`: the `duck://` address and forge's `<owner>/<repo>` half
+# of it, parsed where the sdk parses them.
+duck-address = { workspace = true }
+forge-wire = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
 agent = { workspace = true }

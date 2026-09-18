@@ -21,6 +21,7 @@ document nothing cites is deleted, not archived.
 | --- | --- |
 | Keep a node and its service daemons up under systemd (Linux) or launchd (macOS); ports; logs; why three validators tolerate nothing | [`deploy/node-service.md`](deploy/node-service.md) |
 | Install isolated application executables behind authenticated Gateway HTTP/WebSocket routes; stop, restart, and replace them | [`deploy/application-service.md`](deploy/application-service.md) |
+| Clone, push and depend on a Forge repository by its `duck://` address (`ducktape forge setup`, `git-remote-duck`, Cargo); mirror GitHub into Forge on a timer | [`deploy/forge-git.md`](deploy/forge-git.md) |
 | Which files are secrets, which are irreplaceable, what to copy, what a restore looks like | [`deploy/backup-and-keys.md`](deploy/backup-and-keys.md) |
 | Run the untrusted coordinator (rendezvous + first-contact relay); stand up two NAT'd validators | [`deploy/coordinator.md`](deploy/coordinator.md) |
 | Front a validator with a sentry so it exposes no inbound port | [`deploy/sentry-deployment.md`](deploy/sentry-deployment.md) |

@@ -34,7 +34,8 @@ commonware-utils = { workspace = true }
 # hex codecs for keys, roots and pasted blobs — the shared home.
 duckfs-core = { workspace = true }
 # the `duck://` grammar's chain id: the ONE rule a network name must satisfy
-# (`validate_network_name`), never a second copy of its charset here.
+# (`validate_network_name`), never a second copy of its charset here — and
+# the chain id a `duck://` address carries, which the registry resolves.
 duck-address = { workspace = true }
 # the invite token's mint/verify, shared verbatim with the validator that
 # admits a redemption (`governance::invite`).

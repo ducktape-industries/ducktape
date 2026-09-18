@@ -391,7 +391,7 @@ fn trim_base(url: &str) -> String {
 /// A chain id is the mistake this actually catches: `--node mynet#d0cdf950`
 /// parses, outranks `-n`, and then silently misdirects, so the message names
 /// the flag that WOULD have taken it.
-fn checked_base(source: &str, url: &str) -> Result<String, String> {
+pub(crate) fn checked_base(source: &str, url: &str) -> Result<String, String> {
     let is_http = url.starts_with("http://") || url.starts_with("https://");
     if is_http {
         return Ok(trim_base(url));

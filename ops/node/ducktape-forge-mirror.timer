@@ -1,0 +1,11 @@
+# Runs ducktape-forge-mirror.service every five minutes: that is the most a
+# Forge mirror lags its GitHub branch.
+[Unit]
+Description=Ducktape Forge mirror, every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+
+[Install]
+WantedBy=timers.target
