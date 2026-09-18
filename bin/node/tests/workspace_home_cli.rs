@@ -310,9 +310,9 @@ fn init_writes_module_hashes_and_the_genesis() {
     let d = workspace_config::NetworkDescriptor::load(&ws.join("network.toml")).unwrap();
     let ids: Vec<&str> = d.modules.iter().map(|m| m.id.as_str()).collect();
     // the descriptor pins every founding entry: the module set and the
-    // founding views (`home`), each under its own hash
+    // view-only entries (`home`, `members`, …), each under its own hash
     let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
-    want.extend(topology::VIEWS);
+    want.extend(topology::views());
     want.sort_unstable();
     assert_eq!(ids, want);
     let file = ws.join("genesis");
@@ -365,6 +365,16 @@ fn init_accepts_a_module_absent_from_the_binary_catalog() {
         workspace_config::component_path(&source, "directory"),
     )
     .unwrap();
+    // a founding set carries every basic view or `init` refuses it; here each
+    // rides as a view-only entry beside the one module.
+    for id in topology::basic_views() {
+        let view = format!("{id}.view.wasm");
+        std::fs::copy(
+            std::path::Path::new(common::founding_set()).join(&view),
+            source.join(&view),
+        )
+        .unwrap();
+    }
     let workspace = tmp.path().join("network");
     let output = common::ducktape()
         .args([
@@ -389,14 +399,17 @@ fn init_accepts_a_module_absent_from_the_binary_catalog() {
         .unwrap();
     assert_ok(&output, "init with supplied directory module");
     let genesis = workspace_config::Genesis::load(&workspace.join("genesis")).unwrap();
+    let mut want: Vec<&str> = topology::basic_views().chain(["directory"]).collect();
+    want.sort_unstable();
     assert_eq!(
         genesis
             .modules
             .iter()
             .map(|a| a.id.as_str())
             .collect::<Vec<_>>(),
-        ["directory"]
+        want
     );
+    assert!(genesis.component("directory").is_some());
     assert!(
         genesis
             .modules
@@ -423,7 +436,7 @@ fn init_founds_from_the_set_the_build_staged_beside_the_binary() {
     let genesis = workspace_config::Genesis::load(&ws.join("genesis")).expect("the genesis file");
     let ids: Vec<&str> = genesis.modules.iter().map(|a| a.id.as_str()).collect();
     let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
-    want.extend(topology::VIEWS);
+    want.extend(topology::views());
     want.sort_unstable();
     assert_eq!(ids, want);
 }
@@ -606,6 +619,56 @@ fn init_refuses_a_zero_byte_component_and_writes_nothing() {
         "names the artifact path: {error}"
     );
     assert!(!workspace.exists(), "nothing is written on refusal: {}", workspace.display());
+}
+
+/// The app carries no view: every basic view is founded or the network draws
+/// it nowhere, so `init` refuses a set lacking one, by the view's id, before
+/// writing anything.
+#[test]
+fn init_refuses_a_founding_set_lacking_a_basic_view_and_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("supplied");
+    let copied = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(common::founding_set())
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(copied.success(), "copy the staged founding set");
+    std::fs::remove_file(source.join("members.view.wasm")).unwrap();
+    let workspace = tmp.path().join("network");
+    let output = common::ducktape()
+        .args([
+            "node",
+            "init",
+            "--name",
+            "viewless",
+            "--primary-coordinator",
+            "none",
+            "--dir",
+        ])
+        .arg(&workspace)
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--advertised",
+            "127.0.0.1:1",
+            "--modules",
+        ])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "a set lacking a basic view must refuse init"
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("founding_view_missing: members"), "{error}");
+    assert!(
+        !workspace.exists(),
+        "nothing is written on refusal: {}",
+        workspace.display()
+    );
 }
 
 /// An empty founding directory cannot define a module set. The diagnostic

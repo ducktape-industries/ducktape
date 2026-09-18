@@ -243,8 +243,10 @@ CARGO_TARGET_DIR="$PWD/target" cargo build --locked -p node-bin --bin ducktape
 ```
 
 The noded build stages every committed view into the node profile's founding
-set. Require the `governance`, `files`, `pages`, `chat`, and `forge`
-`<id>.view.wasm` files before founding or rollout. Preserve
+set. `crates/topology/basic-views` lists every view the app draws; each rides
+the set as `<id>.view.wasm`, and `node init` refuses a set lacking one
+(`founding_view_missing: <id>`), as `ops/release/archive.sh --kind node`
+refuses to pack it. Preserve
 `pages.index.wasm` and `chat.index.wasm` in every ceremony; the other three
 owners have no mapper. Pass `--assets` only for an existing asset directory.
 Do not edit founding files to perform a live swap.
@@ -286,13 +288,11 @@ or successful activation is implied by the static fixtures in this directory.
 
 The Mac client check is coordinated separately with the app owner. Use fresh
 preferences because an explicit saved endpoint takes priority over the
-environment. Its staged view directory must contain only the six globals
-`agents`, `explorer`, `members`, `node`, `settings`, and `shell` (`*_view.wasm`),
-with the five owner views absent:
+environment. The app carries no view: every one it draws is fetched from the
+node's registry.
 
 ```sh
 DUCKTAPE_HOME="$MAC_SCRATCH" DUCKTAPE_NODE="$NODE_A_HTTP" \
-DUCKTAPE_VIEWS_DIR="$GLOBALS_ONLY" \
   "$APP_BUNDLE/Contents/MacOS/ducktape-app"
 ```
 

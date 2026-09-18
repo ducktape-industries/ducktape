@@ -238,13 +238,7 @@ async fn an_unsigned_bundle_comes_back_signed_and_verifies() {
             .join("Contents/_CodeSignature/CodeResources")
             .is_file()
     );
-    assert!(
-        std::fs::symlink_metadata(signed.join("Contents/MacOS/views"))
-            .unwrap()
-            .file_type()
-            .is_symlink(),
-        "the views link survives the round trip"
-    );
+    sign::validate_layout(&signed).unwrap();
     let rcodesign = fixture::rcodesign();
     for executable in ["ducktape-launcher", "ducktape-app"] {
         rcodesign_verify(&rcodesign, &signed.join("Contents/MacOS").join(executable));

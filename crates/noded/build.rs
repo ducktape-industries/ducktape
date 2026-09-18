@@ -80,7 +80,12 @@ fn stage_founding_set() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let checkout = staged_key::checkout_of_crate(&manifest);
     let modules = staged_dir(profile_dir, "modules", &checkout);
-    stage_preset(&checkout, &modules, topology::PRODUCTION, topology::VIEWS);
+    stage_preset(
+        &checkout,
+        &modules,
+        topology::PRODUCTION,
+        &topology::views(),
+    );
     let simulation: Vec<&str> = topology::TOPOLOGY
         .modules
         .iter()
@@ -243,13 +248,13 @@ pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str], views: &[
             topology::TOPOLOGY.spec(id).is_none(),
             "view {id} is also a module in the topology"
         );
-        // a view-only entry has nothing but its view: topology::VIEWS declares
+        // a view-only entry has nothing but its view: topology::views() declares
         // it, so a checkout lacking the artifact fails here like a missing
         // component, rather than founding a network without it.
         let view = view_staging::committed_view(checkout, id);
         assert!(
             view.is_file(),
-            "view {id} is in topology::VIEWS but {} is not committed (run `make views-sync`)",
+            "view {id} is in topology::views() but {} is not committed (run `make views-sync`)",
             view.display()
         );
         view_staging::stage_view(checkout, dest, id).expect("stage founding view");
