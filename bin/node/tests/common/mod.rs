@@ -951,12 +951,25 @@ impl NetworkShapeCluster {
         }
     }
 
+    /// one more party to this shape — someone a member other than the founder
+    /// invites. Returns its idx for `join`/`spawn`/`wait_*`.
+    pub fn add_node(&mut self) -> usize {
+        let ports = alloc_ports(3);
+        self.p2p_ports.push(ports[0]);
+        self.rpc_ports.push(ports[1]);
+        self.http_ports.push(ports[2]);
+        self.env.push(Vec::new());
+        self.nodes.push(None);
+        self.nodes.len() - 1
+    }
+
     /// this shape's per-node workspace — the directory holding `node.toml`, and
     /// the credential the node mints beside it.
     pub fn workspace(&self, idx: usize) -> PathBuf {
         match idx {
             0 => self.founder_dir.clone(),
-            _ => self.friend_dir.clone(),
+            1 => self.friend_dir.clone(),
+            n => self.dir.path().join(format!("node{n}")),
         }
     }
 
@@ -1081,7 +1094,12 @@ impl NetworkShapeCluster {
     /// `join_friend` reuses one stable key across the ceremony.
     pub fn invite(&self) -> String {
         self.keygen_friend(1);
-        let cfg = self.config_file(0);
+        self.invite_from(0)
+    }
+
+    /// mint a bearer invite from member `idx`'s workspace.
+    pub fn invite_from(&self, idx: usize) -> String {
+        let cfg = self.config_file(idx);
         let out = ducktape()
             .arg("node")
             .args(["invite", "--config"])
@@ -1132,21 +1150,28 @@ impl NetworkShapeCluster {
     /// success — the caller inspects the outcome (a targeted invite refuses a
     /// mismatched local identity at the CLI, before any node spawns).
     pub fn try_join_friend(&self, invite: &str) -> std::process::Output {
+        self.try_join(1, invite)
+    }
+
+    /// run the `join` verb into node `idx`'s workspace and ports WITHOUT
+    /// asserting success.
+    pub fn try_join(&self, idx: usize, invite: &str) -> std::process::Output {
+        let dir = self.workspace(idx);
         ducktape()
             .arg("node")
             .args([
                 "join",
                 invite,
                 "--dir",
-                self.friend_dir.to_str().expect("utf-8 friend dir"),
+                dir.to_str().expect("utf-8 workspace dir"),
                 "--listen",
-                &format!("127.0.0.1:{}", self.p2p_ports[1]),
+                &format!("127.0.0.1:{}", self.p2p_ports[idx]),
                 "--advertised",
-                &format!("127.0.0.1:{}", self.p2p_ports[1]),
+                &format!("127.0.0.1:{}", self.p2p_ports[idx]),
                 "--http",
-                &format!("127.0.0.1:{}", self.http_ports[1]),
+                &format!("127.0.0.1:{}", self.http_ports[idx]),
                 "--rpc",
-                &format!("127.0.0.1:{}", self.rpc_ports[1]),
+                &format!("127.0.0.1:{}", self.rpc_ports[idx]),
                 "--wireguard-listen",
                 &format!("127.0.0.1:{}", alloc_ports(1)[0]),
                 // hermetic: without this the joined node registers with the
@@ -1159,7 +1184,12 @@ impl NetworkShapeCluster {
     }
 
     pub fn join_friend(&self, invite: &str) -> String {
-        let out = self.try_join_friend(invite);
+        self.join(1, invite)
+    }
+
+    /// join node `idx`'s workspace and return the pubkey hex `join` prints.
+    pub fn join(&self, idx: usize, invite: &str) -> String {
+        let out = self.try_join(idx, invite);
         assert!(
             out.status.success(),
             "join failed:\n{}",
@@ -1169,19 +1199,19 @@ impl NetworkShapeCluster {
     }
 
     pub fn config_file(&self, idx: usize) -> PathBuf {
-        match idx {
-            0 => self.founder_dir.join("node.toml"),
-            1 => self.friend_dir.join("node.toml"),
-            _ => panic!("unknown network-shape node idx {idx}"),
-        }
+        assert!(
+            idx < self.nodes.len(),
+            "unknown network-shape node idx {idx}"
+        );
+        self.workspace(idx).join("node.toml")
     }
 
     pub fn spawn(&mut self, idx: usize) {
         let cfg = self.config_file(idx);
         let label = match idx {
-            0 => "founder",
-            1 => "friend",
-            _ => panic!("unknown network-shape node idx {idx}"),
+            0 => "founder".to_string(),
+            1 => "friend".to_string(),
+            n => format!("node{n}"),
         };
         let log = self.dir.path().join(format!("{label}.log"));
         let mut cmd = ducktape();
@@ -1190,7 +1220,7 @@ impl NetworkShapeCluster {
             .arg("--config")
             .arg(&cfg)
             .envs(self.env[idx].iter().map(|(k, v)| (k.clone(), v.clone())));
-        self.nodes[idx] = Some(NodeProc::spawn(idx as u64, log, cmd, label));
+        self.nodes[idx] = Some(NodeProc::spawn(idx as u64, log, cmd, &label));
     }
 
     /// keep node `idx`'s `<kind>` hello alive — a service daemon's ENTIRE

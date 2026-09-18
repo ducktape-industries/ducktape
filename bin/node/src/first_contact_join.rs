@@ -386,7 +386,7 @@ pub struct RelayFallback {
     /// this node's identity signer — every [`nat_traversal::RelayIntro`]
     /// carries a fresh proof-of-possession it signs.
     pub signer: ed25519::PrivateKey,
-    /// the genesis-issued coordinator capability, when the network's relay
+    /// the validator-issued coordinator capability, when the network's relay
     /// gates privately (the same cap every rendezvous request presents).
     pub cap: Option<nat_traversal::CoordCap>,
 }

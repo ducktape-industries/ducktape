@@ -672,7 +672,7 @@ impl NetworkDescriptor {
 /// coordination privacy for the reachability plane — per-network operational
 /// policy (like `checkpoint_blocks`), NOT part of the genesis fingerprint.
 /// `Public` = the coordinator admits any proof-of-possession request;
-/// `Private` (the default) also requires a genesis-issued `CoordCap`.
+/// `Private` (the default) also requires a validator-issued `CoordCap`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Coordination {
     Public,
@@ -790,9 +790,10 @@ pub fn decode_key(hex: &str) -> Result<ed25519::PublicKey, String> {
 
 // ============================================================================
 // coordinator capability — the private-mode admission token a node presents on
-// each rendezvous request. Minted by a genesis validator (`mint_coord_cap`),
-// persisted 0600 beside the descriptor like `invite.token`. Genesis validators
-// need none (the coordinator's pinned set covers them).
+// each rendezvous request. Minted by the validator that seats the node
+// (`mint_coord_cap`), persisted 0600 beside the descriptor like
+// `invite.token`. Genesis validators need none (the coordinator's pinned set
+// covers them).
 // ============================================================================
 
 const COORD_CAP_FILE: &str = "coord.cap";
@@ -1902,6 +1903,7 @@ mod tests {
         // the coordinator, pinned to this genesis key, admits the joiner.
         let policy = AuthPolicy::Private {
             genesis_set: vec![genesis.public_key()],
+            live: Default::default(),
         };
         assert_eq!(
             verify_request(

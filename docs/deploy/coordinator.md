@@ -100,12 +100,34 @@ The coordinator is keyless in every mode:
 - **Default public mode** — no auth flag. Requests must carry proof of
   possession for the node key they claim.
 - **Private mode** — `--genesis-set <network.toml>`. The coordinator reads only
-  the public `validators = [...]` keys from that descriptor and admits genesis
-  validators or holder-presented caps rooted in that set.
+  the public `validators = [...]` keys from that descriptor. They are the
+  floor: a genesis validator, and a node presenting an unexpired cap a genesis
+  validator signed, are always admitted.
+- **Private mode following the live set** — add
+  `--valset-node http://<host>:<port>`. Every 10 s the coordinator reads that
+  node's committed validator set off its open `POST /v1/query` lane (the
+  valset module's `validators` query) and also admits those validators and the
+  caps they sign. Every validator seat mints a cap for the joiner it admits,
+  so a joiner seated by a validator promoted after genesis carries a cap only
+  a coordinator following the live set admits. A reading admits for 60 s after
+  it was taken. Once the node has not answered for that long, a key only that
+  reading named is refused (`coordinator_request_refused`,
+  `reason = "valset_stale"`) until a read succeeds again, while the genesis
+  set keeps admitting.
+
+Name a node of this network that you run: the coordinator believes the set it
+reports, over plain HTTP, so reach it on the same host
+(`http://127.0.0.1:8844`, the node's default `http_listen` port) or over a
+private link. A container's `127.0.0.1` is not the host's; give a Docker
+coordinator an address the node's `http_listen` actually serves. The read logs
+`coordinator_valset_read` when the set first arrives, changes, or recovers,
+and `coordinator_valset_read_failed` (with `reason`, `attempts`, and whether
+the last reading has `lapsed`) on the first failure and every 30th after.
 
 Malformed `--listen`, `--relay-listen`, `--workers`, `--metrics-interval`, and
-malformed/value-less `--genesis-set` are hard errors, not silent fallbacks to a
-weaker policy.
+malformed/value-less `--genesis-set` or `--valset-node` are hard errors, not
+silent fallbacks to a weaker policy; `--valset-node` without `--genesis-set` is
+refused.
 
 ## Authentication workers
 
@@ -214,8 +236,9 @@ sudo cp ops/coordinator/ducktape-coordinator.service /etc/systemd/system/
 
 # Optional: edit /etc/ducktape/coordinator.env to choose a bind address and auth
 # mode. The supplied file binds the TCP relay lane on 0.0.0.0:443, selects four
-# auth workers and public proof-of-possession. For private mode use:
-# COORDINATOR_ARGS=--relay-listen 0.0.0.0:443 --workers 4 --metrics-interval 10 --genesis-set /etc/ducktape/network.toml
+# auth workers and public proof-of-possession. For private mode, following the
+# validator set of a node on this host, use:
+# COORDINATOR_ARGS=--relay-listen 0.0.0.0:443 --workers 4 --metrics-interval 10 --genesis-set /etc/ducktape/network.toml --valset-node http://127.0.0.1:8844
 
 # 4. Start it.
 sudo systemctl daemon-reload
@@ -272,7 +295,7 @@ docker run --cap-drop=ALL --security-opt no-new-privileges --read-only \
   -p 3478:3478/udp -p 443:8443/tcp \
   -v /etc/ducktape/network.toml:/etc/ducktape/network.toml:ro \
   ducktape-coordinator --listen 0.0.0.0:3478 --relay-listen 0.0.0.0:8443 --workers 4 \
-    --genesis-set /etc/ducktape/network.toml
+    --genesis-set /etc/ducktape/network.toml --valset-node http://<node host>:8844
 ```
 
 The image is multi-stage: a `rust:1.96-bookworm` build stage compiles exactly

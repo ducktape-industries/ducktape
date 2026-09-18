@@ -249,9 +249,9 @@ pub enum IntroReply {
     /// the AUTHORITATIVE admission: `Redeem` committed at `height` — the
     /// joiner now holds standing.
     ///
-    /// `cap` carries an OPAQUE genesis-issued coordinator capability (packed
+    /// `cap` carries an OPAQUE validator-issued coordinator capability (packed
     /// `CoordCap` bytes) minted for the joiner when this network coordinates
-    /// PRIVATELY and the answering member is a genesis validator — the joiner
+    /// PRIVATELY and the answering member is a current validator — the joiner
     /// cannot receive it on the invite (its key does not exist at invite-mint
     /// time), so this reply is its only delivery channel; the seal is what
     /// keeps it off the wire. join_gate.rs stays crypto-agnostic: it moves bytes
