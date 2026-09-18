@@ -11,7 +11,7 @@
 #[path = "../build.rs"]
 mod build_script;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use sha2::{Digest as _, Sha256};
@@ -47,12 +47,20 @@ fn every_committed_view_is_the_one_its_lock_names() {
             continue;
         }
         let id = entry.file_name().into_string().expect("utf-8 view id");
-        let founding = topology::TOPOLOGY.spec(&id).is_some() || topology::VIEWS.contains(&&*id);
-        assert!(founding, "crates/views/{id} is not a founding id");
         let bytes = std::fs::read(entry.path().join("view.wasm"))
             .unwrap_or_else(|e| panic!("crates/views/{id}/view.wasm: {e}"));
         committed.insert(id, hex(&Sha256::digest(&bytes)));
     }
+    let basic: BTreeSet<&str> = topology::basic_views().collect();
+    assert_eq!(
+        committed
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        basic,
+        "crates/views must hold exactly the basic views (crates/topology/basic-views): \
+         run `make views-sync`"
+    );
     assert_eq!(
         committed, locked,
         "crates/views must hold exactly the views views.lock records: run `make views-sync`, \

@@ -18,8 +18,15 @@
 # What the archive holds, at its root, is what the launcher on that side
 # extracts into `releases/<sha>/`:
 #   app, macOS   Ducktape.app/                             (the whole bundle)
-#   app, Linux   ducktape-launcher, ducktape-app, views/*.wasm
+#   app, Linux   ducktape-launcher, ducktape-app
 #   node         ducktape, ducktape-node-launcher, modules/
+#
+# AN APP RELEASE CARRIES NO VIEW. Every view the app draws is founded into a
+# network's genesis and served by it, so a `views` directory in an app
+# release is a second copy the network never pinned — refused as
+# `views_in_app_release`. The node archive's `modules/` carries every basic
+# view (crates/topology/basic-views) as `<id>.view.wasm`, or is refused as
+# `founding_view_missing: <id>` — the refusal `node init` makes of that set.
 #   with --sequence and --display, also `release.json`:
 #                {"sequence":3,"display":"2026.09.3+e6352411a"}
 #
@@ -61,7 +68,7 @@ SEQUENCE=""
 DISPLAY_TEXT=""
 
 usage() {
-  sed -n '2,54p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,61p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
@@ -123,8 +130,12 @@ require_executable() {
     exit 1
   fi
 }
-require_views() {
-  ls "$1"/*.wasm >/dev/null 2>&1 || { echo "archive.sh: views_missing: $1 holds no .wasm" >&2; exit 1; }
+refuse_views() {
+  local views
+  for views in "$@"; do
+    [ ! -e "$views" ] && [ ! -L "$views" ] \
+      || refuse views_in_app_release "$views: the network serves every view out of its genesis; an app release carries none"
+  done
 }
 
 # The founding set THIS checkout's build staged beside the binaries in $1:
@@ -150,6 +161,11 @@ resolve_founding_set() {
   # with no record ships a release that refuses itself on first use.
   [ -f "$FOUNDING_SET/.staged-by" ] \
     || refuse founding_set_unowned "$FOUNDING_SET carries no .staged-by, so the binary beside it will refuse the set as a stranger's"
+  local id
+  for id in $(cat "$checkout/crates/topology/basic-views"); do
+    [ -f "$FOUNDING_SET/$id.view.wasm" ] \
+      || refuse founding_view_missing "$id — $FOUNDING_SET holds no $id.view.wasm, so 'node init' from this release would refuse it"
+  done
 }
 
 # The bundle's own checks, on macOS only: signature kind, then the ticket.
@@ -176,7 +192,7 @@ pack_app() {
       [ "$(basename "$FROM")" = Ducktape.app ] || { echo "archive.sh: --from must name Ducktape.app on macOS, not $FROM" >&2; exit 1; }
       require_executable "$FROM/Contents/MacOS/ducktape-launcher" launcher_missing
       require_executable "$FROM/Contents/MacOS/ducktape-app" app_missing
-      require_views "$FROM/Contents/MacOS/views"
+      refuse_views "$FROM/Contents/MacOS/views" "$FROM/Contents/Resources/views"
       refuse_unfit_bundle "$FROM"
       PARENT=$(cd "$FROM/.." && pwd -P)
       MEMBERS=(Ducktape.app)
@@ -184,9 +200,9 @@ pack_app() {
     linux)
       require_executable "$FROM/ducktape-launcher" launcher_missing
       require_executable "$FROM/ducktape-app" app_missing
-      require_views "$FROM/views"
+      refuse_views "$FROM/views"
       PARENT=$(cd "$FROM" && pwd -P)
-      MEMBERS=(ducktape-launcher ducktape-app views)
+      MEMBERS=(ducktape-launcher ducktape-app)
       ;;
   esac
 }

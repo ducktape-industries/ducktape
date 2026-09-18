@@ -30,6 +30,10 @@ pub use workspace_config::*;
 /// mapper through wasmtime, so a zero-byte or truncated artifact refuses
 /// `node init` instead of minting an unbootable network.
 ///
+/// Then every basic view (`topology::basic_views()`) must ride in the set:
+/// the app carries none, so a network founded without one draws that view
+/// nowhere — refused as `founding_view_missing: <id>`.
+///
 /// called only from `cmd_init`, not from `resolve_dev_shape`: the dev shape
 /// never writes a genesis or descriptor file (its `GenesisSource::FoundingSet`
 /// is re-hashed from the staged directory on every resolve, i.e. every dev
@@ -69,5 +73,12 @@ pub fn validate_founding_set(
     });
     drop(index);
     let _ = std::fs::remove_dir_all(&scratch);
-    result
+    result?;
+    match topology::basic_views().find(|id| !genesis.carries_view(id)) {
+        Some(id) => Err(format!(
+            "founding_view_missing: {id} — {} holds no {id}.view.wasm (run `make views-sync`)",
+            source.display()
+        )),
+        None => Ok(()),
+    }
 }
