@@ -98,6 +98,16 @@ manifest, process contract, and install/activate/stop/restart commands.
   silently ignored; `use`, `help` and `cgroup` need no node and never read it.
 - `completions/` — shell completions for the `ducktape` CLI.
 
+## Release acceptance walk
+
+- `qa/run.sh` — the walk runner (ducktape-industries/ducktape-qa) at exactly
+  the rev `qa/RUNNER_REV` names, cloned into
+  `${XDG_CACHE_HOME:-~/.cache}/ducktape-qa/<rev>` and refused if that checkout
+  is not clean at that rev. A bare scenario name is one of the pinned
+  checkout's `scenarios/acceptance/*.json`; `--check` loads all of them, which
+  gates a rev bump without a rig. [`../docs/roll-a-node-release.md`](../docs/roll-a-node-release.md)
+  says where in a release cut it runs and what the params file holds.
+
 ## Networking and media harnesses
 
 - `coordinator/` — systemd unit, env example, and Dockerfile for the UDP

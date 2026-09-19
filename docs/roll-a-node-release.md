@@ -151,6 +151,38 @@ no reader ever sees a manifest naming an archive that is not there yet.
 `--sequence` is the monotonic downgrade guard: strictly above the last
 published. The key here must be the one the nodes pin.
 
+## Acceptance walk
+
+The archive is built and the channel entry is published, so the release can
+now be accepted the way a member meets it: a fresh machine installs it and
+joins. `ops/qa/run.sh` runs that walk on its own rig — its own Xvfb, its own
+HOME and `DUCKTAPE_HOME` — through the walk runner
+(ducktape-industries/ducktape-qa) at exactly the rev `ops/qa/RUNNER_REV`
+names, cloned once under `${XDG_CACHE_HOME:-~/.cache}/ducktape-qa/<rev>` and
+refused if that checkout is not clean at that rev:
+
+```
+JEV_API_KEY=… ops/qa/run.sh setup.json update-path.json \
+    --out ~/qa/<walk tag> --params ~/qa/params.json
+```
+
+A bare name is one of the pinned checkout's `scenarios/acceptance/*.json`; a
+path with a slash is the caller's own file. `--check` loads every acceptance
+scenario through the pinned runner and says so, which is how a rev bump is
+gated without a rig.
+
+Copy the params file from the pinned checkout's `params.example.json` and fill
+it in: the app and node archives, the published sha256, sequence and display
+version, and the network. Every secret is named there BY PATH and never
+inline — the release keys the walk compares against, and `invite_file`, a
+single-use invitation minted for this walk and written `0600`. `setup.json`
+spends that invite and runs a member node, so the walk needs a fresh invite
+and a fresh `--out` each time.
+
+Exit 0 is PASS, 1 FAIL, 2 FAIL-UNJUDGED, 3 a bad scenario or command line.
+Each invocation writes its transcript, ledger and result under a new
+`<out>/run-NN/`.
+
 ## 3. Designate it
 
 Publishing puts the bytes on the network. WHEN to run them is a separate
