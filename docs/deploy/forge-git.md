@@ -82,18 +82,37 @@ this machine's loopback.
 
 ## Cargo
 
-Cargo's built-in fetcher cannot run a remote helper, so a repository with a
-`duck://` git dependency commits `.cargo/config.toml`:
+Cargo's built-in fetcher cannot run a remote helper. `forge setup` writes
 
 ```toml
 [net]
 git-fetch-with-cli = true
 ```
 
-A dependency is pinned by commit, and the lock records the source URL and the
-commit: moving one dependency between its GitHub URL and its `duck://` address
-edits that URL in `Cargo.toml` and in `Cargo.lock`'s `source =` line, never
-the `#<sha>`.
+into `$CARGO_HOME/config.toml` (`~/.cargo/config.toml` by default), so every
+Cargo on this machine shells out to `git` and reaches the helper. A `[net]`
+table that is already there is left alone and named instead.
+
+A lock names one source per crate, so a dependency graph moves onto a network
+at the git layer, not in its manifests:
+
+```sh
+ducktape forge setup --instead-of https://github.com/ducktape-industries/
+```
+
+records
+
+```
+url.duck://<chain-id>/forge/<owner>/.insteadOf = https://github.com/ducktape-industries/
+```
+
+in this repository's git configuration, or the user's with `--global`, and
+`--owner <handle>` picks the Forge when the network serves more than one. Every
+dependency under the prefix — direct or transitive, in any crate of the graph —
+then resolves through the network, while `Cargo.toml` and `Cargo.lock` keep the
+URL and the `#<sha>` they have, so `--locked` holds. A rerun writes nothing; a
+prefix already rewritten to another Forge is refused, naming the `git config
+--unset` that clears it.
 
 ## Mirroring GitHub into Forge
 

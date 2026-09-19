@@ -49,9 +49,16 @@ pub enum ForgeCmd {
     /// put `git-remote-duck` on PATH, beside this `ducktape` (idempotent;
     /// prints every change)
     ///
-    /// A consuming Cargo repository commits `.cargo/config.toml` with
-    /// `[net] git-fetch-with-cli = true`: Cargo's built-in fetcher cannot
-    /// run a remote helper. Setup does not touch Cargo configuration.
+    /// Setup also sets `[net] git-fetch-with-cli = true` in the user's Cargo
+    /// configuration: Cargo's built-in fetcher cannot run a remote helper, so
+    /// without it Cargo never reaches this machine's `git-remote-duck`.
+    ///
+    /// `--instead-of <https-prefix>` adds git's own rewrite of that prefix to
+    /// `duck://<network>/forge/<owner>/`, in this repository or (`--global`)
+    /// for the user. Every dependency under the prefix then resolves through
+    /// the network while `Cargo.toml` and `Cargo.lock` keep the URL they
+    /// have — a lock names one source, so rewriting at the git layer is what
+    /// moves a whole dependency graph at once.
     ///
     /// Setup succeeds only when every registered network resolves the way
     /// the helper will resolve it and has a Git door: an account with a
@@ -76,6 +83,18 @@ pub struct SetupArgs {
     /// lists them
     #[arg(long, value_name = "PATH", conflicts_with = "node")]
     pub config: Option<PathBuf>,
+    /// rewrite every git URL under this https prefix to the network's Forge:
+    /// `https://github.com/<org>/` becomes `duck://<chain-id>/forge/<owner>/`
+    /// without a Cargo file changing a byte
+    #[arg(long, value_name = "URL-PREFIX")]
+    pub instead_of: Option<String>,
+    /// the `<owner>` the rewrite points at, when a door has more than one
+    #[arg(long, value_name = "HANDLE", requires = "instead_of")]
+    pub owner: Option<String>,
+    /// write the rewrite to the user's git configuration instead of the
+    /// repository this runs in
+    #[arg(long, requires = "instead_of")]
+    pub global: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -244,9 +263,19 @@ fn setup(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    for door in git_doors(&root, gateway_base, door_owners)? {
+    let doors = git_doors(&root, gateway_base, door_owners)?;
+    for door in &doors {
         println!("{door}");
     }
+    if let Some(prefix) = &args.instead_of {
+        let base = rewrite_base(&doors, args.owner.as_deref())?;
+        let scope = match args.global {
+            true => Scope::User,
+            false => Scope::Repository,
+        };
+        println!("{}", rewrite_url(Path::new("."), scope, prefix, &base)?);
+    }
+    println!("{}", cargo_fetch_with_cli(&cargo_home()?)?);
     let ducktape = invoked_binary()?;
     let dir = ducktape.parent().unwrap_or(Path::new("."));
     let name = ducktape
@@ -302,6 +331,27 @@ fn pick_workspace(root: &Path, config: &Path) -> Result<String, String> {
     ))
 }
 
+/// one network's working Git door: the authority an address spells, the
+/// workspace the helper resolves it through, and the `<owner>`s it serves.
+#[derive(Debug)]
+struct Door {
+    authority: String,
+    workspace: PathBuf,
+    owners: Vec<String>,
+}
+
+impl std::fmt::Display for Door {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "duck://{}/forge/<owner>/<repo> goes through {} for owner {}",
+            self.authority,
+            self.workspace.display(),
+            self.owners.join(", ")
+        )
+    }
+}
+
 /// every registered network the helper can be asked about, resolved and
 /// diagnosed exactly as a `git clone duck://…` on it would be: one line per
 /// working door, or ONE refusal naming every network that would fail and
@@ -311,7 +361,7 @@ fn git_doors(
     root: &Path,
     gateway: impl Fn(&str) -> Result<String, String>,
     owners: impl Fn(&str) -> Result<Vec<String>, String>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<Door>, String> {
     let mut chains: Vec<ChainId> = Vec::new();
     for (chain_id, _) in workspace_config::registered_networks_in(root)? {
         let Ok(chain) = chain_id.parse::<ChainId>() else {
@@ -331,11 +381,11 @@ fn git_doors(
         let door = network_door(root, &chain, &gateway)
             .and_then(|door| owners(&door.node).map(|owners| (door, owners)));
         match door {
-            Ok((door, owners)) => doors.push(format!(
-                "duck://{authority}/forge/<owner>/<repo> goes through {} for owner {}",
-                door.registered.file().display(),
-                owners.join(", ")
-            )),
+            Ok((door, owners)) => doors.push(Door {
+                authority,
+                workspace: door.registered.file().to_path_buf(),
+                owners,
+            }),
             Err(lacks) => missing.push(format!("network {authority}: {lacks}")),
         }
     }
@@ -635,6 +685,182 @@ fn link_helper(dir: &Path, target: &Path) -> Result<String, String> {
     ))
 }
 
+/// which configuration a rewrite is written to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Scope {
+    Repository,
+    User,
+}
+
+impl Scope {
+    fn flag(self) -> &'static str {
+        match self {
+            Scope::Repository => "--local",
+            Scope::User => "--global",
+        }
+    }
+
+    fn shown(self) -> &'static str {
+        match self {
+            Scope::Repository => "this repository's git configuration",
+            Scope::User => "the user's git configuration",
+        }
+    }
+}
+
+/// the `duck://<network>/forge/<owner>/` a rewrite points at: the one open
+/// door and owner, narrowed by `--owner` when a machine has several.
+fn rewrite_base(doors: &[Door], owner: Option<&str>) -> Result<String, String> {
+    let mut bases: Vec<String> = doors
+        .iter()
+        .flat_map(|door| {
+            door.owners
+                .iter()
+                .filter(|have| owner.is_none_or(|want| have.as_str() == want))
+                .map(|have| format!("duck://{}/forge/{have}/", door.authority))
+        })
+        .collect();
+    bases.sort();
+    bases.dedup();
+    match bases.as_slice() {
+        [base] => Ok(base.clone()),
+        [] => Err(match owner {
+            Some(want) => format!("no registered network has a Git door for owner {want}"),
+            None => "no registered network has a Git door to rewrite to".into(),
+        }),
+        many => Err(format!(
+            "a rewrite points at one Forge and these are open: {} — pick one with --owner <handle>",
+            many.join(", ")
+        )),
+    }
+}
+
+/// run `git config` in `dir` at `scope`.
+fn git_config(dir: &Path, scope: Scope, args: &[&str]) -> Result<std::process::Output, String> {
+    std::process::Command::new("git")
+        .current_dir(dir)
+        .arg("config")
+        .arg(scope.flag())
+        .args(args)
+        .output()
+        .map_err(|e| format!("run git config: {e}"))
+}
+
+/// point every git URL under `prefix` at `base`, and say what changed. A
+/// rewrite already in place is left alone; a prefix another base already
+/// claims is refused rather than doubled, because git picking between two
+/// claims on one prefix is not something a dependency graph can depend on.
+fn rewrite_url(dir: &Path, scope: Scope, prefix: &str, base: &str) -> Result<String, String> {
+    let read = git_config(dir, scope, &["--get-regexp", r"^url\..*\.insteadof$"])?;
+    // one match exits 0, no match exits 1, and anything else is git refusing
+    // to read that scope at all (no repository here, say).
+    let listed = match read.status.code() {
+        Some(0) => String::from_utf8_lossy(&read.stdout).into_owned(),
+        Some(1) => String::new(),
+        _ => {
+            return Err(format!(
+                "git config {}: {}",
+                scope.flag(),
+                String::from_utf8_lossy(&read.stderr).trim()
+            ));
+        }
+    };
+    let key = format!("url.{base}.insteadOf");
+    for line in listed.lines() {
+        let Some((name, value)) = line.split_once(' ') else {
+            continue;
+        };
+        if value != prefix {
+            continue;
+        }
+        if name.eq_ignore_ascii_case(&key) {
+            return Ok(format!(
+                "{} already rewrites {prefix} to {base}",
+                scope.shown()
+            ));
+        }
+        return Err(format!(
+            "{} already rewrites {prefix} to {} — unset that one first (`git config {} --unset \
+             {name} {prefix}`)",
+            scope.shown(),
+            name.trim_start_matches("url.")
+                .strip_suffix(".insteadof")
+                .unwrap_or(name),
+            scope.flag()
+        ));
+    }
+    let added = git_config(dir, scope, &["--add", &key, prefix])?;
+    if !added.status.success() {
+        return Err(format!(
+            "git config {} --add {key}: {}",
+            scope.flag(),
+            String::from_utf8_lossy(&added.stderr).trim()
+        ));
+    }
+    Ok(format!("{} rewrites {prefix} to {base}", scope.shown()))
+}
+
+/// the cargo home whose configuration this machine's cargo reads.
+fn cargo_home() -> Result<PathBuf, String> {
+    cargo_home_from(std::env::var_os("CARGO_HOME"), std::env::var_os("HOME"))
+}
+
+fn cargo_home_from(
+    cargo_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    if let Some(dir) = cargo_home.filter(|dir| !dir.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    let home = home
+        .filter(|dir| !dir.is_empty())
+        .ok_or("neither CARGO_HOME nor HOME is set, so this machine has no cargo configuration")?;
+    Ok(PathBuf::from(home).join(".cargo"))
+}
+
+/// set `net.git-fetch-with-cli` in `<cargo home>/config.toml`, and say what
+/// changed. Cargo's own fetcher cannot run a remote helper, so without this
+/// a `duck://` dependency never reaches `git-remote-duck`. A `[net]` table
+/// that is already there is left for the human: appending a second one is
+/// not valid TOML, and rewriting the file would cost every comment in it.
+fn cargo_fetch_with_cli(cargo_home: &Path) -> Result<String, String> {
+    let legacy = cargo_home.join("config");
+    let file = match cargo_home.join("config.toml") {
+        // cargo reads `config` only while `config.toml` is absent, so
+        // creating one beside it would silently orphan the human's file.
+        preferred if preferred.exists() || !legacy.exists() => preferred,
+        _ => legacy,
+    };
+    let shown = file.display();
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {shown}: {e}")),
+    };
+    let parsed: toml::Value = toml::from_str(&text).map_err(|e| format!("{shown}: {e}"))?;
+    let net = parsed.get("net");
+    if let Some(net) = net {
+        return match net.get("git-fetch-with-cli").and_then(toml::Value::as_bool) {
+            Some(true) => Ok(format!("{shown} already sets net.git-fetch-with-cli")),
+            _ => Err(format!(
+                "{shown} has a [net] table already — set `git-fetch-with-cli = true` under it, \
+                 which is what cargo needs to run git-remote-duck"
+            )),
+        };
+    }
+    std::fs::create_dir_all(cargo_home).map_err(|e| format!("{}: {e}", cargo_home.display()))?;
+    let mut next = text;
+    if !next.is_empty() {
+        if !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push('\n');
+    }
+    next.push_str("[net]\ngit-fetch-with-cli = true\n");
+    std::fs::write(&file, next).map_err(|e| format!("write {shown}: {e}"))?;
+    Ok(format!("{shown} now sets net.git-fetch-with-cli = true"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,7 +1010,7 @@ mod tests {
         assert!(again.contains("already"), "{again}");
         let doors = git_doors(root.path(), gateway, alice).expect("picked");
         assert_eq!(doors.len(), 1, "{doors:?}");
-        assert!(doors[0].contains("net-joiner"), "{doors:?}");
+        assert!(doors[0].to_string().contains("net-joiner"), "{doors:?}");
         let target = git_target(root.path(), address, |node| {
             assert_eq!(node, "http://127.0.0.1:18944", "the pick's node");
             Ok("http://127.0.0.1:18845".into())
@@ -968,5 +1194,148 @@ mod tests {
             std::fs::read_to_string(other.path().join(HELPER)).unwrap(),
             "#!/bin/sh\n"
         );
+    }
+
+    fn door(authority: &str, owners: &[&str]) -> Door {
+        Door {
+            authority: authority.into(),
+            workspace: PathBuf::from("/tmp/net/node.toml"),
+            owners: owners.iter().map(|o| (*o).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_rewrite_points_at_one_forge_and_names_the_others() {
+        let one = [door("forgenet-ec8c6586", &["alice"])];
+        assert_eq!(
+            rewrite_base(&one, None).unwrap(),
+            "duck://forgenet-ec8c6586/forge/alice/"
+        );
+
+        let several = [door("forgenet-ec8c6586", &["alice", "bob"])];
+        let refused = rewrite_base(&several, None).expect_err("ambiguous");
+        assert!(refused.contains("--owner"), "{refused}");
+        assert!(refused.contains("forge/bob/"), "{refused}");
+        assert_eq!(
+            rewrite_base(&several, Some("bob")).unwrap(),
+            "duck://forgenet-ec8c6586/forge/bob/"
+        );
+
+        let unknown = rewrite_base(&several, Some("carol")).expect_err("no such owner");
+        assert!(unknown.contains("carol"), "{unknown}");
+    }
+
+    #[test]
+    fn a_rewrite_is_written_once_and_never_doubled() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        git(&["init", "-q"]);
+        let prefix = "https://github.com/ducktape-industries/";
+        let base = "duck://forgenet-ec8c6586/forge/alice/";
+
+        let wrote = rewrite_url(repo.path(), Scope::Repository, prefix, base).unwrap();
+        assert!(wrote.contains("rewrites"), "{wrote}");
+        assert_eq!(
+            git(&[
+                "config",
+                "--local",
+                "--get-all",
+                &format!("url.{base}.insteadOf")
+            ])
+            .trim(),
+            prefix
+        );
+
+        let again = rewrite_url(repo.path(), Scope::Repository, prefix, base).unwrap();
+        assert!(again.contains("already"), "{again}");
+        assert_eq!(
+            git(&[
+                "config",
+                "--local",
+                "--get-all",
+                &format!("url.{base}.insteadOf")
+            ])
+            .lines()
+            .count(),
+            1,
+            "a rerun writes nothing"
+        );
+
+        let other = "duck://forgenet-ec8c6586/forge/bob/";
+        let refused = rewrite_url(repo.path(), Scope::Repository, prefix, other)
+            .expect_err("the prefix is claimed");
+        assert!(refused.contains("alice"), "{refused}");
+        assert!(refused.contains("--unset"), "{refused}");
+    }
+
+    #[test]
+    fn cargo_home_is_the_env_then_home() {
+        use std::ffi::OsString;
+        assert_eq!(
+            cargo_home_from(Some(OsString::from("/opt/cargo")), Some("/home/a".into())).unwrap(),
+            PathBuf::from("/opt/cargo")
+        );
+        assert_eq!(
+            cargo_home_from(Some(OsString::new()), Some("/home/a".into())).unwrap(),
+            PathBuf::from("/home/a/.cargo")
+        );
+        let refused = cargo_home_from(None, None).expect_err("nowhere to write");
+        assert!(refused.contains("CARGO_HOME"), "{refused}");
+    }
+
+    #[test]
+    fn the_cargo_setting_is_written_once_and_an_existing_net_table_is_left_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".cargo");
+        let file = dir.join("config.toml");
+
+        let wrote = cargo_fetch_with_cli(&dir).unwrap();
+        assert!(wrote.contains("now sets"), "{wrote}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "[net]\ngit-fetch-with-cli = true\n"
+        );
+
+        let again = cargo_fetch_with_cli(&dir).unwrap();
+        assert!(again.contains("already"), "{again}");
+
+        std::fs::write(&file, "[net]\nretry = 3\n").unwrap();
+        let refused = cargo_fetch_with_cli(&dir).expect_err("someone else's [net]");
+        assert!(refused.contains("git-fetch-with-cli = true"), "{refused}");
+
+        // keeping what is there: the setting is appended after it, not over it
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, "[build]\njobs = 4").unwrap();
+        cargo_fetch_with_cli(&dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "[build]\njobs = 4\n\n[net]\ngit-fetch-with-cli = true\n"
+        );
+    }
+
+    #[test]
+    fn a_legacy_cargo_config_is_written_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config"), "[build]\njobs = 4\n").unwrap();
+        let wrote = cargo_fetch_with_cli(dir.path()).unwrap();
+        assert!(
+            wrote.ends_with("now sets net.git-fetch-with-cli = true"),
+            "{wrote}"
+        );
+        assert!(
+            !dir.path().join("config.toml").exists(),
+            "a config.toml beside it would orphan the operator's config"
+        );
+        assert!(std::fs::read_to_string(dir.path().join("config"))
+            .unwrap()
+            .contains("git-fetch-with-cli = true"));
     }
 }

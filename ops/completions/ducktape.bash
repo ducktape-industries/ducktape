@@ -45,7 +45,7 @@ _ducktape() {
     local collab_verbs="query key attach send ack help"
     local collab_flags="--target --node --config -n --network --key --trust-node --channel --participant --existing-only --device --expect --to --kind --message-id --credential --seq --ttl-secs --state --reason"
     local forge_verbs="setup publish help"
-    local forge_flags="--node --config -n --network --key"
+    local forge_flags="--node --config -n --network --key --instead-of --owner --global"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=( $(compgen -W "$families" -- "$cur") )
