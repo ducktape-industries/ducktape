@@ -637,12 +637,20 @@ mod tests {
         .map(|(key, value)| (key, value.rsplit_once(':').map_or(value, |(_, port)| port)));
         // `F_HTTP=28800 F_GATEWAY=…`: the founder's (F_) and the resident's
         // (J_) tcp surfaces. WG and INVITE are the UDP exclusion above.
-        let routine: Vec<(&str, &str)> = include_str!("../../../ops/refound-net.sh")
+        let refound = include_str!("../../../ops/refound-net.sh");
+        assert!(
+            !refound.contains("DUCKTAPE_MODULES_DIR="),
+            "refound launcher/service invocations must use current/modules from each release"
+        );
+        let routine: Vec<(&str, &str)> = refound
             .split_whitespace()
             .filter_map(|word| word.split_once('='))
             .filter(|(key, _)| {
                 let surface = key.strip_prefix("F_").or_else(|| key.strip_prefix("J_"));
                 surface.is_some_and(|surface| ["HTTP", "GATEWAY", "RPC", "P2P"].contains(&surface))
+            })
+            .filter(|(_, value)| {
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
             })
             .collect();
         assert_eq!(

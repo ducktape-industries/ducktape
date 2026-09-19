@@ -59,6 +59,7 @@ J_HTTP=28801 J_GATEWAY=28811 J_RPC=28821 J_P2P=28831 J_WG=46710 J_INVITE=46711
 # `--node` resolves against, what the app dials, and what an existing network
 # already serves on. Left empty, it follows the block above and the offset.
 F_HTTP_SET="" J_HTTP_SET=""
+F_ADVERTISED_SET="" J_ADVERTISED_SET=""
 
 LAUNCHER_EXE="ducktape-node-launcher"
 
@@ -106,6 +107,12 @@ usage: ops/refound-net.sh --root DIR [options]
                       default and editing node.toml afterwards.
   --resident-http PORT
                       the resident's http listen, outright. same rule.
+  --founder-advertised HOST:PORT
+                      the founder's advertised WireGuard front (default:
+                      127.0.0.1:<founder's WireGuard port>).
+  --resident-advertised HOST:PORT
+                      the resident's advertised WireGuard front (default:
+                      127.0.0.1:<resident's WireGuard port>).
   --wallet-name NAME  the workspace's active wallet, and the display name of
                       the account founded for it (default: operator). the
                       service daemons refuse to boot without both.
@@ -145,6 +152,8 @@ while [ $# -gt 0 ]; do
         --port-offset) PORT_OFFSET=${2:-0}; shift 2;;
         --founder-http) F_HTTP_SET=${2:-}; shift 2;;
         --resident-http) J_HTTP_SET=${2:-}; shift 2;;
+        --founder-advertised) F_ADVERTISED_SET=${2:-}; shift 2;;
+        --resident-advertised) J_ADVERTISED_SET=${2:-}; shift 2;;
         --wallet-name) WALLET_NAME=${2:-}; shift 2;;
         --wallet-password) WALLET_PASSWORD=${2:-}; shift 2;;
         --wallet-password-file) WALLET_PASSWORD_FILE=${2:-}; shift 2;;
@@ -209,8 +218,26 @@ check_port() {
     esac
     { [ "$2" -ge 1024 ] && [ "$2" -le 65535 ]; } || die "$1: $2 is outside 1024–65535"
 }
+check_advertised() {
+    local flag=$1 address=$2
+    case "$address" in
+        :*) die "$flag: '$address' has no host";;
+        *:*) check_port "$flag" "${address##*:}";;
+        *) die "$flag: '$address' is not a HOST:PORT";;
+    esac
+}
 [ -z "$F_HTTP_SET" ] || { check_port --founder-http "$F_HTTP_SET"; F_HTTP=$F_HTTP_SET; }
 [ -z "$J_HTTP_SET" ] || { check_port --resident-http "$J_HTTP_SET"; J_HTTP=$J_HTTP_SET; }
+F_ADVERTISED="127.0.0.1:$F_WG"
+J_ADVERTISED="127.0.0.1:$J_WG"
+if [ -n "$F_ADVERTISED_SET" ]; then
+    check_advertised --founder-advertised "$F_ADVERTISED_SET"
+    F_ADVERTISED=$F_ADVERTISED_SET
+fi
+if [ -n "$J_ADVERTISED_SET" ]; then
+    check_advertised --resident-advertised "$J_ADVERTISED_SET"
+    J_ADVERTISED=$J_ADVERTISED_SET
+fi
 
 # Both nodes listen on this host, so no two of these tcp ports may be the same
 # one. A collision here binds twice and surfaces three steps later as a join
@@ -489,6 +516,7 @@ DUCKTAPE_HOME="$INIT_HOME" "$STAGED_BIN" node init --name "$NAME" \
     --listen "127.0.0.1:$F_P2P" --advertised "127.0.0.1:$F_P2P" \
     --http "127.0.0.1:$F_HTTP" --gateway "127.0.0.1:$F_GATEWAY" --rpc "127.0.0.1:$F_RPC" \
     --wireguard-listen "0.0.0.0:$F_WG" --invite-listen "0.0.0.0:$F_INVITE" \
+    --wireguard-advertised "$F_ADVERTISED" \
     --primary-coordinator none
 CHAIN=$(ls "$INIT_HOME")
 [ -n "$CHAIN" ] || die "node init left no workspace under $INIT_HOME"
@@ -578,17 +606,9 @@ if [ ! -x "$LAUNCHER" ]; then
     ( cd "$CHECKOUT" && cargo build --release -p node-launcher >&2 )
 fi
 [ -x "$LAUNCHER" ] || die "no launcher at $LAUNCHER — build \`-p node-launcher\` first"
-# The workspace keeps its OWN copy of the founding set, and the launcher's
-# child is pointed at it.
-#
-# The launcher runs `<workspace>/updates/releases/<sha>/ducktape`, and a node
-# resolves its set beside its own binary — so under the launcher there is no
-# set to find, and the failure is not a genesis error but a REACHABILITY one:
-# `netstack_guest_unreadable` kills the reachability plane, so wireguard and
-# the invite listener never bind, and a joiner that cannot redeem just dials
-# p2p forever and is answered `PeerRejected`. Nothing in that chain names the
-# missing modules directory. Pointing the child at the workspace's own copy
-# also survives a release flip, which moves the binary to a new directory.
+# The workspace modules copy seeds the first installed release. After that,
+# `current/modules` beside the running release is the set the child reads, so
+# a release flip moves the netstack guest with its binary.
 install_set() {
     local ws=$1
     [ -d "$ws/modules" ] || cp -r "$STAGE/modules" "$ws/modules"
@@ -619,7 +639,7 @@ cp "$LAUNCHER" "$WS_LAUNCHER"
 # `run` — is the one point where it costs no restart.
 "$WS_LAUNCHER" install --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" \
     --from "$STAGED_BIN" --release-key "$RELEASE_PUB"
-DUCKTAPE_MODULES_DIR="$FOUNDER_WS/modules" setsid nohup \
+setsid nohup \
     "$WS_LAUNCHER" run --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" \
     > "$FOUNDER_WS/launcher.log" 2>&1 < /dev/null &
 disown
@@ -661,6 +681,7 @@ DUCKTAPE_HOME="$JOIN_HOME" "$STAGED_BIN" node join \
     --listen "127.0.0.1:$J_P2P" --advertised "127.0.0.1:$J_P2P" \
     --http "127.0.0.1:$J_HTTP" --gateway "127.0.0.1:$J_GATEWAY" --rpc "127.0.0.1:$J_RPC" \
     --wireguard-listen "0.0.0.0:$J_WG" --invite-listen "0.0.0.0:$J_INVITE" \
+    --wireguard-advertised "$J_ADVERTISED" \
     --primary-coordinator none < "$INVITE_FILE"
 # moved to its own root for the same reason the founder is — see `found`.
 [ -d "$JOIN_HOME/$CHAIN" ] || die "node join left no workspace under $JOIN_HOME"
@@ -682,7 +703,7 @@ cp "$LAUNCHER" "$J_LAUNCHER"
 # pins nothing would sit on the old binary while the validator moved.
 "$J_LAUNCHER" install --workspace "$JOINER_WS" --config "$JOINER_CFG" \
     --from "$WS_BIN" --release-key "$RELEASE_PUB"
-DUCKTAPE_MODULES_DIR="$JOINER_WS/modules" setsid nohup \
+setsid nohup \
     "$J_LAUNCHER" run --workspace "$JOINER_WS" --config "$JOINER_CFG" \
     > "$JOINER_WS/launcher.log" 2>&1 < /dev/null &
 disown
@@ -804,7 +825,7 @@ fi
 # `--config` itself; passing it again is refused as a duplicate.
 for svc in $SERVICES; do
     log="$FOUNDER_WS/service-$svc.log"
-    DUCKTAPE_MODULES_DIR="$FOUNDER_WS/modules" setsid nohup \
+    setsid nohup \
         "$WS_LAUNCHER" service --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" \
         -- service run "$svc" --enable \
         > "$log" 2>&1 < /dev/null &
@@ -992,6 +1013,10 @@ cat <<REPORT
   contract    $CONTRACT
   founder     http 127.0.0.1:$F_HTTP   rpc :$F_RPC   config $FOUNDER_CFG
   resident    http 127.0.0.1:$J_HTTP   rpc :$J_RPC   config $JOINER_CFG
+  founder wg  $F_ADVERTISED
+  resident wg $J_ADVERTISED
+  loopback/private fronts are redeemable only from this box/LAN; use
+  --founder-advertised or --resident-advertised to name a routable front.
   binary      $VOUCH
   set         $MODULES_SRC
   release key $RELEASE_PINNED
