@@ -31,6 +31,7 @@
 
 use std::path::{Path, PathBuf};
 
+use commonware_cryptography::Signer as _;
 use duck_address::{Address, ChainId, Refused};
 use forge_wire::ForgeRepoAddress;
 use workspace_config::{Registered, RemoteWorkspace};
@@ -51,7 +52,16 @@ pub enum ForgeCmd {
     /// A consuming Cargo repository commits `.cargo/config.toml` with
     /// `[net] git-fetch-with-cli = true`: Cargo's built-in fetcher cannot
     /// run a remote helper. Setup does not touch Cargo configuration.
+    ///
+    /// Setup succeeds only when every registered network resolves the way
+    /// the helper will resolve it and has a Git door: an account with a
+    /// handle that publishes a `git` route. Otherwise it names what is
+    /// missing and the verb that supplies it.
     Setup(SetupArgs),
+    /// publish the `git` Gateway route of the wallet's account, served by the
+    /// node this verb dials — the node whose `ducktape gateway bind --label
+    /// git` points at forge's Git service (idempotent; stdin: wallet password)
+    Publish(PublishArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -60,11 +70,27 @@ pub struct SetupArgs {
     /// id is read off its `/v1/status`
     #[arg(long, value_name = "HTTP-URL")]
     pub node: Option<String>,
+    /// the registered workspace `duck://` addresses on its network resolve
+    /// to when several are on it (a validator and its resident on one host):
+    /// its node.toml, or a remote workspace's remote.toml, as the refusal
+    /// lists them
+    #[arg(long, value_name = "PATH", conflicts_with = "node")]
+    pub config: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct PublishArgs {
+    #[command(flatten)]
+    addr: crate::cli_args::NodeAddr,
+    /// path to the user key file (defaults to the keystore's active wallet)
+    #[arg(long, value_name = "PATH")]
+    key: Option<PathBuf>,
 }
 
 pub(crate) fn run(cmd: ForgeCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         ForgeCmd::Setup(args) => setup(args),
+        ForgeCmd::Publish(args) => publish(args),
     }
 }
 
@@ -122,14 +148,39 @@ fn git_target(
     let sentence = |refused: Refused| refused.sentence;
     let address = Address::parse(text).map_err(sentence)?;
     let repository = ForgeRepoAddress::try_from(&address).map_err(sentence)?;
+    let door = network_door(root, &address.chain, gateway)?;
+    Ok(GitTarget {
+        url: format!("{}/{}", door.via.trim_end_matches('/'), repository.repo),
+        authority: format!("{GIT_ROUTE_LABEL}.{}.duck", repository.owner),
+    })
+}
+
+/// where a network's `duck://` Git addresses go through on this machine: the
+/// registered node and the browser gateway base it reports.
+struct NetworkDoor {
+    registered: Registered,
+    node: String,
+    via: String,
+}
+
+/// THE resolution of a network to its door — the helper's, and the one
+/// `forge setup` verifies every registered network by, so setup can never
+/// pass a network the helper refuses.
+fn network_door(
+    root: &Path,
+    chain: &ChainId,
+    gateway: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<NetworkDoor, String> {
+    let sentence = |refused: Refused| refused.sentence;
     let (_chain_id, registered) =
-        workspace_config::resolve_chain_in(root, &address.chain).map_err(sentence)?;
+        workspace_config::resolve_chain_in(root, chain).map_err(sentence)?;
     let node = registered.node_base()?;
     let via = gateway(&node)?;
     reachable_gateway(&node, &via).map_err(sentence)?;
-    Ok(GitTarget {
-        url: format!("{}/{}", via.trim_end_matches('/'), repository.repo),
-        authority: format!("{GIT_ROUTE_LABEL}.{}.duck", repository.owner),
+    Ok(NetworkDoor {
+        registered,
+        node,
+        via,
     })
 }
 
@@ -182,6 +233,9 @@ fn setup(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         let chain_id = status_chain_id(&node)?;
         println!("{}", register_remote(&root, &chain_id, &node)?);
     }
+    if let Some(config) = &args.config {
+        println!("{}", pick_workspace(&root, config)?);
+    }
     if workspace_config::registered_networks_in(&root)?.is_empty() {
         return Err(format!(
             "no network is registered under {} — redeem an invite first (`ducktape node join \
@@ -189,6 +243,9 @@ fn setup(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
             root.display()
         )
         .into());
+    }
+    for door in git_doors(&root, gateway_base, door_owners)? {
+        println!("{door}");
     }
     let ducktape = invoked_binary()?;
     let dir = ducktape.parent().unwrap_or(Path::new("."));
@@ -205,6 +262,241 @@ fn setup(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     Ok(())
+}
+
+/// record `config` — a registered workspace's file — as the one `duck://`
+/// addresses on its network resolve to, and say what changed.
+fn pick_workspace(root: &Path, config: &Path) -> Result<String, String> {
+    let wanted = std::fs::canonicalize(config).map_err(|e| format!("{}: {e}", config.display()))?;
+    let registered = workspace_config::registered_networks_in(root)?;
+    let found = registered
+        .iter()
+        .find(|(_, entry)| std::fs::canonicalize(entry.file()).is_ok_and(|file| file == wanted));
+    let Some((chain_id, entry)) = found else {
+        let rows: Vec<(String, PathBuf)> = registered
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.file().to_path_buf()))
+            .collect();
+        return Err(format!(
+            "{} is not a workspace registered under {} — pick one of:\n{}",
+            config.display(),
+            root.display(),
+            workspace_config::workspace_choices(&rows)
+        ));
+    };
+    let chain: ChainId = chain_id.parse().map_err(|refused: Refused| {
+        format!("network {chain_id} is one a duck:// address cannot name: {refused}")
+    })?;
+    let file = entry.file();
+    let current = workspace_config::picked_workspace_in(root, &chain)?;
+    if current.as_deref() == Some(file) {
+        return Ok(format!(
+            "duck:// addresses on {chain_id} already resolve to {}",
+            file.display()
+        ));
+    }
+    workspace_config::pick_workspace_in(root, &chain, file)?;
+    Ok(format!(
+        "duck:// addresses on {chain_id} resolve to {}",
+        file.display()
+    ))
+}
+
+/// every registered network the helper can be asked about, resolved and
+/// diagnosed exactly as a `git clone duck://…` on it would be: one line per
+/// working door, or ONE refusal naming every network that would fail and
+/// what it lacks. A registry id no address can spell is skipped — no
+/// address names it, so the helper is never asked.
+fn git_doors(
+    root: &Path,
+    gateway: impl Fn(&str) -> Result<String, String>,
+    owners: impl Fn(&str) -> Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    let mut chains: Vec<ChainId> = Vec::new();
+    for (chain_id, _) in workspace_config::registered_networks_in(root)? {
+        let Ok(chain) = chain_id.parse::<ChainId>() else {
+            continue;
+        };
+        let seen = chains
+            .iter()
+            .any(|known| known.salt_hex() == chain.salt_hex());
+        if !seen {
+            chains.push(chain);
+        }
+    }
+    let mut doors = Vec::new();
+    let mut missing = Vec::new();
+    for chain in chains {
+        let authority = chain.authority();
+        let door = network_door(root, &chain, &gateway)
+            .and_then(|door| owners(&door.node).map(|owners| (door, owners)));
+        match door {
+            Ok((door, owners)) => doors.push(format!(
+                "duck://{authority}/forge/<owner>/<repo> goes through {} for owner {}",
+                door.registered.file().display(),
+                owners.join(", ")
+            )),
+            Err(lacks) => missing.push(format!("network {authority}: {lacks}")),
+        }
+    }
+    match missing.is_empty() {
+        true => Ok(doors),
+        false => Err(format!(
+            "git-remote-duck would refuse these, so nothing was linked:\n{}",
+            missing.join("\n")
+        )),
+    }
+}
+
+/// the owners a `duck://…/forge/<owner>/…` address on the network behind
+/// `node` can name, read off the node's committed gateway state.
+fn door_owners(node: &str) -> Result<Vec<String>, String> {
+    let handles = registered_handles(node)?;
+    git_owners(&handles, |account| {
+        published_git_route(node, account).map(|route| route.is_some())
+    })
+}
+
+/// the handles whose account publishes a `git` route — each one an `<owner>`
+/// with a door. None is refused by the verb that supplies what is missing.
+fn git_owners(
+    handles: &[(String, u64)],
+    publishes: impl Fn(u64) -> Result<bool, String>,
+) -> Result<Vec<String>, String> {
+    if handles.is_empty() {
+        return Err(
+            "no account on it has a handle, so no `<owner>` names anyone — set one with \
+             `ducktape account set-handle --handle <name>`"
+                .into(),
+        );
+    }
+    let mut owners = Vec::new();
+    for (handle, account) in handles {
+        if publishes(*account)? {
+            owners.push(handle.clone());
+        }
+    }
+    if owners.is_empty() {
+        let named: Vec<&str> = handles.iter().map(|(handle, _)| handle.as_str()).collect();
+        return Err(format!(
+            "no account with a handle ({}) publishes a `{GIT_ROUTE_LABEL}` route — on the node \
+             that runs forge's Git service, `ducktape gateway bind --label {GIT_ROUTE_LABEL} …` \
+             then `ducktape forge publish`",
+            named.join(", ")
+        ));
+    }
+    Ok(owners)
+}
+
+/// the gateway's own page ceiling for a handle listing.
+const HANDLE_PAGE: u64 = 256;
+
+/// every registered `.duck` handle and the account it names.
+fn registered_handles(node: &str) -> Result<Vec<(String, u64)>, String> {
+    let mut handles = Vec::new();
+    loop {
+        let query = gateway::GatewayQuery::Registrations {
+            from: handles.len() as u64,
+            limit: HANDLE_PAGE,
+        };
+        let reply = crate::cred_cli::query_gateway(node, &query)
+            .map_err(|error| format!("read the handles on the node at {node}: {error}"))?;
+        let gateway::GatewayReply::Registrations(page) = reply else {
+            return Err(format!("unexpected gateway reply: {reply:?}"));
+        };
+        let last_page = (page.len() as u64) < HANDLE_PAGE;
+        handles.extend(page.into_iter().map(|row| (row.handle, row.account_id)));
+        if last_page {
+            return Ok(handles);
+        }
+    }
+}
+
+/// `account`'s published `git` route, if any.
+fn published_git_route(node: &str, account: u64) -> Result<Option<gateway::RouteRecord>, String> {
+    let query = gateway::GatewayQuery::Get {
+        account_id: account,
+        name: gateway::RouteName::named(GIT_ROUTE_LABEL),
+    };
+    let reply = crate::cred_cli::query_gateway(node, &query)
+        .map_err(|error| format!("read the git route of account {account}: {error}"))?;
+    match reply {
+        gateway::GatewayReply::Route(route) => Ok(*route),
+        other => Err(format!("unexpected gateway reply: {other:?}")),
+    }
+}
+
+/// `ducktape forge publish`.
+fn publish(args: PublishArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    let ctx = crate::cred_cli::VerbCtx {
+        addr: args.addr,
+        key: args.key,
+    };
+    let base = ctx.http_base()?;
+    let publisher = crate::cred_cli::Publisher::of_node(&base)?;
+    let user = ctx.signer(&mut stdin)?;
+    let account = crate::account_cli::own_account(&base, user.public_key().as_ref())?.number;
+    let current = published_git_route(&base, account)?;
+    let Some(statement) = git_route(&publisher, account, current.as_ref()) else {
+        println!("the {GIT_ROUTE_LABEL} route of account {account} is already published here");
+        return Ok(());
+    };
+    let preimage = gateway::route_signing_preimage(&statement)?;
+    let revision = statement.revision;
+    let message = gateway::GatewayMsg::SetRoute {
+        statement,
+        authorization: gateway::MemberAuthorization {
+            signer: user.public_key().as_ref().to_vec(),
+            signature: user
+                .sign(gateway::GATEWAY_ROUTE_NS, &preimage)
+                .as_ref()
+                .to_vec(),
+        },
+    };
+    let height = crate::cred_cli::submit_gateway(&base, &user, &message)?;
+    println!(
+        "published the {GIT_ROUTE_LABEL} route of account {account} (revision {revision}) at height {height}"
+    );
+    Ok(())
+}
+
+/// the `git` route `account` publishes on `publisher`, continuing the
+/// revision stream of `current`; `None` when `current` already says exactly
+/// that. No byte cap either way: a push is a whole history and carries no
+/// length to check (who may push is forge's own gate, the push certificate),
+/// and a clone is the whole history the Gateway streams back.
+fn git_route(
+    publisher: &crate::cred_cli::Publisher,
+    account: u64,
+    current: Option<&gateway::RouteRecord>,
+) -> Option<gateway::RouteStatement> {
+    let route = Some(gateway::RouteDefinition {
+        target: gateway::RouteTarget::LoopbackHttp,
+        policy: gateway::RoutePolicy {
+            audience: gateway::RouteAudience::Network,
+            methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
+            max_request_bytes: None,
+            max_response_bytes: 0,
+            allow_authorization: false,
+            allow_upgrade: false,
+        },
+    });
+    let current = current.map(|record| &record.statement);
+    let unchanged = current.is_some_and(|statement| {
+        statement.route == route && statement.publisher_node == publisher.node
+    });
+    if unchanged {
+        return None;
+    }
+    Some(gateway::RouteStatement {
+        chain_id: publisher.chain_id.clone(),
+        account_id: account,
+        name: gateway::RouteName::named(GIT_ROUTE_LABEL),
+        publisher_node: publisher.node.clone(),
+        revision: current.map_or(1, |statement| statement.revision + 1),
+        route,
+    })
 }
 
 /// the chain id the node at `node` serves, off its `/v1/status`.
@@ -353,6 +645,162 @@ mod tests {
 
     fn gateway(base: &'static str) -> impl FnOnce(&str) -> Result<String, String> {
         move |_node| Ok(base.to_string())
+    }
+
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        cmd: ForgeCmd,
+    }
+
+    fn parse(line: &str) -> Result<ForgeCmd, clap::Error> {
+        use clap::Parser as _;
+        TestCli::try_parse_from(line.split(' ')).map(|cli| cli.cmd)
+    }
+
+    /// `setup` picks a workspace by the path the refusal lists, never beside
+    /// `--node` (which registers one); `publish` addresses its node the way
+    /// every signing verb does and takes no password argument.
+    #[test]
+    fn setup_and_publish_parse_their_selectors() {
+        let ForgeCmd::Setup(setup) = parse("t setup --config /h/net/node.toml").unwrap() else {
+            panic!("a setup");
+        };
+        assert_eq!(setup.config, Some(PathBuf::from("/h/net/node.toml")));
+        assert!(setup.node.is_none());
+        assert!(
+            parse("t setup --config /h/net/node.toml --node http://127.0.0.1:1").is_err(),
+            "one selector"
+        );
+        let ForgeCmd::Publish(publish) =
+            parse("t publish --config /h/net/node.toml --key /h/k").unwrap()
+        else {
+            panic!("a publish");
+        };
+        assert_eq!(publish.addr.config, Some(PathBuf::from("/h/net/node.toml")));
+        assert_eq!(publish.key, Some(PathBuf::from("/h/k")));
+        let ForgeCmd::Publish(publish) = parse("t publish -n forgedry#65e7feac").unwrap() else {
+            panic!("a publish");
+        };
+        assert_eq!(publish.addr.network.as_deref(), Some("forgedry#65e7feac"));
+        assert!(parse("t publish --password x").is_err(), "no password flag");
+        assert!(parse("t publish --label api").is_err(), "the label is git");
+    }
+
+    /// The first publish is revision 1 on the dialed node; a rerun that would
+    /// say the same is nothing; a move to another node continues the stream.
+    #[test]
+    fn publishing_the_git_route_continues_its_revision_stream() {
+        let here = crate::cred_cli::Publisher {
+            chain_id: "forgedry#65e7feac".into(),
+            node: vec![1; 32],
+        };
+        let first = git_route(&here, 7, None).expect("nothing published yet");
+        assert_eq!(first.revision, 1);
+        assert_eq!(first.account_id, 7);
+        assert_eq!(first.name, gateway::RouteName::named(GIT_ROUTE_LABEL));
+        let policy = &first.route.as_ref().unwrap().policy;
+        assert_eq!(policy.max_request_bytes, None, "a push is uncapped");
+        assert_eq!(policy.max_response_bytes, 0, "a clone is uncapped");
+        let record = |statement: gateway::RouteStatement| gateway::RouteRecord {
+            statement,
+            authorization: gateway::MemberAuthorization {
+                signer: Vec::new(),
+                signature: Vec::new(),
+            },
+        };
+        let published = record(first);
+        assert_eq!(git_route(&here, 7, Some(&published)), None, "already so");
+        let there = crate::cred_cli::Publisher {
+            chain_id: here.chain_id.clone(),
+            node: vec![2; 32],
+        };
+        let moved = git_route(&there, 7, Some(&published)).expect("another node");
+        assert_eq!(moved.revision, 2);
+        assert_eq!(moved.publisher_node, vec![2; 32]);
+    }
+
+    /// A door needs an owner: a handle, whose account publishes `git`. Each
+    /// missing piece is named with the verb that supplies it.
+    #[test]
+    fn a_door_without_a_handle_or_a_git_route_names_the_verb_it_lacks() {
+        let none = git_owners(&[], |_| panic!("no account to ask")).expect_err("no handle");
+        assert!(none.contains("ducktape account set-handle"), "{none}");
+        let handles = [("alice".to_string(), 3), ("bob".to_string(), 4)];
+        let unpublished = git_owners(&handles, |_| Ok(false)).expect_err("no route");
+        assert!(unpublished.contains("alice, bob"), "{unpublished}");
+        assert!(
+            unpublished.contains("ducktape forge publish"),
+            "{unpublished}"
+        );
+        assert!(
+            unpublished.contains("gateway bind --label git"),
+            "{unpublished}"
+        );
+        assert_eq!(
+            git_owners(&handles, |account| Ok(account == 4)).unwrap(),
+            ["bob"]
+        );
+    }
+
+    /// THE BUG (#2714): a validator and its resident of ONE network in one
+    /// home made setup succeed and every address fail. Setup resolves each
+    /// network exactly as the helper does, so it refuses what the helper
+    /// would, naming the flag; once picked, both resolve to the pick.
+    #[test]
+    fn setup_refuses_a_network_the_helper_would_and_passes_it_once_picked() {
+        let root = home();
+        let mut files = Vec::new();
+        for (dir, node) in [
+            ("net", "http://127.0.0.1:18844"),
+            ("net-joiner", "http://127.0.0.1:18944"),
+        ] {
+            let dir = root.path().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join(workspace_config::REMOTE_WORKSPACE_FILE);
+            RemoteWorkspace {
+                chain_id: "forgedry#65e7feac".into(),
+                node: node.into(),
+            }
+            .save(&file)
+            .unwrap();
+            files.push(file);
+        }
+        let gateway = |_: &str| -> Result<String, String> { Ok("http://127.0.0.1:18845".into()) };
+        let alice = |_: &str| -> Result<Vec<String>, String> { Ok(vec!["alice".into()]) };
+        let address = "duck://forgedry-65e7feac/forge/alice/ducktape";
+
+        let refused = git_doors(root.path(), gateway, alice).expect_err("ambiguous");
+        let helper = git_target(root.path(), address, gateway).expect_err("ambiguous");
+        assert!(
+            refused.contains(&helper),
+            "setup says what the helper says:\n{refused}"
+        );
+        assert!(refused.contains("--config"), "{refused}");
+
+        let picked = pick_workspace(root.path(), &files[1]).unwrap();
+        assert!(picked.contains("resolve to"), "{picked}");
+        let again = pick_workspace(root.path(), &files[1]).unwrap();
+        assert!(again.contains("already"), "{again}");
+        let doors = git_doors(root.path(), gateway, alice).expect("picked");
+        assert_eq!(doors.len(), 1, "{doors:?}");
+        assert!(doors[0].contains("net-joiner"), "{doors:?}");
+        let target = git_target(root.path(), address, |node| {
+            assert_eq!(node, "http://127.0.0.1:18944", "the pick's node");
+            Ok("http://127.0.0.1:18845".into())
+        })
+        .expect("the helper resolves the pick");
+        assert_eq!(target.authority, "git.alice.duck");
+
+        let dead = git_doors(root.path(), gateway, |_| Err("no handle".into())).unwrap_err();
+        assert!(
+            dead.contains("network forgedry-65e7feac: no handle"),
+            "{dead}"
+        );
+        let stranger = root.path().join("stranger.toml");
+        std::fs::write(&stranger, "").unwrap();
+        let unregistered = pick_workspace(root.path(), &stranger).expect_err("not registered");
+        assert!(unregistered.contains("net-joiner"), "{unregistered}");
     }
 
     /// The address becomes the `git` route of the owner's account, the

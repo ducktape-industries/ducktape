@@ -1599,49 +1599,95 @@ pub fn resolve_chain_in(
         }
     };
     let authority = wanted.authority();
-    match matching.as_slice() {
-        [] => Err(duck_address::Refused::new(
-            "network_unknown",
-            format!(
-                "No workspace registered on this machine is on network {authority}. Redeem an \
-                 invite to it (`ducktape node join <invite>`), or register a node that serves it \
-                 (`ducktape forge setup --node <url>`). Registered:\n{}",
-                listed()?
-            ),
-        )),
-        [(chain_id, registered)] => {
-            let agrees = chain_id
-                .parse::<duck_address::ChainId>()
-                .is_ok_and(|registered| registered.label == wanted.label);
-            if !agrees {
+    let (chain_id, registered) = match matching.as_slice() {
+        [] => {
+            return Err(duck_address::Refused::new(
+                "network_unknown",
+                format!(
+                    "No workspace registered on this machine is on network {authority}. Redeem \
+                     an invite to it (`ducktape node join <invite>`), or register a node that \
+                     serves it (`ducktape forge setup --node <url>`). Registered:\n{}",
+                    listed()?
+                ),
+            ));
+        }
+        [one] => one,
+        several => {
+            let picked = picked_workspace_in(root, wanted).map_err(unreadable)?;
+            let chosen =
+                picked.and_then(|file| several.iter().find(|(_, entry)| entry.file() == file));
+            let Some(one) = chosen else {
                 return Err(duck_address::Refused::new(
-                    "label_mismatch",
+                    "network_ambiguous",
                     format!(
-                        "The address names network {authority}, but this machine's registry \
-                         knows {} as {chain_id} ({}).",
-                        wanted.salt_hex(),
-                        registered.file().display()
+                        "{} registered workspaces are on network {authority}, and an address \
+                         names a network, not a workspace — pick the one its addresses resolve \
+                         to with `ducktape forge setup --config <path>`:\n{}",
+                        several.len(),
+                        workspace_choices(
+                            &several
+                                .iter()
+                                .map(|(chain_id, registered)| {
+                                    (chain_id.clone(), registered.file().to_path_buf())
+                                })
+                                .collect::<Vec<_>>()
+                        )
                     ),
                 ));
-            }
-            Ok((chain_id.clone(), registered.clone()))
+            };
+            one
         }
-        several => Err(duck_address::Refused::new(
-            "network_ambiguous",
+    };
+    let agrees = chain_id
+        .parse::<duck_address::ChainId>()
+        .is_ok_and(|registered| registered.label == wanted.label);
+    if !agrees {
+        return Err(duck_address::Refused::new(
+            "label_mismatch",
             format!(
-                "{} registered workspaces are on network {authority}, and an address names a \
-                 network, not a workspace — keep one of them registered:\n{}",
-                several.len(),
-                workspace_choices(
-                    &several
-                        .iter()
-                        .map(|(chain_id, registered)| {
-                            (chain_id.clone(), registered.file().to_path_buf())
-                        })
-                        .collect::<Vec<_>>()
-                )
+                "The address names network {authority}, but this machine's registry knows {} as \
+                 {chain_id} ({}).",
+                wanted.salt_hex(),
+                registered.file().display()
             ),
-        )),
+        ));
+    }
+    Ok((chain_id.clone(), registered.clone()))
+}
+
+/// which registered workspace a `duck://` address resolves to when several
+/// are on its network: `<salt> = "<registered file>"`, one line per network,
+/// written by `ducktape forge setup --config <path>`. Any of them serves a
+/// read; the pick is the one git remotes on this machine go through.
+pub const GIT_WORKSPACE_PICKS: &str = "git-workspaces.toml";
+
+/// the registered file picked for `wanted`'s network, if one was.
+pub fn picked_workspace_in(
+    root: &Path,
+    wanted: &duck_address::ChainId,
+) -> Result<Option<PathBuf>, String> {
+    Ok(read_picks(root)?.remove(&wanted.salt_hex()))
+}
+
+/// record `file` (a registered workspace's file, as [`Registered::file`]
+/// names it) as the pick for `wanted`'s network.
+pub fn pick_workspace_in(
+    root: &Path,
+    wanted: &duck_address::ChainId,
+    file: &Path,
+) -> Result<(), String> {
+    let mut picks = read_picks(root)?;
+    picks.insert(wanted.salt_hex(), file.to_path_buf());
+    let text = toml::to_string(&picks).map_err(|e| format!("encode the git picks: {e}"))?;
+    genesis::write_atomic(&root.join(GIT_WORKSPACE_PICKS), text.as_bytes())
+}
+
+fn read_picks(root: &Path) -> Result<std::collections::BTreeMap<String, PathBuf>, String> {
+    let path = root.join(GIT_WORKSPACE_PICKS);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).map_err(|e| format!("{path:?}: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(format!("read {path:?}: {e}")),
     }
 }
 
@@ -2411,10 +2457,12 @@ mod tests {
     }
 
     /// Two entries on one network — a local workspace and a remote one, or a
-    /// founder and its joiner — cannot be told apart by an address, so the
-    /// address picks neither and names both.
+    /// founder and its joiner — cannot be told apart by an address, so with
+    /// no pick the address resolves to neither, names both and the flag that
+    /// picks one. A pick resolves to exactly that entry; a pick naming no
+    /// registered entry (its workspace since removed) is no pick at all.
     #[test]
-    fn several_registered_workspaces_on_one_network_are_refused_by_name() {
+    fn several_registered_workspaces_on_one_network_resolve_to_the_pick_or_are_refused_by_name() {
         let root = tmp("resolve-several");
         let local = write_workspace(
             &root,
@@ -2426,12 +2474,44 @@ mod tests {
         let remote = write_remote(&root, "b", "dognet#b5b6ea90", "http://10.0.0.5:8844");
         let ambiguous = refused(&root, "dognet-b5b6ea90");
         assert_eq!(ambiguous.reason, "network_ambiguous");
-        for path in [local.join("node.toml"), remote] {
+        assert!(
+            ambiguous
+                .sentence
+                .contains("2 registered workspaces are on network"),
+            "{ambiguous}"
+        );
+        assert!(
+            ambiguous
+                .sentence
+                .contains("ducktape forge setup --config <path>"),
+            "{ambiguous}"
+        );
+        for path in [local.join("node.toml"), remote.clone()] {
             assert!(
                 ambiguous.sentence.contains(&path.display().to_string()),
                 "{ambiguous}"
             );
         }
+
+        let dognet = chain("dognet-b5b6ea90");
+        for picked in [
+            Registered::Local(local.join("node.toml")),
+            Registered::Remote {
+                file: remote.clone(),
+                node: "http://10.0.0.5:8844".into(),
+            },
+        ] {
+            pick_workspace_in(&root, &dognet, picked.file()).unwrap();
+            let (chain_id, registered) = resolve_chain_in(&root, &dognet).expect("the pick");
+            assert_eq!(chain_id, "dognet#b5b6ea90");
+            assert_eq!(registered, picked);
+        }
+
+        pick_workspace_in(&root, &dognet, &root.join("gone/node.toml")).unwrap();
+        assert_eq!(
+            refused(&root, "dognet-b5b6ea90").reason,
+            "network_ambiguous"
+        );
     }
 
     /// The salt is the match key and the label must agree: a label that does
