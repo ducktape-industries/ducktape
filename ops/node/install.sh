@@ -9,9 +9,9 @@
 #
 # Usage:
 #   ops/node/install.sh --workspace <name> --init [-- <node init args...>]
-#   ops/node/install.sh --workspace <name> --join <invite> [--genesis <file>]
+#   ops/node/install.sh --workspace <name> --join-file <file> [--genesis <file>]
 #   ops/node/install.sh --dry-run --workspace <name> --init
-#   ops/node/install.sh --archive <node archive> --workspace <name> --join <invite>
+#   ops/node/install.sh --archive <node archive> --workspace <name> --join-file <file>
 #   ops/node/install.sh --user --workspace <name>
 #
 # `--user` needs no root: it runs a workspace under ~/.ducktape that is
@@ -49,7 +49,7 @@ DRY_RUN=0
 USER_MODE=0
 WORKSPACE=""
 MODE=""       # "init" or "join"
-INVITE=""
+INVITE_FILE=""
 GENESIS=""
 ARCHIVE=""
 INIT_ARGS=()
@@ -60,7 +60,7 @@ while [ $# -gt 0 ]; do
     --user) USER_MODE=1; shift ;;
     --workspace) WORKSPACE="${2:?--workspace needs a value}"; shift 2 ;;
     --init) MODE="init"; shift ;;
-    --join) MODE="join"; INVITE="${2:?--join needs an invite blob}"; shift 2 ;;
+    --join-file) MODE="join"; INVITE_FILE="${2:?--join-file needs a file}"; shift 2 ;;
     --genesis) GENESIS="${2:?--genesis needs a file}"; shift 2 ;;
     --archive) ARCHIVE="${2:?--archive needs a node release archive}"; shift 2 ;;
     --) shift; INIT_ARGS=("$@"); break ;;
@@ -69,7 +69,14 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$WORKSPACE" ] || die "--workspace <name> is required"
-[ "$USER_MODE" = 1 ] || [ -n "$MODE" ] || die "one of --init or --join <invite> is required"
+[ "$USER_MODE" = 1 ] || [ -n "$MODE" ] || die "one of --init or --join-file <file> is required"
+
+if [ "$DRY_RUN" = 0 ] && [ "$MODE" = join ]; then
+  [ -f "$INVITE_FILE" ] || die "invite file is not a regular file: $INVITE_FILE"
+  [ -r "$INVITE_FILE" ] || die "invite file is not readable: $INVITE_FILE"
+  INVITE_MODE=$(stat -c '%a' -- "$INVITE_FILE") || die "cannot read invite file mode: $INVITE_FILE"
+  [ "$INVITE_MODE" = 600 ] || die "invite file must be mode 600, got $INVITE_MODE: $INVITE_FILE"
+fi
 
 # run() either prints the command (--dry-run) or executes it. sudo_run()
 # is the same but only the lines that touch root-owned paths need it.
@@ -193,14 +200,25 @@ sudo_run systemctl daemon-reload
 
 log "5/7 founding or joining the network as the service user"
 DT=(sudo -u ducktape env "DUCKTAPE_HOME=$DUCK_HOME" /usr/local/bin/ducktape)
+join_from_file(){
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '+'
+    printf ' %q' "${DT[@]}" node join
+    if [ -n "$GENESIS" ]; then
+      printf ' --genesis %q' "$GENESIS"
+    fi
+    printf ' < %q\n' "$INVITE_FILE"
+    return
+  fi
+  if [ -n "$GENESIS" ]; then
+    run "${DT[@]}" node join --genesis "$GENESIS" < "$INVITE_FILE"
+  else
+    run "${DT[@]}" node join < "$INVITE_FILE"
+  fi
+}
 case "$MODE" in
   init) run "${DT[@]}" node init --name "$WORKSPACE" --modules "$MODULES_DIR" "${INIT_ARGS[@]}" ;;
-  join)
-    if [ -n "$GENESIS" ]; then
-      run "${DT[@]}" node join "$INVITE" --genesis "$GENESIS"
-    else
-      run "${DT[@]}" node join "$INVITE"
-    fi ;;
+  join) join_from_file ;;
 esac
 
 # the one registered chain id `--workspace` is a prefix of, as `-n` resolves
