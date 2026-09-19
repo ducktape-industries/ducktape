@@ -12,6 +12,7 @@ use recovery::{Manifest, Recovery};
 use crate::explorer::{IndexFold, heal_index};
 use crate::host_state::{NetworkBindings, NodeSubstrates, genesis_host, restore_host};
 use crate::sync::catchup::advance_next_seq_from_frames;
+use crate::sync::serve::SyncStateRequest;
 use crate::util::{fatal, hex};
 
 pub(super) type BootState = (
@@ -376,6 +377,138 @@ where
     }
 }
 
+/// the reason a statesync request is refused while this node is still in
+/// `catch_up`: it has no consensus loop, so the state that answer would need
+/// is not readable yet.
+const NOT_SEATED: &str = "booting_not_seated";
+
+/// runs the boot probe while ANSWERING the probes that reach this node.
+///
+/// the serve task hands every state touch to the consensus loop, and that
+/// loop does not exist yet here — so a peer probing US while we probe IT gets
+/// back nothing but a request timeout, and a cluster restarting together
+/// makes every member wait out the whole budget for answers its peers were
+/// willing but structurally unable to give. that mutual wait is the defect.
+/// boot already owns the two pieces of state those answers come from, so it
+/// drives the seam itself for exactly as long as the probe runs.
+async fn probe_while_serving<C, S>(
+    clock: &impl commonware_runtime::Clock,
+    client: &C,
+    floor: u64,
+    label: &str,
+    sync_state_rx: &mut futures::channel::mpsc::Receiver<SyncStateRequest>,
+    mut serve: S,
+) -> Vec<Result<Vec<statesync::FinalizedFrame>, statesync::SyncError>>
+where
+    C: statesync::SyncClient + crate::blob_fetch::SourceRotate,
+    S: AsyncFnMut(SyncStateRequest),
+{
+    use futures::{FutureExt as _, StreamExt as _};
+
+    let probe = probe_peer_frames(clock, client, floor, label).fuse();
+    futures::pin_mut!(probe);
+    loop {
+        let arrived = futures::select! {
+            answers = probe => return answers,
+            req = sync_state_rx.next() => req,
+        };
+        match arrived {
+            Some(req) => serve(req).await,
+            // the send half lives in the serve task, which outlives boot; a
+            // closed seam means nothing is left to answer, so ride the probe
+            // out on its own — re-polling a drained stream would spin.
+            None => return probe.await,
+        }
+    }
+}
+
+/// answers one state touch out of what BOOT owns, before the consensus loop
+/// exists.
+///
+/// only the two an unseated node can answer honestly: `Standing` off the
+/// recovered host's committed valset and `Frames` off the recovery journal —
+/// the same reads `run::sync::on_sync` makes, so a peer cannot tell which of
+/// the two answered it. the rest need the orchestrator, a capture lease or
+/// the derived index, and are REFUSED at once: a refusal costs the requester
+/// one round trip, a silence costs it a full request timeout.
+async fn serve_before_seated(
+    req: SyncStateRequest,
+    label: &str,
+    host: &Host,
+    recovery: &mut Recovery<commonware_runtime::tokio::Context>,
+) {
+    match req {
+        SyncStateRequest::Standing { requester, reply } => {
+            let _ = reply.send(standing_before_seated(host, requester).await);
+        }
+        SyncStateRequest::Frames {
+            after_height,
+            up_to_height,
+            reply,
+        } => frames_before_seated(recovery, after_height, up_to_height, reply).await,
+        SyncStateRequest::Boundary { reply, .. } => refuse_before_seated(reply, "boundary", label),
+        SyncStateRequest::ModuleServe { reply, .. } => {
+            refuse_before_seated(reply, "module_serve", label)
+        }
+        SyncStateRequest::IndexOps { reply, .. } => {
+            refuse_before_seated(reply, "index_ops", label)
+        }
+        SyncStateRequest::TipCoords { reply } => refuse_before_seated(reply, "tip_coords", label),
+    }
+}
+
+/// the fail-closed standing gate, read off the recovered host exactly as the
+/// seated loop reads it off the live one: committed validators ∪ residents.
+async fn standing_before_seated(host: &Host, requester: [u8; 32]) -> bool {
+    let members = crate::host_reads::read_valset_members(host)
+        .await
+        .unwrap_or_default();
+    let residents = crate::host_reads::read_valset_residents(host).await;
+    members
+        .iter()
+        .chain(residents.iter())
+        .any(|key| key.as_slice() == requester)
+}
+
+/// finalized frames in `(after_height, up_to_height]`, off the journal boot is
+/// holding. the reader is self-contained and `'static`, so the read runs on
+/// its own task and a slow disk never stalls the probe this is racing.
+async fn frames_before_seated(
+    recovery: &mut Recovery<commonware_runtime::tokio::Context>,
+    after_height: u64,
+    up_to_height: u64,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<recovery::JournalFrame>, recovery::Error>>,
+) {
+    match recovery.frame_reader().await {
+        Ok(reader) => {
+            tokio::spawn(async move {
+                let read = reader
+                    .read_finalized_frames(after_height, up_to_height, statesync::FRAME_BATCH_LEN)
+                    .await;
+                let _ = reply.send(read);
+            });
+        }
+        Err(e) => {
+            let _ = reply.send(Err(e));
+        }
+    }
+}
+
+fn refuse_before_seated<T>(
+    reply: tokio::sync::oneshot::Sender<Result<T, String>>,
+    lane: &'static str,
+    label: &str,
+) {
+    tracing::debug!(
+        target: "ducktape::statesync",
+        node = %label,
+        lane,
+        reason = NOT_SEATED,
+        "refused a statesync request that needs state this node has not seated yet"
+    );
+    let _ = reply.send(Err(NOT_SEATED.to_string()));
+}
+
 /// keep the recovered seat, or re-bootstrap it from a peer's checkpoint when
 /// no peer can still serve the frames above its floor (see the module note).
 #[allow(clippy::too_many_arguments)]
@@ -386,6 +519,7 @@ pub(super) async fn catch_up<C>(
     context: &commonware_runtime::tokio::Context,
     index: &indexer::IndexStore,
     recovery: &mut Recovery<commonware_runtime::tokio::Context>,
+    sync_state_rx: &mut futures::channel::mpsc::Receiver<SyncStateRequest>,
     metrics: &noded::NodeMetrics,
     signer: &ed25519::PrivateKey,
     namespace: &[u8],
@@ -406,19 +540,38 @@ where
     let Some(local_height) = seat.resumed.as_ref().and_then(|rec| rec.height) else {
         return seat;
     };
-    // and a validator with nobody to ask has nothing to probe: a solo chain's
-    // peer book holds only this key, and the client skips itself, so every
-    // attempt would fail identically until the budget ran out. absence of a
-    // peer is not evidence of a gap — keep the local state and boot.
+    // and a validator nobody can ANSWER has nothing to probe. the question is
+    // not who is in the source book — that book is member ∪ resident — but who
+    // runs the server that answers it: `wiring::wire_serve_lanes` is on the
+    // validator lane alone, so a resident is in the book and can never reply,
+    // and a solo chain's book holds only this key, which the client skips.
+    // either way every attempt fails identically, at a request timeout each,
+    // until the budget runs out — and absence of an answer is not evidence of
+    // a gap. with no other MEMBER up, keep the local state and boot.
     let me = signer.public_key();
-    let somebody_to_ask = {
-        let peers = blob_peers.read().expect("blob peers lock");
-        peers.iter().any(|peer| peer != &me)
-    };
-    if !somebody_to_ask {
+    let a_member_could_answer = seat.member_keys.iter().any(|member| member != &me);
+    if !a_member_could_answer {
+        tracing::info!(
+            target: "ducktape::statesync",
+            node = %label,
+            reason = "catch_up_no_member_to_ask",
+            local_height,
+            "no other member runs a statesync server; booting on the recovered state"
+        );
         return seat;
     }
-    let probes = probe_peer_frames(context, client, local_height, label).await;
+    let probes = {
+        let host = &seat.host;
+        probe_while_serving(
+            context,
+            client,
+            local_height,
+            label,
+            sync_state_rx,
+            async |req| serve_before_seated(req, label, host, recovery).await,
+        )
+        .await
+    };
     let CatchUp::Rebootstrap { retained_from } = decide_catch_up(&probes) else {
         // THE ONE SEAM ON THE VALIDATOR RESTART LANE THAT HOLDS A SOURCE, and
         // the same helper the resident restart runs (`replica::park`) at the
@@ -909,6 +1062,70 @@ mod tests {
             // holding nothing at all.
             assert!(answers.is_empty());
             assert_eq!(decide_catch_up(&answers), CatchUp::Local);
+        });
+    }
+
+    /// THE MUTUAL WAIT: a member whose own probe is in flight must still
+    /// answer the probes reaching it, or a cluster that restarts together
+    /// deadlocks on itself until every budget expires.
+    #[test]
+    fn the_probe_answers_the_peers_probing_it_while_it_runs() {
+        let executor = commonware_runtime::deterministic::Runner::default();
+        executor.start(|context| async move {
+            // a peer that is dark for two attempts, so the probe is still
+            // running when the requests arrive and ends on its own after.
+            let peer = StubPeer::failing(2);
+            let (mut tx, mut rx) = futures::channel::mpsc::channel::<SyncStateRequest>(8);
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            futures::SinkExt::send(
+                &mut tx,
+                SyncStateRequest::Standing {
+                    requester: [9; 32],
+                    reply: reply_tx,
+                },
+            )
+            .await
+            .expect("the seam has room");
+
+            let served = Arc::new(AtomicU32::new(0));
+            let counter = served.clone();
+            let answers = probe_while_serving(&context, &peer, 1_000, "t", &mut rx, async |req| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                let SyncStateRequest::Standing { reply, .. } = req else {
+                    panic!("only a Standing request was sent");
+                };
+                let _ = reply.send(true);
+            })
+            .await;
+
+            assert_eq!(served.load(Ordering::Relaxed), 1, "the seam went unpumped");
+            assert_eq!(reply_rx.await, Ok(true), "the requester got no answer");
+            // and the probe itself still ran to a decisive answer.
+            assert_eq!(answers.len(), 1);
+            assert_eq!(decide_catch_up(&answers), CatchUp::Local);
+        });
+    }
+
+    /// a drained seam must not become a spin: re-polling a finished stream
+    /// returns `None` forever, so the loop has to stop selecting on it.
+    #[test]
+    fn a_closed_seam_lets_the_probe_run_to_its_budget() {
+        let executor = commonware_runtime::deterministic::Runner::default();
+        executor.start(|context| async move {
+            let peer = StubPeer::failing(u32::MAX);
+            let (tx, mut rx) = futures::channel::mpsc::channel::<SyncStateRequest>(8);
+            drop(tx);
+            let started = context.current();
+            let answers = probe_while_serving(&context, &peer, 1_000, "t", &mut rx, async |_req| {
+                panic!("nothing can arrive on a closed seam");
+            })
+            .await;
+            let spent = context
+                .current()
+                .duration_since(started)
+                .expect("the clock does not run backwards");
+            assert!(spent >= crate::constants::BOOT_PROBE_BUDGET);
+            assert!(answers.is_empty());
         });
     }
 
