@@ -169,7 +169,11 @@ log "2/7 dedicated user + state dir"
 if [ "$DRY_RUN" = 1 ] || ! id ducktape >/dev/null 2>&1; then
   sudo_run useradd --system --home-dir "$DUCK_HOME" --shell /usr/sbin/nologin ducktape
 fi
-sudo_run usermod -aG kvm ducktape
+if [ "$DRY_RUN" = 1 ] || getent group kvm >/dev/null 2>&1; then
+  sudo_run usermod -aG kvm ducktape
+else
+  log "no kvm group; skipping optional /dev/kvm access"
+fi
 sudo_run install -d -o ducktape -g ducktape -m 0700 "$DUCK_HOME"
 
 # the founding set the service user founds from (`node init --modules`) and
