@@ -63,6 +63,8 @@ enumerates it and the printed path is the only way back to it.
 | `--guest DIR` | a guest image (`vmlinux`, `rootfs.ext4`) installed as the workspace's own. |
 | `--mirror REPO` | a git checkout to import into the network's forge. |
 | `--port-offset N` | add N to every port. The TCP block (28800–28831) plus N must stay below 32768, where the kernel starts handing ports to outbound connections. |
+| `--founder-http PORT` | the founder's http listen outright, so a network already served on a port is re-founded on it instead of on the default and edited afterwards; every other port still follows `--port-offset`. |
+| `--resident-http PORT` | the resident's http listen outright, under the same rule. |
 | `--wallet-name` | the workspace's active wallet and the account founded for it. |
 | `--wallet-password` | its password. No default — left out, one is generated and written `0600` to `<workspace>/wallet-<name>.password`. |
 | `--skip-app` | do not rebuild the desktop app. |

@@ -55,6 +55,10 @@ WALLET_MNEMONIC=""
 PORT_OFFSET=0
 F_HTTP=28800 F_GATEWAY=28810 F_RPC=28820 F_P2P=28830 F_WG=46700 F_INVITE=46701
 J_HTTP=28801 J_GATEWAY=28811 J_RPC=28821 J_P2P=28831 J_WG=46710 J_INVITE=46711
+# The http listen is the one port an operator names from outside: it is what
+# `--node` resolves against, what the app dials, and what an existing network
+# already serves on. Left empty, it follows the block above and the offset.
+F_HTTP_SET="" J_HTTP_SET=""
 
 LAUNCHER_EXE="ducktape-node-launcher"
 
@@ -96,6 +100,12 @@ usage: ops/refound-net.sh --root DIR [options]
                       one needs an offset. keep the tcp block (28800–28831)
                       plus N below 32768, where the kernel's ephemeral range
                       starts.
+  --founder-http PORT the founder's http listen, outright. every other port
+                      still follows --port-offset. use it to found on the port
+                      a network already serves, instead of founding on the
+                      default and editing node.toml afterwards.
+  --resident-http PORT
+                      the resident's http listen, outright. same rule.
   --wallet-name NAME  the workspace's active wallet, and the display name of
                       the account founded for it (default: operator). the
                       service daemons refuse to boot without both.
@@ -133,6 +143,8 @@ while [ $# -gt 0 ]; do
         --guest) GUEST_SRC=${2:-}; shift 2;;
         --mirror) MIRROR_REPO=${2:-}; shift 2;;
         --port-offset) PORT_OFFSET=${2:-0}; shift 2;;
+        --founder-http) F_HTTP_SET=${2:-}; shift 2;;
+        --resident-http) J_HTTP_SET=${2:-}; shift 2;;
         --wallet-name) WALLET_NAME=${2:-}; shift 2;;
         --wallet-password) WALLET_PASSWORD=${2:-}; shift 2;;
         --wallet-password-file) WALLET_PASSWORD_FILE=${2:-}; shift 2;;
@@ -188,6 +200,31 @@ if [ "$PORT_OFFSET" -ne 0 ]; then
         eval "$v=\$(( \$$v + PORT_OFFSET ))"
     done
 fi
+
+# An explicit http port is the final word, not an input to the sum: the offset
+# is applied above, and a named port replaces the result.
+check_port() {
+    case "$2" in
+        ''|*[!0-9]*) die "$1: '$2' is not a port number (1024–65535)";;
+    esac
+    { [ "$2" -ge 1024 ] && [ "$2" -le 65535 ]; } || die "$1: $2 is outside 1024–65535"
+}
+[ -z "$F_HTTP_SET" ] || { check_port --founder-http "$F_HTTP_SET"; F_HTTP=$F_HTTP_SET; }
+[ -z "$J_HTTP_SET" ] || { check_port --resident-http "$J_HTTP_SET"; J_HTTP=$J_HTTP_SET; }
+
+# Both nodes listen on this host, so no two of these tcp ports may be the same
+# one. A collision here binds twice and surfaces three steps later as a join
+# blaming the invite. WireGuard and the invite door are udp and cannot clash
+# with an http listener, so they are not in the set. An offset shifts every
+# port equally and never collides; only a named http port can.
+TCP_PORTS="$F_HTTP $F_GATEWAY $F_RPC $F_P2P $J_HTTP $J_GATEWAY $J_RPC $J_P2P"
+for p in $TCP_PORTS; do
+    claims=0
+    for q in $TCP_PORTS; do
+        if [ "$p" = "$q" ]; then claims=$(( claims + 1 )); fi
+    done
+    [ "$claims" -eq 1 ] || die "port $p is claimed twice by this run's ports ($TCP_PORTS)"
+done
 
 # NOTE: the port check does NOT live here. Freeing these ports is what the
 # teardown below does, so checking them before it would refuse every re-run
