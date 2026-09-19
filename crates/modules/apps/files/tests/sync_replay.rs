@@ -586,8 +586,7 @@ fn ingest_rejects_size_chunk_shape_mismatch() {
     let body = bad.encode();
     let id = object_id(Kind::File, &body);
     let err = fs.ingest_object(&id, Kind::File.tag(), &body).unwrap_err();
-    assert!(err.contains("shape invalid"), "got: {err}");
-    assert!(err.starts_with("files: "), "unprefixed ingest error: {err}");
+    assert_eq!(err, "ingest file object size/chunk shape invalid");
 
     // a well-shaped FileObj ingests even though its chunk is not yet present —
     // chunks arrive later in the fetch loop, so shape is all that is checkable here.

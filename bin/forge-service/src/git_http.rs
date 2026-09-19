@@ -51,9 +51,6 @@ const GIT_MAX_INFLATE_RATIO: u64 = 64;
 /// id, plus the 4-byte pkt length header, this yields a 65520-byte line — git's
 /// `LARGE_PACKET_MAX`, the ceiling a side-band-64k client accepts.
 const GIT_SIDE_BAND_CHUNK: usize = 65515;
-/// the ref namespace pushes may touch: any branch. a command outside
-/// `refs/heads/*` (tags, notes) is refused with a per-ref `ng`.
-const GIT_HEADS_PREFIX: &str = "refs/heads/";
 /// 40 ascii zeros: git's "null" oid — the old value of a ref being created, and
 /// the head advertised for an unborn repo.
 const GIT_ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -219,11 +216,33 @@ fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// the heads an advertisement offers — NOT the same set for the two services.
+/// one ref line an advertisement offers: the full refname, its oid, and — for
+/// an annotated tag on the fetch side — the commit it peels to, which git reads
+/// off a `<oid> <refname>^{}` line to follow tags into a plain `git fetch`.
+#[derive(Debug, PartialEq, Eq)]
+struct AdvertisedRef {
+    refname: String,
+    oid: String,
+    peeled: Option<String>,
+}
+
+impl AdvertisedRef {
+    fn new(name: forge::refs::RefName, oid: String) -> Self {
+        Self {
+            refname: name.full(),
+            oid,
+            peeled: None,
+        }
+    }
+}
+
+/// the refs an advertisement offers, branches then tags — NOT the same set for
+/// the two services.
 ///
-/// PUSH advertises forge's COMMITTED heads: the client builds its ref commands
+/// PUSH advertises forge's COMMITTED refs: the client builds its ref commands
 /// against what it is shown and consensus gates each as a CAS against the
-/// committed head, so advertising anything else mints a doomed push.
+/// committed head, so advertising anything else mints a doomed push. a tag it
+/// is not shown, it re-sends as a create, which consensus refuses whole.
 ///
 /// FETCH advertises what this node can actually SERVE — its ON-DISK refs. the
 /// two diverge on a node whose objects have not caught up yet (a resident, or
@@ -237,7 +256,7 @@ async fn advertised_refs(
     handle: &ServiceState,
     repo: &str,
     service: GitService,
-) -> Result<Vec<forge::RefHead>, Response> {
+) -> Result<Vec<AdvertisedRef>, Response> {
     match service {
         GitService::Receive => forge_refs(handle, repo).await,
         GitService::Upload => servable_refs(handle, repo)
@@ -247,47 +266,73 @@ async fn advertised_refs(
 
 /// the fetch half of [`advertised_refs`], reading the same on-disk repo
 /// [`build_upload_pack`] packs from.
-fn servable_refs(handle: &ServiceState, repo: &str) -> Result<Vec<forge::RefHead>, String> {
+fn servable_refs(handle: &ServiceState, repo: &str) -> Result<Vec<AdvertisedRef>, String> {
     on_disk_refs(&handle.forge_repo, repo).map_err(|e| format!("read forge refs: {e}"))
 }
 
-/// this node's on-disk branches for `repo`. a repo dir nothing has
+/// this node's on-disk branches and tags for `repo`. a repo dir nothing has
 /// materialized here yet is an empty listing, which advertises as an empty
 /// repository — the same answer an unborn repo gives.
-fn on_disk_refs(base: &std::path::Path, repo: &str) -> Result<Vec<forge::RefHead>, git2::Error> {
+fn on_disk_refs(base: &std::path::Path, repo: &str) -> Result<Vec<AdvertisedRef>, git2::Error> {
+    use forge::refs::RefName;
     let dir = base.join(repo);
     if !dir.join(".git").exists() {
         return Ok(Vec::new());
     }
     let repo = git2::Repository::open(&dir)?;
-    Ok(forge::list_branches(&repo)?
+    let branches = forge::list_branches(&repo)?
         .into_iter()
-        .map(|(name, head)| forge::RefHead {
-            name,
-            head: head.to_string(),
-        })
-        .collect())
+        .map(|(name, oid)| AdvertisedRef::new(RefName::Branch(name), oid.to_string()));
+    let mut refs: Vec<AdvertisedRef> = branches.collect();
+    for (name, oid) in forge::list_tags(&repo)? {
+        let annotated = repo.find_tag(oid).is_ok();
+        let peeled = match annotated {
+            true => Some(
+                repo.find_object(oid, None)?
+                    .peel_to_commit()?
+                    .id()
+                    .to_string(),
+            ),
+            false => None,
+        };
+        refs.push(AdvertisedRef {
+            peeled,
+            ..AdvertisedRef::new(RefName::Tag(name), oid.to_string())
+        });
+    }
+    Ok(refs)
 }
 
-/// query the forge module for a repo's committed branches (`[]` == unborn).
-/// errors surface as an http `Response` so callers can early-return them.
-async fn forge_refs(handle: &ServiceState, repo: &str) -> Result<Vec<forge::RefHead>, Response> {
-    let result = handle
-        .client
-        .query(
-            &handle.module,
-            &forge::ForgeQuery::ListRefs {
-                repo: repo.to_string(),
-            },
-        )
-        .await;
-    match result {
-        Ok(forge::ForgeReply::Refs(refs)) => Ok(refs),
-        Ok(_) => Err(error_response(
+/// query the forge module for a repo's committed branches and tags (`[]` ==
+/// unborn). errors surface as an http `Response` so callers can early-return
+/// them.
+async fn forge_refs(handle: &ServiceState, repo: &str) -> Result<Vec<AdvertisedRef>, Response> {
+    use forge::refs::RefName;
+    let list_refs = forge::ForgeQuery::ListRefs {
+        repo: repo.to_string(),
+    };
+    let list_tags = forge::ForgeQuery::ListTags {
+        repo: repo.to_string(),
+    };
+    let branches = handle.client.query(&handle.module, &list_refs).await;
+    let tags = handle.client.query(&handle.module, &list_tags).await;
+    match (branches, tags) {
+        (Ok(forge::ForgeReply::Refs(branches)), Ok(forge::ForgeReply::Tags(tags))) => {
+            let branches = branches
+                .into_iter()
+                .map(|r| AdvertisedRef::new(RefName::Branch(r.name), r.head));
+            let tags = tags
+                .into_iter()
+                .map(|t| AdvertisedRef::new(RefName::Tag(t.name), t.oid));
+            Ok(branches.chain(tags).collect())
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            Err(error_response(StatusCode::BAD_GATEWAY, &error.to_string()))
+        }
+        _ => Err(error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "unexpected ListRefs reply",
+            "unexpected ListRefs/ListTags reply",
         )),
-        Err(error) => Err(error_response(StatusCode::BAD_GATEWAY, &error.to_string())),
     }
 }
 
@@ -355,17 +400,22 @@ fn parse_push_commands(
             certificate.nonce
         ));
     }
-    let cmds = certificate
-        .updates
-        .iter()
-        .map(|u| {
-            (
-                oid_hex(u.prev_oid.as_deref()),
-                oid_hex(u.new_oid.as_deref()),
-                format!("{GIT_HEADS_PREFIX}{}", u.ref_name),
-            )
-        })
-        .collect();
+    use forge::refs::RefName;
+    let branches = certificate.updates.iter().map(|u| {
+        (
+            oid_hex(u.prev_oid.as_deref()),
+            oid_hex(u.new_oid.as_deref()),
+            RefName::Branch(u.ref_name.clone()).full(),
+        )
+    });
+    let tags = certificate.tags.iter().map(|t| {
+        (
+            oid_hex(None),
+            oid_hex(Some(&t.oid)),
+            RefName::Tag(t.name.clone()).full(),
+        )
+    });
+    let cmds = branches.chain(tags).collect();
     Ok(PushCommands {
         cmds,
         cert: Some(forge::PushCert {
@@ -411,6 +461,63 @@ fn command_triple(line: &str) -> Result<(String, String, String), String> {
         return Err("malformed ref-update command".into());
     };
     Ok((old.to_string(), new.to_string(), refname.to_string()))
+}
+
+/// why a push's command list cannot become a `PushRefs` op.
+#[derive(Debug, PartialEq, Eq)]
+enum CommandRefusal {
+    /// a command outside `refs/heads/*` and `refs/tags/*`.
+    OutsideHeadsOrTags,
+    /// an `old` or `new` oid that is neither the null oid nor 40 hex.
+    MalformedOid(&'static str),
+    /// a command that moves or deletes a tag. a tag is created once and never
+    /// moves, and `TagCreate` has no way to say anything else.
+    TagImmutable,
+}
+
+/// split a push's `(old, new, refname)` commands into the op's branch moves
+/// and tag creations. each command is classified ONCE, by
+/// [`forge::refs::RefName::classify`] — the same namespace rule consensus
+/// reads a certificate by — and that one answer both refuses the push and
+/// picks the list a command lands in. the null oid means "create"
+/// (`prev_oid` None) / "delete" (`new_oid` None); a tag command must create,
+/// and name validation and a tag name already taken stay with consensus.
+fn push_updates(
+    cmds: &[(String, String, String)],
+) -> Result<(Vec<forge::RefUpdate>, Vec<forge::TagCreate>), CommandRefusal> {
+    use forge::refs::RefName;
+    let classified: Option<Vec<RefName>> = cmds
+        .iter()
+        .map(|(_, _, refname)| RefName::classify(refname))
+        .collect();
+    let names = classified.ok_or(CommandRefusal::OutsideHeadsOrTags)?;
+    let mut updates = Vec::new();
+    let mut tags = Vec::new();
+    for ((old, new, _), name) in cmds.iter().zip(names) {
+        let prev_oid = command_oid(old).ok_or(CommandRefusal::MalformedOid("old"))?;
+        let new_oid = command_oid(new).ok_or(CommandRefusal::MalformedOid("new"))?;
+        match (name, prev_oid, new_oid) {
+            (RefName::Branch(ref_name), prev_oid, new_oid) => updates.push(forge::RefUpdate {
+                ref_name,
+                prev_oid,
+                new_oid,
+            }),
+            (RefName::Tag(name), None, Some(oid)) => tags.push(forge::TagCreate { name, oid }),
+            (RefName::Tag(_), _, _) => return Err(CommandRefusal::TagImmutable),
+        }
+    }
+    Ok((updates, tags))
+}
+
+/// one command oid: the null oid is `Some(None)`, 40 hex is its raw bytes,
+/// anything else is `None` (malformed).
+fn command_oid(hex: &str) -> Option<Option<Vec<u8>>> {
+    if hex == GIT_ZERO_OID {
+        return Some(None);
+    }
+    hex_to_bytes(hex)
+        .filter(|bytes| bytes.len() == GIT_OID_RAW_LEN)
+        .map(Some)
 }
 
 fn oid_hex(oid: Option<&[u8]>) -> String {
@@ -557,8 +664,11 @@ pub(crate) async fn git_info_refs(
 /// it is the same question. A repo seeded on `dev` has no `main` at all, and a
 /// client told nothing falls back to a `refs/heads/main` that does not exist —
 /// it clones every ref and lands on an UNBORN HEAD.
-fn default_branch(refs: &[forge::RefHead]) -> Option<&forge::RefHead> {
-    let named = |branch: &'static str| refs.iter().find(move |r| r.name == branch);
+fn default_branch(refs: &[AdvertisedRef]) -> Option<&AdvertisedRef> {
+    let named = |branch: &str| {
+        let refname = forge::refs::RefName::Branch(branch.to_string()).full();
+        refs.iter().find(move |r| r.refname == refname)
+    };
     named(forge::refs::INTEGRATION_BRANCH).or_else(|| named(forge::refs::MAIN_BRANCH))
 }
 
@@ -566,9 +676,10 @@ fn default_branch(refs: &[forge::RefHead]) -> Option<&forge::RefHead> {
 /// flush, the ref line(s), then a flush. an unborn repo advertises the null oid
 /// against the magic `capabilities^{}` ref (so caps ride along with no real ref)
 /// — a clone then reports an empty repository. a born repo advertises EVERY
-/// committed branch; a fetch advertisement leads with a `HEAD` line at the
-/// [`default_branch`]'s oid so `git clone` resolves the branch to check out.
-/// capabilities ride the first emitted line after a NUL, per the v0 protocol.
+/// branch and tag (an annotated tag followed by its peeled line); a fetch
+/// advertisement leads with a `HEAD` line at the [`default_branch`]'s oid so
+/// `git clone` resolves the branch to check out. capabilities ride the first
+/// emitted line after a NUL, per the v0 protocol.
 async fn git_advertise_refs(handle: &ServiceState, repo: &str, service: GitService) -> Response {
     let refs = match advertised_refs(handle, repo, service).await {
         Ok(refs) => refs,
@@ -584,7 +695,7 @@ async fn git_advertise_refs(handle: &ServiceState, repo: &str, service: GitServi
     // from the default sits on that same oid until its first commit — so the
     // guess is wrong exactly when a run has just branched.
     let caps = match default {
-        Some(r) => format!("{caps} symref=HEAD:{GIT_HEADS_PREFIX}{}", r.name),
+        Some(r) => format!("{caps} symref=HEAD:{}", r.refname),
         None => caps,
     };
 
@@ -600,10 +711,13 @@ async fn git_advertise_refs(handle: &ServiceState, repo: &str, service: GitServi
     } else {
         let mut lines: Vec<String> = Vec::new();
         if let Some(r) = default {
-            lines.push(format!("{} HEAD", r.head));
+            lines.push(format!("{} HEAD", r.oid));
         }
         for r in &refs {
-            lines.push(format!("{} {GIT_HEADS_PREFIX}{}", r.head, r.name));
+            lines.push(format!("{} {}", r.oid, r.refname));
+            if let Some(peeled) = &r.peeled {
+                lines.push(format!("{peeled} {}^{{}}", r.refname));
+            }
         }
         for (i, line) in lines.iter().enumerate() {
             if i == 0 {
@@ -794,6 +908,7 @@ fn push_refused(_repo: &str, reason: &str, _detail: &str) {
 /// so they sit ahead of that catch-all.
 fn push_refusal_reason(message: &str) -> &'static str {
     const KNOWN: &[(&str, &str)] = &[
+        ("moves or deletes a tag", "tag_immutable"),
         ("non-fast-forward", "non_fast_forward"),
         ("requires an authenticated external origin", "unsigned"),
         ("offered no push-cert", "push_cert_unoffered"),
@@ -911,59 +1026,41 @@ pub(crate) async fn git_receive_pack(
         }
     };
 
-    // only branches are pushable (no tags/notes). consume-and-refuse: the pack
-    // was fully received; reporting `ng` (not an http error) lets git print a
-    // clean per-ref reason.
-    if cmds
-        .iter()
-        .any(|(_, _, r)| !r.starts_with(GIT_HEADS_PREFIX))
-    {
-        push_refused(&repo, "ref_outside_heads", "only refs/heads/* is supported");
-        let results: Vec<(String, Option<String>)> = cmds
-            .into_iter()
-            .map(|(_, _, r)| (r, Some(format!("only {GIT_HEADS_PREFIX}* is supported"))))
-            .collect();
-        return git_report_status(&results);
-    }
-
-    // old/new == the null oid mean "create" (prev_oid None) / "delete" (new_oid
-    // None); otherwise 40-hex oids the forge per-branch CAS must match.
-    let mut updates = Vec::new();
-    for (old, new, refname) in &cmds {
-        let prev_oid = if old == GIT_ZERO_OID {
-            None
-        } else {
-            match hex_to_bytes(old).filter(|b| b.len() == GIT_OID_RAW_LEN) {
-                Some(bytes) => Some(bytes),
-                None => {
-                    push_refused(&repo, "malformed_oid", "malformed old oid");
-                    return error_response(StatusCode::BAD_REQUEST, "malformed old oid");
-                }
-            }
-        };
-        let new_oid = if new == GIT_ZERO_OID {
-            None
-        } else {
-            match hex_to_bytes(new).filter(|b| b.len() == GIT_OID_RAW_LEN) {
-                Some(bytes) => Some(bytes),
-                None => {
-                    push_refused(&repo, "malformed_oid", "malformed new oid");
-                    return error_response(StatusCode::BAD_REQUEST, "malformed new oid");
-                }
-            }
-        };
-        updates.push(forge::RefUpdate {
-            ref_name: refname[GIT_HEADS_PREFIX.len()..].to_string(),
-            prev_oid,
-            new_oid,
-        });
-    }
+    // only branches and tags are pushable (no notes, no remotes).
+    // consume-and-refuse: the pack was fully received; reporting `ng` (not an
+    // http error) lets git print a clean per-ref reason.
+    let (updates, tags) = match push_updates(&cmds) {
+        Ok(split) => split,
+        Err(CommandRefusal::OutsideHeadsOrTags) => {
+            const REASON: &str = "only refs/heads/* and refs/tags/* are supported";
+            push_refused(&repo, "ref_outside_heads_or_tags", REASON);
+            let results: Vec<(String, Option<String>)> = cmds
+                .into_iter()
+                .map(|(_, _, r)| (r, Some(REASON.to_string())))
+                .collect();
+            return git_report_status(&results);
+        }
+        Err(CommandRefusal::MalformedOid(which)) => {
+            let reason = format!("malformed {which} oid");
+            push_refused(&repo, "malformed_oid", &reason);
+            return error_response(StatusCode::BAD_REQUEST, &reason);
+        }
+        Err(CommandRefusal::TagImmutable) => {
+            const REASON: &str = "a tag is created once and never moves or is deleted";
+            push_refused(&repo, "tag_immutable", REASON);
+            let results: Vec<(String, Option<String>)> = cmds
+                .into_iter()
+                .map(|(_, _, r)| (r, Some(REASON.to_string())))
+                .collect();
+            return git_report_status(&results);
+        }
+    };
 
     // a signed push is refused HERE with the reason consensus would give — a
     // clean per-ref `ng` instead of a rejected block. every validator
     // re-verifies; this node is not trusted for it.
     if let Some(cert) = &cert
-        && let Err(reason) = forge::pushcert::signer(cert, &handle.chain_id, &repo, &updates)
+        && let Err(reason) = forge::pushcert::signer(cert, &handle.chain_id, &repo, &updates, &tags)
     {
         push_refused(&repo, push_refusal_reason(&reason), &reason);
         let results: Vec<(String, Option<String>)> = cmds
@@ -979,7 +1076,8 @@ pub(crate) async fn git_receive_pack(
     // stream from the spool file straight into the node's store — neither end
     // ever holds the pack.
     let pack_bytes = spooled.len.saturating_sub(pack_offset);
-    let pack_digest = if updates.iter().any(|u| u.new_oid.is_some()) {
+    let carries_objects = !tags.is_empty() || updates.iter().any(|u| u.new_oid.is_some());
+    let pack_digest = if carries_objects {
         match handle
             .client
             .put_blob_file(&spooled.path, pack_offset)
@@ -998,10 +1096,12 @@ pub(crate) async fn git_receive_pack(
         None
     };
 
-    // CAS every branch through ONE atomic PushRefs op and await the block.
+    // CAS every branch and create every tag through ONE atomic PushRefs op and
+    // await the block.
     let payload = forge::encode_msg(&forge::ForgeMsg::PushRefs {
         repo: repo.clone(),
         updates,
+        tags,
         pack_digest: pack_digest.map(|digest| digest.to_vec()),
         cert,
     });
@@ -1214,8 +1314,8 @@ pub(crate) async fn git_upload_pack(
 /// NEVER surfaced to the client or put in the log ring's warn line; the
 /// handler answers a fixed 404 and logs this variant's detail at `debug`
 /// only. `WantUnreachable` is a refusal, not a server error: the client asked
-/// for an oid that is not a commit any of this node's branches reaches, and
-/// the handler answers it as a git `ERR` line naming that oid.
+/// for an oid that is not a commit any of this node's branches or tags
+/// reaches, and the handler answers it as a git `ERR` line naming that oid.
 /// `Other` covers everything past those two (a bad want oid, a pack-write
 /// failure) and is not path-bearing.
 #[derive(Debug)]
@@ -1234,23 +1334,20 @@ enum UploadPackError {
 /// first usable common base, which the handler ACKs.
 ///
 /// every want must be a commit reachable from one of this repo's current
-/// branch tips — git's `uploadpack.allowReachableSHA1InWant`, so a client can
-/// fetch the exact commit a `Cargo.lock` pins. that is still only history this
-/// node advertises: a want's closure lies inside some tip's closure, which a
-/// clone of that tip ships anyway. an arbitrary walk of the object database by
-/// oid stays refused — an unknown oid, a tree or blob, or a commit only a
-/// deleted or force-pushed-away branch reached.
+/// branch or tag tips — git's `uploadpack.allowReachableSHA1InWant`, so a
+/// client can fetch the exact commit a `Cargo.lock` pins. that is still only
+/// history this node advertises: a want's closure lies inside some tip's
+/// closure, which a clone of that tip ships anyway. an arbitrary walk of the
+/// object database by oid stays refused — an unknown oid, a tree or blob, or
+/// a commit only a deleted or force-pushed-away branch reached.
 fn build_upload_pack(
     repo_dir: &std::path::Path,
     want_hexes: &[String],
     have_hexes: &[String],
 ) -> Result<(Vec<u8>, Option<String>), UploadPackError> {
     let repo = git2::Repository::open(repo_dir).map_err(UploadPackError::RepoUnavailable)?;
-    let tips: Vec<git2::Oid> = forge::list_branches(&repo)
-        .map_err(|e| UploadPackError::Other(format!("read refs: {e}")))?
-        .into_iter()
-        .map(|(_, oid)| oid)
-        .collect();
+    let tips =
+        forge::ref_tips(&repo).map_err(|e| UploadPackError::Other(format!("read refs: {e}")))?;
     let mut oids = Vec::with_capacity(want_hexes.len());
     for hex in want_hexes {
         let oid = git2::Oid::from_str(hex)
@@ -1370,8 +1467,14 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
 -----END SSH SIGNATURE-----\n";
 
     fn signed_commands() -> Vec<Vec<u8>> {
+        signed_commands_over(CERT)
+    }
+
+    /// `cert` framed as a signed push, under [`ARMORED`] — which only verifies
+    /// over [`CERT`] itself; the parse never checks it, `signer` does.
+    fn signed_commands_over(cert: &str) -> Vec<Vec<u8>> {
         let mut lines = vec![b"push-cert\0report-status agent=git/2.43.0\n".to_vec()];
-        for line in CERT.split_inclusive('\n') {
+        for line in cert.split_inclusive('\n') {
             lines.push(line.as_bytes().to_vec());
         }
         for line in ARMORED.split_inclusive('\n') {
@@ -1402,7 +1505,90 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
             prev_oid: None,
             new_oid: Some(hex_to_bytes("ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2").unwrap()),
         }];
-        forge::pushcert::signer(&cert, "chain-a", "lab", &updates).expect("verifies");
+        forge::pushcert::signer(&cert, "chain-a", "lab", &updates, &[]).expect("verifies");
+    }
+
+    #[test]
+    fn a_signed_tag_comes_back_out_under_its_own_namespace() {
+        let offered = forge::pushcert::nonce("chain-a", "lab");
+        let tagged = CERT.replace("refs/heads/main", "refs/tags/v1");
+        let parsed = parse_push_commands(&signed_commands_over(&tagged), Some(&offered)).unwrap();
+        assert_eq!(parsed.cmds[0].2, "refs/tags/v1");
+        let (updates, tags) = push_updates(&parsed.cmds).unwrap();
+        assert!(updates.is_empty());
+        assert_eq!(tags[0].name, "v1");
+        // the fixture signature is over the branch certificate, not this one.
+        let refused =
+            forge::pushcert::signer(&parsed.cert.unwrap(), "chain-a", "lab", &updates, &tags)
+                .unwrap_err();
+        assert!(refused.contains("does not verify"), "{refused}");
+    }
+
+    fn cmd(old: &str, new: &str, refname: &str) -> (String, String, String) {
+        (old.to_string(), new.to_string(), refname.to_string())
+    }
+
+    /// one classification refuses a push and splits it: a branch and a tag in
+    /// one push land in their own lists, and a push naming anything outside
+    /// `refs/heads/*` and `refs/tags/*`, or moving or deleting a tag, is
+    /// refused whole.
+    #[test]
+    fn a_push_splits_into_branch_moves_and_tag_creations_and_refuses_the_rest() {
+        const TIP: &str = "ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2";
+        let tip = hex_to_bytes(TIP).unwrap();
+        let (updates, tags) = push_updates(&[
+            cmd(GIT_ZERO_OID, TIP, "refs/heads/main"),
+            cmd(GIT_ZERO_OID, TIP, "refs/tags/v1"),
+            cmd(TIP, GIT_ZERO_OID, "refs/heads/old"),
+        ])
+        .unwrap();
+        assert_eq!(
+            updates,
+            vec![
+                forge::RefUpdate {
+                    ref_name: "main".into(),
+                    prev_oid: None,
+                    new_oid: Some(tip.clone()),
+                },
+                forge::RefUpdate {
+                    ref_name: "old".into(),
+                    prev_oid: Some(tip.clone()),
+                    new_oid: None,
+                },
+            ]
+        );
+        assert_eq!(
+            tags,
+            vec![forge::TagCreate {
+                name: "v1".into(),
+                oid: tip,
+            }]
+        );
+        const NEXT: &str = "0000000000000000000000000000000000000001";
+        for (old, new) in [(TIP, NEXT), (TIP, GIT_ZERO_OID)] {
+            let refused = push_updates(&[
+                cmd(GIT_ZERO_OID, TIP, "refs/heads/main"),
+                cmd(old, new, "refs/tags/v1"),
+            ]);
+            assert_eq!(
+                refused.unwrap_err(),
+                CommandRefusal::TagImmutable,
+                "{old} -> {new}"
+            );
+        }
+        for outside in ["refs/notes/commits", "refs/remotes/origin/main", "HEAD"] {
+            let refused = push_updates(&[
+                cmd(GIT_ZERO_OID, TIP, "refs/heads/main"),
+                cmd(GIT_ZERO_OID, TIP, outside),
+            ]);
+            assert_eq!(
+                refused.unwrap_err(),
+                CommandRefusal::OutsideHeadsOrTags,
+                "{outside}"
+            );
+        }
+        let malformed = push_updates(&[cmd("zz", TIP, "refs/tags/v1")]);
+        assert_eq!(malformed.unwrap_err(), CommandRefusal::MalformedOid("old"));
     }
 
     #[test]
@@ -1497,11 +1683,13 @@ mod upload_pack_tests {
     }
 
     /// a fetch advertisement offers exactly what this node can pack: nothing
-    /// for a repo it has never materialized, and afterwards the ON-DISK heads
+    /// for a repo it has never materialized, and afterwards the ON-DISK refs
     /// — never a committed head whose objects have not arrived, which would
-    /// take the whole clone down instead of just lagging one branch.
+    /// take the whole clone down instead of just lagging one branch. an
+    /// annotated tag carries the commit it peels to; a lightweight one needs
+    /// none.
     #[test]
-    fn on_disk_refs_offer_only_the_branches_this_node_can_pack() {
+    fn on_disk_refs_offer_only_the_branches_and_tags_this_node_can_pack() {
         let base = tempfile::tempdir().unwrap();
         assert!(
             on_disk_refs(base.path(), "demo").unwrap().is_empty(),
@@ -1519,14 +1707,48 @@ mod upload_pack_tests {
             .unwrap();
         repo.reference("refs/heads/feature/x", head, true, "test")
             .unwrap();
+        repo.reference("refs/tags/light", head, true, "test")
+            .unwrap();
+        let commit = repo.find_object(head, None).unwrap();
+        let annotated = repo.tag("v1", &commit, &sig, "release one", false).unwrap();
 
         let refs = on_disk_refs(base.path(), "demo").unwrap();
 
-        let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["feature/x", "main"], "every born branch, sorted");
-        for r in &refs {
-            assert_eq!(r.head, head.to_string(), "at its on-disk oid");
+        let names: Vec<&str> = refs.iter().map(|r| r.refname.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "refs/heads/feature/x",
+                "refs/heads/main",
+                "refs/tags/light",
+                "refs/tags/v1"
+            ],
+            "every born branch, then every tag, each sorted"
+        );
+        let head = head.to_string();
+        for r in &refs[..3] {
+            assert_eq!((r.oid.as_str(), r.peeled.as_deref()), (head.as_str(), None));
         }
+        assert_eq!(refs[3].oid, annotated.to_string(), "the tag object itself");
+        assert_eq!(
+            refs[3].peeled.as_deref(),
+            Some(head.as_str()),
+            "and the commit"
+        );
+
+        // the want-guard takes a tag tip, and the pack carries the tag object.
+        let dir = base.path().join("demo");
+        let (pack, _) = build_upload_pack(&dir, &[annotated.to_string()], &[]).unwrap();
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = git2::Repository::init_bare(clone_dir.path()).unwrap();
+        let odb = clone.odb().unwrap();
+        let mut writer = odb.packwriter().unwrap();
+        std::io::Write::write_all(&mut writer, &pack).unwrap();
+        writer.commit().unwrap();
+        assert_eq!(
+            clone.find_tag(annotated).unwrap().target_id().to_string(),
+            head
+        );
     }
 
     /// two commits at the origin; a client that has the first must get a pack

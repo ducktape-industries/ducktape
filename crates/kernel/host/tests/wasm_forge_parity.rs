@@ -223,6 +223,7 @@ fn push(updates: Vec<RefUpdate>, pack: Option<[u8; 32]>) -> Msg {
     op(&ForgeMsg::PushRefs {
         repo: REPO.into(),
         updates,
+        tags: Vec::new(),
         pack_digest: pack.map(|d| d.to_vec()),
         cert: None,
     })
@@ -264,14 +265,8 @@ fn reason_of(err: host::SubmitError) -> String {
 
 fn assert_reason_contained(native: &str, wasm: &str, height: u64) {
     // the wit rendering is a debug-escaped string: undo the quote escaping so
-    // a reason that names a repo (`"demo"`) is comparable; a batch member's
-    // reason additionally carries the `Module(..)` rendering on both sides,
-    // so the native needle is its inner text.
+    // a reason that names a repo (`"demo"`) is comparable.
     let wasm = wasm.replace("\\\"", "\"");
-    let native = native
-        .strip_prefix("Module(")
-        .and_then(|inner| inner.strip_suffix(')'))
-        .unwrap_or(native);
     assert!(
         wasm.contains(native),
         "rejections diverge at block {height}: native {native:?} vs wasm {wasm:?}"
@@ -817,10 +812,11 @@ fn a_push_certificate_checks_the_chain_id_identically_on_both_runtimes() {
             new_oid: Some(vec![7u8; 20]),
         }];
         let cert_text =
-            forge::pushcert::certificate(&forge::pushcert::nonce(chain_id, REPO), &updates);
+            forge::pushcert::certificate(&forge::pushcert::nonce(chain_id, REPO), &updates, &[]);
         op(&ForgeMsg::PushRefs {
             repo: REPO.into(),
             updates,
+            tags: Vec::new(),
             pack_digest: Some(vec![9u8; 32]),
             cert: Some(PushCert {
                 sshsig: sshsig(&sk, GIT_SSH_NS, &cert_text),

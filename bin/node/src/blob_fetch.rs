@@ -900,7 +900,7 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
                 target: "ducktape::forge",
                 node = %label,
                 repo = %pending.repo,
-                branch = %pending.branch,
+                refname = %pending.refname,
                 "pulled a forge pack this node was missing"
             );
             continue;
@@ -914,7 +914,7 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
                     target: "ducktape::forge",
                     node = %label,
                     repo = %pending.repo,
-                    branch = %pending.branch,
+                    refname = %pending.refname,
                     head = %pending.head,
                     "a peer rebuilt the objects for a head whose pack is gone"
                 );
@@ -927,7 +927,7 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
                     node = %label,
                     reason = "objects_fetch_failed",
                     repo = %pending.repo,
-                    branch = %pending.branch,
+                    refname = %pending.refname,
                     error = %e,
                     "neither the pushed pack nor a rebuilt one arrived"
                 );
@@ -1399,6 +1399,7 @@ mod tests {
                     prev_oid: None,
                     new_oid: Some(vec![7u8; 20]),
                 }],
+                tags: Vec::new(),
                 pack_digest: Some(digest.to_vec()),
                 cert: None,
             }),

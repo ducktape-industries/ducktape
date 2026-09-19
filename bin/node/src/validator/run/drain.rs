@@ -452,7 +452,7 @@ impl ValidatorRuntime<'_> {
                         // local observability off the DrainedFrame)
                         // so the resident forwards it to its caller
                         // — the duckfs-client engine keys on the
-                        // "files: conflict:" prefix. generic wording
+                        // "conflict:" prefix. generic wording
                         // only when the drain captured no reason.
                         detail: d.reason.clone().unwrap_or_else(|| {
                             "op finalized but rejected (deterministic no-op)".into()

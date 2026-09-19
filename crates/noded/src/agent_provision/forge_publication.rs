@@ -61,6 +61,7 @@ impl Publication for ModulePublication {
                 prev_oid: previous.map(oid).transpose()?,
                 new_oid: Some(oid(&head)?),
             }],
+            tags: Vec::new(),
             pack_digest: Some(digest),
             cert: None,
         };

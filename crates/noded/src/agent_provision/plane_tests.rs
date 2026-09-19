@@ -235,7 +235,7 @@ pub(super) fn files_reply(
         // the verbatim module contract string the engine's taxonomy keys on.
         FilesQuery::Read { .. } => Err(crate::Refused::new(
             "module",
-            "files: chunk not available",
+            "chunk not available",
         )),
         other => panic!("the checkout asked for {other:?}"),
     }

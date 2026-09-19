@@ -95,3 +95,10 @@ commonware-runtime = { workspace = true }
 serde_json = "1"
 # the boundary-fault tests drive stub modules on a plain futures executor.
 futures = "0.3"
+# `module_state_classes.rs` parses the core hops' source: source-lint prunes the
+# `#[cfg(test)]` items, the token walk reads macro bodies syn leaves opaque, and
+# `span-locations` lets a hit name its line.
+source-lint = { workspace = true }
+syn = "2"
+quote = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }

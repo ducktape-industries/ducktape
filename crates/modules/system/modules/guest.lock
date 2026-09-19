@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "ducktape-module-sdk"
 version = "0.0.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "async-trait",
  "sdk",
@@ -214,7 +214,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "module-artifact"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "borsh",
  "serde",
@@ -224,7 +224,7 @@ dependencies = [
 [[package]]
 name = "modules"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#d91dbe32c9d6275383f4ae742acf7a3b94beac5b"
+source = "git+https://github.com/ducktape-industries/ducktape#56cf140a59a13369924bdbecb536e25146a0aff9"
 dependencies = [
  "async-trait",
  "borsh",
@@ -246,7 +246,7 @@ dependencies = [
 [[package]]
 name = "modules-wire"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "borsh",
  "module-artifact",
@@ -298,12 +298,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "refusal-class"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+
+[[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "async-trait",
  "borsh",
+ "refusal-class",
  "serde",
  "serde_json",
  "sha2",
@@ -442,7 +448,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 [[package]]
 name = "valset-wire"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "sdk",
  "serde",
@@ -597,19 +603,19 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[patch.unused]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#16c8e4fcae7d2f998b01825af6eebf0fffb4c848"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"

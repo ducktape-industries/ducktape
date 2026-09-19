@@ -9,7 +9,7 @@
 //! ## per-dispatch re-entry, and why it reproduces the native block
 //!
 //! the native module keeps ONE `ForgeState` alive across a whole block: every
-//! op stages a per-branch fate (one fate per branch per block) and a tracker
+//! op stages a per-ref fate (one fate per branch or tag per block) and a tracker
 //! mutation onto it, and `commit_block` publishes them. an adapter guest is
 //! re-instantiated per DISPATCH, so it cannot hold a block-spanning core.
 //! instead each dispatch re-enters the block from two host-lane values:
@@ -24,11 +24,11 @@
 //!
 //! [`ForgeState::from_lane`] rebuilds the exact native mid-block shape from
 //! the two — committed refs with the staged fates on top — so the
-//! one-fate-per-branch rule and every committed-only check decide identically.
+//! one-fate-per-ref rule and every committed-only check decide identically.
 //! after the op applies, the dispatch re-stages both values and hands each
 //! packed head it staged to the object plane as a [`RefTarget`] record
 //! (kind [`REF_TARGET_KIND`]): the kernel delivers those to the backing at
-//! commit, which turns them back into the native per-branch publish.
+//! commit, which turns them back into the native per-ref publish.
 //!
 //! on a rejected op the `?` short-circuits BEFORE any state save or object
 //! put, so the host aborts the block with nothing staged — the native

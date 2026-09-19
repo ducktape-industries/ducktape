@@ -41,16 +41,18 @@
 
 use crate::PushCert;
 use crate::oid::Oid;
-use crate::tracker_iface::RefUpdate;
+use crate::refs::RefName;
+use crate::tracker_iface::{RefUpdate, TagCreate};
 
 const VERSION_LINE: &str = "certificate version 0.1";
-const HEADS: &str = "refs/heads/";
 
-/// the parsed certificate: what the pusher committed to.
+/// the parsed certificate: what the pusher committed to — its branch moves
+/// and its tag creations, split the way `ForgeMsg::PushRefs` carries them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Certificate {
     pub nonce: String,
     pub updates: Vec<RefUpdate>,
+    pub tags: Vec<TagCreate>,
 }
 
 /// the nonce a node advertises for `repo`, and the one consensus requires a
@@ -86,28 +88,32 @@ pub fn nonce(chain_id: &str, repo: &str) -> String {
 const GIT_NONCE_LEN_LIMIT: usize = 256;
 const _: () = assert!(64 + 1 + crate::MAX_REPO_NAME_LEN < GIT_NONCE_LEN_LIMIT);
 
-/// the certificate text git would write for `updates` under `nonce` — the
-/// shape the bridge's and forge's tests sign; git's own carries pusher/pushee
-/// lines this parser skips.
-pub fn certificate(nonce: &str, updates: &[RefUpdate]) -> Vec<u8> {
+/// the certificate text git would write for `updates` (branches) and `tags`
+/// under `nonce` — the shape the bridge's and forge's tests sign; git's own
+/// carries pusher/pushee lines this parser skips.
+pub fn certificate(nonce: &str, updates: &[RefUpdate], tags: &[TagCreate]) -> Vec<u8> {
     let mut text = format!("{VERSION_LINE}\nnonce {nonce}\n\n");
-    for update in updates {
-        let hex = |oid: &Option<Vec<u8>>| match oid {
-            Some(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-            None => "0".repeat(40),
-        };
-        text.push_str(&format!(
-            "{} {} {HEADS}{}\n",
-            hex(&update.prev_oid),
-            hex(&update.new_oid),
-            update.ref_name
-        ));
+    let hex = |oid: Option<&[u8]>| match oid {
+        Some(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        None => "0".repeat(40),
+    };
+    let branches = updates.iter().map(|u| {
+        let name = RefName::Branch(u.ref_name.clone());
+        (u.prev_oid.as_deref(), u.new_oid.as_deref(), name)
+    });
+    let tags = tags
+        .iter()
+        .map(|t| (None, Some(t.oid.as_slice()), RefName::Tag(t.name.clone())));
+    for (prev, new, name) in branches.chain(tags) {
+        text.push_str(&format!("{} {} {}\n", hex(prev), hex(new), name.full()));
     }
     text.into_bytes()
 }
 
 /// parse the signed text. Header lines other than `nonce` are skipped (git
-/// adds pusher/pushee/push-option); every update line must name a branch.
+/// adds pusher/pushee/push-option); every update line must name a branch or a
+/// tag, and lands in the list of its kind. a tag line must create: one that
+/// moves or deletes a tag is no push `PushRefs` can carry.
 pub fn parse(cert: &[u8]) -> Result<Certificate, String> {
     let text = std::str::from_utf8(cert).map_err(|_| "push certificate is not utf-8")?;
     let mut lines = text.lines();
@@ -130,19 +136,28 @@ pub fn parse(cert: &[u8]) -> Result<Certificate, String> {
         return Err("push certificate carries no nonce".into());
     };
     let mut updates = Vec::new();
+    let mut tags = Vec::new();
     for line in lines {
         if line.is_empty() {
             continue;
         }
-        updates.push(update_line(line)?);
+        let (name, update) = update_line(line)?;
+        match name {
+            RefName::Branch(_) => updates.push(update),
+            RefName::Tag(tag) => tags.push(tag_create(tag, update, line)?),
+        }
     }
-    if updates.is_empty() {
+    if updates.is_empty() && tags.is_empty() {
         return Err("push certificate lists no ref updates".into());
     }
-    Ok(Certificate { nonce, updates })
+    Ok(Certificate {
+        nonce,
+        updates,
+        tags,
+    })
 }
 
-fn update_line(line: &str) -> Result<RefUpdate, String> {
+fn update_line(line: &str) -> Result<(RefName, RefUpdate), String> {
     let mut parts = line.split(' ');
     let (Some(old), Some(new), Some(refname), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -151,16 +166,30 @@ fn update_line(line: &str) -> Result<RefUpdate, String> {
             "push certificate line is not `<old> <new> <refname>`: {line:?}"
         ));
     };
-    let Some(branch) = refname.strip_prefix(HEADS) else {
-        return Err(format!(
-            "push certificate moves a non-branch ref {refname:?}"
-        ));
-    };
-    Ok(RefUpdate {
-        ref_name: branch.to_string(),
+    let name = RefName::parse(refname)
+        .map_err(|why| format!("push certificate names {refname:?}: {why}"))?;
+    let update = RefUpdate {
+        ref_name: name.short().to_string(),
         prev_oid: oid_field(old)?,
         new_oid: oid_field(new)?,
-    })
+    };
+    Ok((name, update))
+}
+
+/// a tag line as the creation it must be: unborn before, set after.
+fn tag_create(name: String, update: RefUpdate, line: &str) -> Result<TagCreate, String> {
+    let RefUpdate {
+        prev_oid: None,
+        new_oid: Some(oid),
+        ..
+    } = update
+    else {
+        return Err(format!(
+            "push certificate line moves or deletes a tag, and a tag is created once and \
+             never moves: {line:?}"
+        ));
+    };
+    Ok(TagCreate { name, oid })
 }
 
 /// a 40-hex sha1; the zero oid is "unborn"/"delete" (`None`).
@@ -171,8 +200,9 @@ fn oid_field(hex: &str) -> Result<Option<Vec<u8>>, String> {
 }
 
 /// the SSH key that signed `cert` for THIS push on THIS chain — the SSHSIG
-/// verifies for the key it embeds, the certificate's updates equal `updates`
-/// as a set, and its nonce is EXACTLY `nonce(chain_id, repo)`. The 32 raw
+/// verifies for the key it embeds, the certificate's branch moves equal
+/// `updates` and its tag creations equal `tags`, each as a set, and its nonce
+/// is EXACTLY `nonce(chain_id, repo)`. The 32 raw
 /// ed25519 key bytes are a member key's form. a certificate minted for a
 /// different chain id, or a different repo, is refused here regardless of
 /// whether this forge instance has ever accepted a certified push before.
@@ -181,6 +211,7 @@ pub fn signer(
     chain_id: &str,
     repo: &str,
     updates: &[RefUpdate],
+    tags: &[TagCreate],
 ) -> Result<Vec<u8>, String> {
     let sig = keyscheme::sshsig::parse(&cert.sshsig)?;
     let verified = keyscheme::sshsig::verify_ed25519(
@@ -200,16 +231,18 @@ pub fn signer(
             certificate.nonce
         ));
     }
-    let same_moves = sorted(&certificate.updates) == sorted(updates);
+    let same_moves = sorted(&certificate.updates, |u| &u.ref_name)
+        == sorted(updates, |u| &u.ref_name)
+        && sorted(&certificate.tags, |t| &t.name) == sorted(tags, |t| &t.name);
     if !same_moves {
         return Err("push certificate does not list this push's ref updates".into());
     }
     Ok(sig.pubkey.to_vec())
 }
 
-fn sorted(updates: &[RefUpdate]) -> Vec<&RefUpdate> {
-    let mut sorted: Vec<&RefUpdate> = updates.iter().collect();
-    sorted.sort_by(|a, b| a.ref_name.cmp(&b.ref_name));
+fn sorted<T>(refs: &[T], name: impl Fn(&T) -> &String) -> Vec<&T> {
+    let mut sorted: Vec<&T> = refs.iter().collect();
+    sorted.sort_by(|a, b| name(a).cmp(name(b)));
     sorted
 }
 
@@ -254,11 +287,12 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
         let parsed = parse(CERT.as_bytes()).unwrap();
         assert_eq!(parsed.nonce, nonce("chain-a", "lab"));
         assert_eq!(parsed.updates, vec![main_birth()]);
+        assert!(parsed.tags.is_empty());
         let cert = PushCert {
             cert: CERT.as_bytes().to_vec(),
             sshsig: dearmor(ARMORED).unwrap(),
         };
-        let key = signer(&cert, "chain-a", "lab", &[main_birth()]).unwrap();
+        let key = signer(&cert, "chain-a", "lab", &[main_birth()], &[]).unwrap();
         assert_eq!(
             key,
             keyscheme::sshsig::authorized_key(
@@ -267,12 +301,12 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
             .unwrap()
         );
         assert!(
-            signer(&cert, "chain-a", "other", &[main_birth()])
+            signer(&cert, "chain-a", "other", &[main_birth()], &[])
                 .unwrap_err()
                 .contains("nonce")
         );
         assert!(
-            signer(&cert, "chain-z", "lab", &[main_birth()])
+            signer(&cert, "chain-z", "lab", &[main_birth()], &[])
                 .unwrap_err()
                 .contains("nonce"),
             "a certificate minted for a different chain is refused, not replayed onto this one"
@@ -280,18 +314,28 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
         let mut moved = main_birth();
         moved.ref_name = "dev".into();
         assert!(
-            signer(&cert, "chain-a", "lab", &[moved])
+            signer(&cert, "chain-a", "lab", &[moved], &[])
                 .unwrap_err()
                 .contains("ref updates")
         );
         let mut extra = vec![main_birth(), main_birth()];
         extra[1].ref_name = "feature".into();
-        assert!(signer(&cert, "chain-a", "lab", &extra).is_err());
+        assert!(signer(&cert, "chain-a", "lab", &extra, &[]).is_err());
+        let main_tag = TagCreate {
+            name: "main".into(),
+            oid: main_birth().new_oid.unwrap(),
+        };
+        assert!(
+            signer(&cert, "chain-a", "lab", &[], &[main_tag])
+                .unwrap_err()
+                .contains("ref updates"),
+            "a branch move the pusher signed never authorizes a tag of that name"
+        );
         let mut forged = cert.clone();
         forged.cert.push(b'\n');
         forged.cert.extend_from_slice(b"0000000000000000000000000000000000000000 ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 refs/heads/dev\n");
         assert!(
-            signer(&forged, "chain-a", "lab", &[main_birth()])
+            signer(&forged, "chain-a", "lab", &[main_birth()], &[])
                 .unwrap_err()
                 .contains("does not verify")
         );
@@ -308,27 +352,41 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
             },
             main_birth(),
         ];
-        let text = certificate(&nonce("chain-b", "lab"), &updates);
+        let tags = vec![TagCreate {
+            name: "v1".into(),
+            oid: main_birth().new_oid.unwrap(),
+        }];
+        let text = certificate(&nonce("chain-b", "lab"), &updates, &tags);
+        assert!(std::str::from_utf8(&text).unwrap().starts_with(&format!(
+            "certificate version 0.1\nnonce {}\n\n",
+            nonce("chain-b", "lab")
+        )));
         assert!(
-            std::str::from_utf8(&text).unwrap().starts_with(&format!(
-                "certificate version 0.1\nnonce {}\n\n",
-                nonce("chain-b", "lab")
-            ))
+            std::str::from_utf8(&text)
+                .unwrap()
+                .ends_with(" refs/tags/v1\n"),
+            "a tag rides the certificate under its own namespace"
         );
-        assert_eq!(parse(&text).unwrap().updates, updates);
+        let parsed = parse(&text).unwrap();
+        assert_eq!(parsed.updates, updates);
+        assert_eq!(parsed.tags, tags, "a tag line classifies as a tag");
         let cert = PushCert {
             sshsig: sshsig(&sk, GIT_SSH_NS, &text),
             cert: text.clone(),
         };
         let reordered: Vec<RefUpdate> = updates.iter().rev().cloned().collect();
-        let key = signer(&cert, "chain-b", "lab", &reordered).unwrap();
+        let key = signer(&cert, "chain-b", "lab", &reordered, &tags).unwrap();
         assert_eq!(key, ssh_pubkey(&sk), "order-free");
+        assert!(
+            signer(&cert, "chain-b", "lab", &updates, &[]).is_err(),
+            "an op that drops the signed tag is not the push the pusher signed"
+        );
         let under_ducktape = PushCert {
             sshsig: sshsig(&sk, keyscheme::sshsig::DUCKTAPE_SSH_NS, &text),
             cert: text,
         };
         assert!(
-            signer(&under_ducktape, "chain-b", "lab", &updates).is_err(),
+            signer(&under_ducktape, "chain-b", "lab", &updates, &tags).is_err(),
             "namespace `git` only"
         );
 
@@ -343,7 +401,23 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
                 .unwrap_err()
                 .contains("no ref updates")
         );
-        assert!(parse(b"certificate version 0.1\nnonce a/b\n\n0000000000000000000000000000000000000000 ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 refs/tags/v1\n").unwrap_err().contains("non-branch"));
+        // a tag CREATE is accepted and lands with the tags; a tag MOVE or
+        // DELETE is refused by name — `TagCreate` cannot carry either, so no
+        // op could ever match the certificate.
+        let tag_create = parse(b"certificate version 0.1\nnonce a/b\n\n0000000000000000000000000000000000000000 ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 refs/tags/v1\n").unwrap();
+        assert!(tag_create.updates.is_empty());
+        assert_eq!(tag_create.tags, tags);
+        let tag_move = b"certificate version 0.1\nnonce a/b\n\nab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 0000000000000000000000000000000000000001 refs/tags/v1\n";
+        let tag_delete = b"certificate version 0.1\nnonce a/b\n\nab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 0000000000000000000000000000000000000000 refs/tags/v1\n";
+        for refused in [&tag_move[..], &tag_delete[..]] {
+            assert!(
+                parse(refused)
+                    .unwrap_err()
+                    .contains("moves or deletes a tag"),
+                "a signed tag move or delete is refused by name"
+            );
+        }
+        assert!(parse(b"certificate version 0.1\nnonce a/b\n\n0000000000000000000000000000000000000000 ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 refs/notes/commits\n").unwrap_err().contains("refs/notes/commits"));
         assert!(
             parse(b"certificate version 0.1\nnonce a/b\n\nzz ab refs/heads/main\n")
                 .unwrap_err()
