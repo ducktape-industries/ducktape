@@ -642,7 +642,10 @@ say "join the resident"
 # takes the whole script down on the spot — with its stderr sent to /dev/null
 # and the `die` below never reached, so the operator gets a bare non-zero exit
 # and no reason at all.
-INVITE_FILE="/tmp/refound-$NAME-$STAMP.invite"
+# In the founder's own workspace, beside the wallet mnemonic and password it
+# is no less sensitive than: a bearer credential on a shared /tmp is readable
+# by whoever gets to it first, and nothing ever cleaned the old ones up.
+INVITE_FILE="$FOUNDER_WS/invite-$STAMP.invite"
 INVITE_OUT=$(DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" node invite --config "$FOUNDER_CFG" 2>&1) \
     || die "node invite failed: $INVITE_OUT"
 # An invite is a bearer credential: 0600 from its first byte, and only its
@@ -731,25 +734,33 @@ if ! DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" account show \
         || die "account create failed — the service daemons will not boot without one"
 fi
 
-say "release key"
-# The founders pin this key at install and nobody else can: a member that joins
-# by invite learns which key signs node releases from what the NETWORK
-# COMMITTED, reading the `release_key node` line back through `release status`
-# and pinning it on first read. A founding that never commits one leaves every
-# later member refusing every designated release with `no_release_key`, on a
-# machine nobody is going to touch.
+say "release keys"
+# The founders pin these keys at install and nobody else can: a member that
+# joins by invite learns which key signs a release from what the NETWORK
+# COMMITTED, reading the `release_key` lines back through `release status` and
+# pinning them on first read. A founding that never commits one leaves every
+# later member refusing every designated release of that kind with
+# `no_release_key`, on a machine nobody is going to touch. BOTH kinds are
+# committed: the node binary and the app are two channels and a member that
+# reads only one of them follows only one.
 #
-# Here and not beside `node init`: this is a governance decision driven through
-# a running node and signed by the operator's wallet key, so it needs both the
-# founder serving and the account above.
+# One key signs both — the operator wallet's — because one operator publishes
+# both; the network still records the two decisions separately, since the two
+# channels are designated separately.
+#
+# Here and not beside `node init`: these are governance decisions driven
+# through a running node and signed by the operator's wallet key, so they need
+# both the founder serving and the account above.
 #
 # Captured, not piped onward, for the reason `node invite` is: the verb's own
 # output is the only account of why it refused.
-KEY_SET=$(printf '%s\n' "$WALLET_PASSWORD" \
-    | DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" release key set --kind node \
-      --pubkey "$RELEASE_PUB" --config "$FOUNDER_CFG" 2>&1) \
-    || die "release key set failed: $KEY_SET"
-echo "$KEY_SET"
+for kind in node app; do
+    KEY_SET=$(printf '%s\n' "$WALLET_PASSWORD" \
+        | DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" release key set --kind "$kind" \
+          --pubkey "$RELEASE_PUB" --config "$FOUNDER_CFG" 2>&1) \
+        || die "release key set --kind $kind failed: $KEY_SET"
+    echo "$KEY_SET"
+done
 
 say "services"
 # `service enable` alone consents to a daemon that is ALREADY SIGNALLING — with
@@ -882,31 +893,43 @@ done
 # A pin is one node's; the COMMITTED key is the network's, and it is the only
 # one a member that joins later can read. So it is read back off the RUNNING
 # founder rather than trusted from the verb that passed.
-committed_node_key() {
-    local cfg=$1
+#
+# `release status` labels each line by CHANNEL, not by the `--kind` that
+# committed it: kind `node` prints `release_key node`, kind `app` prints
+# `release_key stable`. That mapping lives here and nowhere else.
+committed_release_key() {
+    local kind=$1 cfg=$2 line
+    case $kind in
+        node) line="release_key node";;
+        app) line="release_key stable";;
+        *) die "no release status line is known for release kind $kind";;
+    esac
     DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" release status --config "$cfg" 2>/dev/null \
-        | grep -m1 '^release_key node' | cut -f2
+        | grep -m1 "^$line" | cut -f2
 }
 
-# THE check, and it refuses: a founding that did not commit its node release
-# key is a founding whose every later member follows no node channel, which is
-# silent until a release is designated weeks later. Every founding proves it
-# here instead.
+# THE check, and it refuses: a founding that did not commit a release key is a
+# founding whose every later member follows no channel of that kind, which is
+# silent until a release is designated weeks later. Every founding proves both
+# kinds here instead.
 check_committed_release_key() {
-    local want=$1 got=$2
+    local kind=$1 want=$2 got=$3
     if [ "$got" = "$want" ]; then
         return 0
     fi
-    printf '\nrefound-net: the founder says the node release key this network committed is %s, not the %s it pinned.\n' \
-        "$got" "$want" >&2
+    printf '\nrefound-net: the founder says the %s release key this network committed is %s, not the %s it pinned.\n' \
+        "$kind" "$got" "$want" >&2
     printf '  a member that joins this network pins what the network committed, so\n' >&2
-    printf '  it refuses every designated node release with no_release_key.\n' >&2
+    printf '  it refuses every designated %s release with no_release_key.\n' "$kind" >&2
     return 1
 }
 
-RELEASE_COMMITTED=$(committed_node_key "$FOUNDER_CFG") || RELEASE_COMMITTED=""
-[ -n "$RELEASE_COMMITTED" ] \
-    || RELEASE_COMMITTED="(no release_key node line — the founder did not answer release status)"
+NODE_COMMITTED=$(committed_release_key node "$FOUNDER_CFG") || NODE_COMMITTED=""
+[ -n "$NODE_COMMITTED" ] \
+    || NODE_COMMITTED="(no release_key node line — the founder did not answer release status)"
+APP_COMMITTED=$(committed_release_key app "$FOUNDER_CFG") || APP_COMMITTED=""
+[ -n "$APP_COMMITTED" ] \
+    || APP_COMMITTED="(no release_key stable line — the founder did not answer release status)"
 
 SMOKE="skipped (--no-smoke)"
 if [ "$SKIP_SMOKE" = 1 ]; then
@@ -972,7 +995,8 @@ cat <<REPORT
   binary      $VOUCH
   set         $MODULES_SRC
   release key $RELEASE_PINNED
-  committed   $RELEASE_COMMITTED
+  committed   $NODE_COMMITTED as the node release key
+  committed   $APP_COMMITTED as the app release key
   wallet      $WALLET_NAME — mnemonic $SECRETS, password $PASSFILE (both 0600)
   follows     $FOLLOWS
   smoke       $SMOKE
@@ -1006,7 +1030,8 @@ case "$RELEASE_PINNED" in
         VERDICT=1
         ;;
 esac
-check_committed_release_key "$RELEASE_PUB" "$RELEASE_COMMITTED" || VERDICT=1
+check_committed_release_key node "$RELEASE_PUB" "$NODE_COMMITTED" || VERDICT=1
+check_committed_release_key app "$RELEASE_PUB" "$APP_COMMITTED" || VERDICT=1
 if [ "$SMOKE" = "RED" ]; then
     printf '\nrefound-net: the network is up, but a mention does not reach an agent.\n' >&2
     printf '  the smoke output above says which link of the chain broke.\n' >&2
