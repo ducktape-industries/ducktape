@@ -441,10 +441,7 @@ fn admissions_build_through_the_one_wasm_path() {
             )
             .await
             .expect("a map-declared component admits over a fresh map");
-            let host::Admitted::Module(module) = admitted else {
-                panic!("the hello fixture is a `ducktape:module`");
-            };
-            assert_eq!(module.id(), "hello");
+            assert_eq!(admitted.id(), "hello");
             let admitted = host::ModuleFactory::instantiate(
                 &admissions,
                 "kanban",
@@ -452,43 +449,40 @@ fn admissions_build_through_the_one_wasm_path() {
             )
             .await
             .expect("a new tenant can use supported object storage");
-            let host::Admitted::Module(module) = admitted else {
-                panic!("object fixture is a module")
-            };
-            assert_eq!(module.id(), "kanban");
+            assert_eq!(admitted.id(), "kanban");
             assert_eq!(
                 substrates.path("kanban").unwrap(),
                 dir.join("module-storage/kanban")
             );
             assert!(substrates.path("../escape").is_err());
-            // and the ONE refusal that is not fail-closed: bytes that are no
-            // `ducktape:module` at all are another plane's commitment record.
+            // and the refusals that keep the boundary fail-closed. This factory
+            // is only ever asked about an entry committed `Kind::Module`, so a
+            // component from some other world under a module id is an Err that
+            // stalls that id — never an answer that would let one binary seat
+            // what another passes over.
             let netstack = std::fs::read(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("../networking/netstack-machine/component.wasm"),
             )
             .unwrap();
-            let admitted = host::ModuleFactory::instantiate(
+            let seated = host::ModuleFactory::instantiate(
                 &admissions,
                 "netstack",
                 &module_artifact::Artifact::module(netstack).encode(),
             )
-            .await
-            .expect("a foreign-world component is answered, not errored");
-            assert!(
-                matches!(admitted, host::Admitted::ForeignAbi),
-                "the netstack guest is no module admission"
-            );
-            // and the same answer one step earlier: bytes carrying no artifact
-            // frame at all. Erroring here stalls the code plane on every node
-            // forever, for a record this boundary never owned.
-            let admitted = host::ModuleFactory::instantiate(&admissions, "raw", b"\0asm\x01\0\0\0")
-                .await
-                .expect("unframed bytes are answered, not errored");
-            assert!(
-                matches!(admitted, host::Admitted::ForeignAbi),
-                "no artifact frame is no module admission"
-            );
+            .await;
+            let Err(sdk::Error::Module { reason, .. }) = seated else {
+                panic!("a foreign-world component under a module id is a module refusal");
+            };
+            assert_eq!(reason, "module_seat");
+            // and the same refusal one step earlier: bytes carrying no artifact
+            // frame at all.
+            let seated =
+                host::ModuleFactory::instantiate(&admissions, "raw", b"\0asm\x01\0\0\0").await;
+            let Err(sdk::Error::Module { reason, .. }) = seated else {
+                panic!("unframed bytes under a module id are a module refusal");
+            };
+            assert_eq!(reason, "artifact_frame_absent");
         })
     });
 }
@@ -1187,6 +1181,21 @@ fn a_view_entry_is_ready_on_the_view_alone_and_the_tag_must_match_the_kind() {
     let error = noded::compose::validate_deployment("home", modules::Kind::View, &broken, &index)
         .unwrap_err();
     assert!(error.contains("view manifest"), "{error}");
+}
+
+/// a `Kind::Plane` entry is a hash this boundary holds and nothing more: the
+/// artifact belongs to the node plane that owns it, so static deployment
+/// validation does not decode it. The owner supplies the live restore proof
+/// before a validator signals readiness.
+#[test]
+fn a_plane_entry_is_ready_without_decoding_its_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
+    let not_a_frame = b"\0asm\x01\0\0\0 a netstack guest, not a deployment frame";
+    module_artifact::ArtifactRef::decode(not_a_frame)
+        .expect_err("fixture must not be a decodable deployment frame");
+    noded::compose::validate_deployment("netstack", modules::Kind::Plane, not_a_frame, &index)
+        .unwrap();
 }
 
 #[test]

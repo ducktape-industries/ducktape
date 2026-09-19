@@ -16,15 +16,13 @@
 //! SIGNAL — validators only: per pending swap, drive this validator to a
 //! truthful `ModulesMsg::SwapReady`:
 //!
-//! - bytes verified-resident AND loadable on this binary → self-submit ONE
-//!   signal (latched locally; the module's committed readiness set keeps it
-//!   idempotent across restarts).
-//! - bytes held but not loadable on this binary → report the refusal once and
-//!   stay silent. Never signal what is not held AND not runnable: "ready" is a
-//!   machine statement that `sha256(local bytes) == committed hash` and that
-//!   THIS build can instantiate them. Residency alone let a validator on an
-//!   older binary arm a swap it then deterministically rejected every op to
-//!   while its peers applied them — a silent fork (#1297).
+//! - module/view bytes verified-resident AND loadable on this binary →
+//!   self-submit ONE signal (latched locally; the module's committed
+//!   readiness set keeps it idempotent across restarts).
+//! - plane bytes verified-resident → ask the owning plane asynchronously to
+//!   restore the current machine snapshot, then signal only after that proof.
+//! - a deterministic refusal is reported once and stays silent; an answer
+//!   with no running owner is not loadability and remains retryable.
 //!
 //! deliberately NOT a `host::worker::Worker` (same reasoning as the upgrade
 //! signaller): readiness must survive restart/late-join, so every decision
@@ -66,6 +64,15 @@ pub(crate) enum Role {
 /// one finished fetch, reported back to the pump that owns the counter.
 pub(crate) type FetchOutcome = ([u8; 32], Option<BlobFetchError>);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreflightResult {
+    Ready,
+    Refused(String),
+    Unattempted(String),
+}
+
+pub(crate) type PreflightOutcome = (SwapKey, PreflightResult);
+
 /// what one failed fetch earns: the attempt number to report, and whether this
 /// attempt is one of the ones that speaks.
 pub(crate) struct FetchFailure {
@@ -103,6 +110,9 @@ pub(crate) enum CodeVerdict {
     /// held, but this binary cannot instantiate them — a host import this
     /// build does not provide, or a component encoding it does not speak.
     Unloadable { detail: String },
+    /// held plane bytes whose owner must prove they can restore the current
+    /// machine before this node may signal readiness.
+    Preflight { component: Vec<u8> },
     /// not held locally.
     Absent,
 }
@@ -133,6 +143,11 @@ pub(crate) struct CodeReadinessSignaller {
     /// fails, so without this a failed submit would re-read and RE-COMPILE
     /// the same bytes on the next tick.
     loadable: BTreeSet<(String, [u8; 32])>,
+    /// exact plane swaps whose owner answered that restore is impossible.
+    preflighting: BTreeSet<SwapKey>,
+    preflight_refused: BTreeSet<SwapKey>,
+    /// exact plane swaps whose asynchronous owner answer is ready to use.
+    preflighted: BTreeMap<SwapKey, CodeVerdict>,
     /// digests the bytes-only path already found present. The presence read
     /// is a VERIFYING one (the whole blob re-hashed) and the pump ticks every
     /// 100 ms, so without this latch an open ballot's artifact would be
@@ -151,6 +166,8 @@ pub(crate) struct CodeActions {
     /// swaps whose bytes this binary cannot run, with the loader's own words —
     /// emitted ONCE per digest by the `unloadable` latch.
     pub(crate) refusals: Vec<(SwapKey, String)>,
+    /// plane candidates to restore asynchronously through their owner.
+    pub(crate) preflights: Vec<(SwapKey, Vec<u8>)>,
 }
 
 impl CodeReadinessSignaller {
@@ -162,6 +179,9 @@ impl CodeReadinessSignaller {
             failed: BTreeMap::new(),
             unloadable: BTreeSet::new(),
             loadable: BTreeSet::new(),
+            preflighting: BTreeSet::new(),
+            preflight_refused: BTreeSet::new(),
+            preflighted: BTreeMap::new(),
             present: BTreeSet::new(),
         }
     }
@@ -213,6 +233,8 @@ impl CodeReadinessSignaller {
             let Ok(digest) = <[u8; 32]>::try_from(pending.code_hash.as_slice()) else {
                 continue; // malformed hash can never verify — stay silent.
             };
+            // residents only fetch. Validators decide every kind; a plane's
+            // decision is the owner restore proof in `decide_swap`.
             match role {
                 Role::Resident => self.want_bytes(&digest, &mut held, &mut wanted, &mut actions),
                 Role::Validator => self.decide_swap(m, pending, digest, &mut verdict, &mut actions),
@@ -283,22 +305,38 @@ impl CodeReadinessSignaller {
         if self.signaled.contains(&key) {
             return;
         }
+        let plane = m.kind == modules::Kind::Plane;
+        if plane && self.preflight_refused.contains(&key) {
+            return;
+        }
         let latch = (m.module_id.clone(), digest);
         // already refused: this binary will not start loading bytes it
         // could not run, and re-deciding would recompile the component
         // (and re-report the refusal) on every tick until a restart.
-        if self.unloadable.contains(&latch) {
+        if !plane && self.unloadable.contains(&latch) {
             return;
         }
         // the compile is paid ONCE per pair, in either direction: a pair
         // already known to run here skips the probe entirely.
-        let answer = match self.loadable.contains(&latch) {
-            true => CodeVerdict::Loadable,
-            false => verdict(m, &digest),
+        let answer = if plane {
+            match self.preflighted.get(&key) {
+                Some(answer) => answer.clone(),
+                None => match self.request_plane_preflight(&key, m, digest, verdict, actions) {
+                    Some(answer) => answer,
+                    None => return,
+                },
+            }
+        } else {
+            match self.loadable.contains(&latch) {
+                true => CodeVerdict::Loadable,
+                false => verdict(m, &digest),
+            }
         };
         match answer {
             CodeVerdict::Loadable => {
-                self.loadable.insert(latch);
+                if !plane {
+                    self.loadable.insert(latch);
+                }
                 self.signaled.insert(key.clone());
                 let msg = Msg {
                     target: host::MODULES_ID.into(),
@@ -311,8 +349,15 @@ impl CodeReadinessSignaller {
                 actions.signals.push((key, msg));
             }
             CodeVerdict::Unloadable { detail } => {
-                self.unloadable.insert(latch);
+                if plane {
+                    self.preflight_refused.insert(key.clone());
+                } else {
+                    self.unloadable.insert(latch);
+                }
                 actions.refusals.push((key, detail));
+            }
+            CodeVerdict::Preflight { .. } => {
+                unreachable!("plane preflight is consumed by request_plane_preflight")
             }
             CodeVerdict::Absent => {
                 let cooling = self
@@ -322,6 +367,52 @@ impl CodeReadinessSignaller {
                 if !cooling && self.fetching.insert(digest) {
                     actions.fetches.push(digest);
                 }
+            }
+        }
+    }
+
+    /// Start one exact plane/digest restore proof. The caller's verdict only
+    /// prepares the candidate bytes; the owner command is sent by the drain.
+    fn request_plane_preflight(
+        &mut self,
+        key: &SwapKey,
+        module: &modules::ModuleCode,
+        digest: [u8; 32],
+        verdict: &mut impl FnMut(&modules::ModuleCode, &[u8; 32]) -> CodeVerdict,
+        actions: &mut CodeActions,
+    ) -> Option<CodeVerdict> {
+        if !self.preflighting.insert(key.clone()) {
+            return None;
+        }
+        match verdict(module, &digest) {
+            CodeVerdict::Preflight { component } => {
+                actions.preflights.push((key.clone(), component));
+                None
+            }
+            answer => {
+                self.preflighting.remove(key);
+                Some(answer)
+            }
+        }
+    }
+
+    /// Consume owner answers without waiting in the validator loop. Only a
+    /// deterministic refusal is latched; an unattempted answer is retried.
+    pub(crate) fn reap_preflights(
+        &mut self,
+        done: &mut tokio::sync::mpsc::UnboundedReceiver<PreflightOutcome>,
+    ) {
+        while let Ok((key, answer)) = done.try_recv() {
+            self.preflighting.remove(&key);
+            match answer {
+                PreflightResult::Ready => {
+                    self.preflighted.insert(key, CodeVerdict::Loadable);
+                }
+                PreflightResult::Refused(detail) => {
+                    self.preflighted
+                        .insert(key, CodeVerdict::Unloadable { detail });
+                }
+                PreflightResult::Unattempted(_) => {}
             }
         }
     }
@@ -437,6 +528,40 @@ pub(crate) fn spawn_fetches<C>(
             .await
             .err();
             let _ = done.send((digest, failure));
+        });
+    }
+}
+
+/// Ask the live owner plane without awaiting it in the validator loop.
+pub(crate) fn spawn_preflights(
+    preflights: Vec<(SwapKey, Vec<u8>)>,
+    reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
+    done: &tokio::sync::mpsc::UnboundedSender<PreflightOutcome>,
+) {
+    for (key, component) in preflights {
+        let Some(_) = reach_cmd.as_ref() else {
+            let _ = done.send((
+                key,
+                PreflightResult::Unattempted("the reachability plane is not running".into()),
+            ));
+            continue;
+        };
+        let done = done.clone();
+        tokio::spawn(async move {
+            let result = match crate::reachability_plane::preflight_netstack_backend(
+                noded::NetstackSwapRequest::Bytes(component),
+            )
+            .await
+            {
+                crate::reachability_plane::PreflightAnswer::Ready => PreflightResult::Ready,
+                crate::reachability_plane::PreflightAnswer::Refused(detail) => {
+                    PreflightResult::Refused(detail)
+                }
+                crate::reachability_plane::PreflightAnswer::Unattempted(detail) => {
+                    PreflightResult::Unattempted(detail)
+                }
+            };
+            let _ = done.send((key, result));
         });
     }
 }
@@ -754,6 +879,154 @@ mod tests {
         );
         assert!(acts.fetches.is_empty());
         assert!(s.present.contains(&[9u8; 32]));
+    }
+
+    /// A plane fetches first, then asks its owner to restore the live snapshot;
+    /// the signal is impossible before that asynchronous answer.
+    #[test]
+    fn a_plane_fetches_then_preflights_before_signalling() {
+        let mut plane = pending("netstack", "netstack-next", 3, false, &[]);
+        plane.kind = modules::Kind::Plane;
+        let modules = vec![plane];
+        let mut s = CodeReadinessSignaller::new(me());
+        let acts = s.decide(
+            Role::Validator,
+            1,
+            &modules,
+            &no_proposals(),
+            never_held,
+            |_, _| CodeVerdict::Absent,
+        );
+        assert_eq!(acts.fetches, vec![[3u8; 32]]);
+        assert!(acts.signals.is_empty());
+
+        s.fetch_succeeded(&[3; 32]);
+        let acts = s.decide(
+            Role::Validator,
+            1,
+            &modules,
+            &no_proposals(),
+            never_held,
+            |_, _| CodeVerdict::Preflight {
+                component: vec![4, 5],
+            },
+        );
+        assert!(acts.signals.is_empty());
+        assert_eq!(acts.preflights.len(), 1);
+
+        let key = key("netstack", "netstack-next", 3);
+        let (done, mut answers) = tokio::sync::mpsc::unbounded_channel();
+        done.send((key.clone(), PreflightResult::Ready)).unwrap();
+        s.reap_preflights(&mut answers);
+        let acts = s.decide(
+            Role::Validator,
+            1,
+            &modules,
+            &no_proposals(),
+            never_held,
+            |_, _| panic!("a successful preflight is latched"),
+        );
+        assert_eq!(acts.signals.len(), 1);
+        assert!(acts.preflights.is_empty());
+    }
+
+    #[test]
+    fn a_plane_refusal_latches_and_an_unattempted_owner_retries() {
+        let mut plane = pending("netstack", "netstack-next", 3, false, &[]);
+        plane.kind = modules::Kind::Plane;
+        let modules = vec![plane];
+        let key = key("netstack", "netstack-next", 3);
+
+        let mut refusal = CodeReadinessSignaller::new(me());
+        let first = refusal.decide(
+            Role::Validator,
+            1,
+            &modules,
+            &no_proposals(),
+            never_held,
+            |_, _| CodeVerdict::Preflight { component: vec![4] },
+        );
+        assert_eq!(first.preflights.len(), 1);
+        let (done, mut answers) = tokio::sync::mpsc::unbounded_channel();
+        done.send((key.clone(), PreflightResult::Refused("state shape".into())))
+            .unwrap();
+        refusal.reap_preflights(&mut answers);
+        let refused = refusal.decide(
+            Role::Validator,
+            1,
+            &modules,
+            &no_proposals(),
+            never_held,
+            |_, _| panic!("a refused owner is latched"),
+        );
+        assert_eq!(refused.refusals.len(), 1);
+        assert!(
+            refusal
+                .decide(
+                    Role::Validator,
+                    1,
+                    &modules,
+                    &no_proposals(),
+                    never_held,
+                    |_, _| panic!("a refusal is reported once")
+                )
+                .refusals
+                .is_empty()
+        );
+
+        let mut retry = CodeReadinessSignaller::new(me());
+        assert_eq!(
+            retry
+                .decide(
+                    Role::Validator,
+                    1,
+                    &modules,
+                    &no_proposals(),
+                    never_held,
+                    |_, _| CodeVerdict::Preflight { component: vec![4] }
+                )
+                .preflights
+                .len(),
+            1
+        );
+        let (done, mut answers) = tokio::sync::mpsc::unbounded_channel();
+        done.send((key, PreflightResult::Unattempted("no running plane".into())))
+            .unwrap();
+        retry.reap_preflights(&mut answers);
+        assert_eq!(
+            retry
+                .decide(
+                    Role::Validator,
+                    1,
+                    &modules,
+                    &no_proposals(),
+                    never_held,
+                    |_, _| CodeVerdict::Preflight { component: vec![4] }
+                )
+                .preflights
+                .len(),
+            1,
+            "an unattempted owner answer is retryable"
+        );
+    }
+
+    #[test]
+    fn a_resident_plane_fetches_without_owner_preflight_or_signal() {
+        let mut plane = pending("netstack", "netstack-next", 3, false, &[]);
+        plane.kind = modules::Kind::Plane;
+        let modules = vec![plane];
+        let mut s = CodeReadinessSignaller::new(me());
+        let acts = s.decide(
+            Role::Resident,
+            1,
+            &modules,
+            &no_proposals(),
+            |digest| digest == &[3; 32],
+            |_, _| panic!("residents never preflight planes"),
+        );
+        assert!(acts.fetches.is_empty());
+        assert!(acts.preflights.is_empty());
+        assert!(acts.signals.is_empty());
     }
 
     /// BYTE RESIDENCY IS NOT READINESS. A validator whose binary cannot

@@ -12,14 +12,18 @@
 //!   * block `H`'s drain-injected `Advance` flips the committed active hash;
 //!   * the module executes from `H` over fresh state;
 //!   * a node lacking the bytes, or a host with no factory wired, FAILS
-//!     CLOSED — an admission never silently half-lands.
+//!     CLOSED — an admission never silently half-lands;
+//!   * WHO seats an entry is the record's COMMITTED kind, never the bytes: a
+//!     [`modules::Kind::Plane`] record is passed over on every node, and a
+//!     [`modules::Kind::Module`] this build cannot load stalls the boundary on
+//!     every node — two builds over one history can never seat two registries.
 
 use std::collections::BTreeMap;
 
 use futures::executor::block_on;
 use sha2::Digest;
 
-use host::{Admitted, BlockContext, CodeSource, Host, MODULES_ID, ModuleFactory};
+use host::{BlockContext, CodeSource, Host, MODULES_ID, ModuleFactory};
 use modules::{Modules, ModulesMsg, ModulesQuery, ModulesReply};
 use sdk::{Error, Module, Msg, Origin, StateRoot};
 
@@ -70,25 +74,15 @@ struct WasmFactory;
 
 #[async_trait::async_trait(?Send)]
 impl ModuleFactory for WasmFactory {
-    async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<Admitted, Error> {
-        // the node's own answer, in miniature: a module that will not load
-        // HERE stays fail-closed; bytes that are no module at all are another
-        // plane's record (see `noded::compose::Admissions`) — including bytes
-        // that carry no artifact frame in the first place.
-        let Ok(module_artifact::ArtifactRef::Module(artifact)) =
-            module_artifact::ArtifactRef::decode(bytes)
-        else {
-            return Ok(Admitted::ForeignAbi);
-        };
-        match wasm_host::CompiledModule::compile_artifact(bytes)
-            .and_then(|compiled| compiled.over_map(id))
-        {
-            Ok(module) => Ok(Admitted::Module(Box::new(module))),
-            Err(refusal) => match wasm_host::speaks_module_abi(artifact.component) {
-                true => Err(refusal),
-                false => Ok(Admitted::ForeignAbi),
-            },
-        }
+    async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<Box<dyn Module>, Error> {
+        // the node's own answer, in miniature: the entry's COMMITTED kind
+        // already said these are a module's bytes, so every way they fail to
+        // become one — no artifact frame, a frame this runtime cannot compile,
+        // a component that exports something else — is an Err and the boundary
+        // stalls. Answering "not a module" here is what forks a network.
+        let module = wasm_host::CompiledModule::compile_artifact(bytes)
+            .and_then(|compiled| compiled.over_map(id))?;
+        Ok(Box::new(module))
     }
 
     // an admission over a map touches nothing but itself: it is its own scratch.
@@ -390,50 +384,63 @@ fn admission_fails_closed_without_a_module_factory() {
     );
 }
 
-/// THE REGISTRY IS ID-GENERIC AND THE BOUNDARY IS NOT. A record whose code is
-/// not a `ducktape:module` — the reachability plane's `ducktape:netstack`
-/// guest, delivered through the very same governance path — is SKIPPED here:
-/// it is not this boundary's to instantiate, and treating it as an admission
-/// would fail closed on every node, on every block, forever. The entry stays
-/// committed (its own plane's non-blocking reconciler reads it), the root-hash
-/// does not move, and a real admission in the same set still lands.
+/// registers `id` at [`H`] under `kind`, and signals it ready.
+fn arm(host: &mut Host, name: &str, id: &str, kind: modules::Kind, code_hash: Vec<u8>) {
+    submit(
+        host,
+        3,
+        Origin::System,
+        modules_msg(&ModulesMsg::ScheduleRegister {
+            name: name.into(),
+            module_id: id.into(),
+            kind,
+            activation_height: H,
+            code_hash: code_hash.clone(),
+            lanes: Vec::new(),
+        }),
+    );
+    submit(
+        host,
+        4,
+        Origin::External(MEMBER.to_vec()),
+        modules_msg(&ModulesMsg::SwapReady {
+            name: name.into(),
+            module_id: id.into(),
+            code_hash,
+        }),
+    );
+}
+
+/// THE REGISTRY IS ID-GENERIC AND THE BOUNDARY IS NOT — AND THE COMMITTED KIND
+/// SAYS WHICH IS WHICH. A [`modules::Kind::Plane`] record — the reachability
+/// plane's `ducktape:netstack` guest, delivered through the very same
+/// governance path — is passed over here: the committed record already says
+/// another plane realizes it, so no node ever asks its factory what the bytes
+/// ARE. The entry stays committed (its own plane's non-blocking reconciler
+/// reads it) and a real admission in the same set still lands.
 #[test]
-fn a_foreign_abi_record_is_skipped_and_the_boundary_keeps_sealing() {
+fn a_plane_record_is_passed_over_and_the_boundary_keeps_sealing() {
     const NETSTACK: &[u8] = include_bytes!("../../../networking/netstack-machine/component.wasm");
 
     let mut host = bare_host(true);
     let src = MapSource::with(&[COMPONENT, NETSTACK]);
-    for (name, id, code) in [
-        ("netstack-v1", "netstack", NETSTACK),
-        ("kanban-v1", "kanban", COMPONENT),
-    ] {
-        submit(
-            &mut host,
-            3,
-            Origin::System,
-            modules_msg(&ModulesMsg::ScheduleRegister {
-                name: name.into(),
-                module_id: id.into(),
-                kind: modules::Kind::Module,
-                activation_height: H,
-                code_hash: sha(code),
-                lanes: Vec::new(),
-            }),
-        );
-        submit(
-            &mut host,
-            4,
-            Origin::External(MEMBER.to_vec()),
-            modules_msg(&ModulesMsg::SwapReady {
-                name: name.into(),
-                module_id: id.into(),
-                code_hash: sha(code),
-            }),
-        );
-    }
+    arm(
+        &mut host,
+        "netstack-v1",
+        "netstack",
+        modules::Kind::Plane,
+        sha(NETSTACK),
+    );
+    arm(
+        &mut host,
+        "kanban-v1",
+        "kanban",
+        modules::Kind::Module,
+        sha(COMPONENT),
+    );
 
     let root_hash_before = host.root_hash();
-    realize(&mut host, H, &src).expect("a foreign-abi record must not stop the boundary");
+    realize(&mut host, H, &src).expect("a plane record must not stop the boundary");
     assert!(
         host.module_root("netstack").is_none(),
         "nothing seated for another plane's component"
@@ -475,64 +482,61 @@ fn a_foreign_abi_record_is_skipped_and_the_boundary_keeps_sealing() {
     for height in [H, H + 1, H + 2] {
         realize(&mut host, height, &src).expect("later boundaries stay Ok");
     }
-    assert_eq!(host.root_hash(), sealed, "the skip moves nothing");
+    assert_eq!(host.root_hash(), sealed, "the pass-over moves nothing");
     submit(&mut host, H + 2, Origin::External(vec![9; 32]), inc_msg());
     assert_eq!(count(&host), 2, "and blocks keep sealing");
 }
 
-/// THE SAME ANSWER ONE STEP EARLIER. The registry commits a hash, not a
-/// shape: a blob that is not a `ModuleArtifact` frame at all — a bare
-/// component, or any other plane's bytes — is another plane's record too. The
-/// failure is a pure function of committed bytes, so a hard error here is not
-/// a refused swap but a chain that never applies the activation block again,
-/// on every honest node, with no governance op able to reach the fix.
+/// A COMMITTED MODULE THIS BINARY CANNOT SEAT STOPS THE BOUNDARY. The registry
+/// commits a hash AND a kind: bytes registered as a [`modules::Kind::Module`]
+/// that are not a `ModuleArtifact` frame at all — a bare component, or any
+/// other plane's bytes — are a module this build failed to load, never "not a
+/// module". The boundary fails closed and retries forever, which is a stall the
+/// operator sees; the alternative, skipping what this build could not read,
+/// seats a different registry on a node whose build could.
 #[test]
-fn a_non_frame_registry_blob_is_skipped_and_the_boundary_keeps_sealing() {
+fn a_committed_module_this_binary_cannot_seat_stops_the_boundary() {
     // a bare wasm preamble: valid-looking bytes, no artifact frame.
     const RAW: &[u8] = b"\0asm\x01\0\0\0";
 
     let mut host = bare_host(true);
     let src = MapSource::with(&[COMPONENT]).and_raw(RAW);
-    for (name, id, code_hash) in [
-        ("blob-v1", "blob", raw_sha(RAW)),
-        ("kanban-v1", "kanban", sha(COMPONENT)),
-    ] {
-        submit(
-            &mut host,
-            3,
-            Origin::System,
-            modules_msg(&ModulesMsg::ScheduleRegister {
-                name: name.into(),
-                module_id: id.into(),
-                kind: modules::Kind::Module,
-                activation_height: H,
-                code_hash: code_hash.clone(),
-                lanes: Vec::new(),
-            }),
-        );
-        submit(
-            &mut host,
-            4,
-            Origin::External(MEMBER.to_vec()),
-            modules_msg(&ModulesMsg::SwapReady {
-                name: name.into(),
-                module_id: id.into(),
-                code_hash,
-            }),
-        );
-    }
+    arm(
+        &mut host,
+        "blob-v1",
+        "blob",
+        modules::Kind::Module,
+        raw_sha(RAW),
+    );
+    arm(
+        &mut host,
+        "kanban-v1",
+        "kanban",
+        modules::Kind::Module,
+        sha(COMPONENT),
+    );
 
-    realize(&mut host, H, &src).expect("an unframed blob must not stop the boundary");
+    let root_hash_before = host.root_hash();
+    assert!(
+        realize(&mut host, H, &src).is_err(),
+        "bytes committed as a module that will not load must stop the boundary"
+    );
     assert!(
         host.module_root("blob").is_none(),
-        "nothing seated for bytes that are no module"
+        "nothing seated for bytes that would not load"
     );
+    assert_eq!(
+        host.root_hash(),
+        root_hash_before,
+        "a stalled boundary commits nothing at all"
+    );
+
+    // and it stays stopped: the committed record is what it is, so every retry
+    // answers the same way.
     assert!(
-        host.module_root("kanban").is_some(),
-        "the real admission still lands"
+        realize(&mut host, H, &src).is_err(),
+        "the stall is a pure function of committed state"
     );
-    submit(&mut host, H, Origin::External(vec![9; 32]), inc_msg());
-    assert_eq!(count(&host), 1, "the block applied");
 }
 
 /// a registry store whose reads fail while armed — the node-local read
@@ -661,13 +665,13 @@ struct StartingFactory;
 
 #[async_trait::async_trait(?Send)]
 impl ModuleFactory for StartingFactory {
-    async fn instantiate(&self, id: &str, _bytes: &[u8]) -> Result<Admitted, Error> {
+    async fn instantiate(&self, id: &str, _bytes: &[u8]) -> Result<Box<dyn Module>, Error> {
         let mut module = RefusesToStart;
         module
             .initialize(&[])
             .await
             .map_err(|e| Error::module("module_seat", format!("{id} initializes: {e}")))?;
-        Ok(Admitted::Module(Box::new(module)))
+        Ok(Box::new(module))
     }
 
     fn check(&self, id: &str, bytes: &[u8]) -> Result<(), Error> {
@@ -745,4 +749,138 @@ fn unready_admission_never_arms() {
     let (active, pending) = kanban_entry(&host).expect("entry persists");
     assert!(active.is_empty());
     assert!(pending, "still waiting on readiness");
+}
+
+/// a module that seats from any bytes at all.
+struct Anything;
+
+#[async_trait::async_trait(?Send)]
+impl Module for Anything {
+    fn id(&self) -> sdk::ModuleId {
+        "blob".into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot([7; 32])
+    }
+
+    async fn execute(&mut self, _ctx: &mut dyn sdk::Ctx, _msg: &Msg) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn initialize(&mut self, _params: &[u8]) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// a build whose runtime loads bytes this repo's `wasm_host` will not.
+struct SeatsAnything;
+
+#[async_trait::async_trait(?Send)]
+impl ModuleFactory for SeatsAnything {
+    async fn instantiate(&self, _id: &str, _bytes: &[u8]) -> Result<Box<dyn Module>, Error> {
+        Ok(Box::new(Anything))
+    }
+
+    fn check(&self, _id: &str, _bytes: &[u8]) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// TWO BINARIES OVER ONE HISTORY NEVER BOTH ADVANCE WITH DIFFERENT REGISTRIES.
+/// whether a build's runtime can load a given artifact is a property of the
+/// BUILD, not of committed state: the same bytes one node seats, an older or
+/// newer one may not. so the answer "not for me" may never be a quiet skip —
+/// the node that cannot seat what the record commits as a module STOPS, and a
+/// stall commits nothing. the two nodes' registries stay equal because only
+/// one of them moved at all; before #2705 both returned `Ok`, both sealed the
+/// block, and their root hashes forked.
+#[test]
+fn two_builds_that_disagree_about_bytes_never_seat_two_registries() {
+    const RAW: &[u8] = b"\0asm\x01\0\0\0";
+    let src = MapSource::with(&[COMPONENT]).and_raw(RAW);
+
+    // one committed history, replayed on both builds.
+    let arm_both = |host: &mut Host| {
+        arm(host, "blob-v1", "blob", modules::Kind::Module, raw_sha(RAW));
+    };
+
+    let mut loads = bare_host(false);
+    loads.set_module_factory(Box::new(SeatsAnything));
+    arm_both(&mut loads);
+
+    let mut refuses = bare_host(true);
+    arm_both(&mut refuses);
+
+    let agreed = loads.root_hash();
+    assert_eq!(
+        refuses.root_hash(),
+        agreed,
+        "the same committed history, up to the boundary"
+    );
+
+    realize(&mut loads, H, &src).expect("the build that loads these bytes seats them");
+    realize(&mut refuses, H, &src).expect_err("the build that cannot load them stops the boundary");
+
+    assert!(loads.module_root("blob").is_some(), "seated on the one");
+    assert!(
+        refuses.module_root("blob").is_none(),
+        "nothing seated on the other"
+    );
+    assert_ne!(
+        loads.root_hash(),
+        agreed,
+        "the seating node moved past the boundary"
+    );
+    assert_eq!(
+        refuses.root_hash(),
+        agreed,
+        "the refusing node did not move at all — a stall, not a second registry"
+    );
+}
+
+/// THE REVERSE MISMATCH IS ALSO COMMITTED. A plane's bytes may look loadable to
+/// this binary's module factory, but the committed plane kind means this host
+/// must not ask that factory or seat a local module. Two factories therefore
+/// take the same successful no-op path and keep the same registry root.
+#[test]
+fn a_committed_plane_never_asks_a_local_module_factory() {
+    const RAW: &[u8] = b"plane bytes from the committed reachability plane";
+    let src = MapSource::with(&[]).and_raw(RAW);
+
+    let mut module_runtime = bare_host(false);
+    module_runtime.set_module_factory(Box::new(SeatsAnything));
+    arm(
+        &mut module_runtime,
+        "plane-v1",
+        "plane",
+        modules::Kind::Plane,
+        raw_sha(RAW),
+    );
+
+    let mut wasm_runtime = bare_host(true);
+    arm(
+        &mut wasm_runtime,
+        "plane-v1",
+        "plane",
+        modules::Kind::Plane,
+        raw_sha(RAW),
+    );
+
+    let agreed = module_runtime.root_hash();
+    assert_eq!(wasm_runtime.root_hash(), agreed, "same committed history");
+    realize(&mut module_runtime, H, &src).expect("plane is not a module admission");
+    realize(&mut wasm_runtime, H, &src).expect("plane is not a module admission");
+    assert_eq!(
+        module_runtime.root_hash(),
+        agreed,
+        "module factory was not used"
+    );
+    assert_eq!(
+        wasm_runtime.root_hash(),
+        agreed,
+        "wasm factory was not used"
+    );
+    assert!(module_runtime.module_root("plane").is_none());
+    assert!(wasm_runtime.module_root("plane").is_none());
 }

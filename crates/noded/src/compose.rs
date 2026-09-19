@@ -219,8 +219,10 @@ pub async fn compose(
                 register_new(&mut host, Box::new(module))?;
             }
             // a view seats nothing: the registry entry carries its hash and
-            // the desktop fetches the artifact by that hash.
-            modules::Kind::View => {}
+            // the desktop fetches the artifact by that hash. a plane seats
+            // nothing here either — its artifact is realized off the module
+            // boundary by the node plane that owns it.
+            modules::Kind::View | modules::Kind::Plane => {}
         }
     }
     // Durable stores can have advanced beyond the checkpoint. Its registry
@@ -314,8 +316,9 @@ async fn registry_active_set(host: &Host, height: u64) -> Result<Vec<ActiveCode>
         .into_iter()
         .filter(|entry| match entry.kind {
             modules::Kind::Module => true,
-            // a view is a registry entry with nothing to seat.
-            modules::Kind::View => false,
+            // a view is a registry entry with nothing to seat, and so is a
+            // plane — the node plane that owns it realizes its artifact.
+            modules::Kind::View | modules::Kind::Plane => false,
         })
         .filter_map(|entry| {
             let (hash, seat) = seat_at(&entry, height)?;
@@ -446,9 +449,12 @@ pub async fn wasm_module(
 /// Readiness is "a validator can run what the registry entry IS": for a
 /// `Kind::Module` entry the consensus code (declared shape realizable here),
 /// its optional mapper (matching its eventual index install) and its optional
-/// view; for a `Kind::View` entry the view alone. Either way the frame's tag
-/// must be the entry's kind — a view frame under a module id (or a module
-/// frame under a view id) is a named refusal, never a vote. View validation
+/// view; for a `Kind::View` entry the view alone; for a `Kind::Plane` entry
+/// nothing at all, because the artifact is not this boundary's; the owning
+/// plane supplies the live restore proof separately. For the two the boundary
+/// does realize, the frame's tag must be the entry's kind — a view frame under
+/// a module id (or a module frame under a view id) is a named refusal, never a
+/// vote. View validation
 /// checks strict metadata and the canonical Ice ABI without instantiating or
 /// executing the view; unknown imports follow the desktop host's trap policy,
 /// so static acceptance does not guarantee that instantiation, init, or boot
@@ -460,20 +466,24 @@ pub fn validate_deployment(
     index: &indexer::IndexStore,
 ) -> Result<(), String> {
     workspace_config::validate_module_id(id)?;
-    let artifact = module_artifact::ArtifactRef::decode(bytes)?;
-    match (kind, artifact) {
-        (modules::Kind::Module, module_artifact::ArtifactRef::Module(module)) => {
-            validate_module(id, module, index)
-        }
-        (modules::Kind::View, module_artifact::ArtifactRef::View(view)) => {
-            validate_view(view.component)
-        }
-        (modules::Kind::Module, module_artifact::ArtifactRef::View(_)) => Err(format!(
-            "artifact_kind_mismatch: {id} is registered as a module, but the artifact is a view-only frame"
-        )),
-        (modules::Kind::View, module_artifact::ArtifactRef::Module(_)) => Err(format!(
-            "artifact_kind_mismatch: {id} is registered as a view, but the artifact is a module frame"
-        )),
+    match kind {
+        // a plane's artifact is not a deployment frame, and this boundary
+        // never decodes it: the node plane that owns it realizes it, and only
+        // that plane knows whether its live state can be restored. Static
+        // deployment validation therefore has no answer for a plane.
+        modules::Kind::Plane => Ok(()),
+        modules::Kind::Module => match module_artifact::ArtifactRef::decode(bytes)? {
+            module_artifact::ArtifactRef::Module(module) => validate_module(id, module, index),
+            module_artifact::ArtifactRef::View(_) => Err(format!(
+                "artifact_kind_mismatch: {id} is registered as a module, but the artifact is a view-only frame"
+            )),
+        },
+        modules::Kind::View => match module_artifact::ArtifactRef::decode(bytes)? {
+            module_artifact::ArtifactRef::View(view) => validate_view(view.component),
+            module_artifact::ArtifactRef::Module(_) => Err(format!(
+                "artifact_kind_mismatch: {id} is registered as a view, but the artifact is a module frame"
+            )),
+        },
     }
 }
 
@@ -673,7 +683,11 @@ impl Admissions {
 
 #[async_trait::async_trait(?Send)]
 impl host::ModuleFactory for Admissions {
-    async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<host::Admitted, sdk::Error> {
+    async fn instantiate(
+        &self,
+        id: &str,
+        bytes: &[u8],
+    ) -> Result<Box<dyn sdk::Module>, sdk::Error> {
         let mut stores = crate::bundle::qmdb_stores(&self.context);
         admit(id, bytes, &mut stores, &self.substrates, &self.bindings()).await
     }
@@ -684,34 +698,29 @@ impl host::ModuleFactory for Admissions {
 }
 
 /// one admission of `bytes` under `id`, over the stores and substrates it is
-/// handed: the module seated fresh and initialized, or the answer that the
-/// bytes are another plane's record.
+/// handed: the module seated fresh and initialized, or a refusal. The host
+/// only asks this factory for a committed `Kind::Module`; a foreign artifact
+/// therefore fails closed instead of becoming a binary-local classification.
 async fn admit(
     id: &str,
     bytes: &[u8],
     stores: &mut StoreSource<'_>,
     substrates: &Substrates,
     bindings: &Bindings<'_>,
-) -> Result<host::Admitted, sdk::Error> {
-    // bytes carrying no artifact frame at all are no module: another
-    // plane's record committed through the same id-generic registry. Skip
-    // and latch — a hard error here is a permanent code stall on every
-    // node, for bytes this boundary never owned.
-    let Ok(artifact) = module_artifact::ArtifactRef::decode(bytes) else {
-        return Ok(host::Admitted::ForeignAbi);
-    };
-    // the host never asks this factory for a `Kind::View` entry
-    // (`Host::realize_module_swaps` skips them), so a view frame here is
-    // a module entry whose bytes are no module: fail closed rather than
-    // seat an empty core.
-    let artifact = match artifact {
-        module_artifact::ArtifactRef::Module(module) => module,
-        module_artifact::ArtifactRef::View(_) => {
-            return Err(sdk::Error::module(
-                "artifact_kind_mismatch",
-                format!("{id} is a module entry, but the artifact is a view-only frame"),
-            ));
-        }
+) -> Result<Box<dyn sdk::Module>, sdk::Error> {
+    let artifact = module_artifact::ArtifactRef::decode(bytes).map_err(|error| {
+        sdk::Error::module(
+            "artifact_frame_absent",
+            format!(
+                "{id} is committed as a module, but its bytes carry no artifact frame: {error}"
+            ),
+        )
+    })?;
+    let module_artifact::ArtifactRef::Module(_) = artifact else {
+        return Err(sdk::Error::module(
+            "artifact_kind_mismatch",
+            format!("{id} is a module entry, but the artifact is a view-only frame"),
+        ));
     };
     let seated = wasm_module(
         id,
@@ -724,21 +733,9 @@ async fn admit(
         },
     )
     .await;
-    let refusal = match seated {
-        Ok(module) => return Ok(host::Admitted::Module(Box::new(module))),
-        Err(refusal) => refusal,
-    };
-    // ONLY now: do these bytes even speak the module ABI? A `ducktape:
-    // module` this build refused stays fail-closed (an older binary must
-    // never silently seat a different registry set than its peers); bytes
-    // that are no module at all are another plane's record, and this
-    // boundary is not the plane that realizes them. The extra compile is
-    // paid on the refusal path alone, and the host latches the answer.
-    let is_a_module = wasm_host::speaks_module_abi(artifact.component);
-    match is_a_module {
-        true => Err(sdk::Error::module("module_seat", refusal)),
-        false => Ok(host::Admitted::ForeignAbi),
-    }
+    seated
+        .map(|module| Box::new(module) as Box<dyn sdk::Module>)
+        .map_err(|refusal| sdk::Error::module("module_seat", refusal))
 }
 
 /// the admission the activation boundary will run for `bytes` under `id`,

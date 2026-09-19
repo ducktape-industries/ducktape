@@ -14,15 +14,12 @@
 //! loop — reads it and drives the same `swap_netstack()` conversion the admin
 //! route drives. Nothing here can defer a frame or return `Err` to the drain.
 //!
-//! THE DESIGNATION IS THE PENDING RECORD, AT ITS ACTIVATION HEIGHT. A
-//! `ducktape:netstack` component is not a `ducktape:module`, so no validator's
-//! readiness probe can load it and `ScheduleRegister`'s R = n latch never
-//! closes for it: the entry stays pending, and the pending hash IS what
-//! governance designated. The HEIGHT half of the schedule is honoured
-//! regardless — governance schedules a swap AT a height and the registry's
-//! minimum swap lead exists so every node cuts over on the same block. (The
-//! module boundary skips such a record outright — see
-//! `Host::skip_foreign_admission`.)
+//! THE DESIGNATION IS THE REGISTRY'S CODE-AT ANSWER. A `ducktape:netstack`
+//! component is a `Kind::Plane` record, so the owning plane does not seat it
+//! at the module boundary. Readiness and activation still belong to the
+//! registry: an unready or stale pending hash is not code at any height, and
+//! an armed pending hash wins only at its boundary. (The module boundary skips
+//! such a record outright in `Host::realize_module_swaps`.)
 //!
 //! ONE SWAP PER DESIGNATION — spent by a MACHINE'S ANSWER, not by an attempt.
 //! A backend that refuses the swap (a component built against another
@@ -61,32 +58,6 @@ enum Step {
     Swap([u8; 32]),
 }
 
-/// the code a registry entry designates AT `height`: the scheduled swap once
-/// its activation height is reached, else the code already activated.
-///
-/// GOVERNANCE SCHEDULES A SWAP AT A HEIGHT. The registry's minimum swap lead
-/// exists so every node cuts over on the SAME block; acting on the record the
-/// moment it is committed would cut each node over at whatever block it first
-/// saw it. Below the floor the entry still designates what it activated
-/// before, so a node that restarts mid-schedule converges on the code the
-/// network runs now rather than waiting. An EMPTY answer designates nothing —
-/// an admission that has neither reached its floor nor ever activated.
-///
-/// The same first read [`modules::code_at`] makes, minus the readiness latch:
-/// no validator can ever signal `SwapReady` for a component that is not a
-/// `ducktape:module`, and the reachability plane needs no cross-validator
-/// synchrony (it contributes no root-hash).
-fn designated_code(entry: &modules::ModuleCode, height: u64) -> &[u8] {
-    let scheduled = entry
-        .pending
-        .as_ref()
-        .filter(|pending| height >= pending.activation_height);
-    match scheduled {
-        Some(pending) => &pending.code_hash,
-        None => &entry.active_code_hash,
-    }
-}
-
 /// THE PURE DECISION: the committed registry roster, the committed height, and
 /// the designation this process last acted on → this tick's step. Reads
 /// nothing, writes nothing.
@@ -94,7 +65,10 @@ fn step(modules: &[modules::ModuleCode], height: u64, acted: Option<&[u8; 32]>) 
     let Some(entry) = modules.iter().find(|m| m.module_id == NETSTACK_MODULE_ID) else {
         return Step::Nothing;
     };
-    let Ok(designated) = <[u8; 32]>::try_from(designated_code(entry, height)) else {
+    let Some(code) = modules::code_at(entry, height) else {
+        return Step::Nothing;
+    };
+    let Ok(designated) = <[u8; 32]>::try_from(code) else {
         return Step::Nothing; // absent, or a hash no bytes can ever match.
     };
     let already_answered = acted == Some(&designated);
@@ -144,7 +118,9 @@ fn backend_from_roster(
     else {
         return crate::reachability_plane::netstack_backend();
     };
-    let designated = designated_code(entry, height);
+    let Some(designated) = modules::code_at(entry, height) else {
+        return crate::reachability_plane::netstack_backend();
+    };
     if designated.is_empty() {
         return crate::reachability_plane::netstack_backend();
     }
@@ -160,7 +136,7 @@ fn backend_from_roster(
     })
 }
 
-fn artifact_component(bytes: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn artifact_component(bytes: &[u8]) -> Result<Vec<u8>, String> {
     match module_artifact::Artifact::decode(bytes)? {
         module_artifact::Artifact::Module(artifact) => {
             if artifact.index.is_some() {
@@ -402,7 +378,7 @@ mod tests {
             revision: 2,
             status: reachability::BackendStatus::Running { code_hash: [1; 32] },
         };
-        let roster = vec![entry(Some(answer.hash), &[])];
+        let roster = vec![armed(entry(Some(answer.hash), &[]))];
         assert_eq!(
             step(&roster, ACTIVATION, answer.hash_for(&live)),
             Step::Nothing
@@ -442,13 +418,24 @@ mod tests {
             lanes: Vec::new(),
         });
         let next_hash = blobs.put_chunk(replacement.encode());
-        let scheduled = vec![entry(Some(next_hash), &hash)];
+        let unready = vec![entry(Some(next_hash), &hash)];
+        assert!(matches!(
+            backend_from_roster(&unready, ACTIVATION, &blobs),
+            Ok(reachability::NetstackBackend::Guest { component, .. })
+                if component == b"selected component"
+        ));
+        let scheduled = vec![armed(entry(Some(next_hash), &hash))];
         assert!(
             matches!(backend_from_roster(&scheduled, ACTIVATION - 1, &blobs).unwrap(),
             reachability::NetstackBackend::Guest { component, .. } if component == b"selected component")
         );
         assert!(
             matches!(backend_from_roster(&scheduled, ACTIVATION, &blobs).unwrap(),
+            reachability::NetstackBackend::Guest { component, .. } if component == b"replacement")
+        );
+        let committed = vec![entry(None, &next_hash)];
+        assert!(
+            matches!(backend_from_roster(&committed, ACTIVATION + 1, &blobs).unwrap(),
             reachability::NetstackBackend::Guest { component, .. } if component == b"replacement")
         );
         assert!(backend_from_roster(&[entry(None, &[9; 32])], 0, &blobs).is_err());
@@ -462,7 +449,7 @@ mod tests {
     fn entry(pending: Option<[u8; 32]>, active: &[u8]) -> modules::ModuleCode {
         modules::ModuleCode {
             module_id: NETSTACK_MODULE_ID.into(),
-            kind: modules::Kind::Module,
+            kind: modules::Kind::Plane,
             active_code_hash: active.to_vec(),
             pending: pending.map(|code_hash| modules::ScheduledSwap {
                 name: "netstack-v1".into(),
@@ -471,8 +458,19 @@ mod tests {
                 readiness: Vec::new(),
                 ready_at: None,
             }),
-            history: Vec::new(),
+            history: (!active.is_empty())
+                .then_some(modules::Activation {
+                    height: 0,
+                    code_hash: active.to_vec(),
+                })
+                .into_iter()
+                .collect(),
         }
+    }
+
+    fn armed(mut entry: modules::ModuleCode) -> modules::ModuleCode {
+        entry.pending.as_mut().unwrap().ready_at = Some(0);
+        entry
     }
 
     fn other() -> modules::ModuleCode {
@@ -485,14 +483,14 @@ mod tests {
         }
     }
 
-    /// A pending netstack record IS the designation — it can never arm, since
-    /// no validator's readiness probe can load a component that is not a
-    /// `ducktape:module` — and answering it once is the whole contract: a
-    /// refused component is not re-offered every block, a new designation is.
+    /// A pending netstack record follows the registry readiness latch: an
+    /// unready pending is not selected, while an armed one is selected once.
     #[test]
-    fn one_swap_per_designation_and_the_pending_record_is_the_designation() {
+    fn one_swap_per_designation_uses_the_armed_code_at_answer() {
         let designated = [7; 32];
-        let roster = vec![other(), entry(Some(designated), &[])];
+        let unready = vec![other(), entry(Some(designated), &[])];
+        assert_eq!(step(&unready, ACTIVATION, None), Step::Nothing);
+        let roster = vec![other(), armed(entry(Some(designated), &[]))];
         assert_eq!(step(&roster, ACTIVATION, None), Step::Swap(designated));
         assert_eq!(
             step(&roster, ACTIVATION, Some(&designated)),
@@ -501,7 +499,11 @@ mod tests {
         );
         let next = [8; 32];
         assert_eq!(
-            step(&[entry(Some(next), &[])], ACTIVATION, Some(&designated)),
+            step(
+                &[armed(entry(Some(next), &[]))],
+                ACTIVATION,
+                Some(&designated)
+            ),
             Step::Swap(next),
             "a NEW designation is acted on"
         );
@@ -512,12 +514,8 @@ mod tests {
         );
     }
 
-    /// A SCHEDULED SWAP HAPPENS AT ITS HEIGHT. Governance schedules the cutover
-    /// block (the registry's minimum swap lead exists so every node cuts over
-    /// on the same one); a node that swapped the moment it saw the record
-    /// would cut over at whatever block it first read. Below the floor the
-    /// entry designates what it already activated — a node restarting
-    /// mid-schedule converges on the code the network runs NOW.
+    /// An armed scheduled swap happens at its height, while an unready pending
+    /// never replaces the history even after its floor.
     #[test]
     fn a_scheduled_designation_waits_for_its_activation_height() {
         let scheduled = [7; 32];
@@ -527,8 +525,8 @@ mod tests {
             Step::Nothing,
             "below the activation height the schedule designates nothing yet"
         );
-        assert_eq!(step(&roster, ACTIVATION, None), Step::Swap(scheduled));
-        assert_eq!(step(&roster, ACTIVATION + 1, None), Step::Swap(scheduled));
+        assert_eq!(step(&roster, ACTIVATION, None), Step::Nothing);
+        assert_eq!(step(&roster, ACTIVATION + 1, None), Step::Nothing);
         assert_eq!(
             step(&roster, ACTIVATION + 1, Some(&scheduled)),
             Step::Nothing,
@@ -536,13 +534,24 @@ mod tests {
         );
 
         let running = [3; 32];
-        let replacing = vec![entry(Some(scheduled), &running)];
+        let replacing = vec![armed(entry(Some(scheduled), &running))];
         assert_eq!(
             step(&replacing, ACTIVATION - 1, None),
             Step::Swap(running),
             "before the cutover the entry designates the code already activated"
         );
         assert_eq!(step(&replacing, ACTIVATION, None), Step::Swap(scheduled));
+
+        let armed_entry = armed(entry(Some(scheduled), &[]));
+        assert_eq!(
+            step(&[armed_entry], ACTIVATION - 1, None),
+            Step::Nothing,
+            "an armed pending still waits for its activation boundary"
+        );
+        assert_eq!(
+            step(&[armed(entry(Some(scheduled), &[]))], ACTIVATION, None),
+            Step::Swap(scheduled)
+        );
     }
 
     /// A STALE designation IS REPLACEABLE — the registry lets governance
@@ -556,7 +565,7 @@ mod tests {
         let spent = [7; 32];
         let next = [8; 32];
         const REDESIGNATION: u64 = 40;
-        let mut replaced = entry(Some(next), &[]);
+        let mut replaced = armed(entry(Some(next), &[]));
         replaced.pending.as_mut().expect("pending").activation_height = REDESIGNATION;
         let roster = vec![replaced];
         assert_eq!(

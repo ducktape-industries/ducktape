@@ -67,6 +67,18 @@ pub fn validate_founding_set(
         let file = match kind {
             modules::Kind::Module => workspace_config::component_path(source, &module.id),
             modules::Kind::View => source.join(format!("{}.view.wasm", module.id)),
+            // no founding file carries a plane: a founding entry's kind is its
+            // frame's tag, and no frame tag names a plane, so `artifact_kind`
+            // above never yields one. If one ever arrives here it is a staged
+            // file claiming a kind the founding set cannot carry, and the
+            // founding set refuses rather than found a network around it.
+            modules::Kind::Plane => {
+                return Err(format!(
+                    "{} {}: plane_not_foundable: a plane's artifact is not a founding module file",
+                    source.display(),
+                    module.id
+                ));
+            }
         };
         noded::compose::validate_deployment(&module.id, kind, &module.bytes, &index)
             .map_err(|error| format!("{}: {error}", file.display()))

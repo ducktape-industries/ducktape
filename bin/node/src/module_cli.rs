@@ -88,6 +88,10 @@ pub struct StageArgs {
     /// hash governance votes on covers the lanes as well as the code.
     #[arg(long, value_name = "LANES.JSON")]
     pub lanes: Option<PathBuf>,
+    /// Register the bytes as an artifact realized by another node plane. The
+    /// committed kind is `Plane`, so this boundary never seats the component.
+    #[arg(long)]
+    pub plane: bool,
     /// blocks after the proposal's EXECUTE height (not this node's height
     /// right now) at which the swap activates — the same value for every
     /// member co-signing the same proposal, whatever height each one is at
@@ -247,9 +251,12 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         args.assets.as_deref(),
         args.lanes.as_deref(),
     )?;
-    // the frame says what the entry is: a component makes a module frame, a
-    // view alone a view frame — and the registry entry is registered as that.
-    let kind = noded::compose::artifact_kind(&artifact.encode())?;
+    // the frame says what the entry is, except when another plane owns the
+    // same component bytes and commits the distinction in the registry.
+    let kind = match args.plane {
+        true => modules::Kind::Plane,
+        false => noded::compose::artifact_kind(&artifact.encode())?,
+    };
     // and it says which lanes the deployment asks for, for the same reason.
     let declared_lanes = noded::compose::artifact_lanes(&artifact.encode())?;
     let bytes = artifact.encode();
@@ -514,7 +521,7 @@ fn registry_precheck(
 /// refused ready by every validator and could never activate. `update` asks
 /// nothing: a swap keeps the running module's state and never initializes it
 /// (whether the running module takes the bytes is each validator's readiness
-/// question), and a view entry seats no core.
+/// question), and neither a view entry nor a plane entry seats a core.
 fn check_start(
     verb: Verb,
     kind: modules::Kind,
@@ -522,7 +529,7 @@ fn check_start(
     start: impl FnOnce() -> Result<(), sdk::Error>,
 ) -> Result<(), String> {
     match (verb, kind) {
-        (Verb::Update, _) | (Verb::Register, modules::Kind::View) => Ok(()),
+        (Verb::Update, _) | (Verb::Register, modules::Kind::View | modules::Kind::Plane) => Ok(()),
         (Verb::Register, modules::Kind::Module) => start().map_err(|refusal| {
             format!(
                 "module {id} does not start ({refusal}): every validator would refuse it ready, \
@@ -730,7 +737,9 @@ fn stage_component(
         .header("content-type", "application/octet-stream")
         .body(bytes.to_vec())
         .send()
-        .map_err(|error| crate::node_http::transport_failure(http_base, PATH, &error).to_string())?;
+        .map_err(|error| {
+            crate::node_http::transport_failure(http_base, PATH, &error).to_string()
+        })?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     let refused = !status.is_success();
@@ -918,7 +927,7 @@ fn render_proposed(proposed: &[OpenCodeProposal]) -> String {
     out
 }
 
-/// the `kind` column's width: the longer of its two words.
+/// the `kind` column's width: the longest of its words.
 const KIND_WIDTH: usize = 6;
 
 /// the registry kind as the status row prints it.
@@ -926,6 +935,7 @@ fn kind_word(kind: modules::Kind) -> &'static str {
     match kind {
         modules::Kind::Module => "module",
         modules::Kind::View => "view",
+        modules::Kind::Plane => "plane",
     }
 }
 
@@ -1360,10 +1370,7 @@ mod tests {
         // at the height itself the readiness never latched, so the swap can
         // no longer arm — an operator waiting on `ready 1` waits forever.
         let out = render_status(&modules, 120);
-        assert!(
-            out.contains("cdcdcdcdcdcd  DEAD  activation 120"),
-            "{out}"
-        );
+        assert!(out.contains("cdcdcdcdcdcd  DEAD  activation 120"), "{out}");
         assert!(
             render_status(&modules, 119).contains("ready 1"),
             "a swap still short of its height is in flight"

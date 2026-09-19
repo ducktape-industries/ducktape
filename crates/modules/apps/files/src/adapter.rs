@@ -183,7 +183,7 @@ pub(crate) async fn apply_op<S: ObjectStore>(
                         message,
                         changes,
                     )
-                    .map_err(|e| Error::module("files_commit", e))?;
+                    .map_err(|e| Error::module(e.class(), e.to_string()))?;
                 for notification in notifications {
                     ctx.emit_msg(Msg {
                         target: notification.module_id.clone(),

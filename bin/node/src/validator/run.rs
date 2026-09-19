@@ -227,6 +227,7 @@ pub(super) struct ValidatorLoopState<'a> {
 /// one finished pending-swap code fetch: the digest, and the error if the
 /// bytes did not land.
 type FetchOutcome = super::code_announce::FetchOutcome;
+type PreflightOutcome = super::code_announce::PreflightOutcome;
 
 struct ValidatorRuntime<'a> {
     context: &'a commonware_runtime::tokio::Context,
@@ -342,6 +343,8 @@ struct ValidatorRuntime<'a> {
     /// there, where the attempt counter lives. The sender rides in each task.
     fetch_done_tx: tokio::sync::mpsc::UnboundedSender<FetchOutcome>,
     fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<FetchOutcome>,
+    preflight_done_tx: tokio::sync::mpsc::UnboundedSender<PreflightOutcome>,
+    preflight_done_rx: tokio::sync::mpsc::UnboundedReceiver<PreflightOutcome>,
     next_drain: std::time::SystemTime,
     /// the workspace directory as it was at boot, and the next instant the
     /// drain re-checks it is still there — the fail-stop for a workspace
@@ -507,6 +510,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let code_signaller =
         super::code_announce::CodeReadinessSignaller::new(signer.public_key().as_ref().to_vec());
     let (fetch_done_tx, fetch_done_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (preflight_done_tx, preflight_done_rx) = tokio::sync::mpsc::unbounded_channel();
     // graceful checkpoint on SIGTERM/SIGINT — see `QuitSignals`.
     let mut quit = QuitSignals::install(&label);
     // the diagnostic task dump (#1386): SIGUSR1 never checkpoints or exits —
@@ -618,6 +622,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         code_signaller,
         fetch_done_tx,
         fetch_done_rx,
+        preflight_done_tx,
+        preflight_done_rx,
         next_drain: context.current() + DRAIN_TICK,
         workspace_mark,
         next_workspace_check: context.current() + WORKSPACE_CHECK_INTERVAL,

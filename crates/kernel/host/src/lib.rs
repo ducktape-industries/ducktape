@@ -194,33 +194,18 @@ impl CodeSource for NoCodeSource {
 /// store-backed admission opens its store, and stores open asynchronously.
 #[async_trait::async_trait(?Send)]
 pub trait ModuleFactory: Send + Sync {
-    /// a module instance for `id` from encoded deployment bytes already verified
-    /// against the committed code hash — or [`Admitted::ForeignAbi`] for bytes
-    /// that are no module at all.
-    async fn instantiate(&self, id: &str, component_bytes: &[u8]) -> Result<Admitted, Error>;
+    /// a module instance for `id` from encoded deployment bytes already
+    /// verified against the committed code hash. The committed kind already
+    /// says these bytes are a module, so every failure is an error and the
+    /// boundary stalls closed.
+    async fn instantiate(&self, id: &str, component_bytes: &[u8])
+    -> Result<Box<dyn Module>, Error>;
 
     /// the whole admission [`ModuleFactory::instantiate`] would run for `id`
     /// — `initialize` included — over SCRATCH state, dropped once it answers:
-    /// nothing the node runs or stores is touched. `Ok` for bytes that are no
-    /// module at all, which the boundary skips.
+    /// nothing the node runs or stores is touched. It refuses exactly what
+    /// `instantiate` refuses, so an admission that cannot arm never does.
     fn check(&self, id: &str, component_bytes: &[u8]) -> Result<(), Error>;
-}
-
-/// what a [`ModuleFactory`] made of one admission's verified bytes.
-///
-/// The registry is id-generic bookkeeping: any id may carry a hash-pinned
-/// artifact, and the reachability plane's `ducktape:netstack` guest is
-/// delivered through exactly that record. Only the factory can tell the two
-/// apart, and only it may say so — a refusal that is really "this build cannot
-/// run a genuine module" MUST stay fail-closed, or a node seats a different
-/// registry set than its peers and forks in silence.
-pub enum Admitted {
-    /// a `ducktape:module` component, instantiated and ready to seat.
-    Module(Box<dyn Module>),
-    /// the bytes speak another world entirely: the registry entry is another
-    /// plane's commitment record, not an admission. The module boundary skips
-    /// it — see [`Host::realize_module_swaps`].
-    ForeignAbi,
 }
 
 /// sha256 content hash of deployment bytes — the verify side of a code swap.
@@ -1480,11 +1465,6 @@ enum Realization {
     Swap { module_id: ModuleId, bytes: Vec<u8> },
     /// an ADMISSION: the instantiated module takes its registry seat.
     Seat(Box<dyn Module>),
-    /// another plane's component — latch the decision, register nothing.
-    Foreign {
-        module_id: ModuleId,
-        code_hash: Vec<u8>,
-    },
 }
 
 /// the deterministic state machine: a module registry + dispatch + drain.
@@ -1495,12 +1475,6 @@ pub struct Host {
     /// instantiates post-genesis ADMISSIONS at the activation boundary.
     /// `None` fails closed the moment an admission arms — never before.
     module_factory: Option<Box<dyn ModuleFactory>>,
-    /// `(module id, code hash)` pairs this boundary has already decided are
-    /// [`Admitted::ForeignAbi`] — THE LATCH. Deciding costs a component
-    /// compile and this boundary runs before EVERY block, so the answer (which
-    /// cannot change for a fixed pair) is paid, reported, and skipped from
-    /// then on. Per-node bookkeeping, never part of `root()`.
-    foreign_admissions: BTreeSet<(ModuleId, Vec<u8>)>,
     /// the last [`Host::module_status`] answer and the registry identity it was
     /// read at — see [`RegistryIdentity`]. Per-node bookkeeping, never part of
     /// `root()`.
@@ -1528,7 +1502,6 @@ impl Host {
         Self {
             registry: BTreeMap::new(),
             module_factory: None,
-            foreign_admissions: BTreeSet::new(),
             status_cache: Mutex::new(None),
             committed: (0, 0),
         }
@@ -2019,11 +1992,11 @@ impl Host {
     /// drain turns the `Err` into a retryable code stall that never applies
     /// `height`. ABSENT registry → nothing to reconcile, `Ok(())`.
     ///
-    /// The one thing that is NOT an admission is code that speaks another
-    /// world ([`Admitted::ForeignAbi`]): the registry is id-generic and other
-    /// planes commit their hash-pinned components through it, so such an entry
-    /// is skipped and latched ([`Host::skip_foreign_admission`]) rather than
-    /// halting every block on every node forever.
+    /// A `View` or `Plane` entry is not an admission here: the committed kind
+    /// says another boundary owns it. A `Module` entry is seated or fails
+    /// closed; asking the local factory to classify the bytes would make the
+    /// registry depend on the binary and let two nodes diverge while both
+    /// return `Ok`.
     pub async fn realize_module_swaps(
         &mut self,
         height: u64,
@@ -2038,9 +2011,11 @@ impl Host {
         for m in modules {
             // a view entry has nothing to seat: its artifact is a UI the
             // desktop fetches by the registry's hash, and no core runs here.
+            // a plane entry has nothing to seat HERE either: its artifact is
+            // realized off this boundary by the node plane that owns it.
             match m.kind {
                 modules::Kind::Module => {}
-                modules::Kind::View => continue,
+                modules::Kind::View | modules::Kind::Plane => continue,
             }
             let Some(target) = modules::code_at(&m, height) else {
                 continue; // registered, never activated — nothing to realize.
@@ -2059,12 +2034,6 @@ impl Host {
             };
             if current.as_deref() == Some(target) {
                 continue; // already on the designated code — idempotent no-op.
-            }
-            let decided_foreign = self
-                .foreign_admissions
-                .contains(&(m.module_id.clone(), target.to_vec()));
-            if decided_foreign {
-                continue; // another plane's record, already answered — see the latch.
             }
             let Some(bytes) = src.fetch(target).await else {
                 // the ONE line that precedes the fatal: a fail-closed miss is
@@ -2112,15 +2081,7 @@ impl Host {
                     let Some(factory) = &self.module_factory else {
                         return Err(no_module_factory(&m.module_id));
                     };
-                    let Admitted::Module(module) =
-                        factory.instantiate(&m.module_id, &bytes).await?
-                    else {
-                        realizations.push(Realization::Foreign {
-                            module_id: m.module_id.clone(),
-                            code_hash: target.to_vec(),
-                        });
-                        continue;
-                    };
+                    let module = factory.instantiate(&m.module_id, &bytes).await?;
                     if module.id() != m.module_id {
                         return Err(Error::module(
                             "module_factory_mismatch",
@@ -2164,40 +2125,10 @@ impl Host {
                 Realization::Seat(module) => {
                     self.registry.insert(module.id(), module);
                 }
-                Realization::Foreign {
-                    module_id,
-                    code_hash,
-                } => {
-                    self.skip_foreign_admission(&module_id, &code_hash);
-                }
                 Realization::Swap { .. } => unreachable!("swaps were prepared above"),
             }
         }
         Ok(())
-    }
-
-    /// latch one `(id, code hash)` pair as another plane's record and say so
-    /// ONCE. The registry admits any id: the reachability plane's
-    /// `ducktape:netstack` guest is delivered through the very same record,
-    /// and a boundary that treated it as a module admission would fail closed
-    /// on every node, on every block, forever — a halted chain, not a refused
-    /// swap. The code it commits is realized by whatever plane owns that id
-    /// (netstack: its own non-blocking reconciler), never here.
-    fn skip_foreign_admission(&mut self, module_id: &str, code_hash: &[u8]) {
-        let newly_decided = self
-            .foreign_admissions
-            .insert((module_id.to_string(), code_hash.to_vec()));
-        if !newly_decided {
-            return;
-        }
-        tracing::warn!(
-            target: "ducktape::modules",
-            reason = "foreign_module_abi",
-            module = %module_id,
-            code_hash = %hex32(code_hash),
-            "the code this registry entry commits is not a `ducktape:module` — the module \
-             boundary skips it and keeps sealing"
-        );
     }
 
     /// the current root-hash: [`global_root`] over the registered modules.
