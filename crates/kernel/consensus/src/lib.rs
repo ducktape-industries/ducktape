@@ -1343,6 +1343,10 @@ pub struct SimplexReporter<S> {
     store: ContentStore,
     pending: Arc<PendingProposals>,
     inbox: FinalizedInbox,
+    /// the configured restart floor. Commonware reports this certificate once
+    /// during voter startup; it is already applied by the recovered host and
+    /// must not re-enter the application release gate.
+    floor_view: Option<u64>,
     /// the shared retained-certificate window (see [`RetainedFinalizations`]).
     retained: RetainedFinalizations,
     /// the catch-up fetch seam, wired only via
@@ -1363,11 +1367,13 @@ impl<S> SimplexReporter<S> {
         inbox: FinalizedInbox,
         mailbox: Option<PayloadMailbox>,
         retained: RetainedFinalizations,
+        floor_view: Option<u64>,
     ) -> Self {
         Self {
             store,
             pending,
             inbox,
+            floor_view,
             retained,
             fetcher: PayloadFetcher::new(mailbox),
             _marker: std::marker::PhantomData,
@@ -1391,10 +1397,21 @@ where
         if let Activity::Finalization(finalization) = activity {
             let digest = finalization.proposal.payload;
             let view = finalization.proposal.round.view().get();
+            let is_at_or_below_floor = self.floor_view.is_some_and(|floor| view <= floor);
             // committed: drop it from the pending FIFO so `propose` (peek-only)
             // advances and never re-proposes it (removal is by value — see
             // [`PendingProposals::remove`]).
             self.pending.remove(&digest);
+            // Commonware reports the configured floor once while seeding its
+            // voter. The recovered host already applied this block, and the
+            // checkpoint may have no corresponding payload in this epoch's
+            // fresh store, so do not create application work for it. Keep the
+            // certificate for the next checkpoint's floor bookkeeping.
+            if is_at_or_below_floor {
+                retain_finalization(&self.retained, view, finalization.encode().to_vec());
+                self.store.demote(&digest);
+                return Feedback::Ok;
+            }
             // buffer for the async drain in ascending-view order (deduped). a
             // store HIT resolves NOW (the eager path, unchanged); a MISS with a
             // resolver enabled logs an AWAITING slot and we fetch the bytes —
@@ -1632,12 +1649,16 @@ impl SimplexOrderer {
         let handle = automaton.handle(store.clone());
         let (mailbox, fetch_handle) = fetch.unzip();
         let retained = RetainedFinalizations::default();
+        let floor_view = floor
+            .as_ref()
+            .map(|finalization| finalization.proposal.round.view().get());
         let reporter = SimplexReporter::<S>::new(
             store.clone(),
             automaton.pending(),
             inbox.clone(),
             mailbox,
             retained.clone(),
+            floor_view,
         );
 
         // page cache borrows the pooler context BEFORE we hand a child to Engine.
@@ -2323,6 +2344,125 @@ mod tests {
             newest_finalization_at_or_below(&retained, u64::MAX),
             Some((tip, format!("cert-{tip}").into_bytes()))
         );
+    }
+
+    fn test_finalization(
+        view: u64,
+        frame: &[u8],
+    ) -> commonware_consensus::simplex::types::Finalization<
+        commonware_consensus::simplex::scheme::ed25519::Scheme,
+        Digest,
+    > {
+        use commonware_consensus::simplex::{
+            scheme::ed25519 as simplex_ed25519,
+            types::{Finalize, Proposal},
+        };
+        use commonware_consensus::types::{Epoch, Round, View};
+        use commonware_cryptography::{Signer as _, certificate::Scheme as _, ed25519};
+        use commonware_parallel::Sequential;
+        use commonware_utils::{iter::NonEmpty, ordered::Set};
+
+        let key = ed25519::PrivateKey::from_seed(7);
+        let participants = Set::try_from(vec![key.public_key()]).expect("one participant");
+        let scheme = simplex_ed25519::Scheme::signer(b"floor-reporter-test", participants, key)
+            .expect("signer belongs to the participant set");
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(3), View::new(view)),
+            View::new(view.saturating_sub(1)),
+            digest_of(frame),
+        );
+        let finalize = Finalize::sign(&scheme, proposal.clone()).expect("sign finalization");
+        let certificate = scheme
+            .assemble(
+                NonEmpty::new(finalize.attestation, std::iter::empty()),
+                &Sequential,
+            )
+            .expect("assemble finalization");
+
+        commonware_consensus::simplex::types::Finalization {
+            proposal,
+            certificate,
+        }
+    }
+
+    #[test]
+    fn configured_floor_report_is_not_gated_but_later_finalization_is_delivered() {
+        use std::time::Duration;
+
+        use commonware_consensus::{Reporter as _, simplex::types::Activity};
+        use commonware_cryptography::{Signer as _, ed25519};
+        use commonware_p2p::simulated;
+        use commonware_runtime::{Quota, Runner as _, Supervisor as _, deterministic};
+        use commonware_utils::{NZU32, NZUsize};
+
+        deterministic::Runner::timed(Duration::from_secs(5)).start(|context| async move {
+            let me = ed25519::PrivateKey::from_seed(8).public_key();
+            let (network, oracle) = simulated::Network::new_with_peers(
+                context.child("network"),
+                simulated::Config {
+                    max_size: 1024 * 1024,
+                    disconnect_on_block: true,
+                    max_peers_per_set: NZUsize!(8),
+                    tracked_peer_sets: NZUsize!(1),
+                },
+                vec![me.clone()],
+            )
+            .await;
+            network.start();
+
+            let fetch = oracle
+                .control(me.clone())
+                .register(0, Quota::per_second(NZU32!(128)))
+                .await
+                .expect("register resolver fetch");
+            let store = ContentStore::new();
+            let inbox = FinalizedInbox::new();
+            let retained = RetainedFinalizations::default();
+            let (mailbox, fetch_handle) = spawn_payload_fetch(
+                &context,
+                oracle.control(me.clone()),
+                oracle.manager(),
+                me,
+                store.clone(),
+                inbox.clone(),
+                fetch,
+            );
+            let mut reporter =
+                SimplexReporter::<commonware_consensus::simplex::scheme::ed25519::Scheme>::new(
+                    store.clone(),
+                    Arc::new(PendingProposals::default()),
+                    inbox.clone(),
+                    Some(mailbox),
+                    retained.clone(),
+                    Some(9),
+                );
+
+            let floor = test_finalization(9, b"checkpointed floor");
+            reporter.report(Activity::Finalization(floor.clone()));
+            assert_eq!(
+                inbox.min_unreleased_view(),
+                None,
+                "the configured floor must not create an awaiting application slot"
+            );
+            assert_eq!(
+                newest_finalization_at_or_below(&retained, 9),
+                Some((9, floor.encode().to_vec())),
+                "the floor certificate remains available for checkpointing"
+            );
+
+            let later_bytes = b"later finalized frame".to_vec();
+            let later_digest = store.put(later_bytes.clone());
+            let later = test_finalization(10, &later_bytes);
+            assert_eq!(later.proposal.payload, later_digest);
+            reporter.report(Activity::Finalization(later));
+            assert_eq!(
+                inbox.drain(),
+                vec![(10, later_bytes)],
+                "a later finalization still reaches ordered application delivery"
+            );
+
+            fetch_handle.abort();
+        });
     }
 
     #[test]

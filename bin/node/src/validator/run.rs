@@ -752,6 +752,25 @@ impl ValidatorRuntime<'_> {
     }
 }
 
+fn shutdown_floor_cert(
+    epoch: u64,
+    view: u64,
+    cert: Vec<u8>,
+    min_unreleased_view: Option<u64>,
+    height: u64,
+) -> Option<recovery::FloorCert> {
+    let view_is_persistable = view != 0;
+    let gate_is_drained = min_unreleased_view.is_none_or(|pending| pending > view);
+    if !view_is_persistable || !gate_is_drained {
+        return None;
+    }
+    Some(recovery::FloorCert {
+        epoch,
+        height,
+        cert,
+    })
+}
+
 /// best-effort: a failure here is just the crash path, which also recovers.
 async fn graceful_checkpoint(
     node: &mut ValidatorNode,
@@ -761,6 +780,27 @@ async fn graceful_checkpoint(
     let Some(f) = node.finalized() else {
         return ShutdownCheckpoint::Skipped("nothing_finalized");
     };
+    // The manifest and this floor are one recovery boundary: without the
+    // floor, a clean restart re-reports already-applied journal history into
+    // an empty content store and can wedge the ordered release gate.
+    let floor_cert = node.finalized_view().and_then(|tip_view| {
+        let finalization = node.orderer().finalization_at_or_below(tip_view);
+        let min_unreleased_view = node.orderer().min_unreleased_view();
+        finalization.and_then(|(view, cert)| {
+            shutdown_floor_cert(
+                orchestrator.epoch(),
+                view,
+                cert,
+                min_unreleased_view,
+                orchestrator.app_height(view),
+            )
+        })
+    });
+    if let Some(floor_cert) = floor_cert
+        && node.sink_mut().write_floor_cert(&floor_cert).await.is_err()
+    {
+        return ShutdownCheckpoint::Skipped("floor_write_failed");
+    }
     let pos = node.sink_mut().oplog_pos().await;
     let captured = Manifest::capture(
         node.host(),
@@ -788,5 +828,26 @@ async fn graceful_checkpoint(
     match node.sink_mut().write_manifest(&manifest).await {
         Ok(()) => ShutdownCheckpoint::Written,
         Err(_) => ShutdownCheckpoint::Skipped("write_failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shutdown_floor_cert;
+
+    #[test]
+    fn shutdown_floor_requires_a_fully_drained_non_genesis_view() {
+        let cert = vec![7, 8, 9];
+
+        assert_eq!(
+            shutdown_floor_cert(3, 737, cert.clone(), None, 3129).map(|floor| (
+                floor.epoch,
+                floor.height,
+                floor.cert
+            )),
+            Some((3, 3129, cert.clone()))
+        );
+        assert!(shutdown_floor_cert(3, 0, cert.clone(), None, 3129).is_none());
+        assert!(shutdown_floor_cert(3, 737, cert, Some(737), 3129).is_none());
     }
 }
