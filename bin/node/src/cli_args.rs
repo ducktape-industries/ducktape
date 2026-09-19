@@ -1001,13 +1001,14 @@ mod tests {
         };
         assert_eq!(name, "my-team");
         for (bad, reason) in [
-            ("My Team", "[uppercase]"),
-            ("my team", "[authority_incomplete]"),
+            ("My Team", "carries an uppercase letter"),
+            ("my team", "`my team#00000000` is not one"),
         ] {
             let Err(refused) = parse(&["probe", "init", "--name", bad]) else {
                 panic!("{bad:?} parsed");
             };
             let refused = refused.to_string();
+            assert!(refused.contains("[invalid_input]"), "{bad:?}: {refused}");
             assert!(refused.contains(reason), "{bad:?}: {refused}");
         }
     }

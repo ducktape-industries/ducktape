@@ -50,7 +50,7 @@ fn a_lost_claim_race_fails_deterministically() {
     assert_eq!(code, 400, "lost claim must be rejected: {reply}");
     let error = reply["error"].as_str().unwrap_or_default();
     assert!(
-        error.contains("job not claimable (status Processing)"),
+        error.contains("wrong_state: job not claimable (status processing)"),
         "rejection names the committed status: {error}"
     );
 
@@ -84,7 +84,7 @@ fn an_expired_lease_reclaims_exactly_past_its_deadline() {
     // still seals a block, so it advances the clock to height 3).
     let error = sim.submit_rejected("tasks", reclaim.clone(), Some("scavenger"));
     assert!(
-        error.contains("lease not expired"),
+        error.contains("not_yet: the lease on job j1 runs through height 12 (now 3)"),
         "early reclaim: {error}"
     );
 
@@ -99,7 +99,7 @@ fn an_expired_lease_reclaims_exactly_past_its_deadline() {
     } // heights 4..=11 — the next op executes at 12 == deadline
     let error = sim.submit_rejected("tasks", reclaim.clone(), Some("scavenger"));
     assert!(
-        error.contains("lease not expired (height 12 <= deadline 12)"),
+        error.contains("not_yet: the lease on job j1 runs through height 12 (now 12)"),
         "boundary reclaim: {error}"
     );
 
@@ -170,13 +170,13 @@ fn a_matching_post_fires_its_rule_atomically_in_the_same_block() {
     );
     let fired_at = receipt["height"].as_u64().expect("receipt height");
 
-    // the task id is deterministic per (prefix, channel, seq) — m-2 is seq 2.
+    // the task id is deterministic per (prefix, rule, channel, seq) — m-2 is seq 2.
     let tasks = sim.query(
         "tasks",
         serde_json::json!({ "task": { "list": { "limit": 256 } } }),
     );
     assert_eq!(
-        tasks["task"]["tasks"][0]["id"], "auto-general-2",
+        tasks["task"]["tasks"][0]["id"], "auto-r1-general-2",
         "tasks: {tasks}"
     );
     assert_eq!(tasks["task"]["tasks"][0]["title"], "deploy requested");
