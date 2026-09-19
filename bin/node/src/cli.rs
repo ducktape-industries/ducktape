@@ -921,6 +921,25 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The refusal a front NOBODY off this box can dial earns a mint. The
+/// operator named no tunnel address, so `wireguard_advertised = "auto"`
+/// reused the p2p hint and landed on loopback: every stranger handed that
+/// invite resolves it to their OWN machine and fails ninety seconds later,
+/// with nothing in the blob to say why. So the credential is refused instead
+/// of printed, and the refusal names the one line that fixes it.
+///
+/// A loopback the operator WROTE is untouched — a same-box joiner is a real
+/// shape, and this only ever fires on an address the node chose itself.
+fn derived_loopback_refusal(host: &str, port: u16) -> String {
+    format!(
+        "reason=invite_front_derived_loopback nothing in node.toml names this node's tunnel \
+         address, so wireguard_advertised = \"auto\" fell back to {host} — a loopback address \
+         that sends every joiner to their own machine, so nobody off this box could redeem the \
+         invite. Set wireguard_advertised = \"<routable host>:{port}\" in node.toml (or pass \
+         --wireguard-advertised to node init/join) and mint again."
+    )
+}
+
 /// The refusal a dead reachability plane earns a mint, on either side of the
 /// node boundary: one sentence, so the daemon route and the CLI cannot say
 /// different things about the same fact.
@@ -1117,6 +1136,25 @@ pub(crate) fn mint_invite_blob(
     let mut notes = Vec::new();
     let cfg_path = cfg_path.to_path_buf();
     let (raw, base) = config::load_node_toml(&cfg_path)?;
+    // the front is settled HERE, for the same reason the expiry is: a mint
+    // that is not going to happen must not first rewrite the descriptor
+    // below. It is also the one computation of the front — the bootstrap
+    // further down reads this value rather than deriving a second one.
+    let wg_listen: std::net::SocketAddr = raw
+        .wireguard_listen
+        .parse()
+        .map_err(|e| format!("wireguard_listen: {e}"))?;
+    let front = config::invite_front(
+        Some(&raw.advertised),
+        &raw.listen,
+        wg_listen,
+        raw.wireguard_advertised_value(),
+    )?;
+    if let Some(front) = &front {
+        if front.is_derived_loopback() {
+            return Err(derived_loopback_refusal(&front.host, wg_listen.port()).into());
+        }
+    }
     let descriptor_path = base.join(&raw.network);
     let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
     let key = config::load_identity(&base.join(&raw.key_file))?;
@@ -1139,10 +1177,6 @@ pub(crate) fn mint_invite_blob(
     // tunnel routes. the bootstrap is mandatory (the overlay plane
     // carries the data planes and the sealed first-contact intro) — and the
     // network shape always runs the plane (`wireguard_listen` is required).
-    let wg_listen: std::net::SocketAddr = raw
-        .wireguard_listen
-        .parse()
-        .map_err(|e| format!("wireguard_listen: {e}"))?;
     let wireguard = {
         let (wg_keypair, _) =
             reachability::WireGuardKeypair::load_or_generate(&base.join("wireguard.key"))
@@ -1154,25 +1188,9 @@ pub(crate) fn mint_invite_blob(
             .map_err(|e| format!("listen {:?}: {e}", raw.listen))?;
         // a config that NAMES no dialable host mints an endpoint-less
         // bootstrap — never a refusal. Only a config that is WRONG still
-        // aborts the mint (`endpoint_host`'s `Err`).
-        let host = config::endpoint_host(
-            Some(&raw.advertised),
-            &raw.listen,
-            wg_listen,
-            raw.wireguard_advertised_value(),
-        )?;
-        // the tunnel endpoint carries the FULL advertised host:port when
-        // `wireguard_advertised` is configured — the external port can
-        // differ from the bind port in the port-forwarded setup the key
-        // exists for. The intro stays host + intro port.
-        let endpoint = config::invite_wireguard_endpoint(
-            Some(&raw.advertised),
-            &raw.listen,
-            wg_listen,
-            raw.wireguard_advertised_value(),
-        )?;
-        match host.zip(endpoint) {
-            Some((host, endpoint)) => {
+        // aborts the mint (`invite_front`'s `Err`, settled above).
+        match front {
+            Some(config::InviteFront { host, endpoint, .. }) => {
                 let intro_port =
                     config::resolved_invite_listen(Some(&raw.invite_listen), wg_listen)?.port();
                 config::InviteWireGuard {
@@ -3234,10 +3252,16 @@ mod tests {
     }
 
     /// A founder workspace on disk, complete enough for `mint_invite_blob`:
-    /// node.toml, the descriptor it names, and an identity. `advertised` is
-    /// the one value under test; the rest is the shape `node init` writes on
-    /// a single box (unspecified binds, no coordinator).
-    fn founder_workspace(name: &str, advertised: &str) -> std::path::PathBuf {
+    /// node.toml, the descriptor it names, and an identity. `advertised` and
+    /// `wireguard_advertised` are the values under test (`"auto"` is what
+    /// `node init` writes when the operator names no tunnel address); the
+    /// rest is the shape `node init` writes on a single box (unspecified
+    /// binds, no coordinator).
+    fn founder_workspace(
+        name: &str,
+        advertised: &str,
+        wireguard_advertised: &str,
+    ) -> std::path::PathBuf {
         use super::config;
         use commonware_cryptography::Signer as _;
 
@@ -3255,7 +3279,7 @@ mod tests {
                  storage_dir = \"storage\"\nhttp_listen = \"127.0.0.1:0\"\n\
                  gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"127.0.0.1:0\"\n\
                  wireguard_listen = \"0.0.0.0:52333\"\ninvite_listen = \"0.0.0.0:52334\"\n\
-                 wireguard_advertised = \"auto\"\nprimary_coordinator = \"none\"\n\
+                 wireguard_advertised = {wireguard_advertised:?}\nprimary_coordinator = \"none\"\n\
                  coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n"
             ),
         )
@@ -3294,16 +3318,50 @@ mod tests {
             notes.iter().map(super::InviteNote::reason).collect()
         };
 
-        let overlay = founder_workspace("overlay", "overlay");
+        let overlay = founder_workspace("overlay", "overlay", "auto");
         assert!(
             reasons(&overlay).contains(&"invite_not_dialable_off_box"),
             "a blob that reaches this machine only says so"
         );
 
-        let dialable = founder_workspace("dialable", "127.0.0.1:52330");
+        // the same single-box shape, with the tunnel address the operator
+        // writes for it. A loopback front they NAMED is a working same-box
+        // invite, so it mints exactly as before — and an endpoint that IS
+        // named leaves nothing to note.
+        let dialable = founder_workspace("dialable", "127.0.0.1:52330", "127.0.0.1:52333");
         assert!(
             !reasons(&dialable).contains(&"invite_not_dialable_off_box"),
             "an advertised host IS the endpoint — nothing to note"
         );
+    }
+
+    /// The mint end of [`config::InviteFront::is_derived_loopback`]: the
+    /// founder `node init` writes on a single box names no tunnel address,
+    /// so `auto` reuses the loopback p2p hint — and `node invite` refuses by
+    /// name instead of printing a credential no stranger can redeem. The
+    /// blob is the `Ok` payload, so a refusal IS "no blob printed", and
+    /// `cmd_invite` returns the error as a non-zero exit.
+    ///
+    /// Naming the front — either key — mints it, loopback and all.
+    #[test]
+    fn a_derived_loopback_front_refuses_the_mint_and_a_named_one_still_mints() {
+        let derived = founder_workspace("derived-loopback", "127.0.0.1:52330", "auto");
+        let Err(refusal) = super::mint_invite_blob(&derived.join("node.toml"), 7) else {
+            panic!("a front nobody off this box can dial is refused, never printed");
+        };
+        let refusal = refusal.to_string();
+        assert!(
+            refusal.contains("reason=invite_front_derived_loopback"),
+            "the refusal names itself: {refusal}"
+        );
+        assert!(
+            refusal.contains("wireguard_advertised = \"<routable host>:52333\""),
+            "the refusal names the one line that fixes it, at the bind port: {refusal}"
+        );
+
+        let named = founder_workspace("named-loopback", "127.0.0.1:52330", "127.0.0.1:52333");
+        let (blob, _) = super::mint_invite_blob(&named.join("node.toml"), 7)
+            .expect("a loopback front the operator wrote still mints");
+        assert!(!blob.is_empty(), "the same-box joiner's invite is real");
     }
 }
