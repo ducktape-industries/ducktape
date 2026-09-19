@@ -152,9 +152,13 @@ sudo usermod -aG kvm ducktape
 sudo install -d -o ducktape -g ducktape -m 0700 /var/lib/ducktape
 
 # 3. The founding set, beside the binary: what `node init --modules` composes
-#    the genesis from, and what the first release carries.
+#    the genesis from, and what the first release carries. The whole directory
+#    goes across, dotfiles included — the wasm, the `.staged-by` stamp naming
+#    the build that staged the set, the `<id>.lanes` files and the
+#    `<id>.assets` directories. A node whose set lost the stamp refuses to
+#    boot.
 sudo install -d -m 0755 /usr/local/lib/ducktape/modules
-sudo cp ~/.cargo/bin/modules/*.wasm /usr/local/lib/ducktape/modules/
+sudo cp -R ~/.cargo/bin/modules/. /usr/local/lib/ducktape/modules/
 sudo chmod -R a+rX /usr/local/lib/ducktape/modules
 
 # 4. Units and log rotation.

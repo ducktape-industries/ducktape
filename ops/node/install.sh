@@ -167,18 +167,22 @@ sudo_run install -d -o ducktape -g ducktape -m 0700 "$DUCK_HOME"
 
 # the founding set the service user founds from (`node init --modules`) and
 # the first release carries beside its binary (the netstack guest a node
-# reads at boot): every <id>.component.wasm, every <id>.index.wasm,
-# netstack.component.wasm.
+# reads at boot). It is more than the wasm: every <id>.component.wasm, every
+# <id>.index.wasm and netstack.component.wasm, the `.staged-by` stamp naming
+# the build that staged the set, every <id>.lanes file and every <id>.assets
+# directory. The whole directory goes across, dotfiles included — a node that
+# founds from a set missing the stamp refuses to boot, because a set no build
+# claims is a set this binary cannot show it was built with.
 log "3/7 founding set"
 sudo_run install -d -m 0755 "$MODULES_DIR"
 if [ "$DRY_RUN" = 1 ]; then
-  run bash -c "sudo cp '$MODULES_SRC'/*.wasm '$MODULES_DIR/'"
+  run bash -c "sudo cp -R '$MODULES_SRC'/. '$MODULES_DIR/'"
 else
   shopt -s nullglob
   wasm_files=("$MODULES_SRC"/*.wasm)
   shopt -u nullglob
   [ "${#wasm_files[@]}" -gt 0 ] || die "no .wasm files in $MODULES_SRC (make install-node or the archive should have carried them)"
-  sudo cp "${wasm_files[@]}" "$MODULES_DIR/"
+  sudo cp -R "$MODULES_SRC"/. "$MODULES_DIR/"
 fi
 sudo_run chmod -R a+rX "$MODULES_DIR"
 
