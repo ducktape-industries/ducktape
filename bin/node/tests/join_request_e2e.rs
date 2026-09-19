@@ -93,14 +93,14 @@ fn a_tokened_join_redeems_itself_into_a_full_node() {
 /// A joiner seated by a validator promoted AFTER genesis gets a coordinator
 /// cap that a private coordinator admits. The founder rotates out first, so
 /// the promoted friend is the only validator left to seat the third party:
-/// its cap's issuer is in no genesis set, and the coordinator admits the
-/// third party's rendezvous only because it follows the network's CURRENT
-/// validator set off a node.
+/// its cap's issuer is in no genesis set, and the coordinator — pinned to the
+/// genesis set alone, dialing no node — admits the third party's rendezvous
+/// because the cap carries the friend's own cap, which the founder signed.
 #[test]
 fn a_joiner_seated_by_a_promoted_validator_rendezvouses_through_a_private_coordinator() {
     let mut cluster = NetworkShapeCluster::new();
 
-    cluster.init_founder("coord-follows-valset");
+    cluster.init_founder("coord-cap-chain");
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
     let founder_key =
@@ -152,50 +152,40 @@ fn a_joiner_seated_by_a_promoted_validator_rendezvouses_through_a_private_coordi
         friend_key,
         "the promoted friend minted the cap"
     );
+    let parent = cap
+        .parent
+        .as_deref()
+        .expect("minted under the friend's own cap");
+    assert_eq!(
+        common::hex(parent.issuer.as_ref()),
+        founder_key,
+        "the founder rooted the chain when it seated the friend"
+    );
     let signer = workspace_config::load_identity(&workspace.join("identity.key"))
         .expect("the third party's identity");
     assert_eq!(common::hex(signer.public_key().as_ref()), third_key);
     let subject = nat_traversal::NodeKey(signer.public_key().as_ref().try_into().unwrap());
 
     // the private coordinator an operator runs for this network: pinned to
-    // the founder's network.toml, following the friend's node.
+    // the founder's network.toml alone — it reads nothing off any node.
     let founder_toml = cluster.founder_dir.join("network.toml");
     let args = [
         "--genesis-set".to_string(),
         founder_toml.to_str().expect("utf-8 path").to_string(),
-        "--valset-node".to_string(),
-        format!("http://127.0.0.1:{}", cluster.http_ports[1]),
     ];
     let policy = coordinator_bin::select_policy(&args).expect("a private policy");
-    let node = coordinator_bin::valset_node(&args)
-        .expect("a valid --valset-node")
-        .expect("--valset-node is set");
-    let nat_traversal::AuthPolicy::Private { genesis_set, live } = &policy else {
+    let nat_traversal::AuthPolicy::Private { genesis_set } = &policy else {
         panic!("--genesis-set selects the private policy");
     };
     assert!(
         !genesis_set.contains(&cap.issuer),
         "the issuer is no genesis validator"
     );
-    // pinned to genesis alone, the coordinator refuses this cap: the defect.
-    let now = nat_traversal::now_secs();
-    let auth = nat_traversal::sign_authenticator(&signer, b"bind", now, Some(cap.clone()));
-    assert_eq!(
-        nat_traversal::verify_request(&policy, now, 30, subject, b"bind", &auth),
-        Err(nat_traversal::AuthError::NotAdmitted),
-        "a genesis-only coordinator refuses a promoted validator's cap"
-    );
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
-        // one read of the friend's committed set over its open query lane...
-        let read = coordinator_bin::refresh(&node, live)
-            .await
-            .expect("the friend's node serves its validator set");
-        assert_eq!(common::hex(read[0].as_ref()), friend_key);
-
-        // ...and the third party's own rendezvous, with its own key and the
-        // cap it was delivered, is admitted.
+        // the third party's own rendezvous, with its own key and the cap
+        // chain it was delivered, is admitted.
         let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("bind the coordinator");

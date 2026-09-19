@@ -967,6 +967,18 @@ fn run_node(
             // THE PROMOTION SEAT: the park loop returned the baton — the
             // validator role continues INSIDE this process, over the mesh
             // and planes the parked role already runs.
+            // the cap that admits this node arrives with its admission, which
+            // can postdate boot: read it now, so the seat presents it at a
+            // private coordinator and mints joiners' caps under it.
+            let coord_cap = config::load_coord_cap(&workspace).unwrap_or_else(|error| {
+                tracing::warn!(
+                    target: "ducktape::join",
+                    %error,
+                    reason = "coord_cap_unreadable",
+                    "the promoted seat runs without a coordinator capability"
+                );
+                None
+            });
             validator::run_promoted(
                 baton,
                 oracle,

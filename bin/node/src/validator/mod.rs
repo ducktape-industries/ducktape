@@ -150,7 +150,7 @@ pub(crate) async fn run_validator(
         primary_coordinator,
         wireguard_advertised,
         invite_listen,
-        coord_cap,
+        coord_cap.clone(),
         presence_requests,
         overlay_slot.clone(),
         planes.clone(),
@@ -420,6 +420,7 @@ pub(crate) async fn run_validator(
         status,
         status_public_key,
         coordination,
+        coord_cap,
         workspace: gateway_workspace,
     })
     .await;
@@ -831,6 +832,7 @@ pub(crate) async fn run_promoted(
         status,
         status_public_key,
         coordination,
+        coord_cap,
         workspace,
     })
     .await;

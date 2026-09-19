@@ -217,6 +217,9 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) status: noded::StatusCell,
     pub(super) status_public_key: String,
     pub(super) coordination: crate::config::Coordination,
+    /// the cap that admits this node at a private coordinator — the parent a
+    /// non-genesis validator mints a joiner's cap under.
+    pub(super) coord_cap: Option<nat_traversal::CoordCap>,
     /// where a SIGUSR1 task dump lands (`<workspace>/tasks.txt`).
     pub(super) workspace: std::path::PathBuf,
 }
@@ -268,6 +271,9 @@ struct ValidatorRuntime<'a> {
     status: noded::StatusCell,
     status_public_key: String,
     coordination: crate::config::Coordination,
+    /// the genesis set: a validator in it roots a joiner's coordinator cap.
+    genesis_validators: Vec<ed25519::PublicKey>,
+    coord_cap: Option<nat_traversal::CoordCap>,
     /// where a SIGUSR1 task dump lands, and the directory the drain's
     /// workspace guard re-stats.
     workspace: std::path::PathBuf,
@@ -395,6 +401,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         status,
         status_public_key,
         coordination,
+        coord_cap,
         workspace,
     } = state;
     let mut rpc_ingress = rpc_ingress;
@@ -578,6 +585,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         status,
         status_public_key,
         coordination,
+        genesis_validators: validators,
+        coord_cap,
         workspace,
         next_ops_refresh: context.current(),
         expected,

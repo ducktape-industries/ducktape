@@ -1,7 +1,7 @@
 //! The policy selector maps CLI flags to the right `AuthPolicy` variant, and
 //! `--genesis-set` reads the PUBLIC valset out of a real `network.toml`.
 
-use coordinator_bin::{select_policy, valset_node};
+use coordinator_bin::select_policy;
 use nat_traversal::AuthPolicy;
 
 use commonware_cryptography::{Signer as _, ed25519};
@@ -83,34 +83,6 @@ fn genesis_set_with_no_value_is_a_hard_error_not_a_downgrade() {
         "0.0.0.0:1".into(),
     ])
     .unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-}
-
-#[test]
-fn valset_node_is_private_mode_only_and_never_value_less() {
-    // following a node's validators means nothing to a public coordinator:
-    // a hard error, never a silently ignored flag.
-    let err = select_policy(&["--valset-node".into(), "http://127.0.0.1:8844".into()]).unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-
-    let a = ed25519::PrivateKey::from_seed(1).public_key();
-    let (_dir, path) = network_toml(&format!("validators = [\"{}\"]\n", hex(a.as_ref())));
-    let following = [
-        "--genesis-set".to_string(),
-        path,
-        "--valset-node".into(),
-        "http://127.0.0.1:8844".into(),
-    ];
-    assert!(matches!(
-        select_policy(&following).unwrap(),
-        AuthPolicy::Private { .. }
-    ));
-    assert!(valset_node(&following).unwrap().is_some());
-    assert!(valset_node(&following[..2]).unwrap().is_none());
-
-    let err = valset_node(&["--valset-node".into()]).unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    let err = valset_node(&["--valset-node".into(), "127.0.0.1:8844".into()]).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
 

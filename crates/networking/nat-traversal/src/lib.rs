@@ -30,7 +30,7 @@ pub use advert::{
 };
 pub use auth::{
     AuthError, AuthPolicy, Authenticator, COORD_CAP_NS, COORD_CAP_TTL_SECS, COORD_REQ_NS, CoordCap,
-    DEFAULT_FRESHNESS_WINDOW_SECS, LIVE_VALSET_TTL_SECS, LiveValset, mint_coord_cap, now_secs,
+    DEFAULT_FRESHNESS_WINDOW_SECS, MAX_CAP_CHAIN, delegate_coord_cap, mint_coord_cap, now_secs,
     sign_authenticator, verify_request,
 };
 #[cfg(feature = "runtime")]
