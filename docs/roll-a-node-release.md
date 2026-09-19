@@ -129,6 +129,15 @@ no `netstack.component.wasm`, or carries no `.staged-by` record for the binary b
 The printed file name is for the eye. The published name is derived from the
 archive's own sha256 by `app_update::layout`.
 
+Before a network receives its first designation, move every fresh-install kit
+or download to this same archive. Treat that installer change and the first
+designation as one rollout: `ops/node/install.sh --archive` seeds a new
+member's launcher from the archive it is given, and a member seeded from an
+older archive can observe the designation before its first join has produced a
+checkpoint to qualify. Existing members already have a checkpoint; this rule
+is about the archive handed to members joining after the channel becomes
+active.
+
 ## 2. Publish it
 
 ```
