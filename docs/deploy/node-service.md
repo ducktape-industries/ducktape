@@ -93,8 +93,8 @@ owned by the `ducktape` user), so under them the layout is:
 
 A node reads its founding set beside its own binary, so under the launcher it
 reads `current/modules/`, and a release flip moves the binary and its set
-together. The units set no `DUCKTAPE_MODULES_DIR`: a directory named there
-would outrank the set each later release brings.
+together. The units do not override that lookup, so each later release's set
+stays paired with its binary.
 
 ### What grows, and what nothing prunes
 
@@ -124,7 +124,7 @@ alias dt='sudo -u ducktape env DUCKTAPE_HOME=/var/lib/ducktape /usr/local/bin/du
 
 ## Install
 
-`ops/node/install.sh --workspace <name> (--init | --join <invite>)` runs
+`ops/node/install.sh --workspace <name> (--init | --join-file <file>)` runs
 steps 1-7 below end to end (`--dry-run` prints the commands without touching
 the host); the steps are spelled out here for anyone auditing or adapting them.
 `<name>` is a chain id or a unique prefix of one; the script resolves it to
@@ -134,6 +134,10 @@ which carries `ducktape`, `ducktape-node-launcher`, `modules/` and
 `release.json`) instead of step 1's build: it unpacks it with `zstd`, installs
 both binaries and `release.json` into `/usr/local/lib/ducktape`, and step 3
 copies the archive's `modules/`.
+
+The first designation and the archive handed to fresh installers move
+together; follow the [node release runbook](../roll-a-node-release.md) for
+that ordering.
 
 ```sh
 # 1. Build ducktape and its launcher (make install-node puts both in
@@ -171,8 +175,9 @@ sudo systemctl daemon-reload
 #    before genesis) joins with the founder's `<workspace>/genesis`; a
 #    resident fetches it off the mesh at first boot.
 dt node init --name mynet --modules /usr/local/lib/ducktape/modules   # founder
-dt node join '<invite blob>'                                    # ...or a resident
-dt node join '<invite blob>' --genesis /path/to/founders/genesis # ...or a member
+INVITE_FILE=/secure/path/mynet.invite                         # mode 0600
+dt node join < "$INVITE_FILE"                                 # ...or a resident
+dt node join --genesis /path/to/founders/genesis < "$INVITE_FILE" # ...or a member
 dt node list                              # the chain id the instance names
 
 # 6. Seed the first release under the launcher — ONCE: after this the
@@ -188,6 +193,17 @@ sudo install -d -m 0755 /etc/ducktape
 echo "DUCKTAPE_WORKSPACE=\"$W\"" | sudo tee /etc/ducktape/workspace.env
 
 # 7. Enable and start (next section).
+```
+
+For a fresh Linux host, distribute the single-use invite as a 0600 file and
+install from the archive that matches the first designation:
+
+```sh
+INVITE_FILE=/secure/path/mynet.invite
+install -m 0600 /path/to/fresh-invite "$INVITE_FILE"
+ops/node/install.sh --archive MATCHING_ARCHIVE --workspace mynet \
+  --join-file "$INVITE_FILE"
+# add --genesis /path/to/founders/genesis for an admitted member
 ```
 
 `node join` ends on the same instruction for a hand-run node: the two
@@ -429,7 +445,7 @@ The workspace must already be under the launcher — founded or joined as
 yourself, then seeded once:
 
 ```sh
-ducktape node join '<invite>'             # or `ducktape node init --name mynet`
+ducktape node join < "$INVITE_FILE"       # or `ducktape node init --name mynet`
 # --from: the `ducktape` of an unpacked node release, `modules/` beside it
 ducktape-node-launcher install --workspace ~/.ducktape/<chain-id> \
   --config ~/.ducktape/<chain-id>/node.toml --from <release dir>/ducktape
@@ -528,12 +544,13 @@ reads the same on both platforms.
 
 Defaults from `crates/workspace-config/src/node_toml.rs`, written into
 `node.toml` by `init`/`join` and overridable with the plumbing flags
-(`--listen`, `--http`, `--rpc`, `--wireguard-listen`, `--invite-listen`):
+(`--listen`, `--http`, `--rpc`, `--wireguard-listen`,
+`--wireguard-advertised`, `--invite-listen`):
 
 | Plane | Default | Proto | Inbound rule? |
 | --- | --- | --- | --- |
 | p2p control mesh (`listen`) | `[::]:8846` | TCP | **Yes** for a node others dial directly (a founder, a `Direct`-hinted member). A member that advertises `"overlay"` is dialed over the WireGuard tunnel instead. |
-| WireGuard tunnel plane (`wireguard_listen`) | `0.0.0.0:51820` | UDP | **Yes** for an inviter / a node without a coordinator; the plane hole-punches through a coordinator otherwise. Bind the concrete IP on a LAN or VPS without a coordinator — an unspecified bind advertises an endpoint-less record and joiner↔joiner tunnels stay dark. |
+| WireGuard tunnel plane (`wireguard_listen`) | `0.0.0.0:51820` | UDP | **Yes** for an inviter / a node without a coordinator; the plane hole-punches through a coordinator otherwise. Bind the concrete IP on a LAN or VPS without a coordinator — an unspecified bind advertises an endpoint-less record and joiner↔joiner tunnels stay dark. Set `--wireguard-advertised HOST:PORT` when an off-host or NAT join needs a reachable front different from the local bind. |
 | invite intro (`invite_listen`) | WireGuard port + 1 → `0.0.0.0:51821` | UDP | **Yes** on any node that mints invites (a joiner rings this doorbell first). |
 | node HTTP API (`http_listen`) | `0.0.0.0:8844` | TCP | **Yes** for a remote desktop app or CLI. Reads are open to any peer; every mutating `/v1` route requires a per-request user signature or the workspace's operator token from a loopback peer, and `/v1/admin/*` follows `DUCKTAPE_ADMIN` (`crates/noded/src/admin.rs`). Every co-located process dials this plane over loopback whatever it is bound to. |
 | operator rpc (`rpc_listen`) | `127.0.0.1:8845` | TCP | No — loopback only. |
