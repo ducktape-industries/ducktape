@@ -621,7 +621,6 @@ async fn a_node_level_route_refuses_a_self_minted_key_and_admits_the_operator() 
     for (method, uri, body) in [
         ("POST", "/v1/invite", r#"{"ttl_days":365}"#),
         ("POST", "/v1/log-filter", "info"),
-        ("DELETE", "/v1/fs/workspaces/abc", ""),
     ] {
         // a key nobody knows, signed correctly. the whole vector.
         let (handle, _cmds, _events) = node();
@@ -751,12 +750,12 @@ async fn a_module_bound_route_still_admits_any_acting_key() {
     let response = noded::router(handle)
         .oneshot(signed(
             "POST",
-            "/v1/fs/workspaces",
-            serde_json::json!({ "prefix": "/shared/x" }),
+            "/v1/huddle/node-proof",
+            serde_json::json!({ "channel_id": "general" }),
         ))
         .await
         .unwrap();
-    // no workspace root wired → 503, which is PAST the gate. the point is that
+    // no mesh identity wired → 503, which is PAST the gate. the point is that
     // an unknown key was not refused.
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
@@ -2956,13 +2955,13 @@ async fn files_module_rejection_is_a_verbatim_400_envelope() {
 #[tokio::test]
 async fn fs_workspaces_is_503_when_unconfigured() {
     // a handle that never injected the workspace root (the fake actor's) answers
-    // the seam with a clean 503, not a panic. no actor needed: the config guard
+    // the seam with a clean 503, not a panic. no actor needed: the operator
+    // credential asks the gate no membership question, and the config guard
     // returns before any command crosses the lane.
     let (handle, _cmd_rx, _events) = local_node();
 
     let response = noded::router(handle)
-        .oneshot(signed(
-            "POST",
+        .oneshot(post(
             "/v1/fs/workspaces",
             serde_json::json!({ "prefix": "/shared/x" }),
         ))
@@ -2981,8 +2980,7 @@ async fn fs_workspace_commit_rejects_a_bad_slug() {
     let handle = handle.with_duckfs_workspaces(root.path().to_path_buf());
 
     let response = noded::router(handle)
-        .oneshot(signed(
-            "POST",
+        .oneshot(post(
             "/v1/fs/workspaces/BAD/commit",
             serde_json::json!({ "message": "m" }),
         ))

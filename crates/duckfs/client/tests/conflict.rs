@@ -136,7 +136,7 @@ impl NodeApi for ScriptedNode {
         if attempt == 0 {
             Err(ApiError::Rejected {
                 reason: "files_commit".into(),
-                sentence: "files: conflict: /shared/ws/x changed since base".into(),
+                sentence: "conflict: /shared/ws/x changed since base".into(),
             })
         } else {
             Ok(CommitReceipt {

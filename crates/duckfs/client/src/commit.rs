@@ -21,8 +21,8 @@ use crate::plan::{Plan, PlanError, plan};
 use crate::scan::{ScanEntry, ScanKind, disk_path};
 use crate::status::{Status, status};
 
-/// the conflict strings the engine keys on — verbatim from the module (`fs.rs`),
-/// arriving through the http 400 envelope untouched.
+/// the conflict strings the engine keys on — verbatim from duckfs-core
+/// (`fs.rs`), arriving through the http 400 envelope untouched.
 ///
 /// these are SENTENCES rather than classes because the module has no class for
 /// them to be: every rejection out of its commit op, these three included,
@@ -30,9 +30,9 @@ use crate::status::{Status, status};
 /// until it does, matching the words is the only thing that tells a CAS
 /// conflict from a GC'd base from an expired chunk, and those three demand
 /// three different recoveries.
-const CONFLICT_PREFIX: &str = "files: conflict:";
-const BASE_NOT_RESOLVABLE: &str = "files: base snapshot not resolvable";
-const CHUNK_NOT_AVAILABLE: &str = "files: chunk not available";
+const CONFLICT_PREFIX: &str = "conflict:";
+const BASE_NOT_RESOLVABLE: &str = "base snapshot not resolvable";
+const CHUNK_NOT_AVAILABLE: &str = "chunk not available";
 
 /// bound the auto-rebase: after this many disjoint rebases the head is clearly
 /// churning under us, so stop and report rather than spin.
@@ -172,12 +172,12 @@ pub fn commit_with(
     })
 }
 
-/// submit the commit, handling CAS conflicts: on `"files: conflict:"` refetch the
+/// submit the commit, handling CAS conflicts: on `"conflict:"` refetch the
 /// head, diff base→head, and auto-rebase (resubmit with `base = head`) ONLY when
 /// the upstream change set is disjoint from ours — never a silent merge. an
 /// overlapping conflict, an exhausted rebase budget, or a diff that itself rejects
 /// (oversized/unresolvable) all fail safe with a structured [`ConflictReport`]. a
-/// GC'd base (`"files: base snapshot not resolvable"`) stashes the working copy
+/// GC'd base (`"base snapshot not resolvable"`) stashes the working copy
 /// and reports a re-checkout remedy without attempting a rebase.
 fn submit_with_rebase(
     api: &dyn NodeApi,
@@ -389,7 +389,7 @@ fn ensure_staged(api: &dyn NodeApi, blobs: &BTreeMap<String, Vec<u8>>) -> Result
     Ok(())
 }
 
-/// submit the one atomic commit. a `"files: chunk not available"` rejection means
+/// submit the one atomic commit. a `"chunk not available"` rejection means
 /// a staged chunk expired between the probe and this submit — re-stage the whole
 /// set and retry exactly once.
 fn submit(

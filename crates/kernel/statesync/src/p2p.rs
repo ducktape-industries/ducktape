@@ -2,10 +2,11 @@
 //!
 //! requests ride the rpc envelope (`id || frame`) addressed to ONE serving
 //! peer at a time; a background dispatch task drains the channel receiver and
-//! routes each response to its awaiting request by id. responses claiming to
-//! be from a peer outside the candidate SOURCE set are dropped — the mesh is
-//! authenticated, and installable payloads are root-verified anyway, but there
-//! is no reason to let an unrelated peer complete someone else's request.
+//! routes each response to its awaiting request by id. a response completes
+//! a request only when it comes from the peer that request was addressed to;
+//! any other peer's frame is dropped — the mesh is authenticated, and
+//! installable payloads are root-verified anyway, but a tip-coords answer's
+//! whole value is WHO gave it, and no other peer may speak for that one.
 //!
 //! SOURCE ROTATION: the client holds a candidate list, not a pinned server.
 //! every payload is verified against consensus-agreed roots, so which peer
@@ -177,10 +178,11 @@ type QuotaWait = Arc<dyn Fn(SystemTime) -> Pin<Box<dyn Future<Output = ()> + Sen
 /// `(id, body)`; the kernel stays payload-agnostic.
 pub type UnmatchedFrameHook = Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
 
-/// a pending request: the reply slot, the reaper tick it was filed under, and
-/// how many whole sweeps THIS attempt survives before the reaper reaps it
-/// (its [`RETRY_WINDOWS`] entry, in [`window_ticks`]).
-struct PendingEntry {
+/// a pending request: the peer it was sent to, the reply slot, the reaper tick
+/// it was filed under, and how many whole sweeps THIS attempt survives before
+/// the reaper reaps it (its [`RETRY_WINDOWS`] entry, in [`window_ticks`]).
+struct PendingEntry<P> {
+    server: P,
     reply: oneshot::Sender<Vec<u8>>,
     filed_at_tick: u64,
     survive_ticks: u64,
@@ -215,8 +217,8 @@ impl<R> LaneReclaim<R> {
     }
 }
 
-struct Shared {
-    pending: Mutex<HashMap<u64, PendingEntry>>,
+struct Shared<P> {
+    pending: Mutex<HashMap<u64, PendingEntry<P>>>,
     /// monotonically increasing reaper tick (written only by the reaper).
     tick: AtomicU64,
     next_id: AtomicU64,
@@ -336,7 +338,7 @@ pub struct P2pSyncClient<S: Sender> {
     sender: S,
     quota_wait: QuotaWait,
     sources: Arc<Sources<S::PublicKey>>,
-    shared: Arc<Shared>,
+    shared: Arc<Shared<S::PublicKey>>,
     /// the caller's real-key standing proof, signed ONCE via
     /// [`crate::sign_sync_proof`] and attached to every request. the server
     /// verifies it against committed standing and fail-closes on a mismatch.
@@ -487,11 +489,21 @@ where
                 let Ok((_requester, _proof, id, body)) = decode_rpc(&bytes) else {
                     continue;
                 };
-                let waiter = task_shared
-                    .pending
-                    .lock()
-                    .expect("pending poisoned")
-                    .remove(&id);
+                let mut pending = task_shared.pending.lock().expect("pending poisoned");
+                let addressed_elsewhere = pending.get(&id).is_some_and(|e| e.server != peer);
+                if addressed_elsewhere {
+                    drop(pending);
+                    debug!(
+                        target: "ducktape::statesync",
+                        reason = "answer_from_unaddressed_peer",
+                        id,
+                        "a statesync answer dropped — it came from a peer this \
+                         request was not addressed to",
+                    );
+                    continue;
+                }
+                let waiter = pending.remove(&id);
+                drop(pending);
                 if let Some(entry) = waiter {
                     let _ = entry.reply.send(body.to_vec());
                 } else if let Some(hook) = &unmatched {
@@ -625,6 +637,7 @@ where
                 pending.insert(
                     id,
                     PendingEntry {
+                        server: server.clone(),
                         reply: tx,
                         filed_at_tick: shared.tick.load(Ordering::Relaxed),
                         survive_ticks: window_ticks(window),
@@ -1094,6 +1107,110 @@ mod tests {
                 elapsed < Duration::from_secs(RETRY_WINDOWS.iter().map(|w| w.as_secs()).sum()),
                 "the answer must complete the request when it lands, not \
                  after the whole retry budget: took {elapsed:?}"
+            );
+        });
+    }
+
+    /// a candidate the request was NOT addressed to answers its id first: that
+    /// answer is dropped, and the request completes only with the addressed
+    /// server's own answer.
+    #[test]
+    fn an_answer_from_an_unaddressed_candidate_is_dropped() {
+        use commonware_cryptography::Signer as _;
+        use commonware_p2p::simulated::{self, Link};
+        use commonware_runtime::{Runner as _, Spawner as _, Supervisor as _, deterministic};
+        use commonware_utils::{NZU32, NZUsize};
+
+        deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+            let [server, impostor, joiner] =
+                [101, 103, 102].map(|seed| ed25519::PrivateKey::from_seed(seed).public_key());
+            let peers = vec![server.clone(), impostor.clone(), joiner.clone()];
+            let (network, oracle) = simulated::Network::new_with_peers(
+                context.child("network"),
+                simulated::Config {
+                    max_size: 1024 * 1024,
+                    disconnect_on_block: true,
+                    max_peers_per_set: NZUsize!(32),
+                    tracked_peer_sets: NZUsize!(1),
+                },
+                peers.clone(),
+            )
+            .await;
+            network.start();
+            let link = Link {
+                latency: Duration::from_millis(2),
+                jitter: Duration::from_millis(0),
+                success_rate: commonware_utils::probability!(1.0),
+            };
+            for from in &peers {
+                for to in peers.iter().filter(|to| *to != from) {
+                    oracle
+                        .add_link(from.clone(), to.clone(), link.clone())
+                        .await
+                        .expect("link");
+                }
+            }
+            let quota = commonware_runtime::Quota::per_second(NZU32!(128));
+            let register = |peer: &ed25519::PublicKey| {
+                let control = oracle.control(peer.clone());
+                async move {
+                    control
+                        .register(TEST_CHANNEL, quota)
+                        .await
+                        .expect("register")
+                }
+            };
+            let (mut server_tx, mut server_rx) = register(&server).await;
+            let (mut impostor_tx, _impostor_rx) = register(&impostor).await;
+            let (joiner_tx, joiner_rx) = register(&joiner).await;
+
+            let answer = |id: u64, height: u64| {
+                let coords = TipCoords {
+                    height,
+                    ..zero_tip_coords()
+                };
+                let resp = crate::encode_response(&SyncResponse::TipCoords(coords));
+                IoBuf::from(encode_rpc(&[0u8; 32], &[0u8; 64], id, &resp))
+            };
+            // the addressed server hands the id to the impostor, waits until
+            // the impostor's answer is on the wire, and only then answers.
+            let (id_tx, id_rx) = oneshot::channel::<u64>();
+            let (sent_tx, sent_rx) = oneshot::channel::<()>();
+            let to_joiner = joiner.clone();
+            context.child("impostor").spawn(move |_ctx| async move {
+                let Ok(id) = id_rx.await else { return };
+                let _ = impostor_tx.send(Recipients::One(to_joiner), answer(id, 666), false);
+                let _ = sent_tx.send(());
+            });
+            context.child("serve").spawn(move |_ctx| async move {
+                let Ok((peer, msg)) = server_rx.recv().await else {
+                    return;
+                };
+                let bytes: Vec<u8> = msg.into();
+                let Ok((_requester, _proof, id, _body)) = decode_rpc(&bytes) else {
+                    return;
+                };
+                let _ = id_tx.send(id);
+                let _ = sent_rx.await;
+                let _ = server_tx.send(Recipients::One(peer), answer(id, 7), false);
+            });
+
+            // both are candidates; the cursor addresses the server.
+            let client = P2pSyncClient::with_sources(
+                context.child("client"),
+                joiner_tx,
+                joiner_rx,
+                vec![server.clone(), impostor],
+                None,
+                [0u8; 32],
+                [0u8; 64],
+                None,
+            );
+            let (coords, answered_by) = client.fetch_tip_coords().await.expect("answered");
+            assert_eq!(answered_by, server);
+            assert_eq!(
+                coords.height, 7,
+                "the request completed with an answer from a peer it was not addressed to"
             );
         });
     }

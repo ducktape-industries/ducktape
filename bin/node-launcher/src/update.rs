@@ -499,6 +499,7 @@ impl Executor<'_> {
             Command::Exec(sha) => Ok(Progress::Run(sha)),
             Command::Banner(banner) => self.report(banner),
             Command::Gc { keep } => self.collect(&keep),
+            Command::RecordWorld(sha) => self.record_world(sha),
         }
     }
 
@@ -736,6 +737,19 @@ impl Executor<'_> {
 
     fn collect(&self, keep: &[Sha]) -> Result<Progress, Refusal> {
         writers::collect(self.layout, keep);
+        Ok(Progress::Done)
+    }
+
+    /// The release that came up records its own world: only it links the
+    /// world it speaks, and it writes the record the way `init` and `join` do.
+    fn record_world(&self, sha: Sha) -> Result<Progress, Refusal> {
+        Ducktape::record_world(&self.layout.exe_of(sha), &self.layout.config())?;
+        info!(
+            target: crate::TARGET,
+            event = "node_update_world_recorded",
+            release = %sha,
+            "the workspace now holds the module world of the release that came up"
+        );
         Ok(Progress::Done)
     }
 

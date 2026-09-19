@@ -15,7 +15,9 @@
 use std::path::{Path, PathBuf};
 
 use forge::Forge;
-use forge::{ForgeMsg, ForgeQuery, ForgeReply, RefUpdate, decode_reply, encode_msg, encode_query};
+use forge::{
+    ForgeMsg, ForgeQuery, ForgeReply, RefUpdate, TagCreate, decode_reply, encode_msg, encode_query,
+};
 use sdk::{Error, Module, Msg, StateRoot};
 
 /// the module's canonical branch — the ref a materialized push moves.
@@ -55,8 +57,8 @@ fn repo_dir(base: &Path) -> PathBuf {
 
 /// parse forge's multi-branch snapshot container into `(name, main_oid, pack)`
 /// entries — the test-side inverse of `Forge::snapshot` (per repo: name,
-/// ref_count, per-ref branch+oid, pack; the trailing tracker section is
-/// irrelevant here).
+/// branch_count, per-branch name+oid, tag_count, per-tag name+oid, pending,
+/// pack; the trailing tracker section is irrelevant here).
 fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     fn u32_at(bytes: &[u8], p: &mut usize) -> usize {
         let v = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap()) as usize;
@@ -82,7 +84,12 @@ fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
                 main_oid = oid;
             }
         }
-        // the pending section: branches whose objects the sender did not hold.
+        let tag_count = u32_at(bytes, &mut p);
+        for _ in 0..tag_count {
+            let tl = u32_at(bytes, &mut p);
+            p += tl + OID_LEN;
+        }
+        // the pending section: refs whose objects the sender did not hold.
         let pending_count = u32_at(bytes, &mut p);
         for _ in 0..pending_count {
             let bl = u32_at(bytes, &mut p);
@@ -172,6 +179,7 @@ fn push_branch_msg(branch: &str, prev: Option<&[u8]>, new: &[u8], digest: &[u8])
                 new_oid: Some(new.to_vec()),
             }],
             pack_digest: Some(digest.to_vec()),
+            tags: Vec::new(),
             cert: None,
         }),
     }
@@ -842,4 +850,101 @@ fn a_stuck_branch_does_not_disable_the_repos_compaction() {
     let _ = std::fs::remove_dir_all(&dir_c);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&waiting_dir);
+}
+
+/// a tag push round trip. an ANNOTATED tag rides one push beside the branch it
+/// tags, in the one pack `git push` sends; it lands in consensus, materializes
+/// as `refs/tags/<name>` with the tag object itself (not only the commit it
+/// peels to), is listed by `ListTags`, and reaches a fresh node through the
+/// snapshot — whose pack must carry the tag object too — and a restart.
+#[test]
+fn an_annotated_tag_pushes_materializes_and_syncs() {
+    let src_dir = tmp_repo("tag-src");
+    let src = git2::Repository::init(&src_dir).unwrap();
+    let sig =
+        git2::Signature::new("ducktape", "ducktape@localhost", &git2::Time::new(1, 0)).unwrap();
+    let blob = src.blob(b"one").unwrap();
+    let mut tree = src.treebuilder(None).unwrap();
+    tree.insert("a.txt", blob, 0o100644).unwrap();
+    let tree = src.find_tree(tree.write().unwrap()).unwrap();
+    let commit = src
+        .commit(Some(MAIN_REF), &sig, &sig, "one", &tree, &[])
+        .unwrap();
+    let target = src.find_object(commit, None).unwrap();
+    let tag = src.tag("v1", &target, &sig, "release one", false).unwrap();
+    // what git sends: the commit's closure plus the tag object.
+    let mut packer = src.packbuilder().unwrap();
+    let mut walk = src.revwalk().unwrap();
+    walk.push(commit).unwrap();
+    for object in walk {
+        packer.insert_commit(object.unwrap()).unwrap();
+    }
+    packer.insert_object(tag, None).unwrap();
+    let mut pack = git2::Buf::new();
+    packer.write_buf(&mut pack).unwrap();
+
+    let blobs = blobstore::BlobHandle::default();
+    let digest = blobs.put_chunk(pack.to_vec()).to_vec();
+    let base = tmp_repo("tag-dst");
+    let mut node = Forge::with_blobs("forge", base.clone(), blobs).unwrap();
+    let born = |oid: git2::Oid, name: &str| RefUpdate {
+        ref_name: name.into(),
+        prev_oid: None,
+        new_oid: Some(oid.as_bytes().to_vec()),
+    };
+    let msg = Msg {
+        target: "forge".into(),
+        payload: encode_msg(&ForgeMsg::PushRefs {
+            repo: String::new(),
+            updates: vec![born(commit, "main")],
+            tags: vec![TagCreate {
+                name: "v1".into(),
+                oid: tag.as_bytes().to_vec(),
+            }],
+            pack_digest: Some(digest),
+            cert: None,
+        }),
+    };
+    futures::executor::block_on(node.execute(&mut at(1), &msg)).unwrap();
+    futures::executor::block_on(node.commit_block()).unwrap();
+
+    let on_disk = git2::Repository::open(repo_dir(&base)).unwrap();
+    assert_eq!(on_disk.refname_to_id(MAIN_REF).unwrap(), commit);
+    assert_eq!(on_disk.refname_to_id("refs/tags/v1").unwrap(), tag);
+    assert_eq!(on_disk.find_tag(tag).unwrap().target_id(), commit);
+    let listed = futures::executor::block_on(node.query(&encode_query(&ForgeQuery::ListTags {
+        repo: String::new(),
+    })))
+    .unwrap();
+    assert_eq!(
+        decode_reply(&listed).unwrap(),
+        ForgeReply::Tags(vec![forge::TagRef {
+            name: "v1".into(),
+            oid: tag.to_string(),
+        }])
+    );
+
+    let fresh_base = tmp_repo("tag-fresh");
+    let mut fresh = Forge::init("forge", fresh_base.clone()).unwrap();
+    fresh
+        .install(&node.snapshot().unwrap(), node.root())
+        .unwrap();
+    assert_eq!(fresh.root(), node.root());
+    let fresh_repo = git2::Repository::open(repo_dir(&fresh_base)).unwrap();
+    assert_eq!(fresh_repo.refname_to_id("refs/tags/v1").unwrap(), tag);
+    assert!(
+        fresh_repo.find_tag(tag).is_ok(),
+        "the snapshot pack carries the tag object"
+    );
+    drop(fresh);
+    let reopened = Forge::init("forge", fresh_base.clone()).unwrap();
+    assert_eq!(
+        reopened.root(),
+        node.root(),
+        "a restart re-adopts the tag off disk"
+    );
+
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&fresh_base);
 }

@@ -142,7 +142,7 @@ impl HttpNode {
 /// nobody classified. a token is never invented for one here — a made-up word
 /// is one every consumer would then have to tell apart from a word a module
 /// actually chose.
-const UNCLASSIFIED: &str = "unframed_refusal";
+const UNCLASSIFIED: &str = refusal_class::UNFRAMED_REFUSAL;
 
 /// the node's refusal envelope: the sentence a person reads, and the class a
 /// caller branches on. `reason` is absent only when the node refused before any

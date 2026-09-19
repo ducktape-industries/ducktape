@@ -234,6 +234,9 @@ const PACK_BUDGET: std::time::Duration = statesync::p2p::WINDOWS_BEFORE_LAST_ATT
 /// `None` is an honest miss — this node does not hold the head either. it
 /// never packs a walk it has not itself committed to (see
 /// [`forge::build_objects`]), so the lane cannot be turned into an amplifier.
+///
+/// `seat` is the requesting peer's: a build this ask starts holds it until the
+/// build settles, past the answer that started it.
 pub async fn serve_forge_objects(
     forge_repo: &std::path::Path,
     blobs: &blobstore::BlobHandle,
@@ -241,6 +244,7 @@ pub async fn serve_forge_objects(
     repo: &str,
     head: [u8; statesync::FORGE_OID_LEN],
     bases: &[[u8; statesync::FORGE_OID_LEN]],
+    seat: Arc<crate::code_plane::PeerSeat<ed25519::PublicKey>>,
 ) -> SyncResponse {
     let miss = SyncResponse::ForgeObjects { digest: None };
     let (Ok(name), Ok(oid)) = (forge::norm_repo(repo), forge::Oid::from_bytes(&head)) else {
@@ -265,8 +269,10 @@ pub async fn serve_forge_objects(
     };
     let ask: PackAsk = (name, head, known);
     let building = ask.clone();
-    let outcome = one_pack_per_ask(ask, PACK_BUDGET, move || {
-        build_and_stage(staging, building, oid)
+    let build_seat = Arc::clone(&seat);
+    let outcome = one_pack_per_ask(ask, PACK_BUDGET, move || async move {
+        let _seat = build_seat;
+        build_and_stage(staging, building, oid).await
     })
     .await;
 
@@ -894,7 +900,7 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
                 target: "ducktape::forge",
                 node = %label,
                 repo = %pending.repo,
-                branch = %pending.branch,
+                refname = %pending.refname,
                 "pulled a forge pack this node was missing"
             );
             continue;
@@ -908,7 +914,7 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
                     target: "ducktape::forge",
                     node = %label,
                     repo = %pending.repo,
-                    branch = %pending.branch,
+                    refname = %pending.refname,
                     head = %pending.head,
                     "a peer rebuilt the objects for a head whose pack is gone"
                 );
@@ -921,7 +927,7 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
                     node = %label,
                     reason = "objects_fetch_failed",
                     repo = %pending.repo,
-                    branch = %pending.branch,
+                    refname = %pending.refname,
                     error = %e,
                     "neither the pushed pack nor a rebuilt one arrived"
                 );
@@ -1393,6 +1399,7 @@ mod tests {
                     prev_oid: None,
                     new_oid: Some(vec![7u8; 20]),
                 }],
+                tags: Vec::new(),
                 pack_digest: Some(digest.to_vec()),
                 cert: None,
             }),

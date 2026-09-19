@@ -3916,7 +3916,10 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("accept_no_standing"), "got: {err}");
+        assert!(
+            matches!(err, Error::Module { ref reason, .. } if reason == "accept_no_standing"),
+            "got: {err:?}"
+        );
         commit(&mut m);
         assert_eq!(
             get(&m, &sid("s1")).unwrap().assignee,
@@ -3940,8 +3943,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("accept_not_capability_provider"),
-            "got: {err}"
+            matches!(err, Error::Module { ref reason, .. } if reason == "accept_not_capability_provider"),
+            "got: {err:?}"
         );
         commit(&mut m);
         assert_eq!(get(&m, &sid("s1")).unwrap().assignee, None);
@@ -5686,8 +5689,8 @@ mod tests {
         let before = m.root();
         let err = exec(&mut m, &mut ctx, &trigger(&alice_id("over"), b"w")).unwrap_err();
         assert!(
-            err.to_string().contains("origin_live_saga_cap"),
-            "the refusal must carry the stable reason token, got: {err}"
+            matches!(err, Error::Module { ref reason, .. } if reason == "origin_live_saga_cap"),
+            "the refusal must carry the stable reason token, got: {err:?}"
         );
         commit(&mut m);
         assert_eq!(get(&m, &alice_id("over")), None, "and it staged nothing");
@@ -5918,8 +5921,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("live_saga_count_underflow"),
-            "the refusal must carry the stable reason token, got: {err}"
+            matches!(err, Error::Module { ref reason, .. } if reason == "live_saga_count_underflow"),
+            "the refusal must carry the stable reason token, got: {err:?}"
         );
         commit(&mut m);
         assert_eq!(

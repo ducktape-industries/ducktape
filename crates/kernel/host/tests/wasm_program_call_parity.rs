@@ -201,26 +201,26 @@ fn compiled_guest_and_native_finalize_identical_call_results_and_roots() {
     let cases: &[(&[u8], Option<&str>)] = &[
         (
             b"output-cap",
-            Some("Module(declaration_cap: op output exceeds cap (262145 > 262144))"),
+            Some("capacity: op output exceeds cap (262145 > 262144)"),
         ),
         (
             b"output-cap-then-small",
-            Some("Module(declaration_cap: op output exceeds cap (262145 > 262144))"),
+            Some("capacity: op output exceeds cap (262145 > 262144)"),
         ),
         (
             b"output-cap-then-error",
-            Some("Module(explicit_refusal: explicit refusal)"),
+            Some("explicit_refusal: explicit refusal"),
         ),
         (
             b"assigned-cap",
-            Some("Module(declaration_cap: op assigned stamp exceeds cap (65537 > 65536))"),
+            Some("capacity: op assigned stamp exceeds cap (65537 > 65536)"),
         ),
+        (b"module-error", Some("explicit_refusal: explicit refusal")),
         (
-            b"module-error",
-            Some("Module(explicit_refusal: explicit refusal)"),
+            b"self-query",
+            Some("A module cannot query itself; read its own state directly."),
         ),
-        (b"self-query", Some("SelfQuery")),
-        (b"missing-query", Some("UnknownModule(missing)")),
+        (b"missing-query", Some("Module missing is not registered.")),
         (b"declarations-valid", None),
     ];
     for (op, expected_reason) in cases {

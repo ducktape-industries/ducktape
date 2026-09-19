@@ -383,14 +383,44 @@ fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Erro
     // workspace was founded with cannot instantiate the network's components.
     // Without this guard the failure is a "type-checking export func `shape`"
     // deep inside the restore compose — hours of reading the wrong plane.
-    // Refused by name, with no tolerance window: rebuild or re-found.
-    config::guard_founding_binary(
-        &resolved.service.workspace,
-        &resolved.service.chain_id,
-        noded::services::build_identity_or_unknown(),
-        wasm_host::module_world_digest(),
-    )?;
+    // Refused by name, with no tolerance window; the remedy is the role's own.
+    //
+    // One boot is not held to the record: the release a launcher flipped to
+    // and awaits health from. The network designated it and the launcher
+    // qualified it against this very checkpoint before the flip, so a world
+    // that moved is the release's, not a stranger's; the launcher records it
+    // once the release comes up (`node record-world`), and a flip that rolls
+    // back boots the release the record still names.
+    let held_to_the_record = !launcher_awaits_health(&resolved.service.workspace);
+    if held_to_the_record {
+        let founded_here = resolved.validators.contains(&resolved.signer.public_key());
+        let role = match founded_here {
+            true => config::WorkspaceRole::Founder,
+            false => config::WorkspaceRole::Member,
+        };
+        config::guard_founding_binary(
+            &resolved.service.workspace,
+            &resolved.service.chain_id,
+            role,
+            noded::services::build_identity_or_unknown(),
+            wasm_host::module_world_digest(),
+        )?;
+    }
     run_node(resolved, cfg_path, sync_only, log_ring)
+}
+
+/// Whether `workspace`'s launcher flipped to a release and waits for it to
+/// come up (`PendingHealthy` in its state file). No state file, or one that
+/// does not decode, is a node no launcher is flipping.
+fn launcher_awaits_health(workspace: &std::path::Path) -> bool {
+    let state = app_update::workspace::launcher_state_path(workspace);
+    let Ok(text) = std::fs::read_to_string(state) else {
+        return false;
+    };
+    matches!(
+        app_update::state::decode(&text),
+        Ok(app_update::Phase::PendingHealthy(_))
+    )
 }
 
 /// Put the startup open-file raise ([`main`]) in `daemon.log`, ONCE, now that
@@ -450,19 +480,6 @@ fn gateway_can_start(
     wireguard_listen: Option<std::net::SocketAddr>,
 ) -> bool {
     !sync_only && gateway_listen.is_some() && wireguard_listen.is_some()
-}
-
-/// Will this boot have to pull its genesis off the mesh? A network-shape
-/// workspace whose `genesis` file is not on disk holds no module bytes at all,
-/// so it has to reach the mesh to get them — and reaching the mesh needs a
-/// netstack that can only come from the founding set beside this binary. A
-/// dev-seed shape composes straight from a founding set and has already
-/// resolved one by the time this is asked.
-fn fetches_genesis_off_the_mesh(source: &config::GenesisSource) -> bool {
-    match source {
-        config::GenesisSource::Workspace { file, .. } => !file.exists(),
-        config::GenesisSource::FoundingSet(_) => false,
-    }
 }
 
 /// stand up the real-socket node from `cfg` and run it until killed (validator)
@@ -565,21 +582,15 @@ fn run_node(
     // made a missing hypervisor, or a missing guest image, a fatal BOOT error
     // on a node that never needed one.
 
-    // THE FOUNDING SET, BEFORE ANY SOCKET. A workspace whose genesis file is
-    // not there yet has to fetch one off the mesh, and the only netstack this
-    // node can reach the mesh with is the one in the founding set beside this
-    // binary (`reachability_plane::netstack_backend`). Discovering that inside
-    // the runtime costs a bound HTTP listener, a TCP relay dial and a fatal
-    // two seconds later that reads like a network problem — so the same call
-    // the plane makes is made here, where a missing artifact is a sentence.
-    if fetches_genesis_off_the_mesh(&genesis.source) {
-        reachability_plane::netstack_backend().map_err(|error| {
-            format!(
-                "this workspace holds no genesis yet, so this node must fetch one off the \
-                 mesh — and the netstack it reaches the mesh with comes from the founding \
-                 set: {error}"
-            )
-        })?;
+    // THE NETSTACK, BEFORE ANY SOCKET. Every node that runs a reachability
+    // plane reaches its mesh through the netstack guest in the founding set
+    // beside this binary (`reachability_plane::netstack_backend`) — a founder
+    // too, whose genesis carries no netstack, and a workspace with no genesis
+    // yet, which fetches one over that mesh. The same read the plane makes is
+    // made here, where an unreadable guest refuses the boot by name.
+    let runs_a_reachability_plane = wireguard_listen.is_some();
+    if runs_a_reachability_plane {
+        reachability_plane::preflight_netstack()?;
     }
 
     // THE MESH LISTENER, taken for a moment while a bind failure can still be

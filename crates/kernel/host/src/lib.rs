@@ -639,7 +639,7 @@ pub enum MemberOutcome {
     Applied { dispatches: Vec<DispatchRecord> },
     /// the op rejected deterministically; its staged writes were rolled back and
     /// the accepted members replayed, so it left no trace on committed state. the
-    /// reason is the drain [`Error`] rendered to a string.
+    /// reason is the drain [`Error`] as [`carried_refusal`] renders it.
     Rejected { reason: String },
 }
 
@@ -1237,6 +1237,18 @@ enum UnitVerdict {
 }
 
 const REPLAY_BUDGET_REASON: &str = "block replay budget exhausted";
+
+/// the ONE string a rejection is carried as once it leaves [`Error`] (a
+/// member's outcome, a recorded call or delivery outcome): a module refusal in
+/// the frame `sdk::refusal` defines, `<token>: <sentence>`, so a reader can
+/// split the token back off; any other error as its sentence. `Display` alone
+/// is the sentence, and would drop the token a caller branches on.
+pub fn carried_refusal(error: &Error) -> String {
+    match error {
+        Error::Module { reason, sentence } => sdk::refusal::encode(reason, sentence),
+        other => other.to_string(),
+    }
+}
 
 /// a finalized consensus boundary the host is allowed to serve from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2672,7 +2684,7 @@ impl Host {
                         return Err(SubmitError::Rejected(reason));
                     }
                     members[i] = Some(MemberOutcome::Rejected {
-                        reason: reason.to_string(),
+                        reason: carried_refusal(&reason),
                     });
                 }
                 UnitVerdict::Unattempted => {
@@ -2937,7 +2949,7 @@ impl Host {
                 // the unit's own stage is entangled with the accepted units';
                 // roll everything back and rebuild the accepted ones without it.
                 self.isolate(block).await?;
-                Ok(Err(reason.to_string()))
+                Ok(Err(carried_refusal(&reason)))
             }
         }
     }
@@ -3057,7 +3069,7 @@ impl Host {
                         ))));
                     }
                     UnitVerdict::Rejected(reason) => dispatch::CallOutcome::Rejected {
-                        reason: reason.to_string(),
+                        reason: carried_refusal(&reason),
                     },
                     UnitVerdict::Accepted(mut unit) => {
                         // the root dispatch of the unit is the target op; its
@@ -3165,7 +3177,7 @@ impl Host {
                         enqueued: call.enqueued,
                         id: call.id.clone(),
                         disposition: CallDisposition::NotFinalized {
-                            reason: reason.to_string(),
+                            reason: carried_refusal(&reason),
                         },
                         dispatches: Vec::new(),
                     }))
@@ -3210,7 +3222,7 @@ impl Host {
                 }));
             }
             UnitVerdict::Rejected(reason) => DeliveryOutcome::Failed {
-                reason: reason.to_string(),
+                reason: carried_refusal(&reason),
             },
             UnitVerdict::Accepted(mut unit) => {
                 let ack = ack_step(delivery, DeliveryOutcome::Applied);
@@ -3303,7 +3315,7 @@ impl Host {
                     item: delivery.item.clone(),
                     target: delivery.target.clone(),
                     disposition: DeliveryDisposition::NotFinalized {
-                        reason: reason.to_string(),
+                        reason: carried_refusal(&reason),
                     },
                     dispatches: Vec::new(),
                 }))

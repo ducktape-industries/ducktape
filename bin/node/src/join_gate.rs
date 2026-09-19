@@ -24,8 +24,9 @@ use crate::config::{INVITE_NONCE_LEN, InviteToken};
 /// why a gate refused. wire-stable identifiers (the `detail` prose
 /// is free to change; these are not). the terminal bit — whether the joiner
 /// stops (exits) rather than failing over — is set by the member per its
-/// verification checklist, not baked into the code, since `IssuerUnknown` is
-/// non-terminal while every other code is terminal.
+/// verification checklist, not baked into the code: `IssuerUnknown` from the
+/// gate's own view is non-terminal (the joiner bounds how long it waits one
+/// out), from a Redeem consensus applied it is terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectCode {
@@ -39,9 +40,10 @@ pub enum RejectCode {
     BadProof,
     /// the invite nonce is already redeemed (or lost a consensus race).
     Spent,
-    /// the issuer is not in this member's committed valset. NON-TERMINAL —
-    /// a lagging view cannot tell removed from not-yet-seen; the joiner fails
-    /// over to another member.
+    /// the issuer is not in this member's committed valset. From the gate's
+    /// view NON-TERMINAL — a lagging view cannot tell removed from
+    /// not-yet-seen; the joiner fails over to another member, and after
+    /// `first_contact_join::ISSUER_UNKNOWN_ROUNDS` such rounds stops.
     IssuerUnknown,
     /// the member could not settle the gate in time (timeout / submit
     /// failure). NON-TERMINAL — the joiner tries another member.
@@ -62,7 +64,10 @@ pub fn redeem_reject_outcome(reason: Option<&str>) -> (RejectCode, bool) {
     } else if r.contains("does not verify for this network") {
         (RejectCode::BadToken, true)
     } else if r.contains("no longer part of this network") {
-        (RejectCode::IssuerUnknown, false) // V7 stays non-terminal
+        // consensus applied the Redeem against COMMITTED state and found the
+        // issuer gone — not a lagging view (that is the gate's own V7 check,
+        // which answers non-terminally), so no retry can change it.
+        (RejectCode::IssuerUnknown, true)
     } else {
         // "already a validator" / "already holds resident standing" (the joiner
         // gained standing between the V9 check and the drain) or any unknown
@@ -668,11 +673,13 @@ mod tests {
             redeem_reject_outcome(Some("invite already redeemed")),
             (RejectCode::Spent, true)
         );
+        // an issuer consensus finds gone at apply is gone: committed state,
+        // not a lagging view, so the joiner stops instead of retrying.
         assert_eq!(
             redeem_reject_outcome(Some(
                 "the inviting member is no longer part of this network"
             )),
-            (RejectCode::IssuerUnknown, false)
+            (RejectCode::IssuerUnknown, true)
         );
         // an unrecognized / already-standing reason retries rather than kills.
         assert_eq!(

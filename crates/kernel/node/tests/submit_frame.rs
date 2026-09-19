@@ -191,11 +191,11 @@ fn one_origin_flood_is_capped_and_leaves_another_origin_alone() {
         let refusal = node
             .submit_frame(over)
             .await
-            .expect_err("the frame past the cap is refused")
-            .to_string();
+            .expect_err("the frame past the cap is refused");
         assert!(
-            refusal.contains("mempool_origin_full"),
-            "the refusal carries its stable reason token: {refusal}"
+            matches!(&refusal, node::Error::Host(sdk::Error::Module { reason, .. })
+                if reason == "mempool_origin_full"),
+            "the refusal carries its stable reason token: {refusal:?}"
         );
 
         // a second key is unaffected by the first's flood.
@@ -252,8 +252,9 @@ fn custody_bytes_are_capped_and_a_flush_proposes_at_most_k_batches() {
                 continue;
             };
             assert!(
-                refusal.to_string().contains("mempool_bytes_full"),
-                "the byte budget refuses with its stable reason token: {refusal}"
+                matches!(&refusal, node::Error::Host(sdk::Error::Module { reason, .. })
+                    if reason == "mempool_bytes_full"),
+                "the byte budget refuses with its stable reason token: {refusal:?}"
             );
             return;
         }

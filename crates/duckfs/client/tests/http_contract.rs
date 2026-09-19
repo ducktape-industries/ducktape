@@ -222,7 +222,7 @@ fn module_rejection_is_preserved_and_missing_signer_sends_nothing() {
         (
             400,
             serde_json::json!({
-                "error": "files: conflict: /x changed since base",
+                "error": "conflict: /x changed since base",
                 "reason": "files_commit",
             }),
         )
@@ -236,13 +236,13 @@ fn module_rejection_is_preserved_and_missing_signer_sends_nothing() {
         refused,
         ApiError::Rejected {
             reason: "files_commit".into(),
-            sentence: "files: conflict: /x changed since base".into(),
+            sentence: "conflict: /x changed since base".into(),
         }
     );
     // the commit lane's own error reads the same line the read lane does.
     assert_eq!(
         duckfs_client::commit::CommitError::from(refused).to_string(),
-        "files: conflict: /x changed since base [files_commit]"
+        "conflict: /x changed since base [files_commit]"
     );
 }
 
@@ -304,7 +304,7 @@ fn an_unclassified_refusal_is_not_given_a_made_up_class() {
     assert_eq!(
         node.stat("/x", None).unwrap_err(),
         ApiError::Rejected {
-            reason: "unframed_refusal".into(),
+            reason: sdk::refusal::UNFRAMED_REFUSAL.into(),
             sentence: "invalid module target".into(),
         }
     );
