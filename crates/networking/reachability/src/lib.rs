@@ -32,8 +32,8 @@ pub use netstack_machine::{binding, msg};
 // the crate-root surface is exactly what consumers reach for; everything
 // else stays addressable through its module (`binding::`, `msg::`, …).
 pub use executor::{
-    BackendStatus, CoordinatedInviteReply, InstallReply, NetstackBackend, ReachabilityCommand,
-    ReachabilityConfig, ReachabilityError, SwapReply, run, run_observed,
+    BackendStatus, CoordinatedInviteReply, InstallReply, NetstackBackend, PreflightReply,
+    ReachabilityCommand, ReachabilityConfig, ReachabilityError, SwapReply, run, run_observed,
 };
 pub use keys::WireGuardKeypair;
 pub use netstack_machine::binding::{active_set, identity_of, node_key, open_port_policy};

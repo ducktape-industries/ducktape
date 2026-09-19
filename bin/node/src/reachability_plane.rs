@@ -1143,6 +1143,33 @@ pub(crate) enum SwapAnswer {
     Unattempted(String),
 }
 
+/// What one owner-plane restore preflight answered. An unattempted request is
+/// retryable; a refusal is deterministic for this exact candidate and machine.
+pub(crate) enum PreflightAnswer {
+    Ready,
+    Refused(String),
+    Unattempted(String),
+}
+
+fn backend_for_request(
+    request: noded::NetstackSwapRequest,
+) -> Result<reachability::NetstackBackend, String> {
+    match request {
+        noded::NetstackSwapRequest::Component(path) => {
+            let component =
+                std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            Ok(reachability::NetstackBackend::Guest {
+                component,
+                step_fuel: reachability::NETSTACK_STEP_FUEL,
+            })
+        }
+        noded::NetstackSwapRequest::Bytes(component) => Ok(reachability::NetstackBackend::Guest {
+            component,
+            step_fuel: reachability::NETSTACK_STEP_FUEL,
+        }),
+    }
+}
+
 /// Swap the live plane's netstack backend. A refusal leaves the running
 /// machine untouched — the executor's contract — so nothing retries a
 /// [`SwapAnswer::Refused`].
@@ -1152,23 +1179,9 @@ pub(crate) enum SwapAnswer {
 /// reconciler takes the [`noded::NetstackSwapRequest::Bytes`] road instead —
 /// its component is already a verified chunk on the blob plane.
 pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> SwapAnswer {
-    let backend = match request {
-        noded::NetstackSwapRequest::Component(path) => {
-            let component = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    return SwapAnswer::Unattempted(format!("{}: {error}", path.display()));
-                }
-            };
-            reachability::NetstackBackend::Guest {
-                component,
-                step_fuel: reachability::NETSTACK_STEP_FUEL,
-            }
-        }
-        noded::NetstackSwapRequest::Bytes(component) => reachability::NetstackBackend::Guest {
-            component,
-            step_fuel: reachability::NETSTACK_STEP_FUEL,
-        },
+    let backend = match backend_for_request(request) {
+        Ok(backend) => backend,
+        Err(error) => return SwapAnswer::Unattempted(error),
     };
     let name = backend.name();
     let lane = LIVE_PLANE
@@ -1195,6 +1208,44 @@ pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> SwapAn
         Err(_) => {
             SwapAnswer::Unattempted("the reachability plane dropped the swap reply".to_string())
         }
+    }
+}
+
+/// Prove that the live owner plane can restore its current machine into this
+/// candidate. The executor discards the restored machine and leaves execution
+/// status and interface state untouched.
+pub(crate) async fn preflight_netstack_backend(
+    request: noded::NetstackSwapRequest,
+) -> PreflightAnswer {
+    let backend = match backend_for_request(request) {
+        Ok(backend) => backend,
+        Err(error) => return PreflightAnswer::Unattempted(error),
+    };
+    let lane = LIVE_PLANE
+        .read()
+        .expect("live plane lock poisoned")
+        .as_ref()
+        .and_then(|live| live.commands.upgrade());
+    let Some(lane) = lane else {
+        return PreflightAnswer::Unattempted("the reachability plane is not running".into());
+    };
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    if lane
+        .send(reachability::ReachabilityCommand::PreflightBackend {
+            backend,
+            reply: reachability::PreflightReply(reply),
+        })
+        .await
+        .is_err()
+    {
+        return PreflightAnswer::Unattempted("the reachability plane stopped".into());
+    }
+    match outcome.await {
+        Ok(Ok(())) => PreflightAnswer::Ready,
+        Ok(Err(reason)) => PreflightAnswer::Refused(reason),
+        Err(_) => PreflightAnswer::Unattempted(
+            "the reachability plane dropped the preflight reply".into(),
+        ),
     }
 }
 

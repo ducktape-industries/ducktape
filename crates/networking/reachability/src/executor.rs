@@ -205,6 +205,17 @@ impl std::fmt::Debug for SwapReply {
     }
 }
 
+/// The outcome a [`ReachabilityCommand::PreflightBackend`] caller awaits:
+/// `Ok` means the candidate restored the current machine state and was
+/// discarded; `Err` leaves the running machine untouched.
+pub struct PreflightReply(pub tokio::sync::oneshot::Sender<Result<(), String>>);
+
+impl std::fmt::Debug for PreflightReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreflightReply")
+    }
+}
+
 /// Node -> plane.
 #[derive(Debug)]
 pub enum ReachabilityCommand {
@@ -272,6 +283,13 @@ pub enum ReachabilityCommand {
     SwapBackend {
         backend: NetstackBackend,
         reply: SwapReply,
+    },
+    /// Prove that `backend` can restore the current machine's snapshot, then
+    /// discard the candidate. The running machine and execution status do not
+    /// change.
+    PreflightBackend {
+        backend: NetstackBackend,
+        reply: PreflightReply,
     },
     /// Drain and exit; the interface is torn down on the way out.
     Shutdown,
@@ -517,6 +535,9 @@ async fn host_loop<E: WireGuardEffect>(
                     .swap(&factory, machine, backend, reply, observe)
                     .await?;
             }
+            Input::Preflight { backend, reply } => {
+                host.preflight(&factory, &mut *machine, backend, reply);
+            }
         }
     }
 }
@@ -530,6 +551,10 @@ enum Input {
     Swap {
         backend: NetstackBackend,
         reply: SwapReply,
+    },
+    Preflight {
+        backend: NetstackBackend,
+        reply: PreflightReply,
     },
 }
 
@@ -770,6 +795,9 @@ impl<E: WireGuardEffect> Host<E> {
             ReachabilityCommand::SwapBackend { backend, reply } => {
                 Ok(Input::Swap { backend, reply })
             }
+            ReachabilityCommand::PreflightBackend { backend, reply } => {
+                Ok(Input::Preflight { backend, reply })
+            }
             ReachabilityCommand::Shutdown => step(Event::Shutdown, true),
         }
     }
@@ -862,6 +890,34 @@ impl<E: WireGuardEffect> Host<E> {
                 Ok(machine)
             }
         }
+    }
+
+    /// Snapshot the live machine, restore the candidate through the exact
+    /// production restore path, and drop it. This is deliberately not a swap:
+    /// no status, interface, retarget, or execution transition is emitted.
+    fn preflight(
+        &mut self,
+        factory: &MachineFactory,
+        machine: &mut dyn NetstackMachine,
+        backend: NetstackBackend,
+        reply: PreflightReply,
+    ) {
+        let snapshot = match machine.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(StepError::Fault(reason)) => {
+                let _ = reply.0.send(Err(format!("snapshot: {reason}")));
+                return;
+            }
+            Err(StepError::Protocol(error)) => {
+                let _ = reply.0.send(Err(error.to_string()));
+                return;
+            }
+        };
+        let outcome = factory
+            .restore(&backend, &snapshot)
+            .map(drop)
+            .map_err(|error| error.to_string());
+        let _ = reply.0.send(outcome);
     }
 
     /// Step one event and perform what it decides.

@@ -1477,6 +1477,7 @@ impl ValidatorRuntime<'_> {
             signer,
             label,
             code_signaller,
+            reach_cmd,
             index,
             blob_client,
             blobs,
@@ -1484,11 +1485,14 @@ impl ValidatorRuntime<'_> {
             proposed_code,
             fetch_done_tx,
             fetch_done_rx,
+            preflight_done_tx,
+            preflight_done_rx,
             ..
         } = self;
         // reap finished fetch tasks first, so a failed fetch retries — on a
         // backoff, speaking only on the first failure and every Nth after it.
         code_signaller.reap_fetches(fetch_done_rx, label);
+        code_signaller.reap_preflights(preflight_done_rx);
         code_signaller.tick_fetch_backoff();
         let req = modules::encode_query(&modules::ModulesQuery::ModuleStatus);
         let Ok(bytes) = node.host().query(host::MODULES_ID, &req).await else {
@@ -1530,23 +1534,9 @@ impl ValidatorRuntime<'_> {
             true => Role::Validator,
             false => Role::Resident,
         };
-        // residency is a VERIFYING read (content re-hashed on the disk path)
-        // AND a LOADABILITY read: signing ready must mean sha256(local bytes)
-        // == committed hash AND "this binary can instantiate them" AND "this
-        // host can realize the shape they declare" (an odb substrate for the
-        // id, config keys the network binds). Byte residency alone would let
-        // a validator on an older build arm a swap it then deterministically
-        // rejects every op to while its peers apply them — a silent fork on
-        // activation — and a shape the boundary cannot realize would fail
-        // closed on every validator at once.
-        //
-        // WHAT IT COSTS: the probe COMPILES the component synchronously on
-        // this select loop — a few hundred ms for a 1.8 MB module, during
-        // which `http_ingress` is unpolled, the same occupancy the checkpoint
-        // branch carries a duty cooldown for (#1018). It is paid at most once
-        // per pending swap per boot — `decide` latches the verdict, loadable
-        // and unloadable alike — and every validator pays it at the same
-        // moment, right after the swap commits.
+        // residency is a verifying read. Module and view entries keep their
+        // existing local readiness checks; a plane entry is handed to its
+        // owner, asynchronously, for the live snapshot restore proof.
         let height = node.finalized().map_or(0, |f| f.height);
         let held = |digest: &[u8; 32]| blobs.has_verified_chunk(digest);
         let verdict = |entry: &modules::ModuleCode, digest: &[u8; 32]| {
@@ -1554,14 +1544,14 @@ impl ValidatorRuntime<'_> {
                 return CodeVerdict::Absent;
             };
             let module_id = entry.module_id.as_str();
-            // what "this node can run it" means is the entry's kind: a
-            // module's bytes must instantiate here AND replace the running
-            // module's state shape — or, for an admission, start over scratch
-            // state, since the boundary initializes it; a view's bytes must
-            // speak the view ABI, and no running module is asked about them; a
-            // plane's bytes are asked nothing at all, because the plane that
-            // owns them realizes them off this boundary and residency is the
-            // whole question this node can answer about them.
+            if entry.kind == modules::Kind::Plane {
+                return match crate::netstack_governance::artifact_component(&bytes) {
+                    Ok(component) => CodeVerdict::Preflight { component },
+                    Err(detail) => CodeVerdict::Unloadable {
+                        detail: detail.lines().next().unwrap_or_default().to_string(),
+                    },
+                };
+            }
             let realizable = noded::compose::validate_deployment(
                 module_id, entry.kind, &bytes, index,
             )
@@ -1569,7 +1559,8 @@ impl ValidatorRuntime<'_> {
                 modules::Kind::Module => node
                     .check_module_replacement(module_id, &bytes)
                     .map_err(|error| error.to_string()),
-                modules::Kind::View | modules::Kind::Plane => Ok(()),
+                modules::Kind::View => Ok(()),
+                modules::Kind::Plane => unreachable!("planes use the owner preflight path"),
             });
             match realizable {
                 Ok(()) => CodeVerdict::Loadable,
@@ -1587,6 +1578,11 @@ impl ValidatorRuntime<'_> {
             blob_client,
             blobs,
             fetch_done_tx,
+        );
+        crate::validator::code_announce::spawn_preflights(
+            actions.preflights,
+            reach_cmd.as_ref().cloned(),
+            preflight_done_tx,
         );
         for (key, detail) in actions.refusals {
             tracing::warn!(

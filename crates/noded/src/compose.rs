@@ -450,7 +450,8 @@ pub async fn wasm_module(
 /// `Kind::Module` entry the consensus code (declared shape realizable here),
 /// its optional mapper (matching its eventual index install) and its optional
 /// view; for a `Kind::View` entry the view alone; for a `Kind::Plane` entry
-/// nothing at all, because the artifact is not this boundary's. For the two
+/// nothing at all, because the artifact is not this boundary's; the owning
+/// plane supplies the live restore proof separately. For the two
 /// the boundary does realize, the frame's tag must be the entry's kind — a
 /// view frame under a module id (or a module frame under a view id) is a
 /// named refusal, never a vote. View validation
@@ -468,11 +469,8 @@ pub fn validate_deployment(
     match kind {
         // a plane's artifact is not a deployment frame, and this boundary
         // never decodes it: the node plane that owns it realizes it, and only
-        // that plane knows what its bytes are. Readiness for a plane is
-        // residency alone — the caller has already re-hashed the bytes against
-        // the committed hash. Refusing here instead would make every validator
-        // withhold `SwapReady`, and a hash-pinned artifact whose pin can never
-        // be moved is not one.
+        // that plane knows whether its live state can be restored. Static
+        // deployment validation therefore has no answer for a plane.
         modules::Kind::Plane => Ok(()),
         modules::Kind::Module => match module_artifact::ArtifactRef::decode(bytes)? {
             module_artifact::ArtifactRef::Module(module) => validate_module(id, module, index),

@@ -3223,6 +3223,23 @@ async fn swap_backend(node: &TestNode, backend: NetstackBackend) -> Result<(), S
     rx.await.expect("plane alive")
 }
 
+/// Ask the owner plane to restore the current snapshot into a candidate and
+/// discard that candidate without changing the live execution.
+async fn preflight_backend(
+    commands: &mpsc::Sender<ReachabilityCommand>,
+    backend: NetstackBackend,
+) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    commands
+        .send(ReachabilityCommand::PreflightBackend {
+            backend,
+            reply: reachability::PreflightReply(tx),
+        })
+        .await
+        .unwrap();
+    rx.await.expect("plane alive")
+}
+
 /// A backend swap mid-epoch — native to guest with the retarget just
 /// stepped, guest back to native once applied — continues the epoch on the
 /// swapped machine: one interface, one apply, and the next cutover runs on
@@ -3298,6 +3315,135 @@ async fn a_refused_swap_leaves_the_current_machine_in_place() {
             let fake = nodes[0].effect.0.lock().unwrap();
             assert_eq!(fake.create_calls, 1);
             assert_eq!(fake.applied.len(), 2);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_successful_preflight_restores_current_state_without_swapping() {
+    use reachability::BackendStatus;
+    let dir = tempfile::tempdir().unwrap();
+    let policy = PortPolicy::production();
+    let config = ReachabilityConfig {
+        chain_id: CHAIN.into(),
+        signer: PrivateKey::from_seed(1),
+        wireguard_key_file: dir.path().join("wg.key"),
+        wireguard_port: 51820,
+        wireguard_advertised: Some(endpoint(&policy, 10, 51820, Transport::Udp)),
+        control_endpoint: endpoint(&policy, 10, 443, Transport::Tcp),
+        coordinators: vec![],
+        port_policy: policy,
+        persist_file: None,
+        gossip_ingress: None,
+        backend: observable_guest("first"),
+    };
+    let (commands, receiver) = mpsc::channel(8);
+    let (events, mut received) = mpsc::channel(8);
+    let (status, mut statuses) = mpsc::unbounded_channel();
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let running = tokio::task::spawn_local(reachability::run_observed(
+                config,
+                SharedFake::default(),
+                StaticResolver::default(),
+                receiver,
+                events,
+                move |value| {
+                    status.send(value).unwrap();
+                },
+            ));
+            assert_eq!(statuses.recv().await.unwrap(), BackendStatus::Starting);
+            assert!(statuses.recv().await.unwrap().code_hash().is_some());
+
+            commands.send(ReachabilityCommand::Nudge).await.unwrap();
+            assert!(matches!(
+                received.recv().await.unwrap(),
+                ReachabilityEvent::PersistFailed { ref reason } if reason == "first"
+            ));
+            preflight_backend(&commands, observable_guest("second"))
+                .await
+                .expect("candidate restores the current snapshot");
+            assert!(
+                statuses.try_recv().is_err(),
+                "preflight never publishes status"
+            );
+            commands.send(ReachabilityCommand::Nudge).await.unwrap();
+            assert!(matches!(
+                received.recv().await.unwrap(),
+                ReachabilityEvent::PersistFailed { ref reason } if reason == "first"
+            ));
+            commands.send(ReachabilityCommand::Shutdown).await.unwrap();
+            running.await.unwrap().unwrap();
+            assert_eq!(statuses.recv().await.unwrap(), BackendStatus::Stopped);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn an_incompatible_preflight_refuses_without_status_or_machine_mutation() {
+    use reachability::BackendStatus;
+    let dir = tempfile::tempdir().unwrap();
+    let policy = PortPolicy::production();
+    let config = ReachabilityConfig {
+        chain_id: CHAIN.into(),
+        signer: PrivateKey::from_seed(1),
+        wireguard_key_file: dir.path().join("wg.key"),
+        wireguard_port: 51820,
+        wireguard_advertised: Some(endpoint(&policy, 10, 51820, Transport::Udp)),
+        control_endpoint: endpoint(&policy, 10, 443, Transport::Tcp),
+        coordinators: vec![],
+        port_policy: policy,
+        persist_file: None,
+        gossip_ingress: None,
+        backend: observable_guest("first"),
+    };
+    let (commands, receiver) = mpsc::channel(8);
+    let (events, mut received) = mpsc::channel(8);
+    let (status, mut statuses) = mpsc::unbounded_channel();
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let running = tokio::task::spawn_local(reachability::run_observed(
+                config,
+                SharedFake::default(),
+                StaticResolver::default(),
+                receiver,
+                events,
+                move |value| {
+                    status.send(value).unwrap();
+                },
+            ));
+            assert_eq!(statuses.recv().await.unwrap(), BackendStatus::Starting);
+            assert!(statuses.recv().await.unwrap().code_hash().is_some());
+            commands.send(ReachabilityCommand::Nudge).await.unwrap();
+            assert!(matches!(
+                received.recv().await.unwrap(),
+                ReachabilityEvent::PersistFailed { ref reason } if reason == "first"
+            ));
+
+            let refusal = preflight_backend(
+                &commands,
+                NetstackBackend::Guest {
+                    component: vec![],
+                    step_fuel: 1,
+                },
+            )
+            .await
+            .expect_err("an incompatible candidate must be refused");
+            assert!(refusal.contains("component"), "{refusal}");
+            assert!(
+                statuses.try_recv().is_err(),
+                "refusal never publishes status"
+            );
+            commands.send(ReachabilityCommand::Nudge).await.unwrap();
+            assert!(matches!(
+                received.recv().await.unwrap(),
+                ReachabilityEvent::PersistFailed { ref reason } if reason == "first"
+            ));
+            commands.send(ReachabilityCommand::Shutdown).await.unwrap();
+            running.await.unwrap().unwrap();
+            assert_eq!(statuses.recv().await.unwrap(), BackendStatus::Stopped);
         })
         .await;
 }

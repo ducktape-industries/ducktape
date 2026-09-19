@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use futures::executor::block_on;
 use sha2::Digest;
 
-use host::{BlockContext, CodeSource, Host, MODULES_ID, ModuleFactory};
+use host::{Admitted, BlockContext, CodeSource, Host, MODULES_ID, ModuleFactory};
 use modules::{Modules, ModulesMsg, ModulesQuery, ModulesReply};
 use sdk::{Error, Module, Msg, Origin, StateRoot};
 
@@ -74,7 +74,7 @@ struct WasmFactory;
 
 #[async_trait::async_trait(?Send)]
 impl ModuleFactory for WasmFactory {
-    async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<Box<dyn Module>, Error> {
+    async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<Admitted, Error> {
         // the node's own answer, in miniature: the entry's COMMITTED kind
         // already said these are a module's bytes, so every way they fail to
         // become one — no artifact frame, a frame this runtime cannot compile,
@@ -82,7 +82,7 @@ impl ModuleFactory for WasmFactory {
         // stalls. Answering "not a module" here is what forks a network.
         let module = wasm_host::CompiledModule::compile_artifact(bytes)
             .and_then(|compiled| compiled.over_map(id))?;
-        Ok(Box::new(module))
+        Ok(Admitted::Module(Box::new(module)))
     }
 
     // an admission over a map touches nothing but itself: it is its own scratch.
@@ -665,13 +665,13 @@ struct StartingFactory;
 
 #[async_trait::async_trait(?Send)]
 impl ModuleFactory for StartingFactory {
-    async fn instantiate(&self, id: &str, _bytes: &[u8]) -> Result<Box<dyn Module>, Error> {
+    async fn instantiate(&self, id: &str, _bytes: &[u8]) -> Result<Admitted, Error> {
         let mut module = RefusesToStart;
         module
             .initialize(&[])
             .await
             .map_err(|e| Error::module("module_seat", format!("{id} initializes: {e}")))?;
-        Ok(Box::new(module))
+        Ok(Admitted::Module(Box::new(module)))
     }
 
     fn check(&self, id: &str, bytes: &[u8]) -> Result<(), Error> {
@@ -778,8 +778,8 @@ struct SeatsAnything;
 
 #[async_trait::async_trait(?Send)]
 impl ModuleFactory for SeatsAnything {
-    async fn instantiate(&self, _id: &str, _bytes: &[u8]) -> Result<Box<dyn Module>, Error> {
-        Ok(Box::new(Anything))
+    async fn instantiate(&self, _id: &str, _bytes: &[u8]) -> Result<Admitted, Error> {
+        Ok(Admitted::Module(Box::new(Anything)))
     }
 
     fn check(&self, _id: &str, _bytes: &[u8]) -> Result<(), Error> {
