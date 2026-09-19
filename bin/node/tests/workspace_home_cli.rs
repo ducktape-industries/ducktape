@@ -471,6 +471,13 @@ fn found_and_admit(tmp: &Path) -> (std::path::PathBuf, String) {
             "127.0.0.1:0",
             "--advertised",
             "127.0.0.1:1",
+            // this founder MINTS below, and a mint refuses a front it
+            // DERIVED onto loopback — the operator has to name the tunnel
+            // address themselves. Naming the one the derivation used to
+            // reach keeps the blob identical and this test's subject (`-n`
+            // workspace resolution) untouched.
+            "--wireguard-advertised",
+            "127.0.0.1:51820",
         ],
     );
     assert_ok(&out, "init");
