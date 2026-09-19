@@ -493,6 +493,54 @@ pub fn standby_prewarm_then_promotion(backend: Backend) {
     net.finish();
 }
 
+/// A resident behind NAT — its record advertises no endpoint, so only it
+/// can initiate — survives an epoch cutover that keeps it a resident. The
+/// cutover arrives while it is cut off: the only transport it could
+/// re-offer its record over rides the very tunnel the cutover rebuilds, so
+/// a member that rebuilt its pre-warm layer from nothing would leave the
+/// resident's handshake retries landing on an interface that no longer
+/// knows its key, for good.
+pub fn cutover_keeps_endpoint_less_standby(backend: Backend) {
+    let specs = [
+        NodeSpec::public(10),
+        NodeSpec::public(20),
+        NodeSpec::endpoint_less(30),
+    ];
+    let mut net = Net::new(
+        "cutover_keeps_endpoint_less_standby",
+        "net#natstandby",
+        &specs,
+        backend,
+    );
+    net.retarget_all(1, &[0, 1], &[2], 1);
+    net.run();
+    net.nudges(2);
+    net.run();
+    for member in [0, 1] {
+        assert!(
+            net.tunneled(member, 2),
+            "n{} pre-warmed the endpoint-less resident",
+            member + 1
+        );
+    }
+
+    net.partition(0, 2);
+    net.partition(1, 2);
+    net.retarget_all(2, &[0, 1], &[2], 100);
+    net.run();
+    net.nudges(2);
+    net.run();
+    assert_converged(&net, &[0, 1], 2, 1);
+    for member in [0, 1] {
+        assert!(
+            net.tunneled(member, 2),
+            "n{} kept the endpoint-less resident's tunnel across the cutover",
+            member + 1
+        );
+    }
+    net.finish();
+}
+
 // ------------------------------------------------ 10. slow resolver
 
 /// One resolve never answers: the rest of the mesh assembles regardless,
