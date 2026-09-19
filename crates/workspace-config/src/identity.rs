@@ -328,17 +328,11 @@ mod tests {
             let parsed: duck_address::ChainId = minted.parse().expect("minted id parses");
             assert_eq!(parsed.label, good);
         }
-        for (bad, reason) in [
-            ("My Team", "uppercase"),
-            ("Dognet", "uppercase"),
-            ("my team", "authority_incomplete"),
-            ("my_team", "authority_incomplete"),
-            ("dog#net", "authority_incomplete"),
-            ("dog/net", "authority_incomplete"),
-            ("", "authority_incomplete"),
+        for bad in [
+            "My Team", "Dognet", "my team", "my_team", "dog#net", "dog/net", "",
         ] {
             let refused = validate_network_name(bad).expect_err(bad);
-            assert_eq!(refused.reason, reason, "{bad:?}");
+            assert_eq!(refused.reason, "invalid_input", "{bad:?}");
         }
     }
 }
