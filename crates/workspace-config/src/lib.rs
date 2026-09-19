@@ -1159,7 +1159,8 @@ pub fn sync_source_candidates<A>(
 pub const FOUNDING_FILE: &str = "founding.toml";
 
 /// what the binary that materialized this workspace (`node init`, `node join`)
-/// wrote down about itself.
+/// wrote down about itself — rewritten by a node release its launcher flipped
+/// to once it comes up healthy (`node record-world`).
 ///
 /// `module_world` is the whole comparison. A module component is compiled
 /// against the `ducktape:module` WIT world, and a host binding a different one

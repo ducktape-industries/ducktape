@@ -12,6 +12,13 @@
 #   ops/node/install.sh --workspace <name> --join <invite> [--genesis <file>]
 #   ops/node/install.sh --dry-run --workspace <name> --init
 #   ops/node/install.sh --archive <node archive> --workspace <name> --join <invite>
+#   ops/node/install.sh --user --workspace <name>
+#
+# `--user` needs no root: it runs a workspace under ~/.ducktape that is
+# already under the launcher (`ducktape-node-launcher install` wrote its
+# `updates/state.json`) as this user's own systemd unit,
+# ducktape-node-user@<chain id>, with the `ducktape-node-launcher` on PATH
+# copied into the workspace. It founds, joins and builds nothing.
 #
 # `--archive <file>` installs the program from a node release archive
 # (`ops/release/archive.sh --kind node`: `ducktape`, `ducktape-node-launcher`,
@@ -39,6 +46,7 @@ log(){ printf '\033[36m[install]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[install] %s\033[0m\n' "$*" >&2; exit 1; }
 
 DRY_RUN=0
+USER_MODE=0
 WORKSPACE=""
 MODE=""       # "init" or "join"
 INVITE=""
@@ -49,6 +57,7 @@ INIT_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
+    --user) USER_MODE=1; shift ;;
     --workspace) WORKSPACE="${2:?--workspace needs a value}"; shift 2 ;;
     --init) MODE="init"; shift ;;
     --join) MODE="join"; INVITE="${2:?--join needs an invite blob}"; shift 2 ;;
@@ -60,7 +69,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$WORKSPACE" ] || die "--workspace <name> is required"
-[ -n "$MODE" ] || die "one of --init or --join <invite> is required"
+[ "$USER_MODE" = 1 ] || [ -n "$MODE" ] || die "one of --init or --join <invite> is required"
 
 # run() either prints the command (--dry-run) or executes it. sudo_run()
 # is the same but only the lines that touch root-owned paths need it.
@@ -78,6 +87,40 @@ if [ "$DRY_RUN" = 0 ]; then
   command -v systemctl >/dev/null 2>&1 || die "refusing: systemctl not found (no systemd on this host)"
   [ -z "$ARCHIVE" ] || [ -f "$ARCHIVE" ] || die "no such archive: $ARCHIVE"
   [ -z "$ARCHIVE" ] || command -v zstd >/dev/null 2>&1 || die "--archive needs zstd to unpack $ARCHIVE"
+fi
+
+if [ "$USER_MODE" = 1 ]; then
+  [ -z "$MODE$ARCHIVE$GENESIS" ] || die "refusing: --user founds, joins and unpacks nothing — it runs a workspace already under the launcher"
+  USER_HOME="$HOME/.ducktape"
+  UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  matches=()
+  for dir in "$USER_HOME/$WORKSPACE"*/; do
+    [ -d "$dir" ] && matches+=("$(basename "$dir")")
+  done
+  [ "${#matches[@]}" -eq 1 ] || die "--workspace $WORKSPACE matches ${#matches[@]} workspaces under $USER_HOME; pass more of the chain id"
+  CHAIN_ID="${matches[0]}"
+  WS_DIR="$USER_HOME/$CHAIN_ID"
+  # the unit runs the launcher, which refuses a workspace it was never
+  # installed into: enabling it would only restart that refusal forever.
+  [ -f "$WS_DIR/updates/state.json" ] || die "refusing: $WS_DIR is not under the launcher (no updates/state.json) — seed it first: ducktape-node-launcher install --workspace '$WS_DIR' --config '$WS_DIR/node.toml' --from <ducktape>"
+  LAUNCHER="$(command -v ducktape-node-launcher)" || die "refusing: no ducktape-node-launcher on PATH to copy into $WS_DIR"
+  UNIT="ducktape-node-user@$(systemd-escape "$CHAIN_ID")"
+
+  log "1/3 the launcher into $WS_DIR, the unit into $UNIT_DIR"
+  run install -m 0755 "$LAUNCHER" "$WS_DIR/ducktape-node-launcher"
+  run install -D -m 0644 "$SCRIPT_DIR/ducktape-node-user@.service" "$UNIT_DIR/ducktape-node-user@.service"
+  run systemctl --user daemon-reload
+
+  log "2/3 enable and start $UNIT"
+  run systemctl --user enable --now "$UNIT"
+
+  log "3/3 linger, so the node outlives this login and starts at boot"
+  ME="${USER:-$(id -un)}"
+  run loginctl enable-linger "$ME" \
+    || log "linger needs an admin here, and without it the node stops at logout and waits for a login after a reboot: sudo loginctl enable-linger $ME"
+
+  log "done — log: $WS_DIR/launcher.log; systemctl --user status|restart|stop '$UNIT'"
+  exit 0
 fi
 
 DUCK_HOME=/var/lib/ducktape

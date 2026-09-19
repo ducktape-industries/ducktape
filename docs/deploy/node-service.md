@@ -413,6 +413,49 @@ backed up — no verb helps, and there is no key-rotation verb to reach for
 either: `ducktape node member` is `promote | remove | leave | status`, so the
 key IS the seat. See `backup-and-keys.md`.
 
+## Linux without root (systemd --user)
+
+An operator with no root runs the node as their own systemd user unit,
+`ops/node/ducktape-node-user@.service`, out of their own `~/.ducktape`. The
+unit runs `ducktape-node-launcher run` over the workspace like
+`ducktape-node@` does, restarts it when it exits (except on 77, an invite
+that can never redeem), and gives the launcher 150 s to stop its node.
+
+The workspace must already be under the launcher — founded or joined as
+yourself, then seeded once:
+
+```sh
+ducktape node join '<invite>'             # or `ducktape node init --name mynet`
+# --from: the `ducktape` of an unpacked node release, `modules/` beside it
+ducktape-node-launcher install --workspace ~/.ducktape/<chain-id> \
+  --config ~/.ducktape/<chain-id>/node.toml --from <release dir>/ducktape
+ops/node/install.sh --user --dry-run --workspace <chain-id>   # print the steps
+ops/node/install.sh --user --workspace <chain-id>
+```
+
+`--user` refuses a workspace with no `updates/state.json` rather than enabling
+a unit that would restart a refusal forever. It copies the
+`ducktape-node-launcher` on PATH to `<workspace>/ducktape-node-launcher`,
+installs the unit into `~/.config/systemd/user/`, enables and starts
+`ducktape-node-user@<escaped chain id>`, and turns on linger
+(`loginctl enable-linger "$USER"`) so the node outlives a logout and starts at
+boot. Where linger needs an admin, the install says so and carries on; until
+an admin runs `sudo loginctl enable-linger <user>`, the node stops at logout.
+There is no user unit for the service daemons: a unit name carries one
+instance, and a daemon needs both a workspace and a kind.
+
+The launcher and its node log to `<workspace>/launcher.log`; the node also
+writes `<workspace>/daemon.log`. Stop, start and restart it through systemd,
+never by pid — `Restart=always` starts a killed launcher again:
+
+```sh
+UNIT="ducktape-node-user@$(systemd-escape '<chain-id>')"
+systemctl --user status "$UNIT"
+systemctl --user restart "$UNIT"
+systemctl --user stop "$UNIT"             # stays stopped until start or boot
+systemctl --user disable --now "$UNIT"    # and not at boot either
+```
+
 ## macOS (launchd)
 
 There is no systemd on a Mac, so the node runs as a **per-user LaunchAgent**:
