@@ -149,10 +149,12 @@ sudo install -m 0755 ~/.cargo/bin/ducktape ~/.cargo/bin/ducktape-node-launcher /
 sudo ln -sfn /usr/local/lib/ducktape/ducktape /usr/local/bin/ducktape
 sudo ln -sfn /usr/local/lib/ducktape/ducktape-node-launcher /usr/local/bin/ducktape-node-launcher
 
-# 2. A dedicated user. The kvm group is for the service daemons: compute and
-#    agent open /dev/kvm per run; `node run` itself never does.
+# 2. A dedicated user. On hosts with a kvm group, add the service user so
+#    compute and agent can open /dev/kvm per run; `node run` itself never does.
 sudo useradd --system --home-dir /var/lib/ducktape --shell /usr/sbin/nologin ducktape
-sudo usermod -aG kvm ducktape
+if getent group kvm >/dev/null; then
+  sudo usermod -aG kvm ducktape
+fi
 sudo install -d -o ducktape -g ducktape -m 0700 /var/lib/ducktape
 
 # 3. The founding set, beside the binary: what `node init --modules` composes
