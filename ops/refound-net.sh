@@ -642,7 +642,10 @@ say "join the resident"
 # takes the whole script down on the spot — with its stderr sent to /dev/null
 # and the `die` below never reached, so the operator gets a bare non-zero exit
 # and no reason at all.
-INVITE_FILE="/tmp/refound-$NAME-$STAMP.invite"
+# In the founder's own workspace, beside the wallet mnemonic and password it
+# is no less sensitive than: a bearer credential on a shared /tmp is readable
+# by whoever gets to it first, and nothing ever cleaned the old ones up.
+INVITE_FILE="$FOUNDER_WS/invite-$STAMP.invite"
 INVITE_OUT=$(DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" node invite --config "$FOUNDER_CFG" 2>&1) \
     || die "node invite failed: $INVITE_OUT"
 # An invite is a bearer credential: 0600 from its first byte, and only its
