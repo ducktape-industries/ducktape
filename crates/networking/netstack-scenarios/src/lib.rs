@@ -79,6 +79,7 @@ macro_rules! suite {
             handshake_lost_at_each_stage,
             duplicated_delivery_is_tolerated,
             standby_prewarm_then_promotion,
+            cutover_keeps_endpoint_less_standby,
             slow_resolver_does_not_stall,
             join_direct_invite,
             join_coordinated_invite,
