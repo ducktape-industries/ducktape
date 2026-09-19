@@ -19,8 +19,16 @@
 #
 #   ops/release/publish.sh --kind node --node http://127.0.0.1:8844 \
 #       --key ... --sequence 3 --display "2026.09.3+e6352411a" \
-#       --archive linux-x86_64=target/ducktape-linux-x86_64.tar.zst
+#       --archive linux-x86_64=target/ducktape-linux-x86_64.tar.zst \
+#       --verified-sha <sha256 a second build of that archive printed>
 #   ducktape release schedule --sha <archive sha256> --at <height>
+#
+# A node archive is built twice and published once: each --archive of
+# --kind node must hash to one --verified-sha, the sha256 `archive.sh`
+# printed for a second, independent build of the same commit, or nothing is
+# signed or landed (`archive_not_reproduced`). An app release takes no
+# --verified-sha: its macOS bundle's signature carries a timestamp no second
+# build repeats.
 #
 # The release wallet is an ordinary ducktape wallet minted into a workspace
 # of its own (`ducktape wallet new release --workspace ~/.ducktape/release`);
@@ -48,11 +56,12 @@ NOTES_URL=""
 OUT_DIR="${PUBLISH_OUT_DIR:-target/release-publish}"
 ARCHIVES=()
 EXTRA=()
+VERIFIED=""
 
 KIND="app"
 
 usage() {
-  sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
@@ -66,6 +75,7 @@ while [ $# -gt 0 ]; do
     --archive) ARCHIVES+=("$2"); shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     --kind) KIND="$2"; shift 2 ;;
+    --verified-sha) VERIFIED="$VERIFIED $2"; shift 2 ;;
     # forwarded to `release manifest` verbatim (--node-contract,
     # --successor-key, --successor-from)
     --node-contract|--successor-key|--successor-from) EXTRA+=("$1" "$2"); shift 2 ;;
@@ -85,6 +95,35 @@ case "$KIND" in
   app)  CHANNEL="stable" ;;
   node) CHANNEL="node" ;;
   *) echo "publish.sh: --kind takes app or node, not $KIND" >&2; exit 2 ;;
+esac
+
+sha256_of() {
+  if command -v sha256sum >/dev/null; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+# Build twice, publish once: a node archive is landed only when a second,
+# independent build of it hashed to the same bytes.
+case "$KIND" in
+  app)
+    [ -z "$VERIFIED" ] || { echo "publish.sh: --verified-sha checks a node archive; an app release is not reproducible" >&2; exit 2; }
+    ;;
+  node)
+    for archive in "${ARCHIVES[@]}"; do
+      path="${archive#*=}"
+      own=$(sha256_of "$path")
+      case "$VERIFIED " in
+        *" $own "*) ;;
+        *)
+          echo "publish.sh: archive_not_reproduced: $path hashes to $own, which no --verified-sha names — build it again from the same commit and pass the sha256 archive.sh prints" >&2
+          exit 1
+          ;;
+      esac
+    done
+    ;;
 esac
 
 # Each archive's own identity, if it carries one, is this publish's: the text

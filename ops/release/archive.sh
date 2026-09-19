@@ -117,9 +117,13 @@ esac
 PLATFORM="$OS-$ARCH"
 case "$OS" in
   # bsdtar's spelling of "owners dropped", then GNU tar's. Owners are dropped
-  # so the bytes do not depend on who built them.
-  macos) TAR_OWNER=(--uid 0 --gid 0 --numeric-owner) ;;
-  linux) TAR_OWNER=(--owner=0 --group=0 --numeric-owner) ;;
+  # so the bytes do not depend on who built them. GNU tar also drops what the
+  # build and the copy stamp on a member — mtime, directory read order, the
+  # packer's umask — so one commit packs to one sha256 (`publish.sh
+  # --verified-sha` compares two builds); bsdtar has no spelling for those,
+  # and a macOS archive records its copy times.
+  macos) TAR_NORMAL=(--uid 0 --gid 0 --numeric-owner) ;;
+  linux) TAR_NORMAL=(--owner=0 --group=0 --numeric-owner --format=gnu --sort=name --mtime=@0 --mode=u=rwX,go=rX) ;;
 esac
 
 refuse() { echo "archive.sh: $1: $2" >&2; exit 1; }
@@ -243,7 +247,7 @@ OUT_DIR=$(cd "$OUT_DIR" && pwd -P)
 PARTIAL="$OUT_DIR/$PREFIX-$PLATFORM.tar.zst.partial"
 # No resource forks or xattrs (a quarantine flag must never ride inside a
 # release); owners dropped so the bytes do not depend on who built them.
-COPYFILE_DISABLE=1 tar -C "$PARENT" "${TAR_OWNER[@]}" -cf - "${MEMBERS[@]}" \
+COPYFILE_DISABLE=1 tar -C "$PARENT" "${TAR_NORMAL[@]}" -cf - "${MEMBERS[@]}" \
   | zstd -q -T0 -19 -f -o "$PARTIAL"
 if command -v sha256sum >/dev/null; then
   SHA=$(sha256sum "$PARTIAL" | cut -d' ' -f1)
