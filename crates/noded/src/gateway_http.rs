@@ -322,7 +322,7 @@ async fn gateway_query(
             .map_err(|refused| GatewayFailure::Unavailable(refused.message))
     })
     .await
-    .map_err(|_| GatewayFailure::Unavailable("gateway authorization query timed out".into()))?
+    .map_err(|_| GatewayFailure::Unavailable("gateway query timed out".into()))?
 }
 
 async fn current_route(
@@ -796,25 +796,16 @@ async fn resolve_duck_authority(
     };
     name.validate().map_err(GatewayFailure::Invalid)?;
 
-    let (reply, rx) = oneshot::channel();
-    let mut commands = handle.cmds.clone();
-    commands
-        .send(NodeCommand::Query {
-            target: "gateway".into(),
-            req: gateway::encode_query(&gateway::GatewayQuery::Resolve {
-                name: gateway::DuckDnsName {
-                    handle: alias.to_string(),
-                },
-            }),
-            reply,
-        })
-        .await
-        .map_err(|_| GatewayFailure::Unavailable("node actor is gone".into()))?;
-    let bytes = tokio::time::timeout(GATEWAY_QUERY_DEADLINE, rx)
-        .await
-        .map_err(|_| GatewayFailure::Unavailable("gateway resolve timed out".into()))?
-        .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
-        .map_err(|refused| GatewayFailure::Unavailable(refused.message))?;
+    let bytes = gateway_query(
+        &handle.cmds,
+        "gateway",
+        gateway::encode_query(&gateway::GatewayQuery::Resolve {
+            name: gateway::DuckDnsName {
+                handle: alias.to_string(),
+            },
+        }),
+    )
+    .await?;
     match gateway::decode_reply(&bytes) {
         Ok(gateway::GatewayReply::Resolved(Some(account))) => Ok((account.account_id, name)),
         Ok(gateway::GatewayReply::Resolved(None)) => Err(GatewayFailure::NotFound(format!(
@@ -1436,6 +1427,34 @@ mod tests {
         assert!(
             matches!(result, Err(GatewayFailure::Unavailable(reason)) if reason.contains("timed out"))
         );
+    }
+
+    /// A `.duck` page load resolves its authority through the same queue: a
+    /// saturated actor answers `Unavailable` at the deadline, never a hang.
+    #[tokio::test(start_paused = true)]
+    async fn a_duck_resolve_behind_a_full_queue_gives_up_at_the_deadline() {
+        let (handle, _receiver, _hub) = NodeHandle::channel();
+        let mut filler = handle.cmds.clone();
+        let mut parked = Vec::new();
+        loop {
+            let (reply, answer) = oneshot::channel();
+            let command = NodeCommand::Query {
+                target: "gateway".into(),
+                req: vec![],
+                reply,
+            };
+            if filler.try_send(command).is_err() {
+                break;
+            }
+            parked.push(answer);
+        }
+        let started = tokio::time::Instant::now();
+        let result = resolve_duck_authority(&handle, "app.alice.duck").await;
+        assert!(
+            matches!(result, Err(GatewayFailure::Unavailable(reason)) if reason == "gateway query timed out")
+        );
+        assert_eq!(started.elapsed(), GATEWAY_QUERY_DEADLINE);
+        assert!(!parked.is_empty());
     }
 
     #[tokio::test]

@@ -282,6 +282,12 @@ pub enum Command {
     Banner(UpdateBanner),
     /// Remove every `releases/<sha>` not in `keep`, and stale `.partial`s.
     Gc { keep: Vec<Sha> },
+    /// Launcher only; the app holds no founding record and does nothing.
+    /// Record the module world `sha`'s node speaks as the one its workspace
+    /// holds (`ducktape node record-world`), so a later boot of the release
+    /// that came up healthy is not refused for speaking another world than
+    /// the one the workspace was founded or joined with.
+    RecordWorld(Sha),
 }
 
 /// What the console strip and the Settings "Updates" section show.

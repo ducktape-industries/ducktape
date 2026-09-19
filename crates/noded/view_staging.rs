@@ -3,13 +3,13 @@
 //! A view is DECLARED for a founding id by its committed artifact,
 //! `crates/views/<id>/view.wasm` (with the view's `assets/` beside it): for a
 //! module id in the topology it is the module's own view, packed into its
-//! artifact; for a view-only id in `topology::VIEWS` it is a `Kind::View`
+//! artifact; for a view-only id in `topology::views()` it is a `Kind::View`
 //! entry of its own. The artifact is the declaration exactly as a committed
 //! `index.wasm` declares an index guest — this repo holds the views
 //! ducktape-views builds, not their source, and `make views-sync` is the one
 //! step that moves them, recording the ducktape-views commit and each sha256
-//! in `crates/views/views.lock`. The desktop's own views (`members`, `node`,
-//! …) are never committed here: they ship with the app, not with a network.
+//! in `crates/views/views.lock`. Every basic view (`topology::basic_views()`)
+//! is committed here: the app ships none, the network serves them all.
 use std::path::{Path, PathBuf};
 
 /// `crates/views/<id>/view.wasm`: the committed view that declares one for `id`.

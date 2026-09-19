@@ -64,14 +64,17 @@ fn validator_loop_reads_clock_through_the_seam() {
 const TIME_BASED_WAITS: &[(&str, usize, &str)] = &[
     (
         "common/mod.rs",
-        3,
-        "the hello heartbeat's refresh interval, and the query re-send after a \
-         cutover closed the connection (no node event marks the pump resuming)",
+        4,
+        "the hello heartbeat's refresh interval, the query re-send after a \
+         cutover closed the connection (no node event marks the pump resuming), \
+         and `terminate`'s SIGTERM budget (the budget before SIGKILL IS the \
+         contract, and `Child` has no timed wait)",
     ),
     (
         "suspend_resume_e2e.rs",
-        1,
-        "FREEZE is the scenario: a freeze longer than the founder's read deadline",
+        2,
+        "the freeze IS the scenario: one longer than the founder's read deadline, \
+         one longer than the sync lease",
     ),
 ];
 

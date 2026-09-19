@@ -405,7 +405,7 @@ pub(crate) fn wire_reachability_plane<S, R>(
     wireguard_advertised: Option<Ingress>,
     coordinators: Vec<Ingress>,
     intro_listen: Option<std::net::SocketAddr>,
-    // the genesis-issued admission capability presented on every coordinator
+    // the validator-issued admission capability presented on every coordinator
     // request (private coordination); `None` for a genesis validator, a public
     // coordinator, or the dev shape.
     coord_cap: Option<nat_traversal::CoordCap>,
@@ -1234,7 +1234,7 @@ async fn reachability_plane(
     // the invite intro listener: where a fresh joiner announces its keys
     // (token-authenticated) so its tunnel exists before any p2p.
     intro_listen: Option<std::net::SocketAddr>,
-    // the genesis-issued admission capability presented on every coordinator
+    // the validator-issued admission capability presented on every coordinator
     // request (private coordination); `None` for a genesis validator, a public
     // coordinator, or the dev shape.
     coord_cap: Option<nat_traversal::CoordCap>,
@@ -1437,7 +1437,7 @@ async fn reachability_plane(
     let (invite_intro_tx, mut invite_intro_rx) = (Some(invite_intro_tx), Some(invite_intro_rx));
     // authenticate every coordinator request: the node signs a
     // proof-of-possession with its identity key and, in private coordination,
-    // carries the genesis-issued cap. A fully-open coordinator ignores the
+    // carries the validator-issued cap. A fully-open coordinator ignores the
     // authenticator; a public/private one requires it. With no coordinators
     // configured `bind` short-circuits to pass-through and never touches this.
     let resolver = match &socket_underlay {
@@ -1787,6 +1787,26 @@ pub(crate) fn netstack_backend() -> Result<reachability::NetstackBackend, String
     load_netstack_backend(&path)
 }
 
+/// The boot's own read of the netstack guest, made where an unreadable one is
+/// a refusal by name. Inside the runtime the same failure is a plane that
+/// never starts on a node that otherwise looks healthy: it produces blocks
+/// while no tunnel, no invite and no join can ever work.
+pub(crate) fn preflight_netstack() -> Result<(), String> {
+    netstack_backend().map(drop).map_err(netstack_refusal)
+}
+
+/// Why a node whose netstack guest is unreadable does not boot: `error` names
+/// the file, the rest says what dies without it and what to do.
+fn netstack_refusal(error: String) -> String {
+    format!(
+        "refusing to boot: the netstack guest this node reaches its mesh with is unreadable \
+         ({error}). Without it no tunnel comes up — no member can reach this node, no invite it \
+         mints can be redeemed, and a workspace with no genesis yet cannot fetch one. Put the \
+         release's founding set beside this binary (or set $DUCKTAPE_MODULES_DIR) and start it \
+         again"
+    )
+}
+
 fn load_netstack_backend(path: &std::path::Path) -> Result<reachability::NetstackBackend, String> {
     let component = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(reachability::NetstackBackend::Guest {
@@ -2084,6 +2104,24 @@ mod plane_failure_tests {
 
 #[cfg(test)]
 mod netstack_execution_tests {
+    /// A node whose netstack guest cannot be read refuses its boot naming the
+    /// file, instead of sealing blocks behind a mesh nobody can reach.
+    #[test]
+    fn an_unreadable_netstack_guest_refuses_the_boot_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = workspace_config::netstack_component_path(dir.path());
+        let refusal = super::load_netstack_backend(&path)
+            .map(drop)
+            .map_err(super::netstack_refusal)
+            .expect_err("no guest on disk");
+        assert!(refusal.starts_with("refusing to boot"), "{refusal}");
+        assert!(refusal.contains(&path.display().to_string()), "{refusal}");
+        assert!(refusal.contains("$DUCKTAPE_MODULES_DIR"), "{refusal}");
+
+        std::fs::write(&path, b"guest bytes").unwrap();
+        assert!(super::load_netstack_backend(&path).is_ok());
+    }
+
     #[tokio::test]
     async fn startup_selection_is_delivered_only_to_its_plane_generation() {
         let (commands, _receiver) = tokio::sync::mpsc::channel(1);

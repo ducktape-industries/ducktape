@@ -1,0 +1,33 @@
+# ducktape-forge-mirror — one pass of ops/forge-mirror.sh: GitHub branches
+# into this host's node Forge, fast-forward only. Started by
+# ducktape-forge-mirror.timer; a non-fast-forward fails the unit (see
+# `journalctl -u ducktape-forge-mirror`), and nothing force-syncs.
+#
+# Install: copy ops/forge-mirror.sh and ops/forge-import.py into
+# /usr/local/lib/ducktape/, write /etc/ducktape/forge-mirror.env (the
+# FORGE_MIRROR_* variables the script documents), then
+# `systemctl enable --now ducktape-forge-mirror.timer`.
+[Unit]
+Description=Ducktape Forge mirror (GitHub -> Forge, fast-forward only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# the ducktape user owns the workspace, so it can read the node's admin.token
+# (FORGE_MIRROR_TOKEN_FILE) and nothing here needs more.
+User=ducktape
+Group=ducktape
+# the per-repository state repositories: /var/lib/ducktape-forge-mirror.
+StateDirectory=ducktape-forge-mirror
+StateDirectoryMode=0700
+EnvironmentFile=/etc/ducktape/forge-mirror.env
+ExecStart=/usr/local/lib/ducktape/forge-mirror.sh
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+UMask=0077

@@ -41,7 +41,7 @@ use commonware_runtime::{
 };
 use commonware_utils::{NZU32, NZUsize};
 
-use consensus::{Cadence, ContentStore, Digest, SimplexOrderer, digest_of};
+use consensus::{Cadence, ContentStore, Digest, PAYLOAD_CACHE_BYTES, SimplexOrderer, digest_of};
 
 /// the beat the sim runs at — simulated time, so its size is not wall-clock.
 const CADENCE: Cadence = Cadence::from_millis(1_000);
@@ -377,6 +377,11 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
             stores[i].get(&valid_frame_digest),
             Some(unproposed_valid_frame()),
             "validator {i}: unproposed valid frame keyed by its own digest, never delivered"
+        );
+        // inert for MEMORY too: the flood never outweighs the cache's byte cap.
+        assert!(
+            stores[i].cached_bytes() <= PAYLOAD_CACHE_BYTES,
+            "validator {i}: the payload cache outgrew its byte cap under the flood"
         );
     }
 }

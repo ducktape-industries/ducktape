@@ -47,16 +47,19 @@ impl Drop for Claim {
     }
 }
 
-/// Claim the workspace for this `run`, or refuse because another one holds it.
+/// Claim the workspace for this `run` or `install`, or refuse because another
+/// one holds it.
 ///
-/// ONE `run` PER WORKSPACE. `run` owns `state.json` and the install path, and
+/// ONE WRITER PER WORKSPACE. `run` owns `state.json` and the install path, and
 /// a second one decides from the same files with its own memory of what it has
 /// already answered for: it re-stages a release the first rolled back from,
 /// and a qualify it passes flips `current` out from under the first's live
 /// node. Its own child cannot bind the node's listeners either, so besides
-/// that it does nothing but restart a node that dies on every boot. `service`
-/// mode claims nothing — several daemons share one workspace on purpose, and
-/// none of them writes.
+/// that it does nothing but restart a node that dies on every boot. `install`
+/// rewrites both files whole, so under a live `run` it resets the phase that
+/// `run` is in the middle of, and beside a second install the two race the
+/// link. `service` mode claims nothing — several daemons share one workspace on
+/// purpose, and none of them writes.
 pub fn claim(path: &Path) -> Result<Claim, Refusal> {
     refuse_symlink(path)?;
     let parent = path.parent().ok_or_else(|| {
@@ -77,7 +80,8 @@ pub fn claim(path: &Path) -> Result<Claim, Refusal> {
         false => Err(Refusal::new(
             "workspace_locked",
             format!(
-                "{} is held by another ducktape-node-launcher — one supervises a workspace",
+                "{} is held by another ducktape-node-launcher — a workspace has one writer; \
+                 stop the one running it first",
                 path.display()
             ),
         )),
@@ -169,6 +173,41 @@ pub fn digest_file(path: &Path) -> Result<Sha, Refusal> {
         hasher.update(&buffer[..read]);
     }
     Ok(Sha::from_bytes(hasher.finalize().into()))
+}
+
+/// The sha256 of the image this process runs. Read once, at start: the file an
+/// operator installed may be replaced on disk later, and the image running is
+/// still the one that started.
+pub fn running_image() -> Result<Sha, Refusal> {
+    let path = std::env::current_exe()
+        .map_err(|error| Refusal::new("launcher_image_unreadable", error.to_string()))?;
+    digest_file(&path)
+}
+
+/// The sha256 of the launcher a release ships, or `None` when it ships none.
+pub fn shipped_image(path: &Path) -> Result<Option<Sha>, Refusal> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Refusal::io("digest_failed", path, &error)),
+        Ok(_) => digest_file(path).map(Some),
+    }
+}
+
+/// Replace this process's image with the launcher at `path` — same pid, same
+/// argv — telling it through [`crate::RELAUNCHED_ENV`] that `image` is what
+/// this one exec'd. Returns only when the exec failed.
+pub fn exec_launcher(path: &Path, image: Sha) -> Refusal {
+    use std::os::unix::process::CommandExt as _;
+    let mut argv = std::env::args_os();
+    let mut command = std::process::Command::new(path);
+    if let Some(arg0) = argv.next() {
+        command.arg0(arg0);
+    }
+    let error = command
+        .args(argv)
+        .env(crate::RELAUNCHED_ENV, image.to_string())
+        .exec();
+    Refusal::io("launcher_exec_failed", path, &error)
 }
 
 /// Copy `from` into `to`, directories and regular files only — the founding

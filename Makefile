@@ -5,9 +5,9 @@
 # installs the `ducktape` operator CLI beside its founding set. `make test`
 # is the full local verification gate — run it before every push.
 #
-# The desktop app, its launcher and the views it mounts live in
-# ducktape-industries/ducktape-app; their build and install targets went
-# with them.
+# The desktop app and its launcher live in ducktape-industries/ducktape-app;
+# their build and install targets went with them. The views the app draws
+# are founded into every network: `make views-sync` commits them here.
 
 CARGO ?= cargo
 # every build/test recipe resolves against the COMMITTED lock: a guest's wasm
@@ -218,6 +218,7 @@ test: wasm-embed-check
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/proxmox-view-lane-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/worktree-clean-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/dogfood-forge-test.py && \
+	  PYTHONDONTWRITEBYTECODE=1 python3 ops/forge-mirror-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/refound-smoke-test.py; \
 	else echo "[test] skipped the ops/ script tests — they need python 3.11 (tomllib)" >&2; fi
 # demo-clear's refusal line against a stub admin surface (the reason token it
@@ -378,9 +379,11 @@ modules-sync:
 # source, and names the commit they were built at.
 VIEWS_DIR ?= ../ducktape-views
 VIEWS_REV ?= HEAD
-# the founding ids that carry a view: the topology::PRODUCTION modules with a
-# view crate in ducktape-views, then the view-only topology::VIEWS.
-SYNC_VIEWS := chat files forge governance inbox pages home canvas
+# the basic views: every view the app draws, each founded into a network's
+# genesis and served by it. The ids are read from crates/topology/basic-views,
+# the one list topology::basic_views(), `node init` and ops/release/archive.sh
+# read too.
+SYNC_VIEWS := $(shell cat crates/topology/basic-views)
 
 ## commit each founding view as crates/views/<id>/view.wasm (+ its crate's
 ## assets/ as crates/views/<id>/assets/) and write crates/views/views.lock:
@@ -389,7 +392,11 @@ SYNC_VIEWS := chat files forge governance inbox pages home canvas
 ## so neither a working-tree edit nor a stale target/views over there reaches
 ## the bytes — the lock's commit is the source of every byte beside it, and a
 ## second run at the same commit changes nothing (ducktape-views'
-## ops/views-repro-check.sh holds that build reproducible).
+## ops/views-repro-check.sh holds that build reproducible). Each commit builds
+## into its own cargo target: build-views.sh compiles every commit through one
+## constant path, and `git archive` stamps the sources with the commit's time,
+## so a target shared across commits reads a newer commit's sources as older
+## than the last build's outputs and hands back the last commit's bytes.
 views-sync:
 	@rev=$$(git -C "$(VIEWS_DIR)" rev-parse --verify --quiet "$(VIEWS_REV)^{commit}") \
 	  || { echo "views-sync: views_rev_unknown: no commit $(VIEWS_REV) in $(VIEWS_DIR) (set VIEWS_DIR, VIEWS_REV)"; exit 1; }; \
@@ -400,7 +407,7 @@ views-sync:
 	  test -f "$$src/$$id/Cargo.toml" || { echo "views-sync: view_missing: ducktape-views $$rev has no $$id view crate"; exit 1; }; \
 	  packages="$$packages -p $$id-view"; \
 	done; \
-	(cd "$$src" && CARGO_TARGET_DIR="$(CURDIR)/target/views-sync/cargo" bash ops/build-views.sh $$packages) || exit 1; \
+	(cd "$$src" && CARGO_TARGET_DIR="$$src/target" bash ops/build-views.sh $$packages) || exit 1; \
 	lock=crates/views/views.lock; \
 	{ echo "# written by make views-sync: the ducktape-views commit the views beside"; \
 	  echo "# this file were built at, and the sha256 of each <id>/view.wasm"; \

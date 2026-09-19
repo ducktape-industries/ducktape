@@ -996,17 +996,16 @@ struct SigningGateway {
 }
 
 /// What a bundle IS, independent of its signature: the identity and version
-/// its `Info.plist` names, the executables it carries and the views it ships.
-/// Signing adds `_CodeSignature/` and rewrites the Mach-Os; it changes none of
-/// these, so the reply is checked to carry the same shape as the request.
-/// Signature validity itself is the host's `codesign`/`spctl` call in
-/// `ops/release/archive.sh`, never this side.
+/// its `Info.plist` names and the executables it carries — never a view, which
+/// the network serves out of its genesis. Signing adds `_CodeSignature/` and
+/// rewrites the Mach-Os; it changes none of these, so the reply is checked to
+/// carry the same shape as the request. Signature validity itself is the
+/// host's `codesign`/`spctl` call in `ops/release/archive.sh`, never this side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BundleShape {
     bundle_id: String,
     versions: BTreeMap<&'static str, Option<String>>,
     macos: BTreeSet<String>,
-    views: BTreeSet<String>,
 }
 
 impl BundleShape {
@@ -1017,6 +1016,7 @@ impl BundleShape {
         sign::unpack_bundle(archive, scratch.path())
             .map_err(|refusal| format!("{what} archive: {refusal}"))?;
         let bundle = scratch.path().join(sign::BUNDLE_NAME);
+        refuse_views(&bundle).map_err(|e| format!("{what} bundle: {e}"))?;
         sign::validate_layout(&bundle).map_err(|refusal| format!("{what} bundle: {refusal}"))?;
         Self::of_bundle(&bundle).map_err(|e| format!("{what} bundle: {e}").into())
     }
@@ -1031,14 +1031,28 @@ impl BundleShape {
             .map(|key| (*key, sign::plist_string(&plist, key)))
             .collect();
         let macos = entry_names(&bundle.join("Contents/MacOS"))?;
-        let views = entry_names(&bundle.join("Contents/Resources/views"))?;
         Ok(Self {
             bundle_id,
             versions,
             macos,
-            views,
         })
     }
+}
+
+/// An app release carries no view: the network serves every view the app
+/// draws out of its genesis. A `views` entry is refused by name here, before
+/// the layout check would refuse it anonymously.
+fn refuse_views(bundle: &Path) -> Result<(), String> {
+    for views in ["Contents/MacOS/views", "Contents/Resources/views"] {
+        let present = std::fs::symlink_metadata(bundle.join(views)).is_ok();
+        if present {
+            return Err(format!(
+                "views_in_app_release: {views} — the network serves every view out of its \
+                 genesis; an app release carries none"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn entry_names(dir: &Path) -> Result<BTreeSet<String>, String> {
@@ -1532,17 +1546,12 @@ mod tests {
 
     /// A bundle of the staged shape with no Mach-O in it: the shape check
     /// reads names and the plist, never the executables' bytes.
-    fn stage(root: &Path, bundle_id: &str, version: &str, views: &[&str]) -> PathBuf {
+    fn stage(root: &Path, bundle_id: &str, version: &str) -> PathBuf {
         let bundle = root.join(sign::BUNDLE_NAME);
         let contents = bundle.join("Contents");
         std::fs::create_dir_all(contents.join("MacOS")).unwrap();
-        std::fs::create_dir_all(contents.join("Resources/views")).unwrap();
         for executable in ["ducktape-launcher", "ducktape-app"] {
             std::fs::write(contents.join("MacOS").join(executable), b"\xcf\xfa\xed\xfe").unwrap();
-        }
-        std::os::unix::fs::symlink("../Resources/views", contents.join("MacOS/views")).unwrap();
-        for view in views {
-            std::fs::write(contents.join("Resources/views").join(view), b"\0asm").unwrap();
         }
         let mut plist = std::fs::File::create(contents.join("Info.plist")).unwrap();
         write!(
@@ -1557,16 +1566,16 @@ mod tests {
         bundle
     }
 
-    fn shape_of(bundle_id: &str, version: &str, views: &[&str]) -> BundleShape {
+    fn shape_of(bundle_id: &str, version: &str) -> BundleShape {
         let root = tempfile::tempdir().unwrap();
-        let bundle = stage(root.path(), bundle_id, version, views);
+        let bundle = stage(root.path(), bundle_id, version);
         let archive = sign::pack_bundle(&bundle).unwrap();
         BundleShape::of_archive(&archive, "test").unwrap()
     }
 
     #[test]
-    fn the_shape_is_identity_version_executables_and_views() {
-        let shape = shape_of(sign::BUNDLE_ID, "2026.9.2", &["chat.wasm", "forge.wasm"]);
+    fn the_shape_is_identity_version_and_executables() {
+        let shape = shape_of(sign::BUNDLE_ID, "2026.9.2");
         assert_eq!(shape.bundle_id, sign::BUNDLE_ID);
         assert_eq!(
             shape.versions,
@@ -1577,25 +1586,34 @@ mod tests {
         );
         assert_eq!(
             shape.macos,
-            BTreeSet::from([
-                "ducktape-launcher".into(),
-                "ducktape-app".into(),
-                "views".into()
-            ])
+            BTreeSet::from(["ducktape-launcher".into(), "ducktape-app".into()])
         );
-        assert_eq!(
-            shape.views,
-            BTreeSet::from(["chat.wasm".into(), "forge.wasm".into()])
-        );
+    }
+
+    /// The network serves every view, so a bundle carrying one — the views
+    /// directory or the `MacOS/views` link to it — is refused by name.
+    #[test]
+    fn a_bundle_carrying_views_is_refused_by_name() {
+        for views in ["Contents/Resources/views", "Contents/MacOS/views"] {
+            let root = tempfile::tempdir().unwrap();
+            let bundle = stage(root.path(), sign::BUNDLE_ID, "1");
+            std::fs::create_dir_all(bundle.join(views)).unwrap();
+            std::fs::write(bundle.join(views).join("chat.wasm"), b"\0asm").unwrap();
+            let error = BundleShape::of_archive(&sign::pack_bundle(&bundle).unwrap(), "unsigned")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("views_in_app_release"), "{views}: {error}");
+            assert!(error.starts_with("unsigned bundle"), "{error}");
+        }
     }
 
     #[test]
     fn a_signed_reply_with_the_same_shape_matches_what_was_sent() {
-        let sent = shape_of(sign::BUNDLE_ID, "2026.9.2", &["chat.wasm"]);
+        let sent = shape_of(sign::BUNDLE_ID, "2026.9.2");
         // signing adds _CodeSignature and rewrites the executables: neither
         // is part of the shape, so a re-staged bundle reads the same.
         let root = tempfile::tempdir().unwrap();
-        let bundle = stage(root.path(), sign::BUNDLE_ID, "2026.9.2", &["chat.wasm"]);
+        let bundle = stage(root.path(), sign::BUNDLE_ID, "2026.9.2");
         std::fs::create_dir_all(bundle.join("Contents/_CodeSignature")).unwrap();
         std::fs::write(
             bundle.join("Contents/_CodeSignature/CodeResources"),
@@ -1609,19 +1627,15 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_with_another_version_or_view_set_does_not_match() {
-        let sent = shape_of(sign::BUNDLE_ID, "2026.9.2", &["chat.wasm"]);
-        assert_ne!(shape_of(sign::BUNDLE_ID, "2026.9.3", &["chat.wasm"]), sent);
-        assert_ne!(
-            shape_of(sign::BUNDLE_ID, "2026.9.2", &["chat.wasm", "extra.wasm"]),
-            sent
-        );
+    fn a_reply_with_another_version_does_not_match() {
+        let sent = shape_of(sign::BUNDLE_ID, "2026.9.2");
+        assert_ne!(shape_of(sign::BUNDLE_ID, "2026.9.3"), sent);
     }
 
     #[test]
     fn a_reply_of_another_bundle_id_is_refused_by_the_layout_check() {
         let root = tempfile::tempdir().unwrap();
-        let bundle = stage(root.path(), "dev.example.other", "1", &["a.wasm"]);
+        let bundle = stage(root.path(), "dev.example.other", "1");
         let error = BundleShape::of_archive(&sign::pack_bundle(&bundle).unwrap(), "signed")
             .unwrap_err()
             .to_string();
@@ -1645,7 +1659,7 @@ mod tests {
             error.contains("is a directory but not Ducktape.app"),
             "{error}"
         );
-        let bundle = stage(root.path(), sign::BUNDLE_ID, "1", &["a.wasm"]);
+        let bundle = stage(root.path(), sign::BUNDLE_ID, "1");
         let packed = load_unsigned_archive(&bundle).unwrap();
         assert_eq!(packed, sign::pack_bundle(&bundle).unwrap());
         // the same bytes on disk are sent as they are
@@ -1749,7 +1763,7 @@ mod tests {
     #[test]
     fn unpack_replacing_swaps_the_staged_bundle_and_keeps_it_on_refusal() {
         let dir = tempfile::tempdir().unwrap();
-        let staged = stage(dir.path(), sign::BUNDLE_ID, "1", &["a.wasm"]);
+        let staged = stage(dir.path(), sign::BUNDLE_ID, "1");
         std::fs::write(staged.join("Contents/MacOS/ducktape-app"), b"unsigned").unwrap();
         let error = unpack_replacing(b"not zstd", dir.path())
             .unwrap_err()
@@ -1761,7 +1775,7 @@ mod tests {
         );
 
         let other = tempfile::tempdir().unwrap();
-        let signed = stage(other.path(), sign::BUNDLE_ID, "1", &["a.wasm"]);
+        let signed = stage(other.path(), sign::BUNDLE_ID, "1");
         std::fs::write(signed.join("Contents/MacOS/ducktape-app"), b"signed").unwrap();
         let archive = sign::pack_bundle(&signed).unwrap();
         let replaced = unpack_replacing(&archive, dir.path()).unwrap();
@@ -1770,7 +1784,6 @@ mod tests {
             std::fs::read(staged.join("Contents/MacOS/ducktape-app")).unwrap(),
             b"signed"
         );
-        assert!(std::fs::read_link(staged.join("Contents/MacOS/views")).is_ok());
         // nothing but the bundle is left in the directory
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()

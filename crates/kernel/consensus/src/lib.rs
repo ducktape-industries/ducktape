@@ -275,6 +275,12 @@ mod sim_carrier {
 /// through module state sync, not per-op fetch.
 pub const PAYLOAD_CACHE_CAP: usize = 16_384;
 
+/// cap on the total BYTES of CACHED entries. the count cap alone let a peer
+/// flooding max-size messages hold [`PAYLOAD_CACHE_CAP`] × 2 MiB ≈ 32 GiB; this
+/// bounds the same FIFO window by what it weighs, evicting oldest first. at
+/// honest frame sizes the count cap binds first and this never does.
+pub const PAYLOAD_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
 /// how long the payload resolver waits on one peer for a finalized op's bytes
 /// before it blames that peer and asks another. short on purpose: a starved
 /// node's apply prefix waits on every miss, so a dead peer must cost little.
@@ -298,7 +304,8 @@ const CERTIFICATE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from
 ///   peers resolve them via fetch), so they are exempt from eviction. the
 ///   reporter demotes a digest to cached on finalization.
 /// - CACHED — peer-relayed / fetched bytes ([`ContentStore::put`]): best-effort,
-///   FIFO-bounded at [`PAYLOAD_CACHE_CAP`]. content-addressing keeps a flood
+///   FIFO-bounded at [`PAYLOAD_CACHE_CAP`] entries and [`PAYLOAD_CACHE_BYTES`]
+///   bytes, whichever binds first. content-addressing keeps a flood
 ///   inert for CORRECTNESS (garbage can never match a finalized digest); the cap
 ///   keeps it inert for MEMORY.
 #[derive(Clone, Default)]
@@ -310,8 +317,11 @@ pub struct ContentStore {
 struct StoreInner {
     /// own in-flight submissions — never evicted; demoted on finalization.
     pinned: HashMap<Digest, Vec<u8>>,
-    /// best-effort cache, FIFO-bounded by `order` at [`PAYLOAD_CACHE_CAP`].
+    /// best-effort cache, FIFO-bounded by `order` at [`PAYLOAD_CACHE_CAP`]
+    /// entries and [`PAYLOAD_CACHE_BYTES`] bytes.
     cached: HashMap<Digest, Vec<u8>>,
+    /// total length of every value in `cached`.
+    cached_bytes: usize,
     /// insertion order of `cached` keys — the FIFO eviction queue.
     order: VecDeque<Digest>,
 }
@@ -323,16 +333,27 @@ impl StoreInner {
         if self.pinned.contains_key(&digest) || self.cached.contains_key(&digest) {
             return;
         }
+        self.cached_bytes += bytes.len();
         self.cached.insert(digest, bytes);
         self.order.push_back(digest);
-        while self.cached.len() > PAYLOAD_CACHE_CAP {
+        loop {
+            let over_count = self.cached.len() > PAYLOAD_CACHE_CAP;
+            let over_bytes = self.cached_bytes > PAYLOAD_CACHE_BYTES;
+            if !(over_count || over_bytes) {
+                return;
+            }
             // pop until an entry still live in `cached` is found: `order` may
             // carry keys a demote raced in (harmless — each pop shrinks it).
-            if let Some(old) = self.order.pop_front() {
-                self.cached.remove(&old);
-            } else {
-                break;
-            }
+            let Some(old) = self.order.pop_front() else {
+                return;
+            };
+            self.remove_cached(&old);
+        }
+    }
+
+    fn remove_cached(&mut self, digest: &Digest) {
+        if let Some(bytes) = self.cached.remove(digest) {
+            self.cached_bytes -= bytes.len();
         }
     }
 }
@@ -350,7 +371,7 @@ impl ContentStore {
         let mut inner = self.inner.lock().expect("content store poisoned");
         // already cached (e.g. a peer relayed our identical frame first): lift
         // it into the pinned class so eviction can no longer drop it.
-        inner.cached.remove(&digest);
+        inner.remove_cached(&digest);
         inner.pinned.insert(digest, bytes);
         digest
     }
@@ -416,6 +437,14 @@ impl ContentStore {
             .expect("content store poisoned")
             .cached
             .len()
+    }
+
+    /// total bytes of CACHED entries — bounded by [`PAYLOAD_CACHE_BYTES`].
+    pub fn cached_bytes(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("content store poisoned")
+            .cached_bytes
     }
 }
 
@@ -2425,6 +2454,41 @@ mod tests {
         );
         let last = digest_of(format!("blob-{:08}", PAYLOAD_CACHE_CAP - 1).as_bytes());
         assert!(store.get(&last).is_some(), "the newest entry survives");
+    }
+
+    #[test]
+    fn cached_entries_evict_fifo_at_the_byte_cap() {
+        // max-size messages fill the byte cap long before the count cap: the
+        // cache's weight never exceeds it, and the OLDEST entries go first.
+        const MESSAGE: usize = 2 * 1024 * 1024;
+        let blob = |i: usize| {
+            let mut bytes = vec![0u8; MESSAGE];
+            bytes[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            bytes
+        };
+        let store = ContentStore::new();
+        let flood = PAYLOAD_CACHE_BYTES / MESSAGE + 16;
+        for i in 0..flood {
+            store.put(blob(i));
+            assert!(
+                store.cached_bytes() <= PAYLOAD_CACHE_BYTES,
+                "the cache outgrew its byte cap at insert {i}"
+            );
+        }
+        assert_eq!(store.cached_len(), PAYLOAD_CACHE_BYTES / MESSAGE);
+        assert_eq!(store.cached_bytes(), PAYLOAD_CACHE_BYTES);
+        assert!(
+            !store.contains(&digest_of(&blob(0))),
+            "the oldest was evicted"
+        );
+        assert!(
+            store.contains(&digest_of(&blob(flood - 1))),
+            "the newest survives"
+        );
+
+        // pinning a cached entry takes its weight out of the cached total.
+        store.pin(blob(flood - 1));
+        assert_eq!(store.cached_bytes(), PAYLOAD_CACHE_BYTES - MESSAGE);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! ```text
 //! <workspace>/node.toml                      the node's own config (or --config)
 //! <workspace>/updates/state.json             the update machine's phase
-//! <workspace>/updates/launcher.lock          the running `run`'s exclusive claim
+//! <workspace>/updates/launcher.lock          the one writer's claim: a `run`, an `install`
 //! <workspace>/updates/keys/release.pub       the pinned release key
 //! <workspace>/updates/keys/successor.json    a key rotation this install saw
 //! <workspace>/updates/releases/<sha>/ducktape
@@ -36,6 +36,9 @@ pub const NODE_EXE: &str = "ducktape";
 /// binary carries wasm, so a release without this directory starts a node
 /// that cannot reach the mesh at all.
 pub const MODULES_DIR: &str = "modules";
+
+/// This launcher, as a node release archive ships it beside the binary.
+pub const LAUNCHER_EXE: &str = "ducktape-node-launcher";
 
 /// The node's own config, which is this launcher's alone — the update tree is
 /// shared, a config file name is not.
@@ -86,7 +89,8 @@ impl Layout {
         workspace::launcher_state_path(&self.workspace)
     }
 
-    /// What a `run` holds for as long as it supervises this workspace.
+    /// What a `run` holds for as long as it supervises this workspace, and an
+    /// `install` for as long as it writes.
     pub fn lock_path(&self) -> PathBuf {
         self.updates().join(LOCK_FILE)
     }
@@ -140,6 +144,12 @@ impl Layout {
     pub fn exe(&self) -> PathBuf {
         self.current_link().join(NODE_EXE)
     }
+
+    /// The launcher the install path's release ships — the image a `run`
+    /// becomes before it starts that release's node.
+    pub fn launcher(&self) -> PathBuf {
+        self.current_link().join(LAUNCHER_EXE)
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +178,10 @@ mod tests {
             PathBuf::from(format!("/srv/net/updates/releases/{sha}/ducktape"))
         );
         assert_eq!(layout.exe(), PathBuf::from("/srv/net/current/ducktape"));
+        assert_eq!(
+            layout.launcher(),
+            PathBuf::from("/srv/net/current/ducktape-node-launcher")
+        );
         assert_eq!(
             Layout::link_target(sha),
             PathBuf::from(format!("updates/releases/{sha}"))

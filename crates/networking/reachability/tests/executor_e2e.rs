@@ -815,6 +815,7 @@ async fn private_coordinator_admits_authenticated_bind() {
     let joiner = PrivateKey::from_seed(502); // NOT genesis; admitted by a cap
     let policy = nat_traversal::AuthPolicy::Private {
         genesis_set: vec![g.public_key(), member.public_key()],
+        live: Default::default(),
     };
 
     let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -865,6 +866,7 @@ async fn private_coordinator_denies_uncredentialed_bind() {
     let outsider = PrivateKey::from_seed(602); // NOT in the genesis set, no cap
     let policy = nat_traversal::AuthPolicy::Private {
         genesis_set: vec![g.public_key(), member.public_key()],
+        live: Default::default(),
     };
 
     let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -917,6 +919,7 @@ async fn private_coordinator_cross_peer_punch() {
     let b_signer = PrivateKey::from_seed(702);
     let policy = nat_traversal::AuthPolicy::Private {
         genesis_set: vec![g.public_key()],
+        live: Default::default(),
     };
 
     let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();

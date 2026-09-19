@@ -272,6 +272,37 @@ pub fn key_pin(pinned: Option<PublicKey>, committed: Option<PublicKey>) -> KeyPi
     }
 }
 
+/// Which launcher image starts the node the machine settled on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relaunch {
+    /// This image is the one `current` ships, or `current` ships none: it
+    /// starts the node itself.
+    Stay,
+    /// `current` ships a launcher with other bytes: this process becomes it,
+    /// and the image it becomes starts the node.
+    Exec { from: Sha, to: Sha },
+}
+
+/// THE RELAUNCH DECISION. Reads nothing, writes nothing.
+///
+/// Asked only where no child runs — after the boot drive, and after a flip
+/// stopped the node — because an image exec'd over a live child would not know
+/// it. Images are compared by content: after the exec, the image that runs IS
+/// the file `current` ships, so it stays, and nothing execs twice.
+pub fn relaunch(running: Sha, shipped: Option<Sha>) -> Relaunch {
+    let Some(shipped) = shipped else {
+        return Relaunch::Stay;
+    };
+    let same_image = shipped == running;
+    match same_image {
+        true => Relaunch::Stay,
+        false => Relaunch::Exec {
+            from: running,
+            to: shipped,
+        },
+    }
+}
+
 /// What the supervisor owes the machine on one poll of a live node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Next {
@@ -468,6 +499,7 @@ impl Executor<'_> {
             Command::Exec(sha) => Ok(Progress::Run(sha)),
             Command::Banner(banner) => self.report(banner),
             Command::Gc { keep } => self.collect(&keep),
+            Command::RecordWorld(sha) => self.record_world(sha),
         }
     }
 
@@ -705,6 +737,19 @@ impl Executor<'_> {
 
     fn collect(&self, keep: &[Sha]) -> Result<Progress, Refusal> {
         writers::collect(self.layout, keep);
+        Ok(Progress::Done)
+    }
+
+    /// The release that came up records its own world: only it links the
+    /// world it speaks, and it writes the record the way `init` and `join` do.
+    fn record_world(&self, sha: Sha) -> Result<Progress, Refusal> {
+        Ducktape::record_world(&self.layout.exe_of(sha), &self.layout.config())?;
+        info!(
+            target: crate::TARGET,
+            event = "node_update_world_recorded",
+            release = %sha,
+            "the workspace now holds the module world of the release that came up"
+        );
         Ok(Progress::Done)
     }
 
@@ -1202,6 +1247,21 @@ mod tests {
                 "#!/bin/sh\necho 'thread main panicked'\nexit 101\n"
             )),
             "qualify_refused"
+        );
+    }
+
+    /// A release that ships no launcher, or this very image, leaves the
+    /// supervisor as it is; one that ships other bytes is become.
+    #[test]
+    fn a_launcher_is_become_only_when_current_ships_other_bytes() {
+        assert_eq!(relaunch(sha("day-one"), None), Relaunch::Stay);
+        assert_eq!(relaunch(sha("v2"), Some(sha("v2"))), Relaunch::Stay);
+        assert_eq!(
+            relaunch(sha("day-one"), Some(sha("v2"))),
+            Relaunch::Exec {
+                from: sha("day-one"),
+                to: sha("v2"),
+            }
         );
     }
 

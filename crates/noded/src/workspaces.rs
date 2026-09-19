@@ -55,6 +55,43 @@ fn read_owner(dir: &FsPath) -> Option<Vec<u8>> {
     std::fs::read(owner_path(dir)).ok()
 }
 
+/// may this caller commit or delete the workspace at `dir`? `signed` is `None`
+/// when the request presented the OPERATOR credential (the admin-token header)
+/// instead of a signature — the gate has no other way past it with no
+/// `SignedBy` at all. But the gate ALSO inserts `SignedBy` for a signature by
+/// the operator's OWN key (`operator_key_matches`), so "is this the operator"
+/// is not just "is `signed` absent": a signed caller must be the workspace's
+/// creator or the operator.
+fn owner_or_operator(handle: &NodeHandle, dir: &FsPath, signed: Option<&crate::SignedBy>) -> bool {
+    let Some(crate::SignedBy(acting)) = signed else {
+        return true;
+    };
+    let is_owner = read_owner(dir).is_some_and(|owner| owner == *acting);
+    is_owner || crate::signed_req::operator_key_matches(&handle.admin, acting)
+}
+
+/// how many workspaces one signing key may hold on this node at once. Each is
+/// a full checkout on this node's disk, and any member may create one, so an
+/// unbounded create is an unbounded disk. Deleting one frees its slot.
+pub(crate) const MAX_WORKSPACES_PER_SIGNER: usize = 16;
+
+/// the workspaces under `root` that `owner` created.
+fn owned_count(root: &FsPath, owner: &[u8]) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| read_owner(&entry.path()).is_some_and(|stamped| stamped == owner))
+        .count()
+}
+
+/// every create counts and stamps under this one lock, so concurrent creates by
+/// one signer cannot each pass the count before any of them is stamped.
+/// ponytail: one create at a time per node; a per-signer lock if concurrent
+/// creates ever matter.
+static CREATE_LOCK: Mutex<()> = Mutex::new(());
+
 /// per-workspace commit serialization. keyed by id, each value a mutex two
 /// commits on the same workspace contend on; disjoint workspaces never wait.
 /// state is on disk, so this map is the ONLY in-memory workspace state — a
@@ -150,7 +187,9 @@ pub struct CreateBody {
 
 /// POST /v1/fs/workspaces — materialize a managed checkout under the injected
 /// root, returning `{id, path, snapshot}`. the `path` is where the caller edits
-/// files before committing over the id.
+/// files before committing over the id. A signer already holding
+/// [`MAX_WORKSPACES_PER_SIGNER`] is refused `workspace_cap_reached`; the
+/// operator credential signs nothing and is not counted.
 pub(crate) async fn create_workspace(
     State(handle): State<NodeHandle>,
     signed: Option<axum::Extension<crate::SignedBy>>,
@@ -170,18 +209,25 @@ pub(crate) async fn create_workspace(
         Err(err) => return error_response(StatusCode::BAD_REQUEST, &err),
     };
     let snapshot = body.snapshot;
+    let capped = signed.is_some();
     let result = tokio::task::spawn_blocking(move || {
+        let _guard = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let at_cap = capped && owned_count(&root, &owner) >= MAX_WORKSPACES_PER_SIGNER;
+        if at_cap {
+            return Err(CreateRefusal::CapReached);
+        }
         // a managed checkout records no node url — its commits ride the actor
         // lane, never a stored http base. the owner is stamped right after,
         // so a checkout that fails leaves no owner file behind either.
         let opts = CheckoutOptions::default();
-        match checkout_with(&api, &dir, &prefix, snapshot.as_deref(), &opts) {
-            Ok(index) => match write_owner(&dir, &owner) {
-                Ok(()) => Ok(index),
-                Err(e) => Err(e.to_string()),
-            },
-            Err(e) => Err(e.to_string()),
-        }
+        checkout_with(&api, &dir, &prefix, snapshot.as_deref(), &opts)
+            .map_err(|e| e.to_string())
+            .and_then(|index| {
+                write_owner(&dir, &owner)
+                    .map(|()| index)
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(CreateRefusal::Checkout)
     })
     .await;
     match result {
@@ -192,12 +238,27 @@ pub(crate) async fn create_workspace(
             "snapshot": index.base_snapshot,
         }))
         .into_response(),
-        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
+        Ok(Err(CreateRefusal::CapReached)) => error_response(
+            StatusCode::FORBIDDEN,
+            &format!(
+                "workspace_cap_reached: this key already holds \
+                 {MAX_WORKSPACES_PER_SIGNER} workspaces on this node; delete one first"
+            ),
+        ),
+        Ok(Err(CreateRefusal::Checkout(err))) => error_response(StatusCode::BAD_REQUEST, &err),
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "workspace checkout task panicked",
         ),
     }
+}
+
+/// why a create stopped inside its blocking task.
+enum CreateRefusal {
+    /// the signer already holds [`MAX_WORKSPACES_PER_SIGNER`].
+    CapReached,
+    /// the checkout, or the owner stamp after it, failed.
+    Checkout(String),
 }
 
 /// the POST /v1/fs/workspaces/{id}/commit body.
@@ -228,24 +289,12 @@ pub(crate) async fn commit_workspace(
     // a lock entry is minted per id below — only mint one for an id that
     // names a real, currently-materialized checkout, or any signed member
     // repeatedly posting fresh random ids grows WORKSPACE_LOCKS forever
-    // (delete_workspace, the only pruning path, is Operator-only).
+    // (delete_workspace, the only pruning path, admits only a creator).
     if !dir.exists() {
         return error_response(StatusCode::NOT_FOUND, "workspace not found");
     }
-    // `signed` is `None` when the request presented the OPERATOR credential
-    // (the admin-token header) instead of a user signature — the Acting
-    // lane's gate has no other way past it with no `SignedBy` at all. But the
-    // gate ALSO inserts `SignedBy` for a signature by the operator's OWN key
-    // (`operator_key_matches`, the PoP `ducktape node log-filter` etc. use),
-    // so "is this the operator" is not just "is `signed` absent" — a signed
-    // caller must be either the workspace's creator or the operator, the same
-    // pair DELETE already admits.
-    if let Some(crate::SignedBy(acting)) = signed.as_deref() {
-        let is_owner = read_owner(&dir).is_some_and(|owner| owner == *acting);
-        let is_operator = crate::signed_req::operator_key_matches(&handle.admin, acting);
-        if !is_owner && !is_operator {
-            return error_response(StatusCode::FORBIDDEN, "workspace_not_owner");
-        }
+    if !owner_or_operator(&handle, &dir, signed.as_deref()) {
+        return error_response(StatusCode::FORBIDDEN, "workspace_not_owner");
     }
     let api = ActorNodeApi::new(handle.clone(), origin);
     let lock = workspace_lock(&id);
@@ -278,12 +327,12 @@ pub(crate) async fn commit_workspace(
 /// DELETE /v1/fs/workspaces/{id} — remove the managed checkout dir. idempotent:
 /// deleting an already-gone workspace is still `{ok:true}`.
 ///
-/// AUTH: node-level (`signed_req`, `Authority::Operator`), unlike the
-/// create and commit above. It takes no acting identity and `remove_dir_all`s
-/// any valid-slug dir under the managed root, so a key that proved only
-/// possession would be able to wipe another run's checkout.
+/// AUTH: the same member bar as create (`signed_req`, `Authority::Member`),
+/// then the same pair commit admits: the workspace's creator or the operator.
+/// It `remove_dir_all`s the dir, so any other key is refused.
 pub(crate) async fn delete_workspace(
     State(handle): State<NodeHandle>,
+    signed: Option<axum::Extension<crate::SignedBy>>,
     Path(id): Path<String>,
 ) -> Response {
     let Some(root) = handle.duckfs_workspaces.clone() else {
@@ -293,6 +342,10 @@ pub(crate) async fn delete_workspace(
         return error_response(StatusCode::BAD_REQUEST, "invalid workspace id");
     }
     let dir = root.join(&id);
+    let present = dir.exists();
+    if present && !owner_or_operator(&handle, &dir, signed.as_deref()) {
+        return error_response(StatusCode::FORBIDDEN, "workspace_not_owner");
+    }
     let result = tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -324,9 +377,9 @@ mod tests {
     use super::*;
 
     /// a commit against an id nobody ever created must 404 WITHOUT minting a
-    /// `WORKSPACE_LOCKS` entry — the only pruning path (`delete_workspace`) is
-    /// Operator-only, so a lock entry per unchecked id is unbounded growth any
-    /// signed member can trigger.
+    /// `WORKSPACE_LOCKS` entry — the only pruning path (`delete_workspace`)
+    /// admits only a creator, so a lock entry per unchecked id is unbounded
+    /// growth any signed member can trigger.
     #[tokio::test]
     async fn commit_on_a_nonexistent_workspace_404s_and_mints_no_lock() {
         let (handle, _cmd_rx, _hub) = crate::NodeHandle::channel();
@@ -448,6 +501,179 @@ mod tests {
         let resp = commit_as(handle, id, None).await;
 
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// create takes a MEMBER: a well-signed key that holds no account is
+    /// refused at the gate by name, and a key that holds one gets a checkout.
+    #[tokio::test]
+    async fn create_refuses_a_bare_key_and_admits_a_member() {
+        use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+        use futures::StreamExt as _;
+        use tower::ServiceExt as _;
+        let member = PrivateKey::from_seed(81);
+        let bare = PrivateKey::from_seed(82);
+        let member_key = member.public_key().as_ref().to_vec();
+        let node_key = vec![0xad; 32];
+        let (mut handle, mut commands, _hub) = crate::NodeHandle::channel();
+        handle.admin.node_key = Some(node_key.clone());
+        let root = tempfile::tempdir().unwrap();
+        let handle = handle.with_duckfs_workspaces(root.path());
+        // the node actor, in miniature: identity knows the member, and files
+        // holds an empty tree.
+        let actor = tokio::spawn(async move {
+            while let Some(command) = commands.next().await {
+                let crate::NodeCommand::Query { target, req, reply } = command else {
+                    continue;
+                };
+                let bytes = match target.as_str() {
+                    "identity" => {
+                        let identity::IdentityQuery::OfKey { key } =
+                            identity::decode_query(&req).unwrap()
+                        else {
+                            panic!("unexpected identity query");
+                        };
+                        let account = (key == member_key).then(|| identity::AccountView {
+                            number: 7,
+                            name: "Member".into(),
+                            control: identity::Control::Keys,
+                            keys: vec![],
+                            avatar: None,
+                            bio: None,
+                            updated_at: 0,
+                        });
+                        identity::encode_reply(&identity::IdentityReply::Account(account))
+                    }
+                    "files" => match duckfs_core::decode_query(&req).unwrap() {
+                        duckfs_core::FilesQuery::Refs {} => duckfs_core::encode_reply(
+                            &duckfs_core::FilesReply::Refs(duckfs_core::RefsInfo {
+                                head: None,
+                                pins: Default::default(),
+                                window_len: 0,
+                            }),
+                        ),
+                        duckfs_core::FilesQuery::Find { .. } => {
+                            duckfs_core::encode_reply(&duckfs_core::FilesReply::Find {
+                                entries: vec![],
+                                next: None,
+                            })
+                        }
+                        query => panic!("unexpected files query {query:?}"),
+                    },
+                    target => panic!("unexpected query to {target}"),
+                };
+                let _ = reply.send(Ok(bytes));
+            }
+        });
+        let router = crate::router(handle);
+        let body = br#"{"prefix":"/workspace"}"#;
+        let create = |key: &PrivateKey| {
+            let mut builder = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/fs/workspaces")
+                .header("content-type", "application/json");
+            for (name, value) in crate::signed_req::request_headers(
+                key,
+                "POST",
+                "/v1/fs/workspaces",
+                &node_key,
+                body,
+            ) {
+                builder = builder.header(name, value);
+            }
+            builder.body(axum::body::Body::from(&body[..])).unwrap()
+        };
+        let json = |resp: Response| async move {
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        let refused = router.clone().oneshot(create(&bare)).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json(refused).await["reason"], "key_without_account");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+
+        let created = router.oneshot(create(&member)).await.unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let id = json(created).await["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            read_owner(&root.path().join(id)),
+            Some(member.public_key().as_ref().to_vec())
+        );
+        actor.abort();
+    }
+
+    /// a signer holding the cap is refused by name, and nothing new lands on
+    /// disk; the refusal is decided before any checkout runs.
+    #[tokio::test]
+    async fn a_signer_at_the_cap_is_refused_by_name() {
+        let (handle, _cmd_rx, _hub) = crate::NodeHandle::channel();
+        let root = tempfile::tempdir().unwrap();
+        let handle = handle.with_duckfs_workspaces(root.path());
+        let owner = b"busy-key".to_vec();
+        for n in 0..MAX_WORKSPACES_PER_SIGNER {
+            stamp_owned_dir(root.path(), &format!("{n:032x}"), &owner);
+        }
+
+        let resp = create_workspace(
+            State(handle),
+            Some(axum::Extension(crate::SignedBy(owner))),
+            Json(CreateBody {
+                prefix: None,
+                snapshot: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("workspace_cap_reached"),
+            "{body}"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            MAX_WORKSPACES_PER_SIGNER
+        );
+    }
+
+    /// delete admits the creator and nobody else signed: another key is
+    /// refused and the checkout survives it.
+    #[tokio::test]
+    async fn only_the_creator_deletes_a_workspace() {
+        let (handle, _cmd_rx, _hub) = crate::NodeHandle::channel();
+        let root = tempfile::tempdir().unwrap();
+        let handle = handle.with_duckfs_workspaces(root.path());
+        let id = "ffff000000000000000000000000000f";
+        let owner = b"run-a-key".to_vec();
+        let dir = stamp_owned_dir(root.path(), id, &owner);
+        let delete_as = |key: &[u8]| {
+            delete_workspace(
+                State(handle.clone()),
+                Some(axum::Extension(crate::SignedBy(key.to_vec()))),
+                AxPath(id.to_string()),
+            )
+        };
+
+        assert_eq!(
+            delete_as(b"run-b-key").await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(dir.exists(), "a refused delete removes nothing");
+        assert_eq!(delete_as(&owner).await.status(), StatusCode::OK);
+        assert!(!dir.exists());
+        assert_eq!(
+            delete_as(&owner).await.status(),
+            StatusCode::OK,
+            "idempotent"
+        );
     }
 
     /// the operator's OWN key, signed rather than the admin-token header,

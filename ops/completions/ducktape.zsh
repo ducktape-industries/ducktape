@@ -6,7 +6,7 @@
 # install: put this file on your $fpath as `_ducktape`, then `autoload -U _ducktape`.
 
 _ducktape() {
-    local families=(node user account wallet gateway fs service agent module collab mcp release help --help -h --version -V)
+    local families=(node user account wallet gateway fs service agent module collab mcp release forge help --help -h --version -V)
 
     local node_verbs=(run key init invite admit join list status qualify peers resident member work sandbox log-filter netstack help)
     local node_resident=(accept remove)
@@ -41,6 +41,8 @@ _ducktape() {
     local release_flags=(-n --unpack-into --node --network --config --credential --out --sequence --display --node-contract --notes-url --kind --archive --successor-key --successor-from --key --sig --pubkey --sha --at --lead --json --skip-preflight-i-know-the-wit-moved)
     local collab_verbs=(query key attach send ack help)
     local collab_flags=(--target --node --config -n --network --key --trust-node --channel --participant --existing-only --device --expect --to --kind --message-id --credential --seq --ttl-secs --state --reason)
+    local forge_verbs=(setup help)
+    local forge_flags=(--node)
 
     if (( CURRENT == 2 )); then
         compadd -- $families
@@ -85,6 +87,7 @@ _ducktape() {
         module)  compadd -- $module_verbs $module_flags ;;
         collab)  compadd -- $collab_verbs $collab_flags ;;
         release) compadd -- $release_verbs $release_flags ;;
+        forge)   compadd -- $forge_verbs $forge_flags ;;
     esac
 }
 

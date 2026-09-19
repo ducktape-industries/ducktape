@@ -54,7 +54,7 @@ pub const RELAY_BLOB_CHUNK_BYTES: usize = 768 * 1024;
 /// DROPS an inbound message when it is full (it never blocks a sender), so an
 /// unpaced blast of a pack's chunks silently loses whatever overruns the
 /// burst. A sender that keeps at most this many chunks outstanding never
-/// reaches that boundary: with [`MAX_INCOMING_BLOBS`](crate::relay_runtime)
+/// reaches that boundary: with [`MAX_INCOMING_BLOBS_PER_PEER`](crate::relay_runtime)
 /// transfers to the same peer at once, the offers plus every in-flight chunk
 /// stay well inside one burst, leaving the rest of it for submits and replies.
 pub const RELAY_BLOB_WINDOW_CHUNKS: usize = 16;
@@ -69,7 +69,7 @@ pub const RELAY_BLOB_ACK_EVERY: usize = 4;
 // mailbox — the DROP boundary the window exists to stay under.
 const RELAY_MESSAGES_PER_WINDOW: usize = RELAY_BLOB_WINDOW_CHUNKS + 1;
 const _: () = assert!(
-    RELAY_MESSAGES_PER_WINDOW * crate::relay_runtime::MAX_INCOMING_BLOBS
+    RELAY_MESSAGES_PER_WINDOW * crate::relay_runtime::MAX_INCOMING_BLOBS_PER_PEER
         < crate::constants::MESH_QUOTA_BURST
 );
 

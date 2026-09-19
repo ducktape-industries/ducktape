@@ -293,6 +293,19 @@ impl Genesis {
         Some(self.module(id)?.component)
     }
 
+    /// whether `id`'s entry carries a view: packed into a module's artifact,
+    /// or the whole of a view-only entry.
+    pub fn carries_view(&self, id: &str) -> bool {
+        let Some(bytes) = self.artifact(id) else {
+            return false;
+        };
+        match ArtifactRef::decode(bytes) {
+            Ok(ArtifactRef::Module(module)) => module.view.is_some(),
+            Ok(ArtifactRef::View(_)) => true,
+            Err(_) => false,
+        }
+    }
+
     pub fn index_guest(&self, id: &str) -> Option<&[u8]> {
         self.module(id)?.index
     }
@@ -566,6 +579,9 @@ mod tests {
         let ids: Vec<&str> = genesis.modules.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, ["home", "pages"]);
         assert_eq!(genesis.component("home"), None, "a view has no core");
+        assert!(genesis.carries_view("home"));
+        assert!(!genesis.carries_view("pages"), "a module with no view");
+        assert!(!genesis.carries_view("members"), "an absent id");
         let home = ArtifactRef::decode(genesis.artifact("home").unwrap()).unwrap();
         let ArtifactRef::View(view) = home else {
             panic!("home is a view-only frame");

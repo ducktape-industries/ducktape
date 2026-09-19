@@ -123,6 +123,10 @@ pub enum AttemptResult {
     /// invite, a clock too far off, a full join window): the race fails over
     /// like `Failed`, but this is an answer, and the one that names the fix.
     Refused(String),
+    /// a member's gate does not know the invite's issuer as a validator: the
+    /// race fails over (another member's view may be ahead), and the answer
+    /// is kept, because enough of them in a row are the network's word.
+    IssuerUnknown(String),
     /// the attempt exhausted its window, was refused non-terminally, or the
     /// plane went away — the race fails over to the next candidate.
     Failed(String),
@@ -151,14 +155,85 @@ pub enum FirstContactOutcome {
         detail: String,
     },
     /// every offered path was exhausted. HONEST: the caller must surface this
-    /// and exit non-zero rather than proceed as if joined. `refused` is the
-    /// last refusal a member answered with, if any did — then the mesh was
-    /// reached, and it is the refusal that says what to fix.
+    /// rather than proceed as if joined ([`after_exhausted_round`] decides
+    /// how). `refused` is the last answer a member gave, if any did — then the
+    /// mesh was reached, and it is the answer that says what to fix.
     Terminal {
         tried: usize,
         reason: String,
-        refused: Option<String>,
+        refused: Option<MemberAnswer>,
     },
+}
+
+/// What a member ANSWERED that was neither an admission nor a terminal
+/// refusal. It outlives the race — an out-slot the caller's window cannot
+/// drop — because the answer, not the dark paths around it, says what to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemberAnswer {
+    /// refused before its gate: an expired invite, a clock too far off, a full
+    /// join window. The detail names the fix.
+    Refused(String),
+    /// the invite's issuer is not in the member's committed validator set:
+    /// the member's view lags the issuer's admission, or the issuer is not —
+    /// or no longer — a validator. Only more rounds tell the two apart.
+    IssuerUnknown(String),
+}
+
+/// How many exhausted rounds may answer [`MemberAnswer::IssuerUnknown`]
+/// before the joiner takes it as the network's word. A validator-set change
+/// commits on every member within a few blocks, and rounds are tens of
+/// seconds apart, so an issuer that the answering members still do not know
+/// after these is not a validator: removed, or never seated. Retrying longer
+/// asks the same question of the same state.
+pub const ISSUER_UNKNOWN_ROUNDS: u32 = 3;
+
+/// What an exhausted first-contact round leaves a fresh joiner to do.
+#[derive(Debug, PartialEq)]
+pub enum AfterRound {
+    /// race again: nothing answered on any offered path, so the inviter (and
+    /// every front) is unreachable — down, or its plane is not running. The
+    /// invite is not what failed, and the inviter coming back admits it.
+    InviterUnreachable,
+    /// race again: the issuer is unknown to the members that answered, which
+    /// a view lagging its admission explains for [`ISSUER_UNKNOWN_ROUNDS`].
+    IssuerNotYetKnown(String),
+    /// exit 3: this node's own reachability plane never started, so every
+    /// offered path was dead before it was tried.
+    PlaneDown {
+        reason: &'static str,
+        detail: String,
+    },
+    /// exit 3: a member answered and refused this join before its gate.
+    Refused(String),
+    /// the terminal refusal class: the issuer stayed unknown for every round
+    /// of the bound, so this invite can never redeem.
+    IssuerNotAValidator(String),
+}
+
+/// Decide what an exhausted round leaves a fresh joiner to do. Pure: the
+/// caller performs it. `plane_failure` is this node's own reachability-plane
+/// refusal, `answer` the round's `FirstContactOutcome::Terminal { refused }`,
+/// and `issuer_unknown_rounds` how many rounds (this one included) answered
+/// [`MemberAnswer::IssuerUnknown`].
+pub fn after_exhausted_round(
+    plane_failure: Option<(&'static str, String)>,
+    answer: Option<MemberAnswer>,
+    issuer_unknown_rounds: u32,
+) -> AfterRound {
+    // the invite is the last thing to suspect: a plane that never started
+    // took every path down before any was tried.
+    if let Some((reason, detail)) = plane_failure {
+        return AfterRound::PlaneDown { reason, detail };
+    }
+    let issuer_bound_spent = issuer_unknown_rounds >= ISSUER_UNKNOWN_ROUNDS;
+    match answer {
+        None => AfterRound::InviterUnreachable,
+        Some(MemberAnswer::Refused(detail)) => AfterRound::Refused(detail),
+        Some(MemberAnswer::IssuerUnknown(detail)) => match issuer_bound_spent {
+            true => AfterRound::IssuerNotAValidator(detail),
+            false => AfterRound::IssuerNotYetKnown(detail),
+        },
+    }
 }
 
 /// the inviter as a first-contact candidate (its own WireGuard bootstrap).
@@ -303,7 +378,7 @@ pub async fn race_first_contact<F, Fut>(
     candidates: Vec<Candidate>,
     attempt: F,
     label: &str,
-    refused: &mut Option<String>,
+    refused: &mut Option<MemberAnswer>,
 ) -> FirstContactOutcome
 where
     F: Fn(Candidate) -> Fut,
@@ -361,7 +436,22 @@ where
                     );
                 }
                 last_reason = detail.clone();
-                *refused = Some(detail);
+                *refused = Some(MemberAnswer::Refused(detail));
+            }
+            // once per candidate per race; the round's own retry line counts
+            // the rounds, so this one stays at debug.
+            AttemptResult::IssuerUnknown(detail) => {
+                tracing::debug!(
+                    target: "ducktape::join",
+                    node = %label,
+                    peer = %noded::hex_bytes(&key.as_ref()[..4]),
+                    via = %via,
+                    reason = "issuer_unknown",
+                    detail = %detail,
+                    "a member does not know this invite's issuer — failing over to the next path"
+                );
+                last_reason = detail.clone();
+                *refused = Some(MemberAnswer::IssuerUnknown(detail));
             }
             AttemptResult::Failed(reason) => last_reason = reason,
         }
@@ -386,7 +476,7 @@ pub struct RelayFallback {
     /// this node's identity signer — every [`nat_traversal::RelayIntro`]
     /// carries a fresh proof-of-possession it signs.
     pub signer: ed25519::PrivateKey,
-    /// the genesis-issued coordinator capability, when the network's relay
+    /// the validator-issued coordinator capability, when the network's relay
     /// gates privately (the same cap every rendezvous request presents).
     pub cap: Option<nat_traversal::CoordCap>,
 }
@@ -576,8 +666,16 @@ fn ack_resolution(reply: join_gate::IntroReply) -> Option<AttemptResult> {
             detail,
             terminal: true,
         } => Some(AttemptResult::Rejected { code, detail }),
-        // a non-terminal refusal (issuer view lag, member busy) fails THIS
-        // candidate over — the race tries the next one.
+        // an issuer this member's view does not know fails THIS candidate
+        // over, and is kept: a lagging view explains it for a few rounds, the
+        // network's own state for good (`after_exhausted_round`).
+        join_gate::IntroReply::Rejected {
+            code: join_gate::RejectCode::IssuerUnknown,
+            detail,
+            terminal: false,
+        } => Some(AttemptResult::IssuerUnknown(detail)),
+        // a member too busy to settle the gate in time fails THIS candidate
+        // over — the race tries the next one.
         join_gate::IntroReply::Rejected {
             code,
             detail,
@@ -1255,6 +1353,15 @@ mod tests {
             }),
             Some(AttemptResult::Refused(_))
         ));
+        // an unknown issuer fails over too, but as its own answer.
+        assert!(matches!(
+            ack_resolution(join_gate::IntroReply::Rejected {
+                code: join_gate::RejectCode::IssuerUnknown,
+                detail: "not in this view".into(),
+                terminal: false,
+            }),
+            Some(AttemptResult::IssuerUnknown(_))
+        ));
     }
 
     #[test]
@@ -1343,10 +1450,11 @@ mod tests {
             direct_candidate("refuse", None),
             direct_candidate("fail", None),
         ];
+        let expired = Some(MemberAnswer::Refused("invite expired".into()));
         let mut refused = None;
         match race_first_contact(answered, attempt, "test", &mut refused).await {
             FirstContactOutcome::Terminal { refused, .. } => {
-                assert_eq!(refused.as_deref(), Some("invite expired"));
+                assert_eq!(refused, expired);
             }
             other => panic!("expected Terminal, got {other:?}"),
         }
@@ -1365,7 +1473,72 @@ mod tests {
             cut.is_err(),
             "the dark twin holds the race open past the window"
         );
-        assert_eq!(refused.as_deref(), Some("invite expired"));
+        assert_eq!(refused, expired);
+    }
+
+    /// An issuer a member does not know fails its candidate over like any
+    /// non-terminal answer, but the answer reaches the terminal as what it is.
+    #[tokio::test]
+    async fn an_unknown_issuer_reaches_the_terminal_as_its_own_answer() {
+        let attempt = |c: Candidate| async move {
+            match c.endpoint.as_deref() {
+                Some("lagging") => AttemptResult::IssuerUnknown("not in this view".into()),
+                _ => AttemptResult::Failed("no ack".into()),
+            }
+        };
+        let candidates = vec![
+            direct_candidate("dark", None),
+            direct_candidate("lagging", None),
+        ];
+        let mut refused = None;
+        let outcome = race_first_contact(candidates, attempt, "test", &mut refused).await;
+        let unknown = Some(MemberAnswer::IssuerUnknown("not in this view".into()));
+        assert!(
+            matches!(&outcome, FirstContactOutcome::Terminal { refused, .. } if *refused == unknown),
+            "{outcome:?}"
+        );
+    }
+
+    /// A fresh joiner whose round heard nothing races again and says the
+    /// inviter is unreachable; an unknown issuer is waited out for the bound
+    /// and then ends in the terminal class; the node's own dead plane and a
+    /// member's refusal still end the join, the plane first.
+    #[test]
+    fn an_exhausted_round_retries_an_unreachable_inviter_and_ends_an_unknown_issuer() {
+        let unknown = || Some(MemberAnswer::IssuerUnknown("not a validator".into()));
+        assert_eq!(
+            after_exhausted_round(None, None, 0),
+            AfterRound::InviterUnreachable
+        );
+        for rounds in 1..ISSUER_UNKNOWN_ROUNDS {
+            assert_eq!(
+                after_exhausted_round(None, unknown(), rounds),
+                AfterRound::IssuerNotYetKnown("not a validator".into())
+            );
+        }
+        assert_eq!(
+            after_exhausted_round(None, unknown(), ISSUER_UNKNOWN_ROUNDS),
+            AfterRound::IssuerNotAValidator("not a validator".into())
+        );
+        assert_eq!(
+            after_exhausted_round(
+                None,
+                Some(MemberAnswer::Refused("invite expired".into())),
+                0
+            ),
+            AfterRound::Refused("invite expired".into())
+        );
+        assert_eq!(
+            after_exhausted_round(
+                Some(("netstack_guest_unreadable", "gone".into())),
+                unknown(),
+                ISSUER_UNKNOWN_ROUNDS
+            ),
+            AfterRound::PlaneDown {
+                reason: "netstack_guest_unreadable",
+                detail: "gone".into()
+            }
+        );
     }
 
     fn direct_candidate(endpoint: &str, intro: Option<&str>) -> Candidate {

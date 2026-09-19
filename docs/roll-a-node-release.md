@@ -80,35 +80,23 @@ it founds them, and its report says so:
 ```
 
 An explicit pin — or the move of a differing one — is made in place, no
-re-found:
+re-found, with the workspace's launcher stopped: `install` writes the
+workspace like `run` does, and refuses one a running launcher holds
+(`workspace_locked`). A stopped launcher stops its node first.
 
 ```
+U="ducktape-node@$(systemd-escape '<chain id>')"
+sudo systemctl stop "$U"
 PUB=$(<workspace>/current/ducktape user key status --key <workspace>/keys/operator.key | awk '{print $NF}')
 ducktape-node-launcher install --workspace <workspace> --config <workspace>/node.toml \
     --from <workspace>/current/ducktape --release-key "$PUB"
+sudo systemctl start "$U"
 ```
 
 `--from` names the release the workspace is already running, so nothing is
-copied and `current` does not move; the only new file is the pin. The key is
-read once per node life, so the node child is restarted afterwards — stop it
-and its supervisor boots it again.
-
-Find it by what it is EXECUTING, never by a pattern over command lines: a
-`-f` match hits the editor, the grep and the shell that happen to name the
-same path.
-
-```
-for p in /proc/[0-9]*; do
-    case "$(readlink "$p/exe" 2>/dev/null)" in
-        <workspace>/updates/releases/*/ducktape) echo "stopping ${p#/proc/}"; kill "${p#/proc/}";;
-    esac
-done
-```
-
-`/proc/<pid>/exe` resolves THROUGH the `current` symlink, so a node child's
-executable path names its release directory, never `current/` — a scan looking
-for `current/` matches nothing at all and looks exactly like "nothing is
-running".
+copied and `current` does not move; `state.json` starts over at idle on that
+release, and the pin is the one new file. The launcher reads it when it
+starts.
 
 ## 1. Archive the release
 
@@ -148,8 +136,14 @@ RELEASE_WALLET_PASSWORD=… ops/release/publish.sh --kind node \
     --node http://127.0.0.1:<http port> \
     --key <workspace>/keys/operator.key \
     --sequence 1 --display "0.1.0+97b4ef7bc" \
-    --archive linux-x86_64=ducktape-linux-x86_64.tar.zst
+    --archive linux-x86_64=ducktape-linux-x86_64.tar.zst \
+    --verified-sha <the sha256 archive.sh printed for a second build>
 ```
+
+Publish refuses a node archive whose sha256 no `--verified-sha` names
+(`archive_not_reproduced`): build and archive the same commit a second time,
+in another checkout with its own target directory, and pass the sha256 that
+second `archive.sh` printed.
 
 It composes the manifest, signs it with that wallet, and lands the archive,
 the manifest and the signature under `/shared/releases` — archives first, so
@@ -189,8 +183,9 @@ ducktape release status --json --config <workspace>/node.toml
 
 ## 4. Watch it land
 
-The launcher's events are in `<workspace>/launcher.log`, under
-`ducktape::update`, and they are the whole story in order:
+The launcher logs to its stderr — under the unit, the journal
+(`journalctl -u "ducktape-node@$(systemd-escape '<chain id>')"`) — under
+`ducktape::update`, and its events are the whole story in order:
 
 ```
 node_update_offered      the network designates a release this node is not running
@@ -199,8 +194,18 @@ node_update_staged       staged, waiting for its height    display="0.1.0+97b4ef
 node_update_arming       armed at the committed height; stopping the node to qualify it
 node_update_qualified    the staged binary reopened the workspace checkpoint at the committed root
 node_update_flipped      from=<old sha> to=<new sha>
+node_update_launcher_exec release=<new sha> from=<short> to=<short>  only when the release ships another launcher
 node_update_exec         starting the node
 ```
+
+After a flip the supervisor runs the launcher the release shipped: with the
+old node stopped, it `exec`s `<workspace>/current/ducktape-node-launcher` in
+its own pid when those bytes differ from its own, and that image starts the
+node. A supervisor whose image never logs `node_update_launcher_exec` cannot
+take this step, and restarting it runs the same image again: on such a node,
+install the release's launcher over the path the unit runs
+(`install -m 0755 <workspace>/current/ducktape-node-launcher <ExecStart path>`)
+and restart the unit once; every later flip moves the launcher by itself.
 
 Staging is early and the flip is late: the bytes land while the designation is
 still in the future, and the node is stopped only once, to qualify the binary

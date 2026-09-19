@@ -363,7 +363,9 @@ default) with `Transfer-Encoding: chunked`. The Gateway counts a request body
 as it streams rather than holding it, so an uncapped route costs the node one
 frame, not one repository. Who may push is this service's own gate — the Git
 SSH push certificate and the module's ref rules — not a byte count on the
-transport. Stock Git can supply the route authority through its HTTP header
+transport. Set `max_response_bytes` to `0` (unbounded) for the same reason the
+other way: a clone is the whole history, and a capped route refuses any
+repository whose pack outgrows the cap. Stock Git can supply the route authority through its HTTP header
 configuration when dialing the node's browser Gateway:
 
 ```sh
@@ -383,11 +385,10 @@ manifest memory limit for pack construction, not for the pack.
 
 ## Media service
 
-Build the process with `cargo build --release -p ducktape-media` and the
-companion view in a ducktape-views checkout with
-`bash ops/build-views.sh -p call-view`. Deploy that checkout's
-`target/views/call_view.wasm` as the registry's `call` view. The desktop loads
-that artifact at runtime; its session owns call framing, mute/source controls,
+Build the process with `cargo build --release -p ducktape-media`. Its
+companion `call` view is a basic view (`crates/topology/basic-views`): every
+network founds it into its genesis, and the desktop fetches it from the
+registry at runtime; its session owns call framing, mute/source controls,
 speaking state, and bounded audio playout. A separate instance of the same view
 renders the call window from panel properties without opening devices or another
 transport session. It owns the video grid, participant captions, invite chips,

@@ -1556,8 +1556,9 @@ impl ValidatorRuntime<'_> {
             let module_id = entry.module_id.as_str();
             // what "this node can run it" means is the entry's kind: a
             // module's bytes must instantiate here AND replace the running
-            // module's state shape; a view's bytes must speak the view ABI,
-            // and no running module is asked about them.
+            // module's state shape — or, for an admission, start over scratch
+            // state, since the boundary initializes it; a view's bytes must
+            // speak the view ABI, and no running module is asked about them.
             let realizable = noded::compose::validate_deployment(
                 module_id, entry.kind, &bytes, index,
             )

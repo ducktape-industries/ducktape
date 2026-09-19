@@ -2,7 +2,9 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use coordinator_bin::{process_cpu_ns, process_rss_bytes, select_policy};
+use coordinator_bin::{
+    ValsetNode, follow_valset, process_cpu_ns, process_rss_bytes, select_policy, valset_node,
+};
 use nat_traversal::{
     COORDINATOR_PORT, Coordinator, CoordinatorMetrics, RELAY_PORT, RelayMetrics,
     run_coordinator_workers_with_metrics_using, run_relay_listener,
@@ -25,19 +27,25 @@ fn usage() -> String {
 ducktape coordinator
 
 Usage:
-  coordinator [--listen <addr>] [--relay-listen <addr|none>] [--workers <1|4>] [--metrics-interval <secs>] [--genesis-set <network.toml>]
+  coordinator [--listen <addr>] [--relay-listen <addr|none>] [--workers <1|4>] [--metrics-interval <secs>] [--genesis-set <network.toml> [--valset-node <http://host:port>]]
 
 Options:
-  --listen <addr>              UDP bind address [default: {DEFAULT_LISTEN}]
-  --relay-listen <addr|none>   TCP relay-lane bind; \"none\" disables [default: {DEFAULT_RELAY_LISTEN}]
-  --workers <1|4>              Signature-verification workers [default: 1]
-  --metrics-interval <secs>    Structured metrics period; 0 disables [default: 10]
-  --genesis-set <network.toml> Private mode: pin admission to genesis validators
-  -h, --help                   Print this help and exit
+  --listen <addr>                  UDP bind address [default: {DEFAULT_LISTEN}]
+  --relay-listen <addr|none>       TCP relay-lane bind; \"none\" disables [default: {DEFAULT_RELAY_LISTEN}]
+  --workers <1|4>                  Signature-verification workers [default: 1]
+  --metrics-interval <secs>        Structured metrics period; 0 disables [default: 10]
+  --genesis-set <network.toml>     Private mode: admit the genesis validators and their caps
+  --valset-node <http://host:port> Private mode: also admit this node's current validators
+                                   (read off its {QUERY} lane) and their caps; read every
+                                   {REFRESH}s, trusted for {TTL}s after the last good read
+  -h, --help                       Print this help and exit
 
 Default auth policy:
   public proof-of-possession (no --genesis-set)
-"
+",
+        QUERY = coordinator_bin::QUERY_PATH,
+        REFRESH = coordinator_bin::VALSET_REFRESH.as_secs(),
+        TTL = nat_traversal::LIVE_VALSET_TTL_SECS,
     )
 }
 
@@ -50,7 +58,7 @@ fn validate_args(args: &[String]) -> std::io::Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--listen" | "--relay-listen" | "--workers" | "--metrics-interval"
-            | "--genesis-set" => {
+            | "--genesis-set" | "--valset-node" => {
                 let flag = &args[i];
                 let Some(value) = args.get(i + 1).filter(|v| !v.starts_with("--")) else {
                     return Err(std::io::Error::new(
@@ -66,6 +74,8 @@ fn validate_args(args: &[String]) -> std::io::Result<()> {
                     parse_workers(value)?;
                 } else if flag == "--metrics-interval" {
                     parse_metrics_interval(value)?;
+                } else if flag == "--valset-node" {
+                    ValsetNode::parse(value)?;
                 }
                 i += 2;
             }
@@ -277,12 +287,22 @@ async fn main() -> std::io::Result<()> {
     };
 
     // The per-network authorization policy, selected from CLI flags:
-    //   --genesis-set <network.toml>  => Private (PoP + pinned valset admission)
+    //   --genesis-set <network.toml>  => Private (PoP + admission against the
+    //                                    genesis valset, plus the live one
+    //                                    `--valset-node` follows)
     //   (no flag)                     => public with proof-of-possession
     // A malformed --genesis-set path/file is a HARD error, never a silent
     // fall-through to a weaker policy. The Arc is shared verbatim with the
     // relay lane: ONE policy gates both the UDP loops and the TCP relay.
     let policy = Arc::new(select_policy(&args)?);
+    // `--valset-node` (private mode only — `select_policy` refuses it
+    // otherwise): follow that node's CURRENT validator set, so a cap any
+    // current validator signed admits, not only a genesis one.
+    if let (Some(node), nat_traversal::AuthPolicy::Private { live, .. }) =
+        (valset_node(&args)?, policy.as_ref())
+    {
+        tokio::spawn(follow_valset(node, live.clone()));
+    }
     let workers = match arg_value("--workers") {
         Some(raw) => parse_workers(&raw)?,
         None => 1,

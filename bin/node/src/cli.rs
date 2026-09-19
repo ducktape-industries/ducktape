@@ -35,6 +35,7 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::List => cmd_list(),
         OpCmd::Status(args) => cmd_node_status(args),
         OpCmd::Qualify(args) => crate::qualify::run(args),
+        OpCmd::RecordWorld(args) => cmd_record_world(args),
         OpCmd::Peers(args) => cmd_node_peers(args),
         OpCmd::Resident(cmd) => dispatch_resident(cmd),
         OpCmd::Member(cmd) => dispatch_member(cmd),
@@ -225,13 +226,22 @@ fn dispatch_join(cmd: JoinCmd) -> CommandResult {
 /// prints a friendly notice on stderr and exits 0 (no workspace yet is not
 /// an error).
 fn cmd_list() -> CommandResult {
-    let workspaces = config::list_workspaces()?;
+    let workspaces = config::registered_networks()?;
     if workspaces.is_empty() {
         eprintln!("no workspaces under {}", config::ducktape_home()?.display());
         return Ok(());
     }
-    for (chain_id, config_path) in workspaces {
-        println!("{chain_id}\t{}", config_path.display());
+    // a remote workspace (`ducktape forge setup --node`) names the node it
+    // dials: its file is not a node.toml, and `--config` takes no such file.
+    for (chain_id, registered) in workspaces {
+        match registered {
+            config::Registered::Local(node_toml) => {
+                println!("{chain_id}\t{}", node_toml.display())
+            }
+            config::Registered::Remote { file, node } => {
+                println!("{chain_id}\t{}\tremote node {node}", file.display())
+            }
+        }
     }
     Ok(())
 }
@@ -638,7 +648,7 @@ fn detect_platform_sandbox(workspace: &std::path::Path) -> Option<config::Sandbo
     Some(table)
 }
 
-/// `init --name <human name> [--dir <dir>] [--modules <dir>] [--listen a]
+/// `init --name <name> [--dir <dir>] [--modules <dir>] [--listen a]
 /// [--advertised a] [--http a] [--rpc a] [--primary-coordinator host:port|none]
 /// [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]`
 /// — found a network: mint the chain-id, write the descriptor + node config,
@@ -822,10 +832,21 @@ fn launcher_start(workspace: &std::path::Path) -> String {
     )
 }
 
+/// `node record-world`: the release a node launcher flipped to came up
+/// healthy, so the world it speaks is the workspace's from now on. The
+/// launcher runs it as that release's own binary, the one that links it.
+fn cmd_record_world(args: SelectorArgs) -> CommandResult {
+    let cfg_path = args.selector.config_path()?;
+    let resolved = config::resolve(&cfg_path)?;
+    record_founding_binary(&resolved.service.workspace)?;
+    Ok(())
+}
+
 /// stamp the binary that just materialized `dir` into the workspace's founding
 /// record — the identity `node run` refuses a disagreeing binary against
 /// (`config::guard_founding_binary`). Written by the two verbs that BRING a
-/// workspace into existence, `init` and `join`, and by nothing else.
+/// workspace into existence, `init` and `join`, and by `record-world`, which a
+/// node launcher runs once a release its network designated came up healthy.
 fn record_founding_binary(dir: &std::path::Path) -> Result<(), String> {
     config::FoundingBinary {
         build: noded::services::build_identity_or_unknown().to_string(),
@@ -958,6 +979,13 @@ pub(crate) enum InviteNote {
     /// coordinator stands in for one: the blob admits a joiner on this
     /// machine and nowhere else.
     NotDialableOffBox,
+    /// some carried paths only route inside the LAN or tailnet of the member
+    /// they name; `outside` is what is left for a joiner anywhere else, and
+    /// may be empty.
+    LanOnlyPaths {
+        lan_only: Vec<String>,
+        outside: Vec<String>,
+    },
 }
 
 impl InviteNote {
@@ -968,6 +996,7 @@ impl InviteNote {
             InviteNote::NoMeshStateYet(_) => "invite_no_mesh_state",
             InviteNote::MeshStateUnreadable(_, _) => "invite_mesh_state_unreadable",
             InviteNote::NotDialableOffBox => "invite_not_dialable_off_box",
+            InviteNote::LanOnlyPaths { .. } => "invite_lan_only_paths",
         }
     }
 }
@@ -997,8 +1026,63 @@ impl std::fmt::Display for InviteNote {
                 "this invite is reachable on this machine only — set `advertised` (or a \
                  concrete wireguard_listen IP) and mint again to invite over the network"
             ),
+            InviteNote::LanOnlyPaths { lan_only, outside } => {
+                let lan_only = lan_only.join(", ");
+                let reaches_from_outside = !outside.is_empty();
+                match reaches_from_outside {
+                    true => write!(
+                        f,
+                        "{lan_only} only work(s) from the same LAN or tailnet; from outside \
+                         it, a joiner gets in through {}",
+                        outside.join(", ")
+                    ),
+                    false => write!(
+                        f,
+                        "{lan_only} only work(s) from the same LAN or tailnet, and nothing in \
+                         this invite reaches this network from outside it — a joiner anywhere \
+                         else cannot get in; set `wireguard_advertised` to a public host:port \
+                         and mint again to invite over the internet"
+                    ),
+                }
+            }
         }
     }
+}
+
+/// Which of the paths an invite carries route only inside one LAN or
+/// tailnet — said once, so an operator handing the blob to a stranger
+/// elsewhere knows before the stranger fails. `endpoints` are the direct
+/// `host:port` paths (the inviter's tunnel endpoint, every direct front); the
+/// coordinator is the rendezvous a joiner anywhere reaches a registered member
+/// through. `None` when no path is LAN-only: minting never refuses, because a
+/// LAN invite is a legitimate one.
+fn lan_only_note(endpoints: &[&str], coordinator: Option<&str>) -> Option<InviteNote> {
+    let coordinator = coordinator.map(|c| format!("coordinator {c}"));
+    let paths = endpoints.iter().map(|e| e.to_string()).chain(coordinator);
+    let (lan_only, outside): (Vec<String>, Vec<String>) =
+        paths.partition(|path| path_is_lan_only(path));
+    let every_path_routes = lan_only.is_empty();
+    if every_path_routes {
+        return None;
+    }
+    Some(InviteNote::LanOnlyPaths { lan_only, outside })
+}
+
+/// Does this `host:port` (optionally after a `coordinator ` label) route only
+/// inside one network? An IP literal in a private, CGNAT/tailnet, loopback,
+/// link-local or ULA range, or an mDNS `.local` name — which only the LAN it
+/// is announced on resolves.
+fn path_is_lan_only(path: &str) -> bool {
+    let host_port = path.rsplit(' ').next().unwrap_or(path);
+    if let Ok(addr) = host_port.parse::<std::net::SocketAddr>() {
+        return crate::first_contact_join::ip_is_unroutable_offnet(addr.ip());
+    }
+    let host = host_port
+        .rsplit_once(':')
+        .map_or(host_port, |(host, _)| host);
+    host.trim_end_matches('.')
+        .to_ascii_lowercase()
+        .ends_with(".local")
 }
 
 /// Mint one bearer invite from the workspace `cfg_path` names, answering the
@@ -1163,6 +1247,14 @@ pub(crate) fn mint_invite_blob(
 
     // the expiry lives INSIDE the token (signed), not as a separate blob field.
     // every invite is bearer.
+    let direct_paths: Vec<&str> = wireguard
+        .endpoint
+        .iter()
+        .chain(fronts.iter().filter_map(|front| front.endpoint.as_ref()))
+        .map(String::as_str)
+        .collect();
+    notes.extend(lan_only_note(&direct_paths, coordinator.as_deref()));
+
     let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes(), expires);
     let blob_string = config::encode_invite(
         &invite_descriptor,
@@ -1704,6 +1796,26 @@ pub(super) fn open_proposal_matching<'a>(
         .find(|p| p.status == governance::ProposalStatus::Open && matches(&p.action))
 }
 
+/// the record a ceremony is about to vote on carries the action it proposes.
+/// An id found free can be taken before this verb's own `Propose` lands:
+/// governance refuses the second one at apply (`proposal_id_spent`) and the
+/// record under the id is then another proposer's. A yes on it would be a
+/// ballot for an action this verb never asked for.
+fn require_own_action(
+    opened: &governance::ProposalView,
+    matches: &dyn Fn(&governance::GovAction) -> bool,
+) -> Result<(), String> {
+    let carries_ours = matches(&opened.action);
+    if carries_ours {
+        return Ok(());
+    }
+    Err(format!(
+        "proposal_id_spent: {} holds another proposal's action — nothing was voted; run the \
+         verb again and it mints a fresh id",
+        opened.proposal_id
+    ))
+}
+
 /// drive a governance proposal ceremony for `wanted` through this eligible
 /// account's running node: adopt an existing OPEN proposal `matches` accepts
 /// (else mint an unused `<id_prefix><id_seed>:<n>` id and propose), cast a yes
@@ -1797,6 +1909,7 @@ pub(super) fn drive_proposal_ceremony(
 
     let opened = read_proposal(node.rpc(), &proposal_id)?
         .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
+    require_own_action(&opened, matches)?;
     let after_vote = cast_yes_once(node, &proposal_id, opened, signer)?;
 
     // Execute only when the proposal's frozen rule says the yes power is
@@ -2401,6 +2514,57 @@ mod json_output_tests {
 mod tests {
     use std::collections::BTreeSet;
 
+    /// Minting never refuses a LAN invite, but it says which paths only work
+    /// from the same LAN or tailnet, and whether anything reaches from outside:
+    /// a LAN-only invite says nobody elsewhere gets in, a mixed one names the
+    /// way in, and an invite whose every path routes says nothing.
+    #[test]
+    fn an_invite_names_its_lan_only_paths_and_whether_anything_reaches_from_outside() {
+        let lan_only = super::lan_only_note(
+            &[
+                "192.168.0.70:51820",
+                "100.101.102.103:51820",
+                "10.0.0.2:51820",
+            ],
+            Some("box.local:7777"),
+        )
+        .expect("every path is LAN-only");
+        assert_eq!(lan_only.reason(), "invite_lan_only_paths");
+        let said = lan_only.to_string();
+        for path in [
+            "192.168.0.70:51820",
+            "100.101.102.103:51820",
+            "10.0.0.2:51820",
+            "coordinator box.local:7777",
+        ] {
+            assert!(said.contains(path), "{said}");
+        }
+        assert!(
+            said.contains("a joiner anywhere else cannot get in"),
+            "{said}"
+        );
+
+        let mixed = super::lan_only_note(
+            &["172.16.4.4:51820", "203.0.113.7:51820"],
+            Some("coord.example.org:443"),
+        )
+        .expect("one path is LAN-only")
+        .to_string();
+        assert!(mixed.contains("172.16.4.4:51820 only work(s)"), "{mixed}");
+        assert!(
+            mixed.contains(
+                "a joiner gets in through 203.0.113.7:51820, coordinator coord.example.org:443"
+            ),
+            "{mixed}"
+        );
+        assert!(!mixed.contains("cannot get in"), "{mixed}");
+
+        assert!(
+            super::lan_only_note(&["203.0.113.7:51820"], Some("coord.example.org:443")).is_none(),
+            "every path routes: nothing to say"
+        );
+    }
+
     /// `node status`'s netstack line: nothing at all on a node with no plane,
     /// the backend alone before the first swap, and the outcome with the height
     /// it landed at afterwards — a refusal carrying its reason.
@@ -2851,6 +3015,34 @@ mod tests {
             matches!(a, GovAction::CancelModuleUpdate { .. })
         });
         assert!(none.is_none());
+    }
+
+    /// an id minted free but taken before this verb's `Propose` landed holds
+    /// another proposer's action: the ceremony refuses by name instead of
+    /// casting a yes on it.
+    #[test]
+    fn a_ceremony_never_votes_on_a_record_that_carries_another_action() {
+        use super::require_own_action;
+        use governance::{GovAction, ProposalStatus, ProposalView, VoterKind, VotingRule};
+        let view = |text: &str| ProposalView {
+            proposal_id: "node-release:0".into(),
+            action: GovAction::Signal { text: text.into() },
+            proposer: vec![1],
+            created_at: 0,
+            deadline: 10,
+            status: ProposalStatus::Open,
+            votes: vec![],
+            voter_kind: VoterKind::ValidatorNode,
+            electorate: vec![],
+            voting_rule: VotingRule::Threshold { required_yes: 1 },
+        };
+        let wanted = GovAction::Signal {
+            text: "ours".into(),
+        };
+        let matches = |action: &GovAction| *action == wanted;
+        assert_eq!(require_own_action(&view("ours"), &matches), Ok(()));
+        let refused = require_own_action(&view("theirs"), &matches).unwrap_err();
+        assert!(refused.starts_with("proposal_id_spent:"), "{refused}");
     }
 
     /// the grammar's own consistency check (conflicting ids, broken flatten,

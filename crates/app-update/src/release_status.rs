@@ -12,6 +12,13 @@ use serde::{Deserialize, Serialize};
 use crate::designation::Designation;
 use crate::release_key::ReleaseKeys;
 
+/// The one exit status a node's launcher reads as "do not start me again": the
+/// join gate refused this workspace's invite, so it can never redeem, and every
+/// restart would ask the network the same question and hear the same no. The
+/// launcher stops with this status too, and the unit that runs it holds it
+/// down (`RestartPreventExitStatus=`). `EX_NOPERM`: admission refused.
+pub const EXIT_INVITE_UNREDEEMABLE: u8 = 77;
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseStatus {
     /// The node's http base, as the reader reached it — what the launcher's

@@ -5,8 +5,8 @@
 //! the `archives-<kind>.txt` line `ops/release/publish.sh --archive` takes.
 //!
 //! The node archive packs the REAL founding set this checkout's build staged,
-//! and must carry a view for every founding id that declares one: a network
-//! founded from an archive without them opens in no app.
+//! and must carry every basic view: a network founded from an archive without
+//! them opens in no app, since the app carries none.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,20 +16,19 @@ use app_update::Platform;
 use sha2::{Digest as _, Sha256};
 use workspace_config::staged_key;
 
-/// The Linux app release: the launcher, the app and the views it ships with.
+/// The Linux app release: the launcher and the app, nothing else — every
+/// view it draws is served by the network out of its genesis.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_linux_app_archive_carries_the_launcher_the_app_and_its_views() {
+fn a_linux_app_archive_is_the_launcher_and_the_app_alone() {
     let scratch = tempfile::tempdir().expect("scratch");
     let from = scratch.path().join("app-release");
-    std::fs::create_dir_all(from.join("views")).expect("views dir");
+    std::fs::create_dir_all(&from).expect("release dir");
     write_executable(
         &from.join("ducktape-launcher"),
         "#!/bin/sh\necho launcher\n",
     );
     write_executable(&from.join("ducktape-app"), "#!/bin/sh\necho app\n");
-    std::fs::write(from.join("views/members.wasm"), b"\0asm members").expect("a view");
-    std::fs::write(from.join("views/node.wasm"), b"\0asm node").expect("a view");
     let out = scratch.path().join("out");
 
     let packed = pack("app", &from, &out);
@@ -44,14 +43,17 @@ fn a_linux_app_archive_carries_the_launcher_the_app_and_its_views() {
         );
     }
 
-    // an app with no views opens nothing, so the script refuses to pack it.
-    for view in ["members", "node"] {
-        std::fs::remove_file(from.join(format!("views/{view}.wasm"))).expect("drop a view");
-    }
+    // a view beside the app is a second copy of what the network serves, so
+    // the script refuses to pack one.
+    std::fs::create_dir_all(from.join("views")).expect("views dir");
+    std::fs::write(from.join("views/members.wasm"), b"\0asm members").expect("a view");
     let refused = run_archive_sh("app", &from, &out);
-    assert!(!refused.status.success(), "a view-less app release packed");
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("views_missing"),
+        !refused.status.success(),
+        "an app release with views packed"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("views_in_app_release"),
         "{refused:?}"
     );
 }
@@ -101,11 +103,90 @@ fn a_node_archive_carries_both_binaries_and_the_founding_set_with_its_views() {
     assert_eq!(packed.missing_views(&declared), Vec::<String>::new());
 }
 
-/// The view assertion above is not vacuous: a set shaped like one staged
-/// before views reached the founding set — components, no `<id>.view.wasm` —
-/// packs, and the assertion names every view it lacks.
+/// One commit packs to one sha256: two runs over the same build stamp no
+/// copy time into a member, so a second build's sha256 is comparable at
+/// publish — and publish refuses a node archive no second build reproduced.
+#[cfg(target_os = "linux")]
 #[test]
-fn a_node_archive_of_a_view_less_set_is_caught_missing_every_view() {
+fn a_node_archive_packs_to_one_sha_and_publishes_only_when_reproduced() {
+    let staged = workspace_config::staged_modules_dir(
+        &std::env::current_exe().expect("this test"),
+        noded::services::STAGED_SET,
+    )
+    .expect("cargo build staged the founding set beside this test");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let from = scratch.path().join("release");
+    write_node_binaries(&from);
+    copy_tree(&staged, &from.join(own_set_name()));
+
+    let first = pack("node", &from, &scratch.path().join("first"));
+    let second = pack("node", &from, &scratch.path().join("second"));
+
+    let sha = printed(&first.stdout, "sha256:").to_owned();
+    assert_eq!(
+        sha,
+        printed(&second.stdout, "sha256:"),
+        "one commit, one sha256"
+    );
+    let tar = zstd::decode_all(std::fs::File::open(&first.archive).expect("open the archive"))
+        .expect("a zstd archive");
+    for entry in tar::Archive::new(tar.as_slice())
+        .entries()
+        .expect("a tar archive")
+    {
+        let entry = entry.expect("a member");
+        assert_eq!(
+            entry.header().mtime().expect("mtime"),
+            0,
+            "no copy time is packed"
+        );
+    }
+
+    let key = scratch.path().join("release.key");
+    std::fs::write(&key, b"unread").expect("a key file");
+    let publish = |verified: &[&str]| {
+        let mut command = Command::new("bash");
+        command
+            .arg(checkout().join("ops/release/publish.sh"))
+            .args(["--kind", "node", "--node", "http://127.0.0.1:9"])
+            .arg("--key")
+            .arg(&key)
+            .args(["--sequence", "3", "--display", "0.1.0+abc1234"])
+            .arg("--archive")
+            .arg(format!(
+                "{}={}",
+                Platform::HOST.key(),
+                first.archive.display()
+            ))
+            .arg("--out-dir")
+            .arg(scratch.path().join("publish"));
+        for sha in verified {
+            command.args(["--verified-sha", sha]);
+        }
+        command.output().expect("run publish.sh")
+    };
+    let other = "0".repeat(64);
+    for verified in [&[][..], &[other.as_str()][..]] {
+        let refused = publish(verified);
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("archive_not_reproduced"), "{stderr}");
+        assert!(
+            stderr.contains(&sha),
+            "the refusal names the archive's sha: {stderr}"
+        );
+    }
+    assert!(
+        !scratch.path().join("publish").exists(),
+        "nothing is composed for a release no second build reproduced"
+    );
+}
+
+/// A set lacking a basic view — here one shaped like a set staged before
+/// views reached the founding set: components, no `<id>.view.wasm` — is
+/// refused by the view's name, since `node init` would refuse it too.
+#[test]
+fn a_node_archive_of_a_view_less_set_is_refused_by_the_views_name() {
     let scratch = tempfile::tempdir().expect("scratch");
     let from = scratch.path().join("release");
     write_node_binaries(&from);
@@ -120,10 +201,15 @@ fn a_node_archive_of_a_view_less_set_is_caught_missing_every_view() {
     }
     let out = scratch.path().join("out");
 
-    let packed = pack("node", &from, &out);
+    let refused = run_archive_sh("node", &from, &out);
 
-    let declared = declared_founding_views();
-    assert_eq!(packed.missing_views(&declared), declared);
+    assert!(!refused.status.success(), "a view-less node release packed");
+    let first = &declared_founding_views()[0];
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!("founding_view_missing: {first}")),
+        "{stderr}"
+    );
 }
 
 /// One archive.sh run, read back.
@@ -276,21 +362,9 @@ fn own_set_name() -> String {
     staged_key::staged_set_name("modules", &checkout())
 }
 
-/// Every founding id — a production module or a view-only entry — that
-/// declares a view by carrying a committed `crates/views/<id>/view.wasm`,
-/// the rule `crates/noded/build.rs` stages by.
+/// Every basic view: each is founded, so a node archive carries them all.
 fn declared_founding_views() -> Vec<String> {
-    let checkout = checkout();
-    topology::PRODUCTION
-        .iter()
-        .chain(topology::VIEWS)
-        .filter(|id| {
-            checkout
-                .join(format!("crates/views/{id}/view.wasm"))
-                .is_file()
-        })
-        .map(|id| id.to_string())
-        .collect()
+    topology::basic_views().map(str::to_owned).collect()
 }
 
 fn write_node_binaries(from: &Path) {

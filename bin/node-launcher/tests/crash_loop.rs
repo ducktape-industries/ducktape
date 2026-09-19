@@ -3,7 +3,8 @@
 //! attempt 1 and then only every Nth, carrying the count, and a node that
 //! came up before it exited starts that count over. "Came up" is a published
 //! identity AT a committed height: a resident publishes its identity before
-//! it recovers, and one that dies in recovery never served.
+//! it recovers, and one that dies in recovery never served. A node whose
+//! invite can never redeem is not restarted at all.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -50,10 +51,48 @@ esac
 exit 1
 "#
     );
+    write_node(scratch, &script)
+}
+
+/// `script` as `<scratch>/ducktape`, with a founding set beside it — the shape
+/// an install seeds a release from.
+fn write_node(scratch: &Path, script: &str) -> PathBuf {
+    std::fs::create_dir_all(scratch.join("modules")).unwrap();
     let path = scratch.join("ducktape");
     std::fs::write(&path, script).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
+}
+
+/// A workspace `node init` wrote, with its first release seeded from `binary`.
+fn installed_workspace(dir: &Path, binary: &Path) -> PathBuf {
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("node.toml"), "id = 1\n").unwrap();
+    let installed = Command::new(LAUNCHER)
+        .arg("install")
+        .arg("--workspace")
+        .arg(&workspace)
+        .arg("--from")
+        .arg(binary)
+        .output()
+        .unwrap();
+    assert!(installed.status.success(), "{}", plain(&installed.stderr));
+    workspace
+}
+
+fn run_launcher(workspace: &Path) -> std::process::Output {
+    Command::new(LAUNCHER)
+        .arg("run")
+        .arg("--workspace")
+        .arg(workspace)
+        .env("DUCKTAPE_UPDATE_POLL_MS", "1")
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap()
 }
 
 /// The launcher's log as plain text: the subscriber paints fields in ANSI.
@@ -92,29 +131,9 @@ fn a_node_that_dies_at_boot_is_said_at_attempt_one_and_the_count_restarts_once_i
         .unwrap();
     assert!(fifo.success());
     let binary = fake_node(&scratch);
-    let workspace = dir.path().join("workspace");
+    let workspace = installed_workspace(dir.path(), &binary);
 
-    let installed = Command::new(LAUNCHER)
-        .arg("install")
-        .arg("--workspace")
-        .arg(&workspace)
-        .arg("--from")
-        .arg(&binary)
-        .output()
-        .unwrap();
-    assert!(installed.status.success(), "{}", plain(&installed.stderr));
-
-    let run = Command::new(LAUNCHER)
-        .arg("run")
-        .arg("--workspace")
-        .arg(&workspace)
-        .env("DUCKTAPE_UPDATE_POLL_MS", "1")
-        .env("RUST_LOG", "info")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
+    let run = run_launcher(&workspace);
     let log = plain(&run.stderr);
     assert!(run.status.success(), "{log}");
     assert_eq!(
@@ -154,4 +173,147 @@ fn a_node_that_dies_at_boot_is_said_at_attempt_one_and_the_count_restarts_once_i
         exits[2]
     );
     assert!(log.contains("node_update_stopped"), "{log}");
+}
+
+/// A node whose invite the join gate refused exits with the status that says
+/// no restart can change it — and the launcher stops with it instead of
+/// booting the node again. A launcher that did boot it again finds its second
+/// boot stopping it, so this ends either way and says which.
+#[test]
+fn a_node_whose_invite_cannot_be_redeemed_stops_the_launcher_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = dir.path().join("scratch");
+    let refused = app_update::release_status::EXIT_INVITE_UNREDEEMABLE;
+    let script = format!(
+        r#"#!/bin/sh
+d="{dir}"
+case "$1 $2" in
+"node run")
+    echo boot >> "$d/boots"
+    if [ "$(wc -l < "$d/boots")" -gt 1 ]; then kill -TERM "$PPID"; exit 1; fi
+    exit {refused}
+    ;;
+esac
+exit 1
+"#,
+        dir = scratch.display(),
+    );
+    let binary = write_node(&scratch, &script);
+    let workspace = installed_workspace(dir.path(), &binary);
+
+    let run = run_launcher(&workspace);
+    let log = plain(&run.stderr);
+    let boots = std::fs::read_to_string(scratch.join("boots")).unwrap();
+    assert_eq!(
+        boots.lines().count(),
+        1,
+        "the node is not booted again:\n{log}"
+    );
+    assert_eq!(run.status.code(), Some(i32::from(refused)), "{log}");
+    assert!(log.contains("reason=\"invite_unredeemable\""), "{log}");
+    assert!(
+        log.contains("cannot be redeemed"),
+        "the launcher says why it stopped:\n{log}"
+    );
+}
+
+/// A RELEASE WHOSE LAUNCHER CANNOT START IS ROLLED BACK like a node that
+/// cannot. A flip left `current` on a release shipping a launcher that exits
+/// at once, and this test is the service manager: it starts the INSTALLED
+/// launcher again each time the process dies. Each start counts the boot
+/// before it becomes the shipped launcher, so the second finds the budget
+/// spent, flips back, and starts the previous release's node itself — the
+/// broken launcher is never exec'd again, and no node ran under it.
+#[test]
+fn a_release_whose_launcher_cannot_start_is_rolled_back_by_the_installed_one() {
+    use app_update::{PendingHealthy, Phase, Sha, state, workspace};
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = dir.path().join("scratch");
+    // Each release's node records its mark, then stops the launcher the way
+    // `systemctl stop` does.
+    let node = |mark: &str| {
+        format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\"node run\") echo {mark} >> \"{dir}/runs\"; kill -TERM \"$PPID\"; exit 0 ;;\nesac\nexit 1\n",
+            dir = scratch.display(),
+        )
+    };
+    let binary = write_node(&scratch, &node("old"));
+    let workspace = installed_workspace(dir.path(), &binary);
+    let current = workspace::current_link(&workspace);
+    let old: Sha = std::fs::read_link(&current)
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .parse()
+        .unwrap();
+
+    // What a flip to `new` leaves behind: the release beside the old one,
+    // `current` on it, `previous` on the old one, and no boot counted yet.
+    let new = Sha::digest(b"a release whose launcher cannot start");
+    let release = workspace::releases_dir(&workspace).join(new.to_string());
+    std::fs::create_dir_all(&release).unwrap();
+    for (name, body) in [
+        ("ducktape", node("new")),
+        ("ducktape-node-launcher", "#!/bin/sh\nexit 3\n".to_string()),
+    ] {
+        std::fs::write(release.join(name), body).unwrap();
+        std::fs::set_permissions(release.join(name), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let link = |sha: Sha| Path::new("updates/releases").join(sha.to_string());
+    std::fs::remove_file(&current).unwrap();
+    std::os::unix::fs::symlink(link(new), &current).unwrap();
+    std::os::unix::fs::symlink(link(old), workspace::previous_link(&workspace)).unwrap();
+    let state_path = workspace::launcher_state_path(&workspace);
+    let pending = |boots| {
+        Phase::PendingHealthy(PendingHealthy {
+            current: new,
+            previous: old,
+            boots,
+            pinned_sequence: 0,
+        })
+    };
+    std::fs::write(&state_path, state::encode(&pending(0))).unwrap();
+    let phase = || state::decode(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+
+    // First start: the boot is counted, then the shipped launcher is become —
+    // and it dies with its own status, before any node ran.
+    let first = run_launcher(&workspace);
+    let log = plain(&first.stderr);
+    assert_eq!(first.status.code(), Some(3), "{log}");
+    let exec = log
+        .lines()
+        .find(|line| line.contains("node_update_launcher_exec"))
+        .unwrap_or_else(|| panic!("the launcher never became the shipped one:\n{log}"));
+    assert_eq!(
+        field(exec, "release"),
+        Some(new.to_string().as_str()),
+        "{exec}"
+    );
+    assert_eq!(phase(), pending(1), "{log}");
+    assert!(
+        !scratch.join("runs").exists(),
+        "no node started before the exec:\n{log}"
+    );
+
+    // Second start: the budget is spent. It flips back and runs the old
+    // release's node under the installed launcher.
+    let second = run_launcher(&workspace);
+    let log = plain(&second.stderr);
+    assert!(second.status.success(), "{log}");
+    assert!(!log.contains("node_update_launcher_exec"), "{log}");
+    match phase() {
+        Phase::RolledBack(rolled_back) => {
+            assert_eq!(rolled_back.current, old);
+            assert_eq!(rolled_back.failed, new);
+        }
+        other => panic!("expected the rollback, got {other:?}:\n{log}"),
+    }
+    assert_eq!(std::fs::read_link(&current).unwrap(), link(old));
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("runs")).unwrap(),
+        "old\n",
+        "{log}"
+    );
 }

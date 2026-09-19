@@ -112,6 +112,10 @@ keystore = { workspace = true }
 # and the join ceremony. `config/resolve.rs` — turning those files into a
 # runnable daemon — is what stayed in this binary.
 workspace-config = { workspace = true }
+# `git-remote-duck`: the `duck://` address and forge's `<owner>/<repo>` half
+# of it, parsed where the sdk parses them.
+duck-address = { workspace = true }
+forge-wire = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
 agent = { workspace = true }
@@ -124,7 +128,7 @@ borsh = { workspace = true }
 # endpoint types and the phase-A fake effect it drives.
 reachability = { workspace = true }
 # the coordinator-auth credential types: `coord.cap` is the private-mode
-# admission token a node persists beside its descriptor (minted by a genesis
+# admission token a node persists beside its descriptor (minted by a current
 # validator via `mint_coord_cap`, presented on each rendezvous request).
 nat-traversal = { workspace = true, features = ["runtime"] }
 wireguard = { workspace = true }
@@ -299,3 +303,6 @@ commonware-parallel = { workspace = true }
 # already depends on (reachability::store + wireguard advert types +
 # commonware's Sha256) — all normal [dependencies] above, so the integration
 # tests see them without a redundant [dev-dependencies] re-listing.
+# join_request_e2e admits a joiner's rendezvous through a private coordinator
+# built by the `coordinator` binary's own policy selector and valset read.
+coordinator-bin = { path = "../coordinator" }

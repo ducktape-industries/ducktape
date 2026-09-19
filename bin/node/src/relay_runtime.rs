@@ -20,7 +20,18 @@ use crate::constants::SUBMIT_HOLD;
 use crate::relay;
 use crate::rpc::RpcReply;
 
-pub(crate) const MAX_INCOMING_BLOBS: usize = 4;
+/// required-blob transfers this validator assembles at once, across every
+/// courier: each holds a staging file and a deadline.
+const MAX_INCOMING_BLOBS: usize = 16;
+
+/// required-blob transfers ONE courier may hold open here at once. the global
+/// cap is shared, so without this one peer could take every slot and every
+/// other courier's submit would be refused until it let go.
+pub(crate) const MAX_INCOMING_BLOBS_PER_PEER: usize = 4;
+
+/// refused offers, latched per reason: a courier drives this, one offer at a
+/// time, so an unlatched line is a log bomb.
+static INCOMING_REFUSED: noded::log::Latch = noded::log::Latch::new(100);
 
 /// how long a target may leave the window unmoved before the sender assumes
 /// the chunks it holds outstanding were DROPPED and rewinds to that target's
@@ -534,6 +545,19 @@ impl ValidatorRelay {
         Ok(None)
     }
 
+    /// why a NEW offer from `peer` is refused, if it is: the courier's own
+    /// share first, then the shared ceiling.
+    fn incoming_refusal(&self, peer: &ed25519::PublicKey) -> Option<&'static str> {
+        let held_by_peer = self.incoming.values().filter(|i| &i.peer == peer).count();
+        if held_by_peer >= MAX_INCOMING_BLOBS_PER_PEER {
+            return Some("incoming_blob_peer_cap");
+        }
+        if self.incoming.len() >= MAX_INCOMING_BLOBS {
+            return Some("incoming_blob_cap");
+        }
+        None
+    }
+
     pub(crate) fn on_message<S>(
         &mut self,
         now: SystemTime,
@@ -563,9 +587,17 @@ impl ValidatorRelay {
                     send_blob_result(relay_tx, &peer, frame_id, digest, None);
                     return None;
                 }
-                if self.incoming.len() >= MAX_INCOMING_BLOBS
-                    && !self.incoming.contains_key(&frame_id)
-                {
+                let already_assembling = self.incoming.contains_key(&frame_id);
+                if !already_assembling && let Some(reason) = self.incoming_refusal(&peer) {
+                    if let Some(attempts) = INCOMING_REFUSED.hit(reason) {
+                        tracing::warn!(
+                            target: "ducktape::submit",
+                            peer = %relay::encode_hex(peer.as_ref()),
+                            attempts,
+                            reason,
+                            "required blob transfer REFUSED"
+                        );
+                    }
                     send_blob_result(
                         relay_tx,
                         &peer,
@@ -1404,6 +1436,56 @@ mod tests {
             matches!(action, Some(ValidatorAction::SubmitLocal { frame: admitted, .. }) if admitted == frame)
         );
         assert!(validator.local_fanouts.is_empty());
+    }
+
+    /// one courier holds at most [`MAX_INCOMING_BLOBS_PER_PEER`] transfers:
+    /// its next offer is refused while another courier is still admitted.
+    #[test]
+    fn one_courier_cannot_hold_every_incoming_slot() {
+        use commonware_cryptography::Signer as _;
+        let author = ed25519::PrivateKey::from_seed(201);
+        let noisy = ed25519::PrivateKey::from_seed(202).public_key();
+        let quiet = ed25519::PrivateKey::from_seed(203).public_key();
+        let members = vec![noisy.as_ref().to_vec(), quiet.as_ref().to_vec()];
+        let offer = |seq: u64| {
+            let digest: [u8; 32] = Sha256::digest(seq.to_be_bytes()).into();
+            let msg = Msg {
+                target: "forge".into(),
+                payload: Vec::new(),
+            };
+            let frame = node::encode_frame_with_blob(&author, seq, &msg, Some(digest));
+            relay::RelayMsg::BlobOffer {
+                frame,
+                digest,
+                total: 8,
+            }
+        };
+        let mut validator = ValidatorRelay::new(blobstore::BlobHandle::default());
+        let mut sender = RecordingSender::default();
+        let sent = std::sync::Arc::clone(&sender.0);
+        let now = SystemTime::UNIX_EPOCH;
+        let mut offer_from = |peer: &ed25519::PublicKey, seq| {
+            validator.on_message(now, peer.clone(), offer(seq), &members, &[], &mut sender);
+            validator.incoming.len()
+        };
+
+        for seq in 0..MAX_INCOMING_BLOBS_PER_PEER as u64 {
+            assert_eq!(offer_from(&noisy, seq), seq as usize + 1, "under the cap");
+        }
+        assert_eq!(
+            offer_from(&noisy, 100),
+            MAX_INCOMING_BLOBS_PER_PEER,
+            "a courier past its cap was admitted anyway"
+        );
+        assert!(matches!(
+            sent.lock().unwrap().last(),
+            Some(relay::RelayMsg::BlobResult { error: Some(_), .. })
+        ));
+        assert_eq!(
+            offer_from(&quiet, 200),
+            MAX_INCOMING_BLOBS_PER_PEER + 1,
+            "another courier is still served"
+        );
     }
 
     #[test]

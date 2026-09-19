@@ -15,7 +15,13 @@ starts `<workspace>/current/ducktape node run`, asks it `ducktape release
 status` every poll, and follows the network's node releases — it stages a
 designated release, qualifies it against the workspace checkpoint, flips
 `current` at the activation height and rolls back a release that never comes
-up. A service unit runs the daemon through the launcher's service role,
+up. Whenever it holds no node — at start, and after a flip stopped the old
+one — a `run` launcher whose bytes differ from
+`<workspace>/current/ducktape-node-launcher` `exec`s that file in its own pid
+(`node_update_launcher_exec`), so after a flip the unit's main process runs the
+launcher the release shipped; the unit's `ExecStart` copy is never written, and
+it is what counts a boot and rolls back a release whose launcher cannot start.
+A service unit runs the daemon through the launcher's service role,
 `ducktape-node-launcher service --workspace DIR --config FILE -- service run <kind> --enable`
 (`supervise_service`): the role starts `<workspace>/current/ducktape` and
 restarts the daemon when a release flip moves that link, so the node and its
@@ -43,7 +49,9 @@ one, and logs `node_update_release_key_pinned` once. A pin already on disk is
 never overwritten: one that differs from the network's key is refused as
 `release_key_pinned_differs` (at attempt 1, then every 60th poll, both keys
 named) and stays the key followed; `ducktape-node-launcher install
---release-key <hex>` is the explicit way to move it. Until the network commits
+--release-key <hex>`, with the unit stopped, is the explicit way to move it
+(an install refuses a workspace a running launcher holds:
+`workspace_locked`). Until the network commits
 a key, an unpinned launcher refuses each designated release as
 `no_release_key`. `ducktape release status` prints both sides:
 `release_key node` (the network's) and `pinned` (this workspace's).
@@ -120,7 +128,12 @@ alias dt='sudo -u ducktape env DUCKTAPE_HOME=/var/lib/ducktape /usr/local/bin/du
 steps 1-7 below end to end (`--dry-run` prints the commands without touching
 the host); the steps are spelled out here for anyone auditing or adapting them.
 `<name>` is a chain id or a unique prefix of one; the script resolves it to
-the full chain id once the network is founded or joined.
+the full chain id once the network is founded or joined. `--archive <file>`
+takes the program from a node release archive (`ducktape-<sha7>-linux-<arch>.tar.zst`,
+which carries `ducktape`, `ducktape-node-launcher`, `modules/` and
+`release.json`) instead of step 1's build: it unpacks it with `zstd`, installs
+both binaries and `release.json` into `/usr/local/lib/ducktape`, and step 3
+copies the archive's `modules/`.
 
 ```sh
 # 1. Build ducktape and its launcher (make install-node puts both in
@@ -160,8 +173,10 @@ dt node list                              # the chain id the instance names
 
 # 6. Seed the first release under the launcher — ONCE: after this the
 #    launcher owns `current`. No --release-key: the launcher pins the key the
-#    network committed on its first read. Then name the workspace the service
-#    units run over.
+#    network committed on its first read. Before it writes anything, the
+#    install refuses a directory with no node.toml (`node_config_missing`)
+#    and a binary with no `modules/` beside it (`founding_set_missing`).
+#    Then name the workspace the service units run over.
 W='/var/lib/ducktape/mynet#d0cdf950'
 sudo -u ducktape env DUCKTAPE_HOME=/var/lib/ducktape ducktape-node-launcher install \
   --workspace "$W" --config "$W/node.toml" --from /usr/local/lib/ducktape/ducktape
@@ -200,6 +215,12 @@ sudo systemctl enable --now "ducktape-node@$(systemd-escape 'mynet#d0cdf950')"
 dt node status                            # height + root hash, once it serves
 dt release status                         # the designated release, the network's key, this pin
 ```
+
+A joiner whose invite the network refused exits 77 and so does its launcher,
+which the unit does not restart (`RestartPreventExitStatus=77`): every restart
+would ask the same question and hear the same no. `systemctl status` shows the
+unit failed and the journal carries the refusal; join again with a fresh
+invite, then start the unit.
 
 Service daemons: the instance is the kind (`compute`, `agent`, `airlock`),
 and the workspace is `DUCKTAPE_WORKSPACE` from `/etc/ducktape/workspace.env`.
@@ -391,6 +412,49 @@ If the seat is gone for good — the host is dead and `identity.key` was not
 backed up — no verb helps, and there is no key-rotation verb to reach for
 either: `ducktape node member` is `promote | remove | leave | status`, so the
 key IS the seat. See `backup-and-keys.md`.
+
+## Linux without root (systemd --user)
+
+An operator with no root runs the node as their own systemd user unit,
+`ops/node/ducktape-node-user@.service`, out of their own `~/.ducktape`. The
+unit runs `ducktape-node-launcher run` over the workspace like
+`ducktape-node@` does, restarts it when it exits (except on 77, an invite
+that can never redeem), and gives the launcher 150 s to stop its node.
+
+The workspace must already be under the launcher — founded or joined as
+yourself, then seeded once:
+
+```sh
+ducktape node join '<invite>'             # or `ducktape node init --name mynet`
+# --from: the `ducktape` of an unpacked node release, `modules/` beside it
+ducktape-node-launcher install --workspace ~/.ducktape/<chain-id> \
+  --config ~/.ducktape/<chain-id>/node.toml --from <release dir>/ducktape
+ops/node/install.sh --user --dry-run --workspace <chain-id>   # print the steps
+ops/node/install.sh --user --workspace <chain-id>
+```
+
+`--user` refuses a workspace with no `updates/state.json` rather than enabling
+a unit that would restart a refusal forever. It copies the
+`ducktape-node-launcher` on PATH to `<workspace>/ducktape-node-launcher`,
+installs the unit into `~/.config/systemd/user/`, enables and starts
+`ducktape-node-user@<escaped chain id>`, and turns on linger
+(`loginctl enable-linger "$USER"`) so the node outlives a logout and starts at
+boot. Where linger needs an admin, the install says so and carries on; until
+an admin runs `sudo loginctl enable-linger <user>`, the node stops at logout.
+There is no user unit for the service daemons: a unit name carries one
+instance, and a daemon needs both a workspace and a kind.
+
+The launcher and its node log to `<workspace>/launcher.log`; the node also
+writes `<workspace>/daemon.log`. Stop, start and restart it through systemd,
+never by pid — `Restart=always` starts a killed launcher again:
+
+```sh
+UNIT="ducktape-node-user@$(systemd-escape '<chain-id>')"
+systemctl --user status "$UNIT"
+systemctl --user restart "$UNIT"
+systemctl --user stop "$UNIT"             # stays stopped until start or boot
+systemctl --user disable --now "$UNIT"    # and not at boot either
+```
 
 ## macOS (launchd)
 

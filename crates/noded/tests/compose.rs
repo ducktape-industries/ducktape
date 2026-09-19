@@ -493,6 +493,38 @@ fn admissions_build_through_the_one_wasm_path() {
     });
 }
 
+/// the question a validator answers before it signals an admission ready: the
+/// admission itself, run to the end over scratch state. Every module the
+/// kernel fixture set carries starts there, whatever backing it declares — a
+/// refusal here would keep a sound module from ever activating — and a guest
+/// that cannot start is refused in the admission's own words.
+#[test]
+fn an_admission_check_starts_the_module_over_scratch_state() {
+    run(|context, dir| {
+        Box::pin(async move {
+            let admissions = Admissions::new(&context, &substrates(&dir), &BINDINGS);
+            for entry in std::fs::read_dir(fixtures()).unwrap() {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_str().unwrap();
+                let id = name.strip_suffix(".component.wasm").unwrap();
+                let bytes = module_artifact::Artifact::module(std::fs::read(&path).unwrap());
+                host::ModuleFactory::check(&admissions, id, &bytes.encode())
+                    .unwrap_or_else(|refusal| panic!("{id} starts: {refusal}"));
+            }
+
+            let stale = workspace_config::read_module_artifact(&stale_host_wit(), "forge")
+                .unwrap()
+                .encode();
+            let refusal = host::ModuleFactory::check(&admissions, "forge", &stale)
+                .expect_err("a guest that cannot start is not ready");
+            assert!(
+                refusal.to_string().contains("forge component loads"),
+                "the admission's own words: {refusal}"
+            );
+        })
+    });
+}
+
 /// an ODB-BACKED tenant reads its network's chain id through the same
 /// `sdk::genesis_config` seam a Map/Store tenant does — the kernel half of
 /// #1773: `compose::wasm_module` used to skip the `Backing::Odb` arm
