@@ -330,6 +330,11 @@ enum Authority {
     /// actually decides — so an unknown key gets a refusal from the module, not
     /// from this gate.
     Acting,
+    /// a MEMBER of this network: the verified key holds an account in committed
+    /// identity state. for a route whose effect lands on THIS node (disk, not
+    /// module state), so no module downstream decides who may ask; the key
+    /// rides on as [`SignedBy`] and the handler decides per object.
+    Member,
     /// this node's OPERATOR. the handler reads no acting identity, so there is
     /// no second decider downstream and possession proves nothing: only the
     /// operator credential, or a PoP by [`crate::AdminConfig::owner_key`], gets
@@ -413,13 +418,11 @@ impl Lane {
         let posts = *method == Method::POST;
         let removes = *method == Method::DELETE;
         match self {
-            // POST creates and commits a managed checkout AS the acting key
-            // (`workspaces::acting_origin` → the duckfs authority check).
-            // DELETE `remove_dir_all`s the dir and reads no identity at all, so
-            // possession would let any caller wipe another run's checkout.
-            Lane::Workspace => posts
-                .then_some(Authority::Acting)
-                .or(removes.then_some(Authority::Operator)),
+            // a managed checkout is a directory on THIS node's disk, so create,
+            // commit and delete all take a member, never a bare key; the handler
+            // then admits only the workspace's creator (or the operator) to
+            // commit or delete it, and caps how many one creator holds.
+            Lane::Workspace => (posts || removes).then_some(Authority::Member),
             Lane::Blob => posts.then_some(Authority::Acting),
             // `/v1/submit` is the FRAMELESS lane: unlike Files/Workspace, the
             // verified `SignedBy` key does NOT ride on as the op's origin — the
@@ -526,6 +529,12 @@ pub enum WriteRefusal {
     /// a VALID signature, by a key this node does not know as its operator's,
     /// on a route that changes the node rather than module state.
     NotOperator,
+    /// a VALID signature, by a key that holds no account on this network, on a
+    /// route that admits members ([`Authority::Member`]).
+    NotMember,
+    /// this node could not read its identity state to answer whether the key
+    /// holds an account.
+    MembershipUnreadable,
     /// no service-link token, or not this boot's, on a local service daemon's
     /// route ([`Authority::ServiceLink`]).
     ServiceLinkMissing,
@@ -547,6 +556,8 @@ impl WriteRefusal {
             Self::SignatureMalformed => "signature_malformed",
             Self::SignatureInvalid => "signature_invalid",
             Self::NotOperator => "not_operator",
+            Self::NotMember => "key_without_account",
+            Self::MembershipUnreadable => "membership_unreadable",
             Self::ServiceLinkMissing => "service_link_missing",
             Self::BodyOverCap => "body_over_cap",
             Self::NodeUnidentified => "node_unidentified",
@@ -564,8 +575,9 @@ impl WriteRefusal {
             | Self::SignatureMalformed
             | Self::SignatureInvalid
             | Self::ServiceLinkMissing => StatusCode::UNAUTHORIZED,
-            Self::NotOperator => StatusCode::FORBIDDEN,
+            Self::NotOperator | Self::NotMember => StatusCode::FORBIDDEN,
             Self::BodyOverCap => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::MembershipUnreadable => StatusCode::SERVICE_UNAVAILABLE,
             // this node's own condition, not a defect in what the caller
             // presented — retrying with any signature cannot fix it.
             Self::NodeUnidentified => StatusCode::INTERNAL_SERVER_ERROR,
@@ -586,6 +598,13 @@ impl WriteRefusal {
             Self::NotOperator => {
                 "this route changes the node itself, so it requires this node's operator \
                  credential or a signature by its operator key"
+            }
+            Self::NotMember => {
+                "this route acts for a member of this network, so the signing key must \
+                 hold an account on it"
+            }
+            Self::MembershipUnreadable => {
+                "this node could not read its identity state to check the signing key's account"
             }
             Self::ServiceLinkMissing => {
                 "this route is a local service daemon's, so it requires this node's \
@@ -730,22 +749,47 @@ pub(crate) async fn signed_write_guard(
         Ok(key) => key,
         Err(refusal) => return refuse(&path, refusal),
     };
-    // possession is the WHOLE proof on an `Acting` lane, because the module
-    // downstream reads the key and decides. a node-level handler reads nothing,
-    // so the key itself has to be one this node recognises. The service-link
-    // lane answered above on its secret; a signature is never its credential,
-    // so it fails closed here.
-    let admitted = match authority {
-        Authority::Acting => true,
-        Authority::Operator => operator_key_matches(&handle.admin, &acting),
-        Authority::ServiceLink => false,
-    };
-    if !admitted {
-        return refuse(&path, WriteRefusal::NotOperator);
+    if let Err(refusal) = admit_key(&handle, authority, &acting).await {
+        return refuse(&path, refusal);
     }
     let mut req = axum::extract::Request::from_parts(parts, axum::body::Body::from(body));
     req.extensions_mut().insert(SignedBy(acting));
     next.run(req).await
+}
+
+/// does a VERIFIED key clear `authority`? possession is the WHOLE proof on an
+/// `Acting` lane, because the module downstream reads the key and decides. A
+/// `Member` lane lands on this node, so the key must hold an account in
+/// committed identity state. A node-level handler reads nothing, so the key
+/// itself has to be one this node recognises as its operator's. The
+/// service-link lane answered in the guard on its secret; a signature is never
+/// its credential, so it fails closed here.
+async fn admit_key(
+    handle: &NodeHandle,
+    authority: Authority,
+    acting: &[u8],
+) -> Result<(), WriteRefusal> {
+    match authority {
+        Authority::Acting => Ok(()),
+        Authority::Member => admit_member(handle, acting).await,
+        Authority::Operator => admit_operator(handle, acting),
+        Authority::ServiceLink => Err(WriteRefusal::NotOperator),
+    }
+}
+
+async fn admit_member(handle: &NodeHandle, acting: &[u8]) -> Result<(), WriteRefusal> {
+    match crate::handle::account_of_key(handle, acting.to_vec()).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(WriteRefusal::NotMember),
+        Err(_) => Err(WriteRefusal::MembershipUnreadable),
+    }
+}
+
+fn admit_operator(handle: &NodeHandle, acting: &[u8]) -> Result<(), WriteRefusal> {
+    match operator_key_matches(&handle.admin, acting) {
+        true => Ok(()),
+        false => Err(WriteRefusal::NotOperator),
+    }
 }
 
 /// the data-plane PoP over ONE request, answering the key that signed it.
@@ -1004,20 +1048,23 @@ mod tests {
     /// authority it demands, and the reads that must not be dragged in with
     /// them. the pairs that matter most are the ones that share a path with
     /// their own read — `/v1/files/blob` (POST writes, GET fetches) and `/v1/submit` vs
-    /// `/v1/submit/frame` — and the DELETE that shares its prefix with two
-    /// module-bound POSTs on the workspace lane.
+    /// `/v1/submit/frame` — and the workspace lane, whose DELETE takes the same
+    /// member bar as the POST that creates.
     #[test]
     fn the_gate_covers_every_mutating_route() {
         let gated: &[(Method, &str, Authority)] = &[
             // module-bound: the acting key rides on as `SignedBy` and the
             // module decides.
-            (Method::POST, "/v1/fs/workspaces", Authority::Acting),
+            (Method::POST, "/v1/files/blob", Authority::Acting),
+            // a managed checkout is this node's disk: create, commit and delete
+            // alike take a member, and the handler admits only the creator.
+            (Method::POST, "/v1/fs/workspaces", Authority::Member),
             (
                 Method::POST,
                 "/v1/fs/workspaces/abc/commit",
-                Authority::Acting,
+                Authority::Member,
             ),
-            (Method::POST, "/v1/files/blob", Authority::Acting),
+            (Method::DELETE, "/v1/fs/workspaces/abc", Authority::Member),
             // node-level: the handler reads no identity, so possession of a
             // self-chosen key must not be enough.
             (Method::POST, "/v1/log-filter", Authority::Operator),
@@ -1036,7 +1083,6 @@ mod tests {
                 "/v1/submit/raw/new-product",
                 Authority::Operator,
             ),
-            (Method::DELETE, "/v1/fs/workspaces/abc", Authority::Operator),
             // a local daemon's presence lands in the catalog the operator
             // enables from: the service-link token, never a signature.
             (Method::POST, "/v1/services/hello", Authority::ServiceLink),
