@@ -453,6 +453,8 @@ fn publish_to(
             Platform::HOST.key(),
             path.to_str().expect("utf-8 archive path")
         ))
+        // these bytes stand in for both builds of the release.
+        .args(["--verified-sha", &Sha::digest(archive).to_string()])
         .arg("--out-dir")
         .arg(root.join(format!("publish-{sequence}")))
         .env("DUCKTAPE_BIN", ducktape())

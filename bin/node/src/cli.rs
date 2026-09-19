@@ -1796,6 +1796,26 @@ pub(super) fn open_proposal_matching<'a>(
         .find(|p| p.status == governance::ProposalStatus::Open && matches(&p.action))
 }
 
+/// the record a ceremony is about to vote on carries the action it proposes.
+/// An id found free can be taken before this verb's own `Propose` lands:
+/// governance refuses the second one at apply (`proposal_id_spent`) and the
+/// record under the id is then another proposer's. A yes on it would be a
+/// ballot for an action this verb never asked for.
+fn require_own_action(
+    opened: &governance::ProposalView,
+    matches: &dyn Fn(&governance::GovAction) -> bool,
+) -> Result<(), String> {
+    let carries_ours = matches(&opened.action);
+    if carries_ours {
+        return Ok(());
+    }
+    Err(format!(
+        "proposal_id_spent: {} holds another proposal's action — nothing was voted; run the \
+         verb again and it mints a fresh id",
+        opened.proposal_id
+    ))
+}
+
 /// drive a governance proposal ceremony for `wanted` through this eligible
 /// account's running node: adopt an existing OPEN proposal `matches` accepts
 /// (else mint an unused `<id_prefix><id_seed>:<n>` id and propose), cast a yes
@@ -1889,6 +1909,7 @@ pub(super) fn drive_proposal_ceremony(
 
     let opened = read_proposal(node.rpc(), &proposal_id)?
         .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
+    require_own_action(&opened, matches)?;
     let after_vote = cast_yes_once(node, &proposal_id, opened, signer)?;
 
     // Execute only when the proposal's frozen rule says the yes power is
@@ -2994,6 +3015,34 @@ mod tests {
             matches!(a, GovAction::CancelModuleUpdate { .. })
         });
         assert!(none.is_none());
+    }
+
+    /// an id minted free but taken before this verb's `Propose` landed holds
+    /// another proposer's action: the ceremony refuses by name instead of
+    /// casting a yes on it.
+    #[test]
+    fn a_ceremony_never_votes_on_a_record_that_carries_another_action() {
+        use super::require_own_action;
+        use governance::{GovAction, ProposalStatus, ProposalView, VoterKind, VotingRule};
+        let view = |text: &str| ProposalView {
+            proposal_id: "node-release:0".into(),
+            action: GovAction::Signal { text: text.into() },
+            proposer: vec![1],
+            created_at: 0,
+            deadline: 10,
+            status: ProposalStatus::Open,
+            votes: vec![],
+            voter_kind: VoterKind::ValidatorNode,
+            electorate: vec![],
+            voting_rule: VotingRule::Threshold { required_yes: 1 },
+        };
+        let wanted = GovAction::Signal {
+            text: "ours".into(),
+        };
+        let matches = |action: &GovAction| *action == wanted;
+        assert_eq!(require_own_action(&view("ours"), &matches), Ok(()));
+        let refused = require_own_action(&view("theirs"), &matches).unwrap_err();
+        assert!(refused.starts_with("proposal_id_spent:"), "{refused}");
     }
 
     /// the grammar's own consistency check (conflicting ids, broken flatten,

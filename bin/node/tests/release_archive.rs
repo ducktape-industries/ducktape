@@ -103,6 +103,85 @@ fn a_node_archive_carries_both_binaries_and_the_founding_set_with_its_views() {
     assert_eq!(packed.missing_views(&declared), Vec::<String>::new());
 }
 
+/// One commit packs to one sha256: two runs over the same build stamp no
+/// copy time into a member, so a second build's sha256 is comparable at
+/// publish — and publish refuses a node archive no second build reproduced.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_node_archive_packs_to_one_sha_and_publishes_only_when_reproduced() {
+    let staged = workspace_config::staged_modules_dir(
+        &std::env::current_exe().expect("this test"),
+        noded::services::STAGED_SET,
+    )
+    .expect("cargo build staged the founding set beside this test");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let from = scratch.path().join("release");
+    write_node_binaries(&from);
+    copy_tree(&staged, &from.join(own_set_name()));
+
+    let first = pack("node", &from, &scratch.path().join("first"));
+    let second = pack("node", &from, &scratch.path().join("second"));
+
+    let sha = printed(&first.stdout, "sha256:").to_owned();
+    assert_eq!(
+        sha,
+        printed(&second.stdout, "sha256:"),
+        "one commit, one sha256"
+    );
+    let tar = zstd::decode_all(std::fs::File::open(&first.archive).expect("open the archive"))
+        .expect("a zstd archive");
+    for entry in tar::Archive::new(tar.as_slice())
+        .entries()
+        .expect("a tar archive")
+    {
+        let entry = entry.expect("a member");
+        assert_eq!(
+            entry.header().mtime().expect("mtime"),
+            0,
+            "no copy time is packed"
+        );
+    }
+
+    let key = scratch.path().join("release.key");
+    std::fs::write(&key, b"unread").expect("a key file");
+    let publish = |verified: &[&str]| {
+        let mut command = Command::new("bash");
+        command
+            .arg(checkout().join("ops/release/publish.sh"))
+            .args(["--kind", "node", "--node", "http://127.0.0.1:9"])
+            .arg("--key")
+            .arg(&key)
+            .args(["--sequence", "3", "--display", "0.1.0+abc1234"])
+            .arg("--archive")
+            .arg(format!(
+                "{}={}",
+                Platform::HOST.key(),
+                first.archive.display()
+            ))
+            .arg("--out-dir")
+            .arg(scratch.path().join("publish"));
+        for sha in verified {
+            command.args(["--verified-sha", sha]);
+        }
+        command.output().expect("run publish.sh")
+    };
+    let other = "0".repeat(64);
+    for verified in [&[][..], &[other.as_str()][..]] {
+        let refused = publish(verified);
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("archive_not_reproduced"), "{stderr}");
+        assert!(
+            stderr.contains(&sha),
+            "the refusal names the archive's sha: {stderr}"
+        );
+    }
+    assert!(
+        !scratch.path().join("publish").exists(),
+        "nothing is composed for a release no second build reproduced"
+    );
+}
+
 /// A set lacking a basic view — here one shaped like a set staged before
 /// views reached the founding set: components, no `<id>.view.wasm` — is
 /// refused by the view's name, since `node init` would refuse it too.

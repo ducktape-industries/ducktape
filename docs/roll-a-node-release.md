@@ -136,8 +136,14 @@ RELEASE_WALLET_PASSWORD=… ops/release/publish.sh --kind node \
     --node http://127.0.0.1:<http port> \
     --key <workspace>/keys/operator.key \
     --sequence 1 --display "0.1.0+97b4ef7bc" \
-    --archive linux-x86_64=ducktape-linux-x86_64.tar.zst
+    --archive linux-x86_64=ducktape-linux-x86_64.tar.zst \
+    --verified-sha <the sha256 archive.sh printed for a second build>
 ```
+
+Publish refuses a node archive whose sha256 no `--verified-sha` names
+(`archive_not_reproduced`): build and archive the same commit a second time,
+in another checkout with its own target directory, and pass the sha256 that
+second `archive.sh` printed.
 
 It composes the manifest, signs it with that wallet, and lands the archive,
 the manifest and the signature under `/shared/releases` — archives first, so
