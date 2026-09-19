@@ -12,7 +12,10 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse as _, Response};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
+use futures::StreamExt as _;
 use serde::Deserialize;
+
+pub use git_http::GIT_KEEPALIVE_INTERVAL;
 use subtle::ConstantTimeEq as _;
 
 #[derive(Clone, Deserialize)]
@@ -91,13 +94,20 @@ async fn authenticate(State(state): State<ServiceState>, request: Request, next:
             "authenticated Gateway route required",
         );
     }
-    let Ok(_permit) = state.requests.try_acquire() else {
+    let Ok(seat) = state.requests.clone().try_acquire_owned() else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "request capacity exhausted",
         );
     };
-    next.run(request).await
+    // the seat is held until the answer's last byte, not its head: a clone's
+    // pack streams long after its handler has returned.
+    next.run(request).await.map(|body| {
+        axum::body::Body::from_stream(body.into_data_stream().map(move |chunk| {
+            let _held = &seat;
+            chunk
+        }))
+    })
 }
 
 pub fn router(config: Config, token: [u8; 64]) -> Result<axum::Router, Box<dyn std::error::Error>> {

@@ -47,6 +47,13 @@ const _: () = assert!(BODY_IDLE_TIMEOUT.as_secs() == noded::PROXY_REPLY_TIMEOUT.
 // `KEEPALIVE_INTERVAL` so this per-read ceiling sees progress; a keepalive
 // slower than the ceiling would cut every real signing mid-wait.
 const _: () = assert!(airlock::sign::KEEPALIVE_INTERVAL.as_secs() < BODY_IDLE_TIMEOUT.as_secs());
+// Forge's Git service answers a clone's head on admission and keeps the
+// answer alive while libgit2 counts and deltifies a large pack. It is a
+// separately installed process (a dev-dependency here), so the one number is
+// held to this ceiling where the node's tests build.
+#[cfg(test)]
+const _: () =
+    assert!(ducktape_forge_service::GIT_KEEPALIVE_INTERVAL.as_secs() < BODY_IDLE_TIMEOUT.as_secs());
 /// Two-way silence that ends a bridged WebSocket. Nothing else bounds one: a
 /// socket lives until a peer closes it, and an idle bridge otherwise parks its
 /// upgrade permit and both pump tasks for good.

@@ -824,8 +824,8 @@ impl Publisher {
 
     /// The node this verb dials, as `/v1/status` reports it: what `cred
     /// seal` publishes under, which holds no store and needs no workspace —
-    /// the operator binds the enclave's port on that node.
-    #[cfg(feature = "verify")]
+    /// the operator binds the enclave's port on that node. `forge publish`
+    /// names the node serving the `git` route the same way.
     pub(crate) fn of_node(base: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let status = crate::node_http::get_json(base, "/v1/status")
             .map_err(|error| format!("read the node's status: {error}"))?;
@@ -1135,7 +1135,7 @@ fn authorize(
 /// Submit one gateway op as a frame `user` signed over `/v1/submit/frame` (the
 /// user key is the origin the gateway resolves to the owner account) and
 /// return the committed height.
-fn submit_gateway(
+pub(crate) fn submit_gateway(
     base: &str,
     user: &commonware_cryptography::ed25519::PrivateKey,
     message: &gateway::GatewayMsg,

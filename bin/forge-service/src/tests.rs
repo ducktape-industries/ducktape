@@ -210,7 +210,9 @@ async fn upload_pack_have_round_returns_only_plain_nak() {
 fn seed_repo(store: &std::path::Path, name: &str, branches: &[&str]) -> String {
     let dir = store.join(name);
     let repo = git2::Repository::init(&dir).unwrap();
-    let tree = repo.find_tree(repo.index().unwrap().write_tree().unwrap()).unwrap();
+    let tree = repo
+        .find_tree(repo.index().unwrap().write_tree().unwrap())
+        .unwrap();
     let who = git2::Signature::now("Forge Test", "test@ducktape.local").unwrap();
     let oid = repo
         .commit(
@@ -322,4 +324,103 @@ async fn upload_pack_admits_reachable_wants_and_refuses_the_rest_by_name() {
             "ERR commit {unknown} is not reachable from any ref of lab\n"
         ))
     );
+}
+
+/// THE BUG (#2712): the answer's head went out only once the whole pack was
+/// built, so a repository whose pack took longer than the Gateway's ceiling on
+/// a silent publisher could not be cloned at all. The head now leaves on
+/// admission, a builder still at work keeps the answer alive with git's
+/// keepalive, and the pack that follows installs. "Slow" is a builder held
+/// past the ceiling on the paused clock, never a sleep.
+#[tokio::test(start_paused = true)]
+async fn a_pack_slower_than_the_gateway_ceiling_still_clones() {
+    use futures::StreamExt as _;
+    // noded's `PROXY_REPLY_TIMEOUT`; the node asserts the keepalive under it.
+    const GATEWAY_SILENCE_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
+    let (directory, router) = application();
+    let repo_dir = directory.path().join("slow");
+    let repo = git2::Repository::init_bare(&repo_dir).unwrap();
+    let blob = repo.blob(b"slow\n").unwrap();
+    let mut tree = repo.treebuilder(None).unwrap();
+    tree.insert("slow.txt", blob, 0o100644).unwrap();
+    let tree = repo.find_tree(tree.write().unwrap()).unwrap();
+    let signature = git2::Signature::new("t", "t@t", &git2::Time::new(0, 0)).unwrap();
+    let head = repo
+        .commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "slow",
+            &tree,
+            &[],
+        )
+        .unwrap();
+    let (release, gate) = std::sync::mpsc::channel();
+    crate::git_http::pack_gate::GATES
+        .lock()
+        .unwrap()
+        .push((repo_dir, gate));
+
+    let request = format!(
+        "{}0000{}",
+        pkt(&format!("want {head} multi_ack_detailed side-band-64k\n")),
+        pkt("done\n")
+    );
+    let response = router
+        .oneshot(authenticated(
+            Request::builder()
+                .method("POST")
+                .uri("/slow/git-upload-pack")
+                .body(Body::from(request))
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "the head is out");
+    let mut answer = response.into_body().into_data_stream();
+    assert_eq!(
+        answer.next().await.unwrap().unwrap(),
+        pkt("NAK\n").as_bytes()
+    );
+    let mut held = std::time::Duration::ZERO;
+    while held <= GATEWAY_SILENCE_CEILING {
+        let next = answer.next();
+        tokio::pin!(next);
+        assert!(
+            futures::poll!(&mut next).is_pending(),
+            "the builder is held, so nothing is due yet"
+        );
+        tokio::time::advance(GIT_KEEPALIVE_INTERVAL).await;
+        assert_eq!(
+            next.await.unwrap().unwrap(),
+            &b"0005\x01"[..],
+            "a keepalive"
+        );
+        held += GIT_KEEPALIVE_INTERVAL;
+    }
+
+    release.send(()).unwrap();
+    let mut rest = Vec::new();
+    while let Some(chunk) = answer.next().await {
+        rest.extend_from_slice(&chunk.unwrap());
+    }
+    let mut pack = Vec::new();
+    let mut at = rest.as_slice();
+    loop {
+        let len = usize::from_str_radix(std::str::from_utf8(&at[..4]).unwrap(), 16).unwrap();
+        if len == 0 {
+            assert_eq!(at.len(), 4, "the flush ends the answer");
+            break;
+        }
+        assert_eq!(at[4], 0x01, "pack bytes ride band 1 only");
+        pack.extend_from_slice(&at[5..len]);
+        at = &at[len..];
+    }
+    let clone = tempfile::tempdir().unwrap();
+    let cloned = git2::Repository::init_bare(clone.path()).unwrap();
+    let odb = cloned.odb().unwrap();
+    let mut indexer = odb.packwriter().unwrap();
+    std::io::Write::write_all(&mut indexer, &pack).unwrap();
+    indexer.commit().unwrap();
+    assert_eq!(cloned.find_commit(head).unwrap().message(), Some("slow"));
 }

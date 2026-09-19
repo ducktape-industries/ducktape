@@ -23,9 +23,9 @@ _ducktape() {
     local user_cred="add list remove grant revoke inspect seal"
     local user_verbs="codex claude apple-codesign key sign-gateway-route sign-frame sign-admin sign-caller cred help"
     local user_flags="--snp-ask --snp-ark --team-id --p12-password-file --p12 --api-key --path --method --statement --out --key --node --config -n --network --node-key --publisher-node --head --body --name --json --host --remote --attest --pccs-url --snp-product --snp-vcek --vendor --measurement --credentials --cred-kind --token-stdin"
-    local account_verbs="create show key login set-name set-profile help"
+    local account_verbs="create show key login set-name set-handle set-profile help"
     local account_key="list approve add join remove"
-    local account_flags="--node --config -n --network --key --auth-page --no-browser --name --eth --number --pubkey --scheme --passkey --ssh --label --ticket --avatar --bio"
+    local account_flags="--node --config -n --network --key --auth-page --no-browser --name --eth --number --pubkey --scheme --passkey --ssh --label --ticket --handle --avatar --bio"
     local wallet_verbs="new import list use help"
     local wallet_flags="--config --workspace -n --network --json"
     local gateway_verbs="bind unbind list help"
@@ -44,8 +44,8 @@ _ducktape() {
     local release_flags="-n --unpack-into --node --network --config --credential --out --sequence --display --node-contract --notes-url --kind --archive --successor-key --successor-from --key --sig --pubkey --sha --at --lead --json --skip-preflight-i-know-the-wit-moved"
     local collab_verbs="query key attach send ack help"
     local collab_flags="--target --node --config -n --network --key --trust-node --channel --participant --existing-only --device --expect --to --kind --message-id --credential --seq --ttl-secs --state --reason"
-    local forge_verbs="setup help"
-    local forge_flags="--node"
+    local forge_verbs="setup publish help"
+    local forge_flags="--node --config -n --network --key"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=( $(compgen -W "$families" -- "$cur") )

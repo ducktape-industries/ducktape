@@ -5,6 +5,7 @@ use axum::extract::rejection::BytesRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use futures::StreamExt as _;
 use serde::Deserialize;
 
 use crate::{ServiceState, error_response};
@@ -26,7 +27,7 @@ const GIT_RECEIVE_PACK_CAPS: &str =
 /// `ofs-delta` are standard pack encodings. `allow-reachable-sha1-in-want`
 /// lets a client want any commit a ref reaches, not only a tip — without it
 /// stock git refuses to even send `git fetch <url> <sha>` for a pinned commit
-/// (see [`build_upload_pack`] for the admission rule). no other fetch-side
+/// (see [`admit_upload_pack`] for the admission rule). no other fetch-side
 /// extras (shallow / filter): the answer is either the full closure or a
 /// have-bounded delta.
 const GIT_UPLOAD_PACK_CAPS: &str = "multi_ack_detailed side-band-64k thin-pack ofs-delta \
@@ -51,6 +52,22 @@ const GIT_MAX_INFLATE_RATIO: u64 = 64;
 /// id, plus the 4-byte pkt length header, this yields a 65520-byte line — git's
 /// `LARGE_PACKET_MAX`, the ceiling a side-band-64k client accepts.
 const GIT_SIDE_BAND_CHUNK: usize = 65515;
+/// side-band band 1 carries pack bytes; band 3 a fatal error git prints.
+const GIT_BAND_PACK: u8 = 0x01;
+const GIT_BAND_ERROR: u8 = 0x03;
+/// git's own upload-pack keepalive: an empty band-1 line.
+const GIT_KEEPALIVE_PKT: &[u8] = b"0005\x01";
+/// how long an upload-pack answer may go without a byte while libgit2 counts
+/// and deltifies before [`GIT_KEEPALIVE_PKT`] goes out (git's
+/// `uploadpack.keepAlive` default). The Gateway drops a publisher silent for
+/// its own ceiling, which the node asserts stays well above this.
+pub const GIT_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// side-band lines of one clone's pack queued between the builder thread and
+/// the socket. With the line being filled, a streamed pack holds at most
+/// `(PACK_LINES_IN_FLIGHT + 1) × 65520` bytes ≈ 1.1 MiB this side of libgit2 —
+/// never the pack. (libgit2's own working set is bounded by the repository's
+/// `pack.*` settings — its delta cache and the largest single object.)
+const PACK_LINES_IN_FLIGHT: usize = 16;
 /// 40 ascii zeros: git's "null" oid — the old value of a ref being created, and
 /// the head advertised for an unborn repo.
 const GIT_ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -265,7 +282,7 @@ async fn advertised_refs(
 }
 
 /// the fetch half of [`advertised_refs`], reading the same on-disk repo
-/// [`build_upload_pack`] packs from.
+/// [`write_pack`] packs from.
 fn servable_refs(handle: &ServiceState, repo: &str) -> Result<Vec<AdvertisedRef>, String> {
     on_disk_refs(&handle.forge_repo, repo).map_err(|e| format!("read forge refs: {e}"))
 }
@@ -1159,7 +1176,8 @@ pub(crate) async fn git_receive_pack(
 /// `<forge_repo>/{repo}` READ-ONLY, and after `done` answer with the pack on
 /// side-band-64k band 1: a have-bounded delta behind `ACK <common>` when the
 /// repo knows any of the client's haves, or the full closure behind NAK when
-/// it knows none (see [`build_upload_pack`]).
+/// it knows none (see [`admit_upload_pack`], [`write_pack`]). The head goes
+/// out once the request is admitted; the pack streams as libgit2 writes it.
 pub(crate) async fn git_upload_pack(
     State(handle): State<ServiceState>,
     Path(repo): Path<String>,
@@ -1212,8 +1230,10 @@ pub(crate) async fn git_upload_pack(
             .into_response();
     }
 
-    // the pack build is blocking git2 IO over a non-Send `Repository`; run it off
-    // the async worker, moving only Send data (the dir + hex oids) across.
+    // admission and the pack build are blocking git2 IO; both run on ONE
+    // blocking thread, which answers the admission first and then streams the
+    // pack into `lines` — so the head below goes out before a single object is
+    // counted, however long the pack takes to build.
     let repo_dir = forge_repo.join(&repo);
     let UploadPackRequest {
         wants,
@@ -1221,81 +1241,75 @@ pub(crate) async fn git_upload_pack(
         side_band,
         ..
     } = request;
-    let (pack, common) =
-        match tokio::task::spawn_blocking(move || build_upload_pack(&repo_dir, &wants, &haves))
-            .await
-        {
-            Ok(Ok(built)) => built,
-            Ok(Err(UploadPackError::RepoUnavailable(e))) => {
-                // the git2 detail (which carries the node's absolute forge
-                // path) never reaches the client or the warn-level ring; an
-                // absent/unopenable repo dir is just a 404 to the outside.
-                tracing::debug!(
-                    target: "ducktape::forge",
-                    repo = %repo,
-                    error = %e,
-                    "forge repo unavailable for upload-pack"
-                );
-                return error_response(StatusCode::NOT_FOUND, "no such repo");
-            }
-            // git's own upload-pack refusal shape (`ERR upload-pack: not our
-            // ref`): an `ERR` pkt-line in a 200 answer is what git prints as
-            // `fatal: remote error: <reason>`. An HTTP error status here reaches
-            // the user as a bare "HTTP 400", with the reason lost.
-            Ok(Err(UploadPackError::WantUnreachable(hex))) => {
-                let refusal = format!("ERR commit {hex} is not reachable from any ref of {repo}\n");
-                return (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, "application/x-git-upload-pack-result"),
-                        (header::CACHE_CONTROL, "no-cache"),
-                    ],
-                    pkt_line(refusal.as_bytes()),
-                )
-                    .into_response();
-            }
-            Ok(Err(UploadPackError::Other(msg))) => {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg);
-            }
-            Err(_) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "git pack builder task panicked",
-                );
-            }
-        };
+    let (admitted_tx, admitted) = tokio::sync::oneshot::channel();
+    let (lines_tx, lines) = tokio::sync::mpsc::channel(PACK_LINES_IN_FLIGHT);
+    tokio::task::spawn_blocking(move || {
+        produce_upload_pack(&repo_dir, &wants, &haves, admitted_tx, lines_tx, side_band)
+    });
+    let common = match admitted.await {
+        Ok(Ok(common)) => common,
+        Ok(Err(UploadPackError::RepoUnavailable(e))) => {
+            // the git2 detail (which carries the node's absolute forge
+            // path) never reaches the client or the warn-level ring; an
+            // absent/unopenable repo dir is just a 404 to the outside.
+            tracing::debug!(
+                target: "ducktape::forge",
+                repo = %repo,
+                error = %e,
+                "forge repo unavailable for upload-pack"
+            );
+            return error_response(StatusCode::NOT_FOUND, "no such repo");
+        }
+        // git's own upload-pack refusal shape (`ERR upload-pack: not our
+        // ref`): an `ERR` pkt-line in a 200 answer is what git prints as
+        // `fatal: remote error: <reason>`. An HTTP error status here reaches
+        // the user as a bare "HTTP 400", with the reason lost.
+        Ok(Err(UploadPackError::WantUnreachable(hex))) => {
+            let refusal = format!("ERR commit {hex} is not reachable from any ref of {repo}\n");
+            return (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/x-git-upload-pack-result"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                pkt_line(refusal.as_bytes()),
+            )
+                .into_response();
+        }
+        Ok(Err(UploadPackError::Other(msg))) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg);
+        }
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "git pack builder task panicked",
+            );
+        }
+    };
 
     tracing::debug!(
         target: "ducktape::forge",
         repo = %repo,
-        pack_bytes = pack.len(),
         delta = common.is_some(),
-        "upload-pack served"
+        "upload-pack admitted"
     );
 
-    let mut out = Vec::new();
     // the terminal negotiation line, valid in every v0 multi_ack mode: a bare
     // `ACK <oid>` names the common base the pack builds on (the delta answer),
     // NAK means no usable have was found (the pack is then the full closure).
     // either way a PLAIN pkt-line, BEFORE any side-band framing begins.
-    match &common {
-        Some(oid) => out.extend_from_slice(&pkt_line(format!("ACK {oid}\n").as_bytes())),
-        None => out.extend_from_slice(&pkt_line(b"NAK\n")),
-    }
-    if side_band {
-        // band 1 = pack data, chunked to the side-band-64k ceiling.
-        for chunk in pack.chunks(GIT_SIDE_BAND_CHUNK) {
-            let mut framed = Vec::with_capacity(chunk.len() + 1);
-            framed.push(0x01);
-            framed.extend_from_slice(chunk);
-            out.extend_from_slice(&pkt_line(&framed));
-        }
-        out.extend_from_slice(GIT_FLUSH_PKT);
-    } else {
-        // the client didn't request side-band: the raw pack follows NAK directly
-        // (no band framing, no trailing flush — the pack trailer ends the stream).
-        out.extend_from_slice(&pack);
-    }
+    let negotiated = match &common {
+        Some(oid) => pkt_line(format!("ACK {oid}\n").as_bytes()),
+        None => pkt_line(b"NAK\n"),
+    };
+    let pack = futures::stream::unfold(lines, move |mut lines| async move {
+        next_pack_line(&mut lines, side_band)
+            .await
+            .map(|line| (line, lines))
+    });
+    let body = futures::stream::once(std::future::ready(negotiated))
+        .chain(pack)
+        .map(Ok::<_, std::convert::Infallible>);
 
     (
         StatusCode::OK,
@@ -1303,12 +1317,219 @@ pub(crate) async fn git_upload_pack(
             (header::CONTENT_TYPE, "application/x-git-upload-pack-result"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        out,
+        axum::body::Body::from_stream(body),
     )
         .into_response()
 }
 
-/// [`build_upload_pack`]'s failure modes. `RepoUnavailable` carries the raw
+/// the next line of a streamed upload-pack answer. A builder still counting or
+/// deltifying sends nothing for as long as that takes, so after
+/// [`GIT_KEEPALIVE_INTERVAL`] of silence this answers git's own keepalive — an
+/// empty band-1 line, which every side-band client reads as zero pack bytes —
+/// and every hop sees the exchange alive. Without side-band there is no line a
+/// keepalive could ride; that answer waits as it is.
+async fn next_pack_line(
+    lines: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    side_band: bool,
+) -> Option<Vec<u8>> {
+    if !side_band {
+        return lines.recv().await;
+    }
+    tokio::time::timeout(GIT_KEEPALIVE_INTERVAL, lines.recv())
+        .await
+        .unwrap_or_else(|_silent| Some(GIT_KEEPALIVE_PKT.to_vec()))
+}
+
+/// the blocking half of an upload-pack: admit the request, tell the handler
+/// (which then sends the head), and build the pack straight into `lines`.
+/// The caller hanging up ends the build at libgit2's next progress report or
+/// write, not at its end.
+fn produce_upload_pack(
+    repo_dir: &std::path::Path,
+    want_hexes: &[String],
+    have_hexes: &[String],
+    admitted: tokio::sync::oneshot::Sender<Result<Option<String>, UploadPackError>>,
+    lines: tokio::sync::mpsc::Sender<Vec<u8>>,
+    side_band: bool,
+) {
+    let plan = match admit_upload_pack(repo_dir, want_hexes, have_hexes) {
+        Ok(plan) => plan,
+        Err(refused) => {
+            let _ = admitted.send(Err(refused));
+            return;
+        }
+    };
+    let ack = plan.common.first().map(git2::Oid::to_string);
+    if admitted.send(Ok(ack)).is_err() {
+        return;
+    }
+    pack_gate::wait(repo_dir);
+    let mut sink = PackLines::new(lines, side_band);
+    match write_pack(&plan, &mut sink) {
+        Ok(()) => sink.finish(),
+        Err(error) => sink.fail(&error),
+    }
+}
+
+/// what an admitted upload-pack packs: the wants' closure, minus everything
+/// the `common` bases (the client's haves this repo knows) already reach.
+struct UploadPlan {
+    repo: git2::Repository,
+    wants: Vec<git2::Oid>,
+    common: Vec<git2::Oid>,
+}
+
+/// the packfile answering `plan`, handed to `sink` as libgit2 writes it: every
+/// have this repo knows as a commit hides its closure from the walk, so a
+/// mirror refresh downloads only what moved, and a client with NO usable
+/// common base gets the full self-contained closure. A revwalk PEELS a tag to
+/// its commit, so an annotated tag a want names is put in by hand — or a
+/// receiver's closure check of that want fails on the one object it never got.
+fn write_pack(plan: &UploadPlan, sink: &mut PackLines) -> Result<(), git2::Error> {
+    let repo = &plan.repo;
+    let mut builder = repo.packbuilder()?;
+    // pack bytes are transport-only, so a large pack uses every worker.
+    builder.set_threads(0);
+    let caller = sink.lines.clone();
+    builder.set_progress_callback(move |_stage, _done, _total| !caller.is_closed())?;
+    let mut walk = repo.revwalk()?;
+    for want in &plan.wants {
+        walk.push(*want)?;
+    }
+    for base in &plan.common {
+        walk.hide(*base)?;
+    }
+    builder.insert_walk(&mut walk)?;
+    for want in &plan.wants {
+        let mut oid = *want;
+        while let Ok(tag) = repo.find_tag(oid) {
+            builder.insert_object(oid, None)?;
+            oid = tag.target_id();
+        }
+    }
+    builder.foreach(|bytes| sink.push(bytes))
+}
+
+/// the pack as the wire carries it: libgit2's output cut into side-band-64k
+/// band-1 lines (raw when the client asked for no side-band), handed to the
+/// socket through a channel [`PACK_LINES_IN_FLIGHT`] deep. A full channel
+/// parks the builder thread, so the pack is produced at the pace the caller
+/// reads it: one line filling here plus the queued ones is all of it this
+/// side of libgit2 ever holds.
+struct PackLines {
+    lines: tokio::sync::mpsc::Sender<Vec<u8>>,
+    side_band: bool,
+    filling: Vec<u8>,
+}
+
+impl PackLines {
+    fn new(lines: tokio::sync::mpsc::Sender<Vec<u8>>, side_band: bool) -> Self {
+        Self {
+            lines,
+            side_band,
+            filling: Vec::with_capacity(GIT_SIDE_BAND_CHUNK),
+        }
+    }
+
+    /// take `bytes` of pack; false once the caller is gone, which stops
+    /// libgit2's write.
+    fn push(&mut self, mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() {
+            let room = GIT_SIDE_BAND_CHUNK - self.filling.len();
+            let (now, rest) = bytes.split_at(room.min(bytes.len()));
+            self.filling.extend_from_slice(now);
+            bytes = rest;
+            let line_full = self.filling.len() == GIT_SIDE_BAND_CHUNK;
+            if line_full && !self.send_filling() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn send_filling(&mut self) -> bool {
+        let data = std::mem::replace(&mut self.filling, Vec::with_capacity(GIT_SIDE_BAND_CHUNK));
+        let line = if self.side_band {
+            band_line(GIT_BAND_PACK, &data)
+        } else {
+            data
+        };
+        self.lines.blocking_send(line).is_ok()
+    }
+
+    /// the pack is whole: its last partial line, then the flush that ends a
+    /// side-band answer (a raw pack's own trailer ends the stream).
+    fn finish(mut self) {
+        let partial = !self.filling.is_empty();
+        if partial && !self.send_filling() {
+            return;
+        }
+        if self.side_band {
+            let _ = self.lines.blocking_send(GIT_FLUSH_PKT.to_vec());
+        }
+    }
+
+    /// the build failed after the head went out. Band 3 is git's fatal remote
+    /// error, which a side-band client prints and aborts on; a raw pack just
+    /// ends short, which git refuses as a truncated pack. A caller that hung
+    /// up is not a failure.
+    fn fail(self, error: &git2::Error) {
+        if error.code() == git2::ErrorCode::User {
+            tracing::debug!(
+                target: "ducktape::forge",
+                reason = "caller_gone",
+                "upload-pack stopped"
+            );
+            return;
+        }
+        tracing::warn!(
+            target: "ducktape::forge",
+            reason = "pack_build_failed",
+            error = %error.message(),
+            "upload-pack failed mid-pack"
+        );
+        if self.side_band {
+            let _ = self
+                .lines
+                .blocking_send(band_line(GIT_BAND_ERROR, b"pack build failed\n"));
+        }
+    }
+}
+
+/// one side-band-64k line: the band byte, then `data`.
+fn band_line(band: u8, data: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(data.len() + 1);
+    framed.push(band);
+    framed.extend_from_slice(data);
+    pkt_line(&framed)
+}
+
+/// a test's hold on the pack builder: it waits, after the head has gone out,
+/// until the test lets a repository's pack be built — a build as slow as the
+/// test says, on no clock. Outside tests it is nothing.
+pub(crate) mod pack_gate {
+    #[cfg(not(test))]
+    pub(super) fn wait(_repo_dir: &std::path::Path) {}
+
+    #[cfg(test)]
+    pub(crate) static GATES: std::sync::Mutex<
+        Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
+    > = std::sync::Mutex::new(Vec::new());
+
+    #[cfg(test)]
+    pub(super) fn wait(repo_dir: &std::path::Path) {
+        let gate = {
+            let mut gates = GATES.lock().unwrap();
+            let held = gates.iter().position(|(dir, _)| dir == repo_dir);
+            held.map(|index| gates.swap_remove(index).1)
+        };
+        if let Some(gate) = gate {
+            let _ = gate.recv();
+        }
+    }
+}
+
+/// [`admit_upload_pack`]'s failure modes. `RepoUnavailable` carries the raw
 /// git2 error — libgit2 puts the repo's absolute path verbatim in that
 /// message (`repository.c`'s "could not find repository at '%s'"), so it is
 /// NEVER surfaced to the client or put in the log ring's warn line; the
@@ -1325,13 +1546,11 @@ enum UploadPackError {
     Other(String),
 }
 
-/// build the packfile answering `want_hexes`, bounded by the client's haves:
-/// every have this repo knows as a commit hides its closure from the walk
-/// (forge's `pack_delta`), so a mirror refresh downloads only what moved. a
-/// client with NO usable common base still gets the FULL self-contained
-/// closure (forge's `pack_closure_many` — ONE packing implementation for the
-/// module's snapshot pack and this fetch lane). returns the pack plus the
-/// first usable common base, which the handler ACKs.
+/// admit a fetch of `want_hexes` bounded by `have_hexes`: the repo opens, every
+/// want parses and is reachable, and the haves this repo knows as commits
+/// become the common bases [`write_pack`] hides (the first is what the handler
+/// ACKs). Cheap next to the pack — a walk of commits, no trees or blobs — so
+/// it runs before the head goes out and a refusal is still a status.
 ///
 /// every want must be a commit reachable from one of this repo's current
 /// branch or tag tips — git's `uploadpack.allowReachableSHA1InWant`, so a
@@ -1340,11 +1559,11 @@ enum UploadPackError {
 /// closure, which a clone of that tip ships anyway. an arbitrary walk of the
 /// object database by oid stays refused — an unknown oid, a tree or blob, or
 /// a commit only a deleted or force-pushed-away branch reached.
-fn build_upload_pack(
+fn admit_upload_pack(
     repo_dir: &std::path::Path,
     want_hexes: &[String],
     have_hexes: &[String],
-) -> Result<(Vec<u8>, Option<String>), UploadPackError> {
+) -> Result<UploadPlan, UploadPackError> {
     let repo = git2::Repository::open(repo_dir).map_err(UploadPackError::RepoUnavailable)?;
     let tips =
         forge::ref_tips(&repo).map_err(|e| UploadPackError::Other(format!("read refs: {e}")))?;
@@ -1370,15 +1589,11 @@ fn build_upload_pack(
             common.push(oid);
         }
     }
-    if common.is_empty() {
-        return forge::pack_closure_many(&repo, &oids)
-            .map(|pack| (pack, None))
-            .map_err(|e| UploadPackError::Other(format!("build pack: {e}")));
-    }
-    let ack = common[0].to_string();
-    forge::pack_delta(&repo, &oids, &common)
-        .map(|pack| (pack, Some(ack)))
-        .map_err(|e| UploadPackError::Other(format!("build delta pack: {e}")))
+    Ok(UploadPlan {
+        repo,
+        wants: oids,
+        common,
+    })
 }
 
 /// the first of `wants`, in request order, that no revwalk from `tips` visits;
@@ -1648,6 +1863,70 @@ mod upload_pack_tests {
 
     const WANT: &str = "1111111111111111111111111111111111111111";
     const HAVE: &str = "2222222222222222222222222222222222222222";
+
+    /// the whole pack [`write_pack`] streams for an admitted request, read
+    /// raw (no side-band) off its line channel, plus the base the handler ACKs.
+    fn build_upload_pack(
+        repo_dir: &std::path::Path,
+        wants: &[String],
+        haves: &[String],
+    ) -> Result<(Vec<u8>, Option<String>), UploadPackError> {
+        let plan = admit_upload_pack(repo_dir, wants, haves)?;
+        let ack = plan.common.first().map(git2::Oid::to_string);
+        let (lines, mut read) = tokio::sync::mpsc::channel(PACK_LINES_IN_FLIGHT);
+        let writer = std::thread::spawn(move || {
+            let mut sink = PackLines::new(lines, false);
+            write_pack(&plan, &mut sink).map(|()| sink.finish())
+        });
+        let mut pack = Vec::new();
+        while let Some(line) = read.blocking_recv() {
+            pack.extend_from_slice(&line);
+        }
+        writer
+            .join()
+            .unwrap()
+            .map_err(|e| UploadPackError::Other(format!("build pack: {e}")))?;
+        Ok((pack, ack))
+    }
+
+    /// THE BOUND: the builder is never more than [`PACK_LINES_IN_FLIGHT`]
+    /// lines ahead of the reader, so a pack many times that size is never
+    /// held whole. With the reader stopped `PACK_LINES_IN_FLIGHT + 1` lines
+    /// short of the end, the writer cannot have finished — it holds a line
+    /// no free slot will take until the reader moves.
+    #[test]
+    fn a_pack_bigger_than_the_bound_is_held_one_bound_at_a_time() {
+        let bound = (PACK_LINES_IN_FLIGHT + 1) * (GIT_SIDE_BAND_CHUNK + 5);
+        assert!(bound < 1200 * 1024, "the stated bound is ~1.1 MiB: {bound}");
+        let total_lines = PACK_LINES_IN_FLIGHT * 8;
+        let pack = vec![0x5a; total_lines * GIT_SIDE_BAND_CHUNK];
+        let (lines, mut read) = tokio::sync::mpsc::channel(PACK_LINES_IN_FLIGHT);
+        let writer = std::thread::spawn(move || {
+            let mut sink = PackLines::new(lines, true);
+            // libgit2 hands over whatever it wrote: one call of the whole pack
+            // is the worst case, and it still leaves in lines.
+            assert!(sink.push(&pack));
+            sink.finish();
+        });
+        let mut received = Vec::new();
+        for _ in 0..total_lines - PACK_LINES_IN_FLIGHT - 1 {
+            received.push(read.blocking_recv().expect("a pack line"));
+        }
+        assert!(
+            !writer.is_finished(),
+            "the writer ran more than {PACK_LINES_IN_FLIGHT} lines ahead of its reader"
+        );
+        while let Some(line) = read.blocking_recv() {
+            received.push(line);
+        }
+        writer.join().unwrap();
+        assert_eq!(received.pop().as_deref(), Some(GIT_FLUSH_PKT));
+        assert_eq!(received.len(), total_lines);
+        for line in &received {
+            assert_eq!(line.len(), GIT_SIDE_BAND_CHUNK + 5, "a full side-band line");
+            assert_eq!(line[4], GIT_BAND_PACK);
+        }
+    }
 
     fn request_tail(tail: &[u8]) -> Vec<u8> {
         let mut body =

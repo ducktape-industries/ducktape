@@ -24,6 +24,7 @@ MIRROR_REPO=""
 ASSUME_YES=0
 SKIP_APP=0
 SKIP_SMOKE=0
+KEEP_STAGE=0
 WALLET_NAME="operator"
 # EMPTY ON PURPOSE — there is no default password. A word committed in this
 # file would unlock the release-signing key of every network founded by it.
@@ -115,6 +116,9 @@ usage: ops/refound-net.sh --root DIR [options]
   --no-smoke          do not seed an agent and mention it at the end. the smoke
                       is the only step that crosses the WHOLE chain, and it
                       costs one real agent run; this is how you decline it.
+  --keep-stage        keep the /tmp staging directory (the staged binary,
+                      founding set and init homes). default: it is removed on
+                      every exit, success or failure.
   --yes               proceed past the teardown/archive of an existing root.
 USAGE
     exit 1
@@ -135,6 +139,7 @@ while [ $# -gt 0 ]; do
         --wallet-mnemonic-file) WALLET_MNEMONIC_FILE=${2:-}; shift 2;;
         --skip-app) SKIP_APP=1; shift;;
         --no-smoke) SKIP_SMOKE=1; shift;;
+        --keep-stage) KEEP_STAGE=1; shift;;
         --yes|-y) ASSUME_YES=1; shift;;
         -h|--help) usage;;
         *) die "unknown flag $1 (try --help)";;
@@ -217,6 +222,17 @@ fi
 # founded with.
 STAGE="/tmp/refound-$NAME-$STAMP"
 mkdir -p "$STAGE"
+# The stage is a binary and a founding set (~120 MB) on a /tmp that may be
+# RAM, and nothing runs from it once the workspaces own their copies. It goes
+# on EVERY exit — success, `die`, or a `set -e` stop — unless --keep-stage.
+drop_stage() {
+    if [ "$KEEP_STAGE" = 1 ]; then
+        printf 'kept the stage at %s\n' "$STAGE" >&2
+        return 0
+    fi
+    rm -rf -- "$STAGE"
+}
+trap drop_stage EXIT
 STAGED_BIN="$STAGE/ducktape"
 cp "$BIN_SRC" "$STAGED_BIN"
 VOUCH=$("$STAGED_BIN" --version | awk '{print $2}')
@@ -592,10 +608,13 @@ say "join the resident"
 INVITE_FILE="/tmp/refound-$NAME-$STAMP.invite"
 INVITE_OUT=$(DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" node invite --config "$FOUNDER_CFG" 2>&1) \
     || die "node invite failed: $INVITE_OUT"
-printf '%s\n' "$INVITE_OUT" | grep -o '🦆[A-Za-z0-9_+/=-]*' > "$INVITE_FILE" || true
+# An invite is a bearer credential: 0600 from its first byte, and only its
+# path is ever printed.
+( umask 077; printf '%s\n' "$INVITE_OUT" | grep -o '🦆[A-Za-z0-9_+/=-]*' > "$INVITE_FILE" ) || true
 if [ ! -s "$INVITE_FILE" ]; then
     die "node invite printed no invite blob. it said: $INVITE_OUT"
 fi
+echo "invite (a bearer credential, mode 0600): $INVITE_FILE"
 JOIN_HOME="$STAGE/joiner-home"
 mkdir -p "$JOIN_HOME" "$(dirname "$JOINER_ROOT")"
 DUCKTAPE_HOME="$JOIN_HOME" "$STAGED_BIN" node join \
