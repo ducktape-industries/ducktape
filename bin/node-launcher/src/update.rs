@@ -42,7 +42,8 @@ const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Watch {
     /// The release this launcher refused definitely, rolled back from, or
-    /// found to be the sequence it runs: spent for this launcher's life.
+    /// found to be the sequence it runs: spent until the network designates
+    /// another one, or the missing key is pinned.
     pub refused: Option<Sha>,
     /// The release whose last answer was [`Failure::Transient`].
     pub retry: Option<Retry>,
@@ -200,17 +201,33 @@ const UNFINISHED_READS: [&str; 3] = ["download_failed", "fetch_failed", "short_r
 
 /// THE CLASS DECISION. Reads nothing, writes nothing.
 ///
-/// Transient is only what could not be read whole: a download that failed or
-/// came up short, and a manifest that does not name the designated release
-/// yet. Everything the bytes themselves answer is definite — a bad signature,
-/// a complete file of the wrong size or hash, a malformed archive, a refused
-/// qualify, no key to check with.
+/// Transient is what could not be read whole — a download that failed or came
+/// up short, a manifest that does not name the designated release yet — and
+/// the one qualify verdict that is about this node rather than the bytes.
+/// Everything the bytes themselves answer is definite: a bad signature, a
+/// complete file of the wrong size or hash, a malformed archive, a checkpoint
+/// the staged binary reopened and disagreed with, no key to check with.
 pub fn failure(refused: &Refused) -> Failure {
     match refused {
         Refused::Manifest(refusal) => manifest_failure(*refusal),
         Refused::Download(reason) => read_failure(reason),
         Refused::Launcher(refusal) => read_failure(refusal.reason),
-        Refused::Verify(_) | Refused::Qualify(_) => Failure::Definite,
+        Refused::Qualify(reason) => qualify_failure(reason),
+        Refused::Verify(_) => Failure::Definite,
+    }
+}
+
+/// The verdict a workspace with no checkpoint yet answers with — the node has
+/// run but written nothing to reopen. The next one it writes answers
+/// differently, so the release is asked about again after a backoff instead of
+/// being spent for this launcher's life.
+const NODE_NOT_READY: &str = "no_checkpoint";
+
+fn qualify_failure(reason: &str) -> Failure {
+    let node_not_ready = reason == NODE_NOT_READY;
+    match node_not_ready {
+        true => Failure::Transient,
+        false => Failure::Definite,
     }
 }
 
@@ -350,7 +367,7 @@ pub fn decide(phase: &Phase, status: &ReleaseStatus, watch: &Watch) -> Next {
     }
     match phase {
         Phase::Idle(idle) => offer_or_wait(designation, idle.current),
-        Phase::Staged(staged) => flip_or_offer(designation, staged.staged, status.height),
+        Phase::Staged(staged) => flip_or_offer(designation, staged.staged, status),
         Phase::Downloading(_)
         | Phase::Swapping(_)
         | Phase::PendingHealthy(_)
@@ -369,16 +386,26 @@ fn offer_or_wait(designation: Designation, current: Sha) -> Next {
     }
 }
 
-/// The staged release flips once the network designates it and it is armed.
-/// A designation of any other release is offered — the network moved on, and
+/// The staged release flips once the network designates it, it is armed, and
+/// this node has a checkpoint for the staged binary to qualify against. A
+/// designation of any other release is offered — the network moved on, and
 /// the staged bytes are no longer the ones to run.
-fn flip_or_offer(designation: Designation, staged: Sha, height: u64) -> Next {
+///
+/// ARMED IS NOT ENOUGH. The flip stops the node so the staged binary can
+/// reopen the workspace offline, and a node that has written no checkpoint —
+/// a joiner still syncing the state it joined at, which arms a designation
+/// already activated the moment it first reads the plane — can only answer
+/// `no_checkpoint`. It waits for its own checkpoint instead: a poll costs
+/// nothing, and the question costs the node.
+fn flip_or_offer(designation: Designation, staged: Sha, status: &ReleaseStatus) -> Next {
     let ours = designation.sha256 == staged;
     if !ours {
         return Next::Offer(designation.sha256);
     }
-    let armed = designation.armed_at(height);
-    match armed {
+    let armed = designation.armed_at(status.height);
+    let qualifiable = status.has_checkpoint();
+    let flipping = armed && qualifiable;
+    match flipping {
         true => Next::Flip,
         false => Next::Wait,
     }
@@ -667,9 +694,15 @@ impl Executor<'_> {
             return Some("not_designated");
         }
         let armed = designation.armed_at(live.height);
-        match armed {
+        if !armed {
+            return Some("not_armed");
+        }
+        // The same gate `decide` holds the flip at: there is nothing for the
+        // staged binary to reopen until this node has written a checkpoint.
+        let qualifiable = live.has_checkpoint();
+        match qualifiable {
             true => None,
-            false => Some("not_armed"),
+            false => Some(NODE_NOT_READY),
         }
     }
 
@@ -831,13 +864,24 @@ mod tests {
         Sha::digest(name.as_bytes())
     }
 
+    /// A node serving committed state, checkpoint written — the ordinary
+    /// member. A joiner still syncing is [`syncing`].
     fn status(height: u64, public_key: &str, designation: Option<Designation>) -> ReleaseStatus {
         ReleaseStatus {
             base: "http://127.0.0.1:8844".into(),
             public_key: public_key.into(),
             height,
+            checkpoint_height: height,
             designation,
             ..ReleaseStatus::default()
+        }
+    }
+
+    /// A joiner that has reached a height but written no checkpoint yet.
+    fn syncing(height: u64, designation: Option<Designation>) -> ReleaseStatus {
+        ReleaseStatus {
+            checkpoint_height: 0,
+            ..status(height, "ab", designation)
         }
     }
 
@@ -1172,6 +1216,41 @@ mod tests {
         assert_eq!(decide(&rolled_back, &silent, &fresh()), Next::Wait);
         let published = status(1201, "ab", designating("b", 1200));
         assert_eq!(decide(&rolled_back, &published, &fresh()), Next::Dismiss);
+    }
+
+    /// A JOINER ARMS NOTHING UNTIL IT HAS A CHECKPOINT. It installs at the
+    /// release it was given, syncs state the network passed long ago, and
+    /// reads a designation that activated hundreds of blocks below its first
+    /// served height — armed on its very first poll. The flip would stop it
+    /// to ask a binary about a checkpoint it has not written, so it waits for
+    /// one instead, and flips on the poll after it lands.
+    #[test]
+    fn a_node_with_no_checkpoint_waits_for_one_before_it_stops_to_qualify() {
+        let staged = Phase::Staged(Staged {
+            current: sha("a"),
+            previous: None,
+            pinned_sequence: 1,
+            staged: sha("b"),
+            sequence: 2,
+            display: "the designated one".into(),
+            node_contract: 1,
+            refused: None,
+        });
+        let armed = designating("b", 1200);
+        assert_eq!(decide(&staged, &syncing(1400, armed), &fresh()), Next::Wait);
+        assert_eq!(
+            decide(&staged, &status(1400, "ab", armed), &fresh()),
+            Next::Flip
+        );
+    }
+
+    /// The same gate the executor holds: asked anyway, it answers about this
+    /// node rather than the bytes, and that answer is transient — the next
+    /// checkpoint the node writes answers differently.
+    #[test]
+    fn a_qualify_with_no_checkpoint_is_transient() {
+        assert_eq!(qualify_failure(NODE_NOT_READY), Failure::Transient);
+        assert_eq!(qualify_failure("root_hash_diverged"), Failure::Definite);
     }
 
     /// The phases in flight owe nothing: a drive is running, or a flip is

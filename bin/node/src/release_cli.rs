@@ -867,6 +867,7 @@ fn status(args: StatusArgs) -> CommandResult {
         public_key,
         height,
         root_hash,
+        checkpoint_height,
         designation,
         release_keys,
     } = reading;
@@ -880,6 +881,9 @@ fn status(args: StatusArgs) -> CommandResult {
     );
     println!("height\t{height}");
     println!("root_hash\t{root_hash}");
+    // What a staged binary would reopen to qualify itself; 0 until this node
+    // has written one, which is when a designation can first be flipped to.
+    println!("checkpoint\t{checkpoint_height}");
     for kind in [Kind::Node, Kind::App] {
         let committed = release_keys
             .of(kind)
