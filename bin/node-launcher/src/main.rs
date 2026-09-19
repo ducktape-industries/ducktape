@@ -558,6 +558,12 @@ fn one_node_life(
         if !flipping {
             continue;
         }
+        // The drive ran with the node stopped, and a qualify can take minutes:
+        // a stop that arrived in that window is answered here. Starting a node
+        // first would start one only to stop it on the next poll.
+        if stopping() {
+            return Ok(Life::Stopped);
+        }
         let running = settled.run.unwrap_or_else(|| phase.current());
         child = start_node(layout, image, &ducktape, child_args, running)?;
         reached = Boot::Starting;
@@ -845,7 +851,9 @@ fn settle(watch: &mut Watch, release: Sha, heard: &Heard) {
     }
 }
 
-/// Asked again, `release` would answer the same: not asked again this life.
+/// Asked again, `release` would answer the same: not asked about again until
+/// the network designates another one, or this node pins the key it was
+/// missing (`pin_committed_key` clears the watch).
 fn spend(watch: &mut Watch, release: Sha) {
     watch.refused = Some(release);
     watch.retry = None;
@@ -884,7 +892,7 @@ fn say_refused(refused: &Refused, release: Sha, failure: Failure, attempts: u64)
             class = %failure,
             attempts,
             detail = %refused.detail(),
-            "{}; not asked again until this launcher restarts",
+            "{}; not asked again until the network designates another release",
             refused.sentence()
         ),
         Failure::Transient => warn!(

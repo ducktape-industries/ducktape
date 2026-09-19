@@ -37,6 +37,7 @@ pub(crate) async fn release(State(handle): State<NodeHandle>) -> Response {
         public_key: live.public_key,
         height: live.height,
         root_hash: live.root_hash,
+        checkpoint_height: live.operations.storage.checkpoint_height,
         designation,
         release_keys,
     })

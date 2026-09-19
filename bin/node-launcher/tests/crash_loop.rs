@@ -4,7 +4,9 @@
 //! came up before it exited starts that count over. "Came up" is a published
 //! identity AT a committed height: a resident publishes its identity before
 //! it recovers, and one that dies in recovery never served. A node whose
-//! invite can never redeem is not restarted at all.
+//! invite can never redeem is not restarted at all. A staged release the
+//! network armed is qualified with the node stopped, and one that refuses
+//! leaves the node running the release it already had.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -315,5 +317,120 @@ fn a_release_whose_launcher_cannot_start_is_rolled_back_by_the_installed_one() {
         std::fs::read_to_string(scratch.join("runs")).unwrap(),
         "old\n",
         "{log}"
+    );
+}
+
+/// A STAGED RELEASE THAT REFUSES ITS OWN QUALIFY leaves the node running the
+/// release it already had, under this same launcher. The flip stops the node
+/// so the staged binary can reopen the workspace offline; the answer is the
+/// binary's own token, and a refusal has to put back exactly what the attempt
+/// took away — one supervisor, one node, on `current`.
+#[test]
+fn a_refused_qualification_leaves_the_current_release_supervised() {
+    use app_update::{Phase, Sha, Staged, state, workspace};
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = dir.path().join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let fifo = Command::new("mkfifo")
+        .arg(scratch.join("asked"))
+        .status()
+        .unwrap();
+    assert!(fifo.success());
+
+    // The network designates the staged release and arms it, but only once a
+    // node has booted and recorded itself: a designation the launcher reads
+    // before its first child ran is the joiner's case (#2729), not this one.
+    // The first node blocks until the flip stops it; the second stops the
+    // launcher the way `systemctl stop` does, so the run ends with its answer
+    // on the record. Each boot appends one line to `<scratch>/boots`.
+    let staged = Sha::digest(b"a staged release that refuses its own qualify");
+    let script = format!(
+        r#"#!/bin/sh
+d="{dir}"
+case "$1 $2" in
+"node run")
+    echo boot >> "$d/boots"
+    case "$(wc -l < "$d/boots")" in
+    1) read _ < "$d/asked" ;;
+    *) kill -TERM "$PPID" ;;
+    esac
+    exit 1
+    ;;
+"release status")
+    designation=null
+    [ -s "$d/boots" ] && designation='{{"sha256":"{staged}","activation_height":1}}'
+    echo '{{"base":"http://127.0.0.1:1","public_key":"ab12","height":10,"root_hash":"e3b0","checkpoint_height":10,"designation":'"$designation"'}}'
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+        dir = scratch.display(),
+    );
+    let binary = write_node(&scratch, &script);
+    let workspace = installed_workspace(dir.path(), &binary);
+    let current: Sha = std::fs::read_link(workspace::current_link(&workspace))
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .parse()
+        .unwrap();
+
+    // The staged bytes, as a verified download left them: a binary whose own
+    // `node qualify` names the reason it cannot run this workspace.
+    let release = workspace::releases_dir(&workspace).join(staged.to_string());
+    std::fs::create_dir_all(&release).unwrap();
+    let refuser = release.join("ducktape");
+    std::fs::write(
+        &refuser,
+        "#!/bin/sh\ncase \"$1 $2\" in\n\"node qualify\") echo root_hash_diverged; exit 1 ;;\nesac\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&refuser, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        workspace::launcher_state_path(&workspace),
+        state::encode(&Phase::Staged(Staged {
+            current,
+            previous: None,
+            pinned_sequence: 1,
+            staged,
+            sequence: 2,
+            display: "the staged one".to_string(),
+            node_contract: 1,
+            refused: None,
+        })),
+    )
+    .unwrap();
+
+    let run = run_launcher(&workspace);
+    let log = plain(&run.stderr);
+    assert!(run.status.success(), "{log}");
+    let refusal = log
+        .lines()
+        .find(|line| line.contains("node_update_refused") && line.contains("qualify"))
+        .unwrap_or_else(|| panic!("the refusal is never said:\n{log}"));
+    assert!(
+        refusal.contains("root_hash_diverged"),
+        "the refusal carries the staged binary's own verdict: {refusal}"
+    );
+    assert!(
+        refusal.contains("not asked again until the network designates another release"),
+        "the refusal says what ends it, and a restart is not what ends it: {refusal}"
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("node_update_exec"))
+            .count(),
+        2,
+        "the node is started again, on the release it already ran:\n{log}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("boots"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "the refusal booted a node again, and only one:\n{log}"
     );
 }

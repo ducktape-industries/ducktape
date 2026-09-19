@@ -36,6 +36,11 @@ pub struct ReleaseStatus {
     pub height: u64,
     #[serde(default)]
     pub root_hash: String,
+    /// The height of the last checkpoint this node wrote; 0 until it has
+    /// written one. A joiner syncing its initial state has none, and a
+    /// checkpoint is what a staged binary reopens offline to qualify itself.
+    #[serde(default)]
+    pub checkpoint_height: u64,
     /// The release this network runs, and from which block. `None` until
     /// governance has passed one.
     #[serde(default)]
@@ -59,5 +64,12 @@ impl ReleaseStatus {
     pub fn came_up(&self) -> bool {
         let serving = self.height > 0;
         self.identity_published() && serving
+    }
+
+    /// There is a checkpoint on disk for a staged binary to reopen offline.
+    /// Until there is, `node qualify` can only answer `no_checkpoint`, so
+    /// stopping the node to ask is a node taken down for nothing.
+    pub fn has_checkpoint(&self) -> bool {
+        self.checkpoint_height > 0
     }
 }
