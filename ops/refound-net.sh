@@ -31,6 +31,9 @@ WALLET_NAME="operator"
 # Either way it lands in a 0600 file beside the mnemonic, so the release lane
 # reads it back the same way whoever chose it.
 WALLET_PASSWORD=""
+WALLET_PASSWORD_FILE=""
+WALLET_MNEMONIC_FILE=""
+WALLET_MNEMONIC=""
 
 # The founder's and the resident's port sets. They must not collide with each
 # other or with anything else on the host: two workspaces on one box share the
@@ -98,6 +101,16 @@ usage: ops/refound-net.sh --root DIR [options]
   --wallet-password P its password. NO DEFAULT: left out, one is generated.
                       the mnemonic and the password are each written to their
                       own 0600 file in the workspace, never to stdout.
+  --wallet-password-file F
+                      the password is F's first line. prefer it to the flag
+                      above: an argv word is visible to every process.
+  --wallet-mnemonic-file F
+                      restore the wallet from the mnemonic line in F (the file
+                      `wallet new` wrote) instead of minting one: the
+                      network keeps the release key its installs already pin.
+                      F is read before anything is torn down, so it may live
+                      in the workspace this run archives. needs a password
+                      (the restored wallet's), by either flag above.
   --skip-app          do not rebuild the desktop app.
   --no-smoke          do not seed an agent and mention it at the end. the smoke
                       is the only step that crosses the WHOLE chain, and it
@@ -118,6 +131,8 @@ while [ $# -gt 0 ]; do
         --port-offset) PORT_OFFSET=${2:-0}; shift 2;;
         --wallet-name) WALLET_NAME=${2:-}; shift 2;;
         --wallet-password) WALLET_PASSWORD=${2:-}; shift 2;;
+        --wallet-password-file) WALLET_PASSWORD_FILE=${2:-}; shift 2;;
+        --wallet-mnemonic-file) WALLET_MNEMONIC_FILE=${2:-}; shift 2;;
         --skip-app) SKIP_APP=1; shift;;
         --no-smoke) SKIP_SMOKE=1; shift;;
         --yes|-y) ASSUME_YES=1; shift;;
@@ -127,6 +142,20 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$ROOT" ] || usage
+# an argv word is visible to every process on the host; a file is not.
+if [ -n "$WALLET_PASSWORD_FILE" ]; then
+    [ -r "$WALLET_PASSWORD_FILE" ] || die "--wallet-password-file: cannot read $WALLET_PASSWORD_FILE"
+    WALLET_PASSWORD=$(head -n 1 "$WALLET_PASSWORD_FILE")
+fi
+if [ -n "$WALLET_MNEMONIC_FILE" ]; then
+    [ -r "$WALLET_MNEMONIC_FILE" ] || die "--wallet-mnemonic-file: cannot read $WALLET_MNEMONIC_FILE"
+    [ -n "$WALLET_PASSWORD" ] || die "--wallet-mnemonic-file needs --wallet-password"
+    # `wallet new` has printed the mnemonic alone and, later, under two lines
+    # of prose: the mnemonic is the one line that is only lowercase words and
+    # has a mnemonic's word count.
+    WALLET_MNEMONIC=$(awk '/^[a-z]+( [a-z]+)*$/ && (NF==12||NF==15||NF==18||NF==21||NF==24) {print; exit}' "$WALLET_MNEMONIC_FILE")
+    [ -n "$WALLET_MNEMONIC" ] || die "--wallet-mnemonic-file: no mnemonic line in $WALLET_MNEMONIC_FILE"
+fi
 case "$ROOT" in /*) :;; *) die "--root must be an absolute path";; esac
 # Shell completion appends a slash to a directory, so `--root ~/.ducktape/dognet/`
 # is what an operator actually types. Every match below compares "$root" and
@@ -441,11 +470,25 @@ PASSFILE="$FOUNDER_WS/wallet-$WALLET_NAME.password"
 [ -n "$WALLET_PASSWORD" ] || WALLET_PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -d '\n')
 ( umask 077; printf '%s\n' "$WALLET_PASSWORD" > "$PASSFILE" )
 ( umask 077; : > "$SECRETS" )
-if printf '%s\n' "$WALLET_PASSWORD" \
-    | DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" wallet new "$WALLET_NAME" \
-      --config "$FOUNDER_CFG" > "$SECRETS" 2>&1; then
+# A network re-founded under the SAME release key keeps every installed app and
+# launcher that pinned it: they verify the new network's channel as they did
+# the old one's. `--wallet-mnemonic-file` restores that wallet instead of
+# minting one; the mnemonic was read before the teardown moved its file.
+mint_or_restore_wallet() {
+    if [ -n "$WALLET_MNEMONIC" ]; then
+        printf '%s\n%s\n' "$WALLET_MNEMONIC" "$WALLET_PASSWORD" \
+            | DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" wallet import "$WALLET_NAME" \
+              --config "$FOUNDER_CFG" > /dev/null 2>&1 || return 1
+        ( umask 077; printf '%s\n' "$WALLET_MNEMONIC" > "$SECRETS" )
+        return 0
+    fi
+    printf '%s\n' "$WALLET_PASSWORD" \
+        | DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" wallet new "$WALLET_NAME" \
+          --config "$FOUNDER_CFG" > "$SECRETS" 2>&1
+}
+if mint_or_restore_wallet; then
     chmod 600 "$SECRETS"
-    echo "minted wallet $WALLET_NAME — mnemonic in $SECRETS (0600), not echoed here"
+    echo "wallet $WALLET_NAME ready — mnemonic in $SECRETS (0600), not echoed here"
     echo "password in $PASSFILE (0600) — feed it to the release lane with"
     echo "  RELEASE_WALLET_PASSWORD=\$(cat $PASSFILE)"
     DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" wallet use "$WALLET_NAME" --config "$FOUNDER_CFG" \
