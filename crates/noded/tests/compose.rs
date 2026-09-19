@@ -1189,6 +1189,22 @@ fn a_view_entry_is_ready_on_the_view_alone_and_the_tag_must_match_the_kind() {
     assert!(error.contains("view manifest"), "{error}");
 }
 
+/// a `Kind::Plane` entry is a hash this boundary holds and nothing more: the
+/// artifact belongs to the node plane that owns it, so nothing here decodes
+/// it — bytes that are not a deployment frame at all are still ready. A
+/// refusal would make every validator withhold `SwapReady`, freezing the pin
+/// at its first hash forever.
+#[test]
+fn a_plane_entry_is_ready_without_decoding_its_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
+    let not_a_frame = b"\0asm\x01\0\0\0 a netstack guest, not a deployment frame";
+    module_artifact::ArtifactRef::decode(not_a_frame)
+        .expect_err("fixture must not be a decodable deployment frame");
+    noded::compose::validate_deployment("netstack", modules::Kind::Plane, not_a_frame, &index)
+        .unwrap();
+}
+
 #[test]
 fn deployment_readiness_does_not_instantiate_view() {
     let dir = tempfile::tempdir().unwrap();

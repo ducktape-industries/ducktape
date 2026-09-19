@@ -219,8 +219,10 @@ pub async fn compose(
                 register_new(&mut host, Box::new(module))?;
             }
             // a view seats nothing: the registry entry carries its hash and
-            // the desktop fetches the artifact by that hash.
-            modules::Kind::View => {}
+            // the desktop fetches the artifact by that hash. a plane seats
+            // nothing here either — its artifact is realized off the module
+            // boundary by the node plane that owns it.
+            modules::Kind::View | modules::Kind::Plane => {}
         }
     }
     // Durable stores can have advanced beyond the checkpoint. Its registry
@@ -314,8 +316,9 @@ async fn registry_active_set(host: &Host, height: u64) -> Result<Vec<ActiveCode>
         .into_iter()
         .filter(|entry| match entry.kind {
             modules::Kind::Module => true,
-            // a view is a registry entry with nothing to seat.
-            modules::Kind::View => false,
+            // a view is a registry entry with nothing to seat, and so is a
+            // plane — the node plane that owns it realizes its artifact.
+            modules::Kind::View | modules::Kind::Plane => false,
         })
         .filter_map(|entry| {
             let (hash, seat) = seat_at(&entry, height)?;
@@ -446,9 +449,11 @@ pub async fn wasm_module(
 /// Readiness is "a validator can run what the registry entry IS": for a
 /// `Kind::Module` entry the consensus code (declared shape realizable here),
 /// its optional mapper (matching its eventual index install) and its optional
-/// view; for a `Kind::View` entry the view alone. Either way the frame's tag
-/// must be the entry's kind — a view frame under a module id (or a module
-/// frame under a view id) is a named refusal, never a vote. View validation
+/// view; for a `Kind::View` entry the view alone; for a `Kind::Plane` entry
+/// nothing at all, because the artifact is not this boundary's. For the two
+/// the boundary does realize, the frame's tag must be the entry's kind — a
+/// view frame under a module id (or a module frame under a view id) is a
+/// named refusal, never a vote. View validation
 /// checks strict metadata and the canonical Ice ABI without instantiating or
 /// executing the view; unknown imports follow the desktop host's trap policy,
 /// so static acceptance does not guarantee that instantiation, init, or boot
@@ -460,20 +465,27 @@ pub fn validate_deployment(
     index: &indexer::IndexStore,
 ) -> Result<(), String> {
     workspace_config::validate_module_id(id)?;
-    let artifact = module_artifact::ArtifactRef::decode(bytes)?;
-    match (kind, artifact) {
-        (modules::Kind::Module, module_artifact::ArtifactRef::Module(module)) => {
-            validate_module(id, module, index)
-        }
-        (modules::Kind::View, module_artifact::ArtifactRef::View(view)) => {
-            validate_view(view.component)
-        }
-        (modules::Kind::Module, module_artifact::ArtifactRef::View(_)) => Err(format!(
-            "artifact_kind_mismatch: {id} is registered as a module, but the artifact is a view-only frame"
-        )),
-        (modules::Kind::View, module_artifact::ArtifactRef::Module(_)) => Err(format!(
-            "artifact_kind_mismatch: {id} is registered as a view, but the artifact is a module frame"
-        )),
+    match kind {
+        // a plane's artifact is not a deployment frame, and this boundary
+        // never decodes it: the node plane that owns it realizes it, and only
+        // that plane knows what its bytes are. Readiness for a plane is
+        // residency alone — the caller has already re-hashed the bytes against
+        // the committed hash. Refusing here instead would make every validator
+        // withhold `SwapReady`, and a hash-pinned artifact whose pin can never
+        // be moved is not one.
+        modules::Kind::Plane => Ok(()),
+        modules::Kind::Module => match module_artifact::ArtifactRef::decode(bytes)? {
+            module_artifact::ArtifactRef::Module(module) => validate_module(id, module, index),
+            module_artifact::ArtifactRef::View(_) => Err(format!(
+                "artifact_kind_mismatch: {id} is registered as a module, but the artifact is a view-only frame"
+            )),
+        },
+        modules::Kind::View => match module_artifact::ArtifactRef::decode(bytes)? {
+            module_artifact::ArtifactRef::View(view) => validate_view(view.component),
+            module_artifact::ArtifactRef::Module(_) => Err(format!(
+                "artifact_kind_mismatch: {id} is registered as a view, but the artifact is a module frame"
+            )),
+        },
     }
 }
 
