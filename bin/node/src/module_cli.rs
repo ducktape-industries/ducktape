@@ -88,6 +88,13 @@ pub struct StageArgs {
     /// hash governance votes on covers the lanes as well as the code.
     #[arg(long, value_name = "LANES.JSON")]
     pub lanes: Option<PathBuf>,
+    /// Register the entry as a hash-pinned artifact ANOTHER plane of the node
+    /// realizes (the reachability plane's `netstack` component today): the
+    /// bytes stay a component frame, but no module boundary ever seats them,
+    /// so they need not speak the module ABI. A swap keeps the entry's kind,
+    /// so updating one takes this flag too.
+    #[arg(long)]
+    pub plane: bool,
     /// blocks after the proposal's EXECUTE height (not this node's height
     /// right now) at which the swap activates — the same value for every
     /// member co-signing the same proposal, whatever height each one is at
@@ -249,7 +256,12 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     )?;
     // the frame says what the entry is: a component makes a module frame, a
     // view alone a view frame — and the registry entry is registered as that.
-    let kind = noded::compose::artifact_kind(&artifact.encode())?;
+    // `--plane` is the one thing a frame cannot say: the same component bytes,
+    // committed as a record another plane of the node realizes.
+    let kind = match args.plane {
+        true => modules::Kind::Plane,
+        false => noded::compose::artifact_kind(&artifact.encode())?,
+    };
     // and it says which lanes the deployment asks for, for the same reason.
     let declared_lanes = noded::compose::artifact_lanes(&artifact.encode())?;
     let bytes = artifact.encode();

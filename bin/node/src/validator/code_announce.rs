@@ -213,7 +213,18 @@ impl CodeReadinessSignaller {
             let Ok(digest) = <[u8; 32]>::try_from(pending.code_hash.as_slice()) else {
                 continue; // malformed hash can never verify — stay silent.
             };
-            match role {
+            // who may answer this pending's readiness probe is the entry's
+            // committed kind: a module's bytes take a seat at the boundary and
+            // a view's land in the view registry, so a validator says whether
+            // they load HERE. A record another plane realizes has no boundary
+            // here to answer for it — a validator wants its bytes exactly as a
+            // resident does, the R = n latch never closes, and the pending
+            // record stays the designation that plane reads.
+            let probing_role = match m.kind {
+                modules::Kind::Module | modules::Kind::View => role,
+                modules::Kind::Plane => Role::Resident,
+            };
+            match probing_role {
                 Role::Resident => self.want_bytes(&digest, &mut held, &mut wanted, &mut actions),
                 Role::Validator => self.decide_swap(m, pending, digest, &mut verdict, &mut actions),
             }
@@ -754,6 +765,29 @@ mod tests {
         );
         assert!(acts.fetches.is_empty());
         assert!(s.present.contains(&[9u8; 32]));
+    }
+
+    /// A RECORD ANOTHER PLANE REALIZES IS PULLED BY EVERY ROLE AND PROBED BY
+    /// NONE. No module boundary here seats its bytes, so no validator can
+    /// answer whether they load: `ScheduleRegister`'s R = n latch never
+    /// closes, the pending record stays the designation that plane reads, and
+    /// a validator wants both its active and its pending frame exactly as a
+    /// resident does.
+    #[test]
+    fn a_plane_entry_is_pulled_by_every_role_and_never_probed() {
+        let mut plane = pending("netstack", "netstack-next", 3, false, &[]);
+        plane.kind = modules::Kind::Plane;
+        plane.active_code_hash = vec![9; 32];
+        let modules = vec![plane];
+        for role in [Role::Resident, Role::Validator] {
+            let mut s = CodeReadinessSignaller::new(me());
+            let acts = s.decide(role, 1, &modules, &no_proposals(), never_held, |_, _| {
+                panic!("a plane record is never probed")
+            });
+            assert_eq!(acts.fetches, vec![[9u8; 32], [3u8; 32]], "{role:?}");
+            assert!(acts.signals.is_empty(), "{role:?}");
+            assert!(acts.refusals.is_empty(), "{role:?}");
+        }
     }
 
     /// BYTE RESIDENCY IS NOT READINESS. A validator whose binary cannot

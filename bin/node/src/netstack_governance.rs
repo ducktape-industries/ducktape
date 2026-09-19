@@ -462,7 +462,7 @@ mod tests {
     fn entry(pending: Option<[u8; 32]>, active: &[u8]) -> modules::ModuleCode {
         modules::ModuleCode {
             module_id: NETSTACK_MODULE_ID.into(),
-            kind: modules::Kind::Module,
+            kind: modules::Kind::Plane,
             active_code_hash: active.to_vec(),
             pending: pending.map(|code_hash| modules::ScheduledSwap {
                 name: "netstack-v1".into(),
