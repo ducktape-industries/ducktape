@@ -41,6 +41,11 @@ pub enum OpCmd {
     /// recomposes its committed root hash — what a release launcher asks a
     /// staged binary before it flips. the node must be STOPPED
     Qualify(QualifyArgs),
+    /// record THIS binary's module world as the one the workspace holds —
+    /// what a node launcher runs once a release its network designated came
+    /// up healthy. the node's next boot is checked against the record
+    #[command(hide = true)]
+    RecordWorld(SelectorArgs),
     /// the running node's height and direct peers: connection, traffic, and
     /// the heights this node served each over state sync
     ///

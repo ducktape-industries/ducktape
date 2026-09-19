@@ -294,6 +294,16 @@ fn start(first_release: &str) -> (Net, Sha) {
     net.daemon()
         .expect_line(&["node_update_awaiting_identity", "attempts=1"], BUDGET);
 
+    net.launcher = Some(run_launcher(&net, "launcher.log"));
+    net.log().expect_line(&["mesh identity published"], BUDGET);
+    // and only now does the daemon run, on the release the install seeded.
+    net.daemon().expect_line(&["daemon on release v1"], BUDGET);
+    net.daemon().expect_line(&["airlock", "signaling to"], BUDGET);
+    (net, first)
+}
+
+/// `launcher run` over the workspace, its feed (and the node's) into `log`.
+fn run_launcher(net: &Net, log: &str) -> NodeProc {
     let mut launcher = Command::new(launcher_exe());
     launcher
         .args(["run", "--workspace"])
@@ -301,13 +311,8 @@ fn start(first_release: &str) -> (Net, Sha) {
         .env("DUCKTAPE_HOME", net.dir.path())
         .env("DUCKTAPE_UPDATE_POLL_MS", POLL_MS)
         .env("RUST_LOG", "info");
-    let log = net.dir.path().join("launcher.log");
-    net.launcher = Some(NodeProc::spawn(1, log, launcher, "node launcher"));
-    net.log().expect_line(&["mesh identity published"], BUDGET);
-    // and only now does the daemon run, on the release the install seeded.
-    net.daemon().expect_line(&["daemon on release v1"], BUDGET);
-    net.daemon().expect_line(&["airlock", "signaling to"], BUDGET);
-    (net, first)
+    let log = net.dir.path().join(log);
+    NodeProc::spawn(1, log, launcher, "node launcher")
 }
 
 /// A private copy of the founding set `cargo build` staged beside this test:
@@ -777,6 +782,53 @@ fn a_node_publishes_stages_qualifies_and_flips_its_successor_at_a_height() {
 /// and asked again after a backoff by the same launcher, with no restart. Once
 /// the whole file is served again, the release stages and flips like any
 /// other.
+/// A NODE RELEASE THAT MOVES THE MODULE WORLD stays bootable. The workspace's
+/// founding record names a world no binary here speaks — what a network
+/// founded by an older release holds. The designated release boots through
+/// the flip anyway, the record names its world once it comes up, and a plain
+/// restart of the node is checked against that record and boots.
+#[test]
+fn a_healthy_flip_records_its_world_and_the_node_boots_again_after_a_restart() {
+    let (mut net, _first) = start(&release_binary("v1", false));
+    workspace_config::FoundingBinary {
+        build: "an-older-release".into(),
+        module_world: "0".repeat(64),
+    }
+    .save(&net.workspace)
+    .expect("seed a founding record of another world");
+
+    let second = archive_of(&release_binary("v2", false));
+    let second_sha = publish(&net, 1, "2026.09.3+v2", &second);
+    designate(&net, second_sha, &[]);
+    net.log().expect_line(
+        &["node_update_world_recorded", &second_sha.to_string()],
+        BUDGET,
+    );
+    net.log().expect_line(
+        &["node_update_settled", "phase=idle", &second_sha.to_string()],
+        BUDGET,
+    );
+    let recorded = workspace_config::FoundingBinary::load(&net.workspace)
+        .expect("read the founding record")
+        .expect("the founding record is still there");
+    assert_eq!(
+        recorded.module_world,
+        wasm_host::module_world_digest(),
+        "the record names the world of the release that came up"
+    );
+
+    // the launcher and its node stop, and a fresh launcher boots the node
+    // against the record the flip left.
+    drop(net.launcher.take());
+    net.launcher = Some(run_launcher(&net, "launcher-restarted.log"));
+    net.log().expect_line(&["mesh identity published"], BUDGET);
+    assert_eq!(
+        net.running(),
+        second_sha,
+        "the restart runs the flipped release"
+    );
+}
+
 #[test]
 fn a_download_that_comes_up_short_is_retried_until_the_release_stages() {
     let (mut net, _first) = start(&release_binary("v1", false));

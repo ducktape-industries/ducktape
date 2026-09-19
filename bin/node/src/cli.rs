@@ -35,6 +35,7 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::List => cmd_list(),
         OpCmd::Status(args) => cmd_node_status(args),
         OpCmd::Qualify(args) => crate::qualify::run(args),
+        OpCmd::RecordWorld(args) => cmd_record_world(args),
         OpCmd::Peers(args) => cmd_node_peers(args),
         OpCmd::Resident(cmd) => dispatch_resident(cmd),
         OpCmd::Member(cmd) => dispatch_member(cmd),
@@ -831,10 +832,21 @@ fn launcher_start(workspace: &std::path::Path) -> String {
     )
 }
 
+/// `node record-world`: the release a node launcher flipped to came up
+/// healthy, so the world it speaks is the workspace's from now on. The
+/// launcher runs it as that release's own binary, the one that links it.
+fn cmd_record_world(args: SelectorArgs) -> CommandResult {
+    let cfg_path = args.selector.config_path()?;
+    let resolved = config::resolve(&cfg_path)?;
+    record_founding_binary(&resolved.service.workspace)?;
+    Ok(())
+}
+
 /// stamp the binary that just materialized `dir` into the workspace's founding
 /// record — the identity `node run` refuses a disagreeing binary against
 /// (`config::guard_founding_binary`). Written by the two verbs that BRING a
-/// workspace into existence, `init` and `join`, and by nothing else.
+/// workspace into existence, `init` and `join`, and by `record-world`, which a
+/// node launcher runs once a release its network designated came up healthy.
 fn record_founding_binary(dir: &std::path::Path) -> Result<(), String> {
     config::FoundingBinary {
         build: noded::services::build_identity_or_unknown().to_string(),

@@ -137,6 +137,27 @@ impl Ducktape {
         }
     }
 
+    /// Have `release` record the module world it speaks as the one this
+    /// workspace holds — the founding record its next boot is checked against.
+    pub fn record_world(release: &Path, config: &Path) -> Result<(), Refusal> {
+        let output = Command::new(release)
+            .args(["node", "record-world"])
+            .arg("--config")
+            .arg(config)
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| Refusal::io("record_world_spawn_failed", release, &error))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let said = String::from_utf8_lossy(&output.stderr);
+        Err(Refusal::new(
+            "world_unrecorded",
+            said.lines().next().unwrap_or("no output").to_string(),
+        ))
+    }
+
     /// Start the child this launcher supervises: the install path's binary,
     /// with `args` after the workspace selector.
     pub fn spawn(&self, args: &[OsString]) -> Result<Child, Refusal> {

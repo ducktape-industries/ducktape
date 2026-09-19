@@ -384,19 +384,43 @@ fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Erro
     // Without this guard the failure is a "type-checking export func `shape`"
     // deep inside the restore compose — hours of reading the wrong plane.
     // Refused by name, with no tolerance window; the remedy is the role's own.
-    let founded_here = resolved.validators.contains(&resolved.signer.public_key());
-    let role = match founded_here {
-        true => config::WorkspaceRole::Founder,
-        false => config::WorkspaceRole::Member,
-    };
-    config::guard_founding_binary(
-        &resolved.service.workspace,
-        &resolved.service.chain_id,
-        role,
-        noded::services::build_identity_or_unknown(),
-        wasm_host::module_world_digest(),
-    )?;
+    //
+    // One boot is not held to the record: the release a launcher flipped to
+    // and awaits health from. The network designated it and the launcher
+    // qualified it against this very checkpoint before the flip, so a world
+    // that moved is the release's, not a stranger's; the launcher records it
+    // once the release comes up (`node record-world`), and a flip that rolls
+    // back boots the release the record still names.
+    let held_to_the_record = !launcher_awaits_health(&resolved.service.workspace);
+    if held_to_the_record {
+        let founded_here = resolved.validators.contains(&resolved.signer.public_key());
+        let role = match founded_here {
+            true => config::WorkspaceRole::Founder,
+            false => config::WorkspaceRole::Member,
+        };
+        config::guard_founding_binary(
+            &resolved.service.workspace,
+            &resolved.service.chain_id,
+            role,
+            noded::services::build_identity_or_unknown(),
+            wasm_host::module_world_digest(),
+        )?;
+    }
     run_node(resolved, cfg_path, sync_only, log_ring)
+}
+
+/// Whether `workspace`'s launcher flipped to a release and waits for it to
+/// come up (`PendingHealthy` in its state file). No state file, or one that
+/// does not decode, is a node no launcher is flipping.
+fn launcher_awaits_health(workspace: &std::path::Path) -> bool {
+    let state = app_update::workspace::launcher_state_path(workspace);
+    let Ok(text) = std::fs::read_to_string(state) else {
+        return false;
+    };
+    matches!(
+        app_update::state::decode(&text),
+        Ok(app_update::Phase::PendingHealthy(_))
+    )
 }
 
 /// Put the startup open-file raise ([`main`]) in `daemon.log`, ONCE, now that

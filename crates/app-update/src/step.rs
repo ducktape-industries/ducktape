@@ -25,7 +25,8 @@
 //!   lower one, changes nothing and repeats no banner. `UserRollback`
 //!   discards the staged release. A discarded release never ran, so the pin
 //!   never took its sequence and it is offered again like any newer one.
-//! - `PendingHealthy` + `Rendered` → `Idle` + `Gc`. `Boot` with `boots == 0`
+//! - `PendingHealthy` + `Rendered` → `RecordWorld` → `Idle` + `Gc`; a flip
+//!   rolled back records nothing. `Boot` with `boots == 0`
 //!   → `boots: 1`; `Boot` with `boots ≥ 1` → flip back → `RolledBack` →
 //!   `Exec`. `Boot` while `Swapping` → `ResolveSwap`; `SwapResolved` finishes
 //!   the swap from whichever side landed.
@@ -655,7 +656,10 @@ fn pending_healthy_boot(pending: PendingHealthy) -> (Phase, Vec<Command>) {
     (rolled_back, commands)
 }
 
-/// The healthy signal: keep `current` and `previous`, drop the rest.
+/// The healthy signal: record the world the release speaks, keep `current`
+/// and `previous`, drop the rest. The record lands BEFORE `Idle` does: a crash
+/// between the two boots `PendingHealthy` again and records it again, where
+/// the other order would leave an `Idle` whose release the record refuses.
 fn pending_healthy_rendered(pending: PendingHealthy) -> (Phase, Vec<Command>) {
     let idle = Phase::Idle(Idle {
         current: pending.current,
@@ -665,7 +669,8 @@ fn pending_healthy_rendered(pending: PendingHealthy) -> (Phase, Vec<Command>) {
     let gc = Command::Gc {
         keep: vec![pending.current, pending.previous],
     };
-    (idle.clone(), vec![Command::Persist(idle), gc])
+    let record = Command::RecordWorld(pending.current);
+    (idle.clone(), vec![record, Command::Persist(idle), gc])
 }
 
 // --- RolledBack ------------------------------------------------------------
@@ -1435,12 +1440,13 @@ mod tests {
                 ),
             },
             Case {
-                name: "pending rendered is healthy and collects garbage",
+                name: "pending rendered records the world, is healthy and collects garbage",
                 phase: pending("b", "a", 1),
                 event: Event::Rendered,
                 expect: (
                     idle("b", Some("a"), 18),
                     vec![
+                        Command::RecordWorld(sha("b")),
                         Command::Persist(idle("b", Some("a"), 18)),
                         Command::Gc {
                             keep: vec![sha("b"), sha("a")],
@@ -1738,6 +1744,29 @@ mod tests {
                 keep: vec![sha("b"), sha("a")]
             })
         );
+    }
+
+    /// The workspace's recorded module world follows a flip that settles
+    /// healthy, and only that: a flip that rolls back leaves it naming the
+    /// release that runs again.
+    #[test]
+    fn only_a_healthy_flip_records_the_world_its_release_speaks() {
+        let records = |commands: &[Command]| {
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::RecordWorld(_)))
+        };
+
+        let (_, healthy) = step(pending("b", "a", 0), Event::Rendered);
+        assert_eq!(healthy.first(), Some(&Command::RecordWorld(sha("b"))));
+
+        let (counted, first_boot) = step(pending("b", "a", 0), Event::Boot);
+        let (rolled, rollback) = step(counted, Event::Boot);
+        assert_eq!(rolled, rolled_back("a", "b"));
+        assert!(!records(&first_boot), "{first_boot:?}");
+        assert!(!records(&rollback), "{rollback:?}");
+        let (_, dismissed) = step(rolled, Event::DismissRollbackNotice);
+        assert!(!records(&dismissed), "{dismissed:?}");
     }
 
     /// A NETWORK TAKES A RELEASE BACK by designating the one before it. The
