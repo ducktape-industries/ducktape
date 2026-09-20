@@ -464,5 +464,5 @@ clean:
 kernel-fixtures:
 	$(CARGO) build --manifest-path crates/kernel/fixtures/Cargo.toml \
 	  --target wasm32-unknown-unknown --release
-	cp crates/kernel/fixtures/target/wasm32-unknown-unknown/release/*.wasm \
+	cp crates/kernel/fixtures/target/wasm32-unknown-unknown/release/fixture_*.wasm \
 	  crates/kernel/fixtures/wasm/
