@@ -85,9 +85,7 @@ pub use handle::{
 
 mod module_code;
 pub mod node_work;
-pub use module_code::{
-    CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest, MAX_MODULE_ARTIFACT_BYTES,
-};
+pub use module_code::{CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest};
 pub mod run_control;
 // the node ↔ agent-daemon link: the collaboration messaging bus, and the 0600
 // workspace secret the gated ws topics stand on. public so `main.rs` can build
@@ -808,10 +806,7 @@ pub fn router(handle: NodeHandle) -> Router {
         // receipt out. distinct from `/v1/submit` above, whose `origin` is a
         // caller-supplied string.
         .route("/v1/submit/frame", post(submit_frame))
-        .route(
-            "/v1/submit/raw/{target}",
-            post(submit_raw).layer(DefaultBodyLimit::max(node::MAX_PAYLOAD_BYTES)),
-        )
+        .route("/v1/submit/raw/{target}", post(submit_raw))
         .route("/v1/query", post(query))
         // the AUTHENTICATED read lane, to `/v1/query` what `/v1/submit/frame`
         // is to `/v1/submit`: the caller's own proof decides who is asking, so
@@ -838,33 +833,17 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/huddle/node-proof", post(huddle_node_proof))
         .route("/v1/ws", get(ws))
         .route("/v1/presence/ws", get(presence_ws))
-        .route(
-            "/v1/gateway/proxy",
-            post(gateway_proxy).layer(DefaultBodyLimit::max(
-                gateway_http::JSON_LANE_REQUEST_BYTES * 2 + gateway::MAX_PROXY_HEAD_BYTES,
-            )),
-        )
+        .route("/v1/gateway/proxy", post(gateway_proxy))
         .route(
             "/v1/gateway/operator",
-            post(gateway_http::gateway_operator_proxy)
-                .get(gateway_http::gateway_operator_stream)
-                .layer(DefaultBodyLimit::max(
-                    gateway_http::JSON_LANE_REQUEST_BYTES * 2 + gateway::MAX_PROXY_HEAD_BYTES,
-                )),
+            post(gateway_http::gateway_operator_proxy).get(gateway_http::gateway_operator_stream),
         )
         .route("/v1/gateway/browser", get(gateway_browser_base))
         .route(
             "/v1/gateway/stream",
             get(gateway_http::gateway_native_stream),
         )
-        .route(
-            "/v1/files/blob",
-            // NO body limit, and the one route that has none: `put_blob`
-            // streams to disk, and the bytes arriving here are a git push's
-            // packfile — capping them caps what anyone may push. The json
-            // routes keep axum's (smaller) default limit.
-            post(put_blob).layer(DefaultBodyLimit::disable()),
-        )
+        .route("/v1/files/blob", post(put_blob))
         .route("/v1/files/blob/{digest}", get(get_blob))
         // ---- duckfs workspace RPC (the jobs/sandbox seam) ----
         // managed checkouts under the injected root: create, commit (409 on a
@@ -899,15 +878,10 @@ pub fn router(handle: NodeHandle) -> Router {
     // unmatched path must 404 rather than be told it needs a signature.
     // `signed_req::lane_of` is the whole table — a new mutating route is added
     // THERE, never gated at its own call site.
-    let public = public
-        .route_layer(axum::middleware::from_fn_with_state(
-            handle.clone(),
-            signed_req::signed_write_guard,
-        ))
-        .route_layer(axum::middleware::from_fn_with_state(
-            std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
-            limit_blob_uploads,
-        ));
+    let public = public.route_layer(axum::middleware::from_fn_with_state(
+        handle.clone(),
+        signed_req::signed_write_guard,
+    ));
     // the owner-gated `/v1/admin/*` namespace — merged only when exposure is
     // enabled, so `Disabled` leaves the control surface simply ABSENT (a 404),
     // not a gated-but-present route. its own PoP middleware is baked in.
@@ -926,6 +900,9 @@ pub fn router(handle: NodeHandle) -> Router {
         // gate — defense in depth.)
         .layer(axum::middleware::from_fn(origin_guard::guard))
         .layer(origin_guard::cors())
+        // No route on this surface bounds its body: axum's own 2 MiB default
+        // would otherwise apply to every extractor that reads one.
+        .layer(DefaultBodyLimit::disable())
         .with_state(handle)
 }
 
@@ -1001,9 +978,7 @@ async fn submit_raw(
     body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
     let bounded_target = !target.is_empty() && target.len() <= node::MAX_TARGET_BYTES;
-    if !bounded_target {
-        return error_response(StatusCode::BAD_REQUEST, "invalid module target");
-    }
+    if !bounded_target { return error_response(StatusCode::BAD_REQUEST, "invalid module target"); }
     let body = match body {
         Ok(body) => body,
         Err(error) => return error_response(error.status(), &error.body_text()),
@@ -1452,27 +1427,6 @@ fn no_invite_minter(phase: NodePhase) -> Response {
     )
 }
 
-/// body cap for the op-receipt blob lane. a receipt-lane bound only —
-/// unrelated to duckfs chunking, which rides the op stream.
-async fn limit_blob_uploads(
-    State(slots): State<std::sync::Arc<tokio::sync::Semaphore>>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let uploads_blob =
-        request.method() == axum::http::Method::POST && request.uri().path() == "/v1/files/blob";
-    if !uploads_blob {
-        return next.run(request).await;
-    }
-    let Ok(_permit) = slots.try_acquire() else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "blob upload capacity exhausted",
-        );
-    };
-    next.run(request).await
-}
-
 /// POST /v1/files/blob — raw receipt bytes in, `{"digest":"<64-hex>"}` out.
 ///
 /// bytes go straight into the node-local blob store; NOTHING reaches the node
@@ -1601,13 +1555,9 @@ async fn ws(
     // this upgrade carried, never on anything a frame can say later.
     let on_box = admin::peer_is_loopback(&extensions);
     let operator = signed_req::upgrade_is_operator(&handle, &headers, path_and_query, on_box);
-    // a surface any caller can open: cap the frame/message tungstenite
-    // otherwise defaults to 64 MiB, so a single frame cannot force a large
-    // buffer before any handler gets to look at it (see
-    // `stream::MAX_WS_MESSAGE_BYTES`).
     upgrade
-        .max_message_size(stream::MAX_WS_MESSAGE_BYTES)
-        .max_frame_size(stream::MAX_WS_MESSAGE_BYTES)
+        .max_message_size(usize::MAX)
+        .max_frame_size(usize::MAX)
         .on_upgrade(move |socket| stream::stream_session(socket, handle, reader_of, operator))
 }
 

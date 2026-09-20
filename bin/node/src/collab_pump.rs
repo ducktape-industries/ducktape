@@ -1380,7 +1380,6 @@ fn refusal_token(reason: wire::BindRefusal) -> &'static str {
         wire::BindRefusal::StaleGeneration => "stale_generation",
         wire::BindRefusal::UnknownDevice => "unknown_device",
         wire::BindRefusal::SessionUnreachable => "session_unreachable",
-        wire::BindRefusal::AtCapacity => "at_capacity",
     }
 }
 

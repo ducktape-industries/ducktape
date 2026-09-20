@@ -327,9 +327,7 @@ where
     let mut attempts = 0u32;
     let mut answers = Vec::new();
     loop {
-        let answer =
-            statesync::fetch_frames_capped(client, floor, floor + 1, statesync::MAX_CATCHUP_BYTES)
-                .await;
+        let answer = statesync::fetch_frames(client, floor, floor + 1).await;
         attempts += 1;
         let mesh_not_up_yet = matches!(answer, Err(statesync::SyncError::Transport(_)));
         let reports_a_gap = gap_retained_from(&answer).is_some();

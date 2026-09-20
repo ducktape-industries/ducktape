@@ -33,10 +33,6 @@ topology = { workspace = true }
 # staged beside its executable when no `--modules` names another.
 workspace-config = { workspace = true }
 sdk = { workspace = true }
-# the two module wire codecs the echo oracle speaks: a saga worker request in,
-# a saga follow-up (bid, then result) out over a dispatch WorkSpec.
-dispatch = { workspace = true }
-saga = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
 # variable-length hex decode for the `hex:` origin escape and `--with-valset`
@@ -65,6 +61,7 @@ node = { workspace = true, features = ["sim"] }
 indexer = { workspace = true }
 
 commonware-runtime = { workspace = true }
+commonware-cryptography = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -77,19 +74,8 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 
 [dev-dependencies]
-# the module crates the SCENARIOS speak with — wire types and constants only
-# (`gateway::RouteDefinition`, `tasks::MAX_ATTEMPTS`, the local governance
-# contract,
-# `runs::MAX_ACTIONS_PER_SESSION`, `files::Change`). a test composes the same
-# wasm genesis the binary does; these encode what it submits to it.
-files = { workspace = true }
-gateway = { workspace = true }
-runs = { workspace = true }
-tasks = { workspace = true }
 # the shared raw-http/port/poll harness helpers (was a local copy in harness/).
 nettest = { path = "../../crates/testing/nettest" }
-# the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
-identity = { path = "../../crates/modules/system/identity", features = ["testkit"] }
 # sim_e2e spawns the real binary and needs isolated storage roots.
 tempfile = "3"
 # core_scenarios signs identity member-consent certificates.

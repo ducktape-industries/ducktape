@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use commonware_codec::{DecodeExt as _, Encode as _};
-use commonware_cryptography::{Signer as _, ed25519};
+use commonware_cryptography::{Signer as _, Verifier as _, ed25519};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -55,8 +55,7 @@ pub fn grant_preimage(binding: &[u8], nonce: &[u8], expires: u64) -> Vec<u8> {
 }
 
 pub fn verify_invite_token(token: &InviteToken, binding: &[u8]) -> bool {
-    use commonware_cryptography::Verifier as _;
-    let message = grant_preimage(binding, token.nonce.as_slice(), token.expires_unix_secs);
+    let message = grant_preimage(binding, &token.nonce, token.expires_unix_secs);
     token
         .issuer
         .verify(INVITE_GRANT_NAMESPACE, &message, &token.sig)
@@ -67,12 +66,7 @@ pub fn sign_join_proof(
     binding: &[u8],
     token: &InviteToken,
 ) -> ed25519::Signature {
-    let message = [
-        binding,
-        token.nonce.as_slice(),
-        joiner.public_key().as_ref(),
-    ]
-    .concat();
+    let message = [binding, &token.nonce, joiner.public_key().as_ref()].concat();
     joiner.sign(INVITE_JOIN_NAMESPACE, &message)
 }
 
@@ -82,8 +76,7 @@ pub fn verify_join_proof(
     token: &InviteToken,
     proof: &ed25519::Signature,
 ) -> bool {
-    use commonware_cryptography::Verifier as _;
-    let message = [binding, token.nonce.as_slice(), joiner.as_ref()].concat();
+    let message = [binding, &token.nonce, joiner.as_ref()].concat();
     joiner.verify(INVITE_JOIN_NAMESPACE, &message, proof)
 }
 

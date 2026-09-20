@@ -49,6 +49,8 @@ use wasm_host::{HostOdb, OdbBacking};
 
 use duckfs_disk::{commit_refs, persist_objects};
 
+pub mod identity_contract;
+
 // the files object-read consensus cap is single-sourced in `duckfs-core` (the
 // guest runs that core), but "core rejects strictly before the kernel trap" only
 // holds while the core cap does not EXCEED the kernel's per-dispatch object-plane

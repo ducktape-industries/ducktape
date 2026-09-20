@@ -13,10 +13,8 @@
 //! `submit` is a pure function of `(registry state, msg, env)`:
 //! - the registry is a [`BTreeMap`], so snapshot + root-hash iteration is sorted
 //!   and order-stable across nodes;
-//! - the follow-up queue is FIFO and dispatched purely locally;
-//! - the drain is hard-capped at [`MAX_DISPATCHES`], so it always terminates
-//!   (a self-emitting or A↔B-ping-pong module hits [`Error::BudgetExceeded`]
-//!   rather than looping forever).
+//! - the follow-up queue is FIFO and dispatched purely locally, and the drain
+//!   runs until it is empty.
 //!
 //! ## the borrow seam (remove-execute-reinsert)
 //!
@@ -104,20 +102,6 @@ pub fn global_root_of(pairs: &[(ModuleId, StateRoot)]) -> StateRoot {
     }
     StateRoot(h.finalize().into())
 }
-
-/// hard cap on dispatches per `submit` (the root op plus all follow-ups). a
-/// consensus/genesis constant — identical on every node — so the local re-entry
-/// loop is guaranteed to terminate regardless of module behavior.
-pub const MAX_DISPATCHES: u32 = 1024;
-
-/// hard cap on rollback+replay cycles per BLOCK — [`MAX_DISPATCHES`] is per
-/// `drain_queue` CALL and so bounds one member, never the batch. Per-op
-/// isolation replays every already-accepted member when a member that STAGED
-/// then fails, which is quadratic in the member count; this bounds the block's
-/// re-execution to `members * (1 + MAX_BLOCK_REPLAYS)`. Past the budget the
-/// remaining members are rejected unexecuted — a function of the block alone,
-/// so every validator produces the identical verdict set.
-pub const MAX_BLOCK_REPLAYS: u32 = 8;
 
 /// the genesis-constant module id the `modules` registry registers under. read
 /// by the boundary code-swap realization ([`Host::realize_module_swaps`]) and by
@@ -672,9 +656,8 @@ pub enum CallDisposition {
     /// the source could not record the real outcome; the target's writes (if
     /// any) were rolled back and the call retired under the fixed marker.
     Unrepresentable { attempted: dispatch::Attempt },
-    /// no finalizer could be recorded this block (or the replay budget ran
-    /// out before the call was attempted): the call stays queued, nothing of
-    /// it committed, and the next block attempts it again.
+    /// no finalizer could be recorded this block: the call stays queued,
+    /// nothing of it committed, and the next block attempts it again.
     NotFinalized { reason: String },
 }
 
@@ -698,9 +681,8 @@ pub enum DeliveryDisposition {
         reason: String,
     },
     Unrepresentable,
-    /// no acknowledgment could be recorded this block (or the replay budget
-    /// ran out first): the item stays queued and the next block delivers it
-    /// again.
+    /// no acknowledgment could be recorded this block: the item stays queued
+    /// and the next block delivers it again.
     NotFinalized {
         reason: String,
     },
@@ -790,8 +772,8 @@ struct AcceptedUnit {
     entry: usize,
 }
 
-/// the running state of one block's apply: what is staged, what was
-/// accepted, and how much of the replay budget is spent.
+/// the running state of one block's apply: what is staged and what was
+/// accepted.
 struct BlockRun {
     height: u64,
     consensus_time: u64,
@@ -799,18 +781,8 @@ struct BlockRun {
     /// the host commits or aborts at the boundary.
     touched: BTreeSet<ModuleId>,
     accepted: Vec<AcceptedUnit>,
-    replays: u32,
     /// the block's sibling observations, recorded or served unit by unit.
     observer: Observer,
-}
-
-impl BlockRun {
-    /// the replay budget ran out: every unit not yet attempted stays
-    /// unattempted — a function of the block alone, so every validator stops
-    /// at the identical unit.
-    fn budget_exhausted(&self) -> bool {
-        self.replays > MAX_BLOCK_REPLAYS
-    }
 }
 
 /// the block's witness as its units run. on the live path, every sibling
@@ -1234,11 +1206,7 @@ fn describe_target(module: &str, origin: &Origin, input: &Input) -> String {
 enum UnitVerdict {
     Accepted(AcceptedUnit),
     Rejected(Error),
-    /// the replay budget was exhausted before this unit ran.
-    Unattempted,
 }
-
-const REPLAY_BUDGET_REASON: &str = "block replay budget exhausted";
 
 /// the ONE string a rejection is carried as once it leaves [`Error`] (a
 /// member's outcome, a recorded call or delivery outcome): a module refusal in
@@ -2403,7 +2371,7 @@ impl Host {
     /// the host owns the commit lifecycle: on a clean drain it calls
     /// [`Module::commit_block`] on every touched module (deterministic registry
     /// order) to publish their staged writes together; on ANY drain failure (a
-    /// later `execute` erroring, or [`Error::BudgetExceeded`]) it calls
+    /// later `execute` erroring) it calls
     /// [`Module::abort_block`] on every touched module, so a half-applied block
     /// leaves NO trace — every module root is byte-identical to its pre-block
     /// value. the root-hash is recomposed AFTER the commit, so it reflects exactly
@@ -2648,7 +2616,6 @@ impl Host {
             consensus_time: ctx.consensus_time,
             touched: BTreeSet::new(),
             accepted: Vec::new(),
-            replays: 0,
             observer: Observer::new(observation),
         };
 
@@ -2681,11 +2648,6 @@ impl Host {
                         reason: carried_refusal(&reason),
                     });
                 }
-                UnitVerdict::Unattempted => {
-                    members[i] = Some(MemberOutcome::Rejected {
-                        reason: format!("{REPLAY_BUDGET_REASON} ({MAX_BLOCK_REPLAYS})"),
-                    });
-                }
             }
         }
 
@@ -2694,19 +2656,14 @@ impl Host {
         // observes (live, or served from the witness).
         let mut calls: Vec<Option<CallRecord>> = (0..prepared.calls.len()).map(|_| None).collect();
         for (i, call) in prepared.calls.iter().enumerate() {
-            let verdict = match block.budget_exhausted() {
-                true => None,
-                false => {
-                    block.observer.begin_unit();
-                    let authority = self.call_authority(&block.observer, call).await;
-                    self.check_witness(&mut block).await?;
-                    match authority {
-                        Ok(verdict) => Some(verdict),
-                        Err(error) => {
-                            self.abort_all(&mut block.touched).await?;
-                            return Err(authority_fault(error));
-                        }
-                    }
+            block.observer.begin_unit();
+            let authority = self.call_authority(&block.observer, call).await;
+            self.check_witness(&mut block).await?;
+            let verdict = match authority {
+                Ok(verdict) => verdict,
+                Err(error) => {
+                    self.abort_all(&mut block.touched).await?;
+                    return Err(authority_fault(error));
                 }
             };
             if let Some(record) = self.run_call(&mut block, i, call, verdict).await? {
@@ -2869,9 +2826,6 @@ impl Host {
         block: &mut BlockRun,
         steps: Vec<Step>,
     ) -> Result<UnitVerdict, SubmitError> {
-        if block.budget_exhausted() {
-            return Ok(UnitVerdict::Unattempted);
-        }
         let entry = block.observer.begin_unit();
         let mut events: Vec<Event> = Vec::new();
         let mut dispatches: Vec<DispatchRecord> = Vec::new();
@@ -2996,11 +2950,10 @@ impl Host {
     /// ISOLATE a rejected unit: its partial stage is entangled with the
     /// accepted units' stage (one shared per-module stage), so roll the WHOLE
     /// stage back, then replay only the accepted units to rebuild their writes
-    /// without it. counts against the block's replay budget.
+    /// without it.
     async fn isolate(&mut self, block: &mut BlockRun) -> Result<(), SubmitError> {
         self.abort_all(&mut block.touched).await?;
         self.replay_accepted(block).await?;
-        block.replays += 1;
         Ok(())
     }
 
@@ -3030,21 +2983,8 @@ impl Host {
         block: &mut BlockRun,
         slot: usize,
         call: &PreparedCall,
-        verdict: Option<Verdict>,
+        verdict: Verdict,
     ) -> Result<Option<CallRecord>, SubmitError> {
-        let not_finalized = |reason: String| CallRecord {
-            enqueued: call.enqueued,
-            id: call.id.clone(),
-            disposition: CallDisposition::NotFinalized { reason },
-            dispatches: Vec::new(),
-        };
-        let Some(verdict) = verdict else {
-            // never decided: the block's replay budget ran out before this
-            // call (live), or the journal says the live block never reached it.
-            return Ok(Some(not_finalized(format!(
-                "{REPLAY_BUDGET_REASON} ({MAX_BLOCK_REPLAYS})"
-            ))));
-        };
         let outcome = match verdict {
             Verdict::Refused(refusal) => dispatch::CallOutcome::Refused(refusal),
             Verdict::Admitted => {
@@ -3057,11 +2997,6 @@ impl Host {
                     },
                 };
                 match self.run_unit(block, vec![op]).await? {
-                    UnitVerdict::Unattempted => {
-                        return Ok(Some(not_finalized(format!(
-                            "{REPLAY_BUDGET_REASON} ({MAX_BLOCK_REPLAYS})"
-                        ))));
-                    }
                     UnitVerdict::Rejected(reason) => dispatch::CallOutcome::Rejected {
                         reason: carried_refusal(&reason),
                     },
@@ -3135,14 +3070,6 @@ impl Host {
                 block.accepted.push(unit);
                 Ok(None)
             }
-            UnitVerdict::Unattempted => Ok(Some(CallRecord {
-                enqueued: call.enqueued,
-                id: call.id.clone(),
-                disposition: CallDisposition::NotFinalized {
-                    reason: format!("{REPLAY_BUDGET_REASON} ({MAX_BLOCK_REPLAYS})"),
-                },
-                dispatches: Vec::new(),
-            })),
             UnitVerdict::Rejected(reason) => match fallback {
                 Some(attempted) => {
                     tracing::warn!(
@@ -3205,16 +3132,6 @@ impl Host {
             },
         };
         let outcome = match self.run_unit(block, vec![op]).await? {
-            UnitVerdict::Unattempted => {
-                return Ok(Some(DeliveryRecord {
-                    item: delivery.item.clone(),
-                    target: delivery.target.clone(),
-                    disposition: DeliveryDisposition::NotFinalized {
-                        reason: format!("{REPLAY_BUDGET_REASON} ({MAX_BLOCK_REPLAYS})"),
-                    },
-                    dispatches: Vec::new(),
-                }));
-            }
             UnitVerdict::Rejected(reason) => DeliveryOutcome::Failed {
                 reason: carried_refusal(&reason),
             },
@@ -3271,14 +3188,6 @@ impl Host {
                 block.accepted.push(unit);
                 Ok(None)
             }
-            UnitVerdict::Unattempted => Ok(Some(DeliveryRecord {
-                item: delivery.item.clone(),
-                target: delivery.target.clone(),
-                disposition: DeliveryDisposition::NotFinalized {
-                    reason: format!("{REPLAY_BUDGET_REASON} ({MAX_BLOCK_REPLAYS})"),
-                },
-                dispatches: Vec::new(),
-            })),
             UnitVerdict::Rejected(reason) => {
                 if has_fallback {
                     tracing::warn!(
@@ -3546,12 +3455,11 @@ impl Host {
     /// stand the witness's record in for a module the replay must not run —
     /// record the deterministic [`DispatchRecord`], and push emitted
     /// follow-ups back as `Origin::Module` ops under the same cause until the
-    /// queue empties or [`MAX_DISPATCHES`] is hit. modules only STAGE; the
+    /// queue empties. modules only STAGE; the
     /// caller owns the commit/abort boundary. staged writes and `touched`
     /// accumulate across calls, so a block can drain units one at a time on
     /// top of one another. `events` / `dispatches` are appended to (never
-    /// cleared). the dispatch budget is per-call: each queue-run gets a
-    /// fresh [`MAX_DISPATCHES`].
+    /// cleared). the queue runs until it is empty.
     #[allow(clippy::too_many_arguments)]
     async fn drain_queue(
         &mut self,
@@ -3563,13 +3471,7 @@ impl Host {
         events: &mut Vec<Event>,
         dispatches: &mut Vec<DispatchRecord>,
     ) -> Result<(), Error> {
-        let mut n: u32 = 0;
-
         while let Some((origin, cause, msg)) = queue.pop_front() {
-            n += 1;
-            if n > MAX_DISPATCHES {
-                return Err(Error::BudgetExceeded);
-            }
             let input = Input::Execute {
                 payload: msg.payload.clone(),
             };

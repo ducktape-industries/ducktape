@@ -200,7 +200,6 @@ pub(super) async fn fetch_and_hydrate_genesis<
         client,
         blobs,
         &hash,
-        crate::constants::MAX_GENESIS_BYTES,
         crate::constants::BLOB_FETCH_ATTEMPTS,
     )
     .await
@@ -726,7 +725,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
         let module = module.to_string();
         async move {
             let root = root?;
-            let bytes = fetch_snapshot(&client, boundary, &module, statesync::MAX_SNAPSHOT_BYTES)
+            let bytes = fetch_snapshot(&client, boundary, &module)
                 .await
                 .map_err(|e| format!("{module} snapshot: {e}"))?;
             Ok::<_, String>((bytes, root))
@@ -779,7 +778,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     let code = crate::blob_fetch::FetchingCodeSource::new(
         blobs.clone(),
         client.clone(),
-        crate::constants::MAX_MODULE_CODE_BYTES,
         crate::constants::BLOB_FETCH_ATTEMPTS,
     );
     let mut stores = |module: &str| -> BoxFut<'_, Result<Box<dyn sdk::MerkleStore>, String>> {

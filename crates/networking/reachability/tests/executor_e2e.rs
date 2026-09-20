@@ -52,10 +52,9 @@ const CHAIN: &str = "net#e2e";
 /// The committed `ducktape:netstack` test fixture; node binaries load a file.
 const NETSTACK_COMPONENT: &[u8] = include_bytes!("../../netstack-machine/component.wasm");
 
-fn guest_backend(step_fuel: u64) -> NetstackBackend {
+fn guest_backend() -> NetstackBackend {
     NetstackBackend::Guest {
         component: NETSTACK_COMPONENT.to_vec(),
-        step_fuel,
     }
 }
 
@@ -3122,7 +3121,7 @@ async fn a_guest_backed_node_converges_with_native_peers() {
                 None,
                 &[],
                 &[],
-                vec![guest_backend(reachability::NETSTACK_STEP_FUEL)],
+                vec![guest_backend()],
             );
             retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
             let versions = await_applied(&mut collected, &[0, 1, 2], 1).await;
@@ -3143,13 +3142,9 @@ async fn a_guest_backed_node_converges_with_native_peers() {
 /// A broken deployed component must never run the native protocol instead.
 #[tokio::test]
 async fn a_faulting_guest_stops_without_native_effects() {
-    for backend in [
-        guest_backend(1),
-        NetstackBackend::Guest {
-            component: b"invalid component".to_vec(),
-            step_fuel: reachability::NETSTACK_STEP_FUEL,
-        },
-    ] {
+    for backend in [NetstackBackend::Guest {
+        component: b"invalid component".to_vec(),
+    }] {
         let dir = tempfile::tempdir().unwrap();
         let signer = PrivateKey::from_seed(1);
         let policy = PortPolicy::production();
@@ -3236,7 +3231,7 @@ async fn a_backend_swap_mid_epoch_keeps_the_tunnels() {
             let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
             retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
             // queued right behind the retarget: the epoch is assembling.
-            swap_backend(&nodes[0], guest_backend(reachability::NETSTACK_STEP_FUEL))
+            swap_backend(&nodes[0], guest_backend())
                 .await
                 .expect("the guest continues the epoch");
             let versions = await_applied(&mut collected, &[0, 1, 2], 1).await;
@@ -3284,7 +3279,6 @@ async fn a_refused_swap_leaves_the_current_machine_in_place() {
 
             let not_a_component = NetstackBackend::Guest {
                 component: b"not a component".to_vec(),
-                step_fuel: reachability::NETSTACK_STEP_FUEL,
             };
             let refusal = swap_backend(&nodes[0], not_a_component)
                 .await
@@ -3338,10 +3332,7 @@ fn observable_guest(marker: &str) -> NetstackBackend {
         (canon lift (core func $i "snapshot") (memory $i "memory") (realloc (func $i "realloc")))))"#,
         length = length,
     )).unwrap();
-    NetstackBackend::Guest {
-        component,
-        step_fuel: reachability::NETSTACK_STEP_FUEL,
-    }
+    NetstackBackend::Guest { component }
 }
 
 #[tokio::test]
@@ -3386,7 +3377,7 @@ async fn replacing_wasm_changes_executed_effects_and_reports_actual_code() {
         assert!(matches!(received.recv().await.unwrap(), ReachabilityEvent::PersistFailed { reason } if reason == "second"));
 
         let (reply, answer) = tokio::sync::oneshot::channel();
-        commands.send(ReachabilityCommand::SwapBackend { backend: NetstackBackend::Guest { component: vec![], step_fuel: 1 }, reply: SwapReply(reply) }).await.unwrap();
+        commands.send(ReachabilityCommand::SwapBackend { backend: NetstackBackend::Guest { component: vec![] }, reply: SwapReply(reply) }).await.unwrap();
         assert!(answer.await.unwrap().is_err());
         assert!(statuses.try_recv().is_err(), "a refused candidate never becomes running");
         commands.send(ReachabilityCommand::Nudge).await.unwrap();

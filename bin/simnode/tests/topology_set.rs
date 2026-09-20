@@ -8,6 +8,7 @@
 mod harness;
 
 use harness::Sim;
+use simnode::module_contracts::governance;
 
 fn module_ids(status: &serde_json::Value) -> Vec<String> {
     status["modules"]
@@ -76,9 +77,9 @@ fn with_valset_genesis_appends_topology_sim_valset_and_wires_the_code_registry()
     // instead of being refused at the door. the code hash names no component
     // the network has — the registry refuses that at execute, which is a different
     // (and later) gate; the claim here is only that a registry exists at all.
-    let propose = harness::module_contracts::GovMsg::Propose {
+    let propose = governance::GovMsg::Propose {
         proposal_id: "u".into(),
-        action: harness::module_contracts::GovAction::UpdateModule {
+        action: governance::GovAction::UpdateModule {
             name: "x".into(),
             module_id: "chat".into(),
             activation_lead: 10_000,

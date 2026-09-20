@@ -69,7 +69,6 @@ pub enum PresenceServerControl {
 }
 
 const MAX_REALTIME_ID_BYTES: usize = 256;
-const MAX_PRESENCE_WS_MESSAGE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct PresenceParams {
@@ -177,8 +176,8 @@ pub(crate) async fn presence_ws(
         Err(rejection) => return rejection.into_response(),
     };
     upgrade
-        .max_message_size(MAX_PRESENCE_WS_MESSAGE_BYTES)
-        .max_frame_size(MAX_PRESENCE_WS_MESSAGE_BYTES)
+        .max_message_size(usize::MAX)
+        .max_frame_size(usize::MAX)
         .on_upgrade(move |socket| presence_session(socket, call, params.page))
 }
 

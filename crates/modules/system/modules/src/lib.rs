@@ -34,8 +34,8 @@
 //!
 //! pure logic over a host-injected [`sdk::MerkleStore`]: one point record per
 //! registered module (`mod\0{id}` → kind + activation history + optional
-//! pending swap, borsh) behind the sorted module roster (`modules`, bounded by
-//! [`MAX_MODULES`]) the status/advance walks read. writes are staged during a
+//! pending swap, borsh) behind the sorted module roster (`modules`) the
+//! status/advance walks read. writes are staged during a
 //! block and flushed in one batch at `commit_block`; the module root IS the
 //! store's merkle root, and sync belongs to the store. the `Advance` decide
 //! reads COMMITTED state only ([`sdk::StagedStore::get_committed`]) — the
@@ -55,10 +55,6 @@ use sdk::{
     StateRoot, StateSyncHandle,
 };
 
-/// registered modules retained at once (the roster count cap). the registry
-/// is governance/genesis-authored, so this sits far above any real set;
-/// registering past it refuses loudly at execute.
-pub const MAX_MODULES: usize = 1024;
 /// serialized roster-record byte bound — the uniform poison backstop on top
 /// of the count cap.
 const MAX_ROSTER_RECORD_BYTES: usize = 512 * 1024;
@@ -322,12 +318,6 @@ impl Modules {
                 "module roster carries an id with no record",
             ));
         };
-        if roster.len() >= MAX_MODULES {
-            return Err(Error::module(
-                "module_cap",
-                format!("module cap reached ({MAX_MODULES})"),
-            ));
-        }
         roster.insert(position, module_id.clone());
         self.store_bounded(
             MODULE_ROSTER_KEY.to_vec(),

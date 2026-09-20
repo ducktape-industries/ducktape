@@ -15,10 +15,10 @@ mod harness;
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
 use harness::Sim;
-use harness::module_contracts::{
+use serde_json::{Value, json};
+use simnode::module_contracts::governance::invite::{
     INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof,
 };
-use serde_json::{Value, json};
 use std::path::Path;
 
 type Ed = PrivateKey;

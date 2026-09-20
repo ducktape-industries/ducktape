@@ -203,7 +203,6 @@ pub mod governance {
     use super::*;
 
     pub type Kind = modules::Kind;
-    pub const MAX_PROPOSALS: usize = 1024;
 
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
     #[serde(rename_all = "snake_case", deny_unknown_fields)]

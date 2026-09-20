@@ -12,7 +12,8 @@
 mod harness;
 
 use commonware_cryptography::Signer as _;
-use harness::{add_ed25519_key, create, create_channel, key_origin, post_message, Sim};
+use harness::{Sim, add_ed25519_key, create, create_channel, key_origin, post_message};
+use simnode::module_contracts::tasks;
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
 

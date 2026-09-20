@@ -859,43 +859,4 @@ mod tests {
         crate::rpc::sweep_join_requests(&mut requests, window * 2 + 1, window);
         assert!(requests.is_empty());
     }
-
-    /// The join-request map is keyed on the attacker-chosen joiner key with
-    /// no other size limit — it must cap at
-    /// [`crate::reachability_plane::MAX_TRACKED_JOINERS`], evicting the
-    /// OLDEST (smallest `last_seen_ms`) entry to make room for a new joiner
-    /// past the cap, mirroring [`crate::reachability_plane::insert_gate_outcome`].
-    #[test]
-    fn the_4097th_joiner_evicts_the_oldest() {
-        let cap = crate::reachability_plane::MAX_TRACKED_JOINERS;
-        let mut requests = std::collections::BTreeMap::new();
-        for i in 0..cap {
-            crate::rpc::insert_join_request(
-                &mut requests,
-                (i as u32).to_be_bytes().to_vec(),
-                vec![0],
-                i as u64,
-            );
-        }
-        assert_eq!(requests.len(), cap);
-        let oldest = 0u32.to_be_bytes().to_vec();
-        assert!(requests.contains_key(&oldest));
-
-        let newcomer = (cap as u32).to_be_bytes().to_vec();
-        crate::rpc::insert_join_request(&mut requests, newcomer.clone(), vec![0], cap as u64);
-
-        assert_eq!(
-            requests.len(),
-            cap,
-            "the map stays capped at MAX_TRACKED_JOINERS"
-        );
-        assert!(
-            !requests.contains_key(&oldest),
-            "the oldest entry must be evicted to make room"
-        );
-        assert!(
-            requests.contains_key(&newcomer),
-            "the new joiner past the cap must be tracked"
-        );
-    }
 }

@@ -3,21 +3,6 @@ use std::time::Duration;
 // the consensus signature scheme is ed25519 — see the rekey/respawn contract
 // in `crates/kernel/consensus/src/lib.rs` for a scheme change (an epoch
 // teardown-respawn, not a constant flip).
-/// the module-code fetch cap: the largest content-addressed code artifact (a
-/// wasm component today, a quack capsule tomorrow) this node will pull over
-/// the ranged blob lane or accept on the code plane. a policy bound, not a
-/// frame size — transfers are ranged/streamed, so no single message ever
-/// approaches it. ONE shared cap with the operator-facing stage route
-/// (`noded::MAX_MODULE_ARTIFACT_BYTES`) — a peer-facing artifact was 64x
-/// larger than what an operator could ever stage locally.
-pub(crate) const MAX_MODULE_CODE_BYTES: u64 = noded::MAX_MODULE_ARTIFACT_BYTES as u64;
-/// the genesis fetch cap: a joiner without the founder's `genesis` file pulls
-/// it off the mesh, and that blob is the WHOLE founding set composed — every
-/// module's component, index and view — so the one-artifact cap above refused
-/// every real network's genesis (the founding set is ~23 MB at HEAD) and a
-/// joiner could only ever start with `join --genesis`. eight artifacts' worth
-/// bounds a colluding peer's digest the same way the module cap does.
-pub(crate) const MAX_GENESIS_BYTES: u64 = 8 * MAX_MODULE_CODE_BYTES;
 /// one warning when the committed valset read first fails, then one per this
 /// many further drain passes, for a host query that keeps erroring (#1820).
 /// shared by the validator drain and the replica park loop.

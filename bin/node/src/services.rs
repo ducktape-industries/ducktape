@@ -246,17 +246,16 @@ impl Services {
         // checked with the very function that derives it, over the WIDEST set
         // they could ever produce.
         //
-        // This is what makes both `announce::Refusal` arms properties of the
-        // FILE rather than of whichever code path happened to write it: no
-        // `services.toml` this node will load can carry an illegal tag or imply
-        // more tags than the registry accepts, whoever wrote it. Nothing
-        // downstream has to filter, and the watcher's refusal arms are
-        // unreachable rather than merely unlikely.
+        // This is what makes the `announce::Refusal` a property of the FILE
+        // rather than of whichever code path happened to write it: no
+        // `services.toml` this node will load can carry an illegal tag,
+        // whoever wrote it. Nothing downstream has to filter, and the
+        // watcher's refusal arm is unreachable rather than merely unlikely.
         //
-        // Deliberately ONE call rather than a re-implementation of the two
-        // rules: a second copy is how a bound drifts from the thing it bounds
-        // (the same defect that let a retuned `HEARTBEAT` pass a test pinning
-        // it). Capacity is empty here because neither refusal reads it.
+        // Deliberately ONE call rather than a re-implementation of the rule:
+        // a second copy is how a rule drifts from the thing it governs (the
+        // same defect that let a retuned `HEARTBEAT` pass a test pinning it).
+        // Capacity is empty here because the refusal never reads it.
         crate::announce::announced_set(
             &self.grants,
             &crate::announce::widest(&self.grants),
@@ -1213,8 +1212,8 @@ pub(crate) fn plan_enable(
 
 /// The decide half, with the signaling catalog SUPPLIED rather than fetched.
 ///
-/// Split so the consent boundary's two refusals — an illegal tag and a
-/// cap-crossing union — are reachable from a test. `catalog_now` reads
+/// Split so the consent boundary's refusal — an illegal tag — is reachable
+/// from a test. `catalog_now` reads
 /// `/v1/services` over HTTP, so with it inlined every rule in here could only be
 /// exercised against a running node, which in practice meant not at all.
 fn plan_enable_from(
@@ -1258,16 +1257,16 @@ fn plan_enable_from(
     };
     // REFUSE here if the registry could not take what these grants imply.
     //
-    // Bounded against the WIDEST set the grants could ever produce — every
+    // Checked against the WIDEST set the grants could ever produce — every
     // granted kind signaling everything it was granted — not against whoever
     // happens to be signaling right now. Checking the live set would make this
     // order-dependent: enabling `compute` while `agent`'s daemon was down would
-    // pass, and the union would cross the cap later when `agent` started, with
+    // pass, and an illegal tag would surface later when `agent` started, with
     // no verb running to refuse it and no way for the watcher to do anything
     // but announce a truncated set or nothing at all.
     // the prospective set REPLACES a re-consented kind rather than pushing a
     // second grant for it — the file is unique-and-sorted by kind, and a
-    // doubled kind would both fail `validate` and double-count against the cap.
+    // doubled kind would fail `validate`.
     let mut prospective = load(workspace)?.grants;
     prospective.retain(|existing| existing.kind != grant.kind);
     prospective.push(grant.clone());
@@ -1945,7 +1944,7 @@ fn offer_enable(
         }
     };
     // PLANNING can fail too, and it must not be fatal either — this is where
-    // the tag-legality and cap refusals live, so a host whose capability spec
+    // the tag-legality refusal lives, so a host whose capability spec
     // dir carries one registry-illegal tag would otherwise be unable to
     // `service run` at all. It would exit here, BEFORE the heartbeat thread is
     // spawned, and signal nothing: the operator loses the daemon, the hello,
@@ -2689,34 +2688,9 @@ mod tests {
     }
 
     #[test]
-    fn planning_bounds_the_cap_independently_of_who_is_signaling() {
-        // THE order-dependence guard. `agent` is already granted a full budget
-        // of executors but its daemon is DOWN, so it contributes nothing to the
-        // live signaling set. Bounding the live union would let this enable
-        // through and let the total cross the cap later, when `agent` restarts
-        // and no verb is running to refuse it.
-        let many: Vec<String> = (0..63).map(|n| format!("e{n}")).collect();
-        let borrowed: Vec<&str> = many.iter().map(String::as_str).collect();
-        let (dir, service) = planning_workspace(&[("agent", &borrowed)]);
-        let error = plan_enable_from(
-            dir.path(),
-            "compute",
-            &service,
-            NODE_A,
-            // only compute is signaling; agent is absent.
-            vec![hello_offering("compute", &["codex"])],
-        )
-        .expect_err("the widest union crosses the cap, so the plan must refuse");
-        assert!(
-            error.contains("at most") || error.contains("64"),
-            "the refusal names the registry cap: {error}"
-        );
-    }
-
-    #[test]
     fn planning_succeeds_when_the_widest_union_fits() {
-        // the same shape, under the cap — so the test above is pinning the
-        // bound rather than a plan that could never succeed.
+        // a granted kind that is not signaling still plans: the widest union
+        // is what the registry is asked about, and it has nothing to refuse.
         let (dir, service) = planning_workspace(&[("agent", &["claude"])]);
         let plan = plan_enable_from(
             dir.path(),
@@ -2725,7 +2699,7 @@ mod tests {
             NODE_A,
             vec![hello_offering("compute", &["codex"])],
         )
-        .expect("a union well under the cap plans fine");
+        .expect("a legal union plans fine");
         assert_eq!(plan.grant.kind, "compute");
         assert_eq!(plan.grant.capabilities, vec!["codex".to_string()]);
     }
@@ -2867,32 +2841,14 @@ mod tests {
     /// node's boot rather than only its announce.
     ///
     /// The state this replaces is the one to keep in mind: before it, an
-    /// over-cap `services.toml` booted a healthy-looking node whose watcher then
-    /// refused every tick behind a warn throttled to one line per five minutes —
-    /// boots, looks fine, silently does nothing. Refusing loudly is strictly
-    /// better, and the only writer of this file already bounds it, so a file
-    /// that exceeds the cap means a hand edit or a bug. Both deserve to be loud.
+    /// ill-tagged `services.toml` booted a healthy-looking node whose watcher
+    /// then refused every tick behind a warn throttled to one line per five
+    /// minutes — boots, looks fine, silently does nothing. Refusing loudly is
+    /// strictly better, and the only writer of this file already validates
+    /// it, so a file the registry refuses means a hand edit or a bug. Both
+    /// deserve to be loud.
     #[test]
     fn a_file_the_registry_would_refuse_does_not_load() {
-        let over_cap = Services {
-            grants: vec![ServiceGrant {
-                kind: "compute".into(),
-                instance: "aa".repeat(32),
-                nonce: "bb".repeat(16),
-                granted_unix: 1,
-                // 64 executors + the kind tag = one over the registry's cap.
-                capabilities: (0..64).map(|n| format!("e{n}")).collect(),
-                scopes: Vec::new(),
-            }],
-        };
-        let error = over_cap
-            .validate()
-            .expect_err("an over-cap grant set must not load");
-        assert!(
-            error.contains("64"),
-            "the refusal names the registry's cap: {error}"
-        );
-
         let illegal = Services {
             grants: vec![ServiceGrant {
                 kind: "compute".into(),
@@ -2910,24 +2866,6 @@ mod tests {
             error.contains("Claude Sonnet"),
             "the offending tag is named: {error}"
         );
-    }
-
-    #[test]
-    fn a_grant_set_within_the_cap_loads() {
-        // so the test above pins the bound rather than a file that could never
-        // load: one under the cap is fine.
-        let ok = Services {
-            grants: vec![ServiceGrant {
-                kind: "compute".into(),
-                instance: "aa".repeat(32),
-                nonce: "bb".repeat(16),
-                granted_unix: 1,
-                capabilities: (0..63).map(|n| format!("e{n}")).collect(),
-                scopes: Vec::new(),
-            }],
-        };
-        ok.validate()
-            .expect("63 executors + the kind tag is exactly the cap");
     }
 
     /// Three daemons granting themselves at once keep all three grants.

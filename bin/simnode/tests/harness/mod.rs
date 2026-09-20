@@ -7,8 +7,7 @@
 //! expected — hence the file-wide dead_code allow.
 #![allow(dead_code)]
 
-pub mod module_contracts;
-
+use simnode::module_contracts::runs;
 use std::io::{BufRead as _, BufReader};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -438,36 +437,54 @@ pub fn key_origin(key: &commonware_cryptography::ed25519::PrivateKey) -> String 
 /// the `Create` op founding an account for the submit ORIGIN (declared
 /// ed25519, so a 32-byte origin — an ASCII stand-in or a real key via
 /// [`key_origin`] — founds; anything else is refused as malformed). the
-/// message shape lives ONCE in `identity::testkit`; this wraps it back to the
-/// untyped JSON the sim's `/v1/submit` lane takes.
+/// message shape is the identity guest's current wire contract; this keeps
+/// the scenario harness from linking the producer crate just to serialize it.
 pub fn create(name: &str) -> serde_json::Value {
-    serde_json::to_value(identity::testkit::create(name)).expect("Create serializes")
+    serde_json::json!({
+        "create": { "name": name, "scheme": "ed25519" }
+    })
 }
 
 /// the `AddKey` op admitting `new_key` (the op's ORIGIN) into `account`,
 /// ed25519 `member`'s, consented to at `generation` on the sim's chain. the
 /// consent is single-use (acceptance advances `new_key`'s generation) and
-/// dies at [`CONSENT_EXPIRES`].
+/// dies at [`CONSENT_EXPIRES`]. The preimage is the identity guest's exact
+/// current signing contract.
 pub fn add_ed25519_key(
     member: &commonware_cryptography::ed25519::PrivateKey,
     new_key: &[u8],
     generation: u64,
     account: u64,
 ) -> serde_json::Value {
-    serde_json::to_value(identity::testkit::add_ed25519_key(
-        member,
-        IDENTITY_CHAIN,
-        new_key,
-        generation,
-        None,
-        account,
-        CONSENT_EXPIRES,
-    ))
-    .expect("AddKey serializes")
+    use commonware_cryptography::Signer as _;
+
+    let mut preimage = Vec::new();
+    sdk::codec::push_bytes(&mut preimage, IDENTITY_CHAIN.as_bytes());
+    preimage.push(0);
+    sdk::codec::push_bytes(&mut preimage, new_key);
+    preimage.extend_from_slice(&generation.to_le_bytes());
+    preimage.extend_from_slice(&account.to_le_bytes());
+    preimage.extend_from_slice(&CONSENT_EXPIRES.to_le_bytes());
+    let proof = member
+        .sign(b"ducktape-identity-add-key-v1", &preimage)
+        .as_ref()
+        .to_vec();
+    serde_json::json!({
+        "add_key": {
+            "scheme": "ed25519",
+            "label": null,
+            "authorizer": {
+                "key": member.public_key().as_ref().to_vec(),
+                "account": account,
+                "expires_at": CONSENT_EXPIRES,
+                "proof": proof,
+            }
+        }
+    })
 }
 
 /// the expiry every sim consent carries: the sim's logical clock is
 /// `SIM_EPOCH_MS + height * SIM_BLOCK_MS`, so this is 500 blocks past its
 /// epoch — past every height a sim test drives, inside
-/// `identity::MAX_CONSENT_TTL` of each.
+/// the current identity consent ceiling of each.
 pub const CONSENT_EXPIRES: u64 = simnode::SIM_EPOCH_MS + 500 * simnode::SIM_BLOCK_MS;

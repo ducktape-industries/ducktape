@@ -21,16 +21,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "acl-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "sdk",
- "serde",
-]
-
-[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -86,20 +76,6 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "agent-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "attribution-wire",
- "borsh",
- "dispatch-wire",
- "identity-wire",
- "sdk",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -392,13 +368,13 @@ name = "authpage"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "identity-wire",
  "keyscheme",
  "node",
  "qrcode",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "sdk",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
@@ -1049,16 +1025,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "collaboration-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "chat-wire",
- "sdk",
- "serde",
 ]
 
 [[package]]
@@ -2525,11 +2491,11 @@ name = "ducktape-media"
 version = "0.1.0"
 dependencies = [
  "axum",
- "chat-wire",
  "ducktape-rpc",
  "futures",
  "libc",
  "media-service",
+ "sdk",
  "serde",
  "serde_json",
  "subtle",
@@ -2574,11 +2540,11 @@ dependencies = [
  "duckdns",
  "ducktape-rpc",
  "futures",
- "gateway-wire",
  "libc",
  "provider-host",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "sdk",
  "serde",
  "serde_json",
  "subtle",
@@ -2812,20 +2778,13 @@ dependencies = [
  "duckfs-disk",
  "files",
  "futures",
- "identity-wire",
  "sdk",
  "sdk-testkit",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "wasm-host",
-]
-
-[[package]]
-name = "files-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "duckfs-core",
 ]
 
 [[package]]
@@ -3262,19 +3221,6 @@ dependencies = [
  "serde",
  "statesync",
  "valset",
-]
-
-[[package]]
-name = "governance-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "acl-wire",
- "borsh",
- "commonware-cryptography",
- "modules-wire",
- "sdk",
- "serde",
 ]
 
 [[package]]
@@ -4176,6 +4122,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lane-wasm"
+version = "0.1.0"
+dependencies = [
+ "data-plane",
+ "thiserror 2.0.18",
+ "tracing",
+ "wasmtime",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4326,15 +4282,11 @@ name = "mcp-host"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "chat-wire",
  "duckfs-core",
- "forge-wire",
- "pages-wire",
  "reqwest 0.12.28",
- "runs-wire",
+ "sdk",
  "serde",
  "serde_json",
- "tasks-wire",
 ]
 
 [[package]]
@@ -4423,17 +4375,6 @@ dependencies = [
  "sdk-testkit",
  "serde",
  "statesync",
-]
-
-[[package]]
-name = "modules-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "module-artifact",
- "sdk",
- "serde",
 ]
 
 [[package]]
@@ -5172,17 +5113,6 @@ checksum = "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
 dependencies = [
  "libc",
  "winapi",
-]
-
-[[package]]
-name = "pages-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "index-guest",
- "sdk",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -6148,26 +6078,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "runs-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "agent-wire",
- "borsh",
- "chat-wire",
- "collaboration-wire",
- "dispatch-wire",
- "governance-wire",
- "node-work",
- "run-envelope",
- "sdk",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tasks-wire",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6738,23 +6648,16 @@ dependencies = [
  "blobstore",
  "commonware-cryptography",
  "commonware-runtime",
- "dispatch-wire",
  "duckfs-core",
- "files-wire",
  "futures",
- "gateway-wire",
  "host",
- "identity",
  "indexer",
  "nettest",
  "node",
  "noded",
- "runs-wire",
- "saga-wire",
  "sdk",
  "serde",
  "serde_json",
- "tasks-wire",
  "tempfile",
  "tokio",
  "topology",
@@ -7022,16 +6925,6 @@ name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
-
-[[package]]
-name = "tasks-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "attribution-wire",
- "sdk",
- "serde",
-]
 
 [[package]]
 name = "tempfile"
@@ -8811,12 +8704,13 @@ dependencies = [
  "duck-address",
  "duckfs-core",
  "ducktape-home",
- "identity-wire",
+ "keyscheme",
  "module-artifact",
  "nat-traversal",
  "rand 0.8.6",
  "reachability",
  "sandbox-host",
+ "sdk",
  "serde",
  "serde_json",
  "sha2 0.10.9",

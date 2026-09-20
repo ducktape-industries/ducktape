@@ -30,9 +30,6 @@ use crate::node::Ducktape;
 use crate::refusal::Refusal;
 use crate::writers;
 
-/// A manifest or signature file larger than this is not one.
-const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
-
 /// What this launcher has already settled about the release plane, carried
 /// between polls. Every field exists to stop a loop: a release this launcher
 /// definitely answered for is not asked again — asking costs a download or a
@@ -822,14 +819,6 @@ fn refused(sha: Sha, reason: &str, detail: String) -> Event {
 }
 
 fn read_small(path: &Path) -> Result<Vec<u8>, Refusal> {
-    let meta = std::fs::metadata(path).map_err(|error| Refusal::io("fetch_failed", path, &error))?;
-    let plausible = meta.len() <= MAX_MANIFEST_BYTES;
-    if !plausible {
-        return Err(Refusal::new(
-            "manifest_too_large",
-            format!("{} is {} bytes", path.display(), meta.len()),
-        ));
-    }
     std::fs::read(path).map_err(|error| Refusal::io("fetch_failed", path, &error))
 }
 
@@ -1083,7 +1072,6 @@ mod tests {
             Refused::Manifest(app_update::Refusal::BadSignature),
             Refused::Manifest(app_update::Refusal::SequenceNotNewer),
             launcher("no_release_key"),
-            launcher("manifest_too_large"),
         ];
         for refused in definite {
             assert_eq!(failure(&refused), Failure::Definite, "{refused:?}");

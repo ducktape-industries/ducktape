@@ -12,7 +12,6 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse as _, Response};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
-use futures::StreamExt as _;
 use serde::Deserialize;
 
 pub use git_http::GIT_KEEPALIVE_INTERVAL;
@@ -43,7 +42,6 @@ struct ServiceState {
     account: u64,
     label: String,
     token: [u8; 64],
-    requests: Arc<tokio::sync::Semaphore>,
 }
 
 impl ServiceState {
@@ -94,20 +92,7 @@ async fn authenticate(State(state): State<ServiceState>, request: Request, next:
             "authenticated Gateway route required",
         );
     }
-    let Ok(seat) = state.requests.clone().try_acquire_owned() else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "request capacity exhausted",
-        );
-    };
-    // the seat is held until the answer's last byte, not its head: a clone's
-    // pack streams long after its handler has returned.
-    next.run(request).await.map(|body| {
-        axum::body::Body::from_stream(body.into_data_stream().map(move |chunk| {
-            let _held = &seat;
-            chunk
-        }))
-    })
+    next.run(request).await
 }
 
 pub fn router(config: Config, token: [u8; 64]) -> Result<axum::Router, Box<dyn std::error::Error>> {
@@ -158,31 +143,26 @@ pub fn router(config: Config, token: [u8; 64]) -> Result<axum::Router, Box<dyn s
         account: config.account,
         label: config.label,
         token,
-        requests: Arc::new(tokio::sync::Semaphore::new(2)),
     };
     Ok(axum::Router::new()
-        .route(
-            "/merge",
-            axum::routing::post(merge::merge).layer(DefaultBodyLimit::max(8192)),
-        )
+        .route("/merge", axum::routing::post(merge::merge))
         .route(
             "/{repo}/info/refs",
             axum::routing::get(git_http::git_info_refs),
         )
         .route(
             "/{repo}/git-receive-pack",
-            // NO body limit: a push is as big as the history it carries, and
-            // `git_receive_pack` spools it to disk rather than sizing itself
-            // to it. A limit here is a limit on what anyone may push.
-            axum::routing::post(git_http::git_receive_pack).layer(DefaultBodyLimit::disable()),
+            axum::routing::post(git_http::git_receive_pack),
         )
         .route(
             "/{repo}/git-upload-pack",
             axum::routing::post(git_http::git_upload_pack),
         )
-        // the default bounds the SMALL bodies — a merge request, a fetch's
-        // want/have negotiation. The push route above opts out.
-        .layer(DefaultBodyLimit::max(git_http::GIT_NEGOTIATION_BODY_LIMIT))
+        // NO body limit on any route: a push is as big as the history it
+        // carries, and `git_receive_pack` spools it to disk rather than
+        // sizing itself to it. A limit here is a limit on what anyone may
+        // push.
+        .layer(DefaultBodyLimit::disable())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate,

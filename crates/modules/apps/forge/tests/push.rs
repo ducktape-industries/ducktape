@@ -57,8 +57,8 @@ fn repo_dir(base: &Path) -> PathBuf {
 
 /// parse forge's multi-branch snapshot container into `(name, main_oid, pack)`
 /// entries — the test-side inverse of `Forge::snapshot` (per repo: name,
-/// branch_count, per-branch name+oid, tag_count, per-tag name+oid, pending,
-/// pack; the trailing tracker section is irrelevant here).
+/// owner, branch_count, per-branch name+oid, tag_count, per-tag name+oid,
+/// pending, pack; the trailing tracker section is irrelevant here).
 fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     fn u32_at(bytes: &[u8], p: &mut usize) -> usize {
         let v = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap()) as usize;
@@ -72,6 +72,17 @@ fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
         let nl = u32_at(bytes, &mut p);
         let name = String::from_utf8(bytes[p..p + nl].to_vec()).unwrap();
         p += nl;
+        let owner_tag = bytes[p];
+        p += 1;
+        match owner_tag {
+            0 => {}
+            1 => p += 8,
+            2 => {
+                let key_len = u32_at(bytes, &mut p);
+                p += key_len;
+            }
+            tag => panic!("unknown owner tag {tag}"),
+        }
         let ref_count = u32_at(bytes, &mut p);
         let mut main_oid = Vec::new();
         for _ in 0..ref_count {

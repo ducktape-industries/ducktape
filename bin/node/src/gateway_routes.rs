@@ -119,12 +119,6 @@ pub struct LocalRoutes {
 
 impl LocalRoutes {
     fn validate(&self) -> Result<(), String> {
-        if self.routes.len() > gateway::MAX_ROUTES_PER_ACCOUNT {
-            return Err(format!(
-                "gateway routes: at most {} local routes",
-                gateway::MAX_ROUTES_PER_ACCOUNT
-            ));
-        }
         let mut previous: Option<(&gateway::RouteName, u64)> = None;
         for route in &self.routes {
             route.name.validate()?;

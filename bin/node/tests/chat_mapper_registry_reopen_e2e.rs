@@ -6,8 +6,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::wire::chat;
-use common::wire::chat::{Block, ChatMsg, PostPolicy};
+use common::wire::chat::{Block, ChatMsg, PostPolicy, encode_msg};
 use common::Cluster;
 use common::module_verbs::{
     AFTER, active_hash, assert_ceremony_scheduled, run_on_each, spawn_founders,
@@ -85,7 +84,7 @@ fn old_founding_set_is_pinned() {
 }
 
 fn post(message_id: &str) -> Vec<u8> {
-    chat::encode_msg(&ChatMsg::PostMessage {
+    encode_msg(&ChatMsg::PostMessage {
         channel_id: CHANNEL.into(),
         message_id: message_id.into(),
         blocks: vec![Block::paragraph("state before mapper replacement")],
@@ -94,7 +93,7 @@ fn post(message_id: &str) -> Vec<u8> {
 }
 
 fn add_reaction() -> Vec<u8> {
-    chat::encode_msg(&ChatMsg::AddReaction {
+    encode_msg(&ChatMsg::AddReaction {
         channel_id: CHANNEL.into(),
         seq: 1,
         emoji: EMOJI.into(),
@@ -164,7 +163,7 @@ fn seed_old_state(mut cluster: Cluster) -> Cluster {
     cluster.submit(
         0,
         "chat",
-        &chat::encode_msg(&ChatMsg::CreateChannel {
+        &encode_msg(&ChatMsg::CreateChannel {
             channel_id: CHANNEL.into(),
             name: "Mapper proof".into(),
             post_policy: PostPolicy::Open,

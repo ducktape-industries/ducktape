@@ -238,9 +238,6 @@ const PACK_BUDGET: std::time::Duration = statesync::p2p::WINDOWS_BEFORE_LAST_ATT
 /// `None` is an honest miss — this node does not hold the head either. it
 /// never packs a walk it has not itself committed to (see
 /// [`forge::build_objects`]), so the lane cannot be turned into an amplifier.
-///
-/// `seat` is the requesting peer's: a build this ask starts holds it until the
-/// build settles, past the answer that started it.
 pub async fn serve_forge_objects(
     forge_repo: &std::path::Path,
     blobs: &blobstore::BlobHandle,
@@ -248,7 +245,6 @@ pub async fn serve_forge_objects(
     repo: &str,
     head: [u8; statesync::FORGE_OID_LEN],
     bases: &[[u8; statesync::FORGE_OID_LEN]],
-    seat: Arc<crate::code_plane::PeerSeat<ed25519::PublicKey>>,
 ) -> SyncResponse {
     let miss = SyncResponse::ForgeObjects { digest: None };
     let (Ok(name), Ok(oid)) = (forge::norm_repo(repo), forge::Oid::from_bytes(&head)) else {
@@ -273,9 +269,7 @@ pub async fn serve_forge_objects(
     };
     let ask: PackAsk = (name, head, known);
     let building = ask.clone();
-    let build_seat = Arc::clone(&seat);
     let outcome = one_pack_per_ask(ask, PACK_BUDGET, move || async move {
-        let _seat = build_seat;
         build_and_stage(staging, building, oid).await
     })
     .await;
@@ -458,17 +452,13 @@ fn record_served(served: &ServedPacks, repo: String, digest: [u8; 32]) -> Option
 // ---- the ranged requester ----------------------------------------------------
 
 /// why one blob fetch conversation failed. `Miss` and `Transport` are
-/// rotate-and-retry; `TooLarge` and `Corrupt` indict the source (or the ask)
-/// and also rotate; `Stage` is local disk trouble.
+/// rotate-and-retry; `Corrupt` indicts the source and also rotates; `Stage`
+/// is local disk trouble.
 #[derive(Debug)]
 pub enum BlobFetchError {
     Transport(SyncError),
     /// the source does not hold the digest (or lost it mid-transfer).
     Miss,
-    TooLarge {
-        len: u64,
-        cap: u64,
-    },
     Stage(blobstore::StageError),
     /// the assembled bytes do not hash to the digest — a lying source.
     Corrupt,
@@ -479,9 +469,6 @@ impl std::fmt::Display for BlobFetchError {
         match self {
             Self::Transport(e) => write!(f, "blob fetch transport: {e}"),
             Self::Miss => write!(f, "source does not hold the blob"),
-            Self::TooLarge { len, cap } => {
-                write!(f, "blob length {len} exceeds the fetch cap {cap}")
-            }
             Self::Stage(e) => write!(f, "blob staging: {e}"),
             Self::Corrupt => write!(f, "assembled bytes do not hash to the digest"),
         }
@@ -515,7 +502,6 @@ pub async fn fetch_blob<C: SyncClient + SourceRotate>(
     client: &C,
     blobs: &blobstore::BlobHandle,
     digest: &[u8; 32],
-    cap: u64,
     attempts: usize,
 ) -> Result<(), BlobFetchError> {
     // VERIFIED-resident, not merely present. this gate is the one place where a
@@ -529,7 +515,7 @@ pub async fn fetch_blob<C: SyncClient + SourceRotate>(
     }
     let mut last = BlobFetchError::Miss;
     for _ in 0..attempts.max(1) {
-        match fetch_once(client, blobs, digest, cap).await {
+        match fetch_once(client, blobs, digest).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 client.rotate_source();
@@ -546,7 +532,6 @@ async fn fetch_once<C: SyncClient>(
     client: &C,
     blobs: &blobstore::BlobHandle,
     digest: &[u8; 32],
-    cap: u64,
 ) -> Result<(), BlobFetchError> {
     let len = match client
         .request(SyncRequest::BlobInfo { digest: *digest })
@@ -557,9 +542,6 @@ async fn fetch_once<C: SyncClient>(
         SyncResponse::Error(e) => return Err(SyncError::Server(e).into()),
         other => return Err(SyncError::UnexpectedResponse(other.kind_name()).into()),
     };
-    if len > cap {
-        return Err(BlobFetchError::TooLarge { len, cap });
-    }
     let mut slot = blobs.stage(*digest, len).map_err(BlobFetchError::Stage)?;
     while slot.offset() < len {
         let window = client
@@ -597,16 +579,14 @@ async fn fetch_once<C: SyncClient>(
 pub struct FetchingCodeSource<C> {
     local: blobstore::BlobHandle,
     client: C,
-    cap: u64,
     attempts: usize,
 }
 
 impl<C> FetchingCodeSource<C> {
-    pub fn new(local: blobstore::BlobHandle, client: C, cap: u64, attempts: usize) -> Self {
+    pub fn new(local: blobstore::BlobHandle, client: C, attempts: usize) -> Self {
         Self {
             local,
             client,
-            cap,
             attempts,
         }
     }
@@ -616,9 +596,7 @@ impl<C> FetchingCodeSource<C> {
 impl<C: SyncClient + SourceRotate> host::CodeSource for FetchingCodeSource<C> {
     async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
         let digest: [u8; 32] = code_hash.try_into().ok()?;
-        if let Err(e) =
-            fetch_blob(&self.client, &self.local, &digest, self.cap, self.attempts).await
-        {
+        if let Err(e) = fetch_blob(&self.client, &self.local, &digest, self.attempts).await {
             // an honest report, not a panic: the caller (realize) fails
             // closed on the None and says which hash it needed. `debug`: this
             // fires once per hash per park attempt (the replica park's failure
@@ -787,19 +765,6 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> SyncClient for ServeLaneBlobC
 /// it costs one `stat` per tick when nothing is outstanding.
 const PACK_SWEEP_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// what this lane will pull for a forge pack: WHATEVER THE PUSH CARRIED.
-///
-/// There is no ceiling on a push — a repository's whole history is one push,
-/// and a node that refused to replicate it would leave its own git mirror
-/// permanently behind a head consensus already committed. So this lane's bound
-/// is the same non-bound, and what stands between a node's disk and an
-/// enormous pack is who may push at all (the module's push-cert and ref
-/// gates), not a number here.
-///
-/// The digest is only ever read out of forge's committed catch-up map, so the
-/// bytes being pulled are bytes the validators already accepted at the door.
-const NO_FORGE_PACK_CEILING: u64 = u64::MAX;
-
 /// keep this node's forge substrate healthy, forever: pull the packs forge is
 /// waiting on, then collapse the packs it has piled up.
 ///
@@ -894,7 +859,6 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
             client,
             blobs,
             &pending.digest,
-            NO_FORGE_PACK_CEILING,
             crate::constants::BLOB_FETCH_ATTEMPTS,
         )
         .await;
@@ -995,7 +959,7 @@ async fn objects_once<C: SyncClient>(
         SyncResponse::Error(e) => return Err(SyncError::Server(e).into()),
         other => return Err(SyncError::UnexpectedResponse(other.kind_name()).into()),
     };
-    fetch_once(client, blobs, &digest, NO_FORGE_PACK_CEILING).await?;
+    fetch_once(client, blobs, &digest).await?;
     let Some(pack) = blobs.get_chunk(&digest) else {
         return Err(BlobFetchError::Miss);
     };
@@ -1168,14 +1132,14 @@ mod tests {
         let local = blobstore::BlobHandle::default();
         let client = StoreClient::new(vec![source]);
 
-        fetch_blob(&client, &local, &digest, u64::MAX, 1)
+        fetch_blob(&client, &local, &digest, 1)
             .await
             .expect("fetch succeeds");
         assert_eq!(local.get_chunk(&digest), Some(payload()));
         // idempotent: already resident answers without a conversation.
-        fetch_blob(&client, &local, &digest, 0, 1)
+        fetch_blob(&client, &local, &digest, 1)
             .await
-            .expect("resident short-circuits before the cap check");
+            .expect("resident short-circuits before any conversation");
     }
 
     #[tokio::test]
@@ -1191,7 +1155,7 @@ mod tests {
             blobstore::BlobHandle::default(),
             good,
         ]);
-        fetch_blob(&client, &local, &digest, u64::MAX, 3)
+        fetch_blob(&client, &local, &digest, 3)
             .await
             .expect("third source serves");
         assert_eq!(local.get_chunk(&digest), Some(truth));
@@ -1239,7 +1203,7 @@ mod tests {
         let client = LiarClient {
             bytes: Arc::new(lie),
         };
-        let err = fetch_blob(&client, &local, &digest, u64::MAX, 2)
+        let err = fetch_blob(&client, &local, &digest, 2)
             .await
             .expect_err("a lying source must never publish");
         assert!(matches!(err, BlobFetchError::Corrupt), "got {err}");
@@ -1264,38 +1228,14 @@ mod tests {
         let local = blobstore::BlobHandle::persistent(root.path()).expect("blob root");
         assert_eq!(local.get_chunk(&digest), None, "the local copy is unusable");
 
-        fetch_blob(
-            &StoreClient::new(vec![source]),
-            &local,
-            &digest,
-            u64::MAX,
-            1,
-        )
-        .await
+        fetch_blob(&StoreClient::new(vec![source]), &local, &digest, 1)
+            .await
         .expect("the fetch must run and heal the digest");
         assert_eq!(local.get_chunk(&digest), Some(truth));
     }
 
     fn hex_name(digest: &[u8; 32]) -> String {
         digest.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
-    #[tokio::test]
-    async fn fetch_refuses_blobs_over_the_cap() {
-        let source = blobstore::BlobHandle::default();
-        let digest = source.put_chunk(vec![1u8; 4096]);
-        let local = blobstore::BlobHandle::default();
-        let client = StoreClient::new(vec![source]);
-        let err = fetch_blob(&client, &local, &digest, 4095, 1)
-            .await
-            .expect_err("over-cap must refuse");
-        assert!(matches!(
-            err,
-            BlobFetchError::TooLarge {
-                len: 4096,
-                cap: 4095
-            }
-        ));
     }
 
     #[test]

@@ -23,12 +23,6 @@ use std::collections::VecDeque;
 
 use sdk::{Event, Msg};
 
-/// outer-loop non-termination guard — the async sibling of the host's
-/// `MAX_DISPATCHES`. bounds how many worker rounds one settle loop may drive
-/// before giving up, so a worker that keeps re-triggering itself can't spin
-/// forever.
-pub const MAX_WORKER_ROUNDS: u32 = 256;
-
 /// errors from driving workers.
 #[derive(Debug)]
 pub enum Error {
@@ -39,8 +33,6 @@ pub enum Error {
     Fatal(crate::FatalError),
     /// a worker failed to produce its result.
     Worker(String),
-    /// the outer worker loop exceeded [`MAX_WORKER_ROUNDS`].
-    BudgetExceeded,
 }
 
 impl From<sdk::Error> for Error {
@@ -64,7 +56,6 @@ impl core::fmt::Display for Error {
             Error::Host(e) => write!(f, "host error: {e}"),
             Error::Fatal(e) => write!(f, "{e}"),
             Error::Worker(m) => write!(f, "worker error: {m}"),
-            Error::BudgetExceeded => write!(f, "worker-round budget exceeded"),
         }
     }
 }
@@ -170,9 +161,8 @@ pub trait Lane {
 /// worker follow-up through `lane` (each its own block, its events offered back
 /// for the next round), and keep draining while a follow-up OR a pending
 /// delivery remains — appending the Nudge that flushes a stranded mailbox when
-/// nothing else is queued. bounded by [`MAX_WORKER_ROUNDS`] so a worker that
-/// keeps re-triggering itself can't spin forever. returns every unclaimed event
-/// across all rounds, for the caller to surface through its own log seam.
+/// nothing else is queued. returns every unclaimed event across all rounds,
+/// for the caller to surface through its own log seam.
 pub async fn drive(
     workers: &[Box<dyn Worker>],
     initial: Vec<Event>,
@@ -184,7 +174,6 @@ pub async fn drive(
         mut unclaimed,
     } = offer(workers, initial).await;
     queue.extend(follows);
-    let mut rounds = 1u32;
     loop {
         let Some(follow) = queue.pop_front() else {
             // the never-pop-stack tail: a result committed into the dispatch
@@ -199,10 +188,6 @@ pub async fn drive(
             });
             continue;
         };
-        rounds += 1;
-        if rounds > MAX_WORKER_ROUNDS {
-            return Err(Error::BudgetExceeded);
-        }
         let events = lane.submit(follow).await?;
         let Offered {
             follows,
@@ -339,21 +324,4 @@ mod tests {
         }
     }
 
-    /// a worker whose follow-up re-emits an event it re-claims spins forever;
-    /// the budget stops it at MAX_WORKER_ROUNDS - 1 submits.
-    #[test]
-    fn drive_bounds_a_self_retriggering_worker() {
-        let workers: Vec<Box<dyn Worker>> = vec![Box::new(StubWorker {
-            trigger: "loop",
-            follow: Some(msg("again")),
-        })];
-        let mut lane = StubLane {
-            submitted: Vec::new(),
-            echo: vec![event("loop")],
-            nudge_budget: 0,
-        };
-        let err = block_on(drive(&workers, vec![event("loop")], &mut lane)).expect_err("budget");
-        assert!(matches!(err, Error::BudgetExceeded), "got {err:?}");
-        assert_eq!(lane.submitted.len(), MAX_WORKER_ROUNDS as usize - 1);
-    }
 }

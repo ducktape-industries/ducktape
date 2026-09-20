@@ -17,10 +17,10 @@ mod harness;
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
-use harness::module_contracts::{GovAction, GovMsg, encode_msg as gov_encode};
 use harness::{Sim, create};
 use sdk::Msg;
 use serde_json::{Value, json};
+use simnode::module_contracts::governance::{self, GovAction, GovMsg};
 use std::path::Path;
 
 type Ed = PrivateKey;
@@ -63,7 +63,7 @@ fn gov_frame_ok(sim: &Sim, signer: &Ed, seq: u64, msg: &GovMsg) {
         seq,
         &Msg {
             target: "governance".into(),
-            payload: gov_encode(msg),
+            payload: governance::encode_msg(msg),
         },
     );
     let (code, reply) = sim.submit_frame(&frame);
@@ -175,7 +175,7 @@ fn a_frame_from_a_key_without_standing_is_refused() {
         1,
         &Msg {
             target: "governance".into(),
-            payload: gov_encode(&GovMsg::Propose {
+            payload: governance::encode_msg(&GovMsg::Propose {
                 proposal_id: "nope".into(),
                 action: GovAction::Signal { text: "hi".into() },
                 voting_period: 20,

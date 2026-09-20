@@ -18,10 +18,6 @@ use app_update::{ReleaseKeys, ReleaseSignal, ReleaseStatus};
 use crate::module_contracts::governance;
 use crate::{NodeCommand, NodeHandle};
 
-/// How far one walk goes. A network that has passed this many decisions in
-/// one id space has outgrown a linear probe, not this plane.
-const MAX_PROPOSALS: u64 = 1024;
-
 pub(crate) async fn release(State(handle): State<NodeHandle>) -> Response {
     let live = handle.status_cell().current();
     let signals = passed_signals(&handle, app_update::designation::proposal_id).await;
@@ -55,7 +51,7 @@ pub(crate) async fn release(State(handle): State<NodeHandle>) -> Response {
 /// the route.
 async fn passed_signals(handle: &NodeHandle, id: fn(u64) -> String) -> Vec<String> {
     let mut passed = Vec::new();
-    for nth in 0..MAX_PROPOSALS {
+    for nth in 0u64.. {
         let view = match proposal(handle, id(nth)).await {
             Ok(Some(view)) => view,
             Ok(None) => break,

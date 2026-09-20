@@ -177,10 +177,8 @@ impl CodeReadinessSignaller {
     /// dedupe and the unloadable latch all short-circuit), and quiet once a
     /// swap's `ready_at` has latched.
     ///
-    /// the fetch set is bounded: every pending swap (at most one per
-    /// registry entry) plus at most [`governance::MAX_PROPOSALS`] proposed
-    /// digests, each capped at `MAX_MODULE_CODE_BYTES` by the fetch itself —
-    /// the same bound the code plane's push admission carries.
+    /// the fetch set is every pending swap (at most one per registry entry)
+    /// plus every proposed digest.
     pub(crate) fn decide(
         &mut self,
         role: Role,
@@ -221,7 +219,7 @@ impl CodeReadinessSignaller {
         }
         // an open ballot's bytes: wanted by every member, signalled by none —
         // nothing is scheduled until it passes.
-        for digest in proposed.iter().take(governance::MAX_PROPOSALS) {
+        for digest in proposed {
             self.want_bytes(digest, &mut held, &mut wanted, &mut actions);
         }
         self.present.retain(|digest| wanted.contains(digest));
@@ -413,8 +411,7 @@ impl CodeReadinessSignaller {
 
 /// spawn one ranged, verified fetch per wanted digest; the OUTCOME goes
 /// back to the pump over `done`, which owns the attempt counter, the
-/// backoff and the (latched) warning. Each fetch is capped at
-/// `MAX_MODULE_CODE_BYTES` — the same per-artifact bound the push gate holds.
+/// backoff and the (latched) warning.
 pub(crate) fn spawn_fetches<C>(
     fetches: Vec<[u8; 32]>,
     client: &C,
@@ -432,7 +429,6 @@ pub(crate) fn spawn_fetches<C>(
                 &client,
                 &blobs,
                 &digest,
-                crate::constants::MAX_MODULE_CODE_BYTES,
                 crate::constants::BLOB_FETCH_ATTEMPTS,
             )
             .await
@@ -1185,30 +1181,6 @@ mod tests {
             |_, _| CodeVerdict::Absent,
         );
         assert_eq!(again.fetches, vec![[5u8; 32]]);
-    }
-
-    /// the proposed half is bounded by governance's own roster cap: a
-    /// listing wider than [`governance::MAX_PROPOSALS`] (which the module
-    /// itself refuses to grow) never turns into more fetches than that.
-    #[test]
-    fn proposed_fetches_are_bounded_by_the_proposal_cap() {
-        let mut s = CodeReadinessSignaller::new(me());
-        let proposed: HashSet<[u8; 32]> = (0..(governance::MAX_PROPOSALS as u32 + 7))
-            .map(|i| {
-                let mut d = [0u8; 32];
-                d[..4].copy_from_slice(&i.to_le_bytes());
-                d
-            })
-            .collect();
-        let acts = s.decide(
-            Role::Resident,
-            1,
-            &[],
-            &proposed,
-            |_| false,
-            |_, _| CodeVerdict::Absent,
-        );
-        assert_eq!(acts.fetches.len(), governance::MAX_PROPOSALS);
     }
 
     /// a proposed digest that nobody serves backs off exactly like a pending

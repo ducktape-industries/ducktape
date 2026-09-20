@@ -9,6 +9,7 @@
 //! u32-LE(repo_count)
 //! per BORN repo, sorted by name:            # born == at least one ref
 //!   u32-LE(name_len) name
+//!   owner encoding                           # durable ref-write owner
 //!   u32-LE(branch_count)
 //!   per branch, sorted by short name:
 //!     u32-LE(branch_len) branch  [20-byte head oid]
@@ -30,7 +31,7 @@
 //! retrying materialize, instead of stranding it on a head it can never
 //! explain. the pending set is node-local, so two honest nodes at the same
 //! root legitimately produce different container bytes; nothing compares them
-//! (statesync verifies the ROOT, which covers refs + tracker only).
+//! (statesync verifies the ROOT, which covers refs + owners + tracker).
 
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::io::Write as _;
@@ -50,7 +51,6 @@ use crate::tracker::Tracker;
 /// `FGC1 ++ repo-count ++ (name, refs/pending-key, pack)* ++ sha256(preceding)`.
 const SNAPSHOT_CACHE_MAGIC: &[u8; 4] = b"FGC1";
 const SNAPSHOT_CACHE_DIGEST_LEN: usize = 32;
-const MAX_CACHED_REPOS: u32 = 4096;
 
 #[cfg(test)]
 std::thread_local! {
@@ -119,6 +119,7 @@ impl Forge {
                 }),
             };
             codec::put_str(&mut out, name);
+            crate::refs::put_owner(&mut out, state.owner.as_ref());
             put_ref_map(&mut out, &state.refs);
             put_ref_map(&mut out, &state.tags);
             crate::refs::put_pending(&mut out, state.pending());
@@ -187,9 +188,6 @@ impl Forge {
         let body = payload.strip_prefix(SNAPSHOT_CACHE_MAGIC.as_slice())?;
         let mut reader = Reader::new(body);
         let count = reader.u32().ok()?;
-        if count > MAX_CACHED_REPOS {
-            return None;
-        }
         let mut names = BTreeSet::new();
         let mut disk_keys = Vec::with_capacity(count as usize);
         let mut packs = BTreeMap::new();
@@ -310,6 +308,7 @@ impl Forge {
         for _ in 0..count {
             let name = norm_repo(&r.str_()?)?;
             let refs = RepoRefs {
+                owner: crate::refs::take_owner(&mut r)?,
                 branches: take_ref_map(&mut r, "snapshot_decode", &name)?,
                 tags: take_ref_map(&mut r, "snapshot_decode", &name)?,
             };
@@ -362,9 +361,14 @@ impl Forge {
         }
 
         // ---- PHASE 2: root gate BEFORE any byte reaches an odb --------------
-        let entries = parsed
-            .iter()
-            .map(|(n, repo)| (n.as_str(), &repo.refs.branches, &repo.refs.tags));
+        let entries = parsed.iter().map(|(n, repo)| {
+            (
+                n.as_str(),
+                &repo.refs.branches,
+                &repo.refs.tags,
+                repo.refs.owner.as_ref(),
+            )
+        });
         let composed = compose_state_root(entries, &tracker);
         if composed != expected {
             return Err(Error::module(
@@ -424,6 +428,7 @@ impl Forge {
         self.state.repos = new_repos;
         self.state.tracker = tracker;
         self.state.staged_tracker = None;
+        self.persist_owners()?;
         self.persist_tracker()?;
         self.persist_pending()?;
         Ok(())

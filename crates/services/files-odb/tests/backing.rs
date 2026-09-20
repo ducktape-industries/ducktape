@@ -22,6 +22,7 @@ use files::{
     to_hex,
 };
 use files_odb::FilesOdbBacking;
+use files_odb::identity_contract as identity;
 use sdk::Module as _;
 use sha2::{Digest as _, Sha256};
 use wasm_host::{HostOdb as _, OdbBacking};
@@ -42,11 +43,7 @@ fn test_ctx(origin: sdk::Origin, height: u64) -> sdk_testkit::TestCtx {
         cause: sdk::Cause::Direct,
     })
     .on_query("identity", |req| {
-        let identity::IdentityQuery::OfKey { .. } =
-            identity::decode_query(req).map_err(|e| sdk::Error::module("codec", e))?
-        else {
-            return Err(sdk::Error::QueryUnsupported);
-        };
+        identity::decode_query(req).map_err(|e| sdk::Error::module("codec", e))?;
         Ok(identity::encode_reply(&identity::IdentityReply::Account(
             None,
         )))

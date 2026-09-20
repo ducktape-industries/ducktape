@@ -22,15 +22,9 @@ use crate::overlay_book::{
 };
 
 const RUN_OUTPUT_INTENT: u8 = 1;
-const MAX_EVENT_BYTES: usize = 64 * 1024;
 /// the outbound re-dial cadence: how long a peer's fan-out task waits after
 /// a failed open, and how often the fan-out re-reads the tracked set.
 const DIAL_RETRY: Duration = Duration::from_secs(3);
-
-/// how many distinct run ids ONE peer may hold a first-sender binding for.
-/// Per peer, never node-wide, so a flooding peer only ever exhausts its own
-/// budget and never displaces another peer's bindings.
-const MAX_OBSERVED_RUNS_PER_PEER: usize = 64;
 
 fn run_output_flow() -> FlowId {
     FlowId::derive(b"ducktape:agent-run-output:v1")
@@ -43,31 +37,16 @@ fn run_output_flow() -> FlowId {
 /// this DOES settle: once some peer
 /// has streamed lines for an id this node does not host, that peer is the
 /// only one that may keep streaming them. The first sender binds; every other
-/// peer is refused from then on, and [`MAX_OBSERVED_RUNS_PER_PEER`] bounds how
-/// many such bindings one peer may mint, so a flooding peer only ever spends
-/// its own budget.
+/// peer is refused from then on.
 #[derive(Default)]
 struct RemoteRunBindings(std::sync::Mutex<HashMap<String, PeerId>>);
 
 impl RemoteRunBindings {
     /// the peer this id accepts lines from, binding `sender` if the id is
-    /// unbound. `None` when `sender` has already spent its whole budget of
-    /// first-sender bindings on ids nobody else has ever named.
-    fn bind(&self, id: &str, sender: PeerId) -> Option<PeerId> {
+    /// unbound.
+    fn bind(&self, id: &str, sender: PeerId) -> PeerId {
         let mut bindings = self.0.lock().expect("run bindings lock poisoned");
-        if let Some(host) = bindings.get(id) {
-            return Some(*host);
-        }
-        // ponytail: counted by scanning this peer's bindings — bounded by
-        // MAX_OBSERVED_RUNS_PER_PEER × peers and reached only on an id never
-        // seen before. Keep a per-peer counter beside the map if a node ever
-        // mirrors enough runs for the scan to show.
-        let held = bindings.values().filter(|host| **host == sender).count();
-        if held >= MAX_OBSERVED_RUNS_PER_PEER {
-            return None;
-        }
-        bindings.insert(id.to_string(), sender);
-        Some(sender)
+        *bindings.entry(id.to_string()).or_insert(sender)
     }
 }
 
@@ -103,8 +82,7 @@ impl PerPeerLatch {
 static RUN_REFUSED: PerPeerLatch = PerPeerLatch::new(100);
 
 /// the host gate on an inbound run-output grain: refuses a line naming a run
-/// this node hosts locally, or one bound to a different peer, or one this
-/// peer has no bindings left to claim.
+/// this node hosts locally, or one bound to a different peer.
 fn run_refusal(
     bindings: &RemoteRunBindings,
     registry: &RunOutputRegistry,
@@ -114,11 +92,11 @@ fn run_refusal(
     if registry.is_local(&event.id) {
         return Some("run_hosted_locally");
     }
-    match bindings.bind(&event.id, peer) {
-        Some(host) if host == peer => None,
-        Some(_) => Some("run_not_bound_peer"),
-        None => Some("observed_runs_capped"),
+    let bound_to_this_peer = bindings.bind(&event.id, peer) == peer;
+    if bound_to_this_peer {
+        return None;
     }
+    Some("run_not_bound_peer")
 }
 
 fn run_refused(reason: &'static str, peer: PeerId) {
@@ -373,20 +351,7 @@ async fn write_event<S: AsyncWrite + Unpin>(
             "invalid run id",
         ));
     }
-    let mut payload = serde_json::to_vec(event).map_err(io::Error::other)?;
-    if payload.len() > MAX_EVENT_BYTES {
-        // ponytail: giant provider JSON lines are not useful live telemetry;
-        // move full-fidelity traces to blob refs if operators ever need them.
-        let mut clipped = event.clone();
-        clipped.line = format!("[{} byte output line omitted]", event.line.len());
-        payload = serde_json::to_vec(&clipped).map_err(io::Error::other)?;
-    }
-    if payload.len() > MAX_EVENT_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "run output event too large",
-        ));
-    }
+    let payload = serde_json::to_vec(event).map_err(io::Error::other)?;
     stream
         .write_all(&(payload.len() as u32).to_be_bytes())
         .await?;
@@ -401,7 +366,7 @@ async fn read_event<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Option<R
         Err(error) => return Err(error),
     }
     let len = u32::from_be_bytes(len) as usize;
-    if len == 0 || len > MAX_EVENT_BYTES {
+    if len == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid run output frame length",
@@ -459,37 +424,6 @@ mod tests {
         assert_eq!(
             run_refusal(&bindings, &registry, &event, peer),
             Some("run_hosted_locally")
-        );
-    }
-
-    #[test]
-    fn a_peer_at_its_binding_budget_cannot_claim_a_new_id() {
-        let registry = RunOutputRegistry::default();
-        let bindings = RemoteRunBindings::default();
-        let flooder = PeerId([9u8; 32]);
-        for i in 0..MAX_OBSERVED_RUNS_PER_PEER {
-            let event = RunOutputEvent {
-                id: format!("{i:064x}"),
-                stream: noded::RunStream::Stdout,
-                line: "x".into(),
-            };
-            assert_eq!(run_refusal(&bindings, &registry, &event, flooder), None);
-        }
-        let over_budget = RunOutputEvent {
-            id: format!("{:064x}", MAX_OBSERVED_RUNS_PER_PEER + 1),
-            stream: noded::RunStream::Stdout,
-            line: "x".into(),
-        };
-        assert_eq!(
-            run_refusal(&bindings, &registry, &over_budget, flooder),
-            Some("observed_runs_capped")
-        );
-        // a peer with its own budget is unaffected by the flooder's.
-        let other = PeerId([10u8; 32]);
-        assert_eq!(
-            run_refusal(&bindings, &registry, &over_budget, other),
-            None,
-            "one peer's flood never spends another's budget"
         );
     }
 

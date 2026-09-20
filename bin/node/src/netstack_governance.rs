@@ -157,7 +157,6 @@ fn backend_from_roster(
         .ok_or_else(|| "designated netstack component is absent".to_string())?;
     Ok(reachability::NetstackBackend::Guest {
         component: artifact_component(&bytes)?,
-        step_fuel: reachability::NETSTACK_STEP_FUEL,
     })
 }
 

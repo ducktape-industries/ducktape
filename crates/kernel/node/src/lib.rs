@@ -464,8 +464,7 @@ pub const MAX_BATCH_BYTES: usize = MAX_FRAME_BYTES;
 /// `MAX_BATCH_BYTES` (1 MiB + 16 KiB) fits ~6.8k members in one block. Each
 /// member is one isolation unit in `Host::apply_block`, and one that stages
 /// then fails replays every accepted member before it, so the block's
-/// re-execution is bounded by `members * (1 + host::MAX_BLOCK_REPLAYS)` —
-/// 1024 members keep that under ~9.2k module executions.
+/// re-execution grows with the member count.
 pub const MAX_BATCH_MEMBERS: usize = 1024;
 
 /// hard cap on how many frames [`OrderedNode`] holds in CUSTODY at once

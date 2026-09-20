@@ -43,23 +43,10 @@ pub const AGENT_KIND: &str = "agent";
 /// node that lends credentials needs no container runtime at all.
 pub const AIRLOCK_KIND: &str = "airlock";
 
-/// Cap on distinct kinds the catalog will hold. The kind in a hello is
-/// caller-chosen, so an unbounded map is a trivial memory-exhaustion vector
-/// for any local process — and a host running more than this many distinct
-/// service daemons is not a shape we are trying to serve.
-const MAX_SIGNALING: usize = 64;
-
 /// the longest a kind tag may be — kinds are capability-tag shaped.
 const MAX_KIND_LEN: usize = 32;
 /// the longest a version string may be.
 const MAX_VERSION_LEN: usize = 32;
-/// the most capability tags one hello may offer.
-///
-/// Sized against reality, not a round number: a capability spec expands into
-/// one tag per `[[variants]]` entry, so the two BUILT-IN specs alone already
-/// declare ~37, and an operator spec dir adds more. A tight cap here does not
-/// harden anything — it just refuses ordinary hosts.
-const MAX_CAPABILITIES: usize = 512;
 /// the most grant scopes / declared needs one hello may carry. These are
 /// small by nature: a service asks for a handful of scopes, not hundreds.
 const MAX_LIST_LEN: usize = 32;
@@ -350,8 +337,6 @@ pub fn token_matches(presented: &str, expected: &str) -> bool {
 pub enum HelloRefusal {
     /// the hello itself is not well-formed.
     Malformed(&'static str),
-    /// too many distinct kinds are already signaling.
-    CatalogFull,
 }
 
 impl HelloRefusal {
@@ -359,7 +344,6 @@ impl HelloRefusal {
     pub fn reason(self) -> &'static str {
         match self {
             HelloRefusal::Malformed(_) => "malformed_hello",
-            HelloRefusal::CatalogFull => "catalog_full",
         }
     }
 
@@ -368,7 +352,6 @@ impl HelloRefusal {
     pub fn status(self) -> axum::http::StatusCode {
         match self {
             HelloRefusal::Malformed(_) => axum::http::StatusCode::BAD_REQUEST,
-            HelloRefusal::CatalogFull => axum::http::StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -378,7 +361,6 @@ impl HelloRefusal {
     pub fn message(self) -> String {
         match self {
             HelloRefusal::Malformed(detail) => detail.to_string(),
-            HelloRefusal::CatalogFull => "too many services are signaling to this node".into(),
         }
     }
 }
@@ -407,14 +389,10 @@ impl Hello {
     /// Reject a malformed hello at the boundary, naming one stable reason.
     pub fn validate(&self) -> Result<(), HelloRefusal> {
         if !kind_is_well_formed(&self.kind) {
-            return Err(HelloRefusal::Malformed(
-                "kind must be 1..32 chars of [a-z0-9-]",
-            ));
+            return Err(HelloRefusal::Malformed("kind must be 1..32 chars of [a-z0-9-]"));
         }
         if self.version.len() > MAX_VERSION_LEN || !item_is_well_formed(&self.version) {
-            return Err(HelloRefusal::Malformed(
-                "version must be 1..32 printable ascii chars",
-            ));
+            return Err(HelloRefusal::Malformed("version must be 1..32 printable ascii chars"));
         }
         // the build is no longer compared, but it IS rendered — `service
         // status` prints it — so it stays a validated trust boundary: a
@@ -426,17 +404,11 @@ impl Hello {
         // `core.abbrev = 40`. A cap that refused an honest daemon's own stamp
         // would be the same fail-closed trap the build gate was.
         if !item_is_well_formed(&self.build) {
-            return Err(HelloRefusal::Malformed(
-                "build must be 1..64 printable ascii chars",
-            ));
+            return Err(HelloRefusal::Malformed("build must be 1..64 printable ascii chars"));
         }
-        let lists_ok = self.capabilities.len() <= MAX_CAPABILITIES
-            && self.scopes.len() <= MAX_LIST_LEN
-            && self.needs.len() <= MAX_LIST_LEN;
+        let lists_ok = self.scopes.len() <= MAX_LIST_LEN && self.needs.len() <= MAX_LIST_LEN;
         if !lists_ok {
-            return Err(HelloRefusal::Malformed(
-                "at most 512 capabilities, 32 scopes and 32 needs",
-            ));
+            return Err(HelloRefusal::Malformed("at most 32 scopes and 32 needs"));
         }
         let items_ok = self
             .capabilities
@@ -444,16 +416,12 @@ impl Hello {
             .chain(self.scopes.iter())
             .all(|item| item_is_well_formed(item));
         if !items_ok {
-            return Err(HelloRefusal::Malformed(
-                "each capability/scope must be 1..64 printable ascii chars",
-            ));
+            return Err(HelloRefusal::Malformed("each capability/scope must be 1..64 printable ascii chars"));
         }
         // a need names a KIND, so it obeys the kind grammar — that is what
         // makes it comparable against the grants without any normalizing.
         if !self.needs.iter().all(|need| kind_is_well_formed(need)) {
-            return Err(HelloRefusal::Malformed(
-                "each need must be a service kind (1..32 chars of [a-z0-9-])",
-            ));
+            return Err(HelloRefusal::Malformed("each need must be a service kind (1..32 chars of [a-z0-9-])"));
         }
         Ok(())
     }
@@ -515,9 +483,6 @@ impl ServiceCatalog {
         expire(&mut entries, now);
         let kind = hello.kind.clone();
         let known = entries.contains_key(&kind);
-        if !known && entries.len() >= MAX_SIGNALING {
-            return Err(HelloRefusal::CatalogFull);
-        }
         entries.insert(
             kind.clone(),
             Entry {
@@ -748,24 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn the_catalog_is_capped_but_never_starves_a_daemon_already_in_it() {
-        let catalog = ServiceCatalog::default();
-        let now = Instant::now();
-        for index in 0..MAX_SIGNALING {
-            catalog.hello(hello(&format!("svc-{index}")), now).unwrap();
-        }
-        assert_eq!(catalog.live(now).len(), MAX_SIGNALING);
-        // a NEW kind is refused ...
-        assert!(catalog.hello(hello("one-too-many"), now).is_err());
-        // ... but an existing one still refreshes.
-        catalog.hello(hello("svc-0"), now).unwrap();
-        // and once entries age out, the newcomer is admitted.
-        let later = now + HELLO_TTL + Duration::from_secs(1);
-        catalog.hello(hello("one-too-many"), later).unwrap();
-        assert_eq!(catalog.live(later).len(), 1);
-    }
-
-    #[test]
     fn a_malformed_hello_is_refused_at_the_boundary() {
         let catalog = ServiceCatalog::default();
         let now = Instant::now();
@@ -780,12 +727,6 @@ mod tests {
         let mut long_kind = hello("compute");
         long_kind.kind = "a".repeat(MAX_KIND_LEN + 1);
         assert!(catalog.hello(long_kind, now).is_err());
-
-        let mut too_many = hello("compute");
-        too_many.capabilities = (0..MAX_CAPABILITIES + 1)
-            .map(|i| format!("tag{i}"))
-            .collect();
-        assert!(catalog.hello(too_many, now).is_err());
 
         let mut long_item = hello("compute");
         long_item.scopes = vec!["s".repeat(MAX_ITEM_LEN + 1)];
@@ -898,7 +839,6 @@ mod build_is_metadata_not_a_gate {
         // own build stamp.
         let messages = [
             HelloRefusal::Malformed("kind must be 1..32 chars of [a-z0-9-]").message(),
-            HelloRefusal::CatalogFull.message(),
         ];
         let mine = build_identity_or_unknown();
         for message in messages {

@@ -34,9 +34,8 @@
 //! logical record per proposal (`prop\0{id}`) and per settled invite
 //! redemption (`red\0{nonce}`), plus three aggregate records:
 //!
-//! - the proposal ROSTER (the sorted OPEN-proposal-id list, bounded by
-//!   [`MAX_PROPOSALS`] and, per submitter, by
-//!   [`MAX_OPEN_PROPOSALS_PER_SUBMITTER`]) — the ONE enumeration read. an id
+//! - the proposal ROSTER (the sorted OPEN-proposal-id list) — the ONE
+//!   enumeration read. an id
 //!   leaves the roster the moment it settles: `Execute` evicts it when the
 //!   tally passes or rejects it, and `Propose` opportunistically evicts any
 //!   OTHER roster entry whose own voting deadline has passed with nobody
@@ -53,7 +52,7 @@
 //!   second consensus implementation, which is worse than a bounded
 //!   canonical id list. the operator ceremonies (the CLI's
 //!   adopt-an-open-proposal flow) consume this listing;
-//! - the SHARE REGISTRY (bounded by [`MAX_SHARE_ACCOUNTS`]) — consensus
+//! - the SHARE REGISTRY — consensus
 //!   consumes it whenever a proposal freezes an account electorate;
 //! - the share-MODE flag — consensus consumes it on every `Propose`.
 //!
@@ -127,26 +126,9 @@ const EXECUTION_GRACE: u64 = 100_000;
 
 /// Keep every share value and total exact in the JavaScript operator client.
 const MAX_SAFE_SHARES: u64 = 9_007_199_254_740_991;
-/// The frozen electorate copies the complete allocation into each proposal.
-/// This is intentionally the small-network implementation; checkpointed power
-/// history replaces it if real deployments outgrow this bound.
-const MAX_SHARE_ACCOUNTS: usize = 256;
 /// `proposal_id` byte bound — roster arithmetic and record keys need ids that
 /// cannot balloon.
 pub const MAX_PROPOSAL_ID_BYTES: usize = 256;
-/// ceiling on the roster of currently-OPEN proposals — settled ids (passed,
-/// rejected, or expired) are evicted, so this bounds live contention, not
-/// the network's lifetime proposal count. proposing past this is refused
-/// loudly at propose.
-pub const MAX_PROPOSALS: usize = 1024;
-/// ceiling on OPEN proposals a single frozen `proposer` principal may hold at
-/// once — closes the roster-filling attack [`MAX_PROPOSALS`] alone does not:
-/// without this, one electorate member submits proposals with a voting
-/// window long enough that nobody can execute them early, and eviction on
-/// expiry never triggers before the cap bites. small on purpose — a
-/// legitimate member has no reason to run more than a handful of proposals
-/// concurrently.
-pub const MAX_OPEN_PROPOSALS_PER_SUBMITTER: usize = 8;
 /// serialized roster-record byte bound, enforced at propose — the backstop
 /// on top of the id-length and count caps that keeps the committed record
 /// far under the qmdb value-decode ceiling (the poison-value lesson: a
@@ -396,23 +378,14 @@ impl Governance {
     /// time, or nobody ever will again — and evict it from `roster`. this is
     /// the one place an unexecuted or now-stale-electorate proposal expires
     /// deterministically without a network-wide per-block tick, so `Propose`,
-    /// `Vote`, and `Execute` all run it before acting: `Propose` right where
-    /// the roster cap and the per-submitter cap are about to be checked,
-    /// `Vote`/`Execute` so expiry never depends on someone else proposing.
-    /// when `Execute` calls this on the very proposal it targets, reaping it
-    /// here IS the bounded-execution-window refusal — the subsequent "no
-    /// such open proposal" check catches it. returns how many of the
-    /// SURVIVING open proposals belong to `proposer`, computed in the same
-    /// pass so the caps cost one roster walk together (bounded by
-    /// [`MAX_PROPOSALS`] point reads, the same cost class as
-    /// `GovQuery::Proposals`).
-    async fn reap_expired(
-        &mut self,
-        now: u64,
-        proposer: &[u8],
-        roster: &mut Vec<String>,
-    ) -> Result<usize, Error> {
-        let mut open_by_proposer = 0usize;
+    /// `Vote`, and `Execute` all run it before acting: `Propose` before the
+    /// new id joins the roster, `Vote`/`Execute` so expiry never depends on
+    /// someone else proposing. when `Execute` calls this on the very
+    /// proposal it targets, reaping it here IS the bounded-execution-window
+    /// refusal — the subsequent "no such open proposal" check catches it.
+    /// one point read per open proposal, the same cost class as
+    /// `GovQuery::Proposals`.
+    async fn reap_expired(&mut self, now: u64, roster: &mut Vec<String>) -> Result<(), Error> {
         let mut i = 0;
         while i < roster.len() {
             let id = roster[i].clone();
@@ -430,19 +403,16 @@ impl Governance {
                 roster.remove(i);
                 continue;
             }
-            if proposal.proposer.as_slice() == proposer {
-                open_by_proposer += 1;
-            }
             i += 1;
         }
-        Ok(open_by_proposer)
+        Ok(())
     }
 
-    /// [`Self::reap_expired`] against the whole roster, for callers that
-    /// don't need the per-submitter count `Propose` uses.
+    /// [`Self::reap_expired`] against the whole roster, for callers that do
+    /// not already hold it.
     async fn reap_roster(&mut self, now: u64) -> Result<(), Error> {
         let mut roster = self.roster().await?;
-        self.reap_expired(now, &[], &mut roster).await?;
+        self.reap_expired(now, &mut roster).await?;
         self.stage_roster(&roster)
     }
 
@@ -481,7 +451,6 @@ impl Governance {
                 shares: *shares,
             })
             .collect();
-        // bounded by construction: at most MAX_SHARE_ACCOUNTS allocations.
         self.store(SHARES_KEY.to_vec(), &allocations);
     }
 
@@ -760,12 +729,10 @@ impl Governance {
                         "governance shares are already configured",
                     ));
                 }
-                if allocations.is_empty() || allocations.len() > MAX_SHARE_ACCOUNTS {
+                if allocations.is_empty() {
                     return Err(Error::module(
                         "bad_share_allocation",
-                        format!(
-                            "initial share allocation must contain 1..={MAX_SHARE_ACCOUNTS} accounts"
-                        ),
+                        "initial share allocation must contain at least one account",
                     ));
                 }
                 let mut normalized = BTreeMap::new();
@@ -812,12 +779,6 @@ impl Governance {
                     after.remove(account_id);
                 } else {
                     after.insert(*account_id, *shares);
-                }
-                if after.len() > MAX_SHARE_ACCOUNTS {
-                    return Err(Error::module(
-                        "share_registry_full",
-                        format!("share registry supports at most {MAX_SHARE_ACCOUNTS} accounts"),
-                    ));
                 }
                 Self::total_power(&after)?;
             }
@@ -1028,25 +989,12 @@ impl Governance {
         let submitter = Self::external_origin(ctx)?;
         let (proposer, electorate) = self.frozen_electorate(ctx, &submitter, &action).await?;
         let now = ctx.env().consensus_time;
-        // reap anything already past its own deadline before either cap
-        // below — otherwise a submitter who never calls `Execute` keeps a
-        // permanent roster slot (and a permanent per-submitter slot) past
-        // its own voting window.
-        let open_by_proposer = self.reap_expired(now, &proposer, &mut roster).await?;
-        if roster.len() >= MAX_PROPOSALS {
-            return Err(Error::module(
-                "proposal_cap",
-                format!("proposal cap reached ({MAX_PROPOSALS})"),
-            ));
-        }
-        if open_by_proposer >= MAX_OPEN_PROPOSALS_PER_SUBMITTER {
-            return Err(Error::module(
-                "submitter_proposal_cap",
-                format!("submitter already has {MAX_OPEN_PROPOSALS_PER_SUBMITTER} open proposals"),
-            ));
-        }
-        // Gate the submitter before resolving up to MAX_SHARE_ACCOUNTS Identity
-        // records for an adoption proposal.
+        // reap anything already past its own deadline — otherwise a submitter
+        // who never calls `Execute` keeps a permanent roster slot past its own
+        // voting window.
+        self.reap_expired(now, &mut roster).await?;
+        // Gate the submitter before resolving the Identity records an adoption
+        // proposal names.
         let action = self.normalize_share_action(ctx, action).await?;
 
         let deadline = now.checked_add(voting_period).ok_or_else(|| {
@@ -1378,7 +1326,7 @@ impl Governance {
                     } else {
                         after.insert(*account_id, *shares);
                     }
-                    if after.len() > MAX_SHARE_ACCOUNTS || Self::total_power(&after).is_err() {
+                    if Self::total_power(&after).is_err() {
                         proposal.status = ProposalStatus::Rejected;
                     } else {
                         self.stage_shares(&after);
@@ -1621,8 +1569,8 @@ impl Module for Governance {
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(|e| Error::module("codec", e))? {
             GovQuery::Proposals => {
-                // walk the roster by derived key (≤ MAX_PROPOSALS point
-                // reads). a rostered id without a record is a store bug —
+                // walk the roster by derived key (one point read per open
+                // proposal). a rostered id without a record is a store bug —
                 // loud, never skipped.
                 let mut views = Vec::new();
                 for proposal_id in self.roster().await? {
