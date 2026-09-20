@@ -6,8 +6,8 @@
 # is the full local verification gate — run it before every push.
 #
 # The desktop app and its launcher live in ducktape-industries/ducktape-app;
-# their build and install targets went with them. The views the app draws
-# are founded into every network: `make views-sync` commits them here.
+# `make install` delegates to its pinned install target. The views the app
+# draws are founded into every network: `make views-sync` commits them here.
 
 CARGO ?= cargo
 # every build/test recipe resolves against the COMMITTED lock: a guest's wasm
@@ -19,7 +19,7 @@ LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all airlock-gateway-image rcodesign dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install-node install-coordinator test clean wasm-modules wasm-modules-check modules-sync views-sync wasm-embed-check labs-gate audit
+.PHONY: all airlock-gateway-image rcodesign dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-node install-coordinator test clean wasm-modules wasm-modules-check modules-sync views-sync wasm-embed-check labs-gate audit
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -163,6 +163,16 @@ install-node: prereqs
 	rm -rf "$(CARGO_BIN)/sim-modules"
 	cp -r "target/release/$(STAGED_SIM_MODULES)" "$(CARGO_BIN)/sim-modules"
 	@echo "installed the founding set into $(CARGO_BIN)/modules"
+
+## install the node and the desktop app at the immutable revision in
+## ops/app/APP_REV. The app checkout and its destination are owned by the app's
+## own make install contract; ops/app/install.sh reports that output.
+install: install-node
+	@$(MAKE) --no-print-directory install-app
+
+.PHONY: install-app
+install-app:
+	@bash ops/app/install.sh
 
 ## coordinator -> ~/.cargo/bin/ducktape-coordinator
 install-coordinator:
