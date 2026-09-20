@@ -193,9 +193,6 @@ async fn rejections_inner(context: &deterministic::Context) {
     // the rejection matrix: the governance-only origin gate, every target-
     // shape violation, and undecodable bytes. each rejected block must leave
     // BOTH roots byte-identical (the abort path: staged writes discarded).
-    // (the MAX_POLICY_ENTRIES cap rejection needs a 256-entry fill and is
-    // pinned by the native crate's own tests; the cap check itself is compiled
-    // into the guest unchanged.)
     let rejects: Vec<(Origin, Msg, &str)> = vec![
         (
             Origin::External(vec![7u8; 32]),

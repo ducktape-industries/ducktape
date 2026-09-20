@@ -32,16 +32,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::services::ServiceGrant;
 
-/// the most tags one node may announce.
-///
-/// This is `capability`'s own `MAX_CAPABILITIES`, mirrored HOST-SIDE: the
-/// module's constant is private to a crate under `crates/modules/`, and merely
-/// making it `pub` would rebuild its `component.wasm`, move the code hash
-/// the modules registry seeds it with, and so move the genesis app hash — a flag day for
-/// a visibility keyword. `the_announce_cap_matches_the_modules_own` parses the
-/// module's source to pin the two together; a comment would not have.
-const MAX_ANNOUNCED_TAGS: usize = 64;
-
 /// what one announce carries.
 ///
 /// The pair travels as one value because the module couples them: resources
@@ -55,26 +45,25 @@ pub(crate) struct AnnounceSet {
 
 /// why a set cannot be announced.
 ///
-/// A closed domain, and BOTH arms belong to the consent boundary — they are
-/// what `plan_enable` refuses, so that an operator is never asked to approve a
+/// A closed domain that belongs to the consent boundary — it is what
+/// `plan_enable` refuses, so that an operator is never asked to approve a
 /// consent screen listing tags this node will never announce.
 ///
-/// Both arms are unreachable from the watcher, and both for the SAME reason —
-/// they are properties of the FILE, not of whichever code path wrote it.
-/// `Services::validate` runs this very function over [`widest`] on every
-/// `load`, so no `services.toml` this node will read can carry an illegal tag or
-/// imply more tags than the registry accepts. Every live derivation is a subset
-/// of that bound.
+/// It is unreachable from the watcher, because it is a property of the FILE,
+/// not of whichever code path wrote it. `Services::validate` runs this very
+/// function over [`widest`] on every `load`, so no `services.toml` this node
+/// will read can carry an illegal tag. Every live derivation is a subset of
+/// that set.
 ///
 /// The consequence is deliberate and worth knowing before it surprises someone:
-/// an over-cap or ill-tagged file fails the node's BOOT, not merely its
-/// announce. That is the louder half of the trade. The state it replaces is the
-/// one this campaign has hit repeatedly — a node that boots, looks healthy, and
+/// an ill-tagged file fails the node's BOOT, not merely its announce. That is
+/// the louder half of the trade. The state it replaces is the one this
+/// campaign has hit repeatedly — a node that boots, looks healthy, and
 /// silently announces nothing behind a warn throttled to one line per five
 /// minutes.
 ///
-/// So if either arm ever fires on the watcher path, it is not a set to trim
-/// here — it means `validate` was bypassed, and the fix is upstream.
+/// So if it ever fires on the watcher path, it is not a set to trim here — it
+/// means `validate` was bypassed, and the fix is upstream.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     /// tags the registry's own grammar rejects. The hello boundary's item rule
@@ -82,9 +71,6 @@ pub(crate) enum Refusal {
     /// plus a space), so a third-party daemon or an operator spec dir can
     /// signal `"Claude Sonnet"` and reach the consent screen intact.
     IllegalTags(Vec<String>),
-    /// more tags than the registry accepts. An announce is all-or-nothing, so
-    /// crossing the cap does not cost the excess — it costs the whole set.
-    OverCap { total: usize },
 }
 
 impl std::fmt::Display for Refusal {
@@ -95,11 +81,6 @@ impl std::fmt::Display for Refusal {
                 "the capability registry refuses {} (a tag is 1..64 bytes of [a-z0-9._-]) — \
                  fix the daemon's capability spec, then signal again",
                 tags.join(", ")
-            ),
-            Refusal::OverCap { total } => write!(
-                f,
-                "this node would announce {total} capability tags and the registry accepts at \
-                 most {MAX_ANNOUNCED_TAGS} — narrow a grant or the capability spec dir"
             ),
         }
     }
@@ -154,10 +135,6 @@ pub(crate) fn announced_set(
     if !illegal.is_empty() {
         return Err(Refusal::IllegalTags(illegal));
     }
-    if tags.len() > MAX_ANNOUNCED_TAGS {
-        return Err(Refusal::OverCap { total: tags.len() });
-    }
-
     // empty tags force empty resources — the module rejects the
     // resources-without-tags shape, so it is never emitted.
     let resources = match tags.is_empty() {
@@ -564,21 +541,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn crossing_the_registry_cap_refuses_the_whole_set() {
-        let many: Vec<String> = (0..MAX_ANNOUNCED_TAGS).map(|n| format!("e{n}")).collect();
-        let borrowed: Vec<&str> = many.iter().map(String::as_str).collect();
-        let grants = [grant("compute", &borrowed)];
-        let live = [signal("compute", &borrowed)];
-        // MAX executors + the kind tag = one over.
-        assert_eq!(
-            announced_set(&grants, &live, &caps(8)),
-            Err(Refusal::OverCap {
-                total: MAX_ANNOUNCED_TAGS + 1
-            })
-        );
-    }
-
     /// a workspace whose `services.toml` grants each `(kind, tags)` pair — the
     /// watcher reads consent off disk, so a test grant IS a file.
     fn granted_workspace(grants: &[(&str, &[&str])]) -> tempfile::TempDir {
@@ -795,28 +757,4 @@ mod tests {
         assert!(now.capabilities.len() < bound.capabilities.len());
     }
 
-    #[test]
-    fn the_announce_cap_matches_the_modules_own() {
-        // the mirrored constant, pinned to the module's source. A comment would
-        // not have caught a drift; making the module's const `pub` would have
-        // moved the genesis app hash for a visibility keyword.
-        let source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../crates/modules/system/capability/src/lib.rs"
-        ))
-        .expect("the capability module's source");
-        let module_cap: usize = source
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("const MAX_CAPABILITIES: usize = "))
-            .expect("capability declares MAX_CAPABILITIES")
-            .trim_end_matches(';')
-            .trim()
-            .parse()
-            .expect("a literal cap");
-        assert_eq!(
-            module_cap, MAX_ANNOUNCED_TAGS,
-            "capability::MAX_CAPABILITIES moved; the host-side bound must move with it \
-             (raising it is a flag day — the module's wasm digest is genesis state)"
-        );
-    }
 }

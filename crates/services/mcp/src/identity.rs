@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use runs::ModelRecord;
+use crate::module_contracts::runs::{self, ModelRecord};
 use serde_json::json;
 
 use crate::node::{Node, NodeError, Result};

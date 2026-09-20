@@ -1053,12 +1053,13 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 [[package]]
 name = "identity"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#c065f33e0c85e385a734e7966bfd269a5cb0314c"
+source = "git+https://github.com/ducktape-industries/ducktape#f591d4846c8edd82269f864fcfdb850a5cc4293a"
 dependencies = [
  "async-trait",
  "borsh",
  "commonware-cryptography",
  "ducktape-module-sdk",
+ "identity-wire",
  "keyscheme",
  "sdk",
  "serde",
@@ -1070,6 +1071,17 @@ name = "identity-component"
 version = "0.0.0"
 dependencies = [
  "identity",
+]
+
+[[package]]
+name = "identity-wire"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+dependencies = [
+ "borsh",
+ "keyscheme",
+ "sdk",
+ "serde",
 ]
 
 [[package]]

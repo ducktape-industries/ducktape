@@ -943,13 +943,14 @@ dependencies = [
 [[package]]
 name = "gateway"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#c065f33e0c85e385a734e7966bfd269a5cb0314c"
+source = "git+https://github.com/ducktape-industries/ducktape#f591d4846c8edd82269f864fcfdb850a5cc4293a"
 dependencies = [
  "async-trait",
  "borsh",
  "duckdns",
  "ducktape-module-sdk",
- "keyscheme",
+ "gateway-wire",
+ "identity-wire",
  "sdk",
  "serde",
  "serde_json",
@@ -961,6 +962,19 @@ name = "gateway-component"
 version = "0.0.0"
 dependencies = [
  "gateway",
+]
+
+[[package]]
+name = "gateway-wire"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+dependencies = [
+ "borsh",
+ "duckdns",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -1081,6 +1095,17 @@ name = "id-arena"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
+
+[[package]]
+name = "identity-wire"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+dependencies = [
+ "borsh",
+ "keyscheme",
+ "sdk",
+ "serde",
+]
 
 [[package]]
 name = "indexmap"

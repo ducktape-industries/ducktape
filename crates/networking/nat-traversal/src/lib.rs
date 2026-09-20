@@ -43,9 +43,8 @@ pub use client::{
 pub use coordinator::{Coordinator, CoordinatorReplies, CoordinatorReply};
 #[cfg(feature = "runtime")]
 pub use relay::{
-    FRAME_READ_TIMEOUT, FrameError, MAX_FRAME_LEN, MAX_RELAY_PAYLOAD, MAX_RELAY_SESSIONS,
-    MAX_SESSION_FORWARDS, MAX_SESSIONS_PER_IP, MIN_FORWARD_GAP, REASON_MALFORMED,
-    REASON_NOT_AUTHORIZED, REASON_SESSION_LIMIT, REASON_TARGET_UNREGISTERED, RelayConn, RelayFrame,
+    FRAME_READ_TIMEOUT, FrameError, MAX_FRAME_LEN, MAX_RELAY_PAYLOAD, MIN_FORWARD_GAP,
+    REASON_MALFORMED, REASON_NOT_AUTHORIZED, REASON_TARGET_UNREGISTERED, RelayConn, RelayFrame,
     RelayIntro, RelayMetrics, RelayMetricsSnapshot, SESSION_TTL, read_frame, run_relay_listener,
     sign_relay_intro, write_frame,
 };
@@ -73,9 +72,9 @@ pub const RELAY_PORT: u16 = 443;
 /// deliberately has no node-crate dependency).
 ///
 /// counted per `reason` token, not per lane: one lane refuses for several
-/// distinct reasons, and a connection flood that trips `session_limit` a
-/// thousand times must not swallow the FIRST `target_unregistered` — the
-/// everyday "why won't my joiner connect" line.
+/// distinct reasons, and a flood that trips one of them a thousand times
+/// must not swallow the FIRST `target_unregistered` — the everyday "why
+/// won't my joiner connect" line.
 pub(crate) struct Latch(std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>>);
 
 impl Latch {

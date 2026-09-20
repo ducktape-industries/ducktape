@@ -70,7 +70,7 @@ async fn run_block(context: deterministic::Context) -> StateRoot {
             payload: Vec::new(),
         })
         .await
-        .expect("submit must terminate and succeed (no BudgetExceeded)");
+        .expect("submit must terminate and succeed");
 
     let kv_root_after = host.module_root(KV_ID).unwrap();
 
@@ -98,7 +98,7 @@ async fn run_block(context: deterministic::Context) -> StateRoot {
         "root-hash must be recompute-stable"
     );
 
-    // (c) termination: submit returned Ok rather than Err(BudgetExceeded).
+    // (c) termination: submit returned Ok.
     outcome.root_hash
 }
 

@@ -31,15 +31,8 @@ use syn::visit_mut::VisitMut;
 /// tests;` puts a whole test module in a file whose own text carries no
 /// attribute to notice.
 pub fn rust_sources(root: &Path) -> Vec<PathBuf> {
-    const SKIP: &[&str] = &[
-        "target",
-        "target-shared",
-        ".git",
-        ".claude",
-        ".codex",
-        ".worktree",
-        "node_modules",
-    ];
+    // any `target*`: a worktree builds into its own `target-<unit>`.
+    const SKIP: &[&str] = &[".git", ".claude", ".codex", ".worktree", "node_modules"];
     let mut sources = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(directory) = stack.pop() {
@@ -51,7 +44,8 @@ pub fn rust_sources(root: &Path) -> Vec<PathBuf> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if path.is_dir() {
-                let skipped = SKIP.contains(&name.as_ref()) || name == "tests";
+                let build_output = name.starts_with("target");
+                let skipped = build_output || SKIP.contains(&name.as_ref()) || name == "tests";
                 if !skipped {
                     stack.push(path);
                 }

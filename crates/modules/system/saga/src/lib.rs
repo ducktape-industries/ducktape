@@ -64,7 +64,6 @@
 //! | `spec\0{id}{n:u64-le}` | chunk `n` of that saga's spec, raw bytes |
 //! | `pending{shard:u8}` | one of [`PENDING_SHARDS`] LIVE id shards: a borsh [`PendingIndex`] of the non-terminal ids that hash to it, each carrying its [`PendingMeta`] |
 //! | `terminal` | the terminal receipt index: a borsh `BTreeMap<String, TerminalEntry>` |
-//! | `quota\0{origin}` | one origin's LIVE saga count: a borsh `u32`, capped at [`PER_ORIGIN_LIVE_SAGAS`] |
 //!
 //! ### why the spec is chunked
 //!
@@ -112,30 +111,6 @@
 //! REJECT — quadratically, then absolutely — ops and queries the native module
 //! still accepted, which is a consensus divergence and, since the compute
 //! daemon's readiness probe is `NextExpiry`, a self-sustaining wedge.
-//!
-//! ## the live quota
-//!
-//! retention bounds the TERMINAL tail; nothing bounded the LIVE one. a saga
-//! triggered with neither a deadline nor a lease never expires, and `Cancel`
-//! is gated to the trigger origin — so one principal could accumulate live
-//! sagas without limit, at everyone else's expense, until a `pending` shard
-//! record hit its cap and started refusing unrelated triggers.
-//!
-//! so each origin carries a live count, keyed by the SAME subject `owns_id`
-//! and `Cancel` already gate on. a trigger at the cap is refused with the
-//! `origin_live_saga_cap` reason token; an accepted one claims a slot, and the
-//! `put` that makes a saga terminal returns it — exactly once, because every
-//! handler refuses a terminal saga before it writes, so that `put` happens
-//! once per saga (an underflow is therefore a module bug and is REFUSED, never
-//! clamped). `Prune` and the retention trim are terminal-only and never touch
-//! the count: the slot came back when the saga ENDED, not when its receipt was
-//! collected.
-//!
-//! the ceiling depends on what kind of subject that is. an external key is a
-//! principal, so [`PER_ORIGIN_LIVE_SAGAS`] is a real per-submitter budget. a
-//! module origin is the EMITTING module — every dispatch-created saga shares
-//! one counter — so [`PER_MODULE_LIVE_SAGAS`] is an aggregate in-flight bound
-//! on that module's whole fan-out, not an attribution of abuse.
 //!
 //! ## GC
 //!
@@ -237,46 +212,7 @@ pub const PENDING_PAGE: usize = 64;
 /// walk forward instead of stalling the cursor on it forever.
 pub const PENDING_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
-/// how many LIVE (non-terminal) sagas one EXTERNAL origin may hold at once —
-/// a consensus constant, enforced at trigger time.
-///
-/// the live half of the growth bound. the terminal tail is trimmed
-/// ([`MAX_RETAINED_TERMINAL`]) but a pending saga is never retention's to
-/// take, and one with neither a deadline nor a lease never expires on its own,
-/// so without this a single principal could pin unbounded state — and, once
-/// its ids filled a `pending` shard record, refuse OTHER principals' triggers.
-///
-/// an external key IS a principal, so this is the real per-submitter budget:
-/// well above any honest submitter, far below the shard record's own ceiling.
-pub const PER_ORIGIN_LIVE_SAGAS: u32 = 256;
 
-/// the same ceiling for a MODULE (or system) origin — deliberately far larger,
-/// because a module origin is not a principal.
-///
-/// a quota's subject is whatever `owns_id` gates the id namespace on, and for a
-/// module-triggered saga that is the EMITTING module: the host stamps a
-/// follow-up msg with `Origin::Module(<emitter>)`, so EVERY dispatch-created
-/// saga in the ledger — every agent turn, from every requester — shares the one
-/// `Module("dispatch")` counter. so this number bounds one module's whole
-/// aggregate fan-out; it is NOT an abuse bound attributable to whoever fills
-/// it, because this crate cannot see past the emitter to charge anyone else —
-/// the module's own admission is what gates who may trigger through it.
-///
-/// sizing it like a principal's budget was the trap: at 256 the network's TOTAL
-/// in-flight dispatch would stop there, and the 257th `Dispatch` op from any
-/// module would be refused (a cascaded trigger's `Err` rejects the whole op), so
-/// the few-thousand-pending scale the bounded reads above exist to serve would
-/// be unreachable. even a handful of module producers at this ceiling stays well
-/// inside the shard records' own capacity.
-pub const PER_MODULE_LIVE_SAGAS: u32 = 4096;
-
-/// the live ceiling one origin is held to — see the two constants above.
-fn live_saga_cap(origin: &SagaOrigin) -> u32 {
-    match origin {
-        SagaOrigin::External(_) => PER_ORIGIN_LIVE_SAGAS,
-        SagaOrigin::Module(_) | SagaOrigin::System => PER_MODULE_LIVE_SAGAS,
-    }
-}
 
 /// how many TERMINAL sagas stay in the ledger. a terminal saga has already
 /// fired its callback (P6, in the block it landed) — what remains is a
@@ -389,9 +325,7 @@ const PENDING_SHARDS: u8 = 16;
 // the MAX_SAGA_ID_BYTES cap — a few percent under what the bare id set held,
 // and still 16x the one record the sharding replaced. nothing trims this
 // index: it drains only as sagas terminate, and a saga triggered with neither
-// a deadline nor a lease never expires. the live quota (PER_ORIGIN_LIVE_SAGAS
-// / PER_MODULE_LIVE_SAGAS) is what now stops one origin from getting anywhere
-// near it; the shard cap is the second-order bound behind that quota, and a
+// a deadline nor a lease never expires. the shard cap is the one bound, and a
 // squatter who grinds ids into ONE shard still refuses only the 1/16 of later
 // triggers hashing there.
 const PENDING_INDEX_PREFIX: &[u8] = b"pending";
@@ -417,17 +351,6 @@ fn pending_shard_key(shard: u8) -> Vec<u8> {
 
 /// the terminal receipt index — the retention trim's whole input.
 const TERMINAL_INDEX_KEY: &[u8] = b"terminal";
-
-/// one origin's live-saga count key: prefix + 0 + the origin's canonical byte
-/// form ([`put_origin`], the same encoding every module folds a `SagaOrigin`
-/// into its root preimage with). that form is injective and self-delimiting,
-/// so two origins can never share a counter.
-fn quota_key(origin: &SagaOrigin) -> Vec<u8> {
-    let mut key = b"quota".to_vec();
-    key.push(0);
-    put_origin(&mut key, origin);
-    key
-}
 
 /// which live-index lane a pending projection walks. ONE discriminant: the two
 /// projections differ only in the entries they admit, and the meta's `assigned`
@@ -825,15 +748,6 @@ impl SagaModule {
         Ok(merged)
     }
 
-    /// how many LIVE sagas one origin currently holds; absent reads as zero.
-    async fn live_sagas(&self, origin: &SagaOrigin) -> Result<u32, Error> {
-        let Some(bytes) = self.staged.get(&quota_key(origin)).await? else {
-            return Ok(0);
-        };
-        borsh::from_slice(&bytes)
-            .map_err(|e| Error::module("record_decode", format!("live saga count decode: {e}")))
-    }
-
     /// the terminal receipt index; absent reads as empty.
     async fn load_terminal(&self) -> Result<BTreeMap<String, TerminalEntry>, Error> {
         let Some(bytes) = self.staged.get(TERMINAL_INDEX_KEY).await? else {
@@ -872,45 +786,8 @@ impl SagaModule {
         Ok(())
     }
 
-    /// stage one origin's live count. a count of ZERO drops its key, so an
-    /// origin that settles everything it triggered hashes like one that never
-    /// triggered anything.
-    ///
-    /// the record is a fixed 4 bytes, so it has no check that can fail — which
-    /// is why both callers stage it after their own checks have passed.
-    async fn stage_live_count(&mut self, origin: &SagaOrigin, live: u32) -> Result<(), Error> {
-        let record = (live > 0).then(|| borsh::to_vec(&live).expect("a u32 is serializable"));
-        self.stage_if_changed(&quota_key(origin), record).await
-    }
-
-    /// take one of `origin`'s [`live_saga_cap`] slots — the accepted trigger's
-    /// claim, made only after the record that occupies it is staged.
-    async fn claim_live_slot(&mut self, origin: &SagaOrigin) -> Result<(), Error> {
-        let live = self.live_sagas(origin).await?;
-        self.stage_live_count(origin, live.saturating_add(1)).await
-    }
-
-    /// the count `origin` is left with once one of its sagas ENDS — read by the
-    /// `put` that ends it, and by nothing else.
-    ///
-    /// an underflow is REFUSED, not clamped. exactly-once release is the
-    /// invariant the whole quota rests on, and every other invariant in this
-    /// module fails loudly; a clamp here would swallow the breakage and
-    /// resurface it as its opposite — an origin triggering past its cap — with
-    /// nothing pointing back at the missing claim or the double decrement.
-    async fn live_count_after_release(&self, origin: &SagaOrigin) -> Result<u32, Error> {
-        let live = self.live_sagas(origin).await?;
-        live.checked_sub(1).ok_or_else(|| {
-            Error::module(
-                "live_saga_count_underflow",
-                format!("{origin:?} ended a saga it never claimed"),
-            )
-        })
-    }
-
-    /// the ONE record writer: stage a saga and keep both id indexes — and, on
-    /// a terminal transition, the trigger origin's live count — in lockstep
-    /// with its status. every record it will write is encoded and checked
+    /// the ONE record writer: stage a saga and keep both id indexes in
+    /// lockstep with its status. every record it will write is encoded and checked
     /// BEFORE any of them is staged, so a refused write leaves the overlay
     /// untouched.
     async fn put(&mut self, saga_id: &str, saga: &Saga) -> Result<(), Error> {
@@ -942,29 +819,12 @@ impl SagaModule {
         }
         let pending_record = encode_pending(&pending)?;
         let terminal_record = encode_terminal(&terminal)?;
-        // the last thing that can refuse, so it is DECIDED before anything is
-        // staged: an ending saga hands its slot back, and a count that cannot
-        // absorb the decrement is a module bug rather than a clamp.
-        let released = if saga.status.is_terminal() {
-            Some(self.live_count_after_release(&saga.origin).await?)
-        } else {
-            None
-        };
 
         self.staged.stage(record_key(saga_id), record);
         self.stage_if_changed(&pending_shard_key(shard), pending_record)
             .await?;
         self.stage_if_changed(TERMINAL_INDEX_KEY, terminal_record)
-            .await?;
-        // the slot comes back HERE, and exactly once: every handler refuses a
-        // saga that is already terminal before it writes anything, so this is
-        // the one `put` in a saga's life that carries a terminal status.
-        // `Prune` and the retention trim run later, on an already-counted-down
-        // saga, and deliberately leave the count alone.
-        let Some(live) = released else {
-            return Ok(());
-        };
-        self.stage_live_count(&saga.origin, live).await
+            .await
     }
 
     /// drop a saga entirely — its record, its spec chunks, and its index row.
@@ -1523,22 +1383,10 @@ impl SagaModule {
                         ));
                     }
                 }
-                // the LIVE quota, and the last check before anything is staged
-                // (it is the only one that reads the store). the subject is the
-                // trigger's own origin — the same one `owns_id` just admitted
-                // the id under and `Cancel` will gate on.
                 let origin = saga_origin(&ctx.env().origin)?;
-                let cap = live_saga_cap(&origin);
-                let live = self.live_sagas(&origin).await?;
-                if live >= cap {
-                    return Err(Error::module(
-                        "origin_live_saga_cap",
-                        format!("{live} live sagas is this origin's {cap} cap"),
-                    ));
-                }
                 let now = ctx.env().consensus_time;
                 let saga = Saga {
-                    origin: origin.clone(),
+                    origin,
                     reply_to,
                     reply_payload,
                     spec_len: spec.len() as u64,
@@ -1564,9 +1412,6 @@ impl SagaModule {
                 // chunk can cross the record cap.
                 self.lease_and_request(ctx, saga_id.clone(), saga, &spec)
                     .await?;
-                // the slot is claimed only once the record that occupies it is
-                // staged — the last write of an op that can no longer refuse.
-                self.claim_live_slot(&origin).await?;
                 for (chunk, bytes) in spec.chunks(SPEC_CHUNK_BYTES).enumerate() {
                     self.staged
                         .stage(spec_chunk_key(&saga_id, chunk as u64), bytes.to_vec());
@@ -5542,11 +5387,9 @@ mod tests {
         reads.reset();
         let mut ctx = CaptureCtx::new().at(9);
         exec(&mut m, &mut ctx, &crank()).unwrap();
-        // the shards, the CRANK_BUDGET records it timed out, the terminal
-        // receipt index those transitions write through, and the ONE origin's
-        // live count they hand a slot back to (in general one key per distinct
-        // origin transitioned, so at most another CRANK_BUDGET).
-        let ceiling = PENDING_SHARDS as usize + CRANK_BUDGET as usize + 1 + 1;
+        // the shards, the CRANK_BUDGET records it timed out, and the terminal
+        // receipt index those transitions write through.
+        let ceiling = PENDING_SHARDS as usize + CRANK_BUDGET as usize + 1;
         assert!(
             reads.distinct() <= ceiling,
             "a crank over {BACKLOG} pending sagas read {} keys, over the {ceiling} ceiling",
@@ -5657,287 +5500,6 @@ mod tests {
                 .all(|pair| pair[0].saga_id < pair[1].saga_id),
             "ascending by id across the page boundary"
         );
-    }
-
-    // ---- the per-origin live quota ----------------------------------------
-
-    /// one origin's live count, straight out of the store view.
-    fn live(m: &SagaModule, origin: &Origin) -> u32 {
-        block_on(m.live_sagas(&saga_origin(origin).unwrap())).unwrap()
-    }
-
-    /// whether the ledger holds a count record for `origin` at all — the
-    /// empty-collection-drops-its-key half of the rule.
-    fn has_quota_key(m: &SagaModule, origin: &Origin) -> bool {
-        block_on(m.staged.get(&quota_key(&saga_origin(origin).unwrap())))
-            .unwrap()
-            .is_some()
-    }
-
-    #[test]
-    fn the_live_cap_refuses_by_name_and_leaves_other_origins_alone() {
-        let alice = Origin::External(b"alice".to_vec());
-        let alice_id = |id: &str| namespaced_id(&alice, id);
-        let bob = Origin::External(b"bob".to_vec());
-        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
-
-        let mut ctx = CaptureCtx::new().at(1).with_origin(alice.clone());
-        for i in 0..PER_ORIGIN_LIVE_SAGAS {
-            exec(
-                &mut m,
-                &mut ctx,
-                &trigger(&alice_id(&format!("s{i:04}")), b"w"),
-            )
-            .unwrap();
-        }
-        commit(&mut m);
-        assert_eq!(live(&m, &alice), PER_ORIGIN_LIVE_SAGAS);
-
-        let before = m.root();
-        let err = exec(&mut m, &mut ctx, &trigger(&alice_id("over"), b"w")).unwrap_err();
-        assert!(
-            matches!(err, Error::Module { ref reason, .. } if reason == "origin_live_saga_cap"),
-            "the refusal must carry the stable reason token, got: {err:?}"
-        );
-        commit(&mut m);
-        assert_eq!(get(&m, &alice_id("over")), None, "and it staged nothing");
-        assert_eq!(m.root(), before);
-
-        // the cap is PER ORIGIN: bob's ledger is untouched by alice's flood.
-        let mut bob_ctx = CaptureCtx::new().at(1).with_origin(bob.clone());
-        exec(
-            &mut m,
-            &mut bob_ctx,
-            &trigger(&namespaced_id(&bob, "s0000"), b"w"),
-        )
-        .unwrap();
-        commit(&mut m);
-        assert_eq!(live(&m, &bob), 1);
-        assert_eq!(live(&m, &alice), PER_ORIGIN_LIVE_SAGAS);
-
-        // and a settled saga really frees the slot it held.
-        exec(
-            &mut m,
-            &mut ctx,
-            &msg(&SagaMsg::Cancel {
-                saga_id: alice_id("s0000"),
-            }),
-        )
-        .unwrap();
-        exec(&mut m, &mut ctx, &trigger(&alice_id("over"), b"w")).unwrap();
-        commit(&mut m);
-        assert_eq!(live(&m, &alice), PER_ORIGIN_LIVE_SAGAS);
-        assert!(get(&m, &alice_id("over")).is_some());
-    }
-
-    #[test]
-    fn every_terminal_path_returns_one_slot_and_a_retry_returns_none() {
-        // all five terminal transitions, plus the retry that must NOT look
-        // like one: a re-leased saga is still live work holding its slot.
-        let mut m = SagaModule::with_valset(
-            "saga",
-            Box::new(MemStore::new()),
-            "valset",
-            LeasePolicy::Open,
-        );
-        let validators = vec![b"node-a".to_vec()];
-        let settle = |id: &str, deadline: Option<u64>, max_attempts: u32| SagaMsg::Trigger {
-            pinned_assignee: None,
-            saga_id: sid(id),
-            spec: b"w".to_vec(),
-            reply_to: None,
-            reply_payload: Vec::new(),
-            deadline,
-            max_attempts,
-            lease_views: Some(2),
-            capability: None,
-            demands: Default::default(),
-        };
-        let mut ctx = CaptureCtx::new().at(1).with_validators(validators.clone());
-        for op in [
-            settle("done", None, 1),
-            settle("failed", None, 1),
-            settle("cancelled", None, 1),
-            settle("timedout", Some(4), 1),
-            settle("exhausted", None, 1),
-            settle("retrying", None, 3),
-        ] {
-            exec(&mut m, &mut ctx, &msg(&op)).unwrap();
-        }
-        commit(&mut m);
-        assert_eq!(live(&m, &Origin::System), 6);
-
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .with_origin(Origin::External(b"node-a".to_vec()))
-            .with_validators(validators.clone());
-        exec(
-            &mut m,
-            &mut ctx,
-            &oracle(&sid("done"), 0, Ok(b"r".to_vec())),
-        )
-        .unwrap();
-        assert_eq!(live(&m, &Origin::System), 5, "Done returns one slot");
-        exec(
-            &mut m,
-            &mut ctx,
-            &oracle(&sid("failed"), 0, Err("boom".into())),
-        )
-        .unwrap();
-        assert_eq!(live(&m, &Origin::System), 4, "Failed returns one slot");
-        let mut ctx = CaptureCtx::new().at(2).with_validators(validators.clone());
-        exec(
-            &mut m,
-            &mut ctx,
-            &msg(&SagaMsg::Cancel {
-                saga_id: sid("cancelled"),
-            }),
-        )
-        .unwrap();
-        assert_eq!(live(&m, &Origin::System), 3, "Cancelled returns one slot");
-        commit(&mut m);
-
-        // one crank: a deadline timeout, a lease with no attempts left, and a
-        // lease WITH one — the third stays live.
-        let mut ctx = CaptureCtx::new().at(9).with_validators(validators);
-        exec(&mut m, &mut ctx, &crank()).unwrap();
-        commit(&mut m);
-        assert_eq!(
-            get(&m, &sid("timedout")).unwrap().status,
-            SagaStatus::TimedOut
-        );
-        assert_eq!(
-            get(&m, &sid("exhausted")).unwrap().status,
-            SagaStatus::Failed
-        );
-        let retrying = get(&m, &sid("retrying")).unwrap();
-        assert_eq!(retrying.status, SagaStatus::Pending);
-        assert_eq!(retrying.attempt, 1, "the retry consumed an attempt");
-        assert_eq!(
-            live(&m, &Origin::System),
-            1,
-            "TimedOut and Failed returned theirs; the re-leased saga still holds its own"
-        );
-
-        let mut ctx = CaptureCtx::new()
-            .at(10)
-            .with_origin(Origin::External(b"node-a".to_vec()));
-        exec(
-            &mut m,
-            &mut ctx,
-            &oracle(&sid("retrying"), 1, Ok(b"r".to_vec())),
-        )
-        .unwrap();
-        commit(&mut m);
-        assert_eq!(live(&m, &Origin::System), 0);
-        assert!(
-            !has_quota_key(&m, &Origin::System),
-            "a count of zero drops its key — an origin that settled everything \
-             must hash like one that triggered nothing"
-        );
-    }
-
-    #[test]
-    fn prune_leaves_the_live_count_alone() {
-        // the slot came back when the saga ENDED, not when its receipt was
-        // collected — so the eager GC must not return it a second time.
-        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
-        let mut ctx = CaptureCtx::new().at(1);
-        for id in ["a", "b", "c"] {
-            exec(&mut m, &mut ctx, &trigger(&sid(id), b"w")).unwrap();
-        }
-        exec(
-            &mut m,
-            &mut ctx,
-            &msg(&SagaMsg::Cancel { saga_id: sid("a") }),
-        )
-        .unwrap();
-        commit(&mut m);
-        assert_eq!(live(&m, &Origin::System), 2);
-
-        exec(
-            &mut m,
-            &mut ctx,
-            &msg(&SagaMsg::Prune {
-                saga_ids: vec![sid("a")],
-            }),
-        )
-        .unwrap();
-        commit(&mut m);
-        assert_eq!(get(&m, &sid("a")), None, "the receipt is gone");
-        assert_eq!(
-            live(&m, &Origin::System),
-            2,
-            "and the count is exactly what the two LIVE sagas hold"
-        );
-    }
-
-    #[test]
-    fn a_module_origin_is_not_capped_like_a_principal() {
-        // a module-origin saga's subject is the EMITTING module, so EVERY
-        // dispatch-created saga in the ledger shares one counter. capping that
-        // at a principal's budget would have made it a network-wide in-flight
-        // ceiling: the 257th Dispatch op from ANY module refused, and the whole
-        // op with it, since the trigger is a cascaded msg.
-        let dispatch = Origin::Module("dispatch".into());
-        let alice = Origin::External(b"alice".to_vec());
-        assert_eq!(
-            live_saga_cap(&saga_origin(&alice).unwrap()),
-            PER_ORIGIN_LIVE_SAGAS,
-            "a key IS a principal"
-        );
-        assert_eq!(
-            live_saga_cap(&saga_origin(&dispatch).unwrap()),
-            PER_MODULE_LIVE_SAGAS,
-            "a module id is an aggregate producer"
-        );
-
-        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
-        let mut ctx = CaptureCtx::new().at(1).with_origin(dispatch.clone());
-        let past_a_principals_budget = PER_ORIGIN_LIVE_SAGAS + 1;
-        for i in 0..past_a_principals_budget {
-            let id = namespaced_id(&dispatch, &format!("s{i:05}"));
-            exec(&mut m, &mut ctx, &trigger(&id, b"w")).unwrap();
-        }
-        commit(&mut m);
-        assert_eq!(live(&m, &dispatch), past_a_principals_budget);
-    }
-
-    #[test]
-    fn a_terminal_put_refuses_to_release_a_slot_that_was_never_claimed() {
-        // exactly-once release is what the whole quota rests on, so a count
-        // that cannot absorb the decrement must SAY so. clamping would swallow
-        // it and resurface the breakage as its opposite — an origin triggering
-        // past its cap — with nothing pointing back at the missing claim.
-        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
-        let mut ctx = CaptureCtx::new().at(1);
-        exec(&mut m, &mut ctx, &trigger(&sid("a"), b"w")).unwrap();
-        commit(&mut m);
-        assert_eq!(live(&m, &Origin::System), 1);
-
-        // the breakage the guard is for: the count loses the claim its still
-        // live saga holds.
-        block_on(m.stage_live_count(&SagaOrigin::System, 0)).unwrap();
-        commit(&mut m);
-
-        let before = m.root();
-        let err = exec(
-            &mut m,
-            &mut ctx,
-            &msg(&SagaMsg::Cancel { saga_id: sid("a") }),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::Module { ref reason, .. } if reason == "live_saga_count_underflow"),
-            "the refusal must carry the stable reason token, got: {err:?}"
-        );
-        commit(&mut m);
-        assert_eq!(
-            m.root(),
-            before,
-            "and it refused BEFORE staging — the record is still pending"
-        );
-        assert_eq!(load(&m, &sid("a")).unwrap().status, SagaStatus::Pending);
     }
 
     #[test]

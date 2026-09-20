@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 use tokio::sync::{broadcast, mpsc};
 
+mod chat_contract;
+use chat_contract as chat;
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {

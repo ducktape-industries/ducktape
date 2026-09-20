@@ -494,7 +494,7 @@ async fn cancellation_is_acknowledged_then_settled_only_from_an_accepted_native_
 }
 
 #[tokio::test]
-async fn native_http_body_limit_counts_json_whitespace_and_accepts_exactly_64_mib() {
+async fn native_http_accepts_a_body_past_axums_own_default() {
     let root = tempfile::tempdir().unwrap();
     let signer = ed25519::PrivateKey::from_seed(1);
     let node = TestNode::start(&signer).await;
@@ -510,9 +510,9 @@ async fn native_http_body_limit_counts_json_whitespace_and_accepts_exactly_64_mi
         .action_url
         .replace("/v1/run-action", "/v1/native-conversation");
     let client = reqwest::Client::new();
-    let mut body = Vec::with_capacity(MAX_REQUEST_BYTES + 1);
-    body.extend_from_slice(br#"{"kind":"control"}"#);
-    body.resize(MAX_REQUEST_BYTES, b' ');
+    // past axum's implicit 2 MiB extractor default, which no route here keeps.
+    let mut body = br#"{"kind":"control"}"#.to_vec();
+    body.resize(3 * 1024 * 1024, b' ');
     let accepted = client
         .post(&url)
         .header(ACTION_HEADER, &session.action_token)
@@ -527,94 +527,8 @@ async fn native_http_body_limit_counts_json_whitespace_and_accepts_exactly_64_mi
         json!({"control":"continue", "messages":[]})
     );
     let queries = node.fixture.queries.load(Ordering::SeqCst);
-    assert!(
-        queries > 0,
-        "exact-limit body reached the real native route"
-    );
-    body.push(b' ');
-    let rejected = client
-        .post(&url)
-        .header(ACTION_HEADER, &session.action_token)
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(
-        node.fixture.queries.load(Ordering::SeqCst),
-        queries,
-        "body rejection precedes route effects"
-    );
+    assert!(queries > 0, "the body reached the real native route");
     assert!(node.fixture.submissions.lock().await.is_empty());
-}
-
-#[tokio::test]
-async fn an_oversized_checkpoint_leaves_the_accepted_head_and_cursor_untouched() {
-    let root = tempfile::tempdir().unwrap();
-    let signer = ed25519::PrivateKey::from_seed(1);
-    let node = TestNode::start(&signer).await;
-    let mut accepted = view();
-    accepted.completed_cursor = 1;
-    accepted.admitted_cursor = 2;
-    accepted.next_turn = 3;
-    accepted.history = Some(ConversationHistory {
-        revision: 7,
-        snapshot: "b".repeat(64),
-    });
-    let turn = accepted.active_turn.as_mut().unwrap();
-    turn.turn = 2;
-    turn.from_cursor = 1;
-    turn.through_cursor = 2;
-    turn.checkpoint = Some(checkpoint_record(ConversationHistory {
-        revision: 8,
-        snapshot: "a".repeat(64),
-    }));
-    *node.fixture.view.lock().await = accepted.clone();
-    let mut native = native(root.path());
-    native.configuration = accepted.clone();
-    native.context.turn_id = crate::runs::conversation_turn_id(1, 2);
-    native.context.revision = 8;
-    *node.fixture.worker.lock().await =
-        Some(worker_controls_fixture("job-a", "steer-1", "focus here"));
-    let control_id = controls::qualified_id("job-a", "steer-1");
-    let jsonl = control_history("job-a", "steer-1", "focus here")
-        .replace(LOGICAL_TURN_ID, &native.context.turn_id);
-    let session = super::super::super::start_action_server(
-        node.link.clone(),
-        signer,
-        RUN_ID.into(),
-        Some(native),
-    )
-    .await
-    .unwrap();
-    let url = session
-        .action_url
-        .replace("/v1/run-action", "/v1/native-conversation");
-    let mut body = serde_json::to_vec(&json!({"kind":"checkpoint", "jsonl":jsonl,
-        "delivery":true, "complete":true, "delivered_control_ids":[control_id]}))
-    .unwrap();
-    body.resize(MAX_REQUEST_BYTES + 1, b' ');
-    let response = reqwest::Client::new()
-        .post(url)
-        .header(ACTION_HEADER, &session.action_token)
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(*node.fixture.view.lock().await, accepted);
-    assert_eq!(node.fixture.queries.load(Ordering::SeqCst), 0);
-    assert!(
-        node.fixture.worker.lock().await.as_ref().unwrap().controls[0]
-            .acknowledgements
-            .is_empty()
-    );
-    assert!(
-        node.fixture.submissions.lock().await.is_empty(),
-        "no checkpoint, control ACK or cancellation settlement was signed"
-    );
 }
 
 #[tokio::test]

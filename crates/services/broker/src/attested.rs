@@ -161,7 +161,7 @@ mod tests {
                 oauth_token_url: format!("{upstream}/oauth/token"),
                 oauth_client_id: "test-client".into(),
                 session_ttl_secs: 3600,
-                max_requests: 100,
+                clock: airlock::server::Clock::system(),
                 sign: None,
             },
             "snp",

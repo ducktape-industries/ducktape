@@ -23,15 +23,14 @@
 //! * `handle\0{name}` → owning account number (borsh `u64`), with the 1:1
 //!   inverse `owner\0{account LE8}` → handle (one handle per account BY
 //!   CONSTRUCTION — the old full-map scan is now a point read), behind the
-//!   sorted handle roster (`handles`, bounded by [`MAX_HANDLES`]) the
+//!   sorted handle roster (`handles`) the
 //!   paginated `Registrations` listing walks;
 //! * `route\0{account LE8|flag|label}` → [`RouteRecord`] (borsh), behind a
-//!   PER-ACCOUNT name roster (`routes\0{account LE8}`, bounded by
-//!   [`MAX_ROUTES_PER_ACCOUNT`]) the `List` read walks — routes are never
-//!   deleted (a `route: None` revision is the tombstone), so the roster only
-//!   grows to its cap;
+//!   PER-ACCOUNT name roster (`routes\0{account LE8}`) the `List` read
+//!   walks — routes are never deleted (a `route: None` revision is the
+//!   tombstone), so the roster only grows;
 //! * `cred\0{name}` → [`CredentialRecord`], behind the sorted credential
-//!   roster (`creds`, bounded by [`MAX_CREDENTIALS`]) the `Credentials`
+//!   roster (`creds`) the `Credentials`
 //!   listing walks.
 //!
 //! writes are staged during a block and flushed to the store in one batch at
@@ -69,7 +68,7 @@ use sdk::{
 use crate::{
     CredentialGrantStatement, CredentialRecord, GATEWAY_CREDENTIAL_NS, GATEWAY_ROUTE_NS,
     GatewayMsg, GatewayQuery, GatewayReply, MAX_CREDENTIAL_GRANTS, MAX_QUERY_LIMIT,
-    MAX_ROUTE_STATEMENT_JSON_BYTES, MAX_ROUTES_PER_ACCOUNT, MemberAuthorization,
+    MAX_ROUTE_STATEMENT_JSON_BYTES, MemberAuthorization,
     RemoveCredentialStatement, RouteName, RouteRecord, RouteStatement, RouteSummary,
     SetCredentialStatement, decode_msg, decode_query, encode_reply, grant_credential_preimage,
     remove_credential_preimage, revoke_credential_preimage, route_signing_preimage,
@@ -80,11 +79,6 @@ use crate::{
 /// route-record byte ceiling, enforced at every staged route write on top of
 /// the statement's own JSON bound (the qmdb codec cap is decode-only).
 pub const MAX_RECORD_BYTES: usize = MAX_ROUTE_STATEMENT_JSON_BYTES + 1024;
-/// `.duck` handles retained at once (one per account, so this mirrors
-/// identity's account cap). registering past it refuses loudly at execute.
-pub const MAX_HANDLES: usize = 1024;
-/// credential names retained at once (first registration wins a name).
-pub const MAX_CREDENTIALS: usize = 1024;
 /// roster byte backstop shared by the three roster records.
 const MAX_ROSTER_RECORD_BYTES: usize = 512 * 1024;
 
@@ -403,12 +397,6 @@ impl Gateway {
                     }
                     Err(position) => position,
                 };
-                if roster.len() >= MAX_HANDLES {
-                    return Err(Error::module(
-                        "handle_cap",
-                        format!("gateway: handle cap reached ({MAX_HANDLES})"),
-                    ));
-                }
                 roster.insert(position, handle.clone());
                 self.store_bounded(
                     HANDLE_ROSTER_KEY.to_vec(),
@@ -495,12 +483,6 @@ impl Gateway {
                     "gateway: route roster carries a name with no record",
                 ));
             };
-            if roster.len() >= MAX_ROUTES_PER_ACCOUNT {
-                return Err(Error::module(
-                    "route_cap",
-                    format!("gateway: account route count exceeds {MAX_ROUTES_PER_ACCOUNT}"),
-                ));
-            }
             roster.insert(position, name.clone());
             self.store_bounded(
                 route_roster_key(account_id),
@@ -622,12 +604,6 @@ impl Gateway {
                     "gateway: credential roster carries a name with no record",
                 ));
             };
-            if roster.len() >= MAX_CREDENTIALS {
-                return Err(Error::module(
-                    "credential_cap",
-                    format!("gateway: credential cap reached ({MAX_CREDENTIALS})"),
-                ));
-            }
             roster.insert(position, record.name.clone());
             self.store_bounded(
                 CRED_ROSTER_KEY.to_vec(),

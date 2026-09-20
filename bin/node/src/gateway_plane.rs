@@ -34,8 +34,8 @@ const PROXY_IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// Idle ceiling between BODY reads — from a loopback upstream, and equally
 /// between a caller's request frames. A live SSE feed emits events/keepalives
 /// well inside this, and a client streaming a pack keeps writing as it packs;
-/// a silent-forever peer would otherwise pin its accept permit (16 total) and
-/// its serve task for good. It bounds each READ, never the exchange: a body
+/// a silent-forever peer would otherwise pin its serve task for good. It
+/// bounds each READ, never the exchange: a body
 /// has no size any more, so the only honest deadline is one on progress.
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 // One number, named on both sides of the door: what noded publishes as the
@@ -59,132 +59,8 @@ const _: () =
 /// upgrade permit and both pump tasks for good.
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_ERROR_BYTES: usize = 512;
-/// One-shot HTTP exchanges either half runs at once.
-const MAX_CONCURRENT_REQUESTS: usize = 16;
-/// Live WebSocket bridges either half runs at once. A SEPARATE budget: an
-/// upgrade holds its permit for the socket's whole life, so sharing the
-/// request budget lets a handful of idle sockets starve every gateway request
-/// on the node — the airlock broker's credential relay included.
-const MAX_CONCURRENT_UPGRADES: usize = 64;
-/// Response bodies draining to a peer at once. A THIRD budget, for the same
-/// reason upgrades have their own: a drain lives as long as the peer keeps
-/// reading, so charging it to the request budget lets 16 peers that never read
-/// starve every gateway request on the node.
-const MAX_CONCURRENT_STREAMS: usize = 64;
-/// Inbound exchanges ONE caller node may hold at once. A request permit used
-/// to end within a one-shot deadline; now that a request body streams, it ends
-/// when the caller stops sending, and a caller that dribbles one frame per
-/// [`BODY_IDLE_TIMEOUT`] holds its permit for as long as it likes. The count
-/// is the bound: without this, one peer taking all
-/// [`MAX_CONCURRENT_REQUESTS`] slots is the whole gateway, and with it that
-/// costs four distinct admitted peers instead of one.
-const MAX_INBOUND_REQUESTS_PER_CALLER: usize = 4;
 
 type PlaneSlot = Arc<OnceLock<Arc<StreamService<OverlaySockets>>>>;
-
-/// The plane's three concurrency budgets, held by both halves. They are
-/// separate on purpose, because each permit has a different life: a request
-/// permit ends at the response head, a stream permit at the last body frame,
-/// an upgrade permit at socket close. One budget for all three lets bodies
-/// nobody reads and sockets nobody closes starve every gateway request on the
-/// node. A request QUEUES for its permit, with a deadline; a stream or an
-/// upgrade is REFUSED, because queueing behind work that may never finish is a
-/// hang.
-struct GatewayBudget {
-    requests: Arc<tokio::sync::Semaphore>,
-    streams: Arc<tokio::sync::Semaphore>,
-    upgrades: Arc<tokio::sync::Semaphore>,
-    /// Inbound exchanges per caller node, so the request budget cannot be
-    /// taken whole by one peer. Only the INBOUND half counts here: the caller
-    /// half serves this node's own browser, which is not a stranger.
-    inbound: std::sync::Mutex<std::collections::HashMap<[u8; 32], usize>>,
-}
-
-/// One caller node's share of the inbound request budget, released on drop.
-struct CallerSlot {
-    budget: Arc<GatewayBudget>,
-    caller: [u8; 32],
-}
-
-impl Drop for CallerSlot {
-    fn drop(&mut self) {
-        let mut inbound = self.budget.inbound.lock().expect("gateway budget poisoned");
-        let std::collections::hash_map::Entry::Occupied(mut entry) = inbound.entry(self.caller)
-        else {
-            return;
-        };
-        *entry.get_mut() -= 1;
-        if *entry.get() == 0 {
-            entry.remove();
-        }
-    }
-}
-
-impl GatewayBudget {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            requests: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
-            streams: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
-            upgrades: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UPGRADES)),
-            inbound: std::sync::Mutex::new(std::collections::HashMap::new()),
-        })
-    }
-
-    /// Take `caller`'s share of the inbound budget, or `None` when it already
-    /// holds [`MAX_INBOUND_REQUESTS_PER_CALLER`]. Taken BEFORE the plane-wide
-    /// permit, which queues: a caller already at its own limit must be refused
-    /// outright, not parked in the queue ahead of everyone else.
-    fn admit_caller(self: &Arc<Self>, caller: [u8; 32]) -> Option<CallerSlot> {
-        let mut inbound = self.inbound.lock().expect("gateway budget poisoned");
-        let held = inbound.entry(caller).or_insert(0);
-        if *held >= MAX_INBOUND_REQUESTS_PER_CALLER {
-            return None;
-        }
-        *held += 1;
-        Some(CallerSlot {
-            budget: Arc::clone(self),
-            caller,
-        })
-    }
-
-    /// Queue for a request permit, but only for [`PROXY_IO_TIMEOUT`]: a queued
-    /// request that ages out in the caller is indistinguishable from a hung
-    /// node, so the wait is bounded and the refusal is named.
-    async fn admit_request(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        tokio::time::timeout(PROXY_IO_TIMEOUT, Arc::clone(&self.requests).acquire_owned())
-            .await
-            .ok()?
-            .ok()
-    }
-
-    fn admit_stream(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        Arc::clone(&self.streams).try_acquire_owned().ok()
-    }
-
-    fn admit_upgrade(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        Arc::clone(&self.upgrades).try_acquire_owned().ok()
-    }
-}
-
-/// The request permit a serve task holds, plus the budget it swaps that permit
-/// into a stream permit on at the response head. The swap is the point: the
-/// request budget then covers only the deadline-bound work up to the head, and
-/// the unbounded-in-length drain is charged to the stream budget instead.
-struct RequestSlot {
-    budget: Arc<GatewayBudget>,
-    permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-impl RequestSlot {
-    /// Trade the request permit for a stream permit, or `None` when the stream
-    /// budget is full — the head has not been written yet, so the caller can
-    /// still answer with a clean refusal.
-    fn into_stream_permit(self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let stream = self.budget.admit_stream()?;
-        drop(self.permit);
-        Some(stream)
-    }
-}
 
 pub struct SpawnConfig {
     pub(crate) bindings: commonware_runtime::telemetry::metrics::Registered<
@@ -255,14 +131,12 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
         let commands = commands.clone();
         let client_workspace = workspace.clone();
         let client_ports = node_api_ports.clone();
-        let budget = GatewayBudget::new();
         tokio::spawn(async move {
             while let Some(job) = jobs.recv().await {
                 let slot = Arc::clone(&slot);
                 let commands = commands.clone();
                 let workspace = client_workspace.clone();
                 let node_api_ports = client_ports.clone();
-                let budget = Arc::clone(&budget);
                 tokio::spawn(async move {
                     match job {
                         GatewayJob::Http {
@@ -272,21 +146,6 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                             body,
                             reply,
                         } => {
-                            // The permit is taken HERE, not in the recv loop:
-                            // the loop must keep draining the lane, or a full
-                            // budget wedges every `lane.send` behind it.
-                            let Some(permit) = budget.admit_request().await else {
-                                tracing::warn!(
-                                    target: "ducktape::gateway",
-                                    reason = "request_budget_full",
-                                    open = MAX_CONCURRENT_REQUESTS,
-                                    "gateway request refused"
-                                );
-                                let _ = reply.send(Err(GatewayFailure::Unavailable(
-                                    "gateway request budget is full".into(),
-                                )));
-                                return;
-                            };
                             // No deadline over the exchange. The request body
                             // has no declared size, so a one-shot timer here
                             // would refuse a large push for being large; every
@@ -298,19 +157,11 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                     // Self-serve rides the SAME frame protocol as
                                     // the overlay path over a local duplex, so a
                                     // single-node e2e exercises the real wire.
-                                    // The request permit taken above becomes the
-                                    // spawned server's drain permit, exactly like
-                                    // the overlay-inbound server's own — the local
-                                    // write side is bounded the same way.
                                     let (server_end, caller_end) = tokio::io::duplex(64 * 1024);
                                     let serve_commands = commands.clone();
                                     let serve_workspace = workspace.clone();
                                     let serve_ports = node_api_ports.clone();
                                     let head_for_server = head.clone();
-                                    let serve_slot = RequestSlot {
-                                        budget: Arc::clone(&budget),
-                                        permit,
-                                    };
                                     tokio::spawn(async move {
                                         let scope = LoopbackScope {
                                             workspace: &serve_workspace,
@@ -323,16 +174,13 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                             &own_node,
                                             head_for_server,
                                             Some(body),
-                                            serve_slot,
                                             server_end,
                                         )
                                         .await;
                                     });
-                                    read_streamed_response(&budget, caller_end, max_response_bytes)
-                                        .await
+                                    read_streamed_response(caller_end, max_response_bytes).await
                                 } else {
                                     proxy_remote(
-                                        &budget,
                                         &slot,
                                         publisher_node,
                                         max_response_bytes,
@@ -353,19 +201,6 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                             to_browser,
                             from_browser,
                         } => {
-                            // Its own budget, and the (N+1)th is REFUSED, not
-                            // queued: a queued upgrade would wait on sockets
-                            // that may never close.
-                            let Some(_permit) = budget.admit_upgrade() else {
-                                tracing::warn!(
-                                    target: "ducktape::gateway",
-                                    reason = "upgrade_budget_full",
-                                    open = MAX_CONCURRENT_UPGRADES,
-                                    "gateway upgrade refused"
-                                );
-                                let _ = to_browser.send(noded::GatewayWsMsg::Close(1013)).await;
-                                return;
-                            };
                             if publisher_node == own_node {
                                 // Loopback: pipe our own serve_ws to the caller
                                 // pump over a local duplex.
@@ -460,7 +295,6 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
         planes.register("gateway", "gateway", plane.watch());
         let _ = slot.set(Arc::clone(&service));
         let _plane = plane;
-        let budget = GatewayBudget::new();
         // the accept loop, but only for as long as this lane is ours: the
         // sockets sit on ports derived from the id the registry gave, so a
         // withdrawn lane has to take the plane with it.
@@ -472,10 +306,6 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                 let commands = commands.clone();
                 let workspace = workspace.clone();
                 let node_api_ports = node_api_ports.clone();
-                let budget = Arc::clone(&budget);
-                // Mirrors the client lane: which budget a stream draws on is only
-                // knowable after its head decodes, so the permit is taken inside
-                // the task and the accept loop keeps draining.
                 tokio::spawn(async move {
                     if hello.intent != gateway::PROXY_INTENT {
                         let _ = write_proxy_response(
@@ -506,62 +336,10 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                     // A WebSocket upgrade is long-lived; it owns the stream and
                     // writes its own responses, so it bypasses the one-shot timeout.
                     if head.upgrade {
-                        let Some(_permit) = budget.admit_upgrade() else {
-                            tracing::warn!(
-                                target: "ducktape::gateway",
-                                reason = "upgrade_budget_full",
-                                open = MAX_CONCURRENT_UPGRADES,
-                                "inbound gateway upgrade refused"
-                            );
-                            let _ = write_proxy_response(
-                                &mut stream,
-                                Err(GatewayFailure::Unavailable(
-                                    "gateway upgrade budget is full".into(),
-                                )),
-                            )
-                            .await;
-                            return;
-                        };
                         serve_ws(&commands, &scope, &requester.0, &head, stream).await;
                         return;
                     }
-                    let Some(_caller_slot) = budget.admit_caller(requester.0) else {
-                        tracing::warn!(
-                            target: "ducktape::gateway",
-                            reason = "caller_request_budget_full",
-                            open = MAX_INBOUND_REQUESTS_PER_CALLER,
-                            "inbound gateway request refused"
-                        );
-                        let _ = write_proxy_response(
-                            &mut stream,
-                            Err(GatewayFailure::Unavailable(
-                                "this caller already holds its share of the gateway".into(),
-                            )),
-                        )
-                        .await;
-                        return;
-                    };
-                    let Some(permit) = budget.admit_request().await else {
-                        tracing::warn!(
-                            target: "ducktape::gateway",
-                            reason = "request_budget_full",
-                            open = MAX_CONCURRENT_REQUESTS,
-                            "inbound gateway request refused"
-                        );
-                        let _ = write_proxy_response(
-                            &mut stream,
-                            Err(GatewayFailure::Unavailable(
-                                "gateway request budget is full".into(),
-                            )),
-                        )
-                        .await;
-                        return;
-                    };
-                    let slot = RequestSlot {
-                        budget: Arc::clone(&budget),
-                        permit,
-                    };
-                    serve_proxy_stream(&commands, &scope, &requester.0, head, None, slot, stream)
+                    serve_proxy_stream(&commands, &scope, &requester.0, head, None, stream)
                         .await;
                 });
             }
@@ -577,7 +355,6 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
 }
 
 async fn proxy_remote(
-    budget: &Arc<GatewayBudget>,
     slot: &PlaneSlot,
     publisher: [u8; 32],
     max_response_bytes: u64,
@@ -607,7 +384,7 @@ async fn proxy_remote(
     push_frame(&mut stream, &gateway::ProxyFrame::End)
         .await
         .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-    read_streamed_response(budget, stream, max_response_bytes).await
+    read_streamed_response(stream, max_response_bytes).await
 }
 
 /// What serving a route needs of THIS node, shared by the HTTP proxy and the
@@ -622,9 +399,7 @@ struct LoopbackScope<'a> {
 /// One proxied HTTP exchange over a frame-capable stream (the overlay socket
 /// or the self-serve duplex). `body`: `Some` when the caller already holds the
 /// request body (self-serve); `None` reads `BodyChunk` frames off the stream
-/// until its `End` (overlay). `slot`: the request permit this exchange holds,
-/// swapped for a stream permit at the response head — every serve path holds
-/// one, overlay-inbound and local self-serve alike.
+/// until its `End` (overlay).
 ///
 /// NOTHING here deadlines the exchange as a whole. A request body has no
 /// declared size, so a total deadline would refuse a large push for being
@@ -638,7 +413,6 @@ async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     caller_node: &[u8; 32],
     head: gateway::ProxyRequestHead,
     body: Option<GatewayRequestBody>,
-    slot: RequestSlot,
     stream: S,
 ) {
     // Reading the request and writing the response are independent halves of
@@ -653,7 +427,6 @@ async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         None => RequestBodySource::Frames(reader),
     };
     let outcome = serve_current(commands, scope, caller_node, &head, source).await;
-    let (outcome, _drain_permit) = charge_drain(outcome, slot);
     let _ = write_proxy_response(&mut writer, outcome).await;
 }
 
@@ -718,47 +491,9 @@ fn request_body_frames<R: AsyncRead + Unpin + Send + 'static>(
     rx
 }
 
-/// Swap the serve task's request permit for a stream permit before the head
-/// goes out. A full stream budget replaces the response with a refusal, which
-/// is still clean because the head has not been written yet.
-fn charge_drain(
-    outcome: Result<GatewayResponse, GatewayFailure>,
-    slot: RequestSlot,
-) -> (
-    Result<GatewayResponse, GatewayFailure>,
-    Option<tokio::sync::OwnedSemaphorePermit>,
-) {
-    match outcome {
-        Ok(response) => match slot.into_stream_permit() {
-            Some(permit) => (Ok(response), Some(permit)),
-            None => {
-                tracing::warn!(
-                    target: "ducktape::gateway",
-                    reason = "stream_budget_full",
-                    open = MAX_CONCURRENT_STREAMS,
-                    "gateway response drain refused"
-                );
-                (
-                    Err(GatewayFailure::Unavailable(
-                        "gateway stream budget is full".into(),
-                    )),
-                    None,
-                )
-            }
-        },
-        // The exchange already failed before a body existed to drain; the
-        // request permit just releases, with nothing to swap it for.
-        Err(failure) => (Err(failure), None),
-    }
-}
-
-/// Read the response head, then admit the caller's OWN stream permit before
-/// handing the stream to the body pump — the pump task holds it for the
-/// body's life, independent of whatever permit the far side (self-serve
-/// server or remote publisher) is charged. Returns AT the head — the returned
-/// `GatewayResponse.body` streams.
+/// Read the response head, then hand the stream to the body pump. Returns AT
+/// the head — the returned `GatewayResponse.body` streams.
 async fn read_streamed_response<S: AsyncRead + Unpin + Send + 'static>(
-    budget: &Arc<GatewayBudget>,
     mut stream: S,
     max_response_bytes: u64,
 ) -> Result<GatewayResponse, GatewayFailure> {
@@ -771,20 +506,9 @@ async fn read_streamed_response<S: AsyncRead + Unpin + Send + 'static>(
     let head = tokio::time::timeout(BODY_IDLE_TIMEOUT, read_proxy_head(&mut stream, &mut buf))
         .await
         .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))??;
-    let Some(permit) = budget.admit_stream() else {
-        tracing::warn!(
-            target: "ducktape::gateway",
-            reason = "stream_budget_full",
-            open = MAX_CONCURRENT_STREAMS,
-            "gateway caller stream refused"
-        );
-        return Err(GatewayFailure::Unavailable(
-            "gateway stream budget is full".into(),
-        ));
-    };
     Ok(GatewayResponse {
         head,
-        body: spawn_body_pump(stream, buf, max_response_bytes, permit),
+        body: spawn_body_pump(stream, buf, max_response_bytes),
     })
 }
 
@@ -2385,7 +2109,7 @@ async fn read_frame<S: AsyncRead + Unpin>(
 /// mid-stream failure emits `Failure` after the chunks already sent (the
 /// caller aborts — truncation). Every frame goes out under
 /// [`push_frame`]'s progress deadline, so a peer that stops reading ends the
-/// drain instead of parking the serve task and its permit for good.
+/// drain instead of parking the serve task for good.
 async fn write_proxy_response<S: AsyncWrite + Unpin>(
     stream: &mut S,
     outcome: Result<GatewayResponse, GatewayFailure>,
@@ -2413,8 +2137,8 @@ async fn write_proxy_response<S: AsyncWrite + Unpin>(
 /// One frame written and flushed under a per-frame progress deadline. The
 /// drain's only other bound is the peer's willingness to read: an overlay
 /// stream whose window a non-reading peer has filled blocks `write_all`
-/// forever, and the serve task holds a permit while it does. No progress for
-/// [`PROXY_IO_TIMEOUT`] ends the exchange; the caller sees EOF.
+/// forever. No progress for [`PROXY_IO_TIMEOUT`] ends the exchange; the
+/// caller sees EOF.
 async fn push_frame<S: AsyncWrite + Unpin>(
     stream: &mut S,
     frame: &gateway::ProxyFrame,
@@ -2462,15 +2186,10 @@ async fn read_proxy_head<S: AsyncRead + Unpin>(
 /// Frame → chunk pump for a streamed response body. Runs until `End`,
 /// `Failure`, overflow of the RUNNING cap (`0` = unbounded — the old buffered
 /// clamp is gone; per-frame size stays codec-bounded), or receiver hangup.
-/// `permit` is the caller's own stream-budget permit, admitted by
-/// [`read_streamed_response`] before the head was exposed; it lives inside
-/// this task for the body's whole life and drops on any of those exits —
-/// completion or a consumer that stops reading.
 fn spawn_body_pump<S: AsyncRead + Unpin + Send + 'static>(
     mut stream: S,
     mut buf: Vec<u8>,
     max_response_bytes: u64,
-    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> noded::GatewayBody {
     // One slot: at most one chunk is in flight to the consumer, so a paced
     // reader backpressures the frame wire chunk by chunk. This alone cannot
@@ -2480,7 +2199,6 @@ fn spawn_body_pump<S: AsyncRead + Unpin + Send + 'static>(
     // head-commits-before-abort guarantee (issue #1030).
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(1);
     tokio::spawn(async move {
-        let _stream_permit = permit;
         let mut total: u64 = 0;
         loop {
             let frame = match read_frame(&mut stream, &mut buf).await {
@@ -2634,79 +2352,9 @@ mod tests {
         assert!(failure.detail.len() <= MAX_ERROR_BYTES);
     }
 
-    /// The wedge: an upgrade holds its permit for the socket's whole life, so
-    /// a shared budget lets idle sockets starve every request on the node.
-    #[tokio::test]
-    async fn idle_upgrades_never_spend_the_request_budget() {
-        let budget = GatewayBudget::new();
-        let sockets: Vec<_> = (0..MAX_CONCURRENT_UPGRADES)
-            .map(|_| budget.admit_upgrade().expect("under the upgrade cap"))
-            .collect();
-        assert!(
-            budget.admit_upgrade().is_none(),
-            "the (N+1)th upgrade is refused, never queued behind live sockets"
-        );
-        // The whole point: requests still flow with every socket parked.
-        let requests: Vec<_> = (0..MAX_CONCURRENT_REQUESTS)
-            .map(|_| {
-                budget
-                    .requests
-                    .clone()
-                    .try_acquire_owned()
-                    .expect("the request budget is untouched by upgrades")
-            })
-            .collect();
-        drop(requests);
-        assert!(budget.admit_request().await.is_some());
-        drop(sockets);
-        assert!(
-            budget.admit_upgrade().is_some(),
-            "a closed socket frees one"
-        );
-    }
-
-    /// The same wedge one rung down: a drain lives as long as the peer keeps
-    /// reading, so it must not be charged to the request budget either — and a
-    /// full request budget must refuse fast, not age out in the caller.
-    #[tokio::test(start_paused = true)]
-    async fn stalled_streams_never_spend_the_request_budget() {
-        let budget = GatewayBudget::new();
-        let drains: Vec<_> = (0..MAX_CONCURRENT_STREAMS)
-            .map(|_| budget.admit_stream().expect("under the stream cap"))
-            .collect();
-        assert!(
-            budget.admit_stream().is_none(),
-            "the (N+1)th drain is refused, never queued behind bodies nobody reads"
-        );
-        assert!(
-            budget.admit_request().await.is_some(),
-            "a plain request runs with every drain parked"
-        );
-
-        // A full request budget answers, it does not hang: the acquire has its
-        // own deadline.
-        let taken: Vec<_> = (0..MAX_CONCURRENT_REQUESTS)
-            .map(|_| {
-                budget
-                    .requests
-                    .clone()
-                    .try_acquire_owned()
-                    .expect("the request budget is untouched by drains")
-            })
-            .collect();
-        assert!(budget.admit_request().await.is_none());
-        drop(taken);
-        drop(drains);
-        assert!(
-            budget.admit_stream().is_some(),
-            "a finished drain frees one"
-        );
-    }
-
-    /// A permit swapped at the head is only half the fix: the drain itself must
-    /// end when the peer stops reading, or the serve task parks forever holding
-    /// its stream permit. The reader here stays OPEN and never reads, so the
-    /// duplex fills and the write makes no progress — the issue's peer exactly.
+    /// The drain must end when the peer stops reading, or the serve task parks
+    /// forever. The reader here stays OPEN and never reads, so the duplex
+    /// fills and the write makes no progress.
     #[tokio::test(start_paused = true)]
     async fn a_non_reading_peer_ends_the_drain() {
         let (mut writer, _reader) = tokio::io::duplex(1024);
@@ -2737,237 +2385,6 @@ mod tests {
             std::io::ErrorKind::TimedOut,
             "the drain ends on its own progress deadline: {error:?}"
         );
-    }
-
-    /// The wedge a streamed request body opens: a permit now ends when the
-    /// caller stops sending, so one peer dribbling frames could hold the whole
-    /// request budget forever. Its own share is what stops that — and the
-    /// share is released when the exchange ends, not when the peer says so.
-    #[tokio::test(start_paused = true)]
-    async fn one_caller_cannot_take_the_whole_inbound_request_budget() {
-        let budget = GatewayBudget::new();
-        let greedy = [7u8; 32];
-        let held: Vec<_> = (0..MAX_INBOUND_REQUESTS_PER_CALLER)
-            .map(|_| budget.admit_caller(greedy).expect("under its own share"))
-            .collect();
-        assert!(
-            budget.admit_caller(greedy).is_none(),
-            "a caller at its share is refused outright, never queued ahead of others"
-        );
-        // Another peer is unaffected, and the plane-wide budget is untouched:
-        // what the greedy caller spent is four slots, not the gateway.
-        assert!(budget.admit_caller([8u8; 32]).is_some());
-        assert!(budget.admit_request().await.is_some());
-        drop(held);
-        assert!(
-            budget.admit_caller(greedy).is_some(),
-            "a finished exchange frees the caller's share"
-        );
-        assert!(
-            !budget.inbound.lock().unwrap().contains_key(&[9u8; 32]),
-            "a caller that never called holds no entry — the map is not a leak"
-        );
-    }
-
-    /// The local self-serve server used to pass `None` for its slot, so its
-    /// write drain — the very `write_proxy_response` a real overlay peer's
-    /// response also runs — never charged the stream budget (issue #1889).
-    /// Fill it for real, through `charge_drain`/`RequestSlot` exactly as the
-    /// self-serve spawn now does, with drains a stalled body producer holds
-    /// open forever (never sends, never closes).
-    #[tokio::test]
-    async fn self_serve_drains_spend_the_stream_budget_and_free_it_on_completion() {
-        let budget = GatewayBudget::new();
-        let mut stalls = Vec::new();
-        let mut drains = Vec::new();
-        // The reader half of each duplex must stay open: dropping it closes
-        // the pipe, which fails the head write outright — a peer that never
-        // READS (the stall this test wants) is not a peer that is GONE.
-        let mut readers = Vec::new();
-        for _ in 0..MAX_CONCURRENT_STREAMS {
-            let permit = budget
-                .admit_request()
-                .await
-                .expect("the request budget is untouched by drains");
-            let slot = RequestSlot {
-                budget: Arc::clone(&budget),
-                permit,
-            };
-            let (tx, body) = tokio::sync::mpsc::channel(1);
-            let response = GatewayResponse {
-                head: gateway::ProxyResponseHead {
-                    status: 200,
-                    headers: vec![],
-                },
-                body,
-            };
-            let (outcome, drain_permit) = charge_drain(Ok(response), slot);
-            let drain_permit = drain_permit.expect("under the stream cap");
-            let (mut writer, reader) = tokio::io::duplex(4096);
-            drains.push(tokio::spawn(async move {
-                // Held across the drain, exactly like serve_proxy_stream's own
-                // `_drain_permit` local.
-                let _drain_permit = drain_permit;
-                let _ = write_proxy_response(&mut writer, outcome).await;
-            }));
-            stalls.push(tx); // never sent on: the drain never sees `None`
-            readers.push(reader);
-        }
-        assert_eq!(
-            budget.streams.available_permits(),
-            0,
-            "every self-serve drain above swapped a real stream permit"
-        );
-
-        // The (N+1)th self-serve drain is refused AT THE HEAD — charge_drain's
-        // existing contract, now actually reachable from the self-serve side.
-        let extra_permit = budget
-            .admit_request()
-            .await
-            .expect("the request budget is untouched by drains");
-        let extra_slot = RequestSlot {
-            budget: Arc::clone(&budget),
-            permit: extra_permit,
-        };
-        let ok_response = GatewayResponse {
-            head: gateway::ProxyResponseHead {
-                status: 200,
-                headers: vec![],
-            },
-            body: tokio::sync::mpsc::channel(1).1,
-        };
-        let (refused, refused_permit) = charge_drain(Ok(ok_response), extra_slot);
-        assert!(refused_permit.is_none());
-        match refused {
-            Err(GatewayFailure::Unavailable(message)) => {
-                assert!(message.contains("stream budget is full"), "{message}");
-            }
-            other => panic!("expected a stream-budget refusal, got {other:?}"),
-        }
-
-        // An ordinary request still proceeds with every drain parked.
-        assert!(
-            budget.admit_request().await.is_some(),
-            "request admission stays independent of the stream budget"
-        );
-
-        // Release one drain: drop its stalled producer. `write_proxy_response`
-        // observes the closed body, writes `End`, and the task returns —
-        // dropping the stream permit it held for the drain's whole life.
-        drop(stalls.pop().unwrap());
-        drains
-            .pop()
-            .unwrap()
-            .await
-            .expect("the drain task completes");
-        assert_eq!(
-            budget.streams.available_permits(),
-            1,
-            "the finished drain frees its permit"
-        );
-
-        // The next self-serve drain is admitted.
-        let permit = budget.admit_request().await.expect("under the request cap");
-        let slot = RequestSlot {
-            budget: Arc::clone(&budget),
-            permit,
-        };
-        let outcome: Result<GatewayResponse, GatewayFailure> = Ok(GatewayResponse {
-            head: gateway::ProxyResponseHead {
-                status: 200,
-                headers: vec![],
-            },
-            body: tokio::sync::mpsc::channel(1).1,
-        });
-        let (_, admitted) = charge_drain(outcome, slot);
-        assert!(admitted.is_some(), "a freed permit admits the next drain");
-
-        drop(stalls);
-        drop(readers);
-        for drain in drains {
-            let _ = drain.await;
-        }
-    }
-
-    /// The caller half — self-serve's own read AND every remote publisher,
-    /// since `read_streamed_response` is the one function both go through —
-    /// used to spend no stream permit for its local pump task (issue #1889).
-    /// Fill it for real, with pumps whose consumer never reads: the
-    /// `spawn_body_pump` harness above
-    /// (`streamed_response_arrives_and_zero_cap_is_unbounded`), at budget
-    /// scale.
-    #[tokio::test]
-    async fn caller_pumps_spend_the_stream_budget_and_free_it_on_completion() {
-        async fn write_a_stalled_response(writer: &mut (impl AsyncWrite + Unpin)) {
-            let head = gateway::ProxyResponseHead {
-                status: 200,
-                headers: vec![],
-            };
-            let mut frames =
-                gateway::encode_frame(&gateway::ProxyFrame::ResponseHead(head)).unwrap();
-            // Two chunks: the pump buffers the first (channel capacity 1) and
-            // blocks sending the second — the never-reading consumer, from
-            // the pump's own side of the wire. `End` sits ready for release.
-            for _ in 0..2 {
-                frames.extend(
-                    gateway::encode_frame(&gateway::ProxyFrame::BodyChunk(vec![0u8; 8])).unwrap(),
-                );
-            }
-            frames.extend(gateway::encode_frame(&gateway::ProxyFrame::End).unwrap());
-            writer.write_all(&frames).await.unwrap();
-        }
-
-        let budget = GatewayBudget::new();
-        let mut bodies = Vec::new();
-        for _ in 0..MAX_CONCURRENT_STREAMS {
-            let (mut writer, reader) = tokio::io::duplex(4096);
-            write_a_stalled_response(&mut writer).await;
-            let response = read_streamed_response(&budget, reader, 0)
-                .await
-                .expect("under the stream cap");
-            bodies.push((writer, response.body)); // never `.recv()`: the stalled consumer
-        }
-        assert_eq!(
-            budget.streams.available_permits(),
-            0,
-            "every caller pump above admitted a real stream permit"
-        );
-
-        // The (N+1)th caller response is refused AT THE HEAD — a real head
-        // was read off the wire, but never handed to whoever is waiting on it.
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        write_a_stalled_response(&mut writer).await;
-        match read_streamed_response(&budget, reader, 0).await {
-            Err(GatewayFailure::Unavailable(message)) => {
-                assert!(message.contains("stream budget is full"), "{message}");
-            }
-            other => panic!("expected a stream-budget refusal, got {other:?}"),
-        }
-
-        // An ordinary (non-streaming) request still proceeds with every pump
-        // parked: request admission is independent of the stream budget.
-        assert!(budget.admit_request().await.is_some());
-
-        // Release one consumer: drain its body to completion. The pump's
-        // blocked send unblocks, it reads `End`, and returns — dropping the
-        // permit it held for the pump's whole life.
-        let (_writer, mut body) = bodies.pop().unwrap();
-        while body.recv().await.is_some() {}
-        assert_eq!(
-            budget.streams.available_permits(),
-            1,
-            "the finished pump frees its permit"
-        );
-
-        // The next caller pump is admitted.
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        write_a_stalled_response(&mut writer).await;
-        assert!(
-            read_streamed_response(&budget, reader, 0).await.is_ok(),
-            "a freed permit admits the next stream"
-        );
-
-        drop(bodies);
     }
 
     /// The revocation wire: when the grant stops holding mid-socket, the caller
@@ -3171,9 +2588,7 @@ mod tests {
         let mut buf = Vec::new();
         let got_head = read_proxy_head(&mut reader, &mut buf).await.unwrap();
         assert_eq!(got_head.status, 200);
-        let budget = GatewayBudget::new();
-        let permit = budget.admit_stream().expect("a fresh budget has room");
-        let mut body = spawn_body_pump(reader, buf, 0, permit);
+        let mut body = spawn_body_pump(reader, buf, 0);
         let mut total = Vec::new();
         while let Some(chunk) = body.recv().await {
             total.extend_from_slice(&chunk.unwrap());
@@ -3200,9 +2615,7 @@ mod tests {
 
         let mut buf = Vec::new();
         read_proxy_head(&mut reader, &mut buf).await.unwrap();
-        let budget = GatewayBudget::new();
-        let permit = budget.admit_stream().expect("a fresh budget has room");
-        let mut body = spawn_body_pump(reader, buf, 2048, permit);
+        let mut body = spawn_body_pump(reader, buf, 2048);
         let mut seen = 0usize;
         let mut aborted = false;
         while let Some(item) = body.recv().await {
@@ -3260,9 +2673,8 @@ mod tests {
         let pump = tokio::spawn(async move {
             let _ = write_proxy_response(&mut writer, Ok(response)).await;
         });
-        let budget = GatewayBudget::new();
         let result = async {
-            let mut streamed = read_streamed_response(&budget, reader, cap).await?;
+            let mut streamed = read_streamed_response(reader, cap).await?;
             let body = noded::collect_body(&mut streamed.body).await?;
             Ok((streamed.head, body))
         }

@@ -160,7 +160,7 @@ fn share_governed(storage: &Path) -> Sim {
 
 /// the ballot principal of account `number`: 8 bytes LE, never a key.
 fn principal(number: u64) -> Value {
-    json!(identity::account_principal(number))
+    json!(number.to_le_bytes().to_vec())
 }
 
 // ── account-share governance: adopt, decide, honour the deadline ─

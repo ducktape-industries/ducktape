@@ -180,7 +180,20 @@ fn program_repo_pr_review_and_ref_lifecycle_publish_full_sets() {
         assert_eq!(main.relations[0].recipient, 3);
         assert_eq!(main.relations[0].detail, vec![1; 20]);
 
-        apply(&mut host, key(1), "forge", push("feature", None, Some(2))).await;
+        let member_push = host
+            .submit_at(
+                context(key(1)),
+                message("forge", &push("feature", None, Some(2))),
+            )
+            .await;
+        assert!(member_push.is_err(), "only the program owner may push refs");
+        apply(
+            &mut host,
+            Origin::Program(3),
+            "forge",
+            push("feature", None, Some(2)),
+        )
+        .await;
         apply(
             &mut host,
             Origin::Program(3),
@@ -238,15 +251,33 @@ fn program_repo_pr_review_and_ref_lifecycle_publish_full_sets() {
             merge_oid: "03".repeat(20),
             pack_digest: "09".repeat(32),
         };
-        // the reviewer merges: a merge onto a protected branch is any member's.
-        apply(&mut host, key(2), "forge", merge).await;
+        let reviewer_merge = host
+            .submit_at(context(key(2)), message("forge", &merge))
+            .await;
+        assert!(reviewer_merge.is_err(), "a reviewer cannot merge refs");
+        apply(&mut host, Origin::Program(3), "forge", merge).await;
         assert_eq!(item(&host, 1).await.summary.state, forge::ItemState::Merged);
         let merged = relations(&host, "item", serde_json::json!(["demo", 1])).await;
         assert_eq!(merged.relations, credited.relations);
         assert!(merged.revision > credited.revision);
-        apply(&mut host, key(2), "forge", push("feature", Some(2), None)).await;
+        let reviewer_delete = host
+            .submit_at(
+                context(key(2)),
+                message("forge", &push("feature", Some(2), None)),
+            )
+            .await;
+        assert!(reviewer_delete.is_err(), "a reviewer cannot delete refs");
         let removed = relations(&host, "ref", serde_json::json!(["demo", "feature"])).await;
-        assert!(removed.relations.is_empty());
+        assert_eq!(removed.relations[0].recipient, 3);
+        apply(
+            &mut host,
+            Origin::Program(3),
+            "forge",
+            push("feature", Some(2), None),
+        )
+        .await;
+        let deleted = relations(&host, "ref", serde_json::json!(["demo", "feature"])).await;
+        assert!(deleted.relations.is_empty());
         apply(
             &mut host,
             Origin::Program(3),
@@ -524,30 +555,62 @@ fn item_authorship_records_the_signers_canonical_actor() {
         };
         forge
             .execute(
-                &mut context(9, None),
+                &mut context(9, Some(1)),
                 &message("forge", &push("main", None, Some(1))),
             )
             .await
             .unwrap();
         forge
             .execute(
-                &mut context(9, None),
+                &mut context(11, Some(2)),
                 &message("forge", &issue("key owned")),
             )
             .await
             .unwrap();
         forge.commit_block().await.unwrap();
-        for (index, account) in [Some(1), None, Some(2)].into_iter().enumerate() {
+        let edit = ForgeMsg::EditItem {
+            repo: "demo".into(),
+            number: 1,
+            title: Some("owner edit".into()),
+            body: None,
+        };
+        forge
+            .execute(&mut context(10, Some(1)), &message("forge", &edit))
+            .await
+            .unwrap();
+        forge.commit_block().await.unwrap();
+        forge
+            .execute(
+                &mut context(11, Some(2)),
+                &message(
+                    "forge",
+                    &ForgeMsg::EditItem {
+                        repo: "demo".into(),
+                        number: 1,
+                        title: Some("author edit".into()),
+                        body: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        forge.commit_block().await.unwrap();
+        for (index, account) in [None, Some(3)].into_iter().enumerate() {
             let edit = ForgeMsg::EditItem {
                 repo: "demo".into(),
                 number: 1,
-                title: Some(format!("edit {index}")),
+                title: Some(format!("rejected edit {index}")),
                 body: None,
             };
-            forge
-                .execute(&mut context(10, account), &message("forge", &edit))
-                .await
-                .unwrap();
+            assert!(
+                forge
+                    .execute(&mut context(10, account), &message("forge", &edit))
+                    .await
+                    .is_err()
+            );
+            forge.abort_block().await.unwrap();
+        }
+        for (index, account) in [None, Some(2)].into_iter().enumerate() {
             forge
                 .execute(
                     &mut context(9, account),
@@ -605,7 +668,7 @@ fn ref_attribution_settles_with_the_push_and_a_refused_push_publishes_nothing() 
         let mut state = forge::state::ForgeState::default();
         state
             .apply(
-                &mut context(9, vec![]),
+                &mut context(9, vec![(9, 1), (10, 1), (11, 2)]),
                 &forge::encode_msg(&push("main", None, Some(1))),
                 None,
                 Some("attribution"),
@@ -636,9 +699,26 @@ fn ref_attribution_settles_with_the_push_and_a_refused_push_publishes_nothing() 
         );
         assert_eq!(state.published_image(), before);
         assert!(ctx.msgs().is_empty());
-        // a member other than the one who birthed the repo moves main, and
-        // the report names the ACCOUNT its key resolves to.
+        // a member other than the one who birthed the repo is refused, and
+        // the committed image remains unchanged.
         let mut ctx = context(11, accounts.clone());
+        assert!(
+            state
+                .apply(
+                    &mut ctx,
+                    &forge::encode_msg(&push("main", Some(1), Some(2))),
+                    None,
+                    Some("attribution"),
+                    "sources",
+                )
+                .await
+                .is_err()
+        );
+        assert!(ctx.msgs().is_empty());
+        state.abort();
+        // the owner key resolves to ACCOUNT 1, and its report names that
+        // canonical actor.
+        let mut ctx = context(10, accounts.clone());
         state
             .apply(
                 &mut ctx,
@@ -658,11 +738,11 @@ fn ref_attribution_settles_with_the_push_and_a_refused_push_publishes_nothing() 
             .iter()
             .find(|update| update.object.kind == "ref")
             .unwrap();
-        assert_eq!(main.actor, Actor::Account(2));
+        assert_eq!(main.actor, Actor::Account(1));
         assert_eq!(
             main.relations,
             vec![attribution_module::Relation {
-                recipient: 2,
+                recipient: 1,
                 reason: Reason::Defined("ref_writer".into()),
                 detail: vec![2; 20],
             }]

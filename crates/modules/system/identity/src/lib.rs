@@ -82,8 +82,8 @@
 //! CONTROLLED SET (`ctl\0{controller}` -> the sorted numbers of every account
 //! whose control record names that controller; absent = none), and `next`
 //! (the next account number; absent = 1). no roster: accounts are never
-//! deleted, so `All` walks `acct\0{from..next}` directly, and [`MAX_ACCOUNTS`]
-//! caps `next`. the store hashes every key, so nothing here is a prefix scan:
+//! deleted, so `All` walks `acct\0{from..next}` directly. the store hashes
+//! every key, so nothing here is a prefix scan:
 //! `Controlled` pages the one set record.
 //!
 //! writes are staged during a block and flushed to the store in one batch at
@@ -131,22 +131,12 @@ use sdk::{
     ResolverSyncTarget, StagedStore, StateRoot, StateSyncHandle,
 };
 
-/// accounts retained over the network's life (an account is never deleted).
-/// founding past this -- key-held or program -- refuses loudly at execute.
-pub const MAX_ACCOUNTS: u64 = 65_536;
 /// serialized account-record ceiling, enforced on EVERY staged account write.
 /// there is no growth path that bypasses the gate -- create/add-key/profile
 /// ops all restage the whole record through it -- so an op that would push a
 /// record past the cap is refused loudly and deterministically instead of
 /// poisoning the sync wire.
 pub const MAX_ACCOUNT_RECORD_BYTES: usize = 512 * 1024;
-/// keys one account may associate. the byte cap alone would allow ~11k of
-/// them (a key entry is the pubkey plus its meta, well under 128 bytes), and
-/// EVERY `OfKey`/`All` reader decodes the whole set -- so the association is
-/// bounded by count too: 32 keys x ~128 bytes is ~4 KiB, three orders of
-/// magnitude under [`MAX_ACCOUNT_RECORD_BYTES`]. a person's devices, wallets
-/// and passkeys fit; a scripted key farm does not.
-pub const MAX_KEYS_PER_ACCOUNT: usize = 32;
 
 /// per-account record key: prefix + 0 + the number, little-endian.
 fn acct_key(number: AccountNumber) -> Vec<u8> {
@@ -355,17 +345,9 @@ impl Actor {
 
 // ---- pure decisions --------------------------------------------------------------
 
-/// the number the next account takes and the counter after it. the cap is
-/// the one bound on the numbering; the counter itself is advanced checked so
-/// a store at the cap can never wrap it.
+/// the number the next account takes and the counter after it. the counter
+/// is advanced checked so a full numbering can never wrap.
 fn allocate_number(next: AccountNumber) -> Result<(AccountNumber, AccountNumber), Error> {
-    let cap_reached = next > MAX_ACCOUNTS;
-    if cap_reached {
-        return Err(Error::module(
-            "account_cap",
-            format!("account cap reached ({MAX_ACCOUNTS})"),
-        ));
-    }
     let after = next
         .checked_add(1)
         .ok_or_else(|| Error::module("numbering_exhausted", "account numbering is exhausted"))?;
@@ -1150,13 +1132,6 @@ impl Identity {
         }
         let mut record = self.stored_account(number).await?;
         let keys = record.association()?;
-        let full = keys.len() >= MAX_KEYS_PER_ACCOUNT;
-        if full {
-            return Err(Error::module(
-                "key_cap",
-                format!("account key cap reached ({MAX_KEYS_PER_ACCOUNT})"),
-            ));
-        }
         let authorizer_scheme = keys
             .get(&authorizer.key)
             .map(|meta| meta.scheme)

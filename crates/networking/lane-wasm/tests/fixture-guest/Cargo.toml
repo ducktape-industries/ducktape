@@ -1,0 +1,23 @@
+# The echo guest the envelope tests drive: every event comes back as the
+# effect that mirrors it, so one round trip proves the lowering and lifting of
+# every variant through the real canonical ABI. Built into
+# `../fixtures/echo.media.wasm` by `../fixtures/build.sh`; its own workspace
+# so the host tree never compiles it.
+[package]
+name = "lane-echo-guest"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.57"
+
+[profile.release]
+opt-level = "s"
+strip = true
+panic = "abort"
+
+[workspace]

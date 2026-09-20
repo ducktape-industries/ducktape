@@ -33,7 +33,9 @@ use sha2::{Digest, Sha256};
 
 use crate::codec::{self, Reader};
 use crate::oid::{OID_RAW_LEN, Oid};
-use crate::refs::{INTEGRATION_BRANCH, RefName, RepoRefs, RepoState, StagedRef, norm_branch};
+use crate::refs::{
+    INTEGRATION_BRANCH, RefName, RepoOwner, RepoRefs, RepoState, StagedRef, norm_branch,
+};
 use crate::tracker::{self, Tracker, parse_hex_oid};
 use crate::{
     ForgeMsg, ItemKind, MAX_BRANCHES_PER_REPO, MAX_REFS_PER_PUSH, MAX_TAGS_PER_REPO, PushCert,
@@ -81,12 +83,12 @@ pub const REF_TARGET_KIND: u8 = 1;
 /// [`StateRoot::ZERO`] (the empty-genesis root). see the composition invariant
 /// in the crate doc.
 pub fn compose_state_root<'a>(
-    repos: impl Iterator<Item = (&'a str, &'a RefMap, &'a RefMap)>,
+    repos: impl Iterator<Item = (&'a str, &'a RefMap, &'a RefMap, Option<&'a RepoOwner>)>,
     tracker: &Tracker,
 ) -> StateRoot {
     let mut h = Sha256::new();
     let mut any = false;
-    for (name, branches, tags) in repos {
+    for (name, branches, tags, owner) in repos {
         let born = !branches.is_empty() || !tags.is_empty();
         if !born {
             continue;
@@ -96,6 +98,20 @@ pub fn compose_state_root<'a>(
         // casts never truncate.
         h.update((name.len() as u32).to_le_bytes());
         h.update(name.as_bytes());
+        if let Some(owner) = owner {
+            h.update(b"ducktape.forge.owner.v1\x00");
+            match owner {
+                RepoOwner::Account(account) => {
+                    h.update([0]);
+                    h.update(account.to_le_bytes());
+                }
+                RepoOwner::Key(key) => {
+                    h.update([1]);
+                    h.update((key.len() as u32).to_le_bytes());
+                    h.update(key);
+                }
+            }
+        }
         for refs in [branches, tags] {
             h.update((refs.len() as u32).to_le_bytes());
             for (short, oid) in refs {
@@ -263,7 +279,7 @@ impl ForgeState {
         let entries = self
             .repos
             .iter()
-            .map(|(n, s)| (n.as_str(), &s.refs, &s.tags));
+            .map(|(n, s)| (n.as_str(), &s.refs, &s.tags, s.owner.as_ref()));
         compose_state_root(entries, &self.tracker)
     }
 
@@ -355,7 +371,7 @@ impl ForgeState {
                 cert: _,
             } => {
                 let name = norm_repo(&repo)?;
-                self.stage_push_refs(&name, updates, tags, pack_digest)
+                self.stage_push_refs_as(&name, party, updates, tags, pack_digest)
             }
             ForgeMsg::OpenIssue { repo, title, body } => {
                 let name = norm_repo(&repo)?;
@@ -441,15 +457,16 @@ impl ForgeState {
                 body,
             } => {
                 let name = norm_repo(&repo)?;
+                self.require_item_author_or_owner(&name, number, party)?;
                 self.staged_tracker_mut()
                     .edit_item(&name, number, title, body, now)
             }
             ForgeMsg::SetItemState { repo, number, open } => {
                 let name = norm_repo(&repo)?;
-                // DELIBERATELY open to any authenticated member: closing and
-                // reopening is triage, `Merged` is terminal and refused below,
-                // and the inverse op is one message away. apply has already
-                // authenticated the origin before any state is staged.
+                self.require_item_author_or_owner(&name, number, party)?;
+                // Closing and reopening is triage for the item author or
+                // repository owner. `Merged` remains terminal below, and the
+                // inverse op is one message away.
                 if let Some(verb) = self
                     .staged_tracker_mut()
                     .set_state(&name, number, open, now)?
@@ -473,6 +490,7 @@ impl ForgeState {
                 pack_digest,
             } => {
                 let name = norm_repo(&repo)?;
+                self.require_owner(&name, party)?;
                 let prev_target = parse_hex_oid(&prev_target_oid, "prev_target_oid")?;
                 let expected_source = parse_hex_oid(&expected_source_oid, "expected_source_oid")?;
                 let merge = parse_hex_oid(&merge_oid, "merge_oid")?;
@@ -615,6 +633,53 @@ impl ForgeState {
         }
     }
 
+    /// Require the durable repository owner for a ref-moving write.
+    fn require_owner(&self, name: &str, party: &Party) -> Result<(), Error> {
+        let state = self
+            .repos
+            .get(name)
+            .ok_or_else(|| Error::module("unknown_repo", format!("forge: no repo {name:?}")))?;
+        let Some(owner) = state.owner.as_ref() else {
+            return Err(Error::module(
+                "repo_owner_unset",
+                format!("forge: repo {name:?} has no owner"),
+            ));
+        };
+        if owner.matches(party) {
+            return Ok(());
+        }
+        Err(Error::module(
+            "repo_owner_required",
+            format!("forge: repository {name:?} is writable only by its owner"),
+        ))
+    }
+
+    /// Require either the item's author or the repository owner for edits and
+    /// open/closed state changes. Review and item creation remain member-open.
+    fn require_item_author_or_owner(
+        &self,
+        name: &str,
+        number: u64,
+        party: &Party,
+    ) -> Result<(), Error> {
+        let author = self.tracker_view().item_author(name, number)?;
+        let is_author = author == party;
+        let is_owner = self
+            .repos
+            .get(name)
+            .and_then(|state| state.owner.as_ref())
+            .is_some_and(|owner| owner.matches(party));
+        if is_author || is_owner {
+            return Ok(());
+        }
+        Err(Error::module(
+            "item_author_or_owner_required",
+            format!(
+                "forge: item #{number} in repo {name:?} is writable only by its author or owner"
+            ),
+        ))
+    }
+
     /// Certificate possession proves the signer authorized these exact refs,
     /// repo and network nonce: the signer is the party, never its relay origin.
     async fn push_party(
@@ -633,14 +698,43 @@ impl ForgeState {
         Self::party_of_key(ctx, signer).await
     }
 
+    /// Apply a ref write after checking its repository owner. An unborn repo
+    /// has no ACL yet: the first authenticated person births it and becomes
+    /// the owner atomically with the first successful push.
+    fn stage_push_refs_as(
+        &mut self,
+        name: &str,
+        party: &Party,
+        updates: Vec<RefUpdate>,
+        tags: Vec<TagCreate>,
+        pack_digest: Option<Vec<u8>>,
+    ) -> Result<(), Error> {
+        let owner = RepoOwner::from_party(party)?;
+        if let Some(state) = self.repos.get(name)
+            && let Some(existing) = state.owner.as_ref()
+            && existing != &owner
+        {
+            return Err(Error::module(
+                "repo_owner_required",
+                format!("forge: repository {name:?} is writable only by its owner"),
+            ));
+        }
+        self.stage_push_refs(name, updates, tags, pack_digest)?;
+        self.repos
+            .get_mut(name)
+            .expect("successful push always leaves a repo state")
+            .owner = Some(owner);
+        Ok(())
+    }
+
     /// stage an atomic multi-ref push: validate both lists, then CAS every
     /// branch and stage every tag creation. PURE and deterministic — no repo
     /// opened, nothing installed, no ref moves (see [`RepoState::stage_update`]
     /// and [`RepoState::stage_tag`]).
     ///
-    /// No member owns a repo: any authenticated member births one and moves
-    /// any of its branches under the per-branch CAS. Consensus cannot check
-    /// ref descendancy (a validator may not hold the objects), so what keeps
+    /// The first authenticated pusher owns the repo; later ref writes are
+    /// checked before this per-branch CAS. Consensus cannot check ref
+    /// descendancy (a validator may not hold the objects), so what keeps
     /// `main`/`dev` coherent on disk is materialize's fast-forward rule for a
     /// protected branch and the refusal to delete one — a head that does not
     /// descend from the on-disk ref is held, never installed.
@@ -818,7 +912,7 @@ impl ForgeState {
         encode_image(
             self.repos
                 .iter()
-                .map(|(n, s)| (n.as_str(), &s.refs, &s.tags)),
+                .map(|(n, s)| (n.as_str(), &s.refs, &s.tags, s.owner.as_ref())),
             &self.tracker,
         )
     }
@@ -836,7 +930,7 @@ impl ForgeState {
         encode_image(
             published
                 .iter()
-                .map(|(n, refs)| (*n, &refs.branches, &refs.tags)),
+                .map(|(n, refs)| (*n, &refs.branches, &refs.tags, refs.owner.as_ref())),
             self.tracker_view(),
         )
     }
@@ -1003,7 +1097,7 @@ impl ForgeState {
     }
 }
 
-/// the decoded state image: born repos' branch and tag maps + the tracker.
+/// the decoded state image: born repos' owner/ref maps + the tracker.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct Image {
     pub repos: BTreeMap<String, RepoRefs>,
@@ -1017,28 +1111,31 @@ impl Image {
         compose_state_root(
             self.repos
                 .iter()
-                .map(|(n, refs)| (n.as_str(), &refs.branches, &refs.tags)),
+                .map(|(n, refs)| (n.as_str(), &refs.branches, &refs.tags, refs.owner.as_ref())),
             &self.tracker,
         )
     }
 }
 
 /// encode a state image: `FGI1 ++ u32(repo_count) ++ per BORN repo sorted by
-/// name (u32 name_len ++ name ++ branches ++ tags) ++ u32(tracker_len) ++
-/// tracker`, where each of branches and tags is `u32 count ++ per ref sorted
-/// (u32 short_len ++ short ++ oid[20])`. only born repos (any ref at all) are
-/// carried — exactly the root's preimage material.
+/// name (u32 name_len ++ name ++ owner ++ branches ++ tags) ++
+/// u32(tracker_len) ++ tracker`, where each of branches and tags is `u32 count
+/// ++ per ref sorted (u32 short_len ++ short ++ oid[20])`. only born repos (any
+/// ref at all) are carried — exactly the root's preimage material.
 pub fn encode_image<'a>(
-    repos: impl Iterator<Item = (&'a str, &'a RefMap, &'a RefMap)>,
+    repos: impl Iterator<Item = (&'a str, &'a RefMap, &'a RefMap, Option<&'a RepoOwner>)>,
     tracker: &Tracker,
 ) -> Vec<u8> {
-    let born: Vec<(&str, &RefMap, &RefMap)> = repos
-        .filter(|(_, branches, tags)| !branches.is_empty() || !tags.is_empty())
+    let born: Vec<(&str, &RefMap, &RefMap, Option<&RepoOwner>)> = repos
+        .filter(|(_, branches, tags, _)| !branches.is_empty() || !tags.is_empty())
         .collect();
     let mut out = IMAGE_MAGIC.to_vec();
     codec::put_u32(&mut out, born.len() as u32);
-    for (name, branches, tags) in born {
+    for (name, branches, tags, owner) in born {
         codec::put_str(&mut out, name);
+        // owner is carried before the refs so an owner-less genesis/adopted
+        // repo remains distinguishable from a malformed ref map.
+        crate::refs::put_owner(&mut out, owner);
         put_ref_map(&mut out, branches);
         put_ref_map(&mut out, tags);
     }
@@ -1095,6 +1192,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<Image, Error> {
     for _ in 0..count {
         let name = norm_repo(&r.str_()?)?;
         let refs = RepoRefs {
+            owner: crate::refs::take_owner(&mut r)?,
             branches: take_ref_map(&mut r, "image_decode", &name)?,
             tags: take_ref_map(&mut r, "image_decode", &name)?,
         };
@@ -1313,6 +1411,7 @@ mod tests {
     fn refs(branches: &[(&str, Oid)], tags: &[(&str, Oid)]) -> RepoRefs {
         let map = |pairs: &[(&str, Oid)]| pairs.iter().map(|(n, o)| (n.to_string(), *o)).collect();
         RepoRefs {
+            owner: None,
             branches: map(branches),
             tags: map(tags),
         }
@@ -1666,6 +1765,7 @@ mod tests {
         capped.repos.insert(
             "alpha".into(),
             RepoState::with_committed(RepoRefs {
+                owner: None,
                 branches: BTreeMap::new(),
                 tags: full,
             }),

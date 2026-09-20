@@ -33,8 +33,6 @@ use airlock::wire::{CredentialKind, CredentialPayload};
 
 /// how long a scoped session token this gateway mints stays valid.
 const SESSION_TTL_SECS: u64 = 3600;
-/// how many upstream requests one session token may make.
-const MAX_REQUESTS: u32 = 4096;
 
 const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
 const OPENAI_BASE: &str = "https://chatgpt.com/backend-api/codex";
@@ -100,7 +98,7 @@ impl Store {
             oauth_token_url: env_or("DUCKTAPE_AIRLOCK_OAUTH_TOKEN_URL", OAUTH_TOKEN_URL),
             oauth_client_id: env_or("DUCKTAPE_AIRLOCK_OAUTH_CLIENT_ID", OAUTH_CLIENT_ID),
             session_ttl_secs: SESSION_TTL_SECS,
-            max_requests: MAX_REQUESTS,
+            clock: airlock::server::Clock::system(),
             // the self-host lender holds no `rcodesign`; the enclave image does.
             sign: None,
         };

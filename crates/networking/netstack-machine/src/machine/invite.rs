@@ -15,10 +15,7 @@ use crate::contract::{CmdToken, Effect, ReachabilityEvent, ReqId};
 use crate::epoch::EpochState;
 
 use super::pending::{PendingOp, WgCont};
-use super::{
-    Driver, INTRO_ACK_TIMEOUT_MS, INVITE_PEERS_FULL, InvitePeer, KEEPALIVE_SECONDS,
-    MAX_INVITE_PEERS,
-};
+use super::{Driver, INTRO_ACK_TIMEOUT_MS, InvitePeer, KEEPALIVE_SECONDS};
 
 impl Driver {
     /// Install a join-window tunnel peer (node-authenticated; see the
@@ -75,23 +72,11 @@ impl Driver {
             }
             None => self.base_peers.clone().unwrap_or_default(),
         };
-        // the join-window table is bounded over the UNCOVERED entries: the
-        // aged-out ones make room first, a re-intro refreshes its own slot,
-        // and a full table refuses the intro — the reply text IS the reason
-        // token the inviter logs.
+        // the UNCOVERED entries age out on the join window; a re-intro
+        // refreshes its own entry.
         let now_ms = self.now_ms;
         self.invite_peers
             .retain(|id, invite| merged.contains_key(id) || !invite.expired_at(now_ms));
-        let re_intro = self.invite_peers.contains_key(&identity);
-        let uncovered = self
-            .invite_peers
-            .keys()
-            .filter(|id| !merged.contains_key(id))
-            .count();
-        let table_full = uncovered >= MAX_INVITE_PEERS;
-        if table_full && !re_intro {
-            return Err(INVITE_PEERS_FULL.into());
-        }
         let allowed_ips = self.overlay.identity_allowed_ips(identity);
         let config = PeerTunnelConfig {
             wireguard_public_key,

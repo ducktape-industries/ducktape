@@ -249,10 +249,10 @@ mounts no such route). The caller opens a SEALED session (`body_seal: true`,
 `work: Direct`) on the signing credential — standing is the credential's
 grant, exactly as for a model credential — and posts the `.tar.zst` of an
 UNSIGNED `Ducktape.app` as the sealed body (`bodyseal::seal_request` under
-`POST\n/sign/macos-bundle`; cap `sign::MAX_BUNDLE_BYTES`, 256 MiB). The
+`POST\n/sign/macos-bundle`). The
 reply is the `.tar.zst` of the signed + notarized + stapled bundle as a sealed
-chunk stream (head content type `application/zstd`), and one request spends
-one of the session's `max_requests`. The head is committed BEFORE the
+chunk stream (head content type `application/zstd`). The head is committed
+BEFORE the
 pipeline runs — every hop between the enclave and the caller (the node's
 gateway proxy, its overlay drain) waits seconds for a response head, and
 Apple's notary takes minutes — and the outcome rides the stream: an empty
@@ -277,7 +277,7 @@ the nested `ducktape-app` both, as `ops/bundle-app-macos.sh` does),
 `rcodesign notary-submit --wait` and `rcodesign staple`, and the directory is
 removed on every exit path. Refusals are tokens: before the pipeline starts
 they are the HTTP status and body — `credential_kind_mismatch` (403, a model
-credential), `bundle_too_large` (413), a plaintext session (400); once it
+credential), a plaintext session (400); once it
 runs the head is out and the token is the stream's `Final` —
 `bundle_shape_refused`, `codesign_failed`, `notary_rejected`,
 `staple_failed`, `tool_missing` (the image lacks `rcodesign` or the
