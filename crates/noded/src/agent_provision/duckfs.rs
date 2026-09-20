@@ -16,7 +16,7 @@
 //! wire a files module compose the same v1 envelope with a null source pin.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use compute_service::{
     ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec, assemble_context_doc,
@@ -40,6 +40,7 @@ pub(super) async fn provision(
     prefix: String,
     snapshot: Option<String>,
     node_url: Option<String>,
+    session_keys: &Path,
     spec: &WorkspaceSpec,
 ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
     let checkout_node = node.clone();
@@ -116,7 +117,7 @@ pub(super) async fn provision(
     // the workspace EXISTS now, so ask consensus to bind the run's agent session
     // — never before: a bind for a run that failed to materialize would spend an
     // op on a run that never starts.
-    let session = match super::session::open(&node, spec, &dir).await {
+    let session = match super::session::open(&node, spec, &dir, session_keys).await {
         Ok(session) => session,
         Err(error) => {
             super::cleanup_dirs(dir.clone(), ro_dir.clone()).await;
@@ -229,6 +230,9 @@ impl ProvisionedWorkspace for NodedWorkspace {
     }
 
     async fn cleanup(&self) {
+        if let Some(session) = &self._session {
+            session.release();
+        }
         super::cleanup_dirs(self.dir.clone(), self.ro_dir.clone()).await;
     }
 }

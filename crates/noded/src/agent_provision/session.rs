@@ -26,13 +26,22 @@
 //!
 //! A refused bind fails provisioning. An agent run never starts with a
 //! silently disabled write plane.
+//!
+//! The key SURVIVES the daemon: `runs` holds one session per lease and refuses
+//! a second key for the same `(holder, attempt)`, and it has no release op —
+//! so a daemon that dies mid-run (SIGTERM, crash, drop) and re-runs the same
+//! attempt would be refused its own seat. The seed is therefore persisted
+//! under the node's storage before the bind and read back by the next open of
+//! the same attempt: the same key re-binds as a no-op, first try. The file is
+//! removed when the run COMPLETES ([`RunSession::release`]); drop deliberately
+//! keeps it, because drop is the restart path.
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 use compute_service::WorkspaceSpec;
 use futures::channel::oneshot;
 use futures::{SinkExt as _, StreamExt as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[path = "native.rs"]
@@ -67,6 +76,18 @@ pub(super) struct RunSession {
     local_addr: std::net::SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
+    /// the persisted seed this attempt re-binds with after a daemon restart.
+    key_path: PathBuf,
+}
+
+impl RunSession {
+    /// the run completed: its attempt is settled, so the seat is released —
+    /// the next attempt mints a fresh key. NOT called from drop: a dropped
+    /// session mid-run is a daemon going down, and the restarted daemon must
+    /// find this seed to re-bind the same attempt.
+    pub(super) fn release(&self) {
+        let _ = std::fs::remove_file(&self.key_path);
+    }
 }
 
 impl Drop for RunSession {
@@ -192,19 +213,42 @@ pub(super) fn encode_action_reply(
     )))
 }
 
-/// Generate a host-private key and bind its public half to this execution.
-/// An attributed run must open its session before the provider starts.
+/// the seed file one attempt's key lives in under `keys`: the same
+/// per-attempt slug the run's workspace dir is named by.
+fn key_file(spec: &WorkspaceSpec) -> String {
+    format!("{}.key", super::run_slug(&spec.run_id))
+}
+
+/// this attempt's signer: the seed a previous daemon persisted for it, or a
+/// fresh one minted 0600 before the bind so no committed session ever lacks
+/// its file.
+fn load_or_mint_key(keys: &Path, name: &str) -> Result<ed25519::PrivateKey, String> {
+    let persisted = keys.join(name).exists();
+    let seed_hex = if persisted {
+        crate::services::read_secret_file(keys, name)?
+    } else {
+        crate::services::mint_secret_file(keys, name)?
+    };
+    let seed = duckfs_core::from_hex_32(&seed_hex)
+        .ok_or_else(|| format!("session key {name} is not a 32-byte seed"))?;
+    Ok(ed25519::PrivateKey::decode(seed.as_slice()).expect("32 bytes decode"))
+}
+
+/// Bind this attempt's host-private key to its execution — the persisted one
+/// after a restart, a fresh one otherwise. An attributed run must open its
+/// session before the provider starts.
 pub(super) async fn open(
     node: &NodeLink,
     spec: &WorkspaceSpec,
     workdir: &Path,
+    keys: &Path,
 ) -> Result<Option<RunSession>, String> {
     let Some(agent) = &spec.agent else {
         return Ok(None);
     };
-    let mut seed = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
-    let key = ed25519::PrivateKey::decode(seed.as_slice()).expect("32 random bytes decode");
+    let name = key_file(spec);
+    let key_path = keys.join(&name);
+    let key = load_or_mint_key(keys, &name)?;
     let payload = crate::runs::encode_msg(&crate::runs::RunsMsg::OpenAgentSession {
         run_id: agent.run_id.clone(),
         attempt: agent.attempt,
@@ -217,10 +261,12 @@ pub(super) async fn open(
             attempt = agent.attempt, reason = "bind_rejected", detail = %error,
             "agent session unavailable"
         );
+        // a refused bind is this attempt's end: no seat, no seed to keep.
+        let _ = std::fs::remove_file(&key_path);
         format!("open agent session: {error}")
     })?;
     let native = native::prepare(node, spec, &key, workdir).await?;
-    start_action_server(node.clone(), key, agent.run_id.clone(), native)
+    start_action_server(node.clone(), key, agent.run_id.clone(), native, key_path)
         .await
         .inspect_err(|error| {
             tracing::warn!(
@@ -238,6 +284,7 @@ async fn start_action_server(
     signer: ed25519::PrivateKey,
     run_id: String,
     native: Option<native::NativeState>,
+    key_path: PathBuf,
 ) -> Result<RunSession, String> {
     // A child reaches this signer over a vsock tunnel that terminates on a
     // socket the host process owns, so it dials `127.0.0.1:<port>` exactly
@@ -282,6 +329,7 @@ async fn start_action_server(
         local_addr: address,
         shutdown: Some(shutdown),
         task,
+        key_path,
     })
 }
 
@@ -498,6 +546,7 @@ mod tests {
             signer,
             "run-1".into(),
             None,
+            PathBuf::new(),
         )
         .await
         .expect("bind scoped action signer");

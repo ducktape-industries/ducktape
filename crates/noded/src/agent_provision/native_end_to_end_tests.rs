@@ -574,7 +574,7 @@ async fn start(
     std::fs::create_dir_all(&directory).unwrap();
     let link = network.link.clone();
     let session = network
-        .until(open(&link, &spec, &directory))
+        .until(open(&link, &spec, &directory, &root.join("session-keys")))
         .await
         .unwrap()
         .unwrap();

@@ -503,6 +503,7 @@ async fn native_http_accepts_a_body_past_axums_own_default() {
         signer,
         RUN_ID.into(),
         Some(native(root.path())),
+        std::path::PathBuf::new(),
     )
     .await
     .unwrap();
