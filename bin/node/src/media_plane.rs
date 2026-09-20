@@ -1,6 +1,6 @@
 //! The media executor: the node's huddle runtime, driving ONE realtime guest
-//! ([`crate::media_guest::RealtimeGuest`]) over the chat module's declared
-//! `voice` and `video` lanes.
+//! ([`lane_wasm::LaneMachine`]) over the chat module's declared `voice` and
+//! `video` lanes.
 //!
 //! Runtime shape mirrors the presence hub and the reachability plane: the
 //! executor runs on its OWN plain-tokio OS thread, binds the two lanes' overlay
@@ -16,7 +16,9 @@
 //!   the roster the guest hands back ([`Effect::SetRoster`]) is the
 //!   authorization on top, enforced at demux — flow ids derive from public
 //!   channel ids, so without it any member could inject media into a call it
-//!   is not part of. This node's own key is stripped from every roster.
+//!   is not part of. This node's own key is stripped from every roster. A
+//!   [`Effect::LaneSend`] names a lane and a peer, never a flow: the host
+//!   sends it on the flow of that lane whose roster admits the peer.
 //! - Sessions. A client socket is a numbered session; the guest sees frames
 //!   and rosters by session number and never a key. One [`Effect::Close`]
 //!   ends one session. A guest trap ends EVERY session of that instance and
@@ -34,11 +36,12 @@ use data_plane::{
 };
 use tokio::sync::mpsc;
 
-use crate::media_guest::{
-    Effect, Event, GuestError, GuestFactory, LaneId, LogLevel, PeerKey, RealtimeGuest, SessionId,
-};
 use crate::overlay_book::{LaneKey, LaneSource, OverlayPeers, Plane};
 use crate::presence::ActiveFlows;
+use lane_wasm::{
+    Config, Effect, Event, Frame, GuestError, Lane, LaneBinding, LaneMachine, Session as SessionId,
+    StepError,
+};
 
 /// Media runs no stream class, so the plane's bulk-pacing budget is inert —
 /// these values only need to exist.
@@ -73,6 +76,14 @@ const OVERLAY_DOWN: &str = "the mesh overlay is not up on this node yet, and hud
 /// Why a join is refused when no guest can be brought up: the module set
 /// this node runs carries no realtime artifact for the chat lanes.
 const NO_GUEST: &str = "no_realtime_guest";
+
+/// a raw ed25519 node key, as the overlay and the wiring name this node.
+pub type PeerKey = [u8; 32];
+
+/// How the executor brings a guest up — and back up after a trap — from
+/// the lanes it bound.
+pub type GuestFactory =
+    Arc<dyn Fn(Config) -> Result<Box<dyn LaneMachine + Send>, GuestError> + Send + Sync>;
 /// the reason every session of a trapped instance closes with.
 const GUEST_TRAP: &str = "guest_trap";
 
@@ -95,13 +106,14 @@ impl Plane for VideoPlane {
     const LANE: LaneSource = VIDEO_LANE;
 }
 
-/// the realtime artifact loader. The module set at `dev` ships no realtime
-/// guest yet, so every instantiation answers [`GuestError::Unavailable`] and
-/// the executor refuses joins with [`NO_GUEST`]; the lane-wasm envelope
-/// replaces this body with the component load.
+/// the realtime artifact loader. The module frame at this SDK pin carries
+/// no realtime guest, so every instantiation refuses and the executor
+/// refuses joins with [`NO_GUEST`]; once the frame carries
+/// `<id>.realtime.wasm` this body becomes `lane_wasm::LaneGuest::new`
+/// over the chat module's bytes.
 pub fn guest_factory() -> GuestFactory {
-    Arc::new(|| {
-        Err(GuestError::Unavailable(
+    Arc::new(|_config| {
+        Err(GuestError::Component(
             "the module set carries no chat realtime artifact".into(),
         ))
     })
@@ -133,8 +145,10 @@ pub fn spawn_hub(
         .expect("spawn media-hub thread")
 }
 
-/// one bound lane: the id the guest names it by and the plane that carries it.
+/// one bound lane: the name the module declared it under, the id the guest
+/// names it by, and the plane that carries it.
 struct BoundLane<T: DataPlaneTransport> {
+    name: &'static str,
     service: Service,
     plane: DataPlane<T>,
 }
@@ -150,11 +164,12 @@ async fn bind_media_planes(
         crate::presence_plane::bind_service::<VoicePlane>(&factory, &peers, me, node),
         crate::presence_plane::bind_service::<VideoPlane>(&factory, &peers, me, node),
     );
-    let bound = |(sockets, service)| BoundLane {
+    let bound = |name, (sockets, service)| BoundLane {
+        name,
         service,
         plane: DataPlane::new(sockets, admission.clone(), MEDIA_PLANE_CONFIG),
     };
-    [bound(voice), bound(video)]
+    [bound("voice", voice), bound("video", video)]
 }
 
 /// Bind both lanes, then serve. The request lane is drained throughout: a
@@ -236,9 +251,8 @@ fn refuse_request(request: noded::CallSessionRequest) {
 /// what the flow and session pumps hand the executor.
 enum Inbox {
     Datagram {
-        lane: LaneId,
-        flow: String,
-        peer: PeerKey,
+        lane: Lane,
+        peer: PeerId,
         bytes: Vec<u8>,
     },
     Client {
@@ -277,17 +291,17 @@ impl Drop for Session {
 }
 
 struct Executor<T: DataPlaneTransport> {
-    lanes: HashMap<LaneId, BoundLane<T>>,
+    lanes: HashMap<Lane, BoundLane<T>>,
     admission: Arc<ActiveFlows>,
-    flows: HashMap<(LaneId, String), OpenFlow<T>>,
+    flows: HashMap<(Lane, FlowId), OpenFlow<T>>,
     sessions: HashMap<SessionId, Session>,
     next_session: SessionId,
     /// `None` between a trap and a successful re-instantiation.
-    guest: Option<Box<dyn RealtimeGuest>>,
+    guest: Option<Box<dyn LaneMachine + Send>>,
     factory: GuestFactory,
     inbox: mpsc::Sender<Inbox>,
     inbox_rx: mpsc::Receiver<Inbox>,
-    me: PeerKey,
+    me: PeerId,
     started: Instant,
 }
 
@@ -312,7 +326,7 @@ impl<T: DataPlaneTransport> Executor<T> {
             factory,
             inbox,
             inbox_rx,
-            me,
+            me: PeerId(me),
             started: Instant::now(),
         }
     }
@@ -345,17 +359,9 @@ impl<T: DataPlaneTransport> Executor<T> {
         match input {
             Input::Tick => Some(Event::Tick),
             Input::Join(request) => self.admit_session(request),
-            Input::Inbox(Inbox::Datagram {
-                lane,
-                flow,
-                peer,
-                bytes,
-            }) => Some(Event::Datagram {
-                lane,
-                flow,
-                peer,
-                bytes,
-            }),
+            Input::Inbox(Inbox::Datagram { lane, peer, bytes }) => {
+                Some(Event::Datagram { lane, peer, bytes })
+            }
             Input::Inbox(Inbox::Client {
                 session,
                 message: noded::CallClientIn::Frame(frame),
@@ -365,7 +371,7 @@ impl<T: DataPlaneTransport> Executor<T> {
                 message: noded::CallClientIn::Recipients(peers),
             }) => Some(Event::Roster {
                 session,
-                peers: self.without_me(peers),
+                peers: self.without_me(peers.into_iter().map(PeerId).collect()),
             }),
             Input::Inbox(Inbox::ClientGone { session }) => self.forget_session(session),
         }
@@ -389,12 +395,7 @@ impl<T: DataPlaneTransport> Executor<T> {
     /// perform one effect through its writer.
     async fn perform(&mut self, effect: Effect) {
         match effect {
-            Effect::LaneSend {
-                lane,
-                flow,
-                peer,
-                bytes,
-            } => self.send_lane(lane, flow, peer, bytes).await,
+            Effect::LaneSend { lane, peer, bytes } => self.send_lane(lane, peer, bytes).await,
             Effect::ClientSend { session, frame } => self.send_client(session, frame),
             Effect::SetRoster { lane, flow, peers } => self.set_roster(lane, flow, peers),
             Effect::OpenFlow {
@@ -410,7 +411,7 @@ impl<T: DataPlaneTransport> Executor<T> {
 
     /// this node's own key never belongs in a roster: a hub does not fan out
     /// to itself, and admitting itself would let its own uplink loop back.
-    fn without_me(&self, mut peers: Vec<PeerKey>) -> Vec<PeerKey> {
+    fn without_me(&self, mut peers: Vec<PeerId>) -> Vec<PeerId> {
         peers.retain(|peer| *peer != self.me);
         peers
     }
@@ -476,24 +477,35 @@ impl<T: DataPlaneTransport> Executor<T> {
         tracing::info!(target: "ducktape::media", session, reason = %reason, "call session closed by guest");
         // a full lane loses the reason, not the close: dropping `ends` closes
         // the socket's receiver either way.
-        let _ = ends.to_client.try_send(noded::CallServerOut::Close { reason });
+        let _ = ends
+            .to_client
+            .try_send(noded::CallServerOut::Close { reason });
     }
 
-    fn send_client(&self, session: SessionId, frame: noded::CallFrame) {
+    fn send_client(&self, session: SessionId, frame: Frame) {
         let Some(ends) = self.sessions.get(&session) else {
             return;
         };
         // full lane = the socket is behind; drop this frame rather than
         // queue stale media.
-        let _ = ends
-            .to_client
-            .try_send(noded::CallServerOut::Frame(frame));
+        let _ = ends.to_client.try_send(noded::CallServerOut::Frame(frame));
     }
 
     // ---- the guest ------------------------------------------------------------
 
     fn instantiate(&mut self) {
-        match (self.factory)() {
+        let config = Config {
+            self_peer: self.me,
+            lanes: self
+                .lanes
+                .values()
+                .map(|lane| LaneBinding {
+                    name: lane.name.into(),
+                    id: lane.service.lane_id(),
+                })
+                .collect(),
+        };
+        match (self.factory)(config) {
             Ok(guest) => {
                 tracing::info!(target: "ducktape::media", "realtime guest up");
                 self.guest = Some(guest);
@@ -511,7 +523,7 @@ impl<T: DataPlaneTransport> Executor<T> {
 
     /// the guest's state is unknown: end every session it served, release
     /// every flow it opened, and bring a fresh instance up.
-    async fn recover(&mut self, fault: GuestError) {
+    async fn recover(&mut self, fault: StepError) {
         tracing::warn!(
             target: "ducktape::media",
             reason = "guest_trap",
@@ -524,7 +536,7 @@ impl<T: DataPlaneTransport> Executor<T> {
         for session in open {
             self.close_session(session, GUEST_TRAP.into());
         }
-        let flows: Vec<(LaneId, String)> = self.flows.keys().cloned().collect();
+        let flows: Vec<(Lane, FlowId)> = self.flows.keys().copied().collect();
         for (lane, flow) in flows {
             self.close_flow(lane, flow).await;
         }
@@ -533,12 +545,12 @@ impl<T: DataPlaneTransport> Executor<T> {
 
     // ---- flows ------------------------------------------------------------------
 
-    fn open_flow(&mut self, lane: LaneId, flow: String, max_queued: u32) {
+    fn open_flow(&mut self, lane: Lane, flow: FlowId, max_queued: u32) {
         let Some(bound) = self.lanes.get(&lane) else {
             tracing::warn!(target: "ducktape::media", reason = "unknown_lane", lane, "guest opened a flow on a lane this node does not bind");
             return;
         };
-        let key = (bound.service, FlowId::derive(flow.as_bytes()));
+        let key = (bound.service, flow);
         let policy = DatagramPolicy {
             max_queued: max_queued as usize,
         };
@@ -550,18 +562,10 @@ impl<T: DataPlaneTransport> Executor<T> {
         self.admission.insert(key);
         let pump_handle = handle.clone();
         let inbox = self.inbox.clone();
-        let pump_flow = flow.clone();
         let pump = tokio::spawn(async move {
             loop {
                 let (peer, bytes) = pump_handle.recv().await;
-                let delivered = inbox
-                    .send(Inbox::Datagram {
-                        lane,
-                        flow: pump_flow.clone(),
-                        peer: peer.0,
-                        bytes,
-                    })
-                    .await;
+                let delivered = inbox.send(Inbox::Datagram { lane, peer, bytes }).await;
                 if delivered.is_err() {
                     return;
                 }
@@ -573,7 +577,7 @@ impl<T: DataPlaneTransport> Executor<T> {
 
     /// release a flow: the pump is stopped and AWAITED so its handle drops
     /// here, which unregisters the flow before the next open could collide.
-    async fn close_flow(&mut self, lane: LaneId, flow: String) {
+    async fn close_flow(&mut self, lane: Lane, flow: FlowId) {
         let Some(open) = self.flows.remove(&(lane, flow)) else {
             return;
         };
@@ -583,31 +587,60 @@ impl<T: DataPlaneTransport> Executor<T> {
         drop(open.handle);
     }
 
-    fn set_roster(&mut self, lane: LaneId, flow: String, peers: Vec<PeerKey>) {
+    fn set_roster(&mut self, lane: Lane, flow: FlowId, peers: Vec<PeerId>) {
         let Some(open) = self.flows.get(&(lane, flow)) else {
             return;
         };
-        let peers = self.without_me(peers);
+        let peers: Vec<PeerKey> = self
+            .without_me(peers)
+            .into_iter()
+            .map(|peer| peer.0)
+            .collect();
         self.admission.set_roster(&[open.key], &peers);
+    }
+
+    /// the flow a send to `peer` on `lane` rides: the one whose roster admits
+    /// the peer. Both ends derive a channel's flow from its id, so the peer's
+    /// plane demuxes it into the same channel's queue.
+    // ponytail: linear over the lane's open flows; index peer→flow on
+    // SetRoster if a node ever serves more than a handful of channels.
+    fn flow_admitting(&self, lane: Lane, peer: PeerId) -> Option<&OpenFlow<T>> {
+        self.flows
+            .iter()
+            .filter(|((open_lane, _), _)| *open_lane == lane)
+            .map(|(_, open)| open)
+            .find(|open| self.admission.permits(peer, open.key.0, open.key.1))
     }
 
     // `&mut self`, not `&self`: a shared borrow held across the await would
     // demand the guest be `Sync`, and a wasm store is not.
-    async fn send_lane(&mut self, lane: LaneId, flow: String, peer: PeerKey, bytes: Vec<u8>) {
-        let Some(open) = self.flows.get(&(lane, flow)) else {
+    async fn send_lane(&mut self, lane: Lane, peer: PeerId, bytes: Vec<u8>) {
+        let Some(open) = self.flow_admitting(lane, peer) else {
             return;
         };
         // fire-and-forget: a refused or failed send is the next frame's
         // problem, never the session's.
-        let _ = open.handle.send_to(PeerId(peer), &bytes).await;
+        let _ = open.handle.send_to(peer, &bytes).await;
     }
 }
 
-fn log_guest(level: LogLevel, message: String) {
+fn log_guest(level: tracing::Level, message: String) {
     match level {
-        LogLevel::Debug => tracing::debug!(target: "ducktape::media", guest = true, "{message}"),
-        LogLevel::Info => tracing::info!(target: "ducktape::media", guest = true, "{message}"),
-        LogLevel::Warn => tracing::warn!(target: "ducktape::media", guest = true, "{message}"),
+        tracing::Level::TRACE => {
+            tracing::trace!(target: "ducktape::media", guest = true, "{message}")
+        }
+        tracing::Level::DEBUG => {
+            tracing::debug!(target: "ducktape::media", guest = true, "{message}")
+        }
+        tracing::Level::INFO => {
+            tracing::info!(target: "ducktape::media", guest = true, "{message}")
+        }
+        tracing::Level::WARN => {
+            tracing::warn!(target: "ducktape::media", guest = true, "{message}")
+        }
+        tracing::Level::ERROR => {
+            tracing::error!(target: "ducktape::media", guest = true, "{message}")
+        }
     }
 }
 
@@ -616,7 +649,8 @@ mod tests {
     use super::*;
     use data_plane::sim::{LinkModel, SimNet};
     use data_plane::{BoxFuture, DatagramSocket, PlaneStream, StreamListener};
-    use noded::{CallClientIn, CallFrame, CallServerOut};
+    use lane_wasm::StubGuest;
+    use noded::{CallClientIn, CallServerOut};
     use std::net::{IpAddr, SocketAddr};
     use std::sync::Mutex;
 
@@ -631,164 +665,56 @@ mod tests {
         drop_every: None,
         delay_every: None,
     };
+    /// the text frame that traps the probe.
+    const TRAP: &str = "trap";
+    /// the text frame the probe answers a roster with, once the executor has
+    /// performed the SetRoster ahead of it.
+    const ROSTER_SET: &str = "roster-set";
 
-    /// what the stub guest saw — the test's window into the seam.
+    /// what the guest saw — the test's window into the seam.
     #[derive(Default)]
     struct Seen {
-        rosters: Vec<Vec<PeerKey>>,
+        rosters: Vec<Vec<PeerId>>,
         instantiations: u32,
     }
 
-    /// the relay the call guest will be: per session, three flows on the
-    /// channel; a client's binary frame fans out on the voice flow to the
-    /// roster, a text frame on the control flow; an inbound datagram goes
-    /// down every session on that channel as the same kind of frame. The
-    /// roster is acknowledged with a text frame so a test can wait on it,
-    /// and the text `trap` is the trap.
-    struct StubGuest {
+    /// the envelope's own native double, with two test hooks the contract
+    /// itself does not need: a roster is acknowledged down the session (so a
+    /// test waits on the executor having applied it, never on time) and the
+    /// text [`TRAP`] is the trap.
+    struct Probe {
+        stub: StubGuest,
         seen: Arc<Mutex<Seen>>,
-        sessions: HashMap<SessionId, String>,
-        rosters: HashMap<SessionId, Vec<PeerKey>>,
     }
 
-    fn voice_flow(channel: &str) -> String {
-        format!("voice-channel:{channel}")
-    }
-    fn video_flow(channel: &str) -> String {
-        format!("video-channel:{channel}")
-    }
-    fn ctl_flow(channel: &str) -> String {
-        format!("callctl-channel:{channel}")
-    }
-
-    impl StubGuest {
-        fn flows_of(channel: &str) -> [(LaneId, String); 3] {
-            [
-                (2, voice_flow(channel)),
-                (3, video_flow(channel)),
-                (2, ctl_flow(channel)),
-            ]
-        }
-
-        fn fan_out(&self, session: SessionId, lane: LaneId, flow: String, bytes: &[u8]) -> Vec<Effect> {
-            let Some(roster) = self.rosters.get(&session) else {
-                return Vec::new();
-            };
-            roster
-                .iter()
-                .map(|peer| Effect::LaneSend {
-                    lane,
-                    flow: flow.clone(),
-                    peer: *peer,
-                    bytes: bytes.to_vec(),
-                })
-                .collect()
-        }
-    }
-
-    impl RealtimeGuest for StubGuest {
-        fn step(&mut self, event: Event, _now_ms: u64) -> Result<Vec<Effect>, GuestError> {
-            Ok(match event {
-                Event::Tick => Vec::new(),
-                Event::SessionOpened { session, channel } => {
-                    self.sessions.insert(session, channel.clone());
-                    Self::flows_of(&channel)
-                        .into_iter()
-                        .map(|(lane, flow)| Effect::OpenFlow {
-                            lane,
-                            flow,
-                            max_queued: 32,
-                        })
-                        .collect()
-                }
-                Event::SessionClosed { session } => {
-                    let Some(channel) = self.sessions.remove(&session) else {
-                        return Ok(Vec::new());
-                    };
-                    self.rosters.remove(&session);
-                    let still_served = self.sessions.values().any(|open| *open == channel);
-                    if still_served {
-                        return Ok(Vec::new());
-                    }
-                    Self::flows_of(&channel)
-                        .into_iter()
-                        .map(|(lane, flow)| Effect::CloseFlow { lane, flow })
-                        .collect()
-                }
+    impl LaneMachine for Probe {
+        fn step(&mut self, event: Event, now_ms: u64) -> Result<Vec<Effect>, StepError> {
+            let ack = match &event {
+                Event::ClientFrame {
+                    frame: Frame::Text(text),
+                    ..
+                } if text == TRAP => return Err(StepError::Trap("unreachable executed".into())),
                 Event::Roster { session, peers } => {
                     self.seen.lock().unwrap().rosters.push(peers.clone());
-                    let Some(channel) = self.sessions.get(&session) else {
-                        return Ok(Vec::new());
-                    };
-                    self.rosters.insert(session, peers.clone());
-                    let mut effects: Vec<Effect> = Self::flows_of(channel)
-                        .into_iter()
-                        .map(|(lane, flow)| Effect::SetRoster {
-                            lane,
-                            flow,
-                            peers: peers.clone(),
-                        })
-                        .collect();
-                    effects.push(Effect::ClientSend {
-                        session,
-                        frame: CallFrame::Text("roster-set".into()),
-                    });
-                    effects
+                    Some(Effect::ClientSend {
+                        session: *session,
+                        frame: Frame::Text(ROSTER_SET.into()),
+                    })
                 }
-                Event::ClientFrame {
-                    session,
-                    frame: CallFrame::Binary(bytes),
-                } => {
-                    let Some(channel) = self.sessions.get(&session) else {
-                        return Ok(Vec::new());
-                    };
-                    self.fan_out(session, 2, voice_flow(channel), &bytes)
-                }
-                Event::ClientFrame {
-                    session,
-                    frame: CallFrame::Text(text),
-                } => {
-                    if text == "trap" {
-                        return Err(GuestError::Trap("unreachable executed".into()));
-                    }
-                    let Some(channel) = self.sessions.get(&session) else {
-                        return Ok(Vec::new());
-                    };
-                    self.fan_out(session, 2, ctl_flow(channel), text.as_bytes())
-                }
-                Event::Datagram {
-                    lane: _,
-                    flow,
-                    peer: _,
-                    bytes,
-                } => {
-                    let is_control = flow.starts_with("callctl-channel:");
-                    self.sessions
-                        .iter()
-                        .filter(|(_, channel)| {
-                            flow == voice_flow(channel) || flow == ctl_flow(channel)
-                        })
-                        .map(|(session, _)| Effect::ClientSend {
-                            session: *session,
-                            frame: if is_control {
-                                CallFrame::Text(String::from_utf8_lossy(&bytes).into_owned())
-                            } else {
-                                CallFrame::Binary(bytes.clone())
-                            },
-                        })
-                        .collect()
-                }
-            })
+                _ => None,
+            };
+            let mut effects = self.stub.step(event, now_ms)?;
+            effects.extend(ack);
+            Ok(effects)
         }
     }
 
-    fn stub_factory(seen: Arc<Mutex<Seen>>) -> GuestFactory {
-        Arc::new(move || {
+    fn probe_factory(seen: Arc<Mutex<Seen>>) -> GuestFactory {
+        Arc::new(move |config| {
             seen.lock().unwrap().instantiations += 1;
-            Ok(Box::new(StubGuest {
+            Ok(Box::new(Probe {
+                stub: StubGuest::new(config)?,
                 seen: seen.clone(),
-                sessions: HashMap::new(),
-                rosters: HashMap::new(),
             }))
         })
     }
@@ -803,7 +729,8 @@ mod tests {
         seen: Arc<Mutex<Seen>>,
     ) -> noded::CallLane {
         let admission = Arc::new(ActiveFlows::default());
-        let plane = |net: &SimNet, service| BoundLane {
+        let plane = |name, net: &SimNet, service| BoundLane {
+            name,
             service,
             plane: DataPlane::new(
                 net.endpoint(PeerId(me)),
@@ -811,9 +738,12 @@ mod tests {
                 MEDIA_PLANE_CONFIG,
             ),
         };
-        let lanes = vec![plane(voice_net, VOICE), plane(video_net, VIDEO)];
+        let lanes = vec![
+            plane("voice", voice_net, VOICE),
+            plane("video", video_net, VIDEO),
+        ];
         let (lane, requests) = mpsc::channel(4);
-        tokio::spawn(Executor::new(lanes, admission, me, stub_factory(seen)).run(requests));
+        tokio::spawn(Executor::new(lanes, admission, me, probe_factory(seen)).run(requests));
         lane
     }
 
@@ -828,6 +758,14 @@ mod tests {
         opened.await.unwrap().unwrap()
     }
 
+    async fn send_binary(session: &noded::CallSession, bytes: Vec<u8>) {
+        session
+            .to_hub
+            .send(CallClientIn::Frame(Frame::Binary(bytes)))
+            .await
+            .unwrap();
+    }
+
     /// set the session's roster and wait for the guest's acknowledgement,
     /// which lands after the executor performed the SetRoster effects.
     async fn set_roster(session: &mut noded::CallSession, peers: Vec<PeerKey>) {
@@ -837,54 +775,51 @@ mod tests {
             .await
             .unwrap();
         let acked = session.from_hub.recv().await.unwrap();
-        assert_eq!(acked, CallServerOut::Frame(CallFrame::Text("roster-set".into())));
+        assert_eq!(acked, CallServerOut::Frame(Frame::Text(ROSTER_SET.into())));
     }
 
     async fn next_binary(session: &mut noded::CallSession) -> Vec<u8> {
         match session.from_hub.recv().await.unwrap() {
-            CallServerOut::Frame(CallFrame::Binary(bytes)) => bytes,
+            CallServerOut::Frame(Frame::Binary(bytes)) => bytes,
             other => panic!("expected a binary frame, got {other:?}"),
         }
     }
 
-    fn two_nodes() -> (noded::CallLane, noded::CallLane, Arc<Mutex<Seen>>, Arc<Mutex<Seen>>) {
+    fn two_nodes() -> (noded::CallLane, noded::CallLane, Arc<Mutex<Seen>>) {
         let (voice_net, video_net) = (SimNet::new(), SimNet::new());
         for net in [&voice_net, &video_net] {
             net.set_link(PeerId(KEY_A), PeerId(KEY_B), LINK);
         }
-        let (seen_a, seen_b) = (Arc::new(Mutex::new(Seen::default())), Arc::new(Mutex::new(Seen::default())));
+        let seen_a = Arc::new(Mutex::new(Seen::default()));
         let a = node(&voice_net, &video_net, KEY_A, seen_a.clone());
-        let b = node(&voice_net, &video_net, KEY_B, seen_b.clone());
-        (a, b, seen_a, seen_b)
+        let b = node(&voice_net, &video_net, KEY_B, Arc::default());
+        (a, b, seen_a)
     }
 
     /// a frame A's client sends reaches B's client over the declared voice
-    /// lane, and neither hub's own key survives into the roster it fans out to.
+    /// lane, a control frame reaches the channel's other local session, and
+    /// neither hub's own key survives into the roster it fans out to.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_client_frame_crosses_to_the_peer_client_over_the_voice_lane() {
-        let (a, b, seen_a, _) = two_nodes();
+        let (a, b, seen_a) = two_nodes();
         let mut client_a = open(&a, "general").await;
         let mut client_b = open(&b, "general").await;
         // the client sends the FULL huddle roster, itself included.
         set_roster(&mut client_b, vec![KEY_A, KEY_B]).await;
         set_roster(&mut client_a, vec![KEY_A, KEY_B]).await;
-        client_a
-            .to_hub
-            .send(CallClientIn::Frame(CallFrame::Binary(vec![1, 2, 3])))
-            .await
-            .unwrap();
+        send_binary(&client_a, vec![1, 2, 3]).await;
         assert_eq!(next_binary(&mut client_b).await, vec![1, 2, 3]);
-        // control fans out on its own flow and lands as text.
+        let mut second_a = open(&a, "general").await;
         client_a
             .to_hub
-            .send(CallClientIn::Frame(CallFrame::Text("beacon".into())))
+            .send(CallClientIn::Frame(Frame::Text("beacon".into())))
             .await
             .unwrap();
         assert_eq!(
-            client_b.from_hub.recv().await.unwrap(),
-            CallServerOut::Frame(CallFrame::Text("beacon".into()))
+            second_a.from_hub.recv().await.unwrap(),
+            CallServerOut::Frame(Frame::Text("beacon".into()))
         );
-        assert_eq!(seen_a.lock().unwrap().rosters, vec![vec![KEY_B]]);
+        assert_eq!(seen_a.lock().unwrap().rosters, vec![vec![PeerId(KEY_B)]]);
     }
 
     /// a receiver whose roster no longer names the sender drops the sender's
@@ -892,29 +827,17 @@ mod tests {
     /// sent after A is back does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_roster_change_stops_delivery_at_admission() {
-        let (a, b, _, _) = two_nodes();
+        let (a, b, _) = two_nodes();
         let mut client_a = open(&a, "general").await;
         let mut client_b = open(&b, "general").await;
         set_roster(&mut client_b, vec![KEY_A]).await;
         set_roster(&mut client_a, vec![KEY_B]).await;
-        client_a
-            .to_hub
-            .send(CallClientIn::Frame(CallFrame::Binary(vec![1])))
-            .await
-            .unwrap();
+        send_binary(&client_a, vec![1]).await;
         assert_eq!(next_binary(&mut client_b).await, vec![1]);
         set_roster(&mut client_b, vec![]).await;
-        client_a
-            .to_hub
-            .send(CallClientIn::Frame(CallFrame::Binary(vec![2])))
-            .await
-            .unwrap();
+        send_binary(&client_a, vec![2]).await;
         set_roster(&mut client_b, vec![KEY_A]).await;
-        client_a
-            .to_hub
-            .send(CallClientIn::Frame(CallFrame::Binary(vec![3])))
-            .await
-            .unwrap();
+        send_binary(&client_a, vec![3]).await;
         assert_eq!(
             next_binary(&mut client_b).await,
             vec![3],
@@ -926,12 +849,12 @@ mod tests {
     /// next join is served by a fresh instance.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_guest_trap_closes_every_session_and_reinstantiates() {
-        let (a, _, seen_a, _) = two_nodes();
+        let (a, _, seen_a) = two_nodes();
         let mut first = open(&a, "general").await;
         let mut second = open(&a, "standup").await;
         first
             .to_hub
-            .send(CallClientIn::Frame(CallFrame::Text("trap".into())))
+            .send(CallClientIn::Frame(Frame::Text(TRAP.into())))
             .await
             .unwrap();
         let closed = CallServerOut::Close {
@@ -950,7 +873,15 @@ mod tests {
     async fn no_guest_refuses_the_join_by_name() {
         let admission = Arc::new(ActiveFlows::default());
         let (lane, requests) = mpsc::channel(1);
-        tokio::spawn(Executor::<data_plane::sim::SimEndpoint>::new(Vec::new(), admission, KEY_A, guest_factory()).run(requests));
+        tokio::spawn(
+            Executor::<data_plane::sim::SimEndpoint>::new(
+                Vec::new(),
+                admission,
+                KEY_A,
+                guest_factory(),
+            )
+            .run(requests),
+        );
         let (reply, opened) = tokio::sync::oneshot::channel();
         lane.send(noded::CallSessionRequest {
             channel_id: "general".into(),

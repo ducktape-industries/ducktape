@@ -90,7 +90,6 @@ mod lane_table;
 mod main_tests;
 mod mesh_book;
 mod mesh_lanes;
-mod media_guest;
 mod media_plane;
 mod mesh_window;
 mod module_cli;

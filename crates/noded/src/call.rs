@@ -25,12 +25,9 @@ use crate::{NodeHandle, chat, error_response, hex_bytes};
 // `recipients` — the roster is what host-side admission gates on, so the host
 // parses it and hands the guest the keys.
 
-/// one frame on the call socket, as the guest sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CallFrame {
-    Text(String),
-    Binary(Vec<u8>),
-}
+/// one frame on the call socket: the guest boundary's own frame type, so no
+/// copy stands between the socket and the executor.
+pub use lane_wasm::Frame as CallFrame;
 
 /// what the socket hands the executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +43,9 @@ pub enum CallClientIn {
 pub enum CallServerOut {
     Frame(CallFrame),
     /// the session is over; `reason` is the last text frame the client sees.
-    Close { reason: String },
+    Close {
+        reason: String,
+    },
 }
 
 /// one live huddle session's channel ends, executor ↔ websocket handler.

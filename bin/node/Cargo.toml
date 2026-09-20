@@ -130,6 +130,9 @@ wireguard = { workspace = true }
 # the per-service overlay sockets (src/voice_plane.rs binds them); the mesh arm
 # it replaced is retired.
 data-plane = { workspace = true }
+# the media executor's guest seam: the ducktape:lane realtime world's
+# envelope and its Event/Effect boundary (src/media_plane.rs drives it).
+lane-wasm = { workspace = true }
 # the userspace overlay routing seam: the mesh's
 # runtime context is wrapped so dial/bind route overlay ULAs by address.
 overlay-net = { workspace = true }

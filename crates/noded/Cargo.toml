@@ -28,6 +28,8 @@ verify = ["provider-host/verify"]
 # Static view readiness; no graphics or guest execution.
 view-wire = { workspace = true, features = ["manifest"] }
 wasmtime.workspace = true
+# the call socket's frame type is the realtime guest boundary's own.
+lane-wasm = { workspace = true }
 
 node-work = { workspace = true }
 # Committed-block receipt notifications for interactive program actions.
