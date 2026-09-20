@@ -158,6 +158,10 @@ where
         self.commitments.get(program)
     }
 
+    pub fn commitments(&self) -> impl Iterator<Item = (&ProgramId, &Commitment<E>)> {
+        self.commitments.iter()
+    }
+
     pub fn into_parts(self) -> (Storage, BTreeMap<ProgramId, Commitment<E>>) {
         (self.storage, self.commitments)
     }

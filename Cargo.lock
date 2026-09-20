@@ -5769,6 +5769,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "statesync"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "commonware-codec",
+ "commonware-consensus",
+ "commonware-cryptography",
+ "commonware-parallel",
+ "commonware-runtime",
+ "commonware-storage",
+ "commonware-utils",
+ "consensus",
+ "fixture-modules",
+ "fixture-probe",
+ "fixture-relay",
+ "fixture-valset",
+ "futures",
+ "host",
+ "node",
+ "state",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

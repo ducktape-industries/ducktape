@@ -3,59 +3,26 @@ name = "statesync"
 edition.workspace = true
 version.workspace = true
 
-# the network state-sync layer: a compact binary wire protocol (manifest /
-# chunked snapshot fetch / live qmdb op-range serving), the server-side capture
-# cache a running node answers from, and the joiner-side client helpers —
-# including a remote qmdb resolver that plugs straight into commonware's sync
-# engine. transport-neutral: anything that can move request/response bytes
-# between peers (a p2p channel, a socket, an in-process loopback) can carry it.
-#
-# module crates (kv, document, messaging, ...) may depend on this crate for the
-# shared qmdb serve/wire helpers: it is PLATFORM surface like `sdk`, not another
-# module — the module-isolation rule (impl crates never link impl crates) is
-# about product modules, and this crate contains no module state or product
-# logic.
 [dependencies]
-sdk = { workspace = true }
-host = { workspace = true }
-# the index op-row envelope + key grammar, for the joiner-side structural
-# validation of a backfill page. types-only surface (never the `guest` feature).
-index_guest = { workspace = true }
+abi = { workspace = true }
 borsh = { workspace = true }
-thiserror = { workspace = true }
-# QmdbStore implements the object-safe `sdk::MerkleStore` (async methods boxed).
-async-trait = { workspace = true }
-commonware-storage = { workspace = true }
-commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
+commonware-consensus = { workspace = true }
+commonware-cryptography = { workspace = true }
 commonware-parallel = { workspace = true }
-commonware-runtime = { workspace = true }
-commonware-utils = { workspace = true }
-commonware-p2p = { workspace = true }
-# the off-consensus stream class the data-plane binding (`dataplane.rs`) opens
-# statesync streams on. `io-util` brings the AsyncRead/Write ext traits the
-# binding frames requests/responses with; PacedStream is tokio io.
-data-plane = { workspace = true }
-tokio = { workspace = true, features = ["io-util"] }
-futures = "0.3"
-tracing = { workspace = true }
+commonware-storage = { workspace = true }
+consensus = { workspace = true }
+host = { workspace = true }
+node = { workspace = true }
+state = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-kv = { path = "../../modules/system/kv" }
-sdk-testkit = { workspace = true }
-# the duckfs-odb resolver path proof: a real `files` module drives the generic
-# object-possession loop over an in-process ModuleLane (dev-only; statesync
-# never depends on an app crate at build time).
-files = { path = "../../modules/apps/files" }
-duckfs-core = { workspace = true }
-base64 = { workspace = true }
-futures = "0.3"
-async-trait = { workspace = true }
-# the index backfill lane's end-to-end proof: real fluent31 databases feed op
-# rows through this crate's wire into a joiner store that folds them.
-indexer = { workspace = true }
-tempfile = "3"
-# the sim transport arm: the dataplane binding's round-trip proof runs two
-# planes over one in-memory SimNet under tokio's paused clock.
-data-plane = { workspace = true, features = ["sim"] }
-tokio = { workspace = true, features = ["io-util", "macros", "rt", "test-util"] }
+commonware-runtime = { workspace = true }
+commonware-utils = { workspace = true }
+fixture-modules = { path = "../fixtures/modules" }
+fixture-probe = { path = "../fixtures/probe" }
+fixture-relay = { path = "../fixtures/relay" }
+fixture-valset = { path = "../fixtures/valset" }
+futures = { workspace = true }
+tempfile = { workspace = true }

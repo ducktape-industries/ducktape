@@ -92,6 +92,7 @@ members = [
     "crates/kernel/host",
     "crates/kernel/node",
     "crates/kernel/consensus",
+    "crates/kernel/statesync",
     "crates/networking/wireguard",
     "crates/networking/nat-traversal",
     "crates/networking/netstack-machine",
