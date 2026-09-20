@@ -27,12 +27,12 @@ use provider_host::{AirlockConfig, ProviderSet, RunCancellation};
 use sdk::{Event, Msg};
 use tokio::sync::Semaphore;
 
+use crate::module_contracts::{AdmissionPolicy, RESOURCE_UNAVAILABLE_RESULT};
 use crate::provision::{SharedProvisioner, WorkspaceSpec, assemble_runner_result, bind_workspace};
 use crate::{
     AttemptOutput, ExecJob, Gated, ResourceLedger, attempt_output, clean_error, gate,
     oracle_result_with_usage, renew_lease,
 };
-use dispatch::{AdmissionPolicy, RESOURCE_UNAVAILABLE_RESULT};
 
 /// how many provider runs may execute concurrently unless
 /// `DUCKTAPE_MAX_CONCURRENT_RUNS` says otherwise.
@@ -884,9 +884,9 @@ async fn run_provider(
 #[async_trait::async_trait(?Send)]
 impl Worker for DispatchPool {
     async fn run(&self, event: &Event) -> Result<WorkOutcome, host::worker::Error> {
-        if let Ok(control) = saga::decode_worker_control(&event.payload) {
+        if let Ok(control) = crate::module_contracts::decode_worker_control(&event.payload) {
             match control.command {
-                saga::WorkerControlCommand::CancelAttempt {
+                crate::module_contracts::WorkerControlCommand::CancelAttempt {
                     saga_id,
                     attempt,
                     assignee,
@@ -975,12 +975,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use crate::provision::{ProvisionedWorkspace, WorkspaceReceipt};
-    use dispatch::{WORK_SPEC_KIND, WorkSpec, encode_work_spec};
-    use futures::StreamExt as _;
-    use saga::{
+    use crate::module_contracts::{
         SagaMsg, WorkerControl, WorkerRequest, encode_worker_control, encode_worker_request,
     };
+    use crate::module_contracts::{WORK_SPEC_KIND, WorkSpec, decode_saga_msg, encode_work_spec};
+    use crate::provision::{ProvisionedWorkspace, WorkspaceReceipt};
+    use futures::StreamExt as _;
 
     fn spec_toml(tag: &str) -> provider_host::CapabilitySpec {
         provider_host::CapabilitySpec::parse(
@@ -1478,7 +1478,7 @@ format = "text"
                 .expect("a result within budget")
                 .expect("the lane stays open");
             assert_eq!(msg.target, "saga");
-            match saga::decode_msg(&msg.payload).expect("a saga msg") {
+            match decode_saga_msg(&msg.payload).expect("a saga msg") {
                 SagaMsg::OracleResult {
                     saga_id,
                     attempt,
@@ -1501,7 +1501,7 @@ format = "text"
                     return;
                 };
                 if matches!(
-                    saga::decode_msg(&msg.payload),
+                    decode_saga_msg(&msg.payload),
                     Ok(SagaMsg::OracleResult { .. })
                 ) {
                     panic!("a cancelled attempt delivered an OracleResult");
@@ -1561,7 +1561,7 @@ format = "text"
             attempt,
             outcome,
             usage,
-        } = saga::decode_msg(&msg.payload).unwrap()
+        } = decode_saga_msg(&msg.payload).unwrap()
         else {
             panic!("expected an OracleResult")
         };
@@ -2104,7 +2104,7 @@ format = "text"
                 let deliveries = deliveries.clone();
                 Box::pin(async move {
                     if matches!(
-                        saga::decode_msg(&msg.payload),
+                        decode_saga_msg(&msg.payload),
                         Ok(SagaMsg::OracleResult { .. })
                     ) {
                         deliveries.fetch_add(1, Ordering::SeqCst);
@@ -2154,7 +2154,7 @@ format = "text"
             .unwrap()
             .unwrap();
         assert!(matches!(
-            saga::decode_msg(&msg.payload).unwrap(),
+            decode_saga_msg(&msg.payload).unwrap(),
             SagaMsg::RenewLease { saga_id, attempt: 3 } if saga_id == "s1"
         ));
     }
@@ -2185,7 +2185,7 @@ format = "text"
         let (pool, mut rx) = pool_with(providers, 1);
         pool.run(&effect_for("s1", 0, Some(b"me"))).await.unwrap();
         let msg = rx.next().await.unwrap();
-        let SagaMsg::OracleResult { usage, .. } = saga::decode_msg(&msg.payload).unwrap() else {
+        let SagaMsg::OracleResult { usage, .. } = decode_saga_msg(&msg.payload).unwrap() else {
             panic!("expected OracleResult");
         };
         assert_eq!(usage.unwrap().input_tokens, 100);
@@ -3567,7 +3567,7 @@ format = "text"
     #[tokio::test]
     async fn an_oversized_prose_result_still_fits_the_saga_cap() {
         // THE wedge fix: the host-assembled RunnerResult is the saga Ok
-        // payload, and the saga aborts any Ok over saga::MAX_RESULT_BYTES —
+        // payload, and the saga aborts any Ok over its result cap —
         // an uncapped assembly could then never land and the run would wedge
         // until deadline. an oversized prose answer must deliver TRUNCATED
         // (receipt intact) instead.
@@ -3592,10 +3592,10 @@ format = "text"
 
         let bytes = outcome.expect("the oversized run still delivers Ok");
         assert!(
-            bytes.len() <= saga::MAX_RESULT_BYTES,
+            bytes.len() <= crate::module_contracts::MAX_RESULT_BYTES,
             "the delivered result must fit the saga cap ({} > {})",
             bytes.len(),
-            saga::MAX_RESULT_BYTES
+            crate::module_contracts::MAX_RESULT_BYTES
         );
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["ducktape_runner_result"], 1);
@@ -3625,14 +3625,14 @@ format = "text"
             _prompt: &str,
             _ctx: &provider_host::RunContext,
         ) -> Result<String, String> {
-            Ok("x".repeat(saga::MAX_RESULT_BYTES + 64 * 1024))
+            Ok("x".repeat(crate::module_contracts::MAX_RESULT_BYTES + 64 * 1024))
         }
     }
 
-    /// pin the assembled wire shape against `runs::RunnerResult` field-for-field
+    /// pin the assembled wire shape against the runs producer field-for-field
     /// (a mirror of the consumer's Deserialize). a rename in EITHER crate must
     /// fail THIS test, never production — the receipt round-trips through
-    /// `runs::decode_run_result`.
+    /// decoder.
     #[test]
     fn assembled_runner_result_matches_the_runs_deserialize_contract() {
         // a mirror of runs' faceted Deserialize — a rename in EITHER crate must
@@ -3826,7 +3826,7 @@ format = "text"
 
         // a servable announcement: an immediate Accept claim.
         match pool.run(&effect_for("s1", 0, None)).await.unwrap() {
-            WorkOutcome::Handled(Some(msg)) => match saga::decode_msg(&msg.payload).unwrap() {
+            WorkOutcome::Handled(Some(msg)) => match decode_saga_msg(&msg.payload).unwrap() {
                 SagaMsg::Accept { saga_id, attempt } => {
                     assert_eq!((saga_id.as_str(), attempt), ("s1", 0));
                 }

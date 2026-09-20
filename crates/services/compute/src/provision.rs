@@ -88,9 +88,9 @@ pub struct RoMount {
 }
 
 /// the host-assembled receipt embedded in the `RunnerResult`. field-for-field
-/// with `runs::WorkspaceReceipt` so the assembled bytes round-trip through
-/// `runs::decode_run_result` — a rename in either crate must fail the
-/// cross-crate wire test, never production.
+/// with the runs producer's `WorkspaceReceipt` so the assembled bytes stay
+/// compatible — a rename in either side must fail the golden wire test,
+/// never production.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkspaceReceipt {
     pub source_prefix: String,
@@ -361,7 +361,7 @@ struct RunnerResultWire<'a> {
 /// deterministically on every node. Empty/default facets skip serialization.
 ///
 /// the assembled bytes are delivered as the saga's Ok payload, and the saga
-/// ABORTS any Ok larger than [`saga::MAX_RESULT_BYTES`] at the block — the
+/// ABORTS any Ok larger than the saga result cap at the block — the
 /// attempt could then never land and the run would wedge until its deadline.
 /// so the assembly is capped HERE: an oversized result gets its PROSE
 /// truncated (char-boundary, with a note naming the original size) while the
@@ -433,7 +433,7 @@ fn assemble_result(
         .expect("runner result serializes")
     };
     let full = encode(response_text);
-    if full.len() <= saga::MAX_RESULT_BYTES {
+    if full.len() <= crate::module_contracts::MAX_RESULT_BYTES {
         return full;
     }
     // removing N prose bytes shrinks the JSON by AT LEAST N (escaping only
@@ -449,16 +449,16 @@ fn assemble_result(
     };
     let mut keep = response_text
         .len()
-        .saturating_sub(full.len() - saga::MAX_RESULT_BYTES + note.len() + 16);
+        .saturating_sub(full.len() - crate::module_contracts::MAX_RESULT_BYTES + note.len() + 16);
     while keep > 0 && !response_text.is_char_boundary(keep) {
         keep -= 1;
     }
     let truncated = encode(&format!("{}{note}", &response_text[..keep]));
-    if truncated.len() <= saga::MAX_RESULT_BYTES {
+    if truncated.len() <= crate::module_contracts::MAX_RESULT_BYTES {
         return truncated;
     }
     let bare = encode(&note);
-    if bare.len() <= saga::MAX_RESULT_BYTES {
+    if bare.len() <= crate::module_contracts::MAX_RESULT_BYTES {
         return bare;
     }
     // last rung: even the receipt+sink alone exceed the cap (an unbounded
@@ -507,7 +507,7 @@ fn receipt_stub(r: &WorkspaceReceipt) -> WorkspaceReceipt {
 /// parse used for effects. Validation remains the workspace commit boundary's
 /// job; this seam preserves the proposed subject and body verbatim.
 pub fn commit_message_from_response_text(text: &str) -> Option<String> {
-    serde_json::from_value::<runs::AgentResponse>(parse_response_value(text)?)
+    serde_json::from_value::<crate::module_contracts::AgentResponse>(parse_response_value(text)?)
         .ok()?
         .commit_message
 }
@@ -553,7 +553,7 @@ mod tests {
     fn a_pathological_receipt_still_fits_the_saga_cap() {
         // even when the receipt's free-form strings alone exceed the cap
         // (an unbounded commit_error), the last degrade rung must land the
-        // result under saga::MAX_RESULT_BYTES — an oversized Ok wedges the
+        // result under the saga result cap — an oversized Ok wedges the
         // saga until deadline.
         let receipt = super::WorkspaceReceipt {
             source_prefix: "p".into(),
@@ -562,7 +562,7 @@ mod tests {
             commit_height: None,
             rebased: false,
             no_changes: false,
-            commit_error: Some("x".repeat(saga::MAX_RESULT_BYTES + 4096)),
+            commit_error: Some("x".repeat(crate::module_contracts::MAX_RESULT_BYTES + 4096)),
             branch: None,
             output_commit: None,
         };
@@ -573,7 +573,7 @@ mod tests {
             super::Status::Ok,
         );
         assert!(
-            out.len() <= saga::MAX_RESULT_BYTES,
+            out.len() <= crate::module_contracts::MAX_RESULT_BYTES,
             "degraded result must fit the cap, got {} bytes",
             out.len()
         );
