@@ -1,9 +1,10 @@
 //! The compute service's small, local slices of module-owned wire contracts.
 //!
 //! These types intentionally stop at the values this host consumes or emits.
-//! Their JSON shapes are producer-owned: the fixtures below were copied from
-//! ducktape-sdk at commit `736865710dcfa7c56f9834747287881c1c25d45d` and are
-//! checked independently of this module's encoders.
+//! Their JSON shapes are producer-owned: the fixtures below are pinned to
+//! ducktape-sdk at commit `736865710dcfa7c56f9834747287881c1c25d45d`. The
+//! consumer tests compare local codecs and decoders with those committed bytes;
+//! independent producer-codec execution is recorded in the review evidence.
 
 use std::collections::BTreeMap;
 
@@ -260,6 +261,17 @@ mod tests {
         assert_eq!(encode_saga_msg(&oracle), oracle_bytes);
         assert_eq!(decode_saga_msg(oracle_bytes).unwrap(), oracle);
 
+        let failed = SagaMsg::OracleResult {
+            saga_id: "s".into(),
+            attempt: 2,
+            outcome: Err("failed".into()),
+            usage: None,
+        };
+        let failed_bytes =
+            br#"{"oracle_result":{"saga_id":"s","attempt":2,"outcome":{"Err":"failed"}}}"#;
+        assert_eq!(encode_saga_msg(&failed), failed_bytes);
+        assert_eq!(decode_saga_msg(failed_bytes).unwrap(), failed);
+
         let renew = SagaMsg::RenewLease {
             saga_id: "s".into(),
             attempt: 2,
@@ -312,6 +324,33 @@ mod tests {
         assert!(
             sdk::wire::decode::<AgentResponse>(br#"{"reply_blocks":[],"actions":"invalid"}"#)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_response_fixture_covers_nonempty_reply_and_action() {
+        let bytes = br#"{"reply_blocks":[{"kind":"paragraph","text":"done"}],"actions":[{"operation":"tasks.create","target":{"project":"ducktape"},"input":{"title":"Verify contract"}}],"commit_message":"fix: verify contract"}"#;
+        let response: AgentResponse = sdk::wire::decode(bytes).unwrap();
+        assert_eq!(
+            response.reply_blocks,
+            vec![ReplyBlock {
+                kind: "paragraph".into(),
+                text: "done".into(),
+                lang: None,
+            }]
+        );
+        assert_eq!(
+            response.actions,
+            vec![ActionEnvelope {
+                operation: "tasks.create".into(),
+                target: Some(serde_json::json!({"project": "ducktape"})),
+                input: serde_json::json!({"title": "Verify contract"}),
+            }]
+        );
+        assert_eq!(
+            sdk::wire::encode(&response),
+            bytes,
+            "the local mirror must preserve the producer's field order and omissions"
         );
     }
 }

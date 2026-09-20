@@ -88,9 +88,9 @@ pub struct RoMount {
 }
 
 /// the host-assembled receipt embedded in the `RunnerResult`. field-for-field
-/// with the runs producer's `WorkspaceReceipt` so the assembled bytes stay
-/// compatible — a rename in either side must fail the golden wire test,
-/// never production.
+/// with the runs producer's `WorkspaceReceipt`, kept as a local mirror so the
+/// assembled bytes stay compatible. Producer changes require an explicit
+/// update to this mirror and its golden test.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkspaceReceipt {
     pub source_prefix: String,

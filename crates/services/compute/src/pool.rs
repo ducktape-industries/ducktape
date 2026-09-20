@@ -3629,15 +3629,15 @@ format = "text"
         }
     }
 
-    /// pin the assembled wire shape against the runs producer field-for-field
-    /// (a mirror of the consumer's Deserialize). a rename in EITHER crate must
-    /// fail THIS test, never production — the receipt round-trips through
-    /// decoder.
+    /// pin the assembled wire shape against a local copy of the runs producer
+    /// contract. this catches local assembler or mirror drift; an independent
+    /// producer rename requires deliberately refreshing this copy.
     #[test]
     fn assembled_runner_result_matches_the_runs_deserialize_contract() {
-        // a mirror of runs' faceted Deserialize — a rename in EITHER crate must
-        // fail THIS test. deny_unknown_fields mirrors runs: an assembled key
-        // runs does not know is drift and must fail HERE, not in delivery.
+        // A local mirror of runs' faceted Deserialize keeps accidental local
+        // drift visible before delivery. An independent producer rename does
+        // not reach this test; its fixture and this mirror need an explicit
+        // update together.
         // facet fields carry serde defaults so the minimal shape still decodes.
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
