@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::iter::Peekable;
 
-use abi::{BlobId, Entry, Scan};
+use abi::{Entry, Scan};
 
 use crate::overlay::Overlay;
 use crate::storage::Storage;
@@ -19,14 +19,6 @@ type Layer<'a> = Peekable<Box<dyn Iterator<Item = Item> + 'a>>;
 impl<'a> View<'a> {
     pub fn new(storage: &'a Storage, layers: Vec<&'a Overlay>) -> View<'a> {
         View { storage, layers }
-    }
-
-    pub fn has_blob(&self, id: &BlobId) -> Result<bool> {
-        let staged_in_a_layer = self.layers.iter().any(|layer| layer.has_blob(id));
-        if staged_in_a_layer {
-            return Ok(true);
-        }
-        self.storage.has_blob(id)
     }
 
     pub fn get(&self, program: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -60,8 +52,7 @@ impl<'a> View<'a> {
             reverse: scan.reverse,
         };
         let mut entries = Vec::new();
-        while let Some(next) = merged.next()? {
-            let (key, slot) = next;
+        while let Some((key, slot)) = merged.next()? {
             let Some(value) = slot else { continue };
             entries.push(Entry { key, value });
             let limit_reached = scan.limit.is_some_and(|limit| entries.len() as u64 >= limit);
@@ -112,7 +103,6 @@ impl Merge<'_> {
         }
         Ok(Some((key, slot)))
     }
-
 }
 
 fn precedes(reverse: bool, key: &[u8], best: &[u8]) -> bool {

@@ -1,7 +1,5 @@
-use std::collections::BTreeSet;
 use std::path::Path;
 
-use abi::BlobId;
 use fluent31::{Db, Options, WriteBatch};
 
 use crate::{Error, Result, Writes};
@@ -9,7 +7,7 @@ use crate::{Error, Result, Writes};
 const SEPARATOR: u8 = 0;
 const HEIGHT: &[u8] = b"\xffheight";
 const PENDING: &[u8] = b"\xffpending";
-const BLOB: &[u8] = b"\xffblob\0";
+pub const RESERVED_PREFIX: char = '$';
 
 pub struct Storage {
     db: Db,
@@ -63,20 +61,6 @@ impl Storage {
             }))
     }
 
-    pub fn has_blob(&self, id: &BlobId) -> Result<bool> {
-        Ok(self.db.get(&blob_key(id))?.is_some())
-    }
-
-    pub fn blob_ids(&self) -> Result<BTreeSet<BlobId>> {
-        let end = abi::prefix_end(BLOB);
-        let mut ids = BTreeSet::new();
-        for entry in self.db.iter(Some(BLOB), end.as_deref(), false)? {
-            let (key, _) = entry?;
-            ids.insert(decode(&key[BLOB.len()..])?);
-        }
-        Ok(ids)
-    }
-
     pub fn commit(&self, height: u64, writes: &Writes) -> Result<()> {
         let mut batch = WriteBatch::new();
         stage(&mut batch, writes);
@@ -103,9 +87,6 @@ fn stage(batch: &mut WriteBatch, writes: &Writes) {
             }
         }
     }
-    for id in &writes.blobs {
-        batch.put(blob_key(id), Vec::new());
-    }
 }
 
 pub fn namespaced(program: &str, key: &[u8]) -> Vec<u8> {
@@ -122,17 +103,15 @@ fn namespace_end(program: &str) -> Vec<u8> {
     bytes
 }
 
-fn blob_key(id: &BlobId) -> Vec<u8> {
-    let mut bytes = BLOB.to_vec();
-    bytes.extend_from_slice(&abi::encode(id));
-    bytes
+pub fn reserved(program: &str) -> bool {
+    program.starts_with(RESERVED_PREFIX)
 }
 
 pub fn valid_program_id(program: &str) -> bool {
     let non_empty = !program.is_empty();
     let no_separator = !program.as_bytes().contains(&SEPARATOR);
     let path_segment = !program.contains('/');
-    non_empty && no_separator && path_segment
+    non_empty && no_separator && path_segment && !reserved(program)
 }
 
 fn decode<T: borsh::BorshDeserialize>(bytes: &[u8]) -> Result<T> {

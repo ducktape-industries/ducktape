@@ -291,6 +291,55 @@ pub enum GuestCall {
 
 pub type GuestReply = Result<Vec<u8>, Refusal>;
 
+pub mod roster {
+    use super::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
+
+    pub const PROGRAM: &str = "modules";
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Entry {
+        pub program: ProgramId,
+        pub code: BlobId,
+        pub params: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub enum Query {
+        At(u64),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub enum Reply {
+        Programs(Vec<Entry>),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Genesis {
+        pub programs: Vec<Entry>,
+    }
+}
+
+pub mod validators {
+    use super::{BorshDeserialize, BorshSerialize};
+
+    pub const PROGRAM: &str = "valset";
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub enum Query {
+        Validators,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub enum Reply {
+        Validators(Vec<Vec<u8>>),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Genesis {
+        pub validators: Vec<Vec<u8>>,
+    }
+}
+
 pub fn encode<T: BorshSerialize>(value: &T) -> Vec<u8> {
     borsh::to_vec(value).expect("borsh serialization of an in-memory value cannot fail")
 }
