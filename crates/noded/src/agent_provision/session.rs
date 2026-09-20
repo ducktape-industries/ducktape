@@ -47,14 +47,14 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::node_link::NodeLink;
 
 /// the module that owns the session registry.
 const RUNS_MODULE: &str = "runs";
 const ACTION_HEADER: &str = "x-ducktape-run-action";
-const MAX_ACTION_REQUEST_BYTES: usize = runs_wire::MAX_ACTIONS_BYTES + runs_wire::MAX_DELEGATIONS_BYTES;
+const MAX_ACTION_REQUEST_BYTES: usize = crate::runs::MAX_ACTIONS_BYTES + crate::runs::MAX_DELEGATIONS_BYTES;
 
 pub(super) const ENV_ACTION_URL: &str = "DUCKTAPE_RUN_ACTION_URL";
 pub(super) const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
@@ -91,7 +91,106 @@ struct ActionState {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ActionRequest {
-    message: runs_wire::RunsMsg,
+    message: crate::runs::RunsMsg,
+}
+
+// The local runs contract carries this nested SDK-shaped record through its public receipt,
+// but the node must not name the producer module's dispatch type here. Keep
+// the SDK736 JSON shape local to this consumer boundary instead.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ReceiptStatus {
+    AwaitingProgram,
+    Claimed {
+        call: sdk::CallId,
+    },
+    Completed {
+        call: sdk::CallId,
+        outcome: ReceiptOutcome,
+    },
+    Rejected {
+        reason: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ReceiptOutcome {
+    Applied {
+        output_digest: [u8; 32],
+        assigned: Vec<u8>,
+    },
+    Rejected {
+        reason: String,
+    },
+    Refused(ReceiptRefusal),
+    Unrepresentable {
+        attempted: ReceiptAttempt,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ReceiptRefusal {
+    NotAProgram,
+    Revoked,
+    Suspended,
+    StaleGeneration,
+    WrongExecutor,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ReceiptAttempt {
+    Applied,
+    Rejected,
+    Refused,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ActionRequestReceipt {
+    request_id: String,
+    account: sdk::AccountNumber,
+    generation: u64,
+    run_id: String,
+    operation: String,
+    result: serde_json::Value,
+    target: String,
+    payload: serde_json::Value,
+    status: ReceiptStatus,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum ActionReceiptReply {
+    ActionRequest(Option<ActionRequestReceipt>),
+}
+
+fn decode_action_reply(bytes: &[u8]) -> Result<Option<ActionRequestReceipt>, String> {
+    let ActionReceiptReply::ActionRequest(request) = sdk::wire::decode(bytes)?;
+    Ok(request)
+}
+
+#[cfg(test)]
+pub(super) fn encode_action_reply(
+    request_id: String,
+    run_id: String,
+    status: ReceiptStatus,
+) -> Vec<u8> {
+    sdk::wire::encode(&ActionReceiptReply::ActionRequest(Some(
+        ActionRequestReceipt {
+            request_id,
+            account: 2,
+            generation: 0,
+            run_id,
+            operation: "tasks.create".into(),
+            result: serde_json::Value::Null,
+            target: "tasks".into(),
+            payload: serde_json::Value::Null,
+            status,
+        },
+    )))
 }
 
 /// Generate a host-private key and bind its public half to this execution.
@@ -107,7 +206,7 @@ pub(super) async fn open(
     let mut seed = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
     let key = ed25519::PrivateKey::decode(seed.as_slice()).expect("32 random bytes decode");
-    let payload = runs_wire::encode_msg(&runs_wire::RunsMsg::OpenAgentSession {
+    let payload = crate::runs::encode_msg(&crate::runs::RunsMsg::OpenAgentSession {
         run_id: agent.run_id.clone(),
         attempt: agent.attempt,
         session_key: key.public_key().as_ref().to_vec(),
@@ -208,7 +307,7 @@ async fn run_action(
         return action_response(StatusCode::UNAUTHORIZED, "action token rejected");
     }
     let names_bound_run = match &request.message {
-        runs_wire::RunsMsg::AgentAction { run_id, .. } => run_id == &state.run_id,
+        crate::runs::RunsMsg::AgentAction { run_id, .. } => run_id == &state.run_id,
         _ => false,
     };
     if !names_bound_run {
@@ -268,31 +367,29 @@ async fn action_events(node: &NodeLink) -> Result<ActionEvents, String> {
 async fn action_result(
     node: &NodeLink,
     request_id: &str,
-) -> Result<Option<Result<runs_wire::ActionRequestView, String>>, String> {
+) -> Result<Option<Result<ActionRequestReceipt, String>>, String> {
     let bytes = node
         .query(
             RUNS_MODULE,
-            &runs_wire::encode_query(&runs_wire::RunsQuery::ActionRequest {
+            &crate::runs::encode_query(&crate::runs::RunsQuery::ActionRequest {
                 request_id: request_id.into(),
             }),
         )
         .await?;
-    let runs_wire::RunsReply::ActionRequest(request) = runs_wire::decode_reply(&bytes)? else {
-        return Err("unexpected action request reply".into());
-    };
+    let request = decode_action_reply(&bytes)?;
     let Some(request) = request else {
         return Ok(None);
     };
     match &request.status {
-        runs_wire::ActionStatus::AwaitingProgram | runs_wire::ActionStatus::Claimed { .. } => Ok(None),
-        runs_wire::ActionStatus::Rejected { reason } => Ok(Some(Err(reason.clone()))),
-        runs_wire::ActionStatus::Completed { outcome, .. } => match outcome {
-            dispatch::CallOutcomeSummary::Applied { .. } => Ok(Some(Ok(request))),
-            dispatch::CallOutcomeSummary::Rejected { reason } => Ok(Some(Err(reason.clone()))),
-            dispatch::CallOutcomeSummary::Refused(reason) => {
+        ReceiptStatus::AwaitingProgram | ReceiptStatus::Claimed { .. } => Ok(None),
+        ReceiptStatus::Rejected { reason } => Ok(Some(Err(reason.clone()))),
+        ReceiptStatus::Completed { outcome, .. } => match outcome {
+            ReceiptOutcome::Applied { .. } => Ok(Some(Ok(request))),
+            ReceiptOutcome::Rejected { reason } => Ok(Some(Err(reason.clone()))),
+            ReceiptOutcome::Refused(reason) => {
                 Ok(Some(Err(format!("program action refused: {reason:?}"))))
             }
-            dispatch::CallOutcomeSummary::Unrepresentable { .. } => Ok(Some(Err(
+            ReceiptOutcome::Unrepresentable { .. } => Ok(Some(Err(
                 "program action outcome could not be represented".into(),
             ))),
         },
@@ -303,7 +400,7 @@ async fn await_action_result(
     node: &NodeLink,
     request_id: &str,
     mut events: ActionEvents,
-) -> Result<runs_wire::ActionRequestView, String> {
+) -> Result<ActionRequestReceipt, String> {
     if let Some(result) = action_result(node, request_id).await? {
         return result;
     }
@@ -340,22 +437,22 @@ async fn await_action_result(
 /// response names it `receipt_id` beside the receipt itself.
 async fn submit_action(
     state: &ActionState,
-    message: runs_wire::RunsMsg,
+    message: crate::runs::RunsMsg,
 ) -> Result<serde_json::Value, String> {
-    let runs_wire::RunsMsg::AgentAction {
+    let crate::runs::RunsMsg::AgentAction {
         run_id, request_id, ..
     } = &message
     else {
         return Err("message is outside the run action scope".into());
     };
-    let receipt_id = runs_wire::action_request_id(run_id, request_id);
+    let receipt_id = crate::runs::action_request_id(run_id, request_id);
     // Serialize admission and completion so a later action cannot overtake one
     // whose actual target write is still pending.
     let mut next_seq = state.seq.lock().await;
     let events = action_events(&state.node).await?;
     let msg = sdk::Msg {
         target: RUNS_MODULE.into(),
-        payload: runs_wire::encode_msg(&message),
+        payload: crate::runs::encode_msg(&message),
     };
     let frame = node::encode_frame(&state.signer, *next_seq, &msg);
     *next_seq = next_seq

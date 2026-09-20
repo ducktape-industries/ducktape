@@ -36,7 +36,7 @@
 //! signal, which is strictly worse than a run that stops and says why.
 
 /// the ambient MCP instruction every run carries — MOVED verbatim from the run
-/// envelope's runtime section (`runs::envelope`), which this document replaces.
+/// envelope's runtime section, which this document replaces.
 /// it deliberately does not enumerate the tools: the MCP server ships its own
 /// instructions with the binary, so restating the surface here would only give
 /// the two something to drift apart about.
@@ -46,7 +46,7 @@ const TOOL_PLANE_INSTRUCTION: &str = "A Ducktape MCP tool server named \"ducktap
 /// the module that owns it, never restated here: the string the assembler
 /// advertises and the string the composer pins skills under must be the same
 /// one, or the document points an agent at a prefix nothing lives in.
-pub use runs::SKILL_LIBRARY_PREFIX;
+pub use crate::module_contracts::SKILL_LIBRARY_PREFIX;
 
 /// the tier-2 pointer. named read operations with their real envelope shapes,
 /// because a model that has to guess the call will guess wrong: `files.ls`
@@ -75,14 +75,14 @@ pub const MAX_ALWAYS_BYTES: usize = 64 * 1024;
 pub const MAX_DESCRIPTION_CHARS: usize = 200;
 
 /// hard cap on the curated on-demand skills the index lists — the SAME number
-/// consensus enforces on an agent's curated list ([`runs::MAX_SKILLS_PER_AGENT`]),
+/// consensus enforces on an agent's curated list (`MAX_SKILLS_PER_AGENT`),
 /// deliberately re-exported rather than restated: two caps that could drift is
 /// how you get a record consensus happily accepts and no run can load.
 ///
 /// re-checked here anyway, because the consensus cap only binds at WRITE time —
 /// a record registered before the cap existed still carries whatever it carries,
 /// and the assembler is the last thing standing between it and a run.
-pub use runs::MAX_SKILLS_PER_AGENT as MAX_INDEXED_SKILLS;
+pub use crate::module_contracts::MAX_SKILLS_PER_AGENT as MAX_INDEXED_SKILLS;
 
 /// one curated skill, already materialized. `name` is the CURATED name
 /// consensus committed (`SkillRef.name`), never a name read out of the document

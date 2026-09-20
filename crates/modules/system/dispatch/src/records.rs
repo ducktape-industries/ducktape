@@ -42,12 +42,12 @@
 //! carrying them is one derive, not a hand-written mirror that can drift.
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use saga::{put_origin, take_origin};
 use sdk::{AccountNumber, CallId, Cause, DeliveryOutcome, Error, ModuleId, StagedStore, codec};
 
 use crate::{
     CallOutcome, CallOutcomeSummary, DispatchState, OutputContract, Recipe, Routing, SEP, Status,
 };
+use crate::{put_origin, take_origin};
 
 /// one recipe record per id.
 const RECIPE_PREFIX: &[u8] = b"r/";

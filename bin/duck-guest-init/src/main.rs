@@ -415,7 +415,7 @@ fn run_on_pty(manifest: &RunManifest, host: RawFd) -> Result<i32, String> {
                 libc::close(slave);
             }
         }
-        exec_child(manifest);
+        exec_child(manifest, host);
     }
 
     // the slave stays open in the CHILD only: holding a copy here would keep
@@ -457,7 +457,7 @@ fn run_on_pipes(manifest: &RunManifest, host: RawFd) -> Result<i32, String> {
             libc::close(out_pipe[1]);
             libc::close(err_pipe[1]);
         }
-        exec_child(manifest);
+        exec_child(manifest, host);
     }
 
     unsafe {
@@ -601,7 +601,7 @@ fn feed_pty(buf: &mut Vec<u8>, master: RawFd) {
             Frame::StdinEof => {}
             Frame::Resize { cols, rows } => resize_pty(master, cols, rows),
             // the host never sends these.
-            Frame::Stdout(_) | Frame::Stderr(_) | Frame::Exit(_) => {}
+            Frame::Stdout(_) | Frame::Stderr(_) | Frame::Exit(_) | Frame::Spawn => {}
         }
     }
 }
@@ -648,7 +648,7 @@ fn wait_for_host_close(host: RawFd) {
 /// the child half of the fork. Diverges: on a successful `execve` this process
 /// becomes the CLI, and on a failed one it must `_exit` rather than return into
 /// a second copy of the init.
-fn exec_child(manifest: &RunManifest) -> ! {
+fn exec_child(manifest: &RunManifest, host: RawFd) -> ! {
     let fail = |msg: &str| -> ! {
         let _ = writeln!(std::io::stderr(), "duck-guest-init: {msg}");
         unsafe { libc::_exit(INIT_FAILED) }
@@ -680,6 +680,10 @@ fn exec_child(manifest: &RunManifest) -> ! {
     let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).collect();
     envp_ptrs.push(std::ptr::null());
 
+    // The host-side timing driver cannot observe a guest fork directly. This
+    // marker crosses the existing stdio vsock before exec, so session timing is
+    // anchored to the actual guest child path rather than VM boot completion.
+    send(host, &Frame::Spawn);
     unsafe { libc::execve(argv[0].as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
     fail(&format!("execve {}", manifest.argv[0]))
 }
@@ -794,7 +798,7 @@ fn feed_stdin(buf: &mut Vec<u8>, stdin_fd: &mut RawFd) {
             Frame::Resize { .. } => {}
             // The host never sends these; ignoring them keeps a host-side bug
             // from taking the run down.
-            Frame::Stdout(_) | Frame::Stderr(_) | Frame::Exit(_) => {}
+            Frame::Stdout(_) | Frame::Stderr(_) | Frame::Exit(_) | Frame::Spawn => {}
         }
     }
 }

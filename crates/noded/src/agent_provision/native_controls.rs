@@ -96,32 +96,32 @@ pub(super) fn validate_claims(ids: &[String], receipts: &HistoryReceipts) -> Res
 
 pub(super) async fn worker_controls(
     state: &ActionState,
-) -> Result<Option<runs_wire::WorkerControls>, String> {
+) -> Result<Option<crate::runs::WorkerControls>, String> {
     let bytes = state
         .node
         .query(
             RUNS_MODULE,
-            &runs_wire::encode_query(&runs_wire::RunsQuery::WorkerControls {
+            &crate::runs::encode_query(&crate::runs::RunsQuery::WorkerControls {
                 run_id: state.run_id.clone(),
             }),
         )
         .await?;
-    let runs_wire::RunsReply::WorkerControls(controls) = runs_wire::decode_reply(&bytes)? else {
+    let crate::runs::RunsReply::WorkerControls(controls) = crate::runs::decode_reply(&bytes)? else {
         return Err("unexpected worker controls reply".into());
     };
     Ok(controls)
 }
 
-fn acknowledged(control: &tasks::JobControl, job_attempt: u64) -> bool {
+fn acknowledged(control: &crate::tasks::JobControl, job_attempt: u64) -> bool {
     control.acknowledgements.iter().any(|ack| {
-        ack.attempt == job_attempt && ack.worker == tasks::Party::Module(RUNS_MODULE.into())
+        ack.attempt == job_attempt && ack.worker == crate::tasks::Party::Module(RUNS_MODULE.into())
     })
 }
 
 pub(super) fn plan(
     receipts: &HistoryReceipts,
     approved: &HistoryReceipts,
-    worker: Option<&runs_wire::WorkerControls>,
+    worker: Option<&crate::runs::WorkerControls>,
 ) -> Result<Vec<Acknowledgement>, String> {
     let mut result = Vec::new();
     for (id, receipt) in &receipts.controls {
@@ -138,7 +138,7 @@ pub(super) fn plan(
             }
             continue;
         };
-        let tasks::JobControlInput::Steer { text } = &control.input else {
+        let crate::tasks::JobControlInput::Steer { text } = &control.input else {
             return Err("native cancellation requires a cancellation boundary receipt".into());
         };
         if text != &receipt.text {
@@ -159,7 +159,7 @@ pub(super) fn plan(
 pub(super) fn cancellation_plan(
     receipts: &HistoryReceipts,
     approved: &HistoryReceipts,
-    worker: Option<&runs_wire::WorkerControls>,
+    worker: Option<&crate::runs::WorkerControls>,
     context: &NativeConversationContext,
 ) -> Result<Option<Cancellation>, String> {
     let mut cancellations = Vec::new();
@@ -180,7 +180,7 @@ pub(super) fn cancellation_plan(
         let bound = receipt.conversation_id == context.conversation_id
             && receipt.turn_id == context.turn_id
             && receipt.id == *id
-            && control.input == tasks::JobControlInput::Cancel;
+            && control.input == crate::tasks::JobControlInput::Cancel;
         if !bound {
             return Err("native cancellation receipt is outside this turn's cancel scope".into());
         }
@@ -242,7 +242,7 @@ pub(super) async fn poll(
     let cancel = worker
         .controls
         .iter()
-        .find(|control| control.input == tasks::JobControlInput::Cancel);
+        .find(|control| control.input == crate::tasks::JobControlInput::Cancel);
     if let Some(cancel) = cancel {
         return Ok(
             serde_json::json!({"control":"continue", "messages":[], "cancel":{"id":qualified_id(&worker.job_id, &cancel.operation_id)}}),
@@ -254,10 +254,10 @@ pub(super) async fn poll(
             continue;
         }
         match &control.input {
-            tasks::JobControlInput::Steer { text } => messages.push(serde_json::json!({
+            crate::tasks::JobControlInput::Steer { text } => messages.push(serde_json::json!({
                 "id":qualified_id(&worker.job_id, &control.operation_id), "text":text, "kind":"steer",
             })),
-            tasks::JobControlInput::Cancel => return Err("native cancellation escaped boundary selection".into()),
+            crate::tasks::JobControlInput::Cancel => return Err("native cancellation escaped boundary selection".into()),
         }
     }
     Ok(serde_json::json!({"control":"continue", "messages":messages}))
@@ -284,7 +284,7 @@ async fn acknowledgement_result(
         .ok_or_else(|| "native job control disappeared".to_string())?;
     let complete = acknowledged(control, current.job_attempt);
     let exhausted =
-        !complete && control.acknowledgements.len() >= tasks::MAX_CONTROL_ACKNOWLEDGEMENTS;
+        !complete && control.acknowledgements.len() >= crate::tasks::MAX_CONTROL_ACKNOWLEDGEMENTS;
     if exhausted {
         return Err("native job control acknowledgement cap reached".into());
     }
@@ -304,7 +304,7 @@ pub(super) async fn acknowledge(
         }
         let message = sdk::Msg {
             target: RUNS_MODULE.into(),
-            payload: runs_wire::encode_msg(&runs_wire::RunsMsg::AcknowledgeJobControl {
+            payload: crate::runs::encode_msg(&crate::runs::RunsMsg::AcknowledgeJobControl {
                 run_id: state.run_id.clone(),
                 attempt: native.attempt,
                 operation_id: acknowledgement.operation_id.clone(),
@@ -348,8 +348,8 @@ async fn settlement_result(
         return Err("native cancellation claim moved".into());
     }
     match current.job_status {
-        tasks::JobStatus::Processing => Ok(false),
-        tasks::JobStatus::Cancelled => {
+        crate::tasks::JobStatus::Processing => Ok(false),
+        crate::tasks::JobStatus::Cancelled => {
             let exact = current
                 .result
                 .as_ref()
@@ -359,7 +359,7 @@ async fn settlement_result(
             }
             Ok(true)
         }
-        tasks::JobStatus::Pending | tasks::JobStatus::Done | tasks::JobStatus::Failed => {
+        crate::tasks::JobStatus::Pending | crate::tasks::JobStatus::Done | crate::tasks::JobStatus::Failed => {
             Err("native cancellation job is no longer processing".into())
         }
     }
@@ -378,7 +378,7 @@ async fn settle_cancellation(
     }
     let message = sdk::Msg {
         target: RUNS_MODULE.into(),
-        payload: runs_wire::encode_msg(&runs_wire::RunsMsg::SettleJobCancellation {
+        payload: crate::runs::encode_msg(&crate::runs::RunsMsg::SettleJobCancellation {
             run_id: state.run_id.clone(),
             attempt: native.attempt,
             operation_id: cancellation.acknowledgement.operation_id.clone(),

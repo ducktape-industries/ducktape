@@ -1,14 +1,13 @@
 use super::super::super::super::{RunSession, start_action_server};
 use super::*;
-use runs_wire as runs;
 
-fn report_record(operation_id: &str, payload: &str) -> tasks::WorkerReport {
-    tasks::WorkerReport {
+fn report_record(operation_id: &str, payload: &str) -> crate::tasks::WorkerReport {
+    crate::tasks::WorkerReport {
         operation_id: operation_id.into(),
-        worker: tasks::Party::Module("runs".into()),
+        worker: crate::tasks::Party::Module("runs".into()),
         attempt: 1,
         height: 3,
-        kind: tasks::WorkerReportKind::Report,
+        kind: crate::tasks::WorkerReportKind::Report,
         payload: payload.into(),
     }
 }
@@ -17,7 +16,7 @@ async fn worker(root: &Path) -> (TestNode, RunSession) {
     let signer = ed25519::PrivateKey::from_seed(1);
     let node = TestNode::start(&signer).await;
     let mut native = native(root);
-    native.configuration.source = runs::ConversationSource::Job {
+    native.configuration.source = crate::runs::ConversationSource::Job {
         job_id: "job-a".into(),
     };
     native.context.job_reporting = true;
@@ -109,7 +108,7 @@ async fn semantic_report_waits_for_exact_committed_readback_and_preserves_opaque
         "duplicates still cross Runs' claim/generation authorization"
     );
     assert_eq!(submissions[0], submissions[1]);
-    let runs::RunsMsg::ReportJob {
+    let crate::runs::RunsMsg::ReportJob {
         run_id,
         attempt,
         operation_id,
@@ -123,7 +122,7 @@ async fn semantic_report_waits_for_exact_committed_readback_and_preserves_opaque
     assert!(run_id.contains('\u{1f}'));
     assert_eq!(*attempt, 1);
     assert_eq!(operation_id, "report-1");
-    assert_eq!(*kind, tasks::WorkerReportKind::Report);
+    assert_eq!(*kind, crate::tasks::WorkerReportKind::Report);
     assert_eq!(actual, payload);
     let view = node.fixture.view.lock().await;
     assert!(view.history.is_none());
@@ -140,11 +139,11 @@ async fn semantic_report_rejects_conflicting_worker_attempt_kind_or_payload() {
     let (node, session) = worker(root.path()).await;
     let correct = report_record("report-1", "done");
     let mut wrong_worker = correct.clone();
-    wrong_worker.worker = tasks::Party::Module("other".into());
+    wrong_worker.worker = crate::tasks::Party::Module("other".into());
     let mut wrong_attempt = correct.clone();
     wrong_attempt.attempt = 2;
     let mut wrong_kind = correct.clone();
-    wrong_kind.kind = tasks::WorkerReportKind::Checkpoint;
+    wrong_kind.kind = crate::tasks::WorkerReportKind::Checkpoint;
     let mut wrong_payload = correct.clone();
     wrong_payload.payload = "different".into();
     for wrong in [wrong_worker, wrong_attempt, wrong_kind, wrong_payload] {

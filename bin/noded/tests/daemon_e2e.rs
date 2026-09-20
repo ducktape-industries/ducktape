@@ -19,6 +19,190 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest as _, Sha256};
 
+#[allow(dead_code)]
+mod test_wire {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Program {
+        pub steps: Vec<Step>,
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Step {
+        Branch {
+            test: Predicate,
+            then: u64,
+            or: u64,
+        },
+        Call {
+            module: String,
+            msg: Value,
+            bind: String,
+            decode: Decode,
+            on_failure: Continuation,
+        },
+        Report {
+            recipient: Value,
+            reason: Reason,
+            detail: Value,
+        },
+        Finish,
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Decode {
+        Json,
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Continuation {
+        Step(u64),
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Value {
+        Null,
+        Bool(bool),
+        Number(i128),
+        Text(String),
+        Bytes(Vec<u8>),
+        List(Vec<Value>),
+        Map(BTreeMap<String, Value>),
+        Ref(Vec<String>),
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Predicate {
+        Equals { left: Value, right: Value },
+    }
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Reason {
+        Mention,
+        Authorship,
+        Ownership,
+        Assignment,
+        Credit,
+        Result,
+        Report,
+        Defined(String),
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum AttributionReply {
+        Changes(Vec<ChangeEntry>),
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    pub struct ChangeEntry {
+        pub at: u64,
+        pub change: Change,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    pub struct Change {
+        pub seq: u64,
+        pub source: Source,
+        pub revision: u64,
+        pub recipient: u64,
+        pub reason: Reason,
+        pub kind: ChangeKind,
+        pub detail: Vec<u8>,
+        pub actor: Actor,
+        pub cause: Cause,
+        pub height: u64,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    pub struct Source {
+        pub module: String,
+        pub kind: String,
+        pub object: String,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum ChangeKind {
+        Added,
+        Withdrawn,
+        TransferredIn { from: u64 },
+        TransferredOut { to: u64 },
+    }
+
+    #[derive(Deserialize, Debug, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Actor {
+        Account(u64),
+        Key(Vec<u8>),
+        Module(String),
+        System,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Cause {
+        Direct,
+        Chain { root: Root, hop: Hop },
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Root {
+        Item(ItemRef),
+        Call(CallId),
+        Change { source: String, seq: u64 },
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Hop {
+        Delivery(ItemRef),
+        Call(CallId),
+        Completion(CallId),
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    pub struct ItemRef {
+        pub source: String,
+        pub item: u64,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    pub struct CallId {
+        pub requester: String,
+        pub invocation: String,
+        pub step: u64,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum CallResult {
+        Applied {
+            output: serde_json::Value,
+            assigned: serde_json::Value,
+        },
+        Rejected {
+            reason: String,
+        },
+    }
+}
+
 /// a running daemon, killed on drop so failures never leak an orphan (the
 /// REAL orphan lifecycle — outliving a client — is the desktop shell's
 /// contract with a detached spawn; this harness owns its child instead).
@@ -464,10 +648,13 @@ fn media_product_route_is_absent_and_presence_without_overlay_refuses() {
     assert_eq!(status, 404);
 
     let (status, raw) = daemon.ws_upgrade_refusal("/v1/presence/ws?page=page-1");
-    assert_eq!(status, 503, "no realtime hub → presence refused: {raw}");
+    assert_eq!(
+        status, 500,
+        "keyless daemon refuses presence before the no-hub check: {raw}"
+    );
     assert!(
-        raw.contains("no mesh realtime hub"),
-        "refusal says WHY: {raw}"
+        raw.contains("node_unidentified"),
+        "keyless presence refusal says WHY: {raw}"
     );
 
     let (status, _raw) = daemon.ws_upgrade_refusal("/v1/voice/ws?channel=general");
@@ -656,8 +843,10 @@ fn block_commits_push_tip_heartbeats_before_their_events() {
 
 #[test]
 fn programmable_user_calls_and_reports_failure_through_onchain_attribution() {
-    use agent::{Continuation, Decode, Predicate, Program, Step, Value};
-    use attribution::{Actor, AttributionReply, Reason};
+    use test_wire::{
+        Actor, AttributionReply, CallResult, Continuation, Decode, Hop, Predicate, Program, Reason,
+        Step, Value,
+    };
 
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
@@ -718,6 +907,7 @@ fn programmable_user_calls_and_reports_failure_through_onchain_attribution() {
         (
             "agent",
             serde_json::json!({ "provision": {
+                "request_id": "taskbot",
                 "name": "taskbot", "program": program,
             }}),
         ),
@@ -757,9 +947,7 @@ fn programmable_user_calls_and_reports_failure_through_onchain_attribution() {
             "changes_for": { "recipient": 1, "after": 0, "limit": 64 },
         }),
     );
-    let AttributionReply::Changes(entries) = serde_json::from_value(changes).unwrap() else {
-        panic!("expected the controller's attributions");
-    };
+    let AttributionReply::Changes(entries) = serde_json::from_value(changes).unwrap();
     let reports: Vec<_> = entries
         .iter()
         .map(|entry| &entry.change)
@@ -772,8 +960,8 @@ fn programmable_user_calls_and_reports_failure_through_onchain_attribution() {
         assert!(
             matches!(
                 report.cause,
-                sdk::Cause::Chain {
-                    hop: sdk::Hop::Completion(_),
+                test_wire::Cause::Chain {
+                    hop: Hop::Completion(_),
                     ..
                 }
             ),
@@ -781,10 +969,10 @@ fn programmable_user_calls_and_reports_failure_through_onchain_attribution() {
             report.cause
         );
     }
-    let applied: agent::CallResult = serde_json::from_slice(&reports[0].detail).unwrap();
-    assert!(matches!(applied, agent::CallResult::Applied { .. }));
-    let rejected: agent::CallResult = serde_json::from_slice(&reports[1].detail).unwrap();
-    let agent::CallResult::Rejected { reason } = rejected else {
+    let applied: CallResult = serde_json::from_slice(&reports[0].detail).unwrap();
+    assert!(matches!(applied, CallResult::Applied { .. }));
+    let rejected: CallResult = serde_json::from_slice(&reports[1].detail).unwrap();
+    let CallResult::Rejected { reason } = rejected else {
         panic!("duplicate task must report its target rejection");
     };
     assert!(
@@ -1103,23 +1291,23 @@ fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
     let (code, _) = daemon.request_bytes("GET", &format!("/v1/files/blob/{upper}"), &[]);
     assert_eq!(code, 400, "digest must be lowercase hex");
 
-    // the receipt-lane body cap is 4 MiB inclusive: exactly 4 MiB lands...
+    // The receipt lane streams to disk and has no 4 MiB body ceiling: a
+    // repository packfile may be larger than the old buffered limit.
     let max = vec![0xABu8; 4 * 1024 * 1024];
     let (code, _) = daemon.request_bytes("POST", "/v1/files/blob", &max);
-    assert_eq!(code, 200, "a body of exactly the cap must land");
-    // ...and one byte more is a 413 in the daemon's error envelope.
+    assert_eq!(code, 200, "a 4 MiB body must land");
     let over = vec![0xCDu8; 4 * 1024 * 1024 + 1];
     let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", &over);
     assert_eq!(
         code,
-        413,
-        "oversized body must be rejected: {}",
+        200,
+        "a body beyond the old buffered ceiling must land: {}",
         String::from_utf8_lossy(&body)
     );
-    let err: serde_json::Value = serde_json::from_slice(&body).expect("413 body is json");
+    let over_reply: serde_json::Value = serde_json::from_slice(&body).expect("upload reply json");
     assert!(
-        err["error"].is_string(),
-        "413 uses the error envelope: {err}"
+        over_reply["digest"] == digest_hex(&over),
+        "the streamed oversized upload is addressed by its exact digest: {over_reply}"
     );
 
     // the whole blob lane is off-consensus: no blocks, no root-hash movement.

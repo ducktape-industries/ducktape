@@ -156,8 +156,9 @@ CARGO_BIN = $${CARGO_HOME:-$$HOME/.cargo}/bin
 STAGED_MODULES = modules$(subst /,%,$(CURDIR))
 STAGED_SIM_MODULES = sim-modules$(subst /,%,$(CURDIR))
 install-node: prereqs
-	$(CARGO) install --path bin/node --locked --target-dir target
-	$(CARGO) install --path bin/node-launcher --locked --target-dir target
+	$(CARGO) build $(LOCKED) --release --target-dir target -p node-bin -p node-launcher
+	mkdir -p "$(CARGO_BIN)"
+	install -m 0755 target/release/ducktape target/release/ducktape-node-launcher "$(CARGO_BIN)/"
 	rm -rf "$(CARGO_BIN)/modules"
 	cp -r "target/release/$(STAGED_MODULES)" "$(CARGO_BIN)/modules"
 	rm -rf "$(CARGO_BIN)/sim-modules"
@@ -237,6 +238,11 @@ test: wasm-embed-check
 # bystander naming the path). Needs `bun` (so does demo-clear itself); the
 # script skips with a notice where there is none, like the podman lines above.
 	bash ops/demo-clear-test.sh
+# the unified install contract: `make install` delegates to the App pinned in
+# ops/app/APP_REV, and the checkout it pins lives under target/ where this
+# script owns it. The test ran nowhere until now, which is how a leftover the
+# pinning could repair itself shipped as a permanent `make install` refusal.
+	bash ops/app/install-test.sh
 # the #[ignore]d tests are ignored ONLY because they must not share a process
 # with the parallel suite — they still have to run. `absolute_configs_resolve_
 # after_launch_cwd_is_deleted` re-execs the test binary, and doing that under 32

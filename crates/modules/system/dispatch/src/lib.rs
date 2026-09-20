@@ -89,8 +89,14 @@
 //! module-origin-only — so outcomes route by construction, never by
 //! configuration.
 
-// the wire surface: this module's shared types, flattened at the crate root.
-pub use dispatch_wire::*;
+mod capability_contract;
+pub mod identity_contract;
+pub mod saga_contract;
+mod wire;
+
+// the wire surface belongs to this module. Keep its codec at the crate root
+// so host consumers use the same bytes without an SDK wire crate.
+pub use wire::*;
 
 // the store key space and the per-record codecs.
 mod records;
@@ -98,8 +104,8 @@ mod records;
 use sha2::Digest as _;
 use std::collections::BTreeMap;
 
-use capability::{validate_resources, validate_tag};
-use identity::{Control, IdentityQuery, IdentityReply, ProgramStanding};
+use capability_contract::{validate_resources, validate_tag};
+use identity_contract::{Control, IdentityQuery, IdentityReply, ProgramStanding};
 use records::{
     CallRecord, CallRecordStatus, Calls, MailEntry, Mailbox, call_key, claim_key, committed_call,
     committed_calls, committed_claim, committed_dispatch, committed_mail_entry, committed_mailbox,
@@ -108,8 +114,8 @@ use records::{
     staged_call, staged_calls, staged_claim, staged_dispatch, staged_mail_entry, staged_mailbox,
     staged_recipe,
 };
-use saga::{
-    MAX_ASSIGNEE_BYTES, SagaCallback, SagaMsg, SagaOrigin, SagaOutcome, decode_callback,
+use saga_contract::{
+    MAX_ASSIGNEE_BYTES, SagaCallback, SagaMsg, SagaOutcome, decode_callback,
     encode_msg as saga_encode_msg,
 };
 use sdk::{
@@ -641,10 +647,10 @@ impl DispatchModule {
         let reply = ctx
             .query(
                 &self.identity,
-                &identity::encode_query(&IdentityQuery::Get { number: account }),
+                &identity_contract::encode_query(&IdentityQuery::Get { number: account }),
             )
             .await?;
-        let IdentityReply::Account(view) = identity::decode_reply(&reply)
+        let IdentityReply::Account(view) = identity_contract::decode_reply(&reply)
             .map_err(|e| Error::module("identity_reply_decode", e))?
         else {
             return Err(Error::module(

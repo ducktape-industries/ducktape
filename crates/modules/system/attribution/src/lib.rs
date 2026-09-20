@@ -124,8 +124,11 @@
 //! `commit_block`; the module root IS the store's merkle root, and sync
 //! belongs to the store.
 
-// the wire surface: this module's shared types, flattened at the crate root.
-pub use attribution_wire::*;
+mod wire;
+
+// the wire surface belongs to this module. Keep its codec at the crate root
+// so host consumers use the same bytes without an SDK wire crate.
+pub use wire::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 

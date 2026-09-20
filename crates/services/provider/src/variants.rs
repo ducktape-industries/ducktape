@@ -23,10 +23,9 @@
 //! the app's picker decomposes tags on that promise; the loader enforces it
 //! fail-loud rather than letting a malformed family load as opaque tags.
 
-use capability::validate_tag;
 use serde::Deserialize;
 
-use crate::spec::CapabilitySpec;
+use crate::spec::{CapabilitySpec, validate_tag};
 
 /// the on-disk shape of one `[[variants]]` entry — a dumb serde mirror,
 /// validated by [`expand`]. unknown fields fail loud like everywhere else in
@@ -464,7 +463,10 @@ args = ["run", "--model", "m1"]
                 get(&format!("claude_{model}_{effort}"));
             }
         }
-        assert_eq!(get("pi").isolation.broker, Some(crate::spec::BrokerKind::Pi));
+        assert_eq!(
+            get("pi").isolation.broker,
+            Some(crate::spec::BrokerKind::Pi)
+        );
         assert_eq!(specs.len(), 38, "3 bases + 19 codex + 16 claude variants");
     }
 }

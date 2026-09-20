@@ -75,8 +75,12 @@
 //! `MAX_CLASS_LEN`, and both rosters are byte-gated on top of their count
 //! caps.
 
-// the wire surface: this module's shared types, flattened at the crate root.
-pub use capability_wire::*;
+mod valset_contract;
+mod wire;
+
+// the wire surface belongs to this module. Keep its codec at the crate root
+// so existing host consumers use the same bytes without an SDK wire crate.
+pub use wire::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -85,6 +89,7 @@ use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
 };
+use valset_contract::members_and_residents;
 
 /// most tags a single node may announce. a bound, not a schema: it exists so
 /// one announcement cannot bloat replicated state, while staying far above
@@ -241,7 +246,7 @@ impl CapabilityRegistry {
         if empty_roster {
             return Ok(nodes);
         }
-        let standing = valset::members_and_residents(ctx, valset_id).await?;
+        let standing = members_and_residents(ctx, valset_id).await?;
         Ok(nodes
             .into_iter()
             .filter(|node| standing.contains(node))
@@ -326,7 +331,7 @@ impl CapabilityRegistry {
             // member-gated: validators UNION residents populate the registry,
             // so lookups resolve to known peers — including a joined node
             // that has not been promoted yet.
-            if !valset::members_and_residents(ctx, &valset_id)
+            if !members_and_residents(ctx, &valset_id)
                 .await?
                 .contains(&node)
             {
@@ -642,8 +647,11 @@ impl Module for CapabilityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::valset_contract::{
+        ValsetQuery, ValsetReply, decode_query as valset_decode_query,
+        encode_reply as valset_encode_reply,
+    };
     use crate::{MAX_CLASS_LEN, MAX_TAG_LEN, encode_msg, encode_query};
-    use valset::{ValsetQuery, ValsetReply, encode_reply as valset_encode_reply};
 
     use sdk_testkit::{MemStore, TestCtx};
 
@@ -655,7 +663,7 @@ mod tests {
         residents: Option<Vec<Vec<u8>>>,
     ) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
         move |req| {
-            let q = valset::decode_query(req).map_err(|e| Error::module("codec", e))?;
+            let q = valset_decode_query(req).map_err(|e| Error::module("codec", e))?;
             match (q, &members, &residents) {
                 (ValsetQuery::Validators, Some(m), _) => {
                     Ok(valset_encode_reply(&ValsetReply::Validators(m.clone())))

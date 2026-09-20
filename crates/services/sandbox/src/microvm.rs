@@ -66,6 +66,9 @@ pub struct MicroVmIo {
     /// the guest's own exit frame. Distinct from the VMM process's status,
     /// which only says whether the hypervisor exited cleanly.
     pub exit: tokio::sync::oneshot::Receiver<i32>,
+    /// host-monotonic instant when the guest reported its provider child fork
+    /// immediately before exec.
+    pub spawn: tokio::sync::oneshot::Receiver<std::time::Instant>,
     pub pump: tokio::task::JoinHandle<()>,
     /// every host→guest frame goes out through here, which is why the resize
     /// lane exists at all: ONE task owns the socket's write half (it must, see
@@ -795,16 +798,20 @@ fn spawn_pump(stream: UnixStream) -> MicroVmIo {
     let (out_task, stdout_host) = tokio::io::duplex(64 * 1024);
     let (err_task, stderr_host) = tokio::io::duplex(64 * 1024);
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    let (spawn_tx, spawn_rx) = tokio::sync::oneshot::channel();
     let (input_tx, input_rx) = tokio::sync::mpsc::channel(INPUT_QUEUE);
 
     tokio::spawn(frame_stdin(stdin_task, input_tx.clone()));
-    let pump = tokio::spawn(pump_frames(stream, input_rx, out_task, err_task, exit_tx));
+    let pump = tokio::spawn(pump_frames(
+        stream, input_rx, out_task, err_task, exit_tx, spawn_tx,
+    ));
 
     MicroVmIo {
         stdin: stdin_host,
         stdout: stdout_host,
         stderr: stderr_host,
         exit: exit_rx,
+        spawn: spawn_rx,
         pump,
         input: input_tx,
     }
@@ -838,6 +845,7 @@ async fn pump_frames(
     mut stdout: tokio::io::DuplexStream,
     mut stderr: tokio::io::DuplexStream,
     exit: tokio::sync::oneshot::Sender<i32>,
+    spawn: tokio::sync::oneshot::Sender<std::time::Instant>,
 ) {
     let (mut read_half, mut write_half) = stream.into_split();
 
@@ -878,6 +886,7 @@ async fn pump_frames(
     let mut pending: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut exit = Some(exit);
+    let mut spawn = Some(spawn);
     'outbound: loop {
         let n = match read_half.read(&mut buf).await {
             Ok(0) | Err(_) => break,
@@ -922,6 +931,11 @@ async fn pump_frames(
                         let _ = tx.send(code);
                     }
                     break 'outbound;
+                }
+                Frame::Spawn => {
+                    if let Some(tx) = spawn.take() {
+                        let _ = tx.send(std::time::Instant::now());
+                    }
                 }
                 // the guest never sends these; a stray one is not worth failing
                 // a finished run over.
@@ -1072,7 +1086,10 @@ mod tests {
         let (out_task, _stdout) = tokio::io::duplex(1024);
         let (err_task, _stderr) = tokio::io::duplex(1024);
         let (exit_tx, _exit_rx) = tokio::sync::oneshot::channel();
-        let pump = tokio::spawn(pump_frames(host, input_rx, out_task, err_task, exit_tx));
+        let (spawn_tx, _spawn_rx) = tokio::sync::oneshot::channel();
+        let pump = tokio::spawn(pump_frames(
+            host, input_rx, out_task, err_task, exit_tx, spawn_tx,
+        ));
 
         // a header claiming more than MAX_FRAME_BYTES: refused by `decode`
         // before a byte of payload is read.
@@ -1095,17 +1112,27 @@ mod tests {
         let (out_task, stdout) = tokio::io::duplex(1024);
         let (err_task, stderr) = tokio::io::duplex(1024);
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        let (spawn_tx, spawn_rx) = tokio::sync::oneshot::channel();
         drop(stdout);
         drop(stderr);
-        let pump = tokio::spawn(pump_frames(host, input_rx, out_task, err_task, exit_tx));
+        let pump = tokio::spawn(pump_frames(
+            host, input_rx, out_task, err_task, exit_tx, spawn_tx,
+        ));
         for frame in [
+            Frame::Spawn,
             Frame::Stdout(b"after result".to_vec()),
             Frame::Stderr(b"cleanup".to_vec()),
             Frame::Exit(0),
         ] {
             guest.write_all(&guest_proto::encode(&frame)).await.unwrap();
         }
-        assert_eq!(exit_rx.await.expect("guest exit survives closed readers"), 0);
+        spawn_rx
+            .await
+            .expect("guest spawn marker survives closed readers");
+        assert_eq!(
+            exit_rx.await.expect("guest exit survives closed readers"),
+            0
+        );
         pump.await.unwrap();
         input_tx.closed().await;
     }
