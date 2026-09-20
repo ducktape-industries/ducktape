@@ -45,12 +45,13 @@ trap cleanup EXIT
 say "starting the node in the background"
 ducktape node run >"$NODE_LOG" 2>&1 & NODE_PID=$!
 HEALTH_URL="http://$HOST_IP:8844/v1/status"
-say "waiting up to 60 seconds for Ready at $HEALTH_URL"
-# one bounded client retry (curl's own), not a hand-rolled poll loop
-status=$(curl --fail --silent --max-time 2 --retry 60 --retry-delay 1 --retry-connrefused --retry-all-errors "$HEALTH_URL") || {
-  echo "node was not reachable within 60 seconds" >&2; tail -100 "$NODE_LOG" >&2; exit 1; }
-grep -Eq '"phase"[[:space:]]*:[[:space:]]*"(validating|serving)"' <<<"$status" || {
-  echo "node reachable but not Ready: $status" >&2; tail -100 "$NODE_LOG" >&2; exit 1; }
+say "waiting up to 60 seconds for the validator to come up (event node_phase_transition phase=validating)"
+# HTTP answers before the mesh is up, so a 200 alone is not Ready: wait for the phase event, then query once.
+if ! timeout 60 bash -c 'tail -n +1 -F "$0" | grep -qE "node_phase_transition.*phase=(validating|serving)"' "$NODE_LOG"; then
+  echo "node did not reach validating within 60 seconds" >&2; tail -100 "$NODE_LOG" >&2; exit 1
+fi
+status=$(curl --fail --silent --max-time 5 "$HEALTH_URL") || { echo "status endpoint unreachable at $HEALTH_URL" >&2; tail -100 "$NODE_LOG" >&2; exit 1; }
+grep -Eq '"phase"[[:space:]]*:[[:space:]]*"(validating|serving)"' <<<"$status" || { echo "not Ready: $status" >&2; exit 1; }
 echo "Ready"
 
 say "creating an invite without logging its contents"
