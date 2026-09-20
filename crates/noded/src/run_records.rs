@@ -26,7 +26,6 @@ pub const MAX_SESSION_PAGE: usize = 100;
 pub const DEFAULT_EVENT_PAGE: usize = 100;
 pub const MAX_EVENT_PAGE: usize = 500;
 pub const MAX_EVENT_PAYLOAD_BYTES: usize = 128 * 1024;
-pub const MAX_METADATA_STRING_BYTES: usize = 16 * 1024;
 /// A history reply is bounded independently from the request's event count.
 /// This prevents one provider frame from turning the JSON response into an
 /// unbounded allocation even when the caller asks for the legal page maximum.
@@ -791,38 +790,12 @@ impl SessionRecordStore {
         if let Some(parent) = summary.parent_session_id.as_deref() {
             self.validate_session_id(parent)?;
         }
-        let metadata = [
-            summary.session_id.as_str(),
-            summary.agent_id.as_deref().unwrap_or_default(),
-            summary.model.as_deref().unwrap_or_default(),
-            summary.executor.as_deref().unwrap_or_default(),
-            summary.started_at.as_deref().unwrap_or_default(),
-            summary.last_activity_at.as_deref().unwrap_or_default(),
-        ];
-        if metadata
-            .iter()
-            .any(|value| value.len() > MAX_METADATA_STRING_BYTES)
-        {
-            return Err(StoreError::EventTooLarge);
-        }
         Ok(())
     }
 
     fn validate_event(&self, event: &SessionEvent) -> Result<(), StoreError> {
         if let Some(run_id) = event.run_id.as_deref() {
             validate_run_id(run_id).map_err(|_| StoreError::InvalidCursor)?;
-        }
-        let metadata = [
-            event.event_id.as_str(),
-            event.kind.as_str(),
-            event.stream.as_deref().unwrap_or_default(),
-            event.at.as_deref().unwrap_or_default(),
-        ];
-        if metadata
-            .iter()
-            .any(|value| value.len() > MAX_METADATA_STRING_BYTES)
-        {
-            return Err(StoreError::EventTooLarge);
         }
         if serde_json::to_vec(&event.payload)?.len() > MAX_EVENT_PAYLOAD_BYTES {
             return Err(StoreError::EventTooLarge);
