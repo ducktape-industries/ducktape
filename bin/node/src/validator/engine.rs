@@ -16,7 +16,7 @@ use host::Host;
 use node::OrderedNode;
 use recovery::Recovery;
 use sdk::Msg;
-use tasks::{TaskMsg, encode_task_msg};
+use crate::wire::tasks::{TaskMsg, encode_task_msg};
 
 use crate::constants::CUTOVER_DELAY;
 use crate::host_reads::resume_resident_keys;

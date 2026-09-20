@@ -1,11 +1,14 @@
 //! The shipping initializer on the real Host queue: no timer or boot hook.
 #[path = "../src/chief_cli/plan.rs"]
 mod plan;
+#[path = "../src/wire.rs"]
+mod wire;
 #[path = "chief_support/mod.rs"]
 mod support;
 
 use futures::executor::block_on;
 use support::{Network, member, msg};
+use wire::{agent, chat, pages, runs};
 
 fn fixture(existing: Option<&str>) -> (plan::Plan, agent::Program, u64) {
     let plan = plan::Plan::new(1, "chief", existing, "worker").unwrap();

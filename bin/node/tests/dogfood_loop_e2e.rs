@@ -18,10 +18,11 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use capability::{CapabilityQuery, CapabilityReply};
-use chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, Span};
+use common::wire::{chat, runs};
+use common::wire::chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, Span};
 use common::{Cluster, SandboxStage, sandbox_toml, skip_unless_sandboxed};
-use runs::ModelMsg;
-use runs::{RunOutcome, RunRecord, RunsMsg, RunsQuery, RunsReply};
+use common::wire::runs::ModelMsg;
+use common::wire::runs::{RunOutcome, RunRecord, RunsMsg, RunsQuery, RunsReply};
 
 const CONVERGE: Duration = Duration::from_secs(180);
 const FINALIZE: Duration = Duration::from_secs(60);

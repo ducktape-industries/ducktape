@@ -26,7 +26,50 @@ use saga::{
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
-use valset_module::Valset;
+
+struct ValidatorSet {
+    id: ModuleId,
+    keys: Vec<Vec<u8>>,
+}
+
+impl ValidatorSet {
+    fn new(id: &str, keys: Vec<Vec<u8>>) -> Self {
+        Self {
+            id: id.into(),
+            keys,
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for ValidatorSet {
+    fn id(&self) -> ModuleId {
+        self.id.clone()
+    }
+
+    fn root(&self) -> StateRoot {
+        let bytes = saga::valset_contract::encode_reply(
+            &saga::valset_contract::ValsetReply::Validators(self.keys.clone()),
+        );
+        StateRoot(Sha256::digest(bytes).into())
+    }
+
+    async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        use saga::valset_contract::{ValsetQuery, ValsetReply, decode_query, encode_reply};
+
+        match decode_query(req).map_err(|e| Error::module("codec", e))? {
+            ValsetQuery::Validators => {
+                Ok(encode_reply(&ValsetReply::Validators(self.keys.clone())))
+            }
+            ValsetQuery::Residents => Ok(encode_reply(&ValsetReply::Residents(Vec::new()))),
+            ValsetQuery::MeshWindow => Err(Error::QueryUnsupported),
+        }
+    }
+}
 
 /// a minimal REQUESTER module: it records every `SagaCallback` it is
 /// dispatched, with the same staging discipline as any other module (staged
@@ -322,15 +365,6 @@ fn strict_lease_rejects_a_non_assignee_and_accepts_the_assignee() {
         // three (genesis-seeded) validators; the saga module assigns each
         // attempt over the valset and enforces the lease strictly.
         let keys = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]];
-        let mut valset = Valset::new(
-            "valset",
-            Box::new(sdk_testkit::MemStore::new()),
-            "governance",
-        );
-        for key in &keys {
-            valset.seed(key.clone()).await.expect("seed valset");
-        }
-        valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
             // no capability module is registered: these triggers are untagged,
             // so assignment stays on the valset path.
@@ -341,7 +375,7 @@ fn strict_lease_rejects_a_non_assignee_and_accepts_the_assignee() {
                 "capability",
                 LeasePolicy::Strict,
             )) as Box<dyn Module>,
-            Box::new(valset),
+            Box::new(ValidatorSet::new("valset", keys.clone())),
         ])
         .expect("genesis");
 

@@ -674,11 +674,11 @@ pub(super) fn sanitize_display_name(input: &str) -> String {
 }
 
 /// The agent's address. Consensus admits only DNS-label agent ids
-/// (`runs_wire::validate_agent_id`), and a label fits an RFC 5321 local part
+/// (`crate::runs::validate_agent_id`), and a label fits an RFC 5321 local part
 /// verbatim — so `quackbot` attributes to `quackbot@agents.duck` and the
 /// address round-trips back to the registry key.
 fn attribution_email_local_part(input: &str) -> String {
-    debug_assert!(runs_wire::validate_agent_id(input).is_ok());
+    debug_assert!(crate::runs::validate_agent_id(input).is_ok());
     input.to_owned()
 }
 
