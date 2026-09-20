@@ -495,6 +495,9 @@ pub struct NodeHandle {
     /// `None` on a daemon with no mesh identity (the embedded local daemon,
     /// router tests) — that route 503s there.
     pub(crate) node_signer: Option<commonware_cryptography::ed25519::PrivateKey>,
+    /// Durable machine-owned provider session journals. Absent only on
+    /// embedders that intentionally do not host provider sessions.
+    pub(crate) session_records: Option<crate::run_records::SessionRecordStore>,
 }
 
 impl NodeHandle {
@@ -532,6 +535,7 @@ impl NodeHandle {
                 crate::index::MAX_CONCURRENT_INDEX_VIEWS,
             )),
             node_signer: None,
+            session_records: None,
         };
         (handle, cmd_rx, hub)
     }
@@ -599,6 +603,18 @@ impl NodeHandle {
     pub fn with_admin(mut self, admin: crate::admin::AdminConfig) -> Self {
         self.admin = admin;
         self
+    }
+
+    /// Wire the append-only machine-owned provider session journal. The
+    /// process that owns the storage root opens it once at boot and every
+    /// router clone shares the same store; no handler creates a second store.
+    pub fn with_session_records(mut self, records: crate::run_records::SessionRecordStore) -> Self {
+        self.session_records = Some(records);
+        self
+    }
+
+    pub(crate) fn session_records(&self) -> Option<&crate::run_records::SessionRecordStore> {
+        self.session_records.as_ref()
     }
 
     /// wire the node ↔ agent-daemon link so a `ServiceAttach` can take it and

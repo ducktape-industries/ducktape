@@ -95,6 +95,7 @@ pub use module_code::{
     CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest, MAX_MODULE_ARTIFACT_BYTES,
 };
 pub mod run_control;
+pub mod run_records;
 // the node ↔ agent-daemon link: the collaboration messaging bus, and the 0600
 // workspace secret the gated ws topics stand on. public so `main.rs` can build
 // it and wire it onto the handle.
@@ -878,6 +879,11 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/invite", post(mint_invite))
         // ---- run control (node-local, off-chain) ----
         .route("/v1/run-control", post(run_control::control))
+        // ---- durable provider session records (node-local, off-chain) ----
+        .route(
+            "/v1/run-records/query",
+            post(run_records::query).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         // ---- service signaling (node-local, off-chain, volatile) ----
         // a local service daemon says hello; the entry ages out on its own
         // TTL. Presence only — enablement lives in the workspace's
