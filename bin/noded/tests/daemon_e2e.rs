@@ -19,6 +19,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest as _, Sha256};
 
+#[allow(dead_code)]
 mod test_wire {
     use std::collections::BTreeMap;
 
@@ -946,9 +947,7 @@ fn programmable_user_calls_and_reports_failure_through_onchain_attribution() {
             "changes_for": { "recipient": 1, "after": 0, "limit": 64 },
         }),
     );
-    let AttributionReply::Changes(entries) = serde_json::from_value(changes).unwrap() else {
-        panic!("expected the controller's attributions");
-    };
+    let AttributionReply::Changes(entries) = serde_json::from_value(changes).unwrap();
     let reports: Vec<_> = entries
         .iter()
         .map(|entry| &entry.change)

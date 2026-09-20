@@ -1,5 +1,4 @@
 use super::*;
-use runs_wire as runs;
 use serde_json::json;
 use std::os::unix::fs::symlink;
 
@@ -68,7 +67,7 @@ fn native(parent: &Path) -> NativeState {
     }
 }
 
-fn worker_controls_fixture(job_id: &str, operation_id: &str, text: &str) -> runs::WorkerControls {
+fn worker_controls_fixture(job_id: &str, operation_id: &str, text: &str) -> crate::runs::WorkerControls {
     serde_json::from_value(json!({"job_id":job_id, "job_attempt":1, "job_status":"processing", "result":null, "reports":[], "controls":[{
         "operation_id":operation_id, "input":{"steer":{"text":text}}, "author":{"module":"tasks"}, "height":1, "acknowledgements":[]
     }]})).unwrap()
@@ -95,7 +94,7 @@ fn cancellation_history(job_id: &str, operation_id: &str) -> String {
     )
 }
 
-fn checkpoint_record(history: ConversationHistory) -> runs::ConversationCheckpoint {
+fn checkpoint_record(history: ConversationHistory) -> crate::runs::ConversationCheckpoint {
     serde_json::from_value(json!({"run_id":RUN_ID, "attempt":1, "operation_id":"checkpoint-1", "history":history, "delivery":true})).unwrap()
 }
 
@@ -206,7 +205,7 @@ fn checkpoint_ids_are_stable_and_bound_to_full_bytes_turn_attempt_and_boundary()
     let mut native = native(dir.path());
     let id = operation_id(&native, &history(), true, false);
     assert_eq!(id.len(), 64);
-    assert!(id.len() <= runs::MAX_REQUEST_ID_BYTES);
+    assert!(id.len() <= crate::runs::MAX_REQUEST_ID_BYTES);
     assert_eq!(id, operation_id(&native, &history(), true, false));
     assert_ne!(id, operation_id(&native, &extended_history(), true, false));
     assert_ne!(id, operation_id(&native, &history(), false, false));
@@ -218,7 +217,7 @@ fn checkpoint_ids_are_stable_and_bound_to_full_bytes_turn_attempt_and_boundary()
     assert_ne!(id, operation_id(&native, &history(), true, false));
     native.context.turn_id = LOGICAL_TURN_ID.into();
     native.configuration.active_turn.as_mut().unwrap().run_id =
-        runs::run_id_for("room", 2, "resident");
+        crate::runs::run_id_for("room", 2, "resident");
     assert_ne!(
         id,
         operation_id(&native, &history(), true, false),
@@ -357,7 +356,7 @@ fn restore_uses_active_checkpoint_not_envelope_or_files_head_and_paths_are_relat
 
 #[test]
 fn retry_preserves_logical_delivery_while_the_opaque_execution_id_changes() {
-    assert_eq!(RUN_ID, runs::run_id_for("room", 1, "resident"));
+    assert_eq!(RUN_ID, crate::runs::run_id_for("room", 1, "resident"));
     assert!(RUN_ID.contains('\u{1f}'));
     let api = files_node::ModuleNode::new();
     let root = tempfile::tempdir().unwrap();
@@ -372,14 +371,14 @@ fn retry_preserves_logical_delivery_while_the_opaque_execution_id_changes() {
     std::fs::create_dir(&original_dir).unwrap();
     let (_, first, _) = materialize(&api, &original, &original_dir).unwrap();
     let mut retry = original.clone();
-    let retry_run = runs::run_id_for("room", 2, "resident");
+    let retry_run = crate::runs::run_id_for("room", 2, "resident");
     retry.active_turn.as_mut().unwrap().run_id = retry_run.clone();
     retry.active_turn.as_mut().unwrap().turn = 2;
     retry.next_turn = 3;
     let retry_dir = root.path().join("retry");
     std::fs::create_dir(&retry_dir).unwrap();
     let (_, resumed, _) = materialize(&api, &retry, &retry_dir).unwrap();
-    assert_eq!(first.turn_id, runs::conversation_turn_id(0, 1));
+    assert_eq!(first.turn_id, crate::runs::conversation_turn_id(0, 1));
     assert_eq!(first.turn_id, resumed.turn_id);
     assert_ne!(resumed.turn_id, retry_run);
     let restored = std::fs::read_to_string(retry_dir.join(&resumed.session_path)).unwrap();
@@ -403,19 +402,19 @@ fn semantic_job_reporting_is_derived_only_from_the_committed_job_source() {
     for (name, source, expected) in [
         (
             "worker",
-            runs::ConversationSource::Job {
+            crate::runs::ConversationSource::Job {
                 job_id: "job-a".into(),
             },
             true,
         ),
         (
             "channel",
-            runs::ConversationSource::Channel {
+            crate::runs::ConversationSource::Channel {
                 channel_id: "room".into(),
             },
             false,
         ),
-        ("detached", runs::ConversationSource::Detached, false),
+        ("detached", crate::runs::ConversationSource::Detached, false),
     ] {
         let mut configuration = view();
         configuration.source = source;
@@ -681,7 +680,7 @@ fn cancellation_requires_this_turns_current_job_cancel_and_is_not_input_delivery
         )
         .is_err()
     );
-    worker.controls[0].input = tasks::JobControlInput::Cancel;
+    worker.controls[0].input = crate::tasks::JobControlInput::Cancel;
     assert!(
         controls::cancellation_plan(
             &proof,

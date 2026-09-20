@@ -8,6 +8,7 @@ use commonware_cryptography::Signer as _;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use http_body_util::BodyExt as _;
+use noded::module_contracts::chat;
 use noded::{
     AdminConfig, AdminExposure, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand,
     NodeHandle, NodeStatus,
@@ -3152,10 +3153,7 @@ fn spawn_huddle_actor(mut cmds: mpsc::Receiver<NodeCommand>) {
                     identity::encode_reply(&identity::IdentityReply::Account(account))
                 }
                 "chat" => {
-                    let chat::ChatQuery::Channel { channel_id } = chat::decode_query(&req).unwrap()
-                    else {
-                        panic!("the media gate reads one channel record");
-                    };
+                    let chat::ChatQuery::Channel { channel_id } = chat::decode_query(&req).unwrap();
                     let channel = (channel_id == "general").then(|| chat::Channel {
                         id: "general".into(),
                         name: "general".into(),

@@ -100,14 +100,14 @@ async fn start_worker(
         },
         Msg {
             target: "agent".into(),
-            payload: agent::encode_msg(&agent::AgentMsg::Provision {
+            payload: crate::agent::encode_msg(&crate::agent::AgentMsg::Provision {
                 request_id: RESIDENT.into(),
                 name: "Resident".into(),
-                program: runs::model_program(RESIDENT),
+                program: crate::runs::model_program(RESIDENT),
             }),
         },
-        runs_msg(runs::RunsMsg::ConfigureModel {
-            operation: runs::ModelMsg::RegisterModel {
+        runs_msg(crate::runs::RunsMsg::ConfigureModel {
+            operation: crate::runs::ModelMsg::RegisterModel {
                 account: 2,
                 agent_id: RESIDENT.into(),
                 display_name: "Resident".into(),
@@ -116,7 +116,7 @@ async fn start_worker(
                 skills: None,
             },
         }),
-        runs_msg(runs::RunsMsg::EnableJobWorker { enabled: true }),
+        runs_msg(crate::runs::RunsMsg::EnableJobWorker { enabled: true }),
     ] {
         apply(&mut host, &mut height, controller(), message).await;
     }
@@ -140,7 +140,7 @@ async fn start_worker(
             controller(),
             Msg {
                 target: "tasks".into(),
-                payload: tasks::encode_job_msg(&tasks::JobsMsg::SubmitConversation {
+                payload: crate::tasks::encode_job_msg(&crate::tasks::JobsMsg::SubmitConversation {
                     job_id: "worker".into(),
                     kind: format!("agent/{RESIDENT}"),
                     spec: "native work".into(),
@@ -153,17 +153,17 @@ async fn start_worker(
     (host, height, request, spec)
 }
 
-async fn worker_job(host: &Host) -> tasks::Job {
+async fn worker_job(host: &Host) -> crate::tasks::Job {
     let bytes = host
         .query(
             "tasks",
-            &tasks::encode_job_query(&tasks::JobsQuery::Get {
+            &crate::tasks::encode_job_query(&crate::tasks::JobsQuery::Get {
                 job_id: "worker".into(),
             }),
         )
         .await
         .unwrap();
-    let tasks::JobsReply::Job(Some(job)) = tasks::decode_job_reply(&bytes).unwrap() else {
+    let crate::tasks::JobsReply::Job(Some(job)) = crate::tasks::decode_job_reply(&bytes).unwrap() else {
         panic!("live worker job");
     };
     job
@@ -171,10 +171,10 @@ async fn worker_job(host: &Host) -> tasks::Job {
 
 async fn action_count(host: &Host, run_id: &str) -> u32 {
     let bytes = host
-        .query("runs", &runs::encode_query(&runs::RunsQuery::AgentSessions))
+        .query("runs", &crate::runs::encode_query(&crate::runs::RunsQuery::AgentSessions))
         .await
         .unwrap();
-    let runs::RunsReply::AgentSessions(sessions) = runs::decode_reply(&bytes).unwrap() else {
+    let crate::runs::RunsReply::AgentSessions(sessions) = crate::runs::decode_reply(&bytes).unwrap() else {
         panic!("agent sessions");
     };
     sessions
@@ -266,8 +266,8 @@ fn cancellation_recovery(location: CancelledJobLocation) {
         let mut actor = Actor::new().await;
         let session = start_action_server(actor.link.clone(), signer, run_id.clone(), Some(native)).await.unwrap();
         apply(&mut host, &mut height, controller(), Msg {
-            target:"tasks".into(), payload:tasks::encode_job_msg(&tasks::JobsMsg::Control {
-                job_id:"worker".into(), operation_id:"cancel-1".into(), input:tasks::JobControlInput::Cancel,
+            target:"tasks".into(), payload:crate::tasks::encode_job_msg(&crate::tasks::JobsMsg::Control {
+                job_id:"worker".into(), operation_id:"cancel-1".into(), input:crate::tasks::JobControlInput::Cancel,
             }),
         }).await;
         let control_id = controls::qualified_id("worker", "cancel-1");
@@ -278,7 +278,7 @@ fn cancellation_recovery(location: CancelledJobLocation) {
         let response = actor.request(&mut host, &mut height, &session, body.clone()).await;
         assert_eq!(response.status(), StatusCode::OK, "{}", response.text().await.unwrap());
         let cancelled = worker_job(&host).await;
-        assert_eq!(cancelled.status, tasks::JobStatus::Cancelled);
+        assert_eq!(cancelled.status, crate::tasks::JobStatus::Cancelled);
         assert_eq!(cancelled.controls[0].acknowledgements.len(), 1);
         assert_eq!(cancelled.reports.len(), 1);
         let before = read_conversation(&host, &context.conversation_id).await;
@@ -287,7 +287,7 @@ fn cancellation_recovery(location: CancelledJobLocation) {
         match location {
             CancelledJobLocation::OnBoard => {},
             CancelledJobLocation::Pruned => { apply(&mut host, &mut height, controller(), Msg {
-                target:"tasks".into(), payload:tasks::encode_job_msg(&tasks::JobsMsg::Prune {job_id:"worker".into()}),
+                target:"tasks".into(), payload:crate::tasks::encode_job_msg(&crate::tasks::JobsMsg::Prune {job_id:"worker".into()}),
             }).await; },
         }
         let next = expire_attempt(&mut host, &mut height, &request).await;
@@ -310,12 +310,12 @@ fn cancellation_recovery(location: CancelledJobLocation) {
                     "workspace_receipt":compute_service::WorkspaceReceipt::no_changes(&next_spec)})).unwrap()),
             }),
         }).await;
-        let bytes = host.query("runs", &runs::encode_query(&runs::RunsQuery::RecentRuns)).await.unwrap();
-        let runs::RunsReply::RecentRuns(records) = runs::decode_reply(&bytes).unwrap() else {panic!("recent runs");};
-        assert_eq!(records.iter().find(|record| record.run_id == run_id).unwrap().outcome, runs::RunOutcome::Cancelled,
+        let bytes = host.query("runs", &crate::runs::encode_query(&crate::runs::RunsQuery::RecentRuns)).await.unwrap();
+        let crate::runs::RunsReply::RecentRuns(records) = crate::runs::decode_reply(&bytes).unwrap() else {panic!("recent runs");};
+        assert_eq!(records.iter().find(|record| record.run_id == run_id).unwrap().outcome, crate::runs::RunOutcome::Cancelled,
             "accepted native cancellation must remain admissible after execution restart");
-        let bytes = host.query("runs", &runs::encode_query(&runs::RunsQuery::WorkerControls {run_id})).await.unwrap();
-        let runs::RunsReply::WorkerControls(Some(retained)) = runs::decode_reply(&bytes).unwrap() else {panic!("retained cancellation");};
+        let bytes = host.query("runs", &crate::runs::encode_query(&crate::runs::RunsQuery::WorkerControls {run_id})).await.unwrap();
+        let crate::runs::RunsReply::WorkerControls(Some(retained)) = crate::runs::decode_reply(&bytes).unwrap() else {panic!("retained cancellation");};
         assert_eq!(retained.controls[0].acknowledgements.len(), 1);
         assert_eq!(retained.reports, cancelled.reports);
     });
@@ -360,11 +360,11 @@ fn real_worker_report_route_enforces_claim_budget_idempotency_and_incarnation() 
                 at(height, Origin::Program(2)),
                 Msg {
                     target: "tasks".into(),
-                    payload: tasks::encode_job_msg(&tasks::JobsMsg::Checkpoint {
+                    payload: crate::tasks::encode_job_msg(&crate::tasks::JobsMsg::Checkpoint {
                         job_id: "worker".into(),
                         operation_id: "direct".into(),
                         attempt: worker_job(&host).await.attempt,
-                        kind: tasks::WorkerReportKind::Checkpoint,
+                        kind: crate::tasks::WorkerReportKind::Checkpoint,
                         payload: "not the claim holder".into(),
                     }),
                 },
@@ -387,7 +387,7 @@ fn real_worker_report_route_enforces_claim_budget_idempotency_and_incarnation() 
             response.json::<Value>().await.unwrap(),
             json!({"report":first[0]})
         );
-        assert_eq!(first[0].worker, tasks::Party::Module("runs".into()));
+        assert_eq!(first[0].worker, crate::tasks::Party::Module("runs".into()));
         assert_eq!(action_count(&host, &run_id).await, 1);
         let duplicate = actor
             .request(&mut host, &mut height, &session, report_request("report-0"))
@@ -395,7 +395,7 @@ fn real_worker_report_route_enforces_claim_budget_idempotency_and_incarnation() 
         assert_eq!(duplicate.status(), StatusCode::OK);
         assert_eq!(worker_job(&host).await.reports, first);
         assert_eq!(action_count(&host, &run_id).await, 1);
-        for index in 1..runs::MAX_ACTIONS_PER_SESSION {
+        for index in 1..crate::runs::MAX_ACTIONS_PER_SESSION {
             let response = actor
                 .request(
                     &mut host,
@@ -422,10 +422,10 @@ fn real_worker_report_route_enforces_claim_budget_idempotency_and_incarnation() 
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             action_count(&host, &run_id).await,
-            runs::MAX_ACTIONS_PER_SESSION
+            crate::runs::MAX_ACTIONS_PER_SESSION
         );
         let reports = worker_job(&host).await.reports;
-        assert_eq!(reports.len(), runs::MAX_ACTIONS_PER_SESSION as usize);
+        assert_eq!(reports.len(), crate::runs::MAX_ACTIONS_PER_SESSION as usize);
         let duplicate = actor
             .request(&mut host, &mut height, &session, report_request("report-0"))
             .await;
@@ -454,7 +454,7 @@ fn real_worker_report_route_enforces_claim_budget_idempotency_and_incarnation() 
             Origin::Module("runs".into()),
             Msg {
                 target: "tasks".into(),
-                payload: tasks::encode_job_msg(&tasks::JobsMsg::Finalize {
+                payload: crate::tasks::encode_job_msg(&crate::tasks::JobsMsg::Finalize {
                     job_id: "worker".into(),
                     ok: true,
                     payload: "done".into(),
@@ -468,7 +468,7 @@ fn real_worker_report_route_enforces_claim_budget_idempotency_and_incarnation() 
             controller(),
             Msg {
                 target: "tasks".into(),
-                payload: tasks::encode_job_msg(&tasks::JobsMsg::Prune {
+                payload: crate::tasks::encode_job_msg(&crate::tasks::JobsMsg::Prune {
                     job_id: "worker".into(),
                 }),
             },
@@ -480,7 +480,7 @@ fn real_worker_report_route_enforces_claim_budget_idempotency_and_incarnation() 
             controller(),
             Msg {
                 target: "tasks".into(),
-                payload: tasks::encode_job_msg(&tasks::JobsMsg::SubmitConversation {
+                payload: crate::tasks::encode_job_msg(&crate::tasks::JobsMsg::SubmitConversation {
                     job_id: "worker".into(),
                     kind: format!("agent/{RESIDENT}"),
                     spec: "new incarnation".into(),
@@ -495,11 +495,11 @@ fn real_worker_report_route_enforces_claim_budget_idempotency_and_incarnation() 
         let bytes = host
             .query(
                 "runs",
-                &runs::encode_query(&runs::RunsQuery::WorkerControls { run_id }),
+                &crate::runs::encode_query(&crate::runs::RunsQuery::WorkerControls { run_id }),
             )
             .await
             .unwrap();
-        let runs::RunsReply::WorkerControls(Some(retained)) = runs::decode_reply(&bytes).unwrap()
+        let crate::runs::RunsReply::WorkerControls(Some(retained)) = crate::runs::decode_reply(&bytes).unwrap()
         else {
             panic!("retained worker");
         };
