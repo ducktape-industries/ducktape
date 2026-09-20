@@ -387,6 +387,7 @@ pub fn model_setup(agent_id: &str, capability: &str) -> Vec<(&'static str, serde
         (
             "agent",
             serde_json::json!({ "provision": {
+                "request_id": format!("model-{agent_id}"),
                 "name": agent_id,
                 "program": runs::model_program(agent_id),
             }}),
