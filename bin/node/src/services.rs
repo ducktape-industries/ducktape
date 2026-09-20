@@ -2363,20 +2363,25 @@ mod tests {
 
     #[test]
     fn a_stale_grant_names_new_offers_and_the_exact_reconsent_command() {
-        let mut standing = grant("compute", NODE_A);
-        standing.capabilities = vec!["claude".into(), "pi".into()];
+        let mut empty = grant("compute", NODE_A);
+        empty.capabilities = Vec::new();
         let offered = ["claude", "codex", "pi"]
             .into_iter()
             .map(String::from)
             .collect::<Vec<_>>();
-        let hint = stale_grant_hint("compute", Some(&standing), &offered)
+        let hint = stale_grant_hint("compute", Some(&empty), &offered)
             .expect("an empty-to-nonempty addition needs a hint");
-        assert!(hint.contains("codex"), "the missing offer is named: {hint}");
+        assert!(
+            offered.iter().all(|capability| hint.contains(capability)),
+            "every missing offer is named: {hint}"
+        );
         assert!(
             hint.contains("ducktape service enable compute"),
             "the remedy is exact: {hint}"
         );
 
+        let mut standing = empty.clone();
+        standing.capabilities = vec!["claude".into(), "pi".into()];
         let mut all = standing.clone();
         all.capabilities = offered.clone();
         assert!(stale_grant_hint("compute", Some(&all), &offered).is_none());
