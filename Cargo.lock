@@ -3250,15 +3250,10 @@ dependencies = [
  "borsh",
  "commonware-codec",
  "commonware-cryptography",
- "commonware-runtime",
  "ducktape-module-sdk",
- "futures",
- "host",
  "module-artifact",
  "sdk",
- "sdk-testkit",
  "serde",
- "statesync",
 ]
 
 [[package]]
@@ -3526,6 +3521,7 @@ dependencies = [
  "blobstore",
  "borsh",
  "capability",
+ "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
  "directory",
@@ -4154,14 +4150,10 @@ name = "kv"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "commonware-runtime",
  "ducktape-module-sdk",
- "host",
  "sdk",
- "sdk-testkit",
  "serde",
  "sha2 0.10.9",
- "statesync",
 ]
 
 [[package]]
@@ -4413,16 +4405,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
- "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
  "module-artifact",
- "modules-wire",
  "sdk",
  "sdk-testkit",
  "serde",
- "statesync",
- "valset-wire",
 ]
 
 [[package]]

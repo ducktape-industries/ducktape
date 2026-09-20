@@ -45,7 +45,9 @@
 #[cfg(all(feature = "guest", target_arch = "wasm32"))]
 mod guest;
 
-pub use modules_wire::*;
+mod valset;
+mod wire;
+pub use wire::*;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use sdk::{

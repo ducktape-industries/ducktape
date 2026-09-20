@@ -9,7 +9,6 @@ edition.workspace = true
 guest = ["dep:ducktape-module-sdk"]
 
 [dependencies]
-modules-wire = { workspace = true }
 ducktape-module-sdk = { workspace = true, optional = true }
 sdk = { workspace = true }
 # the store-record codec: compact, canonical, deterministic. wire stays sdk::wire.
@@ -18,13 +17,9 @@ borsh = { workspace = true }
 # and this registry commits what the frame said, so the definition is the
 # frame crate's and there is no second copy to drift.
 module-artifact = { workspace = true }
-valset = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
-# the sync round-trip proof drives a real qmdb source/joiner pair.
-statesync = { workspace = true }
-commonware-runtime = { workspace = true }
 futures = { workspace = true }
 sdk-testkit = { workspace = true }

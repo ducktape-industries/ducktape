@@ -89,6 +89,7 @@ forge-odb = { workspace = true }
 blobstore = { workspace = true }
 tempfile = "3"
 commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
 commonware-runtime = { workspace = true }
 serde_json = "1"
 # the boundary-fault tests drive stub modules on a plain futures executor.

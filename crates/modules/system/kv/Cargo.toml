@@ -18,11 +18,3 @@ serde = { workspace = true }
 async-trait = { workspace = true }
 # the logical-key -> store-key hash (sha256); the store itself is injected.
 sha2 = { workspace = true }
-
-[dev-dependencies]
-host = { workspace = true }
-sdk-testkit = { workspace = true }
-# the tests drive the module the way a host does: construct the concrete
-# QmdbStore and inject it as `Box<dyn MerkleStore>`.
-statesync = { workspace = true }
-commonware-runtime = { workspace = true }

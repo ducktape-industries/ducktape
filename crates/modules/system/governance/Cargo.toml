@@ -35,11 +35,3 @@ async-trait = { workspace = true }
 # admission surface: minted by a member, redeemed in-consensus by `Redeem`.
 commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
-
-[dev-dependencies]
-host = { workspace = true }
-futures = { workspace = true }
-sdk-testkit = { workspace = true }
-# the sync round-trip proof drives a real qmdb source/joiner pair.
-statesync = { workspace = true }
-commonware-runtime = { workspace = true }
