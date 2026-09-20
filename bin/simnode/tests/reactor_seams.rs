@@ -25,6 +25,7 @@ mod harness;
 use commonware_cryptography::Signer as _;
 use harness::{Sim, create, create_channel, key_origin, post_message};
 use serde_json::{Value, json};
+use simnode::module_contracts::{dispatch, gateway, runs, saga};
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
 

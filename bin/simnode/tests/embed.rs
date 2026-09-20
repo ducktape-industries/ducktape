@@ -2,6 +2,7 @@
 
 mod harness; // for try_request (raw HTTP against the embedded server)
 
+use simnode::module_contracts::files;
 use std::net::{SocketAddr, TcpStream};
 
 fn loopback0() -> SocketAddr {
