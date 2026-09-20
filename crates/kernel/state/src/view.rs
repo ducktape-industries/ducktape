@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::iter::Peekable;
 
-use abi::{Entry, Scan};
+use abi::{BlobId, Entry, Scan};
 
 use crate::overlay::Overlay;
 use crate::storage::Storage;
@@ -19,6 +19,14 @@ type Layer<'a> = Peekable<Box<dyn Iterator<Item = Item> + 'a>>;
 impl<'a> View<'a> {
     pub fn new(storage: &'a Storage, layers: Vec<&'a Overlay>) -> View<'a> {
         View { storage, layers }
+    }
+
+    pub fn has_blob(&self, id: &BlobId) -> Result<bool> {
+        let staged_in_a_layer = self.layers.iter().any(|layer| layer.has_blob(id));
+        if staged_in_a_layer {
+            return Ok(true);
+        }
+        self.storage.has_blob(id)
     }
 
     pub fn get(&self, program: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {

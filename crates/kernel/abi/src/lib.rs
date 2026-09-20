@@ -15,13 +15,50 @@ impl core::fmt::Debug for Root {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
+pub enum HashKind {
+    Sha256,
+    Sha1,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
-pub struct BlobId(pub [u8; 32]);
+pub enum BlobId {
+    Sha256([u8; 32]),
+    Sha1([u8; 20]),
+}
+
+impl BlobId {
+    pub fn digest(&self) -> &[u8] {
+        match self {
+            BlobId::Sha256(digest) => digest,
+            BlobId::Sha1(digest) => digest,
+        }
+    }
+
+    pub fn kind(&self) -> HashKind {
+        match self {
+            BlobId::Sha256(_) => HashKind::Sha256,
+            BlobId::Sha1(_) => HashKind::Sha1,
+        }
+    }
+}
 
 impl core::fmt::Debug for BlobId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "BlobId({})", hex(&self.0))
+        write!(f, "BlobId({:?}:{})", self.kind(), hex(self.digest()))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Blob {
+    pub kind: String,
+    pub body: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct BlobHeader {
+    pub kind: String,
+    pub len: u64,
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -210,10 +247,18 @@ pub enum HostOp {
     Scan(Scan),
     CommittedGet(Vec<u8>),
     CommittedScan(Scan),
-    BlobPut(Vec<u8>),
+    BlobPut {
+        hash: HashKind,
+        kind: String,
+        body: Vec<u8>,
+    },
     BlobGet(BlobId),
     BlobStat(BlobId),
-    BlobDelete(BlobId),
+    BlobRead {
+        id: BlobId,
+        offset: u64,
+        len: u64,
+    },
     Root(ProgramId),
     Query { program: ProgramId, request: Vec<u8> },
     Emit(Message),
@@ -229,7 +274,8 @@ pub enum HostReply {
     Entries(Vec<Entry>),
     Done,
     BlobId(BlobId),
-    BlobSize(Option<u64>),
+    Blob(Option<Blob>),
+    BlobHeader(Option<BlobHeader>),
     Root(Option<Root>),
     Query(Result<Vec<u8>, Refusal>),
     Crypto(CryptoReply),

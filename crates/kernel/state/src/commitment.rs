@@ -61,13 +61,13 @@ pub fn codec_config() -> ((), (RangeCfg<usize>, ())) {
     ((), (RangeCfg::from(..), ()))
 }
 
-pub fn config<E: Context>(context: &E, program: &str) -> Config {
+pub fn config<E: Context>(context: &E, name: &str) -> Config {
     let tuning = Tuning::default();
     let page_cache = CacheRef::from_pooler(context, tuning.page_size, tuning.page_cache_pages);
     VariableConfig {
         merkle_config: merkle::full::Config {
-            journal_partition: format!("commitment-{program}-merkle-journal"),
-            metadata_partition: format!("commitment-{program}-merkle-meta"),
+            journal_partition: format!("commitment-{name}-merkle-journal"),
+            metadata_partition: format!("commitment-{name}-merkle-meta"),
             items_per_blob: tuning.items_per_blob,
             write_buffer: tuning.write_buffer,
             replay_buffer: tuning.replay_buffer,
@@ -75,7 +75,7 @@ pub fn config<E: Context>(context: &E, program: &str) -> Config {
             page_cache: page_cache.clone(),
         },
         journal_config: journal::contiguous::variable::Config {
-            partition: format!("commitment-{program}-log"),
+            partition: format!("commitment-{name}-log"),
             items_per_section: tuning.items_per_section,
             write_buffer: tuning.write_buffer,
             replay_buffer: tuning.replay_buffer,
@@ -94,7 +94,7 @@ pub struct Commitment<E>
 where
     E: Context + Spawner,
 {
-    program: String,
+    name: String,
     db: Option<Db<E>>,
 }
 
@@ -102,18 +102,18 @@ impl<E> Commitment<E>
 where
     E: Context + Spawner,
 {
-    pub async fn open(context: E, program: &str) -> Result<Commitment<E>> {
-        let config = config(&context, program);
+    pub async fn open(context: E, name: &str) -> Result<Commitment<E>> {
+        let config = config(&context, name);
         let db = Db::<E>::init(context, config).await?;
         Ok(Commitment {
-            program: program.to_owned(),
+            name: name.to_owned(),
             db: Some(db),
         })
     }
 
     pub async fn sync_from<S>(
         context: E,
-        program: &str,
+        name: &str,
         target: SyncTarget,
         source: S,
     ) -> Result<Commitment<E>>
@@ -121,7 +121,7 @@ where
         S: SourceFor<Db<E>>,
     {
         let tuning = Tuning::default();
-        let db_config = config(&context, program);
+        let db_config = config(&context, name);
         let db = sync::sync(SyncConfig {
             context,
             source,
@@ -138,7 +138,7 @@ where
         .await
         .map_err(|e| Error::Sync(format!("{e:?}")))?;
         Ok(Commitment {
-            program: program.to_owned(),
+            name: name.to_owned(),
             db: Some(db),
         })
     }
@@ -146,11 +146,11 @@ where
     pub fn db(&self) -> Result<&Db<E>> {
         self.db
             .as_ref()
-            .ok_or_else(|| Error::Lost(self.program.clone()))
+            .ok_or_else(|| Error::Lost(self.name.clone()))
     }
 
     pub fn into_db(self) -> Result<Db<E>> {
-        self.db.ok_or(Error::Lost(self.program))
+        self.db.ok_or(Error::Lost(self.name))
     }
 
     pub fn root(&self) -> Result<Root> {
@@ -182,7 +182,7 @@ where
         let db = self
             .db
             .take()
-            .ok_or_else(|| Error::Lost(self.program.clone()))?;
+            .ok_or_else(|| Error::Lost(self.name.clone()))?;
         let mut batch = db.new_batch();
         for (key, slot) in writes {
             let leaf = slot.as_ref().map(|value| {
@@ -217,7 +217,7 @@ where
             if ops.is_empty() {
                 return Err(Error::Corrupt(format!(
                     "the op log of {} is empty at {at} inside its bounds",
-                    self.program
+                    self.name
                 )));
             }
             at = Location::new(*at + ops.len() as u64);

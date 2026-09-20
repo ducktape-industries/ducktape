@@ -637,6 +637,13 @@ dependencies = [
 [[package]]
 name = "blobs"
 version = "0.1.0"
+dependencies = [
+ "abi",
+ "sha1",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "blobstore"

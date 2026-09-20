@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
-use abi::ProgramId;
+use abi::{BlobId, ProgramId};
 
 use crate::Writes;
 
@@ -11,13 +11,17 @@ pub type Slotted<'a> = (&'a [u8], Option<&'a [u8]>);
 #[derive(Default)]
 pub struct Overlay {
     programs: BTreeMap<ProgramId, BTreeMap<Vec<u8>, Slot>>,
+    blobs: BTreeSet<BlobId>,
     undo: Vec<Undo>,
 }
 
-struct Undo {
-    program: ProgramId,
-    key: Vec<u8>,
-    before: Option<Slot>,
+enum Undo {
+    Key {
+        program: ProgramId,
+        key: Vec<u8>,
+        before: Option<Slot>,
+    },
+    Blob(BlobId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,7 +29,7 @@ pub struct Checkpoint(usize);
 
 impl Overlay {
     pub fn is_empty(&self) -> bool {
-        self.programs.values().all(BTreeMap::is_empty)
+        self.programs.values().all(BTreeMap::is_empty) && self.blobs.is_empty()
     }
 
     pub fn get(&self, program: &str, key: &[u8]) -> Option<Option<&[u8]>> {
@@ -46,11 +50,26 @@ impl Overlay {
     fn write(&mut self, program: &str, key: Vec<u8>, slot: Slot) {
         let writes = self.programs.entry(program.to_owned()).or_default();
         let before = writes.insert(key.clone(), slot);
-        self.undo.push(Undo {
+        self.undo.push(Undo::Key {
             program: program.to_owned(),
             key,
             before,
         });
+    }
+
+    pub fn put_blob(&mut self, id: BlobId) {
+        let newly_staged = self.blobs.insert(id);
+        if newly_staged {
+            self.undo.push(Undo::Blob(id));
+        }
+    }
+
+    pub fn has_blob(&self, id: &BlobId) -> bool {
+        self.blobs.contains(id)
+    }
+
+    pub fn blobs(&self) -> impl Iterator<Item = &BlobId> {
+        self.blobs.iter()
     }
 
     pub fn checkpoint(&self) -> Checkpoint {
@@ -60,13 +79,20 @@ impl Overlay {
     pub fn restore(&mut self, checkpoint: Checkpoint) {
         while self.undo.len() > checkpoint.0 {
             let Some(undo) = self.undo.pop() else { return };
-            let Some(writes) = self.programs.get_mut(&undo.program) else { continue };
-            match undo.before {
-                Some(slot) => {
-                    writes.insert(undo.key, slot);
+            match undo {
+                Undo::Key {
+                    program,
+                    key,
+                    before,
+                } => {
+                    let Some(writes) = self.programs.get_mut(&program) else { continue };
+                    match before {
+                        Some(slot) => writes.insert(key, slot),
+                        None => writes.remove(&key),
+                    };
                 }
-                None => {
-                    writes.remove(&undo.key);
+                Undo::Blob(id) => {
+                    self.blobs.remove(&id);
                 }
             }
         }
@@ -102,6 +128,7 @@ impl Overlay {
                 .into_iter()
                 .filter(|(_, writes)| !writes.is_empty())
                 .collect(),
+            blobs: self.blobs,
         }
     }
 }

@@ -1,6 +1,7 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 
-use abi::ProgramId;
+use abi::BlobId;
 use fluent31::{Db, Options, WriteBatch};
 
 use crate::{Error, Result, Writes};
@@ -8,6 +9,7 @@ use crate::{Error, Result, Writes};
 const SEPARATOR: u8 = 0;
 const HEIGHT: &[u8] = b"\xffheight";
 const PENDING: &[u8] = b"\xffpending";
+const BLOB: &[u8] = b"\xffblob\0";
 
 pub struct Storage {
     db: Db,
@@ -61,33 +63,48 @@ impl Storage {
             }))
     }
 
+    pub fn has_blob(&self, id: &BlobId) -> Result<bool> {
+        Ok(self.db.get(&blob_key(id))?.is_some())
+    }
+
+    pub fn blob_ids(&self) -> Result<BTreeSet<BlobId>> {
+        let end = abi::prefix_end(BLOB);
+        let mut ids = BTreeSet::new();
+        for entry in self.db.iter(Some(BLOB), end.as_deref(), false)? {
+            let (key, _) = entry?;
+            ids.insert(decode(&key[BLOB.len()..])?);
+        }
+        Ok(ids)
+    }
+
     pub fn commit(&self, height: u64, writes: &Writes) -> Result<()> {
         let mut batch = WriteBatch::new();
-        for (program, keys) in &writes.programs {
-            for (key, slot) in keys {
-                match slot {
-                    Some(value) => batch.put(namespaced(program, key), value.clone()),
-                    None => batch.delete(namespaced(program, key)),
-                }
-            }
-        }
+        stage(&mut batch, writes);
         batch.put(HEIGHT, abi::encode(&height));
         batch.put(PENDING, abi::encode(writes));
         Ok(self.db.write(batch)?)
     }
 
-    pub fn install(
-        &self,
-        height: u64,
-        entries: impl IntoIterator<Item = (ProgramId, Vec<u8>, Vec<u8>)>,
-    ) -> Result<()> {
+    pub fn install(&self, height: u64, writes: &Writes) -> Result<()> {
         let mut batch = WriteBatch::new();
-        for (program, key, value) in entries {
-            batch.put(namespaced(&program, &key), value);
-        }
+        stage(&mut batch, writes);
         batch.put(HEIGHT, abi::encode(&height));
         batch.delete(PENDING);
         Ok(self.db.write(batch)?)
+    }
+}
+
+fn stage(batch: &mut WriteBatch, writes: &Writes) {
+    for (program, keys) in &writes.programs {
+        for (key, slot) in keys {
+            match slot {
+                Some(value) => batch.put(namespaced(program, key), value.clone()),
+                None => batch.delete(namespaced(program, key)),
+            }
+        }
+    }
+    for id in &writes.blobs {
+        batch.put(blob_key(id), Vec::new());
     }
 }
 
@@ -102,6 +119,12 @@ pub fn namespaced(program: &str, key: &[u8]) -> Vec<u8> {
 fn namespace_end(program: &str) -> Vec<u8> {
     let mut bytes = program.as_bytes().to_vec();
     bytes.push(SEPARATOR + 1);
+    bytes
+}
+
+fn blob_key(id: &BlobId) -> Vec<u8> {
+    let mut bytes = BLOB.to_vec();
+    bytes.extend_from_slice(&abi::encode(id));
     bytes
 }
 

@@ -135,7 +135,7 @@ async fn every_host_op_crosses_the_boundary_and_back() {
         })),
         Step::Op(HostOp::Event(b"happened".to_vec())),
         Step::Op(HostOp::Crypto(CryptoOp::Sha256(b"abc".to_vec()))),
-        Step::Op(HostOp::BlobStat(abi::BlobId([0; 32]))),
+        Step::Op(HostOp::BlobStat(abi::BlobId::Sha1([0; 20]))),
     ];
     let (bench, verdict) = execute(Limits::default(), steps).await;
     assert_eq!(verdict, Ok(Ok(Vec::new())));
@@ -160,7 +160,7 @@ async fn every_host_op_crosses_the_boundary_and_back() {
             HostReply::Crypto(CryptoReply::Digest(Sha256::digest(b"abc").into())),
             HostReply::Refused(Refusal::new(
                 reason::UNSUPPORTED,
-                "the bench does not serve BlobStat(BlobId(0000000000000000000000000000000000000000000000000000000000000000))",
+                "the bench does not serve BlobStat(BlobId(Sha1:0000000000000000000000000000000000000000))",
             )),
         ]
     );

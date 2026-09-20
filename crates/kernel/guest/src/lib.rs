@@ -1,7 +1,8 @@
 pub use abi;
 pub use abi::{
-    BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, GuestCall, GuestReply, HostOp, HostReply,
-    ItemRef, Message, Origin, Outcome, ProgramId, Refusal, Root, Scan, Scheme, reason,
+    Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, GuestCall, GuestReply,
+    HashKind, HostOp, HostReply, ItemRef, Message, Origin, Outcome, ProgramId, Refusal, Root, Scan,
+    Scheme, reason,
 };
 
 pub trait Program {
@@ -145,31 +146,40 @@ pub mod host_ops {
         }
     }
 
-    pub fn blob_put(bytes: impl Into<Vec<u8>>) -> BlobId {
-        match host(&HostOp::BlobPut(bytes.into())) {
-            HostReply::BlobId(id) => id,
+    pub fn blob_put(
+        hash: HashKind,
+        kind: impl Into<String>,
+        body: impl Into<Vec<u8>>,
+    ) -> Result<BlobId, Refusal> {
+        match host(&HostOp::BlobPut {
+            hash,
+            kind: kind.into(),
+            body: body.into(),
+        }) {
+            HostReply::BlobId(id) => Ok(id),
+            HostReply::Refused(refusal) => Err(refusal),
             other => protocol("blob id", other),
         }
     }
 
-    pub fn blob_get(id: BlobId) -> Option<Vec<u8>> {
+    pub fn blob_get(id: BlobId) -> Option<Blob> {
         match host(&HostOp::BlobGet(id)) {
-            HostReply::Value(value) => value,
-            other => protocol("value", other),
+            HostReply::Blob(blob) => blob,
+            other => protocol("blob", other),
         }
     }
 
-    pub fn blob_stat(id: BlobId) -> Option<u64> {
+    pub fn blob_stat(id: BlobId) -> Option<BlobHeader> {
         match host(&HostOp::BlobStat(id)) {
-            HostReply::BlobSize(size) => size,
-            other => protocol("blob size", other),
+            HostReply::BlobHeader(header) => header,
+            other => protocol("blob header", other),
         }
     }
 
-    pub fn blob_delete(id: BlobId) {
-        match host(&HostOp::BlobDelete(id)) {
-            HostReply::Done => {}
-            other => protocol("done", other),
+    pub fn blob_read(id: BlobId, offset: u64, len: u64) -> Option<Vec<u8>> {
+        match host(&HostOp::BlobRead { id, offset, len }) {
+            HostReply::Value(bytes) => bytes,
+            other => protocol("value", other),
         }
     }
 
