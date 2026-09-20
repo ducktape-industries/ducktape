@@ -26,7 +26,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrayvec::ArrayVec;
@@ -34,11 +34,10 @@ use commonware_cryptography::ed25519;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout};
 
 pub use crate::advert::SharedAdverts;
-use crate::advert::{Bucket, source_bucket};
 use crate::auth::{
     AuthError, AuthPolicy, Authenticator, CoordCap, DEFAULT_FRESHNESS_WINDOW_SECS, now_secs,
     sign_authenticator, verify_request,
@@ -74,50 +73,24 @@ pub const MAX_FRAME_LEN: usize = 2048;
 pub const MAX_RELAY_PAYLOAD: usize = 1400;
 
 // ---------------------------------------------------------------------------
-// Session limits (each is a hard cap; the relay is abuse-facing by design)
+// Session deadlines (the relay is abuse-facing by design)
 
-/// Global concurrent-session cap: bounds relay memory and socket use under a
-/// connect flood — 256 in-flight joins is far beyond any real burst.
-pub const MAX_RELAY_SESSIONS: usize = 256;
-/// Per-IP concurrent-session cap: one joiner needs one session; a handful
-/// covers a NAT'd venue without letting a single host soak the global budget.
-pub const MAX_SESSIONS_PER_IP: usize = 4;
 /// Session TTL: the join gate settles in <=30 s; 90 s covers retransmits
 /// without letting an abandoned session pin its UDP socket forever.
 pub const SESSION_TTL: Duration = Duration::from_secs(90);
 /// Per-frame read timeout: a live joiner retransmits every ~2 s, so 15 s of
 /// TCP silence means the peer is gone.
 pub const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(15);
-/// Forward budget in EACH direction: a join needs a handful of datagrams; 64
-/// stops an abusive pump long before it costs anything.
-pub const MAX_SESSION_FORWARDS: u32 = 64;
 /// Pacing floor between joiner->member forwards: the joiner retransmits every
 /// 2 s, so 250 ms only ever bites abuse (a too-fast retransmit is dropped, not
 /// fatal).
 pub const MIN_FORWARD_GAP: Duration = Duration::from_millis(250);
-/// Cap on retry Intro frames RECEIVED, forwarded or not. `MAX_SESSION_FORWARDS`
-/// only bounds frames that clear the pacing floor; a frame the floor drops
-/// still costs a channel recv and a frame decode, so a flood that never once
-/// clears `MIN_FORWARD_GAP` would otherwise run the full `SESSION_TTL` for
-/// free. Sized at 4x `MAX_SESSION_FORWARDS` — generous slack over what a
-/// legitimate joiner's ~2 s cadence produces (~45 frames in 90 s), tight
-/// enough to close a flood long before it matters.
-pub const MAX_SESSION_FRAMES: u32 = MAX_SESSION_FORWARDS * 4;
 /// Bound on one relay->joiner frame write. A joiner that stops READING its
 /// TCP stream would otherwise park the session inside an unbounded
 /// `write_all` once the kernel send buffer fills — a state the TTL branch
 /// cannot preempt, because the select is not polling while the write is
 /// awaited inline.
 const FORWARD_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Cap on refusal writes in flight at once. A `session_limit` refusal frame
-/// is a few bytes, so a generous handful is plenty for real traffic; it
-/// exists only to bound the worst case — a peer that never reads leaves its
-/// accepted socket (and the task writing to it) alive for up to 5 s, and the
-/// accept loop that spawns these tasks does not itself slow down under a
-/// connect flood. Past this many outstanding writes, a refused socket is
-/// dropped with no frame at all: closer to what a flood deserves than an
-/// unbounded task per connection.
-const MAX_PENDING_REFUSAL_WRITES: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Error reasons — stable snake_case tokens (greppable and countable), never
@@ -129,8 +102,6 @@ pub const REASON_TARGET_UNREGISTERED: &[u8] = b"target_unregistered";
 pub const REASON_NOT_AUTHORIZED: &[u8] = b"not_authorized";
 /// The peer sent something that is not a well-formed frame for its position.
 pub const REASON_MALFORMED: &[u8] = b"malformed";
-/// The global or per-IP session cap refused the connection.
-pub const REASON_SESSION_LIMIT: &[u8] = b"session_limit";
 
 // ---------------------------------------------------------------------------
 // Frames
@@ -399,7 +370,6 @@ struct RelayMetricsInner {
     forwards: AtomicU64,
     replies: AtomicU64,
     expired: AtomicU64,
-    refusal_writes_dropped: AtomicU64,
 }
 
 /// Cheap live counters for the relay lane, mirroring `CoordinatorMetrics`:
@@ -412,7 +382,7 @@ pub struct RelayMetrics(Arc<RelayMetricsInner>);
 pub struct RelayMetricsSnapshot {
     /// Sessions whose intro was accepted and first forward sent.
     pub sessions_opened: u64,
-    /// Connections refused before opening (auth, resolution, caps, garbage).
+    /// Connections refused before opening (auth, resolution, garbage).
     pub sessions_rejected: u64,
     /// joiner -> member datagrams sent.
     pub forwards: u64,
@@ -420,11 +390,6 @@ pub struct RelayMetricsSnapshot {
     pub replies: u64,
     /// Sessions that hit the TTL.
     pub expired: u64,
-    /// A `session_limit` refusal that was never told to the peer: the
-    /// bounded refusal-write budget ([`MAX_PENDING_REFUSAL_WRITES`]) was
-    /// exhausted, so the socket was dropped in silence instead of spawning
-    /// another write task.
-    pub refusal_writes_dropped: u64,
 }
 
 impl RelayMetrics {
@@ -436,67 +401,11 @@ impl RelayMetrics {
             forwards: load(&self.0.forwards),
             replies: load(&self.0.replies),
             expired: load(&self.0.expired),
-            refusal_writes_dropped: load(&self.0.refusal_writes_dropped),
         }
     }
 
     fn increment(value: &AtomicU64) {
         value.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Session accounting
-
-#[derive(Default)]
-struct SessionTable {
-    total: usize,
-    // Keyed by Bucket, not IpAddr: an IPv6 /64 is one host (RFC 6177), same
-    // as the advert book's per-source cap (#1505) — see `source_bucket`.
-    per_ip: std::collections::HashMap<Bucket, usize>,
-}
-
-/// RAII admission slot: holds this session's place in the global and per-IP
-/// counts, released on Drop so EVERY exit path (refusal, TTL, io error, even
-/// a panic unwinding the task) frees it.
-struct SessionSlot {
-    table: Arc<Mutex<SessionTable>>,
-    bucket: Bucket,
-}
-
-fn lock_table(table: &Mutex<SessionTable>) -> std::sync::MutexGuard<'_, SessionTable> {
-    // Same poisoning stance as SharedAdverts: a counter table's worst partial
-    // state is an off-by-one; keep admitting joins.
-    table.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-impl SessionSlot {
-    fn try_acquire(table: &Arc<Mutex<SessionTable>>, ip: std::net::IpAddr) -> Option<Self> {
-        let bucket = source_bucket(ip);
-        let mut t = lock_table(table);
-        let ip_count = t.per_ip.get(&bucket).copied().unwrap_or(0);
-        if t.total >= MAX_RELAY_SESSIONS || ip_count >= MAX_SESSIONS_PER_IP {
-            return None;
-        }
-        t.total += 1;
-        *t.per_ip.entry(bucket).or_insert(0) += 1;
-        Some(Self {
-            table: table.clone(),
-            bucket,
-        })
-    }
-}
-
-impl Drop for SessionSlot {
-    fn drop(&mut self) {
-        let mut t = lock_table(&self.table);
-        t.total = t.total.saturating_sub(1);
-        if let Some(count) = t.per_ip.get_mut(&self.bucket) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                t.per_ip.remove(&self.bucket);
-            }
-        }
     }
 }
 
@@ -628,8 +537,6 @@ impl Session {
         let target = intro.target;
         let mut forwards: u32 = 1;
         let mut replies: u32 = 0;
-        let mut frames: u32 = 0;
-        let mut frames_dropped: u32 = 0;
         let mut last_forward = Instant::now();
         let deadline = Instant::now() + SESSION_TTL;
         let mut buf = [0u8; MAX_FRAME_LEN];
@@ -646,28 +553,16 @@ impl Session {
                             if retry.caller != caller || retry.target != target {
                                 return SessionEnd::Refused(REASON_MALFORMED);
                             }
-                            // Frame budget FIRST: bounds sheer frame churn on
-                            // this connection, independent of whether frames
-                            // clear pacing or the forward budget below.
-                            frames += 1;
-                            if frames > MAX_SESSION_FRAMES {
-                                note_frame_budget_exceeded(caller, target, frames_dropped);
-                                return SessionEnd::Closed;
-                            }
-                            // Pacing floor next, still ahead of the ed25519
+                            // Pacing floor FIRST, ahead of the ed25519
                             // verify: the joiner's 2 s cadence never trips
                             // this, a flood does, and is dropped without
                             // malice or a signature check.
                             if last_forward.elapsed() < MIN_FORWARD_GAP {
-                                frames_dropped += 1;
                                 continue;
-                            }
-                            if forwards >= MAX_SESSION_FORWARDS {
-                                return SessionEnd::Closed;
                             }
                             // The verify is the expensive gate, so it runs
                             // last, only for a frame that already cleared
-                            // pacing and the forward budget.
+                            // pacing.
                             if verify_intro(&self.policy, &retry).is_err() {
                                 return SessionEnd::Refused(REASON_NOT_AUTHORIZED);
                             }
@@ -697,9 +592,6 @@ impl Session {
                     // never be a legal intro-ack; drop rather than truncate.
                     if n > MAX_RELAY_PAYLOAD {
                         continue;
-                    }
-                    if replies >= MAX_SESSION_FORWARDS {
-                        return SessionEnd::Closed;
                     }
                     let frame = RelayFrame::Forwarded { payload: buf[..n].to_vec() };
                     match timeout(FORWARD_WRITE_TIMEOUT, write_frame(&mut self.write, &frame)).await
@@ -738,9 +630,9 @@ fn reason_key(reason: &'static [u8]) -> &'static str {
 
 /// One refused relay session, named. `reason` is the same stable token the
 /// peer gets back in its [`RelayFrame::Error`]; latched PER REASON, because
-/// refusing strangers is this lane's steady state under abuse and a connection
-/// flood tripping `session_limit` must not swallow the first
-/// `target_unregistered` — the one an operator is actually hunting.
+/// refusing strangers is this lane's steady state under abuse and a flood of
+/// one refusal must not swallow the first `target_unregistered` — the one an
+/// operator is actually hunting.
 fn note_refused(peer: SocketAddr, reason: &'static [u8]) {
     static REFUSALS: Latch = Latch::new();
     let reason = reason_key(reason);
@@ -756,79 +648,13 @@ fn note_refused(peer: SocketAddr, reason: &'static [u8]) {
     }
 }
 
-/// One session closed for exceeding `MAX_SESSION_FRAMES`, latched: a flood
-/// that never once clears `MIN_FORWARD_GAP` still drives this arm once per
-/// frame, and a per-frame log line would be the very bomb this cap exists to
-/// prevent.
-fn note_frame_budget_exceeded(caller: NodeKey, target: NodeKey, frames_dropped: u32) {
-    static EXCEEDED: Latch = Latch::new();
-    if let Some(occurrences) = EXCEEDED.hit("frame_budget_exceeded") {
-        tracing::warn!(
-            target: "ducktape::reachability",
-            event = "relay_session_frame_budget_exceeded",
-            reason = "frame_budget_exceeded",
-            caller = short_key(caller),
-            member = short_key(target),
-            frames_dropped,
-            occurrences,
-            "relay session closed: frame budget exceeded"
-        );
-    }
-}
-
-/// A `session_limit` refusal write that never happened: the bounded refusal
-/// budget was exhausted, so the socket was dropped rather than spawning yet
-/// another write task. Latched like every other stranger-driven refusal.
-fn note_refusal_write_dropped(peer: SocketAddr) {
-    static DROPPED: Latch = Latch::new();
-    if let Some(occurrences) = DROPPED.hit("refusal_write_dropped") {
-        tracing::debug!(
-            target: "ducktape::reachability",
-            event = "relay_refusal_write_dropped",
-            reason = "refusal_budget_exhausted",
-            peer = %peer,
-            occurrences,
-            "dropped a session_limit refusal write: budget exhausted"
-        );
-    }
-}
-
-/// Tell a refused peer it was the cap, not a dead relay — but only if a
-/// refusal-write permit is free. Without one the accepted socket is simply
-/// dropped (closing it): a session_limit refusal frame is a courtesy, not a
-/// promise, and an unbounded task per refusal is exactly the hole the cap
-/// exists to close (issue: refused connections holding a socket for up to 5 s
-/// with no bound on how many exist at once).
-fn spawn_refusal_write(
-    permits: &Arc<Semaphore>,
-    stream: TcpStream,
-    peer: SocketAddr,
-    metrics: &RelayMetrics,
-) {
-    let Ok(permit) = Arc::clone(permits).try_acquire_owned() else {
-        RelayMetrics::increment(&metrics.0.refusal_writes_dropped);
-        note_refusal_write_dropped(peer);
-        return;
-    };
-    tokio::spawn(async move {
-        let _permit = permit; // held for the write; released on task exit
-        let mut stream = stream;
-        let refusal = RelayFrame::Error {
-            reason: REASON_SESSION_LIMIT.to_vec(),
-        };
-        let _ = timeout(Duration::from_secs(5), write_frame(&mut stream, &refusal)).await;
-    });
-}
-
 async fn run_session(
     stream: TcpStream,
     peer: SocketAddr,
-    slot: SessionSlot,
     policy: Arc<AuthPolicy>,
     adverts: SharedAdverts,
     metrics: RelayMetrics,
 ) {
-    let _slot = slot; // held for the whole session; Drop releases the caps
     let _ = stream.set_nodelay(true);
     let (read_half, write_half) = stream.into_split();
     let (frames_tx, frames) = mpsc::channel(4);
@@ -866,8 +692,6 @@ pub async fn run_relay_listener(
     adverts: SharedAdverts,
     metrics: RelayMetrics,
 ) {
-    let sessions: Arc<Mutex<SessionTable>> = Arc::default();
-    let refusal_permits = Arc::new(Semaphore::new(MAX_PENDING_REFUSAL_WRITES));
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -891,16 +715,9 @@ pub async fn run_relay_listener(
                 continue;
             }
         };
-        let Some(slot) = SessionSlot::try_acquire(&sessions, peer.ip()) else {
-            RelayMetrics::increment(&metrics.0.sessions_rejected);
-            note_refused(peer, REASON_SESSION_LIMIT);
-            spawn_refusal_write(&refusal_permits, stream, peer, &metrics);
-            continue;
-        };
         tokio::spawn(run_session(
             stream,
             peer,
-            slot,
             policy.clone(),
             adverts.clone(),
             metrics.clone(),
@@ -957,7 +774,6 @@ mod tests {
             REASON_TARGET_UNREGISTERED,
             REASON_NOT_AUTHORIZED,
             REASON_MALFORMED,
-            REASON_SESSION_LIMIT,
         ] {
             cases.push(RelayFrame::Error {
                 reason: reason.to_vec(),
@@ -970,15 +786,15 @@ mod tests {
         }
     }
 
-    /// A session-limit flood is this lane's loudest refusal; the line an
-    /// operator came for is the first `target_unregistered`. One latch per lane
-    /// would swallow it 99 times out of 100, so the latch counts per reason.
+    /// A flood of one refusal is this lane's loudest; the line an operator
+    /// came for is the first `target_unregistered`. One latch per lane would
+    /// swallow it 99 times out of 100, so the latch counts per reason.
     #[test]
-    fn a_session_limit_flood_does_not_swallow_the_first_unregistered_refusal() {
+    fn a_refusal_flood_does_not_swallow_the_first_unregistered_refusal() {
         let latch = Latch::new();
-        assert_eq!(latch.hit(reason_key(REASON_SESSION_LIMIT)), Some(1));
+        assert_eq!(latch.hit(reason_key(REASON_MALFORMED)), Some(1));
         for _ in 0..1_000 {
-            let _ = latch.hit(reason_key(REASON_SESSION_LIMIT));
+            let _ = latch.hit(reason_key(REASON_MALFORMED));
         }
         assert_eq!(latch.hit(reason_key(REASON_TARGET_UNREGISTERED)), Some(1));
         // ... and each reason still latches down to first-and-every-Nth on its
@@ -1260,53 +1076,6 @@ mod tests {
         wait_for(&rig.metrics, "two forwards", |m| m.forwards == 2).await;
     }
 
-    /// The exploit from the issue: one valid, signed intro replayed back to
-    /// back so every retry lands inside `MIN_FORWARD_GAP` and never once
-    /// clears pacing to trip `MAX_SESSION_FORWARDS`. Before the fix that ran
-    /// `verify_intro` for every one of these for the full `SESSION_TTL`; now
-    /// pacing runs (and drops) BEFORE verify, and the frame budget closes the
-    /// session long before the TTL regardless.
-    #[tokio::test]
-    async fn frame_flood_that_never_clears_pacing_closes_on_the_frame_budget() {
-        let rig = rig(AuthPolicy::Public).await;
-        let (_member, member_key) = register_member(&rig, 50).await;
-
-        let (joiner_signer, joiner_key) = keypair(51);
-        let mut conn = RelayConn::connect(rig.relay_addr, Duration::from_secs(2))
-            .await
-            .unwrap();
-        let intro = sign_relay_intro(
-            &joiner_signer,
-            joiner_key,
-            member_key,
-            SEALED_INTRO.to_vec(),
-            now_secs(),
-            None,
-        );
-        // Opens the session and forwards once.
-        conn.send(&RelayFrame::Intro(intro.clone())).await.unwrap();
-
-        // Flood the identical, validly-signed retry as fast as the socket
-        // takes it. Every one lands well inside MIN_FORWARD_GAP, so none of
-        // them can ever reach the (already-passed) MAX_SESSION_FORWARDS
-        // check — only the frame budget can end this.
-        for _ in 0..=MAX_SESSION_FRAMES {
-            conn.send(&RelayFrame::Intro(intro.clone())).await.unwrap();
-        }
-
-        // `Closed` (not `Refused`) sends no frame back: the read side just
-        // observes the relay end of the stream close.
-        assert!(
-            conn.recv(Duration::from_secs(2)).await.is_err(),
-            "the session must close once the frame budget is exceeded"
-        );
-
-        // Only the single pacing-clearing FIRST frame was ever forwarded;
-        // every flooded retry was paced out before it could re-verify or
-        // re-forward.
-        assert_eq!(rig.metrics.snapshot().forwards, 1);
-    }
-
     #[tokio::test]
     async fn forged_pop_is_refused_as_not_authorized() {
         let rig = rig(AuthPolicy::Public).await;
@@ -1408,95 +1177,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn per_ip_session_cap_refuses_the_next_connection() {
-        let rig = rig(AuthPolicy::Public).await;
-        // Fill the per-IP budget (loopback: one IP) with idle connections.
-        let mut held = Vec::new();
-        for _ in 0..MAX_SESSIONS_PER_IP {
-            held.push(
-                RelayConn::connect(rig.relay_addr, Duration::from_secs(2))
-                    .await
-                    .unwrap(),
-            );
-        }
-        // A connect() returning does not mean the accept loop has admitted it
-        // yet, so probe until the cap is actually populated: an over-cap probe
-        // is told session_limit; an under-cap probe times out silently (it
-        // became a session) and is dropped to free its slot.
-        let mut refused = false;
-        for _ in 0..50 {
-            let mut probe = RelayConn::connect(rig.relay_addr, Duration::from_secs(2))
-                .await
-                .unwrap();
-            if let Ok(frame) = probe.recv(Duration::from_millis(200)).await {
-                assert_eq!(
-                    frame,
-                    RelayFrame::Error {
-                        reason: REASON_SESSION_LIMIT.to_vec()
-                    }
-                );
-                refused = true;
-                break;
-            }
-            drop(probe);
-            sleep(Duration::from_millis(50)).await;
-        }
-        assert!(refused, "the fifth same-IP connection is refused");
-        assert!(rig.metrics.snapshot().sessions_rejected >= 1);
-        drop(held);
-    }
-
-    #[test]
-    fn per_ip_cap_buckets_ipv6_by_64_not_by_exact_address() {
-        // Five DISTINCT addresses inside one /64: a single host with a routed
-        // prefix (RFC 6177) can pick any of 2^64 of these for free. Bucketing
-        // by the /64 (mirrors advert.rs's `source_bucket`, #1505) must count
-        // them as one source, so the fifth hits MAX_SESSIONS_PER_IP (4).
-        let table: Arc<Mutex<SessionTable>> = Arc::default();
-        let addr_in_prefix = |host: u16| {
-            std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, host))
-        };
-        let mut held = Vec::new();
-        for host in 0..MAX_SESSIONS_PER_IP as u16 {
-            let slot = SessionSlot::try_acquire(&table, addr_in_prefix(host));
-            assert!(slot.is_some(), "session {host} within the cap must admit");
-            held.push(slot.unwrap());
-        }
-        assert!(
-            SessionSlot::try_acquire(&table, addr_in_prefix(MAX_SESSIONS_PER_IP as u16)).is_none(),
-            "a fifth address in the same /64 must be refused as the same source"
-        );
-        drop(held);
-    }
-
-    #[tokio::test]
-    async fn exhausted_refusal_budget_drops_the_socket_with_no_task_and_no_frame() {
-        // A permit-less semaphore models the budget already fully spent by
-        // other refusals in flight.
-        let permits = Arc::new(Semaphore::new(0));
-        let metrics = RelayMetrics::default();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let connector = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
-        let (stream, peer) = listener.accept().await.unwrap();
-        let mut client = connector.await.unwrap();
-
-        spawn_refusal_write(&permits, stream, peer, &metrics);
-
-        // If a task had been spawned it would hold the write open for up to
-        // the 5 s FORWARD-style timeout; with no permit, no task exists at
-        // all, so the accepted socket is simply dropped and the peer sees
-        // EOF right away, not a session_limit frame.
-        let mut buf = [0u8; 8];
-        let n = timeout(Duration::from_millis(500), client.read(&mut buf))
-            .await
-            .expect("closes immediately; must not wait anywhere near the write timeout")
-            .unwrap();
-        assert_eq!(
-            n, 0,
-            "no frame is ever written when the budget is exhausted"
-        );
-        assert_eq!(metrics.snapshot().refusal_writes_dropped, 1);
-    }
 }

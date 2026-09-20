@@ -46,11 +46,8 @@ pub(crate) struct JoinRequestRecord {
 }
 
 /// Insert a freshly-forwarded join request, or refresh `last_seen_ms` on a
-/// retransmit — mirrors [`crate::reachability_plane::insert_gate_outcome`],
-/// capped at the same [`crate::reachability_plane::MAX_TRACKED_JOINERS`],
-/// oldest-by-`last_seen_ms` evicted first. The map is keyed on the
-/// attacker-chosen joiner key with no other size limit, so an unbounded
-/// stream of never-approved joiners must not grow it forever.
+/// retransmit — mirrors [`crate::reachability_plane::insert_gate_outcome`].
+/// [`sweep_join_requests`] is what ages a never-approved joiner out.
 pub(crate) fn insert_join_request(
     map: &mut std::collections::BTreeMap<Vec<u8>, JoinRequestRecord>,
     joiner: Vec<u8>,
@@ -60,14 +57,6 @@ pub(crate) fn insert_join_request(
     if let Some(existing) = map.get_mut(&joiner) {
         existing.last_seen_ms = now_ms;
         return;
-    }
-    if map.len() >= crate::reachability_plane::MAX_TRACKED_JOINERS
-        && let Some(oldest) = map
-            .iter()
-            .min_by_key(|(_, r)| r.last_seen_ms)
-            .map(|(k, _)| k.clone())
-    {
-        map.remove(&oldest);
     }
     map.insert(
         joiner,

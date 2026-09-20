@@ -19,7 +19,8 @@ use std::path::PathBuf;
 
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 
-use crate::refs::RepoState;
+use crate::codec;
+use crate::refs::{RepoOwner, RepoState};
 use crate::state::{ForgeState, RefTarget};
 use crate::tracker::Tracker;
 use crate::*;
@@ -34,6 +35,11 @@ use crate::{
 /// re-adopted at construction (the tracker analogue of the on-disk git refs).
 /// never a valid repo dir name (repos are directories; this is a file).
 const TRACKER_FILE: &str = ".tracker.bin";
+
+/// The native substrate's durable copy of the consensus repo-owner map. The
+/// guest image remains authoritative during state sync; this file lets a
+/// native Forge reopen with the same owner before its next block.
+const OWNER_FILE: &str = ".owners.bin";
 
 /// the node-local file the per-repo CATCH-UP MAP persists to under `base`.
 ///
@@ -66,6 +72,9 @@ pub(crate) const SNAPSHOT_CACHE_FILE: &str = ".snapshot-cache.bin";
 
 /// the 4-byte magic the pending file leads with.
 const FORGE_PENDING_MAGIC: &[u8; 4] = b"FGP1";
+
+/// The owner sidecar's container magic.
+const FORGE_OWNER_MAGIC: &[u8; 4] = b"FGO1";
 
 /// the 4-byte magic every forge snapshot container leads with.
 pub(crate) const FORGE_SNAPSHOT_MAGIC: &[u8; 4] = b"FGv1";
@@ -120,6 +129,55 @@ fn read_pending(base: &std::path::Path) -> Result<BTreeMap<String, refs::Pending
         }
     };
     decode_pending(&bytes)
+}
+
+/// Parse `FGO1 ++ u32(repo_count) ++ (repo, owner)*` from the native
+/// substrate's owner sidecar.
+fn decode_owners(bytes: &[u8]) -> Result<BTreeMap<String, RepoOwner>, Error> {
+    let body = bytes
+        .strip_prefix(FORGE_OWNER_MAGIC.as_slice())
+        .ok_or_else(|| Error::module("owner_decode", "forge owner file: missing the FGO1 magic"))?;
+    let mut reader = codec::Reader::new(body);
+    let count = reader.u32()?;
+    let mut owners = BTreeMap::new();
+    for _ in 0..count {
+        let name = norm_repo(&reader.str_()?)?;
+        let owner = refs::take_owner(&mut reader)?.ok_or_else(|| {
+            Error::module(
+                "owner_decode",
+                format!("forge owner file: {name} has no owner"),
+            )
+        })?;
+        if owners.insert(name.clone(), owner).is_some() {
+            return Err(Error::module(
+                "owner_decode",
+                format!("forge owner file: duplicate repo {name}"),
+            ));
+        }
+    }
+    if !reader.done() {
+        return Err(Error::module(
+            "owner_decode",
+            "forge owner file: trailing bytes after the map",
+        ));
+    }
+    Ok(owners)
+}
+
+fn read_owners(base: &std::path::Path) -> Result<BTreeMap<String, RepoOwner>, Error> {
+    let bytes = match std::fs::read(base.join(OWNER_FILE)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeMap::new());
+        }
+        Err(error) => {
+            return Err(Error::module(
+                "owner_file_read",
+                format!("forge: read owner file: {error}"),
+            ));
+        }
+    };
+    decode_owners(&bytes)
 }
 
 /// packs one repo may accumulate before [`compact_repos`] collapses them —
@@ -439,6 +497,7 @@ impl Forge {
             Error::module("base_dir_create", format!("forge: create base dir: {e}"))
         })?;
 
+        let owners = read_owners(&base)?;
         let mut repos = BTreeMap::new();
         for entry in std::fs::read_dir(&base)
             .map_err(|e| Error::module("base_dir_read", format!("forge: scan base dir: {e}")))?
@@ -472,6 +531,7 @@ impl Forge {
                     .collect()
             };
             let committed = refs::RepoRefs {
+                owner: None,
                 branches: adopt(
                     git::list_branches(&repo)
                         .map_err(|e| Error::module("git_list_branches", e.to_string()))?,
@@ -491,6 +551,19 @@ impl Forge {
         // rewound branch map composes a wrong root.
         for (name, pending) in read_pending(&base)? {
             repos.entry(name).or_default().adopt_pending(pending);
+        }
+
+        // Owner metadata is committed alongside the native ref cache. A
+        // missing entry is allowed for a genesis/adopted repo whose first
+        // authenticated push has not yet assigned its ACL.
+        for (name, owner) in owners {
+            let Some(state) = repos.get_mut(&name) else {
+                return Err(Error::module(
+                    "owner_decode",
+                    format!("forge owner file: no repo {name:?} exists on disk"),
+                ));
+            };
+            state.owner = Some(owner);
         }
 
         // re-adopt the persisted tracker. a corrupt file is FAIL-STOP (like a
@@ -576,6 +649,53 @@ impl Forge {
             )
         })?;
         Ok(())
+    }
+
+    /// Atomically persist the native copy of committed repository owners.
+    /// Owner state is also in the guest image; this sidecar only lets a native
+    /// substrate reopen with the same authorization before state sync runs.
+    pub(crate) fn persist_owners(&self) -> Result<(), Error> {
+        let owners: Vec<_> = self
+            .state
+            .repos
+            .iter()
+            .filter_map(|(name, state)| {
+                state
+                    .is_born()
+                    .then(|| state.owner.as_ref().map(|owner| (name.as_str(), owner)))
+                    .flatten()
+            })
+            .collect();
+        let path = self.base.join(OWNER_FILE);
+        if owners.is_empty() {
+            return match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(Error::module(
+                    "owner_file_write",
+                    format!("forge: clear owner file: {error}"),
+                )),
+            };
+        }
+        let mut bytes = FORGE_OWNER_MAGIC.to_vec();
+        codec::put_u32(&mut bytes, owners.len() as u32);
+        for (name, owner) in owners {
+            codec::put_str(&mut bytes, name);
+            refs::put_owner(&mut bytes, Some(owner));
+        }
+        let tmp = self.base.join(".owners.bin.tmp");
+        std::fs::write(&tmp, bytes).map_err(|error| {
+            Error::module(
+                "owner_file_write",
+                format!("forge: write owner file: {error}"),
+            )
+        })?;
+        std::fs::rename(tmp, path).map_err(|error| {
+            Error::module(
+                "owner_file_write",
+                format!("forge: publish owner file: {error}"),
+            )
+        })
     }
 
     /// atomically publish the advisory [`STUCK_FILE`], or remove it once no
@@ -779,6 +899,7 @@ impl Forge {
         for (name, state) in self.state.repos.iter_mut() {
             state.publish(base, name, blobs)?;
         }
+        self.persist_owners()?;
         // publish both grows the catch-up map (a head whose pack has not
         // arrived) and drains it (materialize caught one up) — either way the
         // durable copy must land in the SAME commit as the heads it describes.
@@ -802,6 +923,9 @@ impl Forge {
     pub fn adopt_refs(&mut self, bytes: &[u8], targets: Vec<RefTarget>) -> Result<(), Error> {
         let image = crate::state::decode_image(bytes)?;
         let fates = self.state.fates_for_image(&image, targets)?;
+        for (name, refs) in &image.repos {
+            self.state.repos.entry(name.clone()).or_default().owner = refs.owner.clone();
+        }
         for (name, staged) in fates {
             self.state.repos.entry(name).or_default().staged = staged;
         }
@@ -2907,11 +3031,11 @@ mod tests {
         r
     }
 
-    // ANY target accepts a merge from ANY member — a protected one included:
-    // a stranger, a reviewer, the member who pushed the repo. reviews are
-    // stored and shown and change nothing about who may merge.
+    // A repository owner may merge onto any target, including protected
+    // branches. Other members may open and review the PR but cannot move a
+    // ref through MergePr.
     #[test]
-    fn merging_onto_any_target_is_any_members() {
+    fn only_the_repo_owner_may_merge_onto_any_target() {
         let base = tmp_base("any-merge");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
         let digest = vec![9u8; 32];
@@ -2971,14 +3095,16 @@ mod tests {
             pack_digest: hex(&digest),
         };
 
-        // a stranger — not the author, not a reviewer, not the pusher — merges
-        // onto the protected branch.
+        // A stranger — not the author, not a reviewer, not the pusher — is
+        // refused before the protected branch can move.
         open_pr(&mut forge, "one", 2);
         let mut stranger = ctx_with_origin(3, user_origin(9));
-        exec_commit(&mut forge, &mut stranger, &merge_of("one"));
+        assert!(exec(&mut forge, &mut stranger, &merge_of("one")).is_err());
+        futures::executor::block_on(forge.abort_block()).unwrap();
+        exec_commit(&mut forge, &mut pusher, &merge_of("one"));
         assert_eq!(forge.state.repos["one"].refs["dev"], oid('c'));
 
-        // a reviewer's review is stored, and the reviewer merges like anyone.
+        // A reviewer's review is stored, but the reviewer cannot merge.
         open_pr(&mut forge, "two", 2);
         let mut reviewer = ctx_with_origin(4, user_origin(3));
         exec_commit(
@@ -2993,7 +3119,9 @@ mod tests {
                 comments: vec![],
             },
         );
-        exec_commit(&mut forge, &mut reviewer, &merge_of("two"));
+        assert!(exec(&mut forge, &mut reviewer, &merge_of("two")).is_err());
+        futures::executor::block_on(forge.abort_block()).unwrap();
+        exec_commit(&mut forge, &mut pusher, &merge_of("two"));
         assert_eq!(forge.state.repos["two"].refs["release"], oid('c'));
 
         // the member who pushed the repo merges too.
@@ -3004,12 +3132,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // SetItemState stays open ON PURPOSE — but it is still authenticated.
     #[test]
-    fn any_member_closes_an_item_but_an_unauthenticated_origin_cannot() {
+    fn only_the_repo_owner_may_push_refs_after_birth_and_reopen() {
+        let base = tmp_base("owner-push");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let mut owner = ctx_with_origin(1, user_origin(1));
+        assert!(push(&mut forge, &mut owner, "demo", "main", None, oid('a')).is_ok());
+
+        let mut member = ctx_with_origin(2, user_origin(9));
+        assert!(
+            push(
+                &mut forge,
+                &mut member,
+                "demo",
+                "main",
+                Some(oid('a')),
+                oid('b')
+            )
+            .is_err()
+        );
+        assert_eq!(forge.state.repos["demo"].refs["main"], oid('a'));
+
+        drop(forge);
+        let mut reopened = Forge::init("forge", base.clone()).unwrap();
+        let mut member = ctx_with_origin(3, user_origin(9));
+        assert!(
+            push(
+                &mut reopened,
+                &mut member,
+                "demo",
+                "main",
+                Some(oid('a')),
+                oid('b')
+            )
+            .is_err()
+        );
+        let mut owner = ctx_with_origin(4, user_origin(1));
+        push(
+            &mut reopened,
+            &mut owner,
+            "demo",
+            "main",
+            Some(oid('a')),
+            oid('b'),
+        )
+        .unwrap();
+        assert_eq!(reopened.state.repos["demo"].refs["main"], oid('b'));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Tracker participation stays open to members, while editing and
+    // open/closed state changes belong to the item author or repo owner.
+    #[test]
+    fn item_author_or_repo_owner_may_edit_and_close() {
         let base = tmp_base("close-open");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
-        let mut author = ctx_with_origin(1, user_origin(1));
+        let mut owner = ctx_with_origin(1, user_origin(1));
+        push(&mut forge, &mut owner, "demo", "main", None, oid('a')).unwrap();
+        let mut module = ctx_with_origin(2, sdk::Origin::Module("mirror".into()));
+        let bypass = ForgeMsg::PushRefs {
+            repo: "demo".into(),
+            updates: vec![RefUpdate {
+                ref_name: "main".into(),
+                prev_oid: Some(oid('a').as_bytes().to_vec()),
+                new_oid: Some(oid('b').as_bytes().to_vec()),
+            }],
+            pack_digest: Some(vec![7u8; 32]),
+            tags: Vec::new(),
+            cert: None,
+        };
+        assert!(exec(&mut forge, &mut module, &bypass).is_err());
+        futures::executor::block_on(forge.abort_block()).unwrap();
+        let mut author = ctx_with_origin(2, user_origin(2));
         exec_commit(
             &mut forge,
             &mut author,
@@ -3025,8 +3219,8 @@ mod tests {
             open: false,
         };
 
-        // the pre-consensus probe and the system origin are refused; a MODULE
-        // is authenticated and is allowed as a tracker author.
+        // the pre-consensus probe and the system origin are refused before
+        // any tracker state is staged.
         for origin in [sdk::Origin::External(Vec::new()), sdk::Origin::System] {
             let mut probe = ctx_with_origin(2, origin.clone());
             assert!(
@@ -3037,12 +3231,15 @@ mod tests {
         }
 
         let mut stranger = ctx_with_origin(3, user_origin(9));
-        exec_commit(&mut forge, &mut stranger, &close);
+        assert!(exec(&mut forge, &mut stranger, &close).is_err());
+        futures::executor::block_on(forge.abort_block()).unwrap();
+        let mut owner = ctx_with_origin(4, user_origin(1));
+        exec_commit(&mut forge, &mut owner, &close);
         let item = forge.state.tracker.get("demo", 1).expect("item");
         assert_eq!(
             item.summary.state,
             ItemState::Closed,
-            "triage is open to all"
+            "the repo owner may close a member-authored item"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -74,10 +74,10 @@ pub(crate) const AIRLOCK_MODEL_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 /// `airlock`. `ducktape release sign-bundle` resolves
 /// `<AIRLOCK_SIGN_ROUTE>.<owner-handle>.duck`.
 pub(crate) const AIRLOCK_SIGN_ROUTE: &str = "airlock-sign";
-/// What the signing lane admits per request: the sealed `.tar.zst` of an
-/// unsigned bundle, the enclave's own `sign::MAX_BUNDLE_BYTES`
-/// (`release_cli` asserts the two agree).
-pub(crate) const AIRLOCK_SIGN_REQUEST_BYTES: u64 = airlock::sign::MAX_BUNDLE_BYTES as u64;
+/// What the signing lane's route policy admits per request: the sealed
+/// `.tar.zst` of an unsigned bundle. The enclave reads the body whole; this
+/// number is the overlay hop's, published in the route statement.
+pub(crate) const AIRLOCK_SIGN_REQUEST_BYTES: u64 = 256 * 1024 * 1024;
 // the model lane is the smaller one, or the split is pointless
 const _: () = assert!(AIRLOCK_MODEL_REQUEST_BYTES < AIRLOCK_SIGN_REQUEST_BYTES);
 

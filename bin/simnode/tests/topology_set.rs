@@ -8,6 +8,7 @@
 mod harness;
 
 use harness::Sim;
+use simnode::module_contracts::governance;
 
 fn module_ids(status: &serde_json::Value) -> Vec<String> {
     status["modules"]

@@ -5,7 +5,7 @@ version.workspace = true
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
-chat.workspace = true
+sdk.workspace = true
 ducktape-rpc.workspace = true
 futures.workspace = true
 libc.workspace = true

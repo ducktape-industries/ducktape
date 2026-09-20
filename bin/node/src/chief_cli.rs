@@ -146,17 +146,27 @@ fn read_manifest(
     path: &str,
     snapshot: Option<&str>,
 ) -> Result<Option<Manifest>> {
-    let Some(stat) = node.stat(path, snapshot)? else {
+    if node.stat(path, snapshot)?.is_none() {
         return Ok(None);
-    };
-    if stat.size > 512 * 1024 {
-        return Err("Chief manifest exceeds its size bound".into());
     }
-    let (bytes, eof) = node.read(path, snapshot, 0, 512 * 1024)?;
-    if !eof {
-        return Err("truncated Chief manifest".into());
+    Ok(Some(serde_json::from_slice(&read_whole(node, path, snapshot)?)?))
+}
+/// the whole file at `path`, assembled from reads paged at the node's read
+/// window.
+fn read_whole(node: &impl NodeApi, path: &str, snapshot: Option<&str>) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    loop {
+        let (page, eof) =
+            node.read(path, snapshot, bytes.len() as u64, duckfs_core::MAX_READ_BYTES)?;
+        let stalled = page.is_empty() && !eof;
+        if stalled {
+            return Err(format!("read of {path} made no progress").into());
+        }
+        bytes.extend_from_slice(&page);
+        if eof {
+            return Ok(bytes);
+        }
     }
-    Ok(Some(serde_json::from_slice(&bytes)?))
 }
 fn require_manifest(base: &str, installed_by: u64, chief_id: &str) -> Result<Manifest> {
     let node = HttpNode::new(base);
@@ -516,17 +526,10 @@ fn read_progress(
     snapshot: Option<&str>,
 ) -> Result<Option<Progress>> {
     let path = format!("{}/initialization.json", plan.root());
-    let Some(stat) = node.stat(&path, snapshot)? else {
+    if node.stat(&path, snapshot)?.is_none() {
         return Ok(None);
-    };
-    if stat.size > 4096 {
-        return Err("installation progress exceeds its bound".into());
     }
-    let (bytes, eof) = node.read(&path, snapshot, 0, 4096)?;
-    if !eof {
-        return Err("truncated installation progress".into());
-    }
-    Ok(Some(serde_json::from_slice(&bytes)?))
+    Ok(Some(serde_json::from_slice(&read_whole(node, &path, snapshot)?)?))
 }
 fn initialization(base: &str, progress: &Progress) -> Result<Option<agent::InvocationView>> {
     // Initialization has one source object and one change. Point directly at

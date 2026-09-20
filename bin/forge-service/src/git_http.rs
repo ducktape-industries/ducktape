@@ -39,15 +39,10 @@ const GIT_RECEIVE_PACK_CAPS: &str = "report-status report-status-v2 delete-refs 
 /// have-bounded delta.
 const GIT_UPLOAD_PACK_CAPS: &str = "multi_ack_detailed side-band-64k thin-pack ofs-delta \
      allow-reachable-sha1-in-want agent=ducktape-forge/0.1";
-/// what a git request that is NOT a push may carry: a fetch's want/have
-/// negotiation and a merge request are lists of oids, not content. A push has
-/// no limit at all — see the receive-pack route.
-pub const GIT_NEGOTIATION_BODY_LIMIT: usize = 8 * 1024 * 1024;
-
 /// how much of a spooled push this bridge reads to find the end of the
-/// pkt-line command section. [`MAX_GIT_PKT_LINES`] lines of `<old> <new>
-/// <ref>` fit inside it several times over; a command section that somehow
-/// does not is read in further doublings rather than refused.
+/// pkt-line command section. Thousands of `<old> <new> <ref>` lines fit
+/// inside it; a command section that somehow does not is read in further
+/// doublings rather than refused.
 const GIT_COMMAND_HEAD_BYTES: usize = 1024 * 1024;
 
 /// the most a gzip-encoded body may INFLATE to, as a multiple of what arrived.
@@ -83,17 +78,6 @@ const GIT_ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const GIT_OID_RAW_LEN: usize = 20;
 /// the flush-pkt: a zero-length pkt that ends a pkt-line stream or section.
 const GIT_FLUSH_PKT: &[u8] = b"0000";
-/// max pkt-lines parsed out of one request — the command/want section
-/// ([`parse_pkt_lines`]) and the upload-pack negotiation tail
-/// ([`parse_upload_pack_request`]'s haves loop) each stop here. a real push
-/// updates at most a few thousand refs (a monorepo touching every branch);
-/// a real fetch negotiation trades at most a few thousand haves before a
-/// client gives up and sends the full closure instead. 65536 gives generous
-/// headroom over that while still bounding what a body of minimal pkt-lines
-/// can force: at the cap, the line list costs on the order of 1.5 MB of `Vec`
-/// headers, not the ~1 GB an unbounded 95 MiB body of 5-byte lines allocates.
-const MAX_GIT_PKT_LINES: usize = 65_536;
-
 /// encode one git pkt-line: a 4-hex length (INCLUDING the 4 length bytes)
 /// followed by the payload. every line this bridge emits is tiny, well under
 /// the 65516-byte payload cap, so no splitting is needed.
@@ -126,9 +110,6 @@ fn parse_pkt_lines(buf: &[u8]) -> Result<(Vec<Vec<u8>>, &[u8]), String> {
         }
         if len < 4 || len > rest.len() {
             return Err("pkt-line length out of range".into());
-        }
-        if lines.len() >= MAX_GIT_PKT_LINES {
-            return Err("too many pkt-lines in request".into());
         }
         lines.push(rest[4..len].to_vec());
         rest = &rest[len..];
@@ -182,7 +163,6 @@ fn parse_upload_pack_request(body: &[u8]) -> Result<UploadPackRequest, String> {
 
     let mut haves = Vec::new();
     let mut done = false;
-    let mut negotiation_lines = 0usize;
     while !rest.is_empty() {
         if done {
             return Err("upload-pack negotiation continued after done".into());
@@ -190,10 +170,6 @@ fn parse_upload_pack_request(body: &[u8]) -> Result<UploadPackRequest, String> {
         if rest.len() < 4 {
             return Err("truncated negotiation pkt-line length header".into());
         }
-        if negotiation_lines >= MAX_GIT_PKT_LINES {
-            return Err("too many negotiation pkt-lines in request".into());
-        }
-        negotiation_lines += 1;
         let hdr = std::str::from_utf8(&rest[..4])
             .map_err(|_| "non-ascii negotiation pkt-line length".to_string())?;
         let len = usize::from_str_radix(hdr, 16)
@@ -797,12 +773,12 @@ async fn git_advertise_refs(handle: &ServiceState, repo: &str, service: GitServi
         .into_response()
 }
 
-/// the two ways [`decode_git_body`] can fail: a malformed gzip stream, or one
-/// that inflates past its cap — a would-be zip bomb.
+/// the two ways spooling a push can fail: a malformed body, or a gzip stream
+/// that inflates beyond any plausible ratio — a zip bomb.
 #[derive(Debug)]
 enum GitBodyError {
     BadEncoding(String),
-    OverCap,
+    GzipBomb,
 }
 
 /// a push's body on disk: what the client sent (gzip already inflated), and
@@ -872,7 +848,7 @@ async fn spool_request_body(
             .unwrap_or(0);
         let bomb = gzip && inflated > received.saturating_mul(GIT_MAX_INFLATE_RATIO);
         if bomb {
-            return Err(GitBodyError::OverCap);
+            return Err(GitBodyError::GzipBomb);
         }
     }
     sink.flush()
@@ -920,12 +896,9 @@ impl SpooledPush {
 /// compresses a fetch's negotiation list; any other encoding is passed through.
 ///
 /// A PUSH does not come through here — it streams to disk
-/// ([`spool_request_body`]) because it has no size limit to be measured
-/// against. What remains is the negotiation lane, and there the inflate is
-/// read through `cap` because gzip's max compression ratio is ~1030:1: an
-/// uncapped `read_to_end` on a body that already fits the compressed limit
-/// could still allocate tens of gigabytes.
-fn decode_git_body(headers: &HeaderMap, body: &[u8], cap: usize) -> Result<Vec<u8>, GitBodyError> {
+/// ([`spool_request_body`]). What remains is the negotiation lane, whose
+/// body is inflated in memory.
+fn decode_git_body(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> {
     let gzip = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
@@ -935,15 +908,9 @@ fn decode_git_body(headers: &HeaderMap, body: &[u8], cap: usize) -> Result<Vec<u
     }
     use std::io::Read as _;
     let mut out = Vec::new();
-    // read one byte past `cap`: a body that inflates to EXACTLY `cap` bytes
-    // still decodes below, while anything larger trips the length check.
     flate2::read::GzDecoder::new(body)
-        .take(cap as u64 + 1)
         .read_to_end(&mut out)
-        .map_err(|e| GitBodyError::BadEncoding(format!("gzip inflate failed: {e}")))?;
-    if out.len() > cap {
-        return Err(GitBodyError::OverCap);
-    }
+        .map_err(|e| format!("gzip inflate failed: {e}"))?;
     Ok(out)
 }
 
@@ -999,7 +966,7 @@ pub(crate) async fn git_receive_pack(
     // file rather than through this process's memory.
     let spooled = match spool_request_body(&handle.forge_repo, &headers, body).await {
         Ok(spooled) => spooled,
-        Err(GitBodyError::OverCap) => {
+        Err(GitBodyError::GzipBomb) => {
             const REASON: &str = "gzip-encoded body inflates beyond any plausible ratio";
             push_refused(&repo, "gzip_bomb", REASON);
             return error_response(StatusCode::BAD_REQUEST, REASON);
@@ -1311,20 +1278,12 @@ pub(crate) async fn git_upload_pack(
     let forge_repo = handle.forge_repo.clone();
     let body = match body {
         Ok(bytes) => bytes,
-        // the DefaultBodyLimit layer rejects an oversized request with 413.
+        // a body the extractor could not read.
         Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
     };
-    let body = match decode_git_body(&headers, &body, GIT_NEGOTIATION_BODY_LIMIT) {
+    let body = match decode_git_body(&headers, &body) {
         Ok(bytes) => bytes,
-        Err(GitBodyError::OverCap) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "gzip-inflated body exceeds the pack body limit",
-            );
-        }
-        Err(GitBodyError::BadEncoding(msg)) => {
-            return error_response(StatusCode::BAD_REQUEST, &msg);
-        }
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
     };
 
     let request = match parse_upload_pack_request(&body) {
@@ -1748,39 +1707,6 @@ fn first_unreachable(
         }
     }
     Ok(wants.iter().copied().find(|want| pending.contains(want)))
-}
-
-#[cfg(test)]
-mod decode_git_body_tests {
-    use super::*;
-    use std::io::Write as _;
-
-    fn gzip_headers() -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
-        headers
-    }
-
-    fn gzip_of_zeros(n: usize) -> Vec<u8> {
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        enc.write_all(&vec![0u8; n]).unwrap();
-        enc.finish().unwrap()
-    }
-
-    #[test]
-    fn a_gzip_body_that_inflates_past_the_cap_is_refused_one_under_it_decodes() {
-        let cap = 4096usize;
-        let headers = gzip_headers();
-
-        let at_cap = gzip_of_zeros(cap);
-        let decoded = decode_git_body(&headers, &at_cap, cap).expect("exactly at the cap decodes");
-        assert_eq!(decoded.len(), cap);
-
-        let over_cap = gzip_of_zeros(cap + 1);
-        let err = decode_git_body(&headers, &over_cap, cap)
-            .expect_err("past the cap must be refused, not fully inflated");
-        assert!(matches!(err, GitBodyError::OverCap));
-    }
 }
 
 #[cfg(test)]
@@ -2226,25 +2152,6 @@ mod upload_pack_tests {
             .expect("unknown negotiation line must fail");
 
         assert!(err.contains("unexpected upload-pack negotiation line"));
-    }
-
-    /// a body entirely of minimal 5-byte pkt-lines (`0005A`, one byte of
-    /// payload) is refused once it passes `MAX_GIT_PKT_LINES`, before it can
-    /// force the ~1 GB of small allocations an unbounded parse would make.
-    #[test]
-    fn a_body_of_minimal_pkt_lines_past_the_cap_is_refused() {
-        let one_line = b"0005A".to_vec();
-        let under_cap: Vec<u8> = one_line.repeat(MAX_GIT_PKT_LINES);
-        let over_cap: Vec<u8> = one_line.repeat(MAX_GIT_PKT_LINES + 1);
-
-        // exactly at the cap: parse_pkt_lines runs out of buffer looking for
-        // the terminating flush, which is its own (unrelated) truncation
-        // error — the point here is it is NOT the "too many" error.
-        let under = parse_pkt_lines(&under_cap).unwrap_err();
-        assert!(!under.contains("too many"), "{under}");
-
-        let over = parse_pkt_lines(&over_cap).unwrap_err();
-        assert!(over.contains("too many pkt-lines in request"), "{over}");
     }
 
     /// `main`: root ← pinned ← tip, plus a commit `gone` that only the deleted

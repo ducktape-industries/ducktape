@@ -40,6 +40,8 @@ use std::io::{BufRead, Write};
 
 use serde_json::{Value, json};
 
+pub mod module_contracts;
+
 mod guide;
 mod identity;
 mod node;

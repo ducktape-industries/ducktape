@@ -84,11 +84,7 @@ async fn serve() -> Result<()> {
             .transpose()
             .context("--session-ttl-secs")?
             .unwrap_or(3600),
-        max_requests: arg("--max-requests")
-            .map(|s| s.parse::<u32>())
-            .transpose()
-            .context("--max-requests")?
-            .unwrap_or(1000),
+        clock: airlock::server::Clock::system(),
         // The enclave image carries the signing toolchain, so this gateway
         // always serves `POST /sign/macos-bundle`; a missing tool at request
         // time is the `tool_missing` refusal, never a silent 404.

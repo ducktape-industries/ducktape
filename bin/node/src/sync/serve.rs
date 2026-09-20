@@ -6,7 +6,7 @@ use commonware_utils::ordered::Set;
 use host::Host;
 use recovery::{Manifest, Recovery};
 use sdk::StateRoot;
-use statesync::{SyncError, SyncServer, fetch_frames_capped};
+use statesync::{SyncError, SyncServer, fetch_frames};
 
 use crate::constants::{CUTOVER_DELAY, MAX_MESSAGE_SIZE};
 use crate::util::{fatal, hex};
@@ -327,13 +327,8 @@ where
     C: statesync::SyncClient,
 {
     let (after_view, up_to_view) = views;
-    let frames = fetch_frames_capped(
-        client,
-        view_base + after_view,
-        view_base + up_to_view,
-        statesync::MAX_CATCHUP_BYTES,
-    )
-    .await
+    let frames = fetch_frames(client, view_base + after_view, view_base + up_to_view)
+        .await
     .map_err(|e| BackfillUnavailable {
         permanent: matches!(e, SyncError::RangePruned { .. }),
         detail: e.to_string(),

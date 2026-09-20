@@ -577,15 +577,15 @@ fn cmd_login(
         &authpage::login_request(&chain_id, &device_key, generation, number, expires_at),
     )?;
     let (_, proof) = authpage::login_consent(&chain_id, &consent)?;
-    let msg = authpage::login_add_key(
+    let msg = identity::decode_msg(&authpage::login_add_key(
         &chain_id,
         &device_key,
         generation,
-        &account,
+        &sdk::wire::encode(&account),
         label,
         proof,
         expires_at,
-    )?;
+    )?)?;
     let height = submit_identity(&base, &user, &msg)?;
     println!("joined account {number} at height {height}");
     print_keys(&own_account(&base, &device_key)?);
@@ -697,7 +697,7 @@ fn consented_add_key(
         generation,
         account,
         consent_expiry(base)?,
-    ))
+    )?)
 }
 
 /// How long a minted consent stays spendable on the validator/replica lanes,
@@ -847,14 +847,15 @@ fn add_key_msg(
     generation: u64,
     account: u64,
     expires_at: u64,
-) -> IdentityMsg {
-    IdentityMsg::AddKey {
+) -> Result<IdentityMsg, String> {
+    let authorizer = config::ed25519_authorizer(
+        user, chain_id, scheme, new_key, generation, account, expires_at,
+    );
+    Ok(IdentityMsg::AddKey {
         scheme,
         label,
-        authorizer: config::ed25519_authorizer(
-            user, chain_id, scheme, new_key, generation, account, expires_at,
-        ),
-    }
+        authorizer: sdk::wire::decode(&authorizer)?,
+    })
 }
 
 /// the joining device's frame: the ticket bytes VERBATIM (the member's proof
@@ -1165,7 +1166,8 @@ mod tests {
             generation,
             TEST_ACCOUNT,
             TEST_EXPIRES,
-        );
+        )
+        .unwrap();
         String::from_utf8(identity::encode_msg(&msg)).unwrap()
     }
 
@@ -1293,7 +1295,8 @@ mod tests {
             0,
             TEST_ACCOUNT,
             TEST_EXPIRES,
-        );
+        )
+        .unwrap();
         let preimage = node::frame_preimage(KeyScheme::Ed25519, &pubkey, 9, &identity_msg(&msg));
         // what ssh-keygen prints for the bytes the CLI pipes into it.
         let armored = armor(&ssh_proof(&sk, node::FRAME_NS, &preimage));
@@ -1391,14 +1394,17 @@ mod tests {
         };
         let (number, proof) = authpage::login_consent("chain-a", &outcome).unwrap();
         assert_eq!(number, 11);
-        let msg = authpage::login_add_key(
-            "chain-a",
-            &device_key,
-            4,
-            &account,
-            None,
-            proof,
-            TEST_EXPIRES,
+        let msg = identity::decode_msg(
+            &authpage::login_add_key(
+                "chain-a",
+                &device_key,
+                4,
+                &sdk::wire::encode(&account),
+                None,
+                proof,
+                TEST_EXPIRES,
+            )
+            .unwrap(),
         )
         .unwrap();
         let frame = user_frame(&device, "identity", identity::encode_msg(&msg));

@@ -31,17 +31,17 @@ commonware-codec = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-p2p = { workspace = true }
 commonware-utils = { workspace = true }
+keyscheme = { workspace = true }
+sdk = { workspace = true }
 # hex codecs for keys, roots and pasted blobs — the shared home.
 duckfs-core = { workspace = true }
 # the `duck://` grammar's chain id: the ONE rule a network name must satisfy
 # (`validate_network_name`), never a second copy of its charset here — and
 # the chain id a `duck://` address carries, which the registry resolves.
 duck-address = { workspace = true }
-# the invite token's mint/verify, shared verbatim with the validator that
-# admits a redemption (`governance::invite`).
-governance = { workspace = true }
-# the member proof an identity file's owner signs — the wire types only.
-identity = { workspace = true }
+# Invite token mint/verify stays local to this workspace boundary; the validator
+# checks the same bytes in its own owning implementation.
+# The local identity contract subset used to build member-consent bytes.
 # the coordinator capability a workspace persists beside its invite.
 nat-traversal = { workspace = true }
 rand = { workspace = true }

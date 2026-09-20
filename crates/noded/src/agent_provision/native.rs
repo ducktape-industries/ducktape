@@ -34,13 +34,6 @@ mod projection;
 #[path = "native_reports.rs"]
 mod reports;
 
-// Limit the ENCODED HTTP request body, not raw native JSONL: JSON string
-// escaping, envelope metadata and whitespace all consume this 64 MiB budget.
-// Every durability boundary sends the full JSONL; native compaction retains
-// entries. There are no deltas, segments, truncation or history windows to
-// bypass this limit. A 413 leaves the last accepted native head intact.
-pub(super) const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
-
 pub(super) struct NativeState {
     pub(super) context: NativeConversationContext,
     configuration: ConversationView,

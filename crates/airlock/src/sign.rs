@@ -64,16 +64,6 @@ use sha2::{Digest as _, Sha256};
 
 use crate::codesign::AppleCodesign;
 
-/// Ceiling on the sealed request body — the `.tar.zst` of an unsigned
-/// bundle. Its own cap, not [`crate::MAX_REQUEST_BYTES`]: a bundle is two
-/// executables and the view set, not a model prompt.
-pub const MAX_BUNDLE_BYTES: usize = 256 * 1024 * 1024;
-
-/// Ceiling on the bundle once unpacked, summed over every entry's declared
-/// size before a byte of it is written: a compressed body under the request
-/// cap must not be a decompression bomb into the enclave's tmpfs.
-pub const MAX_UNPACKED_BYTES: u64 = 1024 * 1024 * 1024;
-
 /// The one top-level entry an archive may carry.
 pub const BUNDLE_NAME: &str = "Ducktape.app";
 
@@ -156,8 +146,6 @@ pub enum Refusal {
     /// The archive is not exactly one unsigned `Ducktape.app` of the shape
     /// `ops/bundle-app-macos.sh` stages (see [`validate_layout`]).
     BundleShapeRefused,
-    /// The bundle unpacks past [`MAX_UNPACKED_BYTES`].
-    BundleTooLarge,
     /// `rcodesign sign` failed.
     CodesignFailed,
     /// Apple's notary service rejected the submission; `submission_id` is
@@ -174,7 +162,6 @@ impl Refusal {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::BundleShapeRefused => "bundle_shape_refused",
-            Self::BundleTooLarge => "bundle_too_large",
             Self::CodesignFailed => "codesign_failed",
             Self::NotaryRejected { .. } => "notary_rejected",
             Self::StapleFailed => "staple_failed",
@@ -557,8 +544,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Unpack the `.tar.zst` into `root`, refusing anything but one
 /// `Ducktape.app/` tree of regular files, directories and symlinks that stay
-/// inside it. Every entry is checked before it is written, and the declared
-/// sizes are summed against [`MAX_UNPACKED_BYTES`] as they go.
+/// inside it. Every entry is checked before it is written.
 ///
 /// Shared with the client side (`ducktape release sign-bundle`), which
 /// unpacks the enclave's reply under the same rules before it trusts its shape.
@@ -569,7 +555,6 @@ pub fn unpack_bundle(archive: &[u8], root: &Path) -> Result<(), Refusal> {
     tar.set_preserve_permissions(false);
     tar.set_unpack_xattrs(false);
     let entries = tar.entries().map_err(|_| Refusal::BundleShapeRefused)?;
-    let mut unpacked: u64 = 0;
     for entry in entries {
         let mut entry = entry.map_err(|_| Refusal::BundleShapeRefused)?;
         let path = entry
@@ -585,11 +570,6 @@ pub fn unpack_bundle(archive: &[u8], root: &Path) -> Result<(), Refusal> {
             EntryKind::of(entry.header().entry_type()),
             link.as_deref(),
         )?;
-        unpacked = unpacked.saturating_add(entry.header().size().unwrap_or(u64::MAX));
-        let too_large = unpacked > MAX_UNPACKED_BYTES;
-        if too_large {
-            return Err(Refusal::BundleTooLarge);
-        }
         let written = entry
             .unpack_in(root)
             .map_err(|_| Refusal::BundleShapeRefused)?;
@@ -1114,25 +1094,6 @@ mod tests {
         // an entry path itself gets no `..`, even one that would stay inside
         assert!(plain_bundle_path(Path::new("Ducktape.app/Contents/../Contents")).is_none());
         assert!(plain_bundle_path(Path::new("Ducktape.app/./Contents")).is_some());
-    }
-
-    #[test]
-    fn a_bundle_declaring_more_than_the_unpacked_cap_is_too_large() {
-        // A header may declare any size; the sum is checked before the
-        // entry is written, so nothing near the cap is allocated here.
-        let encoder = zstd::Encoder::new(Vec::new(), 3).unwrap();
-        let mut tar = tar::Builder::new(encoder);
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_mode(0o644);
-        header.set_size(MAX_UNPACKED_BYTES + 1);
-        header.set_cksum();
-        tar.append_data(&mut header, "Ducktape.app/Contents/big", std::io::empty())
-            .unwrap();
-        let mut encoder = tar.into_inner().unwrap();
-        encoder.flush().unwrap();
-        let archive = encoder.finish().unwrap();
-        assert_eq!(validate_archive(&archive), Err(Refusal::BundleTooLarge));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use host::Host;
 use recovery::{Manifest, Recovery};
-use statesync::{fetch_frames_capped, fetch_manifest};
+use statesync::{fetch_frames, fetch_manifest};
 
 use crate::blob_fetch::SourceRotate;
 use crate::constants::CUTOVER_DELAY;
@@ -348,14 +348,7 @@ where
             let window_to = current_height
                 .saturating_add(CATCHUP_WINDOW_HEIGHTS)
                 .min(tip.height);
-            let frames = match fetch_frames_capped(
-                client,
-                current_height,
-                window_to,
-                statesync::MAX_CATCHUP_BYTES,
-            )
-            .await
-            {
+            let frames = match fetch_frames(client, current_height, window_to).await {
                 Ok(frames) => frames,
                 Err(statesync::SyncError::RangePruned {
                     requested_after,

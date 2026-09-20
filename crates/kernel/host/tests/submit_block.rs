@@ -353,36 +353,3 @@ fn a_staged_then_failing_member_commits_the_accepted_subset() {
     });
 }
 
-// past `MAX_BLOCK_REPLAYS` staging rejections the block stops replaying: every
-// remaining member is rejected UNEXECUTED. the budget is a function of the block
-// alone, so every validator rejects the identical suffix.
-#[test]
-fn the_replay_budget_rejects_the_rest_unexecuted() {
-    block_on(async {
-        let (mut host, executes) = counting_host();
-        let mut ops = vec![(ext(), set("a", "1"))];
-        for _ in 0..=host::MAX_BLOCK_REPLAYS {
-            ops.push((ext(), set("fail", "x")));
-        }
-        let over_budget = ops.len();
-        ops.push((ext(), set("b", "2")));
-
-        let out = host
-            .submit_block(BlockContext::default(), ops)
-            .await
-            .expect("the batch applies");
-
-        assert!(matches!(out.members[0], MemberOutcome::Applied { .. }));
-        assert!(
-            matches!(&out.members[over_budget], MemberOutcome::Rejected { reason }
-                if reason.contains("replay budget")),
-            "the member past the budget is rejected unexecuted"
-        );
-        assert_eq!(committed(&host, "b").await, None, "it never executed");
-        assert_eq!(committed(&host, "a").await, Some("1".into()));
-        // 1 accepted + (MAX_BLOCK_REPLAYS + 1) failures + one replay of `a` per
-        // failure. never the whole prefix per failure, which is the quadratic.
-        let failures = host::MAX_BLOCK_REPLAYS + 1;
-        assert_eq!(executes.get(), 1 + failures + failures);
-    });
-}

@@ -69,31 +69,11 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 /// own callers.
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// mirrors [`saga::MAX_RESULT_BYTES`] (crates/modules/system/saga/src/interface.rs)
-/// without depending on it (a host-crate → consensus-module edge). This is
-/// the cap `compute::provision::assemble_runner_result` already truncates a
-/// run's parsed answer to, WITH a note, before it can land — a run that
-/// finishes with an oversized answer already completes today, just trimmed.
-const RECORDED_RESULT_CAP_BYTES: usize = 256 * 1024;
-/// hard cap on a run's accumulated stdout, checked as each chunk arrives.
-/// Deliberately NOT [`RECORDED_RESULT_CAP_BYTES`] itself: that cap is
-/// enforced downstream with truncation-plus-a-note, so a run whose full
-/// answer is a few hundred KiB over it still succeeds today. Killing the run
-/// at the same size would turn "completes, truncated" into "fails outright"
-/// for those runs — this cap exists only to stop UNBOUNDED accumulation from
-/// a firehose, not to enforce the result size, so it sits an order of
-/// magnitude above it. `codex`'s `jsonl-events` output in particular streams
-/// one JSON object per tool call/patch/diff for the whole turn, not just the
-/// final answer, and can legitimately run to several hundred KiB on an
-/// ordinary tool-calling turn. Past this line the run is TERMINATED outright
-/// — never truncated, since a truncated JSON/JSONL blob would parse into
-/// garbage and land as the run's answer.
-const MAX_RUN_OUTPUT_BYTES: usize = 16 * RECORDED_RESULT_CAP_BYTES; // 4 MiB
 /// hard cap on the accumulated stderr TAIL (oldest bytes drop first). stderr
 /// never becomes the run's answer — only [`excerpt`]'s 400-char slice of it
 /// ever leaves this function, and only on the failure path — so a few KiB of
-/// trailing context is ample; unlike stdout this is a rolling tail, not a
-/// termination trigger.
+/// trailing context is ample; this is a rolling tail, never a termination
+/// trigger.
 const MAX_RUN_STDERR_BYTES: usize = 16 * 1024;
 
 /// the ownership tag a provider set stamps on the runs it creates. Its VALUE
@@ -167,10 +147,24 @@ const UPSTREAM_CREDENTIAL_ENV: [&str; 4] = [
 
 /// the `-c` overrides that aim a codex invocation at this run's loopback broker:
 /// the model-provider block (base URL + [`BROKER_TOKEN_ENV`] bearer, retries
-/// off), the provider selector, and a workspace trust level. shared by the
-/// headless [`CliProvider::broker_argv`] (spliced after the subcommand) and the
+/// off), the provider selector, a workspace trust level, and the start-up work
+/// the guest cannot use switched off. shared by the headless
+/// [`CliProvider::broker_argv`] (spliced after the subcommand) and the
 /// interactive path (prepended — a TUI argv has no subcommand). the child gets a
 /// base URL and an opaque bearer; neither recovers the operator's credential.
+///
+/// The three `off` switches are session-start latency, measured with the
+/// `provider_session_milestone` events and a syscall trace of the CLI. Each
+/// names something codex does at `initialize` / `thread/start` that a guest
+/// with no network device, no D-Bus and a manifest-fixed environment can only
+/// fail at, after spending the time:
+/// - `features.plugins`: a `git ls-remote` + shallow clone of the plugin
+///   marketplace on GitHub, the guest's only outbound TLS attempt.
+/// - `features.shell_snapshot`: a `bash -lc` login-shell environment capture
+///   inside `thread/start`, which is the bulk of that milestone's CPU (the run
+///   environment IS the manifest env; there is no profile to snapshot).
+/// - `mcp_oauth_credentials_store`: `auto` probes the D-Bus secret service for
+///   MCP OAuth tokens; the ducktape tool plane takes none.
 fn broker_provider_overrides(broker: &broker::BrokerEndpoint, workdir: &Path) -> Vec<String> {
     // the workdir is a path, and codex keys `projects.<key>` by TOML string —
     // so it must be QUOTED as one (a bare path breaks the `-c` parse).
@@ -185,6 +179,12 @@ fn broker_provider_overrides(broker: &broker::BrokerEndpoint, workdir: &Path) ->
         "model_provider=\"ducktape\"".into(),
         "-c".into(),
         format!("projects.{project_key}.trust_level=\"untrusted\""),
+        "-c".into(),
+        "features.plugins=false".into(),
+        "-c".into(),
+        "features.shell_snapshot=false".into(),
+        "-c".into(),
+        "mcp_oauth_credentials_store=\"file\"".into(),
     ]
 }
 
@@ -3141,25 +3141,6 @@ impl CliProvider {
                         out_bytes.extend_from_slice(&obuf[..n]);
                         forward_lines(&mut out_pending, &obuf[..n], OutputStream::Stdout, &output_sink, ctx);
                         last_activity = tokio::time::Instant::now();
-                        if out_bytes.len() > MAX_RUN_OUTPUT_BYTES {
-                            if let Some(invocation) = &broker_invocation {
-                                invocation.revoke();
-                            }
-                            control.terminate().await;
-                            tracing::warn!(
-                                target: "ducktape::provider",
-                                reason = "output_cap_exceeded",
-                                bin = %self.bin.display(),
-                                bytes = out_bytes.len(),
-                                cap = MAX_RUN_OUTPUT_BYTES,
-                                "run stdout exceeded the output cap (child killed)"
-                            );
-                            return Err(format!(
-                                "{} stdout exceeded the {MAX_RUN_OUTPUT_BYTES}-byte output cap \
-                                 (child killed): output_cap_exceeded",
-                                self.bin.display()
-                            ));
-                        }
                     }
                     Err(e) => {
                         if let Some(invocation) = &broker_invocation {
@@ -4476,6 +4457,14 @@ broker = "anthropic-messages"
             "{joined}"
         );
         assert!(joined.contains("model_provider=\"ducktape\""), "{joined}");
+        // the guest-unusable start-up work rides every codex argv, off.
+        for switch in [
+            "-c features.plugins=false",
+            "-c features.shell_snapshot=false",
+            "-c mcp_oauth_credentials_store=\"file\"",
+        ] {
+            assert!(joined.contains(switch), "{switch} missing: {joined}");
+        }
         assert!(
             joined.ends_with("--json -"),
             "the stdin marker stays last: {joined}"
@@ -5678,31 +5667,6 @@ printf '{"type":"turn.completed"}\n'"#,
             "killed at ~idle × {}, not the idle window: {:?}",
             p.hard_timeout_factor,
             start.elapsed()
-        );
-    }
-
-    #[tokio::test]
-    async fn a_run_writing_past_the_output_cap_is_terminated_not_truncated() {
-        // a continuously-writing guest must be TERMINATED at the cap, never
-        // truncated and parsed anyway — a truncated JSON/JSONL blob would
-        // otherwise land as the run's "answer". idle stays generous (5s) so
-        // the output cap fires first, not the idle/hard timeout.
-        let dir = scratch("output-cap");
-        let bin = fake_cli(
-            &dir,
-            "firehose",
-            // a 100_000-byte chunk per iteration (no per-byte forking) clears
-            // the 4 MiB cap in ~42 writes rather than thousands of small ones.
-            "cat > /dev/null\n\
-             big=$(printf '%0100000d' 0)\n\
-             while true; do printf '%s' \"$big\"; done",
-        );
-        let p = mock_provider("firehose", "text", bin, "output-cap-wd")
-            .with_timeout(Duration::from_secs(10));
-        let err = p.run("x", &RunContext::default()).await.unwrap_err();
-        assert!(
-            err.contains("output_cap_exceeded"),
-            "names the outcome: {err}"
         );
     }
 
