@@ -18,6 +18,39 @@ use sdk::{Error, MerkleStore, Module as _, ROOT_LEN, ResolverSyncTarget, StateRo
 use sdk_testkit::MemStore;
 use wasm_host::WasmModule;
 
+mod runs_contract {
+    use serde::{Deserialize, Serialize};
+
+    // Golden bytes were produced by runs-wire from ducktape-sdk
+    // 736865710dcfa7c56f9834747287881c1c25d45d. This fixture only consumes
+    // the one query variant needed to measure the point-read cost.
+    const CONVERSATION_QUERY_GOLDEN: &[u8] = br#"{"conversation":{"conversation_id":"absent"}}"#;
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    enum Query {
+        Conversation { conversation_id: String },
+    }
+
+    pub fn conversation_query(conversation_id: &str) -> Vec<u8> {
+        sdk::wire::encode(&Query::Conversation {
+            conversation_id: conversation_id.into(),
+        })
+    }
+
+    #[test]
+    fn conversation_query_matches_golden_and_refuses_other_variants() {
+        assert_eq!(conversation_query("absent"), CONVERSATION_QUERY_GOLDEN);
+        assert!(sdk::wire::decode::<Query>(br#"{"recent_runs":null}"#).is_err());
+        assert!(
+            sdk::wire::decode::<Query>(
+                br#"{"conversation":{"conversation_id":"absent","extra":true}}"#
+            )
+            .is_err()
+        );
+    }
+}
+
 const RUNS_WASM: &[u8] = include_bytes!("fixtures/runs.component.wasm");
 const CHAIN_ID: &str = "cost#d0cdf950";
 /// a stand-in receipt body: the real ones are a wire-encoded record plus its
@@ -148,9 +181,7 @@ fn block_cost(history: usize) -> [BlockCost; 3] {
 
     counters.zero();
     let mark = module.guest_runs();
-    let query = runs::encode_query(&runs::RunsQuery::Conversation {
-        conversation_id: "absent".into(),
-    });
+    let query = runs_contract::conversation_query("absent");
     let _ = futures::executor::block_on(module.query(&query));
     let point_query = counters.cost(module.guest_runs() - mark);
 

@@ -23,11 +23,14 @@
 
 use std::collections::BTreeMap;
 
+#[path = "support/modules_status_contract.rs"]
+mod modules_status_contract;
+
 use futures::executor::block_on;
 use sha2::Digest;
 
 use host::{BlockContext, CodeSource, Host, MODULES_ID};
-use modules::{Modules, ModulesMsg, ModulesQuery, ModulesReply};
+use modules::{Modules, ModulesMsg};
 use sdk::{Error, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
 
@@ -154,18 +157,14 @@ fn count(host: &Host) -> u64 {
 }
 
 fn active_hash(host: &Host) -> (Vec<u8>, bool) {
-    let req = modules::encode_query(&ModulesQuery::ModuleStatus);
+    let req = modules_status_contract::status_query();
     let bytes = block_on(host.query(MODULES_ID, &req)).expect("status");
-    match modules::decode_reply(&bytes).expect("decode") {
-        ModulesReply::ModuleStatus { modules } => {
-            let m = modules
-                .iter()
-                .find(|m| m.module_id == "hello")
-                .expect("hello entry");
-            (m.active_code_hash.clone(), m.pending.is_some())
-        }
-        other => panic!("expected Status, got {other:?}"),
-    }
+    let modules = modules_status_contract::decode_status(&bytes).expect("decode");
+    let m = modules
+        .iter()
+        .find(|m| m.module_id == "hello")
+        .expect("hello entry");
+    (m.active_code_hash.clone(), m.pending.is_some())
 }
 
 fn realize(host: &mut Host, height: u64, src: &dyn CodeSource) -> Result<(), Error> {
@@ -707,12 +706,9 @@ fn a_missing_second_module_realizes_neither() {
 
     // the order the boundary walks: `hello` (resolvable) BEFORE `zz-hello`
     // (absent) is what makes this a partial-realization test at all.
-    let req = modules::encode_query(&ModulesQuery::ModuleStatus);
+    let req = modules_status_contract::status_query();
     let bytes = block_on(host.query(MODULES_ID, &req)).expect("status");
-    let ModulesReply::ModuleStatus { modules } = modules::decode_reply(&bytes).expect("decode")
-    else {
-        panic!("expected ModuleStatus");
-    };
+    let modules = modules_status_contract::decode_status(&bytes).expect("decode");
     let ids: Vec<&str> = modules.iter().map(|m| m.module_id.as_str()).collect();
     assert_eq!(ids, vec!["hello", "zz-hello"], "roster order");
 
