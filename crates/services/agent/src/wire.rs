@@ -317,8 +317,6 @@ pub enum BindRefusal {
     /// the label resolves, but the session behind it cannot be reached (no
     /// registry entry, a dead process, an unreadable key).
     SessionUnreachable,
-    /// this daemon already holds its ceiling of bindings.
-    AtCapacity,
 }
 
 /// what a bound session says it can do. The node publishes this so a sender
@@ -410,8 +408,6 @@ pub enum Event {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Refusal {
-    /// the daemon's concurrent-session cap is reached.
-    AtCapacity,
     /// no provider in this daemon's set serves the requested tag.
     UnknownProvider,
     /// the interactive spawn itself failed (guest artifacts absent, no
@@ -434,7 +430,6 @@ impl Refusal {
     /// the stable token — what the mesh refusal reason and the logs carry.
     pub fn token(self) -> &'static str {
         match self {
-            Refusal::AtCapacity => "at_capacity",
             Refusal::UnknownProvider => "unknown_provider",
             Refusal::SpawnFailed => "spawn_failed",
         }
@@ -448,7 +443,6 @@ impl BindRefusal {
             BindRefusal::StaleGeneration => "stale_generation",
             BindRefusal::UnknownDevice => "unknown_device",
             BindRefusal::SessionUnreachable => "session_unreachable",
-            BindRefusal::AtCapacity => "at_capacity",
         }
     }
 }
@@ -491,10 +485,9 @@ mod tests {
 
     #[test]
     fn the_refusal_tokens_are_the_ones_the_mesh_already_publishes() {
-        // these three strings are a wire contract: `term_plane`'s guest surfaces
+        // these strings are a wire contract: `term_plane`'s guest surfaces
         // them verbatim as `host refused: <reason>: <detail>`, and the pty CLI's
         // diagnosis ladder reads them. Renaming one is a wire change.
-        assert_eq!(Refusal::AtCapacity.token(), "at_capacity");
         assert_eq!(Refusal::UnknownProvider.token(), "unknown_provider");
         assert_eq!(Refusal::SpawnFailed.token(), "spawn_failed");
     }

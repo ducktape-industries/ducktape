@@ -3,12 +3,11 @@
 //! through a worker's follow-up op re-entering as an ORDINARY submit, and a
 //! failed attempt retries through the loop. the drive loop itself is
 //! hand-rolled here exactly like every binary hand-rolls its own (the shape
-//! `host::worker` documents); the `MAX_WORKER_ROUNDS` budget is each drive
-//! loop's own enforcement, not the seam's.
+//! `host::worker` documents).
 
 use futures::executor::block_on;
 use host::Host;
-use host::worker::{Error, MAX_WORKER_ROUNDS, WorkOutcome, Worker};
+use host::worker::{Error, WorkOutcome, Worker};
 use sdk::{Event, Msg};
 use saga::{
     SagaModule, SagaMsg, SagaQuery, SagaReply, SagaStatus, SagaView, decode_reply,
@@ -18,15 +17,10 @@ use std::collections::VecDeque;
 
 /// the minimal settle loop every binary reimplements: submit, offer each
 /// emitted event to every worker, submit each claimed follow-up as its own
-/// block, until quiet or the round budget trips.
+/// block, until quiet.
 async fn settle(host: &mut Host, workers: &[Box<dyn Worker>], msg: Msg) -> Result<(), Error> {
     let mut queue: VecDeque<Msg> = VecDeque::from([msg]);
-    let mut rounds: u32 = 0;
     while let Some(op) = queue.pop_front() {
-        rounds += 1;
-        if rounds > MAX_WORKER_ROUNDS {
-            return Err(Error::BudgetExceeded);
-        }
         let outcome = host.submit(op).await?;
         for eff in &outcome.events {
             for w in workers {

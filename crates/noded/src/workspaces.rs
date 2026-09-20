@@ -70,28 +70,6 @@ fn owner_or_operator(handle: &NodeHandle, dir: &FsPath, signed: Option<&crate::S
     is_owner || crate::signed_req::operator_key_matches(&handle.admin, acting)
 }
 
-/// how many workspaces one signing key may hold on this node at once. Each is
-/// a full checkout on this node's disk, and any member may create one, so an
-/// unbounded create is an unbounded disk. Deleting one frees its slot.
-pub(crate) const MAX_WORKSPACES_PER_SIGNER: usize = 16;
-
-/// the workspaces under `root` that `owner` created.
-fn owned_count(root: &FsPath, owner: &[u8]) -> usize {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter(|entry| read_owner(&entry.path()).is_some_and(|stamped| stamped == owner))
-        .count()
-}
-
-/// every create counts and stamps under this one lock, so concurrent creates by
-/// one signer cannot each pass the count before any of them is stamped.
-/// ponytail: one create at a time per node; a per-signer lock if concurrent
-/// creates ever matter.
-static CREATE_LOCK: Mutex<()> = Mutex::new(());
-
 /// per-workspace commit serialization. keyed by id, each value a mutex two
 /// commits on the same workspace contend on; disjoint workspaces never wait.
 /// state is on disk, so this map is the ONLY in-memory workspace state — a
@@ -187,9 +165,7 @@ pub struct CreateBody {
 
 /// POST /v1/fs/workspaces — materialize a managed checkout under the injected
 /// root, returning `{id, path, snapshot}`. the `path` is where the caller edits
-/// files before committing over the id. A signer already holding
-/// [`MAX_WORKSPACES_PER_SIGNER`] is refused `workspace_cap_reached`; the
-/// operator credential signs nothing and is not counted.
+/// files before committing over the id.
 pub(crate) async fn create_workspace(
     State(handle): State<NodeHandle>,
     signed: Option<axum::Extension<crate::SignedBy>>,
@@ -209,13 +185,7 @@ pub(crate) async fn create_workspace(
         Err(err) => return error_response(StatusCode::BAD_REQUEST, &err),
     };
     let snapshot = body.snapshot;
-    let capped = signed.is_some();
     let result = tokio::task::spawn_blocking(move || {
-        let _guard = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let at_cap = capped && owned_count(&root, &owner) >= MAX_WORKSPACES_PER_SIGNER;
-        if at_cap {
-            return Err(CreateRefusal::CapReached);
-        }
         // a managed checkout records no node url — its commits ride the actor
         // lane, never a stored http base. the owner is stamped right after,
         // so a checkout that fails leaves no owner file behind either.
@@ -227,7 +197,6 @@ pub(crate) async fn create_workspace(
                     .map(|()| index)
                     .map_err(|e| e.to_string())
             })
-            .map_err(CreateRefusal::Checkout)
     })
     .await;
     match result {
@@ -238,27 +207,12 @@ pub(crate) async fn create_workspace(
             "snapshot": index.base_snapshot,
         }))
         .into_response(),
-        Ok(Err(CreateRefusal::CapReached)) => error_response(
-            StatusCode::FORBIDDEN,
-            &format!(
-                "workspace_cap_reached: this key already holds \
-                 {MAX_WORKSPACES_PER_SIGNER} workspaces on this node; delete one first"
-            ),
-        ),
-        Ok(Err(CreateRefusal::Checkout(err))) => error_response(StatusCode::BAD_REQUEST, &err),
+        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "workspace checkout task panicked",
         ),
     }
-}
-
-/// why a create stopped inside its blocking task.
-enum CreateRefusal {
-    /// the signer already holds [`MAX_WORKSPACES_PER_SIGNER`].
-    CapReached,
-    /// the checkout, or the owner stamp after it, failed.
-    Checkout(String),
 }
 
 /// the POST /v1/fs/workspaces/{id}/commit body.
@@ -602,46 +556,6 @@ mod tests {
             Some(member.public_key().as_ref().to_vec())
         );
         actor.abort();
-    }
-
-    /// a signer holding the cap is refused by name, and nothing new lands on
-    /// disk; the refusal is decided before any checkout runs.
-    #[tokio::test]
-    async fn a_signer_at_the_cap_is_refused_by_name() {
-        let (handle, _cmd_rx, _hub) = crate::NodeHandle::channel();
-        let root = tempfile::tempdir().unwrap();
-        let handle = handle.with_duckfs_workspaces(root.path());
-        let owner = b"busy-key".to_vec();
-        for n in 0..MAX_WORKSPACES_PER_SIGNER {
-            stamp_owned_dir(root.path(), &format!("{n:032x}"), &owner);
-        }
-
-        let resp = create_workspace(
-            State(handle),
-            Some(axum::Extension(crate::SignedBy(owner))),
-            Json(CreateBody {
-                prefix: None,
-                snapshot: None,
-            }),
-        )
-        .await;
-
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap()
-                .starts_with("workspace_cap_reached"),
-            "{body}"
-        );
-        assert_eq!(
-            std::fs::read_dir(root.path()).unwrap().count(),
-            MAX_WORKSPACES_PER_SIGNER
-        );
     }
 
     /// delete admits the creator and nobody else signed: another key is

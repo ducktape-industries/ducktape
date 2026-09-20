@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use commonware_codec::{DecodeExt as _, Encode as _};
-use commonware_cryptography::{Signer as _, ed25519};
+use commonware_cryptography::{Signer as _, Verifier as _, ed25519};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -34,10 +34,51 @@ pub fn invite_requires_reachability_defaults(_invite: &Invite) -> bool {
 // node-side pieces — minting (OS randomness) and the on-disk token file.
 // ============================================================================
 
-pub use governance::invite::{
-    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, grant_preimage, sign_join_proof,
-    verify_invite_token, verify_join_proof,
-};
+pub const INVITE_GRANT_NAMESPACE: &[u8] = b"ducktape-invite-grant-v1";
+pub const INVITE_JOIN_NAMESPACE: &[u8] = b"ducktape-invite-join-v1";
+pub const INVITE_NONCE_LEN: usize = 16;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InviteToken {
+    pub issuer: ed25519::PublicKey,
+    pub nonce: [u8; INVITE_NONCE_LEN],
+    pub expires_unix_secs: u64,
+    pub sig: ed25519::Signature,
+}
+
+pub fn grant_preimage(binding: &[u8], nonce: &[u8], expires: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(binding.len() + nonce.len() + 8);
+    out.extend_from_slice(binding);
+    out.extend_from_slice(nonce);
+    out.extend_from_slice(&expires.to_le_bytes());
+    out
+}
+
+pub fn verify_invite_token(token: &InviteToken, binding: &[u8]) -> bool {
+    let message = grant_preimage(binding, &token.nonce, token.expires_unix_secs);
+    token
+        .issuer
+        .verify(INVITE_GRANT_NAMESPACE, &message, &token.sig)
+}
+
+pub fn sign_join_proof(
+    joiner: &ed25519::PrivateKey,
+    binding: &[u8],
+    token: &InviteToken,
+) -> ed25519::Signature {
+    let message = [binding, &token.nonce, joiner.public_key().as_ref()].concat();
+    joiner.sign(INVITE_JOIN_NAMESPACE, &message)
+}
+
+pub fn verify_join_proof(
+    joiner: &ed25519::PublicKey,
+    binding: &[u8],
+    token: &InviteToken,
+    proof: &ed25519::Signature,
+) -> bool {
+    let message = [binding, &token.nonce, joiner.as_ref()].concat();
+    joiner.verify(INVITE_JOIN_NAMESPACE, &message, proof)
+}
 
 /// mint a BEARER invite token binding an invite to `binding` (the genesis
 /// namespace) with `expires_unix_secs`: fresh OS randomness for the

@@ -1,0 +1,15 @@
+[package]
+name = "lane-wasm"
+edition.workspace = true
+version.workspace = true
+
+# The wasmtime embedding of the `ducktape:lane` world (wit/lane.wit — core's
+# PROPOSAL until the SDK adopts it): a module's realtime guest, stepped
+# `step(event, now_ms) -> effects` on a media executor's own thread. Off-
+# consensus, so the envelope is fuel per step and one import (`log`); a trap
+# ends the sessions the instance held, never the node.
+[dependencies]
+data-plane = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+wasmtime = { workspace = true }

@@ -174,10 +174,6 @@ struct Journal {
     /// leave every duplicate to be re-executed: this IS the dedup map, and it
     /// is the same one the journal replays into at boot.
     state: BTreeMap<Key, Entry>,
-    /// how many bytes are already durable, so the live file is bounded by the
-    /// same ceiling the boot read is. A ceiling checked only at boot bounds
-    /// nothing: the run that grows past it never notices.
-    bytes: u64,
     /// the network this journal belongs to, so a rewrite restates it.
     network: String,
     /// why this journal stopped being trustworthy, once it has.
@@ -208,16 +204,6 @@ impl Journal {
         let mut line = serde_json::to_string(record)
             .map_err(|error| format!("encode outbox record: {error}"))?;
         line.push('\n');
-        let width = line.len() as u64;
-        // refused, not poisoned: nothing has been written, so nothing about
-        // the file is uncertain. The caller retries or the item stays where
-        // it is; either way the journal is still readable.
-        let would_exceed = self.bytes + width > MAX_JOURNAL_BYTES;
-        if would_exceed {
-            return Err(format!(
-                "outbox journal would exceed {MAX_JOURNAL_BYTES} bytes; it must be compacted, not overrun"
-            ));
-        }
         // everything below this line is a write we cannot take back.
         if let Err(error) = self.file.write_all(line.as_bytes()).await {
             return Err(self.poison(format!("append outbox record: {error}")));
@@ -225,7 +211,6 @@ impl Journal {
         if let Err(error) = self.file.sync_data().await {
             return Err(self.poison(format!("sync outbox record: {error}")));
         }
-        self.bytes += width;
         Ok(())
     }
 
@@ -243,24 +228,6 @@ impl Journal {
     }
 }
 
-/// the ceiling on a journal this daemon will read back at boot.
-///
-/// An append-only file with no bound is a boot that gets slower forever and
-/// eventually a read that will not fit in memory. 64 MiB is far past any real
-/// mailbox (the network's own cap is 2 MiB of queued payload per participant)
-/// and small enough to read at boot without thinking about it.
-const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
-
-/// the ceiling on tracked items.
-///
-/// Reached only where nothing ever expires — a node that never sends a
-/// `MsgTime` gives [`Outbox::retire_expired`] no clock to prune against, so its
-/// journal grows to this and stays there, refusing admissions. That is the
-/// correct failure: admitting past this point would trade the dedup record for
-/// throughput, and the dedup record is what stops one instruction being carried
-/// out twice.
-pub const MAX_TRACKED: usize = 4096;
-
 impl Outbox {
     /// open (creating) the journal at `dir/outbox.jsonl` and fold whatever is
     /// already there into the recovered state.
@@ -273,17 +240,6 @@ impl Outbox {
             .await
             .map_err(|error| format!("create outbox dir: {error}"))?;
         let path = dir.join("outbox.jsonl");
-        let oversized = tokio::fs::metadata(&path)
-            .await
-            .is_ok_and(|meta| meta.len() > MAX_JOURNAL_BYTES);
-        if oversized {
-            // refused rather than truncated: the journal IS the dedup record,
-            // and dropping it to keep booting would license re-executing every
-            // instruction in it.
-            return Err(format!(
-                "outbox journal exceeds {MAX_JOURNAL_BYTES} bytes; it must be inspected, not discarded"
-            ));
-        }
         let existing = match tokio::fs::read_to_string(&path).await {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -342,7 +298,6 @@ impl Outbox {
         let mut journal = Journal {
             file,
             state: recovered.clone(),
-            bytes: complete as u64,
             network: network.to_string(),
             poisoned: None,
         };
@@ -406,9 +361,6 @@ impl Outbox {
                 state: existing.state,
                 reason: existing.reason.clone(),
             });
-        }
-        if journal.state.len() >= MAX_TRACKED {
-            return Err("outbox is at its tracked-item ceiling".to_string());
         }
         // durable FIRST, published second, both inside this one critical
         // section. A concurrent duplicate either waits here and then sees a
@@ -615,7 +567,6 @@ impl Outbox {
             Err(error) => return Err(journal.poison(format!("reopen compacted outbox: {error}"))),
         };
         journal.file = file;
-        journal.bytes = text.len() as u64;
         journal.state = survivors;
         Ok(())
     }

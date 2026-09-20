@@ -4,6 +4,8 @@ use agent_service::wire;
 use provider_host::{CredentialKind, ResolvedCredential};
 use std::future::Future;
 
+use crate::gateway_contract as gateway;
+
 pub struct Resolved {
     pub credential: wire::Credential,
     pub limits: std::collections::BTreeMap<String, u64>,
@@ -304,7 +306,6 @@ mod tests {
                         };
                         gateway::GatewayReply::Registrations(registrations)
                     }
-                    _ => panic!("unexpected query"),
                 };
                 std::future::ready(Ok(gateway::encode_reply(&reply)))
             },

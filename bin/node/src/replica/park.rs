@@ -798,7 +798,6 @@ pub(super) async fn park(
         std::sync::Arc::new(crate::blob_fetch::FetchingCodeSource::new(
             blobs.clone(),
             client.clone(),
-            crate::constants::MAX_MODULE_CODE_BYTES,
             crate::constants::BLOB_FETCH_ATTEMPTS,
         ));
     // the forge pack sweep: a resident is never a submit-time fanout target, so

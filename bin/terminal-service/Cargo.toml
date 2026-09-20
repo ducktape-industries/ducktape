@@ -6,8 +6,8 @@ version.workspace = true
 [dependencies]
 rand.workspace = true
 agent-service.workspace = true
-gateway.workspace = true
-# the handle-plane value types the gateway wire carries but does not re-export.
+sdk.workspace = true
+# handle-plane value types used by the local gateway contract.
 duckdns.workspace = true
 ducktape-rpc.workspace = true
 futures.workspace = true

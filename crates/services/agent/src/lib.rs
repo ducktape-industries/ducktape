@@ -50,11 +50,6 @@ use tokio::sync::{mpsc, oneshot};
 pub mod messaging;
 pub mod wire;
 
-/// the per-daemon concurrent-session cap. a terminal is arbitrary code
-/// execution on the operator's host burning the operator's subscription, so the
-/// ceiling is deliberately small; over it, create refuses rather than spawning.
-pub const MAX_TERM_SESSIONS: usize = 4;
-
 /// the hard wall-clock ceiling on any single session. A session is a human
 /// driving a CLI TUI, so 4h is a generous single working session; past it the
 /// session is force-closed no matter what. This is the backstop that makes a
@@ -76,13 +71,6 @@ const TERM_READ_BUF: usize = 32 * 1024;
 /// grows without limit at network speed, which is exactly the OOM this bound
 /// exists to prevent.
 const DRIVE_LANE_CAPACITY: usize = 64;
-
-/// the per-session ceiling on bytes sitting in the drive lane, counted from
-/// enqueue to the driver actually receiving the item. `DRIVE_LANE_CAPACITY`
-/// alone bounds the FRAME count, not their size — a peer sending
-/// `DRIVE_LANE_CAPACITY` maximal frames would still be tens of megabytes. This
-/// is the second, size-based half of the same bound.
-const MAX_PENDING_INPUT_BYTES: usize = 1024 * 1024;
 
 /// how long the driver waits for one pty write before giving up on it and
 /// moving to the next queued item. A write blocks for as long as the child
@@ -143,10 +131,6 @@ struct Live {
     /// dropping the map entry ends the driver task — the same drop-driven
     /// teardown the pump and reaper take. Bounded: see [`DRIVE_LANE_CAPACITY`].
     drive: mpsc::Sender<Drive>,
-    /// bytes currently sitting in `drive`, from [`Sessions::enqueue`] to the
-    /// driver's `recv`. Shared with the driver task so it can give back what
-    /// it takes off the lane; see [`MAX_PENDING_INPUT_BYTES`].
-    pending_input_bytes: Arc<AtomicUsize>,
     _reaper_cancel: oneshot::Sender<()>,
     /// declared LAST so it drops last: the container that mounts this directory
     /// is torn down by [`Sessions::finish`] before the entry is dropped at all.
@@ -170,9 +154,9 @@ struct Live {
 ///
 /// A SIGKILLed daemon is the one death that leaves one standing, and that is
 /// deliberately not swept: the node draws a session id at random, so no later
-/// session can name a leftover and inherit it, and what survives is inert bytes
-/// bounded by [`MAX_TERM_SESSIONS`] per kill. The part that is NOT inert — the
-/// containers — is what the daemon's boot sweep already reaps.
+/// session can name a leftover and inherit it, and what survives is inert
+/// bytes. The part that is NOT inert — the containers — is what the daemon's
+/// boot sweep already reaps.
 struct SessionHome {
     dir: PathBuf,
 }
@@ -390,16 +374,9 @@ impl Sessions {
             .providers
             .resolve(&spec.provider)
             .map_err(|detail| (wire::Refusal::UnknownProvider, detail))?;
-        // reserve BEFORE the spawn await, so two concurrent creates cannot both
-        // slip past a stale count. Released on any failure below.
-        let over_cap = self.0.active.fetch_add(1, Ordering::SeqCst) + 1 > MAX_TERM_SESSIONS;
-        if over_cap {
-            self.0.active.fetch_sub(1, Ordering::SeqCst);
-            return Err((
-                wire::Refusal::AtCapacity,
-                format!("terminal session cap ({MAX_TERM_SESSIONS}) reached"),
-            ));
-        }
+        // counted BEFORE the spawn await, so the status line never reads a
+        // stale count. Released on any failure below.
+        self.0.active.fetch_add(1, Ordering::SeqCst);
         match self.spawn(provider, spec).await {
             Ok(()) => Ok(()),
             Err(failure) => {
@@ -463,7 +440,6 @@ impl Sessions {
         // reaper; holding it in the map keeps the ceiling armed for the session.
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let (drive, drive_rx) = mpsc::channel(DRIVE_LANE_CAPACITY);
-        let pending_input_bytes = Arc::new(AtomicUsize::new(0));
         self.0
             .sessions
             .lock()
@@ -473,17 +449,11 @@ impl Sessions {
                 Live {
                     session: session.clone(),
                     drive,
-                    pending_input_bytes: pending_input_bytes.clone(),
                     _reaper_cancel: cancel_tx,
                     _home: home,
                 },
             );
-        self.spawn_driver(
-            spec.session.clone(),
-            session.clone(),
-            drive_rx,
-            pending_input_bytes,
-        );
+        self.spawn_driver(spec.session.clone(), session.clone(), drive_rx);
         self.spawn_pump(spec.session.clone(), session);
         self.spawn_reaper(spec.session, cancel_rx);
         Ok(())
@@ -494,50 +464,27 @@ impl Sessions {
     /// Non-blocking by construction — that is the whole point: `try_send`
     /// never awaits, so a stalled pty on session A can never delay session B,
     /// or the caller (the link, which must keep reading). An unknown id is a
-    /// no-op + `warn` with a named reason, never a panic; a full lane or a
-    /// blown byte budget is a DROP, never a buffer that grows to make room.
+    /// no-op + `warn` with a named reason, never a panic; a full lane is a
+    /// DROP, never a buffer that grows to make room.
     fn enqueue(&self, id: &str, drive: Drive) -> Option<EnqueueRefusal> {
-        let live = self
+        let lane = self
             .0
             .sessions
             .lock()
             .expect("agent sessions lock poisoned")
             .get(id)
-            .map(|live| (live.drive.clone(), live.pending_input_bytes.clone()));
-        let Some((lane, pending_input_bytes)) = live else {
+            .map(|live| live.drive.clone());
+        let Some(lane) = lane else {
             tracing::warn!(target: "ducktape::term", session = %id, reason = "unknown_session", "term drive dropped");
             return Some(EnqueueRefusal::UnknownSession);
         };
-        // only `Input` carries a size worth budgeting; a resize is a fixed
-        // couple of bytes and rides the frame-count bound alone.
-        let input_len = match &drive {
-            Drive::Input(data_b64) => Some(data_b64.len()),
-            Drive::Resize { .. } => None,
-        };
-        if let Some(len) = input_len {
-            let pending = pending_input_bytes.fetch_add(len, Ordering::SeqCst) + len;
-            if pending > MAX_PENDING_INPUT_BYTES {
-                pending_input_bytes.fetch_sub(len, Ordering::SeqCst);
-                return Some(EnqueueRefusal::LaneFull);
-            }
-        }
         match lane.try_send(drive) {
             Ok(()) => None,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                if let Some(len) = input_len {
-                    pending_input_bytes.fetch_sub(len, Ordering::SeqCst);
-                }
-                Some(EnqueueRefusal::LaneFull)
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => Some(EnqueueRefusal::LaneFull),
             // the driver already exited (a teardown race with `finish`); the
             // session is ending, so the drop is benign and not a refusal the
             // caller needs to hear about.
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                if let Some(len) = input_len {
-                    pending_input_bytes.fetch_sub(len, Ordering::SeqCst);
-                }
-                None
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => None,
         }
     }
 
@@ -553,20 +500,11 @@ impl Sessions {
         id: String,
         session: Arc<InteractiveSession>,
         mut lane: mpsc::Receiver<Drive>,
-        pending_input_bytes: Arc<AtomicUsize>,
     ) {
         tokio::spawn(async move {
             while let Some(drive) = lane.recv().await {
                 match drive {
-                    Drive::Input(data_b64) => {
-                        // the byte is off the lane the moment `recv` hands it
-                        // over — give the budget back before the (possibly
-                        // slow) write, not after, so a stalled write does not
-                        // also pin the budget for bytes that already left the
-                        // queue.
-                        pending_input_bytes.fetch_sub(data_b64.len(), Ordering::SeqCst);
-                        write_input(&id, &session, &data_b64).await;
-                    }
+                    Drive::Input(data_b64) => write_input(&id, &session, &data_b64).await,
                     Drive::Resize { cols, rows } => resize(&id, &session, cols, rows),
                 }
             }
@@ -995,7 +933,6 @@ mod tests {
                 Live {
                     session,
                     drive,
-                    pending_input_bytes: Arc::new(AtomicUsize::new(0)),
                     _reaper_cancel: cancel_tx,
                     _home: home,
                 },
@@ -1029,29 +966,6 @@ mod tests {
                 Some(EnqueueRefusal::LaneFull)
             );
         }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn a_session_whose_driver_never_drains_refuses_on_the_byte_budget_too() {
-        // frame-count alone does not bound MEMORY: a handful of large frames
-        // must refuse well before `DRIVE_LANE_CAPACITY` frames have queued.
-        let (plane, root, _rx) = plane("byte-budget");
-        let _drive_rx = register_stalled_session(&plane, &root);
-
-        let big_frame = "y".repeat(200_000); // 1 MiB budget / 200 KiB = 5
-        let mut accepted = 0usize;
-        loop {
-            match plane.enqueue(STUB_SESSION, Drive::Input(big_frame.clone())) {
-                None => accepted += 1,
-                Some(EnqueueRefusal::LaneFull) => break,
-                Some(EnqueueRefusal::UnknownSession) => panic!("the session is registered"),
-            }
-        }
-        assert!(
-            accepted < DRIVE_LANE_CAPACITY,
-            "the byte budget must bind before the frame count does: accepted {accepted}"
-        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

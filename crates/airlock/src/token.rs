@@ -12,12 +12,9 @@ use serde::{Deserialize, Serialize};
 /// Strict, like every type in `wire`: an unknown field in a token payload is a
 /// producer out of step, not something to skip past.
 ///
-/// There is deliberately NO `max_requests` claim. One was minted into every
-/// token and read for a decision nowhere — the live budget keys on `sub` (the
-/// credential NAME) and is refilled by every `/session`, so the number in the
-/// token described a cap that did not exist. An unenforced field in a signed
-/// token is worse than no field: the next reader trusts it. The real budget and
-/// its actual scope are documented on `server::AppState::budgets`.
+/// There is deliberately NO request-budget claim: a number in a signed token
+/// that no reader enforces is worse than no field, because the next reader
+/// trusts it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Claims {
@@ -96,8 +93,7 @@ mod tests {
     /// A validly SIGNED token carrying a field the claim set does not declare
     /// must fail decode, not ride along unread. The signature is genuine here,
     /// so `deny_unknown_fields` is the only thing that can refuse it — which is
-    /// what keeps a re-introduced `max_requests` from becoming a second
-    /// unenforced cap.
+    /// what keeps a re-introduced budget claim from riding along unread.
     #[test]
     fn a_signed_token_with_an_unknown_claim_is_refused() {
         let sk = SigningKey::generate(&mut OsRng);

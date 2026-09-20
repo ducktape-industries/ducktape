@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "dispatch"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#95fb4a60457eddbf3dc56bffab66721eed5642b3"
+source = "git+https://github.com/ducktape-industries/ducktape#f591d4846c8edd82269f864fcfdb850a5cc4293a"
 dependencies = [
  "async-trait",
  "borsh",

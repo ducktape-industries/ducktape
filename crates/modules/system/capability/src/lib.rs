@@ -56,8 +56,8 @@
 //! it to [`CapabilityRegistry::new`], so this crate never names a storage
 //! crate. one logical record per announced node (`node\0{key}`, borsh) and
 //! per claimed class (`class\0{name}`), plus the two rosters the scan reads
-//! walk — the sorted node list (`nodes`, bounded by [`MAX_ANNOUNCED_NODES`])
-//! and the sorted class list (`classes`, bounded by [`MAX_CLASSES`]). the
+//! walk — the sorted node list (`nodes`) and the sorted class list
+//! (`classes`). the
 //! provider scans (`Providers` / `CapableProviders` / `All`) are
 //! DISPATCH-CONSUMED (saga's assignment filters on them at execute), so they
 //! stay canonical behind the capped roster; `Node` / `Resources` /
@@ -69,11 +69,9 @@
 //! a peer (`QmdbStore::sync_from`) and wraps a fresh registry around it.
 //!
 //! oversized values never reach the store (the poison-value lesson): a node
-//! entry is bounded by construction ([`MAX_CAPABILITIES`] tags of
-//! `MAX_TAG_LEN` + [`MAX_RESOURCE_DIMS`] dimensions — `validate_tags` /
-//! `validate_resources` gate every announce), a class record by
-//! `MAX_CLASS_LEN`, and both rosters are byte-gated on top of their count
-//! caps.
+//! entry is gated on every announce (`validate_tags` admits tags of
+//! `MAX_TAG_LEN`, `validate_resources` [`MAX_RESOURCE_DIMS`] dimensions), a
+//! class record by `MAX_CLASS_LEN`, and both rosters are byte-gated.
 
 mod valset_contract;
 mod wire;
@@ -91,21 +89,11 @@ use sdk::{
 };
 use valset_contract::members_and_residents;
 
-/// most tags a single node may announce. a bound, not a schema: it exists so
-/// one announcement cannot bloat replicated state, while staying far above
-/// any real host's executor count.
-const MAX_CAPABILITIES: usize = 64;
 
-/// announced nodes retained at once (the roster count cap). announcements are
-/// valset ∪ resident gated in production, so this sits far above any real
-/// network's node count; announcing past it refuses loudly at execute.
-pub const MAX_ANNOUNCED_NODES: usize = 1024;
 /// serialized node-roster byte bound — the backstop on top of the count cap
 /// (node keys are opaque origin bytes, so the count alone does not bound the
 /// serialized form).
 pub const MAX_NODE_ROSTER_RECORD_BYTES: usize = 512 * 1024;
-/// classes retained over the network's life (claims are permanent).
-pub const MAX_CLASSES: usize = 1024;
 /// serialized class-roster byte bound (class names are ≤ `MAX_CLASS_LEN`, so
 /// this is generous by construction — kept as the uniform poison backstop).
 pub const MAX_CLASS_ROSTER_RECORD_BYTES: usize = 512 * 1024;
@@ -277,15 +265,6 @@ impl CapabilityRegistry {
     /// violations reject deterministically: every validator sees the same
     /// bytes, so every validator rejects identically.
     fn validate_tags(tags: Vec<String>) -> Result<BTreeSet<String>, Error> {
-        if tags.len() > MAX_CAPABILITIES {
-            return Err(Error::module(
-                "capability_cap",
-                format!(
-                    "too many capabilities: {} exceeds the {MAX_CAPABILITIES} cap",
-                    tags.len()
-                ),
-            ));
-        }
         let mut set = BTreeSet::new();
         for tag in tags {
             validate_tag(&tag).map_err(|e| Error::module("bad_capability_tag", e))?;
@@ -386,12 +365,6 @@ impl CapabilityRegistry {
                     "node roster carries a key with no record",
                 ));
             };
-            if roster.len() >= MAX_ANNOUNCED_NODES {
-                return Err(Error::module(
-                    "node_cap",
-                    format!("announced-node cap reached ({MAX_ANNOUNCED_NODES})"),
-                ));
-            }
             roster.insert(position, node.clone());
             self.store_bounded(
                 NODE_ROSTER_KEY.to_vec(),
@@ -446,12 +419,6 @@ impl CapabilityRegistry {
                         "class roster carries a name with no record",
                     ));
                 };
-                if roster.len() >= MAX_CLASSES {
-                    return Err(Error::module(
-                        "class_cap",
-                        format!("class cap reached ({MAX_CLASSES})"),
-                    ));
-                }
                 roster.insert(position, class.clone());
                 self.store_bounded(
                     CLASS_ROSTER_KEY.to_vec(),
@@ -555,7 +522,7 @@ impl Module for CapabilityRegistry {
 
     /// read projection — committed plus this block's staged changes (the
     /// staged-over-committed store view). the provider scans walk the roster
-    /// by derived key (≤ [`MAX_ANNOUNCED_NODES`] point reads). standing is not
+    /// by derived key (one point read per announced node). standing is not
     /// re-checked here — see [`Self::query_with`], the ctx-routed lane every
     /// real caller (saga's `assignment_pool` included) goes through; this
     /// stays the ungated (no-valset) fallback plus a plain point-read path
@@ -1021,16 +988,6 @@ mod tests {
                 "got {err:?} for {bad:?}"
             );
         }
-        // too many tags rejects too.
-        let many: Vec<String> = (0..=MAX_CAPABILITIES).map(|i| format!("t{i}")).collect();
-        let many_refs: Vec<&str> = many.iter().map(String::as_str).collect();
-        let mut ctx = ctx_external(&me);
-        let err =
-            futures::executor::block_on(c.execute(&mut ctx, &announce(&many_refs))).unwrap_err();
-        assert!(
-            matches!(err, Error::Module { ref reason, .. } if reason == "capability_cap"),
-            "got {err:?}"
-        );
         futures::executor::block_on(c.commit_block()).unwrap();
         assert_eq!(c.root(), empty, "rejected announcements staged nothing");
     }

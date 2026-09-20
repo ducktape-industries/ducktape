@@ -68,8 +68,7 @@ fn log_intro_refused(
 /// Returns `false` once the plane's command channel is gone, telling the
 /// caller to exit its receive loop.
 /// one settled gate outcome plus the wall-clock instant it was written: what
-/// [`sweep_gate_outcomes`] ages out and [`insert_gate_outcome`] evicts by,
-/// oldest first, at the cap.
+/// [`sweep_gate_outcomes`] ages out.
 pub(crate) struct GateOutcomeEntry {
     pub(crate) reply: join_gate::IntroReply,
     pub(crate) settled_at: std::time::SystemTime,
@@ -108,17 +107,6 @@ impl UnreachableLatch {
     }
 }
 
-/// cap shared by every per-joiner map this plane and its callers bound: the
-/// gate-outcome map below, and the join-request map in
-/// `validator/run/ingress.rs` (`crate::rpc::insert_join_request`). An invite
-/// is bearer (`join_gate.rs`: no target lock, the join proof binds only the
-/// announced key), so one unexpired token mints unlimited joiner keys and
-/// each verified intro settles an entry — sized generously above the
-/// invite-peer table's own concurrency limit (`reachability::MAX_INVITE_PEERS`,
-/// 64 uncovered tunnels per join window) so ordinary churn never evicts a
-/// live entry.
-pub(crate) const MAX_TRACKED_JOINERS: usize = 4096;
-
 pub(crate) type GateOutcomeMap = HashMap<Vec<u8>, GateOutcomeEntry>;
 
 /// the shared gate-outcome map (joiner key → its resolved [`join_gate::IntroReply`]):
@@ -126,25 +114,15 @@ pub(crate) type GateOutcomeMap = HashMap<Vec<u8>, GateOutcomeEntry>;
 /// on the joiner's next retransmit and seals it back down the tunnel.
 pub(crate) type GateOutcomes = std::sync::Arc<std::sync::Mutex<GateOutcomeMap>>;
 
-/// Insert a freshly-settled outcome, capped at [`MAX_TRACKED_JOINERS`] live
-/// entries: past the cap the OLDEST entry is evicted to make room. A
-/// re-settle of a joiner already tracked (a held gate resolving after an
-/// earlier `Installed`/`Busy` write) never grows the map, so it never evicts.
+/// Insert a freshly-settled outcome. A re-settle of a joiner already tracked
+/// (a held gate resolving after an earlier `Installed`/`Busy` write) replaces
+/// its entry, so the map holds one entry per joiner.
 pub(crate) fn insert_gate_outcome(
     map: &mut GateOutcomeMap,
     joiner: Vec<u8>,
     reply: join_gate::IntroReply,
     now: std::time::SystemTime,
 ) {
-    if map.len() >= MAX_TRACKED_JOINERS
-        && !map.contains_key(&joiner)
-        && let Some(oldest) = map
-            .iter()
-            .min_by_key(|(_, entry)| entry.settled_at)
-            .map(|(key, _)| key.clone())
-    {
-        map.remove(&oldest);
-    }
     map.insert(
         joiner,
         GateOutcomeEntry {
@@ -297,15 +275,7 @@ where
             ack(sealed_reply(reply)).await;
         }
         Ok(Err(e)) => {
-            // a full join-window table is its own reason (the machine's reply
-            // text IS the token); every other refusal shares one — so the
-            // latch, and the count it carries, are per cause.
-            let table_full = e == reachability::INVITE_PEERS_FULL;
-            let reason = if table_full {
-                reachability::INVITE_PEERS_FULL
-            } else {
-                "invite_peer_install_refused"
-            };
+            let reason = "invite_peer_install_refused";
             if let Some(attempts) = INSTALL_REFUSED.hit(reason) {
                 tracing::warn!(
                     target: "ducktape::join",
@@ -1203,15 +1173,11 @@ pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> SwapAn
                     return SwapAnswer::Unattempted(format!("{}: {error}", path.display()));
                 }
             };
-            reachability::NetstackBackend::Guest {
-                component,
-                step_fuel: reachability::NETSTACK_STEP_FUEL,
-            }
+            reachability::NetstackBackend::Guest { component }
         }
-        noded::NetstackSwapRequest::Bytes(component) => reachability::NetstackBackend::Guest {
-            component,
-            step_fuel: reachability::NETSTACK_STEP_FUEL,
-        },
+        noded::NetstackSwapRequest::Bytes(component) => {
+            reachability::NetstackBackend::Guest { component }
+        }
     };
     let name = backend.name();
     let lane = LIVE_PLANE
@@ -1862,10 +1828,7 @@ fn netstack_refusal(error: String) -> String {
 
 fn load_netstack_backend(path: &std::path::Path) -> Result<reachability::NetstackBackend, String> {
     let component = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    Ok(reachability::NetstackBackend::Guest {
-        component,
-        step_fuel: reachability::NETSTACK_STEP_FUEL,
-    })
+    Ok(reachability::NetstackBackend::Guest { component })
 }
 
 /// how long a peer may hold NO live session before it is called DARK.

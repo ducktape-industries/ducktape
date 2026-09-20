@@ -1,0 +1,99 @@
+// PROPOSAL — core's draft of the realtime guest world. The SDK
+// (ducktape-sdk, `crates/module-sdk/wit/`) owns this file once it adopts it;
+// the SDK pin then replaces this copy and `lane_wasm::bindings` points at it.
+package ducktape:lane@0.1.0;
+
+/// The host surface a lane guest may touch: a log line and nothing else.
+/// Every other effect is a returned value (the step is sans-I/O), and unlike
+/// `ducktape:netstack` there is no `sign`/`identity`: no media effect carries
+/// a signature, admission is host-side, and the guest never sees a key.
+interface host {
+  enum level { trace, debug, info, warn, error }
+  /// Forward one tracing event. The host re-emits it under
+  /// `ducktape::lane` with the guest's `target` kept as a field.
+  log: func(level: level, target: string, message: string);
+}
+
+/// The values that cross the boundary. Every byte payload is opaque to the
+/// host: a `datagram` carries the module's own mesh frame layout (for the
+/// call guest: `media_service::voice::media` on the voice lane,
+/// `video::frame` on the video lane) and a client `frame` carries the
+/// module's own client wire (for the call guest: `call_wire` binary frames
+/// and `CallClientControl`/`CallServerControl` json text). The guest owns
+/// both framings; the host copies bytes.
+interface types {
+  use host.{level};
+  /// A declared lane id (`LaneDecl.id` from the module's `lanes.json`).
+  type lane = u8;
+  /// One admitted client socket. Host-assigned, unique for the guest's life.
+  type session = u64;
+  /// The authenticated overlay peer: the 32-byte node key
+  /// (`data_plane::PeerId`).
+  type peer = list<u8>;
+  /// A data-plane flow id on a lane (`data_plane::FlowId`, the guest derives
+  /// it from its own domain string).
+  type flow = u64;
+
+  variant frame {
+    text(string),
+    binary(list<u8>),
+  }
+
+  record datagram { lane: lane, peer: peer, bytes: list<u8> }
+  record client-frame { session: session, frame: frame }
+  record roster { session: session, peers: list<peer> }
+  record session-opened { session: session, channel: string }
+
+  /// One input. `tick` is the wall clock at the host's cadence; every
+  /// other event names its origin.
+  variant event {
+    tick,
+    datagram(datagram),
+    client-frame(client-frame),
+    roster(roster),
+    session-opened(session-opened),
+    session-closed(session),
+  }
+
+  record lane-send { lane: lane, peer: peer, bytes: list<u8> }
+  record client-send { session: session, frame: frame }
+  /// The peers the host admits on `(lane, flow)` from now on — default
+  /// deny, so the guest states the whole set every time.
+  record set-roster { lane: lane, flow: flow, peers: list<peer> }
+  record open-flow { lane: lane, flow: flow, max-queued: u32 }
+  record close-flow { lane: lane, flow: flow }
+  record log-line { level: level, message: string }
+  /// End a session. `reason` is a stable snake_case token the client sees
+  /// as its one closing text frame.
+  record close { session: session, reason: string }
+
+  /// One output. The host performs a step's effects in order, then returns
+  /// to the queue.
+  variant effect {
+    lane-send(lane-send),
+    client-send(client-send),
+    set-roster(set-roster),
+    open-flow(open-flow),
+    close-flow(close-flow),
+    log(log-line),
+    close(close),
+  }
+
+  /// A lane the host bound for this module, by the name the module gave it.
+  record lane-binding { name: string, id: lane }
+  record config { self-peer: peer, lanes: list<lane-binding> }
+}
+
+/// A realtime guest: one long-lived instance per module plane, stepped on
+/// its own OS thread, its state in guest memory between steps. Every step
+/// runs under a fresh fuel budget; exhaustion or any other trap discards
+/// the instance and ends every session it held.
+world media {
+  import host;
+  use types.{config, event, effect};
+
+  /// Called once before the first step.
+  export init: func(config: config) -> result<_, string>;
+  /// Step one event at `now-ms` and return the effects to perform, in order.
+  export step: func(event: event, now-ms: u64) -> list<effect>;
+}

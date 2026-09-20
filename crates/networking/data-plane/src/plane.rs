@@ -40,23 +40,6 @@ use crate::wire::{self, HELLO_ACK, Hello, WireError};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest single token grant — bounds how bursty one paced write can be.
 const MAX_GRANT: usize = 16 * 1024;
-/// Accepted-but-unclassified inbound streams one peer may hold at once.
-///
-/// An accepted stream costs real memory before its opener has said a word:
-/// on the userspace backend it is a smoltcp socket carrying two 256 KiB
-/// buffers, living in the one `SocketSet` behind the stack mutex the
-/// consensus mesh also uses — and the opener may sit on it for the whole
-/// [`HANDSHAKE_TIMEOUT`]. Nothing below bounds them: the virtual listener
-/// re-arms a fresh listening slot on every accept, and admission plus the
-/// service backlog are only consulted after the hello.
-///
-/// The basis is the handshake itself: an opener has exactly one hello in
-/// flight per stream it is opening, so a peer opening streams as fast as it
-/// can still needs only a handful pending at once. A backlog's worth (the
-/// virtual listener's `LISTEN_BACKLOG` is 8) is generous for any real
-/// opener and caps one peer at ~4 MiB of stack buffers instead of unbounded
-/// growth.
-const MAX_PENDING_INBOUND_PER_PEER: usize = 8;
 
 /// The consensus-derived admission view, injected by the node layer (e.g. a
 /// view over finalized channel membership / valset state). Both ends of a
@@ -109,12 +92,6 @@ pub enum OpenError {
     Refused,
 }
 
-/// The first 8 bytes of a peer's key in hex — enough to name one peer in a
-/// log line without spelling out 32 bytes.
-fn peer_hex(peer: PeerId) -> String {
-    peer.0[..8].iter().map(|b| format!("{b:02x}")).collect()
-}
-
 #[derive(Default)]
 struct Stats {
     rogue_datagrams: AtomicU64,
@@ -132,9 +109,6 @@ struct Stats {
     /// Admitted, registered inbound streams refused because the service's
     /// accept backlog was full (dropped without ack).
     backlog_refused_streams: AtomicU64,
-    /// Inbound streams closed on acceptance because the opener already held
-    /// [`MAX_PENDING_INBOUND_PER_PEER`] streams awaiting a hello.
-    pending_limit_refused_streams: AtomicU64,
     /// `accept` attempts that failed for reasons belonging to that one
     /// connection attempt (a reset opener, a listener slot that failed to
     /// re-arm) rather than to the listener itself.
@@ -173,28 +147,6 @@ impl Stats {
         }
     }
 
-    /// One inbound stream closed because its opener is already holding the
-    /// per-peer pre-admission budget. Latched like every other refusal a
-    /// peer can drive at will: first, then every 100th, carrying the count
-    /// and the peer — a peer that keeps hitting this is the diagnosis.
-    fn note_pending_limit(&self, peer: PeerId) {
-        let refused = self
-            .pending_limit_refused_streams
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-        if refused == 1 || refused.is_multiple_of(100) {
-            tracing::warn!(
-                target: "ducktape::dataplane",
-                peer = peer_hex(peer),
-                refused,
-                limit = MAX_PENDING_INBOUND_PER_PEER,
-                reason = "pending_inbound_limit",
-                "closed an inbound stream: this peer already holds its budget \
-                 of accepted streams that have not identified themselves"
-            );
-        }
-    }
-
     /// One `accept` that failed for reasons belonging to that one connection
     /// attempt. Latched like every other per-attempt drop: first, then every
     /// 100th, carrying the count and the io error kind — the counter IS the
@@ -223,9 +175,6 @@ impl Stats {
             unregistered_streams: self.unregistered_streams.load(Ordering::Relaxed),
             hello_failed_streams: self.hello_failed_streams.load(Ordering::Relaxed),
             backlog_refused_streams: self.backlog_refused_streams.load(Ordering::Relaxed),
-            pending_limit_refused_streams: self
-                .pending_limit_refused_streams
-                .load(Ordering::Relaxed),
             accept_errors: self.accept_errors.load(Ordering::Relaxed),
             refused_sends: self.refused_sends.load(Ordering::Relaxed),
         }
@@ -307,9 +256,6 @@ pub struct StatsSnapshot {
     pub hello_failed_streams: u64,
     /// Inbound streams dropped because the service's accept backlog was full.
     pub backlog_refused_streams: u64,
-    /// Inbound streams closed on acceptance because the opener already held
-    /// its budget of streams awaiting a hello.
-    pub pending_limit_refused_streams: u64,
     /// `accept` attempts that failed for reasons belonging to that one
     /// connection attempt rather than to the listener (a reset opener, a
     /// listener slot that failed to re-arm).
@@ -404,10 +350,6 @@ struct Shared<T: DataPlaneTransport> {
     bucket: Arc<TokenBucket>,
     datagram_flows: Mutex<HashMap<(Service, FlowId), Arc<DatagramQueue>>>,
     stream_services: Mutex<HashMap<Service, mpsc::Sender<IncomingStream<T::Stream>>>>,
-    /// Accepted inbound streams per peer that have not finished their hello
-    /// yet — see [`MAX_PENDING_INBOUND_PER_PEER`]. A peer with no pending
-    /// stream holds no entry.
-    pending_inbound: Mutex<HashMap<PeerId, usize>>,
     stats: Stats,
     /// `Arc` so a [`PacedStream`] (which may outlive every plane handle)
     /// keeps its byte accounting attached to this plane.
@@ -417,48 +359,6 @@ struct Shared<T: DataPlaneTransport> {
     /// runs [`Shared::drop`], which aborts them — a plane's life is exactly
     /// the life of its handles, never extended by its own pumps.
     pumps: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-}
-
-impl<T: DataPlaneTransport> Shared<T> {
-    /// Take one of this peer's pre-admission slots, or `None` when the peer
-    /// is already at [`MAX_PENDING_INBOUND_PER_PEER`]. The returned guard
-    /// frees the slot when the per-connection task ends, whatever ends it.
-    fn reserve_pending_inbound(self: &Arc<Self>, peer: PeerId) -> Option<PendingSlot<T>> {
-        let mut pending = self.pending_inbound.lock().expect("pending lock");
-        let held = pending.entry(peer).or_insert(0);
-        if *held >= MAX_PENDING_INBOUND_PER_PEER {
-            return None;
-        }
-        *held += 1;
-        Some(PendingSlot {
-            plane: Arc::downgrade(self),
-            peer,
-        })
-    }
-}
-
-/// One peer's reservation for one accepted-but-unidentified stream. Holds
-/// the plane weakly for the same reason the per-connection task does: a
-/// pending hello must never keep a dropped plane's state alive.
-struct PendingSlot<T: DataPlaneTransport> {
-    plane: Weak<Shared<T>>,
-    peer: PeerId,
-}
-
-impl<T: DataPlaneTransport> Drop for PendingSlot<T> {
-    fn drop(&mut self) {
-        let Some(shared) = self.plane.upgrade() else {
-            return;
-        };
-        let mut pending = shared.pending_inbound.lock().expect("pending lock");
-        let Some(held) = pending.get_mut(&self.peer) else {
-            return;
-        };
-        *held -= 1;
-        if *held == 0 {
-            pending.remove(&self.peer);
-        }
-    }
 }
 
 impl<T: DataPlaneTransport> Drop for Shared<T> {
@@ -523,7 +423,6 @@ impl<T: DataPlaneTransport> DataPlane<T> {
             bucket: pacer.bucket,
             datagram_flows: Mutex::new(HashMap::new()),
             stream_services: Mutex::new(HashMap::new()),
-            pending_inbound: Mutex::new(HashMap::new()),
             stats: Stats::default(),
             traffic: Arc::new(Traffic::default()),
             pumps: Mutex::new(Vec::new()),
@@ -736,21 +635,13 @@ async fn accept_loop<T: DataPlaneTransport>(transport: Arc<T>, plane: Weak<Share
                 return;
             }
         };
-        // Charge the opener for the stream BEFORE anything holds it: until
-        // the hello arrives we know nothing about this connection except
-        // which peer opened it, and that is the only thing left to bound it
-        // by. A refused stream closes on drop, unacked.
-        let Some(slot) = shared.reserve_pending_inbound(peer) else {
-            shared.stats.note_pending_limit(peer);
-            continue;
-        };
-        // The acceptor holds the plane only for the reservation above: a
-        // pump must never be what keeps a dropped plane alive.
+        // The acceptor holds the plane only for the accept above: a pump
+        // must never be what keeps a dropped plane alive.
         drop(shared);
         // Per-connection task: a stalled opener must not block the acceptor.
         // It, too, holds the plane weakly: a hello still pending when the
         // last handle drops must not keep the plane's state alive.
-        tokio::spawn(handle_inbound_stream(plane.clone(), peer, stream, slot));
+        tokio::spawn(handle_inbound_stream(plane.clone(), peer, stream));
     }
 }
 
@@ -758,10 +649,6 @@ async fn handle_inbound_stream<T: DataPlaneTransport>(
     plane: Weak<Shared<T>>,
     peer: PeerId,
     mut stream: T::Stream,
-    // Dropped with this task — classified, refused or timed out, the peer
-    // gets its slot back exactly when it stops holding an unidentified
-    // stream.
-    _slot: PendingSlot<T>,
 ) {
     let hello = timeout(HANDSHAKE_TIMEOUT, wire::read_hello(&mut stream)).await;
     let Some(shared) = plane.upgrade() else {
@@ -1243,54 +1130,6 @@ mod tests {
         assert_eq!(payload, b"after");
         assert_eq!(plane.stats().undeliverable_datagrams, 1);
         assert!(!plane.traffic().halted);
-    }
-
-    /// The budget itself: a peer gets exactly
-    /// [`MAX_PENDING_INBOUND_PER_PEER`] slots, the next reservation is
-    /// refused, and finishing one connection (dropping its guard) hands the
-    /// slot straight back.
-    #[tokio::test]
-    async fn pre_admission_slots_are_per_peer_and_returned_on_close() {
-        let (_datagrams, _accepts, plane) = stub_plane();
-        let shared = plane.shared.clone();
-        let peer = PeerId([2u8; 32]);
-
-        let mut held: Vec<_> = (0..MAX_PENDING_INBOUND_PER_PEER)
-            .map(|_| {
-                shared
-                    .reserve_pending_inbound(peer)
-                    .expect("within the budget")
-            })
-            .collect();
-        assert!(shared.reserve_pending_inbound(peer).is_none());
-        // The budget is per peer: another opener is unaffected.
-        assert!(shared.reserve_pending_inbound(PeerId([3u8; 32])).is_some());
-
-        held.pop();
-        assert!(shared.reserve_pending_inbound(peer).is_some());
-    }
-
-    /// And the acceptor applies it: the stream past the budget is closed on
-    /// acceptance, before any task holds it.
-    #[tokio::test]
-    async fn the_acceptor_closes_an_inbound_stream_past_the_peer_budget() {
-        let (_datagrams, accepts, plane) = stub_plane();
-        let peer = PeerId([4u8; 32]);
-
-        // Every opener stays silent, so each accepted stream sits in its
-        // task holding a slot until the handshake times out.
-        let mut openers = Vec::new();
-        for _ in 0..=MAX_PENDING_INBOUND_PER_PEER {
-            let (ours, theirs) = tokio::io::duplex(64);
-            accepts.send(Ok((peer, theirs))).await.unwrap();
-            openers.push(ours);
-        }
-
-        // The close of the last opener's stream IS the refusal — the plane
-        // dropped it without reading a byte.
-        let refused = openers.last_mut().expect("one opener past the budget");
-        assert_eq!(refused.read(&mut [0u8; 1]).await.unwrap(), 0);
-        assert_eq!(plane.stats().pending_limit_refused_streams, 1);
     }
 
     /// One reset-opener error used to end the accept pump for the life of

@@ -1,6 +1,7 @@
 //! pack state-sync: a fresh forge reconstructs a source namespace's committed
 //! state from SELF-CONTAINED snapshot bytes — a repo-count then, per repo, its
-//! name, 20-byte head oid, and the head's full object closure as a packfile —
+//! name, owner, 20-byte head oid, and the head's full object closure as a
+//! packfile —
 //! and lands on the identical composed root() with the real commit content
 //! intact. the bytes are the whole story: nothing here assumes the two nodes
 //! share a filesystem, a remote, or a `git` binary.
@@ -99,12 +100,25 @@ fn source(tag: &str) -> (PathBuf, Forge) {
 }
 
 /// byte offset of the FIRST repo's head oid in a container: `magic` (4) +
-/// `count` (4) + `name_len` (4) + `name`. valid only for a container with
-/// >= 1 repo.
+/// `count` (4) + `name_len` (4) + `name` + owner. valid only for a container
+/// with >= 1 repo.
 fn first_oid_offset(bytes: &[u8]) -> usize {
     let name_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    // magic(4) count(4) name_len(4) name ref_count(4) branch_len(4) branch [oid]
-    let p = 12 + name_len + 4;
+    let mut p = 12 + name_len;
+    let owner_tag = bytes[p];
+    p += 1;
+    match owner_tag {
+        0 => {}
+        1 => p += 8,
+        2 => {
+            let key_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4 + key_len;
+        }
+        tag => panic!("unknown owner tag {tag}"),
+    }
+    // magic(4) count(4) name_len(4) name owner ref_count(4) branch_len(4)
+    // branch [oid]
+    p += 4;
     let branch_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
     p + 4 + branch_len
 }
@@ -117,13 +131,16 @@ fn first_pack_offset(bytes: &[u8]) -> usize {
 }
 
 /// assemble a one-repo, one-branch (`main`) container with an EMPTY tracker
-/// section: `FGv1 [count=1][name][branch_count=1]["main" oid][tag_count=0]
-/// [pending_count=0][pack_len pack][tracker]`.
+/// section: `FGv1 [count=1][name][owner][branch_count=1]["main" oid]
+/// [tag_count=0][pending_count=0][pack_len pack][tracker]`.
 fn build_container(name: &str, oid: &[u8], pack: &[u8]) -> Vec<u8> {
     let mut out = b"FGv1".to_vec();
     out.extend_from_slice(&1u32.to_le_bytes());
     out.extend_from_slice(&(name.len() as u32).to_le_bytes());
     out.extend_from_slice(name.as_bytes());
+    out.push(2); // the source helper's unbound external key owner
+    out.extend_from_slice(&32u32.to_le_bytes());
+    out.extend_from_slice(&[1u8; 32]);
     out.extend_from_slice(&1u32.to_le_bytes());
     out.extend_from_slice(&4u32.to_le_bytes());
     out.extend_from_slice(b"main");

@@ -291,7 +291,7 @@ input or close commands. There is no configured attachment count, WebSocket
 frame size, output queue, or send deadline ceiling.
 
 A create the service refuses answers the caller with a stable token only
-(`spawn_failed`, `unknown_provider`, `at_capacity`). The sentence that says why
+(`spawn_failed`, `unknown_provider`). The sentence that says why
 is this host's own diagnosis and stays here: read it in the unit's journal,
 where the terminal service writes its `tracing` events to stderr at an `info`
 floor. `RUST_LOG` adds to that floor rather than replacing it, so

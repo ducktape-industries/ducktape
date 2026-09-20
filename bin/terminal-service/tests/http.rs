@@ -1,3 +1,4 @@
+use ducktape_terminal::gateway_contract as gateway;
 use ducktape_terminal::{
     http::{Route, router},
     runtime::Runtime,

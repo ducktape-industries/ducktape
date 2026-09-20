@@ -147,6 +147,9 @@ use sdk::{Event, Msg, Origin};
 use serde::{Deserialize, Serialize};
 use topology::TOPOLOGY;
 
+pub mod module_contracts;
+use module_contracts::{dispatch, saga};
+
 // the sim's genesis sets are the `sim_base` (+ `sim_valset`) selections of the
 // single-source `topology` — noded's exact 16-module default plus the
 // opt-in 5 system modules. changing the daemon set changes the topology, which

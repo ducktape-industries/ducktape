@@ -652,15 +652,10 @@ pub fn admin_router(handle: NodeHandle) -> Router<NodeHandle> {
         .route("/v1/admin/shutdown", post(crate::shutdown))
         .route("/v1/admin/logs/tail", get(logs_tail))
         .route("/v1/admin/netstack/swap", post(netstack_swap))
-        // upgrade staging: ingest + fan a wasm artifact out to members. the body
-        // cap is EXPLICIT (see `MAX_MODULE_ARTIFACT_BYTES`) — without a layer
-        // axum's implicit 2 MiB default applies, and the largest real artifact
-        // is already 1.83 MB of it.
+        // upgrade staging: ingest + fan a wasm artifact out to members.
         .route(
             "/v1/admin/module-code/stage",
-            post(crate::module_code::stage_module_code).layer(
-                axum::extract::DefaultBodyLimit::max(crate::module_code::MAX_MODULE_ARTIFACT_BYTES),
-            ),
+            post(crate::module_code::stage_module_code),
         )
         .route(
             "/v1/admin/module-code/{digest}",

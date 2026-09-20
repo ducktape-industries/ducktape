@@ -534,7 +534,6 @@ pub(crate) async fn drive(
     let mut usage = None;
     let mut steering: Option<ClaudeSteer> = None;
     let mut stop_id: Option<String> = None;
-    let mut stdout_bytes = 0usize;
     let mut explicit_deadline = broker.map(|invocation| invocation.idle_deadline.clone());
     let mut next_id = 10u64;
     let mut pending: HashMap<String, oneshot::Sender<Result<Value, String>>> = HashMap::new();
@@ -621,8 +620,6 @@ pub(crate) async fn drive(
             }
             read = line(&mut stdout, &mut out_pending) => {
                 let raw = read?.ok_or_else(|| format!("provider exited before completing the run: {last_stderr}"))?;
-                stdout_bytes = stdout_bytes.saturating_add(raw.len());
-                if stdout_bytes > crate::MAX_RUN_OUTPUT_BYTES { return Err("provider output exceeded the run limit".into()); }
                 let Ok(frame) = serde_json::from_str::<Value>(&raw) else { continue; };
                 last_activity = tokio::time::Instant::now();
                 emit(&sink,ctx,frame.clone());

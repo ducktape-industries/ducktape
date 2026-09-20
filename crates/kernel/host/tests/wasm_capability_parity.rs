@@ -379,8 +379,6 @@ async fn rejections_inner(context: &deterministic::Context) {
     }
 
     let too_long = "x".repeat(65);
-    let too_many: Vec<String> = (0..=64).map(|i| format!("cap{i}")).collect();
-    let too_many: Vec<&str> = too_many.iter().map(String::as_str).collect();
 
     // the rejection matrix: every distinct refusal family the native module
     // implements. the FIRST is the member gate — a rejection DECIDED by the
@@ -405,7 +403,6 @@ async fn rejections_inner(context: &deterministic::Context) {
         (ext(&m1), announce(&[""]), "must be non-empty"),
         (ext(&m1), announce(&["Codex"]), "invalid characters"),
         (ext(&m1), announce(&[too_long.as_str()]), "exceeds 64 bytes"),
-        (ext(&m1), announce(&too_many), "too many capabilities"),
         (
             ext(&m1),
             Msg {

@@ -83,7 +83,7 @@ async fn boot_gateway(upstream: &str, enclave: &Arc<SnpTestEnclave>) -> String {
             oauth_token_url: format!("{upstream}/oauth/token"),
             oauth_client_id: "test-client".into(),
             session_ttl_secs: 3600,
-            max_requests: 100,
+            clock: airlock::server::Clock::system(),
             sign: None,
         },
         "snp",
@@ -386,9 +386,9 @@ async fn a_sealed_session_requires_a_sealed_body_even_on_a_bodyless_get() {
     );
 }
 
-/// The gateway's own `DefaultBodyLimit` must match the broker's
-/// `MAX_REQUEST_BYTES`, not axum's implicit 2 MiB default — a sealed body
-/// between the two (3 MiB) must reach the upstream, not 413 at the router.
+/// The gateway imposes no body limit of its own — not axum's implicit 2 MiB
+/// default — so a 3 MiB sealed body must reach the upstream, not 413 at the
+/// router.
 #[tokio::test]
 async fn a_3mib_sealed_body_reaches_proxy_inner() {
     use airlock::bodyseal;
@@ -496,7 +496,7 @@ async fn build_seeded_uses_the_initial_credential_without_upload() {
             oauth_token_url: format!("{upstream}/oauth/token"),
             oauth_client_id: "test-client".into(),
             session_ttl_secs: 3600,
-            max_requests: 100,
+            clock: airlock::server::Clock::system(),
             sign: None,
         },
         "snp",
@@ -614,7 +614,7 @@ fn self_host_cfg(
         oauth_token_url: String::new(),
         oauth_client_id: String::new(),
         session_ttl_secs: 3600,
-        max_requests: 100,
+        clock: airlock::server::Clock::system(),
         sign: None,
     }
 }

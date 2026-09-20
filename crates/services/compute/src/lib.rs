@@ -52,8 +52,7 @@ pub use provision::{
     WorkspaceReceipt, WorkspaceSpec,
 };
 pub use soul::{
-    MAX_ALWAYS_BYTES, MAX_DESCRIPTION_CHARS, MAX_INDEXED_SKILLS, SKILL_LIBRARY_PREFIX, SkillDoc,
-    assemble_context_doc, parse_skill_md,
+    MAX_INDEXED_SKILLS, SKILL_LIBRARY_PREFIX, SkillDoc, assemble_context_doc, parse_skill_md,
 };
 pub use workspace_source::WorkspaceSource;
 

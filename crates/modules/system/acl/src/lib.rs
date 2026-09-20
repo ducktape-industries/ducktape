@@ -44,9 +44,6 @@ use sdk::{
     StateRoot, StateSyncHandle,
 };
 
-/// policy entries retained (the count cap). targets are module ids, so this
-/// sits far above any real composition; a set past it refuses loudly.
-pub const MAX_POLICY_ENTRIES: usize = 256;
 
 /// the committed policy table's record key: the strictly-target-sorted
 /// `(target, standing)` list, borsh-encoded. absent = empty table = open.
@@ -97,8 +94,8 @@ impl Acl {
             self.staged.delete(POLICY_KEY.to_vec());
             return;
         }
-        // bounded by construction: ≤ MAX_POLICY_ENTRIES entries of ≤
-        // MAX_TARGET_LEN-byte targets plus a one-byte standing tag.
+        // each entry is a ≤ MAX_TARGET_LEN-byte target plus a one-byte
+        // standing tag.
         let bytes = borsh::to_vec(table).expect("a policy table is serializable");
         self.staged.stage(POLICY_KEY.to_vec(), bytes);
     }
@@ -133,12 +130,6 @@ impl Acl {
             // clearing an absent entry is a documented no-op.
             (Err(_), None) => return Ok(()),
             (Err(i), Some(s)) => {
-                if table.len() >= MAX_POLICY_ENTRIES {
-                    return Err(Error::module(
-                        "policy_cap",
-                        format!("acl policy cap reached ({MAX_POLICY_ENTRIES})"),
-                    ));
-                }
                 table.insert(i, (target, s));
             }
         }
@@ -461,20 +452,6 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, Error::Module { ref reason, .. } if reason == "bad_acl_target"),
-            "got {err:?}"
-        );
-
-        for n in 0..MAX_POLICY_ENTRIES {
-            run(
-                &mut a,
-                &mut ctx,
-                &set(&format!("m{n}"), Some(Standing::Open)),
-            )
-            .unwrap();
-        }
-        let err = run(&mut a, &mut ctx, &set("one-more", Some(Standing::Open))).unwrap_err();
-        assert!(
-            matches!(err, Error::Module { ref reason, .. } if reason == "policy_cap"),
             "got {err:?}"
         );
     }

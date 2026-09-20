@@ -22,6 +22,7 @@ mod harness;
 use commonware_cryptography::Signer as _;
 use harness::{Sim, create_channel, post_message};
 use serde_json::{Value, json};
+use simnode::module_contracts::runs;
 
 /// the node we make the run's execution lease-holder (its Accept'd assignee).
 const NODE: &str = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn";

@@ -182,14 +182,9 @@ async fn joiner_syncs_a_snapshot_over_the_data_plane() {
 
         // the load-bearing assertion: a multi-chunk snapshot round-trips
         // byte-for-byte over the sim stream transport.
-        let synced = fetch_snapshot(
-            &client,
-            manifest.boundary_id(),
-            "bigsnap",
-            statesync::MAX_SNAPSHOT_BYTES,
-        )
-        .await
-        .expect("snapshot fetch");
+        let synced = fetch_snapshot(&client, manifest.boundary_id(), "bigsnap")
+            .await
+            .expect("snapshot fetch");
         assert_eq!(
             synced, expected_snapshot,
             "snapshot bytes survive chunking across the data-plane stream"
@@ -197,13 +192,7 @@ async fn joiner_syncs_a_snapshot_over_the_data_plane() {
 
         // the error lane: a chunk request for a module absent from the captured
         // boundary comes back as a server error, not a hang or a silent empty.
-        let miss = fetch_snapshot(
-            &client,
-            manifest.boundary_id(),
-            "ghost",
-            statesync::MAX_SNAPSHOT_BYTES,
-        )
-        .await;
+        let miss = fetch_snapshot(&client, manifest.boundary_id(), "ghost").await;
         assert!(
             matches!(
                 miss,

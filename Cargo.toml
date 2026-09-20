@@ -23,7 +23,8 @@
 #                      netstack-scenarios [the frozen scenario suite and
 #                      golden traces every backend is held to],
 #                      netstack-wasm [the wasmtime embedding of that
-#                      world], reachability [the host executor + rendezvous
+#                      world], lane-wasm [the ducktape:lane realtime guest
+#                      envelope], reachability [the host executor + rendezvous
 #                      runtime], data-plane, overlay-net) — owns no
 #                      consensus module
 #   crates/modules/   — CONSENSUS MODULES AND NOTHING ELSE. every crate under
@@ -96,6 +97,7 @@ members = [
     "crates/networking/netstack-machine",
     "crates/networking/netstack-scenarios",
     "crates/networking/netstack-wasm",
+    "crates/networking/lane-wasm",
     "crates/networking/reachability",
     "crates/networking/data-plane",
     "crates/networking/overlay-net",
@@ -465,6 +467,7 @@ nat-traversal = { path = "crates/networking/nat-traversal", default-features = f
 netstack-machine = { path = "crates/networking/netstack-machine" }
 netstack-scenarios = { path = "crates/networking/netstack-scenarios" }
 netstack-wasm = { path = "crates/networking/netstack-wasm" }
+lane-wasm = { path = "crates/networking/lane-wasm" }
 reachability = { path = "crates/networking/reachability" }
 data-plane = { path = "crates/networking/data-plane" }
 overlay-net = { path = "crates/networking/overlay-net" }

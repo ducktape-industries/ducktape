@@ -109,13 +109,6 @@ pub const DATA_HEADERS: PopHeaders = PopHeaders {
 /// window for both namespaces: two would only ever drift apart.
 pub const FRESHNESS_SECS: u64 = 30;
 
-/// axum's own default body cap, which is what every gated route that sets no
-/// `DefaultBodyLimit` of its own already enforces — the json lanes
-/// (`/v1/submit`, `/v1/invite`, the workspace RPC) and the
-/// filter string. Spelled here because the middleware runs OUTSIDE the route's
-/// layers and so cannot read the limit they install.
-const DEFAULT_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PopError {
     /// a required header is missing or malformed.
@@ -457,42 +450,6 @@ impl Lane {
             Lane::Open => None,
         }
     }
-
-    /// the largest body this gate will read in order to hash it.
-    ///
-    /// Buffering precedes signature verification, so each lane spends only
-    /// the body budget of its underlying endpoint. A body this gate would
-    /// have to hold is therefore never the same question as how much the
-    /// ROUTE accepts: the blob route takes an unbounded stream, and the
-    /// operator credential — the one a push arrives with — skips this gate
-    /// entirely and streams to the handler.
-    fn max_body(self) -> usize {
-        match self {
-            // the blob lane never asks: [`signed_write_guard`] hands its proof
-            // to the handler and returns before any buffering, because the
-            // body is an unbounded stream the handler hashes to disk. A number
-            // here would be a cap nothing applies.
-            Lane::Blob => {
-                unreachable!("the blob lane defers its proof instead of buffering a body")
-            }
-            Lane::RawSubmit => node::MAX_PAYLOAD_BYTES,
-            Lane::GatewayOperator => {
-                crate::gateway_http::JSON_LANE_REQUEST_BYTES * 2 + gateway::MAX_PROXY_HEAD_BYTES
-            }
-            // json bodies and the log-filter string. `Open` and `ServiceHello`
-            // never reach here (the guard returns before asking), and take the
-            // small cap so a table that ever disagreed fails closed rather than
-            // wide.
-            Lane::Workspace
-            | Lane::Submit
-            | Lane::NodeLevel
-            | Lane::HuddleProof
-            | Lane::ServiceHello
-            | Lane::Open => DEFAULT_JSON_BODY_BYTES,
-            Lane::RunControl => 64 * 1024,
-            Lane::RunRecords => 64 * 1024,
-        }
-    }
 }
 
 /// what this request must prove, or `None` if it is a read. the guard itself
@@ -545,8 +502,8 @@ pub enum WriteRefusal {
     /// no service-link token, or not this boot's, on a local service daemon's
     /// route ([`Authority::ServiceLink`]).
     ServiceLinkMissing,
-    /// the body is larger than any gated route accepts (or its stream broke).
-    BodyOverCap,
+    /// the body's stream broke before it ended, so there is nothing to hash.
+    BodyUnreadable,
     /// this node carries no consensus key to salt the signature with — an
     /// embedded daemon binding the empty salt would verify a signature minted
     /// for ANY such daemon, so it refuses instead of falling back to a
@@ -566,14 +523,14 @@ impl WriteRefusal {
             Self::NotMember => "key_without_account",
             Self::MembershipUnreadable => "membership_unreadable",
             Self::ServiceLinkMissing => "service_link_missing",
-            Self::BodyOverCap => "body_over_cap",
+            Self::BodyUnreadable => "body_unreadable",
             Self::NodeUnidentified => "node_unidentified",
         }
     }
 
     /// 401 for "you presented nothing usable"; 403 for a credential that IS
     /// usable and is not the one this route wants — retrying with a fresher
-    /// signature would not help, so it must not read as 401; 413 for a body
+    /// signature would not help, so it must not read as 401; 400 for a body
     /// this gate could not read to hash.
     pub fn status(self) -> StatusCode {
         match self {
@@ -583,7 +540,7 @@ impl WriteRefusal {
             | Self::SignatureInvalid
             | Self::ServiceLinkMissing => StatusCode::UNAUTHORIZED,
             Self::NotOperator | Self::NotMember => StatusCode::FORBIDDEN,
-            Self::BodyOverCap => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::BodyUnreadable => StatusCode::BAD_REQUEST,
             Self::MembershipUnreadable => StatusCode::SERVICE_UNAVAILABLE,
             // this node's own condition, not a defect in what the caller
             // presented — retrying with any signature cannot fix it.
@@ -618,7 +575,7 @@ impl WriteRefusal {
                  service-link token (x-ducktape-service-link), read from the file \
                  beside node.toml"
             }
-            Self::BodyOverCap => "the request body is larger than this node accepts",
+            Self::BodyUnreadable => "the request body ended before it was complete",
             Self::NodeUnidentified => {
                 "this node has no consensus key to bind the signature to, so it cannot \
                  verify any mutating request"
@@ -746,11 +703,9 @@ pub(crate) async fn signed_write_guard(
         .unwrap_or_else(|| path.clone());
     let headers = req.headers().clone();
     let (parts, body) = req.into_parts();
-    let body = match axum::body::to_bytes(body, lane.max_body()).await {
+    let body = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
-        // `to_bytes` collapses "over the cap" and "the stream broke" into one
-        // error, and the cap is the likelier of the two by far.
-        Err(_) => return refuse(&path, WriteRefusal::BodyOverCap),
+        Err(_) => return refuse(&path, WriteRefusal::BodyUnreadable),
     };
     let acting = match verify_signed_request(&handle, &method, &path_and_query, &headers, &body) {
         Ok(key) => key,
@@ -1201,34 +1156,6 @@ mod tests {
         assert!(upgrade_is_operator(&handle, &credential, path, true));
     }
 
-    /// the hashing cap is reached by an UNAUTHENTICATED caller, so no lane may
-    /// inherit a wider one than its own route accepts — a shared ceiling would
-    /// let anyone make the node hold that much for a small-bodied route.
-    ///
-    /// The blob lane is absent on purpose: it never buffers, so it has no cap
-    /// to compare (asking for one panics, which is the point).
-    #[test]
-    fn no_lane_buffers_more_than_its_own_route_accepts() {
-        let cap = |path: &str| lane_of(path).max_body();
-        assert_eq!(cap("/v1/submit"), DEFAULT_JSON_BODY_BYTES);
-        assert_eq!(cap("/v1/submit/raw/new-product"), node::MAX_PAYLOAD_BYTES);
-        assert_eq!(cap("/v1/fs/workspaces"), DEFAULT_JSON_BODY_BYTES);
-        // the gateway-operator lane is the widest that still buffers, and it
-        // is wide because its own route is: two json bodies plus a proxy head.
-        // Nothing may quietly climb past it.
-        let widest = cap("/v1/gateway/operator");
-        for path in [
-            "/v1/submit",
-            "/v1/submit/raw/new-product",
-            "/v1/fs/workspaces",
-        ] {
-            assert!(
-                cap(path) <= widest,
-                "{path} buffers more than the gateway lane"
-            );
-        }
-    }
-
     /// the blob lane costs nothing to refuse: an upload with no proof on it is
     /// turned away by the gate, so the handler never opens an ingest and no
     /// unauthenticated byte reaches this node's disk.
@@ -1306,7 +1233,7 @@ mod tests {
             WriteRefusal::SignatureMalformed,
             WriteRefusal::SignatureInvalid,
             WriteRefusal::NotOperator,
-            WriteRefusal::BodyOverCap,
+            WriteRefusal::BodyUnreadable,
             WriteRefusal::NodeUnidentified,
         ];
         let mut reasons: Vec<&str> = all.iter().map(|r| r.reason()).collect();
