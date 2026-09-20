@@ -50,6 +50,7 @@ pub(crate) async fn run(
     index: &indexer::IndexStore,
     genesis: &crate::config::GenesisModules,
     presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
+    call_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
 ) {
     metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Syncing);
     tracing::info!(
@@ -111,6 +112,7 @@ pub(crate) async fn run(
     // the session lane to make /v1/presence/ws refuse instead of hang
     // (this branch never reaches main.rs's validator path).
     drop(presence_requests);
+    drop(call_requests);
     network.start();
 
     if sync_sources.is_empty() {

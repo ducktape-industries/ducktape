@@ -90,6 +90,8 @@ mod lane_table;
 mod main_tests;
 mod mesh_book;
 mod mesh_lanes;
+mod media_guest;
+mod media_plane;
 mod mesh_window;
 mod module_cli;
 mod netstack_governance;
@@ -615,6 +617,7 @@ fn run_node(
         stream_hub,
         index,
         presence_requests,
+        call_requests,
         code_stage_requests,
         blobs,
         services,
@@ -858,6 +861,7 @@ fn run_node(
                 &index,
                 &genesis,
                 presence_requests,
+                call_requests,
             )
             .await;
             return;
@@ -953,6 +957,7 @@ fn run_node(
                 metrics.clone(),
                 status.clone(),
                 presence_requests,
+                call_requests,
                 blobs.clone(),
                 overlay_slot.clone(),
                 bulk_pacer.clone(),
@@ -1055,6 +1060,7 @@ fn run_node(
             stream_hub,
             index,
             presence_requests,
+            call_requests,
             code_stage_requests,
             blobs,
             overlay_slot,

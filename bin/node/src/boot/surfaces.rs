@@ -11,6 +11,7 @@ pub(crate) struct Surfaces {
     pub(crate) stream_hub: noded::StreamHub,
     pub(crate) index: std::sync::Arc<indexer::IndexStore>,
     pub(crate) presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
+    pub(crate) call_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
     pub(crate) code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     pub(crate) blobs: noded::blobs::BlobHandle,
     /// the volatile service-signaling catalog shared with the http surface —
@@ -210,6 +211,9 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // sync-only or overlay-less path drops it so the routes refuse promptly.
     let (presence_lane, presence_requests) =
         tokio::sync::mpsc::channel::<noded::PresenceSessionRequest>(8);
+    // the media executor's session lane: /v1/call/ws asks for sessions here.
+    // same lifecycle as presence.
+    let (call_lane, call_requests) = tokio::sync::mpsc::channel::<noded::CallSessionRequest>(8);
     // the module-code stage lane: POST /v1/admin/module-code/stage fans an
     // artifact out through the node's code plane. same shape as the realtime
     // lane — created up front, drained only where the validator spawns the
@@ -226,6 +230,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         .with_forge_repo(storage.join("forge-repo"))
         .with_index_store(index.clone())
         .with_presence(presence_lane)
+        .with_call(call_lane)
         .with_code_stage(code_stage_lane)
         .with_node_signer(signer)
         // the duckfs workspace RPC's managed-checkout root (disk state, separate
@@ -368,6 +373,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         stream_hub,
         index,
         presence_requests,
+        call_requests,
         code_stage_requests,
         blobs,
         services,

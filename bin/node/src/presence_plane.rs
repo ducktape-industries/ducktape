@@ -66,7 +66,7 @@ pub async fn bind_presence_plane(
 /// the reachability plane has to bring the `/128` up. The per-lane
 /// [`OverlayBook`] stamps the resolved lane's ports on egress so datagrams
 /// land on the peer's matching socket.
-async fn bind_service<P: Plane>(
+pub(crate) async fn bind_service<P: Plane>(
     factory: &Arc<dyn SocketFactory>,
     peers: &Arc<OverlayPeers>,
     me: [u8; 32],

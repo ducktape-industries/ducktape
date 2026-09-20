@@ -59,11 +59,14 @@ mod workspaces;
 // the D7 root). public so BOTH node binaries can build one and wire it into
 // their DispatchPool constructor.
 pub mod agent_provision;
-// Pages presence session/control types.
+// realtime websocket legs: the huddle call socket and Pages presence, with
+// the session/control types each shares with its node-side runtime.
 mod call;
 pub use call::{
-    PageCursor, PresenceClientControl, PresenceControlIn, PresenceControlOut, PresenceLane,
-    PresenceParams, PresenceServerControl, PresenceSession, PresenceSessionRequest,
+    CallClientControl, CallClientIn, CallFrame, CallLane, CallParams, CallServerControl,
+    CallServerOut, CallSession, CallSessionRequest, PageCursor, PresenceClientControl,
+    PresenceControlIn, PresenceControlOut, PresenceLane, PresenceParams, PresenceServerControl,
+    PresenceSession, PresenceSessionRequest,
 };
 // the gateway lane: signed-route proxying + the isolated browser-gateway
 // origin (`gateway_http` because the `gateway` crate is a dependency).
@@ -144,7 +147,7 @@ use sdk::StateRoot;
 use serde::{Deserialize, Serialize};
 use workspace_config::{DEFAULT_INVITE_TTL_DAYS, INVITE_TTL_DAYS};
 
-use crate::call::presence_ws;
+use crate::call::{call_ws, presence_ws};
 use crate::gateway_http::{gateway_browser_base, gateway_proxy};
 use crate::index::{blocks, index_ops, index_scan, index_status, index_view};
 use crate::metrics::metrics;
@@ -832,6 +835,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/log-filter", post(log_filter))
         .route("/v1/huddle/node-proof", post(huddle_node_proof))
         .route("/v1/ws", get(ws))
+        .route("/v1/call/ws", get(call_ws))
         .route("/v1/presence/ws", get(presence_ws))
         .route("/v1/gateway/proxy", post(gateway_proxy))
         .route(

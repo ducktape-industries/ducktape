@@ -61,6 +61,7 @@ pub(super) struct ReplicaChannels {
     /// AUTHORITATIVE `Admitted` — the park loop reads it directly.
     pub(super) admitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(super) presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
+    pub(super) call_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
     /// the mesh window tracker, genesis already tracked — the park loop
     /// advances it as generations land, and promotion carries it on.
     pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
@@ -104,6 +105,7 @@ pub(super) async fn wire(
     // from).
     workspace: std::path::PathBuf,
     presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
+    call_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> ReplicaChannels {
     if manifest.is_none() && !recovery.journal_is_empty().await {
@@ -592,6 +594,7 @@ pub(super) async fn wire(
         relay_rx,
         admitted,
         presence_requests,
+        call_requests,
         mesh_window,
         mesh_book,
     }

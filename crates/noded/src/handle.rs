@@ -11,7 +11,7 @@ use axum::response::Response;
 use futures::SinkExt as _;
 use futures::channel::{mpsc, oneshot};
 
-use crate::call::PresenceLane;
+use crate::call::{CallLane, PresenceLane};
 use crate::gateway_http::{BrowserGateway, GatewayLane};
 use crate::gateway_ws_token::WsTokenStore;
 use crate::metrics::NodeMetrics;
@@ -448,6 +448,9 @@ pub struct NodeHandle {
     pub(crate) index: Option<Arc<indexer::IndexStore>>,
     /// Pages presence request lane; absent when no overlay runtime exists.
     pub(crate) presence: Option<PresenceLane>,
+    /// the huddle call lane into the media executor; absent when no overlay
+    /// runtime exists, and `/v1/call/ws` answers 503 there.
+    pub(crate) call: Option<CallLane>,
     /// Purpose-specific gateway request lane. No raw peer, filesystem, or
     /// arbitrary socket proxy is exposed through the client surface.
     pub(crate) gateway: Option<GatewayLane>,
@@ -509,6 +512,7 @@ impl NodeHandle {
             forge_repo: None,
             index: None,
             presence: None,
+            call: None,
             gateway: None,
             browser_gateway: None,
             duckfs_workspaces: None,
@@ -553,6 +557,12 @@ impl NodeHandle {
     /// Connect the Pages presence overlay request lane.
     pub fn with_presence(mut self, presence: PresenceLane) -> Self {
         self.presence = Some(presence);
+        self
+    }
+
+    /// Connect the huddle call lane into the node's media executor.
+    pub fn with_call(mut self, call: CallLane) -> Self {
+        self.call = Some(call);
         self
     }
 

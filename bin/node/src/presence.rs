@@ -55,25 +55,25 @@ type Roster = HashSet<[u8; 32]>;
 
 /// Peer-aware admission for the currently open Pages presence flow.
 #[derive(Default)]
-struct ActiveFlows(Mutex<HashMap<(Service, FlowId), Roster>>);
+pub(crate) struct ActiveFlows(Mutex<HashMap<(Service, FlowId), Roster>>);
 
 impl ActiveFlows {
     /// register a flow with an EMPTY roster: everything drops until the
     /// session's first `recipients` update lands (mirrors the send side,
     /// which also fans out to nobody until the roster arrives).
-    fn insert(&self, key: (Service, FlowId)) {
+    pub(crate) fn insert(&self, key: (Service, FlowId)) {
         self.0
             .lock()
             .expect("flows lock")
             .insert(key, HashSet::new());
     }
 
-    fn remove(&self, key: &(Service, FlowId)) {
+    pub(crate) fn remove(&self, key: &(Service, FlowId)) {
         self.0.lock().expect("flows lock").remove(key);
     }
 
     /// replace the roster on every one of a session's flows (control flows move together).
-    fn set_roster(&self, keys: &[(Service, FlowId)], roster: &[[u8; 32]]) {
+    pub(crate) fn set_roster(&self, keys: &[(Service, FlowId)], roster: &[[u8; 32]]) {
         let allowed: Roster = roster.iter().copied().collect();
         let mut flows = self.0.lock().expect("flows lock");
         for key in keys {

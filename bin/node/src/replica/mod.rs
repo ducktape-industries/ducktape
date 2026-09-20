@@ -108,6 +108,7 @@ pub(crate) async fn run(
     metrics: noded::NodeMetrics,
     status: noded::StatusCell,
     presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
+    call_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
     blobs: noded::blobs::BlobHandle,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
@@ -152,6 +153,7 @@ pub(crate) async fn run(
         invite_fronts,
         workspace.clone(),
         presence_requests,
+        call_requests,
         overlay_slot.clone(),
     )
     .await;

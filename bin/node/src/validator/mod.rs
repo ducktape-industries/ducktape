@@ -56,6 +56,7 @@ pub(crate) async fn run_validator(
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
+    call_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
     code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     blobs: noded::blobs::BlobHandle,
     overlay_slot: overlay_net::userspace::StackSlot,
@@ -152,6 +153,7 @@ pub(crate) async fn run_validator(
         invite_listen,
         coord_cap.clone(),
         presence_requests,
+        call_requests,
         overlay_slot.clone(),
         planes.clone(),
         crate::netstack_governance::startup_backend(

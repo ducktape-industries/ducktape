@@ -582,6 +582,7 @@ pub(super) async fn park(
         relay_rx,
         admitted,
         presence_requests,
+        call_requests,
         mut mesh_window,
         mesh_book,
     } = channels;
@@ -612,6 +613,15 @@ pub(super) async fn park(
             planes.clone(),
             label.clone(),
         );
+        crate::media_plane::spawn_hub(
+            call_requests,
+            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
+            std::sync::Arc::clone(&tracked),
+            me,
+            planes.clone(),
+            label.clone(),
+            crate::media_plane::guest_factory(),
+        );
         crate::agent_plane::spawn(
             label.clone(),
             crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
@@ -630,6 +640,7 @@ pub(super) async fn park(
             "page presence disabled"
         );
         drop(presence_requests);
+        drop(call_requests);
         None
     };
     // the announce pump re-reads the grant from this path per tick; the

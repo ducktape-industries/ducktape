@@ -176,8 +176,16 @@ pub mod chat {
         sdk::wire::decode(bytes)
     }
 
+    pub fn encode_query(query: &ChatQuery) -> Vec<u8> {
+        sdk::wire::encode(query)
+    }
+
     pub fn encode_reply(reply: &ChatReply) -> Vec<u8> {
         sdk::wire::encode(reply)
+    }
+
+    pub fn decode_reply(bytes: &[u8]) -> Result<ChatReply, String> {
+        sdk::wire::decode(bytes)
     }
 
     pub fn huddle_join_preimage(channel_id: &str, user: &[u8]) -> Vec<u8> {

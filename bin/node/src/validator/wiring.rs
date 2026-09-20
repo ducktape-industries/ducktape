@@ -667,6 +667,7 @@ pub(super) async fn wire(
     invite_listen: Option<std::net::SocketAddr>,
     coord_cap: Option<nat_traversal::CoordCap>,
     presence_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
+    call_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
     planes: data_plane::PlaneMonitor,
     netstack_backend: Result<reachability::NetstackBackend, String>,
@@ -780,8 +781,17 @@ pub(super) async fn wire(
                 crate::overlay_book::socket_factory(overlay_capable, &overlay_slot),
                 std::sync::Arc::clone(&peers),
                 me,
+                planes.clone(),
+                label.clone(),
+            );
+            crate::media_plane::spawn_hub(
+                call_requests,
+                crate::overlay_book::socket_factory(overlay_capable, &overlay_slot),
+                std::sync::Arc::clone(&peers),
+                me,
                 planes,
                 label.clone(),
+                crate::media_plane::guest_factory(),
             );
             Some(peers)
         } else {
@@ -794,6 +804,7 @@ pub(super) async fn wire(
                 "page presence disabled; set wireguard_listen to enable the overlay"
             );
             drop(presence_requests);
+            drop(call_requests);
             None
         }
     };
