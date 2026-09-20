@@ -48,7 +48,9 @@
     <key>RUST_LOG</key>
     <string>@RUST_LOG@</string>
     <!-- launchd hands a job a minimal PATH and no login shell, so the Homebrew
-         prefixes the sandbox's tool lookup uses are added explicitly. -->
+       prefixes the sandbox's tool lookup uses are added explicitly. The log
+       paths below default to ~/Library/Logs/ducktape; --home makes them live
+       under that isolated home instead. -->
     <key>PATH</key>
     <string>@PATH@</string>
   </dict>
