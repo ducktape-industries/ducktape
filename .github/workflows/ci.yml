@@ -1,6 +1,6 @@
 # The fast lane: what a push to `dev` proves in minutes, with nothing
-# that builds a wasm guest, bundles a view, or boots a topology. CI is not a
-# merge gate — a PR merges on review — so this runs after the merge, on `dev`,
+# that builds a wasm guest, bundles a view, or boots a topology. The `unit`
+# job is required for PRs into `dev`. It also runs after a push to `dev`
 # and on demand for a branch (`gh workflow run ci.yml --ref <branch>`).
 #
 # One job, one cache. `unit` restores one `target/` for everything the
@@ -14,6 +14,9 @@ name: ci
 
 on:
   push:
+    branches: [dev]
+  # `unit` is a required check on dev, so it must also run on the PR head.
+  pull_request:
     branches: [dev]
   workflow_dispatch:
 
