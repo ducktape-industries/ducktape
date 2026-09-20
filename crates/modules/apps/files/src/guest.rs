@@ -203,7 +203,7 @@ mod entry {
             let query = duckfs_core::decode_query(&req).map_err(|e| rejected("codec", e))?;
             let reply = Self::load()?
                 .query(query)
-                .map_err(|e| rejected("files_query", e))?;
+                .map_err(|e| rejected(e.class(), e.to_string()))?;
             Ok(duckfs_core::encode_reply(&reply))
         }
     }
@@ -547,12 +547,12 @@ mod tests {
 
     /// apply one op to a native `Fs` the way `module.rs` execute does (system
     /// origin, height/time 1) — the single-sourced verb, no guest seam.
-    fn apply_native(fs: &mut Fs<MemStore>, payload: &[u8]) -> Result<(), String> {
+    fn apply_native(fs: &mut Fs<MemStore>, payload: &[u8]) -> Result<(), Error> {
         match payload.first() {
-            Some(&duckfs_core::PUTBLOB_FRAME_TAG) => {
-                fs.putblob(&duckfs_core::Authority::System, 1, &payload[1..])
-            }
-            _ => match duckfs_core::decode_msg(payload)? {
+            Some(&duckfs_core::PUTBLOB_FRAME_TAG) => fs
+                .putblob(&duckfs_core::Authority::System, 1, &payload[1..])
+                .map_err(|e| Error::module("files_putblob", e)),
+            _ => match duckfs_core::decode_msg(payload).map_err(|e| Error::module("codec", e))? {
                 FilesMsg::Commit {
                     base_snapshot,
                     message,
@@ -566,7 +566,8 @@ mod tests {
                         message,
                         changes,
                     )
-                    .map(|_| ()),
+                    .map(|_| ())
+                    .map_err(|e| Error::module(e.class(), e.to_string())),
                 other => panic!("test only drives commits/putblob, got {other:?}"),
             },
         }
@@ -603,13 +604,20 @@ mod tests {
     fn commit_referencing_unstaged_chunk_is_rejected() {
         let phantom = to_hex(&object_id(Kind::Chunk, b"never staged"));
         let mut lane = GuestLane::new();
+        let payload = commit_chunks("/a", 12, &phantom);
         let err = lane
-            .dispatch(1, 1, &commit_chunks("/a", 12, &phantom))
+            .dispatch(1, 1, &payload)
             .expect_err("an unstaged chunk must reject");
         assert!(
             matches!(&err, Error::Module { reason, sentence }
-                if reason == "files_commit" && sentence.contains("chunk not available")),
+                if reason == "not_found" && sentence.contains("chunk") && sentence.contains("not available")),
             "expected the availability reject, got {err:?}"
+        );
+        let mut native = Fs::new(MemStore::new(), Refs::default());
+        let native_error = apply_native(&mut native, &payload).expect_err("native must reject");
+        assert_eq!(
+            native_error, err,
+            "native and guest keep class and sentence"
         );
     }
 
@@ -680,7 +688,7 @@ mod tests {
             .expect_err("a prior-block inline chunk is not referenceable by hash");
         assert!(
             matches!(&err, Error::Module { reason, sentence }
-                if reason == "files_commit" && sentence.contains("chunk not available")),
+                if reason == "not_found" && sentence.contains("chunk") && sentence.contains("not available")),
             "expected the availability reject across the block boundary, got {err:?}"
         );
     }

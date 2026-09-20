@@ -108,7 +108,10 @@ pub fn ed25519_authorizer(
 pub fn validate_network_name(name: &str) -> Result<(), duck_address::Refused> {
     let labelled = duck_address::ChainId {
         label: name.to_string(),
-        salt: Default::default(),
+        // b66f47f requires every parsed authority to carry a real-length salt;
+        // this synthetic salt validates only the label grammar. `mint_chain_id`
+        // supplies the actual network-specific salt later.
+        salt: vec![0; 4],
     };
     labelled
         .to_string()

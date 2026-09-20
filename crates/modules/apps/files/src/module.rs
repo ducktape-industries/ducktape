@@ -327,7 +327,7 @@ impl<S: ObjectStore, R: RefsStore> Module for Files<S, R> {
         let reply = self
             .fs
             .query(q)
-            .map_err(|e| Error::module("files_query", e))?;
+            .map_err(|e| Error::module(e.class(), e.to_string()))?;
         Ok(encode_reply(&reply))
     }
 
