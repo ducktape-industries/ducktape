@@ -168,6 +168,10 @@ pub mod chat {
         sdk::wire::encode(message)
     }
 
+    pub fn decode_msg(bytes: &[u8]) -> Result<ChatMsg, String> {
+        sdk::wire::decode(bytes)
+    }
+
     pub fn decode_query(bytes: &[u8]) -> Result<ChatQuery, String> {
         sdk::wire::decode(bytes)
     }

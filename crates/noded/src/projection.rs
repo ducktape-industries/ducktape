@@ -10,6 +10,7 @@
 //! shaping (those diverge by role — validator receipts, replica seal checks,
 //! per-lane stream cadence — and are not part of the projection).
 
+use crate::module_contracts::chat;
 use sdk::{Origin, StateRoot};
 
 use crate::blobs::BlobHandle;
