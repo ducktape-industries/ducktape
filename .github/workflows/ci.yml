@@ -1,8 +1,7 @@
 # The fast lane: what a push to `dev` proves in minutes, with nothing
-# that builds a wasm guest, bundles a view, or boots a topology. CI is not a
-# merge gate — a PR merges on review — so this runs after the merge, on `dev`,
-# on every PR into `dev` (the `unit` job is a required check there), and on
-# demand for a branch (`gh workflow run ci.yml --ref <branch>`).
+# that builds a wasm guest, bundles a view, or boots a topology. The `unit`
+# job is required for PRs into `dev`. It also runs after a push to `dev`
+# and on demand for a branch (`gh workflow run ci.yml --ref <branch>`).
 #
 # One job, one cache. `unit` restores one `target/` for everything the
 # workspace compiles: the artifact checks are text (`cmp` + `grep`), clippy
