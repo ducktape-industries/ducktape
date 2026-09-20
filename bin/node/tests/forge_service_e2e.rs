@@ -1094,11 +1094,12 @@ fn cargo_builds_a_duck_dependency_locked_and_flips_to_github_and_back() {
     assert_eq!(lock(), github_lock);
 }
 
-/// Scratch-only C6 proof: mirror every org repository's branch and tag refs
-/// through the real `duck://` helper, continue after a per-repo failure, then
-/// clone and build the SDK through Cargo's CLI transport. The source mirrors
-/// are prepared outside this test and named by `C6_SOURCE_ROOT`; no GitHub
-/// write or live network is involved.
+/// Scratch-only C6 proof: mirror every staged org repository's branch and tag
+/// refs through the real `duck://` helper, clone each back and check every
+/// branch SHA, continue after a per-repo failure, then clone and build the SDK
+/// through Cargo's CLI transport. The source mirrors (`<repo>.git`, bare) are
+/// prepared outside this test under `C6_SOURCE_ROOT`; `ducktape-sdk.git` must
+/// be among them. No GitHub write or live network is involved.
 #[test]
 #[ignore = "scratch-only whole-org mirror; requires C6_SOURCE_ROOT"]
 fn c6_mirrors_org_and_builds_a_duck_dependency() {
@@ -1125,15 +1126,19 @@ fn c6_mirrors_org_and_builds_a_duck_dependency() {
         bin: &bin,
         home: home.clone(),
     };
-    let repos = ["ducktape"];
+    // every `<repo>.git` bare mirror staged under the source root.
+    let mut repos: Vec<String> = std::fs::read_dir(&source_root)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            name.strip_suffix(".git").map(str::to_owned)
+        })
+        .collect();
+    repos.sort();
+    assert!(!repos.is_empty(), "no *.git mirrors under {}", source_root.display());
     let mut failed_repos = Vec::new();
-    for repo in repos {
+    for repo in repos.iter().map(String::as_str) {
         let source = source_root.join(format!("{repo}.git"));
-        assert!(
-            source.is_dir(),
-            "missing source mirror: {}",
-            source.display()
-        );
         let refs = git_capture(
             &source,
             &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
@@ -1142,6 +1147,7 @@ fn c6_mirrors_org_and_builds_a_duck_dependency() {
         let branch_names = String::from_utf8_lossy(&refs.stdout);
         let url = format!("duck://{}/forge/alice/{repo}", chain.authority());
         let mut repo_failed = false;
+        let mut pushed = Vec::new();
         for branch in ["main", "master", "dev"] {
             if !branch_names.lines().any(|name| name == branch) {
                 continue;
@@ -1157,6 +1163,28 @@ fn c6_mirrors_org_and_builds_a_duck_dependency() {
                 repo_failed = true;
                 eprintln!("[c6] {repo}/{branch} failed:\n{}", render(&push));
                 break;
+            }
+            pushed.push((branch, expected));
+        }
+        // byte-exact round trip: a clone over duck:// resolves every pushed
+        // branch to the source SHA (an object hash IS its bytes).
+        if !repo_failed {
+            let clones = scratch.path().join("mirror-clones");
+            std::fs::create_dir_all(&clones).unwrap();
+            let started = std::time::Instant::now();
+            git.ok(&clones, &["clone", "-q", "--bare", &url, repo]);
+            eprintln!("[c6] {repo} clone back took {:?}", started.elapsed());
+            for (branch, expected) in &pushed {
+                let back = git_capture(
+                    &clones.join(repo),
+                    &["rev-parse", &format!("refs/heads/{branch}")],
+                );
+                assert!(back.status.success(), "{}", render(&back));
+                assert_eq!(
+                    String::from_utf8_lossy(&back.stdout).trim(),
+                    expected,
+                    "{repo}/{branch} cloned back differently"
+                );
             }
         }
         if !repo_failed {
