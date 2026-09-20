@@ -186,7 +186,7 @@ async fn open_call(cluster: &Cluster, idx: usize, channel_id: &str) -> CallSocke
 }
 
 fn text(value: serde_json::Value) -> Message {
-    Message::Text(value.to_string().into())
+    Message::Text(value.to_string())
 }
 
 fn recipients_frame(peers: &[String]) -> Message {
@@ -249,7 +249,7 @@ async fn publish(mut out: CallSink, video: Vec<u8>) {
         let frame = tokio::select! {
             _ = audio.tick() => {
                 tick += 1;
-                Message::Binary(call_wire::encode_audio(&opus[tick % opus.len()]).into())
+                Message::Binary(call_wire::encode_audio(&opus[tick % opus.len()]))
             }
             _ = camera.tick() => {
                 ts += 100;
@@ -257,7 +257,7 @@ async fn publish(mut out: CallSink, video: Vec<u8>) {
                     keyframe: true,
                     ts_ms: ts,
                     data: video.clone(),
-                }).into())
+                }))
             }
             _ = beacon.tick() => beacon_frame(true),
         };
