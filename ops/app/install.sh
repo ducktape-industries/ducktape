@@ -20,31 +20,45 @@ app_rev=$(<"$pin_file")
 
 mkdir -p "$(dirname -- "$checkout")"
 
-select_pin() {
-	git -C "$checkout" fetch --no-tags origin "$app_rev" >/dev/null 2>&1 \
-		|| die "fetch_failed: could not fetch the pinned App commit"
-	git -C "$checkout" checkout --detach --quiet "$app_rev" \
+# The checkout is build output this script owns, under target/ — never a tree
+# anyone edits, and never the place to test a local App change (the App repo
+# has its own `make install` for that). So it is REPAIRED to the pin rather
+# than inspected and refused: a leftover cargo target from an older layout, a
+# clone interrupted mid-fetch, or a half-applied checkout would otherwise wedge
+# every later `make install` with nothing to do but delete the tree by hand.
+# `--force` discards edits to tracked files and `clean -ffd` removes untracked
+# ones: together exactly what the pin check below can see. Ignored paths are
+# deliberately left alone — the App's bundle step stages under its own
+# (ignored) target/, and clearing that would throw away work no check objects
+# to.
+pin_checkout() {
+	local current
+	current=$(git -C "$checkout" rev-parse --verify HEAD 2>/dev/null || true)
+	if [ "$current" != "$app_rev" ]; then
+		git -C "$checkout" fetch --no-tags origin "$app_rev" >/dev/null 2>&1 \
+			|| die "fetch_failed: could not fetch the pinned App commit"
+	fi
+	git -C "$checkout" checkout --detach --force --quiet "$app_rev" \
 		|| die "checkout_failed: could not select the pinned App commit"
+	git -C "$checkout" clean -ffdq \
+		|| die "clean_failed: could not clear leftovers from $checkout"
 }
 
 if [ -e "$checkout" ]; then
+	# A non-git path here is the one thing repair cannot cover: deleting a
+	# directory this script never created is not its call.
 	[ -d "$checkout/.git" ] || die "checkout_not_git: refusing to replace $checkout"
-	dirty=$(git -C "$checkout" status --porcelain --untracked-files=all 2>/dev/null) \
-		|| die "checkout_invalid: could not inspect the App checkout"
-	[ -z "$dirty" ] || die "checkout_dirty: refusing to change $checkout"
-	current=$(git -C "$checkout" rev-parse --verify HEAD 2>/dev/null || true)
-	[ "$current" = "$app_rev" ] || select_pin
 else
 	git clone --no-checkout "$app_repo" "$checkout" >/dev/null 2>&1 \
 		|| die "fetch_failed: could not clone the pinned App repository"
-	select_pin
 fi
+pin_checkout
 
 actual=$(git -C "$checkout" rev-parse --verify HEAD 2>/dev/null || true)
 [ "$actual" = "$app_rev" ] || die "pin_mismatch: App checkout is not $app_rev"
 dirty=$(git -C "$checkout" status --porcelain --untracked-files=all 2>/dev/null) \
 	|| die "checkout_invalid: could not inspect the App checkout"
-[ -z "$dirty" ] || die "checkout_dirty: App checkout is not clean after pinning"
+[ -z "$dirty" ] || die "repair_failed: App checkout is not clean after pinning"
 [ -f "$checkout/Makefile" ] || die "missing_makefile: pinned App does not provide Makefile"
 
 if ! "$app_make" -C "$checkout" --no-print-directory -n install >/dev/null 2>&1; then
