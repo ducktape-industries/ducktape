@@ -8,7 +8,7 @@
 _ducktape() {
     local families=(node user account wallet gateway fs service agent module collab mcp release forge help --help -h --version -V)
 
-    local node_verbs=(run key init invite admit join list status qualify peers resident member work sandbox log-filter netstack help)
+    local node_verbs=(run key init invite admit join list status stop leave qualify peers resident member work sandbox log-filter netstack help)
     local node_resident=(accept remove)
     local node_member=(promote remove leave status)
     local node_work=(list admit revoke)
