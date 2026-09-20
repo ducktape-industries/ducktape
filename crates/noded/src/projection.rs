@@ -357,7 +357,7 @@ pub fn apply_block_to_index(
             event = "provider_result_tail",
             phase = "index_published",
             height,
-            "derived index published the committed block"
+            "derived index accepted the committed block"
         ),
         Ok(()) => {}
         Err(err) => {
