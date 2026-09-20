@@ -490,7 +490,7 @@ impl DispatchPool {
                                         Ok(mut prepared) => {
                                             prepared.ctx.run_key = Some(run_key_for(&job.saga_id));
                                             prepared.ctx.executing_node = Some(executing_node);
-                                            prepared.ctx.limits = job.demands.clone();
+                                            prepared.ctx.limits = job.limits.clone();
                                             prepared.ctx.cancellation = Some(cancellation.clone());
                                             // resolve a named credential into
                                             // ctx.airlock BEFORE the provider
@@ -743,7 +743,9 @@ async fn execute(
                 let native_terminal = ctx.native_conversation.is_some() && output.text.is_empty();
                 let invalid_terminal = match output.disposition {
                     provider_host::OutputDisposition::Answer => false,
-                    provider_host::OutputDisposition::InputHandled => !native_terminal || output.usage.is_some(),
+                    provider_host::OutputDisposition::InputHandled => {
+                        !native_terminal || output.usage.is_some()
+                    }
                     provider_host::OutputDisposition::Cancelled => !native_terminal,
                 };
                 if invalid_terminal {
@@ -1616,6 +1618,29 @@ format = "text"
         assert!(
             pool.ledger.fits(&capacity),
             "settlement releases reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn demandless_vm_uses_small_limits_while_admission_accounts_full_capacity() {
+        let (providers, probes) = slow_providers(Duration::from_millis(25), false);
+        let capacity = BTreeMap::from([("cores".to_string(), 24), ("mem_gb".to_string(), 94)]);
+        let (pool, mut rx) = pool_with_capacity(providers, 1, capacity.clone());
+
+        pool.run(&effect_for("sized", 0, Some(b"me")))
+            .await
+            .expect("demandless work is admitted");
+        let (_, _, outcome) = next_result(&mut rx).await;
+        outcome.expect("provider run succeeds");
+
+        let (_, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            ctx.limits,
+            BTreeMap::from([("cores".to_string(), 4), ("mem_gb".to_string(), 8)])
+        );
+        assert!(
+            pool.ledger.fits(&capacity),
+            "the full accounted reservation is released after settlement"
         );
     }
 
@@ -2922,7 +2947,10 @@ format = "text"
             "session_path":"session.jsonl", "packages":[], "events":[],
         });
         let effect = effect_with_payload(
-            "native-1", 0, Some(b"me"), &serde_json::to_vec(&envelope).unwrap(),
+            "native-1",
+            0,
+            Some(b"me"),
+            &serde_json::to_vec(&envelope).unwrap(),
         );
         pool.run(&effect).await.unwrap();
         let (_, _, outcome) = next_result(&mut rx).await;
@@ -3715,12 +3743,14 @@ format = "text"
         assert_eq!(parsed.ducktape_runner_result, 1);
         assert_eq!(parsed.response_text, "the answer");
         assert!(!parsed.native_input_handled);
-        let handled = crate::provision::assemble_handled_input_result(&receipt, Sink::Chain, Status::Ok);
+        let handled =
+            crate::provision::assemble_handled_input_result(&receipt, Sink::Chain, Status::Ok);
         let handled: RunsRunnerResult = serde_json::from_slice(&handled).unwrap();
         assert!(handled.native_input_handled);
         assert!(handled.response_text.is_empty());
         assert!(!handled.native_cancelled);
-        let cancelled = crate::provision::assemble_cancelled_result(&receipt, Sink::Chain, Status::Ok);
+        let cancelled =
+            crate::provision::assemble_cancelled_result(&receipt, Sink::Chain, Status::Ok);
         let cancelled: RunsRunnerResult = serde_json::from_slice(&cancelled).unwrap();
         assert!(cancelled.native_cancelled);
         assert!(!cancelled.native_input_handled);

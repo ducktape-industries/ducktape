@@ -69,6 +69,11 @@ pub(crate) struct ExecJob {
     /// through so the pool can reserve this run's share of the host-local
     /// [`ResourceLedger`] before it starts executing.
     pub demands: BTreeMap<String, u64>,
+    /// VM machine limits derived from the original explicit demands. These
+    /// stay separate from [`Self::demands`]: omitted dimensions reserve the
+    /// full announced capacity for admission, while the provider receives a
+    /// bounded default size for the VM it boots.
+    pub limits: BTreeMap<String, u64>,
     pub admission: AdmissionPolicy,
     /// the PENDING reservation this node's own Accept already took for this
     /// exact attempt, if any — converted into the running reservation on
@@ -139,9 +144,11 @@ pub(crate) fn gate(
         Ok(work) => work,
         Err(_) => return Gated::NotMine,
     };
-    // A missing sandbox dimension is unrestricted, not free. Normalize once
-    // so announcement admission, own-lease admission, reservation, and the
-    // backend's hard flags all consume the exact same upper-bound map.
+    // A missing sandbox dimension is unrestricted, not free for admission.
+    // Keep provider sizing separate: reservation uses the full announced
+    // capacity, while the VM receives a bounded default from the explicit
+    // demands that arrived on the wire.
+    let limits = ledger.execution_limits(&work.demands);
     work.demands = ledger.accounted_demands(&work.demands);
     match &request.assignee {
         // the lease gate, host side: someone else's assignment is a
@@ -155,7 +162,7 @@ pub(crate) fn gate(
             ledger.release_pending(&pending_key(&request));
             Gated::Skip("foreign_lease")
         }
-        Some(_) => gate_own_lease(providers, ledger, &request, work),
+        Some(_) => gate_own_lease(providers, ledger, &request, work, limits),
         // an UNASSIGNED request is an announcement, not a work order:
         // running it would be one execution per capable node. claim it
         // with Accept when this host can actually run the capability AND
@@ -202,6 +209,7 @@ fn gate_own_lease(
     ledger: &ResourceLedger,
     request: &WorkerRequest,
     work: WorkSpec,
+    limits: BTreeMap<String, u64>,
 ) -> Gated {
     // Convert this node's own pending Accept claim (if any) here: every path
     // below either moves `claimed` into the executed job, or returns without
@@ -243,6 +251,7 @@ fn gate_own_lease(
         capability: work.capability,
         input,
         demands: work.demands,
+        limits,
         admission: work.admission,
         claimed,
     })
@@ -639,7 +648,7 @@ format = "text"
     #[test]
     fn omitted_sandbox_dimensions_become_full_capacity_demands() {
         let providers = servable_providers();
-        let capacity = demands(&[("cores", 8), ("mem_gb", 16)]);
+        let capacity = demands(&[("cores", 24), ("mem_gb", 94)]);
         let ledger = ResourceLedger::new(capacity.clone());
         let Gated::Execute(job) = gate(
             &providers,
@@ -650,6 +659,7 @@ format = "text"
             panic!("a demandless sandbox run should execute with full accounting")
         };
         assert_eq!(job.demands, capacity);
+        assert_eq!(job.limits, demands(&[("cores", 4), ("mem_gb", 8)]));
 
         let partial = work_spec_with_demands(demands(&[("cores", 2)]));
         let Gated::Execute(job) = gate(
@@ -660,7 +670,37 @@ format = "text"
         ) else {
             panic!("a partial sandbox run should fill its omitted dimensions")
         };
-        assert_eq!(job.demands, demands(&[("cores", 2), ("mem_gb", 16)]));
+        assert_eq!(job.demands, demands(&[("cores", 2), ("mem_gb", 94)]));
+        assert_eq!(job.limits, demands(&[("cores", 2), ("mem_gb", 8)]));
+    }
+
+    #[test]
+    fn explicit_demands_size_small_vms_and_small_capacity_clamps_defaults() {
+        let providers = servable_providers();
+        let capacity = demands(&[("cores", 2), ("mem_gb", 4)]);
+        let ledger = ResourceLedger::new(capacity.clone());
+        let Gated::Execute(job) = gate(
+            &providers,
+            b"me",
+            &ledger,
+            &effect_for(work_spec(), Some(b"me")),
+        ) else {
+            panic!("a demandless sandbox run should execute")
+        };
+        assert_eq!(job.demands, capacity);
+        assert_eq!(job.limits, capacity);
+
+        let explicit = work_spec_with_demands(demands(&[("cores", 1), ("mem_gb", 2)]));
+        let Gated::Execute(job) = gate(
+            &providers,
+            b"me",
+            &ledger,
+            &effect_for(explicit, Some(b"me")),
+        ) else {
+            panic!("an admitted explicit demand should execute")
+        };
+        assert_eq!(job.demands, demands(&[("cores", 1), ("mem_gb", 2)]));
+        assert_eq!(job.limits, demands(&[("cores", 1), ("mem_gb", 2)]));
     }
 
     #[test]

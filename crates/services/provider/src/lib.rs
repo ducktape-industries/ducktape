@@ -472,11 +472,12 @@ pub struct RunContext {
     /// the run's to exec. It stays for an embedder that really does hand a run
     /// a host command.
     pub path_entries: Vec<PathBuf>,
-    /// the run's numeric resource demands (`ExecJob.demands`), keyed by
-    /// dimension (`cores`, `mem_gb`, ...). the pool fills this before
-    /// `provider.run`; `cores` and `mem_gb` become the VM's machine config and
-    /// are REQUIRED (a VM is built at a size), the rest are inert (scheduling
-    /// already matched them). Default empty.
+    /// the run's VM machine limits, keyed by dimension (`cores`, `mem_gb`, ...).
+    /// compute fills this from the original explicit demands before
+    /// `provider.run`; omitted VM dimensions get bounded defaults there, while
+    /// the ledger's full-capacity reservation stays in its own map. `cores`
+    /// and `mem_gb` are required when a microVM is built; the rest are inert
+    /// (scheduling already matched them). Default empty for direct callers.
     pub limits: BTreeMap<String, u64>,
     /// the run's assembled context document — the agent's curated skills, built
     /// into ONE markdown doc by the provisioner (the "soul"). ONE assembly, TWO
@@ -1881,12 +1882,9 @@ fn run_slot() -> String {
     slot.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// the run's vcpu count.
-///
-/// A VM has no "unlimited": every VM is given a size at configuration time, so
-/// a missing dimension is a config error rather than a value to guess from
-/// probed host totals. Under a container an absent key meant an unlimited run;
-/// that state is unrepresentable here and must not be silently invented.
+/// the run's vcpu count. Compute supplies a bounded default before this
+/// provider boundary; a direct provider caller that omits it still gets a
+/// descriptive refusal rather than an unbounded VM.
 fn vm_cores(limits: &BTreeMap<String, u64>) -> Result<u32, String> {
     let cores = limits.get("cores").copied().ok_or_else(|| {
         "a microVM run needs an explicit `cores` limit; a VM has no unlimited size".to_string()
@@ -1898,7 +1896,9 @@ fn vm_mem_mib(limits: &BTreeMap<String, u64>) -> Result<u64, String> {
     let gb = limits.get("mem_gb").copied().ok_or_else(|| {
         "a microVM run needs an explicit `mem_gb` limit; a VM has no unlimited size".to_string()
     })?;
-    Ok(gb.max(1) * 1024)
+    gb.max(1)
+        .checked_mul(1024)
+        .ok_or_else(|| format!("mem_gb {gb} does not fit a MiB value"))
 }
 
 /// Resolve every sandbox mount before handing it to a container/VM. Relative
@@ -3830,6 +3830,13 @@ mod tests {
     /// the images or `/dev/kvm` are absent.
     fn firecracker_backend() -> SandboxBackend {
         firecracker_backend_with(installed_executor_dir())
+    }
+
+    #[test]
+    fn vm_memory_limit_rejects_mib_overflow() {
+        let limits = BTreeMap::from([(String::from("mem_gb"), u64::MAX)]);
+        let error = vm_mem_mib(&limits).expect_err("a u64 GiB value cannot fit in MiB");
+        assert!(error.contains("does not fit a MiB value"), "{error}");
     }
 
     /// the executors directory a hardware test lends its guest:

@@ -55,6 +55,9 @@ pub struct ResourceLedger {
     beat: Mutex<u64>,
 }
 
+const DEFAULT_VM_CORES: u64 = 4;
+const DEFAULT_VM_MEM_GB: u64 = 8;
+
 impl ResourceLedger {
     pub fn new(capacity: BTreeMap<String, u64>) -> Self {
         Self {
@@ -83,6 +86,32 @@ impl ResourceLedger {
             accounted.entry(dimension.clone()).or_insert(*capacity);
         }
         accounted
+    }
+
+    /// Choose the VM's machine size from the original explicit demands. The
+    /// ledger deliberately accounts omitted dimensions at their full announced
+    /// capacity, but a demandless run still gets a small useful VM. Explicit
+    /// dimensions remain unchanged; defaults are clamped to the capacity so a
+    /// provider can never ask the hypervisor for more than this node announced.
+    pub(crate) fn execution_limits(
+        &self,
+        demands: &BTreeMap<String, u64>,
+    ) -> BTreeMap<String, u64> {
+        if self.capacity.is_empty() {
+            return demands.clone();
+        }
+        let mut limits = demands.clone();
+        if let Some(capacity) = self.capacity.get("cores") {
+            limits
+                .entry("cores".into())
+                .or_insert(DEFAULT_VM_CORES.min(*capacity));
+        }
+        if let Some(capacity) = self.capacity.get("mem_gb") {
+            limits
+                .entry("mem_gb".into())
+                .or_insert(DEFAULT_VM_MEM_GB.min(*capacity));
+        }
+        limits
     }
 
     /// Whether this node could ever satisfy the demands. Unlike [`Self::fits`],
@@ -284,6 +313,31 @@ mod tests {
         );
         let direct = ResourceLedger::new(BTreeMap::new());
         assert!(direct.accounted_demands(&res(&[])).is_empty());
+    }
+
+    #[test]
+    fn execution_limits_keep_explicit_demands_and_bound_defaults() {
+        let l = ResourceLedger::new(res(&[("cores", 24), ("mem_gb", 94)]));
+        assert_eq!(
+            l.execution_limits(&res(&[])),
+            res(&[("cores", 4), ("mem_gb", 8)])
+        );
+        assert_eq!(
+            l.execution_limits(&res(&[("cores", 2)])),
+            res(&[("cores", 2), ("mem_gb", 8)])
+        );
+        assert_eq!(
+            l.execution_limits(&res(&[("cores", 2), ("mem_gb", 3)])),
+            res(&[("cores", 2), ("mem_gb", 3)])
+        );
+
+        let small = ResourceLedger::new(res(&[("cores", 2), ("mem_gb", 4)]));
+        assert_eq!(
+            small.execution_limits(&res(&[])),
+            res(&[("cores", 2), ("mem_gb", 4)])
+        );
+        let direct = ResourceLedger::new(BTreeMap::new());
+        assert!(direct.execution_limits(&res(&[])).is_empty());
     }
 
     #[test]
