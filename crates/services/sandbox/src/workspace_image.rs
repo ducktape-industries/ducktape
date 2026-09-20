@@ -29,9 +29,11 @@ use crate::guest_paths;
 /// VM kill, so the floor is above that threshold rather than at it.
 pub const MIN_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
 
-/// the ceiling, refused before a VM boots. A run whose workspace does not fit
-/// cannot be salvaged by retrying, so it must fail at submit-adjacent time.
-pub const MAX_WORKSPACE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// the sparse capacity of a writable workspace image. Input size does not
+/// predict output size: a small source checkout can produce a much larger
+/// build. Only written blocks consume host disk; the guest filesystem is what
+/// a run writes against.
+pub const WORKSPACE_IMAGE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Spare room over the input tree for filesystem metadata.
 /// ext4's own metadata (inodes, bitmaps, the journal) does not fit
@@ -44,16 +46,6 @@ const IMAGE_METADATA_MARGIN_PERCENT: u64 = 20;
 /// image. A 20% margin over a ~100 MiB payload cannot hold both. Reserve
 /// 32 MiB until the proportional allowance is larger.
 const MIN_IMAGE_METADATA_BYTES: u64 = 32 * 1024 * 1024;
-
-/// A writable tree gets the existing byte limit as sparse capacity. Input size
-/// does not predict output size: a small source checkout can produce a much
-/// larger build. Only written blocks consume host disk; the guest filesystem
-/// enforces the limit when a run writes.
-pub fn sized_for(workdir: &Path) -> Result<u64, String> {
-    let measured = tree_bytes(workdir)?;
-    size_or_refuse("workspace", workdir, with_metadata(measured))?;
-    Ok(MAX_WORKSPACE_BYTES)
-}
 
 fn with_metadata(measured: u64) -> u64 {
     let margin = (measured / 100 * IMAGE_METADATA_MARGIN_PERCENT).max(MIN_IMAGE_METADATA_BYTES);
@@ -69,36 +61,7 @@ fn with_metadata(measured: u64) -> u64 {
 /// crossed the cap and the run was REFUSED for a size two thirds of which was
 /// zeroes nothing could ever write to.
 pub fn sized_for_read_only(dir: &Path) -> Result<u64, String> {
-    let measured = tree_bytes(dir)?;
-    size_or_refuse("read-only inputs", dir, with_metadata(measured))
-}
-
-/// the size decision alone, split out so the refusal is unit-testable without
-/// materialising gigabytes on disk.
-///
-/// `what` and `dir` are in the message because there are two images and one
-/// used to say "workspace" for both — sending a reader to inspect a 4 KiB
-/// workspace while the 3 GB asset tree that actually blew the cap went
-/// unnamed.
-pub fn size_or_refuse(what: &str, dir: &Path, size: u64) -> Result<u64, String> {
-    if size > MAX_WORKSPACE_BYTES {
-        // countable, because "this node refuses every run" and "this one tree
-        // is too big" look identical from the outside until you can count them.
-        tracing::warn!(
-            target: "ducktape::sandbox",
-            reason = "image_over_cap",
-            what,
-            size,
-            cap = MAX_WORKSPACE_BYTES,
-            "refusing to build an image over the cap"
-        );
-        return Err(format!(
-            "the {what} at {} need {size} bytes of image, over the \
-             {MAX_WORKSPACE_BYTES}-byte cap",
-            dir.display()
-        ));
-    }
-    Ok(size)
+    Ok(with_metadata(tree_bytes(dir)?))
 }
 
 fn tree_bytes(dir: &Path) -> Result<u64, String> {
@@ -425,11 +388,6 @@ fn stage_whole(source: &Path, staging: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// how deep a staged tree may nest before the rest of it is dropped. A skills
-/// tree is a handful of levels; the cap is what keeps a hostile one off the
-/// daemon's stack.
-const MAX_TREE_DEPTH: usize = 64;
-
 /// does `target`, read off the symlink at `entry`, resolve back inside `root`?
 ///
 /// The tree being staged is a consensus-published duckfs checkout, so its
@@ -480,7 +438,6 @@ struct StagedTree {
     /// walk that terminates by construction is cheaper than one that argues.
     seen: std::collections::HashSet<(u64, u64)>,
     escaping_links: u64,
-    too_deep: u64,
 }
 
 /// copy a directory tree, preserving mode bits.
@@ -495,9 +452,8 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
         root: from.to_path_buf(),
         seen: std::collections::HashSet::new(),
         escaping_links: 0,
-        too_deep: 0,
     };
-    copy_dir(&mut tree, from, to, 0)?;
+    copy_dir(&mut tree, from, to)?;
     if tree.escaping_links > 0 {
         tracing::warn!(
             target: "ducktape::sandbox",
@@ -507,24 +463,10 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
             "dropped symlinks whose target left the staged tree"
         );
     }
-    if tree.too_deep > 0 {
-        tracing::warn!(
-            target: "ducktape::sandbox",
-            reason = "asset_tree_too_deep",
-            tree = %tree.root.display(),
-            count = tree.too_deep,
-            depth = MAX_TREE_DEPTH,
-            "dropped subtrees below the depth cap"
-        );
-    }
     Ok(())
 }
 
-fn copy_dir(tree: &mut StagedTree, from: &Path, to: &Path, depth: usize) -> Result<(), String> {
-    if depth > MAX_TREE_DEPTH {
-        tree.too_deep += 1;
-        return Ok(());
-    }
+fn copy_dir(tree: &mut StagedTree, from: &Path, to: &Path) -> Result<(), String> {
     std::fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
     let entries = std::fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))?;
     for entry in entries {
@@ -553,7 +495,7 @@ fn copy_dir(tree: &mut StagedTree, from: &Path, to: &Path, depth: usize) -> Resu
             if already_walked {
                 continue;
             }
-            copy_dir(tree, &source, &target, depth + 1)?;
+            copy_dir(tree, &source, &target)?;
             continue;
         }
         // a fifo, socket or device node is not an input: opening one blocks the
@@ -665,7 +607,7 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
         let image = root.join("ws.img");
-        let size = sized_for(&src).expect("size");
+        let size = WORKSPACE_IMAGE_BYTES;
         build(&src, &image, size).expect("build");
 
         let out = root.join("out");
@@ -726,7 +668,7 @@ mod tests {
         std::fs::write(src.join("two words.txt"), b"z").expect("spaced");
 
         let image = root.join("ws.img");
-        build(&src, &image, sized_for(&src).expect("size")).expect("build");
+        build(&src, &image, WORKSPACE_IMAGE_BYTES).expect("build");
 
         let host_owner = std::fs::metadata(src.join("plain.txt")).expect("stat").uid();
         assert_ne!(
@@ -789,7 +731,7 @@ mod tests {
         std::fs::write(src.join("only.txt"), b"x").expect("only");
 
         let image = root.join("ws.img");
-        build(&src, &image, sized_for(&src).expect("size")).expect("build");
+        build(&src, &image, WORKSPACE_IMAGE_BYTES).expect("build");
         let out = root.join("out");
         read_back(&image, &out).expect("read back");
 
@@ -830,7 +772,7 @@ mod tests {
         std::fs::write(guest.join("a.txt"), b"keep").expect("a");
 
         let image = root.join("ws.img");
-        build(&guest, &image, sized_for(&guest).expect("size")).expect("build");
+        build(&guest, &image, WORKSPACE_IMAGE_BYTES).expect("build");
 
         read_back(&image, &dest).expect("read back");
 
@@ -847,34 +789,6 @@ mod tests {
         assert_eq!(std::fs::read(dest.join("a.txt")).expect("a back"), b"keep");
 
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A tree over the cap cannot be salvaged by retrying, so it is refused
-    /// before anything is materialised on disk — and the refusal NAMES which
-    /// of the run's two images it is about. There are two, they blow the cap
-    /// for entirely different reasons, and a message that said "workspace" for
-    /// both sent a reader to inspect a 4 KiB directory while the 3 GB asset
-    /// tree that actually refused went unnamed.
-    #[test]
-    fn an_oversized_tree_is_refused_before_any_image_exists_and_names_itself() {
-        let refused = size_or_refuse(
-            "read-only inputs",
-            Path::new("/run/assets"),
-            MAX_WORKSPACE_BYTES + 1,
-        )
-        .expect_err("must refuse");
-        assert!(refused.contains("over the"), "{refused}");
-        assert!(
-            refused.contains("read-only inputs"),
-            "names the tree: {refused}"
-        );
-        assert!(
-            refused.contains("/run/assets"),
-            "names the directory: {refused}"
-        );
-
-        size_or_refuse("workspace", Path::new("/run/ws"), MAX_WORKSPACE_BYTES)
-            .expect("the cap itself is allowed");
     }
 
     /// A read-only image gets a metadata margin, without writable capacity.
@@ -895,12 +809,8 @@ mod tests {
             .set_len(payload)
             .expect("set_len");
 
-        let writable = sized_for(&root).expect("writable size");
+        let writable = WORKSPACE_IMAGE_BYTES;
         let read_only = sized_for_read_only(&root).expect("read-only size");
-        assert_eq!(
-            writable, MAX_WORKSPACE_BYTES,
-            "writable has room for outputs"
-        );
         assert!(
             read_only < writable,
             "read-only {read_only} must be under writable {writable}"
@@ -979,8 +889,7 @@ mod tests {
         let src = root.join("src");
         std::fs::create_dir(&src).unwrap();
         let image = root.join("workspace.img");
-        assert_eq!(sized_for(&src).expect("size"), MAX_WORKSPACE_BYTES);
-        build(&src, &image, sized_for(&src).unwrap()).unwrap();
+        build(&src, &image, WORKSPACE_IMAGE_BYTES).unwrap();
         let meta = std::fs::metadata(&image).unwrap();
         assert!(
             meta.blocks() * 512 < meta.len() / 2,

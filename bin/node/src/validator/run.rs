@@ -109,8 +109,7 @@ struct GatePending {
 
 /// write a resolved gate outcome where the intro doorbell reads it — the
 /// shared map the joiner's next retransmit is answered from. `now` stamps
-/// the entry for [`crate::reachability_plane::sweep_gate_outcomes`] and the
-/// cap eviction in [`insert_gate_outcome`].
+/// the entry for [`crate::reachability_plane::sweep_gate_outcomes`].
 fn settle_gate(
     outcomes: &GateOutcomes,
     joiner: Vec<u8>,

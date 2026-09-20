@@ -1093,15 +1093,6 @@ fn load_unsigned_archive(bundle: &Path) -> Result<Vec<u8>, Box<dyn std::error::E
     } else {
         std::fs::read(bundle).map_err(|e| format!("read {}: {e}", bundle.display()))?
     };
-    let too_large = archive.len() > sign::MAX_BUNDLE_BYTES;
-    if too_large {
-        return Err(format!(
-            "bundle_too_large: the archive is {} bytes, the signing route takes at most {}",
-            archive.len(),
-            sign::MAX_BUNDLE_BYTES
-        )
-        .into());
-    }
     Ok(archive)
 }
 
@@ -1735,18 +1726,6 @@ mod tests {
         assert_eq!(
             open_signed_reply(&keys, b"c", &completed).unwrap(),
             b"archive"
-        );
-    }
-
-    /// The signing lane's two caps are one number: what the enclave reads
-    /// (`sign::MAX_BUNDLE_BYTES`) and what the `airlock-sign` route pins. The
-    /// route's own policy is the only ceiling there is — the gateway module
-    /// pins none, so a lane that buffers declares its own.
-    #[test]
-    fn the_signing_lane_caps_agree() {
-        assert_eq!(
-            sign::MAX_BUNDLE_BYTES as u64,
-            crate::airlock::AIRLOCK_SIGN_REQUEST_BYTES
         );
     }
 

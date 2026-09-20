@@ -52,9 +52,6 @@ pub const AUTH_PAGE: &str = "https://auth.ducktape.industries/";
 /// Nothing on chain ever verifies a reveal signature, so it authorizes nothing.
 pub const REVEAL_NS: &[u8] = b"ducktape:reveal-key:v1";
 
-/// the largest form body the listener reads — an assertion is a few KiB.
-const MAX_BODY_BYTES: usize = 256 * 1024;
-
 /// The discoverable passkey's chain and account hint, stored as `user.id`.
 /// An assertion returns this unsigned; a matching signature still proves access.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -414,9 +411,6 @@ async fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>
         if name.eq_ignore_ascii_case("content-length") {
             content_length = value.trim().parse().unwrap_or(0);
         }
-    }
-    if content_length > MAX_BODY_BYTES {
-        return Err(format!("auth callback body exceeds {MAX_BODY_BYTES} bytes"));
     }
     let mut body = vec![0u8; content_length];
     reader

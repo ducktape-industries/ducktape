@@ -54,7 +54,6 @@ use crate::node_link::NodeLink;
 /// the module that owns the session registry.
 const RUNS_MODULE: &str = "runs";
 const ACTION_HEADER: &str = "x-ducktape-run-action";
-const MAX_ACTION_REQUEST_BYTES: usize = crate::runs::MAX_ACTIONS_BYTES + crate::runs::MAX_DELEGATIONS_BYTES;
 
 pub(super) const ENV_ACTION_URL: &str = "DUCKTAPE_RUN_ACTION_URL";
 pub(super) const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
@@ -263,14 +262,9 @@ async fn start_action_server(
         native,
     });
     let app = Router::new()
-        .route(
-            "/v1/run-action",
-            post(run_action).layer(DefaultBodyLimit::max(MAX_ACTION_REQUEST_BYTES)),
-        )
-        .route(
-            "/v1/native-conversation",
-            post(native::route).layer(DefaultBodyLimit::max(native::MAX_REQUEST_BYTES)),
-        )
+        .route("/v1/run-action", post(run_action))
+        .route("/v1/native-conversation", post(native::route))
+        .layer(DefaultBodyLimit::disable())
         .with_state(state);
     let (shutdown, rx) = oneshot::channel();
     let task = tokio::spawn(async move {

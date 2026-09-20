@@ -21,11 +21,10 @@
 //!   target.
 //!
 //! Admission is default-deny per the plane's contract: members only, one
-//! live transfer per digest, [`MAX_INBOUND_PUSHES_PER_PEER`] concurrent
-//! pushes per peer, per-kind size caps, and a process-wide staging byte
-//! budget — a rogue member can waste bounded disk, never poison a blob. An
-//! admitted push that stops delivering bytes is reaped at
-//! [`RECEIVE_IDLE_TIMEOUT`], so silence costs a peer its seat.
+//! live transfer per digest, and only a digest the registry references — a
+//! rogue member can never poison a blob. An admitted push that stops
+//! delivering bytes is reaped at [`RECEIVE_IDLE_TIMEOUT`], so silence costs a
+//! peer its task.
 //! What a dropped transfer leaves behind is bounded too: an abandoned partial
 //! is resumable for [`blobstore::STAGING_RESUME_WINDOW`] and then swept.
 
@@ -33,7 +32,6 @@ use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use data_plane::{
@@ -42,22 +40,17 @@ use data_plane::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::constants::MAX_MODULE_CODE_BYTES;
 use crate::overlay_book::{BIND_RETRY, LaneSource, OverlayBook, OverlayPeers, Plane, StreamPlane};
 
 const INTENT_PUSH: u8 = 1;
 const INTENT_PULL: u8 = 2;
 
-/// the artifact kinds this plane admits, with their size caps. wire-stable
+/// the artifact kind this plane admits. wire-stable
 /// (the admin RPC names the same value as `noded::CODE_KIND_MODULE`).
 pub(crate) const KIND_MODULE_CODE: u8 = noded::CODE_KIND_MODULE;
 
 /// stream copy window: bounded buffers on both ends, whatever the blob size.
 const WINDOW: usize = 256 * 1024;
-
-/// total bytes of in-flight push staging this node accepts at once. bounds a
-/// rogue member's disk waste; completed/failed transfers return their budget.
-const STAGING_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 
 /// one fan-out send: generous, because a capsule may be large and the bulk
 /// pacer deliberately throttles below the link — a stalled stream fails on
@@ -79,13 +72,6 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 /// silent peer, never a slow one.
 const RECEIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// concurrent push streams this node keeps admitted for ONE peer. the data
-/// plane's `MAX_PENDING_INBOUND_PER_PEER` bounds streams that have not sent a
-/// hello and releases the slot the moment one lands; past the hello this is
-/// its twin — what bounds the tasks, sockets and staging files a single member
-/// can hold open at once.
-const MAX_INBOUND_PUSHES_PER_PEER: usize = 4;
-
 fn code_flow() -> FlowId {
     FlowId::derive(b"ducktape:module-code:v1")
 }
@@ -106,10 +92,6 @@ impl StreamPlane for CodePlane {
     }
 }
 
-fn kind_cap(kind: u8) -> Option<u64> {
-    (kind == KIND_MODULE_CODE).then_some(MAX_MODULE_CODE_BYTES)
-}
-
 /// the digests the modules registry currently NAMES: an activation's code hash
 /// or a pending `ScheduledSwap`'s hash, for any module. `receive_push` admits
 /// a digest only when this set names it — the count of published artifacts
@@ -126,11 +108,9 @@ fn kind_cap(kind: u8) -> Option<u64> {
 /// that same tick). the proposal half is what makes a brand-new artifact
 /// stageable at all (#1861): nothing in the registry can name its bytes until
 /// the ballot passes, yet the ballot is decided by the validators that must
-/// hold them. the bound stays finite — governance's own proposal caps
-/// (`MAX_PROPOSALS`, `MAX_OPEN_PROPOSALS_PER_SUBMITTER`) times
-/// [`MAX_MODULE_CODE_BYTES`] — and a proposal that closes without scheduling
-/// a swap (rejected, expired, superseded) drops its digest out of the set on
-/// the next tick, where the existing reclaim `forget`s the blob.
+/// hold them. a proposal that closes without scheduling a swap (rejected,
+/// expired, superseded) drops its digest out of the set on the next tick,
+/// where the existing reclaim `forget`s the blob.
 #[derive(Clone, Default)]
 pub(crate) struct CodeRegistry(Arc<RwLock<HashSet<[u8; 32]>>>);
 
@@ -268,44 +248,19 @@ async fn accept_loop<T: DataPlaneTransport>(
     blobs: blobstore::BlobHandle,
     registry: CodeRegistry,
 ) {
-    // one live transfer per digest (the staging slot is single-writer), plus
-    // the process-wide staging byte budget.
+    // one live transfer per digest: the staging slot is single-writer.
     let inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>> = Default::default();
-    let budget = Arc::new(AtomicU64::new(0));
-    // the staging byte budget is this plane's shared ceiling, so the seat
-    // ledger bounds only each peer's share.
-    let per_peer = PeerSeats::new(MAX_INBOUND_PUSHES_PER_PEER, usize::MAX);
-    static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
-    while let Some((peer, hello, stream)) = service.accept().await {
+    while let Some((_peer, hello, stream)) = service.accept().await {
         match hello.intent {
             INTENT_PUSH => {
                 let Some((kind, digest, len)) = decode_push_meta(&hello.meta) else {
                     continue;
                 };
-                // the peer's concurrency slot is taken HERE, before a task
-                // exists to hold: a member opening streams in a loop must not
-                // be able to spawn one apiece.
-                let Ok(seat) = per_peer.admit(peer) else {
-                    if let Some(attempts) = REFUSED.hit("peer_push_cap") {
-                        tracing::warn!(
-                            target: "ducktape::modules",
-                            peer = %crate::config::hex_bytes(&peer.0),
-                            attempts,
-                            reason = "peer_push_cap",
-                            "module-code push REFUSED"
-                        );
-                    }
-                    continue;
-                };
                 let blobs = blobs.clone();
                 let inflight = Arc::clone(&inflight);
-                let budget = Arc::clone(&budget);
                 let registry = registry.clone();
                 tokio::spawn(async move {
-                    let _seat = seat;
-                    let _ =
-                        receive_push(stream, kind, digest, len, blobs, inflight, budget, registry)
-                            .await;
+                    let _ = receive_push(stream, kind, digest, len, blobs, inflight, registry).await;
                 });
             }
             INTENT_PULL => {
@@ -322,74 +277,11 @@ async fn accept_loop<T: DataPlaneTransport>(
     }
 }
 
-/// how many seats each peer holds right now, under a per-peer cap and a cap
-/// on every peer together: the ledger a network-facing plane counts its
-/// per-peer work through, so one peer can never hold every seat.
-#[derive(Clone)]
-pub(crate) struct PeerSeats<P> {
-    live: Arc<std::sync::Mutex<std::collections::HashMap<P, usize>>>,
-    per_peer: usize,
-    total: usize,
-}
-
-/// one peer's seat, released by `Drop` when the work holding it ends however
-/// it ends.
-pub(crate) struct PeerSeat<P: Eq + std::hash::Hash> {
-    seats: PeerSeats<P>,
-    peer: P,
-}
-
-impl<P: Eq + std::hash::Hash + Clone> PeerSeats<P> {
-    pub(crate) fn new(per_peer: usize, total: usize) -> Self {
-        Self {
-            live: Default::default(),
-            per_peer,
-            total,
-        }
-    }
-
-    /// the seat, or why not: `peer_cap` when this peer already holds its
-    /// share, `total_cap` when every seat is taken.
-    pub(crate) fn admit(&self, peer: P) -> Result<PeerSeat<P>, &'static str> {
-        let mut live = self.live.lock().expect("peer seat lock");
-        let held = live.get(&peer).copied().unwrap_or(0);
-        if held >= self.per_peer {
-            return Err("peer_cap");
-        }
-        // bounded by `total` itself: every row holds at least one seat.
-        let taken: usize = live.values().sum();
-        if taken >= self.total {
-            return Err("total_cap");
-        }
-        live.insert(peer.clone(), held + 1);
-        Ok(PeerSeat {
-            seats: self.clone(),
-            peer,
-        })
-    }
-}
-
-impl<P: Eq + std::hash::Hash> Drop for PeerSeat<P> {
-    fn drop(&mut self) {
-        let mut live = self.seats.live.lock().expect("peer seat lock");
-        let Some(held) = live.get_mut(&self.peer) else {
-            return;
-        };
-        *held -= 1;
-        // an idle peer keeps no row: the map is bounded by live seats, not by
-        // how many peers have ever held one.
-        if *held == 0 {
-            live.remove(&self.peer);
-        }
-    }
-}
-
 /// the receive half of one push: admission-check, ack with the resume
 /// offset, stream the tail into a disk-staged slot, verify-then-publish,
 /// answer one result frame. a transport drop mid-stream KEEPS the staging —
 /// the custodian's retry resumes at the high-water, for as long as
 /// [`blobstore::STAGING_RESUME_WINDOW`]; past that the partial is reclaimed.
-#[allow(clippy::too_many_arguments)]
 async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     kind: u8,
@@ -397,7 +289,6 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     len: u64,
     blobs: blobstore::BlobHandle,
     inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
-    budget: Arc<AtomicU64>,
     registry: CodeRegistry,
 ) -> io::Result<()> {
     // every refusal below was a SILENT drop through this one closure. a member
@@ -415,29 +306,25 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
         stream.write_all(&[ACK_REFUSED]).await?;
         stream.write_all(&0u64.to_be_bytes()).await
     };
-    let Some(cap) = kind_cap(kind) else {
+    let known_kind = kind == KIND_MODULE_CODE;
+    if !known_kind {
         return refuse(stream, "unknown_kind").await;
-    };
-    if len > cap {
-        return refuse(stream, "over_kind_cap").await;
     }
     // the registry is the only thing that gets to name a digest worth
     // holding: without this, the plane admitted anything a member peer
-    // named, and the count of published artifacts was unbounded — only
-    // their CONCURRENCY was bounded ([`MAX_INBOUND_PUSHES_PER_PEER`],
-    // [`STAGING_BUDGET`]). a peer with mesh standing could stream distinct
-    // artifacts forever and every blob store on the mesh would grow without
-    // bound. checked before any staging: refusing here costs nothing but a
-    // lookup, where admitting first and reclaiming later would have already
-    // paid the disk.
+    // named, and a peer with mesh standing could stream distinct artifacts
+    // forever so every blob store on the mesh would grow without bound.
+    // checked before any staging: refusing here costs nothing but a lookup,
+    // where admitting first and reclaiming later would have already paid the
+    // disk.
     if !registry.is_referenced(&digest) {
         return refuse(stream, "code_push_unreferenced").await;
     }
     // ADMISSION FIRST, and only then the already-have check. the admission is a
     // GUARD, not a closure the exit paths must remember to call: the two ack
     // writes below use `?`, and a connection dropped in that window used to
-    // return with the digest still inflight and its length still charged —
-    // permanently, for the life of the process.
+    // return with the digest still inflight — permanently, for the life of
+    // the process.
     //
     // the order is load-bearing. the already-have probe used to run first, so
     // the per-digest dedupe that collapses N streams naming one digest never
@@ -445,7 +332,7 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     // concurrently. it is a stat now, but the dedupe still belongs in front of
     // it — the cheap check is the one that runs per admitted push, not per
     // stream a peer chooses to open.
-    let _admission = match PushSlot::acquire(&inflight, &budget, digest, len) {
+    let _admission = match PushSlot::acquire(&inflight, digest) {
         Ok(slot) => slot,
         Err(reason) => return refuse(stream, reason).await,
     };
@@ -511,40 +398,26 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     stream.write_all(&[result]).await
 }
 
-/// one push's admission: the digest's inflight slot and its charge against the
-/// process-wide staging budget. both are released by `Drop`, so every exit
-/// path — including an io error on a write with `?` — returns them.
+/// one push's admission: the digest's inflight slot, released by `Drop` so
+/// every exit path — including an io error on a write with `?` — returns it.
 struct PushSlot {
     inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
-    budget: Arc<AtomicU64>,
     digest: [u8; 32],
-    charged: u64,
 }
 
 impl PushSlot {
     /// `Err` carries the refusal reason for the ack frame.
     fn acquire(
         inflight: &Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
-        budget: &Arc<AtomicU64>,
         digest: [u8; 32],
-        len: u64,
     ) -> Result<Self, &'static str> {
         if !inflight.lock().expect("inflight lock").insert(digest) {
             return Err("already_inflight");
         }
-        budget.fetch_add(len, Ordering::Relaxed);
-        let slot = Self {
+        Ok(Self {
             inflight: Arc::clone(inflight),
-            budget: Arc::clone(budget),
             digest,
-            charged: len,
-        };
-        // over budget: dropping `slot` here is what returns both the inflight
-        // entry and the charge.
-        if budget.load(Ordering::Relaxed) > STAGING_BUDGET {
-            return Err("staging_budget_exhausted");
-        }
-        Ok(slot)
+        })
     }
 }
 
@@ -554,7 +427,6 @@ impl Drop for PushSlot {
             .lock()
             .expect("inflight lock")
             .remove(&self.digest);
-        self.budget.fetch_sub(self.charged, Ordering::Relaxed);
     }
 }
 
@@ -902,9 +774,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_ack_write_releases_the_slot_and_the_budget() {
+    async fn a_failed_ack_write_releases_the_slot() {
         let inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>> = Default::default();
-        let budget = Arc::new(AtomicU64::new(0));
         let digest = [9u8; 32];
         let registry = CodeRegistry::default();
         registry.update(HashSet::from([digest]));
@@ -916,7 +787,6 @@ mod tests {
             4096,
             blobstore::BlobHandle::default(),
             Arc::clone(&inflight),
-            Arc::clone(&budget),
             registry,
         )
         .await;
@@ -926,7 +796,6 @@ mod tests {
             inflight.lock().expect("inflight lock").is_empty(),
             "the inflight slot leaked"
         );
-        assert_eq!(budget.load(Ordering::Relaxed), 0, "the budget leaked");
     }
 
     /// a stream that is at EOF and records every byte the receiver writes back.
@@ -986,7 +855,6 @@ mod tests {
             8,
             blobs,
             Arc::clone(&inflight),
-            Arc::new(AtomicU64::new(0)),
             registry,
         )
         .await
@@ -1000,13 +868,11 @@ mod tests {
     }
 
     /// a digest the modules registry names nothing about is refused before
-    /// any staging happens — no inflight entry, no budget charge, no disk
-    /// write. This is #1833: without it any mesh peer with standing could
+    /// any staging happens — no inflight entry, no disk write. This is #1833: without it any mesh peer with standing could
     /// publish unbounded, unreferenced blobs that nothing ever reclaims.
     #[tokio::test]
     async fn an_unreferenced_digest_is_refused_before_staging() {
         let inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>> = Default::default();
-        let budget = Arc::new(AtomicU64::new(0));
         let blobs = blobstore::BlobHandle::default();
         let digest = [3u8; 32];
         // the registry names some OTHER digest — this one is a stranger to it.
@@ -1021,7 +887,6 @@ mod tests {
             4096,
             blobs.clone(),
             Arc::clone(&inflight),
-            Arc::clone(&budget),
             registry,
         )
         .await
@@ -1035,11 +900,6 @@ mod tests {
         assert!(
             inflight.lock().expect("inflight lock").is_empty(),
             "an unreferenced digest never reaches admission"
-        );
-        assert_eq!(
-            budget.load(Ordering::Relaxed),
-            0,
-            "no staging budget was charged"
         );
         assert!(
             !blobs.has_chunk(&digest),
@@ -1130,7 +990,6 @@ mod tests {
             4096,
             blobs.clone(),
             Default::default(),
-            Arc::new(AtomicU64::new(0)),
             registry.clone(),
         )
         .await;
@@ -1251,58 +1110,6 @@ mod tests {
         }
     }
 
-    /// a peer gets [`MAX_INBOUND_PUSHES_PER_PEER`] admitted pushes at a time,
-    /// counted per peer and returned when the task ends.
-    #[test]
-    fn a_peers_concurrent_pushes_are_capped() {
-        let per_peer = PeerSeats::new(MAX_INBOUND_PUSHES_PER_PEER, usize::MAX);
-        let (noisy, quiet) = (PeerId([1u8; 32]), PeerId([2u8; 32]));
-
-        let seats: Vec<_> = (0..MAX_INBOUND_PUSHES_PER_PEER)
-            .map(|_| per_peer.admit(noisy).expect("under the cap"))
-            .collect();
-        assert_eq!(
-            per_peer.admit(noisy).err(),
-            Some("peer_cap"),
-            "a peer past its cap was admitted anyway"
-        );
-        // the cap is per peer, not global.
-        let elsewhere = per_peer.admit(quiet).expect("another peer has its own cap");
-
-        drop(seats);
-        let reused = per_peer
-            .admit(noisy)
-            .expect("a finished push returns its seat");
-        assert!(
-            per_peer
-                .live
-                .lock()
-                .expect("peer seat lock")
-                .contains_key(&noisy),
-            "a peer holding a live push keeps its row"
-        );
-        // an idle peer keeps no row at all.
-        drop((reused, elsewhere));
-        assert!(per_peer.live.lock().expect("peer seat lock").is_empty());
-    }
-
-    /// the total cap binds across peers: once every seat is taken a peer
-    /// still under its own share is refused, and a released seat serves it.
-    #[test]
-    fn every_peer_together_is_capped() {
-        let seats = PeerSeats::new(2, 3);
-        let (a, b) = (PeerId([1u8; 32]), PeerId([2u8; 32]));
-        let held = [
-            seats.admit(a).expect("a under its share"),
-            seats.admit(a).expect("a at its share"),
-            seats.admit(b).expect("b under its share"),
-        ];
-        assert_eq!(seats.admit(b).err(), Some("total_cap"));
-        let [first, ..] = held;
-        drop(first);
-        seats.admit(b).expect("a released seat serves another peer");
-    }
-
     /// a stream that accepts writes and never delivers a byte — the shape of a
     /// member that opens a push and goes silent.
     struct SilentStream;
@@ -1340,12 +1147,11 @@ mod tests {
     }
 
     /// an admitted push that never delivers a byte must end at
-    /// [`RECEIVE_IDLE_TIMEOUT`], returning its inflight slot and its charge —
-    /// it used to block in `read` for the life of the process.
+    /// [`RECEIVE_IDLE_TIMEOUT`], returning its inflight slot — it used to
+    /// block in `read` for the life of the process.
     #[tokio::test(start_paused = true)]
     async fn a_silent_sender_is_reaped_and_returns_its_admission() {
         let inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>> = Default::default();
-        let budget = Arc::new(AtomicU64::new(0));
         let digest = [5u8; 32];
         let registry = CodeRegistry::default();
         registry.update(HashSet::from([digest]));
@@ -1357,7 +1163,6 @@ mod tests {
             4096,
             blobstore::BlobHandle::default(),
             Arc::clone(&inflight),
-            Arc::clone(&budget),
             registry,
         )
         .await
@@ -1367,7 +1172,6 @@ mod tests {
             inflight.lock().expect("inflight lock").is_empty(),
             "the inflight slot leaked"
         );
-        assert_eq!(budget.load(Ordering::Relaxed), 0, "the budget leaked");
     }
 
     #[tokio::test]
@@ -1403,7 +1207,6 @@ mod tests {
             4096,
             blobs.clone(),
             Default::default(),
-            Arc::new(AtomicU64::new(0)),
             registry,
         )
         .await

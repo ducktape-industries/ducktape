@@ -38,10 +38,7 @@ pub use executor::{
 pub use keys::WireGuardKeypair;
 pub use netstack_machine::binding::{active_set, identity_of, node_key, open_port_policy};
 pub use netstack_machine::msg::ReachabilityMsg;
-pub use netstack_machine::{
-    INVITE_JOIN_WINDOW_MS, INVITE_PEERS_FULL, MeshEpochEvent, ReachabilityEvent,
-};
-pub use netstack_wasm::STEP_FUEL as NETSTACK_STEP_FUEL;
+pub use netstack_machine::{INVITE_JOIN_WINDOW_MS, MeshEpochEvent, ReachabilityEvent};
 pub use rendezvous::{
     CarryingPeers, EndpointResolver, NatResolver, RENDEZVOUS_KEEPALIVE, RendezvousStatus,
     Resolution, StaticResolver,

@@ -58,7 +58,7 @@ async fn boot_gateway(enclave: &Arc<SnpTestEnclave>, sign: Option<sign::Tools>) 
             oauth_token_url: String::new(),
             oauth_client_id: String::new(),
             session_ttl_secs: 3600,
-            max_requests: 4,
+            clock: airlock::server::Clock::system(),
             sign,
         },
         "snp",

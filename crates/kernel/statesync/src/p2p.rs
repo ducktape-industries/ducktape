@@ -1264,7 +1264,7 @@ mod tests {
                     height: 1,
                     root_hash: sdk::StateRoot([0u8; 32]),
                 };
-                crate::fetch_snapshot(&client, boundary, "walked", 1024).await
+                crate::fetch_snapshot(&client, boundary, "walked").await
             });
         assert_eq!(
             fetched.expect("the walk waits the quota out instead of failing"),

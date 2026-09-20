@@ -495,63 +495,13 @@ fn a_v6_only_host_is_unreachable_for_the_v4_underlay() {
 }
 
 // ---------------------------------------------------------------------------
-// `GateOutcomes`: an attacker-chosen joiner key must not grow the map
-// unbounded (issue #1580) — capped insertion evicts oldest-first, and a
-// sweep ages entries out on the invite join window.
+// `GateOutcomes`: a sweep ages entries out on the invite join window.
 // ---------------------------------------------------------------------------
 
-use crate::reachability_plane::{
-    GateOutcomeMap, MAX_TRACKED_JOINERS, insert_gate_outcome, sweep_gate_outcomes,
-};
+use crate::reachability_plane::{GateOutcomeMap, insert_gate_outcome, sweep_gate_outcomes};
 
 fn admitted_at(height: u64) -> join_gate::IntroReply {
     join_gate::IntroReply::Admitted { height, cap: None }
-}
-
-#[test]
-fn insert_past_the_cap_evicts_the_oldest_entry() {
-    let mut map: GateOutcomeMap = GateOutcomeMap::new();
-    let t0 = std::time::SystemTime::UNIX_EPOCH;
-    for i in 0..MAX_TRACKED_JOINERS {
-        insert_gate_outcome(
-            &mut map,
-            vec![i as u8, (i >> 8) as u8],
-            admitted_at(i as u64),
-            t0 + std::time::Duration::from_secs(i as u64),
-        );
-    }
-    assert_eq!(map.len(), MAX_TRACKED_JOINERS);
-    let oldest_key = vec![0u8, 0u8];
-    assert!(map.contains_key(&oldest_key));
-
-    // one more distinct joiner past the cap evicts the OLDEST entry, not a
-    // random one, and the map never grows past the cap.
-    let newcomer = vec![0xff, 0xff];
-    insert_gate_outcome(
-        &mut map,
-        newcomer.clone(),
-        admitted_at(999),
-        t0 + std::time::Duration::from_secs(MAX_TRACKED_JOINERS as u64),
-    );
-    assert_eq!(map.len(), MAX_TRACKED_JOINERS);
-    assert!(
-        !map.contains_key(&oldest_key),
-        "the oldest entry made room for the newcomer"
-    );
-    assert!(map.contains_key(&newcomer));
-
-    // re-settling an ALREADY-tracked joiner never grows the map and never
-    // evicts anything — an attacker gains nothing by retransmitting.
-    let second_oldest = vec![1u8, 0u8];
-    assert!(map.contains_key(&second_oldest));
-    insert_gate_outcome(
-        &mut map,
-        second_oldest.clone(),
-        admitted_at(1000),
-        t0 + std::time::Duration::from_secs(MAX_TRACKED_JOINERS as u64 + 1),
-    );
-    assert_eq!(map.len(), MAX_TRACKED_JOINERS);
-    assert!(map.contains_key(&second_oldest));
 }
 
 #[test]

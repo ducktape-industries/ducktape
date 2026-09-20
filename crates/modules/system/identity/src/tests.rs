@@ -749,55 +749,6 @@ fn a_junior_key_cannot_remove_a_senior_one() {
 }
 
 #[test]
-fn the_key_cap_refuses_the_next_admission_until_one_leaves() {
-    let mut id = new_identity();
-    let a = ed(1);
-    create(&mut id, &ed_pub(&a), "alice", KeyScheme::Ed25519).unwrap();
-    let joiner = |n: u64| ed(100 + n);
-    for n in 1..MAX_KEYS_PER_ACCOUNT as u64 {
-        let k = joiner(n);
-        add_key(
-            &mut id,
-            &ed_pub(&k),
-            KeyScheme::Ed25519,
-            ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&k), 0, 1),
-        )
-        .unwrap();
-    }
-    assert_eq!(get(&id, 1).unwrap().keys.len(), MAX_KEYS_PER_ACCOUNT);
-
-    let over = joiner(MAX_KEYS_PER_ACCOUNT as u64);
-    refused(
-        add_key(
-            &mut id,
-            &ed_pub(&over),
-            KeyScheme::Ed25519,
-            ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&over), 0, 1),
-        )
-        .unwrap_err(),
-        "account key cap reached",
-    );
-    // a seat frees one.
-    let leaver = joiner(1);
-    apply(
-        &mut id,
-        &ed_pub(&leaver),
-        IdentityMsg::RemoveKey {
-            key: ed_pub(&leaver),
-        },
-    )
-    .unwrap();
-    add_key(
-        &mut id,
-        &ed_pub(&over),
-        KeyScheme::Ed25519,
-        ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&over), 0, 1),
-    )
-    .unwrap();
-    assert_eq!(get(&id, 1).unwrap().keys.len(), MAX_KEYS_PER_ACCOUNT);
-}
-
-#[test]
 fn the_last_key_is_never_removed_and_strangers_cannot_remove() {
     let mut id = new_identity();
     let a = ed(1);
@@ -1015,36 +966,6 @@ fn set_name_and_profile_are_member_gated_trimmed_and_capped() {
         .unwrap_err(),
         "bio exceeds",
     );
-}
-
-#[test]
-fn the_account_cap_refuses_founding() {
-    let mut id = new_identity();
-    let a = ed(1);
-    create(&mut id, &ed_pub(&a), "alice", KeyScheme::Ed25519).unwrap();
-    // stage the numbering at the cap, the way 65 536 foundings would have.
-    id.store(NEXT_NUMBER_KEY.to_vec(), &(MAX_ACCOUNTS + 1));
-    block_on(id.commit_block()).unwrap();
-    refused(
-        create(&mut id, &ed_pub(&ed(2)), "late", KeyScheme::Ed25519).unwrap_err(),
-        "account cap reached",
-    );
-    // a program shares the numbering and its cap; the refusal stages and
-    // emits nothing.
-    let mut ctx = ctx_with(from_module(AGENT), NOW);
-    let late = IdentityMsg::CreateProgram {
-        name: "late".into(),
-        controller: 1,
-        request: 1,
-    };
-    refused(
-        block_on(id.execute(&mut ctx, &identity_msg(&late))).unwrap_err(),
-        "account cap reached",
-    );
-    assert!(ctx.msgs().is_empty(), "no follow-up without an account");
-    assert!(ctx.assigned().is_none(), "no stamp without an account");
-    assert_eq!(controlled(&id, 1, 0, 16), Vec::<u64>::new());
-    block_on(id.abort_block()).unwrap();
 }
 
 #[test]

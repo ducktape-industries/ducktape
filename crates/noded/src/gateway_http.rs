@@ -126,17 +126,10 @@ pub struct GatewayResponse {
 
 /// Collect a streamed body to completion — the buffered-by-contract consumers
 /// (the JSON proxy lane) and tests use this; the streaming door does not.
-/// Hard-bounded at the buffered ceiling: an unbounded (cap-0 SSE) route
-/// collected here must not become a single-request node OOM.
 pub async fn collect_body(body: &mut GatewayBody) -> Result<Vec<u8>, GatewayFailure> {
     let mut out = Vec::new();
     while let Some(item) = body.recv().await {
         let chunk = item?;
-        if out.len().saturating_add(chunk.len()) as u64 > gateway::MAX_RESPONSE_BODY_BYTES {
-            return Err(GatewayFailure::Unavailable(
-                "response exceeds the buffered-lane ceiling (use the streaming door)".into(),
-            ));
-        }
         out.extend_from_slice(&chunk);
     }
     Ok(out)
@@ -203,9 +196,8 @@ pub const EMPTY_BODY_DIGEST: [u8; 32] = [
 ];
 
 /// A body that is ALREADY in memory, handed on in the streaming shape. The
-/// JSON proxy lanes decode a base64 field bounded by
-/// [`JSON_LANE_REQUEST_BYTES`], so there is nothing to stream there — but the
-/// plane below takes one shape, not two.
+/// JSON proxy lanes decode a base64 field, so there is nothing to stream
+/// there — but the plane below takes one shape, not two.
 pub fn one_shot_body(body: Vec<u8>) -> GatewayRequestBody {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     if !body.is_empty() {
@@ -232,20 +224,6 @@ const GATEWAY_QUERY_DEADLINE: Duration = Duration::from_secs(5);
 /// longer (the airlock enclave under Apple's notary wait) commits its head
 /// first and carries its outcome in the stream, so no lane needs more.
 pub const PROXY_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
-/// The JSON proxy lane's request cap (`/v1/gateway/proxy`, `body_b64`).
-/// That lane is buffered BY CONTRACT — one JSON blob in, one out — so it
-/// carries a model turn's multi-MB context and nothing bulkier; a route
-/// pinned above this (a release bundle) is reached through the browser
-/// door, which reads each request under the route's own cap.
-pub const JSON_LANE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-/// The browser door's own extractor cap: the `/.duck/ws-token` mint body (a
-/// small JSON). The proxied fallback reads its body itself, under the
-/// resolved route's `max_request_bytes`.
-const WS_TOKEN_REQUEST_BYTES: usize = 64 * 1024;
-/// WebSocket doors one page (an account's route) may hold open at once. The
-/// handshake `Origin` cannot key this — CEF sends the literal "null" for a
-/// `duck://` page — so the grant's route is the page.
-const MAX_OPEN_WS_DOORS_PER_PAGE: usize = 4;
 
 /// Take a slot on the gateway lane, bounded by [`LANE_ADMIT_TIMEOUT`]. Every
 /// caller goes through here: an un-deadlined `send` on a lane the plane has
@@ -257,49 +235,6 @@ async fn reserve_lane(lane: GatewayLane) -> Option<tokio::sync::mpsc::OwnedPermi
         .ok()
 }
 
-/// Open-door count per page, so one page cannot park every upgrade slot on the
-/// node. A [`WsDoorGuard`] releases its slot when the bridge task ends.
-#[derive(Default)]
-pub(crate) struct WsDoorLimit {
-    open: std::sync::Mutex<std::collections::HashMap<(u64, gateway::RouteName), usize>>,
-}
-
-pub(crate) struct WsDoorGuard {
-    limit: Arc<WsDoorLimit>,
-    page: (u64, gateway::RouteName),
-}
-
-impl WsDoorLimit {
-    /// Take a slot for `page`, or `None` when the page already holds
-    /// [`MAX_OPEN_WS_DOORS_PER_PAGE`].
-    pub(crate) fn admit(self: &Arc<Self>, page: (u64, gateway::RouteName)) -> Option<WsDoorGuard> {
-        let mut open = self.open.lock().expect("ws door limit poisoned");
-        let count = open.entry(page.clone()).or_insert(0);
-        if *count >= MAX_OPEN_WS_DOORS_PER_PAGE {
-            return None;
-        }
-        *count += 1;
-        Some(WsDoorGuard {
-            limit: Arc::clone(self),
-            page,
-        })
-    }
-}
-
-impl Drop for WsDoorGuard {
-    fn drop(&mut self) {
-        let mut open = self.limit.open.lock().expect("ws door limit poisoned");
-        let std::collections::hash_map::Entry::Occupied(mut entry) = open.entry(self.page.clone())
-        else {
-            return;
-        };
-        *entry.get_mut() -= 1;
-        if *entry.get() == 0 {
-            entry.remove();
-        }
-    }
-}
-
 /// Dedicated least-privilege browser origin for gateway rendering: a separate
 /// loopback listener, never the node API origin. Held on [`NodeHandle`].
 #[derive(Clone)]
@@ -308,8 +243,6 @@ pub(crate) struct BrowserGateway {
     /// Single-use tokens for the WebSocket side door (audit S3), shared between
     /// the `/.duck/ws-token` mint and the `/.duck/ws/{token}` upgrade.
     pub(crate) ws_tokens: Arc<WsTokenStore>,
-    /// Per-page cap on simultaneously open WebSocket doors.
-    pub(crate) ws_doors: Arc<WsDoorLimit>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -777,22 +710,13 @@ async fn open_application_stream(
     let Ok(publisher) = <[u8; 32]>::try_from(record.statement.publisher_node.as_slice()) else {
         return error_response(StatusCode::BAD_GATEWAY, "invalid route publisher");
     };
-    let Some(door) = handle
-        .application_doors
-        .admit((head.account_id, head.name.clone()))
-    else {
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "application stream limit reached",
-        );
-    };
     let Some(slot) = reserve_lane(lane).await else {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway lane is saturated");
     };
     upgrade
-        .max_message_size(gateway::MAX_WS_FRAME_BYTES)
-        .max_frame_size(gateway::MAX_WS_FRAME_BYTES)
-        .on_upgrade(move |socket| bridge_axum_ws(socket, slot, publisher, head, door))
+        .max_message_size(usize::MAX)
+        .max_frame_size(usize::MAX)
+        .on_upgrade(move |socket| bridge_axum_ws(socket, slot, publisher, head))
 }
 
 /// Report the dedicated browser-gateway listener's loopback base URL so the
@@ -873,7 +797,7 @@ pub fn gateway_browser_router(handle: NodeHandle) -> Router {
         .route("/.duck/ws-token", post(gateway_ws_token_mint))
         .route("/.duck/ws/{token}", get(gateway_ws_door))
         .fallback(gateway_browser_proxy)
-        .layer(DefaultBodyLimit::max(WS_TOKEN_REQUEST_BYTES))
+        .layer(DefaultBodyLimit::disable())
         .with_state(handle)
 }
 
@@ -1026,9 +950,8 @@ async fn gateway_browser_proxy(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    // The raw body, NOT `Bytes`: the router's `DefaultBodyLimit` is sized
-    // for the ws-token mint, and this lane's cap is the resolved route's
-    // own `max_request_bytes` — read below, once the record is known.
+    // The raw body, NOT `Bytes`: this lane's only bound is the resolved
+    // route's own `max_request_bytes` — read below, once the record is known.
     body: Body,
 ) -> Response {
     let Some(gateway) = handle.browser_gateway.clone() else {
@@ -1346,13 +1269,6 @@ async fn gateway_ws_door(
     let Some(grant) = browser_gateway.ws_tokens.consume(&token, &origin) else {
         return error_response(StatusCode::FORBIDDEN, "invalid or expired websocket token");
     };
-    let page = (grant.account_id, grant.name.clone());
-    let Some(door) = browser_gateway.ws_doors.admit(page) else {
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "this page already holds its websocket doors open",
-        );
-    };
     let record = match current_route(&handle, grant.account_id, &grant.name).await {
         Ok(record) => record,
         Err(_) => return error_response(StatusCode::BAD_GATEWAY, "route no longer resolves"),
@@ -1377,7 +1293,7 @@ async fn gateway_ws_door(
     let Some(slot) = reserve_lane(lane).await else {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway lane is saturated");
     };
-    upgrade.on_upgrade(move |socket| bridge_axum_ws(socket, slot, publisher, head, door))
+    upgrade.on_upgrade(move |socket| bridge_axum_ws(socket, slot, publisher, head))
 }
 
 /// Bridge a browser WebSocket to the gateway upgrade lane: translate axum
@@ -1388,9 +1304,6 @@ async fn bridge_axum_ws(
     slot: tokio::sync::mpsc::OwnedPermit<GatewayJob>,
     publisher: [u8; 32],
     head: gateway::ProxyRequestHead,
-    // Held for the life of the bridge: the page's door slot comes back when
-    // this task ends.
-    _door: WsDoorGuard,
 ) {
     use futures::{SinkExt as _, StreamExt as _};
     let (to_browser_tx, mut to_browser_rx) = tokio::sync::mpsc::channel::<GatewayWsMsg>(32);
@@ -1657,30 +1570,6 @@ mod tests {
         assert!(
             reserve_lane(lane).await.is_some(),
             "the slot comes back when the job leaves the lane"
-        );
-    }
-
-    #[test]
-    fn a_page_holds_a_bounded_number_of_websocket_doors() {
-        let limit: Arc<WsDoorLimit> = Arc::default();
-        let page = (7u64, gateway::RouteName::named("app"));
-        let doors: Vec<_> = (0..MAX_OPEN_WS_DOORS_PER_PAGE)
-            .map(|_| limit.admit(page.clone()).expect("under the cap"))
-            .collect();
-        assert!(
-            limit.admit(page.clone()).is_none(),
-            "the (N+1)th door on one page is refused"
-        );
-        // Another page keeps its own budget.
-        assert!(
-            limit
-                .admit((7, gateway::RouteName::named("other")))
-                .is_some()
-        );
-        drop(doors);
-        assert!(
-            limit.admit(page).is_some(),
-            "closing a socket returns its door slot"
         );
     }
 

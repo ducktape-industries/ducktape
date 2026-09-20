@@ -16,7 +16,7 @@
 //! through unbuffered where Codex buffers.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,41 +29,19 @@ use axum::routing::{head, post};
 use futures::StreamExt as _;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 
 use airlock::client::{Gateway, SessionRefusedBy, SessionResponseFault};
 pub use airlock::wire::WorkRef;
 
-// Shared with the airlock gateway's own `DefaultBodyLimit` (`airlock::server::assemble`) —
-// see `airlock::MAX_REQUEST_BYTES` for why the two must match.
-use airlock::MAX_REQUEST_BYTES;
-const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
-// Lifetime spend guards for ONE broker. A headless run makes a handful of
-// requests, but an INTERACTIVE session is long-lived — every user turn is 1+
-// requests (plus tool sub-requests, title/compaction calls) — so these must
-// bound a whole work session, not a one-shot: at 64 requests an interactive
-// session would silently 429 (model access dies) after ~an hour of use. Sized
-// for a long session while still capping a runaway that burns the operator's
-// subscription; the per-request/-response byte caps + concurrency still hold.
-const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_REQUESTS: u32 = 4096;
 const CONTROL_HEADER: &str = "x-ducktape-provider-control";
-const MAX_CONTROL_REQUEST_BYTES: usize = 4 * 1024;
-const MAX_CONTROL_REQUESTS: usize = 8;
 const MAX_CONTROL_REQUEST_ID_BYTES: usize = 64;
 const MAX_CONTROL_REQUESTED_SECS: u64 = 30 * 60;
 const MAX_CONTROL_CUMULATIVE_SECS: u64 = 2 * 60 * 60;
-/// Anthropic-broker concurrency. Codex serialises to 1; Claude Code fans out
-/// (parallel tool sub-requests, a haiku title generator), and with a STREAMING
-/// response a permit is held for the whole stream — so 1 would deadlock a
-/// client that opens a second request before the first's body drains.
-/// ponytail: fixed 8, revisit only if a real session starves it.
-const MAX_CONCURRENT: usize = 8;
 /// TCP+TLS connect deadline for every broker/gateway client (#1668). Neither
 /// reqwest client had ANY timeout, so a half-open path (a dead NAT/WireGuard
-/// hop is the realistic case on the airlock overlay arm) parked its
-/// concurrency permit — and, for `refresh_if_needed`/`airlock_reauth`, the
-/// auth mutex — forever. A live connect completes in well under a second; 10s
+/// hop is the realistic case on the airlock overlay arm) parked the request
+/// — and, for `refresh_if_needed`/`airlock_reauth`, the auth mutex — forever. A live connect completes in well under a second; 10s
 /// covers a slow network without masking a genuinely dead one.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Idle-between-reads deadline for the two provider brokers' streamed/buffered
@@ -71,7 +49,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// seconds between chunks (thinking, a slow tool round trip upstream), so this
 /// must be generous — but a connection that never sends anything at all (the
 /// #1668 repro: a listener that accepts and never writes) must not wedge a
-/// permit past a bounded wait. Shrunk under `cfg(test)` so the timeout test
+/// request past a bounded wait. Shrunk under `cfg(test)` so the timeout test
 /// does not need to sleep tens of seconds to observe it.
 #[cfg(not(test))]
 const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -192,9 +170,6 @@ struct BrokerState {
     /// host path, the gateway's `/v1/responses` on the airlock path.
     responses_url: String,
     client: reqwest::Client,
-    requests: AtomicU32,
-    bytes: AtomicU64,
-    concurrent: Semaphore,
     idle_control: Arc<IdleControl>,
 }
 
@@ -208,7 +183,6 @@ struct IdleControlState {
     deadline: Option<watch::Sender<Option<tokio::time::Instant>>>,
     requests: BTreeMap<String, StoredDecision>,
     cumulative_secs: u64,
-    limit_logged: bool,
 }
 
 #[derive(Clone)]
@@ -456,7 +430,6 @@ impl RunBroker {
                 deadline: None,
                 requests: BTreeMap::new(),
                 cumulative_secs: 0,
-                limit_logged: false,
             }),
         });
         let state = Arc::new(BrokerState {
@@ -469,16 +442,13 @@ impl RunBroker {
                 .read_timeout(UPSTREAM_IDLE_TIMEOUT)
                 .build()
                 .map_err(|e| format!("build provider broker client: {e}"))?,
-            requests: AtomicU32::new(0),
-            bytes: AtomicU64::new(0),
-            concurrent: Semaphore::new(1),
             idle_control: idle_control.clone(),
         });
         let app = Router::new()
             .route(client.responses_path(), post(forward_responses))
             .route("/v1/control/provider-idle", post(provider_idle_control))
             .fallback(reject)
-            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+            .layer(DefaultBodyLimit::disable())
             // added LAST so it is the OUTERMOST layer: a request the body limit
             // or the fallback rejects still gets its line.
             .layer(axum::middleware::from_fn(log_request))
@@ -520,7 +490,6 @@ impl RunBroker {
             deadline: Some(deadline),
             requests: BTreeMap::new(),
             cumulative_secs: 0,
-            limit_logged: false,
         };
         BrokerInvocation {
             endpoint: BrokerEndpoint {
@@ -598,30 +567,6 @@ async fn forward_responses(
     if !incoming_authorized(&headers, &state.run_bearer) {
         return response(StatusCode::UNAUTHORIZED, "run broker credential rejected");
     }
-    if state.requests.fetch_add(1, Ordering::Relaxed) >= MAX_REQUESTS {
-        return response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "run broker request budget exhausted",
-        );
-    }
-    if state
-        .bytes
-        .fetch_add(body.len() as u64, Ordering::Relaxed)
-        .saturating_add(body.len() as u64)
-        > MAX_TOTAL_BYTES
-    {
-        return response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "run broker byte budget exhausted",
-        );
-    }
-    let Ok(_permit) = state.concurrent.try_acquire() else {
-        return response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "run broker concurrency exhausted",
-        );
-    };
-
     let (mut upstream, mut binding, mut seal_keys) = match send_codex(&state, &headers, &body).await
     {
         Ok(sent) => sent,
@@ -648,26 +593,10 @@ async fn forward_responses(
     let mut output = Vec::new();
     loop {
         match upstream.chunk().await {
-            Ok(Some(chunk)) => {
-                if output.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-                    return response(
-                        StatusCode::BAD_GATEWAY,
-                        "provider upstream response exceeded cap",
-                    );
-                }
-                output.extend_from_slice(&chunk);
-            }
+            Ok(Some(chunk)) => output.extend_from_slice(&chunk),
             Ok(None) => break,
             Err(e) => return upstream_send_error(&e, "provider"),
         }
-    }
-    if state
-        .bytes
-        .fetch_add(output.len() as u64, Ordering::Relaxed)
-        .saturating_add(output.len() as u64)
-        > MAX_TOTAL_BYTES
-    {
-        return response(StatusCode::BAD_GATEWAY, "run broker byte budget exhausted");
     }
     // Airlock sealed session: the enclave's success body is an opaque sealed
     // stream — unseal it to the plaintext the unmodified codex sandbox expects.
@@ -677,8 +606,8 @@ async fn forward_responses(
     //
     // `seal_keys` is exactly what THIS request's `send_codex` sealed under, not
     // a re-read of `state.auth` after the round trip (see `send_upstream`'s doc
-    // — the anthropic broker's actual race; codex's semaphore of 1 keeps this
-    // one unreachable today, same shape regardless).
+    // — the anthropic broker's actual race; this path returns what it sealed
+    // under, same shape regardless).
     if let Some(keys) = seal_keys {
         let sealed_outer = content_type_str
             .as_deref()
@@ -906,11 +835,11 @@ async fn provider_idle_control(
         }
     }
 
-    let body = match to_bytes(request.into_body(), MAX_CONTROL_REQUEST_BYTES).await {
+    let body = match to_bytes(request.into_body(), usize::MAX).await {
         Ok(body) => body,
         Err(_) => {
             return json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
+                StatusCode::BAD_REQUEST,
                 &IdleControlReply::Denied {
                     request_id: None,
                     reason: "invalid_body",
@@ -1005,21 +934,6 @@ impl IdleControl {
                 StatusCode::CONFLICT,
             );
         }
-        if state.requests.len() >= MAX_CONTROL_REQUESTS {
-            let log = (!state.limit_logged).then(|| {
-                state.limit_logged = true;
-                "status=denied reason=request_limit_exhausted".to_string()
-            });
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                IdleControlReply::Denied {
-                    request_id: Some(request.request_id),
-                    reason: "request_limit_exhausted",
-                },
-                log,
-            );
-        }
-
         let Some(hard_deadline) = state.hard_deadline else {
             return denied(&request.request_id, "inactive", StatusCode::CONFLICT);
         };
@@ -1148,9 +1062,7 @@ fn response(status: StatusCode, message: &str) -> Response<Body> {
 
 /// Turn a failed upstream `send()` into the response the sandbox sees. A
 /// timeout (connect or idle-read, see the broker client builders) gets its own
-/// stable reason token and 504 rather than a generic 502 — the permit that
-/// held it is a local var, already dropped by the time the caller returns
-/// this, so the run's concurrency budget is freed rather than parked forever.
+/// stable reason token and 504 rather than a generic 502.
 fn upstream_send_error(e: &reqwest::Error, provider: &str) -> Response<Body> {
     if e.is_timeout() {
         return response(StatusCode::GATEWAY_TIMEOUT, "upstream_idle_timeout");
@@ -1931,9 +1843,6 @@ struct AnthropicBrokerState {
     client: reqwest::Client,
     /// upstream messages URL — the const in production, a mock in tests.
     messages_url: String,
-    requests: AtomicU32,
-    bytes: AtomicU64,
-    concurrent: Arc<Semaphore>,
 }
 
 impl AnthropicBrokerState {
@@ -2088,9 +1997,6 @@ impl RunBroker {
                 .build()
                 .map_err(|e| format!("build anthropic broker client: {e}"))?,
             messages_url,
-            requests: AtomicU32::new(0),
-            bytes: AtomicU64::new(0),
-            concurrent: Arc::new(Semaphore::new(MAX_CONCURRENT)),
         });
         let app = Router::new()
             // MATCH ON PATH — axum ignores the query string, so `/v1/messages`
@@ -2099,7 +2005,7 @@ impl RunBroker {
             // tolerate the client's `HEAD /` reachability probe.
             .route("/", head(probe_ok))
             .fallback(reject)
-            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+            .layer(DefaultBodyLimit::disable())
             // added LAST so it is the OUTERMOST layer: a request the body limit
             // or the fallback rejects still gets its line.
             .layer(axum::middleware::from_fn(log_request))
@@ -2135,7 +2041,6 @@ impl RunBroker {
                     deadline: None,
                     requests: BTreeMap::new(),
                     cumulative_secs: 0,
-                    limit_logged: false,
                 }),
             }),
             shutdown: Some(shutdown),
@@ -2216,32 +2121,6 @@ async fn forward_messages(
     if !incoming_authorized(&headers, &state.run_bearer) {
         return response(StatusCode::UNAUTHORIZED, "run broker credential rejected");
     }
-    if state.requests.fetch_add(1, Ordering::Relaxed) >= MAX_REQUESTS {
-        return response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "run broker request budget exhausted",
-        );
-    }
-    if state
-        .bytes
-        .fetch_add(body.len() as u64, Ordering::Relaxed)
-        .saturating_add(body.len() as u64)
-        > MAX_TOTAL_BYTES
-    {
-        return response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "run broker byte budget exhausted",
-        );
-    }
-    // held for the WHOLE streamed response (moved into the body stream), so a
-    // client that opens a second request before this one drains is bounded.
-    let Ok(permit) = state.concurrent.clone().try_acquire_owned() else {
-        return response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "run broker concurrency exhausted",
-        );
-    };
-
     // best-effort refresh; a failure proxies the stale token (see the fn doc) —
     // never 502s the session.
     state.refresh_if_needed().await;
@@ -2278,7 +2157,7 @@ async fn forward_messages(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|ct| ct.starts_with("application/octet-stream"));
         if sealed_outer {
-            return relay_sealed(upstream, keys, binding, permit, state).await;
+            return relay_sealed(upstream, keys, binding).await;
         }
         if upstream.status().is_success() {
             return response(
@@ -2293,31 +2172,12 @@ async fn forward_messages(
     // BODY streams through unbuffered below — buffering would stall the TUI.
     let content_type = upstream_content_type(upstream.headers());
 
-    // STREAM the upstream body through as a bounded stream. Error bodies flow
-    // through this same path unmodified (Claude Code's retry/downgrade matches
-    // on the upstream wording).
-    let mut seen = 0usize;
-    let stream = upstream.bytes_stream().map(move |chunk| {
-        // capture the permit for the stream's whole life (freed on stream drop).
-        let _keep = &permit;
-        match chunk {
-            Ok(bytes) => {
-                seen = seen.saturating_add(bytes.len());
-                if seen > MAX_RESPONSE_BYTES {
-                    Err(std::io::Error::other(
-                        "run broker response byte budget exhausted",
-                    ))
-                } else {
-                    // charge the lifetime budget too (#1669): the codex path
-                    // charges its output.len(), this path never did — a long
-                    // streamed answer never counted against MAX_TOTAL_BYTES.
-                    state.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    Ok(bytes)
-                }
-            }
-            Err(e) => Err(std::io::Error::other(e.to_string())),
-        }
-    });
+    // STREAM the upstream body through. Error bodies flow through this same
+    // path unmodified (Claude Code's retry/downgrade matches on the upstream
+    // wording).
+    let stream = upstream
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())));
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     if let Some(content_type) = content_type {
@@ -2336,8 +2196,6 @@ async fn relay_sealed(
     mut upstream: reqwest::Response,
     keys: airlock::handshake::SessionKeys,
     binding: Vec<u8>,
-    permit: tokio::sync::OwnedSemaphorePermit,
-    state: Arc<AnthropicBrokerState>,
 ) -> Response<Body> {
     use airlock::bodyseal::OpenedItem;
     let status =
@@ -2379,12 +2237,7 @@ async fn relay_sealed(
     let finished_at_head = opener.finished();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
     tokio::spawn(async move {
-        let _keep = permit; // concurrency slot held for the stream's life
-        let mut seen = 0usize;
         for data in pending {
-            seen = seen.saturating_add(data.len());
-            // #1669: charge the lifetime budget same as the plain stream path.
-            state.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
             if tx.send(Ok(data)).await.is_err() {
                 return;
             }
@@ -2415,16 +2268,6 @@ async fn relay_sealed(
                                 return;
                             }
                         };
-                        seen = seen.saturating_add(data.len());
-                        if seen > MAX_RESPONSE_BYTES {
-                            let _ = tx
-                                .send(Err(std::io::Error::other(
-                                    "run broker response byte budget exhausted",
-                                )))
-                                .await;
-                            return;
-                        }
-                        state.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
                         if tx.send(Ok(Bytes::from(data))).await.is_err() {
                             return;
                         }
@@ -2869,9 +2712,6 @@ mod tests {
             auth: tokio::sync::Mutex::new(AnthropicAuth::Airlock(session)),
             client: reqwest::Client::new(),
             messages_url: url,
-            requests: AtomicU32::new(0),
-            bytes: AtomicU64::new(0),
-            concurrent: Arc::new(Semaphore::new(MAX_CONCURRENT)),
         };
         let (_resp, binding, keys) = send_upstream(&state, &HeaderMap::new(), &Bytes::from_static(b"{}"))
             .await
@@ -2910,15 +2750,12 @@ mod tests {
         upstream.abort();
     }
 
-    /// #1668 regression: an upstream that accepts the TCP connection and never
-    /// writes a byte (the issue's `nc -l -p PORT >/dev/null` repro) must not
-    /// park the concurrency permit forever. With the client's idle-read
-    /// timeout (shrunk under `cfg(test)`) it 504s with the stable reason token
-    /// instead — and, with capacity 1, a SECOND request proves the permit was
-    /// actually freed: it gets far enough to hit the same hung upstream and
-    /// time out again, rather than being rejected 429 "concurrency exhausted".
+    /// an upstream that accepts the TCP connection and never writes a byte
+    /// (`nc -l -p PORT >/dev/null`) must not park the request forever. With
+    /// the client's idle-read timeout (shrunk under `cfg(test)`) it 504s with
+    /// the stable reason token instead.
     #[tokio::test]
-    async fn upstream_idle_timeout_returns_504_and_frees_the_permit() {
+    async fn upstream_idle_timeout_returns_504() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -2942,9 +2779,6 @@ mod tests {
                 .build()
                 .unwrap(),
             messages_url: format!("http://{addr}/v1/messages"),
-            requests: AtomicU32::new(0),
-            bytes: AtomicU64::new(0),
-            concurrent: Arc::new(Semaphore::new(1)),
         });
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2952,69 +2786,12 @@ mod tests {
             HeaderValue::from_str("Bearer bearer").unwrap(),
         );
 
-        let resp1 =
-            forward_messages(State(state.clone()), headers.clone(), Bytes::from_static(b"{}"))
-                .await;
+        let resp1 = forward_messages(State(state), headers, Bytes::from_static(b"{}")).await;
         assert_eq!(resp1.status(), StatusCode::GATEWAY_TIMEOUT);
         let body1 = to_bytes(resp1.into_body(), 1024).await.unwrap();
         assert_eq!(&body1[..], b"upstream_idle_timeout".as_slice());
 
-        let resp2 =
-            forward_messages(State(state), headers, Bytes::from_static(b"{}")).await;
-        assert_eq!(
-            resp2.status(),
-            StatusCode::GATEWAY_TIMEOUT,
-            "permit must be freed — a 429 here means the first request's permit was never released"
-        );
-
         accept_task.abort();
-    }
-
-    /// #1669 regression: the plain (non-sealed) streamed response's bytes must
-    /// count against `state.bytes` — the codex path already charges its
-    /// `output.len()`, this path never did. Proven by seeding the lifetime
-    /// counter just under `MAX_TOTAL_BYTES`, draining a small streamed
-    /// response, and showing the NEXT request's existing pre-request check
-    /// now refuses it — that check is unchanged; only the charge is new.
-    #[tokio::test]
-    async fn anthropic_streamed_response_bytes_count_against_the_lifetime_budget() {
-        let (url, _seen, upstream) =
-            mock_upstream(StatusCode::OK, "text/event-stream", "0123456789").await;
-        let state = Arc::new(AnthropicBrokerState {
-            run_bearer: "bearer".into(),
-            auth: tokio::sync::Mutex::new(AnthropicAuth::ApiKey("host-secret".into())),
-            client: reqwest::Client::builder()
-                .connect_timeout(CONNECT_TIMEOUT)
-                .read_timeout(UPSTREAM_IDLE_TIMEOUT)
-                .build()
-                .unwrap(),
-            messages_url: url,
-            requests: AtomicU32::new(0),
-            // seeded just under the cap — the mock's 10-byte body tips it over.
-            bytes: AtomicU64::new(MAX_TOTAL_BYTES - 5),
-            concurrent: Arc::new(Semaphore::new(MAX_CONCURRENT)),
-        });
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_str("Bearer bearer").unwrap(),
-        );
-
-        let resp1 =
-            forward_messages(State(state.clone()), headers.clone(), Bytes::from_static(b"{}"))
-                .await;
-        assert_eq!(resp1.status(), StatusCode::OK);
-        // drain the body — the byte charge happens as the stream is polled.
-        let body1 = to_bytes(resp1.into_body(), 1024).await.unwrap();
-        assert_eq!(&body1[..], b"0123456789".as_slice());
-
-        let resp2 = forward_messages(State(state), headers, Bytes::from_static(b"{}")).await;
-        assert_eq!(
-            resp2.status(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "the streamed response's bytes must have counted against the lifetime budget"
-        );
-        upstream.abort();
     }
 
     #[tokio::test]
@@ -3387,7 +3164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_control_bounds_seconds_cumulative_requests_and_body() {
+    async fn idle_control_bounds_seconds_and_cumulative_time() {
         let broker = RunBroker::start_with(UpstreamCredential {
             bearer: "unused".into(),
             account_id: None,
@@ -3408,24 +3185,14 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
         assert_eq!(reply["reason"], "invalid_requested_secs");
 
-        for index in 0..MAX_CONTROL_REQUESTS {
-            let (status, reply) = control_call(
-                &invocation.endpoint,
-                Some(&token),
-                json!({"request_id":format!("r-{index}"), "requested_secs":1}),
-            )
-            .await;
-            assert_eq!(status, reqwest::StatusCode::OK);
-            assert_eq!(reply["status"], "granted");
-        }
         let (status, reply) = control_call(
             &invocation.endpoint,
             Some(&token),
-            json!({"request_id":"r-8", "requested_secs":1}),
+            json!({"request_id":"r-0", "requested_secs":1}),
         )
         .await;
-        assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(reply["reason"], "request_limit_exhausted");
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(reply["status"], "granted");
         let (status, replay) = control_call(
             &invocation.endpoint,
             Some(&token),
@@ -3434,16 +3201,6 @@ mod tests {
         .await;
         assert_eq!(status, reqwest::StatusCode::OK);
         assert_eq!(replay["status"], "granted");
-
-        let client = reqwest::Client::new();
-        let response = client
-            .post(&invocation.endpoint.control_url)
-            .header(CONTROL_HEADER, &token)
-            .body(vec![b'x'; MAX_CONTROL_REQUEST_BYTES + 1])
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
 
         let cumulative = broker.begin_invocation();
         cumulative.arm(tokio::time::Instant::now() + Duration::from_secs(3 * 60 * 60));
@@ -3674,7 +3431,7 @@ mod tests {
                 oauth_token_url: format!("{upstream}/oauth/token"),
                 oauth_client_id: "test-client".into(),
                 session_ttl_secs: 3600,
-                max_requests: 100,
+                clock: airlock::server::Clock::system(),
                 sign: None,
             },
             seeds,
@@ -3728,7 +3485,7 @@ mod tests {
         )>,
         granted_node: Vec<u8>,
         vouched_node: Vec<u8>,
-        max_requests: u32,
+        clock: airlock::server::Clock,
     ) -> String {
         let check: airlock::server::GrantCheck = std::sync::Arc::new(move |question| {
             let granted_node = granted_node.clone();
@@ -3752,7 +3509,7 @@ mod tests {
                 oauth_token_url: format!("{upstream}/oauth/token"),
                 oauth_client_id: "test-client".into(),
                 session_ttl_secs: 3600,
-                max_requests,
+                clock,
                 sign: None,
             },
             seeds,
@@ -3814,7 +3571,7 @@ mod tests {
                 oauth_token_url: format!("{upstream}/oauth/token"),
                 oauth_client_id: "test-client".into(),
                 session_ttl_secs: 3600,
-                max_requests: 100,
+                clock: airlock::server::Clock::system(),
                 sign: None,
             },
             vec![(
@@ -3858,7 +3615,7 @@ mod tests {
             )],
             b"grantee".to_vec(),
             b"grantee".to_vec(),
-            100,
+            airlock::server::Clock::system(),
         )
         .await;
         let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
@@ -3884,8 +3641,7 @@ mod tests {
     /// A BORROWED credential must be able to renew its session.
     ///
     /// The session token a lending gateway mints is scoped: it lapses at
-    /// `session_ttl_secs` or `max_requests`, whichever comes first, and the
-    /// gateway then 401s. The broker re-handshakes once and retries — and that
+    /// `session_ttl_secs`, and the gateway then 401s. The broker re-handshakes once and retries — and that
     /// re-handshake goes to a gateway that is ALWAYS grant-gated, so it only
     /// works if the second session is admitted on the same footing as the first.
     ///
@@ -3898,19 +3654,22 @@ mod tests {
     /// fixed it as a side effect. This test pins the property so it cannot come
     /// back the next time that handshake is touched.
     ///
-    /// The second was still live and is fixed here: a session that spent its
-    /// REQUEST budget answered 429, and the broker only re-handshakes on 401. So
-    /// the TTL half of the symptom recovered and the `max_requests` half did
-    /// not — the run just died, with the sandbox seeing a rate limit that would
-    /// never clear. A spent session is an ended session, so it now answers 401
-    /// like its expiry does.
-    ///
-    /// `max_requests: 1` forces that lapse deterministically: request two costs
-    /// the budget the first one spent, so no clock and no sleep is involved.
+    /// The second is the lapse itself: an expired session answers 401, and
+    /// the broker re-handshakes on exactly that. The gateway runs on a clock
+    /// this test drives, so the lapse is forced deterministically: the clock
+    /// moves past the TTL between request one and request two, and no sleep
+    /// is involved.
     #[tokio::test]
     async fn a_borrowed_credential_renews_its_session_through_the_grant_gate() {
         let upstream = bearer_upstream("tok-renew").await;
         let (kp, seal_pk) = seal_pair();
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        ));
+        let tick = clock.clone();
         let gateway_url = boot_grant_gated_gateway(
             &upstream,
             kp,
@@ -3921,7 +3680,7 @@ mod tests {
             )],
             b"grantee".to_vec(),
             b"grantee".to_vec(),
-            1,
+            airlock::server::Clock::new(move || tick.load(std::sync::atomic::Ordering::Relaxed)),
         )
         .await;
         let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
@@ -3947,8 +3706,9 @@ mod tests {
         assert_eq!(first.status(), reqwest::StatusCode::OK);
         assert!(first.text().await.unwrap().contains("AIRLOCK-OK"));
 
-        // the session's whole budget is spent, so this one 401s at the gateway
-        // and only lands if the re-handshake was admitted.
+        // the session's TTL lapses on the gateway's clock, so this one 401s at
+        // the gateway and only lands if the re-handshake was admitted.
+        clock.fetch_add(3601, std::sync::atomic::Ordering::Relaxed);
         let renewed = ask().await;
         assert_eq!(
             renewed.status(),
@@ -3978,7 +3738,7 @@ mod tests {
             )],
             b"grantee".to_vec(),
             b"stranger".to_vec(),
-            100,
+            airlock::server::Clock::system(),
         )
         .await;
         let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
@@ -4009,7 +3769,7 @@ mod tests {
             )],
             b"grantee".to_vec(),
             b"wedged".to_vec(),
-            100,
+            airlock::server::Clock::system(),
         )
         .await;
         let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);

@@ -251,7 +251,7 @@ async fn boot_gateway_and_upstream() -> (String, u16) {
             oauth_token_url: format!("{upstream}/oauth/token"),
             oauth_client_id: "test-client".into(),
             session_ttl_secs: 3600,
-            max_requests: 100,
+            clock: airlock::server::Clock::system(),
             sign: None,
         },
         "snp",
@@ -285,7 +285,7 @@ async fn boot_signing_gateway(
             oauth_token_url: String::new(),
             oauth_client_id: String::new(),
             session_ttl_secs: 3600,
-            max_requests: 4,
+            clock: airlock::server::Clock::system(),
             sign: Some(airlock::sign::Tools {
                 rcodesign: airlock::sign::fixture::rcodesign(),
                 entitlements: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

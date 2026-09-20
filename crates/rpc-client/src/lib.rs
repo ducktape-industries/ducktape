@@ -12,11 +12,9 @@ use reqwest::{Response, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_tungstenite::tungstenite::Message;
 
-const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 /// one frame of a streamed blob upload: what this process holds of a file
 /// while it crosses to the node, whatever the file's size.
 const BLOB_UPLOAD_FRAME_BYTES: usize = 1024 * 1024;
-const MAX_ERROR_BYTES: usize = 4 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// The throughput floor a blob's bytes are budgeted at, on both legs they
 /// travel: up to the node ([`Client::put_blob_file`]) and out from it to every
@@ -1157,9 +1155,6 @@ fn decode_stream_message(
             _ => None,
         };
     };
-    if text.len() > MAX_JSON_BYTES {
-        return Some(Err(Error::new("RPC stream frame exceeds the client limit")));
-    }
     let frame = match serde_json::from_str::<StreamFrame>(&text) {
         Ok(frame) => frame,
         Err(error) => {
@@ -1217,7 +1212,7 @@ fn module_name(topic: &str, expected: &BTreeSet<String>) -> Result<String> {
 
 async fn decode_json<T: DeserializeOwned>(response: Response) -> Result<T> {
     let status = response.status();
-    let bytes = read_bounded(response, MAX_JSON_BYTES).await?;
+    let bytes = read_all(response).await?;
     if !status.is_success() {
         return Err(refusal(status, &bytes));
     }
@@ -1227,7 +1222,7 @@ async fn decode_json<T: DeserializeOwned>(response: Response) -> Result<T> {
 
 async fn response_error(response: Response) -> Error {
     let status = response.status();
-    match read_bounded(response, MAX_ERROR_BYTES).await {
+    match read_all(response).await {
         Ok(bytes) => refusal(status, &bytes),
         // the body itself could not be read: that is this client's failure, not
         // a refusal anyone authored.
@@ -1235,6 +1230,15 @@ async fn response_error(response: Response) -> Error {
     }
 }
 
+async fn read_all(response: Response) -> Result<Vec<u8>> {
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| Error::new(format!("could not read RPC response: {error}")))?;
+    Ok(bytes.to_vec())
+}
+
+/// a response read against the limit its caller declared for it.
 async fn read_bounded(response: Response, limit: usize) -> Result<Vec<u8>> {
     if response
         .content_length()

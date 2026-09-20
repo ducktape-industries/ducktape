@@ -16,7 +16,6 @@ use commonware_utils::ordered::Set;
 use host::Host;
 
 use crate::blob_fetch;
-use crate::code_plane::{PeerSeat, PeerSeats};
 use crate::config;
 use crate::constants::*;
 use crate::explorer::heal_index;
@@ -260,32 +259,15 @@ pub(super) struct ServeLanes {
 /// out and retry, so pressure degrades to retries instead of memory.
 const SYNC_QUEUE_DEPTH: usize = 64;
 
-/// statesync frames ONE peer may hold in that queue at once. The queue is
-/// shared, so without this one peer's burst could fill it and every other
-/// peer's requests would drop until it drained.
-const SYNC_QUEUED_PER_PEER: usize = 16;
-
-/// forge answers (and the pack builds they start) in flight across every
-/// peer. Builds run one at a time, so this is the queue a pack build waits in.
-const MAX_FORGE_ANSWERS: usize = 8;
-
-/// forge answers ONE peer may hold in flight at once.
-const FORGE_ANSWERS_PER_PEER: usize = 2;
-
 /// answer one `ForgeObjects` request on its OWN task, so the serve loop is
 /// free while the pack builds. The whole reply path moves with it — bounded
 /// encode, the serve-lane observation, the mesh send — because a reply that
 /// outlives its turn on the loop has to carry its own `rpc_id` and peer.
 /// Ordering is not owed here: every answer is addressed by rpc id, and the
 /// requester's `pending` map completes whichever lands.
-///
-/// The peer's seat in `seats` is held by the answer AND by the build it
-/// starts, so a peer can never queue more builds than its share; past it the
-/// request is answered at once with the refusal.
 #[allow(clippy::too_many_arguments)]
 fn spawn_forge_answer(
     context: &commonware_runtime::tokio::Context,
-    seats: &PeerSeats<ed25519::PublicKey>,
     forge_repo: std::path::PathBuf,
     blobs: noded::blobs::BlobHandle,
     served: blob_fetch::ServedPacks,
@@ -298,37 +280,12 @@ fn spawn_forge_answer(
     head: [u8; statesync::FORGE_OID_LEN],
     bases: Vec<[u8; statesync::FORGE_OID_LEN]>,
 ) {
-    static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
-    let seat = seats.admit(peer.clone());
     context
         .child("statesync_forge")
         .spawn(move |_ctx| async move {
-            let resp = match seat {
-                Ok(seat) => {
-                    blob_fetch::serve_forge_objects(
-                        &forge_repo,
-                        &blobs,
-                        &served,
-                        &repo,
-                        head,
-                        &bases,
-                        Arc::new(seat),
-                    )
-                    .await
-                }
-                Err(reason) => {
-                    if let Some(attempts) = REFUSED.hit(reason) {
-                        tracing::warn!(
-                            target: "ducktape::forge",
-                            peer = %config::hex_bytes(peer.as_ref()),
-                            attempts,
-                            reason,
-                            "forge objects request REFUSED"
-                        );
-                    }
-                    statesync::SyncResponse::Error(reason.into())
-                }
-            };
+            let resp =
+                blob_fetch::serve_forge_objects(&forge_repo, &blobs, &served, &repo, head, &bases)
+                    .await;
             let (resp, body) = crate::sync::serve::encode_bounded_response(resp);
             let framed = statesync::encode_rpc(&[0u8; 32], &[0u8; 64], rpc_id, &body);
             monitor.record(
@@ -359,15 +316,9 @@ pub(super) fn wire_serve_lanes(
     // future between ticks is lossless, whereas dropping the p2p receiver's
     // actor-backed `recv()` future mid-flight could eat a delivered
     // message. bounded + drop-on-full: clients time out and retry, so a
-    // flood degrades to retries instead of unbounded memory. each queued
-    // frame holds its sender's seat until the pump has served it, so one
-    // peer fills only its own share of the queue.
-    let queued = PeerSeats::new(SYNC_QUEUED_PER_PEER, SYNC_QUEUE_DEPTH);
-    let (bridge_tx, sync_ingress) = futures::channel::mpsc::channel::<(
-        ed25519::PublicKey,
-        Vec<u8>,
-        PeerSeat<ed25519::PublicKey>,
-    )>(SYNC_QUEUE_DEPTH);
+    // flood degrades to retries instead of unbounded memory.
+    let (bridge_tx, sync_ingress) =
+        futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(SYNC_QUEUE_DEPTH);
     context.child("sync_ingress").spawn(move |_ctx| {
         let mut receiver = sync_rx;
         let mut bridge_tx = bridge_tx;
@@ -377,22 +328,18 @@ pub(super) fn wire_serve_lanes(
                 let Ok((peer, msg)) = receiver.recv().await else {
                     return; // network shutdown — nothing to serve.
                 };
-                let seat = match queued.admit(peer.clone()) {
-                    Ok(seat) => seat,
-                    Err(reason) => {
-                        if let Some(attempts) = DROPPED.hit(reason) {
-                            tracing::warn!(
-                                target: "ducktape::statesync",
-                                peer = %noded::hex_bytes(&peer.as_ref()[..4]),
-                                attempts,
-                                reason,
-                                "statesync request dropped — the serve queue is full"
-                            );
-                        }
-                        continue;
-                    }
-                };
-                let _ = bridge_tx.try_send((peer, msg.into(), seat));
+                let queued = bridge_tx.try_send((peer.clone(), msg.into()));
+                if queued.is_err()
+                    && let Some(attempts) = DROPPED.hit("serve_queue_full")
+                {
+                    tracing::warn!(
+                        target: "ducktape::statesync",
+                        peer = %noded::hex_bytes(&peer.as_ref()[..4]),
+                        attempts,
+                        reason = "serve_queue_full",
+                        "statesync request dropped — the serve queue is full"
+                    );
+                }
             }
         }
     });
@@ -450,8 +397,7 @@ pub(super) fn wire_serve_lanes(
             // can drive these, and sharing REFUSED's counter would let them
             // starve a genuine refusal of its stride-100 print.
             static COCLIENT_DROP: noded::log::Latch = noded::log::Latch::new(100);
-            let forge_seats = PeerSeats::new(FORGE_ANSWERS_PER_PEER, MAX_FORGE_ANSWERS);
-            while let Some((peer, bytes, _queued)) = ingress.next().await {
+            while let Some((peer, bytes)) = ingress.next().await {
                 // mesh frames ride the AUTHENTICATED rpc envelope
                 // (requester ‖ proof ‖ id ‖ body — the id correlates).
                 let Ok((requester, proof, rpc_id, body)) = statesync::decode_rpc(&bytes) else {
@@ -643,7 +589,6 @@ pub(super) fn wire_serve_lanes(
                     statesync::SyncRequest::ForgeObjects { repo, head, bases } => {
                         spawn_forge_answer(
                             &ctx,
-                            &forge_seats,
                             forge_repo.clone(),
                             sync_blobs.clone(),
                             served_packs.clone(),

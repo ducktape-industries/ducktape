@@ -78,19 +78,6 @@ pub(crate) const INTRO_ACK_TIMEOUT_MS: u64 = 2_000;
 /// intro's endpoint (that one pair stays dark until it does).
 pub const INVITE_JOIN_WINDOW_MS: u64 = 90_000;
 
-/// Ceiling on join-window tunnel peers installed at once. An intro is
-/// node-authenticated but NOT membership-checked (that needs committed
-/// state, which runs at the loop), so anyone holding a leaked invite can
-/// mint intros from fresh keypairs; without a cap every exposed member's
-/// WireGuard peer table grew at the attacker's pace until the userspace
-/// device's peer-index assert. Sized for every concurrent honest joiner a
-/// member could plausibly gate at once, not for a flood.
-pub const MAX_INVITE_PEERS: usize = 64;
-
-/// The refusal an intro earns when the join-window table is full — the
-/// reply text the inviter sends back, and the reason token it logs.
-pub const INVITE_PEERS_FULL: &str = "invite_peers_full";
-
 /// One join-window tunnel peer: its interface entry plus the step clock at
 /// its (last) intro, which is what the join-window prune counts from.
 #[derive(Debug, Clone, borsh::BorshSerialize, borsh::BorshDeserialize, borsh::BorshSchema)]
@@ -177,10 +164,9 @@ pub(crate) struct Driver {
     /// JOIN-WINDOW peers (see [`Event::InstallInvitePeer`]):
     /// epoch-independent, merged into every apply as the weakest layer (an
     /// entry never overrides a validated plan or a pre-warm record for the
-    /// same identity, and dissolves once one exists). The UNCOVERED entries
-    /// are bounded at [`MAX_INVITE_PEERS`] and outlive their last intro by
-    /// [`INVITE_JOIN_WINDOW_MS`] at most; a covered one (grafted onto an
-    /// endpoint-less record) spends no slot and never ages out.
+    /// same identity, and dissolves once one exists). An UNCOVERED entry
+    /// outlives its last intro by [`INVITE_JOIN_WINDOW_MS`] at most; a
+    /// covered one (grafted onto an endpoint-less record) never ages out.
     pub(crate) invite_peers: BTreeMap<ValidatorIdentity, InvitePeer>,
     /// the last CONTROL endpoint observed per identity — the only-on-change
     /// ledger behind [`ReachabilityEvent::ControlEndpointObserved`].
@@ -1154,30 +1140,6 @@ mod invite_layer_tests {
             .expect("the intro pushed the interface")
     }
 
-    /// A full join-window table refuses the next stranger with the reason
-    /// token and pushes nothing; a peer already in the table may re-introduce.
-    #[test]
-    fn a_full_invite_table_refuses_the_next_intro() {
-        let mut machine = machine();
-        for seed in 2..2 + MAX_INVITE_PEERS as u64 {
-            assert_eq!(refusal(&intro(&mut machine, seed, 1_000)), None);
-        }
-        assert_eq!(machine.driver.invite_peers.len(), MAX_INVITE_PEERS);
-
-        let overflow = intro(&mut machine, 200, 1_000);
-        assert_eq!(refusal(&overflow), Some(INVITE_PEERS_FULL));
-        assert!(
-            !overflow
-                .iter()
-                .any(|effect| matches!(effect, Effect::WgApply { .. })),
-            "a refused intro never touches the interface"
-        );
-        assert_eq!(machine.driver.invite_peers.len(), MAX_INVITE_PEERS);
-
-        // a re-intro from an installed joiner is not a new slot.
-        assert_eq!(refusal(&intro(&mut machine, 2, 1_500)), None);
-    }
-
     /// An uncovered entry outlives its last intro by the join window: the
     /// next apply past it drops the peer, while a re-intro inside the window
     /// keeps it alive.
@@ -1263,17 +1225,16 @@ mod invite_layer_tests {
         );
     }
 
-    /// The intro path itself prunes and counts by coverage, never by age
-    /// alone: a table of NAT'd members promoted long ago (endpoint-less
-    /// records, entries far older than the window) keeps every grafted
-    /// endpoint through a stranger's late intro — and, being covered, spends
-    /// no join-window slot, so a full table of members still admits it.
+    /// The intro path itself prunes by coverage, never by age alone: a
+    /// table of NAT'd members promoted long ago (endpoint-less records,
+    /// entries far older than the window) keeps every grafted endpoint
+    /// through a stranger's late intro.
     #[test]
-    fn covered_members_survive_a_late_stranger_and_spend_no_slot() {
+    fn covered_members_survive_a_late_stranger() {
         let mut machine = machine();
         let member_key = |octet: u8| X25519PublicKey([octet; 32]);
         let member_endpoint = |octet: u8| SocketAddr::from(([9, 9, 9, octet], 51_820));
-        let octets = 100..100 + MAX_INVITE_PEERS as u8;
+        let octets = 100..164u8;
         let mut base = BTreeMap::new();
         for octet in octets.clone() {
             let member = ValidatorIdentity([octet; 32]);
@@ -1302,11 +1263,7 @@ mod invite_layer_tests {
         machine.driver.base_peers = Some(base);
 
         let effects = intro(&mut machine, 2, INVITE_JOIN_WINDOW_MS + 1);
-        assert_eq!(
-            refusal(&effects),
-            None,
-            "covered entries spend no join-window slot"
-        );
+        assert_eq!(refusal(&effects), None, "the late stranger is admitted");
         let pushed = effects
             .iter()
             .find_map(|effect| match effect {
@@ -1331,7 +1288,7 @@ mod invite_layer_tests {
                 .any(|peer| peer.wireguard_public_key == X25519PublicKey([3; 32])),
             "the stranger is installed"
         );
-        assert_eq!(machine.driver.invite_peers.len(), MAX_INVITE_PEERS + 1);
+        assert_eq!(machine.driver.invite_peers.len(), 65);
     }
 
     /// A byte-identical re-intro (same key, same observed endpoint) changes

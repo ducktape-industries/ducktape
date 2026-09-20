@@ -133,65 +133,6 @@ fn failed_block_rolls_back_every_module() {
     });
 }
 
-// (a) budget exhaustion is a drain failure too: a self-emitting module that also
-// staged a real write must roll that write back when it hits MAX_DISPATCHES.
-struct Looper;
-#[async_trait::async_trait(?Send)]
-impl Module for Looper {
-    fn id(&self) -> ModuleId {
-        "looper".into()
-    }
-    fn root(&self) -> StateRoot {
-        StateRoot::ZERO
-    }
-    async fn execute(&mut self, ctx: &mut dyn Ctx, _m: &Msg) -> Result<(), Error> {
-        // stage a directory write, then re-emit to self forever -> BudgetExceeded.
-        ctx.emit_msg(Msg {
-            target: DIR.into(),
-            payload: dir_encode(&DirMsg::Set {
-                key: "k".into(),
-                value: "v".into(),
-            }),
-        });
-        ctx.emit_msg(Msg {
-            target: "looper".into(),
-            payload: Vec::new(),
-        });
-        Ok(())
-    }
-}
-
-#[test]
-fn budget_exceeded_also_rolls_back() {
-    deterministic::Runner::default().start(|_| async move {
-        let mut host =
-            Host::genesis(vec![Box::new(Directory::new(DIR)), Box::new(Looper)]).expect("genesis");
-
-        let dir0 = host.module_root(DIR).unwrap();
-        let app0 = host.root_hash();
-
-        let err = host
-            .submit(Msg {
-                target: "looper".into(),
-                payload: Vec::new(),
-            })
-            .await
-            .expect_err("must hit the dispatch budget");
-        assert_eq!(err, host::SubmitError::Rejected(Error::BudgetExceeded));
-
-        assert_eq!(
-            host.module_root(DIR).unwrap(),
-            dir0,
-            "directory must roll back on budget exhaustion"
-        );
-        assert_eq!(
-            host.root_hash(),
-            app0,
-            "root-hash unchanged after a budget-exceeded block"
-        );
-    });
-}
-
 // (b) a successful multi-write block commits ALL writes together.
 #[test]
 fn successful_multi_write_block_commits_all_together() {

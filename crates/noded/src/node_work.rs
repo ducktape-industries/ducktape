@@ -129,14 +129,11 @@ fn read_blob(base: &std::path::Path, source: &ForgeBlob) -> Result<Vec<u8>, Blob
     let odb = repo
         .odb()
         .map_err(|error| BlobError::Unavailable(error.to_string()))?;
-    let (size, kind) = odb
+    let (_, kind) = odb
         .read_header(entry.id())
         .map_err(|error| BlobError::Unavailable(error.to_string()))?;
-    let bounded = kind == git2::ObjectType::Blob && size <= node_work::MAX_STAGED_BLOB_BYTES;
-    if !bounded {
-        return Err(BlobError::Invalid(
-            "blob exceeds the staging byte bound".into(),
-        ));
+    if kind != git2::ObjectType::Blob {
+        return Err(BlobError::Invalid("the path names a non-blob object".into()));
     }
     let blob = repo
         .find_blob(entry.id())

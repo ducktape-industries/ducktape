@@ -112,27 +112,6 @@ impl ResolverTarget {
 /// framing stays far under the mesh's 1 MiB message cap.
 pub const CHUNK_LEN: usize = 256 * 1024;
 
-/// default cap on one module's ASSEMBLED snapshot payload
-/// ([`fetch_snapshot`]'s `max_bytes`). the serving peer chooses `total` and
-/// every chunk length on the wire, so without a ceiling here a byzantine
-/// peer drives an unbounded `Vec<u8>` allocation in a joining node — the
-/// bytes are only root-verified after the whole payload is resident. sized
-/// generously (hundreds of MiB): a legitimate module snapshot can be large,
-/// and this is a refusal floor, not a working-set budget. mirrors the blob
-/// lane's `MAX_MODULE_CODE_BYTES` (bin/node/src/constants.rs) without this
-/// crate depending on `node`.
-pub const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
-
-/// default cap on one [`fetch_frames`] call's ASSEMBLED frame suffix. the
-/// serving peer chooses each `Frames` batch's contents, so without a ceiling
-/// here a source can stream an unbounded number of undecodable (but
-/// cost-free — `Disposition::Rejected` leaves roots unchanged) batches and
-/// drive the joiner's RSS up before a single frame is applied. mirrors
-/// [`MAX_SNAPSHOT_BYTES`]'s shape at a smaller size: a frame window is
-/// applied and discarded as it lands, so it never needs to hold hundreds of
-/// MiB at once — a caller that hits this refetches in a smaller window.
-pub const MAX_CATCHUP_BYTES: u64 = 64 * 1024 * 1024;
-
 /// max recovery frames examined per [`SyncResponse::Frames`] batch. This is a
 /// work bound, not a byte guarantee: the node serve path separately budgets the
 /// exact encoded response against its configured mesh message cap.
@@ -198,14 +177,13 @@ pub enum SyncError {
     UnexpectedResponse(&'static str),
     #[error("module {module}: {reason}")]
     Module { module: ModuleId, reason: String },
-    #[error("module {module}: snapshot too large ({reason}, cap {cap} bytes)")]
-    TooLarge {
+    #[error("module {module}: the served stream is malformed ({reason})")]
+    Malformed {
         module: ModuleId,
         /// stable snake_case token — never prose — so a caller (and the log
         /// line it lands in) can tell which check refused without parsing
         /// English.
         reason: &'static str,
-        cap: u64,
     },
     #[error("module {module}: pinned qmdb range pruned ({reason}); refetch manifest")]
     Pruned { module: ModuleId, reason: String },
@@ -2046,24 +2024,19 @@ pub async fn fetch_manifest<C: SyncClient>(client: &C) -> Result<Manifest, SyncE
     }
 }
 
-/// fetch a captured module's full snapshot payload, chunk by chunk, refusing
-/// to assemble more than `max_bytes` — see [`MAX_SNAPSHOT_BYTES`]. both
-/// `total` and each chunk's length are the SERVING peer's choice, so every
-/// bound here runs BEFORE the bytes it would refuse are appended: an
-/// oversized `total` refuses before the loop allocates anything, an
-/// oversized chunk refuses before it is appended, and a peer that keeps
-/// sending past its own declared `total` refuses too (it is lying, not
-/// generous).
+/// fetch a captured module's full snapshot payload, chunk by chunk. each
+/// chunk's length is the SERVING peer's choice, so every check here runs
+/// BEFORE the bytes it would refuse are appended: an oversized chunk refuses
+/// before it is appended, and a peer that keeps sending past its own
+/// declared `total` refuses too (it is lying, not generous).
 pub async fn fetch_snapshot<C: SyncClient>(
     client: &C,
     boundary: BoundaryId,
     module_id: &str,
-    max_bytes: u64,
 ) -> Result<Vec<u8>, SyncError> {
-    let too_large = |reason: &'static str| SyncError::TooLarge {
+    let malformed = |reason: &'static str| SyncError::Malformed {
         module: module_id.to_string(),
         reason,
-        cap: max_bytes,
     };
     let mut out: Vec<u8> = Vec::new();
     loop {
@@ -2074,11 +2047,8 @@ pub async fn fetch_snapshot<C: SyncClient>(
         };
         match client.request(req).await? {
             SyncResponse::Chunk { total, bytes } => {
-                if total > max_bytes {
-                    return Err(too_large("declared_total_exceeds_cap"));
-                }
                 if bytes.len() > CHUNK_LEN {
-                    return Err(too_large("chunk_exceeds_chunk_len"));
+                    return Err(malformed("chunk_exceeds_chunk_len"));
                 }
                 if bytes.is_empty() && out.len() < total as usize {
                     return Err(SyncError::Module {
@@ -2087,13 +2057,10 @@ pub async fn fetch_snapshot<C: SyncClient>(
                     });
                 }
                 let would_be = out.len() as u64 + bytes.len() as u64;
-                if would_be > max_bytes {
-                    return Err(too_large("accumulated_exceeds_cap"));
-                }
                 if would_be > total {
                     // a peer that keeps sending past its own declared total
                     // is lying about the total, the stream, or both.
-                    return Err(too_large("accumulated_exceeds_total"));
+                    return Err(malformed("accumulated_exceeds_total"));
                 }
                 out.extend_from_slice(&bytes);
                 if out.len() as u64 >= total {
@@ -2254,31 +2221,20 @@ where
     }
 }
 
-/// fetch a finite, ordered recovery-frame suffix in bounded batches,
-/// refusing to assemble more than `max_bytes` of frame payload — see
-/// [`MAX_CATCHUP_BYTES`]. mirrors [`fetch_snapshot`]'s cap shape: the check
-/// runs before a frame's bytes are added to the running total, never after.
-/// every caller is a served, UNVERIFIED range — a peer's own reported tip
-/// (the joiner catch-up lane) or a peer's own reported frames (a probe, a
-/// live-drain backfill) — so nothing here gets to skip the cap.
-pub async fn fetch_frames_capped<C: SyncClient>(
+/// fetch a finite, ordered recovery-frame suffix in bounded batches. every
+/// frame height is checked against the range before it is kept, so a served
+/// batch cannot smuggle a frame from outside it.
+pub async fn fetch_frames<C: SyncClient>(
     client: &C,
     after_height: u64,
     up_to_height: u64,
-    max_bytes: u64,
 ) -> Result<Vec<FinalizedFrame>, SyncError> {
     if after_height > up_to_height {
         return Err(SyncError::Server(format!(
             "invalid frame range ({after_height}, {up_to_height}]"
         )));
     }
-    let too_large = |cap: u64| SyncError::TooLarge {
-        module: "recovery".to_string(),
-        reason: "catchup_frames_exceed_cap",
-        cap,
-    };
     let mut out = Vec::new();
-    let mut total_bytes = 0u64;
     let mut after = after_height;
     while after < up_to_height {
         let resp = client
@@ -2303,10 +2259,6 @@ pub async fn fetch_frames_capped<C: SyncClient>(
                              ({after}, {up_to_height}]",
                             frame.height
                         )));
-                    }
-                    total_bytes += frame.frame.len() as u64;
-                    if total_bytes > max_bytes {
-                        return Err(too_large(max_bytes));
                     }
                     last = frame.height;
                     out.push(frame);
@@ -2979,43 +2931,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_snapshot_refuses_oversized_total_before_any_chunk() {
-        let cap = 1024u64;
-        let client = ScriptedClient::new(vec![SyncResponse::Chunk {
-            total: cap + 1,
-            bytes: vec![1, 2, 3],
-        }]);
-        let err = fetch_snapshot(&client, test_boundary(), "mod", cap)
-            .await
-            .expect_err("declared total over cap must refuse");
-        assert!(
-            matches!(
-                err,
-                SyncError::TooLarge {
-                    reason: "declared_total_exceeds_cap",
-                    ..
-                }
-            ),
-            "unexpected error: {err:?}"
-        );
-        // refused on the very first reply — never asked for a second chunk.
-        assert_eq!(client.call_count(), 1);
-    }
-
-    #[tokio::test]
     async fn fetch_snapshot_refuses_an_oversized_chunk() {
-        let cap = 1024u64;
         let client = ScriptedClient::new(vec![SyncResponse::Chunk {
-            total: cap,
+            total: 1024,
             bytes: vec![0u8; CHUNK_LEN + 1],
         }]);
-        let err = fetch_snapshot(&client, test_boundary(), "mod", cap)
+        let err = fetch_snapshot(&client, test_boundary(), "mod")
             .await
             .expect_err("a chunk over CHUNK_LEN must refuse");
         assert!(
             matches!(
                 err,
-                SyncError::TooLarge {
+                SyncError::Malformed {
                     reason: "chunk_exceeds_chunk_len",
                     ..
                 }
@@ -3026,7 +2953,6 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_snapshot_refuses_a_stream_that_overruns_its_own_total() {
-        let cap = 1024u64;
         // total says 10 bytes; the first chunk honestly delivers part of
         // that, but the second keeps sending well past the declared total.
         let client = ScriptedClient::new(vec![
@@ -3039,13 +2965,13 @@ mod tests {
                 bytes: vec![2u8; 10],
             },
         ]);
-        let err = fetch_snapshot(&client, test_boundary(), "mod", cap)
+        let err = fetch_snapshot(&client, test_boundary(), "mod")
             .await
             .expect_err("a peer that sends past its own total is lying");
         assert!(
             matches!(
                 err,
-                SyncError::TooLarge {
+                SyncError::Malformed {
                     reason: "accumulated_exceeds_total",
                     ..
                 }
@@ -3056,7 +2982,6 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_snapshot_assembles_an_honest_stream() {
-        let cap = 1024u64;
         let total = 10u64;
         let client = ScriptedClient::new(vec![
             SyncResponse::Chunk {
@@ -3072,60 +2997,11 @@ mod tests {
                 bytes: vec![8u8, 9, 10],
             },
         ]);
-        let bytes = fetch_snapshot(&client, test_boundary(), "mod", cap)
+        let bytes = fetch_snapshot(&client, test_boundary(), "mod")
             .await
-            .expect("an honest, in-cap stream assembles");
+            .expect("an honest stream assembles");
         assert_eq!(bytes, vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(client.call_count(), 3);
     }
 
-    // ------------------------------------------------------------------
-    // fetch_frames_capped: the served frame batch is the PEER's choice too —
-    // a source can stream any number of oversized "recovery frames" (they
-    // cost it nothing: an undecodable batch lands as Rejected with roots
-    // unchanged) to drive the joiner's RSS up before a single frame applies.
-    // ------------------------------------------------------------------
-
-    fn test_frame(height: u64, len: usize) -> FinalizedFrame {
-        FinalizedFrame {
-            height,
-            frame: vec![0u8; len],
-            disposition: FrameDisposition::Applied,
-            roots: vec![],
-            root_hash: StateRoot([0u8; ROOT_LEN]),
-        }
-    }
-
-    #[tokio::test]
-    async fn fetch_frames_capped_refuses_a_suffix_over_the_byte_cap() {
-        let cap = 16u64;
-        let client = ScriptedClient::new(vec![SyncResponse::Frames {
-            frames: vec![test_frame(1, 10), test_frame(2, 10)],
-        }]);
-        let err = fetch_frames_capped(&client, 0, 2, cap)
-            .await
-            .expect_err("a suffix whose frames exceed the cap must refuse");
-        assert!(
-            matches!(
-                err,
-                SyncError::TooLarge {
-                    reason: "catchup_frames_exceed_cap",
-                    ..
-                }
-            ),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn fetch_frames_capped_assembles_an_in_cap_suffix() {
-        let cap = 1024u64;
-        let client = ScriptedClient::new(vec![SyncResponse::Frames {
-            frames: vec![test_frame(1, 10), test_frame(2, 10)],
-        }]);
-        let frames = fetch_frames_capped(&client, 0, 2, cap)
-            .await
-            .expect("an in-cap suffix assembles");
-        assert_eq!(frames.len(), 2);
-    }
 }

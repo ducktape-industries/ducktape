@@ -1,12 +1,12 @@
 //! reactor-seam scenarios: the block-COMPOSITION seams the real host and the
 //! sim driver own, not any one module's semantics. every block here is
-//! composed by the REAL `host::Host` (route → drain FIFO under
-//! `MAX_DISPATCHES` → commit-or-abort → recompose root-hash), driven over
+//! composed by the REAL `host::Host` (route → drain FIFO to empty →
+//! commit-or-abort → recompose root-hash), driven over
 //! noded's exact /v1 wire plus the /sim control lane. what these pin:
 //!
 //! - the self-retriggering rule: an automation that posts into its own hooked
 //!   channel is the natural infinite loop — WHAT stops it (the module's own
-//!   user-author guard, ahead of the host's dispatch budget).
+//!   user-author guard; the host runs the queue until it empties).
 //! - oracle-drain discipline: worker follow-ups queue behind their triggering
 //!   block and drain ONE per `/sim/step`, never coalescing, undisturbed by a
 //!   peer block wedged between two drains.
@@ -84,10 +84,9 @@ fn echo_work_spec() -> Vec<u8> {
 /// an automations rule whose action posts back into its own hooked channel is
 /// the textbook infinite loop. WHAT stops it, from the wire, is the module's
 /// OWN loop-prevention guard (a rule fires only on `external-user` posts, and
-/// its follow-up post is module-authored), not the host's `MAX_DISPATCHES`
-/// budget — the raw `Error::BudgetExceeded` path stays unreachable through this
-/// route. the guard swallows the re-entry silently (before any run record), so
-/// the whole cascade commits as ONE atomic block.
+/// its follow-up post is module-authored). the guard swallows the re-entry
+/// silently (before any run record), so the whole cascade commits as ONE
+/// atomic block.
 #[test]
 fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
     let storage = tempfile::tempdir().expect("storage dir");
@@ -126,8 +125,8 @@ fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
         Some(fired_at),
         "the rule fire rides the triggering block — no runaway follow-up blocks"
     );
-    // the block COMMITTED — the guard prevented the loop, so there was never a
-    // BudgetExceeded abort (which would have rolled the root-hash back unchanged).
+    // the block COMMITTED — the guard prevented the loop, so the root-hash
+    // moved.
     assert_ne!(
         sim.status()["root_hash"].as_str().map(str::to_string),
         Some(before_hash),

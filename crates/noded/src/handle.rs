@@ -454,7 +454,6 @@ pub struct NodeHandle {
     /// Dedicated least-privilege browser origin for gateway rendering. It is
     /// a separate loopback listener, never the node API origin.
     pub(crate) browser_gateway: Option<BrowserGateway>,
-    pub(crate) application_doors: Arc<crate::gateway_http::WsDoorLimit>,
     /// the root dir the duckfs workspace RPC materializes managed checkouts
     /// under (`<storage>/duckfs-workspaces`). node-local disk state, threaded in
     /// like `forge_repo`; `None` on a handle that never serves the seam (the
@@ -479,16 +478,6 @@ pub struct NodeHandle {
     /// routes to 503. An entry confers no standing: `ducktape service enable`
     /// is the consent boundary.
     pub(crate) services: crate::services::ServiceCatalog,
-    /// how many `POST /v1/index/{module}/view` calls (each a wasm query) or
-    /// `GET /v1/index/status` calls (each a fold-trigger queue scan) may run
-    /// concurrently off an axum worker — see
-    /// [`crate::index::MAX_CONCURRENT_INDEX_VIEWS`]. one shared pool, not one
-    /// per route: both are unauthenticated reads that can burn a worker
-    /// thread's worth of CPU, so they compete for the same budget. `Arc` so
-    /// every clone of this handle (one per accepted connection) shares the
-    /// same gate; always present, since each route already 503s a handle
-    /// with no index store wired.
-    pub(crate) index_view_gate: Arc<tokio::sync::Semaphore>,
     /// this node's own mesh-identity signer — the SAME key `NodeStatus.public_key`
     /// publishes. wired directly (not through the `cmds` actor lane) so
     /// `POST /v1/huddle/node-proof` answers synchronously, like `status` does.
@@ -522,15 +511,11 @@ impl NodeHandle {
             presence: None,
             gateway: None,
             browser_gateway: None,
-            application_doors: Arc::default(),
             duckfs_workspaces: None,
             code_stage: None,
             admin: crate::admin::AdminConfig::default(),
             service_link: None,
             services: crate::services::ServiceCatalog::default(),
-            index_view_gate: Arc::new(tokio::sync::Semaphore::new(
-                crate::index::MAX_CONCURRENT_INDEX_VIEWS,
-            )),
             node_signer: None,
         };
         (handle, cmd_rx, hub)
@@ -650,7 +635,6 @@ impl NodeHandle {
         self.browser_gateway = Some(BrowserGateway {
             listen,
             ws_tokens: Arc::new(WsTokenStore::new()),
-            ws_doors: Arc::default(),
         });
         self
     }
