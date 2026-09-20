@@ -49,7 +49,7 @@ const SELECTION: &[&str] = &[
 
 const BINDINGS: Bindings<'static> = Bindings {
     invite: b"t",
-    chain_id: "t",
+    chain_id: "t#00000000",
     time_unit: sdk::genesis_config::TimeUnit::Height,
 };
 
