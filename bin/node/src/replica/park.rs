@@ -3051,15 +3051,14 @@ mod tests {
         let (cmd, mut commands) = tokio::sync::mpsc::channel(1);
         cmd.try_send(reachability::ReachabilityCommand::ViewTick(560))
             .unwrap();
-        let queued = {
-            let cmd = cmd.clone();
-            tokio::spawn(async move { queue_reach_shutdown(&cmd).await.is_ok() })
-        };
+        let queued = queue_reach_shutdown(&cmd);
+        tokio::pin!(queued);
+        assert!(futures::poll!(queued.as_mut()).is_pending());
         assert!(matches!(
             commands.recv().await,
             Some(reachability::ReachabilityCommand::ViewTick(560))
         ));
-        assert!(queued.await.unwrap());
+        assert!(queued.await.is_ok());
         assert!(matches!(
             commands.recv().await,
             Some(reachability::ReachabilityCommand::Shutdown)
