@@ -1,5 +1,7 @@
 //! Registry ports preserve state roots and their block-boundary decisions.
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+#[path = "support/modules_status_contract.rs"]
+mod modules_status_contract;
 use sdk::{Env, Module, Msg, Origin};
 use sdk_testkit::{MemStore, TestCtx};
 use wasm_host::WasmModule;
@@ -128,7 +130,7 @@ async fn registry_reply(module: &dyn Module) -> Vec<u8> {
     module
         .query_with(
             &TestCtx::at_height(0),
-            &modules::encode_query(&modules::ModulesQuery::ModuleStatus),
+            &modules_status_contract::status_query(),
         )
         .await
         .unwrap()
@@ -248,29 +250,26 @@ fn registry_staged_queries_and_committed_advance_match_native() {
             assert_eq!(native.root(), wasm.root());
             assert_eq!(registry_reply(&native).await, registry_reply(&wasm).await);
         }
-        let modules::ModulesReply::ModuleStatus { modules } =
-            modules::decode_reply(&registry_reply(&wasm).await).unwrap()
-        else {
-            panic!("registry status reply");
-        };
+        let modules = modules_status_contract::decode_status(&registry_reply(&wasm).await)
+            .expect("registry status reply");
         let weather = modules
             .iter()
             .find(|module| module.module_id == "weather")
             .unwrap();
         assert_eq!(weather.active_code_hash, vec![3; 32]);
-        assert_eq!(weather.kind, modules::Kind::Module);
+        assert_eq!(weather.kind, modules_status_contract::Kind::Module);
         assert_eq!(weather.history.last().unwrap().height, 5);
         let home = modules
             .iter()
             .find(|module| module.module_id == "home")
             .unwrap();
-        assert_eq!(home.kind, modules::Kind::View);
+        assert_eq!(home.kind, modules_status_contract::Kind::View);
         assert_eq!(home.active_code_hash, vec![5; 32]);
         let board = modules
             .iter()
             .find(|module| module.module_id == "board")
             .unwrap();
-        assert_eq!(board.kind, modules::Kind::View);
+        assert_eq!(board.kind, modules_status_contract::Kind::View);
         assert_eq!(board.active_code_hash, vec![6; 32]);
         assert_eq!(board.history.len(), 1);
     });
