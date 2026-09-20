@@ -25,6 +25,10 @@ use crate::{
 pub use node::NOP_TARGET;
 
 fn log_provider_result_tail(height: u64, dispatches: &[host::DispatchRecord]) -> bool {
+    let enabled = tracing::enabled!(target: "ducktape::provider", tracing::Level::DEBUG);
+    if !enabled {
+        return false;
+    }
     let mut observed = false;
     for dispatch in dispatches {
         match dispatch.module.as_str() {
