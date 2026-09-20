@@ -366,12 +366,10 @@ name = "attribution"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "attribution-wire",
  "borsh",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
- "identity-wire",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -787,7 +785,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
- "capability-wire",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
@@ -795,16 +792,6 @@ dependencies = [
  "sdk-testkit",
  "serde",
  "statesync",
- "valset-wire",
-]
-
-[[package]]
-name = "capability-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "sdk",
- "serde",
 ]
 
 [[package]]
@@ -2379,13 +2366,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
- "capability-wire",
  "commonware-runtime",
- "dispatch-wire",
  "ducktape-module-sdk",
  "futures",
- "identity-wire",
- "saga",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -5625,7 +5608,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "broker-host",
- "capability-wire",
  "futures",
  "libc",
  "mcp-host",
@@ -6336,13 +6318,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
- "capability-wire",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
  "host",
  "index-guest",
- "saga-wire",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -6350,8 +6330,6 @@ dependencies = [
  "sha2 0.10.9",
  "statesync",
  "tempfile",
- "valset",
- "valset-wire",
 ]
 
 [[package]]
