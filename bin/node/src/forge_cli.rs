@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use commonware_cryptography::Signer as _;
 use duck_address::{Address, ChainId, Refused};
-use forge_wire::ForgeRepoAddress;
+use crate::wire::forge::ForgeRepoAddress;
 use workspace_config::{Registered, RemoteWorkspace};
 
 /// the name git runs the helper by: `git-remote-<scheme>`.

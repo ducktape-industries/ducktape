@@ -29,7 +29,7 @@ use files::{
     decode_reply as files_decode_reply, encode_msg as files_encode_msg, encode_putblob,
     encode_query as files_encode_query, objects::object_id, to_hex,
 };
-use tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
+use common::wire::tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
 /// a distinctive, non-uniform byte pattern (251 is prime, so it aligns with no
 /// power-of-two boundary — truncation or chunk-order corruption is caught, not

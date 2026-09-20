@@ -2,13 +2,10 @@
 use std::collections::BTreeMap;
 
 #[cfg(noded_wire_contracts)]
-use crate::module_contracts::agent;
-#[cfg(noded_wire_contracts)]
-use crate::module_contracts::agent::{Continuation, Decode, Predicate, Program, Step, Value};
+use crate::module_contracts::{agent, runs};
 #[cfg(not(noded_wire_contracts))]
+use crate::wire::{agent, runs};
 use agent::{Continuation, Decode, Predicate, Program, Step, Value};
-#[cfg(noded_wire_contracts)]
-use crate::module_contracts::runs;
 #[cfg(noded_wire_contracts)]
 type ConversationPackage = crate::module_contracts::runs::ConversationPackage;
 #[cfg(not(noded_wire_contracts))]

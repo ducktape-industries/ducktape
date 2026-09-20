@@ -33,14 +33,15 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use capability::{CapabilityQuery, CapabilityReply};
-use chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, PostPolicy, Span};
+use common::wire::{chat, runs};
+use common::wire::chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, PostPolicy, Span};
 use common::{Cluster, SandboxStage, sandbox_toml, skip_unless_sandboxed};
 use duckfs_core::{
     Change, Content, FilesMsg, FilesQuery, FilesReply, decode_reply as files_decode_reply,
     encode_msg as files_encode_msg, encode_query as files_encode_query,
 };
-use runs::{ModelMsg, SkillRef};
-use runs::{RunsMsg, RunsQuery, RunsReply};
+use common::wire::runs::{ModelMsg, SkillRef};
+use common::wire::runs::{RunsMsg, RunsQuery, RunsReply};
 
 const CONVERGE: Duration = Duration::from_secs(180);
 const FINALIZE: Duration = Duration::from_secs(60);

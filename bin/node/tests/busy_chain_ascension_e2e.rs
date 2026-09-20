@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use chat::{Block, ChatMsg, PostPolicy, encode_msg};
+use common::wire::chat::{Block, ChatMsg, PostPolicy, encode_msg};
 use common::NetworkShapeCluster;
 
 /// generous like the sibling legs: boot → served boundary → head follow is

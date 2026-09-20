@@ -18,7 +18,8 @@ mod common;
 
 use std::time::Duration;
 
-use chat::{ChatMsg, ChatQuery, ChatReply};
+use common::wire::{chat};
+use common::wire::chat::{ChatMsg, ChatQuery, ChatReply};
 use common::NetworkShapeCluster;
 use commonware_cryptography::{Signer as _, ed25519};
 

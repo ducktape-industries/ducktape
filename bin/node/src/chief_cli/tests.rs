@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use sha2::Digest as _;
 use std::sync::{Arc, Mutex};
 
+use crate::wire::{agent, runs};
+
 /// Real blocking CLI requests against an event-driven HTTP fixture. Drop closes
 /// admission and joins the server; no polling, deadlines or sleep-based waits.
 struct HttpFixture {

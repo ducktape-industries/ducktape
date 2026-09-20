@@ -1452,6 +1452,77 @@ pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String>
     Ok(out)
 }
 
+/// Move one exact local workspace out of the registry, preserving every file.
+/// The destination is below [`ARCHIVED_WORKSPACES_DIR`], outside the registry
+/// scan. A caller can restore the workspace by moving the returned directory
+/// back to its original path; no overwrite or deletion is attempted.
+pub fn archive_workspace(node_toml: &Path) -> Result<PathBuf, String> {
+    archive_workspace_in(&ducktape_home()?, node_toml)
+}
+
+/// Testable form of [`archive_workspace`]. `node_toml` must identify exactly
+/// one entry in `root`; a chain id alone is not enough when two workspaces
+/// share a network.
+pub fn archive_workspace_in(root: &Path, node_toml: &Path) -> Result<PathBuf, String> {
+    let requested = std::fs::canonicalize(node_toml)
+        .map_err(|e| format!("cannot identify workspace config {node_toml:?}: {e}"))?;
+    let matches: Vec<(String, PathBuf)> = list_workspaces_in(root)?
+        .into_iter()
+        .filter(|(_, candidate)| {
+            std::fs::canonicalize(candidate).is_ok_and(|candidate| candidate == requested)
+        })
+        .collect();
+    let (chain_id, registered) = match matches.as_slice() {
+        [(chain_id, registered)] => (chain_id, registered),
+        [] => {
+            return Err(format!(
+                "workspace config {node_toml:?} is not registered under {root:?}"
+            ));
+        }
+        several => {
+            return Err(format!(
+                "workspace config {node_toml:?} is ambiguous — {} registered entries match",
+                several.len()
+            ));
+        }
+    };
+    let workspace = registered
+        .parent()
+        .ok_or_else(|| format!("workspace config {registered:?} has no directory"))?;
+    let archive_root = root.join(ARCHIVED_WORKSPACES_DIR);
+    if workspace == archive_root {
+        return Err(format!(
+            "workspace {workspace:?} is the archive directory — refusing to move the registry"
+        ));
+    }
+    std::fs::create_dir_all(&archive_root)
+        .map_err(|e| format!("create workspace archive {archive_root:?}: {e}"))?;
+    let base = workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("workspace {workspace:?} has no usable directory name"))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("clock before epoch while archiving {workspace:?}: {e}"))?
+        .as_nanos();
+    for ordinal in 0..1000u16 {
+        let destination = archive_root.join(format!("{base}-{stamp}-{ordinal}"));
+        if destination.exists() {
+            continue;
+        }
+        std::fs::rename(workspace, &destination).map_err(|e| {
+            format!("archive workspace {chain_id} from {workspace:?} to {destination:?}: {e}")
+        })?;
+        return Ok(destination);
+    }
+    Err(format!(
+        "archive workspace {workspace:?} has no unused destination under {archive_root:?}"
+    ))
+}
+
+/// The directory name used to unregister a workspace without deleting it.
+pub const ARCHIVED_WORKSPACES_DIR: &str = "archived-networks";
+
 /// the file that makes a directory under the ducktape home a REMOTE
 /// workspace: a network this machine reaches through a node it does not run.
 /// A directory holding a `network.toml` is a local workspace and its
@@ -1993,6 +2064,66 @@ mod tests {
         let ids: Vec<&str> = got.iter().map(|(c, _)| c.as_str()).collect();
         assert_eq!(ids, ["alpha#00000001", "zebra#00000002"]);
         assert!(got[0].1.ends_with("alpha#00000001/node.toml"));
+    }
+
+    #[test]
+    fn archiving_a_workspace_unregisters_it_without_deleting_data() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("leave#00000001");
+        std::fs::create_dir_all(&workspace).unwrap();
+        NetworkDescriptor {
+            chain_id: "leave#00000001".into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            genesis: String::new(),
+            modules: Vec::new(),
+        }
+        .save(&workspace.join("network.toml"))
+        .unwrap();
+        std::fs::write(workspace.join("node.toml"), "node state").unwrap();
+        std::fs::write(workspace.join("identity.key"), "preserve me").unwrap();
+
+        let archive = archive_workspace_in(root.path(), &workspace.join("node.toml"))
+            .expect("archive the exact workspace");
+        assert!(!workspace.exists());
+        assert!(archive.starts_with(root.path().join(ARCHIVED_WORKSPACES_DIR)));
+        assert_eq!(
+            std::fs::read_to_string(archive.join("identity.key")).unwrap(),
+            "preserve me"
+        );
+        assert!(list_workspaces_in(root.path()).unwrap().is_empty());
+
+        std::fs::rename(&archive, &workspace).unwrap();
+        assert_eq!(list_workspaces_in(root.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn archiving_requires_the_exact_registered_config_path() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("leave#00000002");
+        std::fs::create_dir_all(&workspace).unwrap();
+        NetworkDescriptor {
+            chain_id: "leave#00000002".into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            genesis: String::new(),
+            modules: Vec::new(),
+        }
+        .save(&workspace.join("network.toml"))
+        .unwrap();
+        std::fs::write(workspace.join("node.toml"), "node state").unwrap();
+        let other = root.path().join("other.toml");
+        std::fs::write(&other, "node state").unwrap();
+
+        let refusal = archive_workspace_in(root.path(), &other).expect_err("unregistered path");
+        assert!(refusal.contains("is not registered"), "{refusal}");
+        assert!(workspace.exists());
     }
 
     #[test]
