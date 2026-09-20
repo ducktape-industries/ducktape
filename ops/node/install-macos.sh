@@ -39,6 +39,7 @@ LABEL="dev.ducktape.node"
 RUST_LOG_FILTER="${RUST_LOG:-info}"
 DUCK_HOME="${DUCKTAPE_HOME:-$HOME/.ducktape}"
 DUCKTAPE_BIN="${DUCKTAPE_BIN:-}"
+LOG_DIR="$HOME/Library/Logs/ducktape"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -49,7 +50,11 @@ while [ $# -gt 0 ]; do
     # is the agent's identity in the user's launchd domain.
     --label) LABEL="${2:?--label needs a value}"; shift 2 ;;
     --rust-log) RUST_LOG_FILTER="${2:?--rust-log needs a filter}"; shift 2 ;;
-    --home) DUCK_HOME="${2:?--home needs a directory}"; shift 2 ;;
+    --home)
+      DUCK_HOME="${2:?--home needs a directory}"
+      LOG_DIR="$DUCK_HOME/Library/Logs/ducktape"
+      shift 2
+      ;;
     --binary) DUCKTAPE_BIN="${2:?--binary needs a path}"; shift 2 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -57,7 +62,6 @@ done
 
 [ "$(uname -s)" = "Darwin" ] || die "refusing: this installs a LaunchAgent; on Linux run install.sh"
 
-LOG_DIR="$HOME/Library/Logs/ducktape"
 AGENT_DIR="$HOME/Library/LaunchAgents"
 PLIST="$AGENT_DIR/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
