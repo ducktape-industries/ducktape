@@ -30,12 +30,15 @@
 //! collapses the duplicate.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::sync::Mutex;
 
 use compute_service::AttemptControl;
 use host::worker::{WorkOutcome, Worker};
 use noded::node_link::NodeLink;
 use saga::{SagaMsg, SagaOrigin, SagaQuery, SagaReply, WorkerRequest};
 use sdk::{Event, Msg};
+use serde_json::Value;
 
 use crate::work_admission::{self, WorkVerdict};
 
@@ -125,6 +128,7 @@ pub(crate) struct WorkPump {
     /// that cannot be read look exactly like an idle one, which is the single
     /// most misleading thing this pump could do.
     unreadable: bool,
+    record_requesters: compute_service::SessionRecordRequesterMap,
 }
 
 impl WorkPump {
@@ -133,6 +137,7 @@ impl WorkPump {
         control: AttemptControl,
         me: Vec<u8>,
         workspace: std::path::PathBuf,
+        record_requesters: compute_service::SessionRecordRequesterMap,
     ) -> Self {
         Self {
             pool,
@@ -142,6 +147,7 @@ impl WorkPump {
             claims: HashMap::new(),
             workspace,
             unreadable: false,
+            record_requesters,
         }
     }
 
@@ -232,6 +238,11 @@ impl WorkPump {
                 continue;
             }
             let verdict = self.admits(node, &request.saga_id).await;
+            if let Some(requester) = run_requester(node, &request.saga_id).await
+                && let Ok(mut requesters) = self.record_requesters.lock()
+            {
+                requesters.insert(dispatch_id_for(&request.saga_id), requester);
+            }
             self.record(request, key, verdict, &mut decided);
         }
         decided
@@ -638,6 +649,44 @@ async fn saga_origin(node: &NodeLink, saga_id: &str) -> Option<SagaOrigin> {
     }
 }
 
+fn dispatch_id_for(saga_id: &str) -> String {
+    saga_id
+        .rsplit_once('\x1f')
+        .map_or(saga_id, |(_, dispatch_id)| dispatch_id)
+        .to_owned()
+}
+
+async fn run_requester(node: &NodeLink, saga_id: &str) -> Option<Value> {
+    let dispatch_id = dispatch_id_for(saga_id);
+    let request = serde_json::to_vec(&runs::view::RunsViewQuery::Run { dispatch_id }).ok()?;
+    let bytes = node
+        .query("runs", &request)
+        .await
+        .ok()?;
+    let runs::view::RunsViewReply::Run(Some(detail)) = serde_json::from_slice(&bytes).ok()? else {
+        return None;
+    };
+    Some(requester_value(&detail.run.requester))
+}
+
+fn requester_value(origin: &sdk::Origin) -> Value {
+    match origin {
+        sdk::Origin::External(key) => serde_json::json!({
+            "kind": "external",
+            "principal_id": hex::encode(key),
+        }),
+        sdk::Origin::Module(module_id) => serde_json::json!({
+            "kind": "module",
+            "module_id": module_id,
+        }),
+        sdk::Origin::Program(account_id) => serde_json::json!({
+            "kind": "program",
+            "account_id": account_id,
+        }),
+        sdk::Origin::System => serde_json::json!({"kind": "system"}),
+    }
+}
+
 /// Confirm WHY an assigned attempt disappeared. `AssignedPending` cannot show a
 /// retry that moved to another node; the per-saga view can. An unreadable or
 /// older view is inconclusive and preserves the two-read flap tolerance.
@@ -812,6 +861,7 @@ mod tests {
                 control,
                 ME.to_vec(),
                 std::path::PathBuf::from("/nonexistent-work-admission-workspace"),
+                Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             ),
             offers,
         )

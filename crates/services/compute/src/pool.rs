@@ -25,6 +25,7 @@ use futures::future::{BoxFuture, Either, select};
 use host::worker::{WorkOutcome, Worker};
 use provider_host::{AirlockConfig, ProviderSet, RunCancellation};
 use sdk::{Event, Msg};
+use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
 use crate::module_contracts::{AdmissionPolicy, RESOURCE_UNAVAILABLE_RESULT};
@@ -80,6 +81,11 @@ pub type SpawnFn = Arc<dyn Fn(SpawnKind, BoxFuture<'static, ()>) + Send + Sync>;
 /// on the spawned task, so it may await (a bounded channel send, a command
 /// round-trip) without touching the host loop.
 pub type DeliverFn = Arc<dyn Fn(Msg) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// Non-secret requester projections supplied by the node's committed run
+/// query, keyed by dispatch id. The pool consumes one entry when a provider
+/// session is created and never handles signing credentials.
+pub type SessionRecordRequesterMap = Arc<Mutex<BTreeMap<String, Value>>>;
 
 /// the concurrency cap: `DUCKTAPE_MAX_CONCURRENT_RUNS` when set to a
 /// positive integer (the `DUCKTAPE_PROVIDER_TIMEOUT_SECS` precedent), else
@@ -156,6 +162,89 @@ fn run_key_for(saga_id: &str) -> String {
         .rsplit_once('\x1f')
         .map_or(saga_id, |(_, dispatch_id)| dispatch_id)
         .to_string()
+}
+
+fn record_context(
+    job: &ExecJob,
+    ctx: &provider_host::RunContext,
+    scheduled: bool,
+    requesters: Option<&SessionRecordRequesterMap>,
+) -> provider_host::SessionRecordContext {
+    let run_id = run_key_for(&job.saga_id);
+    let session_id = format!("{run_id}-{}", job.attempt);
+    let requester = requesters.and_then(|requesters| {
+        requesters
+            .lock()
+            .ok()
+            .and_then(|mut requesters| requesters.remove(&run_id))
+    });
+    let delegated = serde_json::from_str::<Value>(&job.input)
+        .ok()
+        .and_then(|value| value.get("run_id").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|run_id| run_id.starts_with("delegate/"));
+    let origin = if delegated {
+        Some("delegation")
+    } else {
+        conversation_origin(ctx)
+    };
+    provider_host::SessionRecordContext {
+        session_id: session_id.clone(),
+        summary: json!({
+            "session_id": session_id,
+            "parent_session_id": null,
+            "run_id": run_id,
+            "agent_id": ctx.agent_id,
+            "origin": origin.map(|kind| json!({"kind": kind})),
+            "requester": requester,
+            "model": null,
+            "executor": job.capability,
+            "invocation_kind": if scheduled { "sched" } else { "runs" },
+            "status": "active",
+            "started_at": null,
+            "last_activity_at": null,
+            "owner_account_id": null,
+            "machine_id": "",
+            "network_id": "",
+            "ordinal": 0,
+        }),
+    }
+}
+
+fn conversation_origin(ctx: &provider_host::RunContext) -> Option<&'static str> {
+    let events = &ctx.native_conversation.as_ref()?.events;
+    let has_chat = events.iter().any(|event| event.input.get("chat").is_some());
+    if !has_chat {
+        return None;
+    }
+    let has_mention = events.iter().any(|event| contains_key(&event.input, "mention"));
+    Some(if has_mention { "mention" } else { "user" })
+}
+
+fn contains_key(value: &Value, wanted: &str) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(|value| contains_key(value, wanted)),
+        Value::Object(values) => {
+            values.contains_key(wanted)
+                || values.values().any(|value| contains_key(value, wanted))
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
+fn record_snapshot(ctx: &provider_host::RunContext, status: &str) {
+    let (Some(record), Some(sink)) = (&ctx.session_record, &ctx.session_record_sink) else {
+        return;
+    };
+    let mut summary = record.summary.clone();
+    summary["status"] = Value::String(status.into());
+    sink.emit(json!({"record": "snapshot", "summary": summary}));
+}
+
+fn record_start(ctx: &provider_host::RunContext) {
+    let (Some(record), Some(sink)) = (&ctx.session_record, &ctx.session_record_sink) else {
+        return;
+    };
+    sink.emit(json!({"record": "start", "summary": record.summary}));
 }
 
 /// one attempt's in-flight identity — the same `(saga_id, attempt)`
@@ -278,6 +367,8 @@ pub struct DispatchPool {
     /// that never lends credentials) — a run carrying a credential name then
     /// fails loudly rather than silently running on the host's own source.
     credential_resolver: Option<SharedCredentialResolver>,
+    record_sink: Option<provider_host::SessionRecordSink>,
+    record_requesters: Option<SessionRecordRequesterMap>,
 }
 
 impl DispatchPool {
@@ -306,6 +397,8 @@ impl DispatchPool {
             provisioner,
             ledger: Arc::new(ResourceLedger::new(capacity)),
             credential_resolver: None,
+            record_sink: None,
+            record_requesters: None,
         }
     }
 
@@ -315,6 +408,19 @@ impl DispatchPool {
     /// names a credential fails resolve (no host-source fallback).
     pub fn with_credential_resolver(mut self, resolver: SharedCredentialResolver) -> Self {
         self.credential_resolver = Some(resolver);
+        self
+    }
+
+    pub fn with_session_record_sink(
+        mut self,
+        sink: provider_host::SessionRecordSink,
+    ) -> Self {
+        self.record_sink = Some(sink);
+        self
+    }
+
+    pub fn with_session_record_requesters(mut self, requesters: SessionRecordRequesterMap) -> Self {
+        self.record_requesters = Some(requesters);
         self
     }
 
@@ -342,6 +448,8 @@ impl DispatchPool {
         let ledger = self.ledger.clone();
         let provisioner = self.provisioner.clone();
         let credential_resolver = self.credential_resolver.clone();
+        let record_sink = self.record_sink.clone();
+        let record_requesters = self.record_requesters.clone();
         let executing_node = provider_host::execution_node_id(&self.node_key);
         let owner_spawn = self.spawn.clone();
         let attempt_guard = AttemptTaskGuard {
@@ -492,6 +600,15 @@ impl DispatchPool {
                                             prepared.ctx.executing_node = Some(executing_node);
                                             prepared.ctx.limits = job.demands.clone();
                                             prepared.ctx.cancellation = Some(cancellation.clone());
+                                            prepared.ctx.session_record_sink = record_sink.clone();
+                                            prepared.ctx.session_record = Some(
+                                                record_context(
+                                                    &job,
+                                                    &prepared.ctx,
+                                                    prepared.credential.is_some(),
+                                                    record_requesters.as_ref(),
+                                                ),
+                                            );
                                             // resolve a named credential into
                                             // ctx.airlock BEFORE the provider
                                             // spawns: a refusal fails the
@@ -738,6 +855,7 @@ async fn execute(
     // failed attempt instead of a silent task death.
     let mut cleanup_here = true;
     let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+        record_start(&ctx);
         match run_provider(provider, &input, &ctx, cancellation).await {
             Ok(output) => {
                 let native_terminal = ctx.native_conversation.is_some() && output.text.is_empty();
@@ -747,8 +865,15 @@ async fn execute(
                     provider_host::OutputDisposition::Cancelled => !native_terminal,
                 };
                 if invalid_terminal {
+                    record_snapshot(&ctx, "failed");
                     return Err("provider returned an inconsistent native terminal result".into());
                 }
+                let status = match output.disposition {
+                    provider_host::OutputDisposition::Cancelled => "interrupted",
+                    provider_host::OutputDisposition::Answer
+                    | provider_host::OutputDisposition::InputHandled => "completed",
+                };
+                record_snapshot(&ctx, status);
                 // The provider process/container has exited and been waited.
                 // Commit and cleanup are storage work, not provider concurrency.
                 drop(permit.take());
@@ -839,7 +964,17 @@ async fn execute(
                 };
                 Ok(attempt_output(output, bytes))
             }
-            Err(e) => Err(e), // failed run: no commit, no output_ref
+            Err(e) => {
+                record_snapshot(
+                    &ctx,
+                    if cancellation.is_cancelled() {
+                        "interrupted"
+                    } else {
+                        "failed"
+                    },
+                );
+                Err(e)
+            } // failed run: no commit, no output_ref
         }
     }))
     .await;
@@ -981,6 +1116,60 @@ mod tests {
     use crate::module_contracts::{WORK_SPEC_KIND, WorkSpec, decode_saga_msg, encode_work_spec};
     use crate::provision::{ProvisionedWorkspace, WorkspaceReceipt};
     use futures::StreamExt as _;
+
+    #[test]
+    fn session_record_context_keeps_scheduler_chat_and_delegation_facts() {
+        let job = ExecJob {
+            saga_id: "a".repeat(64),
+            attempt: 1,
+            capability: "codex".into(),
+            input: "{}".into(),
+            demands: BTreeMap::new(),
+            admission: AdmissionPolicy::Queue,
+            claimed: None,
+        };
+        let context = provider_host::RunContext {
+            native_conversation: Some(provider_host::NativeConversationContext {
+                conversation_id: "conversation".into(),
+                turn_id: "events/1/2".into(),
+                revision: 1,
+                session_path: PathBuf::from("session.jsonl"),
+                packages: Vec::new(),
+                events: vec![provider_host::NativeConversationEvent {
+                    sequence: 1,
+                    operation_id: "chat/1".into(),
+                    actor: json!({"key": [1, 2]}),
+                    input: json!({"chat": {"message": {"blocks": [{"mention": {"account": 7}}]}}}),
+                    admitted_at: 1,
+                }],
+                job_reporting: false,
+                system_prompt: String::new(),
+            }),
+            ..Default::default()
+        };
+        let summary = record_context(&job, &context, true, None).summary;
+        assert_eq!(summary["origin"], json!({"kind": "mention"}));
+        assert_eq!(summary["invocation_kind"], "sched");
+
+        let requesters = Arc::new(Mutex::new(BTreeMap::from([(
+            "a".repeat(64),
+            json!({"kind": "external", "principal_id": "0102"}),
+        )])));
+        let summary = record_context(&job, &context, false, Some(&requesters)).summary;
+        assert_eq!(
+            summary["requester"],
+            json!({"kind": "external", "principal_id": "0102"})
+        );
+        assert!(requesters.lock().unwrap().is_empty());
+
+        let delegated_job = ExecJob {
+            input: json!({"run_id": "delegate/child"}).to_string(),
+            ..job
+        };
+        let summary = record_context(&delegated_job, &context, false, None).summary;
+        assert_eq!(summary["origin"], json!({"kind": "delegation"}));
+        assert_eq!(summary["invocation_kind"], "runs");
+    }
 
     fn spec_toml(tag: &str) -> provider_host::CapabilitySpec {
         provider_host::CapabilitySpec::parse(

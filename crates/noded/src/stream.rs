@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Result as IoResult, Write};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, atomic::{AtomicU64, Ordering}};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket};
@@ -65,6 +65,8 @@ pub(crate) const MAX_RUN_OUTPUT_LINE: usize = 16 * 1024;
 /// link is declared wedged. Generous — a healthy daemon takes one in microseconds
 /// (it only enqueues), so anything near this is a stuck process, not a slow one.
 const SERVICE_COMMAND_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+static PTY_RECORD_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// what a ws client may say to this node.
 ///
@@ -146,6 +148,19 @@ pub enum ClientMsg {
         id: String,
         stream: RunStream,
         line: String,
+    },
+    /// a compute daemon's durable session journal append. This travels on the
+    /// same authenticated attachment as run output, but lands in the machine's
+    /// append-only store before the bounded output ring is updated.
+    RunRecordStart {
+        summary: crate::run_records::SessionSummary,
+    },
+    RunRecordEvent {
+        session_id: String,
+        event: crate::run_records::SessionEvent,
+    },
+    RunRecordSnapshot {
+        summary: crate::run_records::SessionSummary,
     },
     /// a local service daemon claims this connection as its command link.
     ///
@@ -1159,6 +1174,27 @@ pub async fn stream_session(
                                     }
                                 }
                             },
+                            Ok(ClientMsg::RunRecordStart { summary }) => {
+                                if worker.is_some() {
+                                    handle_run_record_start(&handle, summary);
+                                } else if !send_frame(&mut socket, unattached_run_record()).await {
+                                    return;
+                                }
+                            }
+                            Ok(ClientMsg::RunRecordEvent { session_id, event }) => {
+                                if worker.is_some() {
+                                    handle_run_record_event(&handle, &session_id, event);
+                                } else if !send_frame(&mut socket, unattached_run_record()).await {
+                                    return;
+                                }
+                            }
+                            Ok(ClientMsg::RunRecordSnapshot { summary }) => {
+                                if worker.is_some() {
+                                    handle_run_record_snapshot(&handle, summary);
+                                } else if !send_frame(&mut socket, unattached_run_record()).await {
+                                    return;
+                                }
+                            }
                             // a service daemon claiming this connection as its
                             // command link, and the events it publishes back.
                             Ok(ClientMsg::ServiceAttach { kind, token }) => {
@@ -1406,7 +1442,125 @@ fn handle_agent_event(handle: &NodeHandle, attached: bool, event: agent_service:
         }
         return;
     };
+    record_agent_event(handle, &event);
     link.on_event(event);
+}
+
+fn record_agent_event(handle: &NodeHandle, event: &agent_service::wire::Event) {
+    let Some(store) = handle.session_records() else {
+        return;
+    };
+    match event {
+        agent_service::wire::Event::TermCreated { session } => {
+            let summary = crate::run_records::SessionSummary {
+                session_id: session.clone(),
+                parent_session_id: None,
+                run_id: None,
+                agent_id: None,
+                origin: None,
+                requester: None,
+                model: None,
+                executor: None,
+                status: crate::run_records::SessionStatus::Active,
+                invocation_kind: Some(crate::run_records::InvocationKind::Pty),
+                started_at: None,
+                last_activity_at: None,
+                owner_account_id: None,
+                machine_id: String::new(),
+                network_id: String::new(),
+                ordinal: 0,
+            };
+            record_agent_start(store, summary);
+        }
+        agent_service::wire::Event::TermRefused { session, .. } => {
+            let summary = crate::run_records::SessionSummary {
+                session_id: session.clone(),
+                parent_session_id: None,
+                run_id: None,
+                agent_id: None,
+                origin: None,
+                requester: None,
+                model: None,
+                executor: None,
+                status: crate::run_records::SessionStatus::Failed,
+                invocation_kind: Some(crate::run_records::InvocationKind::Pty),
+                started_at: None,
+                last_activity_at: None,
+                owner_account_id: None,
+                machine_id: String::new(),
+                network_id: String::new(),
+                ordinal: 0,
+            };
+            record_agent_start(store, summary);
+        }
+        agent_service::wire::Event::TermOutput {
+            session,
+            chunk_b64,
+        } => {
+            let decoded = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                chunk_b64,
+            );
+            let payload = match decoded {
+                Ok(bytes) => serde_json::json!({
+                    "text": String::from_utf8_lossy(&bytes),
+                    "bytes": bytes.len(),
+                }),
+                Err(_) => serde_json::json!({"bytes_b64": chunk_b64}),
+            };
+            let event = crate::run_records::SessionEvent {
+                seq: 0,
+                event_id: format!(
+                    "pty-output-{session}-{}",
+                    PTY_RECORD_EVENT_ID.fetch_add(1, Ordering::Relaxed)
+                ),
+                run_id: None,
+                at: None,
+                kind: "pty_output".into(),
+                stream: Some("pty".into()),
+                payload,
+            };
+            if let Err(error) = store.append_event(event, session) {
+                tracing::warn!(
+                    target: "ducktape::agent",
+                    reason = "pty_record_event_refused",
+                    error = %error,
+                    "pty output was not durably recorded"
+                );
+            }
+        }
+        agent_service::wire::Event::TermEnded { session } => {
+            let Ok(mut summary) = store.session_summary(session) else {
+                return;
+            };
+            summary.status = crate::run_records::SessionStatus::Completed;
+            if let Err(error) = store.append_remote_snapshot(summary) {
+                tracing::warn!(
+                    target: "ducktape::agent",
+                    reason = "pty_record_snapshot_refused",
+                    error = %error,
+                    "pty terminal state was not durably recorded"
+                );
+            }
+        }
+        agent_service::wire::Event::MsgBound { .. }
+        | agent_service::wire::Event::MsgBindRefused { .. }
+        | agent_service::wire::Event::MsgDelivery { .. } => {}
+    }
+}
+
+fn record_agent_start(
+    store: &crate::run_records::SessionRecordStore,
+    summary: crate::run_records::SessionSummary,
+) {
+    if let Err(error) = store.append_remote_start(summary) {
+        tracing::warn!(
+            target: "ducktape::agent",
+            reason = "pty_record_start_refused",
+            error = %error,
+            "pty session was not durably recorded"
+        );
+    }
 }
 
 fn handle_client_msg(
@@ -1442,6 +1596,9 @@ fn handle_client_msg(
         ClientMsg::ComputeAttach { .. }
         | ClientMsg::RunControlReply { .. }
         | ClientMsg::RunOutput { .. }
+        | ClientMsg::RunRecordStart { .. }
+        | ClientMsg::RunRecordEvent { .. }
+        | ClientMsg::RunRecordSnapshot { .. }
         | ClientMsg::ServiceAttach { .. }
         | ClientMsg::AgentEvent { .. } => Vec::new(),
     }
@@ -1471,6 +1628,64 @@ fn unattached_run_output() -> ServerFrame {
         detail: "run output is published by this node's compute daemon — send \
                  `compute_attach` with the node's service-link token first"
             .into(),
+    }
+}
+
+fn unattached_run_record() -> ServerFrame {
+    ServerFrame::Error {
+        topic: String::new(),
+        code: StreamErrorCode::Forbidden,
+        detail: "run records are published by this node's compute daemon — send compute_attach first"
+            .into(),
+    }
+}
+
+fn handle_run_record_start(handle: &NodeHandle, summary: crate::run_records::SessionSummary) {
+    let Some(store) = handle.session_records() else {
+        return;
+    };
+    if let Err(error) = store.append_remote_start(summary) {
+        tracing::warn!(
+            target: "ducktape::agent",
+            reason = "run_record_start_refused",
+            error = %error,
+            "compute session start was not durably recorded"
+        );
+    }
+}
+
+fn handle_run_record_event(
+    handle: &NodeHandle,
+    session_id: &str,
+    event: crate::run_records::SessionEvent,
+) {
+    let Some(store) = handle.session_records() else {
+        return;
+    };
+    if let Err(error) = store.append_event(event, session_id) {
+        tracing::warn!(
+            target: "ducktape::agent",
+            reason = "run_record_event_refused",
+            error = %error,
+            "compute session event was not durably recorded"
+        );
+    }
+}
+
+fn handle_run_record_snapshot(
+    handle: &NodeHandle,
+    summary: crate::run_records::SessionSummary,
+) {
+    let Some(store) = handle.session_records() else {
+        return;
+    };
+    if let Err(error) = store.append_remote_snapshot(summary) {
+        tracing::warn!(
+            target: "ducktape::agent",
+            reason = "run_record_snapshot_refused",
+            error = %error,
+            "compute session snapshot was not durably recorded"
+        );
     }
 }
 
@@ -2781,6 +2996,49 @@ mod tests {
         handle.with_service_link(crate::service_link::ServiceLink::new(Some(
             TEST_SECRET.into(),
         )))
+    }
+
+    #[test]
+    fn attached_pty_lifecycle_is_written_to_the_machine_store() {
+        let directory = tempfile::tempdir().expect("record directory");
+        let store = crate::run_records::SessionRecordStore::open(
+            directory.path(),
+            crate::run_records::StoreIdentity {
+                machine_id: "machine-a".into(),
+                network_id: "network-a".into(),
+            },
+        )
+        .expect("open records");
+        let (handle, _commands, _hub) = crate::NodeHandle::channel();
+        let handle = handle.with_session_records(store.clone());
+        record_agent_event(
+            &handle,
+            &agent_service::wire::Event::TermCreated {
+                session: "0123456789abcdef".into(),
+            },
+        );
+        record_agent_event(
+            &handle,
+            &agent_service::wire::Event::TermOutput {
+                session: "0123456789abcdef".into(),
+                chunk_b64: "aGVsbG8=".into(),
+            },
+        );
+        record_agent_event(
+            &handle,
+            &agent_service::wire::Event::TermEnded {
+                session: "0123456789abcdef".into(),
+            },
+        );
+        let summary = store
+            .session_summary("0123456789abcdef")
+            .expect("pty summary");
+        assert_eq!(summary.invocation_kind, Some(crate::run_records::InvocationKind::Pty));
+        assert_eq!(summary.status, crate::run_records::SessionStatus::Completed);
+        let events = store
+            .page_events("0123456789abcdef", None, 10, false)
+            .expect("pty events");
+        assert_eq!(events.events[0].payload["text"], "hello");
     }
 
     fn temp_store(modules: &[&str]) -> (tempfile::TempDir, Arc<indexer::IndexStore>) {
