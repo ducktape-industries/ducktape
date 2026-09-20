@@ -300,7 +300,7 @@ pub fn block_row(record: &BlockRecord) -> Vec<u8> {
 /// EQUALITY: never a tolerance window, never "N-1 still works" — that would be
 /// the compat the repository forbids. Nothing on the node reads it, no peer
 /// sees it, and no code branches on its value; the app alone compares.
-pub const NODE_CONTRACT: u32 = 7;
+pub const NODE_CONTRACT: u32 = 8;
 
 /// The surface [`NODE_CONTRACT`] names, fingerprinted: FNV-1a over the sorted
 /// `/v1` route paths of `lib.rs` + `admin.rs` and the ws topic/prefix names
@@ -309,7 +309,7 @@ pub const NODE_CONTRACT: u32 = 7;
 /// `EXPECTED_NODE_CONTRACT` together, then repin this to the value the
 /// failing assertion prints. Repinning WITHOUT the bump is the defect the
 /// test exists to catch.
-pub const NODE_CONTRACT_SURFACE: u64 = 0x58f1_ce29_a683_9115;
+pub const NODE_CONTRACT_SURFACE: u64 = 0x958d_d436_8541_9a11;
 
 /// the status projection: daemon build version, global root-hash, and each
 /// registered module's root. `Default` is the pre-first-publish snapshot in
@@ -856,10 +856,7 @@ pub fn router(handle: NodeHandle) -> Router {
         // ---- run control (node-local, off-chain) ----
         .route("/v1/run-control", post(run_control::control))
         // ---- durable provider session records (node-local, off-chain) ----
-        .route(
-            "/v1/run-records/query",
-            post(run_records::query).layer(DefaultBodyLimit::max(64 * 1024)),
-        )
+        .route("/v1/run-records/query", post(run_records::query))
         // ---- service signaling (node-local, off-chain, volatile) ----
         // a local service daemon says hello; the entry ages out on its own
         // TTL. Presence only — enablement lives in the workspace's
