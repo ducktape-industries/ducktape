@@ -210,9 +210,16 @@ impl SessionTiming {
         self.turn = Some(turn.to_string());
     }
 
+    /// The guest marker is observation, never admission: it may arrive after
+    /// later milestones or never at all. Only a marker seen before anything
+    /// else anchors the clock; a late one is still recorded at its true
+    /// instant, leaving what was already measured alone.
     fn spawned_at(&mut self, at: Instant) {
-        self.started = at;
-        self.last = at;
+        let anchors = self.observed.is_empty();
+        if anchors {
+            self.started = at;
+            self.last = at;
+        }
         self.record("spawn", at, None);
     }
 
@@ -248,8 +255,13 @@ impl SessionTiming {
         if let Some(observer) = &self.observer {
             observer(event);
         }
-        self.last = at;
-        self.last_milestone = Some(milestone);
+        // A marker observed out of order must not drag the delta baseline
+        // backwards and misattribute the next milestone's gap to it.
+        let advances = at >= self.last;
+        if advances {
+            self.last = at;
+            self.last_milestone = Some(milestone);
+        }
         self.observed.push(milestone);
     }
 
@@ -493,14 +505,17 @@ pub(crate) async fn drive(
             started,
         }
     });
-    match start {
-        SpawnStart::Host(at) => timing.spawned_at(at),
-        SpawnStart::Guest(spawn) => {
-            if let Ok(at) = spawn.await {
-                timing.spawned_at(at);
-            }
+    // Telemetry never gates the protocol. The guest spawn marker is observed
+    // inside the loop below, alongside the deadline and cancellation arms, so
+    // a guest that never sends one (an image built before the marker existed)
+    // still gets its `initialize` and still times out on its own terms.
+    let mut spawn_marker = match start {
+        SpawnStart::Host(at) => {
+            timing.spawned_at(at);
+            None
         }
-    }
+        SpawnStart::Guest(spawn) => Some(spawn),
+    };
     let initial = match protocol {
         Protocol::Codex => {
             json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"ducktape-run","version":env!("CARGO_PKG_VERSION")}}})
@@ -552,6 +567,10 @@ pub(crate) async fn drive(
                 if changed.is_err() { explicit_deadline = None; }
             },
             _ = &mut writer.task => return Err("provider input closed".into()),
+            marked = async { match spawn_marker.as_mut() { Some(marker) => marker.await, None => std::future::pending().await } } => {
+                spawn_marker = None;
+                if let Ok(at) = marked { timing.spawned_at(at); }
+            },
             read = line(&mut stderr, &mut err_pending), if err_open => {
                 match read? {
                     Some(line) => { last_stderr = line.clone(); last_activity = tokio::time::Instant::now(); if let Some(sink) = &sink { sink(ctx, OutputLine { stream:OutputStream::Stderr,line }); } }
@@ -1237,6 +1256,215 @@ mod tests {
             };
             let (result, ()) = tokio::join!(run, peer);
             assert!(result.is_err());
+        }
+    }
+
+    /// A guest image built before the spawn marker existed never sends one.
+    /// Telemetry is not admission: the session must still initialize, run and
+    /// answer, and report the marker as missing rather than hanging on it.
+    #[tokio::test]
+    async fn a_session_whose_guest_never_marks_spawn_still_runs_to_its_answer() {
+        let (stdin, input) = tokio::io::duplex(1024);
+        let (stdout, mut output) = tokio::io::duplex(1024);
+        let (stderr, err) = tokio::io::duplex(1024);
+        let (events, mut received) = mpsc::unbounded_channel();
+        let observer: TimingObserver = Arc::new(move |event| {
+            let _ = events.send(event);
+        });
+        let ctx = RunContext {
+            run_key: Some("missing-marker".into()),
+            ..Default::default()
+        };
+        let mut timing =
+            SessionTiming::new(Protocol::Codex, &ctx, Instant::now()).with_observer(observer);
+        // held for the whole session: the channel stays open and silent, which
+        // is exactly what an unmarked guest looks like from the host.
+        let (_marker, spawn) = oneshot::channel();
+        let run = drive(
+            Protocol::Codex,
+            "prompt",
+            (Box::new(stdin), Box::new(stdout), Box::new(stderr)),
+            &ctx,
+            None,
+            (
+                Duration::from_secs(10),
+                tokio::time::Instant::now() + Duration::from_secs(20),
+            ),
+            SessionDriver {
+                broker: None,
+                start: SpawnStart::Guest(spawn),
+                timing: &mut timing,
+            },
+        );
+        let peer = async {
+            let mut input = BufReader::new(input);
+            assert_eq!(receive(&mut input).await["method"], "initialize");
+            send(&mut output, json!({"id":1,"result":{}})).await;
+            assert_eq!(receive(&mut input).await["method"], "initialized");
+            assert_eq!(receive(&mut input).await["method"], "thread/start");
+            send(&mut output, json!({"id":2,"result":{"thread":{"id":"t"}}})).await;
+            assert_eq!(receive(&mut input).await["method"], "turn/start");
+            send(&mut output, json!({"id":3,"result":{"turn":{"id":"turn"}}})).await;
+            send(
+                &mut output,
+                json!({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"done"}}}),
+            )
+            .await;
+            send(
+                &mut output,
+                json!({"method":"turn/completed","params":{"turn":{"status":"completed"}}}),
+            )
+            .await;
+            drop(err);
+        };
+        let (result, ()) = tokio::join!(run, peer);
+        assert_eq!(result.unwrap().text, "done");
+        let mut milestones = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            milestones.push(event.milestone);
+        }
+        assert!(!milestones.contains(&"spawn"), "milestones: {milestones:?}");
+        assert_eq!(milestones.first(), Some(&"initialize_reply"));
+        assert!(!timing.observed.contains(&"spawn"));
+    }
+
+    /// A marker that arrives after the session already measured something is
+    /// recorded at its true instant and nothing else: it must not rebase the
+    /// clock under milestones that were already reported, nor become the
+    /// baseline the next milestone's delta is measured from.
+    #[tokio::test]
+    async fn a_late_spawn_marker_records_its_instant_without_rewriting_measurements() {
+        let (stdin, input) = tokio::io::duplex(1024);
+        let (stdout, mut output) = tokio::io::duplex(1024);
+        let (stderr, err) = tokio::io::duplex(1024);
+        let (events, mut received) = mpsc::unbounded_channel();
+        let observer: TimingObserver = Arc::new(move |event| {
+            let _ = events.send(event);
+        });
+        let ctx = RunContext::default();
+        let started = Instant::now();
+        let forked = started;
+        let mut timing =
+            SessionTiming::new(Protocol::Codex, &ctx, started).with_observer(observer);
+        let (marker, spawn) = oneshot::channel();
+        let run = drive(
+            Protocol::Codex,
+            "prompt",
+            (Box::new(stdin), Box::new(stdout), Box::new(stderr)),
+            &ctx,
+            None,
+            (
+                Duration::from_secs(10),
+                tokio::time::Instant::now() + Duration::from_secs(20),
+            ),
+            SessionDriver {
+                broker: None,
+                start: SpawnStart::Guest(spawn),
+                timing: &mut timing,
+            },
+        );
+        let peer = async {
+            let mut input = BufReader::new(input);
+            assert_eq!(receive(&mut input).await["method"], "initialize");
+            send(&mut output, json!({"id":1,"result":{}})).await;
+            assert_eq!(receive(&mut input).await["method"], "initialized");
+            assert_eq!(receive(&mut input).await["method"], "thread/start");
+            let first = received.recv().await.expect("initialize milestone");
+            assert_eq!(first.milestone, "initialize_reply");
+            // the fork really happened before the initialize reply; only its
+            // delivery is late. The session advances only once the driver has
+            // actually observed the marker.
+            marker.send(forked).unwrap();
+            let late = received.recv().await.expect("spawn milestone");
+            assert_eq!(late.milestone, "spawn");
+            assert_eq!(late.previous_milestone, Some("initialize_reply"));
+            send(&mut output, json!({"id":2,"result":{"thread":{"id":"t"}}})).await;
+            assert_eq!(receive(&mut input).await["method"], "turn/start");
+            let next = received.recv().await.expect("thread start milestone");
+            assert_eq!(next.milestone, "thread_start_reply");
+            // measured from the initialize reply it followed, not from the
+            // marker that landed in between.
+            assert_eq!(next.previous_milestone, Some("initialize_reply"));
+            assert!(next.elapsed_ms >= first.elapsed_ms);
+            assert!(late.elapsed_ms <= first.elapsed_ms);
+            send(&mut output, json!({"id":3,"result":{"turn":{"id":"turn"}}})).await;
+            send(
+                &mut output,
+                json!({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"done"}}}),
+            )
+            .await;
+            send(
+                &mut output,
+                json!({"method":"turn/completed","params":{"turn":{"status":"completed"}}}),
+            )
+            .await;
+            drop(err);
+        };
+        let (result, ()) = tokio::join!(run, peer);
+        assert_eq!(result.unwrap().text, "done");
+        // the clock was never rebased: elapsed is still measured from the
+        // session's own start.
+        assert_eq!(timing.started, started);
+    }
+
+    /// Cancellation and a provider that dies are both handled while the marker
+    /// is still outstanding — neither may wait on telemetry.
+    #[tokio::test]
+    async fn a_session_ends_on_cancel_or_child_exit_before_any_spawn_marker() {
+        for cancelled in [true, false] {
+            let (stdin, input) = tokio::io::duplex(1024);
+            let (stdout, output) = tokio::io::duplex(1024);
+            let (stderr, err) = tokio::io::duplex(1024);
+            let cancellation = crate::RunCancellation::new();
+            let ctx = RunContext {
+                cancellation: Some(cancellation.clone()),
+                ..Default::default()
+            };
+            let mut timing = SessionTiming::new(Protocol::Codex, &ctx, Instant::now());
+            let expected_end = if cancelled {
+                "run cancelled"
+            } else {
+                "provider exited before completing the run"
+            };
+            let (_marker, spawn) = oneshot::channel();
+            let run = drive(
+                Protocol::Codex,
+                "prompt",
+                (Box::new(stdin), Box::new(stdout), Box::new(stderr)),
+                &ctx,
+                None,
+                (
+                    Duration::from_secs(10),
+                    tokio::time::Instant::now() + Duration::from_secs(20),
+                ),
+                SessionDriver {
+                    broker: None,
+                    start: SpawnStart::Guest(spawn),
+                    timing: &mut timing,
+                },
+            );
+            let peer = async {
+                let mut input = BufReader::new(input);
+                // the initialize frame proves the driver reached its loop
+                // without the marker.
+                assert_eq!(receive(&mut input).await["method"], "initialize");
+                // an open stdout in the cancelled case: the session must end
+                // on the cancellation itself, not on the pipe closing.
+                let held = cancelled.then_some(output);
+                if cancelled {
+                    cancellation.cancel();
+                }
+                drop(err);
+                held
+            };
+            let (result, _held) = tokio::join!(run, peer);
+            let Err(error) = result else {
+                panic!("the session must not answer after {expected_end}");
+            };
+            assert!(error.contains(expected_end), "error: {error}");
+            timing.child_exit(Some(1));
+            assert!(!timing.observed.contains(&"spawn"));
+            assert!(timing.observed.contains(&"child_exit"));
         }
     }
 
