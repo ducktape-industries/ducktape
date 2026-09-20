@@ -1,0 +1,19 @@
+name: fresh-install
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+jobs:
+  acceptance:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: run fresh-install acceptance
+        run: bash ops/ci/fresh-install.sh
