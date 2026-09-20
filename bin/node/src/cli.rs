@@ -1150,10 +1150,10 @@ pub(crate) fn mint_invite_blob(
         wg_listen,
         raw.wireguard_advertised_value(),
     )?;
-    if let Some(front) = &front {
-        if front.is_derived_loopback() {
-            return Err(derived_loopback_refusal(&front.host, wg_listen.port()).into());
-        }
+    if let Some(front) = &front
+        && front.is_derived_loopback()
+    {
+        return Err(derived_loopback_refusal(&front.host, wg_listen.port()).into());
     }
     let descriptor_path = base.join(&raw.network);
     let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
