@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use chat::{
+use common::wire::chat::{
     Party, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_reply, encode_msg,
     encode_query,
 };

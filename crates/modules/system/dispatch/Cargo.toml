@@ -16,25 +16,11 @@ version.workspace = true
 guest = ["dep:ducktape-module-sdk"]
 
 [dependencies]
-dispatch-wire = { workspace = true }
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
 ducktape-module-sdk = { workspace = true, optional = true }
 sdk = { workspace = true }
 serde = { workspace = true }
-# default-features = false: dispatch consumes only saga's consensus surface
-# (SagaOrigin/SagaView, the codecs, the shared byte caps, the trigger msgs),
-# and the `runs` guest builds this crate for wasm32 — saga's native-only
-# usage-ledger mapper (indexer -> unix-only IO) must not ride along. a direct
-# path dep because workspace inheritance cannot switch default features off;
-# feature unification keeps native binaries (which enable saga's default
-# `native`) whole.
-saga = { path = "../saga", default-features = false }
-# the shared capability-tag shape rule for Recipe.capability validation.
-capability = { workspace = true }
-# the program-account control record a Call is admitted against (identity's
-# wire types only; identity never depends on dispatch, so there is no cycle).
-identity = { workspace = true }
 # the store-record codec for the call and mailbox records: the sdk's causal
 # types derive it, so a record carrying them is one derive, not a mirror.
 borsh = { workspace = true }

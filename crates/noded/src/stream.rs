@@ -47,7 +47,7 @@ pub const FILES_SCAN_BUDGET: usize = STREAM_CATCHUP_BUDGET * 4;
 pub const LOG_RING_CAPACITY: usize = 4_096;
 pub const RUN_OUTPUT_MAX_RUNS: usize = 32;
 pub const RUN_OUTPUT_MAX_LINES: usize = 2_048;
-/// the exact width of a run-output id: `runs_wire::dispatch_id_for` is a hex
+/// the exact width of a run-output id: `crate::runs::dispatch_id_for` is a hex
 /// sha256, and the agent data plane's `valid_event` enforces the same 64-hex
 /// shape before forwarding a line to a peer. This is NOT cosmetic — see
 /// [`ClientMsg::RunOutput`].
@@ -2144,7 +2144,7 @@ async fn indexed_run_reader(
                 "Run journal is busy.",
             )
         })?;
-    let request = serde_json::to_vec(&runs_wire::view::RunsViewQuery::Run {
+    let request = serde_json::to_vec(&crate::runs::view::RunsViewQuery::Run {
         dispatch_id: dispatch.into(),
     })
     .expect("run query");
@@ -2166,14 +2166,14 @@ async fn indexed_run_reader(
         )
     })?;
     let reply =
-        serde_json::from_slice::<runs_wire::view::RunsViewReply>(&reading.bytes).map_err(|_| {
+        serde_json::from_slice::<crate::runs::view::RunsViewReply>(&reading.bytes).map_err(|_| {
             crate::error_response(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "Run journal unavailable.",
             )
         })?;
     match reply {
-        runs_wire::view::RunsViewReply::Run(Some(detail)) => {
+        crate::runs::view::RunsViewReply::Run(Some(detail)) => {
             run_reader(handle, &detail.run.requester, key)
                 .await
                 .map_err(|_| {
@@ -2183,17 +2183,17 @@ async fn indexed_run_reader(
                     )
                 })
         }
-        runs_wire::view::RunsViewReply::Run(None) | runs_wire::view::RunsViewReply::Runs(_) => Ok(false),
+        crate::runs::view::RunsViewReply::Run(None) | crate::runs::view::RunsViewReply::Runs(_) => Ok(false),
     }
 }
 
 /// every run `runs` has pending, as committed state.
-pub(crate) async fn pending_runs(handle: &NodeHandle) -> Result<Vec<runs_wire::PendingRun>, String> {
+pub(crate) async fn pending_runs(handle: &NodeHandle) -> Result<Vec<crate::runs::PendingRun>, String> {
     let (reply, rx) = futures::channel::oneshot::channel();
     handle
         .send(crate::NodeCommand::Query {
             target: "runs".to_string(),
-            req: runs_wire::encode_query(&runs_wire::RunsQuery::PendingRuns),
+            req: crate::runs::encode_query(&crate::runs::RunsQuery::PendingRuns),
             reply,
         })
         .await
@@ -2202,8 +2202,8 @@ pub(crate) async fn pending_runs(handle: &NodeHandle) -> Result<Vec<runs_wire::P
         .await
         .map_err(|_| "reply dropped".to_string())?
         .map_err(|refused| refused.message)?;
-    match runs_wire::decode_reply(&bytes)? {
-        runs_wire::RunsReply::PendingRuns(runs) => Ok(runs),
+    match crate::runs::decode_reply(&bytes)? {
+        crate::runs::RunsReply::PendingRuns(runs) => Ok(runs),
         _ => Err("unexpected runs reply".to_string()),
     }
 }
@@ -3659,7 +3659,7 @@ mod tests {
                 };
                 let bytes = match target.as_str() {
                     "runs" => {
-                        runs_wire::encode_reply(&runs_wire::RunsReply::PendingRuns(vec![runs_wire::PendingRun {
+                        crate::runs::encode_reply(&crate::runs::RunsReply::PendingRuns(vec![crate::runs::PendingRun {
                             run_id: "attributed/3/chiefduck".into(),
                             dispatch_id: id.clone(),
                             agent_id: "chiefduck".into(),
@@ -3938,7 +3938,7 @@ mod tests {
         handle.admin.node_key = Some(node_key.clone());
         // the committed answer, as `runs` would give it: one pending run, created
         // by `creator`.
-        let pending = runs_wire::PendingRun {
+        let pending = crate::runs::PendingRun {
             run_id: "chat\u{1f}channel-a\u{1f}2\u{1f}agent-1".into(),
             dispatch_id: dispatch.clone(),
             agent_id: "agent-1".into(),
@@ -3955,7 +3955,7 @@ mod tests {
                 let crate::NodeCommand::Query { reply, .. } = command else {
                     continue;
                 };
-                let _ = reply.send(Ok(runs_wire::encode_reply(&runs_wire::RunsReply::PendingRuns(vec![
+                let _ = reply.send(Ok(crate::runs::encode_reply(&crate::runs::RunsReply::PendingRuns(vec![
                     pending.clone(),
                 ]))));
             }

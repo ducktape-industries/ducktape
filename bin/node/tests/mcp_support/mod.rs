@@ -11,6 +11,10 @@ use noded::testkit::{InProcDaemon, committed_module};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "../../src/wire.rs"]
+mod wire;
+use wire::{agent, chat, runs};
+
 pub const AGENT_ID: &str = "quackbot";
 /// this fixture's identity chain id — and the value the `runs` guest reads out
 /// of its genesis `__config` record.

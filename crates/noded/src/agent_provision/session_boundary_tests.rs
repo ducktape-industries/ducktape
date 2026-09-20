@@ -33,14 +33,14 @@ use std::sync::Arc;
 
 use attribution::AttributionModule;
 use capability::CapabilityMsg;
-use chat::{Block, ChatMsg, Mark, PostPolicy, Span};
+use crate::chat::{Block, ChatMsg, Mark, PostPolicy, Span};
 use commonware_runtime::{Runner as _, Supervisor as _};
 use compute_service::{DeliverFn, DispatchPool, SpawnFn};
 use dispatch::DispatchModule;
 use futures::StreamExt as _;
 use host::worker::{WorkOutcome, Worker as _};
 use host::{BlockContext, Host};
-use runs::ModelMsg;
+use crate::runs::ModelMsg;
 use saga::SagaModule;
 use sdk::{Event, Msg, Origin};
 
@@ -213,15 +213,15 @@ async fn mention_run(host: &mut Host) -> Event {
         },
         Msg {
             target: "agent".into(),
-            payload: agent::encode_msg(&agent::AgentMsg::Provision {
+            payload: crate::agent::encode_msg(&crate::agent::AgentMsg::Provision {
                 request_id: AGENT.into(),
                 name: "Quackbot".into(),
-                program: runs::model_program(AGENT),
+                program: crate::runs::model_program(AGENT),
             }),
         },
         Msg {
             target: "runs".into(),
-            payload: runs::encode_msg(&runs::RunsMsg::ConfigureModel {
+            payload: crate::runs::encode_msg(&crate::runs::RunsMsg::ConfigureModel {
                 operation: ModelMsg::RegisterModel {
                     account: 2,
                     agent_id: AGENT.into(),
@@ -234,7 +234,7 @@ async fn mention_run(host: &mut Host) -> Event {
         },
         Msg {
             target: "chat".into(),
-            payload: chat::encode_msg(&ChatMsg::CreateChannel {
+            payload: crate::chat::encode_msg(&ChatMsg::CreateChannel {
                 channel_id: CHANNEL.into(),
                 name: "General".into(),
                 post_policy: PostPolicy::Open,
@@ -242,13 +242,13 @@ async fn mention_run(host: &mut Host) -> Event {
         },
         Msg {
             target: "chat".into(),
-            payload: chat::encode_msg(&ChatMsg::PostMessage {
+            payload: crate::chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: CHANNEL.into(),
                 message_id: "m1".into(),
                 thread: None,
                 blocks: vec![Block::Paragraph(vec![Span {
                     text: "Please help".into(),
-                    marks: vec![Mark::Mention(chat::Party::Account(2))],
+                    marks: vec![Mark::Mention(crate::chat::Party::Account(2))],
                 }])],
             }),
         },
@@ -288,7 +288,7 @@ async fn mention_run(host: &mut Host) -> Event {
 /// identity, which is the assignee `runs` authorizes against). everything else is
 /// the duckfs lane's checkout/commit traffic, answered by the plane tests'
 /// stand-in: the workspace is not this test's subject, consensus is.
-async fn serve(host: &mut Host, height: u64, cmd: NodeCommand) -> Option<runs::RunsMsg> {
+async fn serve(host: &mut Host, height: u64, cmd: NodeCommand) -> Option<crate::runs::RunsMsg> {
     match cmd {
         NodeCommand::Submit {
             target,
@@ -296,7 +296,7 @@ async fn serve(host: &mut Host, height: u64, cmd: NodeCommand) -> Option<runs::R
             reply,
             ..
         } if target == "runs" => {
-            let op = runs::decode_msg(&payload).expect("a runs op");
+            let op = crate::runs::decode_msg(&payload).expect("a runs op");
             let outcome = host
                 .submit_at(
                     at(height, Origin::External(WORKER_NODE.to_vec())),
@@ -427,7 +427,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
         // serve the run's actor traffic until its session bind reaches consensus.
         let bound = loop {
             let cmd = rx.next().await.expect("the actor lane stays open");
-            if let Some(runs::RunsMsg::OpenAgentSession {
+            if let Some(crate::runs::RunsMsg::OpenAgentSession {
                 run_id,
                 attempt,
                 session_key,
@@ -495,24 +495,24 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
 
 // ---- read the module back through its own query surface ---------------------
 
-async fn pending_runs(host: &Host) -> Vec<runs::PendingRun> {
+async fn pending_runs(host: &Host) -> Vec<crate::runs::PendingRun> {
     let reply = host
-        .query("runs", &runs::encode_query(&runs::RunsQuery::PendingRuns))
+        .query("runs", &crate::runs::encode_query(&crate::runs::RunsQuery::PendingRuns))
         .await
         .unwrap();
-    match runs::decode_reply(&reply).unwrap() {
-        runs::RunsReply::PendingRuns(runs) => runs,
+    match crate::runs::decode_reply(&reply).unwrap() {
+        crate::runs::RunsReply::PendingRuns(runs) => runs,
         other => panic!("unexpected reply: {other:?}"),
     }
 }
 
-async fn agent_sessions(host: &Host) -> Vec<runs::AgentSession> {
+async fn agent_sessions(host: &Host) -> Vec<crate::runs::AgentSession> {
     let reply = host
-        .query("runs", &runs::encode_query(&runs::RunsQuery::AgentSessions))
+        .query("runs", &crate::runs::encode_query(&crate::runs::RunsQuery::AgentSessions))
         .await
         .unwrap();
-    match runs::decode_reply(&reply).unwrap() {
-        runs::RunsReply::AgentSessions(sessions) => sessions,
+    match crate::runs::decode_reply(&reply).unwrap() {
+        crate::runs::RunsReply::AgentSessions(sessions) => sessions,
         other => panic!("unexpected reply: {other:?}"),
     }
 }

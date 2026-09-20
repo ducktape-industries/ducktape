@@ -53,7 +53,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rand::RngCore as _;
 use serde_json::{Value, json};
@@ -2882,6 +2882,32 @@ fn effective_provider_deadline(
         .min(hard)
 }
 
+fn described_exit_code(description: &str) -> Option<i32> {
+    description
+        .split_whitespace()
+        .last()
+        .and_then(|code| code.parse().ok())
+}
+
+fn session_error_outcome(error: &str) -> (&'static str, &'static str) {
+    if error.contains("cancelled") {
+        return ("cancelled", "run_cancelled");
+    }
+    if error.contains("timed out") || error.contains("timeout") {
+        return ("timeout", "provider_timeout");
+    }
+    if error.contains("refused") || error.contains("initialization failed") {
+        return ("refused", "provider_refused");
+    }
+    if error.contains("exited before")
+        || error.contains("input closed")
+        || error.starts_with("provider turn ")
+    {
+        return ("early_exit", "provider_ended_early");
+    }
+    ("error", "protocol_driver_failed")
+}
+
 impl CliProvider {
     /// one child process, start to parsed answer, with an explicit argv and
     /// working directory — the shared engine under the cold and resume paths.
@@ -2894,11 +2920,24 @@ impl CliProvider {
         config_home: Option<&Path>,
         broker: Option<&broker::RunBroker>,
     ) -> Result<Invocation, String> {
+        let session_protocol = match self.spec.output {
+            OutputFormat::CodexSession => Some(run_session::Protocol::Codex),
+            OutputFormat::ClaudeSession => Some(run_session::Protocol::Claude),
+            OutputFormat::PiJson
+            | OutputFormat::JsonlEvents
+            | OutputFormat::JsonResult
+            | OutputFormat::Text => None,
+        };
+        let mut timing = session_protocol
+            .map(|protocol| run_session::SessionTiming::new(protocol, ctx, Instant::now()));
         if ctx
             .cancellation
             .as_ref()
             .is_some_and(RunCancellation::is_cancelled)
         {
+            if let Some(timing) = &timing {
+                timing.finish("refused", "cancelled_before_spawn");
+            }
             return Err(format!("{} cancelled before spawn", self.bin.display()));
         }
         let broker_invocation = broker.map(broker::RunBroker::begin_invocation);
@@ -2920,16 +2959,26 @@ impl CliProvider {
         // knows how to wait for exit and terminate.
         type BoxRead = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
         type BoxWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
-        let (mut stdin, mut stdout_pipe, mut stderr_pipe, mut control): (
+        let (mut stdin, mut stdout_pipe, mut stderr_pipe, mut control, spawn_start): (
             BoxWrite,
             BoxRead,
             BoxRead,
             RunControl,
+            run_session::SpawnStart,
         ) = if matches!(self.backend, SandboxBackend::MicroVm { .. }) {
             let final_args = self.broker_argv(args, workdir, &auth);
-            let (vm, io, lanes) = self
+            let (vm, io, lanes) = match self
                 .microvm_boot(&final_args, workdir, ctx, &auth, GuestStdio::Pipes)
-                .await?;
+                .await
+            {
+                Ok(booted) => booted,
+                Err(error) => {
+                    if let Some(timing) = &timing {
+                        timing.finish("refused", "microvm_boot_failed");
+                    }
+                    return Err(error);
+                }
+            };
             (
                 Box::new(io.stdin),
                 Box::new(io.stdout),
@@ -2941,9 +2990,18 @@ impl CliProvider {
                     workdir: workdir.to_path_buf(),
                     _lanes: lanes,
                 })),
+                run_session::SpawnStart::Guest(io.spawn),
             )
         } else {
-            let mut command = self.prepared_command(args, workdir, ctx, &auth)?;
+            let mut command = match self.prepared_command(args, workdir, ctx, &auth) {
+                Ok(command) => command,
+                Err(error) => {
+                    if let Some(timing) = &timing {
+                        timing.finish("refused", "command_prepare_failed");
+                    }
+                    return Err(error);
+                }
+            };
             command
                 .current_dir(workdir)
                 .stdin(Stdio::piped())
@@ -2951,44 +3009,57 @@ impl CliProvider {
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
             configure_process_group(&mut command);
-            let child = command
-                .spawn()
-                .map_err(|e| format!("spawn {} failed: {e}", self.bin.display()))?;
+            let child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    if let Some(timing) = &timing {
+                        timing.finish("refused", "child_spawn_failed");
+                    }
+                    return Err(format!("spawn {} failed: {error}", self.bin.display()));
+                }
+            };
+            let spawned_at = Instant::now();
             let mut live = LiveChild::new(child);
-            let stdin = live
-                .child_mut()
-                .stdin
-                .take()
-                .ok_or_else(|| "child stdin was not piped".to_string())?;
-            let stdout = live
-                .child_mut()
-                .stdout
-                .take()
-                .ok_or_else(|| "child stdout was not piped".to_string())?;
-            let stderr = live
-                .child_mut()
-                .stderr
-                .take()
-                .ok_or_else(|| "child stderr was not piped".to_string())?;
+            let stdin = match live.child_mut().stdin.take() {
+                Some(stdin) => stdin,
+                None => {
+                    if let Some(timing) = &timing {
+                        timing.finish("refused", "child_stdin_not_piped");
+                    }
+                    return Err("child stdin was not piped".into());
+                }
+            };
+            let stdout = match live.child_mut().stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    if let Some(timing) = &timing {
+                        timing.finish("refused", "child_stdout_not_piped");
+                    }
+                    return Err("child stdout was not piped".into());
+                }
+            };
+            let stderr = match live.child_mut().stderr.take() {
+                Some(stderr) => stderr,
+                None => {
+                    if let Some(timing) = &timing {
+                        timing.finish("refused", "child_stderr_not_piped");
+                    }
+                    return Err("child stderr was not piped".into());
+                }
+            };
             (
                 Box::new(stdin),
                 Box::new(stdout),
                 Box::new(stderr),
                 RunControl::Local(live),
+                run_session::SpawnStart::Host(spawned_at),
             )
         };
 
-        let protocol = match self.spec.output {
-            OutputFormat::CodexSession => Some(run_session::Protocol::Codex),
-            OutputFormat::ClaudeSession => Some(run_session::Protocol::Claude),
-            // Pi is a one-shot `--print` run whose events arrive on stdout; it
-            // drives no bidirectional session protocol.
-            OutputFormat::PiJson
-            | OutputFormat::JsonlEvents
-            | OutputFormat::JsonResult
-            | OutputFormat::Text => None,
-        };
-        if let Some(protocol) = protocol {
+        if let Some(protocol) = session_protocol {
+            let timing = timing
+                .as_mut()
+                .expect("session timing exists for a session protocol");
             let result = run_session::drive(
                 protocol,
                 prompt,
@@ -2996,7 +3067,11 @@ impl CliProvider {
                 ctx,
                 self.output_sink.clone(),
                 (idle, hard),
-                broker_invocation.as_ref(),
+                run_session::SessionDriver {
+                    broker: broker_invocation.as_ref(),
+                    start: spawn_start,
+                    timing,
+                },
             )
             .await;
             if let Some(invocation) = &broker_invocation {
@@ -3004,6 +3079,9 @@ impl CliProvider {
             }
             if result.is_err() {
                 control.terminate().await;
+                let (outcome, reason) =
+                    session_error_outcome(result.as_ref().err().expect("the result is an error"));
+                timing.finish(outcome, reason);
                 return result;
             }
             let exited = tokio::time::timeout(
@@ -3013,18 +3091,27 @@ impl CliProvider {
             .await;
             match exited {
                 Ok(Ok((true, _))) => {
-                    control.collect_workspace().await?;
+                    timing.child_exit(Some(0));
+                    if let Err(error) = control.collect_workspace().await {
+                        timing.finish("error", "workspace_collect_failed");
+                        return Err(error);
+                    }
+                    timing.finish("completed", "turn_completed");
                     return result;
                 }
                 Ok(Ok((false, code))) => {
+                    timing.child_exit(described_exit_code(&code));
+                    timing.finish("early_exit", "child_nonzero_exit");
                     control.terminate().await;
                     return Err(format!("provider session exited unsuccessfully: {code:?}"));
                 }
                 Ok(Err(error)) => {
+                    timing.finish("early_exit", "child_wait_failed");
                     control.terminate().await;
                     return Err(error.to_string());
                 }
                 Err(_) => {
+                    timing.finish("timeout", "child_exit_wait_timeout");
                     control.terminate().await;
                     return Err("provider session did not exit after its result".into());
                 }

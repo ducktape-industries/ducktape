@@ -19,17 +19,11 @@
 //! asks the process to exit gracefully — the managing app has no pid, only
 //! this port.
 
-// The app modules' wire crates under the module's OWN name, for the suites
-// only. Core links them as `agent-wire` / `runs-wire` (the native modules ship
-// from ducktape-modules), while bin/node links the same crates bare — and the
-// provisioning suites `#[path]`-include bin/node's chief planner, whose `use
-// agent::…` / `use runs::…` resolve against the crate root. One alias here is
-// what lets that one source file compile in both crates; cargo refuses the
-// same package twice under two names, so it cannot be a second dependency.
+pub mod module_contracts;
+
+pub(crate) use module_contracts::{chat, runs, tasks};
 #[cfg(test)]
-extern crate agent_wire as agent;
-#[cfg(test)]
-extern crate runs_wire as runs;
+pub(crate) use module_contracts::{agent, pages};
 
 // the owner-gated control namespace: `/v1/admin/*` on the same
 // listener, PoP-gated to the node owner. shutdown + module-code moved here off

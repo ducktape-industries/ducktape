@@ -32,6 +32,7 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::sync::Mutex;
+use std::time::Instant;
 
 use compute_service::AttemptControl;
 use host::worker::{WorkOutcome, Worker};
@@ -231,6 +232,7 @@ impl WorkPump {
     /// did not answer.
     async fn gate(&mut self, node: &NodeLink, assigned: Vec<WorkerRequest>) -> Vec<WorkerRequest> {
         let mut decided = Vec::with_capacity(assigned.len());
+        let mut requesters = None;
         for request in assigned {
             let key = (request.saga_id.clone(), request.attempt);
             if self.work.contains_key(&key) {
@@ -238,10 +240,15 @@ impl WorkPump {
                 continue;
             }
             let verdict = self.admits(node, &request.saga_id).await;
-            if let Some(requester) = run_requester(node, &request.saga_id).await
-                && let Ok(mut requesters) = self.record_requesters.lock()
+            let dispatch_id = dispatch_id_for(&request.saga_id);
+            let requesters = match &requesters {
+                Some(requesters) => requesters,
+                None => requesters.insert(pending_run_requesters(node).await),
+            };
+            if let Some(requester) = requesters.get(&dispatch_id)
+                && let Ok(mut recorded) = self.record_requesters.lock()
             {
-                requesters.insert(dispatch_id_for(&request.saga_id), requester);
+                recorded.insert(dispatch_id, requester.clone());
             }
             self.record(request, key, verdict, &mut decided);
         }
@@ -535,19 +542,49 @@ impl WorkPump {
     /// state still names the attempt. Re-sends are duplicate ops at worst — the
     /// saga's result singularity collapses them deterministically.
     async fn send(&mut self, node: &NodeLink, key: &AttemptKey, msg: Msg) {
+        let submit_started = Instant::now();
+        tracing::debug!(
+            target: "ducktape::provider",
+            event = "provider_result_tail",
+            phase = "result_submit_started",
+            saga = %key.0,
+            attempt = key.1,
+            "provider result submission started"
+        );
         match node.submit(&msg.target, &msg.payload).await {
-            Ok(_height) => {
+            Ok(height) => {
+                tracing::debug!(
+                    target: "ducktape::provider",
+                    event = "provider_result_tail",
+                    phase = "result_included",
+                    saga = %key.0,
+                    attempt = key.1,
+                    height,
+                    elapsed_ms = submit_started.elapsed().as_millis() as u64,
+                    "provider result included in a committed block"
+                );
                 if let Some(entry) = self.work.get_mut(key) {
                     entry.stage = Stage::Settled;
                 }
             }
-            Err(error) => tracing::debug!(
-                target: "ducktape::saga",
-                attempt = ?key,
-                error = %error,
-                reason = "result_submit_failed",
-                "compute result will be re-sent"
-            ),
+            Err(error) => {
+                tracing::debug!(
+                    target: "ducktape::provider",
+                    event = "provider_result_tail",
+                    phase = "result_submit_failed",
+                    saga = %key.0,
+                    attempt = key.1,
+                    elapsed_ms = submit_started.elapsed().as_millis() as u64,
+                    "provider result submission failed"
+                );
+                tracing::debug!(
+                    target: "ducktape::saga",
+                    attempt = ?key,
+                    error = %error,
+                    reason = "result_submit_failed",
+                    "compute result will be re-sent"
+                );
+            }
         }
     }
 }
@@ -656,17 +693,23 @@ fn dispatch_id_for(saga_id: &str) -> String {
         .to_owned()
 }
 
-async fn run_requester(node: &NodeLink, saga_id: &str) -> Option<Value> {
-    let dispatch_id = dispatch_id_for(saga_id);
-    let request = serde_json::to_vec(&runs::view::RunsViewQuery::Run { dispatch_id }).ok()?;
-    let bytes = node
-        .query("runs", &request)
-        .await
-        .ok()?;
-    let runs::view::RunsViewReply::Run(Some(detail)) = serde_json::from_slice(&bytes).ok()? else {
-        return None;
+/// The committed requester of every run awaiting execution, keyed by dispatch
+/// id: the session record names WHO asked, and a program's history follows
+/// that program's current controller. One read per gate pass; a run the runs
+/// module no longer lists simply records no requester.
+async fn pending_run_requesters(node: &NodeLink) -> HashMap<String, Value> {
+    let request = crate::wire::runs::encode_query(&crate::wire::runs::RunsQuery::PendingRuns);
+    let Ok(bytes) = node.query("runs", &request).await else {
+        return HashMap::new();
     };
-    Some(requester_value(&detail.run.requester))
+    let Ok(crate::wire::runs::RunsReply::PendingRuns(runs)) =
+        crate::wire::runs::decode_reply(&bytes)
+    else {
+        return HashMap::new();
+    };
+    runs.into_iter()
+        .map(|run| (run.dispatch_id, requester_value(&run.requester)))
+        .collect()
 }
 
 fn requester_value(origin: &sdk::Origin) -> Value {

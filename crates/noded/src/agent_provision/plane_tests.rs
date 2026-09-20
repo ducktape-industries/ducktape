@@ -8,7 +8,6 @@
 //! without booting a node.
 
 use crate::NodeHandle;
-use runs_wire as runs;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -85,8 +84,8 @@ pub(super) fn spawn_files_actor(
 /// every session bind this actor saw, in order — the ops the provisioner ACTUALLY
 /// submitted, so a test asserts against the wire and not against its own belief
 /// about it.
-pub(super) type SessionBinds = std::sync::Arc<std::sync::Mutex<Vec<runs::RunsMsg>>>;
-type SessionActions = std::sync::Arc<std::sync::Mutex<Vec<(sdk::Origin, runs::RunsMsg)>>>;
+pub(super) type SessionBinds = std::sync::Arc<std::sync::Mutex<Vec<crate::runs::RunsMsg>>>;
+type SessionActions = std::sync::Arc<std::sync::Mutex<Vec<(sdk::Origin, crate::runs::RunsMsg)>>>;
 
 /// a stand-in actor for the SESSION lane: it records every op the provisioner
 /// submits and answers it with `bind` — `Ok` for the node that holds the run's
@@ -113,7 +112,7 @@ fn spawn_session_actor(
                     assert_eq!(target, "runs", "the only op a provision submits");
                     seen.lock()
                         .unwrap()
-                        .push(runs::decode_msg(&payload).expect("a runs op"));
+                        .push(crate::runs::decode_msg(&payload).expect("a runs op"));
                     let _ = reply.send(
                         bind.map(|()| committed_block())
                             .map_err(|said| crate::Refused::new("module", said)),
@@ -123,51 +122,46 @@ fn spawn_session_actor(
                     target, req, reply, ..
                 } => {
                     let result = if target == "runs" {
-                        let result = match runs::decode_query(&req).unwrap() {
-                            runs::RunsQuery::AgentSessions => {
-                                runs::RunsReply::AgentSessions(vec![runs::AgentSession {
-                                    run_id: consensus_run_id(),
-                                    agent_id: "quackbot".into(),
-                                    session_key: Vec::new(),
-                                    lease: runs::ExecutionLease {
-                                        holder: Vec::new(),
-                                        attempt: 0,
+                        match crate::runs::decode_query(&req).unwrap() {
+                            crate::runs::RunsQuery::AgentSessions => {
+                                Ok(crate::runs::encode_reply(&crate::runs::RunsReply::AgentSessions(vec![
+                                    crate::runs::AgentSession {
+                                        run_id: consensus_run_id(),
+                                        agent_id: "quackbot".into(),
+                                        session_key: Vec::new(),
+                                        lease: crate::runs::ExecutionLease {
+                                            holder: Vec::new(),
+                                            attempt: 0,
+                                        },
+                                        opened_at: 0,
+                                        actions: 0,
                                     },
-                                    opened_at: 0,
-                                    actions: 0,
-                                }])
+                                ])))
                             }
-                            runs::RunsQuery::ActionRequest { request_id } => {
+                            crate::runs::RunsQuery::ActionRequest { request_id } => {
                                 assert_eq!(
                                     seen_actions.lock().unwrap().len(),
                                     1,
                                     "receipt follows admitted action"
                                 );
-                                runs::RunsReply::ActionRequest(Some(runs::ActionRequestView {
+                                Ok(super::session::encode_action_reply(
                                     request_id,
-                                    account: 2,
-                                    generation: 0,
-                                    run_id: consensus_run_id(),
-                                    operation: "tasks.create".into(),
-                                    result: serde_json::Value::Null,
-                                    target: "tasks".into(),
-                                    payload: serde_json::Value::Null,
-                                    status: runs::ActionStatus::Completed {
+                                    consensus_run_id(),
+                                    super::session::ReceiptStatus::Completed {
                                         call: sdk::CallId {
                                             requester: "agent".into(),
                                             invocation: "2/1".into(),
                                             step: 1,
                                         },
-                                        outcome: dispatch::CallOutcomeSummary::Applied {
+                                        outcome: super::session::ReceiptOutcome::Applied {
                                             output_digest: [0; 32],
                                             assigned: Vec::new(),
                                         },
                                     },
-                                }))
+                                ))
                             }
                             query => panic!("unexpected session query {query:?}"),
-                        };
-                        Ok(runs::encode_reply(&result))
+                        }
                     } else {
                         files_reply(&BTreeMap::new(), false, &req)
                     };
@@ -178,7 +172,7 @@ fn spawn_session_actor(
                     assert_eq!(msg.target, "runs");
                     seen_actions.lock().unwrap().push((
                         origin,
-                        runs::decode_msg(&msg.payload).expect("a runs action"),
+                        crate::runs::decode_msg(&msg.payload).expect("a runs action"),
                     ));
                     let _ = reply.send(Ok(committed_block()));
                 }
@@ -266,7 +260,7 @@ fn file_entry(path: &str, bytes: &[u8]) -> EntryInfo {
 /// right one is bound stands the native runs module up, so it ships from
 /// ducktape-modules.
 fn consensus_run_id() -> String {
-    runs::run_id_for("general", 1, "quackbot")
+    crate::runs::run_id_for("general", 1, "quackbot")
 }
 
 /// a duckfs-source spec: the agent's own workspace prefix (empty in the
@@ -452,7 +446,7 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
 
     let bound = match binds.lock().unwrap().as_slice() {
         [
-            runs::RunsMsg::OpenAgentSession {
+            crate::runs::RunsMsg::OpenAgentSession {
                 run_id,
                 attempt,
                 session_key,
@@ -468,7 +462,7 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
         }
         other => panic!("expected exactly one session bind, got {other:?}"),
     };
-    assert_eq!(bound.len(), runs::SESSION_KEY_LEN);
+    assert_eq!(bound.len(), crate::runs::SESSION_KEY_LEN);
 
     let wrong_token = post_action(
         action_url,
@@ -500,15 +494,15 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
         &serde_json::json!({"message":{"open_agent_session":{
             "attempt": 0,
             "run_id": consensus_run_id(),
-            "session_key": vec![0; runs::SESSION_KEY_LEN],
+            "session_key": vec![0; crate::runs::SESSION_KEY_LEN],
         }}}),
     )
     .await;
     assert_eq!(out_of_scope, 403);
     assert!(actions.lock().unwrap().is_empty());
 
-    let action = runs::ActionEnvelope::new(
-        runs::OP_TASKS_CREATE,
+    let action = crate::runs::ActionEnvelope::new(
+        crate::runs::OP_TASKS_CREATE,
         None,
         serde_json::json!({"task_id": "task-1", "title": "scoped"}),
     );
@@ -533,7 +527,7 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
         );
         assert!(matches!(
             &submitted[0].1,
-            runs::RunsMsg::AgentAction { run_id, .. } if run_id == &consensus_run_id()
+            crate::runs::RunsMsg::AgentAction { run_id, .. } if run_id == &consensus_run_id()
         ));
     }
 
@@ -618,7 +612,7 @@ async fn a_refused_bind_fails_provision_and_removes_the_workspace() {
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
-type ReceiptState = std::sync::Arc<std::sync::Mutex<runs::ActionStatus>>;
+type ReceiptState = std::sync::Arc<std::sync::Mutex<super::session::ReceiptStatus>>;
 
 fn spawn_receipt_actor(
     mut commands: futures::channel::mpsc::Receiver<NodeCommand>,
@@ -627,8 +621,9 @@ fn spawn_receipt_actor(
     ReceiptState,
     tokio::sync::mpsc::UnboundedReceiver<()>,
 ) {
-    let status: ReceiptState =
-        std::sync::Arc::new(std::sync::Mutex::new(runs::ActionStatus::AwaitingProgram));
+    let status: ReceiptState = std::sync::Arc::new(std::sync::Mutex::new(
+        super::session::ReceiptStatus::AwaitingProgram,
+    ));
     let stored = status.clone();
     let (observed, queries) = tokio::sync::mpsc::unbounded_channel();
     let actor = tokio::spawn(async move {
@@ -641,37 +636,33 @@ fn spawn_receipt_actor(
                     target, req, reply, ..
                 } => {
                     assert_eq!(target, "runs");
-                    let response = match runs::decode_query(&req).unwrap() {
-                        runs::RunsQuery::AgentSessions => {
-                            runs::RunsReply::AgentSessions(vec![runs::AgentSession {
-                                run_id: consensus_run_id(),
-                                agent_id: "quackbot".into(),
-                                session_key: Vec::new(),
-                                lease: runs::ExecutionLease {
-                                    holder: Vec::new(),
-                                    attempt: 0,
+                    let response = match crate::runs::decode_query(&req).unwrap() {
+                        crate::runs::RunsQuery::AgentSessions => {
+                            Ok(crate::runs::encode_reply(&crate::runs::RunsReply::AgentSessions(vec![
+                                crate::runs::AgentSession {
+                                    run_id: consensus_run_id(),
+                                    agent_id: "quackbot".into(),
+                                    session_key: Vec::new(),
+                                    lease: crate::runs::ExecutionLease {
+                                        holder: Vec::new(),
+                                        attempt: 0,
+                                    },
+                                    opened_at: 0,
+                                    actions: 0,
                                 },
-                                opened_at: 0,
-                                actions: 0,
-                            }])
+                            ])))
                         }
-                        runs::RunsQuery::ActionRequest { request_id } => {
+                        crate::runs::RunsQuery::ActionRequest { request_id } => {
                             let _ = observed.send(());
-                            runs::RunsReply::ActionRequest(Some(runs::ActionRequestView {
+                            Ok(super::session::encode_action_reply(
                                 request_id,
-                                account: 2,
-                                generation: 0,
-                                run_id: consensus_run_id(),
-                                operation: "tasks.create".into(),
-                                result: serde_json::Value::Null,
-                                target: "tasks".into(),
-                                payload: serde_json::Value::Null,
-                                status: stored.lock().unwrap().clone(),
-                            }))
+                                consensus_run_id(),
+                                stored.lock().unwrap().clone(),
+                            ))
                         }
                         query => panic!("unexpected receipt query {query:?}"),
                     };
-                    let _ = reply.send(Ok(runs::encode_reply(&response)));
+                    let _ = reply.send(response);
                 }
                 // as above: the receipt lane reads as the NODE, never as a
                 // principal.
@@ -699,14 +690,14 @@ fn request_tool_action(session: &super::session::RunSession) -> tokio::task::Joi
 async fn tool_http_waits_for_the_actual_committed_outcome_and_surfaces_target_failure() {
     for (outcome, expected) in [
         (
-            dispatch::CallOutcomeSummary::Applied {
+            super::session::ReceiptOutcome::Applied {
                 output_digest: [1; 32],
                 assigned: Vec::new(),
             },
             200,
         ),
         (
-            dispatch::CallOutcomeSummary::Rejected {
+            super::session::ReceiptOutcome::Rejected {
                 reason: "the target rejected the write".into(),
             },
             400,
@@ -731,7 +722,7 @@ async fn tool_http_waits_for_the_actual_committed_outcome_and_surfaces_target_fa
             !request.is_finished(),
             "admission must not return tool success"
         );
-        *state.lock().unwrap() = runs::ActionStatus::Completed {
+        *state.lock().unwrap() = super::session::ReceiptStatus::Completed {
             call: sdk::CallId {
                 requester: "agent".into(),
                 invocation: "2/1".into(),

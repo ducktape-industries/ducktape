@@ -82,6 +82,9 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 use sha2::Digest as _;
 
+#[cfg(test)]
+use crate::wire::collaboration;
+
 /// where a workspace keeps its scoped messaging keys. `collab-keys` rather than
 /// `keys`, which is the WALLET keystore's directory: these are not wallets and
 /// must never be offered as one.

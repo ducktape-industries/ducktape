@@ -25,6 +25,7 @@
 //! deterministic runtime shares storage across child contexts).
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+use saga::valset_contract::{ValsetReply, encode_reply as valset_encode_reply};
 use saga::{
     MAX_RETAINED_TERMINAL, SPEC_CHUNK_BYTES, SagaModule, SagaMsg, SagaOrigin, SagaQuery, SagaReply,
     SagaStatus, SagaView, decode_reply, encode_msg, encode_query,
@@ -32,7 +33,6 @@ use saga::{
 use sdk::{Env, Error, MerkleStore as _, Module, Msg, Origin, StateRoot, StateSyncHandle};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
-use valset::{ValsetReply, encode_reply as valset_encode_reply};
 
 const SAGA: &str = "saga";
 
