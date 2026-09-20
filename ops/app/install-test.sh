@@ -34,6 +34,7 @@ install:
 	@printf '%s\n' "$$(git rev-parse HEAD)" >> "$(INSTALL_DEST)/installed-revs"
 	@printf '%s\n' "$(CARGO_TARGET_DIR)" > "$(INSTALL_DEST)/target-dir"
 	@printf '%s\n' "$(CARGO_BUILD_JOBS)" > "$(INSTALL_DEST)/jobs"
+	@mkdir -p "$(CARGO_TARGET_DIR)" && touch "$(CARGO_TARGET_DIR)/build-artifact"
 EOF
 git -C "$APP_REPO" add .
 git -C "$APP_REPO" commit -qm first
@@ -55,7 +56,11 @@ APP_REPO="$APP_REPO" APP_REV_FILE="$PIN_FILE" APP_CHECKOUT_DIR="$CHECKOUT" \
 [ "$(git -C "$CHECKOUT" rev-parse HEAD)" = "$PIN" ] || fail 'first install moved off the pinned commit'
 [ "$(<"$DEST/installed-revs")" = "$PIN" ] || fail 'first install delegated the wrong revision'
 assert_contains 'running make install' "$LOG"
-[ "$(<"$DEST/target-dir")" = "$CHECKOUT/target-core-install" ] || fail 'App target not isolated'
+# cargo writes into the target dir; inside the checkout that made the second run die with checkout_dirty.
+target_dir=$(<"$DEST/target-dir")
+[ -n "$target_dir" ] || fail 'App target not set'
+case "$target_dir" in "$CHECKOUT"/*) fail 'App target inside the checkout dirties it' ;; esac
+[ -e "$target_dir/build-artifact" ] || fail 'App build did not use the isolated target'
 [ "$(<"$DEST/jobs")" = 2 ] || fail 'build jobs not forwarded'
 
 # A pinned, clean checkout is reused without consulting the repository again.
@@ -63,6 +68,19 @@ APP_REPO="$TEST_ROOT/no-longer-available" APP_REV_FILE="$PIN_FILE" APP_CHECKOUT_
 	INSTALL_DEST="$DEST" "$SCRIPT" >>"$LOG" 2>&1
 [ "$(wc -l < "$DEST/installed-revs")" -eq 2 ] || fail 'repeated invocation did not run the App install'
 [ "$(git -C "$CHECKOUT" rev-parse HEAD)" = "$PIN" ] || fail 'repeated invocation changed the pin'
+
+# Whatever sits in the checkout is build output, not work: the next install
+# repairs the tree to the pin instead of refusing it. An older layout put the
+# App's cargo target inside the checkout, and the App repo does not ignore it,
+# so every later install died on a tree it could have restored itself.
+mkdir -p "$CHECKOUT/stale-target/release"
+printf 'stale\n' > "$CHECKOUT/stale-target/release/artifact"
+printf 'edited\n' > "$CHECKOUT/src/version"
+APP_REPO="$TEST_ROOT/no-longer-available" APP_REV_FILE="$PIN_FILE" APP_CHECKOUT_DIR="$CHECKOUT" \
+	INSTALL_DEST="$DEST" "$SCRIPT" >>"$LOG" 2>&1
+[ ! -e "$CHECKOUT/stale-target" ] || fail 'leftover build output survived the install'
+[ "$(<"$CHECKOUT/src/version")" = first ] || fail 'edited tracked file not restored to the pin'
+[ "$(wc -l < "$DEST/installed-revs")" -eq 3 ] || fail 'install after a dirty checkout did not run'
 
 # The Core target delegates to the helper without running install-node here.
 TARGET_CHECKOUT=$TEST_ROOT/target-checkout

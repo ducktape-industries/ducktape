@@ -3,16 +3,17 @@
 //!
 //! the flow under test (two humans, three commands):
 //!   friend starts an out-of-mesh node        -> it parks, refused by the mesh
-//!   a member runs `promote <pubkey>` (direct) -> governance passes, valset Join
+//!   a member grants resident standing, then runs `promote <pubkey>` ->
+//!                                      governance passes, valset Join
 //!   the epoch cutover re-tracks the mesh     -> the parked node syncs at the
 //!                                                boundary, fabricates its
 //!                                                recovery checkpoint, reboots,
 //!                                                and votes in the new epoch
 //!
 //! two scenarios, two distinct promotion paths:
-//! - `solo_founder_invites_a_friend`: n=1 -> 2. epoch 1 cannot finalize until
-//!   the friend arrives (quorum 2 of 2), so the boundary freezes AT the epoch
-//!   base — the joiner spawns on the epoch's genesis floor.
+//! - `solo_founder_invites_a_friend`: n=1 -> 2. resident admission crosses one
+//!   epoch before promotion; the promoted seat then freezes the next boundary
+//!   at the 2-of-2 quorum floor.
 //! - `live_quorum_admits_a_fourth_validator`: n=3 -> 4. the three incumbents
 //!   keep finalizing past the cutover (quorum 3 of 4), so the joiner syncs a
 //!   mid-epoch boundary and needs the served finalization floor certificate.
@@ -74,10 +75,27 @@ fn solo_founder_invites_a_friend() {
     cluster.wait_marker(joiner, "joiner mode:", Duration::from_secs(60));
     cluster.wait_marker(joiner, "joining:", Duration::from_secs(60));
 
-    // one command on the founder's node: propose + the deciding solo ballot
-    // + execute, all through the running node's rpc.
+    // A joiner must first hold resident standing: promotion is deliberately
+    // gated on the staged-admission tier so a new quorum seat is caught up.
     let friend_hex = hex(&Cluster::identity(1));
     let cfg = cluster.config_file(0);
+    let (ok, out) = cluster.run_verb(&[
+        "node",
+        "resident",
+        "accept",
+        &friend_hex,
+        "--config",
+        cfg.to_str().expect("utf-8 config path"),
+    ]);
+    assert!(ok, "resident accept failed:\n{out}");
+    assert!(
+        out.contains("granted resident standing"),
+        "unexpected verb output:\n{out}"
+    );
+    cluster.wait_marker(joiner, "resident: pre-synced boundary", CONVERGE);
+
+    // One command on the founder's node: propose + the deciding solo ballot
+    // + execute, all through the running node's rpc.
     let (ok, out) = cluster.run_verb(&[
         "node",
         "member",
@@ -89,10 +107,8 @@ fn solo_founder_invites_a_friend() {
     assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
-    // the cutover (the nop pusher advances the views)
-    // seats the friend directly — epoch 1 then STALLS at its base (quorum
-    // 2-of-2), which is exactly what hands the joiner a frozen boundary at
-    // the epoch's genesis floor.
+    // the cutover (the nop pusher advances the views) seats the friend after
+    // the resident-admission epoch has already crossed.
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
 
     // the parked node notices its admission, syncs the boundary, and SEATS
@@ -104,9 +120,9 @@ fn solo_founder_invites_a_friend() {
     // and the root hash (`replica/park.rs`). Waiting for it here could only
     // ever hang — it did, for 600 s. `restart_e2e` still waits on that marker,
     // correctly, because a real process restart does go through boot.
-    cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
+    cluster.wait_marker(joiner, "admitted at epoch", CONVERGE);
     cluster.wait_marker(joiner, "synced root_hash=", CONVERGE);
-    cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
+    cluster.wait_marker(joiner, "promoted: validator at epoch", CONVERGE);
 
     // THE property: consensus is live again, and only because the friend
     // votes — a 2-validator simplex finalizes nothing without both. an op
@@ -180,9 +196,22 @@ fn a_promoted_validator_converges_the_overlay_mesh() {
     let joiner = cluster.spawn_joiner(2);
     cluster.wait_marker(joiner, "joining:", Duration::from_secs(60));
 
-    // strict majority of 2 is 2: both incumbents run the same command, the
-    // second ballot decides and executes.
+    // strict majority of 2 is 2: both incumbents grant resident standing;
+    // the second ballot decides and executes.
     let friend_hex = hex(&Cluster::identity(2));
+    for member in [0usize, 1] {
+        let cfg = cluster.config_file(member);
+        let (ok, out) = cluster.run_verb(&[
+            "node",
+            "resident",
+            "accept",
+            &friend_hex,
+            "--config",
+            cfg.to_str().expect("utf-8 config path"),
+        ]);
+        assert!(ok, "resident accept via member {member} failed:\n{out}");
+    }
+    cluster.wait_marker(joiner, "resident: pre-synced boundary", CONVERGE);
     for member in [0usize, 1] {
         let cfg = cluster.config_file(member);
         let (ok, out) = cluster.run_verb(&[
@@ -197,9 +226,9 @@ fn a_promoted_validator_converges_the_overlay_mesh() {
     }
 
     for i in 0..2 {
-        cluster.wait_marker(i, "cutover complete: epoch 1", CONVERGE);
+        cluster.wait_marker(i, "cutover complete: epoch 2", CONVERGE);
     }
-    cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
+    cluster.wait_marker(joiner, "promoted: validator at epoch 2", CONVERGE);
 
     // THE property, and the one the seat's missing `Retarget` broke: the
     // promoted node's plane knows its epoch, so it sends its own endpoint
@@ -225,15 +254,29 @@ fn live_quorum_admits_a_fourth_validator() {
     let joiner = cluster.spawn_joiner(3);
     cluster.wait_marker(joiner, "joiner mode:", Duration::from_secs(60));
 
-    // strict majority of 3 is 2: members 0 and 1 each run the SAME command;
-    // the second one's ballot decides and executes.
+    // strict majority of 3 is 2: members 0 and 1 each grant resident
+    // standing, then each run the promotion command; the second ballot in
+    // each ceremony decides and executes.
     let friend_hex = hex(&Cluster::identity(3));
     for member in [0usize, 1] {
         let cfg = cluster.config_file(member);
         let (ok, out) = cluster.run_verb(&[
             "node",
-        "member",
-        "promote",
+            "resident",
+            "accept",
+            &friend_hex,
+            "--config",
+            cfg.to_str().expect("utf-8 config path"),
+        ]);
+        assert!(ok, "resident accept via member {member} failed:\n{out}");
+    }
+    cluster.wait_marker(joiner, "resident: pre-synced boundary", CONVERGE);
+    for member in [0usize, 1] {
+        let cfg = cluster.config_file(member);
+        let (ok, out) = cluster.run_verb(&[
+            "node",
+            "member",
+            "promote",
             &friend_hex,
             "--config",
             cfg.to_str().expect("utf-8 config path"),
@@ -241,9 +284,10 @@ fn live_quorum_admits_a_fourth_validator() {
         assert!(ok, "promote via member {member} failed:\n{out}");
     }
 
-    // direct admission: ONE cutover seats the joiner on every incumbent.
+    // staged admission: the promotion cutover seats the already-synced
+    // resident on every incumbent.
     for i in 0..3 {
-        cluster.wait_marker(i, "cutover complete: epoch 1", CONVERGE);
+        cluster.wait_marker(i, "cutover complete: epoch 2", CONVERGE);
     }
 
     // advance the boundary PAST the epoch base while the joiner is still
@@ -258,9 +302,9 @@ fn live_quorum_admits_a_fourth_validator() {
     }
 
     // in-process seating again — no reboot, so no `recovered root_hash=`.
-    cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
+    cluster.wait_marker(joiner, "admitted at epoch 2", CONVERGE);
     cluster.wait_marker(joiner, "synced root_hash=", CONVERGE);
-    cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
+    cluster.wait_marker(joiner, "promoted: validator at epoch 2", CONVERGE);
 
     // the promoted validator's own op finalizes and reads on an incumbent —
     // its frame bytes start out ONLY in its store, so this proves the joiner
