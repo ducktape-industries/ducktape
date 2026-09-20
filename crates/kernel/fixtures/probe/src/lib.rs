@@ -29,8 +29,10 @@ mod program {
             Ok(())
         }
 
-        fn query(request: &[u8]) -> Result<Vec<u8>, Refusal> {
-            run(request).map(|replies| abi::encode(&replies))
+        fn query(request: &[u8]) -> Result<(), Refusal> {
+            let replies = run(request)?;
+            guest::respond(abi::encode(&replies));
+            Ok(())
         }
     }
 

@@ -37,13 +37,14 @@ mod program {
             Ok(())
         }
 
-        fn query(request: &[u8]) -> Result<Vec<u8>, Refusal> {
+        fn query(request: &[u8]) -> Result<(), Refusal> {
             let roster::Query::At(_) = abi::decode(request)?;
             let programs = guest::scan(Scan::prefix(b"p/"))
                 .into_iter()
                 .map(|entry| abi::decode(&entry.value))
                 .collect::<Result<Vec<roster::Entry>, Refusal>>()?;
-            Ok(abi::encode(&roster::Reply::Programs(programs)))
+            guest::respond(abi::encode(&roster::Reply::Programs(programs)));
+            Ok(())
         }
     }
 

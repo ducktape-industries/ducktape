@@ -41,8 +41,9 @@ mod program {
             }
         }
 
-        fn query(request: &[u8]) -> Result<Vec<u8>, Refusal> {
-            Ok(abi::encode(&guest::get(request)))
+        fn query(request: &[u8]) -> Result<(), Refusal> {
+            guest::respond(abi::encode(&guest::get(request)));
+            Ok(())
         }
     }
 

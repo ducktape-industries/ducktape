@@ -265,6 +265,7 @@ pub enum HostOp {
     Emit(Message),
     Event(Vec<u8>),
     Output(Vec<u8>),
+    Respond(Vec<u8>),
     Crypto(CryptoOp),
 }
 
@@ -291,7 +292,7 @@ pub enum GuestCall {
     Query(Vec<u8>),
 }
 
-pub type GuestReply = Result<Vec<u8>, Refusal>;
+pub type GuestReply = Result<(), Refusal>;
 
 pub mod roster {
     use super::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
@@ -404,7 +405,7 @@ mod tests {
         };
         let reply = HostReply::Query(Err(Refusal::new("r", "s")));
         let call = GuestCall::Execute(vec![3]);
-        let guest_reply: GuestReply = Ok(vec![4]);
+        let guest_reply: GuestReply = Ok(());
         assert_eq!(decode::<Env>(&encode(&env)).unwrap(), env);
         assert_eq!(decode::<HostOp>(&encode(&op)).unwrap(), op);
         assert_eq!(decode::<HostReply>(&encode(&reply)).unwrap(), reply);

@@ -10,13 +10,13 @@ pub trait Program {
         Ok(())
     }
     fn execute(payload: &[u8]) -> Result<(), Refusal>;
-    fn query(request: &[u8]) -> Result<Vec<u8>, Refusal>;
+    fn query(request: &[u8]) -> Result<(), Refusal>;
 }
 
 pub fn dispatch<P: Program>(call: GuestCall) -> GuestReply {
     match call {
-        GuestCall::Init(params) => P::init(&params).map(|()| Vec::new()),
-        GuestCall::Execute(payload) => P::execute(&payload).map(|()| Vec::new()),
+        GuestCall::Init(params) => P::init(&params),
+        GuestCall::Execute(payload) => P::execute(&payload),
         GuestCall::Query(request) => P::query(&request),
     }
 }
@@ -231,6 +231,13 @@ pub mod host_ops {
 
     pub fn output(bytes: impl Into<Vec<u8>>) {
         match host(&HostOp::Output(bytes.into())) {
+            HostReply::Done => {}
+            other => protocol("done", other),
+        }
+    }
+
+    pub fn respond(bytes: impl Into<Vec<u8>>) {
+        match host(&HostOp::Respond(bytes.into())) {
             HostReply::Done => {}
             other => protocol("done", other),
         }

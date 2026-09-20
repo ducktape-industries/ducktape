@@ -22,7 +22,7 @@ mod program {
             Ok(())
         }
 
-        fn query(request: &[u8]) -> Result<Vec<u8>, Refusal> {
+        fn query(request: &[u8]) -> Result<(), Refusal> {
             let members: Vec<validators::Member> = match guest::get(KEY) {
                 Some(bytes) => abi::decode(&bytes)?,
                 None => Vec::new(),
@@ -33,7 +33,8 @@ mod program {
                 ),
                 validators::Query::Members => validators::Reply::Members(members),
             };
-            Ok(abi::encode(&reply))
+            guest::respond(abi::encode(&reply));
+            Ok(())
         }
     }
 

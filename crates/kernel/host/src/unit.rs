@@ -245,7 +245,8 @@ where
             | HostOp::BlobPut { .. }
             | HostOp::Emit(_)
             | HostOp::Event(_)
-            | HostOp::Output(_) => {
+            | HostOp::Output(_)
+            | HostOp::Respond(_) => {
                 HostReply::Refused(Refusal::new(reason::UNSUPPORTED, "a query does not write"))
             }
         };
@@ -262,6 +263,7 @@ where
     layers: Vec<&'a Overlay>,
     stage: &'a Stage,
     stack: Vec<ProgramId>,
+    response: Vec<u8>,
     fault: Option<Error>,
 }
 
@@ -271,15 +273,21 @@ where
     E: Context + Spawner,
 {
     async fn call(&mut self, op: HostOp) -> HostReply {
-        let result = {
-            let reader = Reader {
-                world: self.world,
-                layers: self.layers.clone(),
-                stage: self.stage,
-                env: &self.env,
-                stack: &self.stack,
-            };
-            reader.serve(op).await
+        let result = match op {
+            HostOp::Respond(bytes) => {
+                self.response.extend(bytes);
+                Ok(HostReply::Done)
+            }
+            other => {
+                let reader = Reader {
+                    world: self.world,
+                    layers: self.layers.clone(),
+                    stage: self.stage,
+                    env: &self.env,
+                    stack: &self.stack,
+                };
+                reader.serve(other).await
+            }
         };
         match result {
             Ok(reply) => reply,
@@ -328,6 +336,7 @@ where
         layers,
         stage,
         stack,
+        response: Vec::new(),
         fault: None,
     };
     let verdict = world
@@ -339,7 +348,8 @@ where
         return Err(fault);
     }
     Ok(match verdict {
-        Ok(reply) => reply,
+        Ok(Ok(())) => Ok(unit.response),
+        Ok(Err(refusal)) => Err(refusal),
         Err(fault) => Err(refusal_of(fault)),
     })
 }
@@ -409,6 +419,10 @@ where
                 self.output = bytes;
                 Ok(HostReply::Done)
             }
+            HostOp::Respond(_) => Ok(HostReply::Refused(Refusal::new(
+                reason::UNSUPPORTED,
+                "an op does not respond",
+            ))),
             other => {
                 let reader = Reader {
                     world: self.world,
@@ -466,7 +480,7 @@ where
         return Err(fault);
     }
     let outcome = match verdict {
-        Ok(Ok(_)) => Outcome::Applied { output },
+        Ok(Ok(())) => Outcome::Applied { output },
         Ok(Err(refusal)) => Outcome::Rejected(refusal),
         Err(fault) => Outcome::Rejected(refusal_of(fault)),
     };

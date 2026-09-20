@@ -60,7 +60,7 @@ impl Host for Bench {
                 source: "probe".into(),
                 item: 1,
             }),
-            HostOp::Event(_) | HostOp::Output(_) => HostReply::Done,
+            HostOp::Event(_) | HostOp::Output(_) | HostOp::Respond(_) => HostReply::Done,
             other => HostReply::Refused(Refusal::new(
                 reason::UNSUPPORTED,
                 format!("the bench does not serve {other:?}"),
@@ -134,7 +134,7 @@ async fn every_host_op_crosses_the_boundary_and_back() {
         Step::Op(HostOp::BlobStat(abi::BlobId::Sha1([0; 20]))),
     ];
     let (bench, verdict) = execute(Limits::default(), steps).await;
-    assert_eq!(verdict, Ok(Ok(Vec::new())));
+    assert_eq!(verdict, Ok(Ok(())));
     assert_eq!(bench.seen.len(), 14);
     assert_eq!(
         replies(&bench),
@@ -166,7 +166,7 @@ async fn every_host_op_crosses_the_boundary_and_back() {
 }
 
 #[tokio::test]
-async fn a_query_answers_with_bytes_and_leaves_no_output() {
+async fn a_query_responds_with_bytes_and_sets_no_output() {
     let runtime = Runtime::new(Limits::default());
     let code = runtime.load(PROBE).unwrap();
     let mut bench = Bench::default();
@@ -174,14 +174,15 @@ async fn a_query_answers_with_bytes_and_leaves_no_output() {
     let steps = script(vec![Step::Op(HostOp::Get(b"a".to_vec()))]);
     let verdict = runtime
         .run(&code, GuestCall::Query(steps), &mut bench)
-        .await
-        .unwrap()
-        .unwrap();
+        .await;
+    assert_eq!(verdict, Ok(Ok(())));
     assert_eq!(
-        abi::decode::<Vec<HostReply>>(&verdict).unwrap(),
-        vec![HostReply::Value(Some(b"1".to_vec()))]
+        bench.seen,
+        vec![
+            HostOp::Get(b"a".to_vec()),
+            HostOp::Respond(abi::encode(&vec![HostReply::Value(Some(b"1".to_vec()))])),
+        ]
     );
-    assert_eq!(bench.seen, vec![HostOp::Get(b"a".to_vec())]);
 }
 
 #[tokio::test]
@@ -194,7 +195,7 @@ async fn init_runs_the_program_once_with_its_parameters() {
         value: b"yes".to_vec(),
     })]);
     let verdict = runtime.run(&code, GuestCall::Init(steps), &mut bench).await;
-    assert_eq!(verdict, Ok(Ok(Vec::new())));
+    assert_eq!(verdict, Ok(Ok(())));
     assert_eq!(bench.state.get(b"born".as_slice()), Some(&b"yes".to_vec()));
 }
 
@@ -247,7 +248,7 @@ async fn fuel_is_only_metered_when_a_limit_is_set() {
     let (_, metered) = execute(limits, vec![Step::Op(HostOp::Env)]).await;
     assert!(matches!(metered, Err(Fault::Trap(_))), "{metered:?}");
     let (_, unmetered) = execute(Limits::default(), vec![Step::Op(HostOp::Env)]).await;
-    assert_eq!(unmetered, Ok(Ok(Vec::new())));
+    assert_eq!(unmetered, Ok(Ok(())));
 }
 
 #[tokio::test]
@@ -259,7 +260,7 @@ async fn memory_past_the_limit_is_a_trap() {
     let (_, verdict) = execute(limits, vec![Step::Grow(96)]).await;
     assert!(matches!(verdict, Err(Fault::Trap(_))), "{verdict:?}");
     let (_, within) = execute(limits, vec![Step::Grow(16)]).await;
-    assert_eq!(within, Ok(Ok(Vec::new())));
+    assert_eq!(within, Ok(Ok(())));
 }
 
 #[tokio::test]
