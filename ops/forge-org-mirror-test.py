@@ -42,8 +42,10 @@ def run(*args, cwd=None, env=None, check=True, stdin=None):
     return result
 
 
-def git(*args, cwd=None, check=True):
-    return run("git", *args, cwd=cwd, check=check)
+def git(*args, cwd=None, check=True, stdin=""):
+    # Always close git's stdin with a value: `commit-tree` reads its message
+    # from stdin, and an inherited one would hang the gate instead of failing.
+    return run("git", *args, cwd=cwd, check=check, stdin=stdin)
 
 
 def commit(repo, branch, message):
@@ -369,7 +371,7 @@ def main():
 
         # A Forge branch that is not an ancestor is refused and left intact.
         alt = git("commit-tree", f"{alpha_start}^{{tree}}", "-p", alpha_start,
-                  cwd=forge / "alpha.git", check=True).stdout.strip()
+                  cwd=forge / "alpha.git", stdin="divergent\n").stdout.strip()
         git("update-ref", "refs/heads/main", alt, cwd=forge / "alpha.git")
         diverged = fixture.execute(check=False)
         assert diverged.returncode != 0 and "diverging Forge branch" in diverged.stderr, diverged
@@ -378,7 +380,7 @@ def main():
 
         # A differing existing tag is immutable and is refused.
         tag_alt = git("commit-tree", f"{beta_start}^{{tree}}", "-p", beta_start,
-                      cwd=forge / "beta.git").stdout.strip()
+                      cwd=forge / "beta.git", stdin="differing tag\n").stdout.strip()
         git("update-ref", "refs/tags/v1", tag_alt, cwd=forge / "beta.git")
         tag_refused = fixture.execute(check=False)
         assert tag_refused.returncode != 0 and "existing tag" in tag_refused.stderr, tag_refused
