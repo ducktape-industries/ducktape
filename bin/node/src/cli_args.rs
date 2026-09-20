@@ -34,6 +34,14 @@ pub enum OpCmd {
     Join(JoinCmd),
     /// list registered workspaces (chain-id + config path)
     List,
+    /// stop exactly this workspace under its supported supervisor; preserve
+    /// its registration and every workspace file so it can be started again
+    /// (no PID/name kill and no data removal)
+    Stop(SelectorArgs),
+    /// stop exactly this workspace, then move its complete directory under
+    /// <ducktape-home>/archived-networks/ so it is no longer registered; no
+    /// workspace data is deleted, and moving it back re-registers it
+    Leave(SelectorArgs),
     /// the running node's tip, and how far behind the network it is (reads
     /// the local rpc)
     Status(StatusArgs),

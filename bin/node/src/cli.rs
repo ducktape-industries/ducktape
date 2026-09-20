@@ -33,6 +33,8 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::Admit(args) => cmd_admit(args),
         OpCmd::Join(cmd) => dispatch_join(cmd),
         OpCmd::List => cmd_list(),
+        OpCmd::Stop(args) => cmd_node_stop(args),
+        OpCmd::Leave(args) => cmd_node_leave(args),
         OpCmd::Status(args) => cmd_node_status(args),
         OpCmd::Qualify(args) => crate::qualify::run(args),
         OpCmd::RecordWorld(args) => cmd_record_world(args),
@@ -243,6 +245,319 @@ fn cmd_list() -> CommandResult {
             }
         }
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct LifecycleWorkspace {
+    chain_id: String,
+    config: PathBuf,
+    workspace: PathBuf,
+}
+
+fn lifecycle_workspace(selector: &Selector) -> Result<LifecycleWorkspace, String> {
+    let requested = selector.config_path()?;
+    let requested = std::fs::canonicalize(&requested)
+        .map_err(|error| format!("cannot identify workspace config {requested:?}: {error}"))?;
+    let matches: Vec<(String, PathBuf)> = config::list_workspaces()?
+        .into_iter()
+        .filter(|(_, candidate)| {
+            std::fs::canonicalize(candidate).is_ok_and(|candidate| candidate == requested)
+        })
+        .collect();
+    let (chain_id, config) = match matches.as_slice() {
+        [(chain_id, config)] => (chain_id.clone(), config.clone()),
+        [] => {
+            return Err(format!(
+                "workspace config {requested:?} is not a registered local workspace"
+            ));
+        }
+        several => {
+            return Err(format!(
+                "workspace config {requested:?} is ambiguous — {} registered entries match",
+                several.len()
+            ));
+        }
+    };
+    let workspace = config
+        .parent()
+        .ok_or_else(|| format!("workspace config {config:?} has no directory"))?
+        .to_path_buf();
+    Ok(LifecycleWorkspace {
+        chain_id,
+        config,
+        workspace,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SupervisorClaim {
+    Systemd {
+        user: bool,
+        unit: String,
+    },
+    Launchd {
+        domain: String,
+        label: String,
+        plist: PathBuf,
+    },
+}
+
+/// The lifecycle verbs only control a supervisor that proves its own argv
+/// names this exact workspace and config. They never fall back to a PID or
+/// process-name search.
+fn discover_supervisor(target: &LifecycleWorkspace) -> Result<SupervisorClaim, String> {
+    let mut claims = Vec::new();
+    for user in [true, false] {
+        if let Some(claim) = systemd_claim(target, user) {
+            claims.push(claim);
+        }
+    }
+    claims.extend(launchd_claims(target));
+    match claims.as_slice() {
+        [claim] => Ok(claim.clone()),
+        [] => Err(format!(
+            "no supported supervisor owns workspace {} — refusing to signal a process by name; \
+             stop the process through its own launcher first",
+            target.workspace.display()
+        )),
+        several => Err(format!(
+            "workspace {} has ambiguous supervisor ownership ({} claims) — refusing to stop \
+             any of them",
+            target.workspace.display(),
+            several.len()
+        )),
+    }
+}
+
+fn systemd_claim(target: &LifecycleWorkspace, user: bool) -> Option<SupervisorClaim> {
+    let instance = systemd_instance(&target.chain_id);
+    let prefix = if user {
+        "ducktape-node-user@"
+    } else {
+        "ducktape-node@"
+    };
+    let unit = format!("{prefix}{instance}");
+    let mut command = std::process::Command::new("systemctl");
+    if user {
+        command.arg("--user");
+    }
+    let output = command
+        .args([
+            "show",
+            &unit,
+            "--property=LoadState",
+            "--property=ExecStart",
+            "--no-pager",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let loaded = property(&text, "LoadState").is_some_and(|value| value == "loaded");
+    let exec = text
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))?;
+    let names_workspace = exec_has_arg(exec, "--workspace", &target.workspace);
+    let names_config = exec_has_arg(exec, "--config", &target.config);
+    (loaded && names_workspace && names_config).then_some(SupervisorClaim::Systemd { user, unit })
+}
+
+/// The chain-id grammar only permits characters that systemd leaves literal
+/// except #; keep a fallback for test hosts without systemd-escape while
+/// using the installed helper when available, exactly as the ops installer
+/// does.
+fn systemd_instance(chain_id: &str) -> String {
+    let escaped = std::process::Command::new("systemd-escape")
+        .arg(chain_id)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|escaped| !escaped.is_empty());
+    escaped.unwrap_or_else(|| chain_id.replace('#', "\\x23"))
+}
+
+fn property<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}=")))
+}
+
+fn exec_has_arg(exec: &str, flag: &str, value: &std::path::Path) -> bool {
+    let needle = format!("{flag} {}", value.display());
+    let Some(start) = exec.find(&needle) else {
+        return false;
+    };
+    let before = exec[..start].chars().next_back();
+    let after = exec[start + needle.len()..].chars().next();
+    let valid_before = before.is_none_or(char::is_whitespace);
+    let valid_after =
+        after.is_none_or(|character| character.is_whitespace() || ";}".contains(character));
+    valid_before && valid_after
+}
+
+fn launchd_claims(target: &LifecycleWorkspace) -> Vec<SupervisorClaim> {
+    let Some(domain) = launchd_domain() else {
+        return Vec::new();
+    };
+    let agents = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Library/LaunchAgents"));
+    let Some(agents) = agents else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(agents) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| launchd_claim(entry.path(), &domain, target))
+        .collect()
+}
+
+fn launchd_claim(
+    plist: PathBuf,
+    domain: &str,
+    target: &LifecycleWorkspace,
+) -> Option<SupervisorClaim> {
+    let is_plist = plist
+        .extension()
+        .is_some_and(|extension| extension == "plist");
+    if !is_plist {
+        return None;
+    }
+    let label = plist.file_stem()?.to_str()?.to_string();
+    let text = std::fs::read_to_string(&plist).ok()?;
+    let names_workspace = plist_has_string(&text, &target.workspace);
+    let names_config = plist_has_string(&text, &target.config);
+    if !(names_workspace && names_config) {
+        return None;
+    }
+    let job = format!("{domain}/{label}");
+    let loaded = std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(&job)
+        .output()
+        .ok()
+        .is_some_and(|output| output.status.success());
+    loaded.then_some(SupervisorClaim::Launchd {
+        domain: domain.to_string(),
+        label,
+        plist,
+    })
+}
+
+fn plist_has_string(text: &str, value: &std::path::Path) -> bool {
+    text.contains(&format!("<string>{}</string>", value.display()))
+}
+
+fn launchd_domain() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: geteuid reads the current process credentials and has no
+        // observable side effect.
+        Some(format!("gui/{}", unsafe { libc::geteuid() }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+fn stop_supervisor(claim: &SupervisorClaim, leave: bool) -> CommandResult {
+    match claim {
+        SupervisorClaim::Systemd { user, unit } => {
+            let mut command = std::process::Command::new("systemctl");
+            if *user {
+                command.arg("--user");
+            }
+            if leave {
+                command.args(["disable", "--now", unit]);
+            } else {
+                command.args(["stop", unit]);
+            }
+            run_supervisor_command(command, "systemd", unit)
+        }
+        SupervisorClaim::Launchd {
+            domain,
+            label,
+            plist,
+        } => {
+            let job = format!("{domain}/{label}");
+            let command = std::process::Command::new("launchctl")
+                .arg("bootout")
+                .arg(&job)
+                .output()
+                .map_err(|error| format!("launchd could not stop {job}: {error}"))?;
+            if !command.status.success() {
+                return Err(format!(
+                    "launchd refused to stop {job}: {}",
+                    first_line(&command.stderr)
+                )
+                .into());
+            }
+            if leave {
+                std::fs::remove_file(plist).map_err(|error| {
+                    format!("launchd stopped {job}, but could not remove {plist:?}: {error}")
+                })?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_supervisor_command(
+    mut command: std::process::Command,
+    kind: &str,
+    subject: &str,
+) -> CommandResult {
+    let output = command
+        .output()
+        .map_err(|error| format!("{kind} could not stop {subject}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{kind} refused to stop {subject}: {}",
+        first_line(&output.stderr)
+    )
+    .into())
+}
+
+fn first_line(bytes: &[u8]) -> &str {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.lines().next())
+        .unwrap_or("no diagnostic")
+}
+
+fn cmd_node_stop(args: SelectorArgs) -> CommandResult {
+    let target = lifecycle_workspace(&args.selector)?;
+    let claim = discover_supervisor(&target)?;
+    stop_supervisor(&claim, false)?;
+    println!(
+        "stopped {} — registration and every workspace file were preserved; start it again with \
+         ducktape node run --config {}",
+        target.chain_id,
+        target.config.display()
+    );
+    Ok(())
+}
+
+fn cmd_node_leave(args: SelectorArgs) -> CommandResult {
+    let target = lifecycle_workspace(&args.selector)?;
+    let claim = discover_supervisor(&target)?;
+    stop_supervisor(&claim, true)?;
+    let archive = config::archive_workspace(&target.config)?;
+    println!(
+        "left {} — stopped its supervisor and moved the complete workspace to {}; nothing was \
+         deleted; move that directory back to {} to re-register it",
+        target.chain_id,
+        archive.display(),
+        target.workspace.display()
+    );
     Ok(())
 }
 
