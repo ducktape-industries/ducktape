@@ -167,10 +167,24 @@ const UPSTREAM_CREDENTIAL_ENV: [&str; 4] = [
 
 /// the `-c` overrides that aim a codex invocation at this run's loopback broker:
 /// the model-provider block (base URL + [`BROKER_TOKEN_ENV`] bearer, retries
-/// off), the provider selector, and a workspace trust level. shared by the
-/// headless [`CliProvider::broker_argv`] (spliced after the subcommand) and the
+/// off), the provider selector, a workspace trust level, and the start-up work
+/// the guest cannot use switched off. shared by the headless
+/// [`CliProvider::broker_argv`] (spliced after the subcommand) and the
 /// interactive path (prepended — a TUI argv has no subcommand). the child gets a
 /// base URL and an opaque bearer; neither recovers the operator's credential.
+///
+/// The three `off` switches are session-start latency, measured with the
+/// `provider_session_milestone` events and a syscall trace of the CLI. Each
+/// names something codex does at `initialize` / `thread/start` that a guest
+/// with no network device, no D-Bus and a manifest-fixed environment can only
+/// fail at, after spending the time:
+/// - `features.plugins`: a `git ls-remote` + shallow clone of the plugin
+///   marketplace on GitHub, the guest's only outbound TLS attempt.
+/// - `features.shell_snapshot`: a `bash -lc` login-shell environment capture
+///   inside `thread/start`, which is the bulk of that milestone's CPU (the run
+///   environment IS the manifest env; there is no profile to snapshot).
+/// - `mcp_oauth_credentials_store`: `auto` probes the D-Bus secret service for
+///   MCP OAuth tokens; the ducktape tool plane takes none.
 fn broker_provider_overrides(broker: &broker::BrokerEndpoint, workdir: &Path) -> Vec<String> {
     // the workdir is a path, and codex keys `projects.<key>` by TOML string —
     // so it must be QUOTED as one (a bare path breaks the `-c` parse).
@@ -185,6 +199,12 @@ fn broker_provider_overrides(broker: &broker::BrokerEndpoint, workdir: &Path) ->
         "model_provider=\"ducktape\"".into(),
         "-c".into(),
         format!("projects.{project_key}.trust_level=\"untrusted\""),
+        "-c".into(),
+        "features.plugins=false".into(),
+        "-c".into(),
+        "features.shell_snapshot=false".into(),
+        "-c".into(),
+        "mcp_oauth_credentials_store=\"file\"".into(),
     ]
 }
 
@@ -4476,6 +4496,14 @@ broker = "anthropic-messages"
             "{joined}"
         );
         assert!(joined.contains("model_provider=\"ducktape\""), "{joined}");
+        // the guest-unusable start-up work rides every codex argv, off.
+        for switch in [
+            "-c features.plugins=false",
+            "-c features.shell_snapshot=false",
+            "-c mcp_oauth_credentials_store=\"file\"",
+        ] {
+            assert!(joined.contains(switch), "{switch} missing: {joined}");
+        }
         assert!(
             joined.ends_with("--json -"),
             "the stdin marker stays last: {joined}"
