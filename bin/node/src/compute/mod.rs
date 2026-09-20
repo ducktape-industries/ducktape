@@ -342,6 +342,7 @@ async fn build_pool(
         noded::agent_provision::NodedProvisioner::new(
             node.clone(),
             noded::agent_provision::agent_runs_root(&service.storage_dir)?,
+            service.storage_dir.join("agent-sessions"),
         )
         .with_forge(config::hex_bytes(&node_key))
         .with_node_url(noded::agent_provision::node_http_base(

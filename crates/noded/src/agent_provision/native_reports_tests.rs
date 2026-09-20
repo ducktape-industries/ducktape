@@ -23,7 +23,7 @@ async fn worker(root: &Path) -> (TestNode, RunSession) {
     *node.fixture.view.lock().await = native.configuration.clone();
     *node.fixture.worker.lock().await =
         Some(worker_controls_fixture("job-a", "steer-1", "focus here"));
-    let session = start_action_server(node.link.clone(), signer, RUN_ID.into(), Some(native))
+    let session = start_action_server(node.link.clone(), signer, RUN_ID.into(), Some(native), std::path::PathBuf::new())
         .await
         .unwrap();
     (node, session)
@@ -166,6 +166,7 @@ async fn semantic_report_rejects_nonworkers_and_stale_execution_or_lease_before_
         signer,
         RUN_ID.into(),
         Some(native(root.path())),
+        std::path::PathBuf::new(),
     )
     .await
     .unwrap();

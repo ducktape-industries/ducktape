@@ -405,6 +405,10 @@ fn read_skill_doc(ro_root: &Path, mount: &RoMount) -> Result<SkillDoc, String> {
 pub struct NodedProvisioner {
     node: NodeLink,
     root: PathBuf,
+    /// where each attempt's session seed persists across a daemon restart
+    /// (see [`session`]). Under the node's storage, never under `root`: the
+    /// run tree is what D7 keeps key material OUT of.
+    session_keys: PathBuf,
     /// the forge lane: `Ok` when this node can provision forge worktrees,
     /// `Err(reason)` — decided ONCE at construction, permanent and loud —
     /// when it can't. the duckfs lane is unaffected either way.
@@ -416,10 +420,15 @@ pub struct NodedProvisioner {
 }
 
 impl NodedProvisioner {
-    pub fn new(node: NodeLink, root: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        node: NodeLink,
+        root: impl Into<PathBuf>,
+        session_keys: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             node,
             root: root.into(),
+            session_keys: session_keys.into(),
             forge: Err("this provisioner was built without a forge lane \
                         (with_forge was never called)"
                 .into()),
@@ -497,6 +506,7 @@ impl WorkspaceProvisioner for NodedProvisioner {
                     source_prefix.clone(),
                     source_snapshot.clone(),
                     self.node_url.clone(),
+                    &self.session_keys,
                     spec,
                 )
                 .await
@@ -509,6 +519,7 @@ impl WorkspaceProvisioner for NodedProvisioner {
                         run_dir,
                         ro_root,
                         self.node_url.clone(),
+                        &self.session_keys,
                         spec,
                     )
                     .await

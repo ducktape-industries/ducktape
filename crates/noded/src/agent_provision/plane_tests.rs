@@ -325,7 +325,7 @@ async fn a_run_gets_the_node_base_its_agent_id_and_the_tool_bin_dir_on_path() {
     let tmp = tempfile::tempdir().unwrap();
     let (handle, rx, _hub) = NodeHandle::channel();
     let _actor = spawn_files_actor(rx, skill_tree(), false);
-    let prov = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
+    let prov = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path(), tmp.path().join("session-keys"))
         .with_node_url(Some("http://127.0.0.1:8844".into()));
 
     let ws = prov
@@ -375,7 +375,7 @@ async fn a_duckfs_run_offers_no_pushable_repo_to_the_push_gate() {
     let tmp = tempfile::tempdir().unwrap();
     let (handle, rx, _hub) = NodeHandle::channel();
     let _actor = spawn_files_actor(rx, skill_tree(), false);
-    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
+    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path(), tmp.path().join("session-keys"))
         .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
         .await
         .expect("provision");
@@ -391,7 +391,7 @@ async fn an_unreachable_node_or_an_anonymous_run_omits_the_var_rather_than_guess
     let (handle, rx, _hub) = NodeHandle::channel();
     let _actor = spawn_files_actor(rx, skill_tree(), false);
     // no with_node_url (a node serving no http surface) and no agent_id.
-    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
+    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path(), tmp.path().join("session-keys"))
         .provision(&duckfs_spec(None, Vec::new()))
         .await
         .expect("provision");
@@ -419,7 +419,7 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
     let (handle, rx, _hub) = NodeHandle::channel();
     let (_actor, binds, actions) = spawn_session_actor(rx, Ok(()));
 
-    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
+    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path(), tmp.path().join("session-keys"))
         .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
         .await
         .expect("provision");
@@ -578,7 +578,7 @@ async fn a_run_with_no_agent_opens_no_session_and_submits_no_bind() {
     let (handle, rx, _hub) = NodeHandle::channel();
     let (_actor, binds, _actions) = spawn_session_actor(rx, Ok(()));
 
-    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
+    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path(), tmp.path().join("session-keys"))
         .provision(&duckfs_spec(None, Vec::new()))
         .await
         .expect("provision");
@@ -600,7 +600,8 @@ async fn a_refused_bind_fails_provision_and_removes_the_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let (handle, rx, _hub) = NodeHandle::channel();
     let (_actor, binds, _actions) = spawn_session_actor(rx, Err("runs: not the run's assignee"));
-    let result = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
+    let keys = tempfile::tempdir().unwrap();
+    let result = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path(), keys.path())
         .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
         .await;
     let Err(error) = result else {
@@ -610,6 +611,143 @@ async fn a_refused_bind_fails_provision_and_removes_the_workspace() {
     assert!(error.contains("not the run's assignee"), "{error}");
     assert_eq!(binds.lock().unwrap().len(), 1);
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::read_dir(keys.path()).unwrap().count(),
+        0,
+        "a refused bind keeps no seed: the attempt is over"
+    );
+}
+
+// ---- the seat survives the daemon ------------------------------------------
+
+/// a stand-in for `runs`' one-seat rule, which is the whole reason the seed
+/// persists: the FIRST key bound to a run holds its seat; the same key re-binds
+/// as a no-op, any other key is refused with the module's own sentence — there
+/// is no release op. files queries are answered over an empty tree.
+fn spawn_seat_actor(
+    mut rx: futures::channel::mpsc::Receiver<NodeCommand>,
+) -> (tokio::task::JoinHandle<()>, SessionBinds) {
+    let binds: SessionBinds = Default::default();
+    let seen = binds.clone();
+    let actor = tokio::spawn(async move {
+        let mut seat: Option<Vec<u8>> = None;
+        while let Some(cmd) = rx.next().await {
+            match cmd {
+                NodeCommand::Submit {
+                    payload, reply, ..
+                } => {
+                    let bind = crate::runs::decode_msg(&payload).expect("a runs op");
+                    let crate::runs::RunsMsg::OpenAgentSession { session_key, .. } = &bind else {
+                        panic!("the only op a provision submits is the bind");
+                    };
+                    let taken_by_another_key =
+                        seat.as_ref().is_some_and(|held| held != session_key);
+                    let verdict = if taken_by_another_key {
+                        Err(crate::Refused::new(
+                            "module",
+                            "run already has an open agent session",
+                        ))
+                    } else {
+                        seat = Some(session_key.clone());
+                        Ok(committed_block())
+                    };
+                    seen.lock().unwrap().push(bind);
+                    let _ = reply.send(verdict);
+                }
+                NodeCommand::Query { req, reply, .. } => {
+                    let _ = reply.send(files_reply(&BTreeMap::new(), false, &req));
+                }
+                _ => panic!("the seat lane got an unexpected command"),
+            }
+        }
+    });
+    (actor, binds)
+}
+
+fn bound_key(bind: &crate::runs::RunsMsg) -> Vec<u8> {
+    match bind {
+        crate::runs::RunsMsg::OpenAgentSession { session_key, .. } => session_key.clone(),
+        other => panic!("not a bind: {other:?}"),
+    }
+}
+
+/// THE restart: a daemon dies mid-run (SIGTERM, crash — the session is dropped,
+/// never cleaned up) and the restarted daemon re-runs the same attempt. The
+/// seat in `runs` still holds the first key, so a fresh key would be refused;
+/// the persisted seed re-binds the SAME key and the bind lands first try.
+#[tokio::test]
+async fn a_restarted_daemon_rebinds_the_same_attempt_on_the_first_try() {
+    let tmp = tempfile::tempdir().unwrap();
+    let keys = tmp.path().join("session-keys");
+    let (handle, rx, _hub) = NodeHandle::channel();
+    let (_actor, binds) = spawn_seat_actor(rx);
+    let link = crate::agent_provision::test_link(handle).await;
+
+    let first = NodedProvisioner::new(link.clone(), tmp.path().join("runs-a"), &keys)
+        .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
+        .await
+        .expect("the first daemon binds a fresh key");
+    // teardown on drop: the endpoint dies with the session, the seat is KEPT.
+    drop(first);
+    assert_eq!(
+        std::fs::read_dir(&keys).unwrap().count(),
+        1,
+        "a dropped session keeps its seed: drop is the restart path"
+    );
+
+    let second = NodedProvisioner::new(link, tmp.path().join("runs-b"), &keys)
+        .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
+        .await
+        .expect("the restarted daemon binds on its first attempt");
+    let binds = binds.lock().unwrap().clone();
+    assert_eq!(binds.len(), 2, "one bind per daemon, no retry");
+    assert_eq!(
+        bound_key(&binds[0]),
+        bound_key(&binds[1]),
+        "the restarted daemon re-binds the key the seat already holds"
+    );
+    second.cleanup().await;
+}
+
+/// run completion releases the seat: cleanup removes the seed, so the next
+/// open of the same attempt mints a fresh key instead of re-using a settled
+/// run's.
+#[tokio::test]
+async fn run_completion_releases_the_seat_and_the_next_open_mints_a_fresh_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let keys = tmp.path().join("session-keys");
+    let (handle, rx, _hub) = NodeHandle::channel();
+    let (_actor, binds, _actions) = spawn_session_actor(rx, Ok(()));
+    let prov = NodedProvisioner::new(
+        crate::agent_provision::test_link(handle).await,
+        tmp.path().join("runs"),
+        &keys,
+    );
+
+    let ws = prov
+        .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
+        .await
+        .expect("provision");
+    assert_eq!(std::fs::read_dir(&keys).unwrap().count(), 1);
+    ws.cleanup().await;
+    assert_eq!(
+        std::fs::read_dir(&keys).unwrap().count(),
+        0,
+        "completion releases the seat"
+    );
+
+    let again = prov
+        .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
+        .await
+        .expect("provision after completion");
+    let binds = binds.lock().unwrap().clone();
+    assert_eq!(binds.len(), 2);
+    assert_ne!(
+        bound_key(&binds[0]),
+        bound_key(&binds[1]),
+        "a released seat is never re-bound with the settled run's key"
+    );
+    again.cleanup().await;
 }
 
 type ReceiptState = std::sync::Arc<std::sync::Mutex<super::session::ReceiptStatus>>;
@@ -708,7 +846,7 @@ async fn tool_http_waits_for_the_actual_committed_outcome_and_surfaces_target_fa
         let link = test_link(handle).await;
         let workdir = tempfile::tempdir().unwrap();
         let session = super::session::open(
-            &link, &duckfs_spec(Some("quackbot"), Vec::new()), workdir.path(),
+            &link, &duckfs_spec(Some("quackbot"), Vec::new()), workdir.path(), workdir.path(),
         )
         .await
         .unwrap()
@@ -791,7 +929,7 @@ async fn disconnecting_the_registered_receipt_stream_fails_the_pending_tool_requ
     let link =
         NodeLink::new(format!("http://{address}")).with_workspace_credential(directory.path());
     let session = super::session::open(
-        &link, &duckfs_spec(Some("quackbot"), Vec::new()), directory.path(),
+        &link, &duckfs_spec(Some("quackbot"), Vec::new()), directory.path(), directory.path(),
     )
     .await
     .unwrap()

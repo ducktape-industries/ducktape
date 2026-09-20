@@ -306,6 +306,7 @@ pub(super) async fn provision(
     run_dir: PathBuf,
     ro_root: PathBuf,
     node_url: Option<String>,
+    session_keys: &Path,
     spec: &WorkspaceSpec,
 ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
     let WorkspaceSource::Forge {
@@ -364,7 +365,8 @@ pub(super) async fn provision(
     // the clone EXISTS now, so ask consensus to bind the run's agent session
     // — never before: a bind for a run that failed to materialize would spend an
     // op on a run that never starts.
-    let session = match super::session::open(&node, spec, &workspace_args.run_dir).await {
+    let session =
+        match super::session::open(&node, spec, &workspace_args.run_dir, session_keys).await {
         Ok(session) => session,
         Err(error) => {
             super::cleanup_dirs(workspace_args.run_dir.clone(), ro_dir.clone()).await;
@@ -1050,6 +1052,9 @@ impl ProvisionedWorkspace for ForgeWorkspace {
     }
 
     async fn cleanup(&self) {
+        if let Some(session) = &self._session {
+            session.release();
+        }
         super::cleanup_dirs(self.run_dir.clone(), self.ro_dir.clone()).await;
     }
 }

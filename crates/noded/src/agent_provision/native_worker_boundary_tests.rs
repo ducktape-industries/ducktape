@@ -264,7 +264,7 @@ fn cancellation_recovery(location: CancelledJobLocation) {
         let context = native.context.clone();
         let run_id = spec.agent.as_ref().unwrap().run_id.clone();
         let mut actor = Actor::new().await;
-        let session = start_action_server(actor.link.clone(), signer, run_id.clone(), Some(native)).await.unwrap();
+        let session = start_action_server(actor.link.clone(), signer, run_id.clone(), Some(native), std::path::PathBuf::new()).await.unwrap();
         apply(&mut host, &mut height, controller(), Msg {
             target:"tasks".into(), payload:crate::tasks::encode_job_msg(&crate::tasks::JobsMsg::Control {
                 job_id:"worker".into(), operation_id:"cancel-1".into(), input:crate::tasks::JobControlInput::Cancel,
@@ -298,7 +298,7 @@ fn cancellation_recovery(location: CancelledJobLocation) {
         let restored = provision_native(&mut host, &mut height, &next_spec, &retry_dir).await;
         assert_eq!(std::fs::read_to_string(retry_dir.join(&restored.context.session_path)).unwrap(), jsonl);
         assert_eq!(restored.context.turn_id, context.turn_id);
-        let session = start_action_server(actor.link.clone(), signer, run_id.clone(), Some(restored)).await.unwrap();
+        let session = start_action_server(actor.link.clone(), signer, run_id.clone(), Some(restored), std::path::PathBuf::new()).await.unwrap();
         let response = actor.request(&mut host, &mut height, &session, body).await;
         assert_eq!(response.status(), StatusCode::OK, "same cancellation bytes must reconcile under the new live execution: {}", response.text().await.unwrap());
         let refreshed = read_conversation(&host, &context.conversation_id).await;
@@ -348,7 +348,7 @@ fn real_worker_report_route_enforces_claim_budget_idempotency_and_incarnation() 
             "real worker execution ID crosses transport verbatim"
         );
         let mut actor = Actor::new().await;
-        let session = start_action_server(actor.link.clone(), signer, run_id.clone(), Some(native))
+        let session = start_action_server(actor.link.clone(), signer, run_id.clone(), Some(native), std::path::PathBuf::new())
             .await
             .unwrap();
 

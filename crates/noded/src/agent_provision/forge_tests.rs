@@ -150,6 +150,7 @@ impl Bed {
         NodedProvisioner::new(
             crate::agent_provision::test_link(handle.with_forge_repo(&self.repo_base)).await,
             &self.runs_root,
+            self.runs_root.with_file_name("session-keys"),
         )
         .with_forge(NODE_IDENT)
         .with_test_publication(self.push_base())
@@ -166,6 +167,7 @@ impl Bed {
         let prov = NodedProvisioner::new(
             crate::agent_provision::test_link(handle.with_forge_repo(&self.repo_base)).await,
             &self.runs_root,
+            self.runs_root.with_file_name("session-keys"),
         )
         .with_forge(NODE_IDENT)
         .with_test_publication(self.push_base());
@@ -273,6 +275,7 @@ async fn a_failed_probe_is_permanent_and_loud_and_leaves_no_debris() {
     let prov = NodedProvisioner::new(
         crate::agent_provision::test_link(handle.with_forge_repo(&bed.repo_base)).await,
         &bed.runs_root,
+        bed.runs_root.with_file_name("session-keys"),
     )
     .with_forge_probed(NODE_IDENT, || Err("git probe exploded".into()));
     // PERMANENT: every forge attempt fails with the construction-time reason.
@@ -297,6 +300,7 @@ async fn a_handle_without_a_forge_repo_base_is_a_clear_error() {
     let prov = NodedProvisioner::new(
         crate::agent_provision::test_link(handle).await,
         &bed.runs_root,
+        bed.runs_root.with_file_name("session-keys"),
     )
     .with_forge(NODE_IDENT);
     let err = provision_err(prov.provision(&bed.spec("s1:0", &bed.head, false)).await);
@@ -1650,7 +1654,7 @@ async fn a_restart_mid_run_never_leaves_the_push_presenting_the_provision_time_t
     let link = NodeLink::new(format!("http://{remote}"))
         .with_workspace_credential(workspace.path())
         .with_forge_repo(bed.repo_base.clone());
-    let prov = NodedProvisioner::new(link, &bed.runs_root).with_forge(NODE_IDENT);
+    let prov = NodedProvisioner::new(link, &bed.runs_root, bed.runs_root.with_file_name("session-keys")).with_forge(NODE_IDENT);
 
     let ws = prov
         .provision(&bed.spec("s1:0", &bed.head, false))

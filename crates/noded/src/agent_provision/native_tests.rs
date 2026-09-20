@@ -550,6 +550,7 @@ async fn native_route_is_capability_scoped_and_unavailable_to_non_native_runs() 
         signer,
         RUN_ID.into(),
         None,
+        std::path::PathBuf::new(),
     )
     .await
     .unwrap();
