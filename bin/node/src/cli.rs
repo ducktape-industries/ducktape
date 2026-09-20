@@ -355,14 +355,13 @@ fn systemd_claim(target: &LifecycleWorkspace, user: bool) -> Option<SupervisorCl
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = String::from_utf8(output.stdout).ok()?;
     let loaded = property(&text, "LoadState").is_some_and(|value| value == "loaded");
     let exec = text
         .lines()
         .find_map(|line| line.strip_prefix("ExecStart="))?;
-    let names_workspace = exec_has_arg(exec, "--workspace", &target.workspace);
-    let names_config = exec_has_arg(exec, "--config", &target.config);
-    (loaded && names_workspace && names_config).then_some(SupervisorClaim::Systemd { user, unit })
+    let args = systemd_exec_args(exec)?;
+    (loaded && supervisor_args_match(&args, target)).then_some(SupervisorClaim::Systemd { user, unit })
 }
 
 /// The chain-id grammar only permits characters that systemd leaves literal
@@ -385,17 +384,89 @@ fn property<'a>(text: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|line| line.strip_prefix(&format!("{name}=")))
 }
 
-fn exec_has_arg(exec: &str, flag: &str, value: &std::path::Path) -> bool {
-    let needle = format!("{flag} {}", value.display());
-    let Some(start) = exec.find(&needle) else {
+fn systemd_exec_args(exec: &str) -> Option<Vec<String>> {
+    let encoded = exec.strip_prefix("{ ")?.strip_suffix(" }")?;
+    let encoded = encoded.strip_prefix("path=")?;
+    let encoded = encoded.split_once(" ; argv[]=")?.1;
+    let encoded = encoded.split_once(" ;")?.0;
+    split_systemd_words(encoded)
+}
+
+fn split_systemd_words(encoded: &str) -> Option<Vec<String>> {
+    let chars: Vec<char> = encoded.chars().collect();
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut token_started = false;
+    let mut quote = None;
+    let mut index = 0;
+    while index < chars.len() {
+        let character = chars[index];
+        if let Some(expected) = quote {
+            if character == expected {
+                quote = None;
+                index += 1;
+                continue;
+            }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            token_started = true;
+            index += 1;
+            continue;
+        }
+        if character == '\\' {
+            index += 1;
+            let escaped = *chars.get(index)?;
+            if escaped == 'x' {
+                let high = chars.get(index + 1)?.to_digit(16)?;
+                let low = chars.get(index + 2)?.to_digit(16)?;
+                current.push(char::from_u32(high * 16 + low)?);
+                index += 3;
+            } else {
+                current.push(match escaped {
+                    's' => ' ',
+                    't' => '\t',
+                    'n' => '\n',
+                    'r' => '\r',
+                    other => other,
+                });
+                index += 1;
+            }
+            token_started = true;
+            continue;
+        }
+        if quote.is_none() && character.is_whitespace() {
+            if token_started {
+                args.push(std::mem::take(&mut current));
+                token_started = false;
+            }
+        } else {
+            current.push(character);
+            token_started = true;
+        }
+        index += 1;
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if token_started {
+        args.push(current);
+    }
+    Some(args)
+}
+
+fn supervisor_args_match(args: &[String], target: &LifecycleWorkspace) -> bool {
+    let Some(workspace) = target.workspace.to_str() else {
         return false;
     };
-    let before = exec[..start].chars().next_back();
-    let after = exec[start + needle.len()..].chars().next();
-    let valid_before = before.is_none_or(char::is_whitespace);
-    let valid_after =
-        after.is_none_or(|character| character.is_whitespace() || ";}".contains(character));
-    valid_before && valid_after
+    let Some(config) = target.config.to_str() else {
+        return false;
+    };
+    args.windows(4).any(|window| {
+        window[0] == "--workspace"
+            && window[1] == workspace
+            && window[2] == "--config"
+            && window[3] == config
+    })
 }
 
 fn launchd_claims(target: &LifecycleWorkspace) -> Vec<SupervisorClaim> {
@@ -430,27 +501,83 @@ fn launchd_claim(
     }
     let label = plist.file_stem()?.to_str()?.to_string();
     let text = std::fs::read_to_string(&plist).ok()?;
-    let names_workspace = plist_has_string(&text, &target.workspace);
-    let names_config = plist_has_string(&text, &target.config);
-    if !(names_workspace && names_config) {
+    let plist_args = plist_program_arguments(&text)?;
+    if !supervisor_args_match(&plist_args, target) {
         return None;
     }
     let job = format!("{domain}/{label}");
-    let loaded = std::process::Command::new("launchctl")
+    let output = std::process::Command::new("launchctl")
         .arg("print")
         .arg(&job)
         .output()
-        .ok()
-        .is_some_and(|output| output.status.success());
-    loaded.then_some(SupervisorClaim::Launchd {
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let loaded = String::from_utf8(output.stdout).ok()?;
+    let loaded_args = launchd_print_arguments(&loaded)?;
+    supervisor_args_match(&loaded_args, target).then_some(SupervisorClaim::Launchd {
         domain: domain.to_string(),
         label,
         plist,
     })
 }
 
-fn plist_has_string(text: &str, value: &std::path::Path) -> bool {
-    text.contains(&format!("<string>{}</string>", value.display()))
+fn plist_program_arguments(text: &str) -> Option<Vec<String>> {
+    let after_key = text.split_once("<key>ProgramArguments</key>")?.1;
+    let array = after_key.trim_start().strip_prefix("<array>")?;
+    let body = array.split_once("</array>")?.0;
+    let mut args = Vec::new();
+    let mut rest = body;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return Some(args);
+        }
+        let value = rest.strip_prefix("<string>")?;
+        let (value, tail) = value.split_once("</string>")?;
+        args.push(xml_unescape(value)?);
+        rest = tail;
+    }
+}
+
+fn xml_unescape(value: &str) -> Option<String> {
+    let mut result = String::new();
+    let mut rest = value;
+    while let Some((before, after)) = rest.split_once('&') {
+        result.push_str(before);
+        let (entity, tail) = after.split_once(';')?;
+        result.push(match entity {
+            "amp" => '&',
+            "apos" => '\'',
+            "gt" => '>',
+            "lt" => '<',
+            "quot" => '"',
+            _ => return None,
+        });
+        rest = tail;
+    }
+    result.push_str(rest);
+    Some(result)
+}
+
+fn launchd_print_arguments(text: &str) -> Option<Vec<String>> {
+    let mut in_arguments = false;
+    let mut args = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !in_arguments {
+            in_arguments = line == "arguments = {";
+            continue;
+        }
+        if line == "}" {
+            return Some(args);
+        }
+        if !line.is_empty() {
+            args.push(line.to_string());
+        }
+    }
+    None
 }
 
 fn launchd_domain() -> Option<String> {
@@ -2846,6 +2973,80 @@ mod json_output_tests {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    fn lifecycle_target(workspace: &str) -> super::LifecycleWorkspace {
+        let workspace = std::path::PathBuf::from(workspace);
+        super::LifecycleWorkspace {
+            chain_id: "net#12345678".into(),
+            config: workspace.join("node.toml"),
+            workspace,
+        }
+    }
+
+    #[test]
+    fn systemd_ownership_uses_exact_argument_boundaries() {
+        let target = lifecycle_target("/tmp/network");
+        let prefix = super::systemd_exec_args(
+            "{ path=/fake/launcher ; argv[]=/fake/launcher run --workspace /tmp/network extra --config /tmp/network/node.toml ; ignore_errors=no }",
+        )
+        .expect("fake systemd output");
+        assert!(
+            !super::supervisor_args_match(&prefix, &target),
+            "a workspace path followed by another word is not the owned argv"
+        );
+
+        let spaced = lifecycle_target("/tmp/network home");
+        let exact = super::systemd_exec_args(
+            r#"{ path=/fake/launcher ; argv[]=/fake/launcher run --workspace /tmp/network\x20home --config /tmp/network\x20home/node.toml ; ignore_errors=no }"#,
+        )
+        .expect("escaped systemd output");
+        assert!(super::supervisor_args_match(&exact, &spaced));
+    }
+
+    #[test]
+    fn launchd_ownership_ignores_unrelated_plist_strings() {
+        let target = lifecycle_target("/tmp/owned");
+        let plist = r#"
+            <key>EnvironmentVariables</key>
+            <dict><key>WORKSPACE</key><string>/tmp/owned</string></dict>
+            <key>ProgramArguments</key>
+            <array>
+              <string>/fake/launcher</string>
+              <string>run</string>
+              <string>--workspace</string>
+              <string>/tmp/other</string>
+              <string>--config</string>
+              <string>/tmp/other/node.toml</string>
+            </array>
+        "#;
+        let args = super::plist_program_arguments(plist).expect("program arguments");
+        assert!(
+            !super::supervisor_args_match(&args, &target),
+            "environment values must not establish ownership"
+        );
+    }
+
+    #[test]
+    fn launchd_ownership_checks_loaded_argument_vector() {
+        let target = lifecycle_target("/tmp/owned");
+        let loaded = r#"
+            fake.label = {
+                arguments = {
+                    /fake/launcher
+                    run
+                    --workspace
+                    /tmp/other
+                    --config
+                    /tmp/other/node.toml
+                }
+            }
+        "#;
+        let args = super::launchd_print_arguments(loaded).expect("launchctl print arguments");
+        assert!(
+            !super::supervisor_args_match(&args, &target),
+            "a loaded job with another workspace must not establish ownership"
+        );
+    }
 
     /// Minting never refuses a LAN invite, but it says which paths only work
     /// from the same LAN or tailnet, and whether anything reaches from outside:

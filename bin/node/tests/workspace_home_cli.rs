@@ -731,7 +731,7 @@ if [ \"$1\" = \"--user\" ]; then\n\
 fi\n\
 if [ \"$1\" = \"show\" ]; then\n\
   printf 'LoadState=loaded\\n'\n\
-  printf 'ExecStart=/fake/launcher run --workspace %s --config %s ;\\n' \"$FAKE_WORKSPACE\" \"$FAKE_CONFIG\"\n\
+  printf 'ExecStart={ path=/fake/launcher ; argv[]=/fake/launcher run --workspace %s --config %s ; ignore_errors=no }\\n' \"$FAKE_WORKSPACE\" \"$FAKE_CONFIG\"\n\
   exit 0\n\
 fi\n\
 if [ \"$1\" = \"stop\" ] || [ \"$1\" = \"disable\" ]; then\n\
