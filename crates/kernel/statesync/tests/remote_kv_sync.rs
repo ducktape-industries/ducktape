@@ -203,14 +203,9 @@ fn joiner_rebuilds_kv_over_the_wire_protocol() {
             );
 
             // multi-chunk snapshot lane: bytes reassemble exactly.
-            let snap = fetch_snapshot(
-                &client_for_join,
-                manifest.boundary_id(),
-                "bigsnap",
-                statesync::MAX_SNAPSHOT_BYTES,
-            )
-            .await
-            .expect("big snapshot");
+            let snap = fetch_snapshot(&client_for_join, manifest.boundary_id(), "bigsnap")
+                .await
+                .expect("big snapshot");
             assert_eq!(
                 snap,
                 BigSnapshot::new().bytes,

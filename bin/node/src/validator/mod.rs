@@ -309,7 +309,6 @@ pub(crate) async fn run_validator(
         crate::blob_fetch::FetchingCodeSource::new(
             blobs.clone(),
             blob_client.clone(),
-            crate::constants::MAX_MODULE_CODE_BYTES,
             crate::constants::BLOB_FETCH_ATTEMPTS,
         ),
     ));
@@ -474,7 +473,7 @@ pub(crate) async fn run_promoted(
     use commonware_codec::DecodeExt as _;
     use commonware_utils::ordered::Set;
 
-    use crate::constants::{BLOB_FETCH_ATTEMPTS, CUTOVER_DELAY, MAX_MODULE_CODE_BYTES};
+    use crate::constants::{BLOB_FETCH_ATTEMPTS, CUTOVER_DELAY};
     use crate::reachability_plane::{GateHook, GateOutcomes, wire_reachability_plane};
     use crate::util::fatal;
 
@@ -717,7 +716,6 @@ pub(crate) async fn run_promoted(
         crate::blob_fetch::FetchingCodeSource::new(
             blobs.clone(),
             blob_client.clone(),
-            MAX_MODULE_CODE_BYTES,
             BLOB_FETCH_ATTEMPTS,
         ),
     ));

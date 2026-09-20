@@ -69,31 +69,11 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 /// own callers.
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// mirrors [`saga::MAX_RESULT_BYTES`] (crates/modules/system/saga/src/interface.rs)
-/// without depending on it (a host-crate → consensus-module edge). This is
-/// the cap `compute::provision::assemble_runner_result` already truncates a
-/// run's parsed answer to, WITH a note, before it can land — a run that
-/// finishes with an oversized answer already completes today, just trimmed.
-const RECORDED_RESULT_CAP_BYTES: usize = 256 * 1024;
-/// hard cap on a run's accumulated stdout, checked as each chunk arrives.
-/// Deliberately NOT [`RECORDED_RESULT_CAP_BYTES`] itself: that cap is
-/// enforced downstream with truncation-plus-a-note, so a run whose full
-/// answer is a few hundred KiB over it still succeeds today. Killing the run
-/// at the same size would turn "completes, truncated" into "fails outright"
-/// for those runs — this cap exists only to stop UNBOUNDED accumulation from
-/// a firehose, not to enforce the result size, so it sits an order of
-/// magnitude above it. `codex`'s `jsonl-events` output in particular streams
-/// one JSON object per tool call/patch/diff for the whole turn, not just the
-/// final answer, and can legitimately run to several hundred KiB on an
-/// ordinary tool-calling turn. Past this line the run is TERMINATED outright
-/// — never truncated, since a truncated JSON/JSONL blob would parse into
-/// garbage and land as the run's answer.
-const MAX_RUN_OUTPUT_BYTES: usize = 16 * RECORDED_RESULT_CAP_BYTES; // 4 MiB
 /// hard cap on the accumulated stderr TAIL (oldest bytes drop first). stderr
 /// never becomes the run's answer — only [`excerpt`]'s 400-char slice of it
 /// ever leaves this function, and only on the failure path — so a few KiB of
-/// trailing context is ample; unlike stdout this is a rolling tail, not a
-/// termination trigger.
+/// trailing context is ample; this is a rolling tail, never a termination
+/// trigger.
 const MAX_RUN_STDERR_BYTES: usize = 16 * 1024;
 
 /// the ownership tag a provider set stamps on the runs it creates. Its VALUE
@@ -3161,25 +3141,6 @@ impl CliProvider {
                         out_bytes.extend_from_slice(&obuf[..n]);
                         forward_lines(&mut out_pending, &obuf[..n], OutputStream::Stdout, &output_sink, ctx);
                         last_activity = tokio::time::Instant::now();
-                        if out_bytes.len() > MAX_RUN_OUTPUT_BYTES {
-                            if let Some(invocation) = &broker_invocation {
-                                invocation.revoke();
-                            }
-                            control.terminate().await;
-                            tracing::warn!(
-                                target: "ducktape::provider",
-                                reason = "output_cap_exceeded",
-                                bin = %self.bin.display(),
-                                bytes = out_bytes.len(),
-                                cap = MAX_RUN_OUTPUT_BYTES,
-                                "run stdout exceeded the output cap (child killed)"
-                            );
-                            return Err(format!(
-                                "{} stdout exceeded the {MAX_RUN_OUTPUT_BYTES}-byte output cap \
-                                 (child killed): output_cap_exceeded",
-                                self.bin.display()
-                            ));
-                        }
                     }
                     Err(e) => {
                         if let Some(invocation) = &broker_invocation {

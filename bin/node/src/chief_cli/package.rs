@@ -1,4 +1,4 @@
-//! Runtime package import closure: bounded ordinary source, never host state.
+//! Runtime package import closure: ordinary source, never host state.
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
 
@@ -19,7 +19,7 @@ pub(super) fn package_files(directory: &Path, plan: &Plan) -> Result<BTreeMap<St
         return Err("--package must be a real directory, not a symlink".into());
     }
     let handle = source_dir::Directory::open(directory)?;
-    let manifest_bytes = handle.read("package.json", 32 * 1024)?;
+    let manifest_bytes = handle.read("package.json")?;
     let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
     let whitelist = manifest["files"]
         .as_array()
@@ -84,11 +84,6 @@ pub(super) fn package_files(directory: &Path, plan: &Plan) -> Result<BTreeMap<St
         "chief.config.json".into(),
         serde_json::to_vec(&plan.config())?,
     );
-    let total: usize = files.values().map(Vec::len).sum();
-    let bounded = files.len() <= 128 && total <= 2 * 1024 * 1024;
-    if !bounded {
-        return Err("Chief package exceeds 128 files or 2 MiB".into());
-    }
     Ok(files)
 }
 /// A source-only local walk is insufficient if Put would merge it with old
@@ -103,13 +98,8 @@ pub(super) fn verify_snapshot(
     let prefix = format!("{prefix}/");
     let mut after = None;
     let mut seen = std::collections::BTreeSet::new();
-    let mut entries_read = 0;
     loop {
         let (entries, next) = node.find(&prefix, Some(snapshot), after.as_deref(), 256)?;
-        entries_read += entries.len();
-        if entries_read > 2304 {
-            return Err("pinned package subtree exceeds its bound".into());
-        }
         for entry in entries {
             let relative = entry
                 .path
@@ -120,8 +110,8 @@ pub(super) fn verify_snapshot(
                 continue;
             };
             let expected = &source[relative];
-            let (bytes, eof) = node.read(&entry.path, Some(snapshot), 0, 512 * 1024)?;
-            let exact = eof && &bytes == expected;
+            let bytes = super::read_whole(node, &entry.path, Some(snapshot))?;
+            let exact = &bytes == expected;
             if !exact {
                 return Err("pinned package bytes differ from the installation input".into());
             }
@@ -167,10 +157,6 @@ fn collect_source(
     whitelist: &[String],
     files: &mut BTreeMap<String, Vec<u8>>,
 ) -> Result<()> {
-    let bounded_depth = directory.strip_prefix(root)?.components().count() <= 16;
-    if !bounded_depth {
-        return Err("package directory depth exceeds 16".into());
-    }
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
@@ -233,10 +219,7 @@ fn collect_source(
         if !allowed {
             return Err(format!("non-source package file refused: {name}").into());
         }
-        files.insert(relative, handle.read(&name, 512 * 1024)?);
-        if files.len() > 128 {
-            return Err("package exceeds 128 files".into());
-        }
+        files.insert(relative, handle.read(&name)?);
     }
     Ok(())
 }
@@ -278,18 +261,13 @@ mod source_dir {
         pub(super) fn child(&self, name: &str) -> Result<Self> {
             Ok(Self(open_at(&self.0, OsStr::new(name), libc::O_DIRECTORY)?))
         }
-        pub(super) fn read(&self, name: &str, limit: u64) -> Result<Vec<u8>> {
-            let file = open_at(&self.0, OsStr::new(name), 0)?;
-            let metadata = file.metadata()?;
-            let bounded_regular_file = metadata.is_file() && metadata.len() <= limit;
-            if !bounded_regular_file {
-                return Err("package source is not a bounded regular file".into());
+        pub(super) fn read(&self, name: &str) -> Result<Vec<u8>> {
+            let mut file = open_at(&self.0, OsStr::new(name), 0)?;
+            if !file.metadata()?.is_file() {
+                return Err("package source is not a regular file".into());
             }
             let mut bytes = Vec::new();
-            file.take(limit + 1).read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > limit {
-                return Err("package source grew beyond its bound".into());
-            }
+            file.read_to_end(&mut bytes)?;
             Ok(bytes)
         }
     }
@@ -322,7 +300,7 @@ mod source_dir {
         pub(super) fn child(&self, _: &str) -> Result<Self> {
             Err("package installation requires no-follow directory handles".into())
         }
-        pub(super) fn read(&self, _: &str, _: u64) -> Result<Vec<u8>> {
+        pub(super) fn read(&self, _: &str) -> Result<Vec<u8>> {
             Err("package installation requires no-follow directory handles".into())
         }
     }

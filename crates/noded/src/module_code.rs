@@ -64,20 +64,6 @@ struct StageReply {
     receipts: Vec<CodePeerReceipt>,
 }
 
-/// body cap for the stage lane, set EXPLICITLY rather than inherited.
-///
-/// Without a layer axum applies its implicit 2 MiB default, and the largest
-/// module artifact in tree — `crates/modules/apps/runs/component.wasm`, 1.73 MB
-/// — already sits at 82% of that. The next module to cross it would have been
-/// un-stageable behind an opaque tower error carrying no reason token.
-///
-/// 16 MiB is ~9x that artifact: room for a component and its mapper, while
-/// still BOUNDING an ingest
-/// this route fans out to every member over the code plane. Disabling the limit
-/// would be strictly worse than refusing — one operator-credentialed caller
-/// could drive an unbounded local buffer and an unbounded network fan-out.
-pub use node_work::MAX_STAGED_BLOB_BYTES as MAX_MODULE_ARTIFACT_BYTES;
-
 /// a refusal carrying a stable snake_case `reason` beside the message — the
 /// admin namespace's body shape (`admin::refuse`), so an operator's client
 /// branches on the token instead of parsing tower's prose. `debug`, not `warn`:
@@ -102,27 +88,14 @@ pub(crate) async fn stage_module_code(
     Query(params): Query<StageParams>,
     body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
-    // the `DefaultBodyLimit` layer stops reading past the cap and the extractor
-    // rejects — 413 for over-cap, anything else is a body that never arrived.
-    // Both get a named reason; tower's own text says only "length limit
-    // exceeded", which no client can branch on.
-    let body = match body {
-        Ok(bytes) => bytes,
-        Err(rejection) => {
-            let over_cap = rejection.status() == StatusCode::PAYLOAD_TOO_LARGE;
-            return match over_cap {
-                true => refuse_stage(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "module_artifact_too_large",
-                    "module artifact exceeds this node's stage body cap",
-                ),
-                false => refuse_stage(
-                    StatusCode::BAD_REQUEST,
-                    "module_artifact_unreadable",
-                    "could not read the module artifact body",
-                ),
-            };
-        }
+    // a body that never arrived whole gets a named reason; tower's own text
+    // is prose no client can branch on.
+    let Ok(body) = body else {
+        return refuse_stage(
+            StatusCode::BAD_REQUEST,
+            "module_artifact_unreadable",
+            "could not read the module artifact body",
+        );
     };
     if body.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "empty artifact body");

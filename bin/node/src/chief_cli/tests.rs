@@ -700,11 +700,11 @@ fn held_directory_refuses_leaf_swaps_and_does_not_follow_replaced_ancestors() {
     let original = parent.path().join("original");
     std::fs::rename(&root, &original).unwrap();
     symlink(&secret, &root).unwrap();
-    assert_eq!(handle.read("index.ts", 32).unwrap(), b"source");
+    assert_eq!(handle.read("index.ts").unwrap(), b"source");
     assert!(source_dir::Directory::open(&root).is_err());
     std::fs::remove_file(original.join("index.ts")).unwrap();
     symlink(secret.join("index.ts"), original.join("index.ts")).unwrap();
-    assert!(handle.read("index.ts", 32).is_err());
+    assert!(handle.read("index.ts").is_err());
 }
 
 #[test]

@@ -51,7 +51,6 @@ use crate::tracker::Tracker;
 /// `FGC1 ++ repo-count ++ (name, refs/pending-key, pack)* ++ sha256(preceding)`.
 const SNAPSHOT_CACHE_MAGIC: &[u8; 4] = b"FGC1";
 const SNAPSHOT_CACHE_DIGEST_LEN: usize = 32;
-const MAX_CACHED_REPOS: u32 = 4096;
 
 #[cfg(test)]
 std::thread_local! {
@@ -189,9 +188,6 @@ impl Forge {
         let body = payload.strip_prefix(SNAPSHOT_CACHE_MAGIC.as_slice())?;
         let mut reader = Reader::new(body);
         let count = reader.u32().ok()?;
-        if count > MAX_CACHED_REPOS {
-            return None;
-        }
         let mut names = BTreeSet::new();
         let mut disk_keys = Vec::with_capacity(count as usize);
         let mut packs = BTreeMap::new();

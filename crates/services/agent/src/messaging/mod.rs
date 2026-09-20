@@ -49,11 +49,6 @@ pub mod codex;
 pub mod outbox;
 pub mod wrapper;
 
-/// the per-daemon ceiling on live bindings. A binding is cheap, but each one
-/// is an address a peer can queue into, so the count is bounded rather than
-/// open — the same reasoning as the terminal session cap next door.
-pub const MAX_BINDINGS: usize = 32;
-
 /// one message, wrapped, on its way to a provider.
 pub struct Offer<'a> {
     /// the wrapped text the session will see. Built by [`wrapper::wrap`].
@@ -540,10 +535,6 @@ impl Deliveries {
                 .is_some_and(|bound| bind.generation <= bound.generation);
             if stale {
                 return Err(BindRefusal::StaleGeneration);
-            }
-            let at_capacity = !bindings.contains_key(&key) && bindings.len() >= MAX_BINDINGS;
-            if at_capacity {
-                return Err(BindRefusal::AtCapacity);
             }
         }
         let attachments = Attachments::load(&self.0.attachments)

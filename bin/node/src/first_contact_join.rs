@@ -1061,8 +1061,8 @@ async fn drive_one_relay(
                             "relay says {token}: the member is not relay-reachable"
                         )));
                     }
-                    // not_authorized / session_limit / anything else refused
-                    // US at this relay — the next relay may not.
+                    // not_authorized / anything else refused US at this
+                    // relay — the next relay may not.
                     return RelayLane::NextRelay(format!("relay {addr} refused ({token})"));
                 }
                 // the relay never speaks the client's frame; a stream that

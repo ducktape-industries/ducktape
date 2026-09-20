@@ -1887,56 +1887,28 @@ async fn a_loopback_caller_without_the_operator_credential_cannot_drive_admin() 
     .expect("the operator's shutdown reached the node");
 }
 
-/// the stage lane's body cap is EXPLICIT, and over it is a NAMED refusal.
-///
-/// Two cliffs, one test. Without a `DefaultBodyLimit` layer axum applies its
-/// implicit 2 MiB default, and `crates/modules/apps/runs/component.wasm` is
-/// already 1.73 MB of that — so the next module to grow would have become
-/// un-stageable behind an opaque tower error with no reason token. Above the
-/// real cap the refusal must still be a reason a client can branch on.
+/// the stage lane reads an artifact of any size: axum's implicit 2 MiB
+/// extractor default is disabled on this router, and every real module
+/// artifact is already past it.
 #[tokio::test]
-async fn the_module_stage_body_cap_is_explicit_and_its_refusal_is_named() {
-    fn stage(body: Vec<u8>) -> Request<Body> {
-        with_operator(with_peer(
+async fn the_module_stage_lane_reads_an_artifact_past_axums_own_default() {
+    let (handle, cmd_rx) = operator_handle();
+    spawn_fake_actor(cmd_rx, None);
+    let body = module_artifact::Artifact::module(vec![7u8; 3 * 1024 * 1024]).encode();
+    let response = noded::router(handle)
+        .oneshot(with_operator(with_peer(
             Request::builder()
                 .method("POST")
-                // fanout=false: this handle wires no code plane, and the
-                // network fan-out is not what the body cap is about.
+                // fanout=false: this handle wires no code plane.
                 .uri("/v1/admin/module-code/stage?fanout=false")
                 .header(header::CONTENT_TYPE, "application/octet-stream")
                 .body(Body::from(body))
                 .unwrap(),
             "127.0.0.1:40000",
-        ))
-    }
-
-    // 3 MiB — over axum's implicit default, under ours. The cliff is gone.
-    let (handle, cmd_rx) = operator_handle();
-    spawn_fake_actor(cmd_rx, None);
-    let response = noded::router(handle)
-        .oneshot(stage(
-            module_artifact::Artifact::module(vec![7u8; 3 * 1024 * 1024]).encode(),
-        ))
+        )))
         .await
         .unwrap();
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "an artifact past axum's implicit 2 MiB default must still stage"
-    );
-
-    // over the explicit cap — refused, with a token rather than tower's prose.
-    let (handle, cmd_rx) = operator_handle();
-    spawn_fake_actor(cmd_rx, None);
-    let response = noded::router(handle)
-        .oneshot(stage(vec![7u8; 16 * 1024 * 1024 + 1]))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(
-        body_json(response).await["reason"],
-        "module_artifact_too_large"
-    );
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 /// FAIL CLOSED: a node that minted no operator credential verifies nothing, so

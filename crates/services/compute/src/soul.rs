@@ -59,21 +59,6 @@ pub use crate::module_contracts::SKILL_LIBRARY_PREFIX;
 /// and nothing else.
 const SKILL_LIBRARY_SECTION: &str = "## The shared skill library\nBeyond the skills above, Ducktape carries a shared library of skills in duckfs under `/shared/skills/`, one directory per skill: `/shared/skills/<name>/SKILL.md`, whose YAML frontmatter carries a one-line `description`. It is NOT loaded into this context and costs you nothing until you read it. When your own skills do not cover the task in front of you, list the library with `ducktape_query` (`operation`: `files.ls`, `target`: `{\"path\": \"/shared/skills/\"}`) to see every skill it holds, or search it (`operation`: `files.grep`, `target`: `{\"prefix\": \"/shared/skills/\"}`, `input`: `{\"pattern\": what you are looking for}`) — then read the skill you want in full (`operation`: `files.read`, `target`: `{\"path\": \"/shared/skills/<name>/SKILL.md\"}`). Reading one is cheap; guessing at a task the library already answers is not.";
 
-/// hard cap on the TOTAL bytes of inlined `always` bodies — the persona's
-/// context budget. over it the run FAILS: truncating a persona would hand the
-/// owner a different agent than the one they curated, with no signal anywhere
-/// that it happened. 64 KiB is far more prose than any persona should be and
-/// still a small fraction of a modern context window, so hitting it means the
-/// curation is wrong, not that the cap is tight.
-pub const MAX_ALWAYS_BYTES: usize = 64 * 1024;
-
-/// hard cap on a description's rendered length in the on-demand index. over it
-/// the description is TRUNCATED, not refused — unlike a body, a description is
-/// cosmetic: an index line exists to help the agent choose, and half a sentence
-/// still does that. failing a run over a verbose frontmatter line would be
-/// absurd.
-pub const MAX_DESCRIPTION_CHARS: usize = 200;
-
 /// hard cap on the curated on-demand skills the index lists — the SAME number
 /// consensus enforces on an agent's curated list (`MAX_SKILLS_PER_AGENT`),
 /// deliberately re-exported rather than restated: two caps that could drift is
@@ -111,22 +96,7 @@ pub struct SkillDoc {
 /// pure layer, so both node binaries reach the same verdict from the same
 /// committed record.
 pub fn assemble_context_doc(skills: &[SkillDoc]) -> Result<String, String> {
-    // tier 0. the running total names the skill that CROSSED the cap, which is
-    // the actionable one — "your persona is too big" without a name leaves the
-    // owner to diff bodies by hand.
-    let mut always_bytes = 0usize;
-    for s in skills.iter().filter(|s| s.always) {
-        always_bytes += s.body.len();
-        if always_bytes > MAX_ALWAYS_BYTES {
-            return Err(format!(
-                "the always-loaded skills exceed the {MAX_ALWAYS_BYTES}-byte context budget: {:?} \
-                 takes the inlined total to {always_bytes} bytes. trim it, or curate it as an \
-                 on-demand skill.",
-                s.name
-            ));
-        }
-    }
-    // tier 1. the curator must curate: an index of hundreds is a library, and a
+    // the curator must curate: an index of hundreds is a library, and a
     // library that ships in every prompt is exactly the cost this tiering exists
     // to avoid — the shared one costs nothing.
     let on_demand: Vec<&SkillDoc> = skills.iter().filter(|s| !s.always).collect();
@@ -151,7 +121,7 @@ pub fn assemble_context_doc(skills: &[SkillDoc]) -> Result<String, String> {
             .map(|s| {
                 let where_ = format!("(`$DUCKTAPE_RUN_SKILLS/{}/SKILL.md`)", s.name);
                 match &s.description {
-                    Some(d) => format!("- **{}** — {} {where_}", s.name, clip(d)),
+                    Some(d) => format!("- **{}** — {d} {where_}", s.name),
                     None => format!("- **{}** {where_}", s.name),
                 }
             })
@@ -169,17 +139,6 @@ pub fn assemble_context_doc(skills: &[SkillDoc]) -> Result<String, String> {
     sections.push(TOOL_PLANE_INSTRUCTION.to_string());
     sections.push(SKILL_LIBRARY_SECTION.to_string());
     Ok(sections.join("\n\n"))
-}
-
-/// a long description is trimmed to fit the index line. CHARS, not bytes: a byte
-/// slice through a multi-byte codepoint panics, and an index entry is not worth
-/// a crash.
-fn clip(description: &str) -> String {
-    if description.chars().count() <= MAX_DESCRIPTION_CHARS {
-        return description.to_string();
-    }
-    let head: String = description.chars().take(MAX_DESCRIPTION_CHARS).collect();
-    format!("{}…", head.trim_end())
 }
 
 /// split a `SKILL.md` into its frontmatter `description` and its body.
@@ -320,25 +279,6 @@ mod tests {
         );
     }
 
-    /// tier 0 is the one bound that must never degrade quietly: a truncated
-    /// persona is a DIFFERENT AGENT, and nothing downstream could tell.
-    #[test]
-    fn over_cap_always_bodies_fail_loudly_naming_the_skill_and_the_cap() {
-        let err = assemble_context_doc(&[
-            skill("small", true, None, "tiny"),
-            skill("hog", true, None, &"x".repeat(MAX_ALWAYS_BYTES)),
-        ])
-        .unwrap_err();
-        assert!(err.contains("\"hog\""), "the skill that crossed it: {err}");
-        assert!(
-            err.contains(&MAX_ALWAYS_BYTES.to_string()),
-            "the cap: {err}"
-        );
-        // an on-demand body of any size is FREE — only inlining is budgeted.
-        let oversized_on_demand = skill("hog", false, None, &"x".repeat(MAX_ALWAYS_BYTES * 4));
-        assert!(assemble_context_doc(&[oversized_on_demand]).is_ok());
-    }
-
     #[test]
     fn an_over_cap_index_fails_loudly_and_points_at_the_library() {
         let many: Vec<SkillDoc> = (0..=MAX_INDEXED_SKILLS)
@@ -350,35 +290,6 @@ mod tests {
         assert!(err.contains(&MAX_INDEXED_SKILLS.to_string()), "got {err}");
         assert!(err.contains(SKILL_LIBRARY_PREFIX), "got {err}");
         assert!(assemble_context_doc(&many[..MAX_INDEXED_SKILLS]).is_ok());
-    }
-
-    /// the asymmetry, stated as a test: a body is load-bearing (fail), a
-    /// description is cosmetic (clip).
-    #[test]
-    fn a_long_description_is_truncated_not_refused() {
-        let long = "é".repeat(MAX_DESCRIPTION_CHARS * 3);
-        let doc = assemble_context_doc(&[skill("verbose", false, Some(&long), "b")]).unwrap();
-        assert!(doc.contains('…'), "got {doc}");
-        assert!(
-            !doc.contains(&long),
-            "the full description must not ship: {doc}"
-        );
-        // multi-byte chars: the clip counts CHARS, so the kept head is exactly
-        // the cap (a byte slice here would have panicked).
-        assert!(
-            doc.contains(&format!(
-                "- **verbose** — {}…",
-                "é".repeat(MAX_DESCRIPTION_CHARS)
-            )),
-            "got {doc}"
-        );
-        // a description AT the cap is untouched — no gratuitous ellipsis.
-        let exact = "a".repeat(MAX_DESCRIPTION_CHARS);
-        let doc = assemble_context_doc(&[skill("exact", false, Some(&exact), "b")]).unwrap();
-        assert!(
-            doc.contains(&format!("- **exact** — {exact} (")),
-            "got {doc}"
-        );
     }
 
     #[test]

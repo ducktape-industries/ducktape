@@ -4,12 +4,11 @@
 //! same [`NetstackMachine`] boundary the native machine implements — the
 //! executor never learns which it drives.
 //!
-//! The envelope is off-consensus: fuel per step (a runaway guest traps
-//! instead of wedging the plane) and no ambient imports (the guest sees
-//! exactly `host.sign`, `host.identity`, and `host.log`). A trap, an
-//! exhausted budget, or an undecodable wire value is a [`StepError::Fault`]:
-//! the guest's state is unknown from then on and the executor stops the
-//! plane. It never substitutes another protocol implementation.
+//! The envelope is off-consensus and has no ambient imports (the guest sees
+//! exactly `host.sign`, `host.identity`, and `host.log`). A trap or an
+//! undecodable wire value is a [`StepError::Fault`]: the guest's state is
+//! unknown from then on and the executor stops the plane. It never
+//! substitutes another protocol implementation.
 //!
 //! A guest can also start from a snapshot ([`NetstackGuest::restore`]) and
 //! hand one out ([`NetstackMachine::snapshot`]): the same wire value the
@@ -34,11 +33,6 @@ mod bindings {
 
 use bindings::Netstack;
 use bindings::ducktape::netstack::host;
-
-/// Fuel per step. Generous against the machine's real cost
-/// (a five-member boot step is a few million instructions) and small
-/// against a runaway: exhaustion traps in milliseconds, not minutes.
-pub const STEP_FUEL: u64 = 2_000_000_000;
 
 /// What the host side of the boundary holds for the guest.
 struct HostState {
@@ -99,7 +93,6 @@ pub enum GuestError {
 pub struct NetstackGuest {
     store: Store<HostState>,
     world: Netstack,
-    step_fuel: u64,
 }
 
 impl NetstackGuest {
@@ -110,18 +103,7 @@ impl NetstackGuest {
         signer: Box<dyn IdentitySigner>,
         config: MachineConfig,
     ) -> Result<Self, GuestError> {
-        Self::with_fuel(component, signer, config, STEP_FUEL)
-    }
-
-    /// [`NetstackGuest::new`] with an explicit per-step fuel budget; the
-    /// configure call runs under the default one.
-    pub fn with_fuel(
-        component: &[u8],
-        signer: Box<dyn IdentitySigner>,
-        config: MachineConfig,
-        step_fuel: u64,
-    ) -> Result<Self, GuestError> {
-        let mut guest = Self::instantiate(component, signer, step_fuel)?;
+        let mut guest = Self::instantiate(component, signer)?;
         guest
             .world
             .call_configure(&mut guest.store, &wire::encode_config(&config))
@@ -131,16 +113,14 @@ impl NetstackGuest {
     }
 
     /// A guest continuing from `snapshot` — the wire snapshot any machine
-    /// of this contract took under the same identity — under `step_fuel`
-    /// per step; the restore call runs under the default budget.
+    /// of this contract took under the same identity.
     pub fn restore(
         component: &[u8],
         signer: Box<dyn IdentitySigner>,
         config: MachineConfig,
         snapshot: &[u8],
-        step_fuel: u64,
     ) -> Result<Self, GuestError> {
-        let mut guest = Self::instantiate(component, signer, step_fuel)?;
+        let mut guest = Self::instantiate(component, signer)?;
         guest
             .world
             .call_restore(&mut guest.store, &wire::encode_config(&config), snapshot)
@@ -150,31 +130,21 @@ impl NetstackGuest {
     }
 
     /// Load, link, and instantiate the component — no machine inside yet.
-    fn instantiate(
-        component: &[u8],
-        signer: Box<dyn IdentitySigner>,
-        step_fuel: u64,
-    ) -> Result<Self, GuestError> {
+    fn instantiate(component: &[u8], signer: Box<dyn IdentitySigner>) -> Result<Self, GuestError> {
         let engine = Engine::new(&engine_config()).map_err(component_err)?;
         let component = Component::from_binary(&engine, component).map_err(component_err)?;
         let mut linker = Linker::new(&engine);
         Netstack::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |state| state)
             .map_err(component_err)?;
         let mut store = Store::new(&engine, HostState { signer });
-        store.set_fuel(STEP_FUEL).map_err(component_err)?;
         let world =
             Netstack::instantiate(&mut store, &component, &linker).map_err(component_err)?;
-        Ok(Self {
-            store,
-            world,
-            step_fuel,
-        })
+        Ok(Self { store, world })
     }
 }
 
 impl NetstackMachine for NetstackGuest {
     fn step(&mut self, event: Event, now_ms: u64) -> Result<Vec<Effect>, StepError> {
-        self.store.set_fuel(self.step_fuel).map_err(fault)?;
         let bytes = self
             .world
             .call_step(&mut self.store, &wire::encode_event(&event), now_ms)
@@ -185,7 +155,6 @@ impl NetstackMachine for NetstackGuest {
     }
 
     fn snapshot(&mut self) -> Result<Vec<u8>, StepError> {
-        self.store.set_fuel(self.step_fuel).map_err(fault)?;
         self.world
             .call_snapshot(&mut self.store)
             .map_err(fault)?
@@ -193,13 +162,12 @@ impl NetstackMachine for NetstackGuest {
     }
 }
 
-/// The envelope: the component model and fuel metering, nothing else —
-/// the guest's determinism obligation is trace identity with the native
-/// machine, which the sans-I/O contract already provides.
+/// The envelope: the component model, nothing else — the guest's
+/// determinism obligation is trace identity with the native machine, which
+/// the sans-I/O contract already provides.
 fn engine_config() -> Config {
     let mut config = Config::new();
     config.wasm_component_model(true);
-    config.consume_fuel(true);
     config
 }
 
