@@ -69,6 +69,19 @@ APP_REPO="$TEST_ROOT/no-longer-available" APP_REV_FILE="$PIN_FILE" APP_CHECKOUT_
 [ "$(wc -l < "$DEST/installed-revs")" -eq 2 ] || fail 'repeated invocation did not run the App install'
 [ "$(git -C "$CHECKOUT" rev-parse HEAD)" = "$PIN" ] || fail 'repeated invocation changed the pin'
 
+# Whatever sits in the checkout is build output, not work: the next install
+# repairs the tree to the pin instead of refusing it. An older layout put the
+# App's cargo target inside the checkout, and the App repo does not ignore it,
+# so every later install died on a tree it could have restored itself.
+mkdir -p "$CHECKOUT/stale-target/release"
+printf 'stale\n' > "$CHECKOUT/stale-target/release/artifact"
+printf 'edited\n' > "$CHECKOUT/src/version"
+APP_REPO="$TEST_ROOT/no-longer-available" APP_REV_FILE="$PIN_FILE" APP_CHECKOUT_DIR="$CHECKOUT" \
+	INSTALL_DEST="$DEST" "$SCRIPT" >>"$LOG" 2>&1
+[ ! -e "$CHECKOUT/stale-target" ] || fail 'leftover build output survived the install'
+[ "$(<"$CHECKOUT/src/version")" = first ] || fail 'edited tracked file not restored to the pin'
+[ "$(wc -l < "$DEST/installed-revs")" -eq 3 ] || fail 'install after a dirty checkout did not run'
+
 # The Core target delegates to the helper without running install-node here.
 TARGET_CHECKOUT=$TEST_ROOT/target-checkout
 TARGET_DEST=$TEST_ROOT/target-dest
