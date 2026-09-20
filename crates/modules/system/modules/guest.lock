@@ -224,7 +224,7 @@ dependencies = [
 [[package]]
 name = "modules"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#30a4064576a1553768973f012a10612aa4c028a7"
+source = "git+https://github.com/ducktape-industries/ducktape#aa92eab1dda1d53ecb4303a14b8e2d7c3271ca20"
 dependencies = [
  "async-trait",
  "borsh",

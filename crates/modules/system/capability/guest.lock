@@ -67,7 +67,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "capability"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#95fb4a60457eddbf3dc56bffab66721eed5642b3"
+source = "git+https://github.com/ducktape-industries/ducktape#aa92eab1dda1d53ecb4303a14b8e2d7c3271ca20"
 dependencies = [
  "async-trait",
  "borsh",
