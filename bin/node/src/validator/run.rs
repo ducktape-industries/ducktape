@@ -345,6 +345,9 @@ struct ValidatorRuntime<'a> {
     /// there, where the attempt counter lives. The sender rides in each task.
     fetch_done_tx: tokio::sync::mpsc::UnboundedSender<FetchOutcome>,
     fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<FetchOutcome>,
+    /// the index repair: pulls the heights every module's feed owes off a
+    /// serving peer, one spawned walk at a time, settled here on the drain.
+    index_repair: crate::explorer::IndexRepair,
     next_drain: std::time::SystemTime,
     /// the workspace directory as it was at boot, and the next instant the
     /// drain re-checks it is still there — the fail-stop for a workspace
@@ -510,6 +513,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let code_signaller =
         super::code_announce::CodeReadinessSignaller::new(signer.public_key().as_ref().to_vec());
     let (fetch_done_tx, fetch_done_rx) = tokio::sync::mpsc::unbounded_channel();
+    let index_repair = crate::explorer::IndexRepair::new();
     // graceful checkpoint on SIGTERM/SIGINT — see `QuitSignals`.
     let mut quit = QuitSignals::install(&label);
     // the diagnostic task dump (#1386): SIGUSR1 never checkpoints or exits —
@@ -622,6 +626,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         code_signaller,
         fetch_done_tx,
         fetch_done_rx,
+        index_repair,
         next_drain: context.current() + DRAIN_TICK,
         workspace_mark,
         next_workspace_check: context.current() + WORKSPACE_CHECK_INTERVAL,

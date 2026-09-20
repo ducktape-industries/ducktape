@@ -23,9 +23,7 @@ use crate::constants::*;
 use crate::drain_actions::{
     CutoverTrigger, EpochActions, QuitSignals, ShutdownCause, ShutdownCheckpoint, finish_shutdown,
 };
-use crate::explorer::{
-    boundary_block_row, heal_and_backfill_index, heal_index, retry_owed_backfill,
-};
+use crate::explorer::{IndexRepair, boundary_block_row, owe_index};
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
 use crate::host_state::{NetworkBindings, NodeSubstrates, restore_host, sync_all_modules};
 use crate::relay;
@@ -874,12 +872,7 @@ pub(super) async fn park(
     // gate keeps it. in-memory on purpose: after a restart the first
     // boundary re-fires and every write below is idempotent.
     let mut last_indexed_root: Option<StateRoot> = None;
-    // the index backfills a boot seam could not complete because no source
-    // answered — carried here because the STORE cannot carry it: a refused
-    // walk leaves the module untouched, and the next live block advances every
-    // module watermark over the hole regardless. re-issued from the tip poll
-    // below, on the event that a source answered this node again.
-    let mut backfill_debt = crate::explorer::BackfillDebt::default();
+    let mut index_repair = IndexRepair::new();
     // ---- REPLICA RESTART: recover by journal replay --------------
     //
     // A resident checkpoint is a real recovery base: replay the journal
@@ -921,10 +914,10 @@ pub(super) async fn park(
                 fatal!(label, "replica checkpoint restore: {e}");
             }
         };
-        // heal the derived index against the CHECKPOINT boundary
-        // before replay, so the suffix folds land contiguously.
+        // record what the derived index owes up to the CHECKPOINT boundary
+        // before replay, so the suffix folds land above a visible hole.
         if let Some(ckpt_height) = ckpt.height {
-            heal_index(&index, ckpt_height, &label);
+            owe_index(&index, ckpt_height, &label);
         }
         let mut recovery = recovery_slot
             .take()
@@ -1064,19 +1057,13 @@ pub(super) async fn park(
                 last_plane_epoch = Some(rec.epoch);
             }
         }
-        // THE LAST SEAM BEFORE THIS RESIDENT SERVES, and the only one a
-        // restart passes through: the same helper the ascension runs, because
-        // a restart over a WIPED index directory lands here holding nothing
-        // but a floor. The replay above stamped it (`heal_index` at the
-        // checkpoint) and then folded the suffix back on top through
-        // `replay_fold`, so after a clean replay nothing is stale and the
-        // stale pass finds nothing — what is left for this call is the
-        // history BELOW that floor, reachable only here and only from a
-        // source, plus the one case the fold cannot cover: an opaque height
-        // stopped it, leaving the modules above it stale at tip. An
-        // unreachable source leaves every floor standing, which is exactly
-        // where this line stood before.
-        backfill_debt.absorb(heal_and_backfill_index(&index, &client, tip, &label).await);
+        // THE LAST SEAM BEFORE THIS RESIDENT SERVES: the replay above folded
+        // the suffix on top of whatever the checkpoint left owed, so a clean
+        // replay owes nothing here. what remains is the one case the fold
+        // cannot cover — an opaque height stopped it, leaving modules stale
+        // at tip — and that becomes debt the tip poll repairs.
+        index_repair.owe(&index, tip, &label);
+        index_repair.pass(&index, &client, &label);
         last_indexed_root = Some(root);
         serving = Some((tip, node_r));
         let phase = metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
@@ -1219,6 +1206,7 @@ pub(super) async fn park(
             };
             let tick = context.sleep(fallback).fuse();
             futures::pin_mut!(tick);
+            let mut walk_outcome: Option<crate::explorer::WalkOutcome> = None;
             loop {
                 futures::select_biased! {
                     signal = quit.recv().fuse() => shut_down(
@@ -1684,8 +1672,19 @@ pub(super) async fn park(
                     // (None — every drain gone — only happens at mesh
                     // shutdown; fall through to the tick's exit.)
                     wake = head_wake.next() => if wake.is_some() { break },
+                    // an index repair walk finished: settle it on this loop
+                    // (the refold must not interleave with the fold below)
+                    // and start the next owed range without waiting for the
+                    // fallback poll.
+                    outcome = index_repair.walk_done().fuse() => {
+                        walk_outcome = Some(outcome);
+                        break;
+                    }
                     _ = tick => break,
                 }
+            }
+            if let Some(outcome) = walk_outcome {
+                index_repair.finish(&index, &client, outcome, &label);
             }
         }
         // the activation cutover's seat coords, stashed by the drain pass
@@ -2297,11 +2296,11 @@ pub(super) async fn park(
                 &mut peer_root_skew,
             );
         }
-        // A SOURCE JUST ANSWERED THIS NODE — the one event a refused index
-        // backfill is waiting for. The walk is re-issued here and nowhere
-        // else, so an unreachable source costs this loop nothing but the
-        // poll it was already pacing.
-        retry_owed_backfill(&mut backfill_debt, &index, &client, &label).await;
+        // A SOURCE JUST ANSWERED THIS NODE — the one event an owed index
+        // range is waiting for. the repair paces here and nowhere else, so an
+        // unreachable source costs this loop nothing but the poll it was
+        // already pacing.
+        index_repair.pass(&index, &client, &label);
         // follow the mesh rotation while parked. the tip's window is an
         // UNVERIFIED serving hint from an untrusted server, so it never
         // installs a peer set and never advances the tracker's latch — the
@@ -2646,21 +2645,12 @@ pub(super) async fn park(
                                 root_hash = %hex(&root),
                                 "replica: following the head from {tip}"
                             );
-                            // the derived tier starts exact at the
-                            // ascension tip; per-block folds keep it
-                            // current from here (no more healing).
+                            // the derived tier owes everything up to the
+                            // ascension tip; per-block folds keep it current
+                            // from here and the tip poll pays the debt.
                             if last_indexed_root.as_ref() != Some(&root) {
-                                // the SOURCE'S OWN op rows, under whatever
-                                // this node already holds — inline, while it
-                                // is not yet serving and not yet folding live
-                                // blocks. that window is the whole
-                                // correctness argument for writing straight
-                                // into the feed (see
-                                // `heal_and_backfill_index`), and it closes
-                                // at `serving = Some(..)` below.
-                                backfill_debt.absorb(
-                                    heal_and_backfill_index(&index, &client, tip, &label).await,
-                                );
+                                index_repair.owe(&index, tip, &label);
+                                index_repair.pass(&index, &client, &label);
                                 if let Err(err) =
                                     index.apply_block_record(tip, boundary_block_row(tip, &root))
                                 {
@@ -2672,12 +2662,11 @@ pub(super) async fn park(
                                         "replica explorer row refused"
                                     );
                                 }
-                                // THE HEAL REWOUND FLOORS, so this wake must
-                                // reach the index topics even though it carries
-                                // no dispatches of its own: `heal_index` above
-                                // wiped module dbs and stamped backfill floors,
-                                // and the `lagged` frame a subscriber is owed
-                                // comes only from the scan this wakes.
+                                // THE REPAIR MAY HAVE REFOLDED, so this wake
+                                // must reach the index topics even though it
+                                // carries no dispatches of its own: the
+                                // `lagged` frame a subscriber is owed comes
+                                // only from the scan this wakes.
                                 stream_hub.publish_block(
                                     tip,
                                     hex(&root),
@@ -2909,14 +2898,9 @@ pub(super) async fn park(
                             height: boundary.height,
                             cert,
                         });
-                        // THE LAST MOMENT A SYNC CLIENT EXISTS: `run_promoted`
-                        // seats from the baton and never sees one, so the
-                        // op-row backfill has to run here — at exactly the
-                        // boundary `run_promoted` heals against, which makes
-                        // that later heal the no-op it should be.
-                        backfill_debt.absorb(
-                            heal_and_backfill_index(&index, &client, boundary.height, &label).await,
-                        );
+                        // the index owes up to the cutover boundary like any
+                        // other; the validator's own repair loop pays it.
+                        index_repair.owe(&index, boundary.height, &label);
                         break (boundary, host, floor);
                     }
                     PromotionBoundary::Retry => {}
@@ -3162,8 +3146,8 @@ mod tests {
             "one replay seam in the park loop: {calls:?}"
         );
         let heal_at = source
-            .find("heal_index(&index, ckpt_height, &label);")
-            .expect("the checkpoint boundary is healed before replay");
+            .find("owe_index(&index, ckpt_height, &label);")
+            .expect("the checkpoint boundary is owed before replay");
         let fold_at = source
             .find("let mut replay_fold =")
             .expect("the resident restart builds an IndexFold for the replay");
@@ -3172,7 +3156,7 @@ mod tests {
             .expect("the resident restart passes the fold as the replay sink");
         assert!(
             heal_at < fold_at && fold_at < sink_at,
-            "heal the checkpoint boundary, then fold the suffix on top of it"
+            "owe the checkpoint boundary, then fold the suffix on top of it"
         );
     }
 }

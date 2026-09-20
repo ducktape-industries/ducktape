@@ -701,8 +701,11 @@ fn restamped_testmap() -> Vec<u8> {
     wasm
 }
 
+/// OWING HEIGHTS WIPES NOTHING. A module whose feed skipped a range keeps
+/// every row and view it holds, keeps folding new blocks on top, and carries
+/// the gap as a visible debt until rows fill it.
 #[test]
-fn backfill_wipes_derived_state_and_recreates_the_fold() {
+fn owing_a_range_keeps_the_feed_and_views_and_reports_the_hole() {
     let dir = tempfile::tempdir().unwrap();
     let store = mapped_store(dir.path());
 
@@ -711,34 +714,75 @@ fn backfill_wipes_derived_state_and_recreates_the_fold() {
     wait_for_keys(&mut sub, [seen_key(1, 0)]);
     assert_eq!(store.fold_tip("chat").unwrap(), Some((1, 0)));
 
-    store.mark_backfilled("chat", 5).unwrap();
-    assert_eq!(store.applied_height("chat").unwrap(), 5);
-    assert_eq!(store.backfill_height("chat").unwrap(), Some(5));
-    // THE TIP GOES WITH THE ROWS IT VOUCHED FOR. `clear_db` wipes it like any
-    // other derived key, so a boundary stamp reports UNKNOWN rather than a
-    // position whose derived state no longer exists — which is exactly why a
-    // client waiting on the tip must escape by timeout instead of blocking.
-    assert_eq!(store.fold_tip("chat").unwrap(), None);
+    store.owe("chat", 2, 5).unwrap();
+    assert_eq!(store.applied_height("chat").unwrap(), 1);
+    assert_eq!(store.owed("chat").unwrap(), vec![(2, 5)]);
+    assert_eq!(store.vouched_floor("chat").unwrap(), Some(5));
+    assert_eq!(store.fold_tip("chat").unwrap(), Some((1, 0)));
     let seen = store.scan("chat", b"seen/", None, 10).unwrap();
-    assert!(seen.entries.is_empty(), "derived rows wiped");
+    assert_eq!(seen.entries.len(), 1, "derived rows kept");
     let ops = store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap();
-    assert!(
-        ops.entries.is_empty(),
-        "op feed wiped — it honestly starts at the boundary"
-    );
+    assert_eq!(ops.entries.len(), 1, "op feed kept");
 
-    // the fold trigger was re-registered: new blocks fold from a clean slate,
-    // and no pre-wipe event ever resurrects a wiped row.
-    let mut sub = store.subscribe("chat", b"seen/", Some(b"seen0")).unwrap();
     store.apply_block(&block(6, vec![chat_op(b"two")])).unwrap();
     wait_for_keys(&mut sub, [seen_key(6, 0)]);
     assert_eq!(
         store.view("chat", b"count").unwrap(),
-        1u64.to_be_bytes().to_vec(),
-        "the counter re-derives from zero — nothing pre-wipe survived"
+        2u64.to_be_bytes().to_vec(),
+        "the counter keeps counting over the hole"
     );
-    let seen = store.scan("chat", b"seen/", None, 10).unwrap();
-    assert_eq!(seen.entries.len(), 1);
+    assert_eq!(store.owed("chat").unwrap(), vec![(2, 5)]);
+
+    store.settle_owed("chat", 2, 3).unwrap();
+    assert_eq!(store.owed("chat").unwrap(), vec![(4, 5)]);
+    store.settle_owed("chat", 4, 5).unwrap();
+    assert_eq!(store.owed("chat").unwrap(), Vec::<(u64, u64)>::new());
+    assert_eq!(store.vouched_floor("chat").unwrap(), None);
+}
+
+#[test]
+fn owed_ranges_merge_and_subtract() {
+    assert_eq!(
+        merge_ranges(vec![(5, 6), (1, 2), (3, 4), (9, 9)]),
+        vec![(1, 6), (9, 9)]
+    );
+    assert_eq!(merge_ranges(vec![(1, 10), (3, 4)]), vec![(1, 10)]);
+    assert_eq!(subtract_range(vec![(1, 10)], 4, 6), vec![(1, 3), (7, 10)]);
+    assert_eq!(subtract_range(vec![(1, 10)], 1, 10), vec![]);
+    assert_eq!(
+        subtract_range(vec![(1, 3), (8, 9)], 4, 7),
+        vec![(1, 3), (8, 9)]
+    );
+    assert_eq!(subtract_range(vec![(1, 3), (8, 9)], 0, 8), vec![(9, 9)]);
+}
+
+/// THE VOUCHED FLOOR IS THE TOP OF THE HIGHEST HOLE. A serving node vouches
+/// for the contiguous run below its watermark; the highest owed range caps
+/// that run at its top, whatever sits below.
+#[test]
+fn vouched_floor_is_the_top_of_the_highest_owed_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    assert_eq!(store.vouched_floor("chat").unwrap(), None);
+    store.owe("chat", 1, 3).unwrap();
+    assert_eq!(store.vouched_floor("chat").unwrap(), Some(3));
+    store.owe("chat", 5, 7).unwrap();
+    assert_eq!(store.vouched_floor("chat").unwrap(), Some(7));
+    store.settle_owed("chat", 5, 7).unwrap();
+    assert_eq!(store.vouched_floor("chat").unwrap(), Some(3));
+    store.settle_owed("chat", 1, 3).unwrap();
+    assert_eq!(store.vouched_floor("chat").unwrap(), None);
+}
+
+#[test]
+fn owed_survives_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = bare_store(dir.path());
+        store.owe("chat", 4, 9).unwrap();
+    }
+    let store = bare_store(dir.path());
+    assert_eq!(store.owed("chat").unwrap(), vec![(4, 9)]);
 }
 
 #[test]
@@ -887,9 +931,9 @@ fn prefix_successor_edges() {
 // ----------------------------------------------------------------------------
 
 /// THE BACKFILL IS INDISTINGUISHABLE FROM HAVING SEEN THE BLOCKS. A store
-/// stamped at a boundary and then fed the source's op rows in ASCENDING key
-/// order must land on the same views, the same fold tip, and the same rows as
-/// a twin that watched every block go by through `apply_block`.
+/// that owes a boundary and then receives the source's op rows in ASCENDING
+/// key order must land on the same views, the same fold tip, and the same
+/// rows as a twin that watched every block go by through `apply_block`.
 ///
 /// The order is the whole argument: the fold trigger is changes-mode, so it
 /// folds in COMMIT order — writing ascending makes commit order key order,
@@ -909,8 +953,9 @@ fn a_backfilled_store_matches_a_store_that_saw_the_blocks() {
     live.wait_folds_drained().unwrap();
 
     // the joiner's join seam: canonical state jumped to the boundary, so the
-    // heal stamps — feed and views begin empty at BOUNDARY.
-    joiner.mark_backfilled("chat", BOUNDARY).unwrap();
+    // feed owes everything up to it — empty, and saying so.
+    joiner.owe("chat", 1, BOUNDARY).unwrap();
+    assert_eq!(joiner.vouched_floor("chat").unwrap(), Some(BOUNDARY));
     assert_eq!(
         joiner
             .scan("chat", b"seen/", None, 100)
@@ -931,11 +976,11 @@ fn a_backfilled_store_matches_a_store_that_saw_the_blocks() {
         joiner.write_backfill_rows("chat", &page).unwrap();
     }
     joiner.wait_folds_drained().unwrap();
-    joiner.set_backfill_floor("chat", None).unwrap();
+    joiner.settle_owed("chat", 1, BOUNDARY).unwrap();
+    joiner.advance_watermark("chat", BOUNDARY).unwrap();
 
     // parity: rows, derived views, and the fold tip. `meta/` is deliberately
-    // out — it is host bookkeeping about the FEED, and the boundary stamp
-    // already reset it (`meta/guest` included, so the next open re-converges).
+    // out — it is host bookkeeping about the FEED, not what the feed saw.
     let derived = |s: &IndexStore| {
         s.scan("chat", b"", None, 1024)
             .unwrap()
@@ -954,11 +999,8 @@ fn a_backfilled_store_matches_a_store_that_saw_the_blocks() {
         live.fold_tip("chat").unwrap()
     );
     assert_eq!(joiner.fold_tip("chat").unwrap(), Some((BOUNDARY, 0)));
-    assert_eq!(
-        joiner.backfill_height("chat").unwrap(),
-        None,
-        "floor cleared"
-    );
+    assert_eq!(joiner.vouched_floor("chat").unwrap(), None, "debt settled");
+    assert_eq!(joiner.applied_height("chat").unwrap(), BOUNDARY);
 }
 
 /// A FEED EXTENDED DOWNWARD IS ONLY HONEST AFTER A REFOLD. The floored-module
@@ -983,9 +1025,9 @@ fn a_refold_rebuilds_the_read_model_over_a_feed_extended_downward() {
     }
     live.wait_folds_drained().unwrap();
 
-    // the restarted resident: stamped at a checkpoint, then the journal replay
-    // folded the suffix back on top — watermark at the tip, floor at 5.
-    joiner.mark_backfilled("chat", FLOOR).unwrap();
+    // the restarted resident: owes up to a checkpoint, then the journal replay
+    // folded the suffix on top — watermark at the tip, hole below 5.
+    joiner.owe("chat", 1, FLOOR).unwrap();
     for h in (FLOOR + 1)..=TIP {
         joiner
             .apply_block(&block(h, vec![chat_op(b"payload")]))
@@ -1005,7 +1047,7 @@ fn a_refold_rebuilds_the_read_model_over_a_feed_extended_downward() {
     assert_eq!(below.len(), FLOOR as usize);
     joiner.write_backfill_rows("chat", &below).unwrap();
     joiner.wait_folds_drained().unwrap();
-    joiner.set_backfill_floor("chat", None).unwrap();
+    joiner.settle_owed("chat", 1, FLOOR).unwrap();
     assert_eq!(
         joiner.fold_tip("chat").unwrap(),
         Some((FLOOR, 0)),
@@ -1130,17 +1172,17 @@ fn an_interrupted_refold_is_re_run_whole_by_the_next_open() {
     );
 }
 
-/// THE FLOOR IS THE ONLY THING A BACKFILL MOVES. `write_backfill_rows` must
-/// never touch the watermark (the heal already stamped it at the boundary, and
-/// it vouches for feed contiguity from the floor up), and the floor setter
-/// must both compose a source's own truncation and clear it outright.
+/// A BACKFILL WRITE MOVES NOTHING BUT ROWS. `write_backfill_rows` must never
+/// touch the watermark (it vouches for feed contiguity above the debt) nor
+/// the debt itself; settling is a separate, explicit move.
 #[test]
-fn backfill_writes_leave_the_watermark_and_only_the_floor_moves() {
+fn backfill_writes_leave_the_watermark_and_the_debt_alone() {
     let dir = tempfile::tempdir().unwrap();
     let store = bare_store(dir.path());
-    store.mark_backfilled("chat", 9).unwrap();
+    store.advance_watermark("chat", 9).unwrap();
+    store.owe("chat", 1, 9).unwrap();
     assert_eq!(store.applied_height("chat").unwrap(), 9);
-    assert_eq!(store.backfill_height("chat").unwrap(), Some(9));
+    assert_eq!(store.vouched_floor("chat").unwrap(), Some(9));
 
     let row = borsh::to_vec(&OpRow {
         height: 3,
@@ -1168,15 +1210,17 @@ fn backfill_writes_leave_the_watermark_and_only_the_floor_moves() {
         1
     );
 
-    // compose a late-joined source's own truncation, then clear it.
-    store.set_backfill_floor("chat", Some(2)).unwrap();
-    assert_eq!(store.backfill_height("chat").unwrap(), Some(2));
-    store.set_backfill_floor("chat", None).unwrap();
-    assert_eq!(store.backfill_height("chat").unwrap(), None);
+    assert_eq!(
+        store.owed("chat").unwrap(),
+        vec![(1, 9)],
+        "nor does it settle anything"
+    );
+    store.settle_owed("chat", 1, 9).unwrap();
+    assert_eq!(store.vouched_floor("chat").unwrap(), None);
     assert_eq!(
         store.applied_height("chat").unwrap(),
         9,
-        "clearing the floor never moves the watermark either"
+        "settling never moves the watermark either"
     );
 }
 

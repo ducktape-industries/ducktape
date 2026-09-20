@@ -1,17 +1,17 @@
 # Indexable — the per-module materialized-view contract
 
 The wasm index-guest architecture: a host-written op feed, engine-folded read
-models (fluent31 changes-mode triggers), per-module view guests, boundary
-stamps, and the join-seam op-row backfill. This tier IS the human-facing read
-surface: canonical module queries serve dispatch alone (§5).
+models (fluent31 changes-mode triggers), per-module view guests, the owed
+ledger, and the op-row repair. This tier IS the human-facing read surface:
+canonical module queries serve dispatch alone (§5).
 Code: `crates/kernel/indexer` (the host store: feed writer + guest converge),
 `index-guest` in ducktape-sdk (the contract + authoring SDK; `testmap` is the
 reference mapper), the chat/tasks/pages/inbox/saga modules' `src/index.rs`
 (pure decision cores) + `src/index_guest.rs` (wasm shells, packaged by
 `guest-builder --index`), `crates/noded` (the feed, the HTTP lanes, the shared
-store construction with bundled guests), `bin/node` (the validator: live
-feed, replay feed, boundary stamps, the join-seam backfill), `crates/kernel/statesync`
-(the `IndexOps` wire lane + the joiner-side walk).
+store construction with bundled guests), `bin/node` (the validator and the
+resident: live feed, replay feed, the owed ledger, the repair loop),
+`crates/kernel/statesync` (the `IndexOps` wire lane + the puller-side walk).
 
 ## 1. Position: the derived tier
 
@@ -65,9 +65,9 @@ feed by the trigger backlog, which is observable, never guessed:
 `IndexStore::fold_status` (pending + last drain error) rides
 `GET /v1/index/status` as `fold.{module}`.
 
-Every module gets the feed, the watermark, and the backfill floor
-(`meta/backfill`, §6) with zero module code. A module becomes **indexable**
-by shipping an index guest.
+Every module gets the feed, the watermark, and the owed ledger
+(`meta/owed`, §6) with zero module code. A module becomes **indexable** by
+shipping an index guest.
 
 ## 3. The index guest
 
@@ -86,9 +86,9 @@ when the guest folds, teardown of both when a module stops shipping one. A
 converge marker (`meta/guest`: artifact hash + roles) written last makes a
 warm boot free — a matching marker skips every wasm compile.
 
-Because the guest lives in the database's engine keyspace, no wipe this tier
-performs can touch it — `mark_backfilled`'s clear and `converge_guest`'s clear
-both sweep only user keys. Every node installs the mapper from the module's
+Because the guest lives in the database's engine keyspace, no clear this
+tier performs can touch it — `converge_guest`'s and `refold`'s clears both
+sweep only derived keys. Every node installs the mapper from the module's
 running deployment at open and activation. The component and optional mapper
 travel together through the blob plane under one deployment hash. A changed
 mapper refolds the retained feed; removing it clears its derived rows. Readers
@@ -153,10 +153,10 @@ the module's state machinery, never `sdk`/`host`/`indexer`.
    advances only on op traffic, so a quiet module's tip is arbitrarily old
    while its view is perfectly current (unlike `meta/height`, which bumps on
    every block). ABSENT is normal and means *unknown*, never height 0: a
-   boundary stamp (§6) wipes it with the rest of the derived state, a fresh
-   database has none, and a module that just gained its first index guest has
-   folded nothing yet. So a client waiting on the tip must escape by timeout,
-   never block on it.
+   refold (§7) clears it with the rest of the derived state until the replay
+   lands, a fresh database has none, and a module that just gained its first
+   index guest has folded nothing yet. So a client waiting on the tip must
+   escape by timeout, never block on it.
 
    A mapper UPGRADE never leaves the tip standing over the previous mapper's
    rows: `converge_guest` REFOLDS unconditionally on any artifact-hash change
@@ -166,9 +166,9 @@ the module's state machinery, never `sdk`/`host`/`indexer`.
    `op/` and `meta/` are left alone: a new mapper changes what the rows MEAN,
    never what the feed saw.
 5. **Pre-index history is out of scope.** An op referencing state the feed
-   never carried (enabled mid-life, boundary stamp) folds to a no-op. The
+   never carried (enabled mid-life, an owed range) folds to a no-op. The
    honest fixes are replaying the chain through the feed or pulling the
-   source's real op rows below the boundary (§7) — never a guessed backfill.
+   source's real op rows for the owed heights (§7) — never a guessed backfill.
 
 ### 3.3 View rules
 
@@ -190,7 +190,7 @@ snapshots, like the blob and telemetry lanes.
 
 | route | serves |
 | --- | --- |
-| `GET /v1/index/status` | per-module watermarks, backfill floors, fold health (backlog + last error), the poison flag |
+| `GET /v1/index/status` | per-module watermarks, owed ranges, fold health (backlog + last error), the poison flag |
 | `GET /v1/index/{module}/ops?after=&limit=` | the feed, paged — borsh rows projected to the JSON envelope (`payload` when the payload is JSON, `payload_hex` otherwise) |
 | `GET /v1/index/{module}/scan?prefix=&after=&limit=` | raw derived keys (debugging, generic consumers) |
 | `POST /v1/index/{module}/view` | **the module's own endpoint** — its guest's `query` role |
@@ -243,33 +243,40 @@ The shipped mappers:
 
 There is ONE derivation path: the feed. When canonical state advances
 WITHOUT the op stream — state-sync installs a boundary, an index directory
-is wiped, recovery skips re-executing durable blocks — the module is stamped
-BACKFILLED at the boundary (`mark_backfilled`): trigger torn down first
-(discarding pending events — a wipe's deletes must never reach the guest as
-feed traffic), watermark dropped, user keys cleared (the engine keyspace,
-guest included, is invisible to the sweep and survives), watermark + floor
-stamped, trigger re-registered. Its feed and views honestly BEGIN there,
-visibly via `meta/backfill`; history below a boundary re-enters only by
-replaying blocks through the feed or by the join-seam op-row backfill (§7).
-There is one fold path and no second derivation: a mapper never re-derives
-rows from canonical `Module::query` state.
+is wiped, recovery skips re-executing durable blocks — the module OWES the
+heights its feed skipped (`IndexStore::owe`): the range between its watermark
+and the boundary is merged into a persisted ledger under `meta/owed`, and
+NOTHING else moves. No wipe, no watermark change, no trigger teardown; the
+module keeps serving every row and view it holds, and new blocks keep folding
+on top. The debt is visible via `GET /v1/index/status` (`owed.{module}`) and
+on the wire as the floor the node vouches for (`IndexStore::vouched_floor`:
+the top of its highest owed range). History re-enters only by replaying
+blocks through the feed or by the op-row repair (§7). There is one fold path
+and no second derivation: a mapper never re-derives rows from canonical
+`Module::query` state.
 
 - The index directory stays disposable: delete `<storage>/index` (or one
-  module's subdirectory) and the tier heals — boundary stamps at the next
-  boot, content accruing from new blocks behind a visible floor.
+  module's subdirectory) and the tier heals — the next boot records what the
+  empty databases owe, new blocks accrue above the debt, and the repair pulls
+  the rest off a peer.
 - noded resumes its local block counter **above** the index watermark so
-  feed heights stay monotonic across restarts; at startup it stamps any
-  module whose watermark trails the resume floor.
+  feed heights stay monotonic across restarts; at startup it records what any
+  module whose watermark trails the resume floor owes (`owe_stale_modules`).
 - The consensus validator feeds the identical contract from three sources:
   the live drain (every SEALED frame — a rejected frame feeds empty, it
   still consumed its height), the journal replay, and post-reboot frame
-  catch-up; whatever they cannot reproduce converges on the boundary stamp.
+  catch-up; whatever they cannot reproduce is owed at the boot tip
+  (`owe_index`) and repaired by the runtime.
 - A standing RESIDENT feeds like a validator: the replica fold driver folds
   finalized frames and applies the per-block index fold from their
-  dispatches. Boundary stamps fire only where state jumped
-  WITHOUT frames — the join bootstrap and backfilled heights — and the
-  blocks database gains one honest boundary row there
+  dispatches. Debt is recorded only where state jumped WITHOUT frames — the
+  join bootstrap, a checkpoint restart, backfilled heights — and the blocks
+  database gains one honest boundary row there
   (`IndexStore::apply_block_record`).
+- A ROLE CHANGE touches the index NOT AT ALL. Promotion moves the host to
+  the epoch boundary and hands lanes over; the index carries its debt across
+  the seat and the validator's repair loop keeps paying it. Nothing about a
+  node's authority changes what its read models hold.
 - **Host-write failures poison** (writes refuse, reads keep serving,
   remedy = rebuild). **Guest-fold failures never poison** — they hold that
   module's queue, observably (§3.2 rule 3). Two failure domains, two
@@ -277,84 +284,68 @@ rows from canonical `Module::query` state.
 - Durability is `SyncMode::Periodic` (bounded loss window, torn tails
   truncate on recovery) — correct for a tier whose worst case is a rebuild.
 
-## 7. State-sync: the join-seam op-row backfill
+## 7. The op-row repair
 
-A joiner state-syncs **state**, not op history, so the feed has nothing to
-carry — and a synced node whose views begin empty at the boundary renders its
-modules as a workspace that lost its contents. The shipped answer is the
-BACKFILL lane: the joiner fetches the SOURCE'S OWN op rows below its boundary
-and writes them into its own feed.
+A node that state-synced holds **state**, not op history, so the feed has
+nothing to carry — and a node whose views begin empty at the boundary renders
+its modules as a workspace that lost its contents. The answer is the REPAIR
+loop (`explorer::IndexRepair`): the node fetches a SOURCE'S OWN op rows for
+the heights it owes and writes them into its own feed.
 
-The lane runs at the join seams (resident ascension, cold direct admission),
-inline, BEFORE the node serves anything, over every module whose feed trails
-the boundary:
+The loop is role-independent by construction. The store carries the debt,
+whichever loop the node happens to be running paces the repair (the
+validator's drain pass, the resident's tip poll and walk-done wake), and a
+sync client any role holds serves as the source. One owed range is in flight
+at a time, round-robin across modules so a range no source can pay never
+starves one a source can:
 
-1. a module that already holds a feed RESUMES: the walk starts strictly above
-   its own watermark (`(watermark, u32::MAX)` — the watermark vouches for whole
-   heights), so only the delta crosses the wire and the derived views folded
-   from the rows below it stand untouched. `IndexStore::advance_watermark`
-   closes it: the feed now reaches the boundary, and the floor never moved
-   because nothing below it was ever dropped;
-2. a module with nothing to resume from is STAMPED at the boundary (§6) —
-   which re-registers a fresh fold trigger over an empty `op/` — and walks the
-   whole history below it. So is one whose resume the source cannot cover
-   (a source floor ABOVE the resume point would leave a hole between the two
-   that a single floor cannot express);
-3. either way `SyncRequest::IndexOps { boundary, module, after }` walks the
-   source's rows in ASCENDING key order, cursor-paged and bounded by bytes,
-   writing each page through `IndexStore::write_backfill_rows`;
-4. the fold drains, and `IndexStore::set_backfill_floor` composes the source's
-   own floor into a stamped module's — `None` when the source reaches genesis.
+1. the walk runs as its own task: `SyncRequest::IndexOps { boundary, module,
+   after }` walks the source's rows for `from..=to` in ASCENDING key order,
+   resuming strictly after the end of height `from - 1` (`(from - 1,
+   u32::MAX)` — a watermark vouches for whole heights), cursor-paged and
+   bounded by bytes, writing each page through `IndexStore::write_backfill_rows`.
+   Only the delta crosses the wire; whatever the feed already held stands;
+2. the settle runs ON the loop, serialized with the live block fold: the fold
+   the writes triggered drains, the read model is re-derived over the whole
+   feed (`IndexStore::refold`, below), and `IndexStore::settle_owed` cuts the
+   range out of the ledger; `IndexStore::advance_watermark` closes it, since
+   the feed now reaches the range's top;
+3. a source whose own floor sits INSIDE the range vouches only for the heights
+   above it: those settle, the rest stays owed, and the loop rotates to a
+   source that may hold them. A source whose floor sits at or above the
+   range's top vouches for none of it and counts as a refusal;
+4. a refusal — no source answered, a page failed validation, a store write
+   refused — leaves the range owed, rotates the source, and backs off
+   (doubling from one second, capped at a minute); the first refusal logs and
+   every tenth after it, carrying `attempts`. The debt is cheap to carry and
+   visible, so the retry is forever.
 
-A module that is NOT stale can still be missing everything below its FLOOR, and
-that gap is what a resident restarting over a wiped index directory holds: the
-checkpoint heal stamps the empty databases and the journal replay folds the
-suffix back on top, so every watermark is at the tip and nothing is stale.
-The seam therefore also runs over the floored modules — the restart seam calls
-the same helper the ascension does. The FEED is never wiped there: that module
-has one, and a stamp would destroy it for a walk that can still fail on its
-next page, leaving it worse than it was and doing the same again at the next
-seam. The rows land UNDER the feed instead, which only ever GAINS rows here,
-and the floor drops only when the walk completed.
+The READ MODEL needs the refold: rows below what the fold already consumed
+arrive out of key order by construction, so the derived keyspace is CLEARED
+and re-driven from the whole feed afterwards (`IndexStore::refold` — drop the
+guest marker, clear the derived keys, re-drive `op/` in key order, drain,
+write the marker back), whether the walk finished or died holding half a
+range. Views are blank for the length of that replay — the same window a
+mapper swap opens at boot (§3) — with the feed under them intact throughout,
+and a walk that wrote nothing skips it entirely. The marker discipline is what
+makes a crash mid-refold safe: nothing vouches for the keyspace while it is
+being rebuilt, so an interrupted refold is re-run whole by the next `open`
+instead of being adopted.
 
-The READ MODEL is a different matter: rows below what the fold already consumed
-arrive out of key order by construction, so the derived keyspace is CLEARED and
-re-driven from the whole feed afterwards (`IndexStore::refold` — drop the guest
-marker, clear the derived keys, re-drive `op/` in key order, drain, write the
-marker back), whether the walk finished or died holding half a range. Views are
-blank for the length of that replay — the same window a mapper swap opens at
-boot (§6) — with the feed under them intact throughout, and a walk that wrote
-nothing skips it entirely. The marker discipline is what makes a crash mid-refold
-safe: nothing vouches for the keyspace while it is being rebuilt, so an
-interrupted refold is re-run whole by the next `open` instead of being adopted.
-
-The walk is asked for only when it can succeed: one request from a cursor past
-the boundary returns an empty page carrying the source's own floor, and a
-source floored no lower than this node ends the matter there.
-
-**Why no refold is needed, and why this window is the only one.** Pre-serving
-there are no live folds, no ws subscribers, and no view readers on this node.
-So ascending fetch-and-write makes COMMIT ORDER EQUAL KEY ORDER, which for
-`op/{height:016x}/{seq:08x}` is block-and-drain order: the changes-mode trigger
-folds every row correctly as it lands, and the fold tip advances monotonically
-to the last backfilled row. Doing this later — against a folding, serving node
-— would hand a guest history backwards, and is a defect rather than a slow path.
-`write_backfill_rows` never touches `meta/height`: on a stamped module the heal
-already set it, and it vouches for feed contiguity FROM THE FLOOR UP. A resumed
-module's watermark moves once, after the walk (`advance_watermark`), for the
-same reason — it may only claim the boundary once the rows below it have
-landed.
+`write_backfill_rows` never touches `meta/height` or `meta/owed`: the
+watermark vouches for feed contiguity above the debt, and both move only in
+the settle, once the rows below have landed.
 
 Contents are NOT root-verifiable (the derived tier has no root by design), so
 the lane trusts the serving node — accepted, because the read model is how a
-node renders at all, and the joiner already trusted this exact node enough to
+node renders at all, and a joiner already trusted this exact node enough to
 accept canonical state from it. What is still enforced, once, at the trust
 boundary (`statesync::fetch_index_ops`): every key is byte-exactly the
 canonical `op/{height:016x}/{seq:08x}` rendering of its own position,
 `(height, seq)` ascends strictly across the whole walk, every height is at or
 below the boundary, every row borsh-decodes as an `OpRow` agreeing with its own
 key, the source's watermark covers the requested boundary (a source that folded
-less would leave a HOLE above the joiner's floor), and the source's own floor
+less would leave a HOLE above what it vouched for), and the source's own floor
 stays at or below that boundary (one that rose above it holds none of the range
 being asked for).
 
@@ -363,17 +354,14 @@ load-bearing. `parse_op_key` reads hex with `from_str_radix`, which accepts any
 width and a leading `+`: `op/2/0` parses to `(2, 0)` while sorting AFTER
 `op/0000000000000009/00000000`. Such a key would satisfy every other check above
 and still break the one invariant this lane rests on — and the damage is
-durable and silent, because the next `converge_guest` refold replays `op/` in
-KEY order and would rebuild every derived view from history running backwards.
-The FIXED WIDTH IS THE ORDERING, so it is verified as bytes. Any violation aborts
-that module's backfill; its stamped floor stands, which is honest. Per-module
-failure — network, validation, a source that re-stamped past the boundary —
-never aborts the join: it warns once with a stable reason token and the rest of
-the modules continue. A source that re-stamps MID-WALK, but still at or below
-the boundary, is composed by taking the MAX floor seen across pages: the higher
-floor is the one that does not overclaim.
+durable and silent, because the next refold replays `op/` in KEY order and
+would rebuild every derived view from history running backwards. The FIXED
+WIDTH IS THE ORDERING, so it is verified as bytes. Any violation aborts that
+range's walk; the debt stands, which is honest. A source whose floor rises
+MID-WALK, but stays at or below the boundary, is composed by taking the MAX
+floor seen across pages: the higher floor is the one that does not overclaim.
 
-The blocks database (`_blocks`) is deliberately NOT backfilled: its rows are
+The blocks database (`_blocks`) is deliberately NOT repaired: its rows are
 node-layer observations, not derived state, and a resident writes its own
 honest boundary row instead (`IndexStore::apply_block_record`, §6).
 

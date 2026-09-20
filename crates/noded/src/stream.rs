@@ -2316,7 +2316,7 @@ fn module_start_cursor(
         });
     }
     let height = cursor_height(cursor).expect("checked above");
-    match store.backfill_height(module) {
+    match store.vouched_floor(module) {
         Ok(Some(floor)) if height < floor => {
             let jump =
                 live_cursor(store, module).map_err(|err| unavailable(topic, err.to_string()))?;
@@ -2797,7 +2797,7 @@ fn lag_if_below_backfill(
     cursor: &mut String,
     store: &indexer::IndexStore,
 ) -> Option<CatchUpResult> {
-    let floor = match store.backfill_height(module) {
+    let floor = match store.vouched_floor(module) {
         Ok(Some(floor)) => floor,
         Ok(None) => return None,
         Err(err) => {
@@ -3167,9 +3167,10 @@ mod tests {
     }
 
     #[test]
-    fn resume_below_backfill_floor_lagged_to_live_watermark() {
+    fn resume_below_the_vouched_floor_lagged_to_live_watermark() {
         let (_dir, store) = temp_store(&["chat"]);
-        store.mark_backfilled("chat", 10).expect("mark backfilled");
+        store.owe("chat", 1, 10).expect("owe");
+        store.advance_watermark("chat", 10).expect("watermark");
         let (state, lagged) = prepare_topic(
             "module:chat",
             NO_SECRET,

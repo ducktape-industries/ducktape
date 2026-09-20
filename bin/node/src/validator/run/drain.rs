@@ -1149,6 +1149,7 @@ impl ValidatorRuntime<'_> {
         // saga crank, conversation timers, dispatch delivery nudge.
         self.pump_heartbeat().await;
         self.pump_code_readiness().await;
+        self.pump_index_repair();
         // the committed lane table, into the watch every declared plane
         // binds off. A no-op when the table did not move, so a lane a swap
         // declares binds on the block that declared it and nothing else
@@ -1458,6 +1459,22 @@ impl ValidatorRuntime<'_> {
                 0
             }
         }
+    }
+
+    // INDEX REPAIR: the heights every module's feed owes (a checkpoint
+    // restart over a trailing index, a synced boundary, a promotion seat)
+    // pulled off a serving peer. one spawned walk at a time so a slow peer
+    // never stalls this loop; the refold and the settle run here, serialized
+    // with the live fold above. inert while nothing is owed.
+    fn pump_index_repair(&mut self) {
+        let Self {
+            index,
+            blob_client,
+            index_repair,
+            label,
+            ..
+        } = self;
+        index_repair.pass(index, blob_client, label);
     }
 
     // CODE READINESS: the byte-receipt half of a pending modreg swap, and

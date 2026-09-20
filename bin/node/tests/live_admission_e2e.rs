@@ -584,15 +584,13 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         }),
     );
     //     …and /v1/index/* answers from healthy read models WITH pre-join
-    //     history. the ascension heal still stamps a floor at the boundary,
-    //     but the op-row backfill then walks the source's rows below it and
-    //     CLEARS that floor (indexable spec §7) — so the honest end state is
-    //     no floor at all, or the SOURCE's own floor inherited when the
-    //     source itself joined late. what must never happen again is a floor
-    //     sitting at the joiner's own boundary with an empty feed beneath it.
-    //     polled: a heal drops the watermark FIRST (crash-safety by
-    //     re-trigger), so a read racing an in-flight heal legitimately sees 0
-    //     for a moment, and the floor clears only after the fold drains.
+    //     history. the ascension records what the feed owes up to the
+    //     boundary; the repair then walks the source's rows and settles it
+    //     (indexable spec §7) — so the honest end state is nothing owed, or
+    //     the SOURCE's own debt inherited when the source itself joined late.
+    //     what must never happen is an empty feed beneath the joiner's own
+    //     boundary with nothing saying so.
+    //     polled: the repair is a spawned walk settled on a later loop pass.
     poll(
         &cluster,
         "the resident index to report folding watermarks over a backfilled feed",
@@ -600,18 +598,13 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             let (status, index_status) =
                 common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
             let watermark = index_status["modules"]["tasks"].as_u64().unwrap_or(0);
-            let floor = index_status["backfilled"]["tasks"].as_u64();
+            let owed = index_status["owed"]["tasks"].as_array();
             // the founder is the sync source and has folded from genesis, so it
-            // has no floor of its own to compose in: the joiner's clears outright.
-            // STRONGER than it was under `directory`: that tenant had no index
-            // guest, so `explorer.rs:340-356` cleared the floor for free
-            // (`folds == false`); `tasks` folds through a real mapper, so
-            // `floor.is_none()` now depends on the fold reaching the
-            // backfilled rows.
+            // owes nothing of its own to pass on: the joiner ends owing nothing.
             status == 200
                 && index_status["poisoned"] == serde_json::json!(false)
                 && watermark > 0
-                && floor.is_none()
+                && owed.is_none()
         }),
     );
     //     and the op feed BELOW that boundary is really there — the whole
