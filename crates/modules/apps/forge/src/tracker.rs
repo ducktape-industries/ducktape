@@ -234,6 +234,14 @@ impl Tracker {
             })
     }
 
+    /// The immutable author lookup used by ForgeState's item-management
+    /// authorization gate. Keeping the lookup here preserves the tracker's
+    /// existing missing-item refusal and keeps the state core free of tracker
+    /// map details.
+    pub(crate) fn item_author(&self, repo: &str, number: u64) -> Result<&Party, Error> {
+        Ok(&self.item(repo, number)?.author)
+    }
+
     /// open an issue or PR: assign the next number in the repo's shared space
     /// and insert the record. PR branch existence is the CALLER's check (it
     /// owns the refs); this stays a pure map mutation.

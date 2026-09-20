@@ -58,7 +58,8 @@
 //! ```text
 //! root = sha256( FORGE_ROOT_DOMAIN ++ sha256(
 //!                 for each repo sorted-by-name with >=1 born branch:
-//!                     u32-LE(name.len) ++ name ++ u32-LE(ref_count) ++
+//!                     u32-LE(name.len) ++ name ++ owner ++
+//!                     u32-LE(ref_count) ++
 //!                     for each (branch, head) sorted-by-branch:
 //!                         u32-LE(branch.len) ++ branch ++ head.oid[20]
 //!                 ++ if tracker non-empty:
@@ -74,18 +75,19 @@
 //! branch are protected (never deleted, fast-forward-guarded at materialize);
 //! feature branches may force-push and be deleted — the GitHub flow.
 //!
-//! ## protected branches — every member's to move
+//! ## protected branches — the repository owner's to move
 //!
 //! consensus CANNOT check ref descendancy: a validator may not hold the
-//! objects, and reading them would break the determinism invariant above. no
-//! member owns a repo: any member births one with a push, moves `main`/`dev`
-//! by [`ForgeMsg::PushRefs`] or [`ForgeMsg::MergePr`], and force-pushes or
-//! deletes a feature branch. what a protected branch keeps is the CAS on its
-//! previous head, its refusal to be deleted, and materialize's fast-forward
-//! rule on disk: a head that is not a descendant of the installed one is
-//! never installed. a push is attributed to the ACCOUNT principal its origin
-//! resolves to (every bound key resolves to its canonical account; an unbound
-//! key stays the exact signer) — attribution is who did it, never who may.
+//! objects, and reading them would break the determinism invariant above. the
+//! first authenticated person to birth a repo becomes its owner. only that
+//! owner moves `main`/`dev` by [`ForgeMsg::PushRefs`] or [`ForgeMsg::MergePr`]
+//! and force-pushes or deletes a feature branch. what a protected branch keeps
+//! is the CAS on its previous head, its refusal to be deleted, and materialize's
+//! fast-forward rule on disk: a head that is not a descendant of the installed
+//! one is never installed. a push is attributed to the ACCOUNT principal its
+//! origin resolves to (every bound key resolves to its canonical account; an
+//! unbound key stays the exact signer) — attribution is who did it, while the
+//! durable owner decides who may write refs.
 //!
 //! ## the default repo
 //!
@@ -179,11 +181,12 @@ const MAX_REPO_NAME_LEN: usize = 64;
 /// `"default"`; otherwise it must be 1..=`MAX_REPO_NAME_LEN` bytes of
 /// `[a-z0-9._-]` and never start with `.` (that collides with `.`/`..` as a
 /// path segment, AND with forge's own dot-prefixed state files — `.tracker.bin`,
-/// `.pending.bin`, `.stuck.txt`, `.snapshot-cache.bin` — that live in the same
-/// base dir; a repo named after one of those bricks every node's `commit_block`
-/// forever). a valid non-empty slug returns unchanged, so the map key equals
-/// the on-disk directory name. `pub`: bin/noded's git smart-HTTP layer shares
-/// this validator — the security-relevant check has ONE home.
+/// `.pending.bin`, `.owners.bin`, `.stuck.txt`, `.snapshot-cache.bin` — that
+/// live in the same base dir; a repo named after one of those bricks every
+/// node's `commit_block` forever). a valid non-empty slug returns unchanged,
+/// so the map key equals the on-disk directory name. `pub`: bin/noded's git
+/// smart-HTTP layer shares this validator — the security-relevant check has
+/// ONE home.
 pub fn norm_repo(repo: &str) -> Result<String, Error> {
     if repo.is_empty() {
         return Ok(DEFAULT_REPO.to_string());

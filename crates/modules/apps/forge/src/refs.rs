@@ -2,10 +2,11 @@
 //! single-`main` [`RepoState`].
 //!
 //! consensus state per repo is now a sorted map of born branches
-//! (`short_name -> head oid`); `main` and the shared `dev` integration branch
-//! are protected (never deleted, fast-forward-guarded at materialize time),
-//! while feature branches are plain CAS-guarded refs that may force-push or be
-//! deleted — the GitHub flow (`git push origin feature/x`, open a PR from it).
+//! (`short_name -> head oid`) and its durable owner; `main` and the shared
+//! `dev` integration branch are protected (never deleted, fast-forward-guarded
+//! at materialize time), while feature branches are plain CAS-guarded refs
+//! that the owner may force-push or delete — the GitHub flow (`git push origin
+//! feature/x`, open a PR from it).
 //!
 //! the phase-1 determinism invariant carries over PER BRANCH: consensus only
 //! ever gates on a compare-and-swap against a branch's COMMITTED head; packs,
@@ -19,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "native")]
 use std::path::Path;
 
+use chat::Party;
 #[cfg(feature = "native")]
 use git2::Repository;
 use sdk::{Error, refusal};
@@ -41,9 +43,83 @@ pub const HEADS_PREFIX: &str = "refs/heads/";
 /// where git keeps a repo's tags.
 pub const TAGS_PREFIX: &str = "refs/tags/";
 
+/// The person who owns a repository's ref and item-management writes.
+/// Resolved account identity is preferred; an unbound signing key remains the
+/// owner it proves itself to be on a host without the Identity module.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RepoOwner {
+    Account(u64),
+    Key(Vec<u8>),
+}
+
+impl RepoOwner {
+    /// Turn an authenticated person into the durable repository owner.
+    pub fn from_party(party: &Party) -> Result<Self, Error> {
+        match party {
+            Party::Account(account) => Ok(Self::Account(*account)),
+            Party::Key(key) if !key.is_empty() => Ok(Self::Key(key.clone())),
+            Party::Key(_) => Err(Error::module(
+                "external_origin_required",
+                "forge: operations require an authenticated origin",
+            )),
+            Party::Module(_) | Party::System => Err(Error::module(
+                "external_origin_required",
+                "forge: a repository owner must be an authenticated person",
+            )),
+        }
+    }
+
+    /// Whether this owner authorizes the party for a repository write.
+    pub fn matches(&self, party: &Party) -> bool {
+        match (self, party) {
+            (Self::Account(owner), Party::Account(account)) => owner == account,
+            (Self::Key(owner), Party::Key(key)) => owner == key,
+            _ => false,
+        }
+    }
+}
+
+/// Encode the optional owner in consensus images and snapshots.
+pub fn put_owner(out: &mut Vec<u8>, owner: Option<&RepoOwner>) {
+    match owner {
+        None => codec::put_u8(out, 0),
+        Some(RepoOwner::Account(account)) => {
+            codec::put_u8(out, 1);
+            codec::put_u64(out, *account);
+        }
+        Some(RepoOwner::Key(key)) => {
+            codec::put_u8(out, 2);
+            codec::put_bytes(out, key);
+        }
+    }
+}
+
+/// Decode an optional owner from an untrusted consensus container.
+pub fn take_owner(r: &mut Reader) -> Result<Option<RepoOwner>, Error> {
+    match r.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(RepoOwner::Account(r.u64()?))),
+        2 => {
+            let len = r.u32()? as usize;
+            let key = r.take(len)?.to_vec();
+            if key.is_empty() {
+                return Err(Error::module(
+                    "owner_decode",
+                    "forge: repository owner key is empty",
+                ));
+            }
+            Ok(Some(RepoOwner::Key(key)))
+        }
+        tag => Err(Error::module(
+            "owner_decode",
+            format!("forge: bad repository owner tag {tag}"),
+        )),
+    }
+}
+
 /// `main` and the shared integration branch: undeletable, and installed on
-/// disk only by fast-forward — everything else is a feature branch anyone
-/// may force-push.
+/// disk only by fast-forward — everything else is a feature branch the repo
+/// owner may force-push.
 pub(crate) fn is_protected_branch(branch: &str) -> bool {
     branch == MAIN_BRANCH || branch == INTEGRATION_BRANCH
 }
@@ -116,6 +192,9 @@ impl RefName {
 /// carries them: its branches and its tags, each `short_name -> oid`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepoRefs {
+    /// The committed owner, or `None` for a genesis/adopted repo awaiting its
+    /// first authenticated ref write.
+    pub owner: Option<RepoOwner>,
     pub branches: BTreeMap<String, Oid>,
     pub tags: BTreeMap<String, Oid>,
 }
@@ -229,6 +308,9 @@ impl StagedRef {
 /// plus node-local staging / catch-up scaffolding.
 #[derive(Clone, Default)]
 pub struct RepoState {
+    /// The repository owner is consensus state. It is assigned by the first
+    /// authenticated ref write and then never changes.
+    pub owner: Option<RepoOwner>,
     /// write-through mirror of the COMMITTED born branches — `short_name ->
     /// head`. sorted (`BTreeMap`) so the root preimage composes
     /// order-independently.
@@ -304,6 +386,7 @@ impl RepoState {
     /// a fresh state over adopted/installed committed refs of both kinds.
     pub fn with_committed(committed: RepoRefs) -> Self {
         Self {
+            owner: committed.owner,
             refs: committed.branches,
             tags: committed.tags,
             ..Default::default()
@@ -349,6 +432,7 @@ impl RepoState {
     /// read.
     pub fn committed(&self) -> RepoRefs {
         RepoRefs {
+            owner: self.owner.clone(),
             branches: self.refs.clone(),
             tags: self.tags.clone(),
         }
