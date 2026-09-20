@@ -3,66 +3,23 @@ name = "node"
 edition.workspace = true
 version.workspace = true
 
-# the replication layer: wraps a `host::Host` with an ordering seam
-# (`Orderer` + `RoundOrderer`, agreed total order) so N validators apply a
-# totally-ordered op stream identically. a msg is NOT applied on submit; it is
-# proposed into an agreed order and applied via host.submit ONLY when the order
-# delivers it, identically on every validator. this is what makes an
-# order-DEPENDENT qmdb root converge.
-# depends on sdk (Msg) + host (the state machine); the wire codec lives here so
-# sdk stays dep-clean. the real commonware simplex orderer is a later slice; it
-# is the drop-in behind the same `Orderer` trait.
-[features]
-# the SIM backend (bin/simnode) toggles the pre-decoded ingress
-# (`OrderedNode::submit_decoded`) for its UNSIGNED /sim/peer-block + hex: lanes.
-# OFF by default: the validator lane and node-bin never see it, and the wire
-# op-frame codec gains no unsigned variant (it stays a machine contract).
-sim = []
-
 [dependencies]
-# the block spine: one `block committed` event per applying block.
-tracing = { workspace = true }
-sdk = { workspace = true }
-host = { workspace = true }
-# the sink-backed pre-commit witness implements the host's async trait.
-async-trait = { workspace = true }
-thiserror = { workspace = true }
-# op frames are SIGNED: encode signs (ed25519, the node/device key), decode
-# verifies under the frame's declared scheme, so the host's Origin::External
-# is authenticated authorship under any scheme a key can carry.
-keyscheme = { workspace = true }
+abi = { workspace = true }
+borsh = { workspace = true }
+commonware-codec = { workspace = true }
 commonware-cryptography = { workspace = true }
-# `signed_req`: the body digest inside a data-plane request's signed bytes.
-sha2 = { workspace = true }
-# `resource_limits`: getrlimit/setrlimit/sysconf for the open-file soft limit.
-libc = { workspace = true }
+commonware-runtime = { workspace = true }
+commonware-storage = { workspace = true }
+commonware-utils = { workspace = true }
+host = { workspace = true }
+keyscheme = { workspace = true }
+state = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-# the `log_file` rotation tests open real files in an isolated dir.
-tempfile = { workspace = true }
-# non-ed25519 frame proofs in tests/frame_schemes.rs.
+fixture-modules = { path = "../fixtures/modules" }
+fixture-probe = { path = "../fixtures/probe" }
+fixture-relay = { path = "../fixtures/relay" }
+fixture-valset = { path = "../fixtures/valset" }
 keyscheme = { workspace = true, features = ["testkit"] }
-# a SELF dev-dependency (the `data-plane` pattern): `tests/submit_decoded.rs`
-# opens with `#![cfg(feature = "sim")]` and `sim` is off by default, so
-# `cargo test -p node` compiled it to `running 0 tests` — a green that proved
-# nothing, alive only under `--workspace` or `-p simnode`, which is where the
-# feature happened to get unified in.
-node = { path = ".", features = ["sim"] }
-# the host-side qmdb store handle injected into disk-backed modules.
-statesync = { workspace = true }
-# tests stand hosts over in-memory directory modules and drive the async seams
-# on a plain futures executor.
-directory = { workspace = true }
-futures = "0.3"
-# the agreed-order convergence test stands N validators, each a host with a
-# qmdb-backed kv module (order-DEPENDENT root), on the deterministic runtime.
-kv = { path = "../../modules/system/kv" }
-# the oracle-over-consensus test: a saga tracker module + a mock worker prove an
-# async saga settles to Done when the OracleResult op finalizes on every node.
-saga = { path = "../../modules/system/saga" }
-# the in-memory MerkleStore double the store-backed saga module is injected with.
-sdk-testkit = { workspace = true }
-# the code-swap stall test seeds the real code registry with a hash whose bytes
-# no source can serve — the fail-closed boundary the drain must PAUSE on.
-modules = { path = "../../modules/system/modules" }
-commonware-runtime = { workspace = true }
+tempfile = { workspace = true }

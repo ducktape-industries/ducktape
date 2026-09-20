@@ -84,19 +84,14 @@
 [workspace]
 resolver = "2"
 members = [
-    # kernel — the platform (contract + dispatch + transport + BFT ordering).
-    # The module contract itself (`sdk`, `sdk-testkit`, `index-guest`,
-    # `keyscheme`, `blobstore`, `wasm-host`, `module-artifact`, `node-work`)
-    # lives in ducktape-sdk and reaches this workspace as a git dependency.
     "crates/kernel/abi",
     "crates/kernel/guest",
     "crates/kernel/runtime",
     "crates/kernel/state",
     "crates/kernel/blobs",
     "crates/kernel/host",
-    "crates/kernel/node", "crates/kernel/consensus",
-    "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
-    # networking — the netstack (host-side infra + the modules that govern it)
+    "crates/kernel/node",
+    "crates/kernel/consensus",
     "crates/networking/wireguard",
     "crates/networking/nat-traversal",
     "crates/networking/netstack-machine",
@@ -106,93 +101,28 @@ members = [
     "crates/networking/reachability",
     "crates/networking/data-plane",
     "crates/networking/overlay-net",
-    # modules/system — system modules. every entry implements `sdk::Module`.
-    # Their wire crates live in ducktape-sdk (git dependency).
-    "crates/modules/system/acl",
-    "crates/modules/system/kv",
-    "crates/modules/system/valset",
-    "crates/modules/system/governance",
-    "crates/modules/system/identity",
-    "crates/modules/system/modules",
-    "crates/modules/system/saga",
-    "crates/modules/system/capability",
-    "crates/modules/system/dispatch",
-    "crates/modules/system/attribution",
-    "crates/modules/system/gateway",
-    # airlock — the two-party execution/auth contract. NOT a consensus module
-    # (no MODULE_ID, no guest wasm): a protocol shared by the lender service,
-    # the borrower broker and the enclave binary, so it sits beside the other
-    # cross-plane protocol families rather than under any one party.
     "crates/airlock",
-    "crates/authpage",
-    # keystore — the device keystore (`keys/<name>.key` + the active pointer)
-    # and the argon2id/AEAD seal under it. Same standing, same reason: its two
-    # consumers are the CLI and the desktop app, which share nothing else. It
-    # sat inside bin/node until the app's only route to it was spawning
-    # `ducktape` over pipes, making "can the app find a binary?" a precondition
-    # for opening your own key.
     "crates/keystore",
-    # A workspace on disk (identity, network.toml, node.toml, the invite codec)
-    # and the join ceremony that writes one. Split from bin/node because
-    # joining is the one node operation with no running node to ask.
-    "crates/workspace-config",
-    # THE ducktape home resolution, alone in a zero-dependency leaf so the
-    # light services can read it without workspace-config's graph behind it.
     "crates/ducktape-home",
-    "crates/duckfs/client",
     "crates/rpc-client",
-    # the desktop app's self-update state machine + release-manifest verify,
-    # pure (no I/O): driven by the launcher at boot and by the app while running.
     "crates/app-update",
-    # apps — the two product modules core still builds from source. The rest
-    # (chat, pages, agent, runs, tasks, boards, automations, inbox,
-    # collaboration) live in ducktape-modules; core keeps only their committed
-    # artifacts under crates/modules/apps/<id>/, which crates/noded/build.rs
-    # stages into the founding set by path.
-    "crates/modules/apps/forge",
-    "crates/modules/apps/files",
-    # services — off-chain host-side executors
     "crates/services/agent",
     "crates/services/airlock",
     "crates/services/broker",
-    "crates/services/compute",
-    "crates/services/files-odb",
-    "crates/services/forge-odb",
-    "crates/services/mcp",
     "crates/services/media",
+    "crates/services/mcp",
     "crates/services/provider",
     "crates/services/sandbox",
-    # testing — dev-only shared harness helpers (raw-http client, ports,
-    # poll; and the source lints' shared "is this shipped code" judgement).
-    # NOT a Module Rule surface; no shipping crate depends on it.
-    "crates/testing/nettest", "crates/testing/source-lint",
-    # topology — the module composition catalog every composer draws from
-    "crates/topology",
-    # noded — the daemon library behind the /v1 surface
-    "crates/noded",
-    # bin — runnable binaries
-    "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
+    "crates/testing/nettest",
+    "crates/testing/source-lint",
+    "bin/coordinator",
     "bin/airlock-gateway",
     "bin/media-service",
-    "bin/forge-service",
     "bin/terminal-service",
     "bin/duck-guest-init",
-    # the node's supervisor: the same machine, holding the flip for the
-    # network's governance-designated activation height
     "bin/node-launcher",
 ]
-# labs is a standalone crate (its own [workspace] + Cargo.lock), NOT a member:
-# its quarantined evm/multisig deps (revm, alloy) must never enter — or slow —
-# the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
 exclude = ["crates/labs", "crates/kernel/fixtures"]
-
-# how this workspace names itself to `guest-builder` (ducktape-sdk). A guest is
-# built out of the PLATFORM REPOSITORY at a revision, never out of the working
-# tree: the builder synthesizes a scratch workspace whose module dependency is
-# this git url pinned to a commit, so the url has to come from the platform
-# itself rather than from whoever runs the build.
-[workspace.metadata.guest-builder]
-platform = "https://github.com/ducktape-industries/ducktape"
 
 [workspace.package]
 edition = "2024"

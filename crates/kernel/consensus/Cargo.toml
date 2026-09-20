@@ -3,13 +3,6 @@ name = "consensus"
 edition.workspace = true
 version.workspace = true
 
-# the real commonware-simplex BFT orderer behind node's async `Orderer` seam.
-# additive: `SimplexOrderer` is a drop-in for `RoundOrderer` — `submit` stages an
-# opaque frame + queues its digest, a live simplex `Engine` BFT-orders it, and
-# `poll_delivered` non-blocking-drains the finalized frames in ascending-view
-# order. isolated in its own crate so the commonware C toolchain never touches
-# node's toolchain-free lib tests. depends on `node` only for the trait it impls
-# (orphan rule: trait foreign, type local).
 [dependencies]
 node = { workspace = true }
 commonware-consensus = { workspace = true }
@@ -24,43 +17,21 @@ commonware-codec = { workspace = true }
 tracing = { workspace = true }
 bytes = "1"
 rand_core = { workspace = true }
-# the enqueue signal (tokio::sync::Notify) and the propose-side event select —
-# executor-agnostic sync/select primitives only, no runtime pulled in.
 futures = { workspace = true }
 tokio = { workspace = true }
 
 [features]
-# the mesh-carrier sim arm: `SimMesh` over commonware `simulated::Network`,
-# promoting the wiring the consensus tests already use. dev-only in practice —
-# `bin/node` wires the discovery real arm and never enables this.
 sim = []
 
-# the in-process multi-validator harness needs the sim carrier. The declaration
-# stays (it IS the dependency), but the self dev-dependency below now satisfies
-# it always: "skips instead of failing to compile" meant `cargo test -p
-# consensus` built 7 of 8 targets and printed a green that omitted the
-# N-validator convergence proof entirely, with nothing in the output saying so.
-[[test]]
-name = "in_process_cluster"
-required-features = ["sim"]
-
 [dev-dependencies]
-tracing = { workspace = true }
-# a SELF dev-dependency (the `data-plane` / `airlock` / `node` pattern): it turns
-# `sim` on for our OWN test build, so the focused `cargo test -p consensus` an
-# agent actually runs includes `in_process_cluster` instead of silently dropping
-# it. `make test`'s explicit `-p consensus --features sim` line still covers the
-# same ground and is left as belt-and-braces.
 consensus = { path = ".", features = ["sim"] }
-# the host-side qmdb store handle injected into disk-backed modules.
-statesync = { workspace = true }
-# the N-validator convergence harness: real simplex Engines over one simulated
-# commonware network, each wrapping a host::Host with a qmdb kv module.
+abi = { workspace = true }
 host = { workspace = true }
-sdk = { workspace = true }
-kv = { path = "../../modules/system/kv" }
-directory = { workspace = true }
+fixture-modules = { path = "../fixtures/modules" }
+fixture-probe = { path = "../fixtures/probe" }
+fixture-relay = { path = "../fixtures/relay" }
+fixture-valset = { path = "../fixtures/valset" }
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
-# the follower-seam test encodes finalization certificates it assembles by hand.
-commonware-codec = { workspace = true }
+commonware-storage = { workspace = true }
+tempfile = { workspace = true }
