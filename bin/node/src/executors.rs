@@ -516,7 +516,48 @@ pub(crate) fn run(args: InstallArgs, workspace: &Path) -> InstallResult {
     if chosen.is_empty() {
         return Ok(());
     }
-    install_all(&vendors, &chosen, &dir)
+    install_all(&vendors, &chosen, &dir).map(|()| {
+        let installed: Vec<HarnessArg> = chosen.iter().map(|row| row.provider).collect();
+        print_reconsent_hint(workspace, &installed);
+    })
+}
+
+/// Installing an executor changes what a daemon can offer, not what its
+/// standing grant authorizes. Read only the local grant file here: installation
+/// must not wait for, or depend on, a daemon's transient hello.
+fn print_reconsent_hint(workspace: &Path, installed: &[HarnessArg]) {
+    let Ok(services) = crate::services::load(workspace) else {
+        return;
+    };
+    let kinds = reconsent_kinds(&services.grants, installed);
+    if kinds.is_empty() {
+        return;
+    }
+    println!(
+        "\ninstalled executors are not added to standing grants automatically; re-consent with:"
+    );
+    for kind in kinds {
+        println!("  ducktape service enable {kind}");
+    }
+}
+
+fn reconsent_kinds(
+    grants: &[crate::services::ServiceGrant],
+    installed: &[HarnessArg],
+) -> Vec<String> {
+    grants
+        .iter()
+        .filter(|grant| matches!(grant.kind.as_str(), "agent" | "compute"))
+        .filter(|grant| {
+            installed.iter().any(|provider| {
+                !grant
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == provider.token())
+            })
+        })
+        .map(|grant| grant.kind.clone())
+        .collect()
 }
 
 /// What is here, and — for what is not, or is behind the vendor — exactly what
@@ -1300,6 +1341,43 @@ mod tests {
             sha256: "0".repeat(64),
             payload: Payload::TarGz(files.iter().map(|f| format!("bin/{f}")).collect()),
         }
+    }
+
+    #[test]
+    fn installed_executors_name_enabled_services_that_need_reconsent() {
+        let grants = vec![
+            crate::services::ServiceGrant {
+                kind: "agent".into(),
+                instance: "aa".repeat(32),
+                nonce: "bb".repeat(16),
+                granted_unix: 1,
+                capabilities: Vec::new(),
+                scopes: Vec::new(),
+            },
+            crate::services::ServiceGrant {
+                kind: "compute".into(),
+                instance: "cc".repeat(32),
+                nonce: "dd".repeat(16),
+                granted_unix: 1,
+                capabilities: vec!["claude".into()],
+                scopes: Vec::new(),
+            },
+            crate::services::ServiceGrant {
+                kind: "airlock".into(),
+                instance: "ee".repeat(32),
+                nonce: "ff".repeat(16),
+                granted_unix: 1,
+                capabilities: Vec::new(),
+                scopes: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            reconsent_kinds(
+                &grants,
+                &[HarnessArg::Claude, HarnessArg::Codex, HarnessArg::Pi]
+            ),
+            ["agent", "compute"]
+        );
     }
 
     /// The meter's only real arithmetic is the fill, and it has to hold at both
