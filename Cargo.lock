@@ -4183,6 +4183,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lane-wasm"
+version = "0.1.0"
+dependencies = [
+ "data-plane",
+ "thiserror 2.0.18",
+ "tracing",
+ "wasmtime",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
