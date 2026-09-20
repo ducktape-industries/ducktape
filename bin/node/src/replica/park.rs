@@ -55,9 +55,6 @@ use std::time::Duration;
 /// back. a wedged plane then keeps its lane and the seat proceeds without a
 /// member plane, rather than holding the promotion open behind it.
 const REACH_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
-/// how often the promotion looks for the standby plane to have closed within
-/// [`REACH_SHUTDOWN_GRACE`].
-const REACH_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 
 /// one direct-peer sample off this lane's registry: the exposition parse
 /// plus whatever standing the lane can attest — the serving host's valset
@@ -241,10 +238,32 @@ async fn shutdown_reach_plane(
     reach_reclaim: Option<crate::reachability_plane::ReachLaneHandback>,
 ) -> Option<crate::validator::MeshChannel> {
     let Some(cmd) = reach_cmd else { return None };
-    let _ = cmd.try_send(reachability::ReachabilityCommand::Shutdown);
-    let deadline = std::time::Instant::now() + REACH_SHUTDOWN_GRACE;
-    while !cmd.is_closed() && std::time::Instant::now() < deadline {
-        context.sleep(REACH_SHUTDOWN_POLL).await;
+    let startup_cancelled = crate::reachability_plane::cancel_pending_netstack();
+    let queued = if startup_cancelled {
+        tracing::info!(
+            target: "ducktape::reachability",
+            node = %label,
+            event = "reach_shutdown_cancelled_startup",
+            "standby plane startup cancelled for promotion"
+        );
+        true
+    } else {
+        let shutdown = queue_reach_shutdown(cmd).fuse();
+        let grace = context.sleep(REACH_SHUTDOWN_GRACE).fuse();
+        futures::pin_mut!(shutdown, grace);
+        futures::select_biased! {
+            result = shutdown => result.is_ok(),
+            _ = grace => false,
+        }
+    };
+    if !queued && !cmd.is_closed() {
+        tracing::warn!(
+            target: "ducktape::reachability",
+            node = %label,
+            reason = "reach_shutdown_command_timeout",
+            "standby plane did not accept Shutdown; promoting without a member plane"
+        );
+        return None;
     }
     let (tx_handback, rx_handback) = reach_reclaim?;
     // the pumps hand their halves back as they observe the dead plane;
@@ -267,6 +286,12 @@ async fn shutdown_reach_plane(
             None
         }
     }
+}
+
+async fn queue_reach_shutdown(
+    cmd: &tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
+) -> Result<(), tokio::sync::mpsc::error::SendError<reachability::ReachabilityCommand>> {
+    cmd.send(reachability::ReachabilityCommand::Shutdown).await
 }
 
 /// assemble + publish the replica's `/v1/status` snapshot into the shared
@@ -3018,8 +3043,27 @@ pub(super) async fn park(
 
 #[cfg(test)]
 mod tests {
-    use super::note_source_build;
+    use super::{note_source_build, queue_reach_shutdown};
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[tokio::test]
+    async fn shutdown_waits_for_space_on_a_full_reachability_command_lane() {
+        let (cmd, mut commands) = tokio::sync::mpsc::channel(1);
+        cmd.try_send(reachability::ReachabilityCommand::ViewTick(560))
+            .unwrap();
+        let queued = queue_reach_shutdown(&cmd);
+        tokio::pin!(queued);
+        assert!(futures::poll!(queued.as_mut()).is_pending());
+        assert!(matches!(
+            commands.recv().await,
+            Some(reachability::ReachabilityCommand::ViewTick(560))
+        ));
+        assert!(queued.await.is_ok());
+        assert!(matches!(
+            commands.recv().await,
+            Some(reachability::ReachabilityCommand::Shutdown)
+        ));
+    }
 
     /// the whole detection rule in one pass: a stamp is recorded for the peer
     /// that reported it, a disagreement is named ONCE per (peer, stamp), and

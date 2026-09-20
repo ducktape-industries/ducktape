@@ -528,6 +528,11 @@ where
                     }
                 }
                 if let Some(handback) = rx_handback {
+                    tracing::info!(
+                        target: "ducktape::reachability",
+                        event = "reach_lane_rx_handback",
+                        "reachability input lane returned"
+                    );
                     let _ = handback.send(reach_p2p_rx);
                 }
             });
@@ -795,6 +800,11 @@ where
                     }
                 }
                 if let Some(handback) = tx_handback {
+                    tracing::info!(
+                        target: "ducktape::reachability",
+                        event = "reach_lane_tx_handback",
+                        "reachability output lane returned"
+                    );
                     let _ = handback.send(tx);
                 }
             });
@@ -819,7 +829,12 @@ pub(crate) enum NetstackBoot {
     AwaitRegistry,
 }
 
-type Startup = tokio::sync::oneshot::Sender<Result<reachability::NetstackBackend, String>>;
+enum StartupOutcome {
+    Selected(reachability::NetstackBackend),
+    GuestLoadFailed(String),
+    Cancelled,
+}
+type Startup = tokio::sync::oneshot::Sender<StartupOutcome>;
 struct LivePlane {
     generation: u64,
     commands: tokio::sync::mpsc::WeakSender<reachability::ReachabilityCommand>,
@@ -832,6 +847,10 @@ impl LivePlane {
         }
         self.startup.take()
     }
+
+    fn cancel_start(&mut self) -> Option<Startup> {
+        self.startup.take()
+    }
 }
 static LIVE_PLANE: std::sync::RwLock<Option<LivePlane>> = std::sync::RwLock::new(None);
 
@@ -841,14 +860,36 @@ pub(crate) fn start_pending_netstack(
     generation: u64,
     backend: Result<reachability::NetstackBackend, String>,
 ) {
+    let outcome = match backend {
+        Ok(backend) => StartupOutcome::Selected(backend),
+        Err(error) => StartupOutcome::GuestLoadFailed(error),
+    };
     let start = LIVE_PLANE
         .write()
         .expect("live plane lock poisoned")
         .as_mut()
         .and_then(|live| live.take_start(generation));
     if let Some(start) = start {
-        let _ = start.send(backend);
+        let _ = start.send(outcome);
     }
+}
+
+/// Abort a standby plane that is still waiting for its registry-selected guest.
+/// Its command receiver cannot observe `Shutdown` until that selection arrives;
+/// resolving the startup gate is the direct cancellation seam for promotion.
+pub(crate) fn cancel_pending_netstack() -> bool {
+    LIVE_PLANE
+        .write()
+        .expect("live plane lock poisoned")
+        .as_mut()
+        .is_some_and(cancel_startup)
+}
+
+fn cancel_startup(live: &mut LivePlane) -> bool {
+    let Some(start) = live.cancel_start() else {
+        return false;
+    };
+    start.send(StartupOutcome::Cancelled).is_ok()
 }
 
 pub(crate) fn startup_pending(generation: u64) -> bool {
@@ -1248,7 +1289,7 @@ async fn reachability_plane(
     // the handshake sampler's publication seam (see [`CarryingPeers`]).
     carrying: CarryingPeers,
     generation: u64,
-    startup: tokio::sync::oneshot::Receiver<Result<reachability::NetstackBackend, String>>,
+    startup: tokio::sync::oneshot::Receiver<StartupOutcome>,
 ) {
     use std::net::ToSocketAddrs as _;
     // Every early return marks this plane failed; successful shutdown is
@@ -1267,13 +1308,23 @@ async fn reachability_plane(
         }
     }
     let _execution_guard = ExecutionGuard(generation);
-    let backend = match startup
-        .await
-        .unwrap_or_else(|_| Err("netstack startup selection cancelled".into()))
-    {
-        Ok(backend) => backend,
-        Err(error) => {
+    let backend = match startup.await {
+        Ok(StartupOutcome::Selected(backend)) => backend,
+        Ok(StartupOutcome::Cancelled) => {
+            record_execution(generation, reachability::BackendStatus::Stopped);
+            return;
+        }
+        Ok(StartupOutcome::GuestLoadFailed(error)) => {
             fail_plane(generation, &label, "netstack_guest_unreadable", error);
+            return;
+        }
+        Err(_) => {
+            fail_plane(
+                generation,
+                &label,
+                "netstack_guest_unreadable",
+                "netstack startup selection cancelled".into(),
+            );
             return;
         }
     };
@@ -2135,14 +2186,33 @@ mod netstack_execution_tests {
         let start = live
             .take_start(2)
             .expect("the current generation is still gated");
-        start
-            .send(Err("designated component unavailable".into()))
-            .unwrap();
-        assert_eq!(
-            selected.await.unwrap().unwrap_err(),
-            "designated component unavailable"
-        );
+        assert!(start
+            .send(super::StartupOutcome::GuestLoadFailed(
+                "designated component unavailable".into(),
+            ))
+            .is_ok());
+        let super::StartupOutcome::GuestLoadFailed(error) = selected.await.unwrap() else {
+            panic!("startup failure was not delivered as a guest-load failure");
+        };
+        assert_eq!(error, "designated component unavailable");
         assert!(live.take_start(2).is_none());
+    }
+
+    #[tokio::test]
+    async fn standby_shutdown_cancels_a_pending_guest_selection() {
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        let (startup, selected) = tokio::sync::oneshot::channel();
+        let mut live = super::LivePlane {
+            generation: 3,
+            commands: commands.downgrade(),
+            startup: Some(startup),
+        };
+        assert!(super::cancel_startup(&mut live));
+        assert!(matches!(
+            selected.await.unwrap(),
+            super::StartupOutcome::Cancelled
+        ));
+        assert!(live.cancel_start().is_none());
     }
 
     #[test]
