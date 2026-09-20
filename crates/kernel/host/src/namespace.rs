@@ -4,7 +4,8 @@ pub const BLOBS: &str = "$blobs";
 pub const QUEUE: &str = "$queue";
 pub const PROGRAMS: &str = "$programs";
 pub const NETWORK: &str = "$network";
-pub const RESERVED: [&str; 4] = [BLOBS, QUEUE, PROGRAMS, NETWORK];
+pub const SIGNERS: &str = "$signers";
+pub const RESERVED: [&str; 5] = [BLOBS, QUEUE, PROGRAMS, NETWORK, SIGNERS];
 
 pub const LIMITS: &[u8] = b"limits";
 

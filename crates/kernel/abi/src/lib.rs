@@ -116,6 +116,7 @@ pub mod reason {
     pub const UNSUPPORTED: &str = "unsupported";
     pub const INVALID_INPUT: &str = "invalid_input";
     pub const NOT_FOUND: &str = "not_found";
+    pub const SEQUENCE: &str = "sequence";
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -326,18 +327,26 @@ pub mod validators {
     pub const PROGRAM: &str = "valset";
 
     #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Member {
+        pub key: Vec<u8>,
+        pub address: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
     pub enum Query {
         Validators,
+        Members,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
     pub enum Reply {
         Validators(Vec<Vec<u8>>),
+        Members(Vec<Member>),
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
     pub struct Genesis {
-        pub validators: Vec<Vec<u8>>,
+        pub validators: Vec<Member>,
     }
 }
 

@@ -1,4 +1,4 @@
-pub const KEY: &[u8] = b"validators";
+pub const KEY: &[u8] = b"members";
 
 #[cfg(target_arch = "wasm32")]
 mod program {
@@ -17,18 +17,23 @@ mod program {
         }
 
         fn execute(payload: &[u8]) -> Result<(), Refusal> {
-            let validators: Vec<Vec<u8>> = abi::decode(payload)?;
-            guest::set(KEY, abi::encode(&validators));
+            let members: Vec<validators::Member> = abi::decode(payload)?;
+            guest::set(KEY, abi::encode(&members));
             Ok(())
         }
 
         fn query(request: &[u8]) -> Result<Vec<u8>, Refusal> {
-            let validators::Query::Validators = abi::decode(request)?;
-            let validators: Vec<Vec<u8>> = match guest::get(KEY) {
+            let members: Vec<validators::Member> = match guest::get(KEY) {
                 Some(bytes) => abi::decode(&bytes)?,
                 None => Vec::new(),
             };
-            Ok(abi::encode(&validators::Reply::Validators(validators)))
+            let reply = match abi::decode(request)? {
+                validators::Query::Validators => validators::Reply::Validators(
+                    members.into_iter().map(|member| member.key).collect(),
+                ),
+                validators::Query::Members => validators::Reply::Members(members),
+            };
+            Ok(abi::encode(&reply))
         }
     }
 

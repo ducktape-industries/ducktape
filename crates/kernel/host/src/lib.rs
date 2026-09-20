@@ -19,7 +19,7 @@ use state::{Commitment, Overlay, Storage, Store, View, Writes, valid_program_id}
 
 use crate::unit::{Loaded, World, refusal_of};
 
-pub use namespace::{BLOBS, NETWORK, PROGRAMS, QUEUE, RESERVED};
+pub use namespace::{BLOBS, NETWORK, PROGRAMS, QUEUE, RESERVED, SIGNERS};
 pub use queue::Item;
 pub use runtime::Limits;
 
@@ -59,7 +59,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Genesis {
     pub modules: Vec<u8>,
     pub valset: Vec<u8>,
-    pub validators: Vec<Vec<u8>>,
+    pub validators: Vec<validators::Member>,
     pub programs: Vec<Founding>,
     pub limits: Limits,
     pub time: u64,
@@ -80,6 +80,7 @@ pub struct Block {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Submission {
     pub signer: Vec<u8>,
+    pub seq: u64,
     pub target: ProgramId,
     pub payload: Vec<u8>,
 }
@@ -391,9 +392,42 @@ where
             )
             .await?;
         Ok(reply.and_then(|bytes| {
-            let validators::Reply::Validators(validators) = abi::decode(&bytes)?;
+            let validators::Reply::Validators(validators) = abi::decode(&bytes)? else {
+                return Err(Refusal::new(
+                    reason::PROTOCOL,
+                    "valset answered Validators with another reply",
+                ));
+            };
             Ok(validators)
         }))
+    }
+
+    pub async fn members(
+        &self,
+        time: u64,
+    ) -> Result<std::result::Result<Vec<validators::Member>, Refusal>> {
+        let reply = self
+            .query(
+                Layer::Confirmed,
+                time,
+                Origin::System,
+                validators::PROGRAM,
+                abi::encode(&validators::Query::Members),
+            )
+            .await?;
+        Ok(reply.and_then(|bytes| {
+            let validators::Reply::Members(members) = abi::decode(&bytes)? else {
+                return Err(Refusal::new(
+                    reason::PROTOCOL,
+                    "valset answered Members with another reply",
+                ));
+            };
+            Ok(members)
+        }))
+    }
+
+    pub fn deliveries_due(&self) -> Result<bool> {
+        Ok(!queue::pending(&self.store.view(Vec::new()))?.is_empty())
     }
 
     pub async fn preconfirm(
@@ -466,6 +500,26 @@ where
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Receipt> {
+        let expected = next_sequence(&self.store.view(vec![&*overlay]), &submission.signer)?;
+        let in_sequence = submission.seq == expected;
+        if !in_sequence {
+            return Ok(rejected(
+                &submission.target,
+                Refusal::new(
+                    reason::SEQUENCE,
+                    format!(
+                        "sequence {} is not the signer's next, {expected}",
+                        submission.seq
+                    ),
+                ),
+            ));
+        }
+        let checkpoint = overlay.checkpoint();
+        overlay.set(
+            SIGNERS,
+            submission.signer.clone(),
+            abi::encode(&(submission.seq + 1)),
+        );
         let env = Env {
             height,
             time,
@@ -473,14 +527,19 @@ where
             origin: Origin::External(submission.signer),
             cause: Cause::Direct,
         };
-        self.run(
-            &submission.target,
-            GuestCall::Execute(submission.payload),
-            env,
-            overlay,
-            stage,
-        )
-        .await
+        let receipt = self
+            .run(
+                &submission.target,
+                GuestCall::Execute(submission.payload),
+                env,
+                overlay,
+                stage,
+            )
+            .await?;
+        if let Outcome::Rejected(_) = receipt.outcome {
+            overlay.restore(checkpoint);
+        }
+        Ok(receipt)
     }
 
     async fn run(
@@ -773,6 +832,13 @@ fn programs_of(view: &View<'_>) -> Result<BTreeMap<ProgramId, BlobId>> {
 
 fn program_id(key: Vec<u8>) -> Result<ProgramId> {
     String::from_utf8(key).map_err(|_| Error::Corrupt("a program key is not a string".into()))
+}
+
+fn next_sequence(view: &View<'_>, signer: &[u8]) -> Result<u64> {
+    match view.get(SIGNERS, signer)? {
+        Some(bytes) => abi::decode(&bytes).map_err(corrupt),
+        None => Ok(0),
+    }
 }
 
 fn limits_of(view: &View<'_>) -> Result<Limits> {
