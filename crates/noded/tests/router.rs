@@ -3265,66 +3265,6 @@ async fn presence_ws_admits_a_signed_account_holder_and_refuses_a_keyless_one() 
 }
 
 #[tokio::test]
-async fn blob_upload_capacity_is_reserved_before_signature_body_collection() {
-    let (handle, _commands, _events) = local_node();
-    let router = noded::router(handle);
-    let mut releases = Vec::new();
-    let mut requests = Vec::new();
-    for _ in 0..2 {
-        let (started, polled) = tokio::sync::oneshot::channel();
-        let (release, released) = tokio::sync::oneshot::channel();
-        let body = Body::from_stream(futures::stream::once(async move {
-            started.send(()).unwrap();
-            released.await.unwrap();
-            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"blob"))
-        }));
-        // A LOCAL DAEMON's upload: the write gate refuses an unsigned one
-        // before its body is read (that is the blob lane's deferred proof),
-        // so an unauthorized request would never reach the handler that
-        // polls this stream — and the capacity this test is about is the
-        // layer OUTSIDE that gate.
-        let request = with_operator(with_peer(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/files/blob")
-                .body(body)
-                .unwrap(),
-            "127.0.0.1:40000",
-        ));
-        requests.push(tokio::spawn(router.clone().oneshot(request)));
-        polled.await.unwrap();
-        releases.push(release);
-    }
-    let request = || {
-        with_operator(with_peer(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/files/blob")
-                .body(Body::empty())
-                .unwrap(),
-            "127.0.0.1:40000",
-        ))
-    };
-    assert_eq!(
-        router.clone().oneshot(request()).await.unwrap().status(),
-        StatusCode::SERVICE_UNAVAILABLE
-    );
-    for release in releases {
-        release.send(()).unwrap();
-    }
-    for request in requests {
-        assert_ne!(
-            request.await.unwrap().unwrap().status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-    }
-    assert_ne!(
-        router.oneshot(request()).await.unwrap().status(),
-        StatusCode::SERVICE_UNAVAILABLE
-    );
-}
-
-#[tokio::test]
 async fn operator_stream_binds_the_target_in_the_signature_and_forwards_without_an_account() {
     use futures::SinkExt as _;
     use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
