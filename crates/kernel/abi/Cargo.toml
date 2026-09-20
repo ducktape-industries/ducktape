@@ -1,0 +1,7 @@
+[package]
+name = "abi"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+borsh = { workspace = true }

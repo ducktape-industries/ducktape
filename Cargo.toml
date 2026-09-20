@@ -88,6 +88,11 @@ members = [
     # The module contract itself (`sdk`, `sdk-testkit`, `index-guest`,
     # `keyscheme`, `blobstore`, `wasm-host`, `module-artifact`, `node-work`)
     # lives in ducktape-sdk and reaches this workspace as a git dependency.
+    "crates/kernel/abi",
+    "crates/kernel/guest",
+    "crates/kernel/runtime",
+    "crates/kernel/state",
+    "crates/kernel/blobs",
     "crates/kernel/host",
     "crates/kernel/node", "crates/kernel/consensus",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
@@ -179,7 +184,7 @@ members = [
 # labs is a standalone crate (its own [workspace] + Cargo.lock), NOT a member:
 # its quarantined evm/multisig deps (revm, alloy) must never enter — or slow —
 # the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
-exclude = ["crates/labs"]
+exclude = ["crates/labs", "crates/kernel/runtime/tests/probe"]
 
 # how this workspace names itself to `guest-builder` (ducktape-sdk). A guest is
 # built out of the PLATFORM REPOSITORY at a revision, never out of the working
@@ -338,6 +343,11 @@ duck-address = { git = "https://github.com/ducktape-industries/ducktape-sdk", br
 # in-memory MerkleStore). MAY ONLY appear in `[dev-dependencies]` of consumers —
 # the Module Rule (modules link only sdk + wire surfaces) is untouched.
 sdk-testkit = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "sdk-testkit" }
+abi = { path = "crates/kernel/abi" }
+guest = { path = "crates/kernel/guest" }
+runtime = { path = "crates/kernel/runtime" }
+state = { path = "crates/kernel/state" }
+blobs = { path = "crates/kernel/blobs" }
 host = { path = "crates/kernel/host" }
 node = { path = "crates/kernel/node" }
 consensus = { path = "crates/kernel/consensus" }

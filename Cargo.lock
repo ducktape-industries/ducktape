@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "abi"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+]
+
+[[package]]
 name = "acl"
 version = "0.1.0"
 dependencies = [
@@ -626,6 +633,10 @@ dependencies = [
  "cpufeatures 0.3.0",
  "zeroize",
 ]
+
+[[package]]
+name = "blobs"
+version = "0.1.0"
 
 [[package]]
 name = "blobstore"
@@ -3305,6 +3316,13 @@ dependencies = [
  "ff 0.14.0",
  "rand_core 0.10.1",
  "subtle",
+]
+
+[[package]]
+name = "guest"
+version = "0.1.0"
+dependencies = [
+ "abi",
 ]
 
 [[package]]
@@ -6121,6 +6139,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "async-trait",
+ "borsh",
+ "sha2 0.10.9",
+ "tokio",
+ "wasmtime",
+ "wat",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6813,6 +6844,10 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "state"
+version = "0.1.0"
 
 [[package]]
 name = "statesync"

@@ -1,0 +1,310 @@
+use borsh::{BorshDeserialize, BorshSerialize};
+
+pub type ProgramId = String;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
+pub struct Root(pub [u8; 32]);
+
+impl Root {
+    pub const ZERO: Root = Root([0; 32]);
+}
+
+impl core::fmt::Debug for Root {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Root({})", hex(&self.0))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
+pub struct BlobId(pub [u8; 32]);
+
+impl core::fmt::Debug for BlobId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "BlobId({})", hex(&self.0))
+    }
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    use core::fmt::Write as _;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
+pub enum Origin {
+    External(Vec<u8>),
+    Program(ProgramId),
+    System,
+}
+
+impl Origin {
+    pub fn actor(&self) -> String {
+        match self {
+            Origin::External(key) => format!("ext:{}", hex(key)),
+            Origin::Program(id) => id.clone(),
+            Origin::System => "system".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
+pub struct ItemRef {
+    pub source: ProgramId,
+    pub item: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Refusal {
+    pub reason: String,
+    pub sentence: String,
+}
+
+impl Refusal {
+    pub fn new(reason: impl Into<String>, sentence: impl Into<String>) -> Self {
+        Refusal {
+            reason: reason.into(),
+            sentence: sentence.into(),
+        }
+    }
+}
+
+impl core::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}: {}", self.reason, self.sentence)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+pub mod reason {
+    pub const UNKNOWN_PROGRAM: &str = "unknown_program";
+    pub const TRAP: &str = "trap";
+    pub const PROTOCOL: &str = "protocol";
+    pub const UNSUPPORTED: &str = "unsupported";
+    pub const INVALID_INPUT: &str = "invalid_input";
+    pub const NOT_FOUND: &str = "not_found";
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Outcome {
+    Applied { output: Vec<u8> },
+    Rejected(Refusal),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Cause {
+    Direct,
+    Delivery(ItemRef),
+    Completion { item: ItemRef, outcome: Outcome },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Env {
+    pub height: u64,
+    pub time: u64,
+    pub me: ProgramId,
+    pub origin: Origin,
+    pub cause: Cause,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Message {
+    pub target: ProgramId,
+    pub payload: Vec<u8>,
+    pub reply: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Scan {
+    pub lo: Vec<u8>,
+    pub hi: Option<Vec<u8>>,
+    pub reverse: bool,
+    pub limit: Option<u64>,
+}
+
+impl Scan {
+    pub fn range(lo: impl Into<Vec<u8>>, hi: Option<Vec<u8>>) -> Self {
+        Scan {
+            lo: lo.into(),
+            hi,
+            reverse: false,
+            limit: None,
+        }
+    }
+
+    pub fn prefix(prefix: impl AsRef<[u8]>) -> Self {
+        let prefix = prefix.as_ref();
+        Scan::range(prefix.to_vec(), prefix_end(prefix))
+    }
+
+    pub fn after(mut self, key: impl AsRef<[u8]>) -> Self {
+        let mut lo = key.as_ref().to_vec();
+        lo.push(0);
+        self.lo = lo;
+        self
+    }
+
+    pub fn limit(mut self, limit: u64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn reverse(mut self) -> Self {
+        self.reverse = true;
+        self
+    }
+
+    pub fn admits(&self, key: &[u8]) -> bool {
+        let above_lo = key >= self.lo.as_slice();
+        let below_hi = self.hi.as_ref().is_none_or(|hi| key < hi.as_slice());
+        above_lo && below_hi
+    }
+}
+
+pub fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last_bumpable = prefix.iter().rposition(|&b| b != 0xff)?;
+    let mut end = prefix[..=last_bumpable].to_vec();
+    end[last_bumpable] += 1;
+    Some(end)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Entry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
+pub enum Scheme {
+    Ed25519,
+    Secp256k1,
+    Secp256r1,
+    Bls12381,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum CryptoOp {
+    Sha256(Vec<u8>),
+    Verify {
+        scheme: Scheme,
+        key: Vec<u8>,
+        message: Vec<u8>,
+        signature: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum CryptoReply {
+    Digest([u8; 32]),
+    Verified(bool),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum HostOp {
+    Env,
+    Get(Vec<u8>),
+    Set { key: Vec<u8>, value: Vec<u8> },
+    Delete(Vec<u8>),
+    Scan(Scan),
+    CommittedGet(Vec<u8>),
+    CommittedScan(Scan),
+    BlobPut(Vec<u8>),
+    BlobGet(BlobId),
+    BlobStat(BlobId),
+    BlobDelete(BlobId),
+    Root(ProgramId),
+    Query { program: ProgramId, request: Vec<u8> },
+    Emit(Message),
+    Event(Vec<u8>),
+    Output(Vec<u8>),
+    Crypto(CryptoOp),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum HostReply {
+    Env(Env),
+    Value(Option<Vec<u8>>),
+    Entries(Vec<Entry>),
+    Done,
+    BlobId(BlobId),
+    BlobSize(Option<u64>),
+    Root(Option<Root>),
+    Query(Result<Vec<u8>, Refusal>),
+    Crypto(CryptoReply),
+    Refused(Refusal),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum GuestCall {
+    Init(Vec<u8>),
+    Execute(Vec<u8>),
+    Query(Vec<u8>),
+}
+
+pub type GuestReply = Result<Vec<u8>, Refusal>;
+
+pub fn encode<T: BorshSerialize>(value: &T) -> Vec<u8> {
+    borsh::to_vec(value).expect("borsh serialization of an in-memory value cannot fail")
+}
+
+pub fn decode<T: BorshDeserialize>(bytes: &[u8]) -> Result<T, Refusal> {
+    borsh::from_slice(bytes).map_err(|e| Refusal::new(reason::PROTOCOL, e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_end_is_the_first_key_past_every_extension() {
+        assert_eq!(prefix_end(b"ab"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_end(&[0x61, 0xff]), Some(vec![0x62]));
+        assert_eq!(prefix_end(&[0xff, 0xff]), None);
+        assert_eq!(prefix_end(b""), None);
+        let scan = Scan::prefix(b"ab");
+        assert!(scan.admits(b"ab"));
+        assert!(scan.admits(b"ab\xff\xff"));
+        assert!(!scan.admits(b"ac"));
+        assert!(!scan.admits(b"aa"));
+    }
+
+    #[test]
+    fn after_resumes_past_the_cursor() {
+        let scan = Scan::prefix(b"t/").after(b"t/7");
+        assert!(!scan.admits(b"t/7"));
+        assert!(scan.admits(b"t/7\x00"));
+        assert!(scan.admits(b"t/8"));
+    }
+
+    #[test]
+    fn every_envelope_round_trips() {
+        let env = Env {
+            height: 7,
+            time: 9,
+            me: "a".into(),
+            origin: Origin::Program("b".into()),
+            cause: Cause::Completion {
+                item: ItemRef {
+                    source: "a".into(),
+                    item: 3,
+                },
+                outcome: Outcome::Rejected(Refusal::new("x", "y")),
+            },
+        };
+        let op = HostOp::Query {
+            program: "b".into(),
+            request: vec![1, 2],
+        };
+        let reply = HostReply::Query(Err(Refusal::new("r", "s")));
+        let call = GuestCall::Execute(vec![3]);
+        let guest_reply: GuestReply = Ok(vec![4]);
+        assert_eq!(decode::<Env>(&encode(&env)).unwrap(), env);
+        assert_eq!(decode::<HostOp>(&encode(&op)).unwrap(), op);
+        assert_eq!(decode::<HostReply>(&encode(&reply)).unwrap(), reply);
+        assert_eq!(decode::<GuestCall>(&encode(&call)).unwrap(), call);
+        assert_eq!(decode::<GuestReply>(&encode(&guest_reply)).unwrap(), guest_reply);
+        assert_eq!(decode::<Env>(&[9, 9]).unwrap_err().reason, reason::PROTOCOL);
+    }
+}

@@ -1,0 +1,7 @@
+[package]
+name = "guest"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+abi = { workspace = true }

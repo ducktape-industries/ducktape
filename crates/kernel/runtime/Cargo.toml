@@ -1,0 +1,16 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+abi = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+wasmtime = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+borsh = { workspace = true }
+wat = "1"
