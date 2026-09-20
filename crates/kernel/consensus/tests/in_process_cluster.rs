@@ -147,7 +147,10 @@ async fn build_cluster(
     let quota = Quota::per_second(NZU32!(128));
     let mut carriers: HashMap<ed25519::PublicKey, SimMesh<deterministic::Context>> = HashMap::new();
     for v in participants.iter() {
-        carriers.insert(v.clone(), SimMesh::register(&oracle, v.clone(), quota).await);
+        carriers.insert(
+            v.clone(),
+            SimMesh::register(&oracle, v.clone(), quota).await,
+        );
     }
 
     // perfect all-pairs links so votes/certs/relayed payloads propagate.
@@ -195,7 +198,11 @@ async fn build_cluster(
     // identical genesis module set -> identical genesis root-hash.
     let genesis = nodes[0].root_hash();
     for n in &nodes {
-        assert_eq!(n.root_hash(), genesis, "identical genesis -> identical root-hash");
+        assert_eq!(
+            n.root_hash(),
+            genesis,
+            "identical genesis -> identical root-hash"
+        );
     }
 
     (oracle, participants, nodes)
@@ -203,7 +210,10 @@ async fn build_cluster(
 
 /// submit op `i` to node `i` — the FIFO distribution `converge` and the
 /// partition tests all rely on (exactly one op per validator).
-async fn submit_ops(nodes: &mut [OrderedNode<SimplexOrderer>], ops: &[(ed25519::PrivateKey, u64, Msg)]) {
+async fn submit_ops(
+    nodes: &mut [OrderedNode<SimplexOrderer>],
+    ops: &[(ed25519::PrivateKey, u64, Msg)],
+) {
     for (i, (origin, seq, msg)) in ops.iter().enumerate() {
         nodes[i]
             .submit(origin, *seq, msg.clone())
@@ -252,16 +262,36 @@ async fn pump_ticks(
 }
 
 /// remove both directions of the link between `a` and `b`.
-async fn sever(oracle: &simulated::Oracle<ed25519::PublicKey, deterministic::Context>, a: &ed25519::PublicKey, b: &ed25519::PublicKey) {
-    oracle.remove_link(a.clone(), b.clone()).await.expect("remove link a->b");
-    oracle.remove_link(b.clone(), a.clone()).await.expect("remove link b->a");
+async fn sever(
+    oracle: &simulated::Oracle<ed25519::PublicKey, deterministic::Context>,
+    a: &ed25519::PublicKey,
+    b: &ed25519::PublicKey,
+) {
+    oracle
+        .remove_link(a.clone(), b.clone())
+        .await
+        .expect("remove link a->b");
+    oracle
+        .remove_link(b.clone(), a.clone())
+        .await
+        .expect("remove link b->a");
 }
 
 /// restore both directions of the perfect link between `a` and `b`.
-async fn heal(oracle: &simulated::Oracle<ed25519::PublicKey, deterministic::Context>, a: &ed25519::PublicKey, b: &ed25519::PublicKey) {
+async fn heal(
+    oracle: &simulated::Oracle<ed25519::PublicKey, deterministic::Context>,
+    a: &ed25519::PublicKey,
+    b: &ed25519::PublicKey,
+) {
     let link = full_link();
-    oracle.add_link(a.clone(), b.clone(), link.clone()).await.expect("heal link a->b");
-    oracle.add_link(b.clone(), a.clone(), link).await.expect("heal link b->a");
+    oracle
+        .add_link(a.clone(), b.clone(), link.clone())
+        .await
+        .expect("heal link a->b");
+    oracle
+        .add_link(b.clone(), a.clone(), link)
+        .await
+        .expect("heal link b->a");
 }
 
 /// the number of deterministic block-ticks the halt assertion pumps through —
@@ -296,9 +326,15 @@ async fn converge(mut context: deterministic::Context) {
     // THE MILESTONE: byte-identical root-hash on every validator, moved off genesis,
     // reached with no OS-process mesh — only the swapped in-process carrier.
     let converged = nodes[0].root_hash();
-    assert_ne!(converged, genesis, "the finalized ops moved the root-hash off genesis");
+    assert_ne!(
+        converged, genesis,
+        "the finalized ops moved the root-hash off genesis"
+    );
     for (i, n) in nodes.iter().enumerate() {
-        assert_eq!(applied[i], target, "validator {i} applied EXACTLY the op-set");
+        assert_eq!(
+            applied[i], target,
+            "validator {i} applied EXACTLY the op-set"
+        );
         assert_eq!(
             n.root_hash(),
             converged,
@@ -324,7 +360,11 @@ async fn partition_isolated_c(mut context: deterministic::Context) {
     let height_h = nodes[0].root_hash();
     assert_ne!(height_h, genesis, "height H moved off genesis");
     for n in &nodes {
-        assert_eq!(n.root_hash(), height_h, "every validator agrees at height H");
+        assert_eq!(
+            n.root_hash(),
+            height_h,
+            "every validator agrees at height H"
+        );
     }
 
     // partition: sever validator C from both A and B.
@@ -348,10 +388,20 @@ async fn partition_isolated_c(mut context: deterministic::Context) {
     heal(&oracle, &participants[1], &c).await;
     let applied = pump_to_target(&mut context, &mut nodes, N).await;
     let converged = nodes[0].root_hash();
-    assert_ne!(converged, height_h, "the healed op-set moved the root-hash past height H");
+    assert_ne!(
+        converged, height_h,
+        "the healed op-set moved the root-hash past height H"
+    );
     for (i, n) in nodes.iter().enumerate() {
-        assert_eq!(applied[i], N, "validator {i} applies exactly the healed op-set");
-        assert_eq!(n.root_hash(), converged, "validator {i} converges on the identical root-hash");
+        assert_eq!(
+            applied[i], N,
+            "validator {i} applies exactly the healed op-set"
+        );
+        assert_eq!(
+            n.root_hash(),
+            converged,
+            "validator {i} converges on the identical root-hash"
+        );
     }
 }
 
@@ -391,10 +441,20 @@ async fn partition_isolated_a(mut context: deterministic::Context) {
     heal(&oracle, &a, &participants[2]).await;
     let applied = pump_to_target(&mut context, &mut nodes, N).await;
     let converged = nodes[0].root_hash();
-    assert_ne!(converged, height_h, "the healed op-set moved the root-hash past height H");
+    assert_ne!(
+        converged, height_h,
+        "the healed op-set moved the root-hash past height H"
+    );
     for (i, n) in nodes.iter().enumerate() {
-        assert_eq!(applied[i], N, "validator {i} applies exactly the healed op-set");
-        assert_eq!(n.root_hash(), converged, "validator {i} converges on the identical root-hash");
+        assert_eq!(
+            applied[i], N,
+            "validator {i} applies exactly the healed op-set"
+        );
+        assert_eq!(
+            n.root_hash(),
+            converged,
+            "validator {i} converges on the identical root-hash"
+        );
     }
 }
 

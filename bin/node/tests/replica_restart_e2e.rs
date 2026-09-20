@@ -15,10 +15,10 @@ mod common;
 
 use std::time::Duration;
 
+use common::NetworkShapeCluster;
 use common::wire::chat::{
     Block, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_reply, encode_msg, encode_query,
 };
-use common::NetworkShapeCluster;
 
 const CONVERGE: Duration = Duration::from_secs(180);
 
@@ -31,7 +31,10 @@ fn a_restarted_replica_replays_its_journal_and_resumes_folding() {
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("replica-restart");
-    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    assert!(
+        !chain_id.is_empty(),
+        "init should print the founded chain id"
+    );
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
@@ -96,7 +99,12 @@ fn a_restarted_replica_replays_its_journal_and_resumes_folding() {
     // the offline gap closes (parent-linkage backfill over the Frames lane)
     // and the write that landed while this node was DOWN becomes readable
     // from its own surface.
-    resident_sees(&cluster, "m-offline", "the offline gap to backfill", CONVERGE);
+    resident_sees(
+        &cluster,
+        "m-offline",
+        "the offline gap to backfill",
+        CONVERGE,
+    );
 
     // and steady-state folding resumes at head speed.
     cluster.submit(0, "chat", &encode_msg(&post("m-post", "after the restart")));

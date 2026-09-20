@@ -52,12 +52,12 @@ use commonware_runtime::{Metrics as _, Runner, Supervisor};
 mod account_cli;
 mod agent;
 mod agent_cli;
-mod chief_cli;
 mod agent_plane;
 mod airlock;
 mod announce;
 mod blob_fetch;
 mod boot;
+mod chief_cli;
 mod cli;
 mod cli_args;
 mod code_plane;
@@ -116,8 +116,8 @@ mod tty;
 mod userkey_cli;
 mod util;
 mod validator;
-mod wire;
 mod wallet_cli;
+mod wire;
 mod work_admission;
 use crate::util::fatal;
 use config::Resolved;
@@ -788,7 +788,9 @@ fn run_node(
                     // to the operator exactly like one a machine refused.
                     match answer {
                         SwapAnswer::Swapped(backend) => Ok(backend),
-                        SwapAnswer::Refused(reason) | SwapAnswer::Unattempted(reason) => Err(reason),
+                        SwapAnswer::Refused(reason) | SwapAnswer::Unattempted(reason) => {
+                            Err(reason)
+                        }
                     }
                 })
             });

@@ -48,7 +48,10 @@ fn a_parked_resident_tracks_the_window_and_never_churns_the_mesh() {
     )];
 
     let chain_id = cluster.init_founder("peerset-stability");
-    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    assert!(
+        !chain_id.is_empty(),
+        "init should print the founded chain id"
+    );
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
@@ -57,7 +60,11 @@ fn a_parked_resident_tracks_the_window_and_never_churns_the_mesh() {
     // membership generation that puts the resident into every tracked window.
     let invite = cluster.invite();
     let friend_key_hex = cluster.join_friend(&invite);
-    assert_eq!(friend_key_hex.len(), 64, "join prints the friend's pubkey hex");
+    assert_eq!(
+        friend_key_hex.len(),
+        64,
+        "join prints the friend's pubkey hex"
+    );
     cluster.spawn(1);
     cluster.wait_marker(1, "joining:", Duration::from_secs(60));
     cluster.wait_admitted(1, CONVERGE);
@@ -84,7 +91,8 @@ fn a_parked_resident_tracks_the_window_and_never_churns_the_mesh() {
     let regressions = log.matches("index must monotonically increase").count();
 
     assert_eq!(
-        duplicates + regressions, 0,
+        duplicates + regressions,
+        0,
         "resident logged {duplicates} duplicate-index and {regressions} \
          regressed-index tracker rejections — its window sync is fighting \
          the monotonic tracking discipline and its mesh view is stale"

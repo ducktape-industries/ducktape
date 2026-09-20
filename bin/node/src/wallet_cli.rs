@@ -140,7 +140,10 @@ fn cmd_list(workspace: &Path, json: bool) -> CommandResult {
     for row in rows {
         let marker = if row.active { " [active]" } else { "" };
         let pubkey_short = row.pubkey.get(..16).unwrap_or(&row.pubkey);
-        println!("{:<24} {:<18} {:<10}{marker}", row.name, pubkey_short, row.state);
+        println!(
+            "{:<24} {:<18} {:<10}{marker}",
+            row.name, pubkey_short, row.state
+        );
     }
     Ok(())
 }

@@ -58,11 +58,11 @@ use std::path::Path;
 
 use saga::SagaOrigin;
 
+#[cfg(test)]
+use provider_host::work_admission::parse;
 pub(crate) use provider_host::work_admission::{
     ANYONE, AdmitTarget, WorkAdmission, load, policy_path, save,
 };
-#[cfg(test)]
-use provider_host::work_admission::parse;
 
 /// Test fixture: give `workspace` a policy admitting `account`, through the same
 /// writer the CLI uses. It lives HERE so a lane's own tests never need to name a

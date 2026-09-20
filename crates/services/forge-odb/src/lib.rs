@@ -36,8 +36,8 @@
 //! an aborted block drops the buffered targets ([`OdbBacking::discard_block`])
 //! and the kernel drops the staged image, so nothing here moved.
 
-use forge::state::{REF_TARGET_KIND, RefTarget, decode_ref_target};
 use forge::Forge;
+use forge::state::{REF_TARGET_KIND, RefTarget, decode_ref_target};
 use git_primitives::{GitDiff, GitDiffBudget, GitDiffError, GitObject};
 use sdk::{Error, Module as _, ModuleId, StateRoot, StateSyncHandle};
 use sha2::{Digest as _, Sha256};

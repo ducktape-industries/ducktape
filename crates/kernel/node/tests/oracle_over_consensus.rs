@@ -124,7 +124,11 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
         const N: usize = 3;
         let mut nodes: Vec<OrderedNode<RoundOrderer>> = (0..N)
             .map(|_| {
-                let host = Host::genesis(vec![Box::new(SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new())))]).expect("genesis");
+                let host = Host::genesis(vec![Box::new(SagaModule::new(
+                    "saga",
+                    Box::new(sdk_testkit::MemStore::new()),
+                ))])
+                .expect("genesis");
                 OrderedNode::new(host, RoundOrderer::new())
             })
             .collect();
@@ -158,8 +162,7 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
             pending, genesis,
             "creating the pending saga moved the root-hash off genesis"
         );
-        let events_per_node: Vec<Vec<Event>> =
-            nodes.iter_mut().map(|n| n.take_events()).collect();
+        let events_per_node: Vec<Vec<Event>> = nodes.iter_mut().map(|n| n.take_events()).collect();
         for (i, n) in nodes.iter().enumerate() {
             assert_eq!(n.root_hash(), pending, "all validators converge at Pending");
             assert_eq!(

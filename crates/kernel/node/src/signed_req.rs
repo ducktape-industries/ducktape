@@ -148,10 +148,12 @@ pub fn request_headers_digest(
 
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 #[cfg(test)]
@@ -168,12 +170,19 @@ mod tests {
         let body = b"raw chunk bytes";
         let headers = request_headers(&signer, "POST", "/v1/files/blob", &node_key, body);
         let [(key_name, key_hex), (ts_name, ts), (sig_name, sig_hex)] = headers;
-        assert_eq!((key_name, ts_name, sig_name), (KEY_HEADER, TS_HEADER, SIG_HEADER));
+        assert_eq!(
+            (key_name, ts_name, sig_name),
+            (KEY_HEADER, TS_HEADER, SIG_HEADER)
+        );
         assert_eq!(key_hex, hex(signer.public_key().as_ref()));
 
         let ts: u64 = ts.parse().expect("decimal seconds");
         let sig = sign_request(&signer, "POST", "/v1/files/blob", &node_key, ts, body);
-        assert_eq!(sig_hex, hex(sig.as_ref()), "the header carries this signature");
+        assert_eq!(
+            sig_hex,
+            hex(sig.as_ref()),
+            "the header carries this signature"
+        );
         let message = request_message("POST", "/v1/files/blob", &node_key, ts, body);
         assert!(signer.public_key().verify(DATA_REQ_NS, &message, &sig));
 

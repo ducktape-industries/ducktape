@@ -18,9 +18,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::wire::{chat};
-use common::wire::chat::{ChatMsg, ChatQuery, ChatReply};
 use common::NetworkShapeCluster;
+use common::wire::chat;
+use common::wire::chat::{ChatMsg, ChatQuery, ChatReply};
 use commonware_cryptography::{Signer as _, ed25519};
 
 /// generous like the sibling network-shape legs: join → standing → follow-arm
@@ -41,7 +41,11 @@ fn submit_frame(cluster: &NetworkShapeCluster, idx: usize, frame: &[u8]) -> (u16
 }
 
 /// the committed message record for `message_id`, read from `idx`.
-fn message(cluster: &NetworkShapeCluster, idx: usize, message_id: &str) -> Option<chat::MessageView> {
+fn message(
+    cluster: &NetworkShapeCluster,
+    idx: usize,
+    message_id: &str,
+) -> Option<chat::MessageView> {
     let reply = cluster.query(
         idx,
         "chat",

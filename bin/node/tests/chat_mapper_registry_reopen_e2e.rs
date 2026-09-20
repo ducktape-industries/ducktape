@@ -6,11 +6,11 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::wire::chat::{Block, ChatMsg, PostPolicy, encode_msg};
 use common::Cluster;
 use common::module_verbs::{
     AFTER, active_hash, assert_ceremony_scheduled, run_on_each, spawn_founders,
 };
+use common::wire::chat::{Block, ChatMsg, PostPolicy, encode_msg};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 

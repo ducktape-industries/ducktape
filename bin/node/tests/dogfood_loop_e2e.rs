@@ -18,11 +18,11 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use capability::{CapabilityQuery, CapabilityReply};
-use common::wire::{chat, runs};
 use common::wire::chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, Span};
-use common::{Cluster, SandboxStage, sandbox_toml, skip_unless_sandboxed};
 use common::wire::runs::ModelMsg;
 use common::wire::runs::{RunOutcome, RunRecord, RunsMsg, RunsQuery, RunsReply};
+use common::wire::{chat, runs};
+use common::{Cluster, SandboxStage, sandbox_toml, skip_unless_sandboxed};
 
 const CONVERGE: Duration = Duration::from_secs(180);
 const FINALIZE: Duration = Duration::from_secs(60);
@@ -730,7 +730,10 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
     // a clone of an empty repository succeeds, so reading HEAD would report
     // git's confusion instead of the state that caused it. Say what node 2
     // served, then walk the ref this test is actually about.
-    let served = git_stdout(&dest, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let served = git_stdout(
+        &dest,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    );
     assert!(
         !served.is_empty(),
         "node 2 served an EMPTY repository for {REPO}: it holds {pr_work_branch} at \

@@ -60,7 +60,9 @@ impl Overlay {
     pub fn restore(&mut self, checkpoint: Checkpoint) {
         while self.undo.len() > checkpoint.0 {
             let Some(undo) = self.undo.pop() else { return };
-            let Some(writes) = self.programs.get_mut(&undo.program) else { continue };
+            let Some(writes) = self.programs.get_mut(&undo.program) else {
+                continue;
+            };
             match undo.before {
                 Some(slot) => writes.insert(undo.key, slot),
                 None => writes.remove(&undo.key),

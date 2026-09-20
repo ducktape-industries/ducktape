@@ -458,5 +458,4 @@ mod tests {
         );
         assert_eq!(book.current(key, 3_000), Some(addr(3, 6000)));
     }
-
 }

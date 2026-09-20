@@ -1654,7 +1654,12 @@ async fn a_restart_mid_run_never_leaves_the_push_presenting_the_provision_time_t
     let link = NodeLink::new(format!("http://{remote}"))
         .with_workspace_credential(workspace.path())
         .with_forge_repo(bed.repo_base.clone());
-    let prov = NodedProvisioner::new(link, &bed.runs_root, bed.runs_root.with_file_name("session-keys")).with_forge(NODE_IDENT);
+    let prov = NodedProvisioner::new(
+        link,
+        &bed.runs_root,
+        bed.runs_root.with_file_name("session-keys"),
+    )
+    .with_forge(NODE_IDENT);
 
     let ws = prov
         .provision(&bed.spec("s1:0", &bed.head, false))

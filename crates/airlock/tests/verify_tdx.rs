@@ -74,7 +74,11 @@ fn a_debug_mode_td_is_refused_although_the_honest_fixture_is_not() {
     let Report::TD10(td) = &mut debuggable.report else {
         panic!("the TDX fixture is a TD10 report");
     };
-    assert_eq!(td.td_attributes[0] & 0x01, 0, "the fixture starts non-debug");
+    assert_eq!(
+        td.td_attributes[0] & 0x01,
+        0,
+        "the fixture starts non-debug"
+    );
     td.td_attributes[0] |= 0x01; // TUD.DEBUG
     let refused = accept_tdx_report(&debuggable, &quote_mrtd()).unwrap_err();
     assert!(

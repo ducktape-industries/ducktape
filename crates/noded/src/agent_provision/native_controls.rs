@@ -106,7 +106,8 @@ pub(super) async fn worker_controls(
             }),
         )
         .await?;
-    let crate::runs::RunsReply::WorkerControls(controls) = crate::runs::decode_reply(&bytes)? else {
+    let crate::runs::RunsReply::WorkerControls(controls) = crate::runs::decode_reply(&bytes)?
+    else {
         return Err("unexpected worker controls reply".into());
     };
     Ok(controls)
@@ -359,7 +360,9 @@ async fn settlement_result(
             }
             Ok(true)
         }
-        crate::tasks::JobStatus::Pending | crate::tasks::JobStatus::Done | crate::tasks::JobStatus::Failed => {
+        crate::tasks::JobStatus::Pending
+        | crate::tasks::JobStatus::Done
+        | crate::tasks::JobStatus::Failed => {
             Err("native cancellation job is no longer processing".into())
         }
     }

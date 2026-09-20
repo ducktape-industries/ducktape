@@ -11,8 +11,14 @@ use statesync::qmdb::QmdbStore;
 fn qmdb_root_is_order_dependent() {
     deterministic::Runner::default().start(|context| async move {
         // node "fwd" applies k1 then k2; node "rev" applies k2 then k1.
-        let mut fwd = Kv::new("kv", Box::new(QmdbStore::init(context.child("fwd"), "kv").await));
-        let mut rev = Kv::new("kv", Box::new(QmdbStore::init(context.child("rev"), "kv").await));
+        let mut fwd = Kv::new(
+            "kv",
+            Box::new(QmdbStore::init(context.child("fwd"), "kv").await),
+        );
+        let mut rev = Kv::new(
+            "kv",
+            Box::new(QmdbStore::init(context.child("rev"), "kv").await),
+        );
 
         fwd.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
         fwd.set(b"k2".to_vec(), b"v2".to_vec()).await.expect("set");
@@ -37,8 +43,14 @@ fn qmdb_root_is_context_independent() {
     // entropy, same-order-different-context convergence would be impossible and
     // the whole agreed-order proof would be unreachable.
     deterministic::Runner::default().start(|context| async move {
-        let mut a = Kv::new("kv", Box::new(QmdbStore::init(context.child("va"), "kv").await));
-        let mut b = Kv::new("kv", Box::new(QmdbStore::init(context.child("vb"), "kv").await));
+        let mut a = Kv::new(
+            "kv",
+            Box::new(QmdbStore::init(context.child("va"), "kv").await),
+        );
+        let mut b = Kv::new(
+            "kv",
+            Box::new(QmdbStore::init(context.child("vb"), "kv").await),
+        );
 
         for kv in [&mut a, &mut b] {
             kv.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");

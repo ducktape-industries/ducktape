@@ -11,12 +11,12 @@ use commonware_p2p::authenticated::lookup;
 use commonware_runtime::Supervisor;
 use commonware_utils::ordered::Set;
 
+use crate::wire::tasks::{TaskMsg, encode_task_msg};
 use consensus::{ContentStore, SimplexOrderer};
 use host::Host;
 use node::OrderedNode;
 use recovery::Recovery;
 use sdk::Msg;
-use crate::wire::tasks::{TaskMsg, encode_task_msg};
 
 use crate::constants::CUTOVER_DELAY;
 use crate::host_reads::resume_resident_keys;

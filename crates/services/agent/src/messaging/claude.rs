@@ -1042,9 +1042,19 @@ mod tests {
         // the user's own, as the interface states: 0700 around 0600
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = |path: &Path| std::fs::metadata(path).expect("exists").permissions().mode() & 0o777;
+            let mode = |path: &Path| {
+                std::fs::metadata(path)
+                    .expect("exists")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
             assert_eq!(mode(&dir), 0o700, "the sockets dir is the user's own");
-            assert_eq!(mode(receipts.address()), 0o600, "the receipt address is the user's own");
+            assert_eq!(
+                mode(receipts.address()),
+                0o600,
+                "the receipt address is the user's own"
+            );
         }
         // the peer below is this process, and a verdict is only read from a
         // process a BINDING named. Without this the connection is dropped on

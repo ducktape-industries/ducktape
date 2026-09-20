@@ -91,9 +91,7 @@ pub fn arg_str(args: &Value, name: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| {
-            crate::node::NodeError::Rejected(format!(
-                "this tool needs a string {name:?} argument"
-            ))
+            crate::node::NodeError::Rejected(format!("this tool needs a string {name:?} argument"))
         })
 }
 

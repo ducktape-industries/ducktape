@@ -88,7 +88,10 @@ fn drained_outcomes_correlate_submits_with_dispositions() {
             .op
             .as_ref()
             .expect("a decoded-then-rejected frame still carries its op");
-        assert!(bad_op.dispatches.is_empty(), "a rejected op leaves no trace");
+        assert!(
+            bad_op.dispatches.is_empty(),
+            "a rejected op leaves no trace"
+        );
         // per-frame boundary capture: the reject rolled back, so both frames
         // settled at the same composed root-hash the node now reports.
         assert_eq!(ok_frame.root_hash, node.root_hash());

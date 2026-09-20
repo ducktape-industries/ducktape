@@ -15,12 +15,14 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use common::Cluster;
+use common::wire::tasks::{
+    TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query,
+};
 use files::{
     Change, Content, EntryInfo, FilesMsg, FilesQuery, FilesReply, Kind, RefsInfo,
     decode_reply as files_decode_reply, encode_msg as files_encode_msg, encode_putblob,
     encode_query as files_encode_query, objects::object_id, to_hex,
 };
-use common::wire::tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
 /// a create for `task_id`; NOT an upsert — `tasks` refuses a duplicate id
 /// (`task_board.rs:77-80`). That rejection is ISOLATED, not fatal: the op's

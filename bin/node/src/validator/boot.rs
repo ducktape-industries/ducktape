@@ -448,9 +448,7 @@ async fn serve_before_seated(
         SyncStateRequest::ModuleServe { reply, .. } => {
             refuse_before_seated(reply, "module_serve", label)
         }
-        SyncStateRequest::IndexOps { reply, .. } => {
-            refuse_before_seated(reply, "index_ops", label)
-        }
+        SyncStateRequest::IndexOps { reply, .. } => refuse_before_seated(reply, "index_ops", label),
         SyncStateRequest::TipCoords { reply } => refuse_before_seated(reply, "tip_coords", label),
     }
 }

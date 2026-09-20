@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use commonware_codec::DecodeExt as _;
-use commonware_cryptography::{ed25519, Signer};
+use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::{Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{IoBuf, Quota, Spawner, Supervisor};
@@ -21,9 +21,9 @@ use crate::constants::*;
 use crate::explorer::heal_index;
 use crate::host_reads::{read_valset_residents, resume_member_keys};
 use crate::join_gate;
-use crate::reachability_plane::{wire_reachability_plane, GateHook, GateOutcomes};
+use crate::reachability_plane::{GateHook, GateOutcomes, wire_reachability_plane};
 use crate::sync::catchup::derive_pending_boot;
-use crate::sync::serve::{drive_sync_request, SyncStateRequest};
+use crate::sync::serve::{SyncStateRequest, drive_sync_request};
 use crate::{overlay_book, presence};
 use futures::StreamExt as _;
 use statesync::SyncServer;

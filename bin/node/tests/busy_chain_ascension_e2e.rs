@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use common::wire::chat::{Block, ChatMsg, PostPolicy, encode_msg};
 use common::NetworkShapeCluster;
+use common::wire::chat::{Block, ChatMsg, PostPolicy, encode_msg};
 
 /// generous like the sibling legs: boot → served boundary → head follow is
 /// several blocks of slack even with the founder under load.

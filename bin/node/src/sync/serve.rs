@@ -164,12 +164,11 @@ pub(crate) fn verify_manifest_floor(
     // decode: a server cannot mint a floor its quorum never signed.
     let scheme = simplex_ed25519::Scheme::verifier(namespace, participants);
     let mut rng = commonware_utils::sys_rng();
-    let finalization =
-        consensus::verify_finalization(&mut rng, &scheme, &cert).map_err(|e| {
-            format!(
-                "served finalization floor does not verify against the epoch's participant set: {e}"
-            )
-        })?;
+    let finalization = consensus::verify_finalization(&mut rng, &scheme, &cert).map_err(|e| {
+        format!(
+            "served finalization floor does not verify against the epoch's participant set: {e}"
+        )
+    })?;
     assert_floor_binds_view(
         boundary.view_base,
         boundary.height,
@@ -329,10 +328,10 @@ where
     let (after_view, up_to_view) = views;
     let frames = fetch_frames(client, view_base + after_view, view_base + up_to_view)
         .await
-    .map_err(|e| BackfillUnavailable {
-        permanent: matches!(e, SyncError::RangePruned { .. }),
-        detail: e.to_string(),
-    })?;
+        .map_err(|e| BackfillUnavailable {
+            permanent: matches!(e, SyncError::RangePruned { .. }),
+            detail: e.to_string(),
+        })?;
     tracing::debug!(
         target: "ducktape::statesync",
         node = %label,

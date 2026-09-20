@@ -6,10 +6,10 @@ use commonware_p2p::{Recipients, Sender as _};
 use commonware_runtime::{Clock as _, IoBuf};
 use commonware_utils::ordered::Set;
 
+use crate::wire::{runs, tasks};
 use consensus::ContentStore;
 use recovery::Manifest;
 use sdk::Msg;
-use crate::wire::{runs, tasks};
 use tasks::{TaskQuery, TaskReply, decode_task_reply, encode_task_query};
 
 use super::ValidatorRuntime;
@@ -2011,7 +2011,12 @@ mod block_cadence_tests {
         let block = Duration::from_millis(1_000);
         assert!(dispatch_nudge_due(Some(7), None, Duration::ZERO, block));
         assert!(dispatch_nudge_due(Some(8), Some(7), Duration::ZERO, block));
-        assert!(!dispatch_nudge_due(Some(7), Some(7), Duration::from_millis(999), block));
+        assert!(!dispatch_nudge_due(
+            Some(7),
+            Some(7),
+            Duration::from_millis(999),
+            block
+        ));
         assert!(dispatch_nudge_due(Some(7), Some(7), block, block));
     }
 

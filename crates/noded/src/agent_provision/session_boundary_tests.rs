@@ -27,20 +27,20 @@
 //! are the ones that reach real consensus.
 
 use crate::NodeHandle;
-use std::path::Path;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
+use crate::chat::{Block, ChatMsg, Mark, PostPolicy, Span};
+use crate::runs::ModelMsg;
 use attribution::AttributionModule;
 use capability::CapabilityMsg;
-use crate::chat::{Block, ChatMsg, Mark, PostPolicy, Span};
 use commonware_runtime::{Runner as _, Supervisor as _};
 use compute_service::{DeliverFn, DispatchPool, SpawnFn};
 use dispatch::DispatchModule;
 use futures::StreamExt as _;
 use host::worker::{WorkOutcome, Worker as _};
 use host::{BlockContext, Host};
-use crate::runs::ModelMsg;
 use saga::SagaModule;
 use sdk::{Event, Msg, Origin};
 
@@ -370,8 +370,12 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             // a bare node's ledger fits the demandless jobs it dispatches.
             Default::default(),
             Arc::new(
-                NodedProvisioner::new(crate::agent_provision::test_link(handle).await, &runs_root, tmp.path().join("session-keys"))
-                    .with_node_url(Some("http://127.0.0.1:8844".into())),
+                NodedProvisioner::new(
+                    crate::agent_provision::test_link(handle).await,
+                    &runs_root,
+                    tmp.path().join("session-keys"),
+                )
+                .with_node_url(Some("http://127.0.0.1:8844".into())),
             ),
         );
 
@@ -497,7 +501,10 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
 
 async fn pending_runs(host: &Host) -> Vec<crate::runs::PendingRun> {
     let reply = host
-        .query("runs", &crate::runs::encode_query(&crate::runs::RunsQuery::PendingRuns))
+        .query(
+            "runs",
+            &crate::runs::encode_query(&crate::runs::RunsQuery::PendingRuns),
+        )
         .await
         .unwrap();
     match crate::runs::decode_reply(&reply).unwrap() {
@@ -508,7 +515,10 @@ async fn pending_runs(host: &Host) -> Vec<crate::runs::PendingRun> {
 
 async fn agent_sessions(host: &Host) -> Vec<crate::runs::AgentSession> {
     let reply = host
-        .query("runs", &crate::runs::encode_query(&crate::runs::RunsQuery::AgentSessions))
+        .query(
+            "runs",
+            &crate::runs::encode_query(&crate::runs::RunsQuery::AgentSessions),
+        )
         .await
         .unwrap();
     match crate::runs::decode_reply(&reply).unwrap() {

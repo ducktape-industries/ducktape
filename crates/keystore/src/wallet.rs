@@ -41,9 +41,8 @@ pub fn valid_name(name: &str) -> Result<(), String> {
     let head_ok = chars
         .next()
         .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-    let tail_ok = chars.all(|c| {
-        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
-    });
+    let tail_ok =
+        chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'));
     let len_ok = name.len() <= MAX_NAME_LEN;
     if head_ok && tail_ok && len_ok {
         return Ok(());
@@ -68,7 +67,7 @@ pub fn sanitize_name(raw: &str) -> String {
         }
     }
     let out = out.trim_matches('-').to_string();
-    let out = out.trim_start_matches(&['.',  '_', '-'][..]).to_string();
+    let out = out.trim_start_matches(&['.', '_', '-'][..]).to_string();
     let mut out = match out.is_empty() {
         true => "default".to_string(),
         false => out,
@@ -139,12 +138,15 @@ pub fn active_name(workspace: &Path) -> Option<String> {
 pub fn set_active(workspace: &Path, name: &str) -> Result<(), String> {
     valid_name(name)?;
     if !key_file(workspace, name).exists() {
-        return Err(format!("no wallet named {name:?} — see `ducktape wallet list`"));
+        return Err(format!(
+            "no wallet named {name:?} — see `ducktape wallet list`"
+        ));
     }
     let keys = keys_dir(workspace);
     std::fs::create_dir_all(&keys).map_err(|e| format!("create {}: {e}", keys.display()))?;
     let tmp = keys.join(format!("{ACTIVE_FILE}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, format!("{name}\n")).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::write(&tmp, format!("{name}\n"))
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, keys.join(ACTIVE_FILE)).map_err(|e| format!("activate {name}: {e}"))
 }
 

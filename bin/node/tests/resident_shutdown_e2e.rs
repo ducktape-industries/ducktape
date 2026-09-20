@@ -13,10 +13,10 @@ mod common;
 
 use std::time::Duration;
 
+use common::NetworkShapeCluster;
 use common::wire::chat::{
     Block, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_reply, encode_msg, encode_query,
 };
-use common::NetworkShapeCluster;
 
 const CONVERGE: Duration = Duration::from_secs(180);
 

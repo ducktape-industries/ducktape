@@ -148,8 +148,14 @@ fn unchanged_valset_does_not_churn_epochs() {
 fn resume_rearms_a_pending_cutover() {
     // pre-crash: epoch 2 based at 100, spawn set {a,b,c}, a join observed at
     // view 10 armed a cutover at view 13 — all recorded, then the crash.
-    let mut orchestrator =
-        ValsetOrchestrator::resume(3, members(&["a", "b", "c"]), no_residents(), 2, 100, Some(13));
+    let mut orchestrator = ValsetOrchestrator::resume(
+        3,
+        members(&["a", "b", "c"]),
+        no_residents(),
+        2,
+        100,
+        Some(13),
+    );
 
     assert_eq!(orchestrator.epoch(), 2);
     assert_eq!(orchestrator.epoch_base(), 100);

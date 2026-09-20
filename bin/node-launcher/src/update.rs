@@ -184,9 +184,10 @@ impl Refused {
     pub fn detail(&self) -> &str {
         match self {
             Refused::Launcher(refusal) => &refusal.detail,
-            Refused::Manifest(_) | Refused::Download(_) | Refused::Verify(_) | Refused::Qualify(_) => {
-                ""
-            }
+            Refused::Manifest(_)
+            | Refused::Download(_)
+            | Refused::Verify(_)
+            | Refused::Qualify(_) => "",
         }
     }
 }
@@ -356,9 +357,9 @@ pub fn decide(phase: &Phase, status: &ReleaseStatus, watch: &Watch) -> Next {
     if already_answered {
         return Next::Wait;
     }
-    let backing_off = watch.retry.is_some_and(|retry| {
-        retry.release == designation.sha256 && retry.polls_left > 0
-    });
+    let backing_off = watch
+        .retry
+        .is_some_and(|retry| retry.release == designation.sha256 && retry.polls_left > 0);
     if backing_off {
         return Next::Wait;
     }
@@ -611,7 +612,11 @@ impl Executor<'_> {
     }
 
     fn verify(&self, sha: Sha) -> Result<Progress, Refusal> {
-        let staged = writers::stage(&self.layout.partial(sha), sha, &self.layout.release_dir(sha));
+        let staged = writers::stage(
+            &self.layout.partial(sha),
+            sha,
+            &self.layout.release_dir(sha),
+        );
         let answer = match staged {
             Ok(()) => {
                 let _ = std::fs::remove_file(self.layout.partial(sha));
@@ -836,9 +841,8 @@ pub fn trusted_keys(layout: &Layout) -> Result<Option<TrustedKeys>, Refusal> {
         .parse()
         .map_err(|_| Refusal::new("release_key_invalid", format!("{}", path.display())))?;
     let successor = match std::fs::read_to_string(layout.successor_key_path()) {
-        Ok(text) => serde_json::from_str(&text).map_err(|error| {
-            Refusal::new("successor_key_invalid", error.to_string())
-        })?,
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|error| Refusal::new("successor_key_invalid", error.to_string()))?,
         Err(_) => None,
     };
     Ok(Some(TrustedKeys { pinned, successor }))
@@ -970,7 +974,10 @@ mod tests {
     #[test]
     fn a_designated_release_stages_before_its_height_and_flips_at_it() {
         let unarmed = status(900, "ab", designating("b", 1200));
-        assert_eq!(decide(&idle("a"), &unarmed, &fresh()), Next::Offer(sha("b")));
+        assert_eq!(
+            decide(&idle("a"), &unarmed, &fresh()),
+            Next::Offer(sha("b"))
+        );
         assert_eq!(decide(&staged("a", "b"), &unarmed, &fresh()), Next::Wait);
         let armed = status(1200, "ab", designating("b", 1200));
         assert_eq!(decide(&staged("a", "b"), &armed, &fresh()), Next::Flip);
@@ -982,9 +989,15 @@ mod tests {
     #[test]
     fn a_staged_release_the_network_no_longer_names_gives_way_to_the_one_it_does() {
         let armed = status(1200, "ab", designating("c", 1200));
-        assert_eq!(decide(&staged("a", "b"), &armed, &fresh()), Next::Offer(sha("c")));
+        assert_eq!(
+            decide(&staged("a", "b"), &armed, &fresh()),
+            Next::Offer(sha("c"))
+        );
         let unarmed = status(900, "ab", designating("c", 1200));
-        assert_eq!(decide(&staged("a", "b"), &unarmed, &fresh()), Next::Offer(sha("c")));
+        assert_eq!(
+            decide(&staged("a", "b"), &unarmed, &fresh()),
+            Next::Offer(sha("c"))
+        );
     }
 
     /// Designating the release kept as `previous` again is how a network takes
@@ -1044,7 +1057,10 @@ mod tests {
             }),
             ..Watch::default()
         };
-        assert_eq!(decide(&idle("a"), &other, &backing_off_b), Next::Offer(sha("c")));
+        assert_eq!(
+            decide(&idle("a"), &other, &backing_off_b),
+            Next::Offer(sha("c"))
+        );
     }
 
     /// THE CLASS TABLE. Only a read that did not complete is transient; what
@@ -1118,7 +1134,10 @@ mod tests {
         assert_eq!(class(download_with(four_bytes, 6)), Failure::Transient);
         assert_eq!(class(download_with(four_bytes, 2)), Failure::Definite);
         assert_eq!(
-            class(download_with("#!/bin/sh\necho unreachable >&2\nexit 1\n", 4)),
+            class(download_with(
+                "#!/bin/sh\necho unreachable >&2\nexit 1\n",
+                4
+            )),
             Failure::Transient
         );
         assert_eq!(

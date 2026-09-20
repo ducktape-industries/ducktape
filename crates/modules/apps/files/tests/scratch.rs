@@ -34,8 +34,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use duckfs_disk::SyncScratch;
 use files::{
-    Change, Content, FilesMsg, FilesQuery, FilesSyncReq, FilesSyncResp, ObjectId,
-    decode_sync_resp, encode_msg, encode_query, encode_sync_req, from_hex_32, to_hex,
+    Change, Content, FilesMsg, FilesQuery, FilesSyncReq, FilesSyncResp, ObjectId, decode_sync_resp,
+    encode_msg, encode_query, encode_sync_req, from_hex_32, to_hex,
 };
 use sdk::{Module as _, Origin, StateRoot};
 

@@ -115,10 +115,7 @@ fn scratch_path(path: &Path) -> std::path::PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    path.with_file_name(format!(
-        "{name}.{}.{nonce:016x}.tmp",
-        std::process::id()
-    ))
+    path.with_file_name(format!("{name}.{}.{nonce:016x}.tmp", std::process::id()))
 }
 
 /// create `path` fresh, born 0600, holding exactly `bytes`.
@@ -211,7 +208,11 @@ mod tests {
         let (held, generated) = WireGuardKeypair::publish(loser_secret, &path).unwrap();
 
         assert!(!generated, "the loser did not publish");
-        assert_eq!(held.public_key(), winner.public_key(), "it holds the winner's key");
+        assert_eq!(
+            held.public_key(),
+            winner.public_key(),
+            "it holds the winner's key"
+        );
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -238,7 +239,11 @@ mod tests {
         });
         let (published, _) = WireGuardKeypair::load_or_generate(&path).unwrap();
         for (key, _) in &outcomes {
-            assert_eq!(*key, published.public_key(), "every generator holds the published key");
+            assert_eq!(
+                *key,
+                published.public_key(),
+                "every generator holds the published key"
+            );
         }
         let generated = outcomes.iter().filter(|(_, generated)| *generated).count();
         assert_eq!(generated, 1, "exactly one generator published");

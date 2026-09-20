@@ -196,14 +196,9 @@ pub(super) async fn fetch_and_hydrate_genesis<
             "genesis absent from the workspace; fetching it from the mesh"
         );
     }
-    crate::blob_fetch::fetch_blob(
-        client,
-        blobs,
-        &hash,
-        crate::constants::BLOB_FETCH_ATTEMPTS,
-    )
-    .await
-    .map_err(|e| format!("fetch genesis {}: {e}", hex_bytes(&hash)))?;
+    crate::blob_fetch::fetch_blob(client, blobs, &hash, crate::constants::BLOB_FETCH_ATTEMPTS)
+        .await
+        .map_err(|e| format!("fetch genesis {}: {e}", hex_bytes(&hash)))?;
     // the fetch landed the genesis in the blob store under its pin, which is
     // exactly where a missing workspace file is rewritten from.
     match hydrate_from_disk(blobs, index, genesis)? {

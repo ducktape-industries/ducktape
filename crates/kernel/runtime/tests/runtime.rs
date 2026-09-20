@@ -1,22 +1,14 @@
 use std::collections::BTreeMap;
 
 use abi::{
-    Cause, CryptoOp, CryptoReply, Entry, Env, GuestCall, HostOp, HostReply, Message, Origin,
-    Refusal, Scan, reason,
+    Cause, CryptoOp, CryptoReply, Entry, Env, GuestCall, HostOp, HostReply, ItemRef, Message,
+    Origin, Refusal, Scan, reason,
 };
-use borsh::{BorshDeserialize, BorshSerialize};
+use fixture_probe::Step;
 use runtime::{Fault, Host, Limits, Runtime};
 use sha2::{Digest as _, Sha256};
 
-const PROBE: &[u8] = include_bytes!("fixtures/probe.wasm");
-
-#[derive(BorshSerialize, BorshDeserialize)]
-enum Step {
-    Op(HostOp),
-    Spin,
-    Grow(u32),
-    Fail(String),
-}
+const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 #[derive(Default)]
 struct Bench {
@@ -64,7 +56,11 @@ impl Host for Bench {
             HostOp::Crypto(CryptoOp::Sha256(bytes)) => {
                 HostReply::Crypto(CryptoReply::Digest(Sha256::digest(bytes).into()))
             }
-            HostOp::Emit(_) | HostOp::Event(_) | HostOp::Output(_) => HostReply::Done,
+            HostOp::Emit(_) => HostReply::Item(ItemRef {
+                source: "probe".into(),
+                item: 1,
+            }),
+            HostOp::Event(_) | HostOp::Output(_) => HostReply::Done,
             other => HostReply::Refused(Refusal::new(
                 reason::UNSUPPORTED,
                 format!("the bench does not serve {other:?}"),
@@ -155,7 +151,10 @@ async fn every_host_op_crosses_the_boundary_and_back() {
             }]),
             HostReply::Query(Ok(vec![3, 2, 1])),
             HostReply::Query(Err(Refusal::new(reason::UNKNOWN_PROGRAM, "nobody"))),
-            HostReply::Done,
+            HostReply::Item(ItemRef {
+                source: "probe".into(),
+                item: 1,
+            }),
             HostReply::Done,
             HostReply::Crypto(CryptoReply::Digest(Sha256::digest(b"abc").into())),
             HostReply::Refused(Refusal::new(
@@ -274,13 +273,4 @@ async fn bytes_that_are_not_a_program_do_not_load() {
         .run(&code, GuestCall::Execute(vec![]), &mut bench)
         .await;
     assert!(matches!(verdict, Err(Fault::Load(_))), "{verdict:?}");
-}
-
-#[tokio::test]
-async fn the_same_bytes_hash_the_same() {
-    let runtime = Runtime::new(Limits::default());
-    let one = runtime.load(PROBE).unwrap();
-    let two = runtime.load(PROBE).unwrap();
-    assert_eq!(one.hash(), two.hash());
-    assert_eq!(one.hash(), <[u8; 32]>::from(Sha256::digest(PROBE)));
 }

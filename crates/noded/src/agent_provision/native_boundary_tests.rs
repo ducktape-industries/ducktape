@@ -81,7 +81,9 @@ async fn read_conversation(host: &Host, id: &str) -> ConversationView {
         )
         .await
         .unwrap();
-    let crate::runs::RunsReply::Conversation(Some(view)) = crate::runs::decode_reply(&reply).unwrap() else {
+    let crate::runs::RunsReply::Conversation(Some(view)) =
+        crate::runs::decode_reply(&reply).unwrap()
+    else {
         panic!("the real committed conversation must exist");
     };
     view

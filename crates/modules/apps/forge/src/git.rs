@@ -881,7 +881,9 @@ pub fn bounded_diff(
         Some(tree) => compare_trees(repo, tree, source_tree_oid, "", 0, &mut preflight)?,
     }
     let chosen = affordable(&preflight.leaves, max_blob_bytes);
-    let target_tree = target_tree_oid.map(|tree| repo.find_tree(tree)).transpose()?;
+    let target_tree = target_tree_oid
+        .map(|tree| repo.find_tree(tree))
+        .transpose()?;
     let source_tree = repo.find_tree(source_tree_oid)?;
     let mut opts = DiffOptions::new();
     opts.context_lines(3)
@@ -1016,15 +1018,16 @@ pub fn bounded_file_diff(
             }],
         });
     }
-    let target_tree = target_tree_oid.map(|tree| repo.find_tree(tree)).transpose()?;
+    let target_tree = target_tree_oid
+        .map(|tree| repo.find_tree(tree))
+        .transpose()?;
     let source_tree = repo.find_tree(source_tree_oid)?;
     let mut opts = DiffOptions::new();
     opts.context_lines(3)
         .interhunk_lines(0)
         .disable_pathspec_match(true)
         .pathspec(path);
-    let diff =
-        repo.diff_tree_to_tree(target_tree.as_ref(), Some(&source_tree), Some(&mut opts))?;
+    let diff = repo.diff_tree_to_tree(target_tree.as_ref(), Some(&source_tree), Some(&mut opts))?;
     // NOT `find_similar`: a one-path scope cannot see a rename's other half,
     // so asking would only ever produce the add/delete it already has.
     assemble(&diff, &preflight.leaves, max_bytes)

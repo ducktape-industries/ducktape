@@ -1,10 +1,10 @@
 //! The shipping initializer on the real Host queue: no timer or boot hook.
 #[path = "../src/chief_cli/plan.rs"]
 mod plan;
-#[path = "../src/wire.rs"]
-mod wire;
 #[path = "chief_support/mod.rs"]
 mod support;
+#[path = "../src/wire.rs"]
+mod wire;
 
 use futures::executor::block_on;
 use support::{Network, member, msg};

@@ -25,11 +25,11 @@ mod common;
 
 use std::time::Duration;
 
-use common::wire::{chat, tasks};
-use common::wire::chat::{Party, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy};
 use common::Cluster;
-use governance::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
+use common::wire::chat::{Block, ChatMsg, ChatQuery, ChatReply, Party, PostPolicy};
 use common::wire::tasks::{TaskMsg, TaskQuery, TaskReply};
+use common::wire::{chat, tasks};
+use governance::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.
@@ -411,10 +411,10 @@ fn cluster_lifecycle() {
         "the applied block was recorded: ducktape_blocks_total={blocks_total}"
     );
     assert!(
-        exposition
-            .lines()
-            .any(|l| l.starts_with("ducktape_block_apply_latency_seconds_count")
-                && l.split_whitespace().last() != Some("0")),
+        exposition.lines().any(
+            |l| l.starts_with("ducktape_block_apply_latency_seconds_count")
+                && l.split_whitespace().last() != Some("0")
+        ),
         "the apply-latency histogram observed the block:\n{exposition}"
     );
     assert!(
@@ -463,7 +463,10 @@ fn cluster_lifecycle() {
         "explorer record carries the op's content address: {submitted}"
     );
     let (code, blob) = cluster.http(0, "GET", &format!("/v1/files/blob/{op_hash}"), None);
-    assert_eq!(code, 200, "op hash must dereference on the blob lane: {blob}");
+    assert_eq!(
+        code, 200,
+        "op hash must dereference on the blob lane: {blob}"
+    );
     assert_eq!(
         blob,
         serde_json::json!({ "task": { "create_task": { "task_id": "via-app-surface", "title": "held" } } }),
@@ -528,16 +531,18 @@ fn cluster_lifecycle() {
     let (code, peer_sample) = cluster.http(0, "GET", "/v1/peers", None);
     assert_eq!(code, 200, "peer sample failed: {peer_sample}");
     assert!(
-        peer_sample["sampled_at_ms"].as_u64().is_some_and(|ms| ms > 0),
+        peer_sample["sampled_at_ms"]
+            .as_u64()
+            .is_some_and(|ms| ms > 0),
         "peer sample carries its timestamp: {peer_sample}"
     );
     let listed = peer_sample["peers"]
         .as_array()
         .unwrap_or_else(|| panic!("peer sample carries a peers array: {peer_sample}"));
     assert!(
-        listed.iter().all(|peer| peer["peer"]
-            .as_str()
-            .is_some_and(|key| key.len() == 64)),
+        listed
+            .iter()
+            .all(|peer| peer["peer"].as_str().is_some_and(|key| key.len() == 64)),
         "every peer keys on full mesh-key hex: {peer_sample}"
     );
     assert!(
@@ -647,7 +652,11 @@ fn reachability_plane_converges_mesh_on_boot() {
     cluster.spawn(1);
     for i in 0..2 {
         cluster.wait_marker(i, "mesh verified", Duration::from_secs(60));
-        cluster.wait_marker(i, "tunnels applied (config accepted", Duration::from_secs(60));
+        cluster.wait_marker(
+            i,
+            "tunnels applied (config accepted",
+            Duration::from_secs(60),
+        );
     }
 }
 

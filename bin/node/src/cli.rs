@@ -361,7 +361,8 @@ fn systemd_claim(target: &LifecycleWorkspace, user: bool) -> Option<SupervisorCl
         .lines()
         .find_map(|line| line.strip_prefix("ExecStart="))?;
     let args = systemd_exec_args(exec)?;
-    (loaded && supervisor_args_match(&args, target)).then_some(SupervisorClaim::Systemd { user, unit })
+    (loaded && supervisor_args_match(&args, target))
+        .then_some(SupervisorClaim::Systemd { user, unit })
 }
 
 /// The chain-id grammar only permits characters that systemd leaves literal
@@ -3148,7 +3149,10 @@ mod tests {
         let (reason, detail) =
             super::netstack_failure_in_section(&down).expect("the section names its failure");
         let refusal = super::mesh_down_refusal(&reason, &detail);
-        assert!(refusal.contains("reason=netstack_guest_unreadable"), "{refusal}");
+        assert!(
+            refusal.contains("reason=netstack_guest_unreadable"),
+            "{refusal}"
+        );
         assert!(refusal.contains("never be redeemed"), "{refusal}");
 
         // a running plane names no failure, and nothing is refused.
@@ -3716,7 +3720,10 @@ mod tests {
         let refusal = precheck_promotion(hex, &stranger, &members, &residents)
             .expect_err("a key in neither tier has nothing to be promoted out of");
         assert!(refusal.starts_with("not_a_resident: "), "{refusal}");
-        assert!(refusal.contains(hex), "the refusal names the key: {refusal}");
+        assert!(
+            refusal.contains(hex),
+            "the refusal names the key: {refusal}"
+        );
         assert!(
             refusal.contains("ducktape node resident accept"),
             "and the command that fixes it: {refusal}"

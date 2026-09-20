@@ -721,11 +721,16 @@ mod tests {
             .find(|spec| spec.tag == "pi")
             .unwrap();
         let provider = CliProvider::from_spec(spec, "/nonexistent/pi".into(), SandboxBackend::Bare);
-        let result = provider.spawn_interactive_session(&RunContext::default(), true).await;
+        let result = provider
+            .spawn_interactive_session(&RunContext::default(), true)
+            .await;
         let Err(error) = result else {
             panic!("Pi must not advertise a shared read-only session");
         };
-        assert!(error.contains("shared/command-lane session unsupported"), "{error}");
+        assert!(
+            error.contains("shared/command-lane session unsupported"),
+            "{error}"
+        );
     }
 
     // ---- where the live coverage lives --------------------------------------

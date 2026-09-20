@@ -123,8 +123,8 @@ fn spawn_session_actor(
                 } => {
                     let result = if target == "runs" {
                         match crate::runs::decode_query(&req).unwrap() {
-                            crate::runs::RunsQuery::AgentSessions => {
-                                Ok(crate::runs::encode_reply(&crate::runs::RunsReply::AgentSessions(vec![
+                            crate::runs::RunsQuery::AgentSessions => Ok(crate::runs::encode_reply(
+                                &crate::runs::RunsReply::AgentSessions(vec![
                                     crate::runs::AgentSession {
                                         run_id: consensus_run_id(),
                                         agent_id: "quackbot".into(),
@@ -136,8 +136,8 @@ fn spawn_session_actor(
                                         opened_at: 0,
                                         actions: 0,
                                     },
-                                ])))
-                            }
+                                ]),
+                            )),
                             crate::runs::RunsQuery::ActionRequest { request_id } => {
                                 assert_eq!(
                                     seen_actions.lock().unwrap().len(),
@@ -227,10 +227,7 @@ pub(super) fn files_reply(
             }))
         }
         // the verbatim module contract string the engine's taxonomy keys on.
-        FilesQuery::Read { .. } => Err(crate::Refused::new(
-            "module",
-            "chunk not available",
-        )),
+        FilesQuery::Read { .. } => Err(crate::Refused::new("module", "chunk not available")),
         other => panic!("the checkout asked for {other:?}"),
     }
 }
@@ -325,8 +322,12 @@ async fn a_run_gets_the_node_base_its_agent_id_and_the_tool_bin_dir_on_path() {
     let tmp = tempfile::tempdir().unwrap();
     let (handle, rx, _hub) = NodeHandle::channel();
     let _actor = spawn_files_actor(rx, skill_tree(), false);
-    let prov = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path(), tmp.path().join("session-keys"))
-        .with_node_url(Some("http://127.0.0.1:8844".into()));
+    let prov = NodedProvisioner::new(
+        crate::agent_provision::test_link(handle).await,
+        tmp.path(),
+        tmp.path().join("session-keys"),
+    )
+    .with_node_url(Some("http://127.0.0.1:8844".into()));
 
     let ws = prov
         .provision(&duckfs_spec(Some("quackbot"), vec![skill_mount()]))
@@ -375,10 +376,14 @@ async fn a_duckfs_run_offers_no_pushable_repo_to_the_push_gate() {
     let tmp = tempfile::tempdir().unwrap();
     let (handle, rx, _hub) = NodeHandle::channel();
     let _actor = spawn_files_actor(rx, skill_tree(), false);
-    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path(), tmp.path().join("session-keys"))
-        .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
-        .await
-        .expect("provision");
+    let ws = NodedProvisioner::new(
+        crate::agent_provision::test_link(handle).await,
+        tmp.path(),
+        tmp.path().join("session-keys"),
+    )
+    .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
+    .await
+    .expect("provision");
 
     assert_eq!(ws.forge_repo(), None);
     assert!(ws.operator_credential().is_some());
@@ -391,10 +396,14 @@ async fn an_unreachable_node_or_an_anonymous_run_omits_the_var_rather_than_guess
     let (handle, rx, _hub) = NodeHandle::channel();
     let _actor = spawn_files_actor(rx, skill_tree(), false);
     // no with_node_url (a node serving no http surface) and no agent_id.
-    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path(), tmp.path().join("session-keys"))
-        .provision(&duckfs_spec(None, Vec::new()))
-        .await
-        .expect("provision");
+    let ws = NodedProvisioner::new(
+        crate::agent_provision::test_link(handle).await,
+        tmp.path(),
+        tmp.path().join("session-keys"),
+    )
+    .provision(&duckfs_spec(None, Vec::new()))
+    .await
+    .expect("provision");
 
     let env = ws.env();
     assert!(
@@ -419,10 +428,14 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
     let (handle, rx, _hub) = NodeHandle::channel();
     let (_actor, binds, actions) = spawn_session_actor(rx, Ok(()));
 
-    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path(), tmp.path().join("session-keys"))
-        .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
-        .await
-        .expect("provision");
+    let ws = NodedProvisioner::new(
+        crate::agent_provision::test_link(handle).await,
+        tmp.path(),
+        tmp.path().join("session-keys"),
+    )
+    .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
+    .await
+    .expect("provision");
     let env = ws.env();
 
     assert!(
@@ -578,10 +591,14 @@ async fn a_run_with_no_agent_opens_no_session_and_submits_no_bind() {
     let (handle, rx, _hub) = NodeHandle::channel();
     let (_actor, binds, _actions) = spawn_session_actor(rx, Ok(()));
 
-    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path(), tmp.path().join("session-keys"))
-        .provision(&duckfs_spec(None, Vec::new()))
-        .await
-        .expect("provision");
+    let ws = NodedProvisioner::new(
+        crate::agent_provision::test_link(handle).await,
+        tmp.path(),
+        tmp.path().join("session-keys"),
+    )
+    .provision(&duckfs_spec(None, Vec::new()))
+    .await
+    .expect("provision");
 
     let env = ws.env();
     assert!(!env.contains_key("DUCKTAPE_RUN_AGENT"));
@@ -601,9 +618,13 @@ async fn a_refused_bind_fails_provision_and_removes_the_workspace() {
     let (handle, rx, _hub) = NodeHandle::channel();
     let (_actor, binds, _actions) = spawn_session_actor(rx, Err("runs: not the run's assignee"));
     let keys = tempfile::tempdir().unwrap();
-    let result = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path(), keys.path())
-        .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
-        .await;
+    let result = NodedProvisioner::new(
+        crate::agent_provision::test_link(handle).await,
+        tmp.path(),
+        keys.path(),
+    )
+    .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
+    .await;
     let Err(error) = result else {
         panic!("the model must not start with a refused session");
     };
@@ -633,9 +654,7 @@ fn spawn_seat_actor(
         let mut seat: Option<Vec<u8>> = None;
         while let Some(cmd) = rx.next().await {
             match cmd {
-                NodeCommand::Submit {
-                    payload, reply, ..
-                } => {
+                NodeCommand::Submit { payload, reply, .. } => {
                     let bind = crate::runs::decode_msg(&payload).expect("a runs op");
                     let crate::runs::RunsMsg::OpenAgentSession { session_key, .. } = &bind else {
                         panic!("the only op a provision submits is the bind");
@@ -775,8 +794,8 @@ fn spawn_receipt_actor(
                 } => {
                     assert_eq!(target, "runs");
                     let response = match crate::runs::decode_query(&req).unwrap() {
-                        crate::runs::RunsQuery::AgentSessions => {
-                            Ok(crate::runs::encode_reply(&crate::runs::RunsReply::AgentSessions(vec![
+                        crate::runs::RunsQuery::AgentSessions => Ok(crate::runs::encode_reply(
+                            &crate::runs::RunsReply::AgentSessions(vec![
                                 crate::runs::AgentSession {
                                     run_id: consensus_run_id(),
                                     agent_id: "quackbot".into(),
@@ -788,8 +807,8 @@ fn spawn_receipt_actor(
                                     opened_at: 0,
                                     actions: 0,
                                 },
-                            ])))
-                        }
+                            ]),
+                        )),
                         crate::runs::RunsQuery::ActionRequest { request_id } => {
                             let _ = observed.send(());
                             Ok(super::session::encode_action_reply(
@@ -846,7 +865,10 @@ async fn tool_http_waits_for_the_actual_committed_outcome_and_surfaces_target_fa
         let link = test_link(handle).await;
         let workdir = tempfile::tempdir().unwrap();
         let session = super::session::open(
-            &link, &duckfs_spec(Some("quackbot"), Vec::new()), workdir.path(), workdir.path(),
+            &link,
+            &duckfs_spec(Some("quackbot"), Vec::new()),
+            workdir.path(),
+            workdir.path(),
         )
         .await
         .unwrap()
@@ -929,7 +951,10 @@ async fn disconnecting_the_registered_receipt_stream_fails_the_pending_tool_requ
     let link =
         NodeLink::new(format!("http://{address}")).with_workspace_credential(directory.path());
     let session = super::session::open(
-        &link, &duckfs_spec(Some("quackbot"), Vec::new()), directory.path(), directory.path(),
+        &link,
+        &duckfs_spec(Some("quackbot"), Vec::new()),
+        directory.path(),
+        directory.path(),
     )
     .await
     .unwrap()

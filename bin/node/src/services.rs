@@ -1370,12 +1370,8 @@ pub(crate) fn commit_enable(
         // announcing a set decided before that pause would retract it. Cannot be
         // refused at this point: `plan_enable` bounded the widest set these grants
         // can produce, and this is a subset of it.
-        crate::announce::announced_set(
-            &services.grants,
-            &signaling_now(base),
-            &plan.capacity,
-        )
-        .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))
+        crate::announce::announced_set(&services.grants, &signaling_now(base), &plan.capacity)
+            .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))
     })?;
     let height = crate::announce::submit(base, workspace, &announce).map_err(|error| {
         format!(
@@ -2309,7 +2305,12 @@ mod tests {
                     .starts_with("GET /v1/services ")
             );
             let body = serde_json::json!({"signaling": [hello_offering("compute", &["claude"])], "build": "test"}).to_string();
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
         });
         assert!(!dir.path().join("node.toml").exists());
         let plan = plan_enable(dir.path(), "compute", &service, [1; 32]).unwrap();
@@ -3645,7 +3646,10 @@ mod tests {
         )))
         .to_string();
         for (printed_grants, expected) in [
-            (true, "the grants above are what this workspace holds on disk"),
+            (
+                true,
+                "the grants above are what this workspace holds on disk",
+            ),
             (false, "this workspace holds no grants on disk"),
         ] {
             let said = unread_refusal(&reason, printed_grants);

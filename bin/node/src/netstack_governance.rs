@@ -556,7 +556,11 @@ mod tests {
         let next = [8; 32];
         const REDESIGNATION: u64 = 40;
         let mut replaced = entry(Some(next), &[]);
-        replaced.pending.as_mut().expect("pending").activation_height = REDESIGNATION;
+        replaced
+            .pending
+            .as_mut()
+            .expect("pending")
+            .activation_height = REDESIGNATION;
         let roster = vec![replaced];
         assert_eq!(
             step(&roster, REDESIGNATION - 1, Some(&spent)),

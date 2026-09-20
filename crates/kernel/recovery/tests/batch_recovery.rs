@@ -64,9 +64,8 @@ fn a_multi_member_batch_seals_as_one_block_and_replays_byte_identically() {
         let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
 
         let pos = node.sink_mut().oplog_pos().await;
-        let manifest =
-            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
-                .expect("capture");
+        let manifest = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
+            .expect("capture");
         assert_eq!(manifest.root_hash, genesis_hash);
         node.sink_mut()
             .write_manifest(&manifest)
@@ -239,9 +238,8 @@ fn an_unsealed_multi_member_batch_rolls_forward_to_the_sealed_roots() {
         let host = fresh_host();
         let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
         let pos = node.sink_mut().oplog_pos().await;
-        let manifest =
-            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
-                .expect("capture");
+        let manifest = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
+            .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest)
             .await
@@ -271,10 +269,7 @@ fn an_unsealed_multi_member_batch_rolls_forward_to_the_sealed_roots() {
         let mut recovery = Recovery::open(context.child("torn"))
             .await
             .expect("reopen recovery");
-        let manifest = recovery
-            .manifest()
-            .expect("decodes")
-            .expect("present");
+        let manifest = recovery.manifest().expect("decodes").expect("present");
         let mut host = fresh_host();
         let recovered = recovery
             .recover(&mut host, &manifest)

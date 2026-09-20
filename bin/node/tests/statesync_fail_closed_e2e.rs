@@ -25,7 +25,9 @@ mod common;
 use std::time::Duration;
 
 use common::Cluster;
-use common::wire::tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
+use common::wire::tasks::{
+    TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query,
+};
 
 #[test]
 fn a_non_standing_peer_is_refused_statesync() {

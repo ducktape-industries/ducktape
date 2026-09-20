@@ -756,5 +756,4 @@ mod tests {
         );
         assert!(now.capabilities.len() < bound.capabilities.len());
     }
-
 }

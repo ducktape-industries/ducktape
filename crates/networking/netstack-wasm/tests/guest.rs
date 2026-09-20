@@ -106,7 +106,8 @@ fn a_snapshot_crosses_the_boundary_both_ways() {
     let taken = native.snapshot().unwrap();
 
     let mut guest =
-        NetstackGuest::restore(COMPONENT, Box::new(signer.clone()), config.clone(), &taken).unwrap();
+        NetstackGuest::restore(COMPONENT, Box::new(signer.clone()), config.clone(), &taken)
+            .unwrap();
     assert_eq!(guest.snapshot().unwrap(), taken);
 
     let from_native = native.step(Event::Nudge, 3_000).unwrap();

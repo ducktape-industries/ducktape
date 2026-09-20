@@ -167,7 +167,8 @@ impl Net {
     /// Everything the launcher and its node have printed, for a failure that
     /// is not one of the log waits.
     fn launcher_tail(&self) -> String {
-        let text = std::fs::read_to_string(self.dir.path().join("launcher.log")).unwrap_or_default();
+        let text =
+            std::fs::read_to_string(self.dir.path().join("launcher.log")).unwrap_or_default();
         let lines: Vec<&str> = text.lines().collect();
         lines[lines.len().saturating_sub(80)..].join("\n")
     }
@@ -271,7 +272,10 @@ fn start(first_release: &str) -> (Net, Sha) {
         .args(["--release-key", &net.release_pubkey])
         .output()
         .expect("launcher install");
-    assert!(installed.status.success(), "launcher install: {installed:?}");
+    assert!(
+        installed.status.success(),
+        "launcher install: {installed:?}"
+    );
     let first = net.running();
 
     // THE SERVICE HALF STARTS FIRST, on purpose: `ducktape service run` exits
@@ -298,7 +302,8 @@ fn start(first_release: &str) -> (Net, Sha) {
     net.log().expect_line(&["mesh identity published"], BUDGET);
     // and only now does the daemon run, on the release the install seeded.
     net.daemon().expect_line(&["daemon on release v1"], BUDGET);
-    net.daemon().expect_line(&["airlock", "signaling to"], BUDGET);
+    net.daemon()
+        .expect_line(&["airlock", "signaling to"], BUDGET);
     (net, first)
 }
 
@@ -665,17 +670,17 @@ fn a_node_publishes_stages_qualifies_and_flips_its_successor_at_a_height() {
     net.log()
         .expect_line(&["node_update_healthy", &second_sha.to_string()], BUDGET);
     net.log().expect_line(
-        &[
-            "node_update_settled",
-            "phase=idle",
-            &second_sha.to_string(),
-        ],
+        &["node_update_settled", "phase=idle", &second_sha.to_string()],
         BUDGET,
     );
     match net.phase() {
         Phase::Idle(idle) => {
             assert_eq!(idle.current, second_sha);
-            assert_eq!(idle.previous, Some(first), "the old release is kept to roll back to");
+            assert_eq!(
+                idle.previous,
+                Some(first),
+                "the old release is kept to roll back to"
+            );
         }
         other => panic!("expected idle after the flip, got {other:?}"),
     }
@@ -909,11 +914,7 @@ fn a_release_is_taken_back_by_designating_the_previous_one_again() {
     net.log()
         .expect_line(&["node_update_healthy", &second_sha.to_string()], BUDGET);
     net.log().expect_line(
-        &[
-            "node_update_settled",
-            "phase=idle",
-            &second_sha.to_string(),
-        ],
+        &["node_update_settled", "phase=idle", &second_sha.to_string()],
         BUDGET,
     );
     net.daemon().expect_line(&["daemon on release v2"], BUDGET);
@@ -960,7 +961,8 @@ fn a_release_is_taken_back_by_designating_the_previous_one_again() {
         ],
         BUDGET,
     );
-    net.log().expect_line_nth(&["node_update_flipped"], 2, BUDGET);
+    net.log()
+        .expect_line_nth(&["node_update_flipped"], 2, BUDGET);
     assert_eq!(net.running(), first, "the install path names v1 again");
     net.log()
         .expect_line(&["node_update_healthy", &first.to_string()], BUDGET);
@@ -986,7 +988,8 @@ fn a_release_is_taken_back_by_designating_the_previous_one_again() {
         1,
         "v2 was downloaded once, and v1 never: it was staged from disk"
     );
-    net.daemon().expect_line_nth(&["daemon on release v1"], 2, BUDGET);
+    net.daemon()
+        .expect_line_nth(&["daemon on release v1"], 2, BUDGET);
 
     net.service
         .as_mut()

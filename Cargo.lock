@@ -2845,6 +2845,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
+name = "fixture-modules"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "guest",
+]
+
+[[package]]
+name = "fixture-probe"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "guest",
+]
+
+[[package]]
+name = "fixture-relay"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "guest",
+]
+
+[[package]]
+name = "fixture-valset"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "guest",
+]
+
+[[package]]
 name = "flagset"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3293,17 +3327,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "greeter"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-modules?branch=dev#8d8b7a2922b2cd255136dcb16fb4fd45ac205f71"
-dependencies = [
- "async-trait",
- "directory",
- "kv-wire",
- "sdk",
-]
-
-[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3520,50 +3543,26 @@ dependencies = [
 name = "host"
 version = "0.1.0"
 dependencies = [
- "acl",
- "acl-wire",
+ "abi",
  "async-trait",
- "attribution",
- "base64 0.22.1",
- "blobstore",
+ "blobs",
  "borsh",
- "capability",
+ "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
- "directory",
- "dispatch",
- "duckdns",
- "files",
- "files-odb",
- "forge",
- "forge-odb",
- "futures",
- "gateway",
- "governance",
- "greeter",
- "identity",
- "index-guest",
- "keyscheme",
- "kv",
- "module-artifact",
- "modules",
+ "commonware-storage",
+ "ed25519-dalek",
+ "fixture-modules",
+ "fixture-probe",
+ "fixture-relay",
+ "fixture-valset",
+ "k256",
  "p256 0.13.2",
- "proc-macro2",
- "quote",
- "saga",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
+ "runtime",
  "sha2 0.10.9",
- "source-lint",
- "statesync",
- "syn 2.0.119",
+ "state",
  "tempfile",
- "tracing",
- "tracing-subscriber",
- "valset",
- "wasm-host",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -6152,6 +6151,8 @@ dependencies = [
  "abi",
  "async-trait",
  "borsh",
+ "fixture-probe",
+ "futures",
  "sha2 0.10.9",
  "tokio",
  "wasmtime",

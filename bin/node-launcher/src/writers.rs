@@ -62,9 +62,9 @@ impl Drop for Claim {
 /// purpose, and none of them writes.
 pub fn claim(path: &Path) -> Result<Claim, Refusal> {
     refuse_symlink(path)?;
-    let parent = path.parent().ok_or_else(|| {
-        Refusal::new("claim_failed", format!("{} has no parent", path.display()))
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| Refusal::new("claim_failed", format!("{} has no parent", path.display())))?;
     fs::create_dir_all(parent).map_err(|error| Refusal::io("claim_failed", parent, &error))?;
     let file = fs::OpenOptions::new()
         .create(true)
@@ -128,7 +128,8 @@ pub fn persist(path: &Path, text: &str) -> Result<(), Refusal> {
 /// `link -> target`, atomically: a symlink at a temp name, renamed over.
 pub fn replace_symlink(link: &Path, target: &Path) -> Result<(), Refusal> {
     if let Some(parent) = link.parent() {
-        fs::create_dir_all(parent).map_err(|error| Refusal::io("symlink_failed", parent, &error))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| Refusal::io("symlink_failed", parent, &error))?;
     }
     let tmp = tmp_name(link);
     let _ = fs::remove_file(&tmp);
@@ -290,8 +291,8 @@ fn clear_dir(dir: &Path) -> Result<(), Refusal> {
 /// a `..`, a symlink, a hard link, a device — is refused by name rather than
 /// unpacked and hoped about.
 fn extract(archive: &Path, release_dir: &Path) -> Result<(), Refusal> {
-    let file =
-        fs::File::open(archive).map_err(|error| Refusal::io("archive_unreadable", archive, &error))?;
+    let file = fs::File::open(archive)
+        .map_err(|error| Refusal::io("archive_unreadable", archive, &error))?;
     let decoder = zstd::Decoder::new(file)
         .map_err(|error| Refusal::io("archive_unreadable", archive, &error))?;
     let mut tar = tar::Archive::new(decoder);
@@ -394,9 +395,7 @@ pub fn collect(layout: &Layout, keep: &[Sha]) {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let is_kept_release = kept.contains(&name);
-        let is_kept_partial = kept
-            .iter()
-            .any(|sha| name == format!("{sha}.partial"));
+        let is_kept_partial = kept.iter().any(|sha| name == format!("{sha}.partial"));
         if is_kept_release || is_kept_partial {
             continue;
         }

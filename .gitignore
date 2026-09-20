@@ -33,6 +33,6 @@ HANDOFF.md
 # wrangler local state (ops/auth-page)
 .wrangler/
 
-# The runtime probe fixture is its own workspace (wasm32 only); its build
-# output lands beside it.
-/crates/kernel/runtime/tests/probe/target/
+# The kernel fixture programs are their own workspace (wasm32 only); its
+# build output lands beside it.
+/crates/kernel/fixtures/target/

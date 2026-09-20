@@ -28,7 +28,8 @@ async fn current_worker(
     let worker = controls::worker_controls(state)
         .await?
         .ok_or_else(|| "native worker job is unavailable".to_string())?;
-    let current = worker.job_id == job_id && worker.job_status == crate::tasks::JobStatus::Processing;
+    let current =
+        worker.job_id == job_id && worker.job_status == crate::tasks::JobStatus::Processing;
     if !current {
         return Err("native worker job is no longer processing".into());
     }

@@ -197,7 +197,11 @@ fn synced_store_reconstructs_source_root_nodes_and_classes() {
         let CapabilityReply::Providers(capable) = &synced_replies[1] else {
             panic!("expected the capable-providers reply");
         };
-        assert_eq!(capable, &vec![live.clone()], "resources synced with the record");
+        assert_eq!(
+            capable,
+            &vec![live.clone()],
+            "resources synced with the record"
+        );
         let CapabilityReply::Classes(classes) = &synced_replies[6] else {
             panic!("expected the classes reply");
         };

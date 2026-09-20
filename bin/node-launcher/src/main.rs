@@ -112,10 +112,16 @@ const STAGED_MODULES_DIR: &str = env!("DUCKTAPE_STAGED_SET");
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
     /// Supervise the node and own the release plane.
-    Run { layout: Layout, args: Vec<OsString> },
+    Run {
+        layout: Layout,
+        args: Vec<OsString>,
+    },
     /// Supervise a service daemon: wait for the node's identity, follow the
     /// install path.
-    Service { layout: Layout, args: Vec<OsString> },
+    Service {
+        layout: Layout,
+        args: Vec<OsString>,
+    },
     /// Seed the first release from a built binary.
     Install {
         layout: Layout,
@@ -236,10 +242,7 @@ fn parse_flags(args: impl Iterator<Item = OsString>) -> Result<Flags, String> {
     let mut args = args.peekable();
     while let Some(argument) = args.next() {
         let name = argument.to_string_lossy().into_owned();
-        let mut value = || {
-            args.next()
-                .ok_or_else(|| format!("{name} needs a value"))
-        };
+        let mut value = || args.next().ok_or_else(|| format!("{name} needs a value"));
         match name.as_str() {
             "--" => {
                 flags.rest = args.collect();
@@ -248,9 +251,7 @@ fn parse_flags(args: impl Iterator<Item = OsString>) -> Result<Flags, String> {
             "--workspace" => flags.workspace = Some(PathBuf::from(value()?)),
             "--config" => flags.config = Some(PathBuf::from(value()?)),
             "--from" => flags.from = Some(PathBuf::from(value()?)),
-            "--release-key" => {
-                flags.release_key = Some(value()?.to_string_lossy().into_owned())
-            }
+            "--release-key" => flags.release_key = Some(value()?.to_string_lossy().into_owned()),
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -751,7 +752,10 @@ fn pin_release_key(layout: &Layout, key: PublicKey) -> Result<TrustedKeys, Refus
     update::trusted_keys(layout)?.ok_or_else(|| {
         Refusal::new(
             "release_key_unreadable",
-            format!("{} vanished after it was written", layout.release_key_path().display()),
+            format!(
+                "{} vanished after it was written",
+                layout.release_key_path().display()
+            ),
         )
     })
 }
@@ -978,9 +982,7 @@ fn follow_install_path(layout: &Layout, mut child: Child, running: Option<&std::
             );
             return;
         }
-        let current = writers::read_link(&layout.current_link())
-            .ok()
-            .flatten();
+        let current = writers::read_link(&layout.current_link()).ok().flatten();
         let flipped = current.as_deref() != running;
         if flipped {
             info!(
@@ -1111,7 +1113,10 @@ fn read_identity(path: &std::path::Path) -> Result<Option<ReleaseIdentity>, Refu
         Err(error) => return Err(Refusal::io("release_identity_unreadable", path, &error)),
     };
     ReleaseIdentity::decode(&text).map(Some).map_err(|error| {
-        Refusal::new("release_identity_invalid", format!("{}: {error}", path.display()))
+        Refusal::new(
+            "release_identity_invalid",
+            format!("{}: {error}", path.display()),
+        )
     })
 }
 
@@ -1413,7 +1418,12 @@ mod tests {
             }),
             ..Watch::default()
         };
-        answered(&mut watch, Next::Offer(designated), &idle("binary"), &Heard::UpToDate);
+        answered(
+            &mut watch,
+            Next::Offer(designated),
+            &idle("binary"),
+            &Heard::UpToDate,
+        );
         assert_eq!((watch.refused, watch.retry), (Some(designated), None));
 
         let status = ReleaseStatus {
@@ -1450,7 +1460,10 @@ mod tests {
         // another release starts its own count
         let other = Sha::digest(b"c");
         answered(&mut watch, Next::Offer(other), &idle("a"), &refused);
-        assert_eq!(watch.retry.map(|retry| (retry.release, retry.attempts)), Some((other, 1)));
+        assert_eq!(
+            watch.retry.map(|retry| (retry.release, retry.attempts)),
+            Some((other, 1))
+        );
         // and a transient run that turns definite is spent after all
         let forged = Heard::Refused(Refused::Manifest(app_update::Refusal::BadSignature));
         answered(&mut watch, Next::Offer(other), &idle("a"), &forged);
@@ -1459,7 +1472,11 @@ mod tests {
         let mut watch = Watch::default();
         answered(&mut watch, Next::Offer(target), &idle("a"), &refused);
         answered(&mut watch, Next::Offer(target), &idle("a"), &Heard::Nothing);
-        assert_eq!(watch, Watch::default(), "the read that landed ends the retry");
+        assert_eq!(
+            watch,
+            Watch::default(),
+            "the read that landed ends the retry"
+        );
     }
 
     fn committing(node: Option<PublicKey>) -> ReleaseStatus {
@@ -1497,7 +1514,10 @@ mod tests {
             .expect("the committed key is followed");
         assert_eq!(keys.pinned, key);
         assert_eq!(pin_on_disk(&layout), Some(format!("{key}\n")));
-        assert_eq!(watch.refused, None, "answers given without a key are spent no longer");
+        assert_eq!(
+            watch.refused, None,
+            "answers given without a key are spent no longer"
+        );
         assert_eq!(watch.key_refusals, 0);
     }
 
@@ -1519,7 +1539,11 @@ mod tests {
             assert_eq!(followed.map(|keys| keys.pinned), Some(ours));
             assert_eq!(watch.key_refusals, poll);
         }
-        assert_eq!(pin_on_disk(&layout), Some(format!("{ours}\n")), "the pin is unchanged");
+        assert_eq!(
+            pin_on_disk(&layout),
+            Some(format!("{ours}\n")),
+            "the pin is unchanged"
+        );
     }
 
     /// A workspace `node init` or `node join` wrote: a directory holding its
@@ -1622,11 +1646,14 @@ mod tests {
 
         let sha = seed(&layout, &binary, None).unwrap();
         let phase = writers::read_state(&layout.state_path()).unwrap().unwrap();
-        assert_eq!(phase, Phase::Idle(Idle {
-            current: sha,
-            previous: None,
-            pinned_sequence: 0,
-        }));
+        assert_eq!(
+            phase,
+            Phase::Idle(Idle {
+                current: sha,
+                previous: None,
+                pinned_sequence: 0,
+            })
+        );
         assert_eq!(
             writers::read_link(&layout.current_link()).unwrap(),
             Some(Layout::link_target(sha))
@@ -1820,14 +1847,19 @@ mod tests {
         };
         assert_eq!(
             offered_at(7),
-            (installed.clone(), vec![Command::Banner(UpdateBanner::UpToDate)]),
+            (
+                installed.clone(),
+                vec![Command::Banner(UpdateBanner::UpToDate)]
+            ),
             "the release it was installed from is not downloaded again"
         );
         assert_eq!(
             offered_at(6),
             (
                 installed.clone(),
-                vec![Command::Banner(UpdateBanner::Refused(Manifest::SequenceNotNewer))]
+                vec![Command::Banner(UpdateBanner::Refused(
+                    Manifest::SequenceNotNewer
+                ))]
             )
         );
         let (newer, commands) = offered_at(8);
@@ -1843,7 +1875,11 @@ mod tests {
         let key = PublicKey::from_bytes([0x11; 32]);
         seed(&layout, &layout.exe(), Some(key)).unwrap();
         let again = writers::read_state(&layout.state_path()).unwrap().unwrap();
-        assert_eq!(again.pinned_sequence(), 7, "installing over current keeps the sequence");
+        assert_eq!(
+            again.pinned_sequence(),
+            7,
+            "installing over current keeps the sequence"
+        );
     }
 
     /// A `release.json` that does not decode refuses the install by name
@@ -1878,7 +1914,10 @@ mod tests {
         let again = seed(&layout, &layout.exe(), Some(key)).unwrap();
 
         assert_eq!(again, sha, "the same bytes are the same release");
-        assert!(layout.exe().exists(), "the binary it was running is still there");
+        assert!(
+            layout.exe().exists(),
+            "the binary it was running is still there"
+        );
         assert_eq!(
             std::fs::read(layout.exe()).unwrap(),
             b"#!/bin/sh\nexit 0\n",

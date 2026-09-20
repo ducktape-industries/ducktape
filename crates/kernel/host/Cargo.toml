@@ -1,102 +1,28 @@
 [package]
 name = "host"
-edition.workspace = true
 version.workspace = true
+edition.workspace = true
 
-# the deterministic state-machine spine: a module registry, the dispatch +
-# local-only follow-up drain, and root-hash composition over the registered
-# modules (`global_root` — sha2 is its one hashing dep). depends on sdk (the
-# contract); it knows nothing of any concrete module beyond `dyn Module`.
 [dependencies]
-# module non-determinism is the most fork-relevant event the kernel can see.
-tracing = { workspace = true }
-sdk = { workspace = true }
-sha2 = { workspace = true }
+abi = { workspace = true }
 async-trait = { workspace = true }
-# WIRE-TYPES-ONLY dep: the drain's boundary code-swap realization reads the
-# modules registry's committed active/pending hashes and injects the shared
-# `Advance` tick. host uses only the crate-root wire types — it never
-# constructs or registers the module impl (same shape as governance reading
-# valset's wire types).
-modules = { path = "../../modules/system/modules" }
-# the drain's delivery injection reads the dispatch module's committed
-# mailbox count between blocks.
-dispatch = { path = "../../modules/system/dispatch" }
-# the drain's acl dispatch gate reads the acl module's policy table and
-# resolves the submitting origin's principal against the valset tiers and the
-# identity ownership indexes. system modules are CORE-RESIDENT: the kernel
-# links the module crate itself (its workspace name resolves to the wire).
-acl = { workspace = true }
-valset = { path = "../../modules/system/valset" }
-identity = { path = "../../modules/system/identity" }
-# the journal codec for a block's prepared internal work (`PreparedWork`),
-# the uniform record codec every module already persists with.
+blobs = { workspace = true }
 borsh = { workspace = true }
-
-[dev-dependencies]
-module-artifact = { workspace = true }
-# the fail-closed proof asserts the OPERATOR-facing line the boundary emits
-# before it errors: a capturing subscriber, not a log-shaped comment.
-tracing-subscriber = { version = "0.3" }
-# the host-side qmdb store handle injected into disk-backed modules.
-statesync = { workspace = true }
-# MemStore: the in-memory MerkleStore double behind store-backed NATIVE
-# siblings in harnesses without a commonware context (the gateway/governance
-# parity proofs' identity sibling).
-sdk-testkit = { workspace = true }
-# the live-code-update proof stands a real wasm module on the host and swaps its
-# component across a code-registry activation boundary (modules is a normal dep).
-wasm-host = { workspace = true }
-# the end-to-end test stands a real qmdb-backed module on the deterministic
-# runtime and drives it through the host.
-# the parity suites run the NATIVE modules against their guests, so the module
-# crates below are named by path: the workspace key resolves to a module's wire.
-kv = { path = "../../modules/system/kv" }
-# `acl` is a normal dep of the host (its wire), so the native module the gate
-# parity proof stands beside the guest enters under its own name.
-acl-module = { path = "../../modules/system/acl", package = "acl" }
-directory = { workspace = true }
-index_guest = { workspace = true }
-capability = { path = "../../modules/system/capability" }
-duckdns = { workspace = true }
-# the gateway/governance parity proofs stand the native modules (and their
-# native identity/valset/modules siblings) beside the wasm ports.
-gateway = { path = "../../modules/system/gateway" }
-governance = { path = "../../modules/system/governance" }
-greeter = { workspace = true }
-# the identity parity proof mints member proofs through keyscheme's testkit
-# (deterministic RFC-6979 P-256 signatures — no OS randomness inside a
-# consensus proof); p256 names the passkey signing-key type it hands around.
-keyscheme = { workspace = true, features = ["testkit"] }
-p256 = { workspace = true }
-base64 = { workspace = true }
-serde = { workspace = true }
-# the delivery drain-injection test stands the real dispatch + saga modules
-# next to a stub receiver.
-saga = { path = "../../modules/system/saga" }
-attribution = { path = "../../modules/system/attribution" }
-files = { path = "../../modules/apps/files" }
-# the wasm files tenant commits through its host-side odb substrate, which is a
-# service crate now — `files` itself names no kernel host.
-files-odb = { workspace = true }
-# the forge root-continuity proof stands the native module beside its wasm port
-# over the git substrate; `testkit` builds the real git history + packs the
-# push ops need.
-forge = { path = "../../modules/apps/forge", features = ["testkit"] }
-# and the wasm side of that proof stands on forge's substrate, a service crate
-# for the same reason files' is.
-forge-odb = { workspace = true }
-blobstore = { workspace = true }
-tempfile = "3"
+commonware-codec = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
-serde_json = "1"
-# the boundary-fault tests drive stub modules on a plain futures executor.
-futures = "0.3"
-# `module_state_classes.rs` parses the core hops' source: source-lint prunes the
-# `#[cfg(test)]` items, the token walk reads macro bodies syn leaves opaque, and
-# `span-locations` lets a hit name its line.
-source-lint = { workspace = true }
-syn = "2"
-quote = "1"
-proc-macro2 = { version = "1", features = ["span-locations"] }
+commonware-storage = { workspace = true }
+ed25519-dalek = { workspace = true }
+k256 = { workspace = true }
+p256 = { workspace = true }
+runtime = { workspace = true }
+sha2 = { workspace = true }
+state = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+fixture-modules = { path = "../fixtures/modules" }
+fixture-probe = { path = "../fixtures/probe" }
+fixture-relay = { path = "../fixtures/relay" }
+fixture-valset = { path = "../fixtures/valset" }
+tempfile = { workspace = true }

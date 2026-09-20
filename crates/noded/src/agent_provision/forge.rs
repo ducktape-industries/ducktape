@@ -31,12 +31,12 @@
 //! ONLY a genuine rebase conflict degrades the receipt (`commit_error` +
 //! `Status::Degraded` via the pool), never the reply (R4).
 
+use super::forge_publication::{ModulePublication, Publication};
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::sync::Arc;
-use super::forge_publication::{Publication, ModulePublication};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use compute_service::{
     ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec, assemble_context_doc,
@@ -367,12 +367,12 @@ pub(super) async fn provision(
     // op on a run that never starts.
     let session =
         match super::session::open(&node, spec, &workspace_args.run_dir, session_keys).await {
-        Ok(session) => session,
-        Err(error) => {
-            super::cleanup_dirs(workspace_args.run_dir.clone(), ro_dir.clone()).await;
-            return Err(error);
-        }
-    };
+            Ok(session) => session,
+            Err(error) => {
+                super::cleanup_dirs(workspace_args.run_dir.clone(), ro_dir.clone()).await;
+                return Err(error);
+            }
+        };
     let mut env = super::run_env(
         &workspace_args.run_dir,
         ro_dir.as_deref(),

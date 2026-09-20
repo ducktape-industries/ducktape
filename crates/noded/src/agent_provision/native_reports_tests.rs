@@ -23,9 +23,15 @@ async fn worker(root: &Path) -> (TestNode, RunSession) {
     *node.fixture.view.lock().await = native.configuration.clone();
     *node.fixture.worker.lock().await =
         Some(worker_controls_fixture("job-a", "steer-1", "focus here"));
-    let session = start_action_server(node.link.clone(), signer, RUN_ID.into(), Some(native), std::path::PathBuf::new())
-        .await
-        .unwrap();
+    let session = start_action_server(
+        node.link.clone(),
+        signer,
+        RUN_ID.into(),
+        Some(native),
+        std::path::PathBuf::new(),
+    )
+    .await
+    .unwrap();
     (node, session)
 }
 

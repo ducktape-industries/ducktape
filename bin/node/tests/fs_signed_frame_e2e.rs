@@ -136,11 +136,26 @@ fn signed_commit_lands_with_the_signer_as_author_and_home_authority() {
         )
         .unwrap(),
     );
-    assert_eq!(status, 200, "node-authored write: {}", String::from_utf8_lossy(&body));
-    let (_, body) = http(port, "POST", "/v1/query", "application/json", br#"{"target":"files","query":{"history":{"limit":8}}}"#);
+    assert_eq!(
+        status,
+        200,
+        "node-authored write: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let (_, body) = http(
+        port,
+        "POST",
+        "/v1/query",
+        "application/json",
+        br#"{"target":"files","query":{"history":{"limit":8}}}"#,
+    );
     let history: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let author: duckfs_core::Actor = serde_json::from_value(history["history"][0]["author"].clone()).unwrap();
-    assert_eq!(author, duckfs_core::Actor::Key(noded::DEFAULT_ORIGIN.as_bytes().to_vec()));
+    let author: duckfs_core::Actor =
+        serde_json::from_value(history["history"][0]["author"].clone()).unwrap();
+    assert_eq!(
+        author,
+        duckfs_core::Actor::Key(noded::DEFAULT_ORIGIN.as_bytes().to_vec())
+    );
 
     // and a tampered frame (payload swapped after signing) never executes.
     let mut tampered = node::encode_frame(

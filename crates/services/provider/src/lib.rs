@@ -247,7 +247,11 @@ fn mcp_argv(dialect: McpDialect, guest_node_url: &str) -> Vec<String> {
 /// marker) LAST. And never blindly after `argv[0]` either: a restricted claude
 /// TUI argv opens `--permission-mode plan`, and splitting a flag from its value
 /// is an argv the CLI rejects.
-fn with_mcp_argv(argv: &[String], dialect: Option<McpDialect>, guest_node_url: &str) -> Vec<String> {
+fn with_mcp_argv(
+    argv: &[String],
+    dialect: Option<McpDialect>,
+    guest_node_url: &str,
+) -> Vec<String> {
     let Some(dialect) = dialect else {
         return argv.to_vec();
     };
@@ -620,13 +624,11 @@ pub trait Provider: Send + Sync {
         prompt: &str,
         ctx: &RunContext,
     ) -> Result<ProviderOutput, String> {
-        self.run(prompt, ctx)
-            .await
-            .map(|text| ProviderOutput {
-                text,
-                usage: None,
-                disposition: OutputDisposition::Answer,
-            })
+        self.run(prompt, ctx).await.map(|text| ProviderOutput {
+            text,
+            usage: None,
+            disposition: OutputDisposition::Answer,
+        })
     }
     /// spawn an INTERACTIVE, pty-backed session driving this executor's TUI (see
     /// [`crate::interactive`]). The default refuses; a spec with an
@@ -1543,7 +1545,10 @@ impl CliProvider {
         match self.spec.isolation.broker {
             Some(BrokerKind::Pi) => {
                 let Some(config) = auth.config_home else {
-                    return Err(format!("{}: Pi broker run has no config home", self.spec.tag));
+                    return Err(format!(
+                        "{}: Pi broker run has no config home",
+                        self.spec.tag
+                    ));
                 };
                 pi::configure(config, broker, &mut set)?;
             }
@@ -3383,8 +3388,8 @@ impl CliProvider {
                 unreachable!("session driver returned above")
             }
         };
-        let unexpected_native_terminal = disposition != OutputDisposition::Answer
-            && ctx.native_conversation.is_none();
+        let unexpected_native_terminal =
+            disposition != OutputDisposition::Answer && ctx.native_conversation.is_none();
         if unexpected_native_terminal {
             return Err("provider returned a native terminal result outside a conversation".into());
         }
@@ -3425,8 +3430,8 @@ impl CliProvider {
                 if self.spec.isolation.broker != Some(BrokerKind::Pi) {
                     return Err("native conversations require the Pi provider".into());
                 }
-                let config = config_home
-                    .ok_or("native conversation requires a fresh Pi config home")?;
+                let config =
+                    config_home.ok_or("native conversation requires a fresh Pi config home")?;
                 pi::prepare_conversation(config, conversation, prompt)?
             }
             None => self.prompt_with_context(prompt, ctx),
@@ -4609,7 +4614,8 @@ broker = "anthropic-messages"
             .into_iter()
             .find(|spec| spec.tag == "pi")
             .unwrap();
-        let provider = CliProvider::from_spec(spec, PathBuf::from("/usr/bin/pi"), SandboxBackend::Bare);
+        let provider =
+            CliProvider::from_spec(spec, PathBuf::from("/usr/bin/pi"), SandboxBackend::Bare);
         let workdir = scratch("pi-config");
         for kind in [CredentialKind::Claude, CredentialKind::Codex] {
             let home = provider.prepare_config_home(&workdir).unwrap().unwrap();
@@ -4645,9 +4651,10 @@ broker = "anthropic-messages"
             let models: Value =
                 serde_json::from_slice(&std::fs::read(home.config().join("models.json")).unwrap())
                     .unwrap();
-            let settings: Value =
-                serde_json::from_slice(&std::fs::read(home.config().join("settings.json")).unwrap())
-                    .unwrap();
+            let settings: Value = serde_json::from_slice(
+                &std::fs::read(home.config().join("settings.json")).unwrap(),
+            )
+            .unwrap();
             let selected = match kind {
                 CredentialKind::Claude => "anthropic",
                 CredentialKind::Codex => "openai-codex",
@@ -6542,8 +6549,7 @@ format = "text"
         let configured: Value = serde_json::from_str(&claude[1]).expect("literal json");
         assert_eq!(configured["mcpServers"]["ducktape"]["type"], "http");
         assert_eq!(
-            configured["mcpServers"]["ducktape"]["url"],
-            "http://127.0.0.1:41999/mcp",
+            configured["mcpServers"]["ducktape"]["url"], "http://127.0.0.1:41999/mcp",
             "one slash, whatever the base carried"
         );
         assert!(
@@ -6592,7 +6598,10 @@ format = "text"
         // a flag-led argv (an interactive TUI one) takes it at the front, so a
         // flag is never separated from its value.
         let restricted = arg(&["--permission-mode", "plan"]);
-        assert_eq!(restricted[restricted.len() - 2..], ["--permission-mode", "plan"]);
+        assert_eq!(
+            restricted[restricted.len() - 2..],
+            ["--permission-mode", "plan"]
+        );
         assert_eq!(restricted[0], "-c");
 
         // an empty argv is the bare TUI launch, and gets the wiring alone.

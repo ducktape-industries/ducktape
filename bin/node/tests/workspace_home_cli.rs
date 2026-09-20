@@ -22,7 +22,10 @@ fn ducktape(home: &Path, args: &[&str]) -> std::process::Output {
 
 fn init(home: &Path, name: &str) -> String {
     // hermetic: no ambient coordinator baked into the workspace config.
-    let out = ducktape(home, &["init", "--name", name, "--primary-coordinator", "none"]);
+    let out = ducktape(
+        home,
+        &["init", "--name", name, "--primary-coordinator", "none"],
+    );
     assert!(
         out.status.success(),
         "init failed:\nstdout:\n{}\nstderr:\n{}",
@@ -73,7 +76,10 @@ fn run_refuses_a_binary_whose_module_world_is_not_the_founding_one() {
     assert!(founded.contains("module_world"), "record: {founded:?}");
 
     // the same workspace, founded by a binary that spoke another module world.
-    let foreign = format!("build = \"fc4ad8d5a\"\nmodule_world = \"{}\"\n", "0".repeat(64));
+    let foreign = format!(
+        "build = \"fc4ad8d5a\"\nmodule_world = \"{}\"\n",
+        "0".repeat(64)
+    );
     std::fs::write(&record, foreign).expect("rewrite the founding record");
 
     let out = ducktape(home.path(), &["run", "-n", &chain_id]);
@@ -96,7 +102,10 @@ fn same_name_founds_two_distinct_workspaces() {
     assert_ne!(first, second);
     let out = ducktape(home.path(), &["list"]);
     let listing = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(listing.contains(&first) && listing.contains(&second), "list: {listing:?}");
+    assert!(
+        listing.contains(&first) && listing.contains(&second),
+        "list: {listing:?}"
+    );
 }
 
 /// init a workspace with the child's PATH pinned to `path_dir`, returning the
@@ -105,7 +114,14 @@ fn same_name_founds_two_distinct_workspaces() {
 /// binary.
 fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::path::PathBuf) {
     let out = common::ducktape()
-        .args(["node", "init", "--name", name, "--primary-coordinator", "none"])
+        .args([
+            "node",
+            "init",
+            "--name",
+            name,
+            "--primary-coordinator",
+            "none",
+        ])
         .env("DUCKTAPE_HOME", home)
         .env("PATH", path_dir)
         .output()
@@ -118,8 +134,8 @@ fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::pat
     );
     let chain_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let workspace = home.join(&chain_id);
-    let toml = std::fs::read_to_string(workspace.join("node.toml"))
-        .expect("read generated node.toml");
+    let toml =
+        std::fs::read_to_string(workspace.join("node.toml")).expect("read generated node.toml");
     (toml, workspace)
 }
 
@@ -281,12 +297,18 @@ fn one_workspace_needs_no_selector_in_any_family() {
     let second = init(home.path(), "othernet");
     let out = ducktape_raw(home.path(), &["service", "list"]);
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(!out.status.success(), "two workspaces must not be guessed at");
+    assert!(
+        !out.status.success(),
+        "two workspaces must not be guessed at"
+    );
     assert!(
         stderr.contains(&chain_id) && stderr.contains(&second),
         "an ambiguous home names its candidates: {stderr}"
     );
-    assert!(stderr.contains("-n"), "and the flag that picks one: {stderr}");
+    assert!(
+        stderr.contains("-n"),
+        "and the flag that picks one: {stderr}"
+    );
 }
 
 /// `--modules <dir>` is how a founder pins its genesis wasm set: every
@@ -301,13 +323,31 @@ fn init_writes_module_hashes_and_the_genesis() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("ws");
     let out = common::ducktape()
-        .args(["node", "init", "--name", "bundled", "--primary-coordinator", "none", "--dir"])
+        .args([
+            "node",
+            "init",
+            "--name",
+            "bundled",
+            "--primary-coordinator",
+            "none",
+            "--dir",
+        ])
         .arg(&ws)
-        .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--advertised",
+            "127.0.0.1:1",
+            "--modules",
+        ])
         .arg(common::founding_set())
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let d = workspace_config::NetworkDescriptor::load(&ws.join("network.toml")).unwrap();
     let ids: Vec<&str> = d.modules.iter().map(|m| m.id.as_str()).collect();
     // the descriptor pins every founding entry: the module set and the
@@ -353,7 +393,10 @@ fn init_writes_module_hashes_and_the_genesis() {
         want.contains(&"chat"),
         "the founding set carries chat's index guest, or this pin proves nothing"
     );
-    assert_eq!(guests, want, "every index guest the set holds rides in the genesis");
+    assert_eq!(
+        guests, want,
+        "every index guest the set holds rides in the genesis"
+    );
 }
 
 #[test]
@@ -427,13 +470,25 @@ fn init_founds_from_the_set_the_build_staged_beside_the_binary() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("ws");
     let out = common::ducktape()
-        .args(["node", "init", "--name", "staged", "--primary-coordinator", "none", "--dir"])
+        .args([
+            "node",
+            "init",
+            "--name",
+            "staged",
+            "--primary-coordinator",
+            "none",
+            "--dir",
+        ])
         .arg(&ws)
         .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1"])
         .env_remove("DUCKTAPE_MODULES_DIR")
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let genesis = workspace_config::Genesis::load(&ws.join("genesis")).expect("the genesis file");
     let ids: Vec<&str> = genesis.modules.iter().map(|a| a.id.as_str()).collect();
     let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
@@ -551,7 +606,10 @@ fn a_member_join_without_the_genesis_is_refused_naming_the_flag() {
     );
     assert!(!out.status.success(), "a member needs its genesis at join");
     let err = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(err.contains("--genesis"), "the refusal names the flag: {err}");
+    assert!(
+        err.contains("--genesis"),
+        "the refusal names the flag: {err}"
+    );
     assert!(
         !joiner.join("genesis").exists(),
         "a refused join installs no genesis"
@@ -614,19 +672,44 @@ fn init_refuses_a_zero_byte_component_and_writes_nothing() {
     std::fs::write(workspace_config::component_path(&source, "oops"), b"").unwrap();
     let workspace = tmp.path().join("network");
     let output = common::ducktape()
-        .args(["node", "init", "--name", "zero-byte", "--primary-coordinator", "none", "--dir"])
+        .args([
+            "node",
+            "init",
+            "--name",
+            "zero-byte",
+            "--primary-coordinator",
+            "none",
+            "--dir",
+        ])
         .arg(&workspace)
-        .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--advertised",
+            "127.0.0.1:1",
+            "--modules",
+        ])
         .arg(&source)
         .output()
         .unwrap();
-    assert!(!output.status.success(), "a zero-byte artifact must refuse init");
+    assert!(
+        !output.status.success(),
+        "a zero-byte artifact must refuse init"
+    );
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(
-        error.contains(workspace_config::component_path(&source, "oops").to_str().unwrap()),
+        error.contains(
+            workspace_config::component_path(&source, "oops")
+                .to_str()
+                .unwrap()
+        ),
         "names the artifact path: {error}"
     );
-    assert!(!workspace.exists(), "nothing is written on refusal: {}", workspace.display());
+    assert!(
+        !workspace.exists(),
+        "nothing is written on refusal: {}",
+        workspace.display()
+    );
 }
 
 /// The app carries no view: every basic view is founded or the network draws
@@ -687,9 +770,23 @@ fn init_refuses_an_empty_module_directory() {
     let empty = tmp.path().join("empty");
     std::fs::create_dir_all(&empty).unwrap();
     let out = common::ducktape()
-        .args(["node", "init", "--name", "x", "--primary-coordinator", "none", "--dir"])
+        .args([
+            "node",
+            "init",
+            "--name",
+            "x",
+            "--primary-coordinator",
+            "none",
+            "--dir",
+        ])
         .arg(tmp.path().join("ws"))
-        .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--advertised",
+            "127.0.0.1:1",
+            "--modules",
+        ])
         .arg(&empty)
         .output()
         .unwrap();
@@ -773,13 +870,19 @@ exit 1\n",
     assert!(!fake_log.exists(), "discovery must not issue a stop");
 
     let ambiguous = run("stop", &second_config, "1");
-    assert!(!ambiguous.status.success(), "ambiguous ownership was controlled");
+    assert!(
+        !ambiguous.status.success(),
+        "ambiguous ownership was controlled"
+    );
     assert!(
         String::from_utf8_lossy(&ambiguous.stderr).contains("ambiguous supervisor ownership"),
         "ambiguity: {}",
         String::from_utf8_lossy(&ambiguous.stderr)
     );
-    assert!(!fake_log.exists(), "ambiguous discovery must not issue a stop");
+    assert!(
+        !fake_log.exists(),
+        "ambiguous discovery must not issue a stop"
+    );
 
     let stopped = run("stop", &second_config, "0");
     assert!(

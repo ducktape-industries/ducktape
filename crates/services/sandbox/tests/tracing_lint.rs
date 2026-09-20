@@ -139,7 +139,14 @@ fn every_sandbox_event_names_the_plane_target() {
     let offenders: Vec<String> = events()
         .iter()
         .filter(|event| !event.body.contains("target: \"ducktape::sandbox\""))
-        .map(|event| format!("{}:{} {}", event.file.display(), event.line, event.macro_name))
+        .map(|event| {
+            format!(
+                "{}:{} {}",
+                event.file.display(),
+                event.line,
+                event.macro_name
+            )
+        })
         .collect();
     assert!(
         offenders.is_empty(),
@@ -155,7 +162,14 @@ fn every_refusal_carries_a_reason_token() {
         .iter()
         .filter(|event| NEEDS_REASON.contains(&event.macro_name))
         .filter(|event| !event.body.contains("reason"))
-        .map(|event| format!("{}:{} {}", event.file.display(), event.line, event.macro_name))
+        .map(|event| {
+            format!(
+                "{}:{} {}",
+                event.file.display(),
+                event.line,
+                event.macro_name
+            )
+        })
         .collect();
     assert!(
         offenders.is_empty(),
@@ -296,7 +310,14 @@ fn no_run_event_logs_a_credential_or_a_uri_path() {
     let offenders: Vec<String> = events()
         .iter()
         .filter(|event| BANNED.iter().any(|banned| event.body.contains(banned)))
-        .map(|event| format!("{}:{} {}", event.file.display(), event.line, event.macro_name))
+        .map(|event| {
+            format!(
+                "{}:{} {}",
+                event.file.display(),
+                event.line,
+                event.macro_name
+            )
+        })
         .collect();
     assert!(
         offenders.is_empty(),

@@ -3003,5 +3003,4 @@ mod tests {
         assert_eq!(bytes, vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(client.call_count(), 3);
     }
-
 }

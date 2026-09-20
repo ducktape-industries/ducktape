@@ -51,7 +51,10 @@ fn v1_finalization(n: u64, proposal: &Proposal<consensus::Digest>) -> Vec<u8> {
     let attestations: Vec<_> = schemes
         .iter()
         .take(quorum)
-        .map(|s| s.sign(Subject::Finalize { proposal }).expect("signer signs"))
+        .map(|s| {
+            s.sign(Subject::Finalize { proposal })
+                .expect("signer signs")
+        })
         .collect();
     let attestations = commonware_utils::iter::NonEmpty::try_new(attestations.into_iter())
         .expect("a quorum is never empty");

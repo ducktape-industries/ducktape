@@ -44,7 +44,6 @@ use sdk::{
     StateRoot, StateSyncHandle,
 };
 
-
 /// the committed policy table's record key: the strictly-target-sorted
 /// `(target, standing)` list, borsh-encoded. absent = empty table = open.
 const POLICY_KEY: &[u8] = b"policy";

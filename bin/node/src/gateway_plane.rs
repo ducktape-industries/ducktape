@@ -339,8 +339,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                         serve_ws(&commands, &scope, &requester.0, &head, stream).await;
                         return;
                     }
-                    serve_proxy_stream(&commands, &scope, &requester.0, head, None, stream)
-                        .await;
+                    serve_proxy_stream(&commands, &scope, &requester.0, head, None, stream).await;
                 });
             }
         };

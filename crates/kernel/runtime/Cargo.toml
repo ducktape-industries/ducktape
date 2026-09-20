@@ -6,11 +6,13 @@ edition.workspace = true
 [dependencies]
 abi = { workspace = true }
 async-trait = { workspace = true }
-sha2 = { workspace = true }
+borsh = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 wasmtime = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
-borsh = { workspace = true }
+fixture-probe = { path = "../fixtures/probe" }
+sha2 = { workspace = true }
 wat = "1"

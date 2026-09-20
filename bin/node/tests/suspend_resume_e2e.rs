@@ -25,10 +25,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use common::NetworkShapeCluster;
 use common::wire::chat::{
     Block, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_reply, encode_msg, encode_query,
 };
-use common::NetworkShapeCluster;
 
 /// generous like the sibling legs: standing → follow-arm sync → first
 /// pre-synced boundary is several blocks of slack.
@@ -93,7 +93,10 @@ fn a_suspended_resident_resumes_following_within_the_deadline_budget() {
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("suspend-resume");
-    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    assert!(
+        !chain_id.is_empty(),
+        "init should print the founded chain id"
+    );
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
@@ -284,7 +287,10 @@ fn a_resident_frozen_past_the_sync_lease_rebootstraps_to_the_founders_root() {
         let (code, body) =
             nettest::try_http_json(cluster.http_ports[idx], "GET", "/v1/status", None).ok()?;
         (code == 200).then_some(())?;
-        Some((body["height"].as_u64()?, body["root_hash"].as_str()?.to_owned()))
+        Some((
+            body["height"].as_u64()?,
+            body["root_hash"].as_str()?.to_owned(),
+        ))
     };
 
     let (height, root) = cluster.await_committed(

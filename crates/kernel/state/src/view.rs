@@ -55,7 +55,9 @@ impl<'a> View<'a> {
         while let Some((key, slot)) = merged.next()? {
             let Some(value) = slot else { continue };
             entries.push(Entry { key, value });
-            let limit_reached = scan.limit.is_some_and(|limit| entries.len() as u64 >= limit);
+            let limit_reached = scan
+                .limit
+                .is_some_and(|limit| entries.len() as u64 >= limit);
             if limit_reached {
                 break;
             }
@@ -87,7 +89,9 @@ impl Merge<'_> {
                 winner = Some((index, key.clone()));
             }
         }
-        let Some((top, key)) = winner else { return Ok(None) };
+        let Some((top, key)) = winner else {
+            return Ok(None);
+        };
         let mut slot = None;
         for (index, layer) in self.layers.iter_mut().enumerate() {
             let at_key = layer
@@ -96,7 +100,9 @@ impl Merge<'_> {
             if !at_key {
                 continue;
             }
-            let Some(Ok((_, value))) = layer.next() else { continue };
+            let Some(Ok((_, value))) = layer.next() else {
+                continue;
+            };
             if index == top {
                 slot = value;
             }

@@ -202,10 +202,7 @@ fn carry_repins_byte_identical_frames() {
 }
 
 /// [`get`] for the sinked node type (the generic parameter differs).
-async fn get_sinked(
-    node: &OrderedNode<RoundOrderer, PinRecorder>,
-    key: &str,
-) -> Option<String> {
+async fn get_sinked(node: &OrderedNode<RoundOrderer, PinRecorder>, key: &str) -> Option<String> {
     let reply = node
         .host()
         .query(

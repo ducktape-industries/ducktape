@@ -42,8 +42,12 @@ impl Writes {
     }
 }
 
-pub fn commitment_name(program: &str) -> String {
-    format!("program-{program}")
+pub fn commitment_name(store: &str, program: &str) -> String {
+    format!(
+        "{}-{}",
+        abi::hex(store.as_bytes()),
+        abi::hex(program.as_bytes())
+    )
 }
 
 pub struct Store<E>
@@ -51,6 +55,7 @@ where
     E: Context + Spawner,
 {
     context: E,
+    name: String,
     storage: Storage,
     commitments: BTreeMap<ProgramId, Commitment<E>>,
 }
@@ -61,11 +66,13 @@ where
 {
     pub async fn open(
         context: E,
+        name: &str,
         storage: Storage,
         programs: impl IntoIterator<Item = ProgramId>,
     ) -> Result<Store<E>> {
         let mut store = Store {
             context,
+            name: name.to_owned(),
             storage,
             commitments: BTreeMap::new(),
         };
@@ -78,6 +85,7 @@ where
 
     pub async fn adopt(
         context: E,
+        name: &str,
         storage: Storage,
         height: u64,
         commitments: BTreeMap<ProgramId, Commitment<E>>,
@@ -95,6 +103,7 @@ where
         storage.install(height, &writes)?;
         Ok(Store {
             context,
+            name: name.to_owned(),
             storage,
             commitments,
         })
@@ -108,7 +117,7 @@ where
             .context
             .child("program")
             .with_attribute("program", program);
-        let commitment = Commitment::open(context, &commitment_name(program)).await?;
+        let commitment = Commitment::open(context, &commitment_name(&self.name, program)).await?;
         self.commitments.insert(program.to_owned(), commitment);
         Ok(())
     }
@@ -131,6 +140,10 @@ where
             }
         }
         Ok(())
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn storage(&self) -> &Storage {

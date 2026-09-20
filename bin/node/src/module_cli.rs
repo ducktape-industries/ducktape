@@ -730,7 +730,9 @@ fn stage_component(
         .header("content-type", "application/octet-stream")
         .body(bytes.to_vec())
         .send()
-        .map_err(|error| crate::node_http::transport_failure(http_base, PATH, &error).to_string())?;
+        .map_err(|error| {
+            crate::node_http::transport_failure(http_base, PATH, &error).to_string()
+        })?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     let refused = !status.is_success();
@@ -1360,10 +1362,7 @@ mod tests {
         // at the height itself the readiness never latched, so the swap can
         // no longer arm — an operator waiting on `ready 1` waits forever.
         let out = render_status(&modules, 120);
-        assert!(
-            out.contains("cdcdcdcdcdcd  DEAD  activation 120"),
-            "{out}"
-        );
+        assert!(out.contains("cdcdcdcdcdcd  DEAD  activation 120"), "{out}");
         assert!(
             render_status(&modules, 119).contains("ready 1"),
             "a swap still short of its height is in flight"

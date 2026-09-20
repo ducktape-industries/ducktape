@@ -265,7 +265,9 @@ fn nothing_answering_is_unreachable_not_a_transport_string() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let draining = format!("http://{}", listener.local_addr().expect("addr"));
     let drain = std::thread::spawn(move || drop(listener.accept().expect("the client connects")));
-    let failure = HttpNode::new(&draining).ls("/", None, None, 10).unwrap_err();
+    let failure = HttpNode::new(&draining)
+        .ls("/", None, None, 10)
+        .unwrap_err();
     drain.join().expect("the drain thread finishes");
     assert_eq!(failure, ApiError::Unreachable { base: draining });
 }

@@ -21,7 +21,7 @@
 //! (server.rs) is the only header rule, and forwarding the rest verbatim is
 //! by design.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 use rand_core::{OsRng, RngCore};
@@ -73,14 +73,13 @@ pub fn open_request(keys: &SessionKeys, aad: &[u8], blob: &[u8]) -> Result<Vec<u
 /// the enclave's per-sub replay-dedup key). Empty input (a bodyless request)
 /// yields an empty binding.
 pub fn request_binding(sealed_blob: &[u8]) -> Vec<u8> {
-    sealed_blob.get(..12).map(<[u8]>::to_vec).unwrap_or_default()
+    sealed_blob
+        .get(..12)
+        .map(<[u8]>::to_vec)
+        .unwrap_or_default()
 }
 
-fn stream_cipher(
-    keys: &SessionKeys,
-    salt: &[u8; SALT_LEN],
-    binding: &[u8],
-) -> ChaCha20Poly1305 {
+fn stream_cipher(keys: &SessionKeys, salt: &[u8; SALT_LEN], binding: &[u8]) -> ChaCha20Poly1305 {
     let mut label = STREAM_LABEL.to_vec();
     label.extend_from_slice(binding);
     let key = aead::hkdf32_salted(&keys.body, salt, &label);
@@ -114,7 +113,13 @@ impl StreamSealer {
     pub fn new(keys: &SessionKeys, binding: &[u8]) -> (Self, Vec<u8>) {
         let mut salt = [0u8; SALT_LEN];
         OsRng.fill_bytes(&mut salt);
-        (Self { cipher: stream_cipher(keys, &salt, binding), counter: 0 }, salt.to_vec())
+        (
+            Self {
+                cipher: stream_cipher(keys, &salt, binding),
+                counter: 0,
+            },
+            salt.to_vec(),
+        )
     }
 
     fn seal_marked(&mut self, mark: u8, payload: &[u8]) -> Vec<u8> {
@@ -254,8 +259,7 @@ impl StreamOpener {
                         items.push(OpenedItem::Final);
                     } else {
                         items.push(OpenedItem::Refused(
-                            String::from_utf8(payload.to_vec())
-                                .context("refusal token utf8")?,
+                            String::from_utf8(payload.to_vec()).context("refusal token utf8")?,
                         ));
                     }
                 }
@@ -306,12 +310,15 @@ mod tests {
         for byte in &wire {
             items.extend(opener.feed(std::slice::from_ref(byte)).unwrap());
         }
-        assert_eq!(items, vec![
-            OpenedItem::Head("text/event-stream".into()),
-            OpenedItem::Data(b"data: a\n\n".to_vec()),
-            OpenedItem::Data(b"data: b\n\n".to_vec()),
-            OpenedItem::Final,
-        ]);
+        assert_eq!(
+            items,
+            vec![
+                OpenedItem::Head("text/event-stream".into()),
+                OpenedItem::Data(b"data: a\n\n".to_vec()),
+                OpenedItem::Data(b"data: b\n\n".to_vec()),
+                OpenedItem::Final,
+            ]
+        );
         assert!(opener.finished());
     }
 
@@ -324,12 +331,18 @@ mod tests {
         wire.extend(sealer.seal_refused("notary_rejected"));
         let mut opener = StreamOpener::new(&keys, b"");
         let items = opener.feed(&wire).unwrap();
-        assert_eq!(items, vec![
-            OpenedItem::Head("application/zstd".into()),
-            OpenedItem::Data(Vec::new()),
-            OpenedItem::Refused("notary_rejected".into()),
-        ]);
-        assert!(opener.finished(), "a refused stream is finished, not truncated");
+        assert_eq!(
+            items,
+            vec![
+                OpenedItem::Head("application/zstd".into()),
+                OpenedItem::Data(Vec::new()),
+                OpenedItem::Refused("notary_rejected".into()),
+            ]
+        );
+        assert!(
+            opener.finished(),
+            "a refused stream is finished, not truncated"
+        );
         assert!(opener.feed(b"x").is_err(), "nothing may follow a refusal");
     }
 
@@ -386,7 +399,10 @@ mod tests {
         let mut opener = StreamOpener::new(&keys, b"");
         let items = opener.feed(truncated).unwrap();
         assert!(items.iter().all(|item| !matches!(item, OpenedItem::Final)));
-        assert!(!opener.finished(), "a stream without the final marker is TRUNCATED");
+        assert!(
+            !opener.finished(),
+            "a stream without the final marker is TRUNCATED"
+        );
     }
 
     #[test]
@@ -425,9 +441,15 @@ mod tests {
         wire.extend(sealer.seal_final());
 
         let mut opener_b = StreamOpener::new(&keys, &request_binding(&blob_b));
-        assert!(opener_b.feed(&wire).is_err(), "replayed response must not open for B");
+        assert!(
+            opener_b.feed(&wire).is_err(),
+            "replayed response must not open for B"
+        );
         let mut opener_a = StreamOpener::new(&keys, &request_binding(&blob_a));
-        assert!(opener_a.feed(&wire).is_ok(), "the bound requester still opens it");
+        assert!(
+            opener_a.feed(&wire).is_ok(),
+            "the bound requester still opens it"
+        );
     }
 
     #[test]

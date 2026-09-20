@@ -443,7 +443,9 @@ mod tests {
                 if let crate::NodeCommand::Query { target, req, reply } = command {
                     let bytes = match target.as_str() {
                         "runs" => {
-                            crate::runs::encode_reply(&crate::runs::RunsReply::PendingRuns(vec![pending.clone()]))
+                            crate::runs::encode_reply(&crate::runs::RunsReply::PendingRuns(vec![
+                                pending.clone(),
+                            ]))
                         }
                         "identity" => {
                             let account = match identity::decode_query(&req).unwrap() {

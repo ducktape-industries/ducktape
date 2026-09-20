@@ -163,7 +163,8 @@ async fn worker_job(host: &Host) -> crate::tasks::Job {
         )
         .await
         .unwrap();
-    let crate::tasks::JobsReply::Job(Some(job)) = crate::tasks::decode_job_reply(&bytes).unwrap() else {
+    let crate::tasks::JobsReply::Job(Some(job)) = crate::tasks::decode_job_reply(&bytes).unwrap()
+    else {
         panic!("live worker job");
     };
     job
@@ -171,10 +172,15 @@ async fn worker_job(host: &Host) -> crate::tasks::Job {
 
 async fn action_count(host: &Host, run_id: &str) -> u32 {
     let bytes = host
-        .query("runs", &crate::runs::encode_query(&crate::runs::RunsQuery::AgentSessions))
+        .query(
+            "runs",
+            &crate::runs::encode_query(&crate::runs::RunsQuery::AgentSessions),
+        )
         .await
         .unwrap();
-    let crate::runs::RunsReply::AgentSessions(sessions) = crate::runs::decode_reply(&bytes).unwrap() else {
+    let crate::runs::RunsReply::AgentSessions(sessions) =
+        crate::runs::decode_reply(&bytes).unwrap()
+    else {
         panic!("agent sessions");
     };
     sessions
@@ -348,9 +354,15 @@ fn real_worker_report_route_enforces_claim_budget_idempotency_and_incarnation() 
             "real worker execution ID crosses transport verbatim"
         );
         let mut actor = Actor::new().await;
-        let session = start_action_server(actor.link.clone(), signer, run_id.clone(), Some(native), std::path::PathBuf::new())
-            .await
-            .unwrap();
+        let session = start_action_server(
+            actor.link.clone(),
+            signer,
+            run_id.clone(),
+            Some(native),
+            std::path::PathBuf::new(),
+        )
+        .await
+        .unwrap();
 
         // The keyless worker program is NOT Tasks' claim holder. The relay must
         // emit as Runs rather than widening Tasks or pretending to be the model.
@@ -499,7 +511,8 @@ fn real_worker_report_route_enforces_claim_budget_idempotency_and_incarnation() 
             )
             .await
             .unwrap();
-        let crate::runs::RunsReply::WorkerControls(Some(retained)) = crate::runs::decode_reply(&bytes).unwrap()
+        let crate::runs::RunsReply::WorkerControls(Some(retained)) =
+            crate::runs::decode_reply(&bytes).unwrap()
         else {
             panic!("retained worker");
         };

@@ -1255,7 +1255,11 @@ mod tests {
         let path = unique_socket_path("silent-request");
         let tunnel_listener = UnixListener::bind(&path).expect("bind tunnel socket");
         let run = Arc::new(TunnelRun::new());
-        let accept = tokio::spawn(serve_tunnel(tunnel_listener, service_port, Arc::clone(&run)));
+        let accept = tokio::spawn(serve_tunnel(
+            tunnel_listener,
+            service_port,
+            Arc::clone(&run),
+        ));
 
         let mut guest = UnixStream::connect(&path).await.expect("connect guest");
         // the whole "request": sent once, then the guest→service direction

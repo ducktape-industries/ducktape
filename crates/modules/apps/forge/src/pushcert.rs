@@ -435,7 +435,8 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
     #[test]
     fn a_minted_chain_ids_nonce_is_one_git_will_sign() {
         let git_accepts = |byte: u8| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'/' | b'<' | b'>' | b'=' | b'_')
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'/' | b'<' | b'>' | b'=' | b'_')
         };
         let longest_repo = "r".repeat(crate::MAX_REPO_NAME_LEN);
         for (chain, repo) in [

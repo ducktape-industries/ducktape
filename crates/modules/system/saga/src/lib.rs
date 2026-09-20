@@ -212,8 +212,6 @@ pub const PENDING_PAGE: usize = 64;
 /// walk forward instead of stalling the cursor on it forever.
 pub const PENDING_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
-
-
 /// how many TERMINAL sagas stay in the ledger. a terminal saga has already
 /// fired its callback (P6, in the block it landed) — what remains is a
 /// read-only receipt, and an unbounded pile of receipts is the state-growth

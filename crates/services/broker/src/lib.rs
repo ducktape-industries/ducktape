@@ -752,7 +752,10 @@ async fn codex_airlock_reauth(state: &BrokerState) -> bool {
     let CodexAuth::Airlock(session) = &mut *auth else {
         return false;
     };
-    match session.gateway.open_session_sealed(&session.seal_pk, &session.sub, &session.work).await
+    match session
+        .gateway
+        .open_session_sealed(&session.seal_pk, &session.sub, &session.work)
+        .await
     {
         Ok((token, keys)) => {
             session.token = token;
@@ -809,7 +812,9 @@ fn codex_body(status: StatusCode, inner_ct: Option<String>, body: Vec<u8>) -> Re
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     if let Some(value) = inner_ct.and_then(|ct| HeaderValue::from_str(&ct).ok()) {
-        response.headers_mut().insert(axum::http::header::CONTENT_TYPE, value);
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
     }
     response
 }
@@ -1406,9 +1411,7 @@ impl AnthropicAuth {
             // the scoped session token, plus `x-duck-authority` on the remote
             // topology so the local node's browser-gateway routes it onto the
             // overlay (a no-op locally).
-            Self::Airlock(session) => {
-                session.gateway.route(request.bearer_auth(&session.token))
-            }
+            Self::Airlock(session) => session.gateway.route(request.bearer_auth(&session.token)),
         }
     }
 
@@ -1464,9 +1467,10 @@ async fn open_airlock_session(cfg: AirlockConfig) -> Result<(AirlockSession, Str
     // REPORTDATA; `PinnedSealPk` is the self-host anchor — the on-chain seal_pk
     // pinned directly, no quote to verify.
     let seal_pk = match &cfg.trust {
-        AirlockTrust::Attested { measurement, attest } => {
-            verify_attested(&gateway, &cfg, measurement, attest).await?
-        }
+        AirlockTrust::Attested {
+            measurement,
+            attest,
+        } => verify_attested(&gateway, &cfg, measurement, attest).await?,
         AirlockTrust::PinnedSealPk(pk) => *pk,
     };
     // The session names the CREDENTIAL and the WORK it draws for, and nothing
@@ -1484,7 +1488,17 @@ async fn open_airlock_session(cfg: AirlockConfig) -> Result<(AirlockSession, Str
         Ok(opened) => opened,
         Err(refusal) => return Err(refusal.reason().to_string()),
     };
-    Ok((AirlockSession { gateway, seal_pk, sub: cfg.sub, work: cfg.work, token, keys }, base))
+    Ok((
+        AirlockSession {
+            gateway,
+            seal_pk,
+            sub: cfg.sub,
+            work: cfg.work,
+            token,
+            keys,
+        },
+        base,
+    ))
 }
 
 /// How long the delegated lane waits out a lender that is a block behind.
@@ -1514,7 +1528,10 @@ async fn open_session_retrying(
     cfg: &AirlockConfig,
 ) -> Result<(String, airlock::handshake::SessionKeys), SessionRefusal> {
     for attempt in 1..=SESSION_RETRY_ATTEMPTS {
-        let error = match gateway.open_session_sealed(seal_pk, &cfg.sub, &cfg.work).await {
+        let error = match gateway
+            .open_session_sealed(seal_pk, &cfg.sub, &cfg.work)
+            .await
+        {
             Ok(opened) => return Ok(opened),
             Err(error) => error,
         };
@@ -1774,9 +1791,11 @@ impl AirlockConfig {
             (None, Some(handle)) => match env_nonempty("DUCKTAPE_AIRLOCK_VIA") {
                 Some(via) => AirlockGateway::Remote { handle, via },
                 None => {
-                    return Some(Err("DUCKTAPE_AIRLOCK_REMOTE requires DUCKTAPE_AIRLOCK_VIA \
+                    return Some(Err(
+                        "DUCKTAPE_AIRLOCK_REMOTE requires DUCKTAPE_AIRLOCK_VIA \
                                      (the local node's browser-gateway URL)"
-                        .into()));
+                            .into(),
+                    ));
                 }
             },
             (None, None) => return None,
@@ -1806,7 +1825,10 @@ impl AirlockConfig {
         Some(Ok(Self {
             kind: CredentialKind::Claude,
             gateway,
-            trust: AirlockTrust::Attested { measurement, attest },
+            trust: AirlockTrust::Attested {
+                measurement,
+                attest,
+            },
             sub: env_nonempty("DUCKTAPE_AIRLOCK_SUB").unwrap_or_else(|| "compute-provider".into()),
             // The env lane is an operator pointing this broker at a gateway by
             // hand; there is no committed work behind it to point at.
@@ -2278,7 +2300,9 @@ async fn relay_sealed(
                 }
                 Ok(None) => {
                     let _ = tx
-                        .send(Err(std::io::Error::other("airlock: sealed response truncated")))
+                        .send(Err(std::io::Error::other(
+                            "airlock: sealed response truncated",
+                        )))
                         .await;
                     return;
                 }
@@ -2294,7 +2318,8 @@ async fn relay_sealed(
     ));
     *resp.status_mut() = status;
     if let Some(value) = inner_ct.and_then(|ct| HeaderValue::from_str(&ct).ok()) {
-        resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, value);
+        resp.headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
     }
     resp
 }
@@ -2562,8 +2587,11 @@ mod tests {
                 move |uri: axum::http::Uri, headers: HeaderMap, _body: Bytes| async move {
                     let mut s = seen_handler.lock().unwrap();
                     s.headers = Some(headers);
-                    s.path_and_query =
-                        Some(uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_default());
+                    s.path_and_query = Some(
+                        uri.path_and_query()
+                            .map(|p| p.as_str().to_string())
+                            .unwrap_or_default(),
+                    );
                     Response::builder()
                         .status(status)
                         .header(axum::http::header::CONTENT_TYPE, content_type)
@@ -2582,17 +2610,13 @@ mod tests {
         (format!("http://{addr}/v1/messages"), seen, task)
     }
 
-    async fn start_anthropic_pointed_at(
-        auth: AnthropicAuth,
-        url: String,
-    ) -> RunBroker {
+    async fn start_anthropic_pointed_at(auth: AnthropicAuth, url: String) -> RunBroker {
         RunBroker::start_anthropic_with(auth, url).await.unwrap()
     }
 
     #[tokio::test]
     async fn anthropic_rejects_wrong_or_absent_bearer() {
-        let (url, _seen, upstream) =
-            mock_upstream(StatusCode::OK, "application/json", "{}").await;
+        let (url, _seen, upstream) = mock_upstream(StatusCode::OK, "application/json", "{}").await;
         let broker =
             start_anthropic_pointed_at(AnthropicAuth::ApiKey("host-secret".into()), url).await;
         let client = reqwest::Client::new();
@@ -2600,7 +2624,13 @@ mod tests {
 
         // absent authorization → 401.
         assert_eq!(
-            client.post(&endpoint).body("{}").send().await.unwrap().status(),
+            client
+                .post(&endpoint)
+                .body("{}")
+                .send()
+                .await
+                .unwrap()
+                .status(),
             reqwest::StatusCode::UNAUTHORIZED
         );
         // wrong bearer → 401.
@@ -2632,7 +2662,10 @@ mod tests {
             .post(&endpoint)
             .bearer_auth(&broker.endpoint.run_bearer)
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14")
+            .header(
+                "anthropic-beta",
+                "oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
+            )
             .body("{}")
             .send()
             .await
@@ -2697,8 +2730,14 @@ mod tests {
     #[tokio::test]
     async fn send_upstream_returns_the_keys_it_actually_sealed_under() {
         let (url, _seen, upstream) = mock_upstream(StatusCode::OK, "application/json", "{}").await;
-        let keys_a = airlock::handshake::SessionKeys { session: [1u8; 32], body: [2u8; 32] };
-        let keys_b = airlock::handshake::SessionKeys { session: [3u8; 32], body: [4u8; 32] };
+        let keys_a = airlock::handshake::SessionKeys {
+            session: [1u8; 32],
+            body: [2u8; 32],
+        };
+        let keys_b = airlock::handshake::SessionKeys {
+            session: [3u8; 32],
+            body: [4u8; 32],
+        };
         let session = AirlockSession {
             gateway: Gateway::local("http://127.0.0.1:1".into()),
             seal_pk: [0u8; 32],
@@ -2713,17 +2752,23 @@ mod tests {
             client: reqwest::Client::new(),
             messages_url: url,
         };
-        let (_resp, binding, keys) = send_upstream(&state, &HeaderMap::new(), &Bytes::from_static(b"{}"))
-            .await
-            .unwrap();
+        let (_resp, binding, keys) =
+            send_upstream(&state, &HeaderMap::new(), &Bytes::from_static(b"{}"))
+                .await
+                .unwrap();
         let keys = keys.expect("airlock session seals every request");
-        assert_eq!(keys.body, keys_a.body, "must return what it sealed under, not a re-read");
+        assert_eq!(
+            keys.body, keys_a.body,
+            "must return what it sealed under, not a re-read"
+        );
 
         // A sibling request's concurrent `airlock_reauth` swaps the session's
         // keys in place — the exact race in the issue.
         {
             let mut auth = state.auth.lock().await;
-            let AnthropicAuth::Airlock(session) = &mut *auth else { unreachable!() };
+            let AnthropicAuth::Airlock(session) = &mut *auth else {
+                unreachable!()
+            };
             session.keys = keys_b.clone();
         }
 
@@ -2737,7 +2782,10 @@ mod tests {
         sealed.extend(sealer.seal_final());
 
         let mut opener_correct = airlock::bodyseal::StreamOpener::new(&keys, &binding);
-        assert!(opener_correct.feed(&sealed).is_ok(), "the returned keys must open it");
+        assert!(
+            opener_correct.feed(&sealed).is_ok(),
+            "the returned keys must open it"
+        );
 
         let mut opener_stale_reread = airlock::bodyseal::StreamOpener::new(&keys_b, &binding);
         let err = opener_stale_reread
@@ -2796,8 +2844,7 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_oauth_path_sends_bearer_not_x_api_key() {
-        let (url, seen, upstream) =
-            mock_upstream(StatusCode::OK, "application/json", "{}").await;
+        let (url, seen, upstream) = mock_upstream(StatusCode::OK, "application/json", "{}").await;
         let broker = start_anthropic_pointed_at(
             AnthropicAuth::Oauth(OauthTokens {
                 access_token: "sk-oauth-host".into(),
@@ -2819,7 +2866,10 @@ mod tests {
         let seen = seen.lock().unwrap();
         let headers = seen.headers.as_ref().unwrap();
         assert_eq!(headers["authorization"], "Bearer sk-oauth-host");
-        assert!(headers.get("x-api-key").is_none(), "oauth path sends no x-api-key");
+        assert!(
+            headers.get("x-api-key").is_none(),
+            "oauth path sends no x-api-key"
+        );
         upstream.abort();
     }
 
@@ -2855,8 +2905,12 @@ mod tests {
             "/v1/messages",
             post(|| async {
                 let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
-                    Ok(Bytes::from_static(b"event: message_start\ndata: {\"a\":1}\n\n")),
-                    Ok(Bytes::from_static(b"event: message_stop\ndata: {\"b\":2}\n\n")),
+                    Ok(Bytes::from_static(
+                        b"event: message_start\ndata: {\"a\":1}\n\n",
+                    )),
+                    Ok(Bytes::from_static(
+                        b"event: message_stop\ndata: {\"b\":2}\n\n",
+                    )),
                 ];
                 let stream = futures::stream::iter(chunks);
                 Response::builder()
@@ -2909,8 +2963,7 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_tolerates_head_probe() {
-        let (url, _seen, upstream) =
-            mock_upstream(StatusCode::OK, "application/json", "{}").await;
+        let (url, _seen, upstream) = mock_upstream(StatusCode::OK, "application/json", "{}").await;
         let broker =
             start_anthropic_pointed_at(AnthropicAuth::ApiKey("host-secret".into()), url).await;
         let status = reqwest::Client::new()
@@ -3258,8 +3311,13 @@ mod tests {
     async fn an_attested_trust_refuses_by_name_when_verify_is_not_compiled_in() {
         let cfg = AirlockConfig {
             kind: CredentialKind::Claude,
-            gateway: AirlockGateway::Local { url: "http://127.0.0.1:1".into() },
-            trust: AirlockTrust::Attested { measurement: "11".repeat(48), attest: "snp".into() },
+            gateway: AirlockGateway::Local {
+                url: "http://127.0.0.1:1".into(),
+            },
+            trust: AirlockTrust::Attested {
+                measurement: "11".repeat(48),
+                attest: "snp".into(),
+            },
             sub: "test-sub".into(),
             work: WorkRef::Direct,
             snp_product: None,
@@ -3350,7 +3408,10 @@ mod tests {
         assert_eq!(headers["authorization"], "Bearer sess-tok");
         // The path host sees CIPHERTEXT: the sealed body carries the marker
         // header and none of the child's plaintext.
-        assert_eq!(headers[airlock::bodyseal::SEAL_HEADER], airlock::bodyseal::SEAL_V1);
+        assert_eq!(
+            headers[airlock::bodyseal::SEAL_HEADER],
+            airlock::bodyseal::SEAL_V1
+        );
         assert!(
             !body.windows(6).any(|w| w == b"prompt"),
             "the child's plaintext must never reach a path host"
@@ -3378,7 +3439,10 @@ mod tests {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
                 if got != want {
-                    return (StatusCode::UNAUTHORIZED, format!("want {want:?} got {got:?}"))
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        format!("want {want:?} got {got:?}"),
+                    )
                         .into_response();
                 }
                 ([("content-type", "text/event-stream")], body).into_response()
@@ -3391,7 +3455,9 @@ mod tests {
             )
             .route(
                 "/responses",
-                post(guard("event: response.output_text.delta\ndata: CODEX-OK\n\n")),
+                post(guard(
+                    "event: response.output_text.delta\ndata: CODEX-OK\n\n",
+                )),
             );
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -3577,7 +3643,9 @@ mod tests {
             vec![(
                 "owner-claude-1".into(),
                 airlock::wire::CredentialKind::Claude,
-                airlock::wire::CredentialPayload::Bearer { access_token: "tok-grant".into() },
+                airlock::wire::CredentialPayload::Bearer {
+                    access_token: "tok-grant".into(),
+                },
             )],
             Some(check),
         )
@@ -3591,14 +3659,25 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let gateway_url = format!("http://{addr}");
-        let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
+        let rc = resolved(
+            "owner-claude-1",
+            CredentialKind::Claude,
+            &gateway_url,
+            seal_pk,
+        );
         AnthropicAuth::airlock(AirlockConfig::self_host(
             &rc,
-            WorkRef::Saga { saga_id: "sched\u{1f}pending".into() },
+            WorkRef::Saga {
+                saga_id: "sched\u{1f}pending".into(),
+            },
         ))
         .await
         .expect("a lender that answers on the second ask still opens the session");
-        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2, "asked exactly twice");
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "asked exactly twice"
+        );
     }
 
     #[tokio::test]
@@ -3611,14 +3690,21 @@ mod tests {
             vec![(
                 "owner-claude-1".into(),
                 airlock::wire::CredentialKind::Claude,
-                airlock::wire::CredentialPayload::Bearer { access_token: "tok-grant".into() },
+                airlock::wire::CredentialPayload::Bearer {
+                    access_token: "tok-grant".into(),
+                },
             )],
             b"grantee".to_vec(),
             b"grantee".to_vec(),
             airlock::server::Clock::system(),
         )
         .await;
-        let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
+        let rc = resolved(
+            "owner-claude-1",
+            CredentialKind::Claude,
+            &gateway_url,
+            seal_pk,
+        );
         let (auth, messages_url) =
             AnthropicAuth::airlock(AirlockConfig::self_host(&rc, WorkRef::Direct))
                 .await
@@ -3635,7 +3721,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        assert!(resp.text().await.unwrap().contains("AIRLOCK-OK"), "gated self-host round-trip");
+        assert!(
+            resp.text().await.unwrap().contains("AIRLOCK-OK"),
+            "gated self-host round-trip"
+        );
     }
 
     /// A BORROWED credential must be able to renew its session.
@@ -3676,14 +3765,21 @@ mod tests {
             vec![(
                 "owner-claude-1".into(),
                 airlock::wire::CredentialKind::Claude,
-                airlock::wire::CredentialPayload::Bearer { access_token: "tok-renew".into() },
+                airlock::wire::CredentialPayload::Bearer {
+                    access_token: "tok-renew".into(),
+                },
             )],
             b"grantee".to_vec(),
             b"grantee".to_vec(),
             airlock::server::Clock::new(move || tick.load(std::sync::atomic::Ordering::Relaxed)),
         )
         .await;
-        let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
+        let rc = resolved(
+            "owner-claude-1",
+            CredentialKind::Claude,
+            &gateway_url,
+            seal_pk,
+        );
         let (auth, messages_url) =
             AnthropicAuth::airlock(AirlockConfig::self_host(&rc, WorkRef::Direct))
                 .await
@@ -3734,14 +3830,21 @@ mod tests {
             vec![(
                 "owner-claude-1".into(),
                 airlock::wire::CredentialKind::Claude,
-                airlock::wire::CredentialPayload::Bearer { access_token: "tok-grant".into() },
+                airlock::wire::CredentialPayload::Bearer {
+                    access_token: "tok-grant".into(),
+                },
             )],
             b"grantee".to_vec(),
             b"stranger".to_vec(),
             airlock::server::Clock::system(),
         )
         .await;
-        let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
+        let rc = resolved(
+            "owner-claude-1",
+            CredentialKind::Claude,
+            &gateway_url,
+            seal_pk,
+        );
         let refused = AnthropicAuth::airlock(AirlockConfig::self_host(&rc, WorkRef::Direct)).await;
         // and it is named for what happened. The grant gate's refusal is the
         // headline feature of the lending path; reporting it as a seal_pk
@@ -3765,14 +3868,21 @@ mod tests {
             vec![(
                 "owner-claude-1".into(),
                 airlock::wire::CredentialKind::Claude,
-                airlock::wire::CredentialPayload::Bearer { access_token: "tok-grant".into() },
+                airlock::wire::CredentialPayload::Bearer {
+                    access_token: "tok-grant".into(),
+                },
             )],
             b"grantee".to_vec(),
             b"wedged".to_vec(),
             airlock::server::Clock::system(),
         )
         .await;
-        let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
+        let rc = resolved(
+            "owner-claude-1",
+            CredentialKind::Claude,
+            &gateway_url,
+            seal_pk,
+        );
         let undetermined =
             AnthropicAuth::airlock(AirlockConfig::self_host(&rc, WorkRef::Direct)).await;
         assert_eq!(
@@ -3801,21 +3911,33 @@ mod tests {
         // `credential_not_granted` sends the operator to add a grant that is not
         // the problem.
         let named = |status, reason: &str| {
-            R::of_gateway_refusal(&SessionRefusedBy { status, reason: reason.into() })
+            R::of_gateway_refusal(&SessionRefusedBy {
+                status,
+                reason: reason.into(),
+            })
         };
         assert_eq!(named(403, "caller_node_unverified"), R::CallerUnverified);
         assert_eq!(named(403, "credential_not_granted"), R::NotGranted);
         // a node's proxy in the path answers with prose, not a token.
-        assert_eq!(named(502, "loopback upstream refused the connection"), R::Unreachable);
+        assert_eq!(
+            named(502, "loopback upstream refused the connection"),
+            R::Unreachable
+        );
         // and the tag is what the chain actually carries.
-        let unvouched: anyhow::Error =
-            SessionRefusedBy { status: 403, reason: "caller_node_unverified".into() }.into();
+        let unvouched: anyhow::Error = SessionRefusedBy {
+            status: 403,
+            reason: "caller_node_unverified".into(),
+        }
+        .into();
         assert_eq!(R::of(&unvouched), R::CallerUnverified);
 
         // past the response boundary there is no status to read, so the client
         // tags the step. A body that is not the wire shape means REACHABLE and
         // answering — the one name it must never take is the seal_pk mismatch.
-        assert_eq!(R::after_response(SessionResponseFault::Malformed), R::Malformed);
+        assert_eq!(
+            R::after_response(SessionResponseFault::Malformed),
+            R::Malformed
+        );
         assert_eq!(
             R::after_response(SessionResponseFault::TokenWouldNotOpen),
             R::SealPkMismatch
@@ -3841,7 +3963,11 @@ mod tests {
         ]
         .map(R::reason);
         let unique: std::collections::BTreeSet<_> = reasons.iter().collect();
-        assert_eq!(unique.len(), reasons.len(), "every refusal needs its own name");
+        assert_eq!(
+            unique.len(),
+            reasons.len(),
+            "every refusal needs its own name"
+        );
     }
 
     /// The failure an upgrade actually produces: the lender's daemon is not
@@ -3868,7 +3994,10 @@ mod tests {
             WorkRef::Direct,
         );
         let refused = AnthropicAuth::airlock(cfg).await;
-        assert_eq!(refused.err().as_deref(), Some("airlock_gateway_unreachable"));
+        assert_eq!(
+            refused.err().as_deref(),
+            Some("airlock_gateway_unreachable")
+        );
     }
 
     /// A lender that is up but holds no such credential answers 404, which is a
@@ -3905,7 +4034,9 @@ mod tests {
             vec![(
                 "owner-claude-1".into(),
                 airlock::wire::CredentialKind::Claude,
-                airlock::wire::CredentialPayload::Bearer { access_token: "tok-e2e".into() },
+                airlock::wire::CredentialPayload::Bearer {
+                    access_token: "tok-e2e".into(),
+                },
             )],
         )
         .await;
@@ -3934,7 +4065,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         let body = resp.text().await.unwrap();
-        assert!(body.contains("AIRLOCK-OK"), "sealed self-host round-trip: {body}");
+        assert!(
+            body.contains("AIRLOCK-OK"),
+            "sealed self-host round-trip: {body}"
+        );
     }
 
     #[tokio::test]
@@ -3951,7 +4085,9 @@ mod tests {
             vec![(
                 "owner-claude-1".into(),
                 airlock::wire::CredentialKind::Claude,
-                airlock::wire::CredentialPayload::Bearer { access_token: "tok-ctx".into() },
+                airlock::wire::CredentialPayload::Bearer {
+                    access_token: "tok-ctx".into(),
+                },
             )],
         )
         .await;
@@ -3981,7 +4117,9 @@ mod tests {
             vec![(
                 "owner-claude-1".into(),
                 airlock::wire::CredentialKind::Claude,
-                airlock::wire::CredentialPayload::Bearer { access_token: "tok-e2e".into() },
+                airlock::wire::CredentialPayload::Bearer {
+                    access_token: "tok-e2e".into(),
+                },
             )],
         )
         .await;
@@ -4012,7 +4150,9 @@ mod tests {
             vec![(
                 "owner-claude-1".into(),
                 airlock::wire::CredentialKind::Claude,
-                airlock::wire::CredentialPayload::Bearer { access_token: "tok-e2e".into() },
+                airlock::wire::CredentialPayload::Bearer {
+                    access_token: "tok-e2e".into(),
+                },
             )],
         )
         .await;
@@ -4383,7 +4523,9 @@ mod tests {
             vec![(
                 "owner-codex-1".into(),
                 airlock::wire::CredentialKind::Codex,
-                airlock::wire::CredentialPayload::Bearer { access_token: "tok-codex".into() },
+                airlock::wire::CredentialPayload::Bearer {
+                    access_token: "tok-codex".into(),
+                },
             )],
         )
         .await;
@@ -4410,6 +4552,9 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         let body = resp.text().await.unwrap();
-        assert!(body.contains("CODEX-OK"), "sealed codex self-host round-trip: {body}");
+        assert!(
+            body.contains("CODEX-OK"),
+            "sealed codex self-host round-trip: {body}"
+        );
     }
 }

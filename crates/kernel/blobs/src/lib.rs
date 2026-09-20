@@ -68,7 +68,12 @@ pub struct Stage {
 }
 
 impl Stage {
-    pub fn put(&mut self, hash: HashKind, kind: &str, body: &[u8]) -> std::result::Result<BlobId, Refusal> {
+    pub fn put(
+        &mut self,
+        hash: HashKind,
+        kind: &str,
+        body: &[u8],
+    ) -> std::result::Result<BlobId, Refusal> {
         let framed = frame(kind, body)?;
         let id = id_of(hash, &framed);
         self.framed.entry(id).or_insert(framed);
@@ -142,8 +147,8 @@ impl Blobs {
         let Some(framed) = self.framed(id)? else {
             return Ok(None);
         };
-        let (header, body) = parse(&framed)
-            .ok_or_else(|| Error::Corrupt(*id, "the frame does not parse".into()))?;
+        let (header, body) =
+            parse(&framed).ok_or_else(|| Error::Corrupt(*id, "the frame does not parse".into()))?;
         Ok(Some(Blob {
             kind: header.kind,
             body: body.to_vec(),
@@ -186,8 +191,7 @@ impl Blobs {
         let Some((mut file, header, body_start)) = self.open_framed(id)? else {
             return Ok(None);
         };
-        let start = offset.min(header.len);
-        let end = offset.saturating_add(len).min(header.len);
+        let (start, end) = window(header.len, offset, len);
         file.seek(SeekFrom::Start(body_start + start))?;
         let mut bytes = vec![0u8; (end - start) as usize];
         file.read_exact(&mut bytes)?;
@@ -203,11 +207,55 @@ impl Blobs {
     }
 }
 
-pub fn read_framed(stage: &Stage, blobs: &Blobs, id: &BlobId) -> Result<Option<Vec<u8>>> {
-    if let Some(framed) = stage.get(id) {
-        return Ok(Some(framed.to_vec()));
+pub fn window(len: u64, offset: u64, want: u64) -> (u64, u64) {
+    let start = offset.min(len);
+    let end = offset.saturating_add(want).min(len);
+    (start, end)
+}
+
+pub struct Layered<'a> {
+    pub stage: &'a Stage,
+    pub blobs: &'a Blobs,
+}
+
+impl Layered<'_> {
+    pub fn framed(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
+        if let Some(framed) = self.stage.get(id) {
+            return Ok(Some(framed.to_vec()));
+        }
+        self.blobs.framed(id)
     }
-    blobs.framed(id)
+
+    pub fn get(&self, id: &BlobId) -> Result<Option<Blob>> {
+        let Some(framed) = self.stage.get(id) else {
+            return self.blobs.get(id);
+        };
+        let (header, body) = staged(id, framed)?;
+        Ok(Some(Blob {
+            kind: header.kind,
+            body: body.to_vec(),
+        }))
+    }
+
+    pub fn stat(&self, id: &BlobId) -> Result<Option<BlobHeader>> {
+        let Some(framed) = self.stage.get(id) else {
+            return self.blobs.stat(id);
+        };
+        Ok(Some(staged(id, framed)?.0))
+    }
+
+    pub fn read(&self, id: &BlobId, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
+        let Some(framed) = self.stage.get(id) else {
+            return self.blobs.read(id, offset, len);
+        };
+        let (header, body) = staged(id, framed)?;
+        let (start, end) = window(header.len, offset, len);
+        Ok(Some(body[start as usize..end as usize].to_vec()))
+    }
+}
+
+fn staged<'a>(id: &BlobId, framed: &'a [u8]) -> Result<(BlobHeader, &'a [u8])> {
+    parse(framed).ok_or_else(|| Error::Corrupt(*id, "the staged frame does not parse".into()))
 }
 
 #[cfg(test)]
@@ -219,10 +267,7 @@ mod tests {
         let framed = frame("blob", b"hello\n").unwrap();
         assert_eq!(framed, b"blob 6\0hello\n");
         let id = id_of(HashKind::Sha1, &framed);
-        assert_eq!(
-            hex(id.digest()),
-            "ce013625030ba8dba906f756967f9e9ca394464a"
-        );
+        assert_eq!(hex(id.digest()), "ce013625030ba8dba906f756967f9e9ca394464a");
         let (header, body) = parse(&framed).unwrap();
         assert_eq!(header.kind, "blob");
         assert_eq!(header.len, 6);
@@ -232,7 +277,10 @@ mod tests {
     #[test]
     fn a_kind_is_one_word() {
         assert_eq!(frame("", b"").unwrap_err().reason, reason::INVALID_INPUT);
-        assert_eq!(frame("two words", b"").unwrap_err().reason, reason::INVALID_INPUT);
+        assert_eq!(
+            frame("two words", b"").unwrap_err().reason,
+            reason::INVALID_INPUT
+        );
         assert!(parse(b"blob 3\0hi").is_none());
         assert!(parse(b"blob\0hi").is_none());
     }
@@ -246,7 +294,16 @@ mod tests {
         let again = stage.put(HashKind::Sha256, "page", b"0123456789").unwrap();
         assert_eq!(id, again);
         assert!(!blobs.has(&id));
-        assert_eq!(read_framed(&stage, &blobs, &id).unwrap().unwrap(), b"page 10\x000123456789");
+        let layered = Layered {
+            stage: &stage,
+            blobs: &blobs,
+        };
+        assert_eq!(
+            layered.framed(&id).unwrap().unwrap(),
+            b"page 10\x000123456789"
+        );
+        assert_eq!(layered.read(&id, 3, 4).unwrap().unwrap(), b"3456");
+        assert_eq!(layered.stat(&id).unwrap().unwrap().len, 10);
         blobs.promote(stage).unwrap();
         assert!(blobs.has(&id));
         assert_eq!(

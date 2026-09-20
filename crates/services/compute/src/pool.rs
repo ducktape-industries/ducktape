@@ -180,7 +180,12 @@ fn record_context(
     });
     let delegated = serde_json::from_str::<Value>(&job.input)
         .ok()
-        .and_then(|value| value.get("run_id").and_then(Value::as_str).map(str::to_owned))
+        .and_then(|value| {
+            value
+                .get("run_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .is_some_and(|run_id| run_id.starts_with("delegate/"));
     let origin = if delegated {
         Some("delegation")
@@ -216,7 +221,9 @@ fn conversation_origin(ctx: &provider_host::RunContext) -> Option<&'static str> 
     if !has_chat {
         return None;
     }
-    let has_mention = events.iter().any(|event| contains_key(&event.input, "mention"));
+    let has_mention = events
+        .iter()
+        .any(|event| contains_key(&event.input, "mention"));
     Some(if has_mention { "mention" } else { "user" })
 }
 
@@ -224,8 +231,7 @@ fn contains_key(value: &Value, wanted: &str) -> bool {
     match value {
         Value::Array(values) => values.iter().any(|value| contains_key(value, wanted)),
         Value::Object(values) => {
-            values.contains_key(wanted)
-                || values.values().any(|value| contains_key(value, wanted))
+            values.contains_key(wanted) || values.values().any(|value| contains_key(value, wanted))
         }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
     }
@@ -411,10 +417,7 @@ impl DispatchPool {
         self
     }
 
-    pub fn with_session_record_sink(
-        mut self,
-        sink: provider_host::SessionRecordSink,
-    ) -> Self {
+    pub fn with_session_record_sink(mut self, sink: provider_host::SessionRecordSink) -> Self {
         self.record_sink = Some(sink);
         self
     }
@@ -601,14 +604,12 @@ impl DispatchPool {
                                             prepared.ctx.limits = job.demands.clone();
                                             prepared.ctx.cancellation = Some(cancellation.clone());
                                             prepared.ctx.session_record_sink = record_sink.clone();
-                                            prepared.ctx.session_record = Some(
-                                                record_context(
-                                                    &job,
-                                                    &prepared.ctx,
-                                                    prepared.credential.is_some(),
-                                                    record_requesters.as_ref(),
-                                                ),
-                                            );
+                                            prepared.ctx.session_record = Some(record_context(
+                                                &job,
+                                                &prepared.ctx,
+                                                prepared.credential.is_some(),
+                                                record_requesters.as_ref(),
+                                            ));
                                             // resolve a named credential into
                                             // ctx.airlock BEFORE the provider
                                             // spawns: a refusal fails the
@@ -861,7 +862,9 @@ async fn execute(
                 let native_terminal = ctx.native_conversation.is_some() && output.text.is_empty();
                 let invalid_terminal = match output.disposition {
                     provider_host::OutputDisposition::Answer => false,
-                    provider_host::OutputDisposition::InputHandled => !native_terminal || output.usage.is_some(),
+                    provider_host::OutputDisposition::InputHandled => {
+                        !native_terminal || output.usage.is_some()
+                    }
                     provider_host::OutputDisposition::Cancelled => !native_terminal,
                 };
                 if invalid_terminal {
@@ -3111,7 +3114,10 @@ format = "text"
             "session_path":"session.jsonl", "packages":[], "events":[],
         });
         let effect = effect_with_payload(
-            "native-1", 0, Some(b"me"), &serde_json::to_vec(&envelope).unwrap(),
+            "native-1",
+            0,
+            Some(b"me"),
+            &serde_json::to_vec(&envelope).unwrap(),
         );
         pool.run(&effect).await.unwrap();
         let (_, _, outcome) = next_result(&mut rx).await;
@@ -3904,12 +3910,14 @@ format = "text"
         assert_eq!(parsed.ducktape_runner_result, 1);
         assert_eq!(parsed.response_text, "the answer");
         assert!(!parsed.native_input_handled);
-        let handled = crate::provision::assemble_handled_input_result(&receipt, Sink::Chain, Status::Ok);
+        let handled =
+            crate::provision::assemble_handled_input_result(&receipt, Sink::Chain, Status::Ok);
         let handled: RunsRunnerResult = serde_json::from_slice(&handled).unwrap();
         assert!(handled.native_input_handled);
         assert!(handled.response_text.is_empty());
         assert!(!handled.native_cancelled);
-        let cancelled = crate::provision::assemble_cancelled_result(&receipt, Sink::Chain, Status::Ok);
+        let cancelled =
+            crate::provision::assemble_cancelled_result(&receipt, Sink::Chain, Status::Ok);
         let cancelled: RunsRunnerResult = serde_json::from_slice(&cancelled).unwrap();
         assert!(cancelled.native_cancelled);
         assert!(!cancelled.native_input_handled);

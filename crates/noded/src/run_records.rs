@@ -256,9 +256,8 @@ fn codex_payload(frame: &Value) -> Option<SessionEventPayload> {
 /// needs both.
 fn claude_payload(frame: &Value) -> Option<SessionEventPayload> {
     let blocks = frame["message"]["content"].as_array();
-    let block_of = |kind: &str| {
-        blocks.and_then(|blocks| blocks.iter().find(|block| block["type"] == kind))
-    };
+    let block_of =
+        |kind: &str| blocks.and_then(|blocks| blocks.iter().find(|block| block["type"] == kind));
     match frame["type"].as_str()? {
         "system" if frame["subtype"] == "init" => Some(SessionEventPayload::Turn {
             turn_id: frame["session_id"].as_str().unwrap_or_default().to_owned(),
@@ -291,7 +290,10 @@ fn claude_payload(frame: &Value) -> Option<SessionEventPayload> {
         "user" => {
             let result = block_of("tool_result")?;
             Some(SessionEventPayload::ToolResult {
-                tool_id: result["tool_use_id"].as_str().unwrap_or_default().to_owned(),
+                tool_id: result["tool_use_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
                 result: result["content"].clone(),
                 error: (result["is_error"] == true).then(|| "tool_error".to_owned()),
             })
@@ -545,12 +547,11 @@ impl SessionRecordStore {
             Ok(()) => Ok(()),
             Err(StoreError::SessionExists) => {
                 let existing = self.session_summary(&summary.session_id)?;
-                let same_record = existing.ordinal != 0
-                    && {
-                        let mut expected = summary;
-                        expected.ordinal = existing.ordinal;
-                        existing == expected
-                    };
+                let same_record = existing.ordinal != 0 && {
+                    let mut expected = summary;
+                    expected.ordinal = existing.ordinal;
+                    existing == expected
+                };
                 same_record.then_some(()).ok_or(StoreError::SessionExists)
             }
             Err(error) => Err(error),
@@ -567,10 +568,7 @@ impl SessionRecordStore {
         self.append_line(&path, &JournalLine::Snapshot { summary }, false)
     }
 
-    pub fn append_remote_snapshot(
-        &self,
-        mut summary: SessionSummary,
-    ) -> Result<(), StoreError> {
+    pub fn append_remote_snapshot(&self, mut summary: SessionSummary) -> Result<(), StoreError> {
         summary.machine_id = self.0.identity.machine_id.clone();
         summary.network_id = self.0.identity.network_id.clone();
         let existing = self.session_summary(&summary.session_id)?;
@@ -1452,8 +1450,7 @@ fn sanitize_text(text: &str) -> String {
             .filter_map(|marker| {
                 lowered.find(marker).and_then(|start| {
                     let value_start = start + marker.len();
-                    (!lowered[value_start..].starts_with("[redacted]"))
-                        .then_some((start, *marker))
+                    (!lowered[value_start..].starts_with("[redacted]")).then_some((start, *marker))
                 })
             })
             .min_by_key(|(start, _)| *start)
@@ -1597,10 +1594,8 @@ mod tests {
             end_cursor: "q1.synthetic.synthetic".into(),
             has_more: true,
         };
-        let expected: Value = serde_json::from_str(include_str!(
-            "../testdata/run-records/events-tail.json"
-        ))
-        .unwrap();
+        let expected: Value =
+            serde_json::from_str(include_str!("../testdata/run-records/events-tail.json")).unwrap();
         assert_eq!(serde_json::to_value(tail).unwrap(), expected);
 
         let empty_tail = EventsReply {
@@ -1621,10 +1616,9 @@ mod tests {
         .unwrap();
         assert_eq!(serde_json::to_value(empty_tail).unwrap(), expected);
 
-        let session_for_run: Value = serde_json::from_str(include_str!(
-            "../testdata/run-records/session-for-run.json"
-        ))
-        .unwrap();
+        let session_for_run: Value =
+            serde_json::from_str(include_str!("../testdata/run-records/session-for-run.json"))
+                .unwrap();
         assert_eq!(session_for_run, sessions_fixture);
     }
 
@@ -1879,15 +1873,28 @@ mod tests {
         ));
         assert_eq!(value, Value::String("[redacted capability url]".into()));
         let value = sanitize_payload(Value::String("token=abc password=def".into()));
-        assert_eq!(value, Value::String("token=[redacted] password=[redacted]".into()));
+        assert_eq!(
+            value,
+            Value::String("token=[redacted] password=[redacted]".into())
+        );
     }
 
     #[tokio::test]
     async fn refusal_bodies_are_stable_tokens() {
-        for reason in ["cursor_rejected", "wrong_kind", "zero_limit", "not_found_or_unauthorized"] {
+        for reason in [
+            "cursor_rejected",
+            "wrong_kind",
+            "zero_limit",
+            "not_found_or_unauthorized",
+        ] {
             let response = query_refusal(StatusCode::BAD_REQUEST, reason);
-            let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
-            assert_eq!(body.as_ref(), format!(r#"{{"reason":"{reason}"}}"#).as_bytes());
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                body.as_ref(),
+                format!(r#"{{"reason":"{reason}"}}"#).as_bytes()
+            );
         }
     }
 
@@ -1914,13 +1921,23 @@ mod tests {
         assert_eq!(value["has_more"], true);
         let last_seq = returned.last().unwrap()["seq"].as_u64().unwrap();
         let cursor = value["end_cursor"].as_str().unwrap().to_string();
-        let response =
-            events_response(&store, b"signer", "session-a", Some(&cursor), Some(500), false);
+        let response = events_response(
+            &store,
+            b"signer",
+            "session-a",
+            Some(&cursor),
+            Some(500),
+            false,
+        );
         let bytes = axum::body::to_bytes(response.into_body(), MAX_EVENT_REPLY_BYTES * 2)
             .await
             .unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["events"][0]["seq"], last_seq + 1, "no gap after a pop");
+        assert_eq!(
+            value["events"][0]["seq"],
+            last_seq + 1,
+            "no gap after a pop"
+        );
     }
 
     #[tokio::test]
@@ -2182,7 +2199,9 @@ mod tests {
         let mut record = summary("program-session", None);
         record.requester = Some(RequesterPrincipal::Program { account_id: 42 });
         store.append_start(record).unwrap();
-        store.append_event(event("event-1"), "program-session").unwrap();
+        store
+            .append_event(event("event-1"), "program-session")
+            .unwrap();
 
         let queries = [
             serde_json::json!({"kind":"sessions"}),
@@ -2197,9 +2216,12 @@ mod tests {
                     let (status, reply) = route(&handle, &key, body).await;
                     seen.push(match reply["kind"].as_str() {
                         Some("sessions") => {
-                            status == StatusCode::OK && reply["sessions"].as_array().unwrap().len() == 1
+                            status == StatusCode::OK
+                                && reply["sessions"].as_array().unwrap().len() == 1
                         }
-                        Some("events") => status == StatusCode::OK && reply["events"][0]["seq"] == 1,
+                        Some("events") => {
+                            status == StatusCode::OK && reply["events"][0]["seq"] == 1
+                        }
                         _ => {
                             assert_eq!(status, StatusCode::NOT_FOUND);
                             assert_eq!(reply["reason"], "not_found_or_unauthorized");

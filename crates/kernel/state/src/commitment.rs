@@ -12,7 +12,10 @@ use commonware_storage::{
     qmdb::{
         any::{
             VariableConfig,
-            unordered::{Update, variable::{Db as Qmdb, Operation}},
+            unordered::{
+                Update,
+                variable::{Db as Qmdb, Operation},
+            },
         },
         sync::{self, SourceFor, Target, engine::Config as SyncConfig},
     },

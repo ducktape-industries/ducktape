@@ -322,7 +322,9 @@ mod tests {
         );
         // quoted values unwrap.
         assert_eq!(
-            parse_skill_md("---\ndescription: \"quoted\"\n---\nbody").0.as_deref(),
+            parse_skill_md("---\ndescription: \"quoted\"\n---\nbody")
+                .0
+                .as_deref(),
             Some("quoted")
         );
     }

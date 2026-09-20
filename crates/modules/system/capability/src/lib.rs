@@ -89,7 +89,6 @@ use sdk::{
 };
 use valset_contract::members_and_residents;
 
-
 /// serialized node-roster byte bound — the backstop on top of the count cap
 /// (node keys are opaque origin bytes, so the count alone does not bound the
 /// serialized form).

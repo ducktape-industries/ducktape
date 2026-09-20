@@ -178,7 +178,11 @@ static PACK_BUILD: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1)
 /// and the base set sorted and deduped. It is the single-flight KEY, so two
 /// peers — or one peer's three retries — asking for the same objects must
 /// produce the same tuple.
-type PackAsk = (String, [u8; statesync::FORGE_OID_LEN], Vec<[u8; statesync::FORGE_OID_LEN]>);
+type PackAsk = (
+    String,
+    [u8; statesync::FORGE_OID_LEN],
+    Vec<[u8; statesync::FORGE_OID_LEN]>,
+);
 
 /// what a build settled on: the staged digest, `None` for an honest miss
 /// (this node does not hold the head either), or a reason token this node
@@ -1226,7 +1230,7 @@ mod tests {
 
         fetch_blob(&StoreClient::new(vec![source]), &local, &digest, 1)
             .await
-        .expect("the fetch must run and heal the digest");
+            .expect("the fetch must run and heal the digest");
         assert_eq!(local.get_chunk(&digest), Some(truth));
     }
 
@@ -1411,7 +1415,11 @@ mod pack_flight {
     /// distinct per test: the slot map is process-global, and `settle` evicts
     /// by repo name.
     fn ask(repo: &str) -> PackAsk {
-        (repo.to_string(), [7u8; statesync::FORGE_OID_LEN], Vec::new())
+        (
+            repo.to_string(),
+            [7u8; statesync::FORGE_OID_LEN],
+            Vec::new(),
+        )
     }
 
     /// A RETRY BURST IS ONE PACK. The client re-sends the same request up to
@@ -1455,11 +1463,15 @@ mod pack_flight {
         let asked = ask("over-budget");
 
         let counted = Arc::clone(&builds);
-        let impatient = one_pack_per_ask(asked.clone(), Duration::from_millis(50), move || async move {
-            counted.fetch_add(1, AtomicOrdering::SeqCst);
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            Ok(Some([2u8; 32]))
-        });
+        let impatient = one_pack_per_ask(
+            asked.clone(),
+            Duration::from_millis(50),
+            move || async move {
+                counted.fetch_add(1, AtomicOrdering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(Some([2u8; 32]))
+            },
+        );
         let counted = Arc::clone(&builds);
         let patient = one_pack_per_ask(asked, Duration::from_secs(300), move || async move {
             counted.fetch_add(1, AtomicOrdering::SeqCst);

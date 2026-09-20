@@ -100,14 +100,35 @@ fn three_applying_frames_form_one_block_at_one_height() {
         let signer = sk(1);
 
         // three distinct applying ops, enqueued in FIFO order.
-        let id0 = node.submit(&signer, 0, dir_set("a", "1")).await.expect("submit a");
-        let id1 = node.submit(&signer, 1, dir_set("b", "2")).await.expect("submit b");
-        let id2 = node.submit(&signer, 2, dir_set("c", "3")).await.expect("submit c");
-        assert_eq!(node.pending_batch_len(), 3, "all three enqueued, none proposed yet");
+        let id0 = node
+            .submit(&signer, 0, dir_set("a", "1"))
+            .await
+            .expect("submit a");
+        let id1 = node
+            .submit(&signer, 1, dir_set("b", "2"))
+            .await
+            .expect("submit b");
+        let id2 = node
+            .submit(&signer, 2, dir_set("c", "3"))
+            .await
+            .expect("submit c");
+        assert_eq!(
+            node.pending_batch_len(),
+            3,
+            "all three enqueued, none proposed yet"
+        );
 
         // ONE flush packs all three into ONE batch super-frame.
-        assert_eq!(node.flush_batch().await.expect("flush"), 1, "one batch submitted");
-        assert_eq!(node.pending_batch_len(), 0, "flush drained the pending queue");
+        assert_eq!(
+            node.flush_batch().await.expect("flush"),
+            1,
+            "one batch submitted"
+        );
+        assert_eq!(
+            node.pending_batch_len(),
+            0,
+            "flush drained the pending queue"
+        );
 
         // drive to a fixpoint.
         while node.drain_delivered().await.expect("drain") != 0 {}
@@ -120,7 +141,11 @@ fn three_applying_frames_form_one_block_at_one_height() {
         assert_eq!(h, 0, "the batch is the first block, at height 0");
         for d in &drained {
             assert_eq!(d.height, h, "every member shares the block height");
-            assert_eq!(d.root_hash, node.root_hash(), "every member shares the batch root-hash");
+            assert_eq!(
+                d.root_hash,
+                node.root_hash(),
+                "every member shares the batch root-hash"
+            );
             assert_eq!(d.disposition, Disposition::Applied);
         }
         let mut ids: Vec<_> = drained.iter().map(|d| d.id).collect();
@@ -128,7 +153,11 @@ fn three_applying_frames_form_one_block_at_one_height() {
         ids.dedup();
         assert_eq!(ids.len(), 3, "the three member FrameIds are distinct");
         // and they are exactly the submit ids.
-        assert!([id0, id1, id2].iter().all(|id| drained.iter().any(|d| d.id == *id)));
+        assert!(
+            [id0, id1, id2]
+                .iter()
+                .all(|id| drained.iter().any(|d| d.id == *id))
+        );
 
         // EXACTLY ONE seal for that height, Applied (the batch moved state).
         let recorded = seals.0.borrow();
@@ -138,7 +167,10 @@ fn three_applying_frames_form_one_block_at_one_height() {
 
         // the finalized boundary advanced by exactly one block.
         let boundary = node.finalized().expect("boundary set");
-        assert_eq!(boundary.height, 0, "finalized advanced by exactly one block");
+        assert_eq!(
+            boundary.height, 0,
+            "finalized advanced by exactly one block"
+        );
         assert_eq!(boundary.root_hash, node.root_hash());
     });
 }
@@ -151,9 +183,18 @@ fn a_mixed_batch_rejects_one_member_at_the_shared_height() {
         let signer = sk(2);
 
         // applied, applied, rejected — one batch, one height.
-        let id_ok0 = node.submit(&signer, 0, dir_set("a", "1")).await.expect("submit a");
-        let id_ok1 = node.submit(&signer, 1, dir_set("b", "2")).await.expect("submit b");
-        let id_bad = node.submit(&signer, 2, dir_bad()).await.expect("submit bad");
+        let id_ok0 = node
+            .submit(&signer, 0, dir_set("a", "1"))
+            .await
+            .expect("submit a");
+        let id_ok1 = node
+            .submit(&signer, 1, dir_set("b", "2"))
+            .await
+            .expect("submit b");
+        let id_bad = node
+            .submit(&signer, 2, dir_bad())
+            .await
+            .expect("submit bad");
 
         assert_eq!(node.flush_batch().await.expect("flush"), 1);
         while node.drain_delivered().await.expect("drain") != 0 {}
@@ -165,18 +206,34 @@ fn a_mixed_batch_rejects_one_member_at_the_shared_height() {
         let h = drained[0].height;
         for d in &drained {
             assert_eq!(d.height, h, "all members share the block height");
-            assert_eq!(d.root_hash, node.root_hash(), "all members share the batch root-hash");
+            assert_eq!(
+                d.root_hash,
+                node.root_hash(),
+                "all members share the batch root-hash"
+            );
         }
 
-        let disp = |id| drained.iter().find(|d| d.id == id).expect("drained").disposition;
+        let disp = |id| {
+            drained
+                .iter()
+                .find(|d| d.id == id)
+                .expect("drained")
+                .disposition
+        };
         assert_eq!(disp(id_ok0), Disposition::Applied);
         assert_eq!(disp(id_ok1), Disposition::Applied);
         assert_eq!(disp(id_bad), Disposition::Rejected);
 
         // the rejected member is a decoded-then-module-rejected op: it carries
         // the module's verbatim reason, UNWRAPPED (no `Module(..)` wrapper).
-        let bad = drained.iter().find(|d| d.id == id_bad).expect("bad drained");
-        let reason = bad.reason.as_deref().expect("a rejected member carries a reason");
+        let bad = drained
+            .iter()
+            .find(|d| d.id == id_bad)
+            .expect("bad drained");
+        let reason = bad
+            .reason
+            .as_deref()
+            .expect("a rejected member carries a reason");
         assert!(
             !reason.contains("Module("),
             "the reason is the module string unwrapped, got: {reason}"
@@ -214,14 +271,26 @@ fn flush_greedily_splits_pending_into_multiple_capped_batches() {
         assert_eq!(node.pending_batch_len(), 3);
 
         // ONE flush produces TWO batches (the greedy cap split).
-        assert_eq!(node.flush_batch().await.expect("flush"), 2, "greedy split into two batches");
+        assert_eq!(
+            node.flush_batch().await.expect("flush"),
+            2,
+            "greedy split into two batches"
+        );
         assert_eq!(node.pending_batch_len(), 0);
 
         while node.drain_delivered().await.expect("drain") != 0 {}
 
         let drained = node.take_drained();
-        assert_eq!(drained.len(), 3, "every member applied across the two batches");
-        assert!(drained.iter().all(|d| d.disposition == Disposition::Applied));
+        assert_eq!(
+            drained.len(),
+            3,
+            "every member applied across the two batches"
+        );
+        assert!(
+            drained
+                .iter()
+                .all(|d| d.disposition == Disposition::Applied)
+        );
 
         // the two greedily-packed members share ONE block; the third is alone in
         // the other block. (which block is height 0 vs 1 is the orderer's agreed
@@ -230,7 +299,10 @@ fn flush_greedily_splits_pending_into_multiple_capped_batches() {
         let pos = |key| {
             drained
                 .iter()
-                .position(|d| d.op.as_ref().is_some_and(|op| op.payload == dir_set(key, &big).payload))
+                .position(|d| {
+                    d.op.as_ref()
+                        .is_some_and(|op| op.payload == dir_set(key, &big).payload)
+                })
                 .expect("member present")
         };
         let h = |key| drained[pos(key)].height;
@@ -240,7 +312,10 @@ fn flush_greedily_splits_pending_into_multiple_capped_batches() {
         heights.sort();
         assert_eq!(heights, [0, 1], "two consecutive blocks");
         // FIFO within the shared batch: k0 (enqueued first) drains before k1.
-        assert!(pos("k0") < pos("k1"), "member order within a batch is enqueue order");
+        assert!(
+            pos("k0") < pos("k1"),
+            "member order within a batch is enqueue order"
+        );
 
         // two batches -> two seals, at the two consecutive heights.
         let recorded = seals.0.borrow();

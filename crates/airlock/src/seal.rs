@@ -6,7 +6,7 @@
 //!
 //! Blob layout: `eph_pk(32) || nonce(12) || ciphertext(+16 tag)`.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use rand_core::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -50,7 +50,9 @@ impl SealKeypair {
     /// the matching secret from the `seal_pk` it read out of the attested
     /// REPORTDATA, so the session binds to the attested enclave.
     pub fn ecdh(&self, peer_pk: &[u8; 32]) -> [u8; 32] {
-        self.secret.diffie_hellman(&PublicKey::from(*peer_pk)).to_bytes()
+        self.secret
+            .diffie_hellman(&PublicKey::from(*peer_pk))
+            .to_bytes()
     }
 }
 

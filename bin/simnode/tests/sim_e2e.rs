@@ -262,7 +262,10 @@ fn the_spawned_sim_serves_a_credentialed_admin_surface() {
     // credential is absent.
     let (code, body) =
         nettest::try_http_json(port, "GET", "/v1/admin/ping", None).expect("sim reachable");
-    assert_eq!(code, 401, "an uncredentialed admin caller must be refused: {body}");
+    assert_eq!(
+        code, 401,
+        "an uncredentialed admin caller must be refused: {body}"
+    );
     assert_eq!(
         body["reason"], "operator_token_missing",
         "503 here means the sim minted no credential at all: {body}"

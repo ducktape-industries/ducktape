@@ -17,8 +17,7 @@ fn step_orderer_preserves_fifo_where_roundorderer_sorts() {
         for f in &frames {
             round.submit(f.clone()).await.expect("submit");
         }
-        let round_out: Vec<Vec<u8>> =
-            round.poll_delivered().into_iter().map(|(_, f)| f).collect();
+        let round_out: Vec<Vec<u8>> = round.poll_delivered().into_iter().map(|(_, f)| f).collect();
         assert_eq!(
             round_out,
             vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
@@ -38,10 +37,18 @@ fn step_orderer_preserves_fifo_where_roundorderer_sorts() {
         handle.release_all();
         let step_out = step.poll_delivered();
         let bytes: Vec<Vec<u8>> = step_out.iter().map(|(_, f)| f.clone()).collect();
-        assert_eq!(bytes, frames.to_vec(), "FIFO arrival order preserved, not sorted");
+        assert_eq!(
+            bytes,
+            frames.to_vec(),
+            "FIFO arrival order preserved, not sorted"
+        );
         // views stamped monotonically from 0.
         let views: Vec<u64> = step_out.iter().map(|(v, _)| *v).collect();
-        assert_eq!(views, vec![0, 1, 2], "views are monotone per delivered frame");
+        assert_eq!(
+            views,
+            vec![0, 1, 2],
+            "views are monotone per delivered frame"
+        );
     });
 }
 
@@ -81,14 +88,16 @@ fn step_orderer_permits_accumulate_before_submit() {
     block_on(async {
         let (mut step, handle) = StepOrderer::new();
         handle.release(2);
-        assert!(step.poll_delivered().is_empty(), "no frames yet, nothing to deliver");
+        assert!(
+            step.poll_delivered().is_empty(),
+            "no frames yet, nothing to deliver"
+        );
 
         step.submit(b"a".to_vec()).await.expect("submit");
         step.submit(b"b".to_vec()).await.expect("submit");
         step.submit(b"c".to_vec()).await.expect("submit");
 
-        let delivered: Vec<Vec<u8>> =
-            step.poll_delivered().into_iter().map(|(_, f)| f).collect();
+        let delivered: Vec<Vec<u8>> = step.poll_delivered().into_iter().map(|(_, f)| f).collect();
         assert_eq!(
             delivered,
             vec![b"a".to_vec(), b"b".to_vec()],

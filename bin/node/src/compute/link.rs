@@ -116,8 +116,7 @@ async fn pump<S>(
     hint: &Notify,
     lines: &mut mpsc::Receiver<OutputLine>,
     records: &mut mpsc::UnboundedReceiver<serde_json::Value>,
-)
-where
+) where
     S: futures::Sink<
             tokio_tungstenite::tungstenite::Message,
             Error = tokio_tungstenite::tungstenite::Error,
@@ -261,9 +260,10 @@ mod tests {
             })
             .await
             .unwrap();
-        let task = tokio::spawn(async move {
-            pump(client, &Notify::new(), &mut lines, &mut records).await
-        });
+        let task =
+            tokio::spawn(
+                async move { pump(client, &Notify::new(), &mut lines, &mut records).await },
+            );
         let frame = server.next().await.unwrap().unwrap().into_text().unwrap();
         let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(value["line"], "retained output");
@@ -334,18 +334,17 @@ mod tests {
             })
             .await
             .unwrap();
-        let task = tokio::spawn(async move {
-            pump(client, &Notify::new(), &mut lines, &mut records).await
-        });
-        let first: serde_json::Value = serde_json::from_str(
-            &server.next().await.unwrap().unwrap().into_text().unwrap(),
-        )
-        .unwrap();
+        let task =
+            tokio::spawn(
+                async move { pump(client, &Notify::new(), &mut lines, &mut records).await },
+            );
+        let first: serde_json::Value =
+            serde_json::from_str(&server.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap();
         assert_eq!(first["op"], "run_record_start");
-        let second: serde_json::Value = serde_json::from_str(
-            &server.next().await.unwrap().unwrap().into_text().unwrap(),
-        )
-        .unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(&server.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap();
         assert_eq!(second["op"], "run_output");
         server.close(None).await.unwrap();
         drop(server);

@@ -197,7 +197,8 @@ fn an_unwritten_home_lists_over_http_and_accepts_its_first_child() {
     let sim = boot_auto(storage.path());
     let port = sim.addr().port();
     let home = serde_json::json!({"target":"files","query":{"ls":{"path":"/home/acct:7","snapshot":null,"after":null,"limit":256}}});
-    let (status, reply) = harness::try_request(port, "POST", "/v1/query", Some(&home)).expect("list home");
+    let (status, reply) =
+        harness::try_request(port, "POST", "/v1/query", Some(&home)).expect("list home");
     assert_eq!(status, 200, "an unwritten home is empty: {reply}");
     assert_eq!(reply["ls"]["entries"], serde_json::json!([]));
     assert!(reply["ls"]["next"].is_null());
@@ -220,7 +221,8 @@ fn an_unwritten_home_lists_over_http_and_accepts_its_first_child() {
     )
     .expect("commit first child");
     assert_eq!(status, 200, "home write: {reply}");
-    let (status, reply) = harness::try_request(port, "POST", "/v1/query", Some(&home)).expect("list home");
+    let (status, reply) =
+        harness::try_request(port, "POST", "/v1/query", Some(&home)).expect("list home");
     assert_eq!(status, 200);
     assert_eq!(reply["ls"]["entries"][0]["path"], "/home/acct:7/notes");
     let (status, _) =

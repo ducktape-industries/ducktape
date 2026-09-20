@@ -260,7 +260,8 @@ async fn accept_loop<T: DataPlaneTransport>(
                 let inflight = Arc::clone(&inflight);
                 let registry = registry.clone();
                 tokio::spawn(async move {
-                    let _ = receive_push(stream, kind, digest, len, blobs, inflight, registry).await;
+                    let _ =
+                        receive_push(stream, kind, digest, len, blobs, inflight, registry).await;
                 });
             }
             INTENT_PULL => {

@@ -173,7 +173,11 @@ async fn refused_in_band(
     archive: &[u8],
 ) -> String {
     let (status, wire, binding) = post_sealed(gateway_url, token, keys, archive).await;
-    assert_eq!(status, reqwest::StatusCode::OK, "the head is committed before the pipeline runs");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "the head is committed before the pipeline runs"
+    );
     let reply = open_reply(keys, &binding, &wire);
     assert_eq!(reply.content_type, "application/zstd");
     assert!(reply.data.is_empty(), "a refused stream carries no archive");

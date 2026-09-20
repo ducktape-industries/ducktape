@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize as _;
 
-use super::default_primary_coordinator;
-use super::PlumbingOverrides;
 use super::DEFAULT_CHECKPOINT_BLOCKS;
+use super::PlumbingOverrides;
+use super::default_primary_coordinator;
 
 /// the generated defaults: a fresh init/join with no flags yields a node
 /// with every surface up. Loopback for the operator surfaces (HTTP app

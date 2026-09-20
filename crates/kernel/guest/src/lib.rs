@@ -190,7 +190,10 @@ pub mod host_ops {
         }
     }
 
-    pub fn query(program: impl Into<ProgramId>, request: impl Into<Vec<u8>>) -> Result<Vec<u8>, Refusal> {
+    pub fn query(
+        program: impl Into<ProgramId>,
+        request: impl Into<Vec<u8>>,
+    ) -> Result<Vec<u8>, Refusal> {
         match host(&HostOp::Query {
             program: program.into(),
             request: request.into(),
@@ -200,22 +203,22 @@ pub mod host_ops {
         }
     }
 
-    pub fn emit(target: impl Into<ProgramId>, payload: impl Into<Vec<u8>>) {
+    pub fn emit(target: impl Into<ProgramId>, payload: impl Into<Vec<u8>>) -> ItemRef {
         send(target, payload, false)
     }
 
-    pub fn call(target: impl Into<ProgramId>, payload: impl Into<Vec<u8>>) {
+    pub fn call(target: impl Into<ProgramId>, payload: impl Into<Vec<u8>>) -> ItemRef {
         send(target, payload, true)
     }
 
-    fn send(target: impl Into<ProgramId>, payload: impl Into<Vec<u8>>, reply: bool) {
+    fn send(target: impl Into<ProgramId>, payload: impl Into<Vec<u8>>, reply: bool) -> ItemRef {
         match host(&HostOp::Emit(Message {
             target: target.into(),
             payload: payload.into(),
             reply,
         })) {
-            HostReply::Done => {}
-            other => protocol("done", other),
+            HostReply::Item(item) => item,
+            other => protocol("item", other),
         }
     }
 

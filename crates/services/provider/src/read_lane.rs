@@ -638,7 +638,10 @@ mod tests {
     #[test]
     fn the_tool_plane_is_served_here_and_never_forwarded() {
         assert!(matches!(classify(MCP_PATH, "", Some("app")), Route::Mcp));
-        assert!(matches!(classify("/v1/query", "", Some("app")), Route::Pass));
+        assert!(matches!(
+            classify("/v1/query", "", Some("app")),
+            Route::Pass
+        ));
     }
 
     /// THE credential-scope gate: a run delegated with one repo draws the

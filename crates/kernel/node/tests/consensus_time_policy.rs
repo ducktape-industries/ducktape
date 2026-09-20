@@ -17,15 +17,30 @@ fn stamp_is_the_pure_formula() {
     );
     assert_eq!(ConsensusTimePolicy::HeightIsTime.stamp(7), 7);
     // base_ms + height * block_ms.
-    assert_eq!(ConsensusTimePolicy::Epoch { base_ms: 100, block_ms: 10 }.stamp(0), 100);
-    assert_eq!(ConsensusTimePolicy::Epoch { base_ms: 100, block_ms: 10 }.stamp(3), 130);
+    assert_eq!(
+        ConsensusTimePolicy::Epoch {
+            base_ms: 100,
+            block_ms: 10
+        }
+        .stamp(0),
+        100
+    );
+    assert_eq!(
+        ConsensusTimePolicy::Epoch {
+            base_ms: 100,
+            block_ms: 10
+        }
+        .stamp(3),
+        130
+    );
 }
 
 #[test]
 fn epoch_policy_reaches_env_consensus_time() {
     futures::executor::block_on(async {
         let log: ProbeLog = Arc::new(Mutex::new(Vec::new()));
-        let host = host::Host::genesis(vec![Box::new(Probe { log: log.clone() })]).expect("genesis");
+        let host =
+            host::Host::genesis(vec![Box::new(Probe { log: log.clone() })]).expect("genesis");
         let mut node = OrderedNode::new(host, RoundOrderer::new());
         node.set_consensus_time_policy(ConsensusTimePolicy::Epoch {
             base_ms: 1_000_000,
@@ -47,7 +62,10 @@ fn epoch_policy_reaches_env_consensus_time() {
         assert_eq!(seen[0].1.consensus_time, 1_000_000, "height 0 -> base_ms");
         assert_eq!(seen[1].0, b"b");
         assert_eq!(seen[1].1.height, 1);
-        assert_eq!(seen[1].1.consensus_time, 1_001_000, "height 1 -> base_ms + block_ms");
+        assert_eq!(
+            seen[1].1.consensus_time, 1_001_000,
+            "height 1 -> base_ms + block_ms"
+        );
     });
 }
 

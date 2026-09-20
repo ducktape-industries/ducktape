@@ -4,9 +4,9 @@
 //! Requires an installed Pi and a current `ducktape` MCP executable; opt-in so
 //! ordinary noded unit tests do not silently depend on those external binaries.
 use super::*;
+use crate::testkit::committed_module;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use commonware_cryptography::ed25519;
-use crate::testkit::committed_module;
 use host::{BlockContext, Host};
 use sdk::{Msg, Origin};
 use serde_json::{Value, json};
@@ -71,7 +71,11 @@ impl Network {
         validators.seed(key(8)).await.unwrap();
         validators.finish_seed().await.unwrap();
         let host = Host::genesis(vec![
-            Box::new(identity::Identity::new("identity", store(), CHAIN_ID.into())),
+            Box::new(identity::Identity::new(
+                "identity",
+                store(),
+                CHAIN_ID.into(),
+            )),
             Box::new(
                 attribution::AttributionModule::new("attribution", store())
                     .with_subscribers(["agent"]),
@@ -356,10 +360,15 @@ impl Network {
     async fn session_actions(&self, child: &Child) -> u32 {
         let bytes = self
             .host
-            .query("runs", &crate::runs::encode_query(&crate::runs::RunsQuery::AgentSessions))
+            .query(
+                "runs",
+                &crate::runs::encode_query(&crate::runs::RunsQuery::AgentSessions),
+            )
             .await
             .unwrap();
-        let crate::runs::RunsReply::AgentSessions(sessions) = crate::runs::decode_reply(&bytes).unwrap() else {
+        let crate::runs::RunsReply::AgentSessions(sessions) =
+            crate::runs::decode_reply(&bytes).unwrap()
+        else {
             panic!("real AgentSessions");
         };
         sessions
@@ -776,7 +785,11 @@ async fn bootstrap(network: &mut Network, repo: &Path) -> plan::Plan {
         )
         .await;
     network
-        .submit(1, "runs", crate::runs::RunsMsg::EnableJobWorker { enabled: true })
+        .submit(
+            1,
+            "runs",
+            crate::runs::RunsMsg::EnableJobWorker { enabled: true },
+        )
         .await;
     let plan = plan::Plan::new(1, "connected", None, "worker").unwrap();
     let prefix = format!("{}/package", plan.root());
@@ -997,7 +1010,9 @@ async fn actual_chief_and_independent_native_worker_share_one_real_host() {
             crate::chat::ChatMsg::EditMessage {
                 channel_id: plan.channel_id.clone(),
                 seq: 2,
-                blocks: vec![crate::chat::Block::paragraph("MUTATED AFTER FROZEN ADMISSION")],
+                blocks: vec![crate::chat::Block::paragraph(
+                    "MUTATED AFTER FROZEN ADMISSION",
+                )],
                 base_rev: None,
             },
         )

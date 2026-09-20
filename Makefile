@@ -19,7 +19,7 @@ LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all airlock-gateway-image rcodesign dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-node install-coordinator test clean wasm-modules wasm-modules-check modules-sync views-sync wasm-embed-check labs-gate audit runtime-probe
+.PHONY: all airlock-gateway-image rcodesign dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-node install-coordinator test clean wasm-modules wasm-modules-check modules-sync views-sync wasm-embed-check labs-gate audit kernel-fixtures
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -459,10 +459,10 @@ audit:
 clean:
 	$(CARGO) clean
 
-## rebuild the runtime's probe program (a wasm32 program exercising every host
-## op) and refresh the committed fixture the runtime tests load.
-runtime-probe:
-	$(CARGO) build --manifest-path crates/kernel/runtime/tests/probe/Cargo.toml \
+## rebuild the kernel fixture programs (wasm32 guests the runtime and host
+## tests load) and refresh their committed bytes.
+kernel-fixtures:
+	$(CARGO) build --manifest-path crates/kernel/fixtures/Cargo.toml \
 	  --target wasm32-unknown-unknown --release
-	cp crates/kernel/runtime/tests/probe/target/wasm32-unknown-unknown/release/probe.wasm \
-	  crates/kernel/runtime/tests/fixtures/probe.wasm
+	cp crates/kernel/fixtures/target/wasm32-unknown-unknown/release/*.wasm \
+	  crates/kernel/fixtures/wasm/

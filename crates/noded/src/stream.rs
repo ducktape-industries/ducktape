@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Result as IoResult, Write};
-use std::sync::{Arc, Mutex, RwLock, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket};
@@ -1481,14 +1484,9 @@ fn record_agent_event(handle: &NodeHandle, event: &agent_service::wire::Event) {
             };
             record_agent_start(store, summary);
         }
-        agent_service::wire::Event::TermOutput {
-            session,
-            chunk_b64,
-        } => {
-            let decoded = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                chunk_b64,
-            );
+        agent_service::wire::Event::TermOutput { session, chunk_b64 } => {
+            let decoded =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, chunk_b64);
             let payload = match decoded {
                 Ok(bytes) => serde_json::json!({
                     "text": String::from_utf8_lossy(&bytes),
@@ -1623,8 +1621,9 @@ fn unattached_run_record() -> ServerFrame {
     ServerFrame::Error {
         topic: String::new(),
         code: StreamErrorCode::Forbidden,
-        detail: "run records are published by this node's compute daemon — send compute_attach first"
-            .into(),
+        detail:
+            "run records are published by this node's compute daemon — send compute_attach first"
+                .into(),
     }
 }
 
@@ -1660,10 +1659,7 @@ fn handle_run_record_event(
     }
 }
 
-fn handle_run_record_snapshot(
-    handle: &NodeHandle,
-    summary: crate::run_records::SessionSummary,
-) {
+fn handle_run_record_snapshot(handle: &NodeHandle, summary: crate::run_records::SessionSummary) {
     let Some(store) = handle.session_records() else {
         return;
     };
@@ -2102,20 +2098,20 @@ async fn indexed_run_reader(
     .expect("run query");
     let reading = tokio::task::spawn_blocking(move || store.view_with_tip("runs", &request))
         .await
-    .map_err(|_| {
-        crate::error_response(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "Run journal unavailable.",
-        )
-    })?;
+        .map_err(|_| {
+            crate::error_response(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Run journal unavailable.",
+            )
+        })?;
     let reading = reading.map_err(|_| {
         crate::error_response(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "Run journal unavailable.",
         )
     })?;
-    let reply =
-        serde_json::from_slice::<crate::runs::view::RunsViewReply>(&reading.bytes).map_err(|_| {
+    let reply = serde_json::from_slice::<crate::runs::view::RunsViewReply>(&reading.bytes)
+        .map_err(|_| {
             crate::error_response(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "Run journal unavailable.",
@@ -2132,12 +2128,16 @@ async fn indexed_run_reader(
                     )
                 })
         }
-        crate::runs::view::RunsViewReply::Run(None) | crate::runs::view::RunsViewReply::Runs(_) => Ok(false),
+        crate::runs::view::RunsViewReply::Run(None) | crate::runs::view::RunsViewReply::Runs(_) => {
+            Ok(false)
+        }
     }
 }
 
 /// every run `runs` has pending, as committed state.
-pub(crate) async fn pending_runs(handle: &NodeHandle) -> Result<Vec<crate::runs::PendingRun>, String> {
+pub(crate) async fn pending_runs(
+    handle: &NodeHandle,
+) -> Result<Vec<crate::runs::PendingRun>, String> {
     let (reply, rx) = futures::channel::oneshot::channel();
     handle
         .send(crate::NodeCommand::Query {
@@ -2982,7 +2982,10 @@ mod tests {
         let summary = store
             .session_summary("0123456789abcdef")
             .expect("pty summary");
-        assert_eq!(summary.invocation_kind, Some(crate::run_records::InvocationKind::Pty));
+        assert_eq!(
+            summary.invocation_kind,
+            Some(crate::run_records::InvocationKind::Pty)
+        );
         assert_eq!(summary.status, crate::run_records::SessionStatus::Completed);
         let events = store
             .page_events("0123456789abcdef", None, 10, false)
@@ -3608,18 +3611,20 @@ mod tests {
                 };
                 let bytes = match target.as_str() {
                     "runs" => {
-                        crate::runs::encode_reply(&crate::runs::RunsReply::PendingRuns(vec![crate::runs::PendingRun {
-                            run_id: "attributed/3/chiefduck".into(),
-                            dispatch_id: id.clone(),
-                            agent_id: "chiefduck".into(),
-                            channel_id: "general".into(),
-                            anchor_seq: 4,
-                            thread_root: None,
-                            job_id: None,
-                            job_claim_height: 0,
-                            requester: sdk::Origin::Program(42),
-                            created_at: 0,
-                        }]))
+                        crate::runs::encode_reply(&crate::runs::RunsReply::PendingRuns(vec![
+                            crate::runs::PendingRun {
+                                run_id: "attributed/3/chiefduck".into(),
+                                dispatch_id: id.clone(),
+                                agent_id: "chiefduck".into(),
+                                channel_id: "general".into(),
+                                anchor_seq: 4,
+                                thread_root: None,
+                                job_id: None,
+                                job_claim_height: 0,
+                                requester: sdk::Origin::Program(42),
+                                created_at: 0,
+                            },
+                        ]))
                     }
                     "identity" => {
                         let account = match identity::decode_query(&req).unwrap() {
@@ -3904,9 +3909,9 @@ mod tests {
                 let crate::NodeCommand::Query { reply, .. } = command else {
                     continue;
                 };
-                let _ = reply.send(Ok(crate::runs::encode_reply(&crate::runs::RunsReply::PendingRuns(vec![
-                    pending.clone(),
-                ]))));
+                let _ = reply.send(Ok(crate::runs::encode_reply(
+                    &crate::runs::RunsReply::PendingRuns(vec![pending.clone()]),
+                )));
             }
         });
 
@@ -4056,8 +4061,7 @@ mod tests {
         // that function turns "this node minted no secret" into "this node
         // admits EVERYBODY", and only this case can see it.
         let (unminted, _cmds, _hub) = crate::NodeHandle::channel();
-        let unminted =
-            unminted.with_service_link(crate::service_link::ServiceLink::new(None));
+        let unminted = unminted.with_service_link(crate::service_link::ServiceLink::new(None));
         for presented in ["", TEST_SECRET] {
             assert!(
                 !unminted.workspace_secret_matches(presented),
@@ -4341,10 +4345,7 @@ mod tests {
         let Err(refusal) = take_service_link(&handle, crate::services::AGENT_KIND, "any") else {
             panic!("a handle with no service link has nothing to give");
         };
-        assert!(
-            refusal.contains("service link is not enabled"),
-            "{refusal}"
-        );
+        assert!(refusal.contains("service link is not enabled"), "{refusal}");
     }
 
     #[tokio::test]

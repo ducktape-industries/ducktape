@@ -24,12 +24,14 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use common::Cluster;
+use common::wire::tasks::{
+    TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query,
+};
 use files::{
     CHUNK_SIZE, Change, Content, EntryInfo, FilesMsg, FilesQuery, FilesReply, Kind,
     decode_reply as files_decode_reply, encode_msg as files_encode_msg, encode_putblob,
     encode_query as files_encode_query, objects::object_id, to_hex,
 };
-use common::wire::tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
 /// a distinctive, non-uniform byte pattern (251 is prime, so it aligns with no
 /// power-of-two boundary — truncation or chunk-order corruption is caught, not

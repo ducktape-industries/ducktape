@@ -87,7 +87,10 @@ fn every_manifest_composed_host_sets_its_committed_clock_before_returning() {
 fn the_restored_clock_comes_from_the_manifest_and_never_from_a_wall_clock() {
     let src = host_state();
 
-    for line in src.lines().filter(|l| l.contains("host.restore_committed(")) {
+    for line in src
+        .lines()
+        .filter(|l| l.contains("host.restore_committed("))
+    {
         let from_a_height = line.contains("height");
         assert!(
             from_a_height,
@@ -116,9 +119,14 @@ fn genesis_deliberately_sets_no_clock() {
         .find(|line| **line > genesis_at)
         .expect("genesis_host returns a host");
 
-    let body = src.lines().skip(genesis_at).take(genesis_returns - genesis_at);
+    let body = src
+        .lines()
+        .skip(genesis_at)
+        .take(genesis_returns - genesis_at);
     assert!(
-        !body.into_iter().any(|line| line.contains("restore_committed")),
+        !body
+            .into_iter()
+            .any(|line| line.contains("restore_committed")),
         "genesis has applied no block, so (0, 0) is the truth and not an omission"
     );
 }

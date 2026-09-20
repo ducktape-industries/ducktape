@@ -18,10 +18,10 @@ mod common;
 
 use std::time::Duration;
 
+use common::NetworkShapeCluster;
 use common::wire::chat::{
     Block, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_reply, encode_msg, encode_query,
 };
-use common::NetworkShapeCluster;
 
 /// generous like the sibling legs: standing → follow-arm sync → first
 /// pre-synced boundary is several blocks of slack.
@@ -41,7 +41,10 @@ fn resident_adopts_boundaries_on_the_cert_wake_not_the_fallback_poll() {
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("resident-follow");
-    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    assert!(
+        !chain_id.is_empty(),
+        "init should print the founded chain id"
+    );
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
@@ -128,11 +131,29 @@ fn resident_adopts_boundaries_on_the_cert_wake_not_the_fallback_poll() {
 
     // ---- the point, twice: each leg's deadline opens at the moment the
     // previous adoption was observed, when the fallback is a known 12s away.
-    cluster.submit(0, "chat", &encode_msg(&post("m-follow-1", "first wake leg")));
-    resident_sees(&cluster, "m-follow-1", "the first wake-driven adoption", WAKE_WINDOW);
+    cluster.submit(
+        0,
+        "chat",
+        &encode_msg(&post("m-follow-1", "first wake leg")),
+    );
+    resident_sees(
+        &cluster,
+        "m-follow-1",
+        "the first wake-driven adoption",
+        WAKE_WINDOW,
+    );
 
-    cluster.submit(0, "chat", &encode_msg(&post("m-follow-2", "second wake leg")));
-    resident_sees(&cluster, "m-follow-2", "the second wake-driven adoption", WAKE_WINDOW);
+    cluster.submit(
+        0,
+        "chat",
+        &encode_msg(&post("m-follow-2", "second wake leg")),
+    );
+    resident_sees(
+        &cluster,
+        "m-follow-2",
+        "the second wake-driven adoption",
+        WAKE_WINDOW,
+    );
 
     cluster.kill(1);
     cluster.kill(0);

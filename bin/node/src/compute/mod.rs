@@ -26,7 +26,10 @@
 //! have to be identifiable by the one that replaces it.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use compute_service::{
     DeliverFn, DispatchPool, SessionRecordRequesterMap, SpawnFn, SpawnKind,
@@ -253,10 +256,7 @@ fn output_sink(
             };
             let payload =
                 noded::run_records::SessionEventPayload::from_output_line(stream, &line.line);
-            let event_id = format!(
-                "frame-{}",
-                RECORD_EVENT_ID.fetch_add(1, Ordering::Relaxed)
-            );
+            let event_id = format!("frame-{}", RECORD_EVENT_ID.fetch_add(1, Ordering::Relaxed));
             sink.emit(serde_json::json!({
                 "record": "event",
                 "session_id": record.session_id.clone(),
@@ -524,12 +524,22 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            ["control", "provider_frame", "turn", "message", "tool_call", "tool_result"]
+            [
+                "control",
+                "provider_frame",
+                "turn",
+                "message",
+                "tool_call",
+                "tool_result"
+            ]
         );
         assert_eq!(records[1]["event"]["stream"], "stderr");
         assert_eq!(records[1]["event"]["payload"]["text"], "provider text");
         assert_eq!(records[0]["event"]["payload"]["action"], "ready");
-        assert!(receiver.try_recv().is_ok(), "display lane remains populated");
+        assert!(
+            receiver.try_recv().is_ok(),
+            "display lane remains populated"
+        );
     }
 
     #[test]

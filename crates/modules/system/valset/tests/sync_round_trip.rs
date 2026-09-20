@@ -23,7 +23,7 @@ use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
-use valset::{ValsetMsg, ValsetQuery, ValsetReply, Valset, decode_reply, encode_msg, encode_query};
+use valset::{Valset, ValsetMsg, ValsetQuery, ValsetReply, decode_reply, encode_msg, encode_query};
 
 // deterministic VALID ed25519 public keys: any 32 bytes is a valid seed.
 fn key(seed: u8) -> Vec<u8> {

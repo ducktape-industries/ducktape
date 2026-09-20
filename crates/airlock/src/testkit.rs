@@ -8,9 +8,9 @@
 //! test that dials a lending gateway's listener directly is testing a topology
 //! production does not have.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use p384::ecdsa::signature::DigestSigner;
-use sev::certs::snp::{ca, Certificate};
+use sev::certs::snp::{Certificate, ca};
 use sev::firmware::guest::AttestationReport;
 use sev::parser::{Decoder, Encoder};
 use sha2::{Digest, Sha384};
@@ -41,10 +41,22 @@ impl SnpTestEnclave {
         let vcek_key = p384::ecdsa::SigningKey::random(&mut rng);
 
         let ark_der = mint_cert(CertRole::Root, "CN=test ARK", rsa_spki(&ark_key)?, &ark_key)?;
-        let ask_der =
-            mint_cert(CertRole::SubCa { issuer: "CN=test ARK" }, "CN=test ASK", rsa_spki(&ask_key)?, &ark_key)?;
-        let vcek_der =
-            mint_cert(CertRole::Leaf { issuer: "CN=test ASK" }, "CN=test VCEK", p384_spki(&vcek_key)?, &ask_key)?;
+        let ask_der = mint_cert(
+            CertRole::SubCa {
+                issuer: "CN=test ARK",
+            },
+            "CN=test ASK",
+            rsa_spki(&ask_key)?,
+            &ark_key,
+        )?;
+        let vcek_der = mint_cert(
+            CertRole::Leaf {
+                issuer: "CN=test ASK",
+            },
+            "CN=test VCEK",
+            p384_spki(&vcek_key)?,
+            &ask_key,
+        )?;
 
         Ok(Self {
             ca: ca::Chain {
@@ -61,23 +73,29 @@ impl SnpTestEnclave {
     pub fn quote(&self, report_data: &[u8; REPORT_DATA_LEN]) -> Result<Vec<u8>> {
         let mut report = AttestationReport {
             version: 2,
-            sig_algo: 1,          // ECDSA P-384 with SHA-384
-            chip_id: [1u8; 64],   // non-Turin-like -> legacy TCB layout
+            sig_algo: 1,        // ECDSA P-384 with SHA-384
+            chip_id: [1u8; 64], // non-Turin-like -> legacy TCB layout
             measurement: self.measurement.0,
             report_data: *report_data,
             ..Default::default()
         };
 
         let mut bytes = Vec::new();
-        report.encode(&mut bytes, ()).context("encode unsigned report")?;
+        report
+            .encode(&mut bytes, ())
+            .context("encode unsigned report")?;
 
         let digest = Sha384::new_with_prefix(&bytes[..SIGNED_LEN]);
         let sig: p384::ecdsa::Signature = self.signer.sign_digest(digest);
-        report.signature =
-            sev::certs::snp::ecdsa::Signature::new(le72(&sig.r().to_bytes()), le72(&sig.s().to_bytes()));
+        report.signature = sev::certs::snp::ecdsa::Signature::new(
+            le72(&sig.r().to_bytes()),
+            le72(&sig.s().to_bytes()),
+        );
 
         let mut out = Vec::new();
-        report.encode(&mut out, ()).context("encode signed report")?;
+        report
+            .encode(&mut out, ())
+            .context("encode signed report")?;
         // The signed prefix must be unchanged by the re-encode, and the minted
         // bytes must survive the real parser.
         debug_assert_eq!(&out[..SIGNED_LEN], &bytes[..SIGNED_LEN]);
@@ -127,8 +145,9 @@ impl SnpTestEnclave {
 /// them, and asserting the lender refuses it.
 #[cfg(feature = "server")]
 pub fn behind_gateway_proxy(app: axum::Router, node: &[u8]) -> axum::Router {
-    let stamped: axum::http::HeaderValue =
-        hex::encode(node).parse().expect("hex is a valid header value");
+    let stamped: axum::http::HeaderValue = hex::encode(node)
+        .parse()
+        .expect("hex is a valid header value");
     app.layer(axum::middleware::from_fn(
         move |mut request: axum::extract::Request, next: axum::middleware::Next| {
             let stamped = stamped.clone();
@@ -151,17 +170,25 @@ fn le72(be: &[u8]) -> [u8; 72] {
     out
 }
 
-fn rsa_spki(key: &rsa::pss::SigningKey<Sha384>) -> Result<x509_cert::spki::SubjectPublicKeyInfoOwned> {
+fn rsa_spki(
+    key: &rsa::pss::SigningKey<Sha384>,
+) -> Result<x509_cert::spki::SubjectPublicKeyInfoOwned> {
     use rsa::signature::Keypair;
     use x509_cert::spki::EncodePublicKey;
-    let der = key.verifying_key().to_public_key_der().context("RSA SPKI")?;
+    let der = key
+        .verifying_key()
+        .to_public_key_der()
+        .context("RSA SPKI")?;
     x509_cert::spki::SubjectPublicKeyInfoOwned::try_from(der.as_bytes())
         .map_err(|e| anyhow!("RSA SPKI parse: {e}"))
 }
 
 fn p384_spki(key: &p384::ecdsa::SigningKey) -> Result<x509_cert::spki::SubjectPublicKeyInfoOwned> {
     use x509_cert::spki::EncodePublicKey;
-    let der = key.verifying_key().to_public_key_der().context("P-384 SPKI")?;
+    let der = key
+        .verifying_key()
+        .to_public_key_der()
+        .context("P-384 SPKI")?;
     x509_cert::spki::SubjectPublicKeyInfoOwned::try_from(der.as_bytes())
         .map_err(|e| anyhow!("P-384 SPKI parse: {e}"))
 }
@@ -190,9 +217,10 @@ fn mint_cert(
     let name = |s: &str| Name::from_str(s).with_context(|| format!("DN {s}"));
     let profile = match role {
         CertRole::Root => Profile::Root,
-        CertRole::SubCa { issuer } => {
-            Profile::SubCA { issuer: name(issuer)?, path_len_constraint: None }
-        }
+        CertRole::SubCa { issuer } => Profile::SubCA {
+            issuer: name(issuer)?,
+            path_len_constraint: None,
+        },
         CertRole::Leaf { issuer } => Profile::Leaf {
             issuer: name(issuer)?,
             enable_key_agreement: false,

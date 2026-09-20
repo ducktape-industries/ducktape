@@ -32,7 +32,10 @@ impl Storage {
     }
 
     pub fn pending(&self) -> Result<Option<Writes>> {
-        self.db.get(PENDING)?.map(|bytes| decode(&bytes)).transpose()
+        self.db
+            .get(PENDING)?
+            .map(|bytes| decode(&bytes))
+            .transpose()
     }
 
     pub fn get(&self, program: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {

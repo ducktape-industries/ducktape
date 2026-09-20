@@ -451,9 +451,7 @@ async fn submit_and_drain(
                 tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
                 std::process::exit(1);
             }
-            Err(err @ SubmitError::Rejected(_)) => {
-                return Err(noded::Refused::of_submit(&err))
-            }
+            Err(err @ SubmitError::Rejected(_)) => return Err(noded::Refused::of_submit(&err)),
         };
 
     // The reactor nudges committed delivery and call queues through this

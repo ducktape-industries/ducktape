@@ -4,7 +4,7 @@
 //! wire frame carries. NO wire variant — the codec stays a machine contract.
 #![cfg(feature = "sim")]
 
-use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query, Directory};
+use directory::{DirMsg, DirQuery, DirReply, Directory, decode_reply, encode_msg, encode_query};
 use futures::executor::block_on;
 use host::{BlockOp, Host};
 use node::{Disposition, OrderedNode, Orderer, StepOrderer};
@@ -23,7 +23,10 @@ fn set(key: &str, value: &str) -> Msg {
 async fn get<O: Orderer>(node: &OrderedNode<O>, key: &str) -> Option<String> {
     let reply = node
         .host()
-        .query("directory", &encode_query(&DirQuery::Get { key: key.into() }))
+        .query(
+            "directory",
+            &encode_query(&DirQuery::Get { key: key.into() }),
+        )
         .await
         .expect("query");
     match decode_reply(&reply).expect("decode") {
@@ -61,7 +64,10 @@ fn submit_decoded_lands_unsigned_op_in_next_block() {
         // (proof it bypassed the verifying decode) under the returned id.
         assert_eq!(get(&node, "k").await.as_deref(), Some("peer-v"));
         let drained = node.take_drained();
-        let d = drained.iter().find(|d| d.id == id).expect("drained frame under the returned id");
+        let d = drained
+            .iter()
+            .find(|d| d.id == id)
+            .expect("drained frame under the returned id");
         assert_eq!(d.disposition, Disposition::Applied);
         match &d.op {
             Some(op) => assert_eq!(
@@ -85,7 +91,10 @@ fn submit_decoded_interleaves_with_signed_frames_in_fifo() {
         let mut node = OrderedNode::new(host, orderer);
 
         // enqueue a signed client op, then an unsigned peer op — both park.
-        let signed = node.submit(&signer, 0, set("who", "signed")).await.expect("submit");
+        let signed = node
+            .submit(&signer, 0, set("who", "signed"))
+            .await
+            .expect("submit");
         let peer = node.submit_decoded(BlockOp::bare(
             Origin::External(b"peer".to_vec()),
             set("who", "peer"),

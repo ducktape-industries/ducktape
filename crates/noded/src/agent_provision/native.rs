@@ -5,6 +5,9 @@ use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::runs::{
+    ConversationHistory, ConversationStatus, ConversationTurnPhase, ConversationView,
+};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
@@ -16,7 +19,6 @@ use duckfs_client::checkout::checkout;
 use duckfs_client::commit::{CommitError, commit};
 use futures::StreamExt as _;
 use provider_host::{NativeConversationContext, NativeConversationEvent, NativePackage};
-use crate::runs::{ConversationHistory, ConversationStatus, ConversationTurnPhase, ConversationView};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -92,7 +94,8 @@ pub(super) async fn prepare(
     let same_configuration = view.conversation_id == descriptor.conversation_id
         && view.agent_id == agent.agent_id
         && view.active_turn.as_ref().is_some_and(|turn| {
-            descriptor.turn_id == crate::runs::conversation_turn_id(turn.from_cursor, turn.through_cursor)
+            descriptor.turn_id
+                == crate::runs::conversation_turn_id(turn.from_cursor, turn.through_cursor)
         })
         && view.history_prefix == descriptor.history_prefix
         && view.session_path == descriptor.session_path
@@ -223,7 +226,8 @@ async fn conversation(node: &NodeLink, id: &str) -> Result<ConversationView, Str
             }),
         )
         .await?;
-    let crate::runs::RunsReply::Conversation(Some(view)) = crate::runs::decode_reply(&bytes)? else {
+    let crate::runs::RunsReply::Conversation(Some(view)) = crate::runs::decode_reply(&bytes)?
+    else {
         return Err("native conversation not found in committed Runs state".into());
     };
     Ok(view)
@@ -253,7 +257,8 @@ async fn frozen_events(
                 }),
             )
             .await?;
-        let crate::runs::RunsReply::ConversationEvents(events) = crate::runs::decode_reply(&bytes)? else {
+        let crate::runs::RunsReply::ConversationEvents(events) = crate::runs::decode_reply(&bytes)?
+        else {
             return Err("unexpected native conversation events reply".into());
         };
         let contiguous = events.len() as u64 == limit

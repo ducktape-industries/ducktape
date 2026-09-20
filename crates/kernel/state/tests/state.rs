@@ -48,7 +48,7 @@ fn an_overlay_restores_to_a_checkpoint() {
 fn a_view_merges_storage_under_its_layers_top_layer_winning() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::open(context, storage(&dir), [APP.to_owned()])
+        let mut store = Store::open(context, "s", storage(&dir), [APP.to_owned()])
             .await
             .unwrap();
         store
@@ -123,7 +123,12 @@ fn a_view_merges_storage_under_its_layers_top_layer_winning() {
                 .unwrap(),
             vec![entry(b"b", b"22"), entry(b"c", b"33")]
         );
-        assert!(observing.scan("other", &Scan::prefix(b"")).unwrap().is_empty());
+        assert!(
+            observing
+                .scan("other", &Scan::prefix(b""))
+                .unwrap()
+                .is_empty()
+        );
     });
 }
 
@@ -131,7 +136,7 @@ fn a_view_merges_storage_under_its_layers_top_layer_winning() {
 fn a_committed_block_reaches_storage_and_commitment_and_survives_reopen() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::open(context.child("first"), storage(&dir), [APP.to_owned()])
+        let mut store = Store::open(context.child("first"), "s", storage(&dir), [APP.to_owned()])
             .await
             .unwrap();
         assert_eq!(store.height().unwrap(), None);
@@ -148,13 +153,21 @@ fn a_committed_block_reaches_storage_and_commitment_and_survives_reopen() {
             .unwrap();
         let root_at_1 = store.root(APP).unwrap().unwrap();
         assert_ne!(root_at_1, root_at_0);
-        assert_eq!(store.commitment(APP).unwrap().height().await.unwrap(), Some(1));
+        assert_eq!(
+            store.commitment(APP).unwrap().height().await.unwrap(),
+            Some(1)
+        );
         assert_eq!(store.roots().unwrap(), vec![(APP.to_owned(), root_at_1)]);
         drop(store);
 
-        let store = Store::open(context.child("second"), storage(&dir), [APP.to_owned()])
-            .await
-            .unwrap();
+        let store = Store::open(
+            context.child("second"),
+            "s",
+            storage(&dir),
+            [APP.to_owned()],
+        )
+        .await
+        .unwrap();
         assert_eq!(store.height().unwrap(), Some(1));
         assert_eq!(store.root(APP).unwrap().unwrap(), root_at_1);
         assert_eq!(store.root("nobody").unwrap(), None);
@@ -170,6 +183,7 @@ fn a_crash_after_storage_and_before_commitment_is_reconciled_at_open() {
         let reference = tempfile::tempdir().unwrap();
         let mut whole = Store::open(
             context.child("whole"),
+            "s",
             storage(&reference),
             ["reference".to_owned()],
         )
@@ -186,7 +200,7 @@ fn a_crash_after_storage_and_before_commitment_is_reconciled_at_open() {
         let expected_root = whole.root("reference").unwrap().unwrap();
 
         let dir = tempfile::tempdir().unwrap();
-        let mut torn = Store::open(context.child("torn"), storage(&dir), [APP.to_owned()])
+        let mut torn = Store::open(context.child("torn"), "s", storage(&dir), [APP.to_owned()])
             .await
             .unwrap();
         torn.commit(0, writes(APP, &[(b"a", Some(b"1"))]))
@@ -195,14 +209,25 @@ fn a_crash_after_storage_and_before_commitment_is_reconciled_at_open() {
         torn.storage()
             .commit(1, &writes(APP, &[(b"a", None), (b"b", Some(b"2"))]))
             .unwrap();
-        assert_eq!(torn.commitment(APP).unwrap().height().await.unwrap(), Some(0));
+        assert_eq!(
+            torn.commitment(APP).unwrap().height().await.unwrap(),
+            Some(0)
+        );
         drop(torn);
 
-        let healed = Store::open(context.child("healed"), storage(&dir), [APP.to_owned()])
-            .await
-            .unwrap();
+        let healed = Store::open(
+            context.child("healed"),
+            "s",
+            storage(&dir),
+            [APP.to_owned()],
+        )
+        .await
+        .unwrap();
         assert_eq!(healed.height().unwrap(), Some(1));
-        assert_eq!(healed.commitment(APP).unwrap().height().await.unwrap(), Some(1));
+        assert_eq!(
+            healed.commitment(APP).unwrap().height().await.unwrap(),
+            Some(1)
+        );
         assert_eq!(healed.root(APP).unwrap().unwrap(), expected_root);
     });
 }
@@ -213,6 +238,7 @@ fn a_joiner_rebuilds_storage_from_a_synced_commitment() {
         let upstream_dir = tempfile::tempdir().unwrap();
         let mut upstream = Store::open(
             context.child("upstream"),
+            "s",
             storage(&upstream_dir),
             ["upstream".to_owned()],
         )
@@ -250,18 +276,11 @@ fn a_joiner_rebuilds_storage_from_a_synced_commitment() {
             .unwrap()
             .unwrap();
         let (_, commitments) = upstream.into_parts();
-        let source = Arc::new(
-            commitments
-                .into_values()
-                .next()
-                .unwrap()
-                .into_db()
-                .unwrap(),
-        );
+        let source = Arc::new(commitments.into_values().next().unwrap().into_db().unwrap());
 
         let synced = Commitment::sync_from(
             context.child("sync"),
-            &commitment_name(APP),
+            &commitment_name("s", APP),
             target,
             source,
         )
@@ -272,6 +291,7 @@ fn a_joiner_rebuilds_storage_from_a_synced_commitment() {
         let dir = tempfile::tempdir().unwrap();
         let joiner = Store::adopt(
             context.child("joiner"),
+            "s",
             storage(&dir),
             1,
             BTreeMap::from([(APP.to_owned(), synced)]),

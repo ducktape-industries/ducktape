@@ -159,7 +159,10 @@ fn refuse_a_foreign_binary(binary: &Path) {
     // `ducktape <cargo version>+<stamp>`, the stamp a short sha with a
     // working-tree digest appended when the build was dirty.
     let Some((_, stamp)) = line.rsplit_once('+') else {
-        panic!("{} --version printed no build stamp: {line:?}", binary.display());
+        panic!(
+            "{} --version printed no build stamp: {line:?}",
+            binary.display()
+        );
     };
     let commit = stamp.split('-').next().unwrap_or(stamp);
     if commit_is_ours(commit) {
@@ -2013,10 +2016,7 @@ impl Cluster {
     /// run a ducktape VERB (resident accept, admit, ...) to completion and
     /// return (success, combined output).
     pub fn run_verb(&self, args: &[&str]) -> (bool, String) {
-        let out = ducktape()
-            .args(args)
-            .output()
-            .expect("run ducktape verb");
+        let out = ducktape().args(args).output().expect("run ducktape verb");
         (
             out.status.success(),
             format!(
@@ -3360,7 +3360,9 @@ mod pin_tests {
             "a spawned node must find the PINNED set beside itself, not the live one"
         );
         assert!(
-            Path::new(founding_set()).join("chat.component.wasm").exists(),
+            Path::new(founding_set())
+                .join("chat.component.wasm")
+                .exists(),
             "the pinned set carries the staged artifacts, not an empty directory"
         );
     }

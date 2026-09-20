@@ -15,7 +15,9 @@ impl core::fmt::Debug for Root {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize,
+)]
 pub enum HashKind {
     Sha256,
     Sha1,
@@ -63,10 +65,12 @@ pub struct BlobHeader {
 
 pub fn hex(bytes: &[u8]) -> String {
     use core::fmt::Write as _;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
@@ -74,16 +78,6 @@ pub enum Origin {
     External(Vec<u8>),
     Program(ProgramId),
     System,
-}
-
-impl Origin {
-    pub fn actor(&self) -> String {
-        match self {
-            Origin::External(key) => format!("ext:{}", hex(key)),
-            Origin::Program(id) => id.clone(),
-            Origin::System => "system".to_owned(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
@@ -242,7 +236,10 @@ pub enum CryptoReply {
 pub enum HostOp {
     Env,
     Get(Vec<u8>),
-    Set { key: Vec<u8>, value: Vec<u8> },
+    Set {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
     Delete(Vec<u8>),
     Scan(Scan),
     CommittedGet(Vec<u8>),
@@ -260,7 +257,10 @@ pub enum HostOp {
         len: u64,
     },
     Root(ProgramId),
-    Query { program: ProgramId, request: Vec<u8> },
+    Query {
+        program: ProgramId,
+        request: Vec<u8>,
+    },
     Emit(Message),
     Event(Vec<u8>),
     Output(Vec<u8>),
@@ -273,6 +273,7 @@ pub enum HostReply {
     Value(Option<Vec<u8>>),
     Entries(Vec<Entry>),
     Done,
+    Item(ItemRef),
     BlobId(BlobId),
     Blob(Option<Blob>),
     BlobHeader(Option<BlobHeader>),
@@ -399,7 +400,10 @@ mod tests {
         assert_eq!(decode::<HostOp>(&encode(&op)).unwrap(), op);
         assert_eq!(decode::<HostReply>(&encode(&reply)).unwrap(), reply);
         assert_eq!(decode::<GuestCall>(&encode(&call)).unwrap(), call);
-        assert_eq!(decode::<GuestReply>(&encode(&guest_reply)).unwrap(), guest_reply);
+        assert_eq!(
+            decode::<GuestReply>(&encode(&guest_reply)).unwrap(),
+            guest_reply
+        );
         assert_eq!(decode::<Env>(&[9, 9]).unwrap_err().reason, reason::PROTOCOL);
     }
 }

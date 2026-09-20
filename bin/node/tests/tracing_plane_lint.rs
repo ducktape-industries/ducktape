@@ -53,10 +53,10 @@ const PLANES: &[&str] = &[
     "service",      // service registration and admission on the node
     "statesync",    // catch-up: serving and consuming state sync
     "stream",       // the node's websocket topic streams
-    "submit",       // transaction submission from a client, and the relay lane carrying a submit's blobs
-    "term",         // terminal sessions and the pty plane
-    "update",       // the desktop app's self-update: manifest checks, downloads, staging
-    "voice",        // huddle media end to end: the engine, the media service, the app's tiles
+    "submit", // transaction submission from a client, and the relay lane carrying a submit's blobs
+    "term",   // terminal sessions and the pty plane
+    "update", // the desktop app's self-update: manifest checks, downloads, staging
+    "voice",  // huddle media end to end: the engine, the media service, the app's tiles
 ];
 
 /// the trees an event can live in.

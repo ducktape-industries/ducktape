@@ -134,13 +134,15 @@ fn every_json_extractor_type_denies_unknown_fields() {
     );
     let missing: Vec<String> = extractors
         .iter()
-        .filter_map(|(file, line, ty)| match definition_denies_unknown(&files, ty) {
-            Some(true) => None,
-            Some(false) => Some(format!("{file}:{line} Json<{ty}>")),
-            None => Some(format!(
-                "{file}:{line} Json<{ty}> — not defined under crates/noded/src"
-            )),
-        })
+        .filter_map(
+            |(file, line, ty)| match definition_denies_unknown(&files, ty) {
+                Some(true) => None,
+                Some(false) => Some(format!("{file}:{line} Json<{ty}>")),
+                None => Some(format!(
+                    "{file}:{line} Json<{ty}> — not defined under crates/noded/src"
+                )),
+            },
+        )
         .collect();
     assert!(
         missing.is_empty(),

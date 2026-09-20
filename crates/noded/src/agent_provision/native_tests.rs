@@ -67,7 +67,11 @@ fn native(parent: &Path) -> NativeState {
     }
 }
 
-fn worker_controls_fixture(job_id: &str, operation_id: &str, text: &str) -> crate::runs::WorkerControls {
+fn worker_controls_fixture(
+    job_id: &str,
+    operation_id: &str,
+    text: &str,
+) -> crate::runs::WorkerControls {
     serde_json::from_value(json!({"job_id":job_id, "job_attempt":1, "job_status":"processing", "result":null, "reports":[], "controls":[{
         "operation_id":operation_id, "input":{"steer":{"text":text}}, "author":{"module":"tasks"}, "height":1, "acknowledgements":[]
     }]})).unwrap()

@@ -2227,26 +2227,35 @@ mod tests {
         fn configured(v: Option<&str>) -> Option<&str> {
             v.filter(|v| *v != "auto")
         }
-        let is_loopback =
-            |host: &str| host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+        let is_loopback = |host: &str| {
+            host.parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+        };
 
-        let advertised_values = [None, Some("auto"), Some("127.0.0.1:41820"), Some("203.0.113.9:41820")];
+        let advertised_values = [
+            None,
+            Some("auto"),
+            Some("127.0.0.1:41820"),
+            Some("203.0.113.9:41820"),
+        ];
         let listen_values = ["0.0.0.0:51820", "127.0.0.1:51820", "192.0.2.7:51820"];
-        let p2p_values = [Some("127.0.0.1:52330"), Some("203.0.113.1:443"), Some("overlay")];
+        let p2p_values = [
+            Some("127.0.0.1:52330"),
+            Some("203.0.113.1:443"),
+            Some("overlay"),
+        ];
 
         for wireguard_advertised in advertised_values {
             for wireguard_listen in listen_values {
                 for p2p in p2p_values {
                     let wg: SocketAddr = wireguard_listen.parse().unwrap();
-                    let case =
-                        format!("advertised={wireguard_advertised:?} listen={wireguard_listen} p2p={p2p:?}");
-                    let Some(front) = invite_front(
-                        p2p,
-                        "[::]:52330",
-                        wg,
-                        configured(wireguard_advertised),
-                    )
-                    .unwrap_or_else(|e| panic!("{case}: {e}")) else {
+                    let case = format!(
+                        "advertised={wireguard_advertised:?} listen={wireguard_listen} p2p={p2p:?}"
+                    );
+                    let Some(front) =
+                        invite_front(p2p, "[::]:52330", wg, configured(wireguard_advertised))
+                            .unwrap_or_else(|e| panic!("{case}: {e}"))
+                    else {
                         // no address in this config at all — an endpoint-less
                         // blob, which hands nobody a loopback front.
                         continue;

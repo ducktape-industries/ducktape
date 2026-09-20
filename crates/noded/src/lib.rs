@@ -21,9 +21,9 @@
 
 pub mod module_contracts;
 
-pub(crate) use module_contracts::{chat, runs, tasks};
 #[cfg(test)]
 pub(crate) use module_contracts::{agent, pages};
+pub(crate) use module_contracts::{chat, runs, tasks};
 
 // the owner-gated control namespace: `/v1/admin/*` on the same
 // listener, PoP-gated to the node owner. shutdown + module-code moved here off
@@ -981,7 +981,9 @@ async fn submit_raw(
     body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
     let bounded_target = !target.is_empty() && target.len() <= node::MAX_TARGET_BYTES;
-    if !bounded_target { return error_response(StatusCode::BAD_REQUEST, "invalid module target"); }
+    if !bounded_target {
+        return error_response(StatusCode::BAD_REQUEST, "invalid module target");
+    }
     let body = match body {
         Ok(body) => body,
         Err(error) => return error_response(error.status(), &error.body_text()),

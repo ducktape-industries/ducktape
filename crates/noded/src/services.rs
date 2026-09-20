@@ -389,10 +389,14 @@ impl Hello {
     /// Reject a malformed hello at the boundary, naming one stable reason.
     pub fn validate(&self) -> Result<(), HelloRefusal> {
         if !kind_is_well_formed(&self.kind) {
-            return Err(HelloRefusal::Malformed("kind must be 1..32 chars of [a-z0-9-]"));
+            return Err(HelloRefusal::Malformed(
+                "kind must be 1..32 chars of [a-z0-9-]",
+            ));
         }
         if self.version.len() > MAX_VERSION_LEN || !item_is_well_formed(&self.version) {
-            return Err(HelloRefusal::Malformed("version must be 1..32 printable ascii chars"));
+            return Err(HelloRefusal::Malformed(
+                "version must be 1..32 printable ascii chars",
+            ));
         }
         // the build is no longer compared, but it IS rendered — `service
         // status` prints it — so it stays a validated trust boundary: a
@@ -404,7 +408,9 @@ impl Hello {
         // `core.abbrev = 40`. A cap that refused an honest daemon's own stamp
         // would be the same fail-closed trap the build gate was.
         if !item_is_well_formed(&self.build) {
-            return Err(HelloRefusal::Malformed("build must be 1..64 printable ascii chars"));
+            return Err(HelloRefusal::Malformed(
+                "build must be 1..64 printable ascii chars",
+            ));
         }
         let lists_ok = self.scopes.len() <= MAX_LIST_LEN && self.needs.len() <= MAX_LIST_LEN;
         if !lists_ok {
@@ -416,12 +422,16 @@ impl Hello {
             .chain(self.scopes.iter())
             .all(|item| item_is_well_formed(item));
         if !items_ok {
-            return Err(HelloRefusal::Malformed("each capability/scope must be 1..64 printable ascii chars"));
+            return Err(HelloRefusal::Malformed(
+                "each capability/scope must be 1..64 printable ascii chars",
+            ));
         }
         // a need names a KIND, so it obeys the kind grammar — that is what
         // makes it comparable against the grants without any normalizing.
         if !self.needs.iter().all(|need| kind_is_well_formed(need)) {
-            return Err(HelloRefusal::Malformed("each need must be a service kind (1..32 chars of [a-z0-9-])"));
+            return Err(HelloRefusal::Malformed(
+                "each need must be a service kind (1..32 chars of [a-z0-9-])",
+            ));
         }
         Ok(())
     }
@@ -837,9 +847,7 @@ mod build_is_metadata_not_a_gate {
         // a refusal body answers the request it is on: every refusal describes
         // the CALLER's input or this node's capacity, and never this node's
         // own build stamp.
-        let messages = [
-            HelloRefusal::Malformed("kind must be 1..32 chars of [a-z0-9-]").message(),
-        ];
+        let messages = [HelloRefusal::Malformed("kind must be 1..32 chars of [a-z0-9-]").message()];
         let mine = build_identity_or_unknown();
         for message in messages {
             assert!(

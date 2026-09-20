@@ -68,12 +68,12 @@ use sdk::{
 use crate::{
     CredentialGrantStatement, CredentialRecord, GATEWAY_CREDENTIAL_NS, GATEWAY_ROUTE_NS,
     GatewayMsg, GatewayQuery, GatewayReply, MAX_CREDENTIAL_GRANTS, MAX_QUERY_LIMIT,
-    MAX_ROUTE_STATEMENT_JSON_BYTES, MemberAuthorization,
-    RemoveCredentialStatement, RouteName, RouteRecord, RouteStatement, RouteSummary,
-    SetCredentialStatement, decode_msg, decode_query, encode_reply, grant_credential_preimage,
-    remove_credential_preimage, revoke_credential_preimage, route_signing_preimage,
-    set_credential_preimage, validate_account_number, validate_authorization,
-    validate_credential_name, validate_route_statement,
+    MAX_ROUTE_STATEMENT_JSON_BYTES, MemberAuthorization, RemoveCredentialStatement, RouteName,
+    RouteRecord, RouteStatement, RouteSummary, SetCredentialStatement, decode_msg, decode_query,
+    encode_reply, grant_credential_preimage, remove_credential_preimage,
+    revoke_credential_preimage, route_signing_preimage, set_credential_preimage,
+    validate_account_number, validate_authorization, validate_credential_name,
+    validate_route_statement,
 };
 
 /// route-record byte ceiling, enforced at every staged route write on top of

@@ -31,9 +31,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::wire::forge::ForgeRepoAddress;
 use commonware_cryptography::Signer as _;
 use duck_address::{Address, ChainId, Refused};
-use crate::wire::forge::ForgeRepoAddress;
 use workspace_config::{Registered, RemoteWorkspace};
 
 /// the name git runs the helper by: `git-remote-<scheme>`.
@@ -1334,8 +1334,10 @@ mod tests {
             !dir.path().join("config.toml").exists(),
             "a config.toml beside it would orphan the operator's config"
         );
-        assert!(std::fs::read_to_string(dir.path().join("config"))
-            .unwrap()
-            .contains("git-fetch-with-cli = true"));
+        assert!(
+            std::fs::read_to_string(dir.path().join("config"))
+                .unwrap()
+                .contains("git-fetch-with-cli = true")
+        );
     }
 }

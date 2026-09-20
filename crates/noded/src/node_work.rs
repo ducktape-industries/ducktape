@@ -133,7 +133,9 @@ fn read_blob(base: &std::path::Path, source: &ForgeBlob) -> Result<Vec<u8>, Blob
         .read_header(entry.id())
         .map_err(|error| BlobError::Unavailable(error.to_string()))?;
     if kind != git2::ObjectType::Blob {
-        return Err(BlobError::Invalid("the path names a non-blob object".into()));
+        return Err(BlobError::Invalid(
+            "the path names a non-blob object".into(),
+        ));
     }
     let blob = repo
         .find_blob(entry.id())

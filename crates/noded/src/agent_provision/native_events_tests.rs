@@ -100,17 +100,19 @@ async fn query(State(fixture): State<Arc<Fixture>>, Json(body): Json<Value>) -> 
                 .unwrap()
             }
             crate::runs::RunsQuery::AgentSessions => {
-                serde_json::to_value(crate::runs::RunsReply::AgentSessions(vec![crate::runs::AgentSession {
-                    run_id: RUN_ID.into(),
-                    agent_id: "resident".into(),
-                    session_key: fixture.signer.clone(),
-                    lease: crate::runs::ExecutionLease {
-                        holder: vec![7; 32],
-                        attempt: 1,
+                serde_json::to_value(crate::runs::RunsReply::AgentSessions(vec![
+                    crate::runs::AgentSession {
+                        run_id: RUN_ID.into(),
+                        agent_id: "resident".into(),
+                        session_key: fixture.signer.clone(),
+                        lease: crate::runs::ExecutionLease {
+                            holder: vec![7; 32],
+                            attempt: 1,
+                        },
+                        opened_at: 1,
+                        actions: 0,
                     },
-                    opened_at: 1,
-                    actions: 0,
-                }]))
+                ]))
                 .unwrap()
             }
             crate::runs::RunsQuery::ConversationEvents {
