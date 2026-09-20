@@ -1470,6 +1470,7 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         summarize_capabilities(&kind, &hello.capabilities),
     ))?;
 
+    warn_stale_grant(&workspace, &kind, &hello.capabilities);
     offer_enable(&workspace, &kind, args.offer(), &service, node_key, &base)?;
 
     // the heartbeat must outlive this call: for compute it runs BESIDE the
@@ -1774,6 +1775,50 @@ fn discover_hello(
     })
 }
 
+/// Warn when a live hello offers capabilities this standing grant did not
+/// include. A grant is consent, so discovery never expands it implicitly.
+fn warn_stale_grant(workspace: &Path, kind: &str, offered: &[String]) {
+    let Ok(Some(grant)) = grant_for(workspace, kind) else {
+        return;
+    };
+    let Some(missing) = stale_grant_hint(kind, Some(&grant), offered) else {
+        return;
+    };
+    tracing::warn!(
+        target: "ducktape::service",
+        event = "service_grant_stale",
+        reason = "offered_capabilities_not_granted",
+        %kind,
+        "{missing}"
+    );
+}
+
+/// Explain why a changed offer is unavailable without changing consent.
+fn stale_grant_hint(
+    kind: &str,
+    standing: Option<&ServiceGrant>,
+    offered: &[String],
+) -> Option<String> {
+    let standing = standing?;
+    let missing: Vec<&str> = offered
+        .iter()
+        .map(String::as_str)
+        .filter(|capability| {
+            !standing
+                .capabilities
+                .iter()
+                .any(|granted| granted == capability)
+        })
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "offered capabilities {} are not in the standing grant; they are unavailable until re-consent with: ducktape service enable {kind}",
+        missing.join(", ")
+    ))
+}
+
 /// Signal once, and report whether the node that answered is on our build.
 ///
 /// The node returns its own stamp in the OK body. That is what makes skew a
@@ -2036,6 +2081,7 @@ impl HelloWatch {
             offering = %summarize_capabilities(&self.kind, &derived.capabilities),
             "the executors directory changed — offering a new set"
         );
+        warn_stale_grant(&self.service.workspace, &self.kind, &derived.capabilities);
         *hello = derived;
     }
 }
@@ -2155,12 +2201,15 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
         // It is printed on a re-consent too, and for the same reason: the
         // SERVING half reads the grant at startup (`serve_kind`), so a widened
         // grant is announced before the running process will execute it.
-        write_err(&format!(
-            "  restart the daemon to pick the grant up: ^C, then ducktape service run {}\n",
-            plan.kind
-        ))?;
+        write_err(&restart_advice(&plan.kind))?;
     }
     Ok(())
+}
+
+fn restart_advice(kind: &str) -> String {
+    format!(
+        "  restart the daemon to pick the grant up: ^C, then ducktape service run {kind}; for service-managed daemons, restart the systemd/launchd unit instead\n"
+    )
 }
 
 /// How an on-chain announce reads to someone who has never heard the word
@@ -2310,6 +2359,98 @@ mod tests {
         let mut clock = ExecutorsClock::new(None);
         assert!(!clock.moved());
         assert!(!clock.moved());
+    }
+
+    #[test]
+    fn a_stale_grant_names_new_offers_and_the_exact_reconsent_command() {
+        let mut empty = grant("compute", NODE_A);
+        empty.capabilities = Vec::new();
+        let offered = ["claude", "codex", "pi"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let hint = stale_grant_hint("compute", Some(&empty), &offered)
+            .expect("an empty-to-nonempty addition needs a hint");
+        assert!(
+            offered.iter().all(|capability| hint.contains(capability)),
+            "every missing offer is named: {hint}"
+        );
+        assert!(
+            hint.contains("ducktape service enable compute"),
+            "the remedy is exact: {hint}"
+        );
+
+        let mut standing = empty.clone();
+        standing.capabilities = vec!["claude".into(), "pi".into()];
+        let mut all = standing.clone();
+        all.capabilities = offered.clone();
+        assert!(stale_grant_hint("compute", Some(&all), &offered).is_none());
+        let reordered = ["pi", "claude"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        assert!(stale_grant_hint("compute", Some(&all), &reordered).is_none());
+        assert!(
+            stale_grant_hint("compute", Some(&all), &["claude".into()]).is_none(),
+            "an offered subset needs no warning"
+        );
+        assert!(
+            stale_grant_hint("compute", None, &offered).is_none(),
+            "the existing no-grant instructions cover a first grant"
+        );
+
+        let mixed = ["claude", "codex"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let mixed_hint = stale_grant_hint("compute", Some(&standing), &mixed)
+            .expect("an addition mixed with a removal still needs a hint");
+        assert!(
+            mixed_hint.contains("codex"),
+            "the addition is named: {mixed_hint}"
+        );
+    }
+
+    #[test]
+    fn stale_grant_warning_is_on_startup_and_offer_change_not_heartbeat() {
+        let source = include_str!("services.rs");
+        let startup = source
+            .split("fn run_service(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// ").next())
+            .expect("run_service has a body");
+        assert!(
+            startup.contains("warn_stale_grant"),
+            "startup must check the grant"
+        );
+
+        let refresh = source
+            .split("fn refresh(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// ").next())
+            .expect("HelloWatch::refresh has a body");
+        assert!(
+            refresh.contains("warn_stale_grant"),
+            "changed offers must check the grant"
+        );
+
+        let heartbeat = source
+            .split("fn heartbeat(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn enable(").next())
+            .expect("heartbeat has a body");
+        assert!(
+            !heartbeat.contains("warn_stale_grant"),
+            "a heartbeat must not repeat the lifecycle warning"
+        );
+    }
+
+    #[test]
+    fn service_enable_restart_advice_covers_foreground_and_units() {
+        let advice = restart_advice("compute");
+        assert!(advice.contains("^C, then ducktape service run compute"));
+        assert!(advice.contains("restart the systemd/launchd unit"));
+        assert!(advice.contains("service-managed"));
     }
 
     fn row(kind: &str) -> ServiceRow {

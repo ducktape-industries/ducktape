@@ -19,6 +19,190 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest as _, Sha256};
 
+#[allow(dead_code)]
+mod test_wire {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Program {
+        pub steps: Vec<Step>,
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Step {
+        Branch {
+            test: Predicate,
+            then: u64,
+            or: u64,
+        },
+        Call {
+            module: String,
+            msg: Value,
+            bind: String,
+            decode: Decode,
+            on_failure: Continuation,
+        },
+        Report {
+            recipient: Value,
+            reason: Reason,
+            detail: Value,
+        },
+        Finish,
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Decode {
+        Json,
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Continuation {
+        Step(u64),
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Value {
+        Null,
+        Bool(bool),
+        Number(i128),
+        Text(String),
+        Bytes(Vec<u8>),
+        List(Vec<Value>),
+        Map(BTreeMap<String, Value>),
+        Ref(Vec<String>),
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Predicate {
+        Equals { left: Value, right: Value },
+    }
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Reason {
+        Mention,
+        Authorship,
+        Ownership,
+        Assignment,
+        Credit,
+        Result,
+        Report,
+        Defined(String),
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum AttributionReply {
+        Changes(Vec<ChangeEntry>),
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    pub struct ChangeEntry {
+        pub at: u64,
+        pub change: Change,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    pub struct Change {
+        pub seq: u64,
+        pub source: Source,
+        pub revision: u64,
+        pub recipient: u64,
+        pub reason: Reason,
+        pub kind: ChangeKind,
+        pub detail: Vec<u8>,
+        pub actor: Actor,
+        pub cause: Cause,
+        pub height: u64,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    pub struct Source {
+        pub module: String,
+        pub kind: String,
+        pub object: String,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum ChangeKind {
+        Added,
+        Withdrawn,
+        TransferredIn { from: u64 },
+        TransferredOut { to: u64 },
+    }
+
+    #[derive(Deserialize, Debug, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Actor {
+        Account(u64),
+        Key(Vec<u8>),
+        Module(String),
+        System,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Cause {
+        Direct,
+        Chain { root: Root, hop: Hop },
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Root {
+        Item(ItemRef),
+        Call(CallId),
+        Change { source: String, seq: u64 },
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Hop {
+        Delivery(ItemRef),
+        Call(CallId),
+        Completion(CallId),
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    pub struct ItemRef {
+        pub source: String,
+        pub item: u64,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    pub struct CallId {
+        pub requester: String,
+        pub invocation: String,
+        pub step: u64,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum CallResult {
+        Applied {
+            output: serde_json::Value,
+            assigned: serde_json::Value,
+        },
+        Rejected {
+            reason: String,
+        },
+    }
+}
+
 /// a running daemon, killed on drop so failures never leak an orphan (the
 /// REAL orphan lifecycle — outliving a client — is the desktop shell's
 /// contract with a detached spawn; this harness owns its child instead).
@@ -659,8 +843,10 @@ fn block_commits_push_tip_heartbeats_before_their_events() {
 
 #[test]
 fn programmable_user_calls_and_reports_failure_through_onchain_attribution() {
-    use agent::{Continuation, Decode, Predicate, Program, Step, Value};
-    use attribution::{Actor, AttributionReply, Reason};
+    use test_wire::{
+        Actor, AttributionReply, CallResult, Continuation, Decode, Hop, Predicate, Program, Reason,
+        Step, Value,
+    };
 
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
@@ -761,9 +947,7 @@ fn programmable_user_calls_and_reports_failure_through_onchain_attribution() {
             "changes_for": { "recipient": 1, "after": 0, "limit": 64 },
         }),
     );
-    let AttributionReply::Changes(entries) = serde_json::from_value(changes).unwrap() else {
-        panic!("expected the controller's attributions");
-    };
+    let AttributionReply::Changes(entries) = serde_json::from_value(changes).unwrap();
     let reports: Vec<_> = entries
         .iter()
         .map(|entry| &entry.change)
@@ -776,8 +960,8 @@ fn programmable_user_calls_and_reports_failure_through_onchain_attribution() {
         assert!(
             matches!(
                 report.cause,
-                sdk::Cause::Chain {
-                    hop: sdk::Hop::Completion(_),
+                test_wire::Cause::Chain {
+                    hop: Hop::Completion(_),
                     ..
                 }
             ),
@@ -785,10 +969,10 @@ fn programmable_user_calls_and_reports_failure_through_onchain_attribution() {
             report.cause
         );
     }
-    let applied: agent::CallResult = serde_json::from_slice(&reports[0].detail).unwrap();
-    assert!(matches!(applied, agent::CallResult::Applied { .. }));
-    let rejected: agent::CallResult = serde_json::from_slice(&reports[1].detail).unwrap();
-    let agent::CallResult::Rejected { reason } = rejected else {
+    let applied: CallResult = serde_json::from_slice(&reports[0].detail).unwrap();
+    assert!(matches!(applied, CallResult::Applied { .. }));
+    let rejected: CallResult = serde_json::from_slice(&reports[1].detail).unwrap();
+    let CallResult::Rejected { reason } = rejected else {
         panic!("duplicate task must report its target rejection");
     };
     assert!(

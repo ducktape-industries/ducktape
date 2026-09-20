@@ -366,12 +366,10 @@ name = "attribution"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "attribution-wire",
  "borsh",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
- "identity-wire",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -787,7 +785,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
- "capability-wire",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
@@ -795,16 +792,6 @@ dependencies = [
  "sdk-testkit",
  "serde",
  "statesync",
- "valset-wire",
-]
-
-[[package]]
-name = "capability-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "sdk",
- "serde",
 ]
 
 [[package]]
@@ -2379,13 +2366,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
- "capability-wire",
  "commonware-runtime",
- "dispatch-wire",
  "ducktape-module-sdk",
  "futures",
- "identity-wire",
- "saga",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -4588,7 +4571,6 @@ name = "node-bin"
 version = "0.1.0"
 dependencies = [
  "agent-service",
- "agent-wire",
  "airlock",
  "airlock-service",
  "anstream",
@@ -4607,9 +4589,7 @@ dependencies = [
  "bytes",
  "capability",
  "chacha20poly1305 0.10.1",
- "chat-wire",
  "clap",
- "collaboration-wire",
  "commonware-actor",
  "commonware-codec",
  "commonware-consensus",
@@ -4633,7 +4613,6 @@ dependencies = [
  "files",
  "flate2",
  "forge",
- "forge-wire",
  "futures",
  "gateway",
  "git2",
@@ -4655,14 +4634,12 @@ dependencies = [
  "noded",
  "objc2-foundation",
  "overlay-net",
- "pages-wire",
  "provider-host",
  "rand 0.8.6",
  "reachability",
  "recovery",
  "reqwest 0.12.28",
  "run-envelope",
- "runs-wire",
  "saga",
  "sandbox-host",
  "sdk",
@@ -4674,7 +4651,6 @@ dependencies = [
  "statesync",
  "syn 2.0.119",
  "tar",
- "tasks-wire",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -4722,7 +4698,6 @@ name = "noded"
 version = "0.1.0"
 dependencies = [
  "agent-service",
- "agent-wire",
  "app-update",
  "async-trait",
  "attribution",
@@ -4732,7 +4707,6 @@ dependencies = [
  "borsh",
  "bytes",
  "capability",
- "chat-wire",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
@@ -4759,12 +4733,10 @@ dependencies = [
  "nettest",
  "node",
  "node-work",
- "pages-wire",
  "provider-host",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "run-envelope",
- "runs-wire",
  "saga",
  "sdk",
  "sdk-testkit",
@@ -4773,7 +4745,6 @@ dependencies = [
  "sha2 0.10.9",
  "statesync",
  "syn 2.0.119",
- "tasks-wire",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",
@@ -4794,9 +4765,7 @@ dependencies = [
 name = "noded-bin"
 version = "0.1.0"
 dependencies = [
- "agent-wire",
  "async-trait",
- "attribution-wire",
  "base64 0.22.1",
  "commonware-cryptography",
  "commonware-runtime",
@@ -4808,6 +4777,7 @@ dependencies = [
  "node",
  "noded",
  "sdk",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -5620,7 +5590,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "broker-host",
- "capability-wire",
  "futures",
  "libc",
  "mcp-host",
@@ -5629,7 +5598,6 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "run-envelope",
- "runs-wire",
  "sandbox-host",
  "serde",
  "serde_json",
@@ -6331,13 +6299,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
- "capability-wire",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
  "host",
  "index-guest",
- "saga-wire",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -6345,8 +6311,6 @@ dependencies = [
  "sha2 0.10.9",
  "statesync",
  "tempfile",
- "valset",
- "valset-wire",
 ]
 
 [[package]]

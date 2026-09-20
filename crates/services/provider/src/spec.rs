@@ -73,10 +73,31 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use capability::validate_tag;
 use serde::Deserialize;
 
 use crate::variants::{self, RawVariant};
+
+pub(crate) fn validate_tag(tag: &str) -> Result<(), String> {
+    const MAX_TAG_LEN: usize = 64;
+    if tag.is_empty() {
+        return Err("capability tag must be non-empty".into());
+    }
+    if tag.len() > MAX_TAG_LEN {
+        return Err(format!(
+            "capability tag exceeds {MAX_TAG_LEN} bytes: {} bytes",
+            tag.len()
+        ));
+    }
+    if !tag
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+    {
+        return Err(format!(
+            "capability tag has invalid characters (want [a-z0-9._-]): {tag:?}"
+        ));
+    }
+    Ok(())
+}
 
 /// the one spec format version this build understands. parsing rejects any
 /// other value loudly — an operator on a newer format gets "unsupported spec
@@ -1579,5 +1600,14 @@ args = ["run", "--model", "m", "--hard", "-"]
         assert!(err.contains("duplicate capability tag"), "got {err:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_tag_rule_keeps_consensus_boundaries() {
+        assert!(validate_tag("codex").is_ok());
+        assert!(validate_tag(&"a".repeat(64)).is_ok());
+        assert!(validate_tag(&"a".repeat(65)).is_err());
+        assert!(validate_tag("Codex").is_err());
+        assert!(validate_tag("codex/").is_err());
     }
 }

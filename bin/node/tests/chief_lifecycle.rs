@@ -6,6 +6,8 @@
 #[allow(dead_code)]
 #[path = "../src/chief_cli/plan.rs"]
 mod plan;
+#[path = "../src/wire.rs"]
+mod wire;
 
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
@@ -16,6 +18,7 @@ use host::{BlockContext, Host};
 use noded::testkit::committed_module;
 use sdk::{Msg, Origin};
 use sha2::{Digest as _, Sha256};
+use wire::{agent, chat, pages, runs, tasks};
 
 /// this composition's identity chain id — and the value the `runs` guest reads
 /// out of its genesis `__config` record.
@@ -68,6 +71,38 @@ type Stores = BTreeMap<&'static str, Store>;
 fn store(stores: &mut Stores, name: &'static str) -> Box<dyn sdk::MerkleStore> {
     Box::new(stores.entry(name).or_default().clone())
 }
+
+// `runs-wire` exposes this reply with its own dispatch-wire dependency. The
+// node test consumes only the stable status shape, so keep that nested type at
+// this boundary instead of coupling the test to the producer's wire crate.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ActionReceiptReply {
+    ActionRequest(Option<ActionReceipt>),
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ActionReceipt {
+    status: ActionReceiptStatus,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ActionReceiptStatus {
+    Completed { outcome: ActionReceiptOutcome },
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ActionReceiptOutcome {
+    Applied {
+        #[serde(rename = "output_digest")]
+        _output_digest: [u8; 32],
+        #[serde(rename = "assigned")]
+        _assigned: Vec<u8>,
+    },
+}
+
 fn signer(seed: u64) -> PrivateKey {
     PrivateKey::from_seed(seed)
 }
@@ -384,7 +419,7 @@ impl Network {
         )
         .await;
         self.drain().await;
-        let runs::RunsReply::ActionRequest(Some(receipt)) = self
+        let ActionReceiptReply::ActionRequest(Some(receipt)) = self
             .query(
                 "runs",
                 runs::RunsQuery::ActionRequest {
@@ -398,9 +433,8 @@ impl Network {
         assert!(
             matches!(
                 receipt.status,
-                runs::ActionStatus::Completed {
-                    outcome: dispatch::CallOutcomeSummary::Applied { .. },
-                    ..
+                ActionReceiptStatus::Completed {
+                    outcome: ActionReceiptOutcome::Applied { .. },
                 }
             ),
             "{request}: {receipt:?}"

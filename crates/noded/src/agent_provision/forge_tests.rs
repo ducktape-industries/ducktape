@@ -13,7 +13,6 @@ use super::super::plane_tests::{
 use super::*;
 use crate::NodeHandle;
 use compute_service::WorkspaceProvisioner as _;
-use runs_wire as runs;
 
 /// write `body` to `path` as an executable script, through a child shell
 /// rather than this process: a file this process holds open for writing is
@@ -208,7 +207,7 @@ impl Bed {
             // item's channel), never the host-local `run_id` above.
             agent: Some(compute_service::AgentExecution {
                 native_conversation: None,
-                run_id: runs::run_id_for(&format!("forge:{REPO}:7"), 1, AGENT),
+                run_id: crate::runs::run_id_for(&format!("forge:{REPO}:7"), 1, AGENT),
                 attempt: 0,
                 agent_id: AGENT.into(),
                 display_name: AGENT_DISPLAY_NAME.into(),
@@ -704,7 +703,7 @@ fn git_control_sanitization_rejects_nested_object_and_ref_symlinks() {
 fn attribution_addresses_round_trip_a_label_shaped_agent_id() {
     let longest = "x".repeat(63);
     for id in [AGENT, "qa-luna", "a", longest.as_str()] {
-        assert!(runs::validate_agent_id(id).is_ok(), "{id}");
+        assert!(crate::runs::validate_agent_id(id).is_ok(), "{id}");
         let local = attribution_email_local_part(id);
         assert_eq!(local, id);
         assert!(local.len() <= 63, "{local}");

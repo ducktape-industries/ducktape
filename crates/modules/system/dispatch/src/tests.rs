@@ -8,11 +8,11 @@
 //! root continuity proof is the host crate's `wasm_dispatch_parity`.
 
 use super::*;
-use futures::executor::block_on;
-use identity::{
+use crate::identity_contract::{
     AccountView, decode_query as identity_decode_query, encode_reply as identity_encode_reply,
 };
-use saga::{decode_msg as saga_decode_msg, encode_callback};
+use crate::saga_contract::{decode_msg as saga_decode_msg, encode_callback};
+use futures::executor::block_on;
 use sdk::Env;
 use sdk_testkit::{MemStore, TestCtx};
 
@@ -42,10 +42,7 @@ fn mk_ctx(height: u64, origin: Origin) -> TestCtx {
 fn with_identity(ctx: TestCtx, accounts: Vec<AccountView>) -> TestCtx {
     ctx.on_query("identity", move |req| {
         let IdentityQuery::Get { number } =
-            identity_decode_query(req).map_err(|e| Error::module("codec", e))?
-        else {
-            return Err(Error::module("only_get_served", "only Get is served here"));
-        };
+            identity_decode_query(req).map_err(|e| Error::module("codec", e))?;
         let account = accounts.iter().find(|a| a.number == number).cloned();
         Ok(identity_encode_reply(&IdentityReply::Account(account)))
     })
