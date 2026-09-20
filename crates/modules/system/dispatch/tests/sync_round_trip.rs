@@ -23,13 +23,15 @@
 //! deterministic runtime shares storage across child contexts).
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+use dispatch::identity_contract::{
+    AccountView, Control, IdentityQuery, IdentityReply, ProgramStanding,
+};
+use dispatch::saga_contract::{SagaCallback, SagaOutcome, encode_callback};
 use dispatch::{
     AdmissionPolicy, CallOutcome, CallStatus, CallView, DispatchModule, DispatchMsg, DispatchQuery,
     DispatchReply, DispatchStatus, DispatchView, OutputContract, PendingCall, Recipe, Routing,
     decode_reply, encode_msg, encode_query,
 };
-use identity::{AccountView, Control, IdentityQuery, IdentityReply, ProgramStanding};
-use saga::{SagaCallback, SagaOutcome, encode_callback};
 use sdk::{
     Ack, CallId, Cause, DeliveryOutcome, Env, Error, MerkleStore as _, Module, Msg, Origin,
     StateRoot, StateSyncHandle,
@@ -59,11 +61,8 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
 /// executed by `runs`, which a `Call` is admitted against.
 fn requester_ctx(height: u64) -> TestCtx {
     ctx(height, Origin::Module(RUNS.into())).on_query(IDENTITY, |req| {
-        let IdentityQuery::Get { number } =
-            identity::decode_query(req).map_err(|e| Error::module("codec", e))?
-        else {
-            return Err(Error::module("only_get_served", "only Get is served here"));
-        };
+        let IdentityQuery::Get { number } = dispatch::identity_contract::decode_query(req)
+            .map_err(|e| Error::module("codec", e))?;
         let account = (number == PROGRAM).then(|| AccountView {
             number,
             name: "program".into(),
@@ -78,7 +77,9 @@ fn requester_ctx(height: u64) -> TestCtx {
             bio: None,
             updated_at: 0,
         });
-        Ok(identity::encode_reply(&IdentityReply::Account(account)))
+        Ok(dispatch::identity_contract::encode_reply(
+            &IdentityReply::Account(account),
+        ))
     })
 }
 
