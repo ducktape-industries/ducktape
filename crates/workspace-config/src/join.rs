@@ -84,11 +84,11 @@ struct Listener {
 
 const LISTENER_NAMES: [&str; 6] = [
     "listen",
-    "http_listen",
-    "gateway_listen",
-    "rpc_listen",
-    "wireguard_listen",
-    "invite_listen",
+    "http",
+    "gateway",
+    "rpc",
+    "wireguard-listen",
+    "invite-listen",
 ];
 const LISTENER_PROTOCOLS: [ListenerProtocol; 6] = [
     ListenerProtocol::Tcp,
@@ -580,7 +580,7 @@ mod tests {
             "{error}"
         );
         assert!(
-            error.contains("TCP") && error.contains("http_listen"),
+            error.contains("TCP") && error.contains("--http") && !error.contains("--http_listen"),
             "{error}"
         );
         assert!(
