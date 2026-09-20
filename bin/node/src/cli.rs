@@ -33,6 +33,8 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::Admit(args) => cmd_admit(args),
         OpCmd::Join(cmd) => dispatch_join(cmd),
         OpCmd::List => cmd_list(),
+        OpCmd::Stop(args) => cmd_node_stop(args),
+        OpCmd::Leave(args) => cmd_node_leave(args),
         OpCmd::Status(args) => cmd_node_status(args),
         OpCmd::Qualify(args) => crate::qualify::run(args),
         OpCmd::RecordWorld(args) => cmd_record_world(args),
@@ -243,6 +245,446 @@ fn cmd_list() -> CommandResult {
             }
         }
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct LifecycleWorkspace {
+    chain_id: String,
+    config: PathBuf,
+    workspace: PathBuf,
+}
+
+fn lifecycle_workspace(selector: &Selector) -> Result<LifecycleWorkspace, String> {
+    let requested = selector.config_path()?;
+    let requested = std::fs::canonicalize(&requested)
+        .map_err(|error| format!("cannot identify workspace config {requested:?}: {error}"))?;
+    let matches: Vec<(String, PathBuf)> = config::list_workspaces()?
+        .into_iter()
+        .filter(|(_, candidate)| {
+            std::fs::canonicalize(candidate).is_ok_and(|candidate| candidate == requested)
+        })
+        .collect();
+    let (chain_id, config) = match matches.as_slice() {
+        [(chain_id, config)] => (chain_id.clone(), config.clone()),
+        [] => {
+            return Err(format!(
+                "workspace config {requested:?} is not a registered local workspace"
+            ));
+        }
+        several => {
+            return Err(format!(
+                "workspace config {requested:?} is ambiguous — {} registered entries match",
+                several.len()
+            ));
+        }
+    };
+    let workspace = config
+        .parent()
+        .ok_or_else(|| format!("workspace config {config:?} has no directory"))?
+        .to_path_buf();
+    Ok(LifecycleWorkspace {
+        chain_id,
+        config,
+        workspace,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SupervisorClaim {
+    Systemd {
+        user: bool,
+        unit: String,
+    },
+    Launchd {
+        domain: String,
+        label: String,
+        plist: PathBuf,
+    },
+}
+
+/// The lifecycle verbs only control a supervisor that proves its own argv
+/// names this exact workspace and config. They never fall back to a PID or
+/// process-name search.
+fn discover_supervisor(target: &LifecycleWorkspace) -> Result<SupervisorClaim, String> {
+    let mut claims = Vec::new();
+    for user in [true, false] {
+        if let Some(claim) = systemd_claim(target, user) {
+            claims.push(claim);
+        }
+    }
+    claims.extend(launchd_claims(target));
+    match claims.as_slice() {
+        [claim] => Ok(claim.clone()),
+        [] => Err(format!(
+            "no supported supervisor owns workspace {} — refusing to signal a process by name; \
+             stop the process through its own launcher first",
+            target.workspace.display()
+        )),
+        several => Err(format!(
+            "workspace {} has ambiguous supervisor ownership ({} claims) — refusing to stop \
+             any of them",
+            target.workspace.display(),
+            several.len()
+        )),
+    }
+}
+
+fn systemd_claim(target: &LifecycleWorkspace, user: bool) -> Option<SupervisorClaim> {
+    let instance = systemd_instance(&target.chain_id);
+    let prefix = if user {
+        "ducktape-node-user@"
+    } else {
+        "ducktape-node@"
+    };
+    let unit = format!("{prefix}{instance}");
+    let mut command = std::process::Command::new("systemctl");
+    if user {
+        command.arg("--user");
+    }
+    let output = command
+        .args([
+            "show",
+            &unit,
+            "--property=LoadState",
+            "--property=ExecStart",
+            "--no-pager",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let loaded = property(&text, "LoadState").is_some_and(|value| value == "loaded");
+    let exec = text
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))?;
+    let args = systemd_exec_args(exec)?;
+    (loaded && supervisor_args_match(&args, target)).then_some(SupervisorClaim::Systemd { user, unit })
+}
+
+/// The chain-id grammar only permits characters that systemd leaves literal
+/// except #; keep a fallback for test hosts without systemd-escape while
+/// using the installed helper when available, exactly as the ops installer
+/// does.
+fn systemd_instance(chain_id: &str) -> String {
+    let escaped = std::process::Command::new("systemd-escape")
+        .arg(chain_id)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|escaped| !escaped.is_empty());
+    escaped.unwrap_or_else(|| chain_id.replace('#', "\\x23"))
+}
+
+fn property<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}=")))
+}
+
+fn systemd_exec_args(exec: &str) -> Option<Vec<String>> {
+    let encoded = exec.strip_prefix("{ ")?.strip_suffix(" }")?;
+    let encoded = encoded.strip_prefix("path=")?;
+    let encoded = encoded.split_once(" ; argv[]=")?.1;
+    let encoded = encoded.split_once(" ;")?.0;
+    split_systemd_words(encoded)
+}
+
+fn split_systemd_words(encoded: &str) -> Option<Vec<String>> {
+    let chars: Vec<char> = encoded.chars().collect();
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut token_started = false;
+    let mut quote = None;
+    let mut index = 0;
+    while index < chars.len() {
+        let character = chars[index];
+        if let Some(expected) = quote {
+            if character == expected {
+                quote = None;
+                index += 1;
+                continue;
+            }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            token_started = true;
+            index += 1;
+            continue;
+        }
+        if character == '\\' {
+            index += 1;
+            let escaped = *chars.get(index)?;
+            if escaped == 'x' {
+                let high = chars.get(index + 1)?.to_digit(16)?;
+                let low = chars.get(index + 2)?.to_digit(16)?;
+                current.push(char::from_u32(high * 16 + low)?);
+                index += 3;
+            } else {
+                current.push(match escaped {
+                    's' => ' ',
+                    't' => '\t',
+                    'n' => '\n',
+                    'r' => '\r',
+                    other => other,
+                });
+                index += 1;
+            }
+            token_started = true;
+            continue;
+        }
+        if quote.is_none() && character.is_whitespace() {
+            if token_started {
+                args.push(std::mem::take(&mut current));
+                token_started = false;
+            }
+        } else {
+            current.push(character);
+            token_started = true;
+        }
+        index += 1;
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if token_started {
+        args.push(current);
+    }
+    Some(args)
+}
+
+fn supervisor_args_match(args: &[String], target: &LifecycleWorkspace) -> bool {
+    let Some(workspace) = target.workspace.to_str() else {
+        return false;
+    };
+    let Some(config) = target.config.to_str() else {
+        return false;
+    };
+    args.windows(4).any(|window| {
+        window[0] == "--workspace"
+            && window[1] == workspace
+            && window[2] == "--config"
+            && window[3] == config
+    })
+}
+
+fn launchd_claims(target: &LifecycleWorkspace) -> Vec<SupervisorClaim> {
+    let Some(domain) = launchd_domain() else {
+        return Vec::new();
+    };
+    let agents = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Library/LaunchAgents"));
+    let Some(agents) = agents else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(agents) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| launchd_claim(entry.path(), &domain, target))
+        .collect()
+}
+
+fn launchd_claim(
+    plist: PathBuf,
+    domain: &str,
+    target: &LifecycleWorkspace,
+) -> Option<SupervisorClaim> {
+    let is_plist = plist
+        .extension()
+        .is_some_and(|extension| extension == "plist");
+    if !is_plist {
+        return None;
+    }
+    let label = plist.file_stem()?.to_str()?.to_string();
+    let text = std::fs::read_to_string(&plist).ok()?;
+    let plist_args = plist_program_arguments(&text)?;
+    if !supervisor_args_match(&plist_args, target) {
+        return None;
+    }
+    let job = format!("{domain}/{label}");
+    let output = std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(&job)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let loaded = String::from_utf8(output.stdout).ok()?;
+    let loaded_args = launchd_print_arguments(&loaded)?;
+    supervisor_args_match(&loaded_args, target).then_some(SupervisorClaim::Launchd {
+        domain: domain.to_string(),
+        label,
+        plist,
+    })
+}
+
+fn plist_program_arguments(text: &str) -> Option<Vec<String>> {
+    let after_key = text.split_once("<key>ProgramArguments</key>")?.1;
+    let array = after_key.trim_start().strip_prefix("<array>")?;
+    let body = array.split_once("</array>")?.0;
+    let mut args = Vec::new();
+    let mut rest = body;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return Some(args);
+        }
+        let value = rest.strip_prefix("<string>")?;
+        let (value, tail) = value.split_once("</string>")?;
+        args.push(xml_unescape(value)?);
+        rest = tail;
+    }
+}
+
+fn xml_unescape(value: &str) -> Option<String> {
+    let mut result = String::new();
+    let mut rest = value;
+    while let Some((before, after)) = rest.split_once('&') {
+        result.push_str(before);
+        let (entity, tail) = after.split_once(';')?;
+        result.push(match entity {
+            "amp" => '&',
+            "apos" => '\'',
+            "gt" => '>',
+            "lt" => '<',
+            "quot" => '"',
+            _ => return None,
+        });
+        rest = tail;
+    }
+    result.push_str(rest);
+    Some(result)
+}
+
+fn launchd_print_arguments(text: &str) -> Option<Vec<String>> {
+    let mut in_arguments = false;
+    let mut args = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !in_arguments {
+            in_arguments = line == "arguments = {";
+            continue;
+        }
+        if line == "}" {
+            return Some(args);
+        }
+        if !line.is_empty() {
+            args.push(line.to_string());
+        }
+    }
+    None
+}
+
+fn launchd_domain() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: geteuid reads the current process credentials and has no
+        // observable side effect.
+        Some(format!("gui/{}", unsafe { libc::geteuid() }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+fn stop_supervisor(claim: &SupervisorClaim, leave: bool) -> CommandResult {
+    match claim {
+        SupervisorClaim::Systemd { user, unit } => {
+            let mut command = std::process::Command::new("systemctl");
+            if *user {
+                command.arg("--user");
+            }
+            if leave {
+                command.args(["disable", "--now", unit]);
+            } else {
+                command.args(["stop", unit]);
+            }
+            run_supervisor_command(command, "systemd", unit)
+        }
+        SupervisorClaim::Launchd {
+            domain,
+            label,
+            plist,
+        } => {
+            let job = format!("{domain}/{label}");
+            let command = std::process::Command::new("launchctl")
+                .arg("bootout")
+                .arg(&job)
+                .output()
+                .map_err(|error| format!("launchd could not stop {job}: {error}"))?;
+            if !command.status.success() {
+                return Err(format!(
+                    "launchd refused to stop {job}: {}",
+                    first_line(&command.stderr)
+                )
+                .into());
+            }
+            if leave {
+                std::fs::remove_file(plist).map_err(|error| {
+                    format!("launchd stopped {job}, but could not remove {plist:?}: {error}")
+                })?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_supervisor_command(
+    mut command: std::process::Command,
+    kind: &str,
+    subject: &str,
+) -> CommandResult {
+    let output = command
+        .output()
+        .map_err(|error| format!("{kind} could not stop {subject}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{kind} refused to stop {subject}: {}",
+        first_line(&output.stderr)
+    )
+    .into())
+}
+
+fn first_line(bytes: &[u8]) -> &str {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.lines().next())
+        .unwrap_or("no diagnostic")
+}
+
+fn cmd_node_stop(args: SelectorArgs) -> CommandResult {
+    let target = lifecycle_workspace(&args.selector)?;
+    let claim = discover_supervisor(&target)?;
+    stop_supervisor(&claim, false)?;
+    println!(
+        "stopped {} — registration and every workspace file were preserved; start it again with \
+         ducktape node run --config {}",
+        target.chain_id,
+        target.config.display()
+    );
+    Ok(())
+}
+
+fn cmd_node_leave(args: SelectorArgs) -> CommandResult {
+    let target = lifecycle_workspace(&args.selector)?;
+    let claim = discover_supervisor(&target)?;
+    stop_supervisor(&claim, true)?;
+    let archive = config::archive_workspace(&target.config)?;
+    println!(
+        "left {} — stopped its supervisor and moved the complete workspace to {}; nothing was \
+         deleted; move that directory back to {} to re-register it",
+        target.chain_id,
+        archive.display(),
+        target.workspace.display()
+    );
     Ok(())
 }
 
@@ -2531,6 +2973,80 @@ mod json_output_tests {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    fn lifecycle_target(workspace: &str) -> super::LifecycleWorkspace {
+        let workspace = std::path::PathBuf::from(workspace);
+        super::LifecycleWorkspace {
+            chain_id: "net#12345678".into(),
+            config: workspace.join("node.toml"),
+            workspace,
+        }
+    }
+
+    #[test]
+    fn systemd_ownership_uses_exact_argument_boundaries() {
+        let target = lifecycle_target("/tmp/network");
+        let prefix = super::systemd_exec_args(
+            "{ path=/fake/launcher ; argv[]=/fake/launcher run --workspace /tmp/network extra --config /tmp/network/node.toml ; ignore_errors=no }",
+        )
+        .expect("fake systemd output");
+        assert!(
+            !super::supervisor_args_match(&prefix, &target),
+            "a workspace path followed by another word is not the owned argv"
+        );
+
+        let spaced = lifecycle_target("/tmp/network home");
+        let exact = super::systemd_exec_args(
+            r#"{ path=/fake/launcher ; argv[]=/fake/launcher run --workspace /tmp/network\x20home --config /tmp/network\x20home/node.toml ; ignore_errors=no }"#,
+        )
+        .expect("escaped systemd output");
+        assert!(super::supervisor_args_match(&exact, &spaced));
+    }
+
+    #[test]
+    fn launchd_ownership_ignores_unrelated_plist_strings() {
+        let target = lifecycle_target("/tmp/owned");
+        let plist = r#"
+            <key>EnvironmentVariables</key>
+            <dict><key>WORKSPACE</key><string>/tmp/owned</string></dict>
+            <key>ProgramArguments</key>
+            <array>
+              <string>/fake/launcher</string>
+              <string>run</string>
+              <string>--workspace</string>
+              <string>/tmp/other</string>
+              <string>--config</string>
+              <string>/tmp/other/node.toml</string>
+            </array>
+        "#;
+        let args = super::plist_program_arguments(plist).expect("program arguments");
+        assert!(
+            !super::supervisor_args_match(&args, &target),
+            "environment values must not establish ownership"
+        );
+    }
+
+    #[test]
+    fn launchd_ownership_checks_loaded_argument_vector() {
+        let target = lifecycle_target("/tmp/owned");
+        let loaded = r#"
+            fake.label = {
+                arguments = {
+                    /fake/launcher
+                    run
+                    --workspace
+                    /tmp/other
+                    --config
+                    /tmp/other/node.toml
+                }
+            }
+        "#;
+        let args = super::launchd_print_arguments(loaded).expect("launchctl print arguments");
+        assert!(
+            !super::supervisor_args_match(&args, &target),
+            "a loaded job with another workspace must not establish ownership"
+        );
+    }
 
     /// Minting never refuses a LAN invite, but it says which paths only work
     /// from the same LAN or tailnet, and whether anything reaches from outside:

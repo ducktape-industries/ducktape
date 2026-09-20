@@ -15,10 +15,6 @@ async-trait = { workspace = true }
 # credential broker next door is built from.
 axum = "0.8"
 futures = { workspace = true }
-# `ModelRecord::permits` and its two duckfs-reply filters: the read lane and the
-# `ducktape mcp` tool plane gate on the SAME predicate on the SAME record, so
-# neither can drift into admitting what the other refuses.
-runs = { workspace = true }
 # the agent tool plane's catalog, which each run's node lane serves as a
 # streamable-HTTP MCP endpoint (src/read_lane.rs). Serving it HERE is what keeps
 # it out of the guest entirely.

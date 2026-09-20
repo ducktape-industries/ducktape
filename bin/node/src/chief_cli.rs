@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::cred_cli::{VerbCtx, query_node};
+use crate::wire::{agent, chat, pages, runs};
 use plan::Plan;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

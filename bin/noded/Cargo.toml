@@ -44,9 +44,7 @@ commonware-cryptography = { workspace = true }
 base64 = { workspace = true }
 duckfs-client = { workspace = true }
 nettest = { path = "../../crates/testing/nettest" }
-# typed programmable-user and attribution assertions over the real daemon.
-agent = { workspace = true }
-attribution = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = "3"
