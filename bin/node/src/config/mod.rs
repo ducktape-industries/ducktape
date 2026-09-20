@@ -67,6 +67,14 @@ pub fn validate_founding_set(
         let file = match kind {
             modules::Kind::Module => workspace_config::component_path(source, &module.id),
             modules::Kind::View => source.join(format!("{}.view.wasm", module.id)),
+            // no founding file is a plane artifact: the frame has no such tag.
+            modules::Kind::Plane => {
+                return Err(format!(
+                    "{} {}: a plane artifact has no founding file",
+                    source.display(),
+                    module.id
+                ));
+            }
         };
         noded::compose::validate_deployment(&module.id, kind, &module.bytes, &index)
             .map_err(|error| format!("{}: {error}", file.display()))

@@ -123,7 +123,7 @@ fn alice() -> Origin {
 
 /// the chain id this composition's identity plane is scoped to — the same
 /// value the `runs` guest reads out of its genesis `__config` record.
-const CHAIN_ID: &str = "session-boundary";
+const CHAIN_ID: &str = "session-boundary#d0cdf950";
 
 /// the genesis set the collaboration loop runs on — chat + the attribution plane +
 /// the dispatch plane + the registry + runs.

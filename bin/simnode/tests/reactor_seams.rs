@@ -448,7 +448,7 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
         ),
         // gateway — the account's founding key signs a route naming `node` as
         // its publisher. the composer binds the gateway guest's genesis
-        // `__config` to chain id "local" and the default sim genesis has no
+        // `__config` to `LOCAL_CHAIN_ID` and the default sim genesis has no
         // valset, so the only ceremony is: the origin is a member of the
         // route's account, and a current Ed25519 member signs.
         (
@@ -466,7 +466,7 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
 /// same preimage, same signature.
 fn gateway_set_route(key: &Ed, node: &str) -> Value {
     let statement = gateway::RouteStatement {
-        chain_id: "local".into(),
+        chain_id: noded::LOCAL_CHAIN_ID.into(),
         account_id: 1,
         name: gateway::RouteName::named("api"),
         publisher_node: node.as_bytes().to_vec(),

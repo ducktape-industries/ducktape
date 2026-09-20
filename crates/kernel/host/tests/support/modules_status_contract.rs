@@ -24,6 +24,7 @@ pub enum Reply {
 pub enum Kind {
     Module,
     View,
+    Plane,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]

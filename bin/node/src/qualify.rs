@@ -217,14 +217,15 @@ fn links(resolved: &config::Resolved) -> Result<String, Unqualified> {
 }
 
 /// what the registry says each module is executing right now: its last
-/// activation's hash. A view has no component to link, and an admission that
-/// has not reached its boundary yet has no active hash at all.
+/// activation's hash. A view or a plane entry has no component to link here,
+/// and an admission that has not reached its boundary yet has no active hash
+/// at all.
 fn running_code(roster: &[modules::ModuleCode]) -> BTreeMap<String, [u8; 32]> {
     roster
         .iter()
         .filter(|entry| match entry.kind {
             modules::Kind::Module => true,
-            modules::Kind::View => false,
+            modules::Kind::View | modules::Kind::Plane => false,
         })
         .filter_map(|entry| {
             let hash: [u8; 32] = entry.active_code_hash.as_slice().try_into().ok()?;

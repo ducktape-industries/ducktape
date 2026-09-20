@@ -373,7 +373,7 @@ fn find_unresolvable_snapshot_errors() {
     let reply = find_query(&f, "/shared", Some(&bad), None, 256);
     assert!(
         matches!(&reply, Err(sdk::Error::Module { reason, sentence })
-            if reason == "files_query" && sentence.contains("snapshot not resolvable")),
+            if reason == "not_found" && sentence.contains("is not resolvable")),
         "got {reply:?}"
     );
 }
@@ -562,7 +562,7 @@ fn grep_rejects_empty_and_oversized_patterns() {
     let empty = grep_query(&f, "", "/shared", None, None, MAX_PAGE);
     assert!(
         matches!(&empty, Err(sdk::Error::Module { reason, sentence })
-            if reason == "files_query" && sentence.contains("pattern must not be empty")),
+            if reason == "invalid_input" && sentence.contains("pattern must not be empty")),
         "got {empty:?}"
     );
 
@@ -570,7 +570,7 @@ fn grep_rejects_empty_and_oversized_patterns() {
     let toolong = grep_query(&f, &long, "/shared", None, None, MAX_PAGE);
     assert!(
         matches!(&toolong, Err(sdk::Error::Module { reason, sentence })
-            if reason == "files_query" && sentence.contains("pattern exceeds")),
+            if reason == "capacity" && sentence.contains("pattern exceeds")),
         "got {toolong:?}"
     );
 }
@@ -894,7 +894,7 @@ fn diff_unresolvable_snapshot_errors() {
     let reply = diff_query(&f, &bad, &s1, "/");
     assert!(
         matches!(&reply, Err(sdk::Error::Module { reason, sentence })
-            if reason == "files_query" && sentence.contains("snapshot not resolvable")),
+            if reason == "not_found" && sentence.contains("is not resolvable")),
         "got {reply:?}"
     );
 }
@@ -926,7 +926,7 @@ fn diff_too_large_errors_to_bound_the_reply() {
     let reply = diff_query(&f, &base, &after, "/");
     assert!(
         matches!(&reply, Err(sdk::Error::Module { reason, sentence })
-            if reason == "files_query" && sentence.contains("diff too large")),
+            if reason == "capacity" && sentence.contains("diff too large")),
         "got {reply:?}"
     );
     // narrowing the prefix bounds the reply back under the cap.

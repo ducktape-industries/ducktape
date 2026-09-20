@@ -514,7 +514,7 @@ fn registry_precheck(
 /// refused ready by every validator and could never activate. `update` asks
 /// nothing: a swap keeps the running module's state and never initializes it
 /// (whether the running module takes the bytes is each validator's readiness
-/// question), and a view entry seats no core.
+/// question), and a view or plane entry seats no core here.
 fn check_start(
     verb: Verb,
     kind: modules::Kind,
@@ -522,7 +522,8 @@ fn check_start(
     start: impl FnOnce() -> Result<(), sdk::Error>,
 ) -> Result<(), String> {
     match (verb, kind) {
-        (Verb::Update, _) | (Verb::Register, modules::Kind::View) => Ok(()),
+        (Verb::Update, _)
+        | (Verb::Register, modules::Kind::View | modules::Kind::Plane) => Ok(()),
         (Verb::Register, modules::Kind::Module) => start().map_err(|refusal| {
             format!(
                 "module {id} does not start ({refusal}): every validator would refuse it ready, \
@@ -918,7 +919,7 @@ fn render_proposed(proposed: &[OpenCodeProposal]) -> String {
     out
 }
 
-/// the `kind` column's width: the longer of its two words.
+/// the `kind` column's width: the longest of its words.
 const KIND_WIDTH: usize = 6;
 
 /// the registry kind as the status row prints it.
@@ -926,6 +927,7 @@ fn kind_word(kind: modules::Kind) -> &'static str {
     match kind {
         modules::Kind::Module => "module",
         modules::Kind::View => "view",
+        modules::Kind::Plane => "plane",
     }
 }
 

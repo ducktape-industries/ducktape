@@ -2038,9 +2038,11 @@ impl Host {
         for m in modules {
             // a view entry has nothing to seat: its artifact is a UI the
             // desktop fetches by the registry's hash, and no core runs here.
+            // a plane entry is seated by the node plane that owns it, off
+            // the module boundary — no core here either.
             match m.kind {
                 modules::Kind::Module => {}
-                modules::Kind::View => continue,
+                modules::Kind::View | modules::Kind::Plane => continue,
             }
             let Some(target) = modules::code_at(&m, height) else {
                 continue; // registered, never activated — nothing to realize.

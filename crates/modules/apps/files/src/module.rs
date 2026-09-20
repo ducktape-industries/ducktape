@@ -1,6 +1,7 @@
 //! the native module glue: [`Files`] implements [`sdk::Module`] over the pure
-//! [`Fs`] core. origin/env map in here; a core `String` error maps out as a
-//! module refusal whose token names the `files_*` step that failed;
+//! [`Fs`] core. origin/env map in here; typed core refusals keep their
+//! canonical class and sentence at the module boundary, while persistence and
+//! codec errors keep their `files_*` step token;
 //! watch-notification emission (task 9) and the gc watermark trigger (task 13)
 //! land here too.
 
@@ -327,7 +328,7 @@ impl<S: ObjectStore, R: RefsStore> Module for Files<S, R> {
         let reply = self
             .fs
             .query(q)
-            .map_err(|e| Error::module("files_query", e))?;
+            .map_err(|e| Error::module(e.class(), e.to_string()))?;
         Ok(encode_reply(&reply))
     }
 

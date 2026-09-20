@@ -946,7 +946,10 @@ pub const ORACLE_ORIGIN: &[u8] = &[b'o'; 32];
 /// genesis roots are comparable only while they share it, and a client that
 /// signs an identity consent reads the chain id from status, so a status
 /// disagreeing with the bindings would mint signatures nothing accepts.
-pub const LOCAL_CHAIN_ID: &str = "local";
+/// Shaped as a duck:// authority (`<label>-<salt>`, the salt an even count of
+/// lowercase hex digits): the runs guest refuses a genesis chain id that is
+/// not one.
+pub const LOCAL_CHAIN_ID: &str = "local-00000000";
 
 /// POST /v1/submit — the FRAMELESS lane.
 ///

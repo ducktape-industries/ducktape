@@ -1559,7 +1559,8 @@ impl ValidatorRuntime<'_> {
             // module's bytes must instantiate here AND replace the running
             // module's state shape — or, for an admission, start over scratch
             // state, since the boundary initializes it; a view's bytes must
-            // speak the view ABI, and no running module is asked about them.
+            // speak the view ABI, and no running module is asked about them;
+            // a plane entry is refused by the deployment check itself.
             let realizable = noded::compose::validate_deployment(
                 module_id, entry.kind, &bytes, index,
             )
@@ -1567,7 +1568,7 @@ impl ValidatorRuntime<'_> {
                 modules::Kind::Module => node
                     .check_module_replacement(module_id, &bytes)
                     .map_err(|error| error.to_string()),
-                modules::Kind::View => Ok(()),
+                modules::Kind::View | modules::Kind::Plane => Ok(()),
             });
             match realizable {
                 Ok(()) => CodeVerdict::Loadable,

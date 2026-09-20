@@ -372,7 +372,7 @@ fn serve_sync_rejects_oversized_request() {
     // MAX_SYNC_IDS is fine; one past it rejects, even with well-formed hex ids.
     let ids = vec!["00".repeat(32); MAX_SYNC_IDS + 1];
     let err = fs.serve_sync(FilesSyncReq::GetObjects { ids }).unwrap_err();
-    assert!(err.contains("too many ids"), "got: {err}");
+    assert!(err.to_string().contains("too many ids"), "got: {err}");
 }
 
 #[test]
@@ -449,7 +449,7 @@ fn serve_sync_rejects_non_hex_id_without_partial_reply() {
     let result = fs.serve_sync(FilesSyncReq::GetObjects { ids });
     // Err carries no Objects payload at all — the error IS the whole reply.
     let err = result.unwrap_err();
-    assert!(err.contains("sync id is not hex"), "got: {err}");
+    assert!(err.to_string().contains("sync id is not hex"), "got: {err}");
 }
 
 // ---- test 3: replay is idempotent (deterministic op stream) ------------------
@@ -659,5 +659,8 @@ fn read_errs_on_short_interior_chunk() {
             len: 32,
         })
         .unwrap_err();
-    assert!(err.contains("length inconsistent"), "got: {err}");
+    assert!(
+        err.to_string().contains("length inconsistent"),
+        "got: {err}"
+    );
 }

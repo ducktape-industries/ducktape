@@ -64,7 +64,7 @@ fn committed_guests_deliver_a_model_reply_to_chat() {
                 blobs: blobstore::BlobHandle::default(),
             };
             let bindings = Bindings {
-                invite: b"model-reply-test", chain_id: "model-reply-test",
+                invite: b"model-reply-test", chain_id: "model-reply-test-0badc0de",
                 time_unit: sdk::genesis_config::TimeUnit::Height,
             };
             let mut host = compose(&code, &mut stores, &substrates, &bindings,

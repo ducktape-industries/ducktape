@@ -20,7 +20,7 @@ mod plan;
 
 /// the chain id this composition's identity plane is scoped to, and the value
 /// the `runs` guest reads out of its genesis `__config` record.
-const CHAIN_ID: &str = "connected-chief";
+const CHAIN_ID: &str = "connected-chief#d0cdf950";
 const TASK: &str = "connected-task";
 const JOB: &str = "connected-dispatch";
 const REPORT: &str = "Connected worker evidence: native Pi published this authenticated report. 🦆";

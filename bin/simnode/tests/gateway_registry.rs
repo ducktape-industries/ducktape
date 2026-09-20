@@ -22,7 +22,7 @@
 //! authorship is the reactor_seams ceremony exactly: the founding Ed25519 member
 //! signs the route-signing preimage under `GATEWAY_ROUTE_NS` and submits the op
 //! as the origin (its `hex:` escape). the sim wires `Gateway::new(.., None,
-//! "local")` (no valset), so membership gating is absent and the only ceremony
+//! LOCAL_CHAIN_ID)` (no valset), so membership gating is absent and the only ceremony
 //! is the account's Create plus the member signature — the same reach
 //! reactor_seams walks.
 
@@ -35,8 +35,8 @@ use std::path::Path;
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
 
-/// the sim's gateway chain id (the composer's `Bindings { chain_id: "local" }`).
-const CHAIN: &str = "local";
+/// the sim's gateway chain id (the composer's `Bindings { chain_id }`).
+const CHAIN: &str = noded::LOCAL_CHAIN_ID;
 /// the account the first Create founds.
 const ACCOUNT: u64 = 1;
 

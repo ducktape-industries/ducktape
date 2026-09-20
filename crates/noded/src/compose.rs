@@ -219,8 +219,9 @@ pub async fn compose(
                 register_new(&mut host, Box::new(module))?;
             }
             // a view seats nothing: the registry entry carries its hash and
-            // the desktop fetches the artifact by that hash.
-            modules::Kind::View => {}
+            // the desktop fetches the artifact by that hash. a plane entry
+            // is seated by the node plane that owns it, not here.
+            modules::Kind::View | modules::Kind::Plane => {}
         }
     }
     // Durable stores can have advanced beyond the checkpoint. Its registry
@@ -314,8 +315,8 @@ async fn registry_active_set(host: &Host, height: u64) -> Result<Vec<ActiveCode>
         .into_iter()
         .filter(|entry| match entry.kind {
             modules::Kind::Module => true,
-            // a view is a registry entry with nothing to seat.
-            modules::Kind::View => false,
+            // a view or a plane entry has nothing to seat at this boundary.
+            modules::Kind::View | modules::Kind::Plane => false,
         })
         .filter_map(|entry| {
             let (hash, seat) = seat_at(&entry, height)?;
@@ -473,6 +474,11 @@ pub fn validate_deployment(
         )),
         (modules::Kind::View, module_artifact::ArtifactRef::Module(_)) => Err(format!(
             "artifact_kind_mismatch: {id} is registered as a view, but the artifact is a module frame"
+        )),
+        // the artifact frame has no plane tag: a plane entry is realized by
+        // the node plane that owns it, and no module frame can agree with it.
+        (modules::Kind::Plane, _) => Err(format!(
+            "artifact_kind_mismatch: {id} is registered as a plane artifact, which no module frame realizes"
         )),
     }
 }
