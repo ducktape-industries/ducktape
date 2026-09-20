@@ -284,6 +284,11 @@ tempfile = "3"
 airlock = { path = "../../crates/airlock", features = ["client", "server"] }
 axum = "0.8"
 data-plane = { workspace = true, features = ["sim"] }
+# media_goldens.rs pins the native voice/video/call-wire bytes the realtime
+# call guest must reproduce, and media_lane_e2e.rs speaks `call_wire` on
+# `/v1/call/ws`; the huddle roster op the e2e commits is chat's own wire.
+media-service = { workspace = true }
+chat = { workspace = true }
 # voice::overlay_e2e stands two userspace WireGuard overlay stacks up on
 # loopback (the crates/networking/overlay-net/tests/loopback_pair harness shape) to
 # prove huddle media crosses the REAL overlay headless — this derives the
