@@ -444,6 +444,11 @@ pub struct RunContext {
     /// set by the oracle pool before provider.run so the output sink can key
     /// a per-run ring the app subscribes as run-output:<dispatch_id>.
     pub run_key: Option<String>,
+    /// The durable machine record for this provider session. The node owns the
+    /// journal; this context only carries its producer metadata and a callback
+    /// that forwards append requests to that node.
+    pub session_record: Option<SessionRecordContext>,
+    pub session_record_sink: Option<SessionRecordSink>,
     /// host-local cancellation for this live run. `None` = the run cannot be
     /// cancelled (runs to completion); cancelling the token terminates the
     /// provider process tree and any live microVM.
@@ -507,6 +512,31 @@ pub struct RunContext {
     /// repo) refuses every push at the lane. Set by the provisioner from the
     /// committed spec, never by the guest.
     pub forge_repo: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRecordContext {
+    pub session_id: String,
+    pub summary: Value,
+}
+
+#[derive(Clone)]
+pub struct SessionRecordSink(Arc<dyn Fn(Value) + Send + Sync>);
+
+impl std::fmt::Debug for SessionRecordSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionRecordSink(..)")
+    }
+}
+
+impl SessionRecordSink {
+    pub fn new(callback: impl Fn(Value) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn emit(&self, record: Value) {
+        (self.0)(record);
+    }
 }
 
 /// which child stream produced one live output line.
@@ -5847,6 +5877,8 @@ printf '%s\n' "$PATH"
             agent_id: Some("bot".into()),
             native_conversation: None,
             run_key: None,
+            session_record: None,
+            session_record_sink: None,
             cancellation: None,
             executing_node: None,
             workdir_override: Some(override_dir.clone()),

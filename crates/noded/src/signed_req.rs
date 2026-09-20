@@ -311,6 +311,7 @@ enum Lane {
     /// and still has to be able to join a huddle through it.
     HuddleProof,
     RunControl,
+    RunRecords,
     Open,
 }
 
@@ -382,6 +383,9 @@ fn lane_of(path: &str) -> Lane {
     if path == "/v1/run-control" {
         return Lane::RunControl;
     }
+    if path == "/v1/run-records/query" {
+        return Lane::RunRecords;
+    }
     if let Some((_, lane)) = LANE_PREFIXES
         .iter()
         .find(|(prefix, _)| path.starts_with(prefix))
@@ -432,7 +436,9 @@ impl Lane {
             Lane::NodeLevel => posts.then_some(Authority::Operator),
             // the proof binds the SIGNER; the handler refuses a key that holds
             // no account, so possession is the gate's whole job here.
-            Lane::HuddleProof | Lane::RunControl => posts.then_some(Authority::Acting),
+            Lane::HuddleProof | Lane::RunControl | Lane::RunRecords => {
+                posts.then_some(Authority::Acting)
+            }
             Lane::GatewayOperator => {
                 let exchange = posts || *method == Method::GET;
                 exchange.then_some(Authority::Operator)
@@ -1031,6 +1037,7 @@ mod tests {
             // operator credential to offer: possession, then the handler's
             // own account check.
             (Method::POST, "/v1/huddle/node-proof", Authority::Acting),
+            (Method::POST, "/v1/run-records/query", Authority::Acting),
             // the frameless op lane: the framed op is re-signed as the NODE,
             // never the caller (#1808), so it takes the same operator-only bar.
             (Method::POST, "/v1/submit", Authority::Operator),

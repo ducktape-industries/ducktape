@@ -45,6 +45,7 @@ pub(crate) async fn attach(
     ws_url: String,
     hint: std::sync::Arc<Notify>,
     mut lines: mpsc::Receiver<OutputLine>,
+    mut records: mpsc::UnboundedReceiver<serde_json::Value>,
     token: String,
     resync: std::sync::Arc<Notify>,
 ) {
@@ -83,7 +84,7 @@ pub(crate) async fn attach(
                 }
                 failures = 0;
                 tokio::select! {
-                    _ = pump(socket, &hint, &mut lines) => {},
+                    _ = pump(socket, &hint, &mut lines, &mut records) => {},
                     _ = resync.notified() => {},
                 }
                 // a dropped link redials on the same pace as a failed dial:
@@ -110,7 +111,12 @@ pub(crate) async fn attach(
 
 /// One connection's lifetime: hints out of it, output lines into it. Returns
 /// when the socket closes, so the caller redials.
-async fn pump<S>(socket: S, hint: &Notify, lines: &mut mpsc::Receiver<OutputLine>)
+async fn pump<S>(
+    socket: S,
+    hint: &Notify,
+    lines: &mut mpsc::Receiver<OutputLine>,
+    records: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+)
 where
     S: futures::Sink<
             tokio_tungstenite::tungstenite::Message,
@@ -127,6 +133,29 @@ where
     let mut pending = futures::stream::FuturesUnordered::new();
     loop {
         tokio::select! {
+            biased;
+            record = records.recv() => {
+                let Some(record) = record else { continue };
+                let frame = match record["record"].as_str() {
+                    Some("start") => serde_json::json!({
+                        "op": "run_record_start",
+                        "summary": record["summary"].clone(),
+                    }),
+                    Some("event") => serde_json::json!({
+                        "op": "run_record_event",
+                        "session_id": record["session_id"].clone(),
+                        "event": record["event"].clone(),
+                    }),
+                    Some("snapshot") => serde_json::json!({
+                        "op": "run_record_snapshot",
+                        "summary": record["summary"].clone(),
+                    }),
+                    _ => continue,
+                };
+                if tx.send(Message::Text(frame.to_string())).await.is_err() {
+                    return;
+                }
+            }
             frame = rx.next() => {
                 let command = frame.as_ref().and_then(|frame| frame.as_ref().ok())
                     .and_then(|frame| frame.to_text().ok())
@@ -222,6 +251,7 @@ mod tests {
         let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
         let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
         let (sender, mut lines) = mpsc::channel(2);
+        let (_record_sender, mut records) = mpsc::unbounded_channel();
         sender.send(OutputLine { run_key: "already-closed".into(), stderr: false, line: serde_json::json!({"type":"run_control","state":"ready","turn":"old","steers":true}).to_string() }).await.unwrap();
         sender
             .send(OutputLine {
@@ -231,7 +261,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let task = tokio::spawn(async move { pump(client, &Notify::new(), &mut lines).await });
+        let task = tokio::spawn(async move {
+            pump(client, &Notify::new(), &mut lines, &mut records).await
+        });
         let frame = server.next().await.unwrap().unwrap().into_text().unwrap();
         let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(value["line"], "retained output");
@@ -254,10 +286,11 @@ mod tests {
 
         let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<OutputLine>(4);
         drop(line_tx);
+        let (_record_tx, mut record_rx) = tokio::sync::mpsc::unbounded_channel();
         let hint = std::sync::Arc::new(Notify::new());
         let mut pumping = tokio::spawn({
             let hint = hint.clone();
-            async move { pump(client, &hint, &mut line_rx).await }
+            async move { pump(client, &hint, &mut line_rx, &mut record_rx).await }
         });
 
         // the lane was closed before the first frame; a heartbeat must still
@@ -278,5 +311,44 @@ mod tests {
             .expect("the server closes its side");
         drop(server);
         pumping.await.expect("pump returns when the socket ends");
+    }
+
+    #[tokio::test]
+    async fn durable_records_are_forwarded_before_display_output() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let (line_sender, mut lines) = mpsc::channel(2);
+        let (record_sender, mut records) = mpsc::unbounded_channel();
+        record_sender
+            .send(serde_json::json!({
+                "record": "start",
+                "summary": {"session_id": "session-a"}
+            }))
+            .unwrap();
+        line_sender
+            .send(OutputLine {
+                run_key: "a".repeat(64),
+                stderr: false,
+                line: "display output".into(),
+            })
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move {
+            pump(client, &Notify::new(), &mut lines, &mut records).await
+        });
+        let first: serde_json::Value = serde_json::from_str(
+            &server.next().await.unwrap().unwrap().into_text().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["op"], "run_record_start");
+        let second: serde_json::Value = serde_json::from_str(
+            &server.next().await.unwrap().unwrap().into_text().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second["op"], "run_output");
+        server.close(None).await.unwrap();
+        drop(server);
+        task.await.unwrap();
     }
 }

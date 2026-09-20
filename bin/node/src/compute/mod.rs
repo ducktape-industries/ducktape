@@ -26,9 +26,12 @@
 //! have to be identifiable by the one that replaces it.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
-use compute_service::{DeliverFn, DispatchPool, SpawnFn, SpawnKind, max_concurrent_runs_from_env};
+use compute_service::{
+    DeliverFn, DispatchPool, SessionRecordRequesterMap, SpawnFn, SpawnKind,
+    max_concurrent_runs_from_env,
+};
 use noded::node_link::NodeLink;
 
 use crate::config;
@@ -47,6 +50,8 @@ const SWEEP: std::time::Duration = std::time::Duration::from_secs(15);
 const READY_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 /// log attempt 1, then every Nth — never an unconditional warn in a retry loop.
 const LOG_EVERY: u64 = 15;
+static RECORD_EVENT_ID: AtomicU64 = AtomicU64::new(1);
+static RECORD_LANE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Everything the daemon needs, resolved before any of it runs.
 ///
@@ -118,6 +123,7 @@ async fn run(
     backend.probe()?;
 
     let (line_tx, line_rx) = tokio::sync::mpsc::channel(link::OUTPUT_LANE);
+    let (record_tx, record_rx) = tokio::sync::mpsc::unbounded_channel();
     let resync = Arc::new(tokio::sync::Notify::new());
     let providers = provider_host::discover(
         &node_key,
@@ -137,11 +143,13 @@ async fn run(
         ws_url(&http_base),
         hint.clone(),
         line_rx,
+        record_rx,
         link_token,
         resync,
     ));
 
-    let (mut pump, mut delivered) = build_pool(&node, &service, node_key, providers).await?;
+    let (mut pump, mut delivered) =
+        build_pool(&node, &service, node_key, providers, record_tx).await?;
 
     tracing::info!(
         target: "ducktape::service",
@@ -238,6 +246,31 @@ fn output_sink(
         let Some(run_key) = ctx.run_key.as_deref() else {
             return;
         };
+        if let (Some(record), Some(sink)) = (&ctx.session_record, &ctx.session_record_sink) {
+            let stream = match line.stream {
+                provider_host::OutputStream::Stdout => "stdout",
+                provider_host::OutputStream::Stderr => "stderr",
+            };
+            let payload =
+                noded::run_records::SessionEventPayload::from_output_line(stream, &line.line);
+            let event_id = format!(
+                "frame-{}",
+                RECORD_EVENT_ID.fetch_add(1, Ordering::Relaxed)
+            );
+            sink.emit(serde_json::json!({
+                "record": "event",
+                "session_id": record.session_id.clone(),
+                "event": {
+                    "seq": 0,
+                    "event_id": event_id,
+                    "run_id": record.summary["run_id"].clone(),
+                    "at": null,
+                    "kind": payload.kind(),
+                    "stream": stream,
+                    "payload": serde_json::Value::from(payload),
+                },
+            }));
+        }
         let offered = lines.try_send(link::OutputLine {
             run_key: run_key.to_string(),
             stderr: line.stream == provider_host::OutputStream::Stderr,
@@ -270,7 +303,10 @@ async fn build_pool(
     service: &config::ServiceConfig,
     node_key: Vec<u8>,
     providers: provider_host::ProviderSet,
+    record_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
 ) -> Result<(intake::WorkPump, tokio::sync::mpsc::Receiver<sdk::Msg>), Box<dyn std::error::Error>> {
+    let record_requesters: SessionRecordRequesterMap =
+        Arc::new(std::sync::Mutex::new(BTreeMap::new()));
     let spawn: SpawnFn = Arc::new(|kind, future| {
         match kind {
             // Queue waiters share the runtime. An admitted run gets a task of
@@ -341,10 +377,30 @@ async fn build_pool(
         capacity_of(service),
         provisioner,
     )
-    .with_credential_resolver(resolver);
+    .with_credential_resolver(resolver)
+    .with_session_record_requesters(record_requesters.clone())
+    .with_session_record_sink(provider_host::SessionRecordSink::new(move |record| {
+        if record_tx.send(record).is_err() {
+            let occurrences = RECORD_LANE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            if occurrences == 1 || occurrences.is_multiple_of(100) {
+                tracing::warn!(
+                    target: "ducktape::compute",
+                    occurrences,
+                    reason = "record_lane_closed",
+                    "durable session record could not reach the node"
+                );
+            }
+        }
+    }));
     let control = pool.attempt_control();
     Ok((
-        intake::WorkPump::new(Box::new(pool), control, node_key, service.workspace.clone()),
+        intake::WorkPump::new(
+            Box::new(pool),
+            control,
+            node_key,
+            service.workspace.clone(),
+            record_requesters,
+        ),
         rx,
     ))
 }
@@ -412,6 +468,67 @@ mod tests {
             emit(&serde_json::json!({"type":"run_control","state":state}).to_string());
             assert!(resync.notified().now_or_never().is_some());
         }
+    }
+
+    #[test]
+    fn output_sink_emits_provider_and_control_records_with_stable_kinds() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let records_for_sink = records.clone();
+        let session_record_sink = provider_host::SessionRecordSink::new(move |record| {
+            records_for_sink.lock().unwrap().push(record);
+        });
+        let sink = output_sink(sender, Arc::new(tokio::sync::Notify::new()));
+        let ctx = provider_host::RunContext {
+            run_key: Some("a".repeat(64)),
+            session_record: Some(provider_host::SessionRecordContext {
+                session_id: "session-a".into(),
+                summary: serde_json::json!({"run_id": "a".repeat(64)}),
+            }),
+            session_record_sink: Some(session_record_sink),
+            ..Default::default()
+        };
+        sink(
+            &ctx,
+            provider_host::OutputLine {
+                stream: provider_host::OutputStream::Stdout,
+                line: r#"{"type":"run_control","state":"ready"}"#.into(),
+            },
+        );
+        sink(
+            &ctx,
+            provider_host::OutputLine {
+                stream: provider_host::OutputStream::Stderr,
+                line: "provider text".into(),
+            },
+        );
+        for line in [
+            r#"{"method":"turn/started","params":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"id":"m1","type":"agentMessage","text":"hi"}}}"#,
+            r#"{"type":"assistant","message":{"id":"msg","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+        ] {
+            sink(
+                &ctx,
+                provider_host::OutputLine {
+                    stream: provider_host::OutputStream::Stdout,
+                    line: line.into(),
+                },
+            );
+        }
+        let records = records.lock().unwrap();
+        let kinds: Vec<_> = records
+            .iter()
+            .map(|record| record["event"]["kind"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["control", "provider_frame", "turn", "message", "tool_call", "tool_result"]
+        );
+        assert_eq!(records[1]["event"]["stream"], "stderr");
+        assert_eq!(records[1]["event"]["payload"]["text"], "provider text");
+        assert_eq!(records[0]["event"]["payload"]["action"], "ready");
+        assert!(receiver.try_recv().is_ok(), "display lane remains populated");
     }
 
     #[test]

@@ -1,0 +1,27 @@
+{
+  "kind": "events",
+  "refresh": "poll",
+  "identity": {
+    "machine_id": "machine-a",
+    "network_id": "network-a"
+  },
+  "session_id": "session-a",
+  "events": [
+    {
+      "seq": 1,
+      "event_id": "event-a",
+      "run_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "at": "2026-09-20T00:00:01Z",
+      "kind": "message",
+      "stream": "stdout",
+      "payload": {
+        "type": "message",
+        "message_id": "message-a",
+        "role": "assistant",
+        "text": "hello"
+      }
+    }
+  ],
+  "end_cursor": "q1.synthetic.synthetic",
+  "has_more": false
+}

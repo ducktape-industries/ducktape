@@ -44,7 +44,8 @@ mod workspace_source;
 pub use ledger::{ReservationGuard, ResourceLedger};
 pub use pool::{
     AttemptControl, CredentialResolver, DeliverFn, DispatchPool, Resolved,
-    SharedCredentialResolver, SpawnFn, SpawnKind, max_concurrent_runs_from_env,
+    SessionRecordRequesterMap, SharedCredentialResolver, SpawnFn, SpawnKind,
+    max_concurrent_runs_from_env,
 };
 pub use provision::{
     AgentExecution, ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner,

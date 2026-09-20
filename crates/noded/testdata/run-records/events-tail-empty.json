@@ -1,0 +1,12 @@
+{
+  "kind": "events",
+  "refresh": "poll",
+  "identity": {
+    "machine_id": "machine-a",
+    "network_id": "network-a"
+  },
+  "session_id": "session-a",
+  "events": [],
+  "end_cursor": "q1.synthetic.synthetic",
+  "has_more": false
+}

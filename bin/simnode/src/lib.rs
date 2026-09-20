@@ -427,9 +427,15 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     // its mutating `/v1` writes. `DUCKTAPE_ADMIN=off` still removes the control
     // surface entirely (the credential is minted regardless); a mint failure
     // refuses every admin request rather than falling back to loopback trust.
+    let records = noded::run_records::SessionRecordStore::open_machine(
+        storage.join("session-records"),
+        LOCAL_CHAIN_ID,
+    )
+    .map_err(|error| error.to_string())?;
     let handle = handle
         .with_forge_repo(forge_repo.clone())
         .with_index_store(index.clone())
+        .with_session_records(records)
         .with_admin(noded::AdminConfig::minted(
             noded::AdminExposure::from_env(),
             &storage,

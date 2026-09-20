@@ -625,6 +625,7 @@ fn run_node(
     } = boot::surfaces::bind(boot::surfaces::BindConfig {
         sync_only,
         label: &label,
+        network_id: &identity_chain_id,
         storage: &storage,
         // the config dir where gateway-routes.json lives (= storage in the dev
         // shape); a service daemon registers its loopback port there.
