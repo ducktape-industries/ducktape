@@ -4710,7 +4710,6 @@ name = "noded"
 version = "0.1.0"
 dependencies = [
  "agent-service",
- "agent-wire",
  "app-update",
  "async-trait",
  "attribution",
@@ -4720,7 +4719,6 @@ dependencies = [
  "borsh",
  "bytes",
  "capability",
- "chat-wire",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
@@ -4747,12 +4745,10 @@ dependencies = [
  "nettest",
  "node",
  "node-work",
- "pages-wire",
  "provider-host",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "run-envelope",
- "runs-wire",
  "saga",
  "sdk",
  "sdk-testkit",
@@ -4761,7 +4757,6 @@ dependencies = [
  "sha2 0.10.9",
  "statesync",
  "syn 2.0.119",
- "tasks-wire",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",
@@ -4782,9 +4777,7 @@ dependencies = [
 name = "noded-bin"
 version = "0.1.0"
 dependencies = [
- "agent-wire",
  "async-trait",
- "attribution-wire",
  "base64 0.22.1",
  "commonware-cryptography",
  "commonware-runtime",
@@ -4796,6 +4789,7 @@ dependencies = [
  "node",
  "noded",
  "sdk",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -5616,7 +5610,6 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "run-envelope",
- "runs-wire",
  "sandbox-host",
  "serde",
  "serde_json",

@@ -48,6 +48,9 @@ pub(crate) mod view_staging;
 pub(crate) mod staged_key;
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(noded_wire_contracts)");
+    println!("cargo:rustc-cfg=noded_wire_contracts");
+
     // re-run when HEAD moves. `--git-path` resolves correctly inside a git
     // worktree, where `.git` is a file pointing elsewhere.
     for path in ["HEAD", "index"] {

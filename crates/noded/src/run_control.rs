@@ -425,7 +425,7 @@ mod tests {
         let run = "d".repeat(64);
         let (mut handle, mut queries, _) = crate::NodeHandle::channel();
         handle.admin.node_key = Some(node_key.clone());
-        let pending = runs_wire::PendingRun {
+        let pending = crate::runs::PendingRun {
             run_id: "run".into(),
             dispatch_id: run.clone(),
             agent_id: "agent".into(),
@@ -443,7 +443,7 @@ mod tests {
                 if let crate::NodeCommand::Query { target, req, reply } = command {
                     let bytes = match target.as_str() {
                         "runs" => {
-                            runs_wire::encode_reply(&runs_wire::RunsReply::PendingRuns(vec![pending.clone()]))
+                            crate::runs::encode_reply(&crate::runs::RunsReply::PendingRuns(vec![pending.clone()]))
                         }
                         "identity" => {
                             let account = match identity::decode_query(&req).unwrap() {
