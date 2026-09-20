@@ -37,7 +37,7 @@ dependencies = [
 [[package]]
 name = "boards"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-modules#ce1f3492d73c11c7611fc6a2554f1b77fcc44e7f"
+source = "git+https://github.com/ducktape-industries/ducktape-modules#749fd1d1cdc1a52b14cacb1c01aa2592c0957742"
 dependencies = [
  "async-trait",
  "boards-wire",
@@ -57,7 +57,7 @@ dependencies = [
 [[package]]
 name = "boards-wire"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b66f47f1f4b0c869786ce195e382f2e83fd15277"
 dependencies = [
  "refusal-class",
  "serde",
@@ -138,7 +138,7 @@ dependencies = [
 [[package]]
 name = "ducktape-module-sdk"
 version = "0.0.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b66f47f1f4b0c869786ce195e382f2e83fd15277"
 dependencies = [
  "async-trait",
  "sdk",
@@ -287,12 +287,12 @@ dependencies = [
 [[package]]
 name = "refusal-class"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b66f47f1f4b0c869786ce195e382f2e83fd15277"
 
 [[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b66f47f1f4b0c869786ce195e382f2e83fd15277"
 dependencies = [
  "async-trait",
  "borsh",
@@ -581,19 +581,19 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[patch.unused]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b66f47f1f4b0c869786ce195e382f2e83fd15277"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b66f47f1f4b0c869786ce195e382f2e83fd15277"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b66f47f1f4b0c869786ce195e382f2e83fd15277"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#b66f47f1f4b0c869786ce195e382f2e83fd15277"
