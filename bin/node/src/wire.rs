@@ -154,6 +154,11 @@ pub mod chat {
             blocks: Vec<Block>,
             base_rev: Option<u32>,
         },
+        AddReaction {
+            channel_id: String,
+            seq: u64,
+            emoji: String,
+        },
     }
 
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
