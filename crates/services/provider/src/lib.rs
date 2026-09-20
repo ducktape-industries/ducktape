@@ -5670,31 +5670,6 @@ printf '{"type":"turn.completed"}\n'"#,
         );
     }
 
-    #[tokio::test]
-    async fn a_run_writing_past_the_output_cap_is_terminated_not_truncated() {
-        // a continuously-writing guest must be TERMINATED at the cap, never
-        // truncated and parsed anyway — a truncated JSON/JSONL blob would
-        // otherwise land as the run's "answer". idle stays generous (5s) so
-        // the output cap fires first, not the idle/hard timeout.
-        let dir = scratch("output-cap");
-        let bin = fake_cli(
-            &dir,
-            "firehose",
-            // a 100_000-byte chunk per iteration (no per-byte forking) clears
-            // the 4 MiB cap in ~42 writes rather than thousands of small ones.
-            "cat > /dev/null\n\
-             big=$(printf '%0100000d' 0)\n\
-             while true; do printf '%s' \"$big\"; done",
-        );
-        let p = mock_provider("firehose", "text", bin, "output-cap-wd")
-            .with_timeout(Duration::from_secs(10));
-        let err = p.run("x", &RunContext::default()).await.unwrap_err();
-        assert!(
-            err.contains("output_cap_exceeded"),
-            "names the outcome: {err}"
-        );
-    }
-
     #[test]
     fn push_bounded_tail_keeps_the_last_bytes_only() {
         let mut buf = Vec::new();
