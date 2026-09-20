@@ -1482,13 +1482,10 @@ name = "compute-service"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "dispatch-wire",
  "futures",
  "host",
  "provider-host",
  "run-envelope",
- "runs-wire",
- "saga-wire",
  "sdk",
  "serde",
  "serde_json",
