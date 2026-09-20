@@ -835,7 +835,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 [[package]]
 name = "governance"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#aa92eab1dda1d53ecb4303a14b8e2d7c3271ca20"
+source = "git+https://github.com/ducktape-industries/ducktape#7e1083ccc2c93d0df8548b92caf4def49d48ed0b"
 dependencies = [
  "async-trait",
  "borsh",
