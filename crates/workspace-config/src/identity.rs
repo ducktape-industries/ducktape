@@ -77,9 +77,11 @@ pub fn load_identity(path: &Path) -> Result<ed25519::PrivateKey, String> {
 
 /// an existing ed25519 member's consent to admit `new_key` (of `scheme`) into
 /// `account` at the new key's CURRENT generation on `chain_id`, dying at
-/// `expires_at` -- the [`identity::Authorizer`] an `AddKey` carries. the CLI's
-/// own key is always ed25519, so this is the one authorizer shape it mints;
-/// the 64 signature bytes ARE the `KeyScheme::Ed25519` proof encoding.
+/// `expires_at` -- the `Authorizer` an `AddKey` carries, encoded as the
+/// identity module's wire shape so the caller decodes it into ITS OWN
+/// contract. the CLI's own key is always ed25519, so this is the one
+/// authorizer shape it mints; the 64 signature bytes ARE the
+/// `KeyScheme::Ed25519` proof encoding.
 pub fn ed25519_authorizer(
     user: &ed25519::PrivateKey,
     chain_id: &str,
@@ -88,10 +90,10 @@ pub fn ed25519_authorizer(
     generation: u64,
     account: u64,
     expires_at: u64,
-) -> identity::Authorizer {
+) -> Vec<u8> {
     let preimage =
         identity::add_key_preimage(chain_id, scheme, new_key, generation, account, expires_at);
-    identity::Authorizer {
+    sdk::wire::encode(&identity::Authorizer {
         key: user.public_key().as_ref().to_vec(),
         account,
         expires_at,
@@ -99,7 +101,7 @@ pub fn ed25519_authorizer(
             .sign(identity::IDENTITY_ADD_KEY_NS, &preimage)
             .as_ref()
             .to_vec(),
-    }
+    })
 }
 
 /// refuse a network name the `duck://` address grammar cannot carry. The name
@@ -196,8 +198,10 @@ mod tests {
         )
     }
 
+    /// the minted consent as a consumer decodes it: encoded by the mint,
+    /// decoded through this crate's own identity contract.
     fn consent(generation: u64) -> identity::Authorizer {
-        ed25519_authorizer(
+        let encoded = ed25519_authorizer(
             &ed25519::PrivateKey::from_seed(1),
             CHAIN,
             identity::KeyScheme::Ed25519,
@@ -205,7 +209,8 @@ mod tests {
             generation,
             ACCOUNT,
             EXPIRES,
-        )
+        );
+        sdk::wire::decode(&encoded).expect("the mint encodes an authorizer")
     }
 
     #[test]
@@ -286,7 +291,7 @@ mod tests {
         let msg = identity::IdentityMsg::AddKey {
             scheme: identity::KeyScheme::Ed25519,
             label: Some("laptop".into()),
-            authorizer: ed25519_authorizer(
+            authorizer: sdk::wire::decode(&ed25519_authorizer(
                 &user,
                 "test@abc",
                 identity::KeyScheme::Ed25519,
@@ -294,7 +299,8 @@ mod tests {
                 2,
                 ACCOUNT,
                 EXPIRES,
-            ),
+            ))
+            .expect("the mint encodes an authorizer"),
         };
         let encoded = identity::encode_msg(&msg);
         assert_eq!(

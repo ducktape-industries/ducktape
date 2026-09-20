@@ -808,19 +808,22 @@ pub fn login_consent(chain_id: &str, outcome: &Outcome) -> Result<(u64, Vec<u8>)
     ))
 }
 
-/// the `AddKey` a login submits: the authorizer is whichever of the account's
-/// passkeys verifies the assertion (the page does not say which one signed),
-/// carrying the assertion envelope as its proof. `Err` when none does — a
+/// the `AddKey` a login submits, as the identity module's encoded message:
+/// the authorizer is whichever of the account's passkeys verifies the
+/// assertion (the page does not say which one signed), carrying the assertion
+/// envelope as its proof. `account` is the identity module's encoded
+/// `AccountView` for the account being joined. `Err` when no key signed — a
 /// consent at another generation, or a passkey off this account.
 pub fn login_add_key(
     chain_id: &str,
     device_key: &[u8],
     generation: u64,
-    account: &identity::AccountView,
+    account: &[u8],
     label: Option<String>,
     proof: Vec<u8>,
     expires_at: u64,
-) -> Result<identity::IdentityMsg, String> {
+) -> Result<Vec<u8>, String> {
+    let account: identity::AccountView = sdk::wire::decode(account)?;
     let preimage = identity::add_key_preimage(
         chain_id,
         KeyScheme::Ed25519,
@@ -847,7 +850,7 @@ pub fn login_add_key(
             account.number
         ));
     };
-    Ok(identity::IdentityMsg::AddKey {
+    Ok(sdk::wire::encode(&identity::IdentityMsg::AddKey {
         scheme: KeyScheme::Ed25519,
         label,
         authorizer: identity::Authorizer {
@@ -856,7 +859,7 @@ pub fn login_add_key(
             expires_at,
             proof,
         },
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -1288,6 +1291,7 @@ mod tests {
         let (a, c, s) =
             passkey_assertion_parts(&mine, RP, identity::IDENTITY_ADD_KEY_NS, &preimage);
         let proof = keyscheme::webauthn_proof(&a, &c, &s);
+        let account = sdk::wire::encode(&account);
         let msg = login_add_key(
             "chain-a",
             &device_key,
@@ -1299,7 +1303,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            msg,
+            sdk::wire::decode::<identity::IdentityMsg>(&msg).unwrap(),
             identity::IdentityMsg::AddKey {
                 scheme: KeyScheme::Ed25519,
                 label: Some("laptop".into()),
@@ -1313,11 +1317,25 @@ mod tests {
             "the passkey that signed is the authorizer"
         );
         // another generation, or a passkey off the account: no signer.
-        assert!(login_add_key("chain-a", &device_key, 5, &account, None, proof, 900).is_err());
+        assert!(
+            login_add_key(
+                "chain-a",
+                &device_key,
+                5,
+                &account,
+                None,
+                proof.clone(),
+                900
+            )
+            .is_err()
+        );
         let (a, c, s) =
             passkey_assertion_parts(&passkey(4), RP, identity::IDENTITY_ADD_KEY_NS, &preimage);
         let foreign = keyscheme::webauthn_proof(&a, &c, &s);
         assert!(login_add_key("chain-a", &device_key, 4, &account, None, foreign, 900).is_err());
+        // and an account the identity contract does not decode is refused
+        // before any key is considered.
+        assert!(login_add_key("chain-a", &device_key, 4, b"{}", None, proof, 900).is_err());
     }
 
     #[tokio::test]
