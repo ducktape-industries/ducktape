@@ -30,6 +30,7 @@
 //! collapses the duplicate.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use compute_service::AttemptControl;
 use host::worker::{WorkOutcome, Worker};
@@ -524,19 +525,49 @@ impl WorkPump {
     /// state still names the attempt. Re-sends are duplicate ops at worst — the
     /// saga's result singularity collapses them deterministically.
     async fn send(&mut self, node: &NodeLink, key: &AttemptKey, msg: Msg) {
+        let submit_started = Instant::now();
+        tracing::debug!(
+            target: "ducktape::provider",
+            event = "provider_result_tail",
+            phase = "result_submit_started",
+            saga = %key.0,
+            attempt = key.1,
+            "provider result submission started"
+        );
         match node.submit(&msg.target, &msg.payload).await {
-            Ok(_height) => {
+            Ok(height) => {
+                tracing::debug!(
+                    target: "ducktape::provider",
+                    event = "provider_result_tail",
+                    phase = "result_included",
+                    saga = %key.0,
+                    attempt = key.1,
+                    height,
+                    elapsed_ms = submit_started.elapsed().as_millis() as u64,
+                    "provider result included in a committed block"
+                );
                 if let Some(entry) = self.work.get_mut(key) {
                     entry.stage = Stage::Settled;
                 }
             }
-            Err(error) => tracing::debug!(
-                target: "ducktape::saga",
-                attempt = ?key,
-                error = %error,
-                reason = "result_submit_failed",
-                "compute result will be re-sent"
-            ),
+            Err(error) => {
+                tracing::debug!(
+                    target: "ducktape::provider",
+                    event = "provider_result_tail",
+                    phase = "result_submit_failed",
+                    saga = %key.0,
+                    attempt = key.1,
+                    elapsed_ms = submit_started.elapsed().as_millis() as u64,
+                    "provider result submission failed"
+                );
+                tracing::debug!(
+                    target: "ducktape::saga",
+                    attempt = ?key,
+                    error = %error,
+                    reason = "result_submit_failed",
+                    "compute result will be re-sent"
+                );
+            }
         }
     }
 }
