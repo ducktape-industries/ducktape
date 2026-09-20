@@ -798,9 +798,9 @@ fn real_dispatch_applied_summary_preserves_projected_id_in_assigned() {
         Origin::External(vec![0x42; 32]),
         Msg {
             target: "identity".into(),
-            payload: identity::encode_msg(&identity::IdentityMsg::Create {
+            payload: identity_module::encode_msg(&identity_module::IdentityMsg::Create {
                 name: "controller".into(),
-                scheme: identity::KeyScheme::Ed25519,
+                scheme: identity_module::KeyScheme::Ed25519,
             }),
         },
     );
@@ -810,7 +810,7 @@ fn real_dispatch_applied_summary_preserves_projected_id_in_assigned() {
         Origin::Module("projection-caller".into()),
         Msg {
             target: "identity".into(),
-            payload: identity::encode_msg(&identity::IdentityMsg::CreateProgram {
+            payload: identity_module::encode_msg(&identity_module::IdentityMsg::CreateProgram {
                 name: "projection-program".into(),
                 controller: 1,
                 request: 1,

@@ -21,14 +21,14 @@ pub fn test_ctx(origin: Origin, height: u64) -> TestCtx {
         cause: sdk::Cause::Direct,
     })
     .on_query("identity", |req| {
-        let identity::IdentityQuery::OfKey { .. } =
-            identity::decode_query(req).map_err(|e| sdk::Error::module("codec", e))?
+        let identity_module::IdentityQuery::OfKey { .. } =
+            identity_module::decode_query(req).map_err(|e| sdk::Error::module("codec", e))?
         else {
             return Err(sdk::Error::QueryUnsupported);
         };
-        Ok(identity::encode_reply(&identity::IdentityReply::Account(
-            None,
-        )))
+        Ok(identity_module::encode_reply(
+            &identity_module::IdentityReply::Account(None),
+        ))
     })
 }
 

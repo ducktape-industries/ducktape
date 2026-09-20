@@ -1,6 +1,6 @@
 mod harness;
 
-use attribution::{AttributionMsg, AttributionQuery, AttributionReply, Reason, Source};
+use attribution_module::{AttributionMsg, AttributionQuery, AttributionReply, Reason, Source};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use files::{
     Actor, Change, Content, FilesMsg, FilesQuery, FilesReply, FilesWriteOutput, WriteOutcome,
@@ -82,12 +82,12 @@ fn write(path: &str) -> FilesMsg {
         }],
     }
 }
-async fn identity(host: &mut Host, origin: Origin, operation: identity::IdentityMsg) {
+async fn identity(host: &mut Host, origin: Origin, operation: identity_module::IdentityMsg) {
     host.submit_at(
         context(origin),
         Msg {
             target: "identity".into(),
-            payload: identity::encode_msg(&operation),
+            payload: identity_module::encode_msg(&operation),
         },
     )
     .await
@@ -97,16 +97,16 @@ async fn provision(host: &mut Host) {
     identity(
         host,
         alice(),
-        identity::IdentityMsg::Create {
+        identity_module::IdentityMsg::Create {
             name: "Alice".into(),
-            scheme: identity::KeyScheme::Ed25519,
+            scheme: identity_module::KeyScheme::Ed25519,
         },
     )
     .await;
     identity(
         host,
         Origin::Module("executor".into()),
-        identity::IdentityMsg::CreateProgram {
+        identity_module::IdentityMsg::CreateProgram {
             name: "Writer".into(),
             controller: 1,
             request: 0,
@@ -123,7 +123,7 @@ async fn query(host: &Host, query: FilesQuery) -> FilesReply {
     )
     .unwrap()
 }
-async fn relations(host: &Host, kind: &str, object: String) -> attribution::ObjectRelations {
+async fn relations(host: &Host, kind: &str, object: String) -> attribution_module::ObjectRelations {
     let query = AttributionQuery::Relations {
         source: Source {
             module: "files".into(),
@@ -132,10 +132,11 @@ async fn relations(host: &Host, kind: &str, object: String) -> attribution::Obje
         },
     };
     let reply = host
-        .query("attribution", &attribution::encode_query(&query))
+        .query("attribution", &attribution_module::encode_query(&query))
         .await
         .unwrap();
-    let AttributionReply::Relations(Some(relations)) = attribution::decode_reply(&reply).unwrap()
+    let AttributionReply::Relations(Some(relations)) =
+        attribution_module::decode_reply(&reply).unwrap()
     else {
         panic!("source record")
     };
@@ -296,13 +297,13 @@ fn unauthorized_or_suspended_program_writes_and_failed_publications_leave_no_sou
             context(Origin::Module("files".into())),
             Msg {
                 target: "attribution".into(),
-                payload: attribution::encode_msg(&AttributionMsg::Attribute {
-                    object: attribution::ObjectRef {
+                payload: attribution_module::encode_msg(&AttributionMsg::Attribute {
+                    object: attribution_module::ObjectRef {
                         kind: "pin".into(),
                         object: files::to_hex(b"conflict"),
                     },
                     revision: 100,
-                    actor: attribution::Actor::System,
+                    actor: attribution_module::Actor::System,
                     relations: Vec::new(),
                     transfers: Vec::new(),
                 }),
@@ -346,9 +347,9 @@ fn unauthorized_or_suspended_program_writes_and_failed_publications_leave_no_sou
         identity(
             &mut host,
             Origin::Module("executor".into()),
-            identity::IdentityMsg::SetProgramStanding {
+            identity_module::IdentityMsg::SetProgramStanding {
                 account: 2,
-                standing: identity::ProgramStanding::Suspended,
+                standing: identity_module::ProgramStanding::Suspended,
             },
         )
         .await;
@@ -388,9 +389,9 @@ fn a_keys_writes_are_attributed_to_the_account_it_holds_at_the_time() {
         identity(
             &mut host,
             alice(),
-            identity::IdentityMsg::Create {
+            identity_module::IdentityMsg::Create {
                 name: "Alice".into(),
-                scheme: identity::KeyScheme::Ed25519,
+                scheme: identity_module::KeyScheme::Ed25519,
             },
         )
         .await;
@@ -404,9 +405,9 @@ fn a_keys_writes_are_attributed_to_the_account_it_holds_at_the_time() {
         assert_eq!(output(&written).actor, Actor::Account(1));
         let sibling = PrivateKey::from_seed(42);
         let sibling_bytes = sibling.public_key().as_ref().to_vec();
-        let preimage = identity::add_key_preimage(
+        let preimage = identity_module::add_key_preimage(
             "files-test",
-            identity::KeyScheme::Ed25519,
+            identity_module::KeyScheme::Ed25519,
             &sibling_bytes,
             0,
             1,
@@ -415,15 +416,15 @@ fn a_keys_writes_are_attributed_to_the_account_it_holds_at_the_time() {
         identity(
             &mut host,
             Origin::External(sibling_bytes.clone()),
-            identity::IdentityMsg::AddKey {
-                scheme: identity::KeyScheme::Ed25519,
+            identity_module::IdentityMsg::AddKey {
+                scheme: identity_module::KeyScheme::Ed25519,
                 label: None,
-                authorizer: identity::Authorizer {
+                authorizer: identity_module::Authorizer {
                     key: key_bytes.clone(),
                     account: 1,
                     expires_at: 100,
                     proof: key
-                        .sign(identity::IDENTITY_ADD_KEY_NS, &preimage)
+                        .sign(identity_module::IDENTITY_ADD_KEY_NS, &preimage)
                         .as_ref()
                         .to_vec(),
                 },
@@ -434,15 +435,15 @@ fn a_keys_writes_are_attributed_to_the_account_it_holds_at_the_time() {
         identity(
             &mut host,
             alice(),
-            identity::IdentityMsg::RemoveKey { key: key_bytes },
+            identity_module::IdentityMsg::RemoveKey { key: key_bytes },
         )
         .await;
         identity(
             &mut host,
             alice(),
-            identity::IdentityMsg::Create {
+            identity_module::IdentityMsg::Create {
                 name: "Reassigned".into(),
-                scheme: identity::KeyScheme::Ed25519,
+                scheme: identity_module::KeyScheme::Ed25519,
             },
         )
         .await;

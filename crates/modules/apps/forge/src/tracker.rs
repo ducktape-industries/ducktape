@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 
-use chat::Party;
+use crate::chat_contract::{self as chat, Party};
 use sdk::{Error, Msg};
 
 use crate::codec::{self, Reader};

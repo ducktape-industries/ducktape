@@ -1,12 +1,14 @@
 //! Real Host publication, ordinary program rights and durable source history.
-use attribution::{Actor, AttributionQuery, AttributionReply, ObjectRelations, Reason, Source};
 use attribution_module::AttributionModule;
-use chat::Party;
+use attribution_module::{
+    Actor, AttributionQuery, AttributionReply, ObjectRelations, Reason, Source,
+};
+use forge::Party;
 use forge::{Forge, ForgeMsg, ForgeQuery, ForgeReply, RefUpdate, ReviewVerdict};
 use futures::executor::block_on;
 use host::{BlockContext, Host};
-use identity::{IdentityMsg, KeyScheme};
 use identity_module::Identity;
+use identity_module::{IdentityMsg, KeyScheme};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sdk_testkit::{MemStore, TestCtx};
 use std::path::PathBuf;
@@ -35,7 +37,7 @@ impl Module for Executor {
         StateRoot::ZERO
     }
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        identity::authenticate_event(&ctx.env().origin, "identity", &msg.payload)
+        identity_module::authenticate_event(&ctx.env().origin, "identity", &msg.payload)
             .map_err(|e| Error::module("authenticate_event", e))?;
         Ok(())
     }
@@ -128,7 +130,7 @@ async fn relations(host: &Host, kind: &str, object: serde_json::Value) -> Object
     let bytes = host
         .query(
             "attribution",
-            &attribution::encode_query(&AttributionQuery::Relations {
+            &attribution_module::encode_query(&AttributionQuery::Relations {
                 source: Source {
                     module: "forge".into(),
                     kind: kind.into(),
@@ -138,7 +140,8 @@ async fn relations(host: &Host, kind: &str, object: serde_json::Value) -> Object
         )
         .await
         .unwrap();
-    let AttributionReply::Relations(Some(relations)) = attribution::decode_reply(&bytes).unwrap()
+    let AttributionReply::Relations(Some(relations)) =
+        attribution_module::decode_reply(&bytes).unwrap()
     else {
         panic!("source relations")
     };
@@ -266,8 +269,8 @@ fn rejected_central_publication_rolls_back_the_odb_source_and_number() {
             &mut host,
             Origin::Module("forge".into()),
             "attribution",
-            attribution::AttributionMsg::Attribute {
-                object: attribution::ObjectRef {
+            attribution_module::AttributionMsg::Attribute {
+                object: attribution_module::ObjectRef {
                     kind: "ref".into(),
                     object: serde_json::json!(["demo", "main"]).to_string(),
                 },
@@ -322,8 +325,8 @@ fn test_ctx(origin: Origin) -> TestCtx {
     })
 }
 fn revision(ctx: &TestCtx) -> u64 {
-    let attribution::AttributionMsg::AttributeBatch { updates } =
-        attribution::decode_msg(&ctx.msgs().last().unwrap().payload).unwrap()
+    let attribution_module::AttributionMsg::AttributeBatch { updates } =
+        attribution_module::decode_msg(&ctx.msgs().last().unwrap().payload).unwrap()
     else {
         panic!("batch")
     };
@@ -498,22 +501,25 @@ fn item_authorship_records_the_signers_canonical_actor() {
             .with_attribution("attribution");
         let context = |byte, account: Option<u64>| {
             test_ctx(key(byte)).on_query("identity", move |req| {
-                let identity::IdentityQuery::OfKey { key } = identity::decode_query(req).unwrap()
+                let identity_module::IdentityQuery::OfKey { key } =
+                    identity_module::decode_query(req).unwrap()
                 else {
                     panic!("key lookup");
                 };
                 let resolved = (key == vec![byte; 32]).then_some(account).flatten();
-                Ok(identity::encode_reply(&identity::IdentityReply::Account(
-                    resolved.map(|number| identity::AccountView {
-                        number,
-                        name: "person".into(),
-                        control: identity::Control::Keys,
-                        keys: Vec::new(),
-                        avatar: None,
-                        bio: None,
-                        updated_at: 0,
-                    }),
-                )))
+                Ok(identity_module::encode_reply(
+                    &identity_module::IdentityReply::Account(resolved.map(|number| {
+                        identity_module::AccountView {
+                            number,
+                            name: "person".into(),
+                            control: identity_module::Control::Keys,
+                            keys: Vec::new(),
+                            avatar: None,
+                            bio: None,
+                            updated_at: 0,
+                        }
+                    })),
+                ))
             })
         };
         forge
@@ -573,24 +579,27 @@ fn ref_attribution_settles_with_the_push_and_a_refused_push_publishes_nothing() 
     block_on(async {
         let context = |byte, accounts: Vec<(u8, u64)>| {
             test_ctx(key(byte)).on_query("identity", move |req| {
-                let identity::IdentityQuery::OfKey { key } = identity::decode_query(req).unwrap()
+                let identity_module::IdentityQuery::OfKey { key } =
+                    identity_module::decode_query(req).unwrap()
                 else {
                     panic!("key lookup");
                 };
                 let account = accounts
                     .iter()
                     .find_map(|(byte, number)| (key == vec![*byte; 32]).then_some(*number));
-                Ok(identity::encode_reply(&identity::IdentityReply::Account(
-                    account.map(|number| identity::AccountView {
-                        number,
-                        name: "person".into(),
-                        control: identity::Control::Keys,
-                        keys: Vec::new(),
-                        avatar: None,
-                        bio: None,
-                        updated_at: 0,
-                    }),
-                )))
+                Ok(identity_module::encode_reply(
+                    &identity_module::IdentityReply::Account(account.map(|number| {
+                        identity_module::AccountView {
+                            number,
+                            name: "person".into(),
+                            control: identity_module::Control::Keys,
+                            keys: Vec::new(),
+                            avatar: None,
+                            bio: None,
+                            updated_at: 0,
+                        }
+                    })),
+                ))
             })
         };
         let mut state = forge::state::ForgeState::default();
@@ -640,8 +649,8 @@ fn ref_attribution_settles_with_the_push_and_a_refused_push_publishes_nothing() 
             )
             .await
             .unwrap();
-        let attribution::AttributionMsg::AttributeBatch { updates } =
-            attribution::decode_msg(&ctx.msgs()[0].payload).unwrap()
+        let attribution_module::AttributionMsg::AttributeBatch { updates } =
+            attribution_module::decode_msg(&ctx.msgs()[0].payload).unwrap()
         else {
             panic!("source report");
         };
@@ -652,7 +661,7 @@ fn ref_attribution_settles_with_the_push_and_a_refused_push_publishes_nothing() 
         assert_eq!(main.actor, Actor::Account(2));
         assert_eq!(
             main.relations,
-            vec![attribution::Relation {
+            vec![attribution_module::Relation {
                 recipient: 2,
                 reason: Reason::Defined("ref_writer".into()),
                 detail: vec![2; 20],
@@ -705,7 +714,7 @@ fn signed_push_attributes_the_real_account_signer_instead_of_its_relay() {
         let bytes = host
             .query(
                 "attribution",
-                &attribution::encode_query(&AttributionQuery::ChangesOf {
+                &attribution_module::encode_query(&AttributionQuery::ChangesOf {
                     source: Source {
                         module: "forge".into(),
                         kind: "ref".into(),
@@ -717,7 +726,8 @@ fn signed_push_attributes_the_real_account_signer_instead_of_its_relay() {
             )
             .await
             .unwrap();
-        let AttributionReply::Changes(changes) = attribution::decode_reply(&bytes).unwrap() else {
+        let AttributionReply::Changes(changes) = attribution_module::decode_reply(&bytes).unwrap()
+        else {
             panic!("changes")
         };
         assert_eq!(changes[0].change.actor, Actor::Account(4));

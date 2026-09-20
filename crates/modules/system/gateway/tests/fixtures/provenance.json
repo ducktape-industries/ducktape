@@ -1,0 +1,215 @@
+{
+  "format": "ducktape-wire-fixture-provenance-v1",
+  "producer_source": {
+    "repository": "ducktape-sdk",
+    "commit": "8c764093d5974b4328c0b90de157d72597540020",
+    "paths": [
+      "crates/modules/system/gateway/wire/src/lib.rs",
+      "crates/modules/system/gateway/wire/src/proxy.rs",
+      "crates/modules/system/gateway/wire/src/frames.rs"
+    ]
+  },
+  "codec_source": {
+    "repository": "ducktape-sdk",
+    "commit": "8c764093d5974b4328c0b90de157d72597540020",
+    "paths": [
+      "crates/modules/system/gateway/wire/src/lib.rs",
+      "crates/modules/system/gateway/wire/src/proxy.rs",
+      "crates/modules/system/gateway/wire/src/frames.rs"
+    ]
+  },
+  "hash_scope": "sha256 is over the committed fixture file bytes; hex entries hash their UTF-8 hex text, not the decoded bytes",
+  "fixtures": {
+    "body_digest.hex": {
+      "sha256": "a48be3539d6c61adb92d3ee74898f4b5434ff2ec1ddde3b578094ab4c1d0b069",
+      "encoding": "utf-8-hex",
+      "decoded_format": "32-byte SHA-256 digest",
+      "type": "request body bytes",
+      "variant": "b\"gateway request body\"",
+      "encoder": "body_digest",
+      "decoder": "hex fixture helper",
+      "producer_output": true
+    },
+    "caller_pop_preimage.hex": {
+      "sha256": "501018447ee66155014db40ccc039fc309c87bbba4e61cd21b23780726a195cb",
+      "encoding": "utf-8-hex",
+      "decoded_format": "custom little-endian caller proof preimage bytes",
+      "type": "ProxyRequestHead",
+      "variant": "UserPop request, publisher 0x22*32, timestamp 42",
+      "encoder": "caller_pop_preimage",
+      "decoder": "hex fixture helper",
+      "producer_output": true
+    },
+    "frame_failure.hex": {
+      "sha256": "1f85c2bb268445070e90d53ec5e71e18868d6f0546a123d991fdb7fafc288ce8",
+      "encoding": "utf-8-hex",
+      "decoded_format": "ProxyFrame wire bytes ([type:u8][len:u32 BE][payload])",
+      "type": "ProxyFrame",
+      "variant": "Failure(TooLarge)",
+      "encoder": "encode_frame",
+      "decoder": "decode_frame",
+      "producer_output": true
+    },
+    "frame_response_head.hex": {
+      "sha256": "16e4c3543dc121059cce1dcc21db1b41e9b2cdfe55240982af59e8666d0b9040",
+      "encoding": "utf-8-hex",
+      "decoded_format": "ProxyFrame wire bytes ([type:u8][len:u32 BE][payload])",
+      "type": "ProxyFrame",
+      "variant": "ResponseHead(201, content-type)",
+      "encoder": "encode_frame",
+      "decoder": "decode_frame",
+      "producer_output": true
+    },
+    "gateway_caller_namespace.hex": {
+      "sha256": "505144a300e55c5ade703dde45bd6a4d828dea5d8bfa6a40a6aadb0e74c4ab3b",
+      "encoding": "utf-8-hex",
+      "decoded_format": "raw ASCII namespace bytes",
+      "type": "GATEWAY_CALLER_NS",
+      "variant": "ducktape-gateway-caller-v1",
+      "encoder": "GATEWAY_CALLER_NS",
+      "decoder": "hex fixture helper",
+      "producer_output": true
+    },
+    "gateway_credential_namespace.hex": {
+      "sha256": "afd9ef426ba8158e9126556f4892495b81dd3fcdb44138eb91f7da1f20dc9889",
+      "encoding": "utf-8-hex",
+      "decoded_format": "raw ASCII namespace bytes",
+      "type": "GATEWAY_CREDENTIAL_NS",
+      "variant": "ducktape-gateway-credential-v1",
+      "encoder": "GATEWAY_CREDENTIAL_NS",
+      "decoder": "hex fixture helper",
+      "producer_output": true
+    },
+    "gateway_route_namespace.hex": {
+      "sha256": "2e004f6af148761e988a0b879be5642df04d35fa876fa000829e619c136dff22",
+      "encoding": "utf-8-hex",
+      "decoded_format": "raw ASCII namespace bytes",
+      "type": "GATEWAY_ROUTE_NS",
+      "variant": "ducktape-gateway-route-v1",
+      "encoder": "GATEWAY_ROUTE_NS",
+      "decoder": "hex fixture helper",
+      "producer_output": true
+    },
+    "msg_set_handle_none.json": {
+      "sha256": "b8396142910c5c37f28d98d6042c3e65c56056bb6b997dde6d07366de05812b8",
+      "encoding": "utf-8",
+      "decoded_format": "serde_json",
+      "type": "GatewayMsg",
+      "variant": "SetHandle(None)",
+      "encoder": "encode_msg",
+      "decoder": "decode_msg",
+      "producer_output": true
+    },
+    "proxy_flow_domain.hex": {
+      "sha256": "049df4b9599d21037445b9ad29e1b101b9ecd1caccc4f53f2d410d02d90a9989",
+      "encoding": "utf-8-hex",
+      "decoded_format": "raw ASCII domain bytes",
+      "type": "PROXY_FLOW_DOMAIN",
+      "variant": "ducktape-gateway-proxy-v1",
+      "encoder": "PROXY_FLOW_DOMAIN",
+      "decoder": "hex fixture helper",
+      "producer_output": true
+    },
+    "proxy_request_head.json": {
+      "sha256": "8c343b60f2dd50317ebb7ba355e65576d812602514c617f7e5d3e931141903d7",
+      "encoding": "utf-8",
+      "decoded_format": "serde_json",
+      "type": "ProxyRequestHead",
+      "variant": "account caller, user_pop absent",
+      "encoder": "encode_proxy_request_head",
+      "decoder": "decode_proxy_request_head",
+      "producer_output": true
+    },
+    "proxy_request_head_user_pop.json": {
+      "sha256": "b38727876b1843f8dcf0e081e2e532e859271881ccb9fe0bf186a9f089598894",
+      "encoding": "utf-8",
+      "decoded_format": "serde_json",
+      "type": "ProxyRequestHead",
+      "variant": "UserPop present",
+      "encoder": "encode_proxy_request_head",
+      "decoder": "decode_proxy_request_head",
+      "producer_output": true
+    },
+    "proxy_unknown_field.json": {
+      "sha256": "c85763b89e4ecbeec15f5ac4a79b3e02f561d3e5b14e802406165a54ce8a426c",
+      "encoding": "utf-8",
+      "decoded_format": "serde_json (negative input)",
+      "type": "ProxyRequestHead",
+      "variant": "unknown field refusal",
+      "encoder": null,
+      "decoder": "decode_proxy_request_head",
+      "producer_output": false,
+      "negative_input": true
+    },
+    "query_get.json": {
+      "sha256": "46ea3e5dd1cbfdb1bde71b0127f79c19a7d05bd2fb442b44a337fead1f29096e",
+      "encoding": "utf-8",
+      "decoded_format": "serde_json",
+      "type": "GatewayQuery",
+      "variant": "Get(RouteName::named(\"api\"))",
+      "encoder": "encode_query",
+      "decoder": "decode_query",
+      "producer_output": true
+    },
+    "query_registrations_page.json": {
+      "sha256": "be2ea1dddf293208912e3dbc2ede2641d971727649520eac6d3280d9302d40d4",
+      "encoding": "utf-8",
+      "decoded_format": "serde_json",
+      "type": "GatewayQuery",
+      "variant": "Registrations",
+      "encoder": "encode_query",
+      "decoder": "decode_query",
+      "producer_output": true
+    },
+    "query_resolve.json": {
+      "sha256": "dec09325fde6a3b96b7849b3984bfb8b0b02021dcc47e717609c082c04a9906f",
+      "encoding": "utf-8",
+      "decoded_format": "serde_json",
+      "type": "GatewayQuery",
+      "variant": "Resolve(DuckDnsName{handle: alice})",
+      "encoder": "encode_query",
+      "decoder": "decode_query",
+      "producer_output": true
+    },
+    "reply_resolved_none.json": {
+      "sha256": "6879059c48c995817876af5c591caaf7c5e22d6dd0edc91aac78d5ca097e46f7",
+      "encoding": "utf-8",
+      "decoded_format": "serde_json",
+      "type": "GatewayReply",
+      "variant": "Resolved(None)",
+      "encoder": "encode_reply",
+      "decoder": "decode_reply",
+      "producer_output": true
+    },
+    "reply_resolved_some.json": {
+      "sha256": "e83f7f177b5748be52eff9dbc495d7600cf89a1d47116ca274fcfe64ef24d9dc",
+      "encoding": "utf-8",
+      "decoded_format": "serde_json",
+      "type": "GatewayReply",
+      "variant": "Resolved(Some(account 7))",
+      "encoder": "encode_reply",
+      "decoder": "decode_reply",
+      "producer_output": true
+    },
+    "reply_route.json": {
+      "sha256": "4cfc71cc47412bc10602687d0c58d49c1ddf8d1d87725f95b71f34ea6e9f5829",
+      "encoding": "utf-8",
+      "decoded_format": "serde_json",
+      "type": "GatewayReply",
+      "variant": "Route(Some(RouteRecord))",
+      "encoder": "encode_reply",
+      "decoder": "decode_reply",
+      "producer_output": true
+    },
+    "route_signing_preimage.hex": {
+      "sha256": "f57e51d100d76933b21fa614b04ee605dda4342e6b5f9b174ab2d83267fdb3fb",
+      "encoding": "utf-8-hex",
+      "decoded_format": "custom little-endian route signing preimage bytes",
+      "type": "RouteStatement",
+      "variant": "named loopback route, owner audience",
+      "encoder": "route_signing_preimage",
+      "decoder": "hex fixture helper",
+      "producer_output": true
+    }
+  }
+}

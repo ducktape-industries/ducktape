@@ -824,6 +824,7 @@ impl Forge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat_contract as chat;
     use crate::{decode_reply, encode_msg, encode_query};
 
     use sdk_testkit::TestCtx;
@@ -2432,7 +2433,7 @@ mod tests {
         assert_eq!(ctx.msgs()[0].target, "chat");
         let chat::ChatMsg::CreateChannel {
             channel_id, name, ..
-        } = chat::decode_msg(&ctx.msgs()[0].payload).unwrap()
+        } = crate::chat_contract::decode_msg(&ctx.msgs()[0].payload).unwrap()
         else {
             panic!("expected CreateChannel")
         };

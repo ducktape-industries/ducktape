@@ -1,7 +1,9 @@
 //! Native and guest writes share identity resolution, pure operations and
 //! source-owned attribution publication. The host commits their effects together.
 
-use attribution::{AttributionMsg, ObjectRef, Reason, Relation};
+use crate::attribution_contract as attribution;
+use crate::attribution_contract::{AttributionMsg, ObjectRef, Reason, Relation};
+use crate::identity_contract as identity;
 use duckfs_core::{
     Actor, Authority, FilesMsg, FilesWriteOutput, Fs, Kind, ObjectStore, PUTBLOB_FRAME_TAG, Refs,
     WriteOutcome, decode_msg, encode_write_output, to_hex,
@@ -17,12 +19,7 @@ async fn identity_account(
         .await?;
     let reply =
         identity::decode_reply(&bytes).map_err(|e| Error::module("identity_reply_decode", e))?;
-    let identity::IdentityReply::Account(account) = reply else {
-        return Err(Error::module(
-            "unexpected_identity_reply",
-            "files: unexpected identity reply",
-        ));
-    };
+    let identity::IdentityReply::Account(account) = reply;
     Ok(account)
 }
 

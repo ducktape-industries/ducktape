@@ -15,6 +15,11 @@ use std::collections::BTreeSet;
 
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+use gateway::identity_contract as identity;
+use gateway::identity_contract::{
+    AccountView, IdentityQuery, IdentityReply, KeyView, decode_query as identity_decode_query,
+    encode_reply as identity_encode_reply,
+};
 use gateway::{
     CredentialGrantStatement, CredentialKind, CredentialRecord, DuckDnsName, GATEWAY_CREDENTIAL_NS,
     GATEWAY_ROUTE_NS, Gateway, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization,
@@ -23,10 +28,7 @@ use gateway::{
     grant_credential_preimage, remove_credential_preimage, route_signing_preimage,
     set_credential_preimage,
 };
-use identity::{
-    AccountView, IdentityQuery, IdentityReply, KeyScheme, KeyView,
-    decode_query as identity_decode_query, encode_reply as identity_encode_reply,
-};
+use keyscheme::KeyScheme;
 use sdk::{Env, Error, MerkleStore as _, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
@@ -75,12 +77,11 @@ fn ctx(height: u64, founder: &Ed) -> TestCtx {
         cause: sdk::Cause::Direct,
     })
     .on_query("identity", move |req| {
-        match identity_decode_query(req).map_err(|e| Error::module("codec", e))? {
-            IdentityQuery::OfKey { .. } => Ok(identity_encode_reply(&IdentityReply::Account(
-                Some(view.clone()),
-            ))),
-            _ => Err(Error::QueryUnsupported),
-        }
+        let IdentityQuery::OfKey { .. } =
+            identity_decode_query(req).map_err(|e| Error::module("codec", e))?;
+        Ok(identity_encode_reply(&IdentityReply::Account(Some(
+            view.clone(),
+        ))))
     })
 }
 

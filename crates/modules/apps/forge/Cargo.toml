@@ -23,11 +23,11 @@ guest = ["dep:ducktape-module-sdk"]
 testkit = ["native"]
 
 [dependencies]
-forge-wire = { workspace = true }
 base64 = { workspace = true }
 sdk = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+keyscheme = { workspace = true }
 # the node-local blob store forge fetches Push packfiles from by digest. the
 # same node-local receipt lane the daemon and the files module share; the
 # packfile bytes never enter consensus (see the `PushRefs` op in state.rs).
@@ -38,15 +38,12 @@ sha2 = { workspace = true }
 # issue/PR (`forge:<repo>:<n>`) and posts state-change system lines into it via
 # emit_msg follow-ups — the same seam runs/automations use. forge reuses
 # chat's Party so the app renders forge authors through the same path.
-chat = { workspace = true }
-attribution = { workspace = true }
 # identity's WIRE TYPES only: forge resolves a ref-moving origin to the account
 # it belongs to, so the SAME human's node-key `git push` and user-key app merge
 # are attributed to one account (see `ForgeState::party_of_origin`).
-identity = { workspace = true }
+duck-address = { workspace = true }
 # `git push --signed`: the push certificate's OpenSSH signature is verified
 # in consensus (`pushcert::signer`), by every validator.
-keyscheme = { workspace = true }
 async-trait = { workspace = true }
 # the node's log plane — `materialize`'s pack-missing / refused-advance warnings
 # must reach the app's Logs tab and `RUST_LOG`, which a `println!` never does.

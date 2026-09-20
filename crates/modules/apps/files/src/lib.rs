@@ -4,6 +4,14 @@
 //! lives in `duckfs-disk`; this crate keeps the consensus module id and the SDK
 //! module implementation, and re-exports the core API.
 
+#[cfg(any(feature = "native", feature = "guest", test))]
+mod attribution_contract;
+#[cfg(any(feature = "native", feature = "guest", test))]
+mod identity_contract;
+
+#[cfg(test)]
+mod wire_goldens;
+
 pub use duckfs_core::*;
 
 #[cfg(any(feature = "native", feature = "guest"))]

@@ -1,0 +1,1 @@
+{"attribute_batch":{"updates":[{"object":{"kind":"ref","object":"repo/main"},"revision":3,"actor":{"account":7},"relations":[{"recipient":8,"reason":{"defined":"ref_writer"},"detail":[1,2]}],"transfers":[]}]}}

@@ -10,10 +10,12 @@
 //! `.duck` is Ducktape presentation syntax, never installed into the host DNS
 //! stack.
 
+pub mod identity_contract;
 mod module;
+mod wire;
 
-pub use gateway_wire::*;
 pub use module::Gateway;
+pub use wire::*;
 
 // the `.duck` handle-plane surface, absorbed as gateway's internal facet: the
 // grammar and wire TYPES for human names are re-exported here so callers speak

@@ -23,9 +23,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use attribution::{Actor, AttributionMsg, AttributionUpdate, ObjectRef, Reason, Relation};
-use chat::Party;
-use identity::{IdentityQuery, IdentityReply};
+use crate::attribution_contract::{
+    Actor, AttributionMsg, AttributionUpdate, ObjectRef, Reason, Relation,
+};
+use crate::chat_contract::Party;
+use crate::identity_contract::{IdentityQuery, IdentityReply};
 use sdk::{Ctx, Error, Origin, StateRoot, refusal};
 use sha2::{Digest, Sha256};
 
@@ -562,21 +564,20 @@ impl ForgeState {
     async fn identity_account(ctx: &dyn Ctx, key: &[u8]) -> Result<Option<u64>, Error> {
         let query = IdentityQuery::OfKey { key: key.to_vec() };
         let reply = match ctx
-            .query(IDENTITY_MODULE, &identity::encode_query(&query))
+            .query(
+                IDENTITY_MODULE,
+                &crate::identity_contract::encode_query(&query),
+            )
             .await
         {
             Ok(bytes) => bytes,
             Err(Error::UnknownModule(_) | Error::QueryUnsupported) => return Ok(None),
             Err(other) => return Err(other),
         };
-        match identity::decode_reply(&reply)
+        match crate::identity_contract::decode_reply(&reply)
             .map_err(|e| Error::module("identity_reply_decode", e))?
         {
             IdentityReply::Account(account) => Ok(account.map(|a| a.number)),
-            other => Err(Error::module(
-                "unexpected_identity_reply",
-                format!("forge: identity answered an account query with {other:?}"),
-            )),
         }
     }
 
@@ -801,7 +802,9 @@ impl ForgeState {
             .collect();
         ctx.emit_msg(sdk::Msg {
             target: target.into(),
-            payload: attribution::encode_msg(&AttributionMsg::AttributeBatch { updates }),
+            payload: crate::attribution_contract::encode_msg(&AttributionMsg::AttributeBatch {
+                updates,
+            }),
         });
         Ok(())
     }
@@ -1277,8 +1280,8 @@ pub fn decode_ref_target(bytes: &[u8]) -> Result<RefTarget, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat_contract::Party;
     use crate::tracker_iface::ItemKind;
-    use chat::Party;
 
     fn oid(c: char) -> Oid {
         Oid::from_hex(&c.to_string().repeat(40)).unwrap()

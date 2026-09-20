@@ -119,11 +119,22 @@
 //!   the block boundary. the root is byte-identical across the two, so the
 //!   cutover moves no committed state.
 
-// the wire surface: this module's shared types, flattened at the crate root.
-pub use forge_wire::*;
-// the wire crate under the two names the module's own files reach it by.
-pub(crate) use forge_wire as interface;
-pub(crate) use forge_wire as tracker_iface;
+// The wire surface is owned by this producer. It stays flattened at the
+// crate root so callers keep the same names while no SDK module contract is
+// linked into the guest.
+mod address;
+mod attribution_contract;
+mod chat_contract;
+mod identity_contract;
+mod tracker_iface;
+mod wire;
+
+#[cfg(test)]
+mod contract_goldens;
+
+pub use chat_contract::Party;
+pub(crate) use wire as interface;
+pub use wire::*;
 
 mod codec;
 #[cfg(feature = "native")]

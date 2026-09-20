@@ -13,23 +13,23 @@ native = [
   "dep:sdk",
   "dep:async-trait",
   "dep:serde_json",
+  "dep:serde",
   "dep:tracing",
-  "dep:identity",
-  "dep:attribution",
+  "dep:keyscheme",
 ]
 # the wasm-guest port: `FilesGuest` runs `duckfs_core::Fs<GuestOdb>` over the
 # WIT object plane, single-sourcing the op semantics with `native`. non-default
 # and wasm-only (the ducktape-module-sdk bindings compile only for
 # wasm32-unknown-unknown); pulls its `odb` feature for `GuestOdb`.
-guest = ["dep:ducktape-module-sdk", "dep:sdk", "dep:serde_json", "dep:identity", "dep:attribution"]
+guest = ["dep:ducktape-module-sdk", "dep:sdk", "dep:serde_json", "dep:serde", "dep:keyscheme"]
 
 [dependencies]
 duckfs-core = { workspace = true }
 duckfs-disk = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 sdk = { workspace = true, optional = true }
-identity = { workspace = true, optional = true }
-attribution = { workspace = true, optional = true }
+keyscheme = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 # native only: the module glue narrates a SKIPPED gc sweep. the pure core and
 # the wasm guest never log — no tracing reaches either.

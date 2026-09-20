@@ -254,6 +254,7 @@ pub use entry::FilesGuest;
 #[cfg(test)]
 mod tests {
     use super::{Dispatched, dispatch};
+    use crate::identity_contract as identity;
     use base64::Engine as _;
     use duckfs_core::objects::object_id;
     use duckfs_core::{
