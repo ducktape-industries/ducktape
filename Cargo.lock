@@ -953,7 +953,6 @@ dependencies = [
  "pin-project",
  "rand 0.10.2",
  "rand_core 0.10.1",
- "rand_distr",
  "rayon",
  "thiserror 2.0.18",
  "tracing",
@@ -1241,14 +1240,13 @@ name = "consensus"
 version = "0.1.0"
 dependencies = [
  "abi",
- "bytes",
  "commonware-actor",
+ "commonware-broadcast",
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-p2p",
  "commonware-parallel",
- "commonware-resolver",
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
@@ -1262,8 +1260,8 @@ dependencies = [
  "node",
  "rand_core 0.10.1",
  "tempfile",
- "tokio",
- "tracing",
+ "thiserror 2.0.18",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3781,11 +3779,12 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "borsh",
+ "bytes",
  "commonware-codec",
+ "commonware-consensus",
  "commonware-cryptography",
  "commonware-runtime",
  "commonware-storage",
- "commonware-utils",
  "fixture-modules",
  "fixture-probe",
  "fixture-relay",

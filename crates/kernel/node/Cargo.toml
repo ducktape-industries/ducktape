@@ -6,11 +6,12 @@ version.workspace = true
 [dependencies]
 abi = { workspace = true }
 borsh = { workspace = true }
+bytes = "1"
 commonware-codec = { workspace = true }
+commonware-consensus = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-storage = { workspace = true }
-commonware-utils = { workspace = true }
 host = { workspace = true }
 keyscheme = { workspace = true }
 state = { workspace = true }
