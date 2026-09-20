@@ -34,6 +34,7 @@ install:
 	@printf '%s\n' "$$(git rev-parse HEAD)" >> "$(INSTALL_DEST)/installed-revs"
 	@printf '%s\n' "$(CARGO_TARGET_DIR)" > "$(INSTALL_DEST)/target-dir"
 	@printf '%s\n' "$(CARGO_BUILD_JOBS)" > "$(INSTALL_DEST)/jobs"
+	@mkdir -p "$(CARGO_TARGET_DIR)" && touch "$(CARGO_TARGET_DIR)/build-artifact"
 EOF
 git -C "$APP_REPO" add .
 git -C "$APP_REPO" commit -qm first
@@ -55,7 +56,11 @@ APP_REPO="$APP_REPO" APP_REV_FILE="$PIN_FILE" APP_CHECKOUT_DIR="$CHECKOUT" \
 [ "$(git -C "$CHECKOUT" rev-parse HEAD)" = "$PIN" ] || fail 'first install moved off the pinned commit'
 [ "$(<"$DEST/installed-revs")" = "$PIN" ] || fail 'first install delegated the wrong revision'
 assert_contains 'running make install' "$LOG"
-[ "$(<"$DEST/target-dir")" = "$CHECKOUT/target-core-install" ] || fail 'App target not isolated'
+# cargo writes into the target dir; inside the checkout that made the second run die with checkout_dirty.
+target_dir=$(<"$DEST/target-dir")
+[ -n "$target_dir" ] || fail 'App target not set'
+case "$target_dir" in "$CHECKOUT"/*) fail 'App target inside the checkout dirties it' ;; esac
+[ -e "$target_dir/build-artifact" ] || fail 'App build did not use the isolated target'
 [ "$(<"$DEST/jobs")" = 2 ] || fail 'build jobs not forwarded'
 
 # A pinned, clean checkout is reused without consulting the repository again.

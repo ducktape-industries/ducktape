@@ -11,7 +11,7 @@ pin_file=${APP_REV_FILE:-$repo_root/ops/app/APP_REV}
 checkout=${APP_CHECKOUT_DIR:-$repo_root/target/unified-install/ducktape-app}
 app_repo=${APP_REPO:-https://github.com/ducktape-industries/ducktape-app.git}
 app_make=${APP_MAKE:-make}
-export CARGO_TARGET_DIR=${APP_CARGO_TARGET_DIR:-$checkout/target-core-install}
+export CARGO_TARGET_DIR=${APP_CARGO_TARGET_DIR:-$repo_root/target/unified-install/app-target}
 export CARGO_BUILD_JOBS
 
 [ -r "$pin_file" ] || die "missing_pin_file: $pin_file"
