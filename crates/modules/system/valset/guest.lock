@@ -1708,7 +1708,7 @@ checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
 [[package]]
 name = "valset"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#56cf140a59a13369924bdbecb536e25146a0aff9"
+source = "git+https://github.com/ducktape-industries/ducktape#30a4064576a1553768973f012a10612aa4c028a7"
 dependencies = [
  "async-trait",
  "borsh",
@@ -1718,7 +1718,6 @@ dependencies = [
  "sdk",
  "serde",
  "serde_json",
- "valset-wire",
 ]
 
 [[package]]
@@ -1726,15 +1725,6 @@ name = "valset-component"
 version = "0.0.0"
 dependencies = [
  "valset",
-]
-
-[[package]]
-name = "valset-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "sdk",
- "serde",
 ]
 
 [[package]]

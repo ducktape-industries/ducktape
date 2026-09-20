@@ -294,7 +294,7 @@ source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736
 [[package]]
 name = "saga"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#56cf140a59a13369924bdbecb536e25146a0aff9"
+source = "git+https://github.com/ducktape-industries/ducktape#30a4064576a1553768973f012a10612aa4c028a7"
 dependencies = [
  "async-trait",
  "borsh",
@@ -306,7 +306,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "valset-wire",
 ]
 
 [[package]]
@@ -475,15 +474,6 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
-
-[[package]]
-name = "valset-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "sdk",
- "serde",
-]
 
 [[package]]
 name = "version_check"

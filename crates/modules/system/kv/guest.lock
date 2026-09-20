@@ -179,11 +179,10 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "kv"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#56cf140a59a13369924bdbecb536e25146a0aff9"
+source = "git+https://github.com/ducktape-industries/ducktape#30a4064576a1553768973f012a10612aa4c028a7"
 dependencies = [
  "async-trait",
  "ducktape-module-sdk",
- "kv-wire",
  "sdk",
  "serde",
  "sha2",
@@ -194,15 +193,6 @@ name = "kv-component"
 version = "0.0.0"
 dependencies = [
  "kv",
-]
-
-[[package]]
-name = "kv-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "sdk",
- "serde",
 ]
 
 [[package]]

@@ -5,9 +5,8 @@ version = 4
 [[package]]
 name = "acl"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#56cf140a59a13369924bdbecb536e25146a0aff9"
+source = "git+https://github.com/ducktape-industries/ducktape#30a4064576a1553768973f012a10612aa4c028a7"
 dependencies = [
- "acl-wire",
  "async-trait",
  "borsh",
  "ducktape-module-sdk",
@@ -21,16 +20,6 @@ name = "acl-component"
 version = "0.0.0"
 dependencies = [
  "acl",
-]
-
-[[package]]
-name = "acl-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "sdk",
- "serde",
 ]
 
 [[package]]
