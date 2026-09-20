@@ -69,6 +69,7 @@ use crate::cli_args::NodeAddr;
 use crate::config::{self, hex_bytes};
 use crate::cred_cli::{VerbCtx, query_node};
 use crate::userkey_cli::user_frame;
+use crate::wire::runs;
 
 type AgentResult = Result<(), Box<dyn std::error::Error>>;
 

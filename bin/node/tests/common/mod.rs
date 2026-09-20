@@ -9,6 +9,7 @@
 //! helpers — the per-binary dead-code lint would otherwise flag whichever
 //! helpers this particular binary skips.
 #![allow(dead_code)]
+
 //!
 //! the constraints this harness encodes (they are invariants of the node, not
 //! choices of the tests):
@@ -22,6 +23,9 @@
 //!   apply — it is a liveness marker, not proof of specific ops; state
 //!   assertions go through rpc queries instead.
 
+#[path = "../../src/wire.rs"]
+pub mod wire;
+
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -29,6 +33,8 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+use wire::{agent, runs};
 
 /// the `ducktape module …` verbs as an e2e drives them, shared by the suites
 /// that exercise a live code swap.

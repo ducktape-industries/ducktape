@@ -1,6 +1,7 @@
 //! Pure, network-persisted installation identity and the explicit initializer.
 use std::collections::BTreeMap;
 
+use crate::wire::{agent, runs};
 use agent::{Continuation, Decode, Predicate, Program, Step, Value};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

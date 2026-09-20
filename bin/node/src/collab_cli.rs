@@ -47,6 +47,7 @@
 use std::io::BufRead;
 
 use crate::cred_cli::VerbCtx;
+use crate::wire::{chat, collaboration};
 
 type CollabResult = Result<(), Box<dyn std::error::Error>>;
 

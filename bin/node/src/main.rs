@@ -116,6 +116,7 @@ mod tty;
 mod userkey_cli;
 mod util;
 mod validator;
+mod wire;
 mod wallet_cli;
 mod work_admission;
 use crate::util::fatal;
