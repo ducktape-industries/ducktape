@@ -15,6 +15,8 @@ version.workspace = true
 duckfs-core = { workspace = true }
 duckfs-disk = { workspace = true }
 sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 # the kernel host whose `OdbBacking` trait this crate implements. no cycle —
 # wasm-host has no files dep.
 wasm-host = { workspace = true }
@@ -23,12 +25,11 @@ wasm-host = { workspace = true }
 # the crash-safety suite stands the DEPLOYED files guest on this backing, so it
 # needs the guest loader as well as the trait.
 base64 = { workspace = true }
-# the native files module the backing suite drives (its workspace name is the wire).
+# the native files module the backing suite drives for end-to-end persistence.
 files = { path = "../../modules/apps/files" }
 futures = "0.3"
 # `test_ctx` answers the identity query the native `Files` makes while building
 # the committed dir the backing is then opened on.
-identity = { workspace = true }
 sdk-testkit = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }

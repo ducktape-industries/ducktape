@@ -40,6 +40,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use keyscheme::KeyScheme;
 use sha2::{Digest as _, Sha256};
 
+mod identity_contract;
+use identity_contract as identity;
+
 /// the live page. Its host IS the RP ID every passkey is scoped to — changing
 /// it invalidates every registered passkey (acceptable at zero live networks).
 pub const AUTH_PAGE: &str = "https://auth.ducktape.industries/";

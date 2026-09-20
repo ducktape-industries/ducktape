@@ -6,6 +6,7 @@ use std::path::Path;
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Signer as _, ed25519};
 
+use super::identity_contract as identity;
 use super::{hex_bytes, unhex};
 
 /// load the identity at `path`, or generate one there from OS randomness.

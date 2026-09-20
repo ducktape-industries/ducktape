@@ -31,6 +31,7 @@ mod harness;
 use commonware_cryptography::Signer as _;
 use harness::{Sim, create, key_origin};
 use serde_json::{Value, json};
+use simnode::module_contracts::gateway;
 use std::path::Path;
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;

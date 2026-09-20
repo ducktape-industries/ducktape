@@ -395,13 +395,13 @@ name = "authpage"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "identity-wire",
  "keyscheme",
  "node",
  "qrcode",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "sdk",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
@@ -2546,11 +2546,11 @@ name = "ducktape-media"
 version = "0.1.0"
 dependencies = [
  "axum",
- "chat-wire",
  "ducktape-rpc",
  "futures",
  "libc",
  "media-service",
+ "sdk",
  "serde",
  "serde_json",
  "subtle",
@@ -2595,11 +2595,11 @@ dependencies = [
  "duckdns",
  "ducktape-rpc",
  "futures",
- "gateway-wire",
  "libc",
  "provider-host",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "sdk",
  "serde",
  "serde_json",
  "subtle",
@@ -2833,20 +2833,13 @@ dependencies = [
  "duckfs-disk",
  "files",
  "futures",
- "identity-wire",
  "sdk",
  "sdk-testkit",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "wasm-host",
-]
-
-[[package]]
-name = "files-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "duckfs-core",
 ]
 
 [[package]]
@@ -4353,15 +4346,11 @@ name = "mcp-host"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "chat-wire",
  "duckfs-core",
- "forge-wire",
- "pages-wire",
  "reqwest 0.12.28",
- "runs-wire",
+ "sdk",
  "serde",
  "serde_json",
- "tasks-wire",
 ]
 
 [[package]]
@@ -6786,24 +6775,16 @@ dependencies = [
  "blobstore",
  "commonware-cryptography",
  "commonware-runtime",
- "dispatch-wire",
  "duckfs-core",
- "files-wire",
  "futures",
- "gateway-wire",
- "governance-wire",
  "host",
- "identity",
  "indexer",
  "nettest",
  "node",
  "noded",
- "runs-wire",
- "saga-wire",
  "sdk",
  "serde",
  "serde_json",
- "tasks-wire",
  "tempfile",
  "tokio",
  "topology",
@@ -8870,13 +8851,13 @@ dependencies = [
  "duck-address",
  "duckfs-core",
  "ducktape-home",
- "governance-wire",
- "identity-wire",
+ "keyscheme",
  "module-artifact",
  "nat-traversal",
  "rand 0.8.6",
  "reachability",
  "sandbox-host",
+ "sdk",
  "serde",
  "serde_json",
  "sha2 0.10.9",

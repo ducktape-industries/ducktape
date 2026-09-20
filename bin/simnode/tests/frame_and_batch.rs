@@ -13,6 +13,7 @@ mod harness;
 use commonware_cryptography::Signer as _;
 use harness::{Sim, create, create_channel};
 use sdk::Msg;
+use simnode::module_contracts::files;
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
 
