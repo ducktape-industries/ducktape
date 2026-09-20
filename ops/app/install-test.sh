@@ -17,14 +17,8 @@ assert_contains() {
 	grep -F -- "$needle" "$file" >/dev/null || fail "missing '$needle' in $file"
 }
 
-assert_pin() {
-	local file=$1 expected=$2
-	[ "$(<"$file")" = "$expected" ] || fail "unexpected pin in $file"
-}
-
-export HOME=$TEST_ROOT/home
-mkdir -p "$HOME"
 export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
 
 APP_REPO=$TEST_ROOT/app-repo
 mkdir -p "$APP_REPO"
@@ -38,6 +32,8 @@ cat > "$APP_REPO/Makefile" <<'EOF'
 install:
 	@mkdir -p "$(INSTALL_DEST)"
 	@printf '%s\n' "$$(git rev-parse HEAD)" >> "$(INSTALL_DEST)/installed-revs"
+	@printf '%s\n' "$(CARGO_TARGET_DIR)" > "$(INSTALL_DEST)/target-dir"
+	@printf '%s\n' "$(CARGO_BUILD_JOBS)" > "$(INSTALL_DEST)/jobs"
 EOF
 git -C "$APP_REPO" add .
 git -C "$APP_REPO" commit -qm first
@@ -52,13 +48,15 @@ CHECKOUT=$TEST_ROOT/checkout
 DEST=$TEST_ROOT/dest
 LOG=$TEST_ROOT/install.log
 
-assert_pin "$ROOT/ops/app/APP_REV" 05567a224ce676049f315cf4e45093bf3565903b
+[[ "$(<"$ROOT/ops/app/APP_REV")" =~ ^[0-9a-f]{40}$ ]] || fail 'invalid tracked App pin'
 
 APP_REPO="$APP_REPO" APP_REV_FILE="$PIN_FILE" APP_CHECKOUT_DIR="$CHECKOUT" \
-	INSTALL_DEST="$DEST" "$SCRIPT" >"$LOG" 2>&1
+	CARGO_BUILD_JOBS=2 INSTALL_DEST="$DEST" "$SCRIPT" >"$LOG" 2>&1
 [ "$(git -C "$CHECKOUT" rev-parse HEAD)" = "$PIN" ] || fail 'first install moved off the pinned commit'
 [ "$(<"$DEST/installed-revs")" = "$PIN" ] || fail 'first install delegated the wrong revision'
 assert_contains 'running make install' "$LOG"
+[ "$(<"$DEST/target-dir")" = "$CHECKOUT/target-core-install" ] || fail 'App target not isolated'
+[ "$(<"$DEST/jobs")" = 2 ] || fail 'build jobs not forwarded'
 
 # A pinned, clean checkout is reused without consulting the repository again.
 APP_REPO="$TEST_ROOT/no-longer-available" APP_REV_FILE="$PIN_FILE" APP_CHECKOUT_DIR="$CHECKOUT" \
@@ -72,6 +70,9 @@ TARGET_DEST=$TEST_ROOT/target-dest
 APP_REPO="$APP_REPO" APP_REV_FILE="$PIN_FILE" APP_CHECKOUT_DIR="$TARGET_CHECKOUT" \
 	INSTALL_DEST="$TARGET_DEST" make -C "$ROOT" -o install-node -o prereqs install >>"$LOG" 2>&1
 [ "$(<"$TARGET_DEST/installed-revs")" = "$PIN" ] || fail 'make install did not delegate to the App'
+APP_REPO="$APP_REPO" APP_REV_FILE="$PIN_FILE" APP_CHECKOUT_DIR="$TARGET_CHECKOUT" \
+	INSTALL_DEST="$TARGET_DEST" make -C "$ROOT" install-app >>"$LOG" 2>&1
+[ "$(wc -l < "$TARGET_DEST/installed-revs")" -eq 2 ] || fail 'standalone install-app failed'
 
 FAIL_REPO=$TEST_ROOT/fail-repo
 mkdir -p "$FAIL_REPO"

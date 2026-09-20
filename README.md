@@ -36,10 +36,14 @@ The app's `make install` output names its installed files and destinations.
 
 ## Quick start
 
-After installation, initialize a network:
+After initialization, start the node using the launcher commands printed by
+`node init`. To join instead, or inspect and use the running network:
 
 ```sh
-ducktape node init --name mynet     # found your own network here
+ducktape node join <invite>         # join someone else's network instead
+ducktape node status               # inspect the running network
+ducktape wallet new <you>          # mint your user key
+ducktape account create --name <you>
 ```
 
 Then, to run agents on it:

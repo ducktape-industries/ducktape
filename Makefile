@@ -168,6 +168,10 @@ install-node: prereqs
 ## ops/app/APP_REV. The app checkout and its destination are owned by the app's
 ## own make install contract; ops/app/install.sh reports that output.
 install: install-node
+	@$(MAKE) --no-print-directory install-app
+
+.PHONY: install-app
+install-app:
 	@bash ops/app/install.sh
 
 ## coordinator -> ~/.cargo/bin/ducktape-coordinator
