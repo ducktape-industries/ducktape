@@ -951,8 +951,10 @@ pub const ORACLE_ORIGIN: &[u8] = &[b'o'; 32];
 /// `/v1/status` serves it back. ONE value across noded and simnode — their
 /// genesis roots are comparable only while they share it, and a client that
 /// signs an identity consent reads the chain id from status, so a status
-/// disagreeing with the bindings would mint signatures nothing accepts.
-pub const LOCAL_CHAIN_ID: &str = "local";
+/// disagreeing with the bindings would mint signatures nothing accepts. The
+/// salt keeps this synthetic local network in the qualified chain-id grammar
+/// enforced by the Runs guest.
+pub const LOCAL_CHAIN_ID: &str = "local#00000000";
 
 /// POST /v1/submit — the FRAMELESS lane.
 ///

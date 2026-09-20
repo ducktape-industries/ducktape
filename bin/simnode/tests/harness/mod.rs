@@ -412,10 +412,11 @@ pub fn found_account(sim: &Sim, name: &str, seed: u64) -> String {
     origin
 }
 
-/// the sim's identity chain id — the composer's `Bindings { chain_id: "local" }`
+/// the sim's identity chain id — the composer's
+/// `Bindings { chain_id: "local#00000000" }`
 /// seeded into the identity guest's genesis `__config`, so every add-key consent
 /// signs over it (the same value the gateway guest scopes routes to).
-pub const IDENTITY_CHAIN: &str = "local";
+pub const IDENTITY_CHAIN: &str = "local#00000000";
 
 /// the `hex:` origin escape naming a REAL ed25519 key as the submit origin —
 /// the only way a json-string origin lane can found an account whose member

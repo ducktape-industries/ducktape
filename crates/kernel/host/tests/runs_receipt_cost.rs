@@ -181,15 +181,15 @@ fn a_blocks_cost_is_its_own_receipts_not_the_history() {
         small, large,
         "the block path grew with a history it never named"
     );
-    // The load path asks for its four records (`__config`, `__state`,
-    // `__root`, `__history`) in ONE prefetch, so an entry point resolves them
-    // in a single pause and reads each once; the sweep then reads the action
-    // queue it is there to drain, and the query the record it was asked for.
+    // The load path asks for its five records in ONE prefetch, so an entry
+    // point resolves them in a single pause and reads each once; the sweep
+    // then reads the action queue it is there to drain, and the query the
+    // record it was asked for.
     // Exact, like the native twin: a read per record replayed, or a history
     // walked, shows up here as a bigger number.
     assert_eq!(
-        small[0].reads, 6,
-        "the pending sweep: four records + its queue"
+        small[0].reads, 7,
+        "the pending sweep: five records + its queue"
     );
     assert_eq!(
         small[1].reads, 5,
@@ -207,13 +207,13 @@ fn a_blocks_cost_is_its_own_receipts_not_the_history() {
     // The replay budget, which no count of records can see: a run is driven
     // from the top, pauses on the first read the memo cannot answer, and is
     // replayed with that answer added — so the runs are the pauses plus the
-    // one that finishes. The sweep pauses three times (the four-record
-    // prefetch, then the action queue, then the conversation queue, its two
-    // awaited steps) and the point query twice (the prefetch, then the record
-    // it names). A tenant that lost its prefetch would resolve the SAME
-    // records one pause at a time: identical reads above, more runs here.
+    // one that finishes. The qualified guest's sweep takes five runs for its
+    // prefetch, queue reads, and completion; the point query takes three (the
+    // prefetch, then the record it names, then its answer). A tenant that lost
+    // its prefetch would resolve the SAME records one pause at a time:
+    // identical reads above, more runs here.
     assert_eq!(
-        small[0].runs, 4,
+        small[0].runs, 5,
         "the pending sweep: prefetch + two queues, then the run that returns"
     );
     assert_eq!(

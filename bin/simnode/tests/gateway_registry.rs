@@ -35,8 +35,9 @@ use std::path::Path;
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
 
-/// the sim's gateway chain id (the composer's `Bindings { chain_id: "local" }`).
-const CHAIN: &str = "local";
+/// the sim's gateway chain id (the composer's
+/// `Bindings { chain_id: "local#00000000" }`).
+const CHAIN: &str = "local#00000000";
 /// the account the first Create founds.
 const ACCOUNT: u64 = 1;
 
