@@ -39,21 +39,152 @@ account's published `git` route.
 
 ## Opening the door on a network
 
-On the node that runs forge's Git service (`application-service.md`, "Git
-service"), with the wallet of the account that will own the door (each signing
-verb reads the wallet password on stdin):
+The following is the complete path on a founded Linux node. It uses the
+independently installed Git service described in [`application-service.md`,
+"Git service"](application-service.md#git-service), the existing Gateway
+installer, and the existing account and Forge verbs. It does not require
+constructing or submitting a Gateway frame by hand.
+
+### Install the Git service
+
+Build or obtain a trusted `ducktape-forge-service` executable and record its
+SHA-256. On the node host, set these to the node's actual values:
 
 ```sh
-ducktape account set-handle --handle <owner> -n <chain-id>
-ducktape gateway bind --label git --port <service-port> \
-  --credential-file <handoff-token> -n <chain-id>
-ducktape forge publish -n <chain-id>
+NODE=http://127.0.0.1:8844
+WORKSPACE=/var/lib/ducktape/<chain-id>
+ACCOUNT=<account-number>
+PORT=<unused-loopback-port>
+BINARY=/srv/releases/ducktape-forge-service
+STATUS=$(mktemp)
+MANIFEST=/etc/ducktape/forge.json
+SEED=/etc/ducktape/forge-signing-seed
+curl -fsS "$NODE/v1/status" >"$STATUS"
+sudo install -d -m 0750 /etc/ducktape
+if ! sudo test -s "$SEED"; then
+  sudo python3 - "$SEED" <<'PY'
+import os
+import secrets
+import sys
+
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as output:
+    output.write(secrets.token_hex(32))
+PY
+fi
+sudo chmod 0600 "$SEED"
 ```
 
+The service seed is a new private key for this service, not the node key and
+not the account wallet. Generate it once and keep it root-readable. Create the
+installer manifest without printing the seed or any Gateway credential:
+
+```sh
+sudo python3 - "$STATUS" "$SEED" "$MANIFEST" "$NODE" "$WORKSPACE" \
+  "$ACCOUNT" "$PORT" "$BINARY" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+
+status_file, seed_file, manifest_file, node, workspace, account, port, binary = sys.argv[1:]
+status = json.loads(Path(status_file).read_bytes())
+seed = Path(seed_file).read_text().strip()
+binary_path = Path(binary)
+workspace_path = Path(workspace)
+config = {
+    "node_url": node,
+    "node_key": status["public_key"],
+    "chain_id": status["chain_id"],
+    "account": int(account),
+    "label": "git",
+    "module": "forge",
+    "git_store": "/var/lib/application-storage/git",
+    "signing_seed": seed,
+}
+manifest = {
+    "name": "forge",
+    "binary": str(binary_path),
+    "sha256": hashlib.sha256(binary_path.read_bytes()).hexdigest(),
+    "workspace": str(workspace_path),
+    "node_user": "ducktape",
+    "account": int(account),
+    "label": "git",
+    "port": int(port),
+    "config": config,
+    "memory_max": 536870912,
+    "cpu_quota": 100,
+    "tasks_max": 64,
+    "readonly_paths": [{
+        "source": str(workspace_path / "storage" / "forge-repo"),
+        "destination": "/var/lib/application-storage/git",
+    }],
+    "devices": [],
+}
+payload = json.dumps(manifest, indent=2) + "\n"
+fd = os.open(manifest_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as output:
+        output.write(payload)
+except BaseException:
+    os.close(fd)
+    raise
+PY
+rm -f "$STATUS"
+```
+
+`WORKSPACE/storage/forge-repo` is the node's materialized Forge store. The
+installer mounts only that directory read-only; it must already exist and its
+directories and files must permit the isolated service to read them. Do not
+mount the whole workspace, `storage`, a node key, or an administrator
+credential. The manifest's `git_store` is the mount destination, not the host
+path.
+
+Install and activate through the existing helper. Activation generates the
+private upstream handoff credential and performs the local `gateway bind`; do
+not create or copy that credential yourself:
+
+```sh
+sudo python3 ops/application-service/install.py \
+  --ducktape /usr/local/bin/ducktape install "$MANIFEST"
+sudo python3 ops/application-service/install.py \
+  --ducktape /usr/local/bin/ducktape activate forge
+systemctl status ducktape-application-forge.socket ducktape-application-forge.service
+```
+
+### Set the owner and publish the route
+
+Use the wallet of `ACCOUNT` on the node that runs the service. The signing
+verbs read its password from stdin; they do not take a password or a raw frame
+on the command line:
+
+```sh
+DT=(sudo -u ducktape env DUCKTAPE_HOME=/var/lib/ducktape /usr/local/bin/ducktape)
+"${DT[@]}" account set-handle --handle <owner> -n <chain-id>
+"${DT[@]}" forge publish -n <chain-id>
+```
+
+`gateway bind` is the installer activation step above. It binds the service's
+exact account and `git` label to the port, while `forge publish` signs the
+network-audience GET/POST route whose authority is `git.<owner>.duck`.
 `forge publish` signs the `git` route of the wallet's account with the node it
 dials as the publisher: GET and POST, audience `network`, no byte cap either
 way. A rerun that would publish the same route publishes nothing; a publish
 from another node continues the route's revision stream.
+
+Finally, on each client machine, run the one-time helper setup and use the
+address whose owner is the handle just assigned:
+
+```sh
+ducktape forge setup --config <node.toml>   # or --node <http-url>
+git clone duck://<label>-<salt>/forge/<owner>/<repo>
+```
+
+`forge setup` checks the same door the helper will use and names the missing
+handle or route if the path is incomplete. Re-running the installer activation,
+`account set-handle`, `forge publish`, or `forge setup` is safe and idempotent.
 
 ## What the helper does
 
