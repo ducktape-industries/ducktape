@@ -15,10 +15,7 @@ use crate::{ServiceState, error_response};
 // the generic content-addressed store. Fetch reads only the explicit read-only
 // tenant binding, so it advertises only object closures it can actually serve.
 
-/// the capabilities forge's receive-pack advertises. deliberately NO
-/// `side-band-64k`, so the client sends the report-status back as plain
-/// pkt-lines (not muxed onto a side channel) — the minimal wire this bridge
-/// needs to read.
+/// the capabilities forge's receive-pack advertises.
 ///
 /// `side-band-64k` is what lets a push's answer START before the block that
 /// lands it: the report rides band 1 behind [`GIT_KEEPALIVE_PKT`] lines, so
