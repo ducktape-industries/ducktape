@@ -528,6 +528,11 @@ where
                     }
                 }
                 if let Some(handback) = rx_handback {
+                    tracing::info!(
+                        target: "ducktape::reachability",
+                        event = "reach_lane_rx_handback",
+                        "reachability input lane returned"
+                    );
                     let _ = handback.send(reach_p2p_rx);
                 }
             });
@@ -795,6 +800,11 @@ where
                     }
                 }
                 if let Some(handback) = tx_handback {
+                    tracing::info!(
+                        target: "ducktape::reachability",
+                        event = "reach_lane_tx_handback",
+                        "reachability output lane returned"
+                    );
                     let _ = handback.send(tx);
                 }
             });
@@ -820,6 +830,7 @@ pub(crate) enum NetstackBoot {
 }
 
 type Startup = tokio::sync::oneshot::Sender<Result<reachability::NetstackBackend, String>>;
+const STARTUP_CANCELLED: &str = "reachability startup cancelled";
 struct LivePlane {
     generation: u64,
     commands: tokio::sync::mpsc::WeakSender<reachability::ReachabilityCommand>,
@@ -830,6 +841,10 @@ impl LivePlane {
         if self.generation != generation {
             return None;
         }
+        self.startup.take()
+    }
+
+    fn cancel_start(&mut self) -> Option<Startup> {
         self.startup.take()
     }
 }
@@ -849,6 +864,24 @@ pub(crate) fn start_pending_netstack(
     if let Some(start) = start {
         let _ = start.send(backend);
     }
+}
+
+/// Abort a standby plane that is still waiting for its registry-selected guest.
+/// Its command receiver cannot observe `Shutdown` until that selection arrives;
+/// resolving the startup gate is the direct cancellation seam for promotion.
+pub(crate) fn cancel_pending_netstack() -> bool {
+    LIVE_PLANE
+        .write()
+        .expect("live plane lock poisoned")
+        .as_mut()
+        .is_some_and(cancel_startup)
+}
+
+fn cancel_startup(live: &mut LivePlane) -> bool {
+    let Some(start) = live.cancel_start() else {
+        return false;
+    };
+    start.send(Err(STARTUP_CANCELLED.into())).is_ok()
 }
 
 pub(crate) fn startup_pending(generation: u64) -> bool {
@@ -1267,13 +1300,23 @@ async fn reachability_plane(
         }
     }
     let _execution_guard = ExecutionGuard(generation);
-    let backend = match startup
-        .await
-        .unwrap_or_else(|_| Err("netstack startup selection cancelled".into()))
-    {
-        Ok(backend) => backend,
-        Err(error) => {
+    let backend = match startup.await {
+        Ok(Ok(backend)) => backend,
+        Ok(Err(error)) if error == STARTUP_CANCELLED => {
+            record_execution(generation, reachability::BackendStatus::Stopped);
+            return;
+        }
+        Ok(Err(error)) => {
             fail_plane(generation, &label, "netstack_guest_unreadable", error);
+            return;
+        }
+        Err(_) => {
+            fail_plane(
+                generation,
+                &label,
+                "netstack_guest_unreadable",
+                "netstack startup selection cancelled".into(),
+            );
             return;
         }
     };
@@ -2143,6 +2186,23 @@ mod netstack_execution_tests {
             "designated component unavailable"
         );
         assert!(live.take_start(2).is_none());
+    }
+
+    #[tokio::test]
+    async fn standby_shutdown_cancels_a_pending_guest_selection() {
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        let (startup, selected) = tokio::sync::oneshot::channel();
+        let mut live = super::LivePlane {
+            generation: 3,
+            commands: commands.downgrade(),
+            startup: Some(startup),
+        };
+        assert!(super::cancel_startup(&mut live));
+        assert_eq!(
+            selected.await.unwrap().unwrap_err(),
+            super::STARTUP_CANCELLED
+        );
+        assert!(live.cancel_start().is_none());
     }
 
     #[test]
