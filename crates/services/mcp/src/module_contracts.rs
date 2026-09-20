@@ -144,20 +144,6 @@ pub mod runs {
     }
 
     #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-    #[serde(rename_all = "snake_case")]
-    pub enum LaneKind {
-        Live,
-        Final,
-    }
-
-    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-    #[serde(deny_unknown_fields)]
-    pub struct OperationView {
-        pub name: String,
-        pub lanes: Vec<LaneKind>,
-    }
-
-    #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
     #[serde(rename_all = "snake_case", deny_unknown_fields)]
     pub enum ModelStatus {
         Active,
@@ -187,7 +173,26 @@ pub mod runs {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub recipe_hash: Vec<u8>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        pub skills: Vec<Value>,
+        pub skills: Vec<SkillRef>,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum LoadMode {
+        Always,
+        #[default]
+        OnDemand,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct SkillRef {
+        pub name: String,
+        pub source_prefix: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source_snapshot: Option<String>,
+        #[serde(default)]
+        pub load: LoadMode,
     }
 
     fn is_general(role: &ModelRole) -> bool {
@@ -222,39 +227,90 @@ pub mod runs {
         Delegations { caller_run_id: String },
     }
 
-    pub fn catalog(_filter: Option<&str>) -> Vec<OperationView> {
-        [
-            "reply",
-            "react",
-            "unreact",
-            "chat.post_message",
-            "tasks.create",
-            "tasks.update_status",
-            "pages.comment",
-            "jobs.comment",
-            "pages.set_checked",
-            "pages.post",
-            "duckfs.write_text",
-            "collaboration.deliver",
-            "collaboration.acknowledge",
-            "agent.call",
-            OP_SUBMIT,
-        ]
-        .into_iter()
-        .filter(|name| _filter.is_none_or(|prefix| name.starts_with(prefix)))
-        .map(|name| OperationView {
-            name: name.into(),
-            lanes: vec![LaneKind::Live, LaneKind::Final],
-        })
-        .collect()
-    }
-
     pub fn encode<T: Serialize>(value: &T) -> Result<Value, String> {
         serde_json::to_value(value).map_err(|error| error.to_string())
     }
 
     pub fn encode_msg(message: &RunsMsg) -> Vec<u8> {
         sdk::wire::encode(message)
+    }
+}
+
+#[cfg(test)]
+pub mod producer_catalog_fixture {
+    use super::runs;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum LaneKind {
+        Live,
+        Final,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OperationView {
+        pub name: String,
+        pub lanes: Vec<LaneKind>,
+    }
+
+    // Producer-derived from SDK 736865710dcfa7c56f9834747287881c1c25d45d
+    // crates/modules/apps/runs/wire/src/catalog.rs.
+    // Keep this projection test-only: runtime actions fetch the live catalog from Runs.
+    const LIVE_ONLY: &[LaneKind] = &[LaneKind::Live];
+    const LIVE_AND_FINAL: &[LaneKind] = &[LaneKind::Live, LaneKind::Final];
+    const FINAL_ONLY: &[LaneKind] = &[LaneKind::Final];
+
+    const CATALOG: &[(&str, &[LaneKind])] = &[
+        ("reply", LIVE_ONLY),
+        ("react", LIVE_AND_FINAL),
+        ("unreact", LIVE_AND_FINAL),
+        ("chat.post_message", LIVE_AND_FINAL),
+        ("pages.comment", LIVE_AND_FINAL),
+        ("pages.set_checked", LIVE_AND_FINAL),
+        ("pages.post", LIVE_AND_FINAL),
+        ("jobs.comment", LIVE_AND_FINAL),
+        ("tasks.create", LIVE_AND_FINAL),
+        ("tasks.update_status", LIVE_AND_FINAL),
+        ("duckfs.write_text", LIVE_AND_FINAL),
+        ("modules.update", FINAL_ONLY),
+        ("forge.open_pr", FINAL_ONLY),
+        ("collaboration.deliver", LIVE_ONLY),
+        ("collaboration.acknowledge", LIVE_ONLY),
+        ("agent.call", LIVE_ONLY),
+        (runs::OP_SUBMIT, LIVE_AND_FINAL),
+    ];
+
+    pub fn catalog(filter: Option<&str>) -> Vec<OperationView> {
+        CATALOG
+            .iter()
+            .filter(|(name, _)| filter.is_none_or(|prefix| name.starts_with(prefix)))
+            .map(|(name, lanes)| OperationView {
+                name: (*name).into(),
+                lanes: lanes.to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn producer_catalog_fixture_keeps_order_lanes_and_filter() {
+        let all = catalog(None);
+        assert_eq!(
+            all.iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            CATALOG.iter().map(|(name, _)| *name).collect::<Vec<_>>()
+        );
+        assert_eq!(all[0].lanes, vec![LaneKind::Live]);
+        assert_eq!(all[11].lanes, vec![LaneKind::Final]);
+        assert_eq!(all[12].lanes, vec![LaneKind::Final]);
+        assert_eq!(all[13].lanes, vec![LaneKind::Live]);
+        assert_eq!(all[16].lanes, vec![LaneKind::Live, LaneKind::Final]);
+        assert_eq!(
+            catalog(Some("modules."))
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["modules.update"]
+        );
     }
 }
 
@@ -277,6 +333,22 @@ mod tests {
                 after: Some("t-3".into()),
             })),
             br#"{"task":{"list":{"limit":8,"after":"t-3"}}}"#
+        );
+    }
+
+    #[test]
+    fn model_skill_refs_keep_producer_validation_strict() {
+        assert!(
+            serde_json::from_str::<runs::SkillRef>(
+                r#"{"name":"docs","source_prefix":"/shared/skills/docs","load":"unknown"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<runs::SkillRef>(
+                r#"{"name":"docs","source_prefix":"/shared/skills/docs","extra":true}"#
+            )
+            .is_err()
         );
     }
 }

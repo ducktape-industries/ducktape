@@ -22,11 +22,18 @@ pub enum Control {
         controller: u64,
         executor: String,
         generation: u64,
-        standing: String,
+        standing: ProgramStanding,
     },
     Revoked {
         controller: u64,
     },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProgramStanding {
+    Active,
+    Suspended,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -113,5 +120,11 @@ mod tests {
             sdk::wire::decode::<IdentityMsg>(expected_message).unwrap(),
             message
         );
+    }
+
+    #[test]
+    fn program_standing_keeps_producer_validation_strict() {
+        let unknown = br#"{"program":{"controller":1,"executor":"identity","generation":0,"standing":"unknown"}}"#;
+        assert!(sdk::wire::decode::<Control>(unknown).is_err());
     }
 }

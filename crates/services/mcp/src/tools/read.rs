@@ -998,7 +998,7 @@ mod tests {
     use super::*;
     use crate::identity::tests::{fake_node, standing_record};
     use crate::identity::{ENV_NODE, ENV_RUN_ID};
-    use crate::module_contracts::chat;
+    use crate::module_contracts::{chat, producer_catalog_fixture as producer_runs};
 
     #[test]
     fn whoami_answers_for_no_agent_and_reports_a_bound_one_unchanged() {
@@ -1254,7 +1254,7 @@ mod tests {
                 );
             }
             assert!(
-                runs::catalog(None)
+                producer_runs::catalog(None)
                     .iter()
                     .all(|write| write.name != op.name),
                 "{} collides with a write operation",
