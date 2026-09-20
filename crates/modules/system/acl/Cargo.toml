@@ -15,7 +15,6 @@ version.workspace = true
 guest = ["dep:ducktape-module-sdk"]
 
 [dependencies]
-acl-wire = { workspace = true }
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
 ducktape-module-sdk = { workspace = true, optional = true }
@@ -27,10 +26,9 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
-# the dispatch-gate proof drives a real host over acl + valset + identity.
+# the dispatch-gate proof drives a real host over acl and owned valset/identity
+# query doubles; the producer does not link sibling implementations.
 host = { workspace = true }
-valset = { path = "../valset" }
-identity = { path = "../identity" }
 futures = { workspace = true }
 sdk-testkit = { workspace = true }
 # the gate proof signs identity member-auth certificates (deterministic seeds).

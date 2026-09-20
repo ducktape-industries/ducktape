@@ -21,12 +21,8 @@ use acl::{Acl, AclMsg, Standing};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
 use host::{BlockContext, Host, SubmitError};
-use identity::{Identity, IdentityMsg, KeyScheme};
-use sdk::{Error, Msg, Origin};
+use sdk::{Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sdk_testkit::MemStore;
-use valset::{Valset, ValsetMsg};
-
-const CHAIN: &str = "gate-chain";
 
 fn keypair(seed: u64) -> PrivateKey {
     PrivateKey::from_seed(seed)
@@ -36,23 +32,331 @@ fn key_bytes(k: &PrivateKey) -> Vec<u8> {
     k.public_key().as_ref().to_vec()
 }
 
+/// The gate's production reads are byte contracts, not implementation
+/// contracts. Keep this test's doubles local so the ACL producer never links
+/// the valset or identity modules just to exercise host dispatch.
+mod sibling_contracts {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum ValsetMsg {
+        Join { key: Vec<u8> },
+        Leave { key: Vec<u8> },
+        Grant { key: Vec<u8> },
+        Revoke { key: Vec<u8> },
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum ValsetQuery {
+        Validators,
+        Residents,
+        MeshWindow,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum ValsetReply {
+        Validators(Vec<Vec<u8>>),
+        Residents(Vec<Vec<u8>>),
+        MeshWindow(Vec<GenerationSet>),
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct GenerationSet {
+        pub generation: u64,
+        pub validators: Vec<Vec<u8>>,
+        pub residents: Vec<Vec<u8>>,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum IdentityMsg {
+        Create { name: String, scheme: String },
+        SetName { name: String },
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum IdentityQuery {
+        OfKey { key: Vec<u8> },
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum IdentityReply {
+        Account(Option<AccountView>),
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct AccountView {
+        pub number: u64,
+        pub name: String,
+        pub control: Control,
+        pub keys: Vec<KeyView>,
+        pub avatar: Option<String>,
+        pub bio: Option<String>,
+        pub updated_at: u64,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum Control {
+        Keys,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct KeyView {
+        pub scheme: String,
+        pub pubkey: Vec<u8>,
+        pub label: Option<String>,
+        pub added_at: u64,
+    }
+
+    pub fn encode_valset_msg(msg: &ValsetMsg) -> Vec<u8> {
+        sdk::wire::encode(msg)
+    }
+
+    pub fn decode_valset_msg(bytes: &[u8]) -> Result<ValsetMsg, String> {
+        sdk::wire::decode(bytes)
+    }
+
+    pub fn decode_valset_query(bytes: &[u8]) -> Result<ValsetQuery, String> {
+        sdk::wire::decode(bytes)
+    }
+
+    pub fn encode_valset_reply(reply: &ValsetReply) -> Vec<u8> {
+        sdk::wire::encode(reply)
+    }
+
+    pub fn decode_identity_msg(bytes: &[u8]) -> Result<IdentityMsg, String> {
+        sdk::wire::decode(bytes)
+    }
+
+    pub fn encode_identity_msg(msg: &IdentityMsg) -> Vec<u8> {
+        sdk::wire::encode(msg)
+    }
+
+    pub fn decode_identity_query(bytes: &[u8]) -> Result<IdentityQuery, String> {
+        sdk::wire::decode(bytes)
+    }
+
+    pub fn encode_identity_reply(reply: &IdentityReply) -> Vec<u8> {
+        sdk::wire::encode(reply)
+    }
+}
+
+type Tiers = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+struct ValsetStub {
+    validators: Vec<Vec<u8>>,
+    residents: Vec<Vec<u8>>,
+    staged: Option<Tiers>,
+}
+
+impl ValsetStub {
+    fn new(validator: Vec<u8>) -> Self {
+        Self {
+            validators: vec![validator],
+            residents: Vec::new(),
+            staged: None,
+        }
+    }
+
+    fn view(&self) -> Tiers {
+        self.staged
+            .clone()
+            .unwrap_or_else(|| (self.validators.clone(), self.residents.clone()))
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for ValsetStub {
+    fn id(&self) -> ModuleId {
+        "valset".into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot::ZERO
+    }
+
+    async fn execute(&mut self, ctx: &mut dyn sdk::Ctx, msg: &Msg) -> Result<(), Error> {
+        let governance_origin =
+            matches!(&ctx.env().origin, Origin::Module(id) if id == "governance");
+        if !governance_origin {
+            return Err(Error::module(
+                "not_governance",
+                "valset: membership changes only via governance",
+            ));
+        }
+        let command = sibling_contracts::decode_valset_msg(&msg.payload)
+            .map_err(|e| Error::module("codec", e))?;
+        let (mut validators, mut residents) = self.view();
+        match command {
+            sibling_contracts::ValsetMsg::Join { key } => {
+                if !validators.contains(&key) {
+                    validators.push(key);
+                }
+            }
+            sibling_contracts::ValsetMsg::Leave { key } => {
+                validators.retain(|member| member != &key);
+            }
+            sibling_contracts::ValsetMsg::Grant { key } => {
+                if !residents.contains(&key) {
+                    residents.push(key);
+                }
+            }
+            sibling_contracts::ValsetMsg::Revoke { key } => {
+                residents.retain(|member| member != &key);
+            }
+        }
+        self.staged = Some((validators, residents));
+        Ok(())
+    }
+
+    async fn query(&self, request: &[u8]) -> Result<Vec<u8>, Error> {
+        let query = sibling_contracts::decode_valset_query(request)
+            .map_err(|e| Error::module("codec", e))?;
+        let (validators, residents) = self.view();
+        let reply = match query {
+            sibling_contracts::ValsetQuery::Validators => {
+                sibling_contracts::ValsetReply::Validators(validators)
+            }
+            sibling_contracts::ValsetQuery::Residents => {
+                sibling_contracts::ValsetReply::Residents(residents)
+            }
+            sibling_contracts::ValsetQuery::MeshWindow => {
+                sibling_contracts::ValsetReply::MeshWindow(Vec::new())
+            }
+        };
+        Ok(sibling_contracts::encode_valset_reply(&reply))
+    }
+
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        if let Some((validators, residents)) = self.staged.take() {
+            self.validators = validators;
+            self.residents = residents;
+        }
+        Ok(())
+    }
+
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.staged = None;
+        Ok(())
+    }
+}
+
+struct IdentityStub {
+    keys: Vec<Vec<u8>>,
+    staged: Option<Vec<Vec<u8>>>,
+}
+
+impl IdentityStub {
+    fn new() -> Self {
+        Self {
+            keys: Vec::new(),
+            staged: None,
+        }
+    }
+
+    fn view(&self) -> Vec<Vec<u8>> {
+        self.staged.clone().unwrap_or_else(|| self.keys.clone())
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for IdentityStub {
+    fn id(&self) -> ModuleId {
+        "identity".into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot::ZERO
+    }
+
+    async fn execute(&mut self, ctx: &mut dyn sdk::Ctx, msg: &Msg) -> Result<(), Error> {
+        let Origin::External(key) = &ctx.env().origin else {
+            return Err(Error::module(
+                "not_external",
+                "identity: expected an external key",
+            ));
+        };
+        let command = sibling_contracts::decode_identity_msg(&msg.payload)
+            .map_err(|e| Error::module("codec", e))?;
+        let mut keys = self.view();
+        match command {
+            sibling_contracts::IdentityMsg::Create { .. } => {
+                if keys.contains(key) {
+                    return Err(Error::module(
+                        "key_already_claimed",
+                        "identity: key already belongs to an account",
+                    ));
+                }
+                keys.push(key.clone());
+            }
+            sibling_contracts::IdentityMsg::SetName { .. } => {
+                if !keys.contains(key) {
+                    return Err(Error::module(
+                        "no_identity_account",
+                        "identity: origin key belongs to no account",
+                    ));
+                }
+            }
+        }
+        self.staged = Some(keys);
+        Ok(())
+    }
+
+    async fn query(&self, request: &[u8]) -> Result<Vec<u8>, Error> {
+        let sibling_contracts::IdentityQuery::OfKey { key } =
+            sibling_contracts::decode_identity_query(request)
+                .map_err(|e| Error::module("codec", e))?;
+        let account = self
+            .view()
+            .contains(&key)
+            .then(|| sibling_contracts::AccountView {
+                number: 1,
+                name: "founder".into(),
+                control: sibling_contracts::Control::Keys,
+                keys: vec![sibling_contracts::KeyView {
+                    scheme: "ed25519".into(),
+                    pubkey: key,
+                    label: None,
+                    added_at: 1,
+                }],
+                avatar: None,
+                bio: None,
+                updated_at: 1,
+            });
+        Ok(sibling_contracts::encode_identity_reply(
+            &sibling_contracts::IdentityReply::Account(account),
+        ))
+    }
+
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        if let Some(keys) = self.staged.take() {
+            self.keys = keys;
+        }
+        Ok(())
+    }
+
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.staged = None;
+        Ok(())
+    }
+}
+
 /// a host with an EMPTY acl table, a valset seeded with member 1, and a bare
 /// identity plane — the production system-module shape in miniature.
-async fn gate_host() -> Host {
-    let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
-    valset
-        .seed(key_bytes(&keypair(1)))
-        .await
-        .expect("seed valset");
-    valset.finish_seed().await.expect("seed valset");
+fn gate_host() -> Host {
     Host::genesis(vec![
-        Box::new(valset),
+        Box::new(ValsetStub::new(key_bytes(&keypair(1)))),
         Box::new(Acl::new("acl", Box::new(MemStore::new()), "governance")),
-        Box::new(Identity::new(
-            "identity",
-            Box::new(MemStore::new()),
-            CHAIN.into(),
-        )),
+        Box::new(IdentityStub::new()),
     ])
     .expect("genesis")
 }
@@ -96,7 +400,7 @@ async fn set_policy(host: &mut Host, at: u64, target: &str, standing: Option<Sta
 }
 
 fn valset_grant(key: &PrivateKey) -> Vec<u8> {
-    valset::encode_msg(&ValsetMsg::Grant {
+    sibling_contracts::encode_valset_msg(&sibling_contracts::ValsetMsg::Grant {
         key: key_bytes(key),
     })
 }
@@ -104,7 +408,7 @@ fn valset_grant(key: &PrivateKey) -> Vec<u8> {
 #[test]
 fn the_default_is_allow_all_and_the_target_module_still_gates_semantically() {
     block_on(async {
-        let mut host = gate_host().await;
+        let mut host = gate_host();
         let nobody = keypair(9);
 
         // an EMPTY table admits any external origin to any target: the op
@@ -130,7 +434,7 @@ fn the_default_is_allow_all_and_the_target_module_still_gates_semantically() {
 #[test]
 fn a_set_policy_refuses_no_standing_keys_at_dispatch_and_clears_back_to_open() {
     block_on(async {
-        let mut host = gate_host().await;
+        let mut host = gate_host();
         let (member, nobody) = (keypair(1), keypair(9));
 
         set_policy(&mut host, 1, "acl", Some(Standing::Validator)).await;
@@ -196,7 +500,7 @@ fn a_set_policy_refuses_no_standing_keys_at_dispatch_and_clears_back_to_open() {
 #[test]
 fn node_standing_admits_residents_and_the_wildcard_covers_unlisted_targets() {
     block_on(async {
-        let mut host = gate_host().await;
+        let mut host = gate_host();
         let (member, resident, nobody) = (keypair(1), keypair(2), keypair(9));
 
         // grant resident standing (a module-origin write — the gate bypasses
@@ -254,7 +558,7 @@ fn node_standing_admits_residents_and_the_wildcard_covers_unlisted_targets() {
 #[test]
 fn user_standing_resolves_through_the_identity_account_plane() {
     block_on(async {
-        let mut host = gate_host().await;
+        let mut host = gate_host();
         let (founder, nobody) = (keypair(10), keypair(9));
         let node_key = key_bytes(&keypair(1)); // a valset member — still no account
 
@@ -264,9 +568,9 @@ fn user_standing_resolves_through_the_identity_account_plane() {
             Origin::External(key_bytes(&founder)),
             1,
             "identity",
-            identity::encode_msg(&IdentityMsg::Create {
+            sibling_contracts::encode_identity_msg(&sibling_contracts::IdentityMsg::Create {
                 name: "founder".into(),
-                scheme: KeyScheme::Ed25519,
+                scheme: "ed25519".into(),
             }),
         )
         .await
@@ -276,9 +580,10 @@ fn user_standing_resolves_through_the_identity_account_plane() {
 
         // the founder's key resolves to the account — the op passes dispatch
         // (identity then answers itself).
-        let probe = identity::encode_msg(&IdentityMsg::SetName {
-            name: "gate".into(),
-        });
+        let probe =
+            sibling_contracts::encode_identity_msg(&sibling_contracts::IdentityMsg::SetName {
+                name: "gate".into(),
+            });
         submit(
             &mut host,
             Origin::External(key_bytes(&founder)),

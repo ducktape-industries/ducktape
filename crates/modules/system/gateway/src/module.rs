@@ -55,12 +55,12 @@
 //! config is consensus state in the store's merkle root from genesis and
 //! rides state-sync like any other record. this module never writes that key.
 
-use borsh::{BorshDeserialize, BorshSerialize};
-use duckdns::{HandleRegistration, ResolvedAccount, validate_handle};
-use identity::{
+use crate::identity_contract::{
     AccountView, IdentityQuery, IdentityReply, KeyView, decode_reply as identity_decode_reply,
     encode_query as identity_encode_query,
 };
+use borsh::{BorshDeserialize, BorshSerialize};
+use duckdns::{HandleRegistration, ResolvedAccount, validate_handle};
 use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
@@ -288,10 +288,6 @@ impl Gateway {
             IdentityReply::Account(None) => Err(Error::module(
                 "no_identity_account",
                 "gateway: origin key belongs to no Identity account",
-            )),
-            other => Err(Error::module(
-                "unexpected_identity_reply",
-                format!("gateway: identity answered OfKey with {other:?}"),
             )),
         }
     }

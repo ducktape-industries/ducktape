@@ -7,11 +7,10 @@ version.workspace = true
 # its founding key) collects many MEMBER KEYS of different schemes and owns
 # many NODES (each a mesh/valset identity). state is pure logic over a
 # host-injected qmdb MerkleStore (StagedStore records); the module root IS the
-# store's merkle root. depends on sdk + valset wire types (to member-gate
-# binds) + keyscheme (the one verifier every member proof rides — shared with
+# store's merkle root. depends on sdk + keyscheme (the one verifier every
+# member proof rides — shared with
 # the kernel frame codec, so a member key and a frame origin verify identically).
 [dependencies]
-identity-wire = { workspace = true }
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
 ducktape-module-sdk = { workspace = true, optional = true }

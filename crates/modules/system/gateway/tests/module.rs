@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use commonware_cryptography::{Signer as _, ed25519};
 use futures::executor::block_on;
+use gateway::identity_contract as identity;
+use gateway::identity_contract::{AccountView, IdentityQuery, IdentityReply, KeyView};
 use gateway::{
     CredentialGrantStatement, CredentialKind, CredentialRecord, DuckDnsName, GATEWAY_CREDENTIAL_NS,
     GATEWAY_ROUTE_NS, Gateway, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization,
@@ -11,7 +13,7 @@ use gateway::{
     grant_credential_preimage, remove_credential_preimage, revoke_credential_preimage,
     route_signing_preimage, set_credential_preimage, validate_credential_name,
 };
-use identity::{AccountView, IdentityQuery, IdentityReply, KeyScheme, KeyView};
+use keyscheme::KeyScheme;
 use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
 
 const CHAIN_ID: &str = "test#12345678";
@@ -60,12 +62,11 @@ impl Ctx for TestCtx {
     async fn query(&self, target: &str, request: &[u8]) -> Result<Vec<u8>, Error> {
         match target {
             "identity" => {
-                match identity::decode_query(request).map_err(|e| Error::module("codec", e))? {
-                    IdentityQuery::OfKey { key } => Ok(identity::encode_reply(
-                        &IdentityReply::Account(self.accounts.get(&key).cloned()),
-                    )),
-                    _ => Err(Error::QueryUnsupported),
-                }
+                let IdentityQuery::OfKey { key } =
+                    identity::decode_query(request).map_err(|e| Error::module("codec", e))?;
+                Ok(identity::encode_reply(&IdentityReply::Account(
+                    self.accounts.get(&key).cloned(),
+                )))
             }
             _ => Err(Error::UnknownModule(target.into())),
         }
