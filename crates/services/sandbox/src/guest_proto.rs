@@ -48,10 +48,11 @@ const TAG_EXIT: u8 = 2;
 const TAG_STDIN: u8 = 3;
 const TAG_STDIN_EOF: u8 = 4;
 const TAG_RESIZE: u8 = 5;
+const TAG_SPAWN: u8 = 6;
 const HEADER_BYTES: usize = 5;
 
 /// One enum for both directions. The host sends [`Frame::Stdin`] and
-/// [`Frame::StdinEof`]; the guest sends the other three. A single codec means a
+/// [`Frame::StdinEof`]; the guest sends the other four. A single codec means a
 /// single place where the wire format can drift, which is the whole reason both
 /// ends compile the same file.
 ///
@@ -76,6 +77,9 @@ pub enum Frame {
         cols: u16,
         rows: u16,
     },
+    /// the guest observed the provider child fork immediately before exec.
+    /// This is a timing marker, not provider output.
+    Spawn,
 }
 
 pub fn encode(frame: &Frame) -> Vec<u8> {
@@ -99,6 +103,7 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
             out.extend(rows.to_le_bytes());
             return out;
         }
+        Frame::Spawn => (TAG_SPAWN, &[]),
     };
     let mut out = Vec::with_capacity(HEADER_BYTES + payload.len());
     out.push(tag);
@@ -148,6 +153,15 @@ pub fn decode(buf: &mut Vec<u8>) -> Result<Option<Frame>, String> {
                 rows: u16::from_le_bytes([bytes[2], bytes[3]]),
             }
         }
+        TAG_SPAWN => {
+            if !payload.is_empty() {
+                return Err(format!(
+                    "guest spawn frame carried {} bytes, want 0",
+                    payload.len()
+                ));
+            }
+            Frame::Spawn
+        }
         other => return Err(format!("guest frame carried unknown tag {other}")),
     };
     Ok(Some(frame))
@@ -181,6 +195,7 @@ mod tests {
                 cols: u16::MAX,
                 rows: 0,
             },
+            Frame::Spawn,
         ] {
             let mut buf = encode(&frame);
             let got = decode(&mut buf).expect("decode").expect("a whole frame");

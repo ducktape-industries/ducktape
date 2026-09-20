@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock},
-    time::Duration,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
@@ -138,6 +138,159 @@ impl Drop for Registration {
 pub enum Protocol {
     Codex,
     Claude,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TimingEvent {
+    pub milestone: &'static str,
+    pub elapsed_ms: u64,
+    pub delta_ms: u64,
+    pub previous_milestone: Option<&'static str>,
+    pub exit_code: Option<i32>,
+}
+
+pub(crate) type TimingObserver = Arc<dyn Fn(TimingEvent) + Send + Sync>;
+
+pub(crate) enum SpawnStart {
+    Host(Instant),
+    Guest(oneshot::Receiver<Instant>),
+}
+
+pub(crate) struct SessionDriver<'a> {
+    pub broker: Option<&'a broker_host::BrokerInvocation>,
+    pub start: SpawnStart,
+    pub timing: &'a mut SessionTiming,
+}
+
+pub(crate) struct SessionTiming {
+    protocol: Protocol,
+    run: Option<String>,
+    session: Option<String>,
+    thread: Option<String>,
+    turn: Option<String>,
+    started: Instant,
+    last: Instant,
+    last_milestone: Option<&'static str>,
+    observed: Vec<&'static str>,
+    observer: Option<TimingObserver>,
+}
+
+impl SessionTiming {
+    pub(crate) fn new(protocol: Protocol, ctx: &RunContext, started: Instant) -> Self {
+        Self {
+            protocol,
+            run: ctx.run_key.clone(),
+            session: None,
+            thread: None,
+            turn: None,
+            started,
+            last: started,
+            last_milestone: None,
+            observed: Vec::new(),
+            observer: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_observer(mut self, observer: TimingObserver) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    fn set_session(&mut self, session: &str) {
+        self.session = Some(session.to_string());
+    }
+
+    fn set_thread(&mut self, thread: &str) {
+        self.thread = Some(thread.to_string());
+        self.set_session(thread);
+    }
+
+    fn set_turn(&mut self, turn: &str) {
+        self.turn = Some(turn.to_string());
+    }
+
+    fn spawned_at(&mut self, at: Instant) {
+        self.started = at;
+        self.last = at;
+        self.record("spawn", at, None);
+    }
+
+    fn record(&mut self, milestone: &'static str, at: Instant, exit_code: Option<i32>) {
+        let already_seen = self.observed.contains(&milestone);
+        if already_seen {
+            return;
+        }
+        let elapsed_ms = at.saturating_duration_since(self.started).as_millis() as u64;
+        let delta_ms = at.saturating_duration_since(self.last).as_millis() as u64;
+        let event = TimingEvent {
+            milestone,
+            elapsed_ms,
+            delta_ms,
+            previous_milestone: self.last_milestone,
+            exit_code,
+        };
+        tracing::debug!(
+            target: "ducktape::provider",
+            event = "provider_session_milestone",
+            run = self.run.as_deref().unwrap_or("unkeyed"),
+            protocol = ?self.protocol,
+            session = self.session.as_deref().unwrap_or("unknown"),
+            thread = self.thread.as_deref().unwrap_or("unknown"),
+            turn = self.turn.as_deref().unwrap_or("unknown"),
+            milestone,
+            elapsed_ms,
+            delta_ms,
+            previous_milestone = self.last_milestone.unwrap_or("none"),
+            exit_code = ?exit_code,
+            "provider session milestone observed"
+        );
+        if let Some(observer) = &self.observer {
+            observer(event);
+        }
+        self.last = at;
+        self.last_milestone = Some(milestone);
+        self.observed.push(milestone);
+    }
+
+    pub(crate) fn finish(&self, outcome: &'static str, reason: &'static str) {
+        let expected = match self.protocol {
+            Protocol::Codex => [
+                "spawn",
+                "initialize_reply",
+                "thread_start_reply",
+                "turn_started",
+                "first_item",
+                "turn_completed",
+                "child_exit",
+            ]
+            .as_slice(),
+            Protocol::Claude => ["spawn", "initialize_reply", "child_exit"].as_slice(),
+        };
+        let missing = expected
+            .iter()
+            .copied()
+            .filter(|milestone| !self.observed.contains(milestone))
+            .collect::<Vec<_>>();
+        tracing::debug!(
+            target: "ducktape::provider",
+            event = "provider_session_finished",
+            run = self.run.as_deref().unwrap_or("unkeyed"),
+            protocol = ?self.protocol,
+            session = self.session.as_deref().unwrap_or("unknown"),
+            thread = self.thread.as_deref().unwrap_or("unknown"),
+            turn = self.turn.as_deref().unwrap_or("unknown"),
+            outcome,
+            reason,
+            last_milestone = self.last_milestone.unwrap_or("none"),
+            missing_milestones = ?missing,
+            "provider session finished"
+        );
+    }
+
+    pub(crate) fn child_exit(&mut self, code: Option<i32>) {
+        self.record("child_exit", Instant::now(), code);
+    }
 }
 
 /// A same-turn App Server instruction, fenced by the observed turn id.
@@ -314,8 +467,13 @@ pub(crate) async fn drive(
     ctx: &RunContext,
     sink: Option<OutputSink>,
     (idle, hard): (Duration, tokio::time::Instant),
-    broker: Option<&broker_host::BrokerInvocation>,
+    driver: SessionDriver<'_>,
 ) -> Result<crate::Invocation, String> {
+    let SessionDriver {
+        broker,
+        start,
+        timing,
+    } = driver;
     let started = tokio::time::Instant::now();
     let (sender, mut offers) = mpsc::channel(16);
     let _registration = ctx.run_key.clone().map(|key| {
@@ -335,6 +493,14 @@ pub(crate) async fn drive(
             started,
         }
     });
+    match start {
+        SpawnStart::Host(at) => timing.spawned_at(at),
+        SpawnStart::Guest(spawn) => {
+            if let Ok(at) = spawn.await {
+                timing.spawned_at(at);
+            }
+        }
+    }
     let initial = match protocol {
         Protocol::Codex => {
             json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"ducktape-run","version":env!("CARGO_PKG_VERSION")}}})
@@ -454,17 +620,23 @@ pub(crate) async fn drive(
                             if frame.get("error").is_some() { return Err(frame["error"]["message"].as_str().unwrap_or("Session initialization failed").into()); }
                             match id {
                                 1 => {
+                                    timing.record("initialize_reply", Instant::now(), None);
                                     writer.send(json!({"method":"initialized"}))?;
                                     writer.send(json!({"id":2,"method":"thread/start","params":{"approvalPolicy":"on-request"}}))?;
                                 }
                                 2 => {
+                                    timing.record("thread_start_reply", Instant::now(), None);
                                     thread = frame["result"]["thread"]["id"].as_str().ok_or("missing provider thread")?.into();
+                                    timing.set_thread(&thread);
                                     writer.send(json!({"id":3,"method":"turn/start","params":{"threadId":thread,"input":[{"type":"text","text":prompt}]}}))?;
                                 }
-                                3 => { turn = frame["result"]["turn"]["id"].as_str().ok_or("missing provider turn")?.into(); ready(&sink,ctx,&turn,true); }
+                                3 => { turn = frame["result"]["turn"]["id"].as_str().ok_or("missing provider turn")?.into(); timing.set_turn(&turn); ready(&sink,ctx,&turn,true); }
                                 _ => {}
                             }
                         } else {
+                            if method.starts_with("item/") {
+                                timing.record("first_item", Instant::now(), None);
+                            }
                             match method {
                                 "thread/tokenUsage/updated" => {
                                     let total = &frame["params"]["tokenUsage"]["total"];
@@ -476,9 +648,10 @@ pub(crate) async fn drive(
                                         ..Default::default()
                                     });
                                 }
-                                "turn/started" => { turn = frame["params"]["turn"]["id"].as_str().unwrap_or_default().into(); ready(&sink,ctx,&turn,true); }
+                                "turn/started" => { turn = frame["params"]["turn"]["id"].as_str().unwrap_or_default().into(); timing.set_turn(&turn); timing.record("turn_started", Instant::now(), None); ready(&sink,ctx,&turn,true); }
                                 "item/completed" if frame["params"]["item"]["type"] == "agentMessage" => { answer = frame["params"]["item"]["text"].as_str().unwrap_or_default().into(); }
                                 "turn/completed" => {
+                                    timing.record("turn_completed", Instant::now(), None);
                                     let status = frame["params"]["turn"]["status"].as_str().unwrap_or_default();
                                     if status == "interrupted" { acknowledge_stop(&mut stop_id,&mut pending); }
                                     if status != "completed" { return Err(format!("provider turn {status}")); }
@@ -500,6 +673,9 @@ pub(crate) async fn drive(
                             "control_response" => {
                                 let id = frame["response"]["request_id"].as_str().unwrap_or_default();
                                 if id == "1" {
+                                    if frame["response"]["subtype"] != "error" {
+                                        timing.record("initialize_reply", Instant::now(), None);
+                                    }
                                     writer.send(json!({"type":"user","message":{"role":"user","content":prompt},"parent_tool_use_id":null}))?;
                                 } else if let Some(steer) = &mut steering {
                                     if id == (next_id-1).to_string() {
@@ -511,7 +687,7 @@ pub(crate) async fn drive(
                                     let _ = reply.send(result);
                                 }
                             }
-                            "system" if frame["subtype"] == "init" => { thread = frame["session_id"].as_str().unwrap_or_default().into(); turn = format!("{}:{}",thread,next_id); ready(&sink,ctx,&turn,true); }
+                            "system" if frame["subtype"] == "init" => { thread = frame["session_id"].as_str().unwrap_or_default().into(); timing.set_session(&thread); turn = format!("{}:{}",thread,next_id); timing.set_turn(&turn); ready(&sink,ctx,&turn,true); }
                             "user" => { if let Some(id) = frame["uuid"].as_str() && let Some(reply) = pending.remove(id) { let _ = reply.send(Ok(json!({"status":"accepted"}))); } }
                             "control_request" if frame["request"]["subtype"] == "can_use_tool" => { if approvals.len() >= 16 { return Err("Too many pending approvals".into()); } let id = frame["request_id"].as_str().unwrap_or_default().to_string(); approvals.insert(id.clone(),frame.clone()); approval(&sink,ctx,&turn,&id,&frame["request"])?; }
                             "result" => {
@@ -735,6 +911,7 @@ mod tests {
             ..Default::default()
         };
         let prompt = "한글 ".repeat(16384);
+        let mut timing = SessionTiming::new(Protocol::Codex, &ctx, Instant::now());
         let run = drive(
             Protocol::Codex,
             &prompt,
@@ -745,7 +922,11 @@ mod tests {
                 Duration::from_secs(10),
                 tokio::time::Instant::now() + Duration::from_secs(20),
             ),
-            None,
+            SessionDriver {
+                broker: None,
+                start: SpawnStart::Host(Instant::now()),
+                timing: &mut timing,
+            },
         );
         let peer = async {
             let mut input = BufReader::new(input);
@@ -828,6 +1009,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_timing_records_order_once_and_separates_child_exit() {
+        let (stdin, input) = tokio::io::duplex(1024);
+        let (stdout, mut output) = tokio::io::duplex(1024);
+        let (stderr, err) = tokio::io::duplex(1024);
+        let (events, mut received) = mpsc::unbounded_channel();
+        let observer: TimingObserver = Arc::new(move |event| {
+            events.send(event).expect("timing observer is alive");
+        });
+        let ctx = RunContext {
+            run_key: Some("timing-test".into()),
+            ..Default::default()
+        };
+        let mut timing =
+            SessionTiming::new(Protocol::Codex, &ctx, Instant::now()).with_observer(observer);
+        let run = drive(
+            Protocol::Codex,
+            "prompt is never logged",
+            (Box::new(stdin), Box::new(stdout), Box::new(stderr)),
+            &ctx,
+            None,
+            (
+                Duration::from_secs(10),
+                tokio::time::Instant::now() + Duration::from_secs(20),
+            ),
+            SessionDriver {
+                broker: None,
+                start: SpawnStart::Host(Instant::now()),
+                timing: &mut timing,
+            },
+        );
+        let peer = async {
+            let mut input = BufReader::new(input);
+            assert_eq!(receive(&mut input).await["method"], "initialize");
+            send(&mut output, json!({"id":1,"result":{}})).await;
+            assert_eq!(receive(&mut input).await["method"], "initialized");
+            assert_eq!(receive(&mut input).await["method"], "thread/start");
+            send(
+                &mut output,
+                json!({"id":2,"result":{"thread":{"id":"thread-timing"}}}),
+            )
+            .await;
+            assert_eq!(receive(&mut input).await["method"], "turn/start");
+            send(
+                &mut output,
+                json!({"id":3,"result":{"turn":{"id":"turn-timing"}}}),
+            )
+            .await;
+            send(
+                &mut output,
+                json!({"method":"turn/started","params":{"turn":{"id":"turn-timing"}}}),
+            )
+            .await;
+            send(
+                &mut output,
+                json!({"method":"item/started","params":{"item":{"type":"commandExecution"}}}),
+            )
+            .await;
+            send(
+                &mut output,
+                json!({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"done"}}}),
+            )
+            .await;
+            send(
+                &mut output,
+                json!({"method":"item/completed","params":{"item":{"type":"commandExecution"}}}),
+            )
+            .await;
+            send(
+                &mut output,
+                json!({"method":"turn/completed","params":{"turn":{"status":"completed"}}}),
+            )
+            .await;
+            drop(err);
+        };
+        let (result, ()) = tokio::join!(run, peer);
+        assert_eq!(result.unwrap().text, "done");
+        timing.child_exit(Some(0));
+
+        let mut captured = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            captured.push(event);
+        }
+        let milestones = captured
+            .iter()
+            .map(|event| event.milestone)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            milestones,
+            vec![
+                "spawn",
+                "initialize_reply",
+                "thread_start_reply",
+                "turn_started",
+                "first_item",
+                "turn_completed",
+                "child_exit",
+            ]
+        );
+        let child_exit = captured.last().expect("child exit milestone");
+        assert_eq!(child_exit.milestone, "child_exit");
+        assert_eq!(child_exit.previous_milestone, Some("turn_completed"));
+        assert_eq!(child_exit.exit_code, Some(0));
+        assert!(child_exit.delta_ms <= child_exit.elapsed_ms);
+    }
+
+    #[tokio::test]
     async fn both_protocols_answer_approvals_and_confirm_stop_at_the_terminal_event() {
         for protocol in [Protocol::Codex, Protocol::Claude] {
             let key = format!("approval-{protocol:?}");
@@ -839,6 +1126,7 @@ mod tests {
                 run_key: Some(key.clone()),
                 ..Default::default()
             };
+            let mut timing = SessionTiming::new(protocol, &ctx, Instant::now());
             let run = drive(
                 protocol,
                 "hello",
@@ -849,7 +1137,11 @@ mod tests {
                     Duration::from_secs(10),
                     tokio::time::Instant::now() + Duration::from_secs(20),
                 ),
-                None,
+                SessionDriver {
+                    broker: None,
+                    start: SpawnStart::Host(Instant::now()),
+                    timing: &mut timing,
+                },
             );
             let peer = async {
                 let mut input = BufReader::new(input);
@@ -993,6 +1285,7 @@ mod tests {
             ..Default::default()
         };
         let (sink, mut events) = sink();
+        let mut timing = SessionTiming::new(protocol, &ctx, Instant::now());
         let run = drive(
             protocol,
             "Do not use tools. Calculate the first 80 primes and their cumulative sums, carefully.",
@@ -1003,7 +1296,11 @@ mod tests {
                 Duration::from_secs(60),
                 tokio::time::Instant::now() + Duration::from_secs(90),
             ),
-            None,
+            SessionDriver {
+                broker: None,
+                start: SpawnStart::Host(Instant::now()),
+                timing: &mut timing,
+            },
         );
         let input = async {
             let turn = loop {
