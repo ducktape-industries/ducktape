@@ -1,0 +1,34 @@
+{
+  "kind": "sessions",
+  "refresh": "poll",
+  "identity": {
+    "machine_id": "machine-a",
+    "network_id": "network-a"
+  },
+  "sessions": [
+    {
+      "session_id": "session-a",
+      "parent_session_id": null,
+      "run_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "agent_id": "agent",
+      "origin": {
+        "kind": "mention"
+      },
+      "requester": {
+        "kind": "program",
+        "account_id": 7
+      },
+      "model": "model",
+      "executor": "executor",
+      "invocation_kind": "runs",
+      "status": "active",
+      "started_at": "2026-09-20T00:00:00Z",
+      "last_activity_at": "2026-09-20T00:00:01Z",
+      "owner_account_id": 7,
+      "machine_id": "machine-a",
+      "network_id": "network-a"
+    }
+  ],
+  "next_cursor": null,
+  "has_more": false
+}
