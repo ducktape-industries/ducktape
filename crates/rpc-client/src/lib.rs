@@ -175,7 +175,7 @@ impl std::error::Error for SubmitFailure {}
 ///
 /// The bar it has to clear is the NODE's own hold for the same frame:
 /// `SUBMIT_HOLD` plus `relay::blob_transfer_allowance(bytes, targets)` — the
-/// node budgets the fan-out at 1 MiB/s over hex-inflated bytes, once per
+/// node budgets the fan-out at 512 KiB/s over hex-inflated bytes, once per
 /// target (`bin/node/src/relay.rs`). A client that gives up first turns a
 /// submit the node is still honestly working on into a reported failure. At
 /// 64 KiB/s this clears that hold up to EIGHT fan-out targets, since the node
@@ -1559,7 +1559,7 @@ mod tests {
     #[test]
     fn a_submit_budget_outlasts_the_node_still_fanning_the_pack_out() {
         // the node's hold, from `bin/node/src/relay.rs`: a 10 s base plus the
-        // pack at 1 MiB/s, hex-inflated (2x) and counted once per target.
+        // pack at 512 KiB/s, hex-inflated (2x) and counted once per target.
         let node_hold = |bytes: u64, targets: u64| {
             Duration::from_secs(10 + (bytes * 2 * targets).div_ceil(1024 * 1024))
         };

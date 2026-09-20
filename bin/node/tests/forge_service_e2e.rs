@@ -1094,6 +1094,158 @@ fn cargo_builds_a_duck_dependency_locked_and_flips_to_github_and_back() {
     assert_eq!(lock(), github_lock);
 }
 
+/// Scratch-only C6 proof: mirror every org repository's branch and tag refs
+/// through the real `duck://` helper, continue after a per-repo failure, then
+/// clone and build the SDK through Cargo's CLI transport. The source mirrors
+/// are prepared outside this test and named by `C6_SOURCE_ROOT`; no GitHub
+/// write or live network is involved.
+#[test]
+#[ignore = "scratch-only whole-org mirror; requires C6_SOURCE_ROOT"]
+fn c6_mirrors_org_and_builds_a_duck_dependency() {
+    let source_root = PathBuf::from(std::env::var_os("C6_SOURCE_ROOT").expect("C6_SOURCE_ROOT"));
+    let daemon = GatewayGit::start();
+    let scratch = tempfile::TempDir::new().unwrap();
+    let bin = scratch.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ducktape"), bin.join("ducktape")).unwrap();
+    let home = scratch.path().join("home");
+    let cargo_home = scratch.path().join("cargo-home");
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    let node = daemon.cluster.http_base(1);
+    let setup = Command::new(bin.join("ducktape"))
+        .env("DUCKTAPE_HOME", &home)
+        .env("CARGO_HOME", &cargo_home)
+        .args(["forge", "setup", "--node", &node])
+        .output()
+        .unwrap();
+    assert!(setup.status.success(), "{}", render(&setup));
+    let chain: duck_address::ChainId = daemon.cluster.namespace.parse().unwrap();
+    let git = DuckGit {
+        daemon: &daemon,
+        bin: &bin,
+        home: home.clone(),
+    };
+    let repos = ["ducktape"];
+    let mut failed_repos = Vec::new();
+    for repo in repos {
+        let source = source_root.join(format!("{repo}.git"));
+        assert!(
+            source.is_dir(),
+            "missing source mirror: {}",
+            source.display()
+        );
+        let refs = git_capture(
+            &source,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        );
+        assert!(refs.status.success(), "{}", render(&refs));
+        let branch_names = String::from_utf8_lossy(&refs.stdout);
+        let url = format!("duck://{}/forge/alice/{repo}", chain.authority());
+        let mut repo_failed = false;
+        for branch in ["main", "master", "dev"] {
+            if !branch_names.lines().any(|name| name == branch) {
+                continue;
+            }
+            let expected = git_capture(&source, &["rev-parse", &format!("refs/heads/{branch}")]);
+            assert!(expected.status.success(), "{}", render(&expected));
+            let expected = String::from_utf8_lossy(&expected.stdout).trim().to_owned();
+            let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+            let push = git.signed_push(&source, &url, &refspec);
+            let landed = push.status.success();
+            eprintln!("[c6] {repo}/{branch} sha={expected} status={}", push.status);
+            if !landed {
+                repo_failed = true;
+                eprintln!("[c6] {repo}/{branch} failed:\n{}", render(&push));
+                break;
+            }
+        }
+        if !repo_failed {
+            let tags = git_capture(
+                &source,
+                &["for-each-ref", "--format=%(refname:short)", "refs/tags"],
+            );
+            assert!(tags.status.success(), "{}", render(&tags));
+            if !String::from_utf8_lossy(&tags.stdout).trim().is_empty() {
+                let push = git.signed_push(&source, &url, "refs/tags/*:refs/tags/*");
+                eprintln!("[c6] {repo}/tags status={}", push.status);
+                if !push.status.success() {
+                    repo_failed = true;
+                    eprintln!("[c6] {repo}/tags failed:\n{}", render(&push));
+                }
+            }
+        }
+        if repo_failed {
+            failed_repos.push(repo);
+        }
+    }
+    if !failed_repos.is_empty() {
+        eprintln!(
+            "[c6] scratch node logs after failures:\n{}",
+            daemon.cluster.all_log_tails(200)
+        );
+    }
+    assert!(
+        failed_repos.is_empty(),
+        "scratch mirror failed repositories: {failed_repos:?}"
+    );
+
+    let sdk_url = format!("duck://{}/forge/alice/ducktape-sdk", chain.authority());
+    let clones = scratch.path().join("clones");
+    std::fs::create_dir_all(&clones).unwrap();
+    let clone = git.ok(&clones, &["clone", &sdk_url, "sdk"]);
+    assert!(
+        clones.join("sdk/Cargo.toml").is_file(),
+        "{}",
+        render(&clone)
+    );
+    let consumer = scratch.path().join("consumer");
+    std::fs::create_dir_all(consumer.join("src")).unwrap();
+    std::fs::create_dir_all(consumer.join(".cargo")).unwrap();
+    std::fs::write(
+        consumer.join("src/main.rs"),
+        "fn main() { println!(\"duck dependency\"); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        consumer.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"c6-duck-consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nduck-address = {{ git = \"{sdk_url}\", rev = \"{SDK_PIN}\" }}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        consumer.join(".cargo/config.toml"),
+        "[net]\ngit-fetch-with-cli = true\n",
+    )
+    .unwrap();
+    let cargo = |args: &[&str]| {
+        Command::new(env!("CARGO"))
+            .current_dir(&consumer)
+            .env_clear()
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("HOME", std::env::var("HOME").unwrap())
+            .env("CARGO_HOME", &cargo_home)
+            .env("DUCKTAPE_HOME", &home)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let resolve = cargo(&["build"]);
+    assert!(resolve.status.success(), "{}", render(&resolve));
+    let locked = cargo(&["build", "--locked"]);
+    assert!(locked.status.success(), "{}", render(&locked));
+    let lock = std::fs::read_to_string(consumer.join("Cargo.lock")).unwrap();
+    assert!(
+        lock.contains(&format!("git+{sdk_url}?rev={SDK_PIN}#{SDK_PIN}")),
+        "{lock}"
+    );
+}
+
 /// Uses the app test binary's native window and compiled Forge WASM against
 /// this fixture's real Gateway, service, blob store and consensus modules.
 #[test]
