@@ -115,7 +115,7 @@ impl ResourceLedger {
     /// free = capacity − Σ running, per dimension; a demanded dimension the
     /// capacity never named is a mismatch (absent ≠ infinite). Callers pass
     /// [`Self::accounted_demands`] so omitted sandbox dimensions cost their
-    /// full capacity; only the empty-capacity Direct path stays free.
+    /// small default; only the empty-capacity Direct path stays free.
     pub fn fits(&self, demands: &BTreeMap<String, u64>) -> bool {
         let running = self.running.lock().expect("ledger lock");
         self.fits_locked(&running, demands)
