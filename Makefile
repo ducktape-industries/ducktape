@@ -156,8 +156,9 @@ CARGO_BIN = $${CARGO_HOME:-$$HOME/.cargo}/bin
 STAGED_MODULES = modules$(subst /,%,$(CURDIR))
 STAGED_SIM_MODULES = sim-modules$(subst /,%,$(CURDIR))
 install-node: prereqs
-	$(CARGO) install --path bin/node --locked --target-dir target
-	$(CARGO) install --path bin/node-launcher --locked --target-dir target
+	$(CARGO) build $(LOCKED) --release --target-dir target -p node-bin -p node-launcher
+	mkdir -p "$(CARGO_BIN)"
+	install -m 0755 target/release/ducktape target/release/ducktape-node-launcher "$(CARGO_BIN)/"
 	rm -rf "$(CARGO_BIN)/modules"
 	cp -r "target/release/$(STAGED_MODULES)" "$(CARGO_BIN)/modules"
 	rm -rf "$(CARGO_BIN)/sim-modules"
