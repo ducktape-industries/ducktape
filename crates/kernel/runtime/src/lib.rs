@@ -33,7 +33,7 @@ impl core::fmt::Display for Fault {
 
 impl std::error::Error for Fault {}
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 pub trait Host {
     async fn call(&mut self, op: HostOp) -> HostReply;
 }

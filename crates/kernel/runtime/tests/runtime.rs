@@ -26,7 +26,7 @@ fn env() -> Env {
     }
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl Host for Bench {
     async fn call(&mut self, op: HostOp) -> HostReply {
         let reply = match &op {

@@ -265,7 +265,7 @@ where
     fault: Option<Error>,
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl<E> runtime::Host for Query<'_, E>
 where
     E: Context + Spawner,
@@ -383,7 +383,7 @@ where
     }
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl<E> runtime::Host for Execute<'_, E>
 where
     E: Context + Spawner,
