@@ -13,16 +13,17 @@
 //! tunnel bootstrap — the set `node run` needs to race every first-contact path
 //! the invite offers.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 
 use crate::{
-    Invite, Plumbing, Reach, ReachHint, SandboxToml, decode_invite, default_workspace_dir,
-    ducktape_home, guard_join_descriptor, hex_bytes, list_workspaces_in, load_or_generate_identity,
-    merged_plumbing, save_invite_fronts, save_invite_token, save_invite_wireguard,
-    validate_chain_id_shape, write_node_toml,
+    Invite, NodeToml, Plumbing, Reach, ReachHint, SandboxToml, decode_invite,
+    default_workspace_dir, ducktape_home, guard_join_descriptor, hex_bytes, list_workspaces_in,
+    load_node_toml, load_or_generate_identity, merged_plumbing, save_invite_fronts,
+    save_invite_token, save_invite_wireguard, validate_chain_id_shape, write_node_toml,
 };
 
 /// Plumbing the joiner wants instead of the defaults. Every field is an
@@ -68,6 +69,36 @@ pub struct JoinedWorkspace {
     pub compute_runtime: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListenerProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Listener {
+    name: &'static str,
+    protocol: ListenerProtocol,
+    addr: SocketAddr,
+}
+
+const LISTENER_NAMES: [&str; 6] = [
+    "listen",
+    "http_listen",
+    "gateway_listen",
+    "rpc_listen",
+    "wireguard_listen",
+    "invite_listen",
+];
+const LISTENER_PROTOCOLS: [ListenerProtocol; 6] = [
+    ListenerProtocol::Tcp,
+    ListenerProtocol::Tcp,
+    ListenerProtocol::Tcp,
+    ListenerProtocol::Tcp,
+    ListenerProtocol::Udp,
+    ListenerProtocol::Udp,
+];
+
 /// Materialize the workspace an invite admits this device to.
 ///
 /// `dir` is the explicit destination; `None` puts it in the ducktape home under
@@ -85,21 +116,14 @@ pub fn join_workspace(
     // shape to what `node init` actually mints before it is trusted to
     // address a registry directory or a `-n <chain-id>` selector.
     validate_chain_id_shape(&descriptor.chain_id)?;
+    let registry_root = ducktape_home()?;
     let dir = match dir {
         Some(dir) => dir,
         None => {
-            guard_no_chain_id_collision(&ducktape_home()?, &descriptor.chain_id)?;
+            guard_no_chain_id_collision(&registry_root, &descriptor.chain_id)?;
             default_workspace_dir(&descriptor.chain_id)?
         }
     };
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-
-    // Mint (or reuse) this workspace dir's identity. Every invite is BEARER, so
-    // there is no target to match: any freshly minted key may redeem. The
-    // redeeming key is bound by the join proof and the token is single-use, so
-    // a paste simply admits whoever runs it.
-    let (key, generated) = load_or_generate_identity(&dir.join("identity.key"))?;
-    let identity = hex_bytes(key.public_key().as_ref());
     // the issuer `decode_invite` already verified the envelope against — the
     // one field of a pasted blob an attacker cannot choose freely, and what
     // separates a real admit refresh from a descriptor that merely copied our
@@ -142,6 +166,16 @@ pub fn join_workspace(
     });
 
     fold_overlay_reach_hints(&invite, &mut descriptor)?;
+    guard_local_listener_collisions(&registry_root, &dir, &plumbing)?;
+
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+
+    // Mint (or reuse) this workspace dir's identity. Every invite is BEARER, so
+    // there is no target to match: any freshly minted key may redeem. The
+    // redeeming key is bound by the join proof and the token is single-use, so
+    // a paste simply admits whoever runs it.
+    let (key, generated) = load_or_generate_identity(&dir.join("identity.key"))?;
+    let identity = hex_bytes(key.public_key().as_ref());
 
     descriptor.save(&dir.join("network.toml"))?;
     write_node_toml(&dir, &plumbing)?;
@@ -168,6 +202,132 @@ pub fn join_workspace(
         generated,
         compute_runtime,
     })
+}
+
+fn plumbing_listeners(plumbing: &Plumbing) -> Result<Vec<Listener>, String> {
+    parse_listeners(
+        "joined workspace",
+        [
+            plumbing.listen.as_str(),
+            plumbing.http_listen.as_str(),
+            plumbing.gateway_listen.as_str(),
+            plumbing.rpc_listen.as_str(),
+            plumbing.wireguard_listen.as_str(),
+            plumbing.invite_listen.as_str(),
+        ],
+    )
+}
+
+fn node_listeners(owner: &str, node: &NodeToml) -> Result<Vec<Listener>, String> {
+    parse_listeners(
+        owner,
+        [
+            node.listen.as_str(),
+            node.http_listen.as_str(),
+            node.gateway_listen.as_str(),
+            node.rpc_listen.as_str(),
+            node.wireguard_listen.as_str(),
+            node.invite_listen.as_str(),
+        ],
+    )
+}
+
+fn parse_listeners(owner: &str, values: [&str; 6]) -> Result<Vec<Listener>, String> {
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let name = LISTENER_NAMES[index];
+            let protocol = LISTENER_PROTOCOLS[index];
+            let addr = value.parse::<SocketAddr>().map_err(|error| {
+                format!("{owner} listener {name} {value:?} is invalid: {error}")
+            })?;
+            Ok(Listener {
+                name,
+                protocol,
+                addr,
+            })
+        })
+        .collect()
+}
+
+/// Registered workspaces reserve their configured, non-zero listener addresses.
+/// The registry has no process-health information, so the refusal says that it
+/// is a configuration reservation rather than claiming a stopped workspace
+/// currently owns a socket.
+fn guard_local_listener_collisions(
+    root: &Path,
+    target: &Path,
+    plumbing: &Plumbing,
+) -> Result<(), String> {
+    let candidate = plumbing_listeners(plumbing)?;
+    for (chain_id, config_path) in list_workspaces_in(root)? {
+        let owner_dir = config_path.parent();
+        let is_target = owner_dir.is_some_and(|dir| dir == target);
+        let missing_config = !config_path.is_file();
+        if is_target || missing_config {
+            continue;
+        }
+        let owner = format!(
+            "registered workspace {chain_id:?} at {}",
+            config_path.display()
+        );
+        let (node, _) = load_node_toml(&config_path)
+            .map_err(|error| format!("cannot inspect listener reservation for {owner}: {error}"))?;
+        let reserved = node_listeners(&owner, &node)?;
+        for requested in &candidate {
+            for existing in &reserved {
+                let same_protocol = requested.protocol == existing.protocol;
+                let overlaps = listener_addresses_overlap(requested.addr, existing.addr);
+                let collision = same_protocol && overlaps;
+                if collision {
+                    return Err(listener_collision_message(requested, existing, &owner));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn listener_addresses_overlap(left: SocketAddr, right: SocketAddr) -> bool {
+    let left_port = left.port();
+    let right_port = right.port();
+    let either_is_ephemeral = left_port == 0 || right_port == 0;
+    let ports_differ = left_port != right_port;
+    if either_is_ephemeral || ports_differ {
+        return false;
+    }
+
+    let left_is_v4 = left.ip().is_ipv4();
+    let right_is_v4 = right.ip().is_ipv4();
+    let different_address_family = left_is_v4 != right_is_v4;
+    if different_address_family {
+        let left_is_v6_wildcard = !left_is_v4 && left.ip().is_unspecified();
+        let right_is_v6_wildcard = !right_is_v4 && right.ip().is_unspecified();
+        return left_is_v6_wildcard || right_is_v6_wildcard;
+    }
+
+    let same_address = left.ip() == right.ip();
+    let either_is_wildcard = left.ip().is_unspecified() || right.ip().is_unspecified();
+    same_address || either_is_wildcard
+}
+
+fn listener_collision_message(requested: &Listener, existing: &Listener, owner: &str) -> String {
+    let protocol = listener_protocol_name(requested.protocol);
+    format!(
+        "refusing join: {protocol} listener --{} {} overlaps {owner}'s {protocol} listener \
+         --{} {}. The registry reserves each configured non-zero listener even when that \
+         workspace is stopped; this check does not inspect live processes. Choose a different \
+         non-zero --{} address or change/remove the existing reservation before joining.",
+        requested.name, requested.addr, existing.name, existing.addr, requested.name,
+    )
+}
+
+fn listener_protocol_name(protocol: ListenerProtocol) -> &'static str {
+    match protocol {
+        ListenerProtocol::Tcp => "TCP",
+        ListenerProtocol::Udp => "UDP",
+    }
 }
 
 /// refuse a chain id that would make `-n <chain-id>` prefix lookup ambiguous
@@ -362,6 +522,174 @@ mod tests {
         // an unrelated id is fine.
         guard_no_chain_id_collision(root.path(), "cathouse#deadbeef")
             .expect("an unrelated chain id is not a collision");
+    }
+
+    fn test_plumbing(dir: &Path, overrides: PlumbingOverrides) -> Plumbing {
+        merged_plumbing(dir, &overrides).expect("test plumbing")
+    }
+
+    fn register_workspace(root: &Path, name: &str, chain_id: &str, plumbing: &Plumbing) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::NetworkDescriptor {
+            chain_id: chain_id.into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
+            genesis: String::new(),
+            modules: Vec::new(),
+        }
+        .save(&dir.join("network.toml"))
+        .unwrap();
+        write_node_toml(&dir, plumbing).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_second_workspace_fixed_tcp_listener_is_refused_with_its_registered_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = test_plumbing(
+            &root.path().join("owner"),
+            PlumbingOverrides {
+                listen: Some("127.0.0.1:6000".into()),
+                http: Some("127.0.0.1:6100".into()),
+                rpc: Some("127.0.0.1:6002".into()),
+                gateway: Some("127.0.0.1:0".into()),
+                wireguard_listen: Some("0.0.0.0:6200".into()),
+                invite_listen: Some("0.0.0.0:6201".into()),
+                ..Default::default()
+            },
+        );
+        let owner_dir = register_workspace(root.path(), "owner", "owner#a1b2c3d4", &owner);
+        let target = root.path().join("joined");
+        let candidate = test_plumbing(
+            &target,
+            PlumbingOverrides {
+                http: Some("0.0.0.0:6100".into()),
+                ..Default::default()
+            },
+        );
+
+        let error = guard_local_listener_collisions(root.path(), &target, &candidate)
+            .expect_err("the second workspace must not reuse the reserved HTTP port");
+        assert!(error.contains("owner#a1b2c3d4"), "{error}");
+        assert!(
+            error.contains(&owner_dir.join("node.toml").display().to_string()),
+            "{error}"
+        );
+        assert!(
+            error.contains("TCP") && error.contains("http_listen"),
+            "{error}"
+        );
+        assert!(
+            error.contains("stopped") && error.contains("live processes"),
+            "{error}"
+        );
+        assert!(
+            !target.exists(),
+            "listener refusal must precede destination writes"
+        );
+    }
+
+    #[test]
+    fn listener_reservations_distinguish_tcp_udp_wildcards_and_port_zero() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = test_plumbing(
+            &root.path().join("owner"),
+            PlumbingOverrides {
+                listen: Some("127.0.0.1:6000".into()),
+                http: Some("127.0.0.1:6101".into()),
+                rpc: Some("127.0.0.1:6002".into()),
+                gateway: Some("127.0.0.1:0".into()),
+                wireguard_listen: Some("0.0.0.0:6102".into()),
+                invite_listen: Some("0.0.0.0:6103".into()),
+                ..Default::default()
+            },
+        );
+        register_workspace(root.path(), "owner", "owner#a1b2c3d4", &owner);
+
+        let tcp_wildcard = test_plumbing(
+            &root.path().join("tcp-wildcard"),
+            PlumbingOverrides {
+                http: Some("0.0.0.0:6101".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            guard_local_listener_collisions(
+                root.path(),
+                &root.path().join("tcp-wildcard"),
+                &tcp_wildcard
+            )
+            .is_err()
+        );
+
+        let udp_same_port = test_plumbing(
+            &root.path().join("udp-same-port"),
+            PlumbingOverrides {
+                wireguard_listen: Some("127.0.0.1:6101".into()),
+                invite_listen: Some("0.0.0.0:6104".into()),
+                ..Default::default()
+            },
+        );
+        guard_local_listener_collisions(
+            root.path(),
+            &root.path().join("udp-same-port"),
+            &udp_same_port,
+        )
+        .expect("TCP and UDP may use the same port");
+
+        let udp_wildcard = test_plumbing(
+            &root.path().join("udp-wildcard"),
+            PlumbingOverrides {
+                wireguard_listen: Some("127.0.0.1:6102".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            guard_local_listener_collisions(
+                root.path(),
+                &root.path().join("udp-wildcard"),
+                &udp_wildcard
+            )
+            .is_err()
+        );
+
+        let tcp_port_zero = test_plumbing(
+            &root.path().join("tcp-port-zero"),
+            PlumbingOverrides {
+                http: Some("127.0.0.1:0".into()),
+                ..Default::default()
+            },
+        );
+        guard_local_listener_collisions(
+            root.path(),
+            &root.path().join("tcp-port-zero"),
+            &tcp_port_zero,
+        )
+        .expect("port 0 does not reserve a listener port");
+
+        assert!(listener_addresses_overlap(
+            "[::]:6104".parse().unwrap(),
+            "[::1]:6104".parse().unwrap(),
+        ));
+        assert!(!listener_addresses_overlap(
+            "0.0.0.0:6104".parse().unwrap(),
+            "[::1]:6104".parse().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn a_workspace_does_not_conflict_with_its_own_registered_listeners() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("owner");
+        let plumbing = test_plumbing(&dir, PlumbingOverrides::default());
+        register_workspace(root.path(), "owner", "owner#a1b2c3d4", &plumbing);
+
+        guard_local_listener_collisions(root.path(), &dir, &plumbing)
+            .expect("a re-join may retain its own configured listeners");
     }
 
     /// A blob that is not an invite must fail BEFORE anything is written: the
