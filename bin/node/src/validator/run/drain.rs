@@ -1721,6 +1721,15 @@ impl ValidatorRuntime<'_> {
     // is non-empty, push one permissionless Nudge — a no-op
     // whose block carries the injection. duplicate nudges
     // from other nodes are free.
+    //
+    // ONE nudge per committed height, the moment the drain
+    // applied the block that filled the mailbox: the eager flush
+    // right after this turn ships it as its own block, so the
+    // result→chat tail costs one consensus round, not one idle
+    // block time plus a round. the wall-clock gate stays only as
+    // the liveness net for a nudge that was lost before it
+    // applied (a rejected submit, a dropped frame): the height
+    // then never moves and the clock re-arms it.
     async fn pump_dispatch_nudge(&mut self) {
         let Self {
             context,
@@ -1729,13 +1738,21 @@ impl ValidatorRuntime<'_> {
             signer,
             label,
             last_nudge,
+            last_nudge_height,
             cadence,
             ..
         } = self;
         let now = context.current();
-        let nudge_due = now.duration_since(*last_nudge).unwrap_or_default() >= cadence.block_time;
+        let height = node.finalized().map(|block| block.height);
+        let nudge_due = dispatch_nudge_due(
+            height,
+            *last_nudge_height,
+            now.duration_since(*last_nudge).unwrap_or_default(),
+            cadence.block_time,
+        );
         if nudge_due && dispatch_pending_deliveries(node.host()).await > 0 {
             *last_nudge = now;
+            *last_nudge_height = height;
             let seq = *next_seq;
             *next_seq += 1;
             if let Err(e) = node
@@ -1759,6 +1776,7 @@ impl ValidatorRuntime<'_> {
                 tracing::debug!(
                     target: "ducktape::saga",
                     node = %label,
+                    height,
                     "dispatch delivery nudge submitted"
                 );
             }
@@ -1853,6 +1871,21 @@ pub(crate) async fn dispatch_pending_deliveries(host: &host::Host) -> u64 {
         Ok(DispatchReply::PendingDeliveries(n)) => n,
         _ => 0,
     }
+}
+
+/// whether the delivery-nudge pump may submit now — the pure decision behind
+/// [`ValidatorRuntime::pump_dispatch_nudge`]. a committed height the pump has
+/// not nudged at yet is due at once; the same height is due again only once
+/// a block time has passed (the liveness net for a lost nudge).
+fn dispatch_nudge_due(
+    height: Option<u64>,
+    last_nudge_height: Option<u64>,
+    since_last_nudge: std::time::Duration,
+    block_time: std::time::Duration,
+) -> bool {
+    let height_moved = height != last_nudge_height;
+    let clock_due = since_last_nudge >= block_time;
+    height_moved || clock_due
 }
 
 /// the committed saga ledger's earliest pending lease-expiry/deadline — the
@@ -1968,7 +2001,19 @@ mod prune_retention_tests {
 
 #[cfg(test)]
 mod block_cadence_tests {
-    use super::{HeartbeatAction, eager_flush_due, heartbeat_action};
+    use super::{HeartbeatAction, dispatch_nudge_due, eager_flush_due, heartbeat_action};
+    use std::time::Duration;
+
+    /// a block that filled the mailbox is nudged the moment it applies; the
+    /// same height is re-nudged only once a block time has elapsed.
+    #[test]
+    fn dispatch_nudge_follows_the_committed_height() {
+        let block = Duration::from_millis(1_000);
+        assert!(dispatch_nudge_due(Some(7), None, Duration::ZERO, block));
+        assert!(dispatch_nudge_due(Some(8), Some(7), Duration::ZERO, block));
+        assert!(!dispatch_nudge_due(Some(7), Some(7), Duration::from_millis(999), block));
+        assert!(dispatch_nudge_due(Some(7), Some(7), block, block));
+    }
 
     #[test]
     fn pending_ops_flush_immediately_with_nothing_in_flight() {

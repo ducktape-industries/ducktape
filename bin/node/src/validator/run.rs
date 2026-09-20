@@ -333,6 +333,10 @@ struct ValidatorRuntime<'a> {
     /// the recovered block on process startup.
     last_conversation_height: Option<u64>,
     last_nudge: std::time::SystemTime,
+    /// the committed height the last dispatch nudge was submitted at: the
+    /// mailbox fills at a block boundary, so one nudge per committed height
+    /// while it holds work ships the flush block at network speed.
+    last_nudge_height: Option<u64>,
     workers: Vec<Box<dyn host::worker::Worker>>,
     code_signaller: super::code_announce::CodeReadinessSignaller,
     /// completed pending-swap code fetches and their outcome (`None` = the
@@ -613,6 +617,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         last_crank,
         last_conversation_height: None,
         last_nudge,
+        last_nudge_height: None,
         workers,
         code_signaller,
         fetch_done_tx,
