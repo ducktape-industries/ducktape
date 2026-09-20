@@ -1,11 +1,14 @@
 //! governance authorizes a module CODE swap the same way it authorizes a node
 //! upgrade: a member-gated proposal + simple-majority tally, and on passing,
 //! `handle_execute` emits the modreg op as a host-drained follow-up.
+
 //!
-//! these tests register the REAL code registry: what is pinned is the whole
+//! These tests register an owned code-registry contract stub: what is pinned is the whole
 //! authorization chain the live network runs — governance emits, the host
 //! stamps `Origin::Module("governance")`, modreg's origin gate accepts, and
 //! the pending swap LANDS in consensus state.
+
+mod support;
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
@@ -16,14 +19,15 @@ use governance::{
     encode_msg as gov_encode, encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
-use modules::{
+use sdk::{Error, Msg, Origin};
+use sdk_testkit::MemStore;
+use support::modules;
+use support::modules::Modules;
+use support::modules::{
     ModulesMsg, ModulesQuery, ModulesReply, decode_reply as modules_decode,
     encode_msg as modules_encode, encode_query as modules_query,
 };
-use modules_module::Modules;
-use sdk::{Error, Msg, Origin};
-use sdk_testkit::MemStore;
-use valset_module::Valset;
+use support::valset::Valset;
 
 fn member_key(seed: u8) -> Vec<u8> {
     let seed = [seed; 32];
@@ -38,8 +42,8 @@ fn hash(seed: u8) -> Vec<u8> {
     vec![seed; modules::CODE_HASH_LEN]
 }
 
-/// a host with valset (members 1,2) + governance wired to the REAL code
-/// registry, and the `hello` module pre-registered (active code = hash(1)).
+/// a host with valset (members 1,2) + governance wired to the owned code
+/// registry stub, and the `hello` module pre-registered (active code = hash(1)).
 async fn gov_host_with_modreg() -> Host {
     let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
     valset.seed(member_key(1)).await.expect("seed valset");
@@ -178,8 +182,8 @@ async fn pass(host: &mut Host, base: u64, id: &str, action: GovAction) {
     .expect("execute");
 }
 
-/// the headline: a passing UpdateModule lands the pending swap in the REAL
-/// registry — the whole chain from ballot to consensus code state.
+/// the headline: a passing UpdateModule lands the pending swap in the owned
+/// registry contract — the whole chain from ballot to consensus code state.
 #[test]
 fn a_passing_update_module_lands_a_pending_swap_in_the_registry() {
     block_on(async {

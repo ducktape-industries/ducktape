@@ -14,6 +14,8 @@
 //! the config record arrives with it, which is what lets a joiner's wasm
 //! guest read its invite binding from the synced store.
 
+mod support;
+
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -25,7 +27,7 @@ use governance::{
 use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
-use valset::{
+use support::valset::{
     ValsetQuery, ValsetReply, decode_query as valset_decode_query,
     encode_reply as valset_encode_reply,
 };

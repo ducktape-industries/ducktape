@@ -66,7 +66,7 @@ const MODULE_ID: &str = "governance";
 const VALSET_ID: &str = "valset";
 const MODULES_ID: &str = "modules";
 const IDENTITY_ID: &str = "identity";
-const ACL_ID: &str = acl::DEFAULT_ACL_ID;
+const ACL_ID: &str = "acl";
 
 /// this network's invite binding, decoded from the host-seeded genesis
 /// config. a missing or malformed config is host wiring corruption surfaced

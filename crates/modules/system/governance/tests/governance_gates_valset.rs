@@ -8,6 +8,8 @@
 //! frame signature — so what these tests pin is the authorization model the
 //! live network runs.
 
+mod support;
+
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
@@ -19,11 +21,11 @@ use governance::{
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
-use valset::{
+use support::valset::Valset;
+use support::valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode,
     encode_msg as valset_encode, encode_query as valset_query,
 };
-use valset_module::Valset;
 
 fn member_key(seed: u8) -> Vec<u8> {
     let seed = [seed; 32];

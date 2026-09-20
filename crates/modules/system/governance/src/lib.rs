@@ -87,17 +87,21 @@
 //! rides state-sync like any other record. this module never writes that key.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-pub use governance_wire::*;
+mod wire;
+pub use wire::*;
+pub mod identity_contract;
+mod module_contracts;
 
 use std::collections::BTreeMap;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
-use identity::{
-    IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
-    encode_query as identity_encode_query,
+use identity_contract::{
+    AccountView, IdentityQuery, IdentityReply, account_principal,
+    decode_reply as identity_decode_reply, encode_query as identity_encode_query,
 };
+use module_contracts::{acl, modules, valset};
 use modules::{ModulesMsg, encode_msg as modules_encode_msg};
 use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
@@ -538,7 +542,7 @@ impl Governance {
         &self,
         ctx: &dyn Ctx,
         query: IdentityQuery,
-    ) -> Result<Option<identity::AccountView>, Error> {
+    ) -> Result<Option<AccountView>, Error> {
         let reply = ctx
             .query(&self.identity_id, &identity_encode_query(&query))
             .await?;
@@ -652,10 +656,10 @@ impl Governance {
             let total = Self::total_power(&shares)?;
             let powers = shares
                 .into_iter()
-                .map(|(number, shares)| (identity::account_principal(number), shares))
+                .map(|(number, shares)| (account_principal(number), shares))
                 .collect();
             return Ok((
-                identity::account_principal(number),
+                account_principal(number),
                 Electorate {
                     voter_kind: VoterKind::Account,
                     rule: Self::threshold_rule(total, action, true),
@@ -1003,7 +1007,7 @@ impl Governance {
             // brick the network permanently, with no repair proposal able to
             // reach the door that just closed on it.
             let share_mode = self.share_mode().await?;
-            if !Self::electorate_can_still_submit(share_mode, &self.id, target, *standing) {
+            if !Self::electorate_can_still_submit(share_mode, &self.id, target, standing.clone()) {
                 return Err(Error::module(
                     "electorate_lockout",
                     "acl policy would lock the current electorate out of governance itself",
@@ -1115,9 +1119,7 @@ impl Governance {
         // account has, re-voting overwrites the same principal.
         let voter = match electorate.voter_kind {
             VoterKind::ValidatorNode => submitter,
-            VoterKind::Account => {
-                identity::account_principal(self.submitter_account(ctx, &submitter).await?)
-            }
+            VoterKind::Account => account_principal(self.submitter_account(ctx, &submitter).await?),
         };
         let in_electorate = electorate.powers.contains_key(&voter);
         if !in_electorate {
@@ -1403,14 +1405,17 @@ impl Governance {
                         // guarantee about who submits AFTER this lands.
                         let share_mode = self.share_mode().await?;
                         let safe = Self::electorate_can_still_submit(
-                            share_mode, &self.id, target, *standing,
+                            share_mode,
+                            &self.id,
+                            target,
+                            standing.clone(),
                         );
                         if safe {
                             ctx.emit_msg(Msg {
                                 target: acl_id.clone(),
                                 payload: acl::encode_msg(&acl::AclMsg::SetPolicy {
                                     target: target.clone(),
-                                    standing: *standing,
+                                    standing: standing.clone(),
                                 }),
                             });
                         } else {

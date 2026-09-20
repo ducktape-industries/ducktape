@@ -3,23 +3,25 @@
 //! power, so two keys of one account cast ONE account ballot and later share
 //! changes cannot rewrite an open proposal's decision boundary.
 
+mod support;
+
 use std::collections::BTreeMap;
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
+use governance::identity_contract::{
+    AccountView, IdentityQuery, IdentityReply, KeyScheme, KeyView, account_principal,
+    decode_query as identity_decode_query, encode_reply as identity_encode_reply,
+};
 use governance::{
     GovAction, GovMsg, GovQuery, GovReply, Governance, ProposalStatus, ShareAllocation, VoterKind,
     VotingRule, decode_reply, encode_msg, encode_query,
 };
 use host::{BlockContext, Host, SubmitError};
-use identity::{
-    AccountView, IdentityQuery, IdentityReply, KeyScheme, KeyView, account_principal,
-    decode_query as identity_decode_query, encode_reply as identity_encode_reply,
-};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sdk_testkit::MemStore;
-use valset_module::Valset;
+use support::valset::Valset;
 
 fn key(seed: u8) -> Vec<u8> {
     let seed = [seed; 32];
@@ -50,7 +52,7 @@ impl IdentityStub {
             accounts.insert(
                 number,
                 AccountView {
-                    control: identity::Control::Keys,
+                    control: governance::identity_contract::Control::Keys,
                     number,
                     name: format!("account-{number}"),
                     keys: keys

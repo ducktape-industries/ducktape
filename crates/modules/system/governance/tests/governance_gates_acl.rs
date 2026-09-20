@@ -5,12 +5,12 @@
 //! module (and everything gated behind it) permanently, with no repair
 //! proposal able to reach the door that just closed on it.
 //!
-//! ops are driven through a REAL `Host` with a REAL `acl::Acl` module wired,
-//! exactly the composition a live network runs.
+//! ops are driven through a REAL `Host` with an owned ACL contract stub wired,
+//! preserving the live composition and refusal semantics without a sibling
+//! module dependency.
 
-use acl_module::{
-    Acl, AclQuery, AclReply, Standing, decode_reply as acl_decode, encode_query as acl_query,
-};
+mod support;
+
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
@@ -22,7 +22,10 @@ use governance::{
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
-use valset_module::Valset;
+use support::acl::{
+    Acl, AclQuery, AclReply, Standing, decode_reply as acl_decode, encode_query as acl_query,
+};
+use support::valset::Valset;
 
 fn member_key(seed: u8) -> Vec<u8> {
     let seed = [seed; 32];
@@ -33,7 +36,7 @@ fn member_key(seed: u8) -> Vec<u8> {
         .to_vec()
 }
 
-/// a host with valset (members 1,2), governance wired to a REAL acl module.
+/// a host with valset (members 1,2), governance wired to the owned ACL stub.
 async fn gov_host_with_acl() -> Host {
     let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
     valset.seed(member_key(1)).await.expect("seed valset");

@@ -3246,8 +3246,6 @@ dependencies = [
 name = "governance"
 version = "0.1.0"
 dependencies = [
- "acl",
- "acl-wire",
  "async-trait",
  "borsh",
  "commonware-codec",
@@ -3255,18 +3253,12 @@ dependencies = [
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
- "governance-wire",
  "host",
- "identity",
- "identity-wire",
- "modules",
- "modules-wire",
+ "module-artifact",
  "sdk",
  "sdk-testkit",
  "serde",
  "statesync",
- "valset",
- "valset-wire",
 ]
 
 [[package]]
@@ -4165,7 +4157,6 @@ dependencies = [
  "commonware-runtime",
  "ducktape-module-sdk",
  "host",
- "kv-wire",
  "sdk",
  "sdk-testkit",
  "serde",

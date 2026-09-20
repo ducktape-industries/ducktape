@@ -1,5 +1,6 @@
-//! invite redemption end-to-end through a REAL host: minting is the admission
-//! decision, so a `GovMsg::Redeem` carrying a member-minted token plus the
+//! invite redemption end-to-end through a REAL host and owned contracts:
+//! minting is the admission decision, so a `GovMsg::Redeem` carrying a
+//! member-minted token plus the
 //! joiner's proof-of-possession grants standing with no ballot — and the
 //! redeemed-nonce set makes every token single-use.
 //!
@@ -14,6 +15,8 @@
 //! signature — so what these tests pin is the authorization model the live
 //! network runs.
 
+mod support;
+
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
@@ -23,13 +26,13 @@ use governance::{
     encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
-use identity_module::Identity;
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
-use valset::{
+use support::identity::Identity;
+use support::valset::Valset;
+use support::valset::{
     ValsetQuery, ValsetReply, decode_reply as valset_decode, encode_query as valset_query,
 };
-use valset_module::Valset;
 
 const BINDING: &[u8] = b"testnet#00000000@feedface";
 
