@@ -2335,7 +2335,7 @@ dependencies = [
 [[package]]
 name = "directory"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-modules?branch=dev#8d8b7a2922b2cd255136dcb16fb4fd45ac205f71"
+source = "git+https://github.com/ducktape-industries/ducktape-modules?branch=dev#7d93d90a75d8e1691a64e5e4394e1f7da8048413"
 dependencies = [
  "async-trait",
  "sdk",
@@ -3328,7 +3328,7 @@ dependencies = [
 [[package]]
 name = "greeter"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-modules?branch=dev#8d8b7a2922b2cd255136dcb16fb4fd45ac205f71"
+source = "git+https://github.com/ducktape-industries/ducktape-modules?branch=dev#7d93d90a75d8e1691a64e5e4394e1f7da8048413"
 dependencies = [
  "async-trait",
  "directory",
