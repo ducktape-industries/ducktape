@@ -103,6 +103,11 @@ const REPORT_EVERY: u64 = 60;
 /// whose reads keep failing.
 const BACKOFF_CAP_POLLS: u64 = 32;
 
+/// The keyed founding set this checkout stages beside a built node binary.
+/// `build.rs` uses the same path encoder as the node's stager, so a checkout
+/// install carries the exact set that the `--from` binary resolves.
+const STAGED_MODULES_DIR: &str = env!("DUCKTAPE_STAGED_SET");
+
 /// Every way the launcher can be invoked; one match in `main`.
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
@@ -1157,15 +1162,21 @@ fn require_node_config(layout: &Layout) -> Result<(), Refusal> {
 /// do `make install-node`'s layout and the staging directory an operator
 /// builds.
 fn founding_set_beside(from: &std::path::Path) -> Result<PathBuf, Refusal> {
-    let shipped = from.parent().map(|beside| beside.join(MODULES_DIR));
-    shipped.filter(|set| set.is_dir()).ok_or_else(|| {
+    let shipped = from.parent().and_then(|beside| {
+        [beside.join(STAGED_MODULES_DIR), beside.join(MODULES_DIR)]
+            .into_iter()
+            .find(|set| set.is_dir())
+    });
+    shipped.ok_or_else(|| {
         Refusal::new(
             "founding_set_missing",
             format!(
-                "no `{MODULES_DIR}/` beside {} — a node reads its founding set beside its own \
+                "no founding set beside {} — a node reads its founding set beside its own \
                  binary and reaches the mesh through the netstack guest in it, so a release \
-                 without one never joins or serves. Install from an unpacked node release \
-                 archive, or from the directory `make install-node` writes",
+                 without one never joins or serves. A checkout build uses \
+                 `{STAGED_MODULES_DIR}/`; installed layouts use `{MODULES_DIR}/`. Install \
+                 from an unpacked node release archive, or from the directory `make \
+                 install-node` writes",
                 from.display()
             ),
         )
@@ -1655,6 +1666,39 @@ mod tests {
         assert!(
             release.join("modules/.staged-by").exists(),
             "and the record the binary checks the set against rides along"
+        );
+    }
+
+    /// A checkout build stages its set under the checkout-keyed sibling name,
+    /// while the launcher install command still names the profile's binary.
+    #[test]
+    fn install_carries_the_checkout_keyed_founding_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("target/debug");
+        std::fs::create_dir_all(profile.join(STAGED_MODULES_DIR)).unwrap();
+        std::fs::write(
+            profile
+                .join(STAGED_MODULES_DIR)
+                .join("netstack.component.wasm"),
+            b"checkout netstack",
+        )
+        .unwrap();
+        let binary = profile.join("ducktape");
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let layout = node_workspace(&dir.path().join("workspace"));
+        let sha = seed(&layout, &binary, None).unwrap();
+
+        assert_eq!(
+            std::fs::read(
+                layout
+                    .release_dir(sha)
+                    .join("modules/netstack.component.wasm")
+            )
+            .unwrap(),
+            b"checkout netstack"
         );
     }
 
