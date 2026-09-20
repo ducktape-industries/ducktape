@@ -12,13 +12,14 @@
 //!   surface.
 
 use std::fmt::Write as _;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize as _;
 
-use super::DEFAULT_CHECKPOINT_BLOCKS;
-use super::PlumbingOverrides;
 use super::default_primary_coordinator;
+use super::PlumbingOverrides;
+use super::DEFAULT_CHECKPOINT_BLOCKS;
 
 /// the generated defaults: a fresh init/join with no flags yields a node
 /// with every surface up. Loopback for the operator surfaces (HTTP app
@@ -306,6 +307,11 @@ pub fn merged_plumbing(dir: &Path, overrides: &PlumbingOverrides) -> Result<Plum
         .or_else(|| e.map(|r| r.primary_coordinator.clone()))
         .unwrap_or_else(default_primary_coordinator);
     let derived_relay = derive_coordinator_relay(&primary_coordinator);
+    let gateway_listen = gateway_listen
+        .map(str::to_string)
+        .or_else(|| e.map(|r| r.gateway_listen.clone()))
+        .unwrap_or_else(|| DEFAULT_GATEWAY_LISTEN.into());
+    validate_gateway_listen(&gateway_listen)?;
     Ok(Plumbing {
         advertised: advertised
             .map(str::to_string)
@@ -316,10 +322,7 @@ pub fn merged_plumbing(dir: &Path, overrides: &PlumbingOverrides) -> Result<Plum
             .map(str::to_string)
             .or_else(|| e.map(|r| r.http_listen.clone()))
             .unwrap_or_else(|| DEFAULT_HTTP_LISTEN.into()),
-        gateway_listen: gateway_listen
-            .map(str::to_string)
-            .or_else(|| e.map(|r| r.gateway_listen.clone()))
-            .unwrap_or_else(|| DEFAULT_GATEWAY_LISTEN.into()),
+        gateway_listen,
         rpc_listen: rpc_listen
             .map(str::to_string)
             .or_else(|| e.map(|r| r.rpc_listen.clone()))
@@ -345,6 +348,19 @@ pub fn merged_plumbing(dir: &Path, overrides: &PlumbingOverrides) -> Result<Plum
         wireguard_listen,
         primary_coordinator,
     })
+}
+
+fn validate_gateway_listen(gateway_listen: &str) -> Result<(), String> {
+    let address: SocketAddr = gateway_listen.parse().map_err(|error| {
+        format!("invalid gateway_listen {gateway_listen:?} (expected 127.0.0.1:<port>): {error}")
+    })?;
+    let is_exact_loopback = address.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST);
+    if !is_exact_loopback {
+        return Err(format!(
+            "gateway_listen must bind exactly 127.0.0.1, got {gateway_listen:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// the intro listener default: `wireguard_listen`'s port + 1, computed at
@@ -724,6 +740,55 @@ mod tests {
         // no [sandbox] table by default: a fresh node is consensus-only, and
         // the commented example in the file must not parse as a live table.
         assert_eq!(raw.sandbox, None);
+    }
+
+    #[test]
+    fn gateway_must_be_exact_ipv4_loopback_before_config_is_written() {
+        for (gateway, error_start) in [
+            (
+                "0.0.0.0:39102",
+                "gateway_listen must bind exactly 127.0.0.1",
+            ),
+            ("[::1]:39102", "gateway_listen must bind exactly 127.0.0.1"),
+            ("not-an-address", "invalid gateway_listen"),
+        ] {
+            let dir = tmp("gateway-refused");
+            let result = merged_plumbing(
+                &dir,
+                &PlumbingOverrides {
+                    gateway: Some(gateway.into()),
+                    ..Default::default()
+                },
+            );
+            let Err(err) = result else {
+                panic!("non-IPv4-loopback gateway must fail");
+            };
+            assert!(err.starts_with(error_start), "{err}");
+            assert!(!dir.join("node.toml").exists());
+        }
+
+        let dir = tmp("gateway-accepted");
+        let plumbing = merged_plumbing(
+            &dir,
+            &PlumbingOverrides {
+                http: Some("0.0.0.0:39103".into()),
+                ..Default::default()
+            },
+        )
+        .expect("remote HTTP with the default gateway is valid");
+        assert_eq!(plumbing.http_listen, "0.0.0.0:39103");
+        assert_eq!(plumbing.gateway_listen, DEFAULT_GATEWAY_LISTEN);
+
+        let dir = tmp("gateway-loopback");
+        let plumbing = merged_plumbing(
+            &dir,
+            &PlumbingOverrides {
+                gateway: Some("127.0.0.1:39104".into()),
+                ..Default::default()
+            },
+        )
+        .expect("IPv4 loopback gateway is valid");
+        assert_eq!(plumbing.gateway_listen, "127.0.0.1:39104");
     }
 
     /// nothing optional: a file missing ANY key refuses to parse, and the
