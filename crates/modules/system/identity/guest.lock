@@ -1053,7 +1053,7 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 [[package]]
 name = "identity"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#56cf140a59a13369924bdbecb536e25146a0aff9"
+source = "git+https://github.com/ducktape-industries/ducktape#f591d4846c8edd82269f864fcfdb850a5cc4293a"
 dependencies = [
  "async-trait",
  "borsh",
