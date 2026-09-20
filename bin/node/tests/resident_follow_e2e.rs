@@ -18,7 +18,7 @@ mod common;
 
 use std::time::Duration;
 
-use chat::{
+use common::wire::chat::{
     Block, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_reply, encode_msg, encode_query,
 };
 use common::NetworkShapeCluster;

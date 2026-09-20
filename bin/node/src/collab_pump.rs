@@ -47,7 +47,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use agent_service::wire;
-use collaboration as collab;
+use crate::wire::{chat, collaboration as collab};
 use futures::SinkExt as _;
 use futures::channel::{mpsc, oneshot};
 use tokio::sync::mpsc as lane;

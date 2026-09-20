@@ -53,11 +53,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use capability::{CapabilityQuery, CapabilityReply};
-use chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, PostPolicy, Span};
+use common::wire::{chat, runs};
+use common::wire::chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, PostPolicy, Span};
 use common::{Cluster, SandboxStage, sandbox_toml, skip_unless_sandboxed};
 use dispatch::{DispatchQuery, DispatchReply, DispatchStatus};
-use runs::ModelMsg;
-use runs::{RunsMsg, RunsQuery, RunsReply};
+use common::wire::runs::ModelMsg;
+use common::wire::runs::{RunsMsg, RunsQuery, RunsReply};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.

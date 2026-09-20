@@ -14,7 +14,7 @@ mod common;
 
 use std::time::Duration;
 
-use chat::{ChatMsg, PostPolicy, encode_msg};
+use common::wire::chat::{ChatMsg, PostPolicy, encode_msg};
 use common::{NetworkShapeCluster, ducktape};
 
 const BOOT: Duration = Duration::from_secs(120);

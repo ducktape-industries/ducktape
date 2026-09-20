@@ -7,6 +7,10 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+#[path = "../src/wire.rs"]
+mod wire;
+use wire::runs;
+
 use serde_json::{Value, json};
 
 const RUN_ID: &str = "saga-7:0";
