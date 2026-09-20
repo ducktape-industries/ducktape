@@ -37,6 +37,17 @@ struct PendingClaim {
     claimed_at_beat: u64,
 }
 
+/// the size a run gets for a dimension it did not ask for. Small on purpose:
+/// see [`ResourceLedger::accounted_demands`].
+pub const DEFAULT_RUN_CORES: u64 = 2;
+pub const DEFAULT_RUN_MEM_GB: u64 = 2;
+fn default_run_size(dimension: &str) -> Option<u64> {
+    match dimension {
+        "cores" => Some(DEFAULT_RUN_CORES),
+        "mem_gb" => Some(DEFAULT_RUN_MEM_GB),
+        _ => None,
+    }
+}
 pub struct ResourceLedger {
     capacity: BTreeMap<String, u64>,
     running: Arc<Mutex<BTreeMap<String, BTreeMap<String, u64>>>>,
@@ -66,11 +77,15 @@ impl ResourceLedger {
         }
     }
 
-    /// Turn omitted dimensions into an honest upper bound. On a sandboxed
-    /// node, leaving (say) memory unspecified means the run may use the whole
-    /// node, not zero memory: reserve and enforce the full announced capacity
-    /// for that dimension. An empty ledger is the Direct path, where a
-    /// demandless run remains deliberately unrestricted.
+    /// Turn omitted dimensions into a concrete size. On a sandboxed node the
+    /// accounted demand IS the microVM's size, so an omitted dimension gets a
+    /// small default (capped by capacity), never the whole node: a
+    /// host-sized guest spends its boot initialising page tables it will
+    /// never touch (measured 21-28 s for 94 GiB / 24 vcpus against 2.4 s for
+    /// 2 GiB / 2 vcpus), and every chat turn pays it. A run that needs more
+    /// says so in its demands. A dimension this table does not know (none
+    /// today) still reserves its full capacity. An empty ledger is the Direct
+    /// path, where a demandless run remains deliberately unrestricted.
     pub(crate) fn accounted_demands(
         &self,
         demands: &BTreeMap<String, u64>,
@@ -80,7 +95,10 @@ impl ResourceLedger {
         }
         let mut accounted = demands.clone();
         for (dimension, capacity) in &self.capacity {
-            accounted.entry(dimension.clone()).or_insert(*capacity);
+            let default = default_run_size(dimension).unwrap_or(*capacity);
+            accounted
+                .entry(dimension.clone())
+                .or_insert(default.min(*capacity));
         }
         accounted
     }
@@ -97,7 +115,7 @@ impl ResourceLedger {
     /// free = capacity − Σ running, per dimension; a demanded dimension the
     /// capacity never named is a mismatch (absent ≠ infinite). Callers pass
     /// [`Self::accounted_demands`] so omitted sandbox dimensions cost their
-    /// full capacity; only the empty-capacity Direct path stays free.
+    /// small default; only the empty-capacity Direct path stays free.
     pub fn fits(&self, demands: &BTreeMap<String, u64>) -> bool {
         let running = self.running.lock().expect("ledger lock");
         self.fits_locked(&running, demands)
@@ -272,16 +290,26 @@ mod tests {
     }
 
     #[test]
-    fn omitted_sandbox_dimensions_account_for_full_capacity() {
+    fn omitted_sandbox_dimensions_get_the_small_default_never_the_node() {
         let l = ResourceLedger::new(res(&[("cores", 8), ("mem_gb", 16)]));
         assert_eq!(
             l.accounted_demands(&res(&[])),
-            res(&[("cores", 8), ("mem_gb", 16)])
+            res(&[("cores", 2), ("mem_gb", 2)])
         );
+        // an explicit demand is kept; only the omitted dimension defaults.
         assert_eq!(
-            l.accounted_demands(&res(&[("cores", 2)])),
-            res(&[("cores", 2), ("mem_gb", 16)])
+            l.accounted_demands(&res(&[("cores", 6)])),
+            res(&[("cores", 6), ("mem_gb", 2)])
         );
+        // a node smaller than the default sells what it has.
+        let tiny = ResourceLedger::new(res(&[("cores", 1), ("mem_gb", 1)]));
+        assert_eq!(
+            tiny.accounted_demands(&res(&[])),
+            res(&[("cores", 1), ("mem_gb", 1)])
+        );
+        // an unknown dimension still reserves its whole capacity.
+        let gpu = ResourceLedger::new(res(&[("gpu", 4)]));
+        assert_eq!(gpu.accounted_demands(&res(&[])), res(&[("gpu", 4)]));
         let direct = ResourceLedger::new(BTreeMap::new());
         assert!(direct.accounted_demands(&res(&[])).is_empty());
     }

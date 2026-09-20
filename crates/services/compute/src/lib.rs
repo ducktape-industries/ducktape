@@ -637,21 +637,21 @@ format = "text"
     }
 
     #[test]
-    fn omitted_sandbox_dimensions_become_full_capacity_demands() {
+    fn omitted_sandbox_dimensions_become_the_small_default_demands() {
         let providers = servable_providers();
         let capacity = demands(&[("cores", 8), ("mem_gb", 16)]);
-        let ledger = ResourceLedger::new(capacity.clone());
+        let ledger = ResourceLedger::new(capacity);
         let Gated::Execute(job) = gate(
             &providers,
             b"me",
             &ledger,
             &effect_for(work_spec(), Some(b"me")),
         ) else {
-            panic!("a demandless sandbox run should execute with full accounting")
+            panic!("a demandless sandbox run should execute with the default size")
         };
-        assert_eq!(job.demands, capacity);
+        assert_eq!(job.demands, demands(&[("cores", 2), ("mem_gb", 2)]));
 
-        let partial = work_spec_with_demands(demands(&[("cores", 2)]));
+        let partial = work_spec_with_demands(demands(&[("cores", 6)]));
         let Gated::Execute(job) = gate(
             &providers,
             b"me",
@@ -660,7 +660,7 @@ format = "text"
         ) else {
             panic!("a partial sandbox run should fill its omitted dimensions")
         };
-        assert_eq!(job.demands, demands(&[("cores", 2), ("mem_gb", 16)]));
+        assert_eq!(job.demands, demands(&[("cores", 6), ("mem_gb", 2)]));
     }
 
     #[test]
