@@ -230,10 +230,17 @@ pub trait ProvisionedWorkspace: Send + Sync {
     fn native_conversation(&self) -> Option<provider_host::NativeConversationContext> {
         None
     }
-    /// the node's operator credential the run's node lane lends to every
+    /// the node's operator credential the run's node lane lends to an admitted
     /// forge push → `ctx.operator_credential`. `None` (the default, for an
     /// embedder with no node) refuses every push.
     fn operator_credential(&self) -> Option<OperatorCredential> {
+        None
+    }
+    /// the ONE repo this workspace pinned → `ctx.forge_repo`, the only repo the
+    /// lane lends [`Self::operator_credential`] to a push on. `None` (the
+    /// default, and every duckfs workspace) refuses every push: a workspace
+    /// that named no repo gives a run no authority over any.
+    fn forge_repo(&self) -> Option<String> {
         None
     }
     /// commit ONLY the rw source; `audit_message` is host-only receipt context
@@ -275,6 +282,7 @@ pub fn bind_workspace(ws: &dyn ProvisionedWorkspace, ctx: &mut RunContext) {
     }
     ctx.context_doc = ws.context_doc();
     ctx.operator_credential = ws.operator_credential();
+    ctx.forge_repo = ws.forge_repo();
 }
 
 // ---- runner result ----------------------------------------------------------

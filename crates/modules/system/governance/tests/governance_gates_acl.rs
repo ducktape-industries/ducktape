@@ -8,7 +8,7 @@
 //! ops are driven through a REAL `Host` with a REAL `acl::Acl` module wired,
 //! exactly the composition a live network runs.
 
-use acl::{
+use acl_module::{
     Acl, AclQuery, AclReply, Standing, decode_reply as acl_decode, encode_query as acl_query,
 };
 use commonware_codec::DecodeExt as _;
@@ -22,7 +22,7 @@ use governance::{
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
-use valset::Valset;
+use valset_module::Valset;
 
 fn member_key(seed: u8) -> Vec<u8> {
     let seed = [seed; 32];
@@ -176,7 +176,7 @@ fn a_user_standing_policy_on_governance_is_refused_at_propose_in_validator_mode(
         .await
         .expect_err("a policy the validator-mode electorate can never satisfy is refused");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("lock")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "electorate_lockout"),
             "got {err:?}"
         );
         assert_eq!(proposal_status(&host, "brick-it").await, None);
@@ -207,7 +207,7 @@ fn a_user_standing_wildcard_policy_is_also_refused_at_propose() {
         .await
         .expect_err("a wildcard policy that would brick governance is refused too");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("lock")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "electorate_lockout"),
             "got {err:?}"
         );
     });

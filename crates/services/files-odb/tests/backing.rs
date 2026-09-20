@@ -43,7 +43,7 @@ fn test_ctx(origin: sdk::Origin, height: u64) -> sdk_testkit::TestCtx {
     })
     .on_query("identity", |req| {
         let identity::IdentityQuery::OfKey { .. } =
-            identity::decode_query(req).map_err(sdk::Error::Module)?
+            identity::decode_query(req).map_err(|e| sdk::Error::module("codec", e))?
         else {
             return Err(sdk::Error::QueryUnsupported);
         };

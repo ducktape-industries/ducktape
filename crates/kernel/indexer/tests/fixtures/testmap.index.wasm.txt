@@ -1,0 +1,8 @@
+The reference index guest the fold suites run: it derives `seen/{height}/{seq}`
+and `count` from the op feed.
+
+Source: ducktape-sdk, the `index-guest` crate's testmap guest.
+
+Three suites include these bytes — `crates/kernel/indexer/src/tests.rs`,
+`crates/kernel/statesync/tests/remote_kv_sync.rs` and the explorer tests in
+`bin/node/src/explorer.rs` — so the artifact is committed once, here.

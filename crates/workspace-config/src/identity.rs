@@ -101,6 +101,21 @@ pub fn ed25519_authorizer(
     }
 }
 
+/// refuse a network name the `duck://` address grammar cannot carry. The name
+/// is the label of every chain id [`mint_chain_id`] mints from it, and sdk's
+/// [`duck_address::ChainId`] is the ONE rule for a label: a name passes
+/// exactly when a chain id labelled with it round-trips through that parser.
+pub fn validate_network_name(name: &str) -> Result<(), duck_address::Refused> {
+    let labelled = duck_address::ChainId {
+        label: name.to_string(),
+        salt: Default::default(),
+    };
+    labelled
+        .to_string()
+        .parse::<duck_address::ChainId>()
+        .map(drop)
+}
+
 /// mint a chain-id: the human-readable name plus a short salt, so two
 /// unrelated networks that pick the same name still get distinct namespaces
 /// (their handshakes fail cleanly instead of colliding). the salt hashes the
@@ -300,5 +315,24 @@ mod tests {
             mode, 0o600,
             "secret must never be world-readable, even transiently"
         );
+    }
+
+    /// a name the address grammar carries mints a chain id sdk's parser
+    /// reads back; any other is refused by the parser's own reason token.
+    #[test]
+    fn a_network_name_is_a_label_the_address_grammar_carries() {
+        let founder = ed25519::PrivateKey::from_seed(1).public_key();
+        for good in ["dognet", "my-team-2", "0"] {
+            assert_eq!(validate_network_name(good), Ok(()), "{good:?}");
+            let minted = mint_chain_id(good, &founder);
+            let parsed: duck_address::ChainId = minted.parse().expect("minted id parses");
+            assert_eq!(parsed.label, good);
+        }
+        for bad in [
+            "My Team", "Dognet", "my team", "my_team", "dog#net", "dog/net", "",
+        ] {
+            let refused = validate_network_name(bad).expect_err(bad);
+            assert_eq!(refused.reason, "invalid_input", "{bad:?}");
+        }
     }
 }

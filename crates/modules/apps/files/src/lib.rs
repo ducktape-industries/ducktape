@@ -44,6 +44,6 @@ pub mod testkit {
     pub use duckfs_core::testkit::*;
 
     pub fn gc_due(height: u64, watermark: u64) -> bool {
-        crate::module::gc_due(height, watermark)
+        duckfs_disk::gc_due(height, watermark)
     }
 }

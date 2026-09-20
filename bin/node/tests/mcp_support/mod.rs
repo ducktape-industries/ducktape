@@ -7,16 +7,25 @@ use std::process::{Child, Command, Stdio};
 
 use commonware_cryptography::{Signer as _, ed25519};
 use host::Host;
-use noded::testkit::InProcDaemon;
+use noded::testkit::{InProcDaemon, committed_module};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const AGENT_ID: &str = "quackbot";
+/// this fixture's identity chain id — and the value the `runs` guest reads out
+/// of its genesis `__config` record.
+const CHAIN_ID: &str = "mcp-test";
 /// Deterministic Ed25519 fixture seed; every admitted write is actually signed.
 pub const OWNER: u64 = 7;
 static FRAME_SEQ: AtomicU64 = AtomicU64::new(1);
 pub fn owner_key() -> ed25519::PrivateKey {
     ed25519::PrivateKey::from_seed(OWNER)
+}
+
+/// the in-memory authenticated store every store-backed module in this fixture
+/// rides — native and guest alike.
+fn mem_store() -> Box<dyn sdk::MerkleStore> {
+    Box::new(sdk_testkit::MemStore::new())
 }
 
 pub struct Harness {
@@ -48,71 +57,50 @@ impl Harness {
         let blobs = noded::blobs::BlobHandle::persistent(&blob_root).expect("harness blob store");
 
         let daemon = InProcDaemon::start_with_blob_root(
+            // agent, chat, tasks and runs are the COMMITTED guests this repo
+            // ships (`crates/modules/apps/<id>/component.wasm`): their source
+            // lives in ducktape-modules, and the sibling wiring a native
+            // constructor used to take as arguments is compiled into each
+            // guest. The system modules, forge and files are core-resident and
+            // still native. `block_on` because a guest comes up asynchronously
+            // and the testkit builds its host on the actor thread, before that
+            // thread's own executor starts.
             move || {
-                Host::genesis(vec![
-                    // no commonware context in this sync closure, so the
-                    // registry rides the in-memory store test double.
-                    Box::new(agent::AgentModule::new(
-                        "agent",
-                        Box::new(sdk_testkit::MemStore::new()),
-                        agent::Siblings {
-                            identity: "identity".into(),
-                            attribution: "attribution".into(),
-                            dispatch: "dispatch".into(),
-                        },
-                    )),
-                    Box::new(identity::Identity::new(
-                        "identity",
-                        Box::new(sdk_testkit::MemStore::new()),
-                        "mcp-test".into(),
-                    )),
-                    Box::new(
-                        chat::Chat::new("chat", Box::new(sdk_testkit::MemStore::new()))
-                            .with_identity("identity")
-                            .with_attribution("attribution"),
-                    ),
-                    Box::new(saga::SagaModule::new(
-                        "saga",
-                        Box::new(sdk_testkit::MemStore::new()),
-                    )),
-                    Box::new(tasks::Tasks::new(
-                        "tasks",
-                        "identity",
-                        "attribution",
-                        Box::new(sdk_testkit::MemStore::new()),
-                    )),
-                    Box::new(dispatch::DispatchModule::new(
-                        "dispatch",
-                        "saga",
-                        "identity",
-                        Box::new(sdk_testkit::MemStore::new()),
-                    )),
-                    Box::new(
-                        attribution::AttributionModule::new(
-                            "attribution",
-                            Box::new(sdk_testkit::MemStore::new()),
-                        )
-                        .with_subscribers(["agent"]),
-                    ),
-                    Box::new(
-                        forge::Forge::with_blobs("forge", forge_base, blobs).expect("forge module"),
-                    ),
-                    // duckfs, the shared filesystem the read plane pages
-                    // through. in-memory like every other double here: the
-                    // module's odb is not what these tests are about.
-                    Box::new(files::Files::in_mem()),
-                    Box::new(runs::RunsModule::new(
-                        "runs",
-                        "chat",
-                        "saga",
-                        "attribution",
-                        "dispatch",
-                        "agent",
-                        Some("tasks".into()),
-                        None,
-                    )),
-                ])
-                .expect("genesis")
+                futures::executor::block_on(async {
+                    Host::genesis(vec![
+                        // no commonware context in this closure, so every
+                        // store-backed module rides the in-memory test double.
+                        Box::new(committed_module("agent", mem_store(), CHAIN_ID).await),
+                        Box::new(identity::Identity::new(
+                            "identity",
+                            mem_store(),
+                            CHAIN_ID.into(),
+                        )),
+                        Box::new(committed_module("chat", mem_store(), CHAIN_ID).await),
+                        Box::new(saga::SagaModule::new("saga", mem_store())),
+                        Box::new(committed_module("tasks", mem_store(), CHAIN_ID).await),
+                        Box::new(dispatch::DispatchModule::new(
+                            "dispatch",
+                            "saga",
+                            "identity",
+                            mem_store(),
+                        )),
+                        Box::new(
+                            attribution::AttributionModule::new("attribution", mem_store())
+                                .with_subscribers(["agent"]),
+                        ),
+                        Box::new(
+                            forge::Forge::with_blobs("forge", forge_base, blobs)
+                                .expect("forge module"),
+                        ),
+                        // duckfs, the shared filesystem the read plane pages
+                        // through. in-memory like every other double here: the
+                        // module's odb is not what these tests are about.
+                        Box::new(files::Files::in_mem()),
+                        Box::new(committed_module("runs", mem_store(), CHAIN_ID).await),
+                    ])
+                    .expect("genesis")
+                })
             },
             [
                 "identity",

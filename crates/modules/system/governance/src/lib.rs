@@ -87,11 +87,7 @@
 //! rides state-sync like any other record. this module never writes that key.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
-// the invite capability: token types + verification, shared by the node's
-// mint/lobby paths and the in-consensus `Redeem` handler below.
-pub mod invite;
+pub use governance_wire::*;
 
 use std::collections::BTreeMap;
 
@@ -124,18 +120,6 @@ const MAX_VOTING_PERIOD: u64 = 1_000_000_000;
 /// `deadline + EXECUTION_GRACE` the proposal is dead: refused on `Execute`
 /// and settled `Rejected` on the spot, same as any other reap.
 const EXECUTION_GRACE: u64 = 100_000;
-
-/// floor on `activation_lead` (`UpdateModule`/`RegisterModule`), validated at
-/// Propose: the lead is blocks after the EXECUTE height, and the modules
-/// registry itself refuses any `activation_height <= execute_height +
-/// modules::MIN_SWAP_LEAD` — so a lead this small can NEVER execute
-/// successfully. strictly above [`modules::MIN_SWAP_LEAD`] guarantees the
-/// registry's own floor is cleared whatever height Execute lands at.
-pub const MIN_ACTIVATION_LEAD: u64 = modules::MIN_SWAP_LEAD + 1;
-/// ceiling on `activation_lead` — a fat-fingered or hostile lead must not
-/// arm a swap so far in the future it is effectively unreachable. generous,
-/// same order as [`MAX_VOTING_PERIOD`].
-pub const MAX_ACTIVATION_LEAD: u64 = 1_000_000_000;
 
 /// Keep every share value and total exact in the JavaScript operator client.
 const MAX_SAFE_SHARES: u64 = 9_007_199_254_740_991;
@@ -327,7 +311,7 @@ impl Governance {
     {
         match self.staged.get(key).await? {
             Some(bytes) => Ok(Some(
-                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+                borsh::from_slice(&bytes).map_err(|e| Error::module("codec", e.to_string()))?,
             )),
             None => Ok(None),
         }
@@ -361,10 +345,10 @@ impl Governance {
     {
         let bytes = borsh::to_vec(value).expect("governance value is serializable");
         if bytes.len() > cap {
-            return Err(Error::Module(format!(
-                "{what} record too large: {} > {cap} bytes",
-                bytes.len()
-            )));
+            return Err(Error::module(
+                "record_too_large",
+                format!("{what} record too large: {} > {cap} bytes", bytes.len()),
+            ));
         }
         self.staged.stage(key, bytes);
         Ok(())
@@ -428,10 +412,12 @@ impl Governance {
         let mut i = 0;
         while i < roster.len() {
             let id = roster[i].clone();
-            let mut proposal = self
-                .proposal(&id)
-                .await?
-                .ok_or_else(|| Error::Module(format!("missing proposal record: {id}")))?;
+            let mut proposal = self.proposal(&id).await?.ok_or_else(|| {
+                Error::module(
+                    "missing_proposal_record",
+                    format!("missing proposal record: {id}"),
+                )
+            })?;
             let execution_deadline = proposal.deadline.saturating_add(EXECUTION_GRACE);
             let expired = proposal.status == ProposalStatus::Open && now >= execution_deadline;
             if expired {
@@ -506,9 +492,10 @@ impl Governance {
     fn external_origin(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
         match &ctx.env().origin {
             Origin::External(key) => Ok(key.clone()),
-            other => Err(Error::Module(format!(
-                "governance actions require an external submitter, got {other:?}"
-            ))),
+            other => Err(Error::module(
+                "external_origin_required",
+                format!("governance actions require an external submitter, got {other:?}"),
+            )),
         }
     }
 
@@ -534,8 +521,9 @@ impl Governance {
     async fn submitter_account(&self, ctx: &dyn Ctx, submitter: &[u8]) -> Result<u64, Error> {
         match self.resolve_actor(ctx, submitter).await? {
             Actor::Account { number } => Ok(number),
-            Actor::Node => Err(Error::Module(
-                "submitter key belongs to no Identity account".into(),
+            Actor::Node => Err(Error::module(
+                "no_identity_account",
+                "submitter key belongs to no Identity account",
             )),
         }
     }
@@ -554,11 +542,13 @@ impl Governance {
         let reply = ctx
             .query(&self.identity_id, &identity_encode_query(&query))
             .await?;
-        match identity_decode_reply(&reply).map_err(Error::Module)? {
+        match identity_decode_reply(&reply)
+            .map_err(|e| Error::module("identity_reply_decode", e))?
+        {
             IdentityReply::Account(account) => Ok(account),
-            IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
-                Err(Error::Module("unexpected identity reply".into()))
-            }
+            IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => Err(
+                Error::module("unexpected_identity_reply", "unexpected identity reply"),
+            ),
         }
     }
 
@@ -568,8 +558,9 @@ impl Governance {
             .await?
             .is_some();
         if !exists {
-            return Err(Error::Module(
-                "share allocation names no existing Identity account".into(),
+            return Err(Error::module(
+                "unknown_identity_account",
+                "share allocation names no existing Identity account",
             ));
         }
         Ok(())
@@ -577,13 +568,15 @@ impl Governance {
 
     fn total_power<K>(powers: &BTreeMap<K, u64>) -> Result<u64, Error> {
         let total = powers.values().try_fold(0u64, |sum, power| {
-            sum.checked_add(*power)
-                .ok_or_else(|| Error::Module("total governance shares overflow u64".into()))
+            sum.checked_add(*power).ok_or_else(|| {
+                Error::module("shares_overflow", "total governance shares overflow u64")
+            })
         })?;
         if total == 0 || total > MAX_SAFE_SHARES {
-            return Err(Error::Module(format!(
-                "total governance shares must be in 1..={MAX_SAFE_SHARES}"
-            )));
+            return Err(Error::module(
+                "bad_total_shares",
+                format!("total governance shares must be in 1..={MAX_SAFE_SHARES}"),
+            ));
         }
         Ok(total)
     }
@@ -643,13 +636,17 @@ impl Governance {
     ) -> Result<(Vec<u8>, Electorate), Error> {
         if self.share_mode().await? {
             let shares = self.shares().await?.ok_or_else(|| {
-                Error::Module("account-share mode has no configured registry".into())
+                Error::module(
+                    "no_share_registry",
+                    "account-share mode has no configured registry",
+                )
             })?;
             let number = self.submitter_account(ctx, submitter).await?;
             let holds_shares = shares.contains_key(&number);
             if !holds_shares {
-                return Err(Error::Module(
-                    "submitter account holds no governance shares".into(),
+                return Err(Error::module(
+                    "not_a_shareholder",
+                    "submitter account holds no governance shares",
                 ));
             }
             let total = Self::total_power(&shares)?;
@@ -674,8 +671,9 @@ impl Governance {
         let members = self.members(ctx).await?;
         let submitter_is_member = members.iter().any(|member| member == submitter);
         if !submitter_is_member {
-            return Err(Error::Module(
-                "submitter is not a validator-set member node".into(),
+            return Err(Error::module(
+                "not_a_member",
+                "submitter is not a validator-set member node",
             ));
         }
         let powers: BTreeMap<Vec<u8>, u64> =
@@ -700,11 +698,12 @@ impl Governance {
                 &valset_encode_query(&ValsetQuery::Residents),
             )
             .await?;
-        match valset_decode_reply(&reply).map_err(Error::Module)? {
+        match valset_decode_reply(&reply).map_err(|e| Error::module("valset_reply_decode", e))? {
             ValsetReply::Residents(residents) => Ok(residents),
-            other => Err(Error::Module(format!(
-                "valset answered a Residents query with {other:?}"
-            ))),
+            other => Err(Error::module(
+                "unexpected_valset_reply",
+                format!("valset answered a Residents query with {other:?}"),
+            )),
         }
     }
 
@@ -757,20 +756,25 @@ impl Governance {
         match &mut action {
             GovAction::AdoptShares { allocations } => {
                 if self.shares().await?.is_some() {
-                    return Err(Error::Module(
-                        "governance shares are already configured".into(),
+                    return Err(Error::module(
+                        "shares_already_configured",
+                        "governance shares are already configured",
                     ));
                 }
                 if allocations.is_empty() || allocations.len() > MAX_SHARE_ACCOUNTS {
-                    return Err(Error::Module(format!(
-                        "initial share allocation must contain 1..={MAX_SHARE_ACCOUNTS} accounts"
-                    )));
+                    return Err(Error::module(
+                        "bad_share_allocation",
+                        format!(
+                            "initial share allocation must contain 1..={MAX_SHARE_ACCOUNTS} accounts"
+                        ),
+                    ));
                 }
                 let mut normalized = BTreeMap::new();
                 for allocation in std::mem::take(allocations) {
                     if allocation.shares == 0 {
-                        return Err(Error::Module(
-                            "initial share allocations must be positive".into(),
+                        return Err(Error::module(
+                            "bad_share_allocation",
+                            "initial share allocations must be positive",
                         ));
                     }
                     self.require_account(ctx, allocation.account_id).await?;
@@ -778,8 +782,9 @@ impl Governance {
                         .insert(allocation.account_id, allocation.shares)
                         .is_some();
                     if duplicate {
-                        return Err(Error::Module(
-                            "initial share allocation contains a duplicate account".into(),
+                        return Err(Error::module(
+                            "bad_share_allocation",
+                            "initial share allocation contains a duplicate account",
                         ));
                     }
                 }
@@ -791,12 +796,16 @@ impl Governance {
             }
             GovAction::SetShares { account_id, shares } => {
                 let current = self.shares().await?.ok_or_else(|| {
-                    Error::Module("adopt governance shares before changing them".into())
+                    Error::module(
+                        "shares_not_configured",
+                        "adopt governance shares before changing them",
+                    )
                 })?;
                 if *shares > MAX_SAFE_SHARES {
-                    return Err(Error::Module(format!(
-                        "account shares must be at most {MAX_SAFE_SHARES}"
-                    )));
+                    return Err(Error::module(
+                        "bad_share_count",
+                        format!("account shares must be at most {MAX_SAFE_SHARES}"),
+                    ));
                 }
                 self.require_account(ctx, *account_id).await?;
                 let mut after = current.clone();
@@ -806,21 +815,24 @@ impl Governance {
                     after.insert(*account_id, *shares);
                 }
                 if after.len() > MAX_SHARE_ACCOUNTS {
-                    return Err(Error::Module(format!(
-                        "share registry supports at most {MAX_SHARE_ACCOUNTS} accounts"
-                    )));
+                    return Err(Error::module(
+                        "share_registry_full",
+                        format!("share registry supports at most {MAX_SHARE_ACCOUNTS} accounts"),
+                    ));
                 }
                 Self::total_power(&after)?;
             }
             GovAction::SetShareMode { enabled } => {
                 if *enabled && self.shares().await?.is_none() {
-                    return Err(Error::Module(
-                        "configure governance shares before enabling share mode".into(),
+                    return Err(Error::module(
+                        "shares_not_configured",
+                        "configure governance shares before enabling share mode",
                     ));
                 }
                 if *enabled == self.share_mode().await? {
-                    return Err(Error::Module(
-                        "governance is already using the requested voting mode".into(),
+                    return Err(Error::module(
+                        "voting_mode_unchanged",
+                        "governance is already using the requested voting mode",
                     ));
                 }
             }
@@ -839,18 +851,25 @@ impl Governance {
         voting_period: u64,
     ) -> Result<(), Error> {
         if proposal_id.is_empty() {
-            return Err(Error::Module("proposal_id must not be empty".into()));
+            return Err(Error::module(
+                "bad_proposal_id",
+                "proposal_id must not be empty",
+            ));
         }
         if proposal_id.len() > MAX_PROPOSAL_ID_BYTES {
-            return Err(Error::Module(format!(
-                "proposal_id exceeds {MAX_PROPOSAL_ID_BYTES} bytes ({} given)",
-                proposal_id.len()
-            )));
+            return Err(Error::module(
+                "bad_proposal_id",
+                format!(
+                    "proposal_id exceeds {MAX_PROPOSAL_ID_BYTES} bytes ({} given)",
+                    proposal_id.len()
+                ),
+            ));
         }
         if voting_period == 0 || voting_period > MAX_VOTING_PERIOD {
-            return Err(Error::Module(format!(
-                "voting_period must be in 1..={MAX_VOTING_PERIOD}"
-            )));
+            return Err(Error::module(
+                "bad_voting_period",
+                format!("voting_period must be in 1..={MAX_VOTING_PERIOD}"),
+            ));
         }
         if let GovAction::AddValidator { key }
         | GovAction::RemoveValidator { key }
@@ -860,8 +879,9 @@ impl Governance {
             // shape-check the key here so a proposal that can never execute is
             // rejected at the door, not at tally time.
             if key.len() != 32 {
-                return Err(Error::Module(
-                    "membership key must be a 32-byte ed25519 public key".into(),
+                return Err(Error::module(
+                    "bad_membership_key",
+                    "membership key must be a 32-byte ed25519 public key",
                 ));
             }
         }
@@ -879,10 +899,10 @@ impl Governance {
             let stands_for_promotion =
                 seated || self.residents(ctx).await?.iter().any(|r| r == key);
             if !stands_for_promotion {
-                return Err(Error::Module(
-                    "not_a_resident: a validator is promoted out of the resident tier — \
-                     grant standing first and let it sync"
-                        .into(),
+                return Err(Error::module(
+                    "not_a_resident",
+                    "a validator is promoted out of the resident tier — \
+                     grant standing first and let it sync",
                 ));
             }
         }
@@ -901,26 +921,35 @@ impl Governance {
         | GovAction::CancelModuleUpdate { name, module_id } = &action
         {
             if self.code_registry_id.is_none() {
-                return Err(Error::Module(
-                    "no code registry wired: module updates are not available on this network"
-                        .into(),
+                return Err(Error::module(
+                    "no_code_registry",
+                    "no code registry wired: module updates are not available on this network",
                 ));
             }
             if name.is_empty() {
-                return Err(Error::Module("module update name must not be empty".into()));
+                return Err(Error::module(
+                    "bad_module_update_name",
+                    "module update name must not be empty",
+                ));
             }
             if module_id.is_empty() {
-                return Err(Error::Module("module_id must not be empty".into()));
+                return Err(Error::module(
+                    "empty_module_id",
+                    "module_id must not be empty",
+                ));
             }
         }
         if let GovAction::UpdateModule { code_hash, .. }
         | GovAction::RegisterModule { code_hash, .. } = &action
             && code_hash.len() != modules::CODE_HASH_LEN
         {
-            return Err(Error::Module(format!(
-                "code_hash must be {} bytes (sha256 of the component)",
-                modules::CODE_HASH_LEN
-            )));
+            return Err(Error::module(
+                "bad_code_hash",
+                format!(
+                    "code_hash must be {} bytes (sha256 of the component)",
+                    modules::CODE_HASH_LEN
+                ),
+            ));
         }
         // the lead is RELATIVE to the EXECUTE height, not the propose height
         // (issue #1775: an absolute height chosen here can go stale if the
@@ -935,10 +964,13 @@ impl Governance {
         } = &action
             && !(MIN_ACTIVATION_LEAD..=MAX_ACTIVATION_LEAD).contains(activation_lead)
         {
-            return Err(Error::Module(format!(
-                "activation_lead must be in {MIN_ACTIVATION_LEAD}..={MAX_ACTIVATION_LEAD} blocks \
-                 after execution"
-            )));
+            return Err(Error::module(
+                "bad_activation_lead",
+                format!(
+                    "activation_lead must be in \
+                     {MIN_ACTIVATION_LEAD}..={MAX_ACTIVATION_LEAD} blocks after execution"
+                ),
+            ));
         }
         // acl policy authorizations: shape-checked at the door like the module
         // updates above (a proposal that can never execute is rejected here,
@@ -948,19 +980,22 @@ impl Governance {
         // every node).
         if let GovAction::SetAclPolicy { target, standing } = &action {
             if self.acl_id.is_none() {
-                return Err(Error::Module(
-                    "no acl module wired: submit-policy changes are not available on this network"
-                        .into(),
+                return Err(Error::module(
+                    "no_acl_module",
+                    "no acl module wired: submit-policy changes are not available on this network",
                 ));
             }
             let well_formed_target = !target.is_empty()
                 && target.trim() == target
                 && target.len() <= acl::MAX_TARGET_LEN;
             if !well_formed_target {
-                return Err(Error::Module(format!(
-                    "acl target must be a non-empty, untrimmed module id of at most {} bytes",
-                    acl::MAX_TARGET_LEN
-                )));
+                return Err(Error::module(
+                    "bad_acl_target",
+                    format!(
+                        "acl target must be a non-empty, untrimmed module id of at most {} bytes",
+                        acl::MAX_TARGET_LEN
+                    ),
+                ));
             }
             // #1777: never let a proposal that CAN pass lock the electorate
             // out of governance itself — SetPolicy is reachable only through
@@ -969,8 +1004,9 @@ impl Governance {
             // reach the door that just closed on it.
             let share_mode = self.share_mode().await?;
             if !Self::electorate_can_still_submit(share_mode, &self.id, target, *standing) {
-                return Err(Error::Module(
-                    "acl policy would lock the current electorate out of governance itself".into(),
+                return Err(Error::module(
+                    "electorate_lockout",
+                    "acl policy would lock the current electorate out of governance itself",
                 ));
             }
         }
@@ -984,9 +1020,10 @@ impl Governance {
         // for a ceremony that never voted (#1766).
         let id_is_spent = self.proposal(&proposal_id).await?.is_some();
         if id_is_spent {
-            return Err(Error::Module(format!(
-                "proposal already exists: {proposal_id}"
-            )));
+            return Err(Error::module(
+                "proposal_id_spent",
+                format!("proposal already exists: {proposal_id}"),
+            ));
         }
         let mut roster = self.roster().await?;
         let submitter = Self::external_origin(ctx)?;
@@ -998,22 +1035,27 @@ impl Governance {
         // its own voting window.
         let open_by_proposer = self.reap_expired(now, &proposer, &mut roster).await?;
         if roster.len() >= MAX_PROPOSALS {
-            return Err(Error::Module(format!(
-                "proposal cap reached ({MAX_PROPOSALS})"
-            )));
+            return Err(Error::module(
+                "proposal_cap",
+                format!("proposal cap reached ({MAX_PROPOSALS})"),
+            ));
         }
         if open_by_proposer >= MAX_OPEN_PROPOSALS_PER_SUBMITTER {
-            return Err(Error::Module(format!(
-                "submitter already has {MAX_OPEN_PROPOSALS_PER_SUBMITTER} open proposals"
-            )));
+            return Err(Error::module(
+                "submitter_proposal_cap",
+                format!("submitter already has {MAX_OPEN_PROPOSALS_PER_SUBMITTER} open proposals"),
+            ));
         }
         // Gate the submitter before resolving up to MAX_SHARE_ACCOUNTS Identity
         // records for an adoption proposal.
         let action = self.normalize_share_action(ctx, action).await?;
 
-        let deadline = now
-            .checked_add(voting_period)
-            .ok_or_else(|| Error::Module("voting deadline overflows consensus time".into()))?;
+        let deadline = now.checked_add(voting_period).ok_or_else(|| {
+            Error::module(
+                "deadline_overflow",
+                "voting deadline overflows consensus time",
+            )
+        })?;
         let proposal = Proposal {
             action,
             proposer,
@@ -1050,15 +1092,20 @@ impl Governance {
         approve: bool,
     ) -> Result<(), Error> {
         self.reap_roster(ctx.env().consensus_time).await?;
-        let mut proposal = self
-            .proposal(&proposal_id)
-            .await?
-            .ok_or_else(|| Error::Module(format!("no such proposal: {proposal_id}")))?;
+        let mut proposal = self.proposal(&proposal_id).await?.ok_or_else(|| {
+            Error::module(
+                "no_such_proposal",
+                format!("no such proposal: {proposal_id}"),
+            )
+        })?;
         if proposal.status != ProposalStatus::Open {
-            return Err(Error::Module("proposal is settled".into()));
+            return Err(Error::module("proposal_settled", "proposal is settled"));
         }
         if ctx.env().consensus_time >= proposal.deadline {
-            return Err(Error::Module("voting closed at the deadline".into()));
+            return Err(Error::module(
+                "voting_closed",
+                "voting closed at the deadline",
+            ));
         }
         let submitter = Self::external_origin(ctx)?;
         let electorate = &proposal.electorate;
@@ -1074,8 +1121,9 @@ impl Governance {
         };
         let in_electorate = electorate.powers.contains_key(&voter);
         if !in_electorate {
-            return Err(Error::Module(
-                "voter is not in the frozen electorate".into(),
+            return Err(Error::module(
+                "not_in_electorate",
+                "voter is not in the frozen electorate",
             ));
         }
         proposal.votes.insert(voter, approve);
@@ -1087,12 +1135,14 @@ impl Governance {
         ctx: &mut dyn Ctx,
         proposal_id: String,
     ) -> Result<(), Error> {
-        let mut proposal = self
-            .proposal(&proposal_id)
-            .await?
-            .ok_or_else(|| Error::Module(format!("no such proposal: {proposal_id}")))?;
+        let mut proposal = self.proposal(&proposal_id).await?.ok_or_else(|| {
+            Error::module(
+                "no_such_proposal",
+                format!("no such proposal: {proposal_id}"),
+            )
+        })?;
         if proposal.status != ProposalStatus::Open {
-            return Err(Error::Module("proposal is settled".into()));
+            return Err(Error::module("proposal_settled", "proposal is settled"));
         }
 
         let now = ctx.env().consensus_time;
@@ -1138,10 +1188,13 @@ impl Governance {
             }
         };
         if now < proposal.deadline && !decidable_early {
-            return Err(Error::Module(format!(
-                "not decidable yet: voting open until {} (yes={yes}, no={no}, total={total})",
-                proposal.deadline
-            )));
+            return Err(Error::module(
+                "not_decidable_yet",
+                format!(
+                    "not decidable yet: voting open until {} (yes={yes}, no={no}, total={total})",
+                    proposal.deadline
+                ),
+            ));
         }
 
         if passes {
@@ -1395,26 +1448,27 @@ impl Governance {
         // the relaying node.
         Self::external_origin(ctx)?;
         let Some(binding) = self.invite_binding.as_deref() else {
-            return Err(Error::Module(
-                "this network is not wired for invite redemption (no binding)".into(),
+            return Err(Error::module(
+                "no_invite_binding",
+                "this network is not wired for invite redemption (no binding)",
             ));
         };
         let issuer_key = ed25519::PublicKey::decode(issuer.as_slice())
-            .map_err(|e| Error::Module(format!("issuer key: {e}")))?;
+            .map_err(|e| Error::module("bad_issuer_key", format!("issuer key: {e}")))?;
         let joiner_key = ed25519::PublicKey::decode(joiner.as_slice())
-            .map_err(|e| Error::Module(format!("joiner key: {e}")))?;
+            .map_err(|e| Error::module("bad_joiner_key", format!("joiner key: {e}")))?;
         if nonce.len() != invite::INVITE_NONCE_LEN {
-            return Err(Error::Module(format!(
-                "nonce must be {} bytes",
-                invite::INVITE_NONCE_LEN
-            )));
+            return Err(Error::module(
+                "bad_invite_nonce",
+                format!("nonce must be {} bytes", invite::INVITE_NONCE_LEN),
+            ));
         }
         let mut nonce_arr = [0u8; invite::INVITE_NONCE_LEN];
         nonce_arr.copy_from_slice(&nonce);
         let sig = ed25519::Signature::decode(token_sig.as_slice())
-            .map_err(|e| Error::Module(format!("token signature: {e}")))?;
+            .map_err(|e| Error::module("bad_token_signature", format!("token signature: {e}")))?;
         let proof_sig = ed25519::Signature::decode(proof.as_slice())
-            .map_err(|e| Error::Module(format!("join proof: {e}")))?;
+            .map_err(|e| Error::module("bad_join_proof", format!("join proof: {e}")))?;
         // EVERY invite is bearer (the targeted form was dropped): there is
         // no target lock. The join proof below binds the redemption to
         // whichever key presents it, and the nonce set makes that
@@ -1426,8 +1480,9 @@ impl Governance {
             sig,
         };
         if !invite::verify_invite_token(&token, binding) {
-            return Err(Error::Module(
-                "invite token signature does not verify for this network".into(),
+            return Err(Error::module(
+                "invite_token_unverified",
+                "invite token signature does not verify for this network",
             ));
         }
         // expiry is NOT enforced here: `consensus_time` is block height on
@@ -1438,15 +1493,17 @@ impl Governance {
         // stays in the op because it is signature-covered — members need it
         // to check expiry against the same bytes the issuer signed.
         if !invite::verify_join_proof(&joiner_key, binding, &token, &proof_sig) {
-            return Err(Error::Module(
-                "joiner proof-of-possession does not verify".into(),
+            return Err(Error::module(
+                "join_proof_unverified",
+                "joiner proof-of-possession does not verify",
             ));
         }
         // a removed member's outstanding invites die with it.
         let members = self.members(ctx).await?;
         if !members.iter().any(|m| m == &issuer) {
-            return Err(Error::Module(
-                "the inviting member is no longer part of this network".into(),
+            return Err(Error::module(
+                "issuer_not_a_member",
+                "the inviting member is no longer part of this network",
             ));
         }
         // an invite grants exactly one thing: valset RESIDENT standing
@@ -1454,11 +1511,15 @@ impl Governance {
         // grant at all — the door admits any validly signed frame, and
         // per-module policy is the acl module's dispatch gate.
         if members.iter().any(|m| m == &joiner) {
-            return Err(Error::Module("joiner is already a validator".into()));
+            return Err(Error::module(
+                "joiner_already_validator",
+                "joiner is already a validator",
+            ));
         }
         if self.residents(ctx).await?.iter().any(|o| o == &joiner) {
-            return Err(Error::Module(
-                "joiner already holds resident standing".into(),
+            return Err(Error::module(
+                "joiner_already_resident",
+                "joiner already holds resident standing",
             ));
         }
         let grant = Msg {
@@ -1471,7 +1532,10 @@ impl Governance {
         // staged-over-committed read collapses two redemptions in one
         // block to first-wins too).
         if self.load::<Redemption>(&red_key(&nonce)).await?.is_some() {
-            return Err(Error::Module("invite already redeemed".into()));
+            return Err(Error::module(
+                "invite_already_redeemed",
+                "invite already redeemed",
+            ));
         }
         self.store(
             red_key(&nonce),
@@ -1514,7 +1578,7 @@ impl Module for Governance {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        match decode_msg(&msg.payload).map_err(Error::Module)? {
+        match decode_msg(&msg.payload).map_err(|e| Error::module("codec", e))? {
             GovMsg::Propose {
                 proposal_id,
                 action,
@@ -1553,7 +1617,7 @@ impl Module for Governance {
     /// read projection — committed plus this block's staged changes (the
     /// staged-over-committed store view).
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match decode_query(req).map_err(Error::Module)? {
+        match decode_query(req).map_err(|e| Error::module("codec", e))? {
             GovQuery::Proposals => {
                 // walk the roster by derived key (≤ MAX_PROPOSALS point
                 // reads). a rostered id without a record is a store bug —
@@ -1561,9 +1625,10 @@ impl Module for Governance {
                 let mut views = Vec::new();
                 for proposal_id in self.roster().await? {
                     let Some(proposal) = self.proposal(&proposal_id).await? else {
-                        return Err(Error::Module(format!(
-                            "missing proposal record: {proposal_id}"
-                        )));
+                        return Err(Error::module(
+                            "missing_proposal_record",
+                            format!("missing proposal record: {proposal_id}"),
+                        ));
                     };
                     views.push(Self::view_of(&proposal_id, &proposal));
                 }

@@ -43,8 +43,8 @@ pub use netstack_machine::{
 };
 pub use netstack_wasm::STEP_FUEL as NETSTACK_STEP_FUEL;
 pub use rendezvous::{
-    EndpointResolver, NatResolver, RENDEZVOUS_KEEPALIVE, RendezvousStatus, Resolution,
-    StaticResolver,
+    CarryingPeers, EndpointResolver, NatResolver, RENDEZVOUS_KEEPALIVE, RendezvousStatus,
+    Resolution, StaticResolver,
 };
 pub use seal::seal;
 pub use store::PersistedMesh;

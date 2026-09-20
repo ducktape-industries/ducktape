@@ -354,6 +354,22 @@ pub async fn fetch_code(
     Ok(bytes)
 }
 
+/// can THIS build load `id`'s deployment at all? `compile_artifact`
+/// instantiates the bytes against this binary's real `ducktape:module/host`
+/// world, so a component whose imports that world no longer provides is
+/// refused right here — which is the ONLY refusal the whole wasm path can
+/// reach without a store, a substrate or a byte of state. that is what makes
+/// it askable of a STAGED binary beside a running node: the roster comes off
+/// the node's rpc and the bytes off the blobstore's immutable files, and the
+/// sentence a refusal carries is the very one the next boot would print.
+pub fn load(id: &str, bytes: &[u8]) -> Result<CompiledModule, String> {
+    workspace_config::validate_module_id(id)?;
+    let compiled = CompiledModule::compile_artifact(bytes)
+        .map_err(|e| format!("{id} component loads: {e}"))?;
+    check_realizable(id, compiled.shape())?;
+    Ok(compiled)
+}
+
 /// the ONE wasm path: wrap `bytes` for `id` over the substrate its declared
 /// shape names. a store-backed module opens its store through the source; an
 /// odb-backed one opens the host substrate for its id and carries its
@@ -369,11 +385,8 @@ pub async fn wasm_module(
     bindings: &Bindings<'_>,
     start: Start<'_, '_>,
 ) -> Result<WasmModule, String> {
-    workspace_config::validate_module_id(id)?;
-    let compiled = CompiledModule::compile_artifact(bytes)
-        .map_err(|e| format!("{id} component loads: {e}"))?;
+    let compiled = load(id, bytes)?;
     let shape = compiled.shape().clone();
-    check_realizable(id, &shape)?;
     let is_fresh = matches!(start, Start::Fresh { .. });
     let wrapped = match shape.backing {
         Backing::Map => compiled.over_map(id),
@@ -648,61 +661,151 @@ impl Admissions {
             time_unit: bindings.time_unit,
         }
     }
+
+    fn bindings(&self) -> Bindings<'_> {
+        Bindings {
+            invite: &self.invite,
+            time_unit: self.time_unit,
+            chain_id: &self.chain_id,
+        }
+    }
 }
 
 #[async_trait::async_trait(?Send)]
 impl host::ModuleFactory for Admissions {
     async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<host::Admitted, sdk::Error> {
-        // bytes carrying no artifact frame at all are no module: another
-        // plane's record committed through the same id-generic registry. Skip
-        // and latch — a hard error here is a permanent code stall on every
-        // node, for bytes this boundary never owned.
-        let Ok(artifact) = module_artifact::ArtifactRef::decode(bytes) else {
-            return Ok(host::Admitted::ForeignAbi);
-        };
-        // the host never asks this factory for a `Kind::View` entry
-        // (`Host::realize_module_swaps` skips them), so a view frame here is
-        // a module entry whose bytes are no module: fail closed rather than
-        // seat an empty core.
-        let artifact = match artifact {
-            module_artifact::ArtifactRef::Module(module) => module,
-            module_artifact::ArtifactRef::View(_) => {
-                return Err(sdk::Error::Module(format!(
-                    "artifact_kind_mismatch: {id} is a module entry, but the artifact is a view-only frame"
-                )));
-            }
-        };
-        let bindings = Bindings {
-            invite: &self.invite,
-            time_unit: self.time_unit,
-            chain_id: &self.chain_id,
-        };
         let mut stores = crate::bundle::qmdb_stores(&self.context);
-        let seated = wasm_module(
-            id,
-            bytes,
-            &mut stores,
-            &self.substrates,
-            &bindings,
-            Start::Fresh {
-                parameters: &sdk::genesis_config::encode_config(&[]),
-            },
-        )
-        .await;
-        let refusal = match seated {
-            Ok(module) => return Ok(host::Admitted::Module(Box::new(module))),
-            Err(refusal) => refusal,
-        };
-        // ONLY now: do these bytes even speak the module ABI? A `ducktape:
-        // module` this build refused stays fail-closed (an older binary must
-        // never silently seat a different registry set than its peers); bytes
-        // that are no module at all are another plane's record, and this
-        // boundary is not the plane that realizes them. The extra compile is
-        // paid on the refusal path alone, and the host latches the answer.
-        let is_a_module = wasm_host::speaks_module_abi(artifact.component);
-        match is_a_module {
-            true => Err(sdk::Error::Module(refusal)),
-            false => Ok(host::Admitted::ForeignAbi),
-        }
+        admit(id, bytes, &mut stores, &self.substrates, &self.bindings()).await
     }
+
+    fn check(&self, id: &str, bytes: &[u8]) -> Result<(), sdk::Error> {
+        check_admission(id, bytes, &self.bindings())
+    }
+}
+
+/// one admission of `bytes` under `id`, over the stores and substrates it is
+/// handed: the module seated fresh and initialized, or the answer that the
+/// bytes are another plane's record.
+async fn admit(
+    id: &str,
+    bytes: &[u8],
+    stores: &mut StoreSource<'_>,
+    substrates: &Substrates,
+    bindings: &Bindings<'_>,
+) -> Result<host::Admitted, sdk::Error> {
+    // bytes carrying no artifact frame at all are no module: another
+    // plane's record committed through the same id-generic registry. Skip
+    // and latch — a hard error here is a permanent code stall on every
+    // node, for bytes this boundary never owned.
+    let Ok(artifact) = module_artifact::ArtifactRef::decode(bytes) else {
+        return Ok(host::Admitted::ForeignAbi);
+    };
+    // the host never asks this factory for a `Kind::View` entry
+    // (`Host::realize_module_swaps` skips them), so a view frame here is
+    // a module entry whose bytes are no module: fail closed rather than
+    // seat an empty core.
+    let artifact = match artifact {
+        module_artifact::ArtifactRef::Module(module) => module,
+        module_artifact::ArtifactRef::View(_) => {
+            return Err(sdk::Error::module(
+                "artifact_kind_mismatch",
+                format!("{id} is a module entry, but the artifact is a view-only frame"),
+            ));
+        }
+    };
+    let seated = wasm_module(
+        id,
+        bytes,
+        stores,
+        substrates,
+        bindings,
+        Start::Fresh {
+            parameters: &sdk::genesis_config::encode_config(&[]),
+        },
+    )
+    .await;
+    let refusal = match seated {
+        Ok(module) => return Ok(host::Admitted::Module(Box::new(module))),
+        Err(refusal) => refusal,
+    };
+    // ONLY now: do these bytes even speak the module ABI? A `ducktape:
+    // module` this build refused stays fail-closed (an older binary must
+    // never silently seat a different registry set than its peers); bytes
+    // that are no module at all are another plane's record, and this
+    // boundary is not the plane that realizes them. The extra compile is
+    // paid on the refusal path alone, and the host latches the answer.
+    let is_a_module = wasm_host::speaks_module_abi(artifact.component);
+    match is_a_module {
+        true => Err(sdk::Error::module("module_seat", refusal)),
+        false => Ok(host::Admitted::ForeignAbi),
+    }
+}
+
+/// the admission the activation boundary will run for `bytes` under `id`,
+/// run now over SCRATCH state and dropped: an in-memory store, a throwaway
+/// substrate directory and blob store, the network's bindings. `initialize`
+/// runs only when an admission is seated, identically on every node, so a
+/// guest that refuses there would stop every node at its activation height;
+/// asked here first, it refuses by name before anyone signals it ready.
+/// Nothing the node runs or stores is touched.
+pub fn check_admission(id: &str, bytes: &[u8], bindings: &Bindings<'_>) -> Result<(), sdk::Error> {
+    let scratch = tempfile::tempdir().map_err(|error| {
+        sdk::Error::module(
+            "admission_scratch",
+            format!("{id}: scratch directory: {error}"),
+        )
+    })?;
+    let substrates = Substrates {
+        directory: scratch.path().to_path_buf(),
+        bindings: BTreeMap::new(),
+        blobs: blobstore::BlobHandle::default(),
+    };
+    let mut stores = |_: &str| -> BoxFut<'static, Result<Box<dyn MerkleStore>, String>> {
+        Box::pin(async { Ok(Box::new(ScratchStore::default()) as Box<dyn MerkleStore>) })
+    };
+    // nothing in a scratch admission waits on I/O — memory and a local
+    // directory — so blocking on it costs the computation alone, like the
+    // compile the readiness probe already pays.
+    futures::executor::block_on(admit(id, bytes, &mut stores, &substrates, bindings)).map(drop)
+}
+
+/// the store a scratch admission starts over. Nothing reads its root: the
+/// module it backs is dropped once it has started.
+#[derive(Default)]
+struct ScratchStore(BTreeMap<[u8; sdk::ROOT_LEN], Vec<u8>>);
+
+#[async_trait::async_trait(?Send)]
+impl MerkleStore for ScratchStore {
+    async fn get(&self, key: &[u8; sdk::ROOT_LEN]) -> Result<Option<Vec<u8>>, sdk::Error> {
+        Ok(self.0.get(key).cloned())
+    }
+
+    async fn commit_batch(
+        &mut self,
+        writes: Vec<([u8; sdk::ROOT_LEN], Option<Vec<u8>>)>,
+    ) -> Result<(), sdk::Error> {
+        for (key, value) in writes {
+            match value {
+                Some(value) => self.0.insert(key, value),
+                None => self.0.remove(&key),
+            };
+        }
+        Ok(())
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot([0; 32])
+    }
+
+    async fn sync_target(&self) -> Result<sdk::ResolverSyncTarget, sdk::Error> {
+        Err(no_sync_lane())
+    }
+
+    async fn serve_sync(&self, _req: &[u8]) -> Result<Vec<u8>, sdk::Error> {
+        Err(no_sync_lane())
+    }
+}
+
+fn no_sync_lane() -> sdk::Error {
+    sdk::Error::module("scratch_store", "a scratch store has no sync lane")
 }

@@ -42,7 +42,7 @@ fn genesis_set_pins_the_validators_from_network_toml() {
 
     let policy = select_policy(&["--genesis-set".into(), path.to_str().unwrap().into()]).unwrap();
     match policy {
-        AuthPolicy::Private { genesis_set } => {
+        AuthPolicy::Private { genesis_set, .. } => {
             assert_eq!(genesis_set.len(), 2);
             assert!(genesis_set.contains(&a));
             assert!(genesis_set.contains(&b));

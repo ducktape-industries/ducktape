@@ -577,8 +577,8 @@ fn rejections_match_and_leave_roots_and_odb_unmoved() {
     assert_eq!(all_roots(&native), all_roots(&wasm), "setup roots diverge");
 
     // the rejection matrix. needles are verified against `fs.rs` error strings
-    // (non-vacuous): each must appear in BOTH the native reason and the wasm
-    // reason (the guest maps `Error::Module` verbatim, so containment holds).
+    // (non-vacuous): each must appear in BOTH the native sentence and the wasm
+    // sentence (the guest carries the sentence verbatim, so containment holds).
     //
     // CASE-6 ADAPTATION: the real STAGING_QUOTA_BYTES is 1 GiB and the
     // per-owner-entry caps are 4096 — neither reachable cheaply through the op
@@ -929,16 +929,17 @@ fn object_read_cap_is_one_bound_on_both_runtimes() {
     );
 }
 
-/// a deterministic module rejection whose reason CONTAINS `needle` — the wasm
-/// runtime wraps the reason in its wit-error rendering then unwraps it verbatim,
-/// so the parity claim is containment, not string equality (same as pages parity).
+/// a deterministic module rejection whose sentence CONTAINS `needle` — the wasm
+/// runtime wraps the sentence in its wit-error rendering then unwraps it
+/// verbatim, so the parity claim is containment, not string equality (same as
+/// pages parity). The token itself is what `files`'s own tests pin.
 fn assert_module_reject(who: &str, height: u64, err: &SubmitError, needle: &str) {
-    let SubmitError::Rejected(Error::Module(reason)) = err else {
+    let SubmitError::Rejected(Error::Module { sentence, .. }) = err else {
         panic!("{who} rejection shape at {height}: {err:?}");
     };
     assert!(
-        reason.contains(needle),
-        "{who} reason at {height}: {reason}"
+        sentence.contains(needle),
+        "{who} sentence at {height}: {sentence}"
     );
 }
 
@@ -1283,7 +1284,10 @@ fn files_cold_load_warm_dispatch_and_reopen_first_query() {
         let cold = std::time::Instant::now();
         let mut wasm = wasm_host(&dir);
         let cold = cold.elapsed();
-        println!("cold_load\twasm\t{:.1}\trepeat {repeat}", cold.as_secs_f64() * 1000.0);
+        println!(
+            "cold_load\twasm\t{:.1}\trepeat {repeat}",
+            cold.as_secs_f64() * 1000.0
+        );
 
         let chunks = [
             vec![0x41; CHUNK_SIZE as usize],
@@ -1328,16 +1332,20 @@ fn files_cold_load_warm_dispatch_and_reopen_first_query() {
 
         let snapshot = head(&wasm);
         let edit = std::time::Instant::now();
-        block_on(wasm.submit_at(
-            block(5, Origin::System),
-            commit_op(
-                Some(&snapshot),
-                "edit 32",
-                (0..32)
-                    .map(|index| put_inline(&format!("/shared/project/docs/{index:06}.txt"), b"edited"))
-                    .collect(),
+        block_on(
+            wasm.submit_at(
+                block(5, Origin::System),
+                commit_op(
+                    Some(&snapshot),
+                    "edit 32",
+                    (0..32)
+                        .map(|index| {
+                            put_inline(&format!("/shared/project/docs/{index:06}.txt"), b"edited")
+                        })
+                        .collect(),
+                ),
             ),
-        ))
+        )
         .unwrap();
         println!(
             "commit_edit_32\twasm\t{:.1}\trepeat {repeat}",
@@ -1350,7 +1358,10 @@ fn files_cold_load_warm_dispatch_and_reopen_first_query() {
         let wasm = wasm_host(&dir);
         let reopen = reopen.elapsed();
         assert_eq!(files_root(&wasm), root, "durable reopen preserves the root");
-        println!("reopen\twasm\t{:.1}\trepeat {repeat}", reopen.as_secs_f64() * 1000.0);
+        println!(
+            "reopen\twasm\t{:.1}\trepeat {repeat}",
+            reopen.as_secs_f64() * 1000.0
+        );
 
         let first = std::time::Instant::now();
         let query = FilesQuery::Read {
@@ -1405,7 +1416,8 @@ fn files_commit_cost_by_document_count() {
         let operation = commit_op(None, "import", import_changes(&bodies));
 
         let start = std::time::Instant::now();
-        let native_outcome = block_on(native.submit_at(block(1, Origin::System), operation.clone()));
+        let native_outcome =
+            block_on(native.submit_at(block(1, Origin::System), operation.clone()));
         let native_ms = start.elapsed().as_secs_f64() * 1000.0;
         let start = std::time::Instant::now();
         let wasm_outcome = block_on(wasm.submit_at(block(1, Origin::System), operation));
@@ -1456,7 +1468,9 @@ fn files_cost_by_object_size_and_query_result_size() {
         "== 64 inline documents, scaling the bytes in each (inline budget {} KiB per commit) ==",
         MAX_INLINE_COMMIT_BYTES / 1024
     );
-    println!("doc_bytes\ttotal_kib\twasm_commit_ms\twasm_read_ms\tread_reply_bytes\trss_kib\toutcome");
+    println!(
+        "doc_bytes\ttotal_kib\twasm_commit_ms\twasm_read_ms\tread_reply_bytes\trss_kib\toutcome"
+    );
     for doc_bytes in [256usize, 1024, 4096, 8192] {
         let dir = tempfile::tempdir().unwrap();
         let mut wasm = wasm_host(&dir);
@@ -1514,7 +1528,10 @@ fn files_cost_by_object_size_and_query_result_size() {
         let change = put_chunks(
             "/shared/project/asset.bin",
             chunk_count as u64 * CHUNK_SIZE,
-            &chunks.iter().map(|chunk| chunk_hex(chunk)).collect::<Vec<_>>(),
+            &chunks
+                .iter()
+                .map(|chunk| chunk_hex(chunk))
+                .collect::<Vec<_>>(),
         );
         let start = std::time::Instant::now();
         block_on(wasm.submit_at(
@@ -1577,6 +1594,10 @@ fn files_cost_by_object_size_and_query_result_size() {
         let FilesReply::Ls { entries, .. } = files::decode_reply(&reply).unwrap() else {
             panic!("listing reply");
         };
-        println!("256\t{limit}\t{ls_ms:.3}\t{}\t{}", reply.len(), entries.len());
+        println!(
+            "256\t{limit}\t{ls_ms:.3}\t{}\t{}",
+            reply.len(),
+            entries.len()
+        );
     }
 }

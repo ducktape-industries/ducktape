@@ -43,7 +43,9 @@ use crate::auth::{
     AuthError, AuthPolicy, Authenticator, CoordCap, DEFAULT_FRESHNESS_WINDOW_SECS, now_secs,
     sign_authenticator, verify_request,
 };
-use crate::wire::{NodeKey, Reader, WireError, put, put_key, put_u16, put_u64};
+use crate::wire::{
+    MAX_CAP_LEN, NodeKey, Reader, WireError, put, put_cap, put_key, put_u16, put_u64,
+};
 use crate::{Latch, short_key};
 
 // ---------------------------------------------------------------------------
@@ -180,7 +182,7 @@ pub enum FrameError {
 /// Largest encoded [`RelayIntro`] body: tag + caller + target + payload
 /// (len-prefixed, capped) + timestamp + pop_sig + cap option. Fits well under
 /// [`MAX_FRAME_LEN`], so every frame encodes on the stack.
-const MAX_INTRO_LEN: usize = 1 + 32 + 32 + 2 + MAX_RELAY_PAYLOAD + 8 + 64 + 1 + 32 + 8 + 64;
+const MAX_INTRO_LEN: usize = 1 + 32 + 32 + 2 + MAX_RELAY_PAYLOAD + 8 + 64 + MAX_CAP_LEN;
 const _: () = assert!(MAX_INTRO_LEN <= MAX_FRAME_LEN);
 
 /// tag ‖ caller ‖ target ‖ payload_len ‖ payload — the CORE bytes the PoP
@@ -251,15 +253,7 @@ impl RelayFrame {
                 write_core(&mut out, &intro.caller, &intro.target, &intro.payload);
                 put_u64(&mut out, intro.auth.timestamp);
                 put(&mut out, intro.auth.pop_sig.as_ref());
-                match &intro.auth.cap {
-                    None => out.push(0),
-                    Some(cap) => {
-                        out.push(1);
-                        put(&mut out, cap.issuer.as_ref());
-                        put_u64(&mut out, cap.not_after);
-                        put(&mut out, cap.issuer_sig.as_ref());
-                    }
-                }
+                put_cap(&mut out, intro.auth.cap.as_ref());
             }
             RelayFrame::Forwarded { payload } => {
                 out.push(TAG_RELAY_FORWARDED);
@@ -294,15 +288,7 @@ impl RelayFrame {
                 let payload = read_payload(&mut r)?;
                 let timestamp = r.u64()?;
                 let pop_sig = r.sig()?;
-                let cap = match r.take(1)?[0] {
-                    0 => None,
-                    1 => Some(CoordCap {
-                        issuer: r.pubkey()?,
-                        not_after: r.u64()?,
-                        issuer_sig: r.sig()?,
-                    }),
-                    _ => return Err(WireError::BadCrypto.into()),
-                };
+                let cap = r.cap()?;
                 RelayFrame::Intro(RelayIntro {
                     caller,
                     target,
@@ -947,8 +933,13 @@ mod tests {
         let issuer = ed25519::PrivateKey::from_seed(2);
         let target = NodeKey([9u8; 32]);
         let mut cases = Vec::new();
-        // Intro with and without a capability — the Option<CoordCap> both ways.
-        for cap in [None, Some(mint_coord_cap(&issuer, caller, 9_999_999))] {
+        // Intro without a capability, with a root cap, and with the deepest
+        // chain — the largest intro the frame bound must hold.
+        let root = mint_coord_cap(&issuer, caller, 9_999_999);
+        let deepest = (1..crate::auth::MAX_CAP_CHAIN).fold(root.clone(), |parent, _| {
+            crate::auth::delegate_coord_cap(&parent, &issuer, caller, 9_999_999).unwrap()
+        });
+        for cap in [None, Some(root), Some(deepest)] {
             cases.push(RelayFrame::Intro(sign_relay_intro(
                 &signer,
                 caller,

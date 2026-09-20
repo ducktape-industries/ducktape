@@ -14,6 +14,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use recovery::Manifest;
 
 use crate::constants::{DRAIN_TICK, WORKSPACE_CHECK_INTERVAL};
+use crate::drain_actions::{QuitSignals, ShutdownCause, ShutdownCheckpoint, finish_shutdown};
 use crate::reachability_plane::{GateOutcomes, insert_gate_outcome};
 use crate::rpc::{JoinRequestRecord, RpcJob};
 use crate::sync::serve::SyncStateRequest;
@@ -25,35 +26,70 @@ pub(super) type ValidatorNode = node::OrderedNode<
     recovery::Recovery<commonware_runtime::tokio::Context>,
 >;
 
-/// held app-surface submit replies, keyed by the submitted frame's content
-/// address: every caller that submitted THIS frame, and the instant the first
-/// of them stops waiting. a list because one FrameId is one consensus unit
-/// however many callers submitted it — replacing the entry would drop the
-/// first caller's reply for an op that finalized.
-type PendingSubmits = std::collections::HashMap<
-    node::FrameId,
-    (
-        Vec<futures::channel::oneshot::Sender<Result<noded::BlockSummary, noded::Refused>>>,
-        std::time::SystemTime,
-    ),
->;
+/// held submit replies, keyed by the submitted frame's content address: every
+/// caller that submitted THIS frame, from either lane, and the instant the
+/// first of them stops waiting. a list because one FrameId is one consensus
+/// unit however many callers submitted it — replacing the entry would drop the
+/// first caller's reply for an op that finalized. settled once in `on_drain`,
+/// expired by one sweep.
+type PendingSubmits =
+    std::collections::HashMap<node::FrameId, (Vec<SubmitReply>, std::time::SystemTime)>;
 
-/// held rpc `submit` replies, the same shape as [`PendingSubmits`] over a
-/// different sink: the rpc lane answers with a json line, not a `BlockSummary`.
+/// one caller parked against a submitted frame, by the lane it asked on: the
+/// http lane answers with a `BlockSummary`, the rpc lane with a json line.
 ///
-/// It exists because `node.submit` returns when the op is ACCEPTED, and the
-/// module that will refuse it has not run yet. The rpc handler used to answer
-/// `ok` there, so every op refused IN CONSENSUS — which is every governance
-/// door check — reached the daemon log and nothing else, and the verb that
-/// submitted it sat until its own unrelated deadline and blamed that (#2533).
-/// The http lane already waited; this is the rpc lane learning to.
-type PendingRpcSubmits = std::collections::HashMap<
-    node::FrameId,
-    (
-        Vec<std::sync::mpsc::Sender<crate::rpc::RpcReply>>,
-        std::time::SystemTime,
-    ),
->;
+/// The rpc lane parks at all because `node.submit` returns when the op is
+/// ACCEPTED, and the module that will refuse it has not run yet. The rpc
+/// handler used to answer `ok` there, so every op refused IN CONSENSUS — which
+/// is every governance door check — reached the daemon log and nothing else,
+/// and the verb that submitted it sat until its own unrelated deadline and
+/// blamed that (#2533).
+enum SubmitReply {
+    Http(futures::channel::oneshot::Sender<Result<noded::BlockSummary, noded::Refused>>),
+    Rpc(std::sync::mpsc::Sender<crate::rpc::RpcReply>),
+}
+
+impl SubmitReply {
+    /// answer with the frame's settled fate, spelled for this caller's lane:
+    /// `http` is the receipt, `rpc` is [`crate::drain_actions::settled_submit`].
+    fn settle(self, http: &Result<noded::BlockSummary, noded::Refused>, rpc: &Result<(), String>) {
+        match self {
+            Self::Http(tx) => {
+                let _ = tx.send(http.clone());
+            }
+            Self::Rpc(tx) => {
+                let line = match rpc {
+                    Ok(()) => crate::rpc::RpcReply::ok(),
+                    Err(reason) => crate::rpc::RpcReply::err(reason.clone()),
+                };
+                let _ = tx.send(line);
+            }
+        }
+    }
+
+    /// the hold ran out before the frame finalized. the op may still land
+    /// later — clients re-query on block events.
+    fn expire(self) {
+        match self {
+            Self::Http(tx) => {
+                let _ = tx.send(Err(noded::Refused::new(
+                    "finalization_timeout",
+                    "timed out awaiting finalization — re-query on the next block",
+                )));
+            }
+            // now that a refusal comes back by itself, a timeout here means
+            // ONLY that the op has not finalized yet — which is what the
+            // sentence has to say (#2533).
+            Self::Rpc(tx) => {
+                let _ = tx.send(crate::rpc::RpcReply::err(
+                    "finalization_timeout: submitted, not finalized yet — re-query on the next \
+                     block"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+}
 
 /// a join gate held open awaiting its `Redeem` frame's consensus fate. the
 /// member submitted the redemption and holds the joiner's outcome
@@ -181,6 +217,9 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) status: noded::StatusCell,
     pub(super) status_public_key: String,
     pub(super) coordination: crate::config::Coordination,
+    /// the cap that admits this node at a private coordinator — the parent a
+    /// non-genesis validator mints a joiner's cap under.
+    pub(super) coord_cap: Option<nat_traversal::CoordCap>,
     /// where a SIGUSR1 task dump lands (`<workspace>/tasks.txt`).
     pub(super) workspace: std::path::PathBuf,
 }
@@ -221,7 +260,6 @@ struct ValidatorRuntime<'a> {
     prev_ckpt: (Option<u64>, u64),
     signer: ed25519::PrivateKey,
     label: String,
-    validators: Vec<ed25519::PublicKey>,
     dev_demo: bool,
     checkpoint_blocks: u64,
     cadence: consensus::Cadence,
@@ -233,6 +271,9 @@ struct ValidatorRuntime<'a> {
     status: noded::StatusCell,
     status_public_key: String,
     coordination: crate::config::Coordination,
+    /// the genesis set: a validator in it roots a joiner's coordinator cap.
+    genesis_validators: Vec<ed25519::PublicKey>,
+    coord_cap: Option<nat_traversal::CoordCap>,
     /// where a SIGUSR1 task dump lands, and the directory the drain's
     /// workspace guard re-stats.
     workspace: std::path::PathBuf,
@@ -244,7 +285,6 @@ struct ValidatorRuntime<'a> {
     applied: usize,
     converged: bool,
     pending_submits: PendingSubmits,
-    pending_rpc_submits: PendingRpcSubmits,
     pending_relays:
         std::collections::HashMap<node::FrameId, (Vec<ed25519::PublicKey>, std::time::SystemTime)>,
     /// join gates held open awaiting their `Redeem` frame's consensus fate,
@@ -361,6 +401,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         status,
         status_public_key,
         coordination,
+        coord_cap,
         workspace,
     } = state;
     let mut rpc_ingress = rpc_ingress;
@@ -380,8 +421,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let expected = validators.len();
     let applied = 0usize;
     let converged = false;
-    // the app-surface lane: held submit replies keyed by the submitted
-    // frame's content address, resolved when the frame drains (or expired
+    // the app-surface and rpc lanes: held submit replies keyed by the
+    // submitted frame's content address, resolved when the frame drains (or expired
     // after SUBMIT_HOLD), plus the last block height published to ws
     // subscribers.
     //
@@ -392,7 +433,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // same id gets the same outcome, and the FIRST one's deadline governs.
     let mut http_ingress = http_cmds;
     let pending_submits: PendingSubmits = std::collections::HashMap::new();
-    let pending_rpc_submits: PendingRpcSubmits = std::collections::HashMap::new();
     // relayed submits held for a wire answer, keyed like pending_submits by
     // the frame's content address: resolved by the SAME drain that resolves
     // local holds, expired on the same SUBMIT_HOLD budget. the peers are where
@@ -467,46 +507,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let code_signaller =
         super::code_announce::CodeReadinessSignaller::new(signer.public_key().as_ref().to_vec());
     let (fetch_done_tx, fetch_done_rx) = tokio::sync::mpsc::unbounded_channel();
-    // graceful checkpoint on process signals (SIGTERM/SIGINT): the desktop
-    // shell SIGTERMs the daemon on quit, so it must take the SAME safe path
-    // as an rpc `Shutdown` — a best-effort final manifest + journal barrier
-    // — instead of tearing down mid-block and leaving the disk ahead of the
-    // last in-memory checkpoint (the recovery brick). the streams are made
-    // INSIDE the tokio async context so the signal driver is live; a
-    // failure to install them is non-fatal: log and carry on WITHOUT the
-    // graceful-quit arm rather than aborting daemon boot — a hard SIGKILL /
-    // power loss already lands on the same WAL-forward recovery, so the
-    // worst case of a missing handler is the pre-fix behavior, not a brick.
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::warn!(
-                target: "ducktape::node",
-                node = %label,
-                signal = "SIGTERM",
-                error = %e,
-                reason = "signal_handler_install_failed",
-                "graceful-quit checkpoint disabled"
-            );
-            None
-        }
-    };
-    let mut sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-    {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::warn!(
-                target: "ducktape::node",
-                node = %label,
-                signal = "SIGINT",
-                error = %e,
-                reason = "signal_handler_install_failed",
-                "graceful-quit checkpoint disabled"
-            );
-            None
-        }
-    };
+    // graceful checkpoint on SIGTERM/SIGINT — see `QuitSignals`.
+    let mut quit = QuitSignals::install(&label);
     // the diagnostic task dump (#1386): SIGUSR1 never checkpoints or exits —
     // it just writes tokio's taskdump to `<workspace>/tasks.txt` so a wedged
     // node can say which task it is parked on. only where tokio's unstable
@@ -572,7 +574,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         prev_ckpt,
         signer,
         label,
-        validators,
         dev_demo,
         checkpoint_blocks,
         cadence,
@@ -584,13 +585,14 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         status,
         status_public_key,
         coordination,
+        genesis_validators: validators,
+        coord_cap,
         workspace,
         next_ops_refresh: context.current(),
         expected,
         applied,
         converged,
         pending_submits,
-        pending_rpc_submits,
         pending_relays,
         pending_gates,
         gating,
@@ -627,31 +629,12 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     runtime.publish_status().await;
 
     loop {
-        // Resolve on whichever signal stream installed. If neither did,
-        // this arm remains pending forever.
-        let signalled = async {
-            match (sigterm.as_mut(), sigint.as_mut()) {
-                (Some(t), Some(i)) => {
-                    let t = t.recv();
-                    let i = i.recv();
-                    futures::pin_mut!(t, i);
-                    futures::future::select(t, i).await;
-                }
-                (Some(t), None) => {
-                    t.recv().await;
-                }
-                (None, Some(i)) => {
-                    i.recv().await;
-                }
-                (None, None) => futures::future::pending::<()>().await,
-            }
-        }
-        .fuse();
+        let signalled = quit.recv().fuse();
         futures::pin_mut!(signalled);
 
         // the SIGUSR1 task dump: a separate arm from `signalled` above —
         // unlike SIGTERM/SIGINT it never checkpoints or exits, so it must
-        // not share `on_signal`'s terminal path.
+        // not share `shut_down`'s terminal path.
         #[cfg(all(
             tokio_unstable,
             target_os = "linux",
@@ -683,7 +666,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         // deadline must outrank every ingress lane.
         let next_drain = runtime.next_drain;
         futures::select_biased! {
-            _ = signalled => runtime.on_signal().await,
+            signal = signalled => runtime.shut_down(ShutdownCause::Signal(signal)).await,
             _ = dumped => {
                 #[cfg(all(
                     tokio_unstable,
@@ -758,50 +741,113 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
 }
 
 impl ValidatorRuntime<'_> {
-    async fn on_signal(&mut self) -> ! {
-        tracing::info!(
-            target: "ducktape::node",
-            node = %self.label,
-            "SIGTERM/SIGINT — graceful checkpoint then exit"
-        );
-        self.graceful_checkpoint().await;
-        std::process::exit(0);
-    }
-
-    async fn graceful_checkpoint(&mut self) {
-        graceful_checkpoint(&mut self.node, &self.orchestrator, self.next_seq).await;
+    /// the validator's ONE shutdown path, SIGTERM/SIGINT and rpc `Shutdown`
+    /// alike: a final manifest at the finalized tip so the restart replays a
+    /// minimal suffix, then the shared terminal step.
+    pub(super) async fn shut_down(&mut self, cause: ShutdownCause) -> ! {
+        let height = self.node.finalized().map(|f| f.height);
+        let checkpoint =
+            graceful_checkpoint(&mut self.node, &self.orchestrator, self.next_seq).await;
+        finish_shutdown(&self.label, cause, height, checkpoint).await
     }
 }
 
+fn shutdown_floor_cert(
+    epoch: u64,
+    view: u64,
+    cert: Vec<u8>,
+    min_unreleased_view: Option<u64>,
+    height: u64,
+) -> Option<recovery::FloorCert> {
+    let view_is_persistable = view != 0;
+    let gate_is_drained = min_unreleased_view.is_none_or(|pending| pending > view);
+    if !view_is_persistable || !gate_is_drained {
+        return None;
+    }
+    Some(recovery::FloorCert {
+        epoch,
+        height,
+        cert,
+    })
+}
+
+/// best-effort: a failure here is just the crash path, which also recovers.
 async fn graceful_checkpoint(
     node: &mut ValidatorNode,
     orchestrator: &consensus::ValsetOrchestrator<ed25519::PublicKey>,
     next_seq: u64,
-) {
-    if let Some(f) = node.finalized() {
-        let pos = node.sink_mut().oplog_pos().await;
-        let captured = Manifest::capture(
-            node.host(),
-            Some(f.height),
-            orchestrator.epoch(),
-            orchestrator.epoch_base(),
-            participant_bytes(orchestrator),
-            resident_bytes(orchestrator),
-            orchestrator
-                .pending_cutover()
-                .map(|cutover| cutover.cutover_view()),
-            pos,
-            next_seq,
-        );
-        // the replay guard rides the checkpoint: the journal suffix a
-        // checkpoint leaves is shallower than the protocol window, so a
-        // restart that rebuilt from the suffix alone would refuse fewer
-        // replayed batches than its peers.
-        if let Ok(manifest) = captured.map(|m| m.with_replay_window(node.replay_window())) {
-            let _ = node.sink_mut().write_manifest(&manifest).await;
-        }
+) -> ShutdownCheckpoint {
+    let Some(f) = node.finalized() else {
+        return ShutdownCheckpoint::Skipped("nothing_finalized");
+    };
+    // The manifest and this floor are one recovery boundary: without the
+    // floor, a clean restart re-reports already-applied journal history into
+    // an empty content store and can wedge the ordered release gate.
+    let floor_cert = node.finalized_view().and_then(|tip_view| {
+        let finalization = node.orderer().finalization_at_or_below(tip_view);
+        let min_unreleased_view = node.orderer().min_unreleased_view();
+        finalization.and_then(|(view, cert)| {
+            shutdown_floor_cert(
+                orchestrator.epoch(),
+                view,
+                cert,
+                min_unreleased_view,
+                orchestrator.app_height(view),
+            )
+        })
+    });
+    if let Some(floor_cert) = floor_cert
+        && node.sink_mut().write_floor_cert(&floor_cert).await.is_err()
+    {
+        return ShutdownCheckpoint::Skipped("floor_write_failed");
     }
+    let pos = node.sink_mut().oplog_pos().await;
+    let captured = Manifest::capture(
+        node.host(),
+        Some(f.height),
+        orchestrator.epoch(),
+        orchestrator.epoch_base(),
+        participant_bytes(orchestrator),
+        resident_bytes(orchestrator),
+        orchestrator
+            .pending_cutover()
+            .map(|cutover| cutover.cutover_view()),
+        pos,
+        next_seq,
+    );
+    // the replay guard rides the checkpoint: the journal suffix a
+    // checkpoint leaves is shallower than the protocol window, so a
+    // restart that rebuilt from the suffix alone would refuse fewer
+    // replayed batches than its peers.
+    let Ok(manifest) = captured.map(|m| m.with_replay_window(node.replay_window())) else {
+        return ShutdownCheckpoint::Skipped("capture_failed");
+    };
     // no trailing sync: every record the sink writes — pin, pre_apply, seal,
     // cutover — fsyncs where it is written, and `write_manifest` syncs the
     // journal before it puts. there is nothing buffered left to barrier.
+    match node.sink_mut().write_manifest(&manifest).await {
+        Ok(()) => ShutdownCheckpoint::Written,
+        Err(_) => ShutdownCheckpoint::Skipped("write_failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shutdown_floor_cert;
+
+    #[test]
+    fn shutdown_floor_requires_a_fully_drained_non_genesis_view() {
+        let cert = vec![7, 8, 9];
+
+        assert_eq!(
+            shutdown_floor_cert(3, 737, cert.clone(), None, 3129).map(|floor| (
+                floor.epoch,
+                floor.height,
+                floor.cert
+            )),
+            Some((3, 3129, cert.clone()))
+        );
+        assert!(shutdown_floor_cert(3, 0, cert.clone(), None, 3129).is_none());
+        assert!(shutdown_floor_cert(3, 737, cert, Some(737), 3129).is_none());
+    }
 }

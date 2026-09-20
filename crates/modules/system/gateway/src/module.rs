@@ -182,7 +182,7 @@ impl Gateway {
     {
         match self.staged.get(key).await? {
             Some(bytes) => Ok(Some(
-                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+                borsh::from_slice(&bytes).map_err(|e| Error::module("codec", e.to_string()))?,
             )),
             None => Ok(None),
         }
@@ -216,10 +216,13 @@ impl Gateway {
     {
         let bytes = borsh::to_vec(value).expect("gateway value is serializable");
         if bytes.len() > cap {
-            return Err(Error::Module(format!(
-                "gateway: {what} record too large: {} > {cap} bytes",
-                bytes.len()
-            )));
+            return Err(Error::module(
+                "record_too_large",
+                format!(
+                    "gateway: {what} record too large: {} > {cap} bytes",
+                    bytes.len()
+                ),
+            ));
         }
         self.staged.stage(key, bytes);
         Ok(())
@@ -279,15 +282,17 @@ impl Gateway {
             )
             .await?,
         )
-        .map_err(Error::Module)?
+        .map_err(|e| Error::module("identity_reply_decode", e))?
         {
             IdentityReply::Account(Some(account)) => Ok(account),
-            IdentityReply::Account(None) => Err(Error::Module(
-                "gateway: origin key belongs to no Identity account".into(),
+            IdentityReply::Account(None) => Err(Error::module(
+                "no_identity_account",
+                "gateway: origin key belongs to no Identity account",
             )),
-            other => Err(Error::Module(format!(
-                "gateway: identity answered OfKey with {other:?}"
-            ))),
+            other => Err(Error::module(
+                "unexpected_identity_reply",
+                format!("gateway: identity answered OfKey with {other:?}"),
+            )),
         }
     }
 
@@ -295,13 +300,15 @@ impl Gateway {
     /// scheme (the frame signature already proved possession).
     fn origin_key(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
         match &ctx.env().origin {
-            Origin::External(key) if key.is_empty() => Err(Error::Module(
-                "gateway: origin must be an external key".into(),
+            Origin::External(key) if key.is_empty() => Err(Error::module(
+                "empty_origin_key",
+                "gateway: origin must be an external key",
             )),
             Origin::External(key) => Ok(key.clone()),
-            other => Err(Error::Module(format!(
-                "gateway: origin must be an external key, got {other:?}"
-            ))),
+            other => Err(Error::module(
+                "external_origin_required",
+                format!("gateway: origin must be an external key, got {other:?}"),
+            )),
         }
     }
 
@@ -317,16 +324,20 @@ impl Gateway {
         what: &str,
     ) -> Result<(), Error> {
         if statement_account != account.number {
-            return Err(Error::Module(format!(
-                "gateway: {what} account is not the origin's account"
-            )));
+            return Err(Error::module(
+                "not_the_origin_account",
+                format!("gateway: {what} account is not the origin's account"),
+            ));
         }
         let signer: &KeyView = account
             .keys
             .iter()
             .find(|key| key.pubkey == authorization.signer)
             .ok_or_else(|| {
-                Error::Module("gateway: signer is not a current account member".into())
+                Error::module(
+                    "not_a_member_key",
+                    "gateway: signer is not a current account member",
+                )
             })?;
         let verifies = signer.scheme.verify(
             &authorization.signer,
@@ -335,9 +346,10 @@ impl Gateway {
             &authorization.signature,
         );
         if !verifies {
-            return Err(Error::Module(format!(
-                "gateway: {what} signature does not verify"
-            )));
+            return Err(Error::module(
+                "signature_unverified",
+                format!("gateway: {what} signature does not verify"),
+            ));
         }
         Ok(())
     }
@@ -356,15 +368,16 @@ impl Gateway {
     ) -> Result<(), Error> {
         let account = self.account_of_origin(ctx, origin).await?.number;
         if let Some(handle) = &handle {
-            validate_handle(handle).map_err(Error::Module)?;
+            validate_handle(handle).map_err(|e| Error::module("bad_handle", e))?;
             if self
                 .handle_owner(handle)
                 .await?
                 .is_some_and(|owner| owner != account)
             {
-                return Err(Error::Module(format!(
-                    "duckdns: handle {handle:?} is already claimed by another account"
-                )));
+                return Err(Error::module(
+                    "handle_already_claimed",
+                    format!("duckdns: handle {handle:?} is already claimed by another account"),
+                ));
             }
         }
 
@@ -387,16 +400,18 @@ impl Gateway {
                     // by the same account, and that returned as a no-op — a
                     // rostered handle here is a store bug.
                     Ok(_) => {
-                        return Err(Error::Module(
-                            "gateway: handle roster carries a name with no record".into(),
+                        return Err(Error::module(
+                            "roster_corrupt",
+                            "gateway: handle roster carries a name with no record",
                         ));
                     }
                     Err(position) => position,
                 };
                 if roster.len() >= MAX_HANDLES {
-                    return Err(Error::Module(format!(
-                        "gateway: handle cap reached ({MAX_HANDLES})"
-                    )));
+                    return Err(Error::module(
+                        "handle_cap",
+                        format!("gateway: handle cap reached ({MAX_HANDLES})"),
+                    ));
                 }
                 roster.insert(position, handle.clone());
                 self.store_bounded(
@@ -430,14 +445,16 @@ impl Gateway {
         authorization: MemberAuthorization,
     ) -> Result<(), Error> {
         if statement.chain_id != self.chain_id {
-            return Err(Error::Module(
-                "gateway: route belongs to another chain".into(),
+            return Err(Error::module(
+                "foreign_chain",
+                "gateway: route belongs to another chain",
             ));
         }
         // the account vouches for the node it names as publisher; the origin
         // is a user key, never compared to it.
         let account = self.account_of_origin(ctx, origin).await?;
-        let preimage = route_signing_preimage(&statement).map_err(Error::Module)?;
+        let preimage =
+            route_signing_preimage(&statement).map_err(|e| Error::module("bad_route", e))?;
         Self::verify_member_signature(
             &account,
             statement.account_id,
@@ -451,37 +468,42 @@ impl Gateway {
             statement,
             authorization,
         };
-        validate_route_statement(&record.statement).map_err(Error::Module)?;
-        validate_authorization(&record.authorization).map_err(Error::Module)?;
+        validate_route_statement(&record.statement).map_err(|e| Error::module("bad_route", e))?;
+        validate_authorization(&record.authorization)
+            .map_err(|e| Error::module("bad_authorization", e))?;
         let account_id = record.statement.account_id;
         let name = record.statement.name.clone();
 
         let existing = self.route_record(account_id, &name).await?;
         // the revision chain: 1 for a fresh name, current + 1 for a replace.
-        let expected =
-            match &existing {
-                None => 1,
-                Some(current) => current.statement.revision.checked_add(1).ok_or_else(|| {
-                    Error::Module("gateway: route revision is exhausted".to_string())
-                })?,
-            };
+        let expected = match &existing {
+            None => 1,
+            Some(current) => current.statement.revision.checked_add(1).ok_or_else(|| {
+                Error::module("revision_exhausted", "gateway: route revision is exhausted")
+            })?,
+        };
         if record.statement.revision != expected {
-            return Err(Error::Module(format!(
-                "gateway: route revision must be {expected}, got {}",
-                record.statement.revision
-            )));
+            return Err(Error::module(
+                "stale_revision",
+                format!(
+                    "gateway: route revision must be {expected}, got {}",
+                    record.statement.revision
+                ),
+            ));
         }
         if existing.is_none() {
             let mut roster = self.route_roster(account_id).await?;
             let Err(position) = roster.binary_search(&name) else {
-                return Err(Error::Module(
-                    "gateway: route roster carries a name with no record".into(),
+                return Err(Error::module(
+                    "roster_corrupt",
+                    "gateway: route roster carries a name with no record",
                 ));
             };
             if roster.len() >= MAX_ROUTES_PER_ACCOUNT {
-                return Err(Error::Module(format!(
-                    "gateway: account route count exceeds {MAX_ROUTES_PER_ACCOUNT}"
-                )));
+                return Err(Error::module(
+                    "route_cap",
+                    format!("gateway: account route count exceeds {MAX_ROUTES_PER_ACCOUNT}"),
+                ));
             }
             roster.insert(position, name.clone());
             self.store_bounded(
@@ -515,8 +537,9 @@ impl Gateway {
         preimage: &[u8],
     ) -> Result<(), Error> {
         if chain_id != self.chain_id {
-            return Err(Error::Module(
-                "gateway: credential belongs to another chain".into(),
+            return Err(Error::module(
+                "foreign_chain",
+                "gateway: credential belongs to another chain",
             ));
         }
         let account = self.account_of_origin(ctx, origin).await?;
@@ -537,14 +560,17 @@ impl Gateway {
         name: &str,
         owner_account: u64,
     ) -> Result<CredentialRecord, Error> {
-        validate_credential_name(name).map_err(Error::Module)?;
-        let record = self
-            .credential_record(name)
-            .await?
-            .ok_or_else(|| Error::Module("gateway: credential is not registered".to_string()))?;
+        validate_credential_name(name).map_err(|e| Error::module("bad_credential_name", e))?;
+        let record = self.credential_record(name).await?.ok_or_else(|| {
+            Error::module(
+                "unknown_credential",
+                "gateway: credential is not registered",
+            )
+        })?;
         if record.owner_account != owner_account {
-            return Err(Error::Module(
-                "gateway: credential is owned by another account".into(),
+            return Err(Error::module(
+                "not_the_credential_owner",
+                "gateway: credential is owned by another account",
             ));
         }
         Ok(record)
@@ -557,7 +583,8 @@ impl Gateway {
         statement: SetCredentialStatement,
         authorization: MemberAuthorization,
     ) -> Result<(), Error> {
-        let preimage = set_credential_preimage(&statement).map_err(Error::Module)?;
+        let preimage =
+            set_credential_preimage(&statement).map_err(|e| Error::module("bad_credential", e))?;
         self.verify_credential_owner(
             ctx,
             origin,
@@ -569,11 +596,14 @@ impl Gateway {
         .await?;
 
         let mut record = statement.record;
-        validate_credential_name(&record.name).map_err(Error::Module)?;
-        validate_account_number(record.owner_account).map_err(Error::Module)?;
+        validate_credential_name(&record.name)
+            .map_err(|e| Error::module("bad_credential_name", e))?;
+        validate_account_number(record.owner_account)
+            .map_err(|e| Error::module("bad_account", e))?;
         if !record.grants.is_empty() {
-            return Err(Error::Module(
-                "gateway: credential registration carries no grants".into(),
+            return Err(Error::module(
+                "no_grants",
+                "gateway: credential registration carries no grants",
             ));
         }
         // first registration in consensus order wins the name: a record whose
@@ -583,21 +613,24 @@ impl Gateway {
             .as_ref()
             .is_some_and(|current| current.owner_account != record.owner_account)
         {
-            return Err(Error::Module(
-                "gateway: credential name already registered".into(),
+            return Err(Error::module(
+                "credential_already_registered",
+                "gateway: credential name already registered",
             ));
         }
         if existing.is_none() {
             let mut roster = self.cred_roster().await?;
             let Err(position) = roster.binary_search(&record.name) else {
-                return Err(Error::Module(
-                    "gateway: credential roster carries a name with no record".into(),
+                return Err(Error::module(
+                    "roster_corrupt",
+                    "gateway: credential roster carries a name with no record",
                 ));
             };
             if roster.len() >= MAX_CREDENTIALS {
-                return Err(Error::Module(format!(
-                    "gateway: credential cap reached ({MAX_CREDENTIALS})"
-                )));
+                return Err(Error::module(
+                    "credential_cap",
+                    format!("gateway: credential cap reached ({MAX_CREDENTIALS})"),
+                ));
             }
             roster.insert(position, record.name.clone());
             self.store_bounded(
@@ -624,7 +657,8 @@ impl Gateway {
         statement: RemoveCredentialStatement,
         authorization: MemberAuthorization,
     ) -> Result<(), Error> {
-        let preimage = remove_credential_preimage(&statement).map_err(Error::Module)?;
+        let preimage = remove_credential_preimage(&statement)
+            .map_err(|e| Error::module("bad_credential", e))?;
         self.verify_credential_owner(
             ctx,
             origin,
@@ -656,7 +690,8 @@ impl Gateway {
         statement: CredentialGrantStatement,
         authorization: MemberAuthorization,
     ) -> Result<(), Error> {
-        let preimage = grant_credential_preimage(&statement).map_err(Error::Module)?;
+        let preimage = grant_credential_preimage(&statement)
+            .map_err(|e| Error::module("bad_credential", e))?;
         self.verify_credential_owner(
             ctx,
             origin,
@@ -666,15 +701,16 @@ impl Gateway {
             &preimage,
         )
         .await?;
-        validate_account_number(statement.account).map_err(Error::Module)?;
+        validate_account_number(statement.account).map_err(|e| Error::module("bad_account", e))?;
         let mut record = self
             .owned_credential(&statement.name, statement.owner_account)
             .await?;
         let is_new_grant = record.grants.insert(statement.account);
         if is_new_grant && record.grants.len() > MAX_CREDENTIAL_GRANTS {
-            return Err(Error::Module(format!(
-                "gateway: credential grant count exceeds {MAX_CREDENTIAL_GRANTS}"
-            )));
+            return Err(Error::module(
+                "grant_cap",
+                format!("gateway: credential grant count exceeds {MAX_CREDENTIAL_GRANTS}"),
+            ));
         }
         self.store(cred_key(&statement.name), &record);
         Ok(())
@@ -687,7 +723,8 @@ impl Gateway {
         statement: CredentialGrantStatement,
         authorization: MemberAuthorization,
     ) -> Result<(), Error> {
-        let preimage = revoke_credential_preimage(&statement).map_err(Error::Module)?;
+        let preimage = revoke_credential_preimage(&statement)
+            .map_err(|e| Error::module("bad_credential", e))?;
         self.verify_credential_owner(
             ctx,
             origin,
@@ -735,7 +772,7 @@ impl Module for Gateway {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let origin = Self::origin_key(ctx)?;
-        match decode_msg(&msg.payload).map_err(Error::Module)? {
+        match decode_msg(&msg.payload).map_err(|e| Error::module("codec", e))? {
             GatewayMsg::SetHandle { handle } => self.set_handle(ctx, &origin, handle).await,
             GatewayMsg::SetRoute {
                 statement,
@@ -776,9 +813,9 @@ impl Module for Gateway {
     /// staged-over-committed store view). the listings walk their rosters by
     /// derived key.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match decode_query(req).map_err(Error::Module)? {
+        match decode_query(req).map_err(|e| Error::module("codec", e))? {
             GatewayQuery::Resolve { name } => {
-                name.validate().map_err(Error::Module)?;
+                name.validate().map_err(|e| Error::module("bad_name", e))?;
                 let resolved = self
                     .handle_owner(&name.handle)
                     .await?
@@ -787,9 +824,12 @@ impl Module for Gateway {
             }
             GatewayQuery::Registrations { from, limit } => {
                 if limit > MAX_QUERY_LIMIT {
-                    return Err(Error::Module(format!(
-                        "duckdns: registration query limit {limit} exceeds {MAX_QUERY_LIMIT}"
-                    )));
+                    return Err(Error::module(
+                        "query_limit",
+                        format!(
+                            "duckdns: registration query limit {limit} exceeds {MAX_QUERY_LIMIT}"
+                        ),
+                    ));
                 }
                 let from = usize::try_from(from).unwrap_or(usize::MAX);
                 let mut registrations = Vec::new();
@@ -801,7 +841,10 @@ impl Module for Gateway {
                     .take(limit as usize)
                 {
                     let account_id = self.handle_owner(handle).await?.ok_or_else(|| {
-                        Error::Module("gateway: handle roster carries a name with no record".into())
+                        Error::module(
+                            "roster_corrupt",
+                            "gateway: handle roster carries a name with no record",
+                        )
                     })?;
                     registrations.push(HandleRegistration {
                         handle: handle.clone(),
@@ -811,18 +854,21 @@ impl Module for Gateway {
                 Ok(encode_reply(&GatewayReply::Registrations(registrations)))
             }
             GatewayQuery::Get { account_id, name } => {
-                validate_account_number(account_id).map_err(Error::Module)?;
-                name.validate().map_err(Error::Module)?;
+                validate_account_number(account_id).map_err(|e| Error::module("bad_account", e))?;
+                name.validate().map_err(|e| Error::module("bad_name", e))?;
                 Ok(encode_reply(&GatewayReply::Route(Box::new(
                     self.route_record(account_id, &name).await?,
                 ))))
             }
             GatewayQuery::List { account_id } => {
-                validate_account_number(account_id).map_err(Error::Module)?;
+                validate_account_number(account_id).map_err(|e| Error::module("bad_account", e))?;
                 let mut routes = Vec::new();
                 for name in self.route_roster(account_id).await? {
                     let record = self.route_record(account_id, &name).await?.ok_or_else(|| {
-                        Error::Module("gateway: route roster carries a name with no record".into())
+                        Error::module(
+                            "roster_corrupt",
+                            "gateway: route roster carries a name with no record",
+                        )
                     })?;
                     let Some(route) = record.statement.route.as_ref() else {
                         continue;
@@ -837,7 +883,8 @@ impl Module for Gateway {
                 Ok(encode_reply(&GatewayReply::Routes(routes)))
             }
             GatewayQuery::Credential { name } => {
-                validate_credential_name(&name).map_err(Error::Module)?;
+                validate_credential_name(&name)
+                    .map_err(|e| Error::module("bad_credential_name", e))?;
                 Ok(encode_reply(&GatewayReply::Credential(
                     self.credential_record(&name).await?,
                 )))
@@ -846,8 +893,9 @@ impl Module for Gateway {
                 let mut credentials = Vec::new();
                 for name in self.cred_roster().await? {
                     let record = self.credential_record(&name).await?.ok_or_else(|| {
-                        Error::Module(
-                            "gateway: credential roster carries a name with no record".into(),
+                        Error::module(
+                            "roster_corrupt",
+                            "gateway: credential roster carries a name with no record",
                         )
                     })?;
                     credentials.push(record);

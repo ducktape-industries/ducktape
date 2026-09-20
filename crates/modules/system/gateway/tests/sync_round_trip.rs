@@ -75,7 +75,7 @@ fn ctx(height: u64, founder: &Ed) -> TestCtx {
         cause: sdk::Cause::Direct,
     })
     .on_query("identity", move |req| {
-        match identity_decode_query(req).map_err(Error::Module)? {
+        match identity_decode_query(req).map_err(|e| Error::module("codec", e))? {
             IdentityQuery::OfKey { .. } => Ok(identity_encode_reply(&IdentityReply::Account(
                 Some(view.clone()),
             ))),

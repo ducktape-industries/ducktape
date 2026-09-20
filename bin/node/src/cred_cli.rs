@@ -34,9 +34,13 @@ use commonware_cryptography::Signer as _;
 use crate::account_cli::resolve_account_authority;
 use crate::cli_args::NodeAddr;
 use crate::config;
-use crate::userkey_cli::load_user_signer;
 
 pub(crate) type CredResult = Result<(), Box<dyn std::error::Error>>;
+
+/// how often a login re-reads its credentials artifact. the login ends when
+/// two reads in a row see the same non-zero size, so this is also how long a
+/// size must hold still to count as fully written.
+const ARTIFACT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// `ducktape user cred <verb>` — the credential subfamily. `--node`/`-n` are the
 /// shared [`NodeAddr`] group every family carries, `global` so they attach in
@@ -308,7 +312,7 @@ impl ProviderArg {
     }
 }
 
-/// Dispatch one `cred` verb. `stdin` is threaded to [`load_user_signer`], which
+/// Dispatch one `cred` verb. `stdin` is threaded to [`VerbCtx::signer`], which
 /// reads the key password from it only when the key file is encrypted.
 pub(crate) fn run(args: CredArgs, stdin: &mut impl BufRead) -> CredResult {
     let CredArgs { cmd, addr, key } = args;
@@ -373,16 +377,25 @@ impl VerbCtx {
         Ok(path)
     }
 
+    /// the unlocked user key for a verb that signs for the node it dials —
+    /// asked for only once that node has answered
+    /// ([`crate::userkey_cli::load_user_signer_for`]).
+    pub(crate) fn signer(
+        &self,
+        stdin: &mut impl std::io::BufRead,
+    ) -> Result<commonware_cryptography::ed25519::PrivateKey, Box<dyn std::error::Error>> {
+        crate::userkey_cli::load_user_signer_for(&self.http_base()?, &self.key_path()?, stdin)
+    }
+
     /// the co-hosted workspace behind the node this verb dials: chain id, the
     /// node's consensus key, and its storage dir. Required by every verb that
     /// mints an owner-signed statement or writes the store.
     ///
-    /// [`NodeAddr::workspace`] is the ONE ladder that answers this, `--node`
+    /// [`NodeAddr::config_file`] is the ONE ladder that answers this, `--node`
     /// included: a bare url names no directory, so it is resolved backwards
     /// through the registry to the workspace that serves it.
     pub(crate) fn workspace(&self) -> Result<config::Resolved, Box<dyn std::error::Error>> {
-        let dir = self.addr.workspace()?;
-        Ok(config::resolve(&dir.join("node.toml"))?)
+        Ok(config::resolve(&self.addr.config_file()?)?)
     }
 }
 
@@ -422,7 +435,7 @@ fn cmd_list(ctx: &VerbCtx, json: bool) -> CredResult {
 fn cmd_grant(ctx: &VerbCtx, name: String, account: String, stdin: &mut impl BufRead) -> CredResult {
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
     let grantee = resolve_account_authority(&base, &account)?;
     let statement = gateway::CredentialGrantStatement {
@@ -453,7 +466,7 @@ fn cmd_revoke(
 ) -> CredResult {
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
     let grantee = resolve_account_authority(&base, &account)?;
     let statement = gateway::CredentialGrantStatement {
@@ -491,7 +504,7 @@ fn cmd_remove(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> CredResu
         return finish_local_removal_only(&resolved.service.storage_dir, &name);
     }
 
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
     let statement = gateway::RemoveCredentialStatement {
         chain_id: resolved.service.chain_id.clone(),
@@ -574,7 +587,7 @@ fn begin_enrolment(
 ) -> Result<Enrolment, Box<dyn std::error::Error>> {
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let user_pub = user.public_key().as_ref().to_vec();
 
     // owner account (membership check) + existing names (for the default's
@@ -811,8 +824,8 @@ impl Publisher {
 
     /// The node this verb dials, as `/v1/status` reports it: what `cred
     /// seal` publishes under, which holds no store and needs no workspace —
-    /// the operator binds the enclave's port on that node.
-    #[cfg(feature = "verify")]
+    /// the operator binds the enclave's port on that node. `forge publish`
+    /// names the node serving the `git` route the same way.
     pub(crate) fn of_node(base: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let status = crate::node_http::get_json(base, "/v1/status")
             .map_err(|error| format!("read the node's status: {error}"))?;
@@ -1055,7 +1068,7 @@ async fn pump_login(command: tokio::process::Command, artifact: &Path) -> CredRe
                 return;
             }
             last = size;
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(ARTIFACT_POLL).await;
         }
     };
 
@@ -1122,7 +1135,7 @@ fn authorize(
 /// Submit one gateway op as a frame `user` signed over `/v1/submit/frame` (the
 /// user key is the origin the gateway resolves to the owner account) and
 /// return the committed height.
-fn submit_gateway(
+pub(crate) fn submit_gateway(
     base: &str,
     user: &commonware_cryptography::ed25519::PrivateKey,
     message: &gateway::GatewayMsg,

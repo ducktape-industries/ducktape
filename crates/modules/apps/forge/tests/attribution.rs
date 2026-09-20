@@ -1,12 +1,12 @@
 //! Real Host publication, ordinary program rights and durable source history.
-use attribution::{
-    Actor, AttributionModule, AttributionQuery, AttributionReply, ObjectRelations, Reason, Source,
-};
+use attribution::{Actor, AttributionQuery, AttributionReply, ObjectRelations, Reason, Source};
+use attribution_module::AttributionModule;
 use chat::Party;
 use forge::{Forge, ForgeMsg, ForgeQuery, ForgeReply, RefUpdate, ReviewVerdict};
 use futures::executor::block_on;
 use host::{BlockContext, Host};
-use identity::{Identity, IdentityMsg, KeyScheme};
+use identity::{IdentityMsg, KeyScheme};
+use identity_module::Identity;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sdk_testkit::{MemStore, TestCtx};
 use std::path::PathBuf;
@@ -36,7 +36,7 @@ impl Module for Executor {
     }
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         identity::authenticate_event(&ctx.env().origin, "identity", &msg.payload)
-            .map_err(Error::Module)?;
+            .map_err(|e| Error::module("authenticate_event", e))?;
         Ok(())
     }
 }
@@ -113,6 +113,7 @@ fn push(branch: &str, prev: Option<u8>, next: Option<u8>) -> ForgeMsg {
             new_oid: next.map(|byte| vec![byte; 20]),
         }],
         pack_digest: next.map(|_| vec![9; 32]),
+        tags: Vec::new(),
         cert: None,
     }
 }
@@ -365,6 +366,7 @@ fn snapshot_reopen_and_guest_reentry_keep_source_revisions() {
                             new_oid: Some(commit.head.clone()),
                         }],
                         pack_digest: Some(digest.to_vec()),
+                        tags: Vec::new(),
                         cert: None,
                     },
                 ),
@@ -687,7 +689,7 @@ fn signed_push_attributes_the_real_account_signer_instead_of_its_relay() {
             unreachable!()
         };
         let bytes =
-            forge::pushcert::certificate(&forge::pushcert::nonce("sources", "demo"), updates);
+            forge::pushcert::certificate(&forge::pushcert::nonce("sources", "demo"), updates, &[]);
         *cert = Some(forge::PushCert {
             sshsig: keyscheme::testkit::sshsig(&signer, keyscheme::sshsig::GIT_SSH_NS, &bytes),
             cert: bytes,

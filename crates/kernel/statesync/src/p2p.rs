@@ -2,19 +2,29 @@
 //!
 //! requests ride the rpc envelope (`id || frame`) addressed to ONE serving
 //! peer at a time; a background dispatch task drains the channel receiver and
-//! routes each response to its awaiting request by id. responses claiming to
-//! be from a peer outside the candidate SOURCE set are dropped — the mesh is
-//! authenticated, and installable payloads are root-verified anyway, but there
-//! is no reason to let an unrelated peer complete someone else's request.
+//! routes each response to its awaiting request by id. a response completes
+//! a request only when it comes from the peer that request was addressed to;
+//! any other peer's frame is dropped — the mesh is authenticated, and
+//! installable payloads are root-verified anyway, but a tip-coords answer's
+//! whole value is WHO gave it, and no other peer may speak for that one.
 //!
 //! SOURCE ROTATION: the client holds a candidate list, not a pinned server.
 //! every payload is verified against consensus-agreed roots, so which peer
 //! serves is purely an availability question — a request that fails at the
-//! transport (unreachable send, reaper timeout) advances the cursor to the
-//! next candidate and surfaces the error, and the caller's existing retry
-//! (manifest loops, the qmdb refetch ladder) lands on the new source. one
-//! failure advances the cursor once, no matter how many concurrent requests
-//! observed it.
+//! transport (a send the local mesh refused, reaper timeout) advances the
+//! cursor to the next candidate and surfaces the error, and the caller's
+//! existing retry (manifest loops, the qmdb refetch ladder) lands on the new
+//! source. one failure advances the cursor once, no matter how many
+//! concurrent requests observed it.
+//!
+//! THE LANE'S QUOTA IS WAITED OUT, NEVER FAILED: every channel carries a
+//! per-peer outbound quota, and a send past it is refused on the spot. a
+//! sequential chunk walk over a fast link (a large snapshot, a loopback
+//! peer) outruns that quota on its own, so treating the refusal as the
+//! source's failure threw away a whole boundary sync on a healthy peer, over
+//! and over. [`send_within_quota`] sleeps until the instant the
+//! limiter names instead — exactly what the receiving side does with its own
+//! inbound limiter.
 //!
 //! every request is TIMED OUT by the dispatch task's reaper: p2p sends to a
 //! peer whose link is not (or no longer) up are silently dropped by the mesh,
@@ -22,7 +32,8 @@
 //! manifest loop does exactly that while the mesh warms up) instead of parking
 //! forever on a reply that will never come. the reaper lives in the dispatch
 //! task because runtime contexts are move-only (not `Clone`): the spawned task
-//! owns the only clock, and the request future itself stays runtime-free.
+//! owns the clock it sweeps on, and a request touches a runtime only to sleep
+//! out the lane's quota, on a child context taken before the spawn.
 //!
 //! BUSY-MESH RETRY: a single missed reaper window does not mean the source is
 //! dead — a founder pushing tens of consensus blocks/s over the same overlay
@@ -40,11 +51,13 @@
 //! timeout counter and, latched, a `warn!` (see [`TIMEOUT_WARN_EVERY`]).
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use commonware_p2p::{Receiver, Recipients, Sender};
+use commonware_p2p::{CheckedSender, Receiver, Recipients, Sender};
 use commonware_runtime::{Clock, IoBuf, Spawner};
 use futures::channel::oneshot;
 use tracing::{debug, warn};
@@ -72,6 +85,13 @@ pub const RETRY_WINDOWS: [Duration; 3] = [
     Duration::from_secs(12),
 ];
 
+/// the windows a request spends on every attempt but its last (3s + 6s). a
+/// server whose answer must land before the requester's final attempt, such as
+/// the forge pack budget, reads this rather than indexing [`RETRY_WINDOWS`],
+/// so a change to the windows moves it here, beside them.
+pub const WINDOWS_BEFORE_LAST_ATTEMPT: Duration =
+    Duration::from_secs(RETRY_WINDOWS[0].as_secs() + RETRY_WINDOWS[1].as_secs());
+
 /// how many reaper-timeout occurrences a source must accumulate before the
 /// latched `warn!` fires again after its first line — never one line per
 /// timeout under a sustained busy mesh (CLAUDE.md: a forever-retry loop logs
@@ -92,6 +112,65 @@ fn window_ticks(window: Duration) -> u64 {
     window.as_secs().div_ceil(REAP_INTERVAL.as_secs()).max(1)
 }
 
+/// why the LOCAL mesh refused a send outright. the lane's quota is not one of
+/// these — [`send_within_quota`] waits it out — and neither is an unreachable
+/// peer: the mesh accepts a frame for a peer it holds no connection to and
+/// drops it, which only the reaper's window can see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendRefused {
+    /// the router's mailbox shed the frame under local backpressure.
+    Backpressure,
+    /// the router is gone: the p2p network this lane rides has shut down.
+    Closed,
+}
+
+impl SendRefused {
+    /// the stable snake_case token a log line and an error carry.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Backpressure => "lane_backpressure",
+            Self::Closed => "lane_closed",
+        }
+    }
+}
+
+/// send `frame` to `peer`, WAITING OUT the lane's per-peer quota: a refusal by
+/// the limiter names the instant it will admit this peer again, and
+/// `wait_until` sleeps to it on the clock the limiter reads (see the module
+/// doc's THE LANE'S QUOTA IS WAITED OUT). only a refusal by the router itself
+/// comes back as an error.
+pub async fn send_within_quota<S, W, F>(
+    sender: &mut S,
+    peer: S::PublicKey,
+    frame: IoBuf,
+    wait_until: W,
+) -> Result<(), SendRefused>
+where
+    S: Sender,
+    W: Fn(SystemTime) -> F,
+    F: Future<Output = ()>,
+{
+    loop {
+        let admits_at = match sender.check(Recipients::One(peer.clone())) {
+            Ok(checked) => {
+                let feedback = checked.send(frame, false);
+                return match feedback.outcome().map(|outcome| outcome.accepted()) {
+                    Some(true) => Ok(()),
+                    Some(false) => Err(SendRefused::Closed),
+                    None => Err(SendRefused::Backpressure),
+                };
+            }
+            Err(admits_at) => admits_at,
+        };
+        wait_until(admits_at).await;
+    }
+}
+
+/// [`send_within_quota`]'s sleep, on the runtime the client was built on —
+/// the limiter's "admits at" instant is a wall-clock time on that runtime's
+/// clock, so the deterministic runtime's tests wait on virtual time.
+type QuotaWait = Arc<dyn Fn(SystemTime) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// sink for inbound frames whose rpc id matches no pending request: another
 /// owner may multiplex its own id space over the same channel (id spaces are
 /// disjoint by construction — this client's ids are small and sequential, a
@@ -99,10 +178,11 @@ fn window_ticks(window: Duration) -> u64 {
 /// `(id, body)`; the kernel stays payload-agnostic.
 pub type UnmatchedFrameHook = Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
 
-/// a pending request: the reply slot, the reaper tick it was filed under, and
-/// how many whole sweeps THIS attempt survives before the reaper reaps it
-/// (its [`RETRY_WINDOWS`] entry, in [`window_ticks`]).
-struct PendingEntry {
+/// a pending request: the peer it was sent to, the reply slot, the reaper tick
+/// it was filed under, and how many whole sweeps THIS attempt survives before
+/// the reaper reaps it (its [`RETRY_WINDOWS`] entry, in [`window_ticks`]).
+struct PendingEntry<P> {
+    server: P,
     reply: oneshot::Sender<Vec<u8>>,
     filed_at_tick: u64,
     survive_ticks: u64,
@@ -137,8 +217,8 @@ impl<R> LaneReclaim<R> {
     }
 }
 
-struct Shared {
-    pending: Mutex<HashMap<u64, PendingEntry>>,
+struct Shared<P> {
+    pending: Mutex<HashMap<u64, PendingEntry<P>>>,
     /// monotonically increasing reaper tick (written only by the reaper).
     tick: AtomicU64,
     next_id: AtomicU64,
@@ -256,8 +336,9 @@ impl<P: Clone + PartialEq> Sources<P> {
 /// candidate set of serving peers, failing over on transport failure.
 pub struct P2pSyncClient<S: Sender> {
     sender: S,
+    quota_wait: QuotaWait,
     sources: Arc<Sources<S::PublicKey>>,
-    shared: Arc<Shared>,
+    shared: Arc<Shared<S::PublicKey>>,
     /// the caller's real-key standing proof, signed ONCE via
     /// [`crate::sign_sync_proof`] and attached to every request. the server
     /// verifies it against committed standing and fail-closes on a mismatch.
@@ -269,6 +350,7 @@ impl<S: Sender> Clone for P2pSyncClient<S> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            quota_wait: Arc::clone(&self.quota_wait),
             sources: Arc::clone(&self.sources),
             shared: Arc::clone(&self.shared),
             requester: self.requester,
@@ -293,7 +375,7 @@ where
         proof: [u8; 64],
     ) -> Self
     where
-        E: Spawner + Clock + Send + 'static,
+        E: Spawner + Clock + Send + Sync + 'static,
         R: Receiver<PublicKey = S::PublicKey> + Send + 'static,
     {
         Self::with_sources(
@@ -329,10 +411,12 @@ where
         reclaim: Option<LaneReclaim<R>>,
     ) -> Self
     where
-        E: Spawner + Clock + Send + 'static,
+        E: Spawner + Clock + Send + Sync + 'static,
         R: Receiver<PublicKey = S::PublicKey> + Send + 'static,
     {
         assert!(!candidates.is_empty(), "at least one sync source");
+        let clock = context.child("quota_wait");
+        let quota_wait: QuotaWait = Arc::new(move |at| Box::pin(clock.sleep_until(at)));
         let sources = Arc::new(Sources::new(candidates, 0));
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
@@ -405,11 +489,21 @@ where
                 let Ok((_requester, _proof, id, body)) = decode_rpc(&bytes) else {
                     continue;
                 };
-                let waiter = task_shared
-                    .pending
-                    .lock()
-                    .expect("pending poisoned")
-                    .remove(&id);
+                let mut pending = task_shared.pending.lock().expect("pending poisoned");
+                let addressed_elsewhere = pending.get(&id).is_some_and(|e| e.server != peer);
+                if addressed_elsewhere {
+                    drop(pending);
+                    debug!(
+                        target: "ducktape::statesync",
+                        reason = "answer_from_unaddressed_peer",
+                        id,
+                        "a statesync answer dropped — it came from a peer this \
+                         request was not addressed to",
+                    );
+                    continue;
+                }
+                let waiter = pending.remove(&id);
+                drop(pending);
                 if let Some(entry) = waiter {
                     let _ = entry.reply.send(body.to_vec());
                 } else if let Some(hook) = &unmatched {
@@ -438,6 +532,7 @@ where
         });
         Self {
             sender,
+            quota_wait,
             sources,
             shared,
             requester,
@@ -542,6 +637,7 @@ where
                 pending.insert(
                     id,
                     PendingEntry {
+                        server: server.clone(),
                         reply: tx,
                         filed_at_tick: shared.tick.load(Ordering::Relaxed),
                         survive_ticks: window_ticks(window),
@@ -549,26 +645,32 @@ where
                 );
             }
             let frame = encode_rpc(&self.requester, &self.proof, id, &body);
-            let attempted = sender.send(Recipients::One(server.clone()), IoBuf::from(frame), false);
-            if attempted.is_empty() {
-                // the source is offline/unreachable, rate-limited, or its
-                // mailbox refused the send under local backpressure right
-                // now — fail fast instead of waiting out the reaper, and
-                // rotate. this is a distinct, immediately-visible drop (see
-                // the module doc), not the reaper's "sent but unanswered"
-                // case below, so it does not retry against the same source.
+            let sent = send_within_quota(
+                &mut sender,
+                server.clone(),
+                IoBuf::from(frame),
+                &*self.quota_wait,
+            )
+            .await;
+            if let Err(refused) = sent {
+                // the local router refused the frame — fail fast instead of
+                // waiting out the reaper, and rotate. this is a distinct,
+                // immediately-visible drop, not the reaper's "sent but
+                // unanswered" case below, so it does not retry against the
+                // same source.
                 shared.pending.lock().expect("pending poisoned").remove(&id);
+                let reason = refused.reason();
                 debug!(
                     target: "ducktape::statesync",
-                    reason = "send_rejected",
+                    reason,
                     kind,
                     attempt = attempt + 1,
-                    "statesync request send accepted no recipients (rate-limited, closed sender, or local backpressure)",
+                    "statesync request refused by the local mesh",
                 );
                 sources.advance_past(at);
-                return Err(SyncError::Transport(
-                    "sync source unreachable (send attempted no recipients)".into(),
-                ));
+                return Err(SyncError::Transport(format!(
+                    "the local mesh refused the sync request ({reason})"
+                )));
             }
             // resolves when the response routes back — or errs when the
             // reaper drops the slot (dropped send / dead server), retrying
@@ -773,8 +875,11 @@ mod tests {
 
     /// stand up a two-peer deterministic mesh (`server`, `joiner`) on one
     /// registered channel and hand back both sides' sender/receiver halves.
+    /// the joiner's lane admits `joiner_per_second` frames a second to one
+    /// peer; the server's the node's 128.
     async fn mesh_pair(
         context: &commonware_runtime::deterministic::Context,
+        joiner_per_second: u32,
     ) -> (
         ed25519::PublicKey,
         (
@@ -827,9 +932,12 @@ mod tests {
             .register(TEST_CHANNEL, quota)
             .await
             .expect("server channel registration");
+        let joiner_quota = commonware_runtime::Quota::per_second(
+            std::num::NonZeroU32::new(joiner_per_second).expect("a lane admits something"),
+        );
         let joiner_side = oracle
             .control(joiner.clone())
-            .register(TEST_CHANNEL, quota)
+            .register(TEST_CHANNEL, joiner_quota)
             .await
             .expect("joiner channel registration");
 
@@ -842,7 +950,7 @@ mod tests {
 
         deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
             let (server, (mut server_tx, mut server_rx), (joiner_tx, joiner_rx)) =
-                mesh_pair(&context).await;
+                mesh_pair(&context, 128).await;
 
             // the first two requests the server receives are silently
             // dropped (never answered) — exactly the busy-mesh shape the
@@ -899,7 +1007,7 @@ mod tests {
 
         deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
             let (server, (_server_tx, mut server_rx), (joiner_tx, joiner_rx)) =
-                mesh_pair(&context).await;
+                mesh_pair(&context, 128).await;
 
             // a genuinely dead source: every request lands and nothing ever
             // answers.
@@ -949,7 +1057,7 @@ mod tests {
 
         deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
             let (server, (mut server_tx, mut server_rx), (joiner_tx, joiner_rx)) =
-                mesh_pair(&context).await;
+                mesh_pair(&context, 128).await;
 
             // a SLOW source, not a dead one: it answers the FIRST request it
             // is asked, once, after that attempt has already been reaped —
@@ -1001,5 +1109,166 @@ mod tests {
                  after the whole retry budget: took {elapsed:?}"
             );
         });
+    }
+
+    /// a candidate the request was NOT addressed to answers its id first: that
+    /// answer is dropped, and the request completes only with the addressed
+    /// server's own answer.
+    #[test]
+    fn an_answer_from_an_unaddressed_candidate_is_dropped() {
+        use commonware_cryptography::Signer as _;
+        use commonware_p2p::simulated::{self, Link};
+        use commonware_runtime::{Runner as _, Spawner as _, Supervisor as _, deterministic};
+        use commonware_utils::{NZU32, NZUsize};
+
+        deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+            let [server, impostor, joiner] =
+                [101, 103, 102].map(|seed| ed25519::PrivateKey::from_seed(seed).public_key());
+            let peers = vec![server.clone(), impostor.clone(), joiner.clone()];
+            let (network, oracle) = simulated::Network::new_with_peers(
+                context.child("network"),
+                simulated::Config {
+                    max_size: 1024 * 1024,
+                    disconnect_on_block: true,
+                    max_peers_per_set: NZUsize!(32),
+                    tracked_peer_sets: NZUsize!(1),
+                },
+                peers.clone(),
+            )
+            .await;
+            network.start();
+            let link = Link {
+                latency: Duration::from_millis(2),
+                jitter: Duration::from_millis(0),
+                success_rate: commonware_utils::probability!(1.0),
+            };
+            for from in &peers {
+                for to in peers.iter().filter(|to| *to != from) {
+                    oracle
+                        .add_link(from.clone(), to.clone(), link.clone())
+                        .await
+                        .expect("link");
+                }
+            }
+            let quota = commonware_runtime::Quota::per_second(NZU32!(128));
+            let register = |peer: &ed25519::PublicKey| {
+                let control = oracle.control(peer.clone());
+                async move {
+                    control
+                        .register(TEST_CHANNEL, quota)
+                        .await
+                        .expect("register")
+                }
+            };
+            let (mut server_tx, mut server_rx) = register(&server).await;
+            let (mut impostor_tx, _impostor_rx) = register(&impostor).await;
+            let (joiner_tx, joiner_rx) = register(&joiner).await;
+
+            let answer = |id: u64, height: u64| {
+                let coords = TipCoords {
+                    height,
+                    ..zero_tip_coords()
+                };
+                let resp = crate::encode_response(&SyncResponse::TipCoords(coords));
+                IoBuf::from(encode_rpc(&[0u8; 32], &[0u8; 64], id, &resp))
+            };
+            // the addressed server hands the id to the impostor, waits until
+            // the impostor's answer is on the wire, and only then answers.
+            let (id_tx, id_rx) = oneshot::channel::<u64>();
+            let (sent_tx, sent_rx) = oneshot::channel::<()>();
+            let to_joiner = joiner.clone();
+            context.child("impostor").spawn(move |_ctx| async move {
+                let Ok(id) = id_rx.await else { return };
+                let _ = impostor_tx.send(Recipients::One(to_joiner), answer(id, 666), false);
+                let _ = sent_tx.send(());
+            });
+            context.child("serve").spawn(move |_ctx| async move {
+                let Ok((peer, msg)) = server_rx.recv().await else {
+                    return;
+                };
+                let bytes: Vec<u8> = msg.into();
+                let Ok((_requester, _proof, id, _body)) = decode_rpc(&bytes) else {
+                    return;
+                };
+                let _ = id_tx.send(id);
+                let _ = sent_rx.await;
+                let _ = server_tx.send(Recipients::One(peer), answer(id, 7), false);
+            });
+
+            // both are candidates; the cursor addresses the server.
+            let client = P2pSyncClient::with_sources(
+                context.child("client"),
+                joiner_tx,
+                joiner_rx,
+                vec![server.clone(), impostor],
+                None,
+                [0u8; 32],
+                [0u8; 64],
+                None,
+            );
+            let (coords, answered_by) = client.fetch_tip_coords().await.expect("answered");
+            assert_eq!(answered_by, server);
+            assert_eq!(
+                coords.height, 7,
+                "the request completed with an answer from a peer it was not addressed to"
+            );
+        });
+    }
+
+    /// a sequential chunk walk that outruns the lane's per-peer quota must
+    /// WAIT the quota out: the limiter refuses a send on the spot, and that
+    /// refusal surfaced as a transport error threw away whole boundary syncs
+    /// against a healthy source. one byte a chunk, the simulated mesh walks
+    /// ~77 chunks a second, far past a 16-a-second lane — the walk only
+    /// completes by sleeping to the limiter's own instant (the deterministic
+    /// executor advances virtual time only while every task waits).
+    #[test]
+    fn a_chunk_walk_past_the_lane_quota_waits_instead_of_failing() {
+        use commonware_runtime::{Runner as _, Spawner as _, Supervisor as _, deterministic};
+
+        let payload: Vec<u8> = (0..64u8).collect();
+        let served = payload.clone();
+        let fetched =
+            deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+                let (server, (mut server_tx, mut server_rx), (joiner_tx, joiner_rx)) =
+                    mesh_pair(&context, 16).await;
+                context.child("serve").spawn(move |_ctx| async move {
+                    while let Ok((peer, msg)) = server_rx.recv().await {
+                        let bytes: Vec<u8> = msg.into();
+                        let (_, _, id, body) = decode_rpc(&bytes).expect("rpc frame");
+                        let Ok(SyncRequest::Chunk { offset, .. }) = crate::decode_request(body)
+                        else {
+                            panic!("the walk asks for chunks only");
+                        };
+                        let at = offset as usize;
+                        let resp = crate::encode_response(&SyncResponse::Chunk {
+                            total: served.len() as u64,
+                            bytes: served[at..=at].to_vec(),
+                        });
+                        let _ = server_tx.send(
+                            Recipients::One(peer),
+                            IoBuf::from(encode_rpc(&[0u8; 32], &[0u8; 64], id, &resp)),
+                            false,
+                        );
+                    }
+                });
+                let client = P2pSyncClient::new(
+                    context.child("client"),
+                    joiner_tx,
+                    joiner_rx,
+                    server,
+                    [0u8; 32],
+                    [0u8; 64],
+                );
+                let boundary = crate::BoundaryId {
+                    height: 1,
+                    root_hash: sdk::StateRoot([0u8; 32]),
+                };
+                crate::fetch_snapshot(&client, boundary, "walked", 1024).await
+            });
+        assert_eq!(
+            fetched.expect("the walk waits the quota out instead of failing"),
+            payload
+        );
     }
 }

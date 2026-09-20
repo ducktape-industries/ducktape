@@ -354,8 +354,10 @@ async fn roundtrip(
     );
 }
 
-/// submit one REJECTED op to both hosts: reasons carry the same needle, and
-/// both governance roots (and all siblings) are byte-identical to pre-block.
+/// submit one REJECTED op to both hosts: both name the SAME refusal class and
+/// carry the same sentence needle, and both governance roots (and all siblings)
+/// are byte-identical to pre-block. `refusal` is `(class token, sentence
+/// needle)` — the two halves `sdk::Error::Module` now carries.
 async fn reject_roundtrip(
     native: &mut Host,
     wasm: &mut Host,
@@ -363,8 +365,9 @@ async fn reject_roundtrip(
     height: u64,
     origin: Origin,
     m: Msg,
-    needle: &str,
+    refusal: (&str, &str),
 ) {
+    let (class, needle) = refusal;
     let (n_before, w_before) = (root_of(native), root_of(wasm));
     let n_err = native
         .submit_at(block(height, origin.clone()), m.clone())
@@ -374,16 +377,26 @@ async fn reject_roundtrip(
         .submit_at(block(height, origin), m)
         .await
         .expect_err("wasm must reject");
-    let SubmitError::Rejected(Error::Module(n_msg)) = n_err else {
+    let SubmitError::Rejected(Error::Module {
+        reason: n_reason,
+        sentence: n_msg,
+    }) = n_err
+    else {
         panic!("native rejection shape: {n_err:?}");
     };
-    let SubmitError::Rejected(Error::Module(w_msg)) = w_err else {
+    let SubmitError::Rejected(Error::Module {
+        reason: w_reason,
+        sentence: w_msg,
+    }) = w_err
+    else {
         panic!("wasm rejection shape: {w_err:?}");
     };
-    assert!(n_msg.contains(needle), "native reason: {n_msg}");
+    assert_eq!(n_reason, class, "native refusal class");
+    assert_eq!(w_reason, class, "wasm token must match the native token");
+    assert!(n_msg.contains(needle), "native sentence: {n_msg}");
     assert!(
         w_msg.contains(needle),
-        "wasm reason must carry the native reason: {w_msg}"
+        "wasm sentence must carry the native sentence: {w_msg}"
     );
     assert_eq!(root_of(native), n_before, "native root moved on reject");
     assert_eq!(root_of(wasm), w_before, "wasm root moved on reject");
@@ -642,7 +655,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
         18,
         Origin::External(ed_pub(&joiner2)),
         redeem(&a, [7; INVITE_NONCE_LEN], INVITE, &joiner2),
-        "already redeemed",
+        ("invite_already_redeemed", "already redeemed"),
     )
     .await;
     // and a FRESH token for a joiner who already holds standing settles too.
@@ -653,7 +666,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
         19,
         Origin::External(ed_pub(&joiner)),
         redeem(&a, [8; INVITE_NONCE_LEN], INVITE, &joiner),
-        "already holds resident standing",
+        ("joiner_already_resident", "already holds resident standing"),
     )
     .await;
 
@@ -718,20 +731,23 @@ async fn rejections_inner(context: &deterministic::Context) {
     // valset sibling reads inside the wasm runtime), ballot/tally lifecycle
     // (unknown, settled, deadline, undecidable), invite verification, origin
     // shapes, and the decode seam.
-    let rejects: Vec<(Origin, Msg, &str)> = vec![
+    let rejects: Vec<(Origin, Msg, &str, &str)> = vec![
         (
             Origin::External(a_pub.clone()),
             propose("", GovAction::Signal { text: "x".into() }, 5),
+            "bad_proposal_id",
             "proposal_id must not be empty",
         ),
         (
             Origin::External(a_pub.clone()),
             propose("p2", GovAction::Signal { text: "x".into() }, 0),
+            "bad_voting_period",
             "voting_period must be in",
         ),
         (
             Origin::External(a_pub.clone()),
             propose("p2", GovAction::AddValidator { key: vec![1; 8] }, 5),
+            "bad_membership_key",
             "32-byte ed25519",
         ),
         // a promotion is proposable only OUT of the resident tier (#2507):
@@ -741,6 +757,7 @@ async fn rejections_inner(context: &deterministic::Context) {
             Origin::External(a_pub.clone()),
             propose("p2", GovAction::AddValidator { key: d_pub.clone() }, 5),
             "not_a_resident",
+            "promoted out of the resident tier",
         ),
         (
             Origin::External(a_pub.clone()),
@@ -754,6 +771,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 },
                 5,
             ),
+            "empty_module_id",
             "module_id must not be empty",
         ),
         (
@@ -768,11 +786,13 @@ async fn rejections_inner(context: &deterministic::Context) {
                 },
                 5,
             ),
+            "bad_code_hash",
             "code_hash must be",
         ),
         (
             Origin::External(a_pub.clone()),
             propose("p", GovAction::Signal { text: "dup".into() }, 5),
+            "proposal_id_spent",
             "proposal already exists",
         ),
         // the standing gate — in validator mode the submitter must ITSELF be
@@ -781,48 +801,57 @@ async fn rejections_inner(context: &deterministic::Context) {
         (
             Origin::External(outsider_pub.clone()),
             propose("p2", GovAction::Signal { text: "x".into() }, 5),
+            "not_a_member",
             "not a validator-set member node",
         ),
         (
             Origin::Module("saga".into()),
             propose("p2", GovAction::Signal { text: "x".into() }, 5),
+            "external_origin_required",
             "external submitter",
         ),
         (
             Origin::External(a_pub.clone()),
             vote("nope", true),
+            "no_such_proposal",
             "no such proposal",
         ),
         (
             Origin::External(outsider_pub.clone()),
             vote("p", true),
+            "not_in_electorate",
             "voter is not in the frozen electorate",
         ),
         (
             Origin::External(a_pub.clone()),
             vote("done", true),
+            "proposal_settled",
             "proposal is settled",
         ),
         // "stale" is still Open but its deadline (1005) has lapsed.
         (
             Origin::External(a_pub.clone()),
             vote("stale", true),
+            "voting_closed",
             "voting closed at the deadline",
         ),
         (
             Origin::External(a_pub.clone()),
             execute("nope"),
+            "no_such_proposal",
             "no such proposal",
         ),
         (
             Origin::External(a_pub.clone()),
             execute("done"),
+            "proposal_settled",
             "proposal is settled",
         ),
         // "p" has no ballots and a far deadline: the tally is undecidable.
         (
             Origin::External(a_pub.clone()),
             execute("p"),
+            "not_decidable_yet",
             "not decidable yet",
         ),
         // invite verification, in-guest: a malformed nonce, a token for
@@ -851,21 +880,25 @@ async fn rejections_inner(context: &deterministic::Context) {
                 });
                 m
             },
+            "bad_invite_nonce",
             "nonce must be",
         ),
         (
             Origin::External(a_pub.clone()),
             redeem(&a, [9; INVITE_NONCE_LEN], b"other-net", &ed(50)),
+            "invite_token_unverified",
             "does not verify for this network",
         ),
         (
             Origin::External(a_pub.clone()),
             redeem(&outsider, [9; INVITE_NONCE_LEN], INVITE, &ed(50)),
+            "issuer_not_a_member",
             "no longer part of this network",
         ),
         (
             Origin::External(a_pub.clone()),
             redeem(&a, [9; INVITE_NONCE_LEN], INVITE, &b),
+            "joiner_already_validator",
             "already a validator",
         ),
         (
@@ -874,15 +907,25 @@ async fn rejections_inner(context: &deterministic::Context) {
                 target: "governance".into(),
                 payload: b"definitely-not-json".to_vec(),
             },
+            "codec",
             "expected value",
         ),
     ];
 
-    for (height, (origin, m, needle)) in rejects.into_iter().enumerate() {
+    for (height, (origin, m, class, needle)) in rejects.into_iter().enumerate() {
         // heights start past the seeding blocks; consensus_time stays past
         // "stale"'s deadline for every entry.
         let height = height as u64 + 8;
-        reject_roundtrip(&mut native, &mut wasm, &ids, height, origin, m, needle).await;
+        reject_roundtrip(
+            &mut native,
+            &mut wasm,
+            &ids,
+            height,
+            origin,
+            m,
+            (class, needle),
+        )
+        .await;
     }
 }
 
@@ -1149,7 +1192,7 @@ async fn share_mode_inner(context: &deterministic::Context) {
         11,
         Origin::External(a_pub.clone()),
         propose("sig3", GovAction::Signal { text: "x".into() }, 5),
-        "belongs to no Identity account",
+        ("no_identity_account", "belongs to no Identity account"),
     )
     .await;
 
@@ -1235,11 +1278,15 @@ async fn genesis_config_inner(context: &deterministic::Context) {
         .submit_at(block(1, Origin::External(ed_pub(&joiner))), m)
         .await
         .expect_err("a foreign binding must refuse the token");
-    let SubmitError::Rejected(Error::Module(reason)) = err else {
+    let SubmitError::Rejected(Error::Module { reason, sentence }) = err else {
         panic!("rejection shape: {err:?}");
     };
+    assert_eq!(
+        reason, "invite_token_unverified",
+        "the binding is what refuses"
+    );
     assert!(
-        reason.contains("does not verify for this network"),
-        "the binding is what refuses: {reason}"
+        sentence.contains("does not verify for this network"),
+        "the binding is what refuses: {sentence}"
     );
 }

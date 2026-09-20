@@ -243,8 +243,10 @@ mod tests {
     #[test]
     fn an_unbound_server_still_answers_every_tool_call() {
         // the failure posture: no node, no agent — and every tool still returns
-        // a readable refusal rather than killing the run's tool plane.
+        // a readable refusal rather than killing the run's tool plane. whoami
+        // needs neither: with no agent, who you are is nobody, and it answers.
         for tool in tools::all() {
+            let answers_unbound = tool.name == "ducktape_whoami";
             let resp = handle(
                 &unbound(),
                 &request("tools/call", json!({"name": tool.name, "arguments": {}})),
@@ -257,8 +259,8 @@ mod tests {
                 tool.name
             );
             assert_eq!(
-                encoded["result"]["isError"], true,
-                "{} must refuse when unbound",
+                encoded["result"]["isError"], !answers_unbound,
+                "{} unbound: {encoded}",
                 tool.name
             );
         }

@@ -17,6 +17,7 @@ version.workspace = true
 guest = ["dep:ducktape-module-sdk"]
 
 [dependencies]
+governance-wire = { workspace = true }
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
 ducktape-module-sdk = { workspace = true, optional = true }
@@ -41,6 +42,14 @@ commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
 
 [dev-dependencies]
+# the NATIVE sibling modules the cross-module suites compose. governance's
+# shipping deps are the types-only wire crates of the same bare names, so the
+# module implementations enter under `<name>-module`; each re-exports its wire
+# crate, so a test may reach either through them.
+valset-module = { path = "../valset", package = "valset" }
+modules-module = { path = "../modules", package = "modules" }
+identity-module = { path = "../identity", package = "identity" }
+acl-module = { path = "../acl", package = "acl" }
 host = { workspace = true }
 futures = { workspace = true }
 sdk-testkit = { workspace = true }

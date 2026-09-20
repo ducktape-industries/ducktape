@@ -6,13 +6,13 @@
 
 use std::io::Write as _;
 
-use duckfs_client::api::{ApiError, NodeApi};
+use duckfs_client::api::NodeApi;
 use duckfs_client::http::HttpNode;
 use duckfs_core::{
     DiffEntry, DiffKind, EntryInfo, EntryKindWire, MAX_PAGE, MAX_READ_BYTES, SnapshotInfo,
 };
 
-use crate::fs_cli::args::{CliError, NodeAddr, resolve_node};
+use crate::fs_cli::args::{CliError, NodeAddr, api_err, resolve_node};
 use crate::fs_cli::{CatArgs, DiffArgs, HistoryArgs, LsArgs, StatArgs};
 
 // --- `--json` row shapes: each mirrors exactly the columns the prose form
@@ -93,13 +93,11 @@ fn node(addr: &NodeAddr) -> Result<HttpNode, CliError> {
     Ok(HttpNode::new(resolve_node(addr)?))
 }
 
-/// map a transport failure to a CLI failure (exit 1).
-fn api_err(e: ApiError) -> CliError {
-    match e {
-        ApiError::NotFound => CliError::failed("not found"),
-        ApiError::Rejected(m) => CliError::failed(m),
-        ApiError::Transport(m) => CliError::failed(format!("cannot reach the node: {m}")),
-    }
+/// nothing is at `path`. the module answers an absent `stat` with a successful
+/// `None` rather than a refusal, so THIS side is the one refusing and names its
+/// own class — it never borrows the module's for words the module never said.
+fn no_entry(path: &str) -> CliError {
+    CliError::refused("no_entry", format!("no entry at {path}"))
 }
 
 fn kind_tag(kind: &EntryKindWire) -> &'static str {
@@ -189,7 +187,7 @@ pub fn stat(args: StatArgs) -> Result<(), CliError> {
     let want_json = args.json;
 
     let Some(e) = node.stat(path, snapshot).map_err(api_err)? else {
-        return Err(CliError::failed(format!("no entry at {path}")));
+        return Err(no_entry(path));
     };
     if want_json {
         print_json(&stat_row(&e));
@@ -248,6 +246,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::fs_cli::args::Message;
 
     fn entry() -> EntryInfo {
         EntryInfo {
@@ -258,6 +257,89 @@ mod tests {
             object: "abc123".into(),
             meta: BTreeMap::new(),
         }
+    }
+
+    /// every read verb refuses in ONE shape: `<sentence> [<reason>]`, with no
+    /// Rust type name wrapped around the words. `cat` and `ls` get the module's
+    /// refusal; `stat` gets a successful `None` and refuses for itself — and the
+    /// two must not read differently.
+    #[test]
+    fn every_refusal_is_a_sentence_then_its_class() {
+        let from_module = api_err(duckfs_client::api::ApiError::Rejected {
+            reason: "files_query".to_string(),
+            sentence: "files: path not found".to_string(),
+        });
+        let from_cli = no_entry("/nope");
+        assert_eq!(
+            from_module.line().as_deref(),
+            Some("files: path not found [files_query]")
+        );
+        assert_eq!(
+            from_cli.line().as_deref(),
+            Some("no entry at /nope [no_entry]")
+        );
+        // the module's sentence carries a `: ` of its own and still arrives
+        // whole: the halves are fields, never split back out of a line.
+        assert_eq!(
+            from_module.message,
+            Message::Refused {
+                reason: "files_query".to_string(),
+                sentence: "files: path not found".to_string(),
+            }
+        );
+
+        let refusals = [&from_module, &from_cli];
+        for refusal in refusals {
+            assert_eq!(refusal.code, 1);
+            let line = refusal.line().expect("a refusal prints a line");
+            assert!(!line.contains("Module("), "{line}");
+            let Message::Refused { reason, sentence } = &refusal.message else {
+                panic!("{:?} is not a refusal", refusal.message);
+            };
+            let is_class_token = !reason.is_empty()
+                && reason
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            assert!(is_class_token, "{reason:?} is not a class token");
+            assert!(!sentence.is_empty(), "{line}");
+            // the token a script greps is the LAST thing on the line.
+            assert!(line.ends_with(&format!(" [{reason}]")), "{line}");
+        }
+    }
+
+    /// THE BUG (#2660): the fs read verbs answered a stopped node with
+    /// `cannot reach the node: error sending request for url (http://…)` while
+    /// every other family said "the node is not running". Driven through the
+    /// real `ls` verb against a port nothing is on, it must say exactly what
+    /// the node's own read lane says, at exit 1.
+    #[test]
+    fn a_stopped_node_is_told_in_the_sentence_every_family_uses() {
+        // bound only to learn a port nothing is on: the connect is REFUSED.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        drop(listener);
+
+        let failed = ls(LsArgs {
+            path: "/".into(),
+            snapshot: None,
+            limit: None,
+            json: false,
+            addr: NodeAddr {
+                node: Some(base.clone()),
+                config: None,
+                network: None,
+            },
+        })
+        .expect_err("nothing listens");
+        let every_family = crate::node_http::get_json(&base, "/v1/status")
+            .expect_err("nothing listens")
+            .to_string();
+        assert!(
+            every_family.starts_with("the node is not running"),
+            "{every_family}"
+        );
+        assert_eq!(failed.line(), Some(every_family));
+        assert_eq!(failed.code, 1);
     }
 
     /// the ls row JSON carries the SAME three facts the text columns do — and

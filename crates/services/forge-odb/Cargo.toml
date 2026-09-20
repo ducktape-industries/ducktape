@@ -11,7 +11,12 @@ version.workspace = true
 [dependencies]
 # the durability ordering is single-sourced: this backing and the native
 # `Module::commit_block` call the same `Forge::{adopt_refs, publish_block}`.
-forge = { workspace = true }
+# THE NATIVE MODULE, by path — the one module crate anything outside
+# `crates/modules` links, because the git substrate a wasm forge tenant commits
+# through IS the native forge (repos, packs, the tracker file). The workspace
+# key `forge` is the wire; `crates/topology/tests/sdk_shaped.rs` names this
+# exception.
+forge = { path = "../../modules/apps/forge" }
 blobstore = { workspace = true }
 # the plain git read types `OdbBacking` speaks, named directly rather than
 # through wasm-host so the substrate and the module agree by construction.

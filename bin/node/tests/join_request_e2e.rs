@@ -11,6 +11,7 @@ mod common;
 use std::time::Duration;
 
 use common::NetworkShapeCluster;
+use commonware_cryptography::Signer as _;
 use valset::{ValsetQuery, ValsetReply};
 
 const CONVERGE: Duration = Duration::from_secs(180);
@@ -87,6 +88,128 @@ fn a_tokened_join_redeems_itself_into_a_full_node() {
     assert!(ok, "promote failed:\n{out}");
     cluster.wait_marker(0, "cutover complete: epoch 2", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch 2", CONVERGE);
+}
+
+/// A joiner seated by a validator promoted AFTER genesis gets a coordinator
+/// cap that a private coordinator admits. The founder rotates out first, so
+/// the promoted friend is the only validator left to seat the third party:
+/// its cap's issuer is in no genesis set, and the coordinator — pinned to the
+/// genesis set alone, dialing no node — admits the third party's rendezvous
+/// because the cap carries the friend's own cap, which the founder signed.
+#[test]
+fn a_joiner_seated_by_a_promoted_validator_rendezvouses_through_a_private_coordinator() {
+    let mut cluster = NetworkShapeCluster::new();
+
+    cluster.init_founder("coord-cap-chain");
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
+    let founder_key =
+        workspace_config::NetworkDescriptor::load(&cluster.founder_dir.join("network.toml"))
+            .expect("the founder's descriptor")
+            .validators
+            .remove(0);
+
+    // the friend joins and is promoted: a validator genesis never named.
+    let invite = cluster.invite();
+    let friend_key = cluster.join_friend(&invite);
+    cluster.spawn(1);
+    cluster.wait_admitted(1, Duration::from_secs(90));
+    let (ok, out) = cluster.run_promote(&friend_key);
+    assert!(ok, "promote failed:\n{out}");
+    cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
+
+    // the founder rotates out. The founder votes first so the surviving
+    // friend executes the removal; the cutover halts the founder.
+    let (ok, out) = cluster.run_membership_verb_as(0, "member remove", &founder_key);
+    assert!(ok, "founder member remove ballot failed:\n{out}");
+    let (ok, out) = cluster.run_membership_verb_as(1, "member remove", &founder_key);
+    assert!(ok, "friend member remove ballot failed:\n{out}");
+    cluster.wait_marker(0, "demoted from the validator set; halting", CONVERGE);
+    cluster.wait_exit(0, CONVERGE);
+    let only_the_friend = vec![common::unhex(&friend_key)];
+    cluster.await_committed(1, "the friend to be the only validator", CONVERGE, || {
+        cluster
+            .query(1, "valset", &valset::encode_query(&ValsetQuery::Validators))
+            .and_then(|raw| valset::decode_reply(&raw).ok())
+            .and_then(|r| match r {
+                ValsetReply::Validators(v) if v == only_the_friend => Some(()),
+                _ => None,
+            })
+    });
+
+    // a third party the friend invites — and, the founder gone, seats.
+    let third = cluster.add_node();
+    let blob = cluster.invite_from(1);
+    let third_key = cluster.join(third, &blob);
+    cluster.spawn(third);
+    cluster.wait_marker(third, "coordinator cap delivered and saved", CONVERGE);
+    let workspace = cluster.workspace(third);
+    let cap = workspace_config::load_coord_cap(&workspace)
+        .expect("the delivered cap reads back")
+        .expect("the seat delivered a cap");
+    assert_eq!(
+        common::hex(cap.issuer.as_ref()),
+        friend_key,
+        "the promoted friend minted the cap"
+    );
+    let parent = cap
+        .parent
+        .as_deref()
+        .expect("minted under the friend's own cap");
+    assert_eq!(
+        common::hex(parent.issuer.as_ref()),
+        founder_key,
+        "the founder rooted the chain when it seated the friend"
+    );
+    let signer = workspace_config::load_identity(&workspace.join("identity.key"))
+        .expect("the third party's identity");
+    assert_eq!(common::hex(signer.public_key().as_ref()), third_key);
+    let subject = nat_traversal::NodeKey(signer.public_key().as_ref().try_into().unwrap());
+
+    // the private coordinator an operator runs for this network: pinned to
+    // the founder's network.toml alone — it reads nothing off any node.
+    let founder_toml = cluster.founder_dir.join("network.toml");
+    let args = [
+        "--genesis-set".to_string(),
+        founder_toml.to_str().expect("utf-8 path").to_string(),
+    ];
+    let policy = coordinator_bin::select_policy(&args).expect("a private policy");
+    let nat_traversal::AuthPolicy::Private { genesis_set } = &policy else {
+        panic!("--genesis-set selects the private policy");
+    };
+    assert!(
+        !genesis_set.contains(&cap.issuer),
+        "the issuer is no genesis validator"
+    );
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        // the third party's own rendezvous, with its own key and the cap
+        // chain it was delivered, is admitted.
+        let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind the coordinator");
+        let coord_addr = coord_sock.local_addr().expect("coordinator addr");
+        tokio::spawn(nat_traversal::run_coordinator(
+            nat_traversal::NatSocket::Owned(coord_sock),
+            policy.clone(),
+        ));
+        let resolver =
+            reachability::NatResolver::bind(subject, vec![coord_addr], (signer, Some(cap)))
+                .await
+                .expect("the rendezvous socket binds");
+        let mut status = resolver.status().expect("the resolver has a coordinator");
+        tokio::time::timeout(CONVERGE, async {
+            while !matches!(
+                *status.borrow_and_update(),
+                reachability::RendezvousStatus::Ready { .. }
+            ) {
+                status.changed().await.expect("the establish task is alive");
+            }
+        })
+        .await
+        .expect("the private coordinator admits the third party's rendezvous");
+    });
 }
 
 #[test]

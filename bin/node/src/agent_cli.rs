@@ -68,7 +68,7 @@ use commonware_cryptography::Signer as _;
 use crate::cli_args::NodeAddr;
 use crate::config::{self, hex_bytes};
 use crate::cred_cli::{VerbCtx, query_node};
-use crate::userkey_cli::{load_user_signer, user_frame};
+use crate::userkey_cli::user_frame;
 
 type AgentResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -797,7 +797,7 @@ fn cmd_sched(args: SchedArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> AgentR
     // resolves to an account (`OfKey`) when the pinned node draws on `--cred`,
     // and a node key is on no account. Unlocked before the id is composed —
     // the id lives under the SIGNER's namespace.
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let origin = sdk::Origin::External(user.public_key().as_ref().to_vec());
     let dispatch_id = fresh_dispatch_id();
     // saga's id space is namespaced per trigger origin, so the run's id lives
@@ -946,7 +946,7 @@ fn submit_control(
     run_id: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let base = ctx.http_base()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let origin = sdk::Origin::External(user.public_key().as_ref().to_vec());
     let lane = control_lane(&origin, run_id);
     let height = crate::node_http::submit_frame(&base, &control_frame(&user, lane, verb, run_id))?;

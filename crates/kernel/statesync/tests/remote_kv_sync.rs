@@ -432,13 +432,13 @@ impl SyncClient for IndexOpsClient {
     }
 }
 
-/// the reference mapper (crates/kernel/index-guest/testmap, refreshed by `make
-/// wasm-modules`). the wire lane has to be proven against a REAL FOLD, not
+/// the reference mapper (`crates/kernel/indexer/tests/fixtures`). the wire
+/// lane has to be proven against a REAL FOLD, not
 /// just raw rows: paging, key order and folding are one mechanism, and a test
 /// that only diffs `op/` bytes would pass with the trigger never firing —
 /// while the user-visible symptom this whole lane exists to fix is an empty
 /// DERIVED view.
-const TESTMAP: &[u8] = include_bytes!("../../index-guest/testmap/index.wasm");
+const TESTMAP: &[u8] = include_bytes!("../../indexer/tests/fixtures/testmap.index.wasm");
 
 fn store(dir: &std::path::Path) -> indexer::IndexStore {
     indexer::IndexStore::open(

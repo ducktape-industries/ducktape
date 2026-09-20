@@ -28,62 +28,54 @@ pub(crate) const EVENT_BUFFER: usize = 64;
 ///
 /// they are separate because they are BOUNDED separately — a client that clips
 /// a long message must never clip the token with it — and because a screen that
-/// keys its behaviour off prose keys it off nothing. the token is a literal, so
-/// it is greppable and countable like every other `reason` in this tree.
+/// keys its behaviour off prose keys it off nothing. a module's refusal brings
+/// its OWN token, so this carries a `String` rather than a literal; it stays
+/// greppable and countable like every other `reason` in this tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused {
-    pub reason: &'static str,
+    pub reason: String,
     pub message: String,
 }
 
 impl Refused {
-    pub fn new(reason: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(reason: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            reason,
+            reason: reason.into(),
             message: message.into(),
         }
     }
 
     /// the kernel's own refusal, split. ONE match with no `_` arm: a new
-    /// [`sdk::Error`] variant fails this build until it is given a token and a
-    /// sentence, which is why the split lives here rather than in a `Display`
-    /// impl on the enum — `sdk` is the deterministic module ABI, compiled into
-    /// every module guest, and what a screen says is not its business.
-    ///
-    /// the sentence deliberately drops the variant's NAME. `sdk::Error`'s
-    /// `Display` is its `Debug`, so `to_string()` yields `Module(forge: …)` —
-    /// an envelope that then reaches a person, and that every reader
-    /// downstream has to peel back off.
+    /// [`sdk::Error`] variant fails this build until it is given a token. the
+    /// sentence is the error's `Display`, which is the sentence alone — a
+    /// module refusal's own words, whole, never the variant's name.
     pub fn of(error: &sdk::Error) -> Self {
-        let (reason, message) = match error {
-            sdk::Error::UnknownModule(id) => {
-                ("unknown_module", format!("no module is registered as {id}"))
-            }
-            sdk::Error::SelfQuery => (
-                "self_query",
-                "a module reads its own state through itself, not through a query".to_owned(),
-            ),
-            sdk::Error::QueryUnsupported => (
-                "query_unsupported",
-                "this module answers no queries".to_owned(),
-            ),
-            sdk::Error::SyncUnsupported => (
-                "sync_unsupported",
-                "this module serves no state sync".to_owned(),
-            ),
-            sdk::Error::SwapUnsupported => (
-                "swap_unsupported",
-                "this module's code is the node binary itself, so it cannot be swapped".to_owned(),
-            ),
-            sdk::Error::BudgetExceeded => (
-                "budget_exceeded",
-                "the follow-up drain exceeded its dispatch budget".to_owned(),
-            ),
-            // the module's own words, whole: nothing here paraphrases a
-            // refusal it did not write.
-            sdk::Error::Module(said) => ("module", said.clone()),
+        let reason: &str = match error {
+            sdk::Error::UnknownModule(_) => "unknown_module",
+            sdk::Error::SelfQuery => "self_query",
+            sdk::Error::QueryUnsupported => "query_unsupported",
+            sdk::Error::SyncUnsupported => "sync_unsupported",
+            sdk::Error::SwapUnsupported => "swap_unsupported",
+            sdk::Error::BudgetExceeded => "budget_exceeded",
+            // the module's own TOKEN: nothing here re-classifies a refusal it
+            // did not write.
+            sdk::Error::Module { reason, .. } => reason,
         };
-        Self { reason, message }
+        Self::new(reason, error.to_string())
+    }
+
+    /// a refusal that reached this node as ONE framed string
+    /// (`<reason>: <sentence>`) rather than as an [`sdk::Error`]: a drained
+    /// frame's captured reason, or a custodian's relayed rejection.
+    ///
+    /// a string that named no class stays UNCLASSIFIED — a token is never
+    /// invented for one here, because a made-up word is one every consumer
+    /// would then have to tell apart from a word a module actually chose.
+    pub fn framed(said: &str) -> Self {
+        match sdk::refusal::decode(said) {
+            Some((reason, sentence)) => Self::new(reason, sentence),
+            None => Self::new(sdk::refusal::UNFRAMED_REFUSAL, said),
+        }
     }
 
     /// a write's refusal. a deterministic rejection is the module's own, whole;
@@ -256,8 +248,27 @@ pub type NetstackSwapper = dyn Fn(NetstackSwapRequest) -> futures::future::BoxFu
     + Send
     + Sync;
 
-/// Mint one bearer invite valid for `ttl_days`, answering the paste blob.
-pub type InviteMinter = dyn Fn(u64) -> Result<String, String> + Send + Sync;
+/// Mint one bearer invite valid for `ttl_days`, answering the paste blob and
+/// the notes the mint left on it.
+pub type InviteMinter = dyn Fn(u64) -> Result<MintedInvite, String> + Send + Sync;
+
+/// A minted invite as `POST /v1/invite` answers it: the paste blob, and every
+/// thing the mint could not do, empty when it could do everything.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MintedInvite {
+    pub invite: String,
+    pub notes: Vec<InviteNote>,
+}
+
+/// One thing a mint could not do. Never a refusal — the blob still admits a
+/// joiner — but it changes what the blob can do (fewer paths, or none off this
+/// machine), so it rides beside the blob for whoever hands the blob on:
+/// `reason` is the stable snake_case token, `sentence` what to do about it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct InviteNote {
+    pub reason: String,
+    pub sentence: String,
+}
 
 impl StatusCell {
     /// publish a complete snapshot — one whole-struct swap.
@@ -267,6 +278,25 @@ impl StatusCell {
             .snapshot
             .write()
             .expect("status snapshot lock poisoned") = status;
+    }
+
+    /// publish the boundary this node RECOVERED off local disk, before any
+    /// consensus boundary exists to publish a whole snapshot from.
+    ///
+    /// A restarting node holds its whole chain on disk for the length of the
+    /// recovery window, and the boot publish leaves `height` 0 and `root_hash`
+    /// empty — an answer indistinguishable from a brand-new empty node, on the
+    /// two numbers a human and every operator script read first. This is the
+    /// same pair a boundary publish carries, written together under one lock,
+    /// so a read still sees one boundary and never a torn one.
+    pub fn publish_recovered(&self, height: u64, root_hash: String) {
+        let mut snapshot = self
+            .inner
+            .snapshot
+            .write()
+            .expect("status snapshot lock poisoned");
+        snapshot.height = height;
+        snapshot.root_hash = root_hash;
     }
 
     /// wire the chain id this daemon serves — once, at boot; a second call is
@@ -322,20 +352,21 @@ impl StatusCell {
     /// programming error.
     pub fn wire_invite_minter(
         &self,
-        mint: impl Fn(u64) -> Result<String, String> + Send + Sync + 'static,
+        mint: impl Fn(u64) -> Result<MintedInvite, String> + Send + Sync + 'static,
     ) {
         if self.inner.invite_minter.set(Arc::new(mint)).is_err() {
             panic!("status cell invite minter wired twice");
         }
     }
 
-    /// One freshly minted invite blob, or `None` when no minter is wired (an
-    /// embedder with no workspace to mint from — the route answers 503).
+    /// One freshly minted invite, or `None` when no minter is wired (a node
+    /// still starting, or an embedder with no workspace to mint from — the
+    /// route answers 503).
     ///
     /// Blocking: the mint reads and REWRITES the descriptor and reads the
     /// persisted mesh state, so a caller on an async runtime owes this a
     /// blocking thread.
-    pub fn mint_invite(&self, ttl_days: u64) -> Option<Result<String, String>> {
+    pub fn mint_invite(&self, ttl_days: u64) -> Option<Result<MintedInvite, String>> {
         self.inner.invite_minter.get().map(|mint| mint(ttl_days))
     }
 
@@ -714,6 +745,56 @@ pub(crate) async fn account_of_key(
 }
 
 #[cfg(test)]
+mod refused_tests {
+    use super::*;
+
+    /// A module refusal reaches the receipt as the module's OWN token. The
+    /// receipt's `reason` is what a caller branches on, so a stamp naming only
+    /// the layer ("module") would tell it nothing it did not already know.
+    #[test]
+    fn a_module_refusal_carries_its_own_token_into_the_receipt() {
+        let refused = Refused::of(&sdk::Error::module(
+            sdk::refusal::STALE,
+            "forge HEAD moved; fetch and retry",
+        ));
+        assert_eq!(refused.reason, sdk::refusal::STALE);
+        assert_eq!(refused.message, "forge HEAD moved; fetch and retry");
+
+        // a kernel refusal keeps its own class, unchanged by the module lane.
+        let unknown = Refused::of(&sdk::Error::UnknownModule("nope".into()));
+        assert_eq!(unknown.reason, "unknown_module");
+    }
+
+    /// The same refusal, but arriving as the ONE framed string a drained frame
+    /// or a relayed rejection carries. It splits back into the same two halves,
+    /// and a sentence that itself contains `": "` survives whole.
+    #[test]
+    fn a_framed_refusal_splits_back_into_its_token_and_sentence() {
+        let sentence = "store-backed state keys: got 7 bytes";
+        let framed = sdk::refusal::encode(sdk::refusal::INVALID_INPUT, sentence);
+        let refused = Refused::framed(&framed);
+        assert_eq!(refused.reason, sdk::refusal::INVALID_INPUT);
+        assert_eq!(refused.message, sentence);
+    }
+
+    /// A refusal that named no class is NOT given one. Inventing a token here
+    /// would mint a word no module chose, which every consumer downstream would
+    /// then have to tell apart from a real one.
+    #[test]
+    fn an_unframed_refusal_is_not_given_a_token() {
+        for unframed in ["nobody framed this", "Not_Snake_Case: sentence"] {
+            let refused = Refused::framed(unframed);
+            assert_eq!(
+                refused.reason,
+                sdk::refusal::UNFRAMED_REFUSAL,
+                "{unframed:?}"
+            );
+            assert_eq!(refused.message, unframed);
+        }
+    }
+}
+
+#[cfg(test)]
 mod status_cell_tests {
     use super::*;
 
@@ -734,5 +815,36 @@ mod status_cell_tests {
         // the first boot fact wins.
         cell.wire_chain_id("other".into());
         assert_eq!(cell.current().chain_id, "mynet#d0cdf950");
+    }
+
+    /// A recovering node answers with the floor it recovered, not with zero.
+    ///
+    /// The boot publish is everything a node knows before it has read its own
+    /// disk: build version and identity, and a zeroed boundary. The moment
+    /// recovery names a floor, the two numbers a reader looks at first say so —
+    /// otherwise a restart is indistinguishable from an empty network for the
+    /// whole window, which on a release flip is every node in the fleet.
+    #[test]
+    fn a_recovered_floor_replaces_the_zeroed_boundary_before_consensus_resumes() {
+        let cell = StatusCell::default();
+        cell.publish(NodeStatus {
+            contract: crate::NODE_CONTRACT,
+            version: "0.1.0+97b4ef7bc".into(),
+            public_key: "aa".into(),
+            ..Default::default()
+        });
+        let booted = cell.current();
+        assert_eq!((booted.height, booted.root_hash.as_str()), (0, ""));
+
+        cell.publish_recovered(6546, "a411ddb91c18f309".into());
+
+        let recovered = cell.current();
+        assert_eq!(recovered.height, 6546);
+        assert_eq!(recovered.root_hash, "a411ddb91c18f309");
+        assert_eq!(
+            recovered.version, "0.1.0+97b4ef7bc",
+            "the recovered pair moves alone; the boot facts stand"
+        );
+        assert_eq!(recovered.public_key, "aa");
     }
 }

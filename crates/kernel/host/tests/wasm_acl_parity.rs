@@ -9,20 +9,31 @@
 //! `AclQuery::PolicyFor` before every external op reaches its target, through
 //! the ordinary module query lane this proof exercises. byte-identical
 //! `PolicyFor` replies across the runtimes therefore ARE the gate-parity
-//! claim — the drain decides from nothing else.
+//! claim — the drain decides from nothing else. and because it decides from
+//! nothing else, a REGISTERED acl whose read fails, or answers anything but
+//! a decodable `PolicyFor`, refuses the op: only an acl the registry does not
+//! hold leaves the network open.
 
-use acl::{
+use std::cell::Cell;
+use std::rc::Rc;
+
+use acl_module::{
     Acl, AclMsg, AclQuery, MAX_TARGET_LEN, Standing, WILDCARD_TARGET, encode_msg, encode_query,
 };
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+use futures::executor::block_on;
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use sdk::{Error, Msg, Origin, StateRoot};
+use sdk::{Ctx, Error, Module, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `acl` module's guest port by
 /// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const ACL_WASM: &[u8] = include_bytes!("fixtures/acl.component.wasm");
+/// replacement guests registered AS `acl`: `noop` answers every query empty,
+/// `kv` refuses a query it cannot decode.
+const NOOP_WASM: &[u8] = include_bytes!("fixtures/noop.component.wasm");
+const KV_WASM: &[u8] = include_bytes!("fixtures/kv.component.wasm");
 
 /// a fresh qmdb store. `label` doubles as the store id (the deterministic
 /// runtime keys storage partitions by id alone).
@@ -221,13 +232,22 @@ async fn rejections_inner(context: &deterministic::Context) {
         // both reject DETERMINISTICALLY with the native module's reason. the
         // wasm runtime wraps the reason in its wit-error rendering, so the
         // parity claim is containment, not string equality.
-        let SubmitError::Rejected(Error::Module(n_msg)) = n_err else {
+        let SubmitError::Rejected(Error::Module {
+            reason: n_reason,
+            sentence: n_msg,
+        }) = n_err
+        else {
             panic!("native rejection shape: {n_err:?}");
         };
-        let SubmitError::Rejected(Error::Module(w_msg)) = w_err else {
+        let SubmitError::Rejected(Error::Module {
+            reason: w_reason,
+            sentence: w_msg,
+        }) = w_err
+        else {
             panic!("wasm rejection shape: {w_err:?}");
         };
         assert!(n_msg.contains(needle), "native reason: {n_msg}");
+        assert_eq!(n_reason, w_reason, "wasm token must match the native token");
         assert!(
             w_msg.contains(needle),
             "wasm reason must carry the native reason: {w_msg}"
@@ -298,4 +318,170 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
         "continuity after the batch"
     );
     assert_eq!(replies(&native).await, replies(&wasm).await);
+}
+
+/// the gated target: counts every execute that reaches it, so "the target
+/// never ran" is observed, not inferred from an error string.
+struct Target(Rc<Cell<u32>>);
+
+#[async_trait::async_trait(?Send)]
+impl Module for Target {
+    fn id(&self) -> String {
+        "target".into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot::ZERO
+    }
+
+    async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
+        self.0.set(self.0.get() + 1);
+        Ok(())
+    }
+}
+
+/// how a registered acl double answers the gate's `PolicyFor` read.
+#[derive(Clone, Copy, Debug)]
+enum Answer {
+    /// the module refuses its own read (a failed store read, say).
+    Fails,
+    /// the module has no read projection.
+    Unsupported,
+    /// bytes that decode as no acl reply.
+    Malformed,
+    /// a well-formed acl reply of the wrong variant.
+    WrongVariant,
+    /// the acl reads a sibling the registry does not hold, and propagates it.
+    NestedUnknown,
+    /// the acl claims it is itself absent — the registry says otherwise.
+    ForgedAbsence,
+    /// the answer the gate reads a policy from.
+    PolicyFor(Option<Standing>),
+}
+
+struct AclDouble(Answer);
+
+#[async_trait::async_trait(?Send)]
+impl Module for AclDouble {
+    fn id(&self) -> String {
+        "acl".into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot::ZERO
+    }
+
+    async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn query_with(&self, ctx: &dyn Ctx, _req: &[u8]) -> Result<Vec<u8>, Error> {
+        match self.0 {
+            Answer::Fails => Err(Error::module(
+                "store_read",
+                "the policy table is unreadable",
+            )),
+            Answer::Unsupported => Err(Error::QueryUnsupported),
+            Answer::Malformed => Ok(b"not an acl reply".to_vec()),
+            Answer::WrongVariant => Ok(acl::encode_reply(&acl::AclReply::Policy(Vec::new()))),
+            Answer::NestedUnknown => ctx.query("ghost", b"").await,
+            Answer::ForgedAbsence => Err(Error::UnknownModule("acl".into())),
+            Answer::PolicyFor(standing) => {
+                Ok(acl::encode_reply(&acl::AclReply::PolicyFor(standing)))
+            }
+        }
+    }
+}
+
+/// submit one external op to `target` through a host composing `acl` (or no
+/// acl at all): what the host said, and how many times the target ran.
+async fn gate(acl: Option<Box<dyn Module>>) -> (Result<(), SubmitError>, u32) {
+    let runs = Rc::new(Cell::new(0));
+    let mut modules: Vec<Box<dyn Module>> = vec![Box::new(Target(runs.clone()))];
+    modules.extend(acl);
+    let mut host = Host::genesis(modules).expect("genesis");
+    let result = host
+        .submit_at(
+            block(1, Origin::External(vec![7u8; 32])),
+            Msg {
+                target: "target".into(),
+                payload: Vec::new(),
+            },
+        )
+        .await
+        .map(|_| ());
+    (result, runs.get())
+}
+
+fn refusal_reason(result: Result<(), SubmitError>) -> String {
+    match result {
+        Err(SubmitError::Rejected(Error::Module { reason, .. })) => reason,
+        other => panic!("expected a module refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_registered_acl_whose_policy_read_fails_refuses_the_op() {
+    let cases = [
+        (Answer::Fails, "acl_query_failed"),
+        (Answer::Unsupported, "acl_query_failed"),
+        (Answer::Malformed, "acl_reply_malformed"),
+        (Answer::WrongVariant, "acl_reply_unexpected"),
+        (Answer::NestedUnknown, "acl_query_failed"),
+        (Answer::ForgedAbsence, "acl_query_failed"),
+    ];
+    for (answer, reason) in cases {
+        let (result, runs) = block_on(gate(Some(Box::new(AclDouble(answer)))));
+        assert_eq!(refusal_reason(result), reason, "{answer:?}");
+        assert_eq!(runs, 0, "{answer:?}: the target ran past a failed acl read");
+    }
+}
+
+#[test]
+fn an_absent_or_open_acl_admits_and_a_set_policy_still_refuses() {
+    let (result, runs) = block_on(gate(None));
+    assert!(
+        result.is_ok(),
+        "no acl composed is an open network: {result:?}"
+    );
+    assert_eq!(runs, 1);
+    for standing in [None, Some(Standing::Open)] {
+        let (result, runs) = block_on(gate(Some(Box::new(AclDouble(Answer::PolicyFor(standing))))));
+        assert!(result.is_ok(), "{standing:?} admits: {result:?}");
+        assert_eq!(runs, 1, "{standing:?}");
+    }
+    // a key with no valset seat never holds validator standing.
+    let (result, runs) = block_on(gate(Some(Box::new(AclDouble(Answer::PolicyFor(Some(
+        Standing::Validator,
+    )))))));
+    assert_eq!(refusal_reason(result), "acl_standing");
+    assert_eq!(runs, 0);
+}
+
+#[test]
+fn a_wasm_acl_replaced_by_a_guest_that_cannot_answer_refuses_the_op() {
+    deterministic::Runner::default().start(|context| async move {
+        // the must-PASS row: the real guest's empty table is the open default.
+        let store = acl_store(&context, "acl_guest").await;
+        let (result, runs) = gate(Some(Box::new(wasm_acl(Box::new(store))))).await;
+        assert!(
+            result.is_ok(),
+            "the acl guest's empty table admits: {result:?}"
+        );
+        assert_eq!(runs, 1);
+
+        // each replacement over the backing it declares.
+        let noop = WasmModule::from_bytes("acl", NOOP_WASM).expect("load noop");
+        let store = acl_store(&context, "kv_as_acl").await;
+        let kv = WasmModule::with_store("acl", KV_WASM, Box::new(store)).expect("load kv");
+        let replacements = [
+            ("noop", noop, "acl_reply_malformed"),
+            ("kv", kv, "acl_query_failed"),
+        ];
+        for (label, module, reason) in replacements {
+            let (result, runs) = gate(Some(Box::new(module))).await;
+            assert_eq!(refusal_reason(result), reason, "{label} as acl");
+            assert_eq!(runs, 0, "{label} as acl: the target ran past a failed read");
+        }
+    });
 }

@@ -90,8 +90,7 @@
 //! configuration.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+pub use dispatch_wire::*;
 
 // the store key space and the per-record codecs.
 mod records;
@@ -186,10 +185,13 @@ fn saga_id_for(key: &str) -> String {
 /// adding one.
 fn check_record(value: &[u8], what: &str) -> Result<(), Error> {
     if value.len() > MAX_RECORD_BYTES {
-        return Err(Error::Module(format!(
-            "{what} is {} bytes, over the {MAX_RECORD_BYTES}-byte store record cap",
-            value.len()
-        )));
+        return Err(Error::module(
+            "record_too_large",
+            format!(
+                "{what} is {} bytes, over the {MAX_RECORD_BYTES}-byte store record cap",
+                value.len()
+            ),
+        ));
     }
     Ok(())
 }
@@ -274,30 +276,42 @@ impl DispatchModule {
         max_attempts: u32,
         description: &str,
     ) -> Result<(), Error> {
-        validate_tag(capability).map_err(Error::Module)?;
+        validate_tag(capability).map_err(|e| Error::module("bad_capability_tag", e))?;
         // a pin is saga's `pinned_assignee` verbatim, and saga refuses one over
         // [`MAX_ASSIGNEE_BYTES`] at TRIGGER time — so an over-long pin admitted
         // here would register fine and then fail every single dispatch under
         // the recipe. the cap belongs where the recipe is admitted.
         if let Routing::Pinned(key) = routing {
             if key.is_empty() {
-                return Err(Error::Module("routing Pinned key must be non-empty".into()));
+                return Err(Error::module(
+                    "bad_pinned_key",
+                    "routing Pinned key must be non-empty",
+                ));
             }
             if key.len() > MAX_ASSIGNEE_BYTES {
-                return Err(Error::Module(format!(
-                    "routing Pinned key is {} bytes; the cap is {MAX_ASSIGNEE_BYTES}",
-                    key.len()
-                )));
+                return Err(Error::module(
+                    "bad_pinned_key",
+                    format!(
+                        "routing Pinned key is {} bytes; the cap is {MAX_ASSIGNEE_BYTES}",
+                        key.len()
+                    ),
+                ));
             }
         }
         if max_attempts == 0 {
-            return Err(Error::Module("max_attempts must be >= 1".into()));
+            return Err(Error::module(
+                "bad_max_attempts",
+                "max_attempts must be >= 1",
+            ));
         }
         if description.len() > MAX_DESCRIPTION_BYTES {
-            return Err(Error::Module(format!(
-                "description is {} bytes; the cap is {MAX_DESCRIPTION_BYTES}",
-                description.len()
-            )));
+            return Err(Error::module(
+                "description_too_long",
+                format!(
+                    "description is {} bytes; the cap is {MAX_DESCRIPTION_BYTES}",
+                    description.len()
+                ),
+            ));
         }
         Ok(())
     }
@@ -308,13 +322,15 @@ impl DispatchModule {
     /// queued, and registering a recipe is the executor's to do.
     fn acting_origin(origin: &Origin) -> Result<SagaOrigin, Error> {
         match origin {
-            Origin::External(key) if key.is_empty() => {
-                Err(Error::Module("external origin key is empty".into()))
-            }
+            Origin::External(key) if key.is_empty() => Err(Error::module(
+                "empty_origin_key",
+                "external origin key is empty",
+            )),
             Origin::External(key) => Ok(SagaOrigin::External(key.clone())),
             Origin::Module(module) => Ok(SagaOrigin::Module(module.clone())),
-            Origin::Program(_) => Err(Error::Module(
-                "a program account cannot register recipes".into(),
+            Origin::Program(_) => Err(Error::module(
+                "program_origin_refused",
+                "a program account cannot register recipes",
             )),
             Origin::System => Ok(SagaOrigin::System),
         }
@@ -325,7 +341,7 @@ impl DispatchModule {
     async fn existing_recipe(&self, recipe_id: &str) -> Result<Recipe, Error> {
         staged_recipe(&self.staged, recipe_id)
             .await?
-            .ok_or_else(|| Error::Module(format!("unknown recipe {recipe_id:?}")))
+            .ok_or_else(|| Error::module("unknown_recipe", format!("unknown recipe {recipe_id:?}")))
     }
 
     // ---- contract validation ---------------------------------------------------------
@@ -390,10 +406,12 @@ impl DispatchModule {
         check_record(&record, "dispatch record")?;
         let remaining = self.consume_reservation().await?;
         let mailbox = staged_mailbox(&self.staged).await?;
-        let next_item = mailbox
-            .next
-            .checked_add(1)
-            .ok_or_else(|| Error::Module("reserved mailbox numbering exhausted".into()))?;
+        let next_item = mailbox.next.checked_add(1).ok_or_else(|| {
+            Error::module(
+                "mailbox_numbering_exhausted",
+                "reserved mailbox numbering exhausted",
+            )
+        })?;
         records::stage_reservations(&mut self.staged, remaining);
         self.staged.stage(dispatch_key_of(&key), record);
         self.staged.stage(
@@ -414,12 +432,16 @@ impl DispatchModule {
         let mailbox = staged_mailbox(&self.staged).await?;
         let reserved = records::staged_reservations(&self.staged).await?;
         let next = reserved.checked_add(1).ok_or_else(|| {
-            Error::Module("mailbox numbering cannot reserve a completion slot".into())
+            Error::module(
+                "mailbox_numbering_exhausted",
+                "mailbox numbering cannot reserve a completion slot",
+            )
         })?;
         let completions_fit = mailbox.next.checked_add(next).is_some();
         if !completions_fit {
-            return Err(Error::Module(
-                "mailbox numbering cannot reserve a completion slot".into(),
+            return Err(Error::module(
+                "mailbox_numbering_exhausted",
+                "mailbox numbering cannot reserve a completion slot",
             ));
         }
         Ok(next)
@@ -429,7 +451,12 @@ impl DispatchModule {
         records::staged_reservations(&self.staged)
             .await?
             .checked_sub(1)
-            .ok_or_else(|| Error::Module("completion has no reserved mailbox slot".into()))
+            .ok_or_else(|| {
+                Error::module(
+                    "no_reserved_slot",
+                    "completion has no reserved mailbox slot",
+                )
+            })
     }
 
     async fn on_dispatch(
@@ -445,26 +472,31 @@ impl DispatchModule {
         // results always have somewhere to land. an external submitter has
         // no execute intake — nothing could ever receive its result.
         let Origin::Module(receiver) = &ctx.env().origin else {
-            return Err(Error::Module(
-                "Dispatch is module-origin only (the dispatching module receives the result)"
-                    .into(),
+            return Err(Error::module(
+                "module_origin_required",
+                "Dispatch is module-origin only (the dispatching module receives the result)",
             ));
         };
         let receiver = receiver.clone();
         sdk::validate_id("dispatch_id", &dispatch_id, MAX_ID_BYTES)?;
         if payload.len() > MAX_PAYLOAD_BYTES {
-            return Err(Error::Module(format!(
-                "payload is {} bytes; the cap is {MAX_PAYLOAD_BYTES}",
-                payload.len()
-            )));
+            return Err(Error::module(
+                "payload_too_large",
+                format!(
+                    "payload is {} bytes; the cap is {MAX_PAYLOAD_BYTES}",
+                    payload.len()
+                ),
+            ));
         }
         // the same validate_resources invariant saga holds at trigger time —
         // checked here too so a malformed demand set is attributed to THIS
         // dispatch, not a downstream saga message.
-        validate_resources(&demands).map_err(Error::Module)?;
+        validate_resources(&demands).map_err(|e| Error::module("bad_resources", e))?;
         let recipe = staged_recipe(&self.staged, &recipe_id)
             .await?
-            .ok_or_else(|| Error::Module(format!("unknown recipe {recipe_id:?}")))?;
+            .ok_or_else(|| {
+                Error::module("unknown_recipe", format!("unknown recipe {recipe_id:?}"))
+            })?;
         let key = dispatch_key(&receiver, &dispatch_id);
         // the receiver's idempotency: the first dispatch under a key wins,
         // a duplicate is a deterministic no-op (mirrors the saga trigger).
@@ -501,8 +533,9 @@ impl DispatchModule {
             .checked_add(MAX_RESULT_BYTES + 8)
             .is_some_and(|bytes| bytes <= MAX_RECORD_BYTES);
         if !outcome_fits {
-            return Err(Error::Module(
-                "dispatch context leaves no room for its result".into(),
+            return Err(Error::module(
+                "context_too_large",
+                "dispatch context leaves no room for its result",
             ));
         }
         let reserved = self.reserve_completion().await?;
@@ -542,8 +575,9 @@ impl DispatchModule {
     /// delivery path, so there is exactly one result state machine.
     async fn on_cancel(&mut self, ctx: &mut dyn Ctx, dispatch_id: String) -> Result<(), Error> {
         let Origin::Module(receiver) = &ctx.env().origin else {
-            return Err(Error::Module(
-                "CancelDispatch is module-origin only (a module cancels its own dispatch)".into(),
+            return Err(Error::module(
+                "module_origin_required",
+                "CancelDispatch is module-origin only (a module cancels its own dispatch)",
             ));
         };
         let key = dispatch_key(receiver, &dispatch_id);
@@ -571,9 +605,9 @@ impl DispatchModule {
         attempt: u32,
     ) -> Result<(), Error> {
         let Origin::Module(receiver) = &ctx.env().origin else {
-            return Err(Error::Module(
-                "ReassignDispatch is module-origin only (a module reassigns its own dispatch)"
-                    .into(),
+            return Err(Error::module(
+                "module_origin_required",
+                "ReassignDispatch is module-origin only (a module reassigns its own dispatch)",
             ));
         };
         let key = dispatch_key(receiver, &dispatch_id);
@@ -610,22 +644,29 @@ impl DispatchModule {
                 &identity::encode_query(&IdentityQuery::Get { number: account }),
             )
             .await?;
-        let IdentityReply::Account(view) = identity::decode_reply(&reply).map_err(Error::Module)?
+        let IdentityReply::Account(view) = identity::decode_reply(&reply)
+            .map_err(|e| Error::module("identity_reply_decode", e))?
         else {
-            return Err(Error::Module(
-                "identity answered an account read with a non-account reply".into(),
+            return Err(Error::module(
+                "unexpected_identity_reply",
+                "identity answered an account read with a non-account reply",
             ));
         };
         let Some(view) = view else {
-            return Err(Error::Module(format!("account {account} does not exist")));
+            return Err(Error::module(
+                "unknown_account",
+                format!("account {account} does not exist"),
+            ));
         };
         match view.control {
-            Control::Keys => Err(Error::Module(format!(
-                "account {account} is key-held, not a program"
-            ))),
-            Control::Revoked { .. } => Err(Error::Module(format!(
-                "program account {account} is revoked"
-            ))),
+            Control::Keys => Err(Error::module(
+                "not_a_program",
+                format!("account {account} is key-held, not a program"),
+            )),
+            Control::Revoked { .. } => Err(Error::module(
+                "program_revoked",
+                format!("program account {account} is revoked"),
+            )),
             Control::Program {
                 executor,
                 generation,
@@ -634,15 +675,20 @@ impl DispatchModule {
             } => {
                 let executed_by_requester = executor == requester;
                 if !executed_by_requester {
-                    return Err(Error::Module(format!(
-                        "program account {account} is executed by {executor:?}, not {requester:?}"
-                    )));
+                    return Err(Error::module(
+                        "not_the_executor",
+                        format!(
+                            "program account {account} is executed by \
+                             {executor:?}, not {requester:?}"
+                        ),
+                    ));
                 }
                 match standing {
                     ProgramStanding::Active => Ok(generation),
-                    ProgramStanding::Suspended => Err(Error::Module(format!(
-                        "program account {account} is suspended"
-                    ))),
+                    ProgramStanding::Suspended => Err(Error::module(
+                        "program_suspended",
+                        format!("program account {account} is suspended"),
+                    )),
                 }
             }
         }
@@ -664,10 +710,13 @@ impl DispatchModule {
         let Some((what, _)) = differing.iter().find(|(_, differs)| *differs) else {
             return Ok(());
         };
-        Err(Error::Module(format!(
-            "call {} was already queued with a different {what}",
-            call_name(&replay.id)
-        )))
+        Err(Error::module(
+            "call_replay_mismatch",
+            format!(
+                "call {} was already queued with a different {what}",
+                call_name(&replay.id)
+            ),
+        ))
     }
 
     async fn on_call(&mut self, ctx: &mut dyn Ctx, call: CallFields) -> Result<(), Error> {
@@ -675,19 +724,23 @@ impl DispatchModule {
         // completion always has somewhere to land — and it is the executor
         // the account's control record must name.
         let Origin::Module(requester) = &ctx.env().origin else {
-            return Err(Error::Module(
-                "Call is module-origin only (the queuing module executes the account and receives the completion)"
-                    .into(),
+            return Err(Error::module(
+                "module_origin_required",
+                "Call is module-origin only (the queuing module executes the account \
+                 and receives the completion)",
             ));
         };
         let requester = requester.clone();
         sdk::validate_id("invocation", &call.invocation, MAX_ID_BYTES)?;
         sdk::require_non_empty("target", &call.target)?;
         if call.payload.len() > MAX_PAYLOAD_BYTES {
-            return Err(Error::Module(format!(
-                "payload is {} bytes; the cap is {MAX_PAYLOAD_BYTES}",
-                call.payload.len()
-            )));
+            return Err(Error::module(
+                "payload_too_large",
+                format!(
+                    "payload is {} bytes; the cap is {MAX_PAYLOAD_BYTES}",
+                    call.payload.len()
+                ),
+            ));
         }
         let generation = self
             .executed_program_generation(ctx, call.account, &requester)
@@ -708,10 +761,13 @@ impl DispatchModule {
         };
         if let Some(enqueued) = staged_claim(&self.staged, &record.id).await? {
             let Some(existing) = staged_call(&self.staged, enqueued).await? else {
-                return Err(Error::Module(format!(
-                    "call {} is claimed under {enqueued} but has no record",
-                    call_name(&record.id)
-                )));
+                return Err(Error::module(
+                    "missing_call_record",
+                    format!(
+                        "call {} is claimed under {enqueued} but has no record",
+                        call_name(&record.id)
+                    ),
+                ));
             };
             return Self::same_call(&existing, &record);
         }
@@ -720,7 +776,10 @@ impl DispatchModule {
         // reused, so both are proven here, ahead of every open call's slot.
         let calls = staged_calls(&self.staged).await?;
         let Some(next_call) = calls.next.checked_add(1) else {
-            return Err(Error::Module("call queue numbering exhausted".into()));
+            return Err(Error::module(
+                "call_numbering_exhausted",
+                "call queue numbering exhausted",
+            ));
         };
         let reserved = self.reserve_completion().await?;
         // PROVE THE FINALIZER CAN WRITE: the completed record is the queued
@@ -764,31 +823,37 @@ impl DispatchModule {
         outcome: &CallOutcome,
     ) -> Result<(), Error> {
         let Some(record) = staged_call(&self.staged, enqueued).await? else {
-            return Err(Error::Module(format!(
-                "completed call {enqueued} has no record"
-            )));
+            return Err(Error::module(
+                "missing_call_record",
+                format!("completed call {enqueued} has no record"),
+            ));
         };
         if record.id != *id {
-            return Err(Error::Module(format!(
-                "call {enqueued} is {}, not {}",
-                call_name(&record.id),
-                call_name(id)
-            )));
+            return Err(Error::module(
+                "call_id_mismatch",
+                format!(
+                    "call {enqueued} is {}, not {}",
+                    call_name(&record.id),
+                    call_name(id)
+                ),
+            ));
         }
         let recorded = match &record.status {
             CallRecordStatus::Queued => {
-                return Err(Error::Module(format!(
-                    "call {enqueued} is below the queue head yet still queued"
-                )));
+                return Err(Error::module(
+                    "call_queue_corrupt",
+                    format!("call {enqueued} is below the queue head yet still queued"),
+                ));
             }
             CallRecordStatus::Completed { outcome } => outcome.summary(),
             CallRecordStatus::Delivered { outcome, .. } => outcome.clone(),
         };
         let same_outcome = recorded == outcome.summary();
         if !same_outcome {
-            return Err(Error::Module(format!(
-                "call {enqueued} was already completed with a different outcome"
-            )));
+            return Err(Error::module(
+                "call_replay_mismatch",
+                format!("call {enqueued} was already completed with a different outcome"),
+            ));
         }
         Ok(())
     }
@@ -801,8 +866,9 @@ impl DispatchModule {
         outcome: CallOutcome,
     ) -> Result<(), Error> {
         if !matches!(ctx.env().origin, Origin::System) {
-            return Err(Error::Module(
-                "CompleteCall is System-origin only (the host's finalizer)".into(),
+            return Err(Error::module(
+                "system_origin_required",
+                "CompleteCall is System-origin only (the host's finalizer)",
             ));
         }
         let calls = staged_calls(&self.staged).await?;
@@ -812,25 +878,35 @@ impl DispatchModule {
         }
         let at_head = enqueued == calls.head && enqueued < calls.next;
         if !at_head {
-            return Err(Error::Module(format!(
-                "CompleteCall {enqueued} is out of order: the call queue head is {}",
-                calls.head
-            )));
+            return Err(Error::module(
+                "call_out_of_order",
+                format!(
+                    "CompleteCall {enqueued} is out of order: the call queue head is {}",
+                    calls.head
+                ),
+            ));
         }
         let Some(mut record) = staged_call(&self.staged, enqueued).await? else {
-            return Err(Error::Module(format!("call {enqueued} has no record")));
+            return Err(Error::module(
+                "missing_call_record",
+                format!("call {enqueued} has no record"),
+            ));
         };
         if record.id != id {
-            return Err(Error::Module(format!(
-                "call {enqueued} is {}, not {}",
-                call_name(&record.id),
-                call_name(&id)
-            )));
+            return Err(Error::module(
+                "call_id_mismatch",
+                format!(
+                    "call {enqueued} is {}, not {}",
+                    call_name(&record.id),
+                    call_name(&id)
+                ),
+            ));
         }
         let CallRecordStatus::Queued = record.status else {
-            return Err(Error::Module(format!(
-                "call {enqueued} at the queue head is not queued"
-            )));
+            return Err(Error::module(
+                "call_queue_corrupt",
+                format!("call {enqueued} at the queue head is not queued"),
+            ));
         };
         record.status = CallRecordStatus::Completed { outcome };
         let completed = encode_call(&record);
@@ -839,7 +915,10 @@ impl DispatchModule {
         check_record(&completed, "completed call record")?;
         let mailbox = staged_mailbox(&self.staged).await?;
         let Some(next_item) = mailbox.next.checked_add(1) else {
-            return Err(Error::Module("mailbox numbering exhausted".into()));
+            return Err(Error::module(
+                "mailbox_numbering_exhausted",
+                "mailbox numbering exhausted",
+            ));
         };
         let remaining = self.consume_reservation().await?;
         records::stage_reservations(&mut self.staged, remaining);
@@ -875,14 +954,22 @@ impl DispatchModule {
         match entry {
             MailEntry::Result { dispatch_key } => {
                 let Some(dispatch) = committed_dispatch(&self.staged, &dispatch_key).await? else {
-                    return Err(Error::Module(format!(
-                        "mailbox item {item} points at dispatch {dispatch_key:?}, which has no record"
-                    )));
+                    return Err(Error::module(
+                        "missing_dispatch_record",
+                        format!(
+                            "mailbox item {item} points at dispatch {dispatch_key:?}, \
+                             which has no record"
+                        ),
+                    ));
                 };
                 let Some(outcome) = dispatch.outcome else {
-                    return Err(Error::Module(format!(
-                        "mailbox item {item} points at dispatch {dispatch_key:?}, which has no recorded outcome"
-                    )));
+                    return Err(Error::module(
+                        "missing_dispatch_outcome",
+                        format!(
+                            "mailbox item {item} points at dispatch {dispatch_key:?}, \
+                             which has no recorded outcome"
+                        ),
+                    ));
                 };
                 let item_ref = ItemRef {
                     source: self.id.clone(),
@@ -907,14 +994,20 @@ impl DispatchModule {
             }
             MailEntry::Call { enqueued } => {
                 let Some(record) = committed_call(&self.staged, enqueued).await? else {
-                    return Err(Error::Module(format!(
-                        "mailbox item {item} points at call {enqueued}, which has no record"
-                    )));
+                    return Err(Error::module(
+                        "missing_call_record",
+                        format!(
+                            "mailbox item {item} points at call {enqueued}, which has no record"
+                        ),
+                    ));
                 };
                 let CallRecordStatus::Completed { outcome } = record.status else {
-                    return Err(Error::Module(format!(
-                        "mailbox item {item} points at call {enqueued}, which is not completed"
-                    )));
+                    return Err(Error::module(
+                        "call_not_completed",
+                        format!(
+                            "mailbox item {item} points at call {enqueued}, which is not completed"
+                        ),
+                    ));
                 };
                 Ok(PendingItem {
                     item,
@@ -945,14 +1038,16 @@ impl DispatchModule {
         now: u64,
     ) -> Result<Receipt, Error> {
         let Some(mut dispatch) = staged_dispatch(&self.staged, dispatch_key).await? else {
-            return Err(Error::Module(format!(
-                "dispatch {dispatch_key:?} in the mailbox has no record"
-            )));
+            return Err(Error::module(
+                "missing_dispatch_record",
+                format!("dispatch {dispatch_key:?} in the mailbox has no record"),
+            ));
         };
         let Some(_outcome) = dispatch.outcome.take() else {
-            return Err(Error::Module(format!(
-                "dispatch {dispatch_key:?} in the mailbox has no recorded outcome"
-            )));
+            return Err(Error::module(
+                "missing_dispatch_outcome",
+                format!("dispatch {dispatch_key:?} in the mailbox has no recorded outcome"),
+            ));
         };
         dispatch.status = Status::Delivered { delivery };
         dispatch.updated_at = now;
@@ -971,14 +1066,16 @@ impl DispatchModule {
         delivery: DeliveryOutcome,
     ) -> Result<Receipt, Error> {
         let Some(mut record) = staged_call(&self.staged, enqueued).await? else {
-            return Err(Error::Module(format!(
-                "call {enqueued} in the mailbox has no record"
-            )));
+            return Err(Error::module(
+                "missing_call_record",
+                format!("call {enqueued} in the mailbox has no record"),
+            ));
         };
         let CallRecordStatus::Completed { outcome } = &record.status else {
-            return Err(Error::Module(format!(
-                "call {enqueued} in the mailbox is not completed"
-            )));
+            return Err(Error::module(
+                "call_not_completed",
+                format!("call {enqueued} in the mailbox is not completed"),
+            ));
         };
         record.status = CallRecordStatus::Delivered {
             outcome: outcome.summary(),
@@ -1030,14 +1127,19 @@ impl DispatchModule {
         let claims_reserved_ns = is_reserved_recipe_id(&recipe_id)
             && !matches!(&origin, SagaOrigin::Module(m) if m == RESERVED_AGENT_NS_OWNER);
         if claims_reserved_ns {
-            return Err(Error::Module(format!(
-                "recipe id {recipe_id:?} is in the reserved {RESERVED_AGENT_NS_PREFIX:?} namespace"
-            )));
+            return Err(Error::module(
+                "reserved_recipe_id",
+                format!(
+                    "recipe id {recipe_id:?} is in the reserved \
+                     {RESERVED_AGENT_NS_PREFIX:?} namespace"
+                ),
+            ));
         }
         if staged_recipe(&self.staged, &recipe_id).await?.is_some() {
-            return Err(Error::Module(format!(
-                "recipe {recipe_id:?} already exists"
-            )));
+            return Err(Error::module(
+                "recipe_exists",
+                format!("recipe {recipe_id:?} already exists"),
+            ));
         }
         let now = ctx.env().consensus_time;
         let record = encode_recipe(&Recipe {
@@ -1070,7 +1172,7 @@ impl DispatchModule {
     }
 
     async fn on_admin(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        match decode_msg(&msg.payload).map_err(Error::Module)? {
+        match decode_msg(&msg.payload).map_err(|e| Error::module("codec", e))? {
             DispatchMsg::RegisterRecipe {
                 recipe_id,
                 description,
@@ -1230,9 +1332,10 @@ impl DispatchModule {
         let mut batch = Vec::new();
         for enqueued in calls.head..end {
             let Some(record) = committed_call(&self.staged, enqueued).await? else {
-                return Err(Error::Module(format!(
-                    "call {enqueued} in the queue has no record"
-                )));
+                return Err(Error::module(
+                    "missing_call_record",
+                    format!("call {enqueued} in the queue has no record"),
+                ));
             };
             batch.push(Self::pending_call(enqueued, record));
         }
@@ -1344,9 +1447,10 @@ impl Module for DispatchModule {
         let mut items = Vec::new();
         for item in mailbox.head..end {
             let Some(entry) = committed_mail_entry(&self.staged, item).await? else {
-                return Err(Error::Module(format!(
-                    "mailbox item {item} in the queue has no entry"
-                )));
+                return Err(Error::module(
+                    "missing_mailbox_entry",
+                    format!("mailbox item {item} in the queue has no entry"),
+                ));
             };
             items.push(self.committed_item(item, entry).await?);
         }
@@ -1369,16 +1473,19 @@ impl Module for DispatchModule {
         }
         let at_head = ack.item == mailbox.head && ack.item < mailbox.next;
         if !at_head {
-            return Err(Error::Module(format!(
-                "acknowledgment of mailbox item {} is out of order: the head is {}",
-                ack.item, mailbox.head
-            )));
+            return Err(Error::module(
+                "ack_out_of_order",
+                format!(
+                    "acknowledgment of mailbox item {} is out of order: the head is {}",
+                    ack.item, mailbox.head
+                ),
+            ));
         }
         let Some(entry) = staged_mail_entry(&self.staged, ack.item).await? else {
-            return Err(Error::Module(format!(
-                "mailbox item {} at the head has no entry",
-                ack.item
-            )));
+            return Err(Error::module(
+                "missing_mailbox_entry",
+                format!("mailbox item {} at the head has no entry", ack.item),
+            ));
         };
         let now = ctx.env().consensus_time;
         let receipt = match entry {
@@ -1392,10 +1499,13 @@ impl Module for DispatchModule {
         };
         let correlated = ack.target == receipt.target;
         if !correlated {
-            return Err(Error::Module(format!(
-                "acknowledgment of mailbox item {} names {:?}; the item is addressed to {:?}",
-                ack.item, ack.target, receipt.target
-            )));
+            return Err(Error::module(
+                "ack_target_mismatch",
+                format!(
+                    "acknowledgment of mailbox item {} names {:?}; the item is addressed to {:?}",
+                    ack.item, ack.target, receipt.target
+                ),
+            ));
         }
         check_record(&receipt.record, "delivery receipt")?;
         self.staged.delete(mailbox_key(ack.item));
@@ -1415,7 +1525,7 @@ impl Module for DispatchModule {
         // COMMITTED state only: the host's between-block pump reads
         // PendingCalls and PendingDeliveries at a block boundary, and a
         // staged overlay must never leak into that decision.
-        match decode_query(req).map_err(Error::Module)? {
+        match decode_query(req).map_err(|e| Error::module("codec", e))? {
             DispatchQuery::Recipe { recipe_id } => Ok(encode_reply(&DispatchReply::Recipe(
                 committed_recipe(&self.staged, &recipe_id).await?,
             ))),

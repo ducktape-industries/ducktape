@@ -34,13 +34,23 @@ pub enum OpCmd {
     Join(JoinCmd),
     /// list registered workspaces (chain-id + config path)
     List,
-    /// the running node's tip: height + root hash (reads the local rpc)
+    /// the running node's tip, and how far behind the network it is (reads
+    /// the local rpc)
     Status(StatusArgs),
     /// can THIS binary run this workspace? reopens the checkpoint offline and
     /// recomposes its committed root hash — what a release launcher asks a
     /// staged binary before it flips. the node must be STOPPED
-    Qualify(SelectorArgs),
-    /// the running node's direct peers: connection, traffic, sync heights
+    Qualify(QualifyArgs),
+    /// record THIS binary's module world as the one the workspace holds —
+    /// what a node launcher runs once a release its network designated came
+    /// up healthy. the node's next boot is checked against the record
+    #[command(hide = true)]
+    RecordWorld(SelectorArgs),
+    /// the running node's height and direct peers: connection, traffic, and
+    /// the heights this node served each over state sync
+    ///
+    /// no row carries a peer's own height: the mesh gossips none. how far
+    /// behind the network this node is: `ducktape node status`
     Peers(StatusArgs),
     /// resident standing: the staged-admission tier
     #[command(subcommand)]
@@ -221,12 +231,9 @@ impl Selector {
                     .into(),
             ),
             _ => Err(format!(
-                "no workspace selected and several are registered — pick one with -n:\n{}",
-                workspaces
-                    .iter()
-                    .map(|(chain_id, _)| format!("  {chain_id}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                "no workspace selected and several are registered — pick one with -n, or \
+                 --config <path> when two share a chain id:\n{}",
+                config::workspace_choices(&workspaces)
             )),
         }
     }
@@ -298,12 +305,9 @@ impl WorkspaceArgs {
                     .into(),
             ),
             _ => Err(format!(
-                "several workspaces exist — pick one with -n:\n{}",
-                workspaces
-                    .iter()
-                    .map(|(chain_id, _)| format!("  {chain_id}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                "several workspaces exist — pick one with -n, or --config <path> when two \
+                 share a chain id:\n{}",
+                config::workspace_choices(&workspaces)
             )),
         }
     }
@@ -314,9 +318,13 @@ impl WorkspaceArgs {
 /// is `--host-node`, because it is a different type of input.
 #[derive(Debug, Default, Clone, clap::Args)]
 pub struct NodeAddr {
-    /// the node's http base url (wins over -n/--network and DUCKTAPE_NODE)
+    /// the node's http base url (wins over --config, -n/--network and DUCKTAPE_NODE)
     #[arg(long, value_name = "HTTP-URL", global = true)]
     pub node: Option<String>,
+    /// a workspace's node.toml — names ONE of two workspaces that share a
+    /// chain id (wins over -n/--network and DUCKTAPE_NODE; --node wins over it)
+    #[arg(long, value_name = "PATH", global = true)]
+    pub config: Option<PathBuf>,
     /// a registered workspace's chain id — resolves to its node.toml http_listen
     #[arg(short = 'n', long = "network", value_name = "CHAIN-ID", global = true)]
     pub network: Option<String>,
@@ -331,6 +339,9 @@ pub struct NodeAddr {
 enum Rung {
     /// `--node <http-url>`
     Flag(String),
+    /// `--config <node.toml>` → that file's `http_listen`. The one rung that
+    /// separates two workspaces sharing a chain id, which `-n` cannot.
+    Config(PathBuf),
     /// `-n/--network <chain-id>` → the workspace node.toml's `http_listen`
     Network(String),
     /// the `DUCKTAPE_NODE` environment variable
@@ -344,8 +355,8 @@ enum Rung {
 
 /// the message every unresolved address ends with — it names every rung, so a
 /// user who hit the bottom of the ladder can see all of it.
-const NO_NODE_ADDRESS: &str =
-    "no node address: pass --node <http-url>, -n/--network <id>, or set DUCKTAPE_NODE";
+const NO_NODE_ADDRESS: &str = "no node address: pass --node <http-url>, --config <node.toml>, \
+     -n/--network <id>, or set DUCKTAPE_NODE";
 
 /// turn a chosen rung into the http base. The one `match`: a new rung must be
 /// routed here or the build fails.
@@ -355,9 +366,22 @@ fn rung_base(rung: Rung) -> Result<String, String> {
         Rung::Env(url) => checked_base("DUCKTAPE_NODE", &url),
         // not a user-typed string: the caller's own recorded address.
         Rung::Context(url) => Ok(trim_base(&url)),
+        Rung::Config(file) => http_of_config(&file),
         Rung::Network(needle) => http_of_workspace(&needle),
         Rung::LoneWorkspace => lone_workspace_base(),
     }
+}
+
+/// the base a node.toml serves, read through [`config::resolve_service`] — the
+/// keyless read `WorkspaceArgs` resolves the same `--config` with.
+fn http_of_config(file: &std::path::Path) -> Result<String, String> {
+    let listen = config::resolve_service(file)?.http_listen.ok_or_else(|| {
+        format!(
+            "{} sets no http_listen, so there is no node surface to dial — pass --node <http-url>",
+            file.display()
+        )
+    })?;
+    Ok(trim_base(&config::http_base_of(&listen)))
 }
 
 /// a trailing slash on the base would double up against every `/v1/...` path.
@@ -372,7 +396,7 @@ fn trim_base(url: &str) -> String {
 /// A chain id is the mistake this actually catches: `--node mynet#d0cdf950`
 /// parses, outranks `-n`, and then silently misdirects, so the message names
 /// the flag that WOULD have taken it.
-fn checked_base(source: &str, url: &str) -> Result<String, String> {
+pub(crate) fn checked_base(source: &str, url: &str) -> Result<String, String> {
     let is_http = url.starts_with("http://") || url.starts_with("https://");
     if is_http {
         return Ok(trim_base(url));
@@ -407,12 +431,9 @@ fn lone_workspace_id() -> Result<String, String> {
         1 => Ok(workspaces.swap_remove(0).0),
         0 => Err(NO_NODE_ADDRESS.into()),
         _ => Err(format!(
-            "{NO_NODE_ADDRESS}\nseveral workspaces are registered — pick one with -n:\n{}",
-            workspaces
-                .iter()
-                .map(|(chain_id, _)| format!("  {chain_id}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            "{NO_NODE_ADDRESS}\nseveral workspaces are registered — pick one with -n, or \
+             --config <path> when two share a chain id:\n{}",
+            config::workspace_choices(&workspaces)
         )),
     }
 }
@@ -430,6 +451,8 @@ fn lone_workspace_base() -> Result<String, String> {
 /// with no registry on disk and no process env to mutate.
 #[derive(Debug, PartialEq, Eq)]
 enum WorkspaceSource {
+    /// the operator named the workspace's config file: it IS the answer.
+    File(PathBuf),
     /// the operator named a workspace: use it, and do NOT search.
     Named(String),
     /// the bottom rung's inference.
@@ -442,6 +465,7 @@ enum WorkspaceSource {
 /// rung must be routed here or the build fails.
 fn rung_workspace_source(rung: Rung) -> WorkspaceSource {
     match rung {
+        Rung::Config(file) => WorkspaceSource::File(file),
         // NOT `Serving`: two registered workspaces may share a base by default,
         // so searching backwards would refuse the very id the operator typed.
         Rung::Network(needle) => WorkspaceSource::Named(needle),
@@ -455,11 +479,24 @@ fn rung_workspace_source(rung: Rung) -> WorkspaceSource {
 /// resolve a source to a directory — the effectful half.
 fn source_workspace(source: WorkspaceSource) -> Result<PathBuf, String> {
     let needle = match source {
+        WorkspaceSource::File(file) => return Ok(config::resolve_service(&file)?.workspace),
         WorkspaceSource::Named(needle) => needle,
         WorkspaceSource::LoneRegistered => lone_workspace_id()?,
         WorkspaceSource::Serving(base) => return workspace_serving(&base),
     };
     config::resolve_network(&needle).map(|(dir, _)| dir)
+}
+
+/// the node.toml behind a source: the file itself when the operator named one,
+/// else the one inside its workspace — [`WorkspaceArgs::config_file`]'s rule, so
+/// a config that does not sit at `<workspace>/node.toml` is still the one read.
+fn source_config_file(source: WorkspaceSource) -> Result<PathBuf, String> {
+    match source {
+        WorkspaceSource::File(file) => Ok(file),
+        source @ (WorkspaceSource::Named(_)
+        | WorkspaceSource::LoneRegistered
+        | WorkspaceSource::Serving(_)) => Ok(source_workspace(source)?.join("node.toml")),
+    }
 }
 
 /// Which registered workspace SERVES `base` — the reverse of [`http_of_workspace`].
@@ -548,13 +585,17 @@ fn workspace_of_matches(base: &str, matches: Vec<(String, PathBuf)>) -> Result<P
         // ordered. Taking the first would read the WRONG node's 0600 secret
         // under an id the operator never chose — so refuse, the way every other
         // ambiguous selection on this ladder does.
+        // this list holds workspace DIRECTORIES; the choice list names the
+        // config inside each, because that is the string an operator retypes.
         several => Err(format!(
-            "several workspaces serve {base} — pick one with -n:\n{}",
-            several
-                .iter()
-                .map(|(chain_id, _)| format!("  {chain_id}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            "several workspaces serve {base} — pick one with -n, or --config <path> when two \
+             share a chain id:\n{}",
+            config::workspace_choices(
+                &several
+                    .iter()
+                    .map(|(chain_id, dir)| (chain_id.clone(), dir.join("node.toml")))
+                    .collect::<Vec<_>>()
+            )
         )),
     }
 }
@@ -571,8 +612,8 @@ impl NodeAddr {
         self.resolve_with(|| None)
     }
 
-    /// the whole ladder: `--node` → `-n/--network` → `DUCKTAPE_NODE` →
-    /// `context()` → the lone registered workspace.
+    /// the whole ladder: `--node` → `--config` → `-n/--network` →
+    /// `DUCKTAPE_NODE` → `context()` → the lone registered workspace.
     ///
     /// `context` is the caller's own ambient address, tried AFTER what the
     /// operator stated and BEFORE the registry inference. `fs` inside a checkout
@@ -608,15 +649,27 @@ impl NodeAddr {
         source_workspace(rung_workspace_source(self.ladder_rung(env_node(), context)))
     }
 
+    /// the node.toml behind the resolved address — `--config` itself when it
+    /// is the rung, else the one inside [`Self::workspace`]. For a verb that
+    /// reads the node's own config (its chain id, its consensus key).
+    pub fn config_file(&self) -> Result<PathBuf, String> {
+        source_config_file(rung_workspace_source(self.ladder_rung(env_node(), || None)))
+    }
+
     /// pick the rung. `env` is a parameter rather than a read so the precedence
     /// is testable without mutating process env — racy across parallel tests,
     /// and `unsafe` since edition 2024.
     fn ladder_rung(&self, env: Option<String>, context: impl FnOnce() -> Option<String>) -> Rung {
         let flag = self.node.clone().filter(|url| !url.is_empty());
+        let file = self
+            .config
+            .clone()
+            .filter(|path| !path.as_os_str().is_empty());
         let network = self.network.clone().filter(|id| !id.is_empty());
         let env = env.filter(|url| !url.is_empty());
         // THE PRECEDENCE. Written once, in one expression, for every family.
         flag.map(Rung::Flag)
+            .or_else(|| file.map(Rung::Config))
             .or_else(|| network.map(Rung::Network))
             .or_else(|| env.map(Rung::Env))
             .or_else(|| context().filter(|url| !url.is_empty()).map(Rung::Context))
@@ -629,6 +682,19 @@ impl NodeAddr {
 pub struct SelectorArgs {
     #[command(flatten)]
     pub selector: Selector,
+}
+
+/// `node qualify [--compose-only]`.
+#[derive(Debug, clap::Args)]
+pub struct QualifyArgs {
+    #[command(flatten)]
+    pub selector: Selector,
+    /// ask only whether the components this network RUNS load against this
+    /// binary's wasm world, reading the roster off the node's rpc and the
+    /// bytes out of its blob files. takes no lock and opens no store, so it
+    /// runs beside a live node — and it says nothing about state layout
+    #[arg(long)]
+    pub compose_only: bool,
 }
 
 /// selector + the machine-readable output toggle.
@@ -670,10 +736,20 @@ pub struct KeyArgs {
     pub dir: Option<PathBuf>,
 }
 
+/// `init --name`, refused at parse time — before any workspace file is written
+/// — when the `duck://` grammar cannot carry it as a chain id's label. The
+/// refusal names sdk's reason token.
+fn network_name(raw: &str) -> Result<String, String> {
+    config::validate_network_name(raw)
+        .map_err(|refused| format!("{} [{}]", refused.sentence, refused.reason))?;
+    Ok(raw.to_string())
+}
+
 #[derive(Debug, clap::Args)]
 pub struct InitArgs {
-    /// human-readable network name (the chain id becomes <name>#<salt>)
-    #[arg(long, value_name = "NAME")]
+    /// network name: the label of every duck:// address naming the network
+    /// (the chain id becomes <name>#<salt>)
+    #[arg(long, value_name = "NAME", value_parser = network_name)]
     pub name: String,
     /// found the network here instead of under the ducktape home
     #[arg(long, value_name = "DIR")]
@@ -765,10 +841,13 @@ pub struct PlumbingArgs {
     /// the address other members dial (or "overlay")
     #[arg(long, value_name = "ADDR", hide_short_help = true)]
     pub advertised: Option<String>,
-    /// node HTTP API listen address
+    /// node HTTP API listen address; for a remote App use
+    /// `0.0.0.0:<port>` here, then enter the node's reachable host URL in
+    /// Connect remote (never `0.0.0.0`)
     #[arg(long, value_name = "ADDR", hide_short_help = true)]
     pub http: Option<String>,
-    /// browser gateway listen address
+    /// local-only browser gateway listen address; must be exactly
+    /// `127.0.0.1:<port>`; remote App connections use `--http`, not this
     #[arg(long, value_name = "ADDR", hide_short_help = true)]
     pub gateway: Option<String>,
     /// local operator rpc listen address
@@ -813,7 +892,42 @@ mod tests {
     fn addr(node: Option<&str>, network: Option<&str>) -> NodeAddr {
         NodeAddr {
             node: node.map(str::to_string),
+            config: None,
             network: network.map(str::to_string),
+        }
+    }
+
+    /// `--config` is a flag of the ONE addressing group, so every family that
+    /// dials a node takes it — `account` and `fs` had no way to name one of two
+    /// workspaces sharing a chain id, while every ambiguity refusal told the
+    /// operator to "pick one with --config <path>".
+    #[test]
+    fn every_node_addressed_family_takes_config() {
+        let families: [&[&str]; 5] = [
+            &["ducktape", "account", "show", "--config", "/w/node.toml"],
+            &[
+                "ducktape",
+                "account",
+                "key",
+                "list",
+                "--config",
+                "/w/node.toml",
+            ],
+            &["ducktape", "fs", "ls", "/", "--config", "/w/node.toml"],
+            &["ducktape", "fs", "cat", "/f", "--config", "/w/node.toml"],
+            &[
+                "ducktape",
+                "user",
+                "cred",
+                "list",
+                "--config",
+                "/w/node.toml",
+            ],
+        ];
+        for argv in families {
+            if let Err(e) = <crate::Cli as clap::Parser>::try_parse_from(argv) {
+                panic!("{argv:?} refused --config:\n{e}");
+            }
         }
     }
 
@@ -870,32 +984,76 @@ mod tests {
         assert!(parse(&["probe", "init", "--name", "demo", "--block-time-ms", "0"]).is_err());
     }
 
+    /// `init --name` is refused at parse time, by the address grammar's own
+    /// reason token, when no `duck://` address could name the network.
+    #[test]
+    fn init_name_is_a_label_the_address_grammar_carries() {
+        #[derive(clap::Parser)]
+        struct Probe {
+            #[command(subcommand)]
+            op: OpCmd,
+        }
+        let parse = |argv: &[&str]| <Probe as clap::Parser>::try_parse_from(argv);
+
+        let name = match parse(&["probe", "init", "--name", "my-team"])
+            .expect("parses")
+            .op
+        {
+            OpCmd::Init(args) => args.name,
+            other => panic!("not an init: {other:?}"),
+        };
+        assert_eq!(name, "my-team");
+        for (bad, reason) in [
+            ("My Team", "carries an uppercase letter"),
+            ("my team", "`my team#00000000` is not one"),
+        ] {
+            let Err(refused) = parse(&["probe", "init", "--name", bad]) else {
+                panic!("{bad:?} parsed");
+            };
+            let refused = refused.to_string();
+            assert!(refused.contains("[invalid_input]"), "{bad:?}: {refused}");
+            assert!(refused.contains(reason), "{bad:?}: {refused}");
+        }
+    }
+
     /// the precedence, pinned rung by rung and hermetically: only the `Flag`,
     /// `Env` and `Context` rungs are resolved to a base (the registry rungs are
     /// asserted as rungs, so no test ever walks `~/.ducktape`).
     #[test]
-    fn the_node_address_ladder_ranks_flag_network_env_context_registry() {
+    fn the_node_address_ladder_ranks_flag_config_network_env_context_registry() {
         let env = || Some("http://env:1/".to_string());
         let ctx = || Some("http://ctx:1/".to_string());
 
-        // 1. --node wins over everything below it.
-        let rung = addr(Some("http://flag:1/"), Some("some-workspace")).ladder_rung(env(), ctx);
+        // 1. --node wins over everything below it, --config included: both
+        //    name one node, and the url is the more direct of the two.
+        let with_config = |node: Option<&str>| NodeAddr {
+            config: Some(PathBuf::from("/w/node.toml")),
+            ..addr(node, Some("some-workspace"))
+        };
+        let rung = with_config(Some("http://flag:1/")).ladder_rung(env(), ctx);
         assert_eq!(rung_base(rung).unwrap(), "http://flag:1");
 
-        // 2. -n/--network beats the env — a rung some user verbs used to
+        // 2. --config beats -n: a chain id cannot separate a founder from the
+        //    member that joined it, and the file can.
+        assert!(matches!(
+            with_config(None).ladder_rung(env(), ctx),
+            Rung::Config(file) if file == std::path::Path::new("/w/node.toml")
+        ));
+
+        // 3. -n/--network beats the env — a rung some user verbs used to
         //    reach only because they ignored DUCKTAPE_NODE entirely.
         assert!(matches!(
             addr(None, Some("some-workspace")).ladder_rung(env(), ctx),
             Rung::Network(id) if id == "some-workspace"
         ));
 
-        // 3. the env beats the caller's ambient context.
+        // 4. the env beats the caller's ambient context.
         assert_eq!(
             rung_base(addr(None, None).ladder_rung(env(), ctx)).unwrap(),
             "http://env:1"
         );
 
-        // 4. the context beats the registry: `fs commit` inside a checkout must
+        // 5. the context beats the registry: `fs commit` inside a checkout must
         //    reach the node it was checked out FROM, not "the one workspace
         //    registered on this box".
         assert_eq!(
@@ -903,7 +1061,7 @@ mod tests {
             "http://ctx:1"
         );
 
-        // 5. nothing at all → the registry inference, the bottom rung.
+        // 6. nothing at all → the registry inference, the bottom rung.
         assert!(matches!(
             addr(None, None).ladder_rung(None, || None),
             Rung::LoneWorkspace
@@ -925,7 +1083,15 @@ mod tests {
             rung_workspace_source(a.ladder_rung(e, c))
         };
 
-        // a named workspace is USED, never searched for.
+        // a named workspace is USED, never searched for — by its file first.
+        let config = NodeAddr {
+            config: Some(PathBuf::from("/w/node.toml")),
+            ..addr(None, Some("chain-a"))
+        };
+        assert_eq!(
+            source(config, env(), ctx),
+            WorkspaceSource::File(PathBuf::from("/w/node.toml"))
+        );
         assert_eq!(
             source(addr(None, Some("chain-a")), env(), ctx),
             WorkspaceSource::Named("chain-a".into())
@@ -999,24 +1165,24 @@ mod tests {
             home.path(),
             "net",
             "dognet#d2a0ec8f",
-            "127.0.0.1:32989",
-            "127.0.0.1:36989",
+            "127.0.0.1:28800",
+            "127.0.0.1:28820",
         );
         let resident = write_workspace(
             home.path(),
             "net-joiner",
             "dognet#d2a0ec8f",
-            "127.0.0.1:32990",
-            "127.0.0.1:36990",
+            "127.0.0.1:28801",
+            "127.0.0.1:28821",
         );
 
         assert_eq!(
-            workspace_serving_in(home.path(), "http://127.0.0.1:32989"),
+            workspace_serving_in(home.path(), "http://127.0.0.1:28800"),
             Ok(founder),
             "the founder's own port did not reach the founder"
         );
         assert_eq!(
-            workspace_serving_in(home.path(), "http://127.0.0.1:32990"),
+            workspace_serving_in(home.path(), "http://127.0.0.1:28801"),
             Ok(resident),
             "the resident's own port did not reach the resident"
         );
@@ -1033,10 +1199,10 @@ mod tests {
             home.path(),
             "other",
             "kitchen#99887766",
-            "127.0.0.1:32989",
-            "127.0.0.1:36991",
+            "127.0.0.1:28800",
+            "127.0.0.1:28822",
         );
-        let Err(why) = workspace_serving_in(home.path(), "http://127.0.0.1:32989") else {
+        let Err(why) = workspace_serving_in(home.path(), "http://127.0.0.1:28800") else {
             panic!("two workspaces on one base must refuse, not pick the first");
         };
         assert!(why.contains("several workspaces serve"), "{why}");
@@ -1053,24 +1219,24 @@ mod tests {
             home.path(),
             "net",
             "dognet#d2a0ec8f",
-            "127.0.0.1:32989",
-            "127.0.0.1:36989",
+            "127.0.0.1:28800",
+            "127.0.0.1:28820",
         );
         let resident = write_workspace(
             home.path(),
             "net-joiner",
             "dognet#d2a0ec8f",
-            "127.0.0.1:32990",
-            "127.0.0.1:36990",
+            "127.0.0.1:28801",
+            "127.0.0.1:28821",
         );
 
         assert_eq!(
-            workspace_for_rpc_in(home.path(), "127.0.0.1:36989"),
+            workspace_for_rpc_in(home.path(), "127.0.0.1:28820"),
             Ok(founder),
             "the founder's own rpc port did not reach the founder"
         );
         assert_eq!(
-            workspace_for_rpc_in(home.path(), "127.0.0.1:36990"),
+            workspace_for_rpc_in(home.path(), "127.0.0.1:28821"),
             Ok(resident),
             "the resident's own rpc port did not reach the resident"
         );
@@ -1087,17 +1253,63 @@ mod tests {
             home.path(),
             "other",
             "kitchen#99887766",
-            "127.0.0.1:32991",
-            "127.0.0.1:36989",
+            "127.0.0.1:28802",
+            "127.0.0.1:28820",
         );
-        let Err(why) = workspace_for_rpc_in(home.path(), "127.0.0.1:36989") else {
+        let Err(why) = workspace_for_rpc_in(home.path(), "127.0.0.1:28820") else {
             panic!("two workspaces on one rpc address must refuse, not pick the first");
         };
         assert!(why.contains("several workspaces serve"), "{why}");
     }
 
-    /// A workspace on disk, complete enough for the registry to list it and for
-    /// its own `http_listen` and `rpc_listen` to be read back.
+    /// `--config` is what separates a founder from the member that joined it:
+    /// each file reaches its OWN port and its OWN directory, where `-n` over
+    /// their one chain id can only refuse. Resolved from the file alone — the
+    /// registry is never asked, so it cannot answer with the other row.
+    #[test]
+    fn config_reaches_the_one_of_two_workspaces_sharing_a_chain_id() {
+        let home = tempfile::tempdir().expect("temp home");
+        let chain = "dognet#d2a0ec8f";
+        let founder = write_workspace(home.path(), "net", chain, "0.0.0.0:28800", "x:1");
+        let joiner = write_workspace(home.path(), "net-joiner", chain, "0.0.0.0:28801", "x:2");
+        let by_config = |dir: &std::path::Path| NodeAddr {
+            config: Some(dir.join("node.toml")),
+            ..addr(None, None)
+        };
+
+        for (dir, base) in [
+            (&founder, "http://127.0.0.1:28800"),
+            (&joiner, "http://127.0.0.1:28801"),
+        ] {
+            let at = by_config(dir);
+            assert_eq!(rung_base(at.ladder_rung(None, || None)), Ok(base.into()));
+            assert_eq!(
+                source_workspace(rung_workspace_source(at.ladder_rung(None, || None))),
+                Ok(dir.clone())
+            );
+            assert_eq!(
+                source_config_file(rung_workspace_source(at.ladder_rung(None, || None))),
+                Ok(dir.join("node.toml"))
+            );
+        }
+
+        // a config that is not `<workspace>/node.toml` is still the file read:
+        // `--config <elsewhere>/alt.toml` names ITS node, never a neighbour's.
+        let alt = founder.join("alt.toml");
+        std::fs::copy(founder.join("node.toml"), &alt).expect("copy config");
+        let at = NodeAddr {
+            config: Some(alt.clone()),
+            ..addr(None, None)
+        };
+        assert_eq!(
+            source_config_file(rung_workspace_source(at.ladder_rung(None, || None))),
+            Ok(alt)
+        );
+    }
+
+    /// A workspace on disk, complete enough for the registry to list it, for
+    /// its own `http_listen` and `rpc_listen` to be read back, and for
+    /// [`config::resolve_service`] to accept its descriptor.
     fn write_workspace(
         root: &std::path::Path,
         ws: &str,
@@ -1105,17 +1317,22 @@ mod tests {
         http: &str,
         rpc: &str,
     ) -> PathBuf {
+        use commonware_cryptography::Signer as _;
         let dir = root.join(ws);
         std::fs::create_dir_all(&dir).expect("mk workspace");
+        let validator = commonware_cryptography::ed25519::PrivateKey::from_seed(1).public_key();
         config::NetworkDescriptor {
             chain_id: chain.into(),
-            validators: Vec::new(),
+            validators: vec![config::hex_bytes(validator.as_ref())],
             bootstrap: Vec::new(),
             reach: Vec::new(),
             coordination: None,
             block_time_ms: config::DEFAULT_BLOCK_TIME_MS,
-            genesis: String::new(),
-            modules: Vec::new(),
+            genesis: "ab".repeat(32),
+            modules: vec![config::ModuleCode {
+                id: "pages".into(),
+                code_hash: "11".repeat(32),
+            }],
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -1222,6 +1439,48 @@ mod tests {
             readers,
             vec!["cli_args.rs".to_string()],
             "DUCKTAPE_NODE must be read only by the one node-addressing ladder"
+        );
+    }
+
+    /// Every rung of the ladder that refuses with a CHOICE renders it through
+    /// [`config::workspace_choices`], so no two of them can disagree about
+    /// order or content — four hand-rolled lists printed the bare chain id,
+    /// and on a box with a founder and its joiner that is the same string
+    /// twice, which names neither.
+    // ponytail: matches the literal line a hand-rolled list formats. A fifth
+    // one built some other way slips past; escalate to a parse if that happens.
+    #[test]
+    fn every_pick_one_list_is_rendered_by_one_function() {
+        // composed, never spelled out: a literal needle would match THIS file.
+        let hand_rolled_line = format!("format!(\"  {}\")", "{chain_id}");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hand_rolled = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read source");
+                if text.contains(&hand_rolled_line) {
+                    hand_rolled.push(
+                        path.strip_prefix(&src)
+                            .expect("under src")
+                            .display()
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        assert!(
+            hand_rolled.is_empty(),
+            "a chain-id-only choice list cannot be acted on — render it with \
+             config::workspace_choices: {hand_rolled:?}"
         );
     }
 }

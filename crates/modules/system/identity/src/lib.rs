@@ -111,8 +111,7 @@
 //! state-sync like any other record. this module never writes that key.
 //!
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+pub use identity_wire::*;
 
 // the one verifier every consent rides — shared with the kernel frame codec,
 // so an account key and a frame origin are verified identically.
@@ -252,10 +251,13 @@ impl ControlRecord {
     fn program(&self) -> Result<&ProgramControl, Error> {
         match self {
             ControlRecord::Program(program) => Ok(program),
-            ControlRecord::Keys(_) => {
-                Err(Error::Module("account is key-held, not a program".into()))
+            ControlRecord::Keys(_) => Err(Error::module(
+                "not_a_program",
+                "account is key-held, not a program",
+            )),
+            ControlRecord::Revoked { .. } => {
+                Err(Error::module("program_revoked", "program is revoked"))
             }
-            ControlRecord::Revoked { .. } => Err(Error::Module("program is revoked".into())),
         }
     }
 
@@ -314,8 +316,9 @@ impl AccountRecord {
     fn association(&self) -> Result<&Association, Error> {
         match &self.control {
             ControlRecord::Keys(keys) => Ok(keys),
-            ControlRecord::Program(_) | ControlRecord::Revoked { .. } => Err(Error::Module(
-                "key index points at an account that holds no keys".into(),
+            ControlRecord::Program(_) | ControlRecord::Revoked { .. } => Err(Error::module(
+                "key_index_corrupt",
+                "key index points at an account that holds no keys",
             )),
         }
     }
@@ -323,8 +326,9 @@ impl AccountRecord {
     fn association_mut(&mut self) -> Result<&mut Association, Error> {
         match &mut self.control {
             ControlRecord::Keys(keys) => Ok(keys),
-            ControlRecord::Program(_) | ControlRecord::Revoked { .. } => Err(Error::Module(
-                "key index points at an account that holds no keys".into(),
+            ControlRecord::Program(_) | ControlRecord::Revoked { .. } => Err(Error::module(
+                "key_index_corrupt",
+                "key index points at an account that holds no keys",
             )),
         }
     }
@@ -356,13 +360,14 @@ impl Actor {
 fn allocate_number(next: AccountNumber) -> Result<(AccountNumber, AccountNumber), Error> {
     let cap_reached = next > MAX_ACCOUNTS;
     if cap_reached {
-        return Err(Error::Module(format!(
-            "account cap reached ({MAX_ACCOUNTS})"
-        )));
+        return Err(Error::module(
+            "account_cap",
+            format!("account cap reached ({MAX_ACCOUNTS})"),
+        ));
     }
     let after = next
         .checked_add(1)
-        .ok_or_else(|| Error::Module("account numbering is exhausted".into()))?;
+        .ok_or_else(|| Error::module("numbering_exhausted", "account numbering is exhausted"))?;
     Ok((next, after))
 }
 
@@ -371,25 +376,34 @@ fn allocate_number(next: AccountNumber) -> Result<(AccountNumber, AccountNumber)
 /// as every queued call saw it, never wrap back to a generation one did.
 fn next_generation(generation: u64) -> Result<u64, Error> {
     generation.checked_add(1).ok_or_else(|| {
-        Error::Module("program generation is exhausted; the control record cannot change".into())
+        Error::module(
+            "generation_exhausted",
+            "program generation is exhausted; the control record cannot change",
+        )
     })
 }
 
 /// a key's admission counter after one more admission.
 fn next_key_generation(generation: u64) -> Result<u64, Error> {
-    generation
-        .checked_add(1)
-        .ok_or_else(|| Error::Module("key admission counter is exhausted".into()))
+    generation.checked_add(1).ok_or_else(|| {
+        Error::module(
+            "key_counter_exhausted",
+            "key admission counter is exhausted",
+        )
+    })
 }
 
 /// the account record as the store takes it, or the reason it cannot.
 fn encode_account(record: &AccountRecord) -> Result<Vec<u8>, Error> {
     let bytes = borsh::to_vec(record).expect("identity value is serializable");
     if bytes.len() > MAX_ACCOUNT_RECORD_BYTES {
-        return Err(Error::Module(format!(
-            "account record too large: {} > {MAX_ACCOUNT_RECORD_BYTES} bytes",
-            bytes.len()
-        )));
+        return Err(Error::module(
+            "record_too_large",
+            format!(
+                "account record too large: {} > {MAX_ACCOUNT_RECORD_BYTES} bytes",
+                bytes.len()
+            ),
+        ));
     }
     Ok(bytes)
 }
@@ -400,10 +414,13 @@ fn encode_value<T: BorshSerialize>(value: &T) -> Result<Vec<u8>, Error> {
     let bytes = borsh::to_vec(value).expect("identity value is serializable");
     let fits_the_store = bytes.len() <= MAX_STORE_VALUE_BYTES;
     if !fits_the_store {
-        return Err(Error::Module(format!(
-            "a record of {} bytes exceeds the store's value bound of {MAX_STORE_VALUE_BYTES}",
-            bytes.len()
-        )));
+        return Err(Error::module(
+            "record_too_large",
+            format!(
+                "a record of {} bytes exceeds the store's value bound of {MAX_STORE_VALUE_BYTES}",
+                bytes.len()
+            ),
+        ));
     }
     Ok(bytes)
 }
@@ -514,32 +531,39 @@ fn decide_transfer(
     let program = record.control.program()?;
     let by_controller = program.controller == actor;
     if !by_controller {
-        return Err(Error::Module(
-            "only its controller transfers control of a program".into(),
+        return Err(Error::module(
+            "not_the_controller",
+            "only its controller transfers control of a program",
         ));
     }
     let to_itself = to == account;
     if to_itself {
-        return Err(Error::Module("an account cannot control itself".into()));
+        return Err(Error::module(
+            "self_control",
+            "an account cannot control itself",
+        ));
     }
     let to_current_controller = to == program.controller;
     if to_current_controller {
-        return Err(Error::Module(format!(
-            "account {account} is already controlled by {to}"
-        )));
+        return Err(Error::module(
+            "control_unchanged",
+            format!("account {account} is already controlled by {to}"),
+        ));
     }
     if !to_record.control.is_live() {
-        return Err(Error::Module(format!(
-            "account {to} cannot control: it is not key-held or an active program"
-        )));
+        return Err(Error::module(
+            "controller_not_live",
+            format!("account {to} cannot control: it is not key-held or an active program"),
+        ));
     }
     // `to` is controlled, transitively, by `account`: handing control to it
     // would close a cycle no chain could ever leave.
     let would_cycle = to_chain.contains(&account);
     if would_cycle {
-        return Err(Error::Module(format!(
-            "account {to} is controlled by {account}: control would cycle"
-        )));
+        return Err(Error::module(
+            "control_cycle",
+            format!("account {to} is controlled by {account}: control would cycle"),
+        ));
     }
     let mut moved = program.clone();
     moved.generation = next_generation(moved.generation)?;
@@ -571,8 +595,9 @@ fn decide_standing(
     let program = record.control.program()?;
     let by_executor = program.executor == executor;
     if !by_executor {
-        return Err(Error::Module(
-            "only its executor sets a program's standing".into(),
+        return Err(Error::module(
+            "not_the_executor",
+            "only its executor sets a program's standing",
         ));
     }
     let mut changed = program.clone();
@@ -595,8 +620,9 @@ fn decide_revoke(
     let program = record.control.program()?;
     let by_controller = program.controller == actor;
     if !by_controller {
-        return Err(Error::Module(
-            "only its controller revokes a program".into(),
+        return Err(Error::module(
+            "not_the_controller",
+            "only its controller revokes a program",
         ));
     }
     Ok(AccountRecord {
@@ -637,7 +663,7 @@ impl Identity {
     {
         match self.staged.get(key).await? {
             Some(bytes) => Ok(Some(
-                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+                borsh::from_slice(&bytes).map_err(|e| Error::module("codec", e.to_string()))?,
             )),
             None => Ok(None),
         }
@@ -666,7 +692,7 @@ impl Identity {
     async fn stored_account(&self, number: AccountNumber) -> Result<AccountRecord, Error> {
         self.account(number)
             .await?
-            .ok_or_else(|| Error::Module("missing account record".into()))
+            .ok_or_else(|| Error::module("missing_account_record", "missing account record"))
     }
 
     /// the account `key` belongs to, if any -- the key-index read.
@@ -682,9 +708,10 @@ impl Identity {
     ) -> Result<Vec<Option<AccountNumber>>, Error> {
         let exceeds_query_limit = references.len() as u64 > MAX_QUERY_LIMIT;
         if exceeds_query_limit {
-            return Err(Error::Module(format!(
-                "identity: reference count exceeds query limit ({MAX_QUERY_LIMIT})"
-            )));
+            return Err(Error::module(
+                "query_limit",
+                format!("identity: reference count exceeds query limit ({MAX_QUERY_LIMIT})"),
+            ));
         }
         let key_reads: Vec<_> = references
             .iter()
@@ -754,9 +781,10 @@ impl Identity {
         loop {
             let revisited = !seen.insert(at);
             if revisited {
-                return Err(Error::Module(format!(
-                    "control chain revisits account {at}: the control graph is corrupt"
-                )));
+                return Err(Error::module(
+                    "control_graph_corrupt",
+                    format!("control chain revisits account {at}: the control graph is corrupt"),
+                ));
             }
             chain.push(at);
             let record = self.stored_account(at).await?;
@@ -797,11 +825,13 @@ impl Identity {
     fn origin_key(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
         match &ctx.env().origin {
             Origin::External(bytes) => submitter_key(bytes),
-            Origin::Program(_) => Err(Error::Module(
-                "key operations are for member keys; a program account holds no key".into(),
+            Origin::Program(_) => Err(Error::module(
+                "not_a_key_account",
+                "key operations are for member keys; a program account holds no key",
             )),
-            Origin::Module(_) | Origin::System => Err(Error::Module(
-                "key operations are origin-gated to external submitters".into(),
+            Origin::Module(_) | Origin::System => Err(Error::module(
+                "external_origin_required",
+                "key operations are origin-gated to external submitters",
             )),
         }
     }
@@ -811,9 +841,10 @@ impl Identity {
     fn acting_module(ctx: &dyn Ctx) -> Result<ModuleId, Error> {
         match &ctx.env().origin {
             Origin::Module(module) => Ok(module.clone()),
-            Origin::External(_) | Origin::Program(_) | Origin::System => Err(Error::Module(
-                "program provisioning and standing are module-origin only (the emitting module is the executor)"
-                    .into(),
+            Origin::External(_) | Origin::Program(_) | Origin::System => Err(Error::module(
+                "module_origin_required",
+                "program provisioning and standing are module-origin only \
+                 (the emitting module is the executor)",
             )),
         }
     }
@@ -827,31 +858,38 @@ impl Identity {
         match &ctx.env().origin {
             Origin::External(bytes) => {
                 let key = submitter_key(bytes)?;
-                let account = self
-                    .owner_of_key(&key)
-                    .await?
-                    .ok_or_else(|| Error::Module("origin key belongs to no account".into()))?;
+                let account = self.owner_of_key(&key).await?.ok_or_else(|| {
+                    Error::module("no_account_for_key", "origin key belongs to no account")
+                })?;
                 let record = self.stored_account(account).await?;
                 Ok((Actor::Key { key, account }, record))
             }
             Origin::Program(account) => {
                 let record = self.account(*account).await?.ok_or_else(|| {
-                    Error::Module(format!("program origin names account {account}, which does not exist"))
+                    Error::module(
+                        "unknown_account",
+                        format!("program origin names account {account}, which does not exist"),
+                    )
                 })?;
                 let runs = matches!(
                     &record.control,
                     ControlRecord::Program(program) if program.standing == ProgramStanding::Active
                 );
                 if !runs {
-                    return Err(Error::Module(format!(
-                        "program origin names account {account}, which is not an active program"
-                    )));
+                    return Err(Error::module(
+                        "not_an_active_program",
+                        format!(
+                            "program origin names account {account}, \
+                             which is not an active program"
+                        ),
+                    ));
                 }
                 Ok((Actor::Program(*account), record))
             }
-            Origin::Module(_) | Origin::System => Err(Error::Module(
-                "account operations act as a key's account or a program account; a module or the system holds none"
-                    .into(),
+            Origin::Module(_) | Origin::System => Err(Error::module(
+                "no_actor_for_origin",
+                "account operations act as a key's account or a program account; \
+                 a module or the system holds none",
             )),
         }
     }
@@ -898,8 +936,9 @@ impl Identity {
 /// a non-empty submitter id, or a deterministic rejection.
 fn submitter_key(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     if bytes.is_empty() {
-        return Err(Error::Module(
-            "external origin must carry a non-empty submitter id".into(),
+        return Err(Error::module(
+            "empty_submitter_id",
+            "external origin must carry a non-empty submitter id",
         ));
     }
     Ok(bytes.to_vec())
@@ -933,7 +972,7 @@ impl Module for Identity {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        match decode_msg(&msg.payload).map_err(Error::Module)? {
+        match decode_msg(&msg.payload).map_err(|e| Error::module("codec", e))? {
             IdentityMsg::Create { name, scheme } => self.create(ctx, name, scheme).await,
             IdentityMsg::AddKey {
                 scheme,
@@ -961,7 +1000,7 @@ impl Module for Identity {
     /// read projection — committed plus this block's staged changes (the
     /// staged-over-committed store view).
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match decode_query(req).map_err(Error::Module)? {
+        match decode_query(req).map_err(|e| Error::module("codec", e))? {
             IdentityQuery::All { from, limit } => {
                 // walk the numbering directly: no deletion ever, so no gaps.
                 let (first, take) = page_window(from, limit);
@@ -1018,12 +1057,16 @@ impl Identity {
     ) -> Result<(), Error> {
         let origin = Self::origin_key(ctx)?;
         if !scheme.pubkey_wellformed(&origin) {
-            return Err(Error::Module(
-                "founding key is malformed for its scheme".into(),
+            return Err(Error::module(
+                "bad_key",
+                "founding key is malformed for its scheme",
             ));
         }
         if self.owner_of_key(&origin).await?.is_some() {
-            return Err(Error::Module("key already belongs to an account".into()));
+            return Err(Error::module(
+                "key_already_claimed",
+                "key already belongs to an account",
+            ));
         }
         let name = clean_name(name)?;
         let (number, after) = allocate_number(self.next_number().await?)?;
@@ -1065,50 +1108,63 @@ impl Identity {
     ) -> Result<(), Error> {
         let origin = Self::origin_key(ctx)?;
         if !scheme.pubkey_wellformed(&origin) {
-            return Err(Error::Module(
-                "joining key is malformed for its scheme".into(),
+            return Err(Error::module(
+                "bad_key",
+                "joining key is malformed for its scheme",
             ));
         }
         if self.owner_of_key(&origin).await?.is_some() {
-            return Err(Error::Module("key already belongs to an account".into()));
+            return Err(Error::module(
+                "key_already_claimed",
+                "key already belongs to an account",
+            ));
         }
-        let number = self
-            .owner_of_key(&authorizer.key)
-            .await?
-            .ok_or_else(|| Error::Module("authorizer belongs to no account".into()))?;
+        let number = self.owner_of_key(&authorizer.key).await?.ok_or_else(|| {
+            Error::module("no_account_for_key", "authorizer belongs to no account")
+        })?;
         // the account is under the authorizer's signature AND is its account
         // right now: a consent minted on one account never admits into another
         // its author later joins.
         if number != authorizer.account {
-            return Err(Error::Module(format!(
-                "consent names account {}, its authorizer is on account {number}",
-                authorizer.account
-            )));
+            return Err(Error::module(
+                "consent_account_mismatch",
+                format!(
+                    "consent names account {}, its authorizer is on account {number}",
+                    authorizer.account
+                ),
+            ));
         }
         let now = ctx.env().consensus_time;
         if now > authorizer.expires_at {
-            return Err(Error::Module(format!(
-                "consent expired at {} (now {now})",
-                authorizer.expires_at
-            )));
+            return Err(Error::module(
+                "consent_expired",
+                format!("consent expired at {} (now {now})", authorizer.expires_at),
+            ));
         }
         if authorizer.expires_at - now > MAX_CONSENT_TTL {
-            return Err(Error::Module(format!(
-                "consent outlives the {MAX_CONSENT_TTL}-block ceiling"
-            )));
+            return Err(Error::module(
+                "consent_ttl",
+                format!("consent outlives the {MAX_CONSENT_TTL}-block ceiling"),
+            ));
         }
         let mut record = self.stored_account(number).await?;
         let keys = record.association()?;
         let full = keys.len() >= MAX_KEYS_PER_ACCOUNT;
         if full {
-            return Err(Error::Module(format!(
-                "account key cap reached ({MAX_KEYS_PER_ACCOUNT})"
-            )));
+            return Err(Error::module(
+                "key_cap",
+                format!("account key cap reached ({MAX_KEYS_PER_ACCOUNT})"),
+            ));
         }
         let authorizer_scheme = keys
             .get(&authorizer.key)
             .map(|meta| meta.scheme)
-            .ok_or_else(|| Error::Module("key index disagrees with its account record".into()))?;
+            .ok_or_else(|| {
+                Error::module(
+                    "key_index_corrupt",
+                    "key index disagrees with its account record",
+                )
+            })?;
 
         // the consent names THIS key at ITS current generation, that account,
         // and that expiry -- nothing else.
@@ -1127,7 +1183,10 @@ impl Identity {
             &preimage,
             &authorizer.proof,
         ) {
-            return Err(Error::Module("authorizer consent does not verify".into()));
+            return Err(Error::module(
+                "consent_unverified",
+                "authorizer consent does not verify",
+            ));
         }
         let label = clean_label(label)?;
         let spent = next_key_generation(generation)?;
@@ -1157,20 +1216,23 @@ impl Identity {
             account: number,
         } = actor
         else {
-            return Err(Error::Module(
-                "key operations are for member keys; a program account holds no key".into(),
+            return Err(Error::module(
+                "not_a_key_account",
+                "key operations are for member keys; a program account holds no key",
             ));
         };
         let keys = record.association_mut()?;
         let Some(target) = keys.get(&key) else {
-            return Err(Error::Module(
-                "target key is not a member of this account".into(),
+            return Err(Error::module(
+                "not_a_member_key",
+                "target key is not a member of this account",
             ));
         };
         let last_key = keys.len() == 1;
         if last_key {
-            return Err(Error::Module(
-                "cannot remove the last key of an account".into(),
+            return Err(Error::module(
+                "last_key",
+                "cannot remove the last key of an account",
             ));
         }
         // SENIORITY. the origin is a member, so the record holds its meta.
@@ -1186,8 +1248,9 @@ impl Identity {
                 .expect("the origin is a member of its own account")
                 .added_at;
         if !removing_self && senior_target {
-            return Err(Error::Module(
-                "cannot remove a key admitted before your own".into(),
+            return Err(Error::module(
+                "senior_key",
+                "cannot remove a key admitted before your own",
             ));
         }
         keys.remove(&key);
@@ -1232,14 +1295,20 @@ impl Identity {
     ) -> Result<(), Error> {
         let executor = Self::acting_module(ctx)?;
         let name = clean_name(name)?;
-        let controller_record = self
-            .account(controller)
-            .await?
-            .ok_or_else(|| Error::Module(format!("controller {controller} is not an account")))?;
+        let controller_record = self.account(controller).await?.ok_or_else(|| {
+            Error::module(
+                "unknown_account",
+                format!("controller {controller} is not an account"),
+            )
+        })?;
         if !controller_record.control.is_live() {
-            return Err(Error::Module(format!(
-                "controller {controller} cannot control: it is not key-held or an active program"
-            )));
+            return Err(Error::module(
+                "controller_not_live",
+                format!(
+                    "controller {controller} cannot control: \
+                     it is not key-held or an active program"
+                ),
+            ));
         }
         let next = self.next_number().await?;
         let controlled = self.controlled_by(controller).await?;
@@ -1273,10 +1342,12 @@ impl Identity {
         standing: ProgramStanding,
     ) -> Result<(), Error> {
         let executor = Self::acting_module(ctx)?;
-        let record = self
-            .account(account)
-            .await?
-            .ok_or_else(|| Error::Module(format!("account {account} does not exist")))?;
+        let record = self.account(account).await?.ok_or_else(|| {
+            Error::module(
+                "unknown_account",
+                format!("account {account} does not exist"),
+            )
+        })?;
         let changed = decide_standing(record, &executor, standing, ctx.env().consensus_time)?;
         self.store_account(account, &changed)
     }
@@ -1289,15 +1360,16 @@ impl Identity {
         to: AccountNumber,
     ) -> Result<(), Error> {
         let (actor, _) = self.acting(ctx).await?;
-        let record = self
-            .account(account)
-            .await?
-            .ok_or_else(|| Error::Module(format!("account {account} does not exist")))?;
+        let record = self.account(account).await?.ok_or_else(|| {
+            Error::module(
+                "unknown_account",
+                format!("account {account} does not exist"),
+            )
+        })?;
         let from = record.control.program()?.controller;
-        let to_record = self
-            .account(to)
-            .await?
-            .ok_or_else(|| Error::Module(format!("account {to} does not exist")))?;
+        let to_record = self.account(to).await?.ok_or_else(|| {
+            Error::module("unknown_account", format!("account {to} does not exist"))
+        })?;
         let loaded = TransferLoaded {
             record,
             to_record,
@@ -1323,10 +1395,12 @@ impl Identity {
         account: AccountNumber,
     ) -> Result<(), Error> {
         let (actor, _) = self.acting(ctx).await?;
-        let record = self
-            .account(account)
-            .await?
-            .ok_or_else(|| Error::Module(format!("account {account} does not exist")))?;
+        let record = self.account(account).await?.ok_or_else(|| {
+            Error::module(
+                "unknown_account",
+                format!("account {account} does not exist"),
+            )
+        })?;
         let revoked = decide_revoke(record, actor.account(), ctx.env().consensus_time)?;
         self.store_account(account, &revoked)
     }
@@ -1336,12 +1410,13 @@ impl Identity {
 fn clean_name(name: String) -> Result<String, Error> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err(Error::Module("account name is empty".into()));
+        return Err(Error::module("bad_name", "account name is empty"));
     }
     if trimmed.len() > MAX_NAME_LEN {
-        return Err(Error::Module(format!(
-            "account name exceeds the {MAX_NAME_LEN}-byte limit"
-        )));
+        return Err(Error::module(
+            "bad_name",
+            format!("account name exceeds the {MAX_NAME_LEN}-byte limit"),
+        ));
     }
     Ok(trimmed.to_string())
 }
@@ -1356,9 +1431,10 @@ fn clean_field(value: Option<String>, max: usize, what: &str) -> Result<Option<S
             if trimmed.is_empty() {
                 Ok(None)
             } else if trimmed.len() > max {
-                Err(Error::Module(format!(
-                    "{what} exceeds the {max}-byte limit"
-                )))
+                Err(Error::module(
+                    "too_long",
+                    format!("{what} exceeds the {max}-byte limit"),
+                ))
             } else {
                 Ok(Some(trimmed.to_string()))
             }

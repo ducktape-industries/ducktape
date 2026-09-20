@@ -20,7 +20,8 @@ use crate::verify::{Refusal, VerifiedManifest};
 /// Each variant wraps a named struct so a `step` handler receives the whole
 /// variant by value; on the wire it is one flat object tagged `"phase"`.
 /// `pinned_sequence` rides in every variant: it is the downgrade guard, it
-/// advances only when a download verifies, and a rollback never lowers it.
+/// advances only at the flip to a staged release, and a rollback never
+/// lowers it — so an equal sequence is a release this install ran.
 // `Downloading` carries the manifest's strings; a `Phase` is built once per
 // transition and persisted, never held in bulk, so the size gap is nothing.
 #[allow(clippy::large_enum_variant)]
@@ -33,6 +34,7 @@ pub enum Phase {
     /// verified — the machine stays here until `Verified`/`VerifyRefused`).
     Downloading(Downloading),
     /// `staged` is verified, extracted, sealed immutable and ready to flip.
+    /// The channel stays open: a newer release supersedes it.
     Staged(Staged),
     /// The crash-safe swap bit: persisted before `Flip`, replaced after.
     /// A boot that finds it asks the executor which side landed.
@@ -73,6 +75,9 @@ pub struct Staged {
     pub sequence: u64,
     pub display: String,
     pub node_contract: u32,
+    /// Why the staged release's own qualify last refused it, if it did. It is
+    /// persisted because the launcher qualifies and the app reports it.
+    pub refused: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +185,16 @@ pub enum Event {
     SwapResolved(SwapState),
     /// App: the channel manifest was fetched and its signature checked.
     ManifestFetched(Result<VerifiedManifest, Refusal>),
+    /// Node launcher: the network designates this release, and it is neither
+    /// what runs nor what is staged. A node offers what its network chose,
+    /// never merely the manifest's latest.
+    Designated(Sha),
+    /// Node launcher, answering `FetchDesignated`: the channel manifest,
+    /// fetched and checked, and the designated release it was fetched for.
+    DesignatedManifestFetched {
+        designated: Sha,
+        result: Result<VerifiedManifest, Refusal>,
+    },
     /// App: `releases/<sha>.partial` is complete.
     DownloadFinished { sha: Sha },
     /// App: the download could not complete; `reason` is a stable token.
@@ -232,6 +247,10 @@ pub enum Command {
     /// Read the channel manifest + `.sig` off the connected network's duckfs
     /// ([`crate::layout`]), verify, answer with `ManifestFetched`.
     Fetch,
+    /// Read and verify the channel manifest exactly as `Fetch` does, for the
+    /// release the network designates; answer with
+    /// `DesignatedManifestFetched` carrying this `Sha`.
+    FetchDesignated(Sha),
     /// Download the archive ([`crate::layout::archive_path`] of `sha` for
     /// the host platform) into `releases/<sha>.partial`, resumable by size,
     /// sha256-checked as it lands; answer with
@@ -263,6 +282,12 @@ pub enum Command {
     Banner(UpdateBanner),
     /// Remove every `releases/<sha>` not in `keep`, and stale `.partial`s.
     Gc { keep: Vec<Sha> },
+    /// Launcher only; the app holds no founding record and does nothing.
+    /// Record the module world `sha`'s node speaks as the one its workspace
+    /// holds (`ducktape node record-world`), so a later boot of the release
+    /// that came up healthy is not refused for speaking another world than
+    /// the one the workspace was founded or joined with.
+    RecordWorld(Sha),
 }
 
 /// What the console strip and the Settings "Updates" section show.

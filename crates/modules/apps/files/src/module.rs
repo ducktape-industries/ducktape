@@ -1,133 +1,22 @@
 //! the native module glue: [`Files`] implements [`sdk::Module`] over the pure
-//! [`Fs`] core. origin/env map in here; core `String` errors map out as
-//! [`Error::Module`]; watch-notification emission (task 9) and the gc
-//! watermark trigger (task 13) land here too.
+//! [`Fs`] core. origin/env map in here; a core `String` error maps out as a
+//! module refusal whose token names the `files_*` step that failed;
+//! watch-notification emission (task 9) and the gc watermark trigger (task 13)
+//! land here too.
 
 use std::path::PathBuf;
 
 use duckfs_core::fs::{Fs, StagedObjects};
 use duckfs_core::state::Refs;
 use duckfs_core::store::{MemRefs, MemStore, ObjectStore, RefsStore};
-use duckfs_core::{
-    GC_PERIOD_BLOCKS, Kind, ObjectId, decode_query, decode_sync_req, encode_reply, encode_sync_resp,
-};
+use duckfs_core::{ObjectId, decode_query, decode_sync_req, encode_reply, encode_sync_resp};
 use duckfs_disk::{DiskRefs, DiskStore};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 
-/// gc is due at `height` iff `height` has crossed into a new
-/// [`GC_PERIOD_BLOCKS`]-wide window since the last swept height (`watermark`).
-/// integer-divide both to the window index and fire when the block's window is
-/// strictly ahead — so exactly one gc runs per period, on the first files-active
-/// block past each boundary, identically on every node (the trigger is a pure
-/// function of the op stream, never the wall clock). `pub(crate)` so the task-13
-/// trigger test can table-drive the boundary (re-exported via `testkit`).
-pub(crate) fn gc_due(height: u64, watermark: u64) -> bool {
-    height / GC_PERIOD_BLOCKS > watermark / GC_PERIOD_BLOCKS
-}
-
-/// steps 2-3 of the durability ordering (the object side): flush the block's
-/// objects into the odb, then fsync the touched fanout dirs so every published
-/// object is durable BEFORE the refs commit point. shared verbatim by the native
-/// [`Files::commit_block`] and the wasm-tenant `files_odb::FilesOdbBacking`'s
-/// `publish_block`, so the crash-safety contract is single-sourced (extract-and-
-/// share, not forked). objects are content-addressed + idempotent, so a re-put on
-/// replay is a cheap no-op.
-///
-/// generic over the object store `S` (integration merge #715×#723): the native
-/// module is now `Files<S, R>`, so this shared helper widens from the concrete
-/// `DiskStore` to any [`ObjectStore`]. the wasm-tenant backing still passes its
-/// concrete `DiskStore`, which satisfies the bound unchanged — the single-source
-/// contract is preserved.
-pub fn persist_objects<S: ObjectStore>(
-    store: &mut S,
-    objects: &[(Kind, Vec<u8>)],
-) -> Result<(), Error> {
-    for (kind, body) in objects {
-        store
-            .put(*kind, body)
-            .map_err(|e| Error::Module(format!("files: odb put: {e}")))?;
-    }
-    store
-        .sync_dirs()
-        .map_err(|e| Error::Module(format!("files: odb sync: {e}")))?;
-    Ok(())
-}
-
-/// steps 4-6 of the durability ordering (the refs side): save the refs envelope
-/// (atomic rename + parent fsync — the commit point), adopt the new refs in core
-/// (the ONLY place the root moves), then run the consensus-neutral gc watermark
-/// trigger and re-save the advanced watermark. returns the (possibly advanced) gc
-/// watermark. shared verbatim by the native [`Files::commit_block`] and the
-/// wasm-tenant `files_odb::FilesOdbBacking`'s `adopt_refs`.
-///
-/// the caller MUST have persisted the block's objects (via [`persist_objects`])
-/// first: the refs file names those objects, so a crash after this returns must
-/// never reach a refs image whose objects' dir-entries never hit disk.
-///
-/// generic over the stores `S`/`R` (integration merge #715×#723): widened from
-/// the concrete `Fs<DiskStore>`/`DiskRefs` so the native `Files<S, R>` commit path
-/// can share it; the wasm-tenant backing passes its concrete disk stores, still
-/// satisfying the bounds.
-pub fn commit_refs<S: ObjectStore, R: RefsStore>(
-    fs: &mut Fs<S>,
-    refs_store: &mut R,
-    refs: Refs,
-    height: u64,
-    gc_watermark: u64,
-    gc_faulted: &mut bool,
-) -> Result<u64, Error> {
-    // 4. the commit point: refs file durable (atomic rename + parent fsync).
-    refs_store
-        .save(&refs, height, gc_watermark)
-        .map_err(|e| Error::Module(format!("files: refs save: {e}")))?;
-    // 5. adopt — root advances only now that the refs file is durable.
-    fs.adopt_refs(refs);
-    // 6. gc watermark trigger — per-node bookkeeping, NOT consensus (the root
-    // covers refs only). run AFTER adopt so a gc crash can never lose committed
-    // state: the block is already durable above. the advanced watermark lives
-    // ONLY in the refs-file envelope (never the root), so re-save it here.
-    if !gc_due(height, gc_watermark) {
-        return Ok(gc_watermark);
-    }
-    // a gc fault SKIPS the sweep; it never fails the block. gc is
-    // consensus-neutral by construction — mark reads committed refs, the sweep
-    // removes only unreachable objects, and the root is `root_bytes(refs)` —
-    // so a boundary that skips its sweep costs disk and NOTHING else. failing
-    // here instead turned one lost or bit-rotted object into a deterministic
-    // brick: every node holding it fail-stops at the same boundary, and the
-    // only remedy is a full wipe-and-resync. mark refuses BEFORE removing
-    // anything, so the store is exactly as it was and the objects stay put.
-    //
-    // the watermark advances either way: the fault outlives the boundary (no
-    // live refetch drives possession on a running node — that lane is still
-    // join-time only), so retrying every files-active block would re-walk the
-    // whole graph for the same answer. the next period retries.
-    match fs.gc() {
-        Ok(_) => *gc_faulted = false,
-        Err(fault) => note_gc_fault(gc_faulted, height, &fault),
-    }
-    refs_store
-        .save(fs.refs(), height, height)
-        .map_err(|e| Error::Module(format!("files: refs save (gc watermark): {e}")))?;
-    Ok(height)
-}
-
-/// report a skipped sweep ONCE per fault run, LATCHED: the fault persists
-/// across boundaries by nature (a lost object stays lost), so a warn per
-/// boundary would bury the first — the only one that dates the corruption. the
-/// latch clears on the next sweep that completes.
-fn note_gc_fault(gc_faulted: &mut bool, height: u64, fault: &str) {
-    if std::mem::replace(gc_faulted, true) {
-        return;
-    }
-    tracing::warn!(
-        target: "ducktape::files",
-        reason = "gc_object_missing",
-        height,
-        fault = %fault,
-        "gc sweep skipped; every object kept"
-    );
-}
+// the durability ordering is duckfs-disk's (`persist_objects`, `commit_refs`):
+// this module and the wasm tenant's `files_odb::FilesOdbBacking` commit through
+// the same two halves, and the disk crate is the one both reach.
+pub use duckfs_disk::{commit_refs, persist_objects};
 
 /// the native module glue over the pure [`Fs`] core. generic over the two
 /// persistence seams — the object store `S` and the refs store `R` — so the same
@@ -164,16 +53,16 @@ impl Files {
     /// restart), height, and gc watermark from the refs-file envelope.
     pub fn open(id: impl Into<ModuleId>, dir: PathBuf) -> Result<Self, Error> {
         let refs_store = DiskRefs::open(dir.clone())
-            .map_err(|e| Error::Module(format!("files: refs open: {e}")))?;
+            .map_err(|e| Error::module("files_refs_open", format!("files: refs open: {e}")))?;
         let (refs, durable_height, gc_watermark) = match refs_store
             .load()
-            .map_err(|e| Error::Module(format!("files: refs load: {e}")))?
+            .map_err(|e| Error::module("files_refs_load", format!("files: refs load: {e}")))?
         {
             Some((refs, height, gc_watermark)) => (refs, Some(height), gc_watermark),
             None => (Refs::default(), None, 0),
         };
         let store = DiskStore::open(dir.join("objects"))
-            .map_err(|e| Error::Module(format!("files: odb open: {e}")))?;
+            .map_err(|e| Error::module("files_odb_open", format!("files: odb open: {e}")))?;
         Ok(Self {
             id: id.into(),
             fs: Fs::new(store, refs),
@@ -227,11 +116,11 @@ impl<S: ObjectStore, R: RefsStore> Files<S, R> {
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot, height: u64) -> Result<(), Error> {
         self.fs
             .install_refs(bytes, expected.0)
-            .map_err(Error::Module)?;
+            .map_err(|e| Error::module("files_install_refs", e))?;
         self.durable_height = Some(height);
         self.refs_store
             .save(self.fs.refs(), height, self.gc_watermark)
-            .map_err(|e| Error::Module(format!("files: refs save: {e}")))?;
+            .map_err(|e| Error::module("files_refs_save", format!("files: refs save: {e}")))?;
         Ok(())
     }
 
@@ -247,7 +136,9 @@ impl<S: ObjectStore, R: RefsStore> Files<S, R> {
     /// the ids of up to `limit` objects reachable from the committed refs but not
     /// yet in the odb — the fetch driver's worklist. see [`Fs::missing_objects`].
     pub fn missing_objects(&self, limit: usize) -> Result<Vec<ObjectId>, Error> {
-        self.fs.missing_objects(limit).map_err(Error::Module)
+        self.fs
+            .missing_objects(limit)
+            .map_err(|e| Error::module("files_missing_objects", e))
     }
 
     /// verify-then-store a batch of fetched objects, then fsync the odb dirs ONCE
@@ -260,12 +151,12 @@ impl<S: ObjectStore, R: RefsStore> Files<S, R> {
         for (id, kind, body) in batch {
             self.fs
                 .ingest_object(id, *kind, body)
-                .map_err(Error::Module)?;
+                .map_err(|e| Error::module("files_ingest_object", e))?;
         }
         self.fs
             .store_mut()
             .sync_dirs()
-            .map_err(|e| Error::Module(format!("files: odb sync: {e}")))?;
+            .map_err(|e| Error::module("files_odb_sync", format!("files: odb sync: {e}")))?;
         Ok(())
     }
 
@@ -276,7 +167,9 @@ impl<S: ObjectStore, R: RefsStore> Files<S, R> {
     /// cheap presence walk. running it here, once at the boundary, keeps the cost
     /// off the loop.
     pub fn possession_complete(&self) -> Result<bool, Error> {
-        self.fs.possession_complete().map_err(Error::Module)
+        self.fs
+            .possession_complete()
+            .map_err(|e| Error::module("files_possession", e))
     }
 
     /// `#[doc(hidden)]` test seam: stage a pending block directly so the real
@@ -417,8 +310,11 @@ impl<S: ObjectStore, R: RefsStore> Module for Files<S, R> {
     }
 
     async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let req = decode_sync_req(req).map_err(Error::Module)?;
-        let resp = self.fs.serve_sync(req).map_err(Error::Module)?;
+        let req = decode_sync_req(req).map_err(|e| Error::module("codec", e))?;
+        let resp = self
+            .fs
+            .serve_sync(req)
+            .map_err(|e| Error::module("files_serve_sync", e))?;
         Ok(encode_sync_resp(&resp))
     }
 
@@ -427,8 +323,11 @@ impl<S: ObjectStore, R: RefsStore> Module for Files<S, R> {
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let q = decode_query(req).map_err(Error::Module)?;
-        let reply = self.fs.query(q).map_err(Error::Module)?;
+        let q = decode_query(req).map_err(|e| Error::module("codec", e))?;
+        let reply = self
+            .fs
+            .query(q)
+            .map_err(|e| Error::module("files_query", e))?;
         Ok(encode_reply(&reply))
     }
 

@@ -100,6 +100,17 @@ pub(crate) async fn run_validator(
         genesis,
     )
     .await;
+    // the recovered floor, the moment it is known and long before the engine
+    // can publish a boundary: the mesh wiring and the boot catch-up probe below
+    // hold this node in `recovering` for tens of seconds, and the boot publish
+    // left `height` 0 and `root_hash` "" — which reads to an operator watching
+    // a release flip as a chain that went to zero.
+    if let Some(recovered) = resumed.as_ref() {
+        status.publish_recovered(
+            recovered.height.unwrap_or(0),
+            crate::util::hex(&recovered.root_hash),
+        );
+    }
 
     let wiring::PreWiring {
         initial_member_keys,
@@ -139,7 +150,7 @@ pub(crate) async fn run_validator(
         primary_coordinator,
         wireguard_advertised,
         invite_listen,
-        coord_cap,
+        coord_cap.clone(),
         presence_requests,
         overlay_slot.clone(),
         planes.clone(),
@@ -163,7 +174,7 @@ pub(crate) async fn run_validator(
         gateway_book,
         blob_peers,
         blob_client,
-        sync_state_rx,
+        mut sync_state_rx,
         sync_state_tx,
         sync_retention,
         relay_ingress,
@@ -268,6 +279,7 @@ pub(crate) async fn run_validator(
         &context,
         &index,
         &mut recovery,
+        &mut sync_state_rx,
         &metrics,
         &signer,
         &namespace,
@@ -317,6 +329,7 @@ pub(crate) async fn run_validator(
     tokio::spawn(crate::sync::divergence::watch_root_divergence(
         blob_client.clone(),
         sync_state_tx,
+        metrics.clone(),
         signer.public_key(),
         label.clone(),
     ));
@@ -408,6 +421,7 @@ pub(crate) async fn run_validator(
         status,
         status_public_key,
         coordination,
+        coord_cap,
         workspace: gateway_workspace,
     })
     .await;
@@ -558,6 +572,7 @@ pub(crate) async fn run_promoted(
     tokio::spawn(crate::sync::divergence::watch_root_divergence(
         blob_client.clone(),
         sync_state_tx,
+        metrics.clone(),
         signer.public_key(),
         label.clone(),
     ));
@@ -818,6 +833,7 @@ pub(crate) async fn run_promoted(
         status,
         status_public_key,
         coordination,
+        coord_cap,
         workspace,
     })
     .await;

@@ -17,6 +17,11 @@ use config::{hex_bytes, unhex};
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
 
+/// how long `node peers` holds between its two samples. rates divide by the
+/// measured gap, so this only trades the verb's latency against how many
+/// messages a rate averages over.
+const PEER_RATE_SAMPLE_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// route one operator verb to its handler — ONE visible dispatch, nothing in
 /// the arms but delegation. (`run` never reaches here; `main.rs` owns the
 /// node-boot path.) the grammar itself lives in `cli_args.rs`.
@@ -30,6 +35,7 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::List => cmd_list(),
         OpCmd::Status(args) => cmd_node_status(args),
         OpCmd::Qualify(args) => crate::qualify::run(args),
+        OpCmd::RecordWorld(args) => cmd_record_world(args),
         OpCmd::Peers(args) => cmd_node_peers(args),
         OpCmd::Resident(cmd) => dispatch_resident(cmd),
         OpCmd::Member(cmd) => dispatch_member(cmd),
@@ -63,7 +69,7 @@ fn cmd_log_filter(args: crate::cli_args::LogFilterArgs) -> CommandResult {
     let key_path = ctx.key_path()?;
     let node_key = crate::node_http::pinned_node_key(&key_path, &base, args.trust_node)?;
     let mut stdin = std::io::BufReader::new(std::io::stdin());
-    let signer = crate::userkey_cli::load_user_signer(&key_path, &mut stdin)?;
+    let signer = crate::userkey_cli::load_user_signer_for(&base, &key_path, &mut stdin)?;
 
     const PATH: &str = "/v1/log-filter";
     let body = args.filter.into_bytes();
@@ -220,23 +226,34 @@ fn dispatch_join(cmd: JoinCmd) -> CommandResult {
 /// prints a friendly notice on stderr and exits 0 (no workspace yet is not
 /// an error).
 fn cmd_list() -> CommandResult {
-    let workspaces = config::list_workspaces()?;
+    let workspaces = config::registered_networks()?;
     if workspaces.is_empty() {
         eprintln!("no workspaces under {}", config::ducktape_home()?.display());
         return Ok(());
     }
-    for (chain_id, config_path) in workspaces {
-        println!("{chain_id}\t{}", config_path.display());
+    // a remote workspace (`ducktape forge setup --node`) names the node it
+    // dials: its file is not a node.toml, and `--config` takes no such file.
+    for (chain_id, registered) in workspaces {
+        match registered {
+            config::Registered::Local(node_toml) => {
+                println!("{chain_id}\t{}", node_toml.display())
+            }
+            config::Registered::Remote { file, node } => {
+                println!("{chain_id}\t{}\tremote node {node}", file.display())
+            }
+        }
     }
     Ok(())
 }
 
 /// `status [--config <path> | -n <chain-id>] [--json]` — read the RUNNING
-/// node's tip off its local rpc and print one machine-parseable line to
-/// stdout:
+/// node's tip off its local rpc and print it to stdout, one line per subject
+/// ([`status_lines`]):
 ///
 /// ```text
 /// height=<h> root_hash=<hex>
+/// role=<role> phase=<phase> …
+/// follow: behind_by=<n> network_height=<h> (heard <age> ago)
 /// ```
 ///
 /// `height=none` means no block has finalized yet. `--json` emits the rpc's
@@ -258,7 +275,11 @@ fn cmd_node_status(args: StatusArgs) -> CommandResult {
         println!("{status}");
         return Ok(());
     }
-    for line in status_lines(status) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is past the epoch")
+        .as_secs();
+    for line in status_lines(status, now) {
         println!("{line}");
     }
     let Some(seconds) = stalled_past_recovery(status) else {
@@ -284,7 +305,7 @@ const CHAIN_IS_STALLED: i32 = 2;
 
 /// What `node status` prints, in order — one `key=value` line per subject, so
 /// the whole answer stays greppable.
-fn status_lines(status: &serde_json::Value) -> Vec<String> {
+fn status_lines(status: &serde_json::Value, now: u64) -> Vec<String> {
     let height = match status["height"].as_u64() {
         Some(h) => h.to_string(),
         None => "none".into(),
@@ -293,8 +314,29 @@ fn status_lines(status: &serde_json::Value) -> Vec<String> {
     let operations = &status["operations"];
     let mut lines = vec![format!("height={height} root_hash={root_hash}")];
     lines.extend(standing_line(operations));
+    lines.push(follow_line(&operations["follow"], now));
     lines.extend(netstack_line(&operations["netstack"]));
     lines
+}
+
+/// the `follow:` line: how far this node's height is from the tip a peer last
+/// answered with, and how long ago that answer landed — the one comparison
+/// that tells a joiner whether `height=` is the tip or far below it. It reads
+/// the same [`noded::FollowOperationalStatus`] `--json` serializes, and
+/// `behind_by=0` prints like any other gap: "caught up" is an answer too.
+///
+/// A node no peer has answered yet says so, rather than a zero gap it never
+/// measured.
+fn follow_line(follow: &serde_json::Value, now: u64) -> String {
+    let Ok(follow) = serde_json::from_value::<noded::FollowOperationalStatus>(follow.clone())
+    else {
+        return "follow: none yet".to_string();
+    };
+    let heard = human_duration(now.saturating_sub(follow.heard_at));
+    format!(
+        "follow: behind_by={} network_height={} (heard {heard} ago)",
+        follow.behind_by, follow.network_height
+    )
 }
 
 /// the `role=`/`phase=` line: where this node stands, and — when it is in
@@ -326,6 +368,7 @@ fn standing_line(operations: &serde_json::Value) -> Option<String> {
     {
         line.push_str(&format!(" stalled_for={seconds}s"));
     }
+    // the gap that sizes a `phase=behind` is the next line's: [`follow_line`].
     Some(line)
 }
 
@@ -347,8 +390,17 @@ fn stalled_past_recovery(status: &serde_json::Value) -> Option<u64> {
 /// runs on, and — once this process has swapped at all — how the last swap
 /// went. `None` on a node with no plane, which prints nothing rather than a
 /// misleading `netstack=none`.
+///
+/// A PLANE THAT IS NOT RUNNING PREEMPTS THE SWAP HISTORY. This node has no
+/// overlay at all while that holds — no tunnels, no join door — so the swap it
+/// last answered is not what the reader needs; the reason it has no mesh is.
 fn netstack_line(netstack: &serde_json::Value) -> Option<String> {
     let backend = netstack["backend"].as_str()?;
+    if let Some((reason, detail)) = netstack_failure_in_section(netstack) {
+        return Some(format!(
+            "netstack={backend} NO MESH reason={reason} — {detail}"
+        ));
+    }
     let last_swap = &netstack["last_swap"];
     let Some(outcome) = last_swap["outcome"].as_str() else {
         return Some(format!("netstack={backend}"));
@@ -400,7 +452,8 @@ fn cmd_netstack_swap(args: crate::cli_args::NetstackSwapArgs) -> CommandResult {
 }
 
 /// `peers [--config <path> | -n <chain-id>] [--json]` — the RUNNING node's
-/// direct-peer sample off its local rpc: one `key=value` line per peer.
+/// direct-peer sample off its local rpc: its own height, then one
+/// `key=value` line per peer ([`peers_lines`]).
 /// `--json` emits one raw [`noded::peers::PeersView`] sample (cumulative
 /// counters — consumers derive rates from deltas); the prose form takes a
 /// second sample after one second so the line can carry live `…/s` rates.
@@ -419,19 +472,50 @@ fn cmd_node_peers(args: StatusArgs) -> CommandResult {
         );
         return Ok(());
     }
-    if first.peers.is_empty() {
-        println!("no direct peers");
-        return Ok(());
-    }
     // cumulative counters only become rates as a delta over time: hold one
     // second, sample again, and let the SECOND sample carry the truth.
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    let second = peers_rpc(&rpc_addr)?;
-    for peer in &second.peers {
-        let baseline = first.peers.iter().find(|p| p.peer == peer.peer);
-        println!("{}", peer_line(peer, baseline, &first, &second));
+    let second = match first.peers.is_empty() {
+        true => None,
+        false => {
+            std::thread::sleep(PEER_RATE_SAMPLE_GAP);
+            Some(peers_rpc(&rpc_addr)?)
+        }
+    };
+    for line in peers_lines(&first, second.as_ref()) {
+        println!("{line}");
     }
     Ok(())
+}
+
+/// What `node peers` prints: the answering node's own position first — the
+/// `height` (and `epoch`) the sample stamps beside the table, the same
+/// figures `--json` carries — then one line per peer. `second` is the rate
+/// sample, absent when the first one found no peer to rate.
+///
+/// The mesh gossips no per-peer head, so no row carries a peer's height; the
+/// `sync_height=`/`sync_boundary=` a row may carry are what THIS node served
+/// that peer over state sync.
+fn peers_lines(
+    first: &noded::peers::PeersView,
+    second: Option<&noded::peers::PeersView>,
+) -> Vec<String> {
+    let Some(second) = second else {
+        return vec![position_line(first), "no direct peers".to_string()];
+    };
+    let rows = second.peers.iter().map(|peer| {
+        let baseline = first.peers.iter().find(|p| p.peer == peer.peer);
+        peer_line(peer, baseline, first, second)
+    });
+    std::iter::once(position_line(second)).chain(rows).collect()
+}
+
+/// `height=<h>[ epoch=<e>]` — the sampler's coordinates; a lane with no
+/// consensus has no epoch to name.
+fn position_line(view: &noded::peers::PeersView) -> String {
+    match view.epoch {
+        Some(epoch) => format!("height={} epoch={epoch}", view.height),
+        None => format!("height={}", view.height),
+    }
 }
 
 /// one `peers` rpc round-trip, decoded to the shared view.
@@ -564,7 +648,7 @@ fn detect_platform_sandbox(workspace: &std::path::Path) -> Option<config::Sandbo
     Some(table)
 }
 
-/// `init --name <human name> [--dir <dir>] [--modules <dir>] [--listen a]
+/// `init --name <name> [--dir <dir>] [--modules <dir>] [--listen a]
 /// [--advertised a] [--http a] [--rpc a] [--primary-coordinator host:port|none]
 /// [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]`
 /// — found a network: mint the chain-id, write the descriptor + node config,
@@ -719,16 +803,50 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         true => format!("--config {}/node.toml", dir.display()),
         false => format!("-n '{chain_id}'"),
     };
-    eprintln!("start:  ducktape node run {selector}");
+    eprintln!("start:  {}", launcher_start(&dir));
     eprintln!("invite: ducktape node invite {selector}");
     println!("{chain_id}");
+    Ok(())
+}
+
+/// How every verb that brings a workspace into existence says to start it:
+/// UNDER `ducktape-node-launcher`, which seeds the first release from this
+/// very binary and then follows the network's node releases — the key they
+/// are signed with included, which it pins from the network on first read. A
+/// bare `ducktape node run` is the verb the launcher execs; started by hand it
+/// follows no release, and no later node release can reach it.
+///
+/// Real paths: the launcher ships beside `ducktape` in every shape that ships
+/// it (the node archive's root, a cargo target directory, an install), so it
+/// is named there.
+fn launcher_start(workspace: &std::path::Path) -> String {
+    let this = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ducktape"));
+    let launcher = this.with_file_name("ducktape-node-launcher");
+    let (launcher, this) = (launcher.display(), this.display());
+    let ws = workspace.display();
+    let config = workspace.join("node.toml");
+    let config = config.display();
+    format!(
+        "`'{launcher}' install --workspace '{ws}' --config '{config}' --from '{this}'` then \
+         `'{launcher}' run --workspace '{ws}' --config '{config}'`"
+    )
+}
+
+/// `node record-world`: the release a node launcher flipped to came up
+/// healthy, so the world it speaks is the workspace's from now on. The
+/// launcher runs it as that release's own binary, the one that links it.
+fn cmd_record_world(args: SelectorArgs) -> CommandResult {
+    let cfg_path = args.selector.config_path()?;
+    let resolved = config::resolve(&cfg_path)?;
+    record_founding_binary(&resolved.service.workspace)?;
     Ok(())
 }
 
 /// stamp the binary that just materialized `dir` into the workspace's founding
 /// record — the identity `node run` refuses a disagreeing binary against
 /// (`config::guard_founding_binary`). Written by the two verbs that BRING a
-/// workspace into existence, `init` and `join`, and by nothing else.
+/// workspace into existence, `init` and `join`, and by `record-world`, which a
+/// node launcher runs once a release its network designated came up healthy.
 fn record_founding_binary(dir: &std::path::Path) -> Result<(), String> {
     config::FoundingBinary {
         build: noded::services::build_identity_or_unknown().to_string(),
@@ -783,12 +901,82 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
     // sealed first-contact intro. `--ttl-days` defaults to and is bounded by
     // `config::{DEFAULT_INVITE_TTL_DAYS, INVITE_TTL_DAYS}` in clap (the same
     // numbers `/v1/invite` resolves), so the value arrives settled.
-    let (blob, notes) = mint_invite_blob(&args.selector.config_path()?, args.ttl_days)?;
+    let cfg_path = args.selector.config_path()?;
+    // the plane's standing lives in the RUNNING node, never in this process: a
+    // CLI mint reads the same files the node owns and can see none of its
+    // state. So ask it, before minting a credential nobody could redeem.
+    if let Some(refusal) = mesh_refusal(&cfg_path) {
+        return Err(refusal.into());
+    }
+    let (blob, notes) = mint_invite_blob(&cfg_path, args.ttl_days)?;
+    // the blob first, the notes after it: a note is not a refusal, and an
+    // operator who is handed one before the thing they asked for reads it as
+    // the reason they did not get it. stdout is flushed between the two so a
+    // redirected (block-buffered) stdout keeps that order too.
+    println!("{blob}");
+    std::io::Write::flush(&mut std::io::stdout())?;
     for note in notes {
         eprintln!("[invite] {note}");
     }
-    println!("{blob}");
     Ok(())
+}
+
+/// The refusal a front NOBODY off this box can dial earns a mint. The
+/// operator named no tunnel address, so `wireguard_advertised = "auto"`
+/// reused the p2p hint and landed on loopback: every stranger handed that
+/// invite resolves it to their OWN machine and fails ninety seconds later,
+/// with nothing in the blob to say why. So the credential is refused instead
+/// of printed, and the refusal names the one line that fixes it.
+///
+/// A loopback the operator WROTE is untouched — a same-box joiner is a real
+/// shape, and this only ever fires on an address the node chose itself.
+fn derived_loopback_refusal(host: &str, port: u16) -> String {
+    format!(
+        "reason=invite_front_derived_loopback nothing in node.toml names this node's tunnel \
+         address, so wireguard_advertised = \"auto\" fell back to {host} — a loopback address \
+         that sends every joiner to their own machine, so nobody off this box could redeem the \
+         invite. Set wireguard_advertised = \"<routable host>:{port}\" in node.toml (or pass \
+         --wireguard-advertised to node init/join) and mint again."
+    )
+}
+
+/// The refusal a dead reachability plane earns a mint, on either side of the
+/// node boundary: one sentence, so the daemon route and the CLI cannot say
+/// different things about the same fact.
+fn mesh_down_refusal(reason: &str, detail: &str) -> String {
+    format!(
+        "reason={reason} this node has no reachability plane, so an invite minted now could \
+         never be redeemed — every path it would carry is dead before a joiner tries it. {detail}"
+    )
+}
+
+/// Ask the node that owns `cfg_path` whether its mesh is up, over the same
+/// unauthenticated `/v1/status` the app reads.
+///
+/// `None` means MINT: either the plane is fine, or NOTHING ANSWERED — a node
+/// that is not running has no plane to be dead, and minting before boot is
+/// ordinary. Only a node that answers and names a netstack failure refuses.
+fn mesh_refusal(cfg_path: &std::path::Path) -> Option<String> {
+    let base = config::http_base_in(cfg_path.parent()?).ok()?;
+    let status = crate::node_http::get_json(&base, "/v1/status").ok()?;
+    let netstack = status.get("operations")?.get("netstack")?;
+    netstack_failure_in_section(netstack)
+        .map(|(reason, detail)| mesh_down_refusal(&reason, &detail))
+}
+
+/// Why this node has no overlay, as its `operations.netstack` section says it
+/// (`noded::NetstackOperationalStatus`) — `None` on a node whose plane is
+/// starting, running or stopped. THE one reader of those two fields: `node
+/// status` prints it and the invite mint refuses on it, and a second reader
+/// would be a second answer to one question.
+fn netstack_failure_in_section(netstack: &serde_json::Value) -> Option<(String, String)> {
+    let reason = netstack.get("failure_reason")?.as_str()?.to_string();
+    let detail = netstack
+        .get("failure_detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((reason, detail))
 }
 
 /// What the mint could not do, said once. A note is never a failure — an
@@ -806,6 +994,17 @@ pub(crate) enum InviteNote {
     NoMeshStateYet(std::path::PathBuf),
     /// mesh state is present and unreadable.
     MeshStateUnreadable(std::path::PathBuf, String),
+    /// nothing in this config names a dialable underlay host, and no
+    /// coordinator stands in for one: the blob admits a joiner on this
+    /// machine and nowhere else.
+    NotDialableOffBox,
+    /// some carried paths only route inside the LAN or tailnet of the member
+    /// they name; `outside` is what is left for a joiner anywhere else, and
+    /// may be empty.
+    LanOnlyPaths {
+        lan_only: Vec<String>,
+        outside: Vec<String>,
+    },
 }
 
 impl InviteNote {
@@ -815,6 +1014,8 @@ impl InviteNote {
             InviteNote::MeshHasNoOtherMembers(_) => "invite_mesh_has_no_other_members",
             InviteNote::NoMeshStateYet(_) => "invite_no_mesh_state",
             InviteNote::MeshStateUnreadable(_, _) => "invite_mesh_state_unreadable",
+            InviteNote::NotDialableOffBox => "invite_not_dialable_off_box",
+            InviteNote::LanOnlyPaths { .. } => "invite_lan_only_paths",
         }
     }
 }
@@ -839,8 +1040,68 @@ impl std::fmt::Display for InviteNote {
                 "mesh state at {} unreadable ({why}) — the invite carries no member fronts",
                 path.display()
             ),
+            InviteNote::NotDialableOffBox => write!(
+                f,
+                "this invite is reachable on this machine only — set `advertised` (or a \
+                 concrete wireguard_listen IP) and mint again to invite over the network"
+            ),
+            InviteNote::LanOnlyPaths { lan_only, outside } => {
+                let lan_only = lan_only.join(", ");
+                let reaches_from_outside = !outside.is_empty();
+                match reaches_from_outside {
+                    true => write!(
+                        f,
+                        "{lan_only} only work(s) from the same LAN or tailnet; from outside \
+                         it, a joiner gets in through {}",
+                        outside.join(", ")
+                    ),
+                    false => write!(
+                        f,
+                        "{lan_only} only work(s) from the same LAN or tailnet, and nothing in \
+                         this invite reaches this network from outside it — a joiner anywhere \
+                         else cannot get in; set `wireguard_advertised` to a public host:port \
+                         and mint again to invite over the internet"
+                    ),
+                }
+            }
         }
     }
+}
+
+/// Which of the paths an invite carries route only inside one LAN or
+/// tailnet — said once, so an operator handing the blob to a stranger
+/// elsewhere knows before the stranger fails. `endpoints` are the direct
+/// `host:port` paths (the inviter's tunnel endpoint, every direct front); the
+/// coordinator is the rendezvous a joiner anywhere reaches a registered member
+/// through. `None` when no path is LAN-only: minting never refuses, because a
+/// LAN invite is a legitimate one.
+fn lan_only_note(endpoints: &[&str], coordinator: Option<&str>) -> Option<InviteNote> {
+    let coordinator = coordinator.map(|c| format!("coordinator {c}"));
+    let paths = endpoints.iter().map(|e| e.to_string()).chain(coordinator);
+    let (lan_only, outside): (Vec<String>, Vec<String>) =
+        paths.partition(|path| path_is_lan_only(path));
+    let every_path_routes = lan_only.is_empty();
+    if every_path_routes {
+        return None;
+    }
+    Some(InviteNote::LanOnlyPaths { lan_only, outside })
+}
+
+/// Does this `host:port` (optionally after a `coordinator ` label) route only
+/// inside one network? An IP literal in a private, CGNAT/tailnet, loopback,
+/// link-local or ULA range, or an mDNS `.local` name — which only the LAN it
+/// is announced on resolves.
+fn path_is_lan_only(path: &str) -> bool {
+    let host_port = path.rsplit(' ').next().unwrap_or(path);
+    if let Ok(addr) = host_port.parse::<std::net::SocketAddr>() {
+        return crate::first_contact_join::ip_is_unroutable_offnet(addr.ip());
+    }
+    let host = host_port
+        .rsplit_once(':')
+        .map_or(host_port, |(host, _)| host);
+    host.trim_end_matches('.')
+        .to_ascii_lowercase()
+        .ends_with(".local")
 }
 
 /// Mint one bearer invite from the workspace `cfg_path` names, answering the
@@ -853,6 +1114,18 @@ pub(crate) fn mint_invite_blob(
     cfg_path: &std::path::Path,
     ttl_days: u64,
 ) -> Result<(String, Vec<InviteNote>), Box<dyn std::error::Error>> {
+    // A NOTE SAYS THE BLOB CARRIES FEWER PATHS; THIS SAYS IT CARRIES NONE. With
+    // no reachability plane this member has no overlay at all — no tunnel, no
+    // intro door — so every path the blob would offer is dead before a joiner
+    // tries one, and the joiner spends ninety seconds finding that out. An
+    // invite nobody can redeem is worse than a refusal.
+    //
+    // In-process only, which is exactly right: the daemon mints through
+    // `/v1/invite` and holds the plane, and a CLI mint in a second process
+    // asks the running node instead (`mesh_refusal`).
+    if let Some((reason, detail)) = crate::reachability_plane::plane_failure() {
+        return Err(mesh_down_refusal(reason, &detail).into());
+    }
     // the expiry is settled FIRST: a TTL outside the range is refused before
     // the descriptor below is rewritten for a mint that was never going to happen.
     let now = std::time::SystemTime::now()
@@ -863,11 +1136,33 @@ pub(crate) fn mint_invite_blob(
     let mut notes = Vec::new();
     let cfg_path = cfg_path.to_path_buf();
     let (raw, base) = config::load_node_toml(&cfg_path)?;
+    // the front is settled HERE, for the same reason the expiry is: a mint
+    // that is not going to happen must not first rewrite the descriptor
+    // below. It is also the one computation of the front — the bootstrap
+    // further down reads this value rather than deriving a second one.
+    let wg_listen: std::net::SocketAddr = raw
+        .wireguard_listen
+        .parse()
+        .map_err(|e| format!("wireguard_listen: {e}"))?;
+    let front = config::invite_front(
+        Some(&raw.advertised),
+        &raw.listen,
+        wg_listen,
+        raw.wireguard_advertised_value(),
+    )?;
+    if let Some(front) = &front
+        && front.is_derived_loopback()
+    {
+        return Err(derived_loopback_refusal(&front.host, wg_listen.port()).into());
+    }
     let descriptor_path = base.join(&raw.network);
     let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
     let key = config::load_identity(&base.join(&raw.key_file))?;
     let dial_hint = config::dialable(Some(&raw.advertised), &raw.listen)?;
-    let has_coordinated_reach = descriptor.has_coordinated_reach()?;
+    // the coordinator this member rendezvouses through rides the invite, so a
+    // joiner registers where the network's members do — its own coordinator,
+    // or none — instead of falling back to the compiled public default.
+    let coordinator = config::primary_coordinator_or_default(Some(&raw.primary_coordinator))?;
     let descriptor_changed = match &dial_hint {
         Some(addr) => descriptor.add_bootstrap(&key.public_key(), addr),
         None => false,
@@ -882,10 +1177,6 @@ pub(crate) fn mint_invite_blob(
     // tunnel routes. the bootstrap is mandatory (the overlay plane
     // carries the data planes and the sealed first-contact intro) — and the
     // network shape always runs the plane (`wireguard_listen` is required).
-    let wg_listen: std::net::SocketAddr = raw
-        .wireguard_listen
-        .parse()
-        .map_err(|e| format!("wireguard_listen: {e}"))?;
     let wireguard = {
         let (wg_keypair, _) =
             reachability::WireGuardKeypair::load_or_generate(&base.join("wireguard.key"))
@@ -895,34 +1186,13 @@ pub(crate) fn mint_invite_blob(
             .parse::<std::net::SocketAddr>()
             .map(|a| a.port())
             .map_err(|e| format!("listen {:?}: {e}", raw.listen))?;
-        let host = match config::endpoint_host(
-            Some(&raw.advertised),
-            &raw.listen,
-            wg_listen,
-            raw.wireguard_advertised_value(),
-        ) {
-            Ok(host) => Some(host),
-            Err(_) if has_coordinated_reach => {
-                // Coordinated reach gives the joiner a rendezvous path; there is
-                // deliberately no inviter-hosted underlay endpoint to bake in.
-                None
-            }
-            Err(err) => return Err(err.into()),
-        };
-        match host {
-            Some(host) => {
+        // a config that NAMES no dialable host mints an endpoint-less
+        // bootstrap — never a refusal. Only a config that is WRONG still
+        // aborts the mint (`invite_front`'s `Err`, settled above).
+        match front {
+            Some(config::InviteFront { host, endpoint, .. }) => {
                 let intro_port =
                     config::resolved_invite_listen(Some(&raw.invite_listen), wg_listen)?.port();
-                // the tunnel endpoint carries the FULL advertised host:port when
-                // `wireguard_advertised` is configured — the external port can
-                // differ from the bind port in the port-forwarded setup the key
-                // exists for. The intro stays host + intro port.
-                let endpoint = config::invite_wireguard_endpoint(
-                    Some(&raw.advertised),
-                    &raw.listen,
-                    wg_listen,
-                    raw.wireguard_advertised_value(),
-                )?;
                 config::InviteWireGuard {
                     public_key: wg_keypair.public_key().0,
                     endpoint: Some(endpoint),
@@ -930,12 +1200,22 @@ pub(crate) fn mint_invite_blob(
                     mesh_port,
                 }
             }
-            None => config::InviteWireGuard {
-                public_key: wg_keypair.public_key().0,
-                endpoint: None,
-                intro: None,
-                mesh_port,
-            },
+            None => {
+                // the coordinator the blob carries gives the joiner a
+                // rendezvous path, so an endpoint-less blob is still a
+                // complete one; without it the joiner has nothing to dial from
+                // another machine, and that is what the operator has to be
+                // told.
+                if coordinator.is_none() {
+                    notes.push(InviteNote::NotDialableOffBox);
+                }
+                config::InviteWireGuard {
+                    public_key: wg_keypair.public_key().0,
+                    endpoint: None,
+                    intro: None,
+                    mesh_port,
+                }
+            }
         }
     };
 
@@ -973,11 +1253,11 @@ pub(crate) fn mint_invite_blob(
         }
     };
 
-    // stop embedding a coordinator address in the invite: the joiner reaches
-    // every path through its OWN ambient coordinator (config/default), never a
-    // coordinator baked into the blob. The inviter still registers with its own
-    // coordinator via its own config; here we only strip Coordinated reach
-    // hints from the ENCODED copy — the on-disk descriptor keeps its config.
+    // the joiner reaches every path through ONE coordinator — its node.toml's,
+    // seeded from the `coordinator` this blob carries — never a per-member
+    // coordinator baked into the descriptor. Here we only strip Coordinated
+    // reach hints from the ENCODED copy — the on-disk descriptor keeps its
+    // config.
     let mut invite_descriptor = descriptor.clone();
     invite_descriptor
         .reach
@@ -985,8 +1265,23 @@ pub(crate) fn mint_invite_blob(
 
     // the expiry lives INSIDE the token (signed), not as a separate blob field.
     // every invite is bearer.
+    let direct_paths: Vec<&str> = wireguard
+        .endpoint
+        .iter()
+        .chain(fronts.iter().filter_map(|front| front.endpoint.as_ref()))
+        .map(String::as_str)
+        .collect();
+    notes.extend(lan_only_note(&direct_paths, coordinator.as_deref()));
+
     let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes(), expires);
-    let blob_string = config::encode_invite(&invite_descriptor, &token, &wireguard, &fronts, &key)?;
+    let blob_string = config::encode_invite(
+        &invite_descriptor,
+        &token,
+        &wireguard,
+        &fronts,
+        coordinator.as_deref(),
+        &key,
+    )?;
     Ok((blob_string, notes))
 }
 
@@ -1036,7 +1331,8 @@ pub(super) fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json
         }
         _ => format!("cannot reach this node's operator rpc on {addr}: {error}"),
     })?;
-    conn.set_read_timeout(Some(std::time::Duration::from_secs(15)))
+    let read_timeout = crate::constants::RPC_CLIENT_READ_TIMEOUT;
+    conn.set_read_timeout(Some(read_timeout))
         .map_err(|e| format!("rpc timeout: {e}"))?;
     let mut writer = conn.try_clone().map_err(|e| format!("rpc clone: {e}"))?;
     let mut line = serde_json::to_string(req).expect("rpc request serializes");
@@ -1047,7 +1343,13 @@ pub(super) fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json
     let mut reply = String::new();
     BufReader::new(conn)
         .read_line(&mut reply)
-        .map_err(|e| format!("rpc read: {e}"))?;
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => format!(
+                "no answer from this node's operator rpc on {addr} in {} s",
+                read_timeout.as_secs()
+            ),
+            _ => format!("rpc read: {error}"),
+        })?;
     serde_json::from_str(reply.trim()).map_err(|e| format!("rpc reply: {e}"))
 }
 
@@ -1512,6 +1814,26 @@ pub(super) fn open_proposal_matching<'a>(
         .find(|p| p.status == governance::ProposalStatus::Open && matches(&p.action))
 }
 
+/// the record a ceremony is about to vote on carries the action it proposes.
+/// An id found free can be taken before this verb's own `Propose` lands:
+/// governance refuses the second one at apply (`proposal_id_spent`) and the
+/// record under the id is then another proposer's. A yes on it would be a
+/// ballot for an action this verb never asked for.
+fn require_own_action(
+    opened: &governance::ProposalView,
+    matches: &dyn Fn(&governance::GovAction) -> bool,
+) -> Result<(), String> {
+    let carries_ours = matches(&opened.action);
+    if carries_ours {
+        return Ok(());
+    }
+    Err(format!(
+        "proposal_id_spent: {} holds another proposal's action — nothing was voted; run the \
+         verb again and it mints a fresh id",
+        opened.proposal_id
+    ))
+}
+
 /// drive a governance proposal ceremony for `wanted` through this eligible
 /// account's running node: adopt an existing OPEN proposal `matches` accepts
 /// (else mint an unused `<id_prefix><id_seed>:<n>` id and propose), cast a yes
@@ -1605,6 +1927,7 @@ pub(super) fn drive_proposal_ceremony(
 
     let opened = read_proposal(node.rpc(), &proposal_id)?
         .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
+    require_own_action(&opened, matches)?;
     let after_vote = cast_yes_once(node, &proposal_id, opened, signer)?;
 
     // Execute only when the proposal's frozen rule says the yes power is
@@ -1796,6 +2119,39 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// What `resident remove` decides before it proposes anything.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ResidentRemoval {
+    /// the key holds no resident standing — the desired state already holds.
+    NoStanding,
+    /// it stands in the resident tier: propose the revocation.
+    Proceed,
+}
+
+/// [`precheck_promotion`]'s mirror. A seated validator is REFUSED, not a no-op:
+/// nothing is removed and the operator is sent to another verb, so a script
+/// must not read success — unlike a key with no standing at all, where the
+/// state asked for already holds.
+pub(super) fn precheck_resident_removal(
+    pubkey_hex: &str,
+    key: &[u8],
+    members: &[Vec<u8>],
+    residents: &[Vec<u8>],
+) -> Result<ResidentRemoval, String> {
+    let seated = members.iter().any(|m| m == key);
+    if seated {
+        return Err(format!(
+            "{pubkey_hex} is a seated validator, not a resident — remove it with \
+             `ducktape node member remove {pubkey_hex}`"
+        ));
+    }
+    let resident = residents.iter().any(|r| r == key);
+    match resident {
+        true => Ok(ResidentRemoval::Proceed),
+        false => Ok(ResidentRemoval::NoStanding),
+    }
+}
+
 /// `resident remove <hex pubkey> [--config node.toml]` — revoke resident
 /// standing: drive a governance RemoveResident proposal through this account's
 /// own RUNNING node. the mirror of `resident accept` with inverted guards — a
@@ -1819,16 +2175,13 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
     let signer = gov_signer(node.rpc(), &cfg_path, &resolved)?;
 
     let members = read_members(node.rpc())?;
-    if members.contains(&key_bytes) {
-        eprintln!(
-            "{pubkey_hex} is a seated validator, not a resident — remove it with \
-             `ducktape node member remove {pubkey_hex}`"
-        );
-        return Ok(());
-    }
-    if !read_residents(node.rpc())?.contains(&key_bytes) {
-        eprintln!("{pubkey_hex} holds no resident standing — nothing to do");
-        return Ok(());
+    let residents = read_residents(node.rpc())?;
+    match precheck_resident_removal(pubkey_hex, &key_bytes, &members, &residents)? {
+        ResidentRemoval::NoStanding => {
+            eprintln!("{pubkey_hex} holds no resident standing — nothing to do");
+            return Ok(());
+        }
+        ResidentRemoval::Proceed => {}
     }
     let wanted = GovAction::RemoveResident { key: key_bytes };
     let same_action = {
@@ -2082,8 +2435,9 @@ fn collect_blob_lines(reader: impl std::io::BufRead) -> std::io::Result<String> 
 /// `--genesis` is the founder's `<workspace>/genesis`: required for a member
 /// (it boots into genesis with no peer to fetch from), optional for a
 /// resident (its first boot fetches the file off the mesh otherwise).
-/// `--primary-coordinator` is node-local plumbing ONLY — it never touches
-/// the invite or the joined descriptor (the coordinator is always ambient).
+/// `--primary-coordinator` overrides the coordinator the invite names for a
+/// fresh workspace (the inviter's own, or "none"); it never touches the
+/// joined descriptor.
 fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     // read BEFORE anything lands on disk: a mistyped path is refused with
     // nothing written, like a bad blob.
@@ -2141,21 +2495,19 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
         joined.chain_id,
         joined.dir.display()
     );
-    // a workspace put where the operator asked is addressed by its file; one
-    // that landed in the registry is addressed by its chain id.
-    let selector = match &args.dir {
-        Some(_) => format!("--config {}/node.toml", joined.dir.display()),
-        None => format!("-n '{}'", joined.chain_id),
-    };
+    let start = launcher_start(&joined.dir);
     if joined.is_member {
-        eprintln!("this identity is a member — start: ducktape node run {selector}");
+        eprintln!("this identity is a member — start it under the launcher: {start}");
     } else {
         eprintln!(
-            "NOT yet a member. start now — `ducktape node run {selector}` redeems \
-             this invite automatically: the node joins the network's VPN, syncs state, and \
-             comes up as a full node. no approval step follows (minting the invite WAS the \
-             approval); a member can later promote it into the quorum with \
-             `ducktape node member promote {}`.",
+            "NOT yet a member. this wrote a workspace; nothing was checked with the network. \
+             start now, under the launcher that follows the network's node releases — {start}. \
+             the node presents the invite on first contact: an invite admits exactly one node, \
+             so if it was already used or has expired the node refuses within seconds \
+             (`invite already redeemed`) and you need a fresh one from the inviter; otherwise \
+             it joins the network's VPN, syncs state, and comes up as a full node. no approval \
+             step follows (minting the invite WAS the approval); a member can later promote it \
+             into the quorum with `ducktape node member promote {}`.",
             joined.identity
         );
     }
@@ -2179,6 +2531,57 @@ mod json_output_tests {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    /// Minting never refuses a LAN invite, but it says which paths only work
+    /// from the same LAN or tailnet, and whether anything reaches from outside:
+    /// a LAN-only invite says nobody elsewhere gets in, a mixed one names the
+    /// way in, and an invite whose every path routes says nothing.
+    #[test]
+    fn an_invite_names_its_lan_only_paths_and_whether_anything_reaches_from_outside() {
+        let lan_only = super::lan_only_note(
+            &[
+                "192.168.0.70:51820",
+                "100.101.102.103:51820",
+                "10.0.0.2:51820",
+            ],
+            Some("box.local:7777"),
+        )
+        .expect("every path is LAN-only");
+        assert_eq!(lan_only.reason(), "invite_lan_only_paths");
+        let said = lan_only.to_string();
+        for path in [
+            "192.168.0.70:51820",
+            "100.101.102.103:51820",
+            "10.0.0.2:51820",
+            "coordinator box.local:7777",
+        ] {
+            assert!(said.contains(path), "{said}");
+        }
+        assert!(
+            said.contains("a joiner anywhere else cannot get in"),
+            "{said}"
+        );
+
+        let mixed = super::lan_only_note(
+            &["172.16.4.4:51820", "203.0.113.7:51820"],
+            Some("coord.example.org:443"),
+        )
+        .expect("one path is LAN-only")
+        .to_string();
+        assert!(mixed.contains("172.16.4.4:51820 only work(s)"), "{mixed}");
+        assert!(
+            mixed.contains(
+                "a joiner gets in through 203.0.113.7:51820, coordinator coord.example.org:443"
+            ),
+            "{mixed}"
+        );
+        assert!(!mixed.contains("cannot get in"), "{mixed}");
+
+        assert!(
+            super::lan_only_note(&["203.0.113.7:51820"], Some("coord.example.org:443")).is_none(),
+            "every path routes: nothing to say"
+        );
+    }
 
     /// `node status`'s netstack line: nothing at all on a node with no plane,
     /// the backend alone before the first swap, and the outcome with the height
@@ -2206,6 +2609,42 @@ mod tests {
         );
     }
 
+    /// A NODE WITH NO OVERLAY SAYS SO WHEREVER ITS STATUS IS READ. A founder
+    /// whose plane never started keeps sealing blocks and keeps answering
+    /// `/v1/status`, so the swap history is not the fact a reader needs — and
+    /// the same two fields refuse an invite mint that nobody could redeem.
+    #[test]
+    fn a_dead_mesh_preempts_the_swap_history_and_refuses_a_mint() {
+        let down = serde_json::json!({
+            "backend": "failed",
+            "failure_reason": "netstack_guest_unreadable",
+            "failure_detail": "no founding set beside the binary",
+            "last_swap": { "outcome": "swapped", "at_height": 12 },
+        });
+        assert_eq!(
+            super::netstack_line(&down),
+            Some(
+                "netstack=failed NO MESH reason=netstack_guest_unreadable — no founding set \
+                 beside the binary"
+                    .to_string()
+            )
+        );
+        let (reason, detail) =
+            super::netstack_failure_in_section(&down).expect("the section names its failure");
+        let refusal = super::mesh_down_refusal(&reason, &detail);
+        assert!(refusal.contains("reason=netstack_guest_unreadable"), "{refusal}");
+        assert!(refusal.contains("never be redeemed"), "{refusal}");
+
+        // a running plane names no failure, and nothing is refused.
+        assert_eq!(
+            super::netstack_failure_in_section(&serde_json::json!({
+                "backend": "guest",
+                "last_swap": null,
+            })),
+            None
+        );
+    }
+
     /// A node answers `status` with everything an operator needs to tell a
     /// wedged chain from a healthy one, so the verb prints it. Height and root
     /// hash alone are identical on both, forever.
@@ -2224,12 +2663,13 @@ mod tests {
             },
         });
         assert_eq!(
-            super::status_lines(&stalled),
+            super::status_lines(&stalled, HEARD_AT),
             [
                 "height=399 root_hash=2170",
                 // `reachable=1` under `quorum=2` IS the diagnosis, and the
                 // seconds say how long it has been true.
                 "role=validator phase=validating quorum=2 reachable=1 stalled_for=116s",
+                "follow: none yet",
             ]
         );
         assert_eq!(super::stalled_past_recovery(&stalled), Some(116));
@@ -2247,14 +2687,80 @@ mod tests {
             },
         });
         assert_eq!(
-            super::status_lines(&beating),
+            super::status_lines(&beating, HEARD_AT),
             [
                 "height=400 root_hash=2171",
                 "role=validator phase=validating quorum=2 reachable=2",
+                "follow: none yet",
             ]
         );
         assert_eq!(super::stalled_past_recovery(&beating), None);
     }
+
+    /// A resident that stopped following prints WHY its screen is stale: the
+    /// phase names it and the gap sizes it. Height and root hash alone are the
+    /// same two numbers a healthy node prints.
+    #[test]
+    fn a_node_that_stopped_following_prints_the_gap_it_stopped_at() {
+        let frozen = serde_json::json!({
+            "height": 155, "root_hash": "2170",
+            "operations": {
+                "role": "resident", "phase": "behind",
+                "follow": { "network_height": 756, "behind_by": 601, "heard_at": HEARD_AT },
+            },
+        });
+        assert_eq!(
+            super::status_lines(&frozen, HEARD_AT + 12)[1..],
+            [
+                "role=resident phase=behind",
+                "follow: behind_by=601 network_height=756 (heard 12s ago)",
+            ]
+        );
+    }
+
+    /// A joiner's first question is "have I caught up?", and `height=` alone
+    /// cannot answer it: the follow line prints the gap `--json` carries —
+    /// while it is catching up, once it has, and before any peer answered.
+    #[test]
+    fn a_joiner_reads_whether_it_has_caught_up() {
+        let joiner = |phase: &str, height: u64, follow: serde_json::Value| {
+            serde_json::json!({
+                "height": height, "root_hash": "2171",
+                "operations": { "role": "resident", "phase": phase, "follow": follow },
+            })
+        };
+        let catching_up = joiner(
+            "syncing",
+            155,
+            serde_json::json!({ "network_height": 756, "behind_by": 601, "heard_at": HEARD_AT }),
+        );
+        assert_eq!(
+            super::status_lines(&catching_up, HEARD_AT + 3)[2],
+            "follow: behind_by=601 network_height=756 (heard 3s ago)"
+        );
+
+        let caught_up = joiner(
+            "serving",
+            756,
+            serde_json::json!({ "network_height": 756, "behind_by": 0, "heard_at": HEARD_AT }),
+        );
+        assert_eq!(
+            super::status_lines(&caught_up, HEARD_AT + 185)[1..],
+            [
+                "role=resident phase=serving",
+                "follow: behind_by=0 network_height=756 (heard 3m05s ago)",
+            ]
+        );
+
+        let unheard = joiner("syncing", 0, serde_json::Value::Null);
+        assert_eq!(
+            super::status_lines(&unheard, HEARD_AT)[2],
+            "follow: none yet"
+        );
+    }
+
+    /// the unix second the fixtures' tip landed at.
+    const HEARD_AT: u64 = 1_758_000_000;
 
     /// A silence shorter than the point the chain recovers on its own is
     /// PRINTED and not exited on: a view change or a slow disk is not a dead
@@ -2273,7 +2779,7 @@ mod tests {
             },
         });
         assert_eq!(
-            super::status_lines(&blipping)[1],
+            super::status_lines(&blipping, HEARD_AT)[1],
             "role=validator phase=validating quorum=2 reachable=2 stalled_for=12s"
         );
         assert_eq!(super::stalled_past_recovery(&blipping), None);
@@ -2292,18 +2798,23 @@ mod tests {
             },
         });
         assert_eq!(
-            super::status_lines(&syncing),
+            super::status_lines(&syncing, HEARD_AT),
             [
                 "height=12 root_hash=aa",
                 "role=resident phase=syncing",
+                "follow: none yet",
                 "netstack=native",
             ]
         );
         assert_eq!(super::stalled_past_recovery(&syncing), None);
 
-        // a daemon that answers no operations at all still answers a tip.
+        // a daemon that answers no operations at all still answers a tip,
+        // and has heard none.
         let bare = serde_json::json!({ "height": 1, "root_hash": "bb" });
-        assert_eq!(super::status_lines(&bare), ["height=1 root_hash=bb"]);
+        assert_eq!(
+            super::status_lines(&bare, HEARD_AT),
+            ["height=1 root_hash=bb", "follow: none yet"]
+        );
         assert_eq!(super::stalled_past_recovery(&bare), None);
     }
 
@@ -2524,6 +3035,34 @@ mod tests {
         assert!(none.is_none());
     }
 
+    /// an id minted free but taken before this verb's `Propose` landed holds
+    /// another proposer's action: the ceremony refuses by name instead of
+    /// casting a yes on it.
+    #[test]
+    fn a_ceremony_never_votes_on_a_record_that_carries_another_action() {
+        use super::require_own_action;
+        use governance::{GovAction, ProposalStatus, ProposalView, VoterKind, VotingRule};
+        let view = |text: &str| ProposalView {
+            proposal_id: "node-release:0".into(),
+            action: GovAction::Signal { text: text.into() },
+            proposer: vec![1],
+            created_at: 0,
+            deadline: 10,
+            status: ProposalStatus::Open,
+            votes: vec![],
+            voter_kind: VoterKind::ValidatorNode,
+            electorate: vec![],
+            voting_rule: VotingRule::Threshold { required_yes: 1 },
+        };
+        let wanted = GovAction::Signal {
+            text: "ours".into(),
+        };
+        let matches = |action: &GovAction| *action == wanted;
+        assert_eq!(require_own_action(&view("ours"), &matches), Ok(()));
+        let refused = require_own_action(&view("theirs"), &matches).unwrap_err();
+        assert!(refused.starts_with("proposal_id_spent:"), "{refused}");
+    }
+
     /// the grammar's own consistency check (conflicting ids, broken flatten,
     /// missing subcommand settings all panic here instead of at first use).
     #[test]
@@ -2596,6 +3135,47 @@ mod tests {
         );
     }
 
+    /// `node peers` opens with the node's OWN position — the `height` (and
+    /// `epoch`) its `--json` carries beside the peer table — whether or not a
+    /// peer answered, so the rows below are anchored to a block.
+    #[test]
+    fn peers_prose_opens_with_the_height_its_json_carries() {
+        let view = |height, epoch, peers| noded::peers::PeersView {
+            sampled_at_ms: 10_000,
+            height,
+            epoch,
+            peers,
+        };
+        let peer = noded::peers::PeerView {
+            peer: "cd".repeat(32),
+            connected: false,
+            connected_since_ms: None,
+            role: None,
+            build: None,
+            msgs_sent: 0,
+            msgs_received: 0,
+            statesync: None,
+        };
+
+        let first = view(5, Some(1), vec![peer.clone()]);
+        let second = view(6, Some(1), vec![peer]);
+        let lines = super::peers_lines(&first, Some(&second));
+        assert_eq!(
+            lines[0], "height=6 epoch=1",
+            "the rate sample's own position"
+        );
+        assert!(lines[1].starts_with("peer=cdcd"), "{lines:?}");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+
+        // no peer to rate: the height still leads, and a lane with no
+        // consensus has no epoch to name.
+        let alone = view(5, None, Vec::new());
+        assert_eq!(
+            super::peers_lines(&alone, None),
+            ["height=5", "no direct peers"]
+        );
+    }
+
     #[test]
     fn durations_compact_by_magnitude() {
         assert_eq!(human_duration(42), "42s");
@@ -2639,5 +3219,149 @@ mod tests {
         );
         // empty rosters refuse rather than wave everything through.
         assert!(precheck_promotion(hex, &stranger, &[], &[]).is_err());
+    }
+
+    /// #2512: `resident remove` of a seated validator printed its redirect
+    /// and exited 0, so a script read "removed". It is a refusal — an `Err`,
+    /// which `main` turns into exit 1 — while a key with no standing stays the
+    /// idempotent no-op it always was.
+    #[test]
+    fn removing_a_seated_validator_as_a_resident_is_refused_not_skipped() {
+        use super::{ResidentRemoval, precheck_resident_removal};
+        let hex = "0101010101010101010101010101010101010101010101010101010101010101";
+        let seated = vec![1u8; 32];
+        let resident = vec![2u8; 32];
+        let stranger = vec![3u8; 32];
+        let members = vec![seated.clone()];
+        let residents = vec![resident.clone()];
+
+        let refusal = precheck_resident_removal(hex, &seated, &members, &residents)
+            .expect_err("a seated key is not a resident to remove");
+        assert!(
+            refusal.contains(&format!("`ducktape node member remove {hex}`")),
+            "it names the verb that does remove it: {refusal}"
+        );
+        assert_eq!(
+            precheck_resident_removal(hex, &resident, &members, &residents),
+            Ok(ResidentRemoval::Proceed)
+        );
+        assert_eq!(
+            precheck_resident_removal(hex, &stranger, &members, &residents),
+            Ok(ResidentRemoval::NoStanding)
+        );
+    }
+
+    /// A founder workspace on disk, complete enough for `mint_invite_blob`:
+    /// node.toml, the descriptor it names, and an identity. `advertised` and
+    /// `wireguard_advertised` are the values under test (`"auto"` is what
+    /// `node init` writes when the operator names no tunnel address); the
+    /// rest is the shape `node init` writes on a single box (unspecified
+    /// binds, no coordinator).
+    fn founder_workspace(
+        name: &str,
+        advertised: &str,
+        wireguard_advertised: &str,
+    ) -> std::path::PathBuf {
+        use super::config;
+        use commonware_cryptography::Signer as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ducktape-invite-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        std::fs::write(
+            dir.join("node.toml"),
+            format!(
+                "network = \"network.toml\"\nkey_file = \"identity.key\"\n\
+                 listen = \"[::]:52330\"\nadvertised = {advertised:?}\n\
+                 storage_dir = \"storage\"\nhttp_listen = \"127.0.0.1:0\"\n\
+                 gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"127.0.0.1:0\"\n\
+                 wireguard_listen = \"0.0.0.0:52333\"\ninvite_listen = \"0.0.0.0:52334\"\n\
+                 wireguard_advertised = {wireguard_advertised:?}\nprimary_coordinator = \"none\"\n\
+                 coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n"
+            ),
+        )
+        .expect("write node.toml");
+        let (me, _) = config::load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        config::NetworkDescriptor {
+            chain_id: "net#25662566".into(),
+            validators: vec![super::hex_bytes(me.public_key().as_ref())],
+            bootstrap: Vec::new(),
+            reach: Vec::new(),
+            coordination: None,
+            block_time_ms: config::DEFAULT_BLOCK_TIME_MS,
+            modules: vec![config::ModuleCode {
+                id: "pages".into(),
+                code_hash: "11".repeat(32),
+            }],
+            genesis: "ab".repeat(32),
+        }
+        .save(&dir.join("network.toml"))
+        .expect("save descriptor");
+        dir
+    }
+
+    /// A single-box founder — `advertised = "overlay"`, unspecified binds, no
+    /// coordinator — has no dialable host to bake into an invite. That is a
+    /// NOTE beside a minted blob, never a refusal: the join over loopback
+    /// works, and an operator told "no dialable host" INSTEAD of being handed
+    /// the credential reads a working node as a broken one. Name a dialable
+    /// `advertised` and there is nothing to say.
+    #[test]
+    fn a_founder_naming_no_host_still_mints_and_is_told_what_the_blob_cannot_do() {
+        let reasons = |dir: &std::path::Path| -> Vec<&'static str> {
+            let (blob, notes) = super::mint_invite_blob(&dir.join("node.toml"), 7)
+                .expect("a founder always gets its invite");
+            assert!(!blob.is_empty(), "the blob is the whole point");
+            notes.iter().map(super::InviteNote::reason).collect()
+        };
+
+        let overlay = founder_workspace("overlay", "overlay", "auto");
+        assert!(
+            reasons(&overlay).contains(&"invite_not_dialable_off_box"),
+            "a blob that reaches this machine only says so"
+        );
+
+        // the same single-box shape, with the tunnel address the operator
+        // writes for it. A loopback front they NAMED is a working same-box
+        // invite, so it mints exactly as before — and an endpoint that IS
+        // named leaves nothing to note.
+        let dialable = founder_workspace("dialable", "127.0.0.1:52330", "127.0.0.1:52333");
+        assert!(
+            !reasons(&dialable).contains(&"invite_not_dialable_off_box"),
+            "an advertised host IS the endpoint — nothing to note"
+        );
+    }
+
+    /// The mint end of [`config::InviteFront::is_derived_loopback`]: the
+    /// founder `node init` writes on a single box names no tunnel address,
+    /// so `auto` reuses the loopback p2p hint — and `node invite` refuses by
+    /// name instead of printing a credential no stranger can redeem. The
+    /// blob is the `Ok` payload, so a refusal IS "no blob printed", and
+    /// `cmd_invite` returns the error as a non-zero exit.
+    ///
+    /// Naming the front — either key — mints it, loopback and all.
+    #[test]
+    fn a_derived_loopback_front_refuses_the_mint_and_a_named_one_still_mints() {
+        let derived = founder_workspace("derived-loopback", "127.0.0.1:52330", "auto");
+        let Err(refusal) = super::mint_invite_blob(&derived.join("node.toml"), 7) else {
+            panic!("a front nobody off this box can dial is refused, never printed");
+        };
+        let refusal = refusal.to_string();
+        assert!(
+            refusal.contains("reason=invite_front_derived_loopback"),
+            "the refusal names itself: {refusal}"
+        );
+        assert!(
+            refusal.contains("wireguard_advertised = \"<routable host>:52333\""),
+            "the refusal names the one line that fixes it, at the bind port: {refusal}"
+        );
+
+        let named = founder_workspace("named-loopback", "127.0.0.1:52330", "127.0.0.1:52333");
+        let (blob, _) = super::mint_invite_blob(&named.join("node.toml"), 7)
+            .expect("a loopback front the operator wrote still mints");
+        assert!(!blob.is_empty(), "the same-box joiner's invite is real");
     }
 }

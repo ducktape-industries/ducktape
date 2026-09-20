@@ -23,13 +23,13 @@ use governance::{
     encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
-use identity::Identity;
+use identity_module::Identity;
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
-use valset::Valset;
 use valset::{
     ValsetQuery, ValsetReply, decode_reply as valset_decode, encode_query as valset_query,
 };
+use valset_module::Valset;
 
 const BINDING: &[u8] = b"testnet#00000000@feedface";
 
@@ -223,8 +223,8 @@ fn a_token_is_single_use() {
         .await
         .expect_err("second redemption must be refused");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m))
-                if m.contains("already redeemed") || m.contains("already holds resident standing")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. })
+                if reason == "invite_already_redeemed" || reason == "joiner_already_resident"),
             "a replay must be refused as a double-admit, got {err:?}"
         );
     });
@@ -248,7 +248,7 @@ fn forged_or_unauthorized_redemptions_are_refused() {
         .await
         .expect_err("non-member token must be refused");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("no longer part")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "issuer_not_a_member"),
             "got {err:?}"
         );
 
@@ -271,7 +271,7 @@ fn forged_or_unauthorized_redemptions_are_refused() {
             .await
             .expect_err("mismatched proof must be refused");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("proof-of-possession")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "join_proof_unverified"),
             "got {err:?}"
         );
 
@@ -311,7 +311,7 @@ fn a_network_without_a_binding_refuses_redemption() {
         .await
         .expect_err("no binding — refuse");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("not wired")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "no_invite_binding"),
             "got {err:?}"
         );
     });

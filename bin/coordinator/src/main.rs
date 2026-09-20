@@ -1,31 +1,47 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use coordinator_bin::{process_cpu_ns, process_rss_bytes, select_policy};
 use nat_traversal::{
-    Coordinator, CoordinatorMetrics, RelayMetrics, run_coordinator_workers_with_metrics_using,
-    run_relay_listener,
+    COORDINATOR_PORT, Coordinator, CoordinatorMetrics, RELAY_PORT, RelayMetrics,
+    run_coordinator_workers_with_metrics_using, run_relay_listener,
 };
 use tokio::net::{TcpListener, UdpSocket};
 
-const USAGE: &str = "\
+/// the UDP rendezvous bind when `--listen` is absent: every interface, on the
+/// port a node dials its coordinator at.
+const DEFAULT_LISTEN: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, COORDINATOR_PORT));
+/// the TCP relay-lane bind when `--relay-listen` is absent: every interface, on
+/// the port a node derives from its coordinator's host.
+const DEFAULT_RELAY_LISTEN: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, RELAY_PORT));
+
+/// `--help`, rendered from the defaults the code binds so the two cannot drift.
+fn usage() -> String {
+    format!(
+        "\
 ducktape coordinator
 
 Usage:
   coordinator [--listen <addr>] [--relay-listen <addr|none>] [--workers <1|4>] [--metrics-interval <secs>] [--genesis-set <network.toml>]
 
 Options:
-  --listen <addr>              UDP bind address [default: 0.0.0.0:3478]
-  --relay-listen <addr|none>   TCP relay-lane bind; \"none\" disables [default: 0.0.0.0:443]
-  --workers <1|4>              Signature-verification workers [default: 1]
-  --metrics-interval <secs>    Structured metrics period; 0 disables [default: 10]
-  --genesis-set <network.toml> Private mode: pin admission to genesis validators
-  -h, --help                   Print this help and exit
+  --listen <addr>                  UDP bind address [default: {DEFAULT_LISTEN}]
+  --relay-listen <addr|none>       TCP relay-lane bind; \"none\" disables [default: {DEFAULT_RELAY_LISTEN}]
+  --workers <1|4>                  Signature-verification workers [default: 1]
+  --metrics-interval <secs>        Structured metrics period; 0 disables [default: 10]
+  --genesis-set <network.toml>     Private mode: admit the genesis validators and any
+                                   cap chain one of them roots (at most {DEPTH} links)
+  -h, --help                       Print this help and exit
 
 Default auth policy:
   public proof-of-possession (no --genesis-set)
-";
+",
+        DEPTH = nat_traversal::MAX_CAP_CHAIN,
+    )
+}
 
 fn arg_value(flag: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != flag).nth(1)
@@ -238,7 +254,7 @@ async fn log_metrics(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
     if wants_help() {
-        print!("{USAGE}");
+        print!("{}", usage());
         return Ok(());
     }
 
@@ -252,18 +268,20 @@ async fn main() -> std::io::Result<()> {
     // quietly expose the untrusted control port on every interface.
     let listen: SocketAddr = match arg_value("--listen") {
         Some(s) => parse_addr("--listen", &s)?,
-        None => "0.0.0.0:3478".parse().expect("default addr parses"),
+        None => DEFAULT_LISTEN,
     };
 
     // `--relay-listen <addr|none>` selects the TCP relay-lane bind; the same
     // hard-error contract as `--listen` (only the literal "none" disables).
     let relay_listen = match arg_value("--relay-listen") {
         Some(raw) => parse_relay_listen(&raw)?,
-        None => Some("0.0.0.0:443".parse().expect("default relay addr parses")),
+        None => Some(DEFAULT_RELAY_LISTEN),
     };
 
     // The per-network authorization policy, selected from CLI flags:
-    //   --genesis-set <network.toml>  => Private (PoP + pinned valset admission)
+    //   --genesis-set <network.toml>  => Private (PoP + admission against the
+    //                                    genesis valset and the cap chains it
+    //                                    roots)
     //   (no flag)                     => public with proof-of-possession
     // A malformed --genesis-set path/file is a HARD error, never a silent
     // fall-through to a weaker policy. The Arc is shared verbatim with the

@@ -149,7 +149,7 @@ impl Module for Fanout {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let (k, v) = parse_set(&msg.payload).ok_or(Error::Module("bad set".into()))?;
+        let (k, v) = parse_set(&msg.payload).ok_or(Error::module("bad_set", "bad set"))?;
         self.pending.push((k.clone(), v.clone()));
         for t in &self.targets {
             ctx.emit_msg(set(t, &k, &v));
@@ -158,7 +158,8 @@ impl Module for Fanout {
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let key = String::from_utf8(req.to_vec()).map_err(|_| Error::Module("bad key".into()))?;
+        let key =
+            String::from_utf8(req.to_vec()).map_err(|_| Error::module("bad_key", "bad key"))?;
         Ok(self
             .committed
             .get(&key)
@@ -263,14 +264,15 @@ impl Module for CursorDisk {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let (k, v) = parse_set(&msg.payload).ok_or(Error::Module("bad set".into()))?;
+        let (k, v) = parse_set(&msg.payload).ok_or(Error::module("bad_set", "bad set"))?;
         self.pending.push((k, v));
         self.pending_height = Some(ctx.env().height);
         Ok(())
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let key = String::from_utf8(req.to_vec()).map_err(|_| Error::Module("bad key".into()))?;
+        let key =
+            String::from_utf8(req.to_vec()).map_err(|_| Error::module("bad_key", "bad key"))?;
         Ok(self
             .cell
             .borrow()
@@ -471,7 +473,10 @@ fn a_lost_trailing_seal_with_a_height_cursor_recovers() {
             .expect("a cursor-bound trailing commit recovers");
 
         assert_eq!(recovered.height, Some(1), "tip block recovered");
-        assert!(recovered.rolled_forward, "the unsealed tip was rolled forward");
+        assert!(
+            recovered.rolled_forward,
+            "the unsealed tip was rolled forward"
+        );
         // ROOT-HASH CONTINUITY: byte-identical to what the live node composed
         // after the tip block — what the network sealed.
         assert_eq!(recovered.root_hash, tip_hash);

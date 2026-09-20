@@ -15,9 +15,10 @@ use std::time::Duration;
 
 use fluent31::StreamEvent;
 
-/// the reference mapper, built by `guest-builder --index` (see its crate docs
-/// for the derived key space: `seen/{height}/{seq}`, `count`).
-const TESTMAP: &[u8] = include_bytes!("../../index-guest/testmap/index.wasm");
+/// the reference mapper: a committed index guest whose derived key space is
+/// `seen/{height}/{seq}` and `count`. Its source ships from ducktape-sdk; the
+/// bytes are pinned here beside the three suites that fold through them.
+const TESTMAP: &[u8] = include_bytes!("../tests/fixtures/testmap.index.wasm");
 /// how long a fold may take before the test calls it stuck. generous: the
 /// wait is event-driven, so healthy runs never sit it out.
 const RECV_DEADLINE: Duration = Duration::from_secs(60);

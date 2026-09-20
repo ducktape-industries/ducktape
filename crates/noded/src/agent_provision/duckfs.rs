@@ -189,6 +189,10 @@ impl ProvisionedWorkspace for NodedWorkspace {
         self._session.as_ref()?.native_conversation.clone()
     }
 
+    /// A duckfs workspace pinned no repo, so its `forge_repo` stays the trait's
+    /// `None` and its lane lends this to nothing. The credential is still
+    /// handed over because the lane strips a GUEST-supplied copy of its header
+    /// by name — a lane that holds none forwards the guest's claim verbatim.
     fn operator_credential(&self) -> Option<OperatorCredential> {
         Some(super::operator_credential(&self.node))
     }

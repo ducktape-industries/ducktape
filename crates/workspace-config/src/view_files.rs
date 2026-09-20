@@ -16,7 +16,7 @@ pub fn ensure_view_ready(dir: &Path, id: &str) -> Result<(), String> {
 fn ensure_ready_path(path: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Err(format!(
-            "{}: declared view is pending; run make views and prepare the founding set again",
+            "{}: view is pending — a write of this view was interrupted; write the directory again",
             path.display()
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

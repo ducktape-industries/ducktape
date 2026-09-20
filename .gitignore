@@ -1,17 +1,7 @@
 /target
-# a worktree's own cargo target dirs, when one is used instead of the shared
-# one (the views workspace is a separate workspace, and its wasm bundler is a
-# third target). Rooted, so nothing named `target-*` deeper in the tree is
-# swept by accident.
-/target-views
-/target-views-wasm
 # labs is a standalone workspace (excluded from the root), so its build output
 # lands outside the root-anchored /target above.
 /crates/labs/target
-/crates/views/target
-# The Ice test runner writes per-test artifacts
-# (screenshots + paint json) under the app crate's own target dir.
-/app/target/
 /.worktree/
 # The guest kernel and rootfs ops/build-guest-rootfs.sh builds: ~900 MB of
 # fetched-and-assembled artifacts, rebuilt from the script on any host.
@@ -26,7 +16,6 @@ node_modules
 # Brainstorm specs and implementation plans are per-PR working files, never a
 # record: they stay local and die with their worktree.
 docs/superpowers/
-app/dist/
 ops/wg-smoke/*.log
 ops/wg-smoke/node*/
 

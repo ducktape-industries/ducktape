@@ -134,9 +134,10 @@ impl NodeApi for ScriptedNode {
             .borrow_mut()
             .push(base.map(str::to_string));
         if attempt == 0 {
-            Err(ApiError::Rejected(
-                "files: conflict: /shared/ws/x changed since base".into(),
-            ))
+            Err(ApiError::Rejected {
+                reason: "files_commit".into(),
+                sentence: "conflict: /shared/ws/x changed since base".into(),
+            })
         } else {
             Ok(CommitReceipt {
                 height: self.height,

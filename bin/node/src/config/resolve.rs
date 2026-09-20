@@ -101,12 +101,12 @@ pub struct Resolved {
     /// Empty for the dev shape and for members.
     pub invite_fronts: Vec<Front>,
     /// the reachability plane's coordination privacy (per-network operational
-    /// policy). `Private` (the default) requires a genesis-issued `CoordCap`
-    /// for a node outside the genesis validator set; `Public` accepts any
+    /// policy). `Private` (the default) requires a validator-issued `CoordCap`
+    /// for a node outside the validator set; `Public` accepts any
     /// proof-of-possession. The dev shape is always `Private` (it never uses a
     /// real coordinator).
     pub coordination: Coordination,
-    /// the genesis-issued admission capability this node presents on every
+    /// the validator-issued admission capability this node presents on every
     /// coordinator request (loaded from `coord.cap` beside the identity).
     /// `None` for a genesis validator (admitted by membership), the dev shape,
     /// or a node that has not been issued one.
@@ -556,7 +556,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         // the reachability plane presents this on every coordinator request; a
         // genesis validator needs none (admitted by membership), a joiner is
         // issued one beside its identity.
-        coord_cap: load_coord_cap(base),
+        coord_cap: load_coord_cap(base)?,
         primary_coordinator: Some(raw.primary_coordinator),
         coordinator_relay: Some(raw.coordinator_relay),
         wireguard_advertised,
@@ -614,7 +614,7 @@ fn resolved_wireguard_advertised(
     let Some(wg) = wireguard_listen else {
         return Ok(None);
     };
-    let Ok(derived) = invite_wireguard_endpoint(advertised, listen, wg, None) else {
+    let Ok(Some(derived)) = invite_wireguard_endpoint(advertised, listen, wg, None) else {
         return Ok(None);
     };
     // a derived value that is not dialable (a port-0 bind) is endpoint-less,
@@ -639,7 +639,11 @@ fn resolved_intro_listener(
     let Some(wg) = wireguard_listen else {
         return Ok(None);
     };
-    if endpoint_host(advertised, listen, wg, wireguard_advertised).is_err() {
+    let mints_a_direct_intro = matches!(
+        endpoint_host(advertised, listen, wg, wireguard_advertised),
+        Ok(Some(_))
+    );
+    if !mints_a_direct_intro {
         return Ok(None);
     }
     resolved_invite_listen(invite_listen, wg).map(Some)
@@ -665,59 +669,134 @@ pub fn resolved_invite_listen(
     }
 }
 
-/// the HOST a minted invite's UDP endpoints carry: an explicit
-/// `wireguard_advertised` wins outright (it IS the truth once configured),
-/// else the WireGuard listen IP when it is concrete, else the advertised
-/// host (an invite must hand the joiner an underlay address that reaches
-/// this machine — the usual listen is unspecified, so `advertised` is the
-/// truth).
+/// WHO chose the front a minted invite carries. The mint turns on this
+/// distinction and nothing else: a loopback front is a working same-box
+/// invite when the operator WROTE that address, and a dead end handed to a
+/// stranger when the node picked it up off a neighbouring config key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontSource {
+    /// the operator named this tunnel address: `wireguard_advertised =
+    /// "host:port"`, or a concrete host in `wireguard_listen`.
+    Named,
+    /// nothing named a tunnel address, so `wireguard_advertised = "auto"`
+    /// fell back to the p2p `advertised`/`listen` host — the only other
+    /// address this config knows. It is a reuse, not a statement about
+    /// where this node is reachable.
+    Derived,
+}
+
+/// the front a minted invite hands a joiner, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteFront {
+    /// the HOST the intro endpoint carries.
+    pub host: String,
+    /// the FULL `host:port` the WireGuard `endpoint` carries — verbatim from
+    /// `wireguard_advertised` when named, else `host` at the bind port.
+    pub endpoint: String,
+    pub source: FrontSource,
+}
+
+impl InviteFront {
+    /// a front NO stranger can ever dial that this node chose ITSELF. The
+    /// operator named no tunnel address, so `auto` reused the p2p hint, and
+    /// that hint is loopback — every joiner off this box resolves it to their
+    /// own machine. The mint refuses on this rather than print a credential
+    /// that only fails ninety seconds later, on someone else's box.
+    ///
+    /// A HOSTNAME is never loopback here: deciding that would mean resolving
+    /// it, and this derivation dials nothing.
+    pub fn is_derived_loopback(&self) -> bool {
+        let derived = self.source == FrontSource::Derived;
+        let loopback = self
+            .host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+        derived && loopback
+    }
+}
+
+/// the front a minted invite's UDP endpoints carry, decided ONCE for the host
+/// and the endpoint together so the two can never disagree about which
+/// address — or whose choice — they came from: an explicit
+/// `wireguard_advertised` wins outright (it IS the truth once configured, and
+/// VERBATIM including its port, because in the port-forwarded setup the key
+/// exists for the external port can differ from the bind port); else the
+/// WireGuard listen IP when it is concrete; else the advertised host (an
+/// invite must hand the joiner an underlay address that reaches this machine —
+/// the usual listen is unspecified, so `advertised` is the truth).
+///
+/// The first two are the operator's own words, the third is this function
+/// reusing the only other address in the file — [`FrontSource`] keeps them
+/// apart all the way to the mint.
+///
+/// `Ok(None)` = nothing in this config NAMES a dialable host (`advertised =
+/// "overlay"`, unspecified binds): endpoint-less, which every caller already
+/// handles — an invite drops its underlay endpoints and the intro listener
+/// stays unbound. Only a config that is WRONG (an `advertised` that can never
+/// be dialed, a malformed `wireguard_advertised`) is an `Err`; absence on the
+/// error channel is what turned a single-box founder's `invite` into a
+/// refusal.
+pub fn invite_front(
+    advertised: Option<&str>,
+    listen: &str,
+    wireguard_listen: SocketAddr,
+    wireguard_advertised: Option<&str>,
+) -> Result<Option<InviteFront>, String> {
+    if let Some(ingress) = parse_wireguard_advertised(wireguard_advertised)? {
+        let (host, endpoint) = match ingress {
+            Ingress::Socket(addr) => (addr.ip().to_string(), addr.to_string()),
+            Ingress::Dns { host, port } => (host.to_string(), format!("{host}:{port}")),
+        };
+        return Ok(Some(InviteFront {
+            host,
+            endpoint,
+            source: FrontSource::Named,
+        }));
+    }
+    let named_bind_host = !wireguard_listen.ip().is_unspecified();
+    let (host, source) = if named_bind_host {
+        (wireguard_listen.ip().to_string(), FrontSource::Named)
+    } else {
+        let Some(dial) = dialable(advertised, listen)? else {
+            return Ok(None);
+        };
+        // strip the port: `host:port` or `[v6]:port`.
+        let host = match dial.rsplit_once(':') {
+            Some((host, _)) => host.trim_matches(['[', ']']).to_string(),
+            None => dial,
+        };
+        (host, FrontSource::Derived)
+    };
+    let endpoint = format!("{host}:{}", wireguard_listen.port());
+    Ok(Some(InviteFront {
+        host,
+        endpoint,
+        source,
+    }))
+}
+
+/// the HOST [`invite_front`] names, for the callers that need only that.
 pub fn endpoint_host(
     advertised: Option<&str>,
     listen: &str,
     wireguard_listen: SocketAddr,
     wireguard_advertised: Option<&str>,
-) -> Result<String, String> {
-    if let Some(ingress) = parse_wireguard_advertised(wireguard_advertised)? {
-        return Ok(match ingress {
-            Ingress::Socket(addr) => addr.ip().to_string(),
-            Ingress::Dns { host, .. } => host.to_string(),
-        });
-    }
-    if !wireguard_listen.ip().is_unspecified() {
-        return Ok(wireguard_listen.ip().to_string());
-    }
-    let dial = dialable(advertised, listen)?.ok_or(
-        "no dialable host for the WireGuard invite endpoints: set `advertised` (or a \
-         concrete wireguard_listen IP) so a joiner can reach this node's tunnel",
-    )?;
-    // strip the port: `host:port` or `[v6]:port`.
-    match dial.rsplit_once(':') {
-        Some((host, _)) => Ok(host.trim_matches(['[', ']']).to_string()),
-        None => Ok(dial),
-    }
+) -> Result<Option<String>, String> {
+    Ok(invite_front(advertised, listen, wireguard_listen, wireguard_advertised)?.map(|f| f.host))
 }
 
-/// the FULL `host:port` a minted invite's WireGuard `endpoint` carries: an
-/// explicit `wireguard_advertised` is used VERBATIM — host AND port — because
-/// in the port-forwarded setup the key exists for, the externally reachable
-/// port can differ from the local bind port (`wireguard_listen`); baking the
-/// advertised host with the bind port would mint an invite whose endpoint is
-/// silently wrong. Absent, the endpoint is today's derivation exactly:
-/// [`endpoint_host`]'s host at the bind port.
+/// the FULL `host:port` [`invite_front`] names, for the callers that need
+/// only that.
 pub fn invite_wireguard_endpoint(
     advertised: Option<&str>,
     listen: &str,
     wireguard_listen: SocketAddr,
     wireguard_advertised: Option<&str>,
-) -> Result<String, String> {
-    if let Some(ingress) = parse_wireguard_advertised(wireguard_advertised)? {
-        return Ok(match ingress {
-            Ingress::Socket(addr) => addr.to_string(),
-            Ingress::Dns { host, port } => format!("{host}:{port}"),
-        });
-    }
-    let host = endpoint_host(advertised, listen, wireguard_listen, None)?;
-    Ok(format!("{host}:{}", wireguard_listen.port()))
+) -> Result<Option<String>, String> {
+    Ok(
+        invite_front(advertised, listen, wireguard_listen, wireguard_advertised)?
+            .map(|f| f.endpoint),
+    )
 }
 
 /// resolve the `advertised` config value into a dial ingress. the sentinel
@@ -2019,8 +2098,10 @@ mod tests {
         let concrete: SocketAddr = "10.0.0.5:51820".parse().unwrap();
 
         assert_eq!(
-            endpoint_host(None, "127.0.0.1:0", concrete, Some("203.0.113.9:9999")).unwrap(),
-            "203.0.113.9",
+            endpoint_host(None, "127.0.0.1:0", concrete, Some("203.0.113.9:9999"))
+                .unwrap()
+                .as_deref(),
+            Some("203.0.113.9"),
             "wireguard_advertised wins even over a concrete wireguard_listen IP"
         );
         assert_eq!(
@@ -2030,20 +2111,50 @@ mod tests {
                 unspecified,
                 Some("tunnel.example.com:9999")
             )
-            .unwrap(),
-            "tunnel.example.com",
+            .unwrap()
+            .as_deref(),
+            Some("tunnel.example.com"),
             "a hostname override stays a hostname"
         );
         assert_eq!(
-            endpoint_host(None, "127.0.0.1:0", concrete, None).unwrap(),
-            "10.0.0.5",
+            endpoint_host(None, "127.0.0.1:0", concrete, None)
+                .unwrap()
+                .as_deref(),
+            Some("10.0.0.5"),
             "absent: today's derivation — the concrete wireguard_listen IP wins"
         );
         assert_eq!(
-            endpoint_host(Some("203.0.113.1:443"), "127.0.0.1:0", unspecified, None).unwrap(),
-            "203.0.113.1",
+            endpoint_host(Some("203.0.113.1:443"), "127.0.0.1:0", unspecified, None)
+                .unwrap()
+                .as_deref(),
+            Some("203.0.113.1"),
             "absent + unspecified listen: falls back to `advertised`/`listen`, unchanged"
         );
+    }
+
+    /// A config that NAMES no dialable host is endpoint-less, not broken: the
+    /// single-box founder shape (`advertised = "overlay"`, unspecified binds)
+    /// answers `Ok(None)` so its `invite` keeps minting. A config that is
+    /// WRONG still refuses — absence and invalidity are different answers, and
+    /// collapsing them onto the error channel is what made a founder's own
+    /// invite read as a failure.
+    #[test]
+    fn a_config_that_names_no_host_is_endpoint_less_not_a_refusal() {
+        let unspecified: SocketAddr = "0.0.0.0:51820".parse().unwrap();
+
+        assert_eq!(
+            endpoint_host(Some("overlay"), "[::]:8846", unspecified, None).unwrap(),
+            None,
+            "the overlay shape names no underlay host — endpoint-less, not an error"
+        );
+        assert_eq!(
+            invite_wireguard_endpoint(Some("overlay"), "[::]:8846", unspecified, None).unwrap(),
+            None,
+            "and the minted endpoint carries that answer through"
+        );
+        let err = endpoint_host(Some("0.0.0.0:8846"), "[::]:8846", unspecified, None)
+            .expect_err("an advertised that can never be dialed is still a config error");
+        assert!(err.contains("not dialable"), "{err}");
     }
 
     /// The invite-mint endpoint (review fix, change 3): with
@@ -2060,8 +2171,9 @@ mod tests {
 
         assert_eq!(
             invite_wireguard_endpoint(None, "127.0.0.1:0", unspecified, Some("203.0.113.9:41820"))
-                .unwrap(),
-            "203.0.113.9:41820",
+                .unwrap()
+                .as_deref(),
+            Some("203.0.113.9:41820"),
             "the advertised endpoint rides verbatim — 41820, never the bind port 51820"
         );
         assert_eq!(
@@ -2071,21 +2183,129 @@ mod tests {
                 concrete,
                 Some("tunnel.example.com:41820")
             )
-            .unwrap(),
-            "tunnel.example.com:41820",
+            .unwrap()
+            .as_deref(),
+            Some("tunnel.example.com:41820"),
             "a hostname override stays a hostname, with ITS port — even over a concrete bind IP"
         );
         assert_eq!(
-            invite_wireguard_endpoint(None, "127.0.0.1:0", concrete, None).unwrap(),
-            "10.0.0.5:51820",
+            invite_wireguard_endpoint(None, "127.0.0.1:0", concrete, None)
+                .unwrap()
+                .as_deref(),
+            Some("10.0.0.5:51820"),
             "absent: today's derivation exactly — the wireguard_listen IP at the bind port"
         );
         assert_eq!(
             invite_wireguard_endpoint(Some("203.0.113.1:443"), "127.0.0.1:0", unspecified, None)
-                .unwrap(),
-            "203.0.113.1:51820",
+                .unwrap()
+                .as_deref(),
+            Some("203.0.113.1:51820"),
             "absent + unspecified listen: the advertised HOST at the WG bind port, unchanged"
         );
+    }
+
+    /// THE invariant behind the mint refusal, over the whole resolution
+    /// space rather than the one shape that caught it: a front a stranger
+    /// gets handed is loopback ONLY IF the operator wrote a loopback address
+    /// down themselves.
+    ///
+    /// Both halves matter and neither implies the other. A front the node
+    /// DERIVED (`wireguard_advertised = "auto"` reusing the p2p hint) that
+    /// lands on loopback must be refused — that is issue #2732, where a
+    /// founder handed a stranger `127.0.0.1:<port>` and nothing said so until
+    /// the redemption failed. A front the operator NAMED must still mint,
+    /// loopback or not: a same-box joiner is a real shape the e2e suites run.
+    ///
+    /// Every combination of what the two tunnel keys can say, against a p2p
+    /// hint that is loopback (the `node init` single-box default, and the
+    /// case that produced the bug), routable, and absent.
+    #[test]
+    fn a_minted_front_is_loopback_only_if_the_operator_named_loopback() {
+        // `node init` writes the sentinel when no flag is passed, and an
+        // ABSENT key defaults to it: both mean "the operator named nothing"
+        // by the time the resolution sees them.
+        fn configured(v: Option<&str>) -> Option<&str> {
+            v.filter(|v| *v != "auto")
+        }
+        let is_loopback =
+            |host: &str| host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+
+        let advertised_values = [None, Some("auto"), Some("127.0.0.1:41820"), Some("203.0.113.9:41820")];
+        let listen_values = ["0.0.0.0:51820", "127.0.0.1:51820", "192.0.2.7:51820"];
+        let p2p_values = [Some("127.0.0.1:52330"), Some("203.0.113.1:443"), Some("overlay")];
+
+        for wireguard_advertised in advertised_values {
+            for wireguard_listen in listen_values {
+                for p2p in p2p_values {
+                    let wg: SocketAddr = wireguard_listen.parse().unwrap();
+                    let case =
+                        format!("advertised={wireguard_advertised:?} listen={wireguard_listen} p2p={p2p:?}");
+                    let Some(front) = invite_front(
+                        p2p,
+                        "[::]:52330",
+                        wg,
+                        configured(wireguard_advertised),
+                    )
+                    .unwrap_or_else(|e| panic!("{case}: {e}")) else {
+                        // no address in this config at all — an endpoint-less
+                        // blob, which hands nobody a loopback front.
+                        continue;
+                    };
+
+                    // the two ways an operator names a tunnel address, and
+                    // the only two that license a loopback front.
+                    let named_a_loopback_front = configured(wireguard_advertised)
+                        .is_some_and(|a| is_loopback(a.rsplit_once(':').unwrap().0))
+                        || wg.ip().is_loopback();
+                    let mints = !front.is_derived_loopback();
+
+                    if mints && is_loopback(&front.host) {
+                        assert!(
+                            named_a_loopback_front,
+                            "{case}: minted the loopback front {} nobody named",
+                            front.host
+                        );
+                    }
+                    assert!(
+                        !named_a_loopback_front || mints,
+                        "{case}: refused a loopback front the operator wrote down"
+                    );
+                    // the host and the full endpoint are one decision: they
+                    // can never name different machines.
+                    assert!(
+                        front.endpoint.starts_with(&front.host),
+                        "{case}: endpoint {} left the host {} behind",
+                        front.endpoint,
+                        front.host
+                    );
+                }
+            }
+        }
+
+        // the cell the issue was filed from, spelled out: nothing named, an
+        // unspecified bind, a loopback p2p hint.
+        let refused = invite_front(
+            Some("127.0.0.1:52330"),
+            "[::]:52330",
+            "0.0.0.0:51820".parse().unwrap(),
+            None,
+        )
+        .unwrap()
+        .expect("the p2p hint is a front");
+        assert_eq!(refused.source, FrontSource::Derived);
+        assert!(refused.is_derived_loopback(), "{refused:?}");
+
+        // and the same shape once the operator answers it.
+        let named = invite_front(
+            Some("127.0.0.1:52330"),
+            "[::]:52330",
+            "0.0.0.0:51820".parse().unwrap(),
+            Some("192.168.0.151:46900"),
+        )
+        .unwrap()
+        .expect("a named front is a front");
+        assert_eq!(named.source, FrontSource::Named);
+        assert_eq!(named.endpoint, "192.168.0.151:46900");
     }
 
     #[test]

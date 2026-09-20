@@ -13,6 +13,7 @@
 //!   under ITS OWN signature (`join`) — the frame origin is the key being
 //!   admitted, so no possession proof rides the payload.
 //! - `set-name`, `set-profile` — display text on the origin's account.
+//! - `set-handle` — the account's `.duck` handle (a gateway op, same origin).
 //! - `key add --passkey|--eth`, `create --eth`, `login` — the browser
 //!   ceremonies ([`authpage`]): a passkey or an Ethereum wallet becomes a
 //!   member key by signing its own `AddKey` frame AS ORIGIN (registration is
@@ -38,7 +39,7 @@ use crate::cli_args::NodeAddr;
 use crate::config::{self, hex_bytes};
 use crate::cred_cli::VerbCtx;
 use crate::node_http;
-use crate::userkey_cli::{frame_seq, load_user_signer, user_frame};
+use crate::userkey_cli::{frame_seq, user_frame};
 
 type AccountResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -110,6 +111,12 @@ pub(crate) enum AccountCmd {
     SetName {
         #[arg(long, value_name = "NAME")]
         name: String,
+    },
+    /// claim this key's account `.duck` handle: `<handle>.duck`, and the
+    /// `<owner>` of a `duck://<network>/forge/<owner>/<repo>` address
+    SetHandle {
+        #[arg(long, value_name = "HANDLE")]
+        handle: String,
     },
     /// set this key's account avatar reference and/or bio
     SetProfile {
@@ -269,6 +276,7 @@ pub(crate) fn run(args: AccountArgs) -> AccountResult {
         AccountCmd::Key(KeyCmd::Join { ticket }) => cmd_key_join(&ctx, ticket, &mut stdin),
         AccountCmd::Key(KeyCmd::Remove { pubkey }) => cmd_key_remove(&ctx, pubkey, &mut stdin),
         AccountCmd::SetName { name } => cmd_set_name(&ctx, name, &mut stdin),
+        AccountCmd::SetHandle { handle } => cmd_set_handle(&ctx, handle, &mut stdin),
         AccountCmd::SetProfile { avatar, bio } => cmd_set_profile(&ctx, avatar, bio, &mut stdin),
     }
 }
@@ -279,7 +287,7 @@ pub(crate) fn run(args: AccountArgs) -> AccountResult {
 
 fn cmd_create(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> AccountResult {
     let base = ctx.http_base()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let height = submit_identity(&base, &user, &create_msg(name))?;
     let account = account_of_key(&base, user.public_key().as_ref())?.ok_or_else(|| {
         format!("committed at height {height}, but the key resolves to no account")
@@ -310,8 +318,8 @@ fn cmd_show(
             key: active_pubkey(ctx)?,
         },
     };
-    let account =
-        account_reply(query_identity(&base, &query)?)?.ok_or("no such account on this node")?;
+    let account = account_reply(query_identity(&base, &query)?)?
+        .ok_or("no such account — found one with `ducktape account create --name <you>`")?;
     print_account(&account);
     Ok(())
 }
@@ -365,7 +373,7 @@ fn cmd_key_add_ssh(
     let pubkey = keyscheme::sshsig::authorized_key(&line)?;
     let base = ctx.http_base()?;
     let chain_id = ctx.workspace()?.service.chain_id;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     own_account(&base, user.public_key().as_ref())?;
     let msg = consented_add_key(&base, &user, &chain_id, KeyScheme::Ed25519, &pubkey, label)?;
     let preimage = node::frame_preimage(
@@ -439,7 +447,7 @@ fn cmd_key_add_hex(
     }
     let base = ctx.http_base()?;
     let chain_id = ctx.workspace()?.service.chain_id;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let msg = consented_add_key(&base, &user, &chain_id, scheme, &new_key, label)?;
     let ticket = String::from_utf8(identity::encode_msg(&msg)).expect("json is utf-8");
     println!("{ticket}");
@@ -458,7 +466,7 @@ fn cmd_key_add_passkey(
 ) -> AccountResult {
     let base = ctx.http_base()?;
     let chain_id = ctx.workspace()?.service.chain_id;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let account = own_account(&base, user.public_key().as_ref())?;
     let registered = ceremony(
         auth,
@@ -502,7 +510,7 @@ fn cmd_key_add_wallet(
 ) -> AccountResult {
     let base = ctx.http_base()?;
     let chain_id = ctx.workspace()?.service.chain_id;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     own_account(&base, user.public_key().as_ref())?;
     let pubkey = reveal_wallet(auth)?;
     let msg = consented_add_key(
@@ -550,7 +558,7 @@ fn cmd_login(
 ) -> AccountResult {
     let base = ctx.http_base()?;
     let chain_id = ctx.workspace()?.service.chain_id;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let device_key = user.public_key().as_ref().to_vec();
     let generation = gen_reply(query_identity(
         &base,
@@ -558,10 +566,8 @@ fn cmd_login(
             key: device_key.clone(),
         },
     )?)?;
-    let number = authpage::assertion_account(
-        &chain_id,
-        &ceremony(auth, &authpage::account_request())?,
-    )?;
+    let number =
+        authpage::assertion_account(&chain_id, &ceremony(auth, &authpage::account_request())?)?;
     let account = account_reply(query_identity(&base, &IdentityQuery::Get { number })?)?
         .ok_or_else(|| format!("the passkey names account {number}, unknown to this node"))?;
     let expires_at = consent_expiry(&base)?;
@@ -763,7 +769,7 @@ fn identity_msg(msg: &IdentityMsg) -> sdk::Msg {
 
 fn cmd_key_join(ctx: &VerbCtx, ticket: String, stdin: &mut impl BufRead) -> AccountResult {
     let base = ctx.http_base()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let height = node_http::submit_frame(&base, &join_frame(&user, &ticket)?)?;
     let account = own_account(&base, user.public_key().as_ref())?;
     println!("joined account {} at height {height}", account.number);
@@ -774,7 +780,7 @@ fn cmd_key_join(ctx: &VerbCtx, ticket: String, stdin: &mut impl BufRead) -> Acco
 fn cmd_key_remove(ctx: &VerbCtx, pubkey: String, stdin: &mut impl BufRead) -> AccountResult {
     let key = config::unhex(&pubkey).map_err(|e| format!("--pubkey hex: {e}"))?;
     let base = ctx.http_base()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let height = submit_identity(&base, &user, &IdentityMsg::RemoveKey { key })?;
     println!("removed at height {height}");
     Ok(())
@@ -782,9 +788,22 @@ fn cmd_key_remove(ctx: &VerbCtx, pubkey: String, stdin: &mut impl BufRead) -> Ac
 
 fn cmd_set_name(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> AccountResult {
     let base = ctx.http_base()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let height = submit_identity(&base, &user, &IdentityMsg::SetName { name })?;
     println!("renamed at height {height}");
+    Ok(())
+}
+
+/// the handle lives in the gateway module (it is a `.duck` name), but it is
+/// the account's, claimed by the same user-signed origin as its name.
+fn cmd_set_handle(ctx: &VerbCtx, handle: String, stdin: &mut impl BufRead) -> AccountResult {
+    let base = ctx.http_base()?;
+    let user = ctx.signer(stdin)?;
+    let message = gateway::GatewayMsg::SetHandle {
+        handle: Some(handle.clone()),
+    };
+    let height = crate::cred_cli::submit_gateway(&base, &user, &message)?;
+    println!("handle {handle} set at height {height}");
     Ok(())
 }
 
@@ -795,7 +814,7 @@ fn cmd_set_profile(
     stdin: &mut impl BufRead,
 ) -> AccountResult {
     let base = ctx.http_base()?;
-    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let user = ctx.signer(stdin)?;
     let height = submit_identity(&base, &user, &IdentityMsg::SetProfile { avatar, bio })?;
     println!("profile set at height {height}");
     Ok(())
@@ -1120,7 +1139,10 @@ mod tests {
             )
             .unwrap();
         });
-        let auth = AuthCtx { page, browser: false };
+        let auth = AuthCtx {
+            page,
+            browser: false,
+        };
         let result = ceremony(&auth, &Request::Get { challenge: [7; 32] });
         assert!(result.unwrap_err().to_string().contains("phone cancelled"));
         server.join().unwrap();
@@ -1155,7 +1177,15 @@ mod tests {
     fn the_verb_tree_is_create_show_key_login_set_name_set_profile() {
         use clap::CommandFactory as _;
         let cmd = TestCli::command();
-        for name in ["create", "show", "key", "login", "set-name", "set-profile"] {
+        for name in [
+            "create",
+            "show",
+            "key",
+            "login",
+            "set-name",
+            "set-handle",
+            "set-profile",
+        ] {
             assert!(cmd.find_subcommand(name).is_some(), "verb {name} missing");
         }
         let key = cmd.find_subcommand("key").unwrap();
@@ -1165,6 +1195,27 @@ mod tests {
                 "key verb {name} missing"
             );
         }
+    }
+
+    /// `set-handle` claims exactly one handle, named by flag; the password
+    /// is never an argument.
+    #[test]
+    fn set_handle_takes_one_handle_by_flag() {
+        use clap::Parser as _;
+        let parse = |line: &str| TestCli::try_parse_from(line.split(' ')).map(|cli| cli.cmd);
+        assert!(matches!(
+            parse("t set-handle --handle operator").unwrap(),
+            AccountCmd::SetHandle { handle } if handle == "operator"
+        ));
+        assert!(parse("t set-handle").is_err(), "no handle");
+        assert!(
+            parse("t set-handle operator").is_err(),
+            "a flag, not a positional"
+        );
+        assert!(
+            parse("t set-handle --handle a --password x").is_err(),
+            "no password flag"
+        );
     }
 
     /// `key add` names its key ONE way: a pasted hex, a browser passkey, or a

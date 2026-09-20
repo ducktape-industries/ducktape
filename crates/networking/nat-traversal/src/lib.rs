@@ -30,7 +30,8 @@ pub use advert::{
 };
 pub use auth::{
     AuthError, AuthPolicy, Authenticator, COORD_CAP_NS, COORD_CAP_TTL_SECS, COORD_REQ_NS, CoordCap,
-    DEFAULT_FRESHNESS_WINDOW_SECS, mint_coord_cap, now_secs, sign_authenticator, verify_request,
+    DEFAULT_FRESHNESS_WINDOW_SECS, MAX_CAP_CHAIN, delegate_coord_cap, mint_coord_cap, now_secs,
+    sign_authenticator, verify_request,
 };
 #[cfg(feature = "runtime")]
 pub use client::{
@@ -53,6 +54,15 @@ pub use simnat::SimNat;
 #[cfg(all(feature = "runtime", any(test, feature = "simnat")))]
 pub use simnet::{SimHandle, SimNetwork, SimSocket};
 pub use wire::{AuthRequest, Msg, NodeKey, WireError};
+
+/// the coordinator's rendezvous port (UDP, the STUN port): where a coordinator
+/// binds by default and where a node dials the shipped default coordinator.
+/// one number for both ends.
+pub const COORDINATOR_PORT: u16 = 3478;
+/// the relay lane's port (TCP): where a coordinator's relay listener binds by
+/// default and what a node derives from its coordinator's host. 443 is the one
+/// port every network forwards, which is the whole reason the lane exists.
+pub const RELAY_PORT: u16 = 443;
 
 /// a first-and-every-Nth counter for a refusal a STRANGER can drive: the first
 /// occurrence logs immediately, then every [`Latch::EVERY`]th, carrying the

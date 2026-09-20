@@ -26,7 +26,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use commonware_codec::{DecodeExt as _, Encode as _};
+use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
 use commonware_utils::Hostname;
@@ -94,36 +94,49 @@ pub fn capability_dir(workspace: &Path) -> PathBuf {
 /// files `node init` composes a genesis from, and the daemons that run no
 /// network (noded, simnode, the dev shape) compose directly from:
 /// `$DUCKTAPE_MODULES_DIR`, else the set the build staged beside this
-/// executable ([`staged_modules_dir`]).
+/// executable under `staged` ([`staged_modules_dir`]).
+///
+/// `staged` is the name the build that linked this binary staged its set
+/// under — `noded::services::STAGED_SET`, baked in by the stager's own run.
+/// It is an argument because this crate has no build script to bake it with
+/// (see `staged_key`).
 ///
 /// This is the only place bare wasm files are read. A network's own wasm
 /// lives in its workspace genesis, never under the ducktape home: two
 /// networks carry two sets, and no directory outside a workspace decides
 /// what its network runs.
-pub fn modules_dir() -> Result<PathBuf, String> {
+pub fn modules_dir(staged: &str) -> Result<PathBuf, String> {
     if let Some(dir) = std::env::var_os("DUCKTAPE_MODULES_DIR") {
         return Ok(PathBuf::from(dir));
     }
     let exe = std::env::current_exe().map_err(|e| format!("current executable: {e}"))?;
-    staged_modules_dir(&exe).ok_or_else(|| {
-        format!(
-            "no founding set beside {} — `cargo build` stages this checkout's own \
-             (target/<profile>/modules%<checkout>, named by its `{}`), `make install-node` \
-             installs one beside the binary as `modules`, or set $DUCKTAPE_MODULES_DIR",
-            exe.display(),
-            staged_key::STAGED_POINTER,
-        )
-    })
+    staged_modules_dir(&exe, staged).ok_or_else(|| no_founding_set(&exe))
+}
+
+/// What a binary with no set beside it says. It names the ARTIFACT that is
+/// missing, because on a release-only host nothing else can put one there: a
+/// node release archive carries `modules/` next to `ducktape`, and a binary
+/// lifted out of the archive on its own is the one way to end up here.
+fn no_founding_set(exe: &Path) -> String {
+    format!(
+        "no founding set beside {} — a node release archive carries the set its binary was \
+         built with as `modules/` beside `ducktape`, so unpack the WHOLE archive (download it \
+         again if only the binary was copied); `ops/release/archive.sh --kind node` packs one \
+         and `ducktape-node-launcher` unpacks it into <workspace>/updates/releases/<sha>/. In a \
+         checkout, `cargo build` stages this checkout's own set beside the binaries it links \
+         (target/<profile>/modules%<checkout>).",
+        exe.display(),
+    )
 }
 
 /// The simulator's packaged preset also includes its small KV test module.
 /// An explicit modules directory remains the caller's complete artifact set.
-pub fn sim_modules_dir() -> Result<PathBuf, String> {
+pub fn sim_modules_dir(staged: &str) -> Result<PathBuf, String> {
     let configured = std::env::var_os("DUCKTAPE_MODULES_DIR");
     if let Some(dir) = configured {
         return Ok(PathBuf::from(dir));
     }
-    Ok(sim_twin(&modules_dir()?))
+    Ok(sim_twin(&modules_dir(staged)?))
 }
 
 /// the simulation set beside a resolved founding set: this checkout's keyed
@@ -138,26 +151,23 @@ fn sim_twin(modules: &Path) -> PathBuf {
     modules.with_file_name(sim)
 }
 
-/// the founding set the build staged beside `exe`: `<exe dir>/modules` (a
-/// `cargo build` binary in `target/<profile>/`, or an installed one), else
-/// `<exe dir>/../modules` (a test executable cargo runs from
-/// `target/<profile>/deps/`). `None` when neither directory exists.
-pub fn staged_modules_dir(exe: &Path) -> Option<PathBuf> {
-    // The set the LAST build staged, named by the pointer that build wrote
-    // beside the binaries — then the unkeyed one. The pointer is read at
-    // RUNTIME and never baked: several checkouts share a profile directory
-    // because their source is identical, which is exactly why cargo shares the
-    // compiled unit a baked key would live in (see `STAGED_POINTER`). Unkeyed
-    // is the INSTALLED layout, which `make install-node` and the pinned dognet
-    // binaries use, and where nothing else writes.
+/// the founding set the build staged beside `exe` under the name `staged`:
+/// `<exe dir>/<staged>` (a `cargo build` binary in `target/<profile>/`), else
+/// `<exe dir>/../<staged>` (a test executable cargo runs from
+/// `target/<profile>/deps/`) — then the unkeyed `modules` in the same two
+/// places, the INSTALLED layout `make install-node`, a release archive and the
+/// pinned dognet binaries have, where nothing else writes. `None` when none of
+/// the four exists.
+///
+/// Nothing here reads a file to learn the name: the profile directory is
+/// written by every checkout building into the target, so a name read from it
+/// at boot is the last builder's, not this binary's.
+pub fn staged_modules_dir(exe: &Path, staged: &str) -> Option<PathBuf> {
     let exe_dir = exe.parent()?;
     let deps_parent = exe_dir.parent();
-    let staged = [Some(exe_dir), deps_parent]
-        .into_iter()
-        .flatten()
-        .find_map(|dir| Some(dir.join(staged_pointer_target(dir)?)));
     let candidates = [
-        staged,
+        Some(exe_dir.join(staged)),
+        deps_parent.map(|dir| dir.join(staged)),
         Some(exe_dir.join("modules")),
         deps_parent.map(|dir| dir.join("modules")),
     ];
@@ -165,17 +175,6 @@ pub fn staged_modules_dir(exe: &Path) -> Option<PathBuf> {
         .into_iter()
         .flatten()
         .find(|candidate| candidate.is_dir())
-}
-
-/// The set name `dir`'s pointer names, if it has one.
-fn staged_pointer_target(dir: &Path) -> Option<String> {
-    let name = std::fs::read_to_string(dir.join(staged_key::STAGED_POINTER)).ok()?;
-    let name = name.trim();
-    // a pointer naming anything but a plain directory name is not one this
-    // build wrote; refuse it rather than following it out of the profile dir.
-    let names_one_directory =
-        !name.is_empty() && !name.contains('/') && name != ".." && name != ".";
-    names_one_directory.then(|| name.to_owned())
 }
 
 /// The build that staged `set`, as `crates/noded/build.rs` recorded it, or
@@ -673,16 +672,26 @@ impl NetworkDescriptor {
 /// coordination privacy for the reachability plane — per-network operational
 /// policy (like `checkpoint_blocks`), NOT part of the genesis fingerprint.
 /// `Public` = the coordinator admits any proof-of-possession request;
-/// `Private` (the default) also requires a genesis-issued `CoordCap`.
+/// `Private` (the default) also requires a validator-issued `CoordCap`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Coordination {
     Public,
     Private,
 }
 
+/// the host of the shared public rendezvous coordinator (see
+/// [`default_primary_coordinator`]).
+const DEFAULT_COORDINATOR_HOST: &str = "relay.ducktape.industries";
+
 /// Shared public rendezvous coordinator used when a network is created without
-/// an explicit direct-only override.
-pub const DEFAULT_PRIMARY_COORDINATOR: &str = "relay.ducktape.industries:3478";
+/// an explicit direct-only override: its host, on the port every coordinator
+/// binds by default ([`nat_traversal::COORDINATOR_PORT`]).
+pub fn default_primary_coordinator() -> String {
+    format!(
+        "{DEFAULT_COORDINATOR_HOST}:{}",
+        nat_traversal::COORDINATOR_PORT
+    )
+}
 
 /// The typed invite format still carries a coordinator key, but the deployed
 /// coordinator is intentionally keyless. Keep one stable valid key in the
@@ -694,10 +703,11 @@ pub fn keyless_coordinator_placeholder_key() -> ed25519::PublicKey {
 /// Resolve the primary coordinator option. `None` means "use the product
 /// default"; `"none"`/`"off"` keeps the old direct-only posture.
 pub fn primary_coordinator_or_default(raw: Option<&str>) -> Result<Option<String>, String> {
+    let default = default_primary_coordinator();
     let coord = raw
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_PRIMARY_COORDINATOR);
+        .unwrap_or(&default);
     if matches!(coord, "none" | "off" | "direct") {
         return Ok(None);
     }
@@ -708,8 +718,9 @@ pub fn primary_coordinator_or_default(raw: Option<&str>) -> Result<Option<String
 }
 
 /// Resolve the ambient coordinator to a dial [`Ingress`] — the AMBIENT source
-/// a joiner's NAT resolver binds (config/default), never one carried in an
-/// invite. `None` when coordination is disabled (`"none"`/`"off"`/`"direct"`).
+/// a joiner's NAT resolver binds (its node.toml, which a join seeds from the
+/// invite; else the default). `None` when coordination is disabled
+/// (`"none"`/`"off"`/`"direct"`).
 pub fn coordinator_ingress(raw: Option<&str>) -> Result<Option<Ingress>, String> {
     match primary_coordinator_or_default(raw)? {
         Some(addr) => ingress_of(&addr),
@@ -744,13 +755,6 @@ impl NetworkDescriptor {
         });
         Ok(())
     }
-
-    pub fn has_coordinated_reach(&self) -> Result<bool, String> {
-        Ok(self
-            .reach_hints()?
-            .iter()
-            .any(|h| matches!(h.reach, Reach::Coordinated(_))))
-    }
 }
 
 /// a reach hint resolved to how the mesh actually reaches a member. `Direct`
@@ -767,48 +771,39 @@ pub enum ReachDial {
 }
 
 pub fn decode_key(hex: &str) -> Result<ed25519::PublicKey, String> {
-    let raw = unhex(hex.trim())?;
+    let digits = hex.trim();
+    let not_a_key = |why: String| format!("{hex:?} is not an ed25519 public key: {why}");
+    // Every way this fails is said here, in this CLI's words: the codec's own
+    // refusal of a short buffer ("Unexpected End-of-Buffer") is written for
+    // its author, not for someone who typed 8 characters where 64 belong.
+    let expected = 2 * <ed25519::PublicKey as commonware_codec::FixedSize>::SIZE;
+    let typed = digits.chars().count();
+    if typed != expected {
+        return Err(not_a_key(format!(
+            "expected {expected} hex characters, got {typed}"
+        )));
+    }
+    let raw = unhex(digits).map_err(not_a_key)?;
     ed25519::PublicKey::decode(raw.as_slice())
-        .map_err(|e| format!("{hex:?} is not an ed25519 public key: {e}"))
+        .map_err(|_| not_a_key("not a valid ed25519 point".into()))
 }
 
 // ============================================================================
 // coordinator capability — the private-mode admission token a node presents on
-// each rendezvous request. Minted by a genesis validator (`mint_coord_cap`),
-// persisted 0600 beside the descriptor like `invite.token`. Genesis validators
-// need none (the coordinator's pinned set covers them).
+// each rendezvous request. Minted by the validator that seats the node
+// (`mint_coord_cap`, or `delegate_coord_cap` under the seating node's own
+// cap), persisted 0600 beside the descriptor like `invite.token`. Genesis
+// validators need none (the coordinator's pinned set covers them).
 // ============================================================================
 
 const COORD_CAP_FILE: &str = "coord.cap";
-const COORD_CAP_LEN: usize = 32 + 8 + 64;
 
 pub fn pack_coord_cap(cap: &nat_traversal::CoordCap) -> Vec<u8> {
-    let mut out = Vec::with_capacity(COORD_CAP_LEN);
-    out.extend_from_slice(cap.issuer.as_ref());
-    out.extend_from_slice(&cap.not_after.to_be_bytes());
-    out.extend_from_slice(cap.issuer_sig.encode().as_ref());
-    out
+    cap.encode()
 }
 
 pub fn unpack_coord_cap(bytes: &[u8]) -> Result<nat_traversal::CoordCap, String> {
-    if bytes.len() != COORD_CAP_LEN {
-        return Err(format!(
-            "coord cap must be {COORD_CAP_LEN} bytes, got {}",
-            bytes.len()
-        ));
-    }
-    let issuer =
-        ed25519::PublicKey::decode(&bytes[..32]).map_err(|e| format!("coord cap issuer: {e}"))?;
-    let mut na = [0u8; 8];
-    na.copy_from_slice(&bytes[32..40]);
-    let not_after = u64::from_be_bytes(na);
-    let issuer_sig =
-        ed25519::Signature::decode(&bytes[40..]).map_err(|e| format!("coord cap sig: {e}"))?;
-    Ok(nat_traversal::CoordCap {
-        issuer,
-        not_after,
-        issuer_sig,
-    })
+    nat_traversal::CoordCap::decode(bytes).map_err(|e| format!("coord cap: {e}"))
 }
 
 pub fn save_coord_cap(dir: &Path, cap: &nat_traversal::CoordCap) -> Result<(), String> {
@@ -828,11 +823,27 @@ pub fn save_coord_cap(dir: &Path, cap: &nat_traversal::CoordCap) -> Result<(), S
         .map_err(|e| format!("write {path:?}: {e}"))
 }
 
-pub fn load_coord_cap(dir: &Path) -> Option<nat_traversal::CoordCap> {
+/// the cap this workspace was issued. `Ok(None)` means none was ever issued
+/// (no file). A file that is present but unreadable is `coord_cap_unreadable`,
+/// never "never issued": reading it as absent would boot the node cap-less and
+/// hide that the one cap it was ever delivered is lost.
+pub fn load_coord_cap(dir: &Path) -> Result<Option<nat_traversal::CoordCap>, String> {
     let path = dir.join(COORD_CAP_FILE);
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let bytes = unhex(raw.trim()).ok()?;
-    unpack_coord_cap(&bytes).ok()
+    if !path.exists() {
+        return Ok(None);
+    }
+    let unreadable = |why: String| {
+        format!(
+            "coord_cap_unreadable: {} ({why}) — the coordinator capability this node was \
+             issued at admission cannot be read, and no path re-issues it; move the file \
+             aside to run without one (a private coordinator then refuses this node's \
+             rendezvous)",
+            path.display()
+        )
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| unreadable(e.to_string()))?;
+    let bytes = unhex(text.trim()).map_err(unreadable)?;
+    unpack_coord_cap(&bytes).map(Some).map_err(unreadable)
 }
 
 /// guard a join against clobbering a DIFFERENT network's descriptor: a
@@ -1126,7 +1137,8 @@ pub fn sync_source_candidates<A>(
 pub const FOUNDING_FILE: &str = "founding.toml";
 
 /// what the binary that materialized this workspace (`node init`, `node join`)
-/// wrote down about itself.
+/// wrote down about itself — rewritten by a node release its launcher flipped
+/// to once it comes up healthy (`node record-world`).
 ///
 /// `module_world` is the whole comparison. A module component is compiled
 /// against the `ducktape:module` WIT world, and a host binding a different one
@@ -1168,15 +1180,29 @@ impl FoundingBinary {
     }
 }
 
-/// refuse a boot whose module world is not the one `dir` was founded with.
+/// how a workspace came to hold its network — which decides what a
+/// module-world refusal can tell its operator to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceRole {
+    /// its identity is a genesis validator: the network was founded here.
+    Founder,
+    /// it joined a network founded elsewhere.
+    Member,
+}
+
+/// refuse a boot whose module world is not the one `dir` was founded or
+/// joined with.
 ///
 /// Up front and by name, because the alternative is a node that comes up,
 /// replays, and dies inside component instantiation naming a `shape` export.
-/// There is no tolerance window and no migration: the operator rebuilds the
-/// binary from the founding commit, or re-founds the network.
+/// There is no tolerance window and no migration. What the operator can do
+/// depends on `role`: a founder re-founds the network with this binary, and a
+/// member — who installed a release and can rebuild nothing — runs the node
+/// release its network runs, or joins the re-founded network afresh.
 pub fn guard_founding_binary(
     dir: &Path,
     chain_id: &str,
+    role: WorkspaceRole,
     build: &str,
     module_world: &str,
 ) -> Result<(), String> {
@@ -1187,10 +1213,22 @@ pub fn guard_founding_binary(
     if speaks_the_founding_world {
         return Ok(());
     }
+    let recorded = &founding.build;
+    let remedy = match role {
+        WorkspaceRole::Founder => format!(
+            "this network was founded here by {recorded}, and a module world moves only by a \
+             re-found: re-found the network with this binary, or run the release it was founded \
+             with"
+        ),
+        WorkspaceRole::Member => format!(
+            "this workspace joined it with {recorded}, and this binary cannot run the network's \
+             components: run the node release the network runs, or — if the network was \
+             re-founded — join the new one with a fresh invite from a current member"
+        ),
+    };
     Err(format!(
-        "refusing to boot {chain_id}: founded by {}, running {build} (module world differs) — \
-         rebuild this binary from the founding commit, or re-found the network",
-        founding.build
+        "refusing to boot {chain_id}: running {build}, whose module world is not the one this \
+         workspace holds — {remedy}"
     ))
 }
 
@@ -1241,59 +1279,71 @@ fn is_workspace_dir_name(name: &str) -> bool {
     single && components.next().is_none()
 }
 
+/// THE "pick one" list. Every refusal that offers a choice between registered
+/// workspaces renders it through here, so no two of them can disagree about
+/// order or content.
+///
+/// Each line carries the CONFIG PATH beside the chain id, because the chain id
+/// alone does not name a row: a founder and the member that joined it share
+/// one, and a list that printed the id twice offered the operator two
+/// identical strings and no way to act on either. The path is what tells them
+/// apart and what `--config` takes. Same `<chain-id>\t<path>` shape as
+/// `ducktape node list`, indented as a choice.
+pub fn workspace_choices(rows: &[(String, PathBuf)]) -> String {
+    rows.iter()
+        .map(|(chain_id, node_toml)| format!("  {chain_id}\t{}", node_toml.display()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// resolve `--network <chain id>` to a workspace's node.toml: scan the
 /// ducktape home for descriptors whose chain-id matches `needle` — exact
-/// first, else a unique prefix (so `ducktape` finds `ducktape#a1b2c3d4`).
-/// ambiguity and absence are loud errors that name what WAS found.
+/// first, else a prefix (so `ducktape` finds `ducktape#a1b2c3d4`). the match
+/// must be UNIQUE either way; ambiguity and absence are loud errors that name
+/// what WAS found.
 pub fn find_workspace_config(needle: &str) -> Result<PathBuf, String> {
     find_workspace_config_in(&ducktape_home()?, needle)
 }
 
 fn find_workspace_config_in(root: &Path, needle: &str) -> Result<PathBuf, String> {
-    let entries = std::fs::read_dir(root)
-        .map_err(|e| format!("no workspaces under {root:?} ({e}) — pass --config <node.toml>"))?;
-    let mut matches: Vec<(String, PathBuf)> = Vec::new();
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        let descriptor_path = dir.join("network.toml");
-        if !descriptor_path.is_file() {
-            continue;
-        }
-        // an unreadable descriptor in one workspace must not break addressing
-        // the others — skip it, but say so: silence here reads as "no such
-        // workspace" when the real story is a torn network.toml.
-        let d = match NetworkDescriptor::load(&descriptor_path) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(
-                    target: "ducktape::node",
-                    reason = "descriptor_unreadable",
-                    dir = %dir.display(),
-                    error = %e,
-                    "skipping workspace with an unreadable network.toml"
-                );
-                continue;
-            }
-        };
-        if d.chain_id == needle {
-            return Ok(dir.join("node.toml"));
-        }
-        if d.chain_id.starts_with(needle) {
-            matches.push((d.chain_id, dir.join("node.toml")));
-        }
+    // an empty needle is not a prefix that matches everything, it is a missing
+    // value: `-n ''` used to "match" every workspace on the box and then refuse
+    // as ambiguous, naming the whole home for a flag the operator left blank.
+    if needle.is_empty() {
+        return Err(
+            "-n/--network was given an empty value — pass a chain id or a unique prefix of one \
+             (`ducktape node list`)"
+                .into(),
+        );
     }
-    match matches.len() {
-        0 => Err(format!(
-            "no workspace under {root:?} matches network {needle:?}"
+    // the same scan `node list` prints, so the resolver and every "pick one"
+    // list agree on which workspaces exist, in one order — sorted, not read_dir's.
+    let registered = list_workspaces_in(root)?;
+    let exact: Vec<(String, PathBuf)> = registered
+        .iter()
+        .filter(|(chain_id, _)| chain_id == needle)
+        .cloned()
+        .collect();
+    // an exact hit still outranks a prefix hit, but it no longer ENDS the scan:
+    // two workspaces of one network carry one chain id, and returning on the
+    // first made `-n <exact id>` a read_dir coin flip between them.
+    let matches = match exact.is_empty() {
+        false => exact,
+        true => registered
+            .into_iter()
+            .filter(|(chain_id, _)| chain_id.starts_with(needle))
+            .collect(),
+    };
+    match matches.as_slice() {
+        [] => Err(format!(
+            "no workspace under {root:?} matches network {needle:?} — pass --config <node.toml>"
         )),
-        1 => Ok(matches.swap_remove(0).1),
-        _ => Err(format!(
-            "network {needle:?} is ambiguous — matches: {}",
-            matches
-                .iter()
-                .map(|(c, _)| c.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+        [(_, node_toml)] => Ok(node_toml.clone()),
+        several => Err(format!(
+            "network {needle:?} is ambiguous — it matches {} registered workspaces, \
+             select one with --config <path>:\n{}",
+            several.len(),
+            workspace_choices(several)
         )),
     }
 }
@@ -1401,36 +1451,350 @@ pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String>
     Ok(out)
 }
 
+/// the file that makes a directory under the ducktape home a REMOTE
+/// workspace: a network this machine reaches through a node it does not run.
+/// A directory holding a `network.toml` is a local workspace and its
+/// `remote.toml`, if any, is never read.
+pub const REMOTE_WORKSPACE_FILE: &str = "remote.toml";
+
+/// a remote workspace: the chain id the node reported on `/v1/status`, and the
+/// node's http base. No credential: nothing this machine sends that node is
+/// authorized by a file here.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteWorkspace {
+    pub chain_id: String,
+    pub node: String,
+}
+
+impl RemoteWorkspace {
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
+        toml::from_str(&text).map_err(|e| format!("{path:?}: {e}"))
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let text = toml::to_string(self).expect("a remote workspace serializes");
+        genesis::write_atomic(path, text.as_bytes())
+    }
+}
+
+/// where a registered network's node answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Registered {
+    /// a workspace this machine runs: its node.toml.
+    Local(PathBuf),
+    /// a remote workspace: its `remote.toml`, and the node's http base.
+    Remote { file: PathBuf, node: String },
+}
+
+impl Registered {
+    /// the file that registered it — what a "pick one" list shows.
+    pub fn file(&self) -> &Path {
+        match self {
+            Registered::Local(node_toml) => node_toml,
+            Registered::Remote { file, .. } => file,
+        }
+    }
+
+    /// the node's http base: [`http_base_of`] a local node.toml's
+    /// `http_listen`, a remote workspace's `node` as registered.
+    pub fn node_base(&self) -> Result<String, String> {
+        match self {
+            Registered::Local(node_toml) => {
+                let (raw, _) = node_toml::load_node_toml(node_toml)?;
+                Ok(http_base_of(&raw.http_listen))
+            }
+            Registered::Remote { node, .. } => Ok(node.clone()),
+        }
+    }
+}
+
+/// every registered network — the local workspaces [`list_workspaces_in`]
+/// finds, then the remote ones — as `(chain id, where its node answers)`.
+pub fn registered_networks() -> Result<Vec<(String, Registered)>, String> {
+    registered_networks_in(&ducktape_home()?)
+}
+
+pub fn registered_networks_in(root: &Path) -> Result<Vec<(String, Registered)>, String> {
+    let mut out: Vec<(String, Registered)> = list_workspaces_in(root)?
+        .into_iter()
+        .map(|(chain_id, node_toml)| (chain_id, Registered::Local(node_toml)))
+        .collect();
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(format!("read {root:?}: {e}")),
+    };
+    let mut remote = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let file = dir.join(REMOTE_WORKSPACE_FILE);
+        let is_remote = !dir.join("network.toml").exists() && file.is_file();
+        if !is_remote {
+            continue;
+        }
+        match RemoteWorkspace::load(&file) {
+            Ok(workspace) => remote.push((
+                workspace.chain_id,
+                Registered::Remote {
+                    file,
+                    node: workspace.node,
+                },
+            )),
+            Err(e) => warn!(
+                target: "ducktape::node",
+                reason = "remote_workspace_unreadable",
+                dir = %dir.display(),
+                error = %e,
+                "skipping an unreadable remote workspace"
+            ),
+        }
+    }
+    remote.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.file().cmp(b.1.file())));
+    out.extend(remote);
+    Ok(out)
+}
+
+/// the registered networks whose chain id carries `wanted`'s salt — the match
+/// key; the label is display and is checked by [`resolve_chain_in`]. A
+/// registry id that is not an address's chain id (a `node init --name` the
+/// address grammar cannot spell) matches nothing.
+pub fn registered_on(
+    root: &Path,
+    wanted: &duck_address::ChainId,
+) -> Result<Vec<(String, Registered)>, String> {
+    Ok(registered_networks_in(root)?
+        .into_iter()
+        .filter(|(chain_id, _)| {
+            chain_id
+                .parse::<duck_address::ChainId>()
+                .is_ok_and(|registered| registered.salt_hex() == wanted.salt_hex())
+        })
+        .collect())
+}
+
+/// the ONE registered network a `duck://` address names, found by its chain
+/// id and nothing else: no active workspace, no lone-workspace default, no
+/// `./node.toml`, no environment variable. The salt matches, the label must
+/// agree, and none or several matches are refused with the registry listed.
+pub fn resolve_chain_in(
+    root: &Path,
+    wanted: &duck_address::ChainId,
+) -> Result<(String, Registered), duck_address::Refused> {
+    let unreadable = |e: String| duck_address::Refused::new("registry_unreadable", e);
+    let matching = registered_on(root, wanted).map_err(unreadable)?;
+    let listed = || -> Result<String, duck_address::Refused> {
+        let rows: Vec<(String, PathBuf)> = registered_networks_in(root)
+            .map_err(unreadable)?
+            .into_iter()
+            .map(|(chain_id, registered)| (chain_id, registered.file().to_path_buf()))
+            .collect();
+        match rows.is_empty() {
+            true => Ok(format!(
+                "  (nothing is registered under {})",
+                root.display()
+            )),
+            false => Ok(workspace_choices(&rows)),
+        }
+    };
+    let authority = wanted.authority();
+    let (chain_id, registered) = match matching.as_slice() {
+        [] => {
+            return Err(duck_address::Refused::new(
+                "network_unknown",
+                format!(
+                    "No workspace registered on this machine is on network {authority}. Redeem \
+                     an invite to it (`ducktape node join <invite>`), or register a node that \
+                     serves it (`ducktape forge setup --node <url>`). Registered:\n{}",
+                    listed()?
+                ),
+            ));
+        }
+        [one] => one,
+        several => {
+            let picked = picked_workspace_in(root, wanted).map_err(unreadable)?;
+            let chosen =
+                picked.and_then(|file| several.iter().find(|(_, entry)| entry.file() == file));
+            let Some(one) = chosen else {
+                return Err(duck_address::Refused::new(
+                    "network_ambiguous",
+                    format!(
+                        "{} registered workspaces are on network {authority}, and an address \
+                         names a network, not a workspace — pick the one its addresses resolve \
+                         to with `ducktape forge setup --config <path>`:\n{}",
+                        several.len(),
+                        workspace_choices(
+                            &several
+                                .iter()
+                                .map(|(chain_id, registered)| {
+                                    (chain_id.clone(), registered.file().to_path_buf())
+                                })
+                                .collect::<Vec<_>>()
+                        )
+                    ),
+                ));
+            };
+            one
+        }
+    };
+    let agrees = chain_id
+        .parse::<duck_address::ChainId>()
+        .is_ok_and(|registered| registered.label == wanted.label);
+    if !agrees {
+        return Err(duck_address::Refused::new(
+            "label_mismatch",
+            format!(
+                "The address names network {authority}, but this machine's registry knows {} as \
+                 {chain_id} ({}).",
+                wanted.salt_hex(),
+                registered.file().display()
+            ),
+        ));
+    }
+    Ok((chain_id.clone(), registered.clone()))
+}
+
+/// which registered workspace a `duck://` address resolves to when several
+/// are on its network: `<salt> = "<registered file>"`, one line per network,
+/// written by `ducktape forge setup --config <path>`. Any of them serves a
+/// read; the pick is the one git remotes on this machine go through.
+pub const GIT_WORKSPACE_PICKS: &str = "git-workspaces.toml";
+
+/// the registered file picked for `wanted`'s network, if one was.
+pub fn picked_workspace_in(
+    root: &Path,
+    wanted: &duck_address::ChainId,
+) -> Result<Option<PathBuf>, String> {
+    Ok(read_picks(root)?.remove(&wanted.salt_hex()))
+}
+
+/// record `file` (a registered workspace's file, as [`Registered::file`]
+/// names it) as the pick for `wanted`'s network.
+pub fn pick_workspace_in(
+    root: &Path,
+    wanted: &duck_address::ChainId,
+    file: &Path,
+) -> Result<(), String> {
+    let mut picks = read_picks(root)?;
+    picks.insert(wanted.salt_hex(), file.to_path_buf());
+    let text = toml::to_string(&picks).map_err(|e| format!("encode the git picks: {e}"))?;
+    genesis::write_atomic(&root.join(GIT_WORKSPACE_PICKS), text.as_bytes())
+}
+
+fn read_picks(root: &Path) -> Result<std::collections::BTreeMap<String, PathBuf>, String> {
+    let path = root.join(GIT_WORKSPACE_PICKS);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).map_err(|e| format!("{path:?}: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(format!("read {path:?}: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A binary resolves the set THE POINTER BESIDE IT names, before the
-    /// unkeyed one, from the profile directory and from `deps/` where cargo
-    /// runs tests — and an installed layout (a plain `modules` beside the
-    /// binary, which is what `make install-node` and the pinned dognet
-    /// binaries have) resolves exactly as it did before any keying.
+    /// THE BUG (#2512): `node admit deadbeef` answered with the codec's
+    /// "Unexpected End-of-Buffer: Not enough bytes remaining to read data".
+    /// A person who typed the wrong thing is told what the right thing is, and
+    /// a key that IS right still decodes (the must-pass case).
     #[test]
-    fn a_binary_resolves_the_set_its_pointer_names_before_the_installed_one() {
+    fn a_bad_pubkey_is_refused_in_the_clis_own_words() {
+        for (typed, why) in [
+            ("deadbeef", "expected 64 hex characters, got 8"),
+            (&"ab".repeat(33), "expected 64 hex characters, got 66"),
+            (&"zz".repeat(32), ""),
+        ] {
+            let said = decode_key(typed).expect_err("not a key");
+            assert!(
+                said.starts_with(&format!("{typed:?} is not an ed25519 public key: ")),
+                "{said}"
+            );
+            assert!(said.ends_with(why), "{said}");
+            assert!(!said.contains("Buffer"), "no codec text: {said}");
+        }
+        let key = ed25519::PrivateKey::from_seed(7).public_key();
+        assert_eq!(decode_key(&hex_bytes(key.as_ref())), Ok(key));
+    }
+
+    /// A member installed a release and can rebuild nothing, so the refusal
+    /// never tells anybody to rebuild: a founder is sent to re-found, a member
+    /// to the release its network runs or a fresh invite. The binary that
+    /// speaks the recorded world still boots (the must-pass case).
+    #[test]
+    fn a_module_world_refusal_names_each_roles_own_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        FoundingBinary {
+            build: "0.1.0+aaaa".into(),
+            module_world: "world-a".into(),
+        }
+        .save(dir.path())
+        .unwrap();
+        let refuse = |role| {
+            guard_founding_binary(dir.path(), "net#1", role, "0.1.0+bbbb", "world-b")
+                .expect_err("module world differs")
+        };
+
+        let founder = refuse(WorkspaceRole::Founder);
+        assert!(
+            founder.contains("re-found the network with this binary"),
+            "{founder}"
+        );
+        let member = refuse(WorkspaceRole::Member);
+        assert!(
+            member.contains("run the node release the network runs"),
+            "{member}"
+        );
+        assert!(member.contains("fresh invite"), "{member}");
+        assert!(!member.contains("re-found the network with"), "{member}");
+        for said in [&founder, &member] {
+            assert!(!said.contains("rebuild"), "{said}");
+            assert!(
+                said.contains("0.1.0+aaaa") && said.contains("0.1.0+bbbb"),
+                "{said}"
+            );
+        }
+
+        let same = guard_founding_binary(
+            dir.path(),
+            "net#1",
+            WorkspaceRole::Member,
+            "0.1.0+cccc",
+            "world-a",
+        );
+        assert_eq!(same, Ok(()));
+    }
+
+    /// A binary resolves the set its build staged, by the name that build
+    /// baked in, before the unkeyed one, from the profile directory and from
+    /// `deps/` where cargo runs tests — and an installed layout (a plain
+    /// `modules` beside the binary, which is what `make install-node` and the
+    /// pinned dognet binaries have) resolves exactly as it did before any
+    /// keying.
+    #[test]
+    fn a_binary_resolves_the_set_its_build_named_before_the_installed_one() {
         let scratch = tempfile::tempdir().unwrap();
         let profile = scratch.path().join("debug");
         let exe = profile.join("ducktape");
         std::fs::create_dir_all(profile.join("deps")).unwrap();
+        let ours = "modules%home%someone%checkout";
 
         std::fs::create_dir(profile.join("modules")).unwrap();
-        assert_eq!(staged_modules_dir(&exe).unwrap(), profile.join("modules"));
-
-        let ours = "modules%home%someone%checkout";
-        std::fs::create_dir(profile.join(ours)).unwrap();
-        std::fs::write(profile.join(staged_key::STAGED_POINTER), ours).unwrap();
         assert_eq!(
-            staged_modules_dir(&exe).unwrap(),
+            staged_modules_dir(&exe, ours).unwrap(),
+            profile.join("modules")
+        );
+
+        std::fs::create_dir(profile.join(ours)).unwrap();
+        assert_eq!(
+            staged_modules_dir(&exe, ours).unwrap(),
             profile.join(ours),
-            "another checkout's `modules` must not outrank the one we were pointed at"
+            "another checkout's `modules` must not outrank the one we were built with"
         );
         let test_exe = profile.join("deps/noded-1234");
         assert_eq!(
-            staged_modules_dir(&test_exe).unwrap(),
+            staged_modules_dir(&test_exe, ours).unwrap(),
             profile.join(ours),
             "a test binary runs from deps/"
         );
@@ -1439,7 +1803,7 @@ mod tests {
         let installed = scratch.path().join("bin");
         std::fs::create_dir_all(installed.join("modules")).unwrap();
         assert_eq!(
-            staged_modules_dir(&installed.join("ducktape")).unwrap(),
+            staged_modules_dir(&installed.join("ducktape"), ours).unwrap(),
             installed.join("modules")
         );
         assert_eq!(
@@ -1452,25 +1816,77 @@ mod tests {
         );
     }
 
-    /// A pointer is a NAME, never a path: a profile directory is written by
-    /// every checkout sharing the target, so one that could carry `..` would
-    /// be a way to aim a node at any directory on the box.
+    /// A NODE RELEASE resolves its set exactly like an installed one, because
+    /// there is one layout: the archive unpacks `ducktape` and `modules/` side
+    /// by side into `<workspace>/updates/releases/<sha>/`, and `/proc/self/exe`
+    /// resolves through `current` to that directory.
     #[test]
-    fn a_pointer_that_is_not_a_plain_name_is_refused() {
+    fn a_release_directory_resolves_the_set_its_archive_unpacked_beside_the_binary() {
+        let scratch = tempfile::tempdir().unwrap();
+        let release = scratch.path().join("updates/releases/deadbeef");
+        std::fs::create_dir_all(release.join("modules")).unwrap();
+        let built_as = "modules%home%release%checkout";
+        assert_eq!(
+            staged_modules_dir(&release.join("ducktape"), built_as).unwrap(),
+            release.join("modules")
+        );
+
+        // and a binary lifted out of the archive on its own — the one way to
+        // reach a release host with no set — is told which ARTIFACT is
+        // missing, never an environment variable it has no way to fill.
+        let alone = scratch.path().join("bin/ducktape");
+        assert!(staged_modules_dir(&alone, built_as).is_none());
+        let refusal = no_founding_set(&alone);
+        assert!(refusal.contains("release archive"), "{refusal}");
+        assert!(refusal.contains("modules/"), "{refusal}");
+        assert!(
+            !refusal.contains("DUCKTAPE_MODULES_DIR"),
+            "the fatal names the artifact to download, not an env var: {refusal}"
+        );
+    }
+
+    /// What a binary resolves depends on nothing a sibling checkout writes.
+    ///
+    /// Every checkout building into a shared target writes into one profile
+    /// directory: its own keyed set, and — at an older revision — a pointer
+    /// file naming it. A binary that read the name from there at boot followed
+    /// the LAST build, so a suite already running composed another revision's
+    /// wasm the moment a sibling built. Here a sibling has staged its set and
+    /// named it in every file it could, and the binary still resolves its own.
+    #[test]
+    fn a_siblings_build_cannot_redirect_the_set_a_binary_resolves() {
         let scratch = tempfile::tempdir().unwrap();
         let profile = scratch.path().join("debug");
-        let exe = profile.join("ducktape");
-        std::fs::create_dir_all(&profile).unwrap();
-        std::fs::create_dir(profile.join("modules")).unwrap();
-
-        for refused in ["../elsewhere", "/etc", "..", ".", "", "  "] {
-            std::fs::write(profile.join(staged_key::STAGED_POINTER), refused).unwrap();
-            assert_eq!(
-                staged_modules_dir(&exe).unwrap(),
-                profile.join("modules"),
-                "{refused:?} must not resolve"
-            );
+        std::fs::create_dir_all(profile.join("deps")).unwrap();
+        let ours = "modules%home%someone%ours";
+        let theirs = "modules%home%someone%theirs";
+        for set in [ours, theirs] {
+            std::fs::create_dir(profile.join(set)).unwrap();
         }
+        let exe = profile.join("ducktape");
+        let test_exe = profile.join("deps/simnode-1234");
+        let before = [&exe, &test_exe].map(|exe| staged_modules_dir(exe, ours));
+
+        for dir in [&profile, &profile.join("deps")] {
+            std::fs::write(dir.join(".staged-modules"), theirs).unwrap();
+        }
+        std::fs::write(
+            profile.join(theirs).join(staged_key::STAGED_OWNER),
+            "def5678",
+        )
+        .unwrap();
+
+        let after = [&exe, &test_exe].map(|exe| staged_modules_dir(exe, ours));
+        assert_eq!(
+            after, before,
+            "a sibling's build moved what this binary resolves"
+        );
+        assert_eq!(after, [Some(profile.join(ours)), Some(profile.join(ours))]);
+        assert_eq!(
+            sim_twin(&profile.join(ours)),
+            profile.join("sim-modules%home%someone%ours"),
+            "and the simulator's twin is ours too"
+        );
     }
 
     /// The record inside a set says which build wrote it. Reading it back is
@@ -1517,13 +1933,32 @@ mod tests {
         let subject = NodeKey([0x11; 32]);
         let cap = mint_coord_cap(&g, subject, 4_000_000);
         let bytes = pack_coord_cap(&cap);
-        assert_eq!(bytes.len(), 32 + 8 + 64);
+        assert_eq!(bytes.len(), 1 + 32 + 8 + 64);
         assert_eq!(unpack_coord_cap(&bytes).unwrap(), cap);
+        // a delegated cap persists with its whole chain.
+        let delegate = ed25519::PrivateKey::from_seed(8);
+        let child =
+            nat_traversal::delegate_coord_cap(&cap, &delegate, NodeKey([0x22; 32]), 4_000_000)
+                .expect("one link under the bound");
+        assert_eq!(unpack_coord_cap(&pack_coord_cap(&child)).unwrap(), child);
 
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_coord_cap(dir.path()).is_none());
+        assert_eq!(load_coord_cap(dir.path()).unwrap(), None);
         save_coord_cap(dir.path(), &cap).unwrap();
-        assert_eq!(load_coord_cap(dir.path()).unwrap(), cap);
+        assert_eq!(load_coord_cap(dir.path()).unwrap(), Some(cap));
+    }
+
+    /// A cap file that does not decode is a named refusal, not "never issued":
+    /// both a torn write and non-hex garbage refuse by name.
+    #[test]
+    fn a_corrupt_coord_cap_refuses_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(COORD_CAP_FILE);
+        for corrupt in ["abcd\n", "not hex at all\n"] {
+            std::fs::write(&path, corrupt).unwrap();
+            let err = load_coord_cap(dir.path()).expect_err("a corrupt cap is not absent");
+            assert!(err.starts_with("coord_cap_unreadable:"), "{err}");
+        }
     }
 
     #[test]
@@ -1829,10 +2264,55 @@ mod tests {
             find_workspace_config_in(&root, "kitchen").expect("prefix"),
             root.join("b").join("node.toml")
         );
-        // absence and ambiguity are loud.
+        // absence is loud, and an empty value is refused as the missing value
+        // it is rather than treated as a prefix that matches the whole box.
         assert!(find_workspace_config_in(&root, "nope").is_err());
-        let err = find_workspace_config_in(&root, "").expect_err("ambiguous");
-        assert!(err.contains("ambiguous"), "{err}");
+        let ambiguous = find_workspace_config_in(&root, "").expect_err("empty");
+        assert!(
+            ambiguous.contains("empty value"),
+            "an empty -n is a missing value, not a prefix that matches the box: {ambiguous}"
+        );
+    }
+
+    /// Two workspaces of ONE network — a founder and the member that joined
+    /// it — is the ordinary shape (`ops/refound-net.sh` builds exactly that),
+    /// and the chain id they share cannot name either one. Returning the
+    /// first `read_dir` reached made `-n <exact chain id>` a coin flip that
+    /// read like an answer, for `node status`, `node peers`, `module update`
+    /// and every other verb carrying the selector.
+    #[test]
+    fn a_chain_id_two_workspaces_share_is_refused_with_both_config_paths() {
+        let root = tmp("shared-chain");
+        for ws in ["founder", "joiner"] {
+            let dir = root.join(ws);
+            std::fs::create_dir_all(&dir).expect("mk workspace");
+            NetworkDescriptor {
+                chain_id: "twinned#a1b2c3d4".into(),
+                validators: vec![],
+                bootstrap: vec![],
+                reach: vec![],
+                coordination: None,
+                block_time_ms: DEFAULT_BLOCK_TIME_MS,
+                genesis: String::new(),
+                modules: Vec::new(),
+            }
+            .save(&dir.join("network.toml"))
+            .expect("save");
+        }
+        // the EXACT id is the sharp case: it used to return on the first hit.
+        for needle in ["twinned#a1b2c3d4", "twinned"] {
+            let err = find_workspace_config_in(&root, needle)
+                .expect_err("a shared chain id names no single workspace");
+            for ws in ["founder", "joiner"] {
+                let path = root.join(ws).join("node.toml");
+                assert!(
+                    err.contains(&path.display().to_string()),
+                    "{needle:?} must name {}: {err}",
+                    path.display()
+                );
+            }
+            assert!(err.contains("--config"), "{needle:?}: {err}");
+        }
     }
 
     #[test]
@@ -1885,6 +2365,196 @@ mod tests {
         );
         std::fs::write(dir.join("node.toml"), node_toml).expect("write node.toml");
         dir
+    }
+
+    fn write_remote(root: &Path, ws: &str, chain: &str, node: &str) -> PathBuf {
+        let dir = root.join(ws);
+        std::fs::create_dir_all(&dir).expect("mk remote workspace");
+        let file = dir.join(REMOTE_WORKSPACE_FILE);
+        RemoteWorkspace {
+            chain_id: chain.into(),
+            node: node.into(),
+        }
+        .save(&file)
+        .expect("save remote workspace");
+        file
+    }
+
+    fn chain(authority: &str) -> duck_address::ChainId {
+        authority.parse().expect("an address chain id")
+    }
+
+    fn refused(root: &Path, authority: &str) -> duck_address::Refused {
+        resolve_chain_in(root, &chain(authority)).expect_err("refused")
+    }
+
+    /// An address resolves by its chain id and by nothing else. The lone
+    /// registered workspace — the bottom rung every `-n`-less verb stands on —
+    /// is of ANOTHER network here, and it is not chosen: the refusal lists it.
+    #[test]
+    fn an_address_on_no_registered_network_is_refused_and_the_lone_workspace_is_not_chosen() {
+        let root = tmp("resolve-unknown");
+        let empty = refused(&root, "dognet-b5b6ea90");
+        assert_eq!(empty.reason, "network_unknown");
+        assert!(empty.sentence.contains("nothing is registered"), "{empty}");
+
+        let other = write_workspace(
+            &root,
+            "a",
+            "kitchen#99887766",
+            "0.0.0.0:9000",
+            "0.0.0.0:8844",
+        );
+        let unknown = refused(&root, "dognet-b5b6ea90");
+        assert_eq!(unknown.reason, "network_unknown");
+        assert!(unknown.sentence.contains("dognet-b5b6ea90"), "{unknown}");
+        assert!(unknown.sentence.contains("redeem") || unknown.sentence.contains("Redeem"));
+        assert!(
+            unknown
+                .sentence
+                .contains(&other.join("node.toml").display().to_string()),
+            "the refusal lists the registry: {unknown}"
+        );
+    }
+
+    /// One match — local or remote, the same kind of entry with a different
+    /// node base — is the answer, whatever else is registered.
+    #[test]
+    fn one_registered_network_resolves_to_its_node_base_local_or_remote() {
+        let root = tmp("resolve-one");
+        write_workspace(
+            &root,
+            "a",
+            "kitchen#99887766",
+            "0.0.0.0:9000",
+            "0.0.0.0:8844",
+        );
+        let local = write_workspace(
+            &root,
+            "b",
+            "dognet#b5b6ea90",
+            "0.0.0.0:9001",
+            "0.0.0.0:18844",
+        );
+        let (chain_id, registered) =
+            resolve_chain_in(&root, &chain("dognet-b5b6ea90")).expect("resolves");
+        assert_eq!(chain_id, "dognet#b5b6ea90");
+        assert_eq!(registered, Registered::Local(local.join("node.toml")));
+        assert_eq!(registered.node_base().unwrap(), "http://127.0.0.1:18844");
+
+        let file = write_remote(&root, "c", "far#0badf00d", "http://10.0.0.5:8844");
+        let (chain_id, registered) =
+            resolve_chain_in(&root, &chain("far-0badf00d")).expect("resolves");
+        assert_eq!(chain_id, "far#0badf00d");
+        assert_eq!(
+            registered,
+            Registered::Remote {
+                file,
+                node: "http://10.0.0.5:8844".into()
+            }
+        );
+        assert_eq!(registered.node_base().unwrap(), "http://10.0.0.5:8844");
+    }
+
+    /// Two entries on one network — a local workspace and a remote one, or a
+    /// founder and its joiner — cannot be told apart by an address, so with
+    /// no pick the address resolves to neither, names both and the flag that
+    /// picks one. A pick resolves to exactly that entry; a pick naming no
+    /// registered entry (its workspace since removed) is no pick at all.
+    #[test]
+    fn several_registered_workspaces_on_one_network_resolve_to_the_pick_or_are_refused_by_name() {
+        let root = tmp("resolve-several");
+        let local = write_workspace(
+            &root,
+            "a",
+            "dognet#b5b6ea90",
+            "0.0.0.0:9000",
+            "0.0.0.0:8844",
+        );
+        let remote = write_remote(&root, "b", "dognet#b5b6ea90", "http://10.0.0.5:8844");
+        let ambiguous = refused(&root, "dognet-b5b6ea90");
+        assert_eq!(ambiguous.reason, "network_ambiguous");
+        assert!(
+            ambiguous
+                .sentence
+                .contains("2 registered workspaces are on network"),
+            "{ambiguous}"
+        );
+        assert!(
+            ambiguous
+                .sentence
+                .contains("ducktape forge setup --config <path>"),
+            "{ambiguous}"
+        );
+        for path in [local.join("node.toml"), remote.clone()] {
+            assert!(
+                ambiguous.sentence.contains(&path.display().to_string()),
+                "{ambiguous}"
+            );
+        }
+
+        let dognet = chain("dognet-b5b6ea90");
+        for picked in [
+            Registered::Local(local.join("node.toml")),
+            Registered::Remote {
+                file: remote.clone(),
+                node: "http://10.0.0.5:8844".into(),
+            },
+        ] {
+            pick_workspace_in(&root, &dognet, picked.file()).unwrap();
+            let (chain_id, registered) = resolve_chain_in(&root, &dognet).expect("the pick");
+            assert_eq!(chain_id, "dognet#b5b6ea90");
+            assert_eq!(registered, picked);
+        }
+
+        pick_workspace_in(&root, &dognet, &root.join("gone/node.toml")).unwrap();
+        assert_eq!(
+            refused(&root, "dognet-b5b6ea90").reason,
+            "network_ambiguous"
+        );
+    }
+
+    /// The salt is the match key and the label must agree: a label that does
+    /// not is refused naming both spellings, never resolved on the salt alone.
+    #[test]
+    fn a_label_the_registry_does_not_know_the_network_by_is_refused() {
+        let root = tmp("resolve-label");
+        write_workspace(
+            &root,
+            "a",
+            "dognet-mainnet#b5b6ea90",
+            "0.0.0.0:9000",
+            "0.0.0.0:8844",
+        );
+        let mismatch = refused(&root, "dognet-b5b6ea90");
+        assert_eq!(mismatch.reason, "label_mismatch");
+        assert!(mismatch.sentence.contains("dognet-b5b6ea90"), "{mismatch}");
+        assert!(
+            mismatch.sentence.contains("dognet-mainnet#b5b6ea90"),
+            "{mismatch}"
+        );
+    }
+
+    /// A directory with a `network.toml` is a local workspace; a stray
+    /// `remote.toml` beside it does not register the network twice.
+    #[test]
+    fn a_local_workspace_is_never_also_a_remote_one() {
+        let root = tmp("resolve-local-wins");
+        let local = write_workspace(
+            &root,
+            "a",
+            "dognet#b5b6ea90",
+            "0.0.0.0:9000",
+            "0.0.0.0:8844",
+        );
+        write_remote(&root, "a", "dognet#b5b6ea90", "http://10.0.0.5:8844");
+        assert_eq!(
+            registered_networks_in(&root).unwrap(),
+            [(
+                "dognet#b5b6ea90".to_string(),
+                Registered::Local(local.join("node.toml"))
+            )]
+        );
     }
 
     #[test]

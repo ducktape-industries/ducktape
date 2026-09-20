@@ -46,6 +46,12 @@ commonware-cryptography = { workspace = true }
 host = { workspace = true }
 # Actual call receipts must carry minted snapshot IDs through assigned stamps.
 dispatch = { workspace = true }
+# the NATIVE system modules the host suites register beside `Files`. their
+# plain names resolve to the wire crates above, so the module crates take a
+# second name here.
+identity-module = { package = "identity", path = "../../system/identity" }
+attribution-module = { package = "attribution", path = "../../system/attribution" }
+dispatch-module = { package = "dispatch", path = "../../system/dispatch" }
 # the shared `TestCtx` the duckfs harness builds on (dev-only, Module Rule intact).
 sdk-testkit = { workspace = true }
 futures = "0.3"

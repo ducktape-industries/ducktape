@@ -29,14 +29,14 @@ The sentry listens on a **public** address and TCP-splices to the validator's
 private network, VPC, or a firewall exception).
 
 ```
-joiner ──▶ sentry(public :443) ──▶ validator(listen 10.0.0.7:52200, private)
+joiner ──▶ sentry(public :443) ──▶ validator(listen 10.0.0.7:8846, private)
              (transparent TCP splice; ciphertext only)
 ```
 
 Validator config:
 
 ```toml
-listen     = "10.0.0.7:52200"          # private; reachable only from the sentry
+listen     = "10.0.0.7:8846"           # private; reachable only from the sentry
 advertised = "sentry.example.com:443"  # what peers dial
 ```
 
@@ -61,7 +61,7 @@ Once admitted, the handshake succeeds and state-sync flows through the pipe;
 
 Realizations of the splice, cheapest first:
 
-- **`nginx stream`** — `stream { server { listen 443; proxy_pass 10.0.0.7:52200; } }`
+- **`nginx stream`** — `stream { server { listen 443; proxy_pass 10.0.0.7:8846; } }`
 - **HAProxy TCP mode** — `mode tcp` frontend/backend.
 - **A small Rust forwarder** — an accept loop that, per connection, dials the
   target and runs `std::io::copy` in both directions (`sentry_e2e.rs` stands

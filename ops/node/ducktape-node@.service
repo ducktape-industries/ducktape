@@ -1,18 +1,27 @@
-# ducktape-node@<network> — one workspace's node, supervised.
+# ducktape-node@<chain-id> — one workspace's node, supervised by
+# ducktape-node-launcher.
 #
-# The instance is the workspace selector `ducktape node run -n` takes: a
-# registered chain id or any unique prefix of it (`ducktape node list`). A
-# chain id carries `#`, which a unit name cannot, so either use the name
-# prefix (`ducktape-node@mynet`) or escape the full id
-# (`systemctl start "ducktape-node@$(systemd-escape 'mynet#d0cdf950')"`).
-# `%I` below hands the UNESCAPED instance to `-n`, so both forms select the
-# workspace; `%i` would pass the `\x23` form, which matches no chain id.
+# The instance is the workspace DIRECTORY under DUCKTAPE_HOME, which is the
+# network's full chain id (`ducktape node list`). A chain id carries `#`,
+# which a unit name cannot, so escape it:
+# `systemctl start "ducktape-node@$(systemd-escape 'mynet#d0cdf950')"`.
+# `%I` below is the UNESCAPED instance, so it names the directory again.
+#
+# The unit runs the LAUNCHER, never the node: `run` starts
+# `<workspace>/current/ducktape node run`, polls it, and follows the network's
+# node releases — stage, qualify, flip, roll back — pinning the release key
+# the network commits on its first read. `ops/node/install.sh` seeds
+# `<workspace>/current` with `ducktape-node-launcher install` before the unit
+# first starts; the launcher refuses a workspace with no install
+# (`state_missing`). A node started as a bare `ducktape node run` follows no
+# release, and no later node release can reach it.
 #
 # Everything the node keeps lives under DUCKTAPE_HOME (/var/lib/ducktape, the
 # StateDirectory), one directory per network and nothing else:
 # <chain-id>/{node.toml,network.toml,identity.key,keys/,guest/,executors/,
-# capabilities/,storage/,daemon.log}. The founding set is program data
-# (/usr/local/lib/ducktape/modules, DUCKTAPE_MODULES_DIR). See
+# capabilities/,storage/,updates/,current,daemon.log}. The founding set rides
+# with each release (`current/modules/`, beside the binary that reads it), so
+# a flip moves the binary and its set together. See
 # docs/deploy/node-service.md for install, ports, logs and backup.
 #
 # Hardening mirrors ops/coordinator/ducktape-coordinator.service where the
@@ -30,26 +39,35 @@ Wants=network-online.target
 User=ducktape
 Group=ducktape
 # /var/lib/ducktape, created and chowned by systemd; DUCKTAPE_HOME is where
-# the workspaces live. The founding set the installer copied beside the
-# binary's prefix is what `node init` founds from and where the netstack
-# guest is read at boot; a network's own wasm is its workspace `genesis` file.
+# the workspaces live. No DUCKTAPE_MODULES_DIR: a node resolves its founding
+# set (the netstack guest it reads at boot) beside its own binary, and every
+# release the launcher installs carries one there — a directory named here
+# would outrank the set each later release brings. A network's own wasm is its
+# workspace `genesis` file.
 StateDirectory=ducktape
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/ducktape
 Environment=DUCKTAPE_HOME=/var/lib/ducktape
-Environment=DUCKTAPE_MODULES_DIR=/usr/local/lib/ducktape/modules
-# Optional: RUST_LOG, extra flags in DUCKTAPE_NODE_ARGS. The file is not
-# required.
+# Optional: RUST_LOG, extra `node run` flags in DUCKTAPE_NODE_ARGS. The file
+# is not required.
 EnvironmentFile=-/etc/ducktape/node.env
-ExecStart=/usr/local/bin/ducktape node run -n %I $DUCKTAPE_NODE_ARGS
-# SIGTERM: a validator takes the graceful path (a final checkpoint + journal
-# barrier, bin/node/src/validator/run.rs); a resident's park loop installs no
-# handler, dies by default action and re-syncs at the next boot. Give the
-# validator time; a hard kill lands on WAL-forward recovery at the next boot.
+ExecStart=/usr/local/bin/ducktape-node-launcher run --workspace /var/lib/ducktape/%I --config /var/lib/ducktape/%I/node.toml -- $DUCKTAPE_NODE_ARGS
+# SIGTERM reaches the LAUNCHER only (KillMode=mixed), which stops its node the
+# way a flip does: SIGTERM, then up to 120 s to checkpoint, then SIGKILL. A
+# validator and a resident alike take the graceful path — a final checkpoint,
+# then one `node_shutdown` line (bin/node/src/drain_actions.rs). systemd's own
+# SIGKILL comes after the launcher's budget, never before it.
 KillSignal=SIGTERM
-TimeoutStopSec=120
+KillMode=mixed
+TimeoutStopSec=150
 Restart=always
 RestartSec=3
+# 77: the join gate refused this workspace's invite, so it can never redeem
+# (`app_update::release_status::EXIT_INVITE_UNREDEEMABLE`). The node exits
+# with it, the launcher stops with it, and a restart would only ask the same
+# question again — so systemd leaves the unit failed. Join again with a fresh
+# invite, then start the unit.
+RestartPreventExitStatus=77
 # The node raises its own soft limit to 65536; the hard limit must allow it.
 LimitNOFILE=65536
 

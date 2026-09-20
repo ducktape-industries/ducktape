@@ -2,10 +2,11 @@
 
 Repo-side helpers for running, seeding, and maintaining a ducktape node. The
 runnable surfaces are the node daemon (`node-bin`/`noded`), the deterministic
-`simnode`, the UDP coordinator, and the native Iced desktop app (`app/`,
-`cargo run -p ducktape-app`) — the scripts here drive the node side, and
-`demo-seed.sh` seeds a workspace the app can then open. Most scripts back a
-`make` target; see the repository `Makefile`.
+`simnode`, the UDP coordinator, and the desktop app (its own repository,
+[ducktape-app](https://github.com/ducktape-industries/ducktape-app)) — the
+scripts here drive the node side, and `demo-seed.sh` seeds a workspace the
+app can then open. Most scripts back a `make` target; see the repository
+`Makefile`.
 
 ## Dev and demo network
 
@@ -34,9 +35,11 @@ each step is ordered the way it is.
 
 ## Running a node as a service
 
-- `node/` — `ducktape-node@.service` (instance = workspace selector for
-  `ducktape node run -n`), `ducktape-service@.service` (instance = kind for
-  `ducktape service run compute|agent|airlock`) and the `copytruncate`
+- `node/` — `ducktape-node@.service` (instance = the workspace's escaped
+  chain id; runs `ducktape-node-launcher run` over it),
+  `ducktape-service@.service` (instance = kind; runs
+  `ducktape-node-launcher service … -- service run compute|agent|airlock`
+  over `DUCKTAPE_WORKSPACE`) and the `copytruncate`
   logrotate drop-in for `daemon.log` / `<kind>.log`. `install.sh` runs the
   Linux install end to end (`--dry-run` prints it). The install, port and
   log recipe is `docs/deploy/node-service.md`; what to back up is
@@ -60,13 +63,6 @@ manifest, process contract, and install/activate/stop/restart commands.
   installs the pinned Rust and the `wasm-tools` CLI of the componentizer's
   release through `guest-rust-tools.sh` by
   default; `ROOTFS_SETUP` selects a custom setup.
-- `macos-preflight.sh` — checks a macOS host for everything the vz backend
-  needs (Hypervisor.framework, the CLT, `e2fsprogs`/`squashfs`/`zstd`, the musl
-  target, the entitled `bin/duck-vz-shim` on PATH)
-  and reports release-signing readiness — the Developer ID identities in the
-  keychain and the `ICE_NOTARY_*` variables — informationally, since a local
-  build needs neither. `--prompt` (what `make dev` passes) offers to run the
-  fixes it can.
 - `firecracker/` — `boot-bench.sh` and `snapshot-bench.sh`, the cold-boot and
   snapshot-restore timing lanes for the microVM sandbox.
 
@@ -77,14 +73,18 @@ manifest, process contract, and install/activate/stop/restart commands.
   `POST /sign/macos-bundle` signs with, and what `cargo test -p airlock`
   needs on `PATH` (`make rcodesign`).
 - `airlock-gateway/stage-image.sh` (`make airlock-gateway-image`) — the
-  enclave image root: the release `airlock-gateway`, `rcodesign`, and
-  `app/packaging/entitlements.plist` at the binary's default paths.
+  enclave image root: the release `airlock-gateway`, `rcodesign`, and the
+  entitlements plist at the binary's default paths.
 
 ## Forge
 
 - `dogfood-forge.sh` (`make dogfood-forge`) — mirror GitHub `origin/dev` into
   the local node's Forge `dev` without moving release-only `main`; needs a
   running node.
+- `forge-mirror.sh` — mirror GitHub branches into a node's Forge on a timer
+  (`node/ducktape-forge-mirror.{service,timer}`), fast-forward only: a
+  non-fast-forward fails the pass and names which side moved. Its test is
+  `forge-mirror-test.py`; the recipe is `docs/deploy/forge-git.md`.
 
 ## Node operator CLI
 
@@ -97,6 +97,16 @@ manifest, process contract, and install/activate/stop/restart commands.
   `DUCKTAPE_NODE` pointing at a remote one is refused by name rather than
   silently ignored; `use`, `help` and `cgroup` need no node and never read it.
 - `completions/` — shell completions for the `ducktape` CLI.
+
+## Release acceptance walk
+
+- `qa/run.sh` — the walk runner (ducktape-industries/ducktape-qa) at exactly
+  the rev `qa/RUNNER_REV` names, cloned into
+  `${XDG_CACHE_HOME:-~/.cache}/ducktape-qa/<rev>` and refused if that checkout
+  is not clean at that rev. A bare scenario name is one of the pinned
+  checkout's `scenarios/acceptance/*.json`; `--check` loads all of them, which
+  gates a rev bump without a rig. [`../docs/roll-a-node-release.md`](../docs/roll-a-node-release.md)
+  says where in a release cut it runs and what the params file holds.
 
 ## Networking and media harnesses
 
@@ -233,19 +243,20 @@ phase, and retain its block lead. Record both timestamps and activation heights.
 
 ### Preparing the actual view ceremony
 
-After the aggregate UI pin and view/assets staging CLI are integrated, prepare
-views before rebuilding the node in the same checkout:
+The founding views are committed under `crates/views/`; to move them to a
+[ducktape-views](https://github.com/ducktape-industries/ducktape-views)
+commit, sync and commit them, then rebuild the node:
 
 ```sh
-CARGO_TARGET_DIR="$PWD/target" make views
+make views-sync VIEWS_DIR=../ducktape-views VIEWS_REV=<commit>
 CARGO_TARGET_DIR="$PWD/target" cargo build --locked -p node-bin --bin ducktape
 ```
 
-`make views` writes all eleven guests to the checkout's `target/views` even
-when the Cargo build target is elsewhere. The subsequent noded build stages
-`governance`, `files`, `pages`, `chat`, and `forge` views into the node profile's
-`modules` directory. Require all five `<id>.view.wasm` files and no
-`<id>.view.pending` markers before founding or rollout. Preserve
+The noded build stages every committed view into the node profile's founding
+set. `crates/topology/basic-views` lists every view the app draws; each rides
+the set as `<id>.view.wasm`, and `node init` refuses a set lacking one
+(`founding_view_missing: <id>`), as `ops/release/archive.sh --kind node`
+refuses to pack it. Preserve
 `pages.index.wasm` and `chat.index.wasm` in every ceremony; the other three
 owners have no mapper. Pass `--assets` only for an existing asset directory.
 Do not edit founding files to perform a live swap.
@@ -287,13 +298,11 @@ or successful activation is implied by the static fixtures in this directory.
 
 The Mac client check is coordinated separately with the app owner. Use fresh
 preferences because an explicit saved endpoint takes priority over the
-environment. Its staged view directory must contain only the six globals
-`agents`, `explorer`, `members`, `node`, `settings`, and `shell` (`*_view.wasm`),
-with the five owner views absent:
+environment. The app carries no view: every one it draws is fetched from the
+node's registry.
 
 ```sh
 DUCKTAPE_HOME="$MAC_SCRATCH" DUCKTAPE_NODE="$NODE_A_HTTP" \
-DUCKTAPE_VIEWS_DIR="$GLOBALS_ONLY" \
   "$APP_BUNDLE/Contents/MacOS/ducktape-app"
 ```
 
@@ -329,16 +338,9 @@ node ops/proxmox-view-observe-test.mjs
   `.wasm` outside a test, so a binary can never carry a second copy of a module.
   No script here: it is a source-parsing lint,
   `crates/topology/tests/wasm_embed.rs`, beside `sdk_shaped` and
-  `tracing_plane_lint`.
-- `wasm-repro-check.sh` (`make wasm-repro-check`) — builds one guest component
-  twice, in two scratch directories, and asserts the bytes are identical and
-  carry no host path, so a committed artifact never depends on the builder's
-  `/home/...`. Needs the wasm32 target and a pushed HEAD.
-- `make wasm-rebuild-check` — the other reproducibility gate, a Makefile target
-  with no script here: it rebuilds every committed guest (each `component.wasm`
-  and `index.wasm`) out of the repository at HEAD, seeded from its committed
-  `guest.lock`, and cmps it against the bytes in the tree. Same needs.
-- `make audit` — the third out-of-band gate: `cargo deny check advisories` over
+  `tracing_plane_lint`. The guest reproducibility and rebuild-drift gates ship
+  with the guest builder in ducktape-sdk.
+- `make audit` — the other out-of-band gate: `cargo deny check advisories` over
   the committed `Cargo.lock`, under the repo-root `deny.toml` where every
   carried advisory names why it is carried and what clears it. Needs `cargo
   deny` and network, so it is not in the offline `test` gate; run it when the

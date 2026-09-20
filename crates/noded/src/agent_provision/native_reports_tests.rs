@@ -1,5 +1,6 @@
 use super::super::super::super::{RunSession, start_action_server};
 use super::*;
+use runs_wire as runs;
 
 fn report_record(operation_id: &str, payload: &str) -> tasks::WorkerReport {
     tasks::WorkerReport {

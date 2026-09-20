@@ -9,8 +9,9 @@
 //! oneshot reply. that is safe ONLY on a `spawn_blocking` thread (never an axum
 //! worker): the actor lives on its own thread, and futures channels are
 //! executor-agnostic, so blocking one blocking-pool thread on the reply never
-//! starves the actor. a module rejection returns VERBATIM as
-//! [`ApiError::Rejected`] — the conflict taxonomy keys on the exact string.
+//! starves the actor. a module rejection returns as [`ApiError::Rejected`] with
+//! both halves untouched — its class beside its verbatim sentence, which the
+//! conflict taxonomy still keys on.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -22,7 +23,7 @@ use duckfs_core::{
 use futures::channel::oneshot;
 
 const FILES_MODULE: &str = "files";
-use crate::{BlockSummary, NodeCommand, NodeHandle};
+use crate::{BlockSummary, NodeCommand, NodeHandle, Refused};
 
 /// a `NodeApi` bound to one node's actor lane. cheap to clone (holds only the
 /// command-channel handle); a fresh one is made per workspace request.
@@ -57,8 +58,11 @@ impl ActorNodeApi {
                 .map_err(|_| ApiError::Transport("node actor is gone".into()))?;
             match rx.await {
                 Ok(Ok(block)) => Ok(block),
-                // the module's own sentence passes through untouched.
-                Ok(Err(refused)) => Err(ApiError::Rejected(refused.message)),
+                // the module's own class AND sentence pass through untouched.
+                Ok(Err(refused)) => Err(ApiError::Rejected {
+                    reason: refused.reason,
+                    sentence: refused.message,
+                }),
                 Err(_) => Err(ApiError::Transport("node actor dropped the reply".into())),
             }
         })
@@ -78,7 +82,7 @@ impl ActorNodeApi {
                 .map_err(|_| ApiError::Transport("node actor is gone".into()))?;
             let bytes = match rx.await {
                 Ok(Ok(bytes)) => bytes,
-                Ok(Err(refused)) => return Err(map_query_error(refused.message)),
+                Ok(Err(refused)) => return Err(map_query_error(refused)),
                 Err(_) => return Err(ApiError::Transport("node actor dropped the reply".into())),
             };
             decode_reply(&bytes).map_err(ApiError::Transport)
@@ -87,13 +91,21 @@ impl ActorNodeApi {
 }
 
 /// map a query rejection to the api taxonomy: an absent path or an unresolvable
-/// snapshot is a 404-equivalent [`ApiError::NotFound`]; every other rejection is
-/// [`ApiError::Rejected`] (verbatim — the same mapping the http surface uses).
-fn map_query_error(err: String) -> ApiError {
-    if err.contains("not found") || err.contains("not resolvable") {
-        ApiError::NotFound
-    } else {
-        ApiError::Rejected(err)
+/// snapshot is a 404-equivalent [`ApiError::NotFound`]; every other rejection
+/// keeps both halves (the same mapping the http surface uses).
+///
+/// the absent/unresolvable test reads the SENTENCE because the files module
+/// answers every query rejection under one `files_query` class — the class it
+/// would take instead does not exist yet.
+fn map_query_error(refused: Refused) -> ApiError {
+    let absent =
+        refused.message.contains("not found") || refused.message.contains("not resolvable");
+    if absent {
+        return ApiError::NotFound;
+    }
+    ApiError::Rejected {
+        reason: refused.reason,
+        sentence: refused.message,
     }
 }
 

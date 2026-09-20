@@ -46,10 +46,11 @@ sdk = { workspace = true }
 # supply wire types and host-side services; files/forge provide ODB substrates.
 topology = { workspace = true }
 wasm-host = { workspace = true }
-valset = { workspace = true }
-modules = { workspace = true }
-kv = { workspace = true }
-files = { workspace = true }
+# system modules are CORE-RESIDENT: the daemon links the module crates by
+# path (a workspace name resolves to a module's wire crate).
+valset = { path = "../modules/system/valset" }
+modules = { path = "../modules/system/modules" }
+kv = { path = "../modules/system/kv" }
 # the disk odb `open_odb` hands a wasm files tenant. a service crate, not the
 # module: `files` names no kernel host.
 files-odb = { workspace = true }
@@ -58,12 +59,17 @@ forge-odb = { workspace = true }
 chat = { workspace = true }
 # the `/v1/call/ws` framing (the webview leg of a huddle) and the voice frame size.
 tasks = { workspace = true }
-identity = { workspace = true }
-gateway = { workspace = true }
+identity = { path = "../modules/system/identity" }
+# `GET /v1/release` walks the passed governance signals the release plane
+# rides (wire types only) and answers in the document the launcher and the
+# desktop app both decode.
+governance = { workspace = true }
+app-update = { workspace = true }
+gateway = { path = "../modules/system/gateway" }
 agent-wire = { workspace = true }
 runs-wire = { workspace = true }
-dispatch = { workspace = true }
-attribution = { workspace = true }
+dispatch = { path = "../modules/system/dispatch" }
+attribution = { path = "../modules/system/attribution" }
 compute-service = { workspace = true }
 # the agent-daemon wire: the messaging bus this node's service link carries.
 # Linking the crate is how both sides agree on the protocol.
@@ -71,9 +77,10 @@ agent-service = { workspace = true }
 # host-side provider discovery: the dispatch worker runs the operator's locally
 # installed executor CLIs (BYO), never any credential file.
 provider-host = { workspace = true }
-saga = { workspace = true }
-# Forge wire types and native automation object storage primitives.
-forge = { workspace = true }
+saga = { path = "../modules/system/saga" }
+# Forge wire types and native automation object storage primitives (forge is
+# core-resident: the git substrate is a node service).
+forge = { path = "../modules/apps/forge" }
 # Generic signed request verification.
 keyscheme = { workspace = true }
 # duckfs wire/path/object helpers used by the daemon's HTTP and workspace
@@ -120,6 +127,9 @@ reqwest = { workspace = true }
 rand = "0.8"
 async-trait = { workspace = true }
 futures = "0.3"
+# the scratch substrate an admission check starts over (and the isolated
+# storage roots of the admin-token, git-lane and testkit tests).
+tempfile = "3"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors"] }
 # Local automation worktree and pack construction primitives.
@@ -138,28 +148,27 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 topology = { workspace = true }
 
 [dev-dependencies]
-# the NATIVE modules, which only the in-crate provision tests stand up
-# (`RunsModule::new`, `agent::AgentModule::new` in agent_provision's two
-# `#[cfg(test)]` files). The daemon itself speaks to them over the wire and
-# links `runs-wire`/`agent-wire` alone — which is the point of the split, and
-# what these two lines being DEV-only proves.
-agent = { workspace = true }
-runs = { workspace = true }
-pages = { workspace = true }
+# the run wire surface. The native module behind it ships from
+# ducktape-modules, so no suite here composes one: the provisioning suites
+# stand the COMMITTED guest up through `testkit::committed_module` and speak to
+# it over these types.
 run-envelope = { workspace = true }
+# the pages wire surface: the connected end-to-end provisioning run reads the
+# record page its agent published back out of the committed `pages` guest.
+pages = { workspace = true }
 wat = "1"
+# the native files module: the provisioning suites stand a native `Files` up.
+files = { path = "../modules/apps/files" }
 # MemStore: the in-memory MerkleStore double behind store-backed modules in
 # the in-crate provision tests.
 sdk-testkit = { workspace = true }
 # the capability registry: the session-boundary test wires saga with
 # `with_assignment`, so `Accept`'s capability gate needs a real registry to
 # announce a provider into.
-capability = { workspace = true }
+capability = { path = "../modules/system/capability" }
 # the shared raw-http/port/poll harness helpers (daemon_e2e was a local copy).
 nettest = { path = "../testing/nettest" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio = { version = "1", features = ["test-util"] }
-# isolated storage roots for the admin-token, git-lane and testkit tests.
-tempfile = "3"
 syn = { version = "2", features = ["full"] }

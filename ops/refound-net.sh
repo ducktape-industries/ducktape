@@ -24,21 +24,42 @@ MIRROR_REPO=""
 ASSUME_YES=0
 SKIP_APP=0
 SKIP_SMOKE=0
+KEEP_STAGE=0
 WALLET_NAME="operator"
-WALLET_PASSWORD="ducktape"
+# EMPTY ON PURPOSE — there is no default password. A word committed in this
+# file would unlock the release-signing key of every network founded by it.
+# Left empty, the wallet step below generates one; --wallet-password overrides.
+# Either way it lands in a 0600 file beside the mnemonic, so the release lane
+# reads it back the same way whoever chose it.
+WALLET_PASSWORD=""
+WALLET_PASSWORD_FILE=""
+WALLET_MNEMONIC_FILE=""
+WALLET_MNEMONIC=""
 
 # The founder's and the resident's port sets. They must not collide with each
 # other or with anything else on the host: two workspaces on one box share the
 # fixed defaults, and the join then fails with a message that blames the invite
 # rather than the address already in use.
 #
-# These defaults are the LIVE network's, so proving this script on a scratch
-# pair while that network is up needs `--port-offset` — otherwise the scratch
-# founder binds the real one's http port and the rehearsal takes down the thing
-# it was rehearsing for.
+# These defaults are the set a network founded by this script runs on, so
+# proving it on a scratch pair beside a live network needs `--port-offset` —
+# otherwise the scratch founder binds the real one's http port and the
+# rehearsal takes down the thing it was rehearsing for.
+#
+# The TCP block is 28800–28831: the tens digit is the surface (http 0, gateway
+# 1, rpc 2, p2p 3), the ones digit the node (founder 0, resident 1). It sits
+# BELOW 32768, the bottom of Linux's ephemeral range: the kernel hands a port
+# above that to any outbound connection as its source port, and a node that
+# restarts while one holds its listener's port cannot bind it. WireGuard and
+# the invite door are UDP and keep their own set.
 PORT_OFFSET=0
-F_P2P=35620 F_HTTP=32989 F_GATEWAY=33989 F_RPC=34989 F_WG=46700 F_INVITE=46701
-J_P2P=35630 J_HTTP=32990 J_GATEWAY=33990 J_RPC=34990 J_WG=46710 J_INVITE=46711
+F_HTTP=28800 F_GATEWAY=28810 F_RPC=28820 F_P2P=28830 F_WG=46700 F_INVITE=46701
+J_HTTP=28801 J_GATEWAY=28811 J_RPC=28821 J_P2P=28831 J_WG=46710 J_INVITE=46711
+# The http listen is the one port an operator names from outside: it is what
+# `--node` resolves against, what the app dials, and what an existing network
+# already serves on. Left empty, it follows the block above and the offset.
+F_HTTP_SET="" J_HTTP_SET=""
+F_ADVERTISED_SET="" J_ADVERTISED_SET=""
 
 LAUNCHER_EXE="ducktape-node-launcher"
 
@@ -75,17 +96,46 @@ usage: ops/refound-net.sh --root DIR [options]
   --guest DIR         a guest image directory (vmlinux + rootfs.ext4) to install
                       as the workspace's own. runs boot what is here.
   --mirror REPO       a git checkout to import into the network's forge.
-  --port-offset N     add N to every port. the defaults are the live network's,
-                      so a scratch run alongside it needs an offset.
+  --port-offset N     add N to every port. the defaults are what a network
+                      founded by this script runs on, so a scratch run beside
+                      one needs an offset. keep the tcp block (28800–28831)
+                      plus N below 32768, where the kernel's ephemeral range
+                      starts.
+  --founder-http PORT the founder's http listen, outright. every other port
+                      still follows --port-offset. use it to found on the port
+                      a network already serves, instead of founding on the
+                      default and editing node.toml afterwards.
+  --resident-http PORT
+                      the resident's http listen, outright. same rule.
+  --founder-advertised HOST:PORT
+                      the founder's advertised WireGuard front (default:
+                      127.0.0.1:<founder's WireGuard port>).
+  --resident-advertised HOST:PORT
+                      the resident's advertised WireGuard front (default:
+                      127.0.0.1:<resident's WireGuard port>).
   --wallet-name NAME  the workspace's active wallet, and the display name of
                       the account founded for it (default: operator). the
                       service daemons refuse to boot without both.
-  --wallet-password P its password (default: ducktape). the mnemonic is written
-                      to a 0600 file in the workspace, never to stdout.
+  --wallet-password P its password. NO DEFAULT: left out, one is generated.
+                      the mnemonic and the password are each written to their
+                      own 0600 file in the workspace, never to stdout.
+  --wallet-password-file F
+                      the password is F's first line. prefer it to the flag
+                      above: an argv word is visible to every process.
+  --wallet-mnemonic-file F
+                      restore the wallet from the mnemonic line in F (the file
+                      `wallet new` wrote) instead of minting one: the
+                      network keeps the release key its installs already pin.
+                      F is read before anything is torn down, so it may live
+                      in the workspace this run archives. needs a password
+                      (the restored wallet's), by either flag above.
   --skip-app          do not rebuild the desktop app.
   --no-smoke          do not seed an agent and mention it at the end. the smoke
                       is the only step that crosses the WHOLE chain, and it
                       costs one real agent run; this is how you decline it.
+  --keep-stage        keep the /tmp staging directory (the staged binary,
+                      founding set and init homes). default: it is removed on
+                      every exit, success or failure.
   --yes               proceed past the teardown/archive of an existing root.
 USAGE
     exit 1
@@ -100,10 +150,17 @@ while [ $# -gt 0 ]; do
         --guest) GUEST_SRC=${2:-}; shift 2;;
         --mirror) MIRROR_REPO=${2:-}; shift 2;;
         --port-offset) PORT_OFFSET=${2:-0}; shift 2;;
+        --founder-http) F_HTTP_SET=${2:-}; shift 2;;
+        --resident-http) J_HTTP_SET=${2:-}; shift 2;;
+        --founder-advertised) F_ADVERTISED_SET=${2:-}; shift 2;;
+        --resident-advertised) J_ADVERTISED_SET=${2:-}; shift 2;;
         --wallet-name) WALLET_NAME=${2:-}; shift 2;;
         --wallet-password) WALLET_PASSWORD=${2:-}; shift 2;;
+        --wallet-password-file) WALLET_PASSWORD_FILE=${2:-}; shift 2;;
+        --wallet-mnemonic-file) WALLET_MNEMONIC_FILE=${2:-}; shift 2;;
         --skip-app) SKIP_APP=1; shift;;
         --no-smoke) SKIP_SMOKE=1; shift;;
+        --keep-stage) KEEP_STAGE=1; shift;;
         --yes|-y) ASSUME_YES=1; shift;;
         -h|--help) usage;;
         *) die "unknown flag $1 (try --help)";;
@@ -111,6 +168,20 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$ROOT" ] || usage
+# an argv word is visible to every process on the host; a file is not.
+if [ -n "$WALLET_PASSWORD_FILE" ]; then
+    [ -r "$WALLET_PASSWORD_FILE" ] || die "--wallet-password-file: cannot read $WALLET_PASSWORD_FILE"
+    WALLET_PASSWORD=$(head -n 1 "$WALLET_PASSWORD_FILE")
+fi
+if [ -n "$WALLET_MNEMONIC_FILE" ]; then
+    [ -r "$WALLET_MNEMONIC_FILE" ] || die "--wallet-mnemonic-file: cannot read $WALLET_MNEMONIC_FILE"
+    [ -n "$WALLET_PASSWORD" ] || die "--wallet-mnemonic-file needs --wallet-password"
+    # `wallet new` has printed the mnemonic alone and, later, under two lines
+    # of prose: the mnemonic is the one line that is only lowercase words and
+    # has a mnemonic's word count.
+    WALLET_MNEMONIC=$(awk '/^[a-z]+( [a-z]+)*$/ && (NF==12||NF==15||NF==18||NF==21||NF==24) {print; exit}' "$WALLET_MNEMONIC_FILE")
+    [ -n "$WALLET_MNEMONIC" ] || die "--wallet-mnemonic-file: no mnemonic line in $WALLET_MNEMONIC_FILE"
+fi
 case "$ROOT" in /*) :;; *) die "--root must be an absolute path";; esac
 # Shell completion appends a slash to a directory, so `--root ~/.ducktape/dognet/`
 # is what an operator actually types. Every match below compares "$root" and
@@ -138,6 +209,49 @@ if [ "$PORT_OFFSET" -ne 0 ]; then
         eval "$v=\$(( \$$v + PORT_OFFSET ))"
     done
 fi
+
+# An explicit http port is the final word, not an input to the sum: the offset
+# is applied above, and a named port replaces the result.
+check_port() {
+    case "$2" in
+        ''|*[!0-9]*) die "$1: '$2' is not a port number (1024–65535)";;
+    esac
+    { [ "$2" -ge 1024 ] && [ "$2" -le 65535 ]; } || die "$1: $2 is outside 1024–65535"
+}
+check_advertised() {
+    local flag=$1 address=$2
+    case "$address" in
+        :*) die "$flag: '$address' has no host";;
+        *:*) check_port "$flag" "${address##*:}";;
+        *) die "$flag: '$address' is not a HOST:PORT";;
+    esac
+}
+[ -z "$F_HTTP_SET" ] || { check_port --founder-http "$F_HTTP_SET"; F_HTTP=$F_HTTP_SET; }
+[ -z "$J_HTTP_SET" ] || { check_port --resident-http "$J_HTTP_SET"; J_HTTP=$J_HTTP_SET; }
+F_ADVERTISED="127.0.0.1:$F_WG"
+J_ADVERTISED="127.0.0.1:$J_WG"
+if [ -n "$F_ADVERTISED_SET" ]; then
+    check_advertised --founder-advertised "$F_ADVERTISED_SET"
+    F_ADVERTISED=$F_ADVERTISED_SET
+fi
+if [ -n "$J_ADVERTISED_SET" ]; then
+    check_advertised --resident-advertised "$J_ADVERTISED_SET"
+    J_ADVERTISED=$J_ADVERTISED_SET
+fi
+
+# Both nodes listen on this host, so no two of these tcp ports may be the same
+# one. A collision here binds twice and surfaces three steps later as a join
+# blaming the invite. WireGuard and the invite door are udp and cannot clash
+# with an http listener, so they are not in the set. An offset shifts every
+# port equally and never collides; only a named http port can.
+TCP_PORTS="$F_HTTP $F_GATEWAY $F_RPC $F_P2P $J_HTTP $J_GATEWAY $J_RPC $J_P2P"
+for p in $TCP_PORTS; do
+    claims=0
+    for q in $TCP_PORTS; do
+        if [ "$p" = "$q" ]; then claims=$(( claims + 1 )); fi
+    done
+    [ "$claims" -eq 1 ] || die "port $p is claimed twice by this run's ports ($TCP_PORTS)"
+done
 
 # NOTE: the port check does NOT live here. Freeing these ports is what the
 # teardown below does, so checking them before it would refuse every re-run
@@ -172,6 +286,17 @@ fi
 # founded with.
 STAGE="/tmp/refound-$NAME-$STAMP"
 mkdir -p "$STAGE"
+# The stage is a binary and a founding set (~120 MB) on a /tmp that may be
+# RAM, and nothing runs from it once the workspaces own their copies. It goes
+# on EVERY exit — success, `die`, or a `set -e` stop — unless --keep-stage.
+drop_stage() {
+    if [ "$KEEP_STAGE" = 1 ]; then
+        printf 'kept the stage at %s\n' "$STAGE" >&2
+        return 0
+    fi
+    rm -rf -- "$STAGE"
+}
+trap drop_stage EXIT
 STAGED_BIN="$STAGE/ducktape"
 cp "$BIN_SRC" "$STAGED_BIN"
 VOUCH=$("$STAGED_BIN" --version | awk '{print $2}')
@@ -200,24 +325,12 @@ fi
 [ -n "$MODULES_SRC" ] && [ -d "$MODULES_SRC" ] \
     || die "no founding set found. build in this checkout, or set \$DUCKTAPE_MODULES_DIR."
 
-# A `*.pending` marker is a view whose staging was interrupted; founding on one
-# fails at genesis with that file named. Catch it here rather than three steps
-# in, and say what fixes it.
-#
 # Counted with a nullglob array, NOT `ls glob | wc -l`: under `pipefail` a glob
 # that matches nothing makes `ls` exit 2, the pipeline inherits it, and `set -e`
-# kills the script on the assignment — so the HEALTHY case is the one that
-# aborts the run.
+# kills the script on the assignment.
 shopt -s nullglob
-pending_views=( "$MODULES_SRC"/*.pending )
 staged_entries=( "$MODULES_SRC"/* )
 shopt -u nullglob
-if [ "${#pending_views[@]}" -ne 0 ]; then
-    printf 'refound-net: the founding set at %s has %d pending view(s):\n' \
-        "$MODULES_SRC" "${#pending_views[@]}" >&2
-    printf '  %s\n' "${pending_views[@]}" >&2
-    die "run \`make views\` in $CHECKOUT and build again."
-fi
 
 cp -r "$MODULES_SRC" "$STAGE/modules"
 echo "staged founding set $MODULES_SRC (${#staged_entries[@]} entries)"
@@ -403,6 +516,7 @@ DUCKTAPE_HOME="$INIT_HOME" "$STAGED_BIN" node init --name "$NAME" \
     --listen "127.0.0.1:$F_P2P" --advertised "127.0.0.1:$F_P2P" \
     --http "127.0.0.1:$F_HTTP" --gateway "127.0.0.1:$F_GATEWAY" --rpc "127.0.0.1:$F_RPC" \
     --wireguard-listen "0.0.0.0:$F_WG" --invite-listen "0.0.0.0:$F_INVITE" \
+    --wireguard-advertised "$F_ADVERTISED" \
     --primary-coordinator none
 CHAIN=$(ls "$INIT_HOME")
 [ -n "$CHAIN" ] || die "node init left no workspace under $INIT_HOME"
@@ -426,16 +540,38 @@ echo "founded $CHAIN at $FOUNDER_WS"
 #
 # `wallet new` PRINTS A MNEMONIC. It is written to a 0600 file in the
 # workspace and never to this script's stdout, which is a log an operator
-# pastes around.
+# pastes around. The PASSWORD gets the same treatment and for the same
+# reason: this key signs the network's node releases, so a password an
+# operator did not choose is generated here — never carried in this file,
+# where it would unlock every network ever founded by this script.
 # --------------------------------------------------------------------------
 say "wallet"
 SECRETS="$FOUNDER_WS/wallet-$WALLET_NAME.secret"
+PASSFILE="$FOUNDER_WS/wallet-$WALLET_NAME.password"
+[ -n "$WALLET_PASSWORD" ] || WALLET_PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -d '\n')
+( umask 077; printf '%s\n' "$WALLET_PASSWORD" > "$PASSFILE" )
 ( umask 077; : > "$SECRETS" )
-if printf '%s\n' "$WALLET_PASSWORD" \
-    | DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" wallet new "$WALLET_NAME" \
-      --config "$FOUNDER_CFG" > "$SECRETS" 2>&1; then
+# A network re-founded under the SAME release key keeps every installed app and
+# launcher that pinned it: they verify the new network's channel as they did
+# the old one's. `--wallet-mnemonic-file` restores that wallet instead of
+# minting one; the mnemonic was read before the teardown moved its file.
+mint_or_restore_wallet() {
+    if [ -n "$WALLET_MNEMONIC" ]; then
+        printf '%s\n%s\n' "$WALLET_MNEMONIC" "$WALLET_PASSWORD" \
+            | DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" wallet import "$WALLET_NAME" \
+              --config "$FOUNDER_CFG" > /dev/null 2>&1 || return 1
+        ( umask 077; printf '%s\n' "$WALLET_MNEMONIC" > "$SECRETS" )
+        return 0
+    fi
+    printf '%s\n' "$WALLET_PASSWORD" \
+        | DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" wallet new "$WALLET_NAME" \
+          --config "$FOUNDER_CFG" > "$SECRETS" 2>&1
+}
+if mint_or_restore_wallet; then
     chmod 600 "$SECRETS"
-    echo "minted wallet $WALLET_NAME — mnemonic in $SECRETS (0600), not echoed here"
+    echo "wallet $WALLET_NAME ready — mnemonic in $SECRETS (0600), not echoed here"
+    echo "password in $PASSFILE (0600) — feed it to the release lane with"
+    echo "  RELEASE_WALLET_PASSWORD=\$(cat $PASSFILE)"
     DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" wallet use "$WALLET_NAME" --config "$FOUNDER_CFG" \
         || echo "could not set $WALLET_NAME active (continuing)"
 else
@@ -470,17 +606,9 @@ if [ ! -x "$LAUNCHER" ]; then
     ( cd "$CHECKOUT" && cargo build --release -p node-launcher >&2 )
 fi
 [ -x "$LAUNCHER" ] || die "no launcher at $LAUNCHER — build \`-p node-launcher\` first"
-# The workspace keeps its OWN copy of the founding set, and the launcher's
-# child is pointed at it.
-#
-# The launcher runs `<workspace>/updates/releases/<sha>/ducktape`, and a node
-# resolves its set beside its own binary — so under the launcher there is no
-# set to find, and the failure is not a genesis error but a REACHABILITY one:
-# `netstack_guest_unreadable` kills the reachability plane, so wireguard and
-# the invite listener never bind, and a joiner that cannot redeem just dials
-# p2p forever and is answered `PeerRejected`. Nothing in that chain names the
-# missing modules directory. Pointing the child at the workspace's own copy
-# also survives a release flip, which moves the binary to a new directory.
+# The workspace modules copy seeds the first installed release. After that,
+# `current/modules` beside the running release is the set the child reads, so
+# a release flip moves the netstack guest with its binary.
 install_set() {
     local ws=$1
     [ -d "$ws/modules" ] || cp -r "$STAGE/modules" "$ws/modules"
@@ -511,7 +639,7 @@ cp "$LAUNCHER" "$WS_LAUNCHER"
 # `run` — is the one point where it costs no restart.
 "$WS_LAUNCHER" install --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" \
     --from "$STAGED_BIN" --release-key "$RELEASE_PUB"
-DUCKTAPE_MODULES_DIR="$FOUNDER_WS/modules" setsid nohup \
+setsid nohup \
     "$WS_LAUNCHER" run --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" \
     > "$FOUNDER_WS/launcher.log" 2>&1 < /dev/null &
 disown
@@ -534,19 +662,26 @@ say "join the resident"
 # takes the whole script down on the spot — with its stderr sent to /dev/null
 # and the `die` below never reached, so the operator gets a bare non-zero exit
 # and no reason at all.
-INVITE_FILE="/tmp/refound-$NAME-$STAMP.invite"
+# In the founder's own workspace, beside the wallet mnemonic and password it
+# is no less sensitive than: a bearer credential on a shared /tmp is readable
+# by whoever gets to it first, and nothing ever cleaned the old ones up.
+INVITE_FILE="$FOUNDER_WS/invite-$STAMP.invite"
 INVITE_OUT=$(DUCKTAPE_HOME="$HOME_DIR" "$STAGED_BIN" node invite --config "$FOUNDER_CFG" 2>&1) \
     || die "node invite failed: $INVITE_OUT"
-printf '%s\n' "$INVITE_OUT" | grep -o '🦆[A-Za-z0-9_+/=-]*' > "$INVITE_FILE" || true
+# An invite is a bearer credential: 0600 from its first byte, and only its
+# path is ever printed.
+( umask 077; printf '%s\n' "$INVITE_OUT" | grep -o '🦆[A-Za-z0-9_+/=-]*' > "$INVITE_FILE" ) || true
 if [ ! -s "$INVITE_FILE" ]; then
     die "node invite printed no invite blob. it said: $INVITE_OUT"
 fi
+echo "invite (a bearer credential, mode 0600): $INVITE_FILE"
 JOIN_HOME="$STAGE/joiner-home"
 mkdir -p "$JOIN_HOME" "$(dirname "$JOINER_ROOT")"
 DUCKTAPE_HOME="$JOIN_HOME" "$STAGED_BIN" node join \
     --listen "127.0.0.1:$J_P2P" --advertised "127.0.0.1:$J_P2P" \
     --http "127.0.0.1:$J_HTTP" --gateway "127.0.0.1:$J_GATEWAY" --rpc "127.0.0.1:$J_RPC" \
     --wireguard-listen "0.0.0.0:$J_WG" --invite-listen "0.0.0.0:$J_INVITE" \
+    --wireguard-advertised "$J_ADVERTISED" \
     --primary-coordinator none < "$INVITE_FILE"
 # moved to its own root for the same reason the founder is — see `found`.
 [ -d "$JOIN_HOME/$CHAIN" ] || die "node join left no workspace under $JOIN_HOME"
@@ -568,7 +703,7 @@ cp "$LAUNCHER" "$J_LAUNCHER"
 # pins nothing would sit on the old binary while the validator moved.
 "$J_LAUNCHER" install --workspace "$JOINER_WS" --config "$JOINER_CFG" \
     --from "$WS_BIN" --release-key "$RELEASE_PUB"
-DUCKTAPE_MODULES_DIR="$JOINER_WS/modules" setsid nohup \
+setsid nohup \
     "$J_LAUNCHER" run --workspace "$JOINER_WS" --config "$JOINER_CFG" \
     > "$JOINER_WS/launcher.log" 2>&1 < /dev/null &
 disown
@@ -620,6 +755,34 @@ if ! DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" account show \
         || die "account create failed — the service daemons will not boot without one"
 fi
 
+say "release keys"
+# The founders pin these keys at install and nobody else can: a member that
+# joins by invite learns which key signs a release from what the NETWORK
+# COMMITTED, reading the `release_key` lines back through `release status` and
+# pinning them on first read. A founding that never commits one leaves every
+# later member refusing every designated release of that kind with
+# `no_release_key`, on a machine nobody is going to touch. BOTH kinds are
+# committed: the node binary and the app are two channels and a member that
+# reads only one of them follows only one.
+#
+# One key signs both — the operator wallet's — because one operator publishes
+# both; the network still records the two decisions separately, since the two
+# channels are designated separately.
+#
+# Here and not beside `node init`: these are governance decisions driven
+# through a running node and signed by the operator's wallet key, so they need
+# both the founder serving and the account above.
+#
+# Captured, not piped onward, for the reason `node invite` is: the verb's own
+# output is the only account of why it refused.
+for kind in node app; do
+    KEY_SET=$(printf '%s\n' "$WALLET_PASSWORD" \
+        | DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" release key set --kind "$kind" \
+          --pubkey "$RELEASE_PUB" --config "$FOUNDER_CFG" 2>&1) \
+        || die "release key set --kind $kind failed: $KEY_SET"
+    echo "$KEY_SET"
+done
+
 say "services"
 # `service enable` alone consents to a daemon that is ALREADY SIGNALLING — with
 # nothing running it refuses, "there is nothing to consent to". `service run
@@ -652,10 +815,19 @@ fi
 # The grant line is also NOT proof the daemon lives: it enables, prints
 # `announced at height N`, and can still exit on the next line. So each one
 # waits for its grant, then waits out the exit window and must still be there.
+#
+# Each daemon runs under the launcher's `service` role, never as a bare
+# `service run`: the role starts `<workspace>/current/ducktape` and restarts
+# its child when a release flip moves that link, so a node release carries
+# its daemons with it. A bare daemon keeps the binary it started from until
+# someone with a shell restarts it, and `service status` shows the skew
+# (`build X (this node: Y)`) for as long as that takes. The role appends
+# `--config` itself; passing it again is refused as a duplicate.
 for svc in $SERVICES; do
     log="$FOUNDER_WS/service-$svc.log"
-    DUCKTAPE_MODULES_DIR="$FOUNDER_WS/modules" setsid nohup \
-        "$WS_BIN" service run "$svc" --config "$FOUNDER_CFG" --enable \
+    setsid nohup \
+        "$WS_LAUNCHER" service --workspace "$FOUNDER_WS" --config "$FOUNDER_CFG" \
+        -- service run "$svc" --enable \
         > "$log" 2>&1 < /dev/null &
     disown
     n=0
@@ -739,6 +911,47 @@ for ws in "$FOUNDER_WS" "$JOINER_WS"; do
     fi
 done
 
+# A pin is one node's; the COMMITTED key is the network's, and it is the only
+# one a member that joins later can read. So it is read back off the RUNNING
+# founder rather than trusted from the verb that passed.
+#
+# `release status` labels each line by CHANNEL, not by the `--kind` that
+# committed it: kind `node` prints `release_key node`, kind `app` prints
+# `release_key stable`. That mapping lives here and nowhere else.
+committed_release_key() {
+    local kind=$1 cfg=$2 line
+    case $kind in
+        node) line="release_key node";;
+        app) line="release_key stable";;
+        *) die "no release status line is known for release kind $kind";;
+    esac
+    DUCKTAPE_HOME="$HOME_DIR" "$WS_BIN" release status --config "$cfg" 2>/dev/null \
+        | grep -m1 "^$line" | cut -f2
+}
+
+# THE check, and it refuses: a founding that did not commit a release key is a
+# founding whose every later member follows no channel of that kind, which is
+# silent until a release is designated weeks later. Every founding proves both
+# kinds here instead.
+check_committed_release_key() {
+    local kind=$1 want=$2 got=$3
+    if [ "$got" = "$want" ]; then
+        return 0
+    fi
+    printf '\nrefound-net: the founder says the %s release key this network committed is %s, not the %s it pinned.\n' \
+        "$kind" "$got" "$want" >&2
+    printf '  a member that joins this network pins what the network committed, so\n' >&2
+    printf '  it refuses every designated %s release with no_release_key.\n' "$kind" >&2
+    return 1
+}
+
+NODE_COMMITTED=$(committed_release_key node "$FOUNDER_CFG") || NODE_COMMITTED=""
+[ -n "$NODE_COMMITTED" ] \
+    || NODE_COMMITTED="(no release_key node line — the founder did not answer release status)"
+APP_COMMITTED=$(committed_release_key app "$FOUNDER_CFG") || APP_COMMITTED=""
+[ -n "$APP_COMMITTED" ] \
+    || APP_COMMITTED="(no release_key stable line — the founder did not answer release status)"
+
 SMOKE="skipped (--no-smoke)"
 if [ "$SKIP_SMOKE" = 1 ]; then
     :
@@ -800,9 +1013,16 @@ cat <<REPORT
   contract    $CONTRACT
   founder     http 127.0.0.1:$F_HTTP   rpc :$F_RPC   config $FOUNDER_CFG
   resident    http 127.0.0.1:$J_HTTP   rpc :$J_RPC   config $JOINER_CFG
+  founder wg  $F_ADVERTISED
+  resident wg $J_ADVERTISED
+  loopback/private fronts are redeemable only from this box/LAN; use
+  --founder-advertised or --resident-advertised to name a routable front.
   binary      $VOUCH
   set         $MODULES_SRC
   release key $RELEASE_PINNED
+  committed   $NODE_COMMITTED as the node release key
+  committed   $APP_COMMITTED as the app release key
+  wallet      $WALLET_NAME — mnemonic $SECRETS, password $PASSFILE (both 0600)
   follows     $FOLLOWS
   smoke       $SMOKE
 
@@ -835,6 +1055,8 @@ case "$RELEASE_PINNED" in
         VERDICT=1
         ;;
 esac
+check_committed_release_key node "$RELEASE_PUB" "$NODE_COMMITTED" || VERDICT=1
+check_committed_release_key app "$RELEASE_PUB" "$APP_COMMITTED" || VERDICT=1
 if [ "$SMOKE" = "RED" ]; then
     printf '\nrefound-net: the network is up, but a mention does not reach an agent.\n' >&2
     printf '  the smoke output above says which link of the chain broke.\n' >&2

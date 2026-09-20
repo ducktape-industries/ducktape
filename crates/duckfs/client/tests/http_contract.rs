@@ -4,9 +4,10 @@
 //! this pins the exact request lines/bodies the engine sends and the reply
 //! shapes it parses, WITHOUT a daemon: a stage POSTs raw bytes and reads
 //! `{digest}`, a commit POSTs the snake_case body and reads the CAMELCASE
-//! `BlockSummary`, and a module rejection arriving as a 400 `{"error": ...}`
-//! surfaces as `ApiError::Rejected` with the string VERBATIM (the conflict
-//! taxonomy depends on it). the real daemon round-trip lives in
+//! `BlockSummary`, and a module rejection arriving as a 400
+//! `{"error": ..., "reason": ...}` surfaces as `ApiError::Rejected` with BOTH
+//! halves verbatim (the conflict taxonomy depends on the sentence; the screen
+//! depends on the class). the real daemon round-trip lives in
 //! `bin/noded/tests/daemon_e2e.rs`.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -220,16 +221,92 @@ fn module_rejection_is_preserved_and_missing_signer_sends_nothing() {
     let stub = Stub::new(|_, _, _| {
         (
             400,
-            serde_json::json!({ "error": "files: conflict: /x changed since base" }),
+            serde_json::json!({
+                "error": "conflict: /x changed since base",
+                "reason": "files_commit",
+            }),
         )
     });
     let unsigned = HttpNode::new(stub.url());
     assert!(unsigned.commit(None, "m", Vec::new()).is_err());
     assert!(stub.requests().is_empty());
     let node = signing_node(&stub);
+    let refused = node.commit(None, "m", Vec::new()).unwrap_err();
     assert_eq!(
-        node.commit(None, "m", Vec::new()).unwrap_err(),
-        ApiError::Rejected("files: conflict: /x changed since base".into())
+        refused,
+        ApiError::Rejected {
+            reason: "files_commit".into(),
+            sentence: "conflict: /x changed since base".into(),
+        }
+    );
+    // the commit lane's own error reads the same line the read lane does.
+    assert_eq!(
+        duckfs_client::commit::CommitError::from(refused).to_string(),
+        "conflict: /x changed since base [files_commit]"
+    );
+}
+
+/// a node nothing answers for is its OWN case, carrying the base it was dialed
+/// at — not reqwest's sentence and the url folded into a transport string,
+/// which left the CLI nothing to classify (#2660). a hang-up before any
+/// response is the same condition: it is what a draining node does to a read.
+#[test]
+fn nothing_answering_is_unreachable_not_a_transport_string() {
+    // bound only to learn a port nothing is on: the connect is REFUSED.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let refused = format!("http://{}", listener.local_addr().expect("addr"));
+    drop(listener);
+    assert_eq!(
+        HttpNode::new(&refused).ls("/", None, None, 10).unwrap_err(),
+        ApiError::Unreachable { base: refused }
+    );
+
+    // accept, then hang up without writing a byte.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let draining = format!("http://{}", listener.local_addr().expect("addr"));
+    let drain = std::thread::spawn(move || drop(listener.accept().expect("the client connects")));
+    let failure = HttpNode::new(&draining).ls("/", None, None, 10).unwrap_err();
+    drain.join().expect("the drain thread finishes");
+    assert_eq!(failure, ApiError::Unreachable { base: draining });
+}
+
+/// BOTH halves of the node's envelope survive the read lane, and the error a
+/// person ends up reading is `<sentence> [<reason>]` — the module's own words
+/// first, the class token last, and no Rust type name anywhere in between.
+#[test]
+fn a_read_refusal_keeps_its_class_beside_its_sentence() {
+    let stub = Stub::new(|_, _, _| {
+        (
+            400,
+            serde_json::json!({ "error": "files: path not found", "reason": "files_query" }),
+        )
+    });
+    let node = HttpNode::new(stub.url());
+    let refused = node.stat("/nope", None).unwrap_err();
+    assert_eq!(
+        refused,
+        ApiError::Rejected {
+            reason: "files_query".into(),
+            sentence: "files: path not found".into(),
+        }
+    );
+    assert_eq!(refused.to_string(), "files: path not found [files_query]");
+    assert!(!refused.to_string().contains("Module("));
+}
+
+/// an envelope with no class — the node refusing before any module saw the
+/// request — is filed under the unclassified one rather than given an invented
+/// token, and its sentence still reaches the reader whole.
+#[test]
+fn an_unclassified_refusal_is_not_given_a_made_up_class() {
+    let stub = Stub::new(|_, _, _| (400, serde_json::json!({ "error": "invalid module target" })));
+    let node = HttpNode::new(stub.url());
+    assert_eq!(
+        node.stat("/x", None).unwrap_err(),
+        ApiError::Rejected {
+            reason: sdk::refusal::UNFRAMED_REFUSAL.into(),
+            sentence: "invalid module target".into(),
+        }
     );
 }
 

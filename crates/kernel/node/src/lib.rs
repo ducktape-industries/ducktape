@@ -154,6 +154,17 @@ pub type FrameId = [u8; 32];
 /// per-origin check would refuse its every subsequent op.
 pub const REPLAY_WINDOW_HEIGHTS: usize = 4096;
 
+/// THE replay-window verdict: `batch` already sealed at a height `window`
+/// remembers. one rule, read by the live drain and by recovery's trailing
+/// roll-forward over the same restored window — two copies could disagree on
+/// a replayed batch, and that disagreement is a fork.
+pub fn in_replay_window<'a>(
+    window: impl IntoIterator<Item = &'a (u64, FrameId)>,
+    batch: &FrameId,
+) -> bool {
+    window.into_iter().any(|(_, sealed)| sealed == batch)
+}
+
 /// how often a standing code-swap stall re-warns: attempt 1, then every Nth.
 /// the drain retries every tick, so an unconditional warn would evict the
 /// 4096-line ring in minutes — taking the evidence around the stall with it.
@@ -213,6 +224,15 @@ pub const MAX_FRAME_BYTES: usize = (1 << 20) + (16 << 10);
 /// a module id is a handful of ASCII bytes, so this is headroom, not a limit
 /// the decoder enforces.
 pub const MAX_TARGET_BYTES: usize = 64;
+
+/// the idle-chain heartbeat filler's target — a module that deliberately does
+/// not exist, so the nop rejects identically on every validator and leaves no
+/// state. it is a member like any other on the wire, so the drain counts it
+/// apart from real rejections: a rejected member with any OTHER target is an
+/// op that died. the heartbeat SUBMITS with this exact target and noded's
+/// projection hides a block whose only op is it (both re-export this
+/// constant), so the submit, the count and the filter can never drift.
+pub const NOP_TARGET: &str = "consensus.nop";
 
 /// the bytes [`encode_frame`] wraps around a payload: scheme tag 1, origin
 /// length prefix 8 + 32-byte ed25519 pubkey, seq 8, target length prefix 8 +
@@ -342,14 +362,15 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
 /// Unknown tags, missing metadata, truncated digests and surplus proof bytes
 /// are rejected. The ordinary decoder uses this same codec and drops metadata.
 pub fn decode_frame_with_blob(bytes: &[u8]) -> Result<(Origin, Msg, Option<[u8; 32]>), Error> {
-    let parse_err = || Error::Host(sdk::Error::Module("frame does not parse".into()));
+    let parse_err = || Error::Host(sdk::Error::module("frame_decode", "frame does not parse"));
     let mut buf = bytes;
     let (tag, rest) = buf.split_first().ok_or_else(parse_err)?;
     buf = rest;
     let scheme = KeyScheme::from_tag(*tag).ok_or_else(|| {
-        Error::Host(sdk::Error::Module(format!(
-            "frame scheme tag {tag} is unknown"
-        )))
+        Error::Host(sdk::Error::module(
+            "frame_decode",
+            format!("frame scheme tag {tag} is unknown"),
+        ))
     })?;
     let origin = take_slice(&mut buf).ok_or_else(parse_err)?;
     // seq is ordering/replay metadata, consumed but not surfaced.
@@ -372,13 +393,15 @@ pub fn decode_frame_with_blob(bytes: &[u8]) -> Result<(Origin, Msg, Option<[u8; 
     };
     let preimage_len = bytes.len() - buf.len();
     if !scheme.pubkey_wellformed(origin) {
-        return Err(Error::Host(sdk::Error::Module(
-            "frame origin is malformed for its scheme".into(),
+        return Err(Error::Host(sdk::Error::module(
+            "frame_origin_malformed",
+            "frame origin is malformed for its scheme",
         )));
     }
     if !scheme.verify(origin, FRAME_NS, &bytes[..preimage_len], buf) {
-        return Err(Error::Host(sdk::Error::Module(
-            "frame proof does not bind this op to its origin".into(),
+        return Err(Error::Host(sdk::Error::module(
+            "frame_proof_unverified",
+            "frame proof does not bind this op to its origin",
         )));
     }
     Ok((
@@ -546,8 +569,9 @@ pub fn encode_batch(members: &[Vec<u8>]) -> Vec<u8> {
 /// `Err` — the drain treats a whole undecodable batch as one Rejected block.
 pub fn decode_batch(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let corrupt = || {
-        Error::Host(sdk::Error::Module(
-            "batch super-frame does not parse".into(),
+        Error::Host(sdk::Error::module(
+            "batch_decode",
+            "batch super-frame does not parse",
         ))
     };
     let mut buf = bytes;
@@ -877,9 +901,9 @@ pub struct DrainedFrame {
     /// decoding) or one whose decode/signature check failed.
     pub op: Option<DrainedOp>,
     /// node-local, NON-CONSENSUS: why a [`Disposition::Rejected`] frame was
-    /// rejected — the module's VERBATIM error string (so a submitter's held
-    /// reply can string-match it, e.g. duckfs-client keys on the module's
-    /// `"files: conflict:"` prefix), or a short reason for a decode/signature
+    /// rejected — the module's refusal framed `<token>: <sentence>`
+    /// ([`host::carried_refusal`]), so a submitter's held reply splits the
+    /// module's own token back off, or a short reason for a decode/signature
     /// failure. `None` for an applied or discarded frame. this rides ONLY the
     /// in-memory record: a rejection is a deterministic no-op that every honest
     /// validator computes identically, but the reason is pure observability and
@@ -887,40 +911,19 @@ pub struct DrainedFrame {
     pub reason: Option<String>,
 }
 
-/// the verbatim, submitter-facing string for a deterministic rejection.
-///
-/// on the batch path the host has ALREADY stringified the reject error with its
-/// WRAPPED `Display` (`Module(<verbatim>)` for a module rejection, since
-/// [`sdk::Error`]'s `Display` renders like its `Debug`). the duckfs-client
-/// engine string-matches the module's `"files: conflict:"` prefix on the FRONT
-/// of the reply detail, so no `Module(..)` wrapper may precede it — reverse
-/// exactly that one wrapper. the strip is an EXACT inverse (`Debug` for `Module`
-/// is `write!("Module({m})")`, no escaping), and it correctly leaves any other
-/// kind (e.g. `UnknownModule(..)`) untouched. node-local observability only:
-/// this string is never journaled, sealed, or hashed.
 /// hex for a log line — a state root as a raw byte array is unreadable, and
 /// hand-rolling this beats pulling a hex dependency into the kernel for one line.
 fn hex_root(root: &StateRoot) -> String {
     root.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// a mempool-cap refusal. the stable snake_case reason token leads the string
-/// so a submitter and a log line key on the same greppable name, and the bound
-/// it hit follows for the human reading it.
+/// a mempool-cap refusal: the stable snake_case token a submitter and a log
+/// line both key on, plus the bound it hit for the human reading it.
 fn custody_refused(reason: &str, bound: usize) -> Error {
-    Error::Host(sdk::Error::Module(format!(
-        "{reason}: this node's op mempool is at its {bound} bound — retry shortly"
-    )))
-}
-
-fn member_reason(reason: String) -> String {
-    match reason
-        .strip_prefix("Module(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        Some(inner) => inner.to_string(),
-        None => reason,
-    }
+    Error::Host(sdk::Error::module(
+        reason,
+        format!("this node's op mempool is at its {bound} bound — retry shortly"),
+    ))
 }
 
 /// the decoded contents of one drained frame: authenticated authorship, the
@@ -1576,10 +1579,13 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         // journaled, proposed, or held in custody for it. guards the relay
         // entry too — a resident's over-cap frame must not panic its relay.
         if frame.len() > MAX_FRAME_BYTES {
-            return Err(Error::Host(sdk::Error::Module(format!(
-                "op frame is {} bytes, over the {MAX_FRAME_BYTES}-byte cap — split the payload",
-                frame.len()
-            ))));
+            return Err(Error::Host(sdk::Error::module(
+                "frame_too_large",
+                format!(
+                    "op frame is {} bytes, over the {MAX_FRAME_BYTES}-byte cap — split the payload",
+                    frame.len()
+                ),
+            )));
         }
         decode_member(&frame)?;
         let id = frame_id(&frame);
@@ -1866,12 +1872,17 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // the refusal lives HERE, in the apply path, keyed on a protocol
             // constant, so every validator reaches it at the same block with
             // the same verdict. journaled Rejected like any other deterministic
-            // whole-batch no-op, so the height still seals.
-            let replayed = self
-                .replay_window
-                .iter()
-                .any(|(_, applied)| *applied == batch_id);
+            // whole-batch no-op, so the height still seals: its block record
+            // first, carrying no work (the refusal runs none), then the seal
+            // — recovery replays a seal only against the record it seals. the
+            // refusal precedes code-swap realization on purpose: a refused
+            // height realizes nothing, since an admission realized here would
+            // move the roots of a block that applies nothing.
+            let replayed = in_replay_window(&self.replay_window, &batch_id);
             if replayed {
+                self.sink
+                    .pre_apply(height, &frame, &host::PreparedWork::default())
+                    .await?;
                 self.drained.push(DrainedFrame {
                     id: batch_id,
                     height,
@@ -1992,10 +2003,12 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         });
                         ops.push(op);
                     }
-                    // keep the codec's verbatim reason — a submitter's held
-                    // reply surfaces it. node-local observability only.
-                    Err(Error::Host(sdk::Error::Module(reason))) => {
-                        decode_fail.push((mid, reason));
+                    // keep the codec's refusal FRAMED (`<reason>: <sentence>`)
+                    // — a submitter's held reply surfaces it and the receipt
+                    // lane splits it back into its token. node-local
+                    // observability only.
+                    Err(Error::Host(sdk::Error::Module { reason, sentence })) => {
+                        decode_fail.push((mid, sdk::refusal::encode(&reason, &sentence)));
                     }
                     Err(e) => decode_fail.push((mid, e.to_string())),
                 }
@@ -2058,7 +2071,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         disposition: Disposition::Rejected,
                         root_hash: self.host.root_hash(),
                         op: None,
-                        reason: Some(member_reason(e.to_string())),
+                        reason: Some(host::carried_refusal(&e)),
                     });
                     self.seal(height, Disposition::Rejected).await?;
                     self.remember_applied(height, batch_id);
@@ -2087,7 +2100,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     .push((height, outcome.internal_dispatches()));
             }
             let mut any_applied = false;
-            let (mut applied_count, mut rejected_count) = (0usize, 0usize);
+            let (mut applied_count, mut rejected_count, mut nop_count) = (0usize, 0usize, 0usize);
             // one record per applying member, in member (input/FIFO) order; the
             // host guarantees `members` is 1:1 with `ops` in input order. custody
             // ends for each resolved member.
@@ -2099,23 +2112,26 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     payload: op_payload,
                 } = meta;
                 self.release_custody(&mid);
+                // the heartbeat nop is rejected BY DESIGN (its target does not
+                // exist); it is counted on its own so `rejected` below means
+                // only what the comment on the idle-block line says it means.
+                let is_heartbeat_nop = op_target == NOP_TARGET;
                 let (disposition, dispatches, reason) = match member_outcome {
                     MemberOutcome::Applied { dispatches } => {
                         any_applied = true;
                         applied_count += 1;
                         (Disposition::Applied, dispatches, None)
                     }
-                    // the host stringifies the reject error with its WRAPPED
-                    // Display (`Module(<verbatim>)`); unwrap it so a submitter's
-                    // held reply keeps matching the module's own prefix (duckfs-
-                    // client keys on "files: conflict:"). node-local only.
+                    // the host carries the reject error FRAMED
+                    // (`host::carried_refusal`), so the receipt lane splits it
+                    // into the module's own token and sentence. node-local only.
                     MemberOutcome::Rejected { reason } => {
-                        rejected_count += 1;
-                        (
-                            Disposition::Rejected,
-                            Vec::new(),
-                            Some(member_reason(reason)),
-                        )
+                        if is_heartbeat_nop {
+                            nop_count += 1;
+                        } else {
+                            rejected_count += 1;
+                        }
+                        (Disposition::Rejected, Vec::new(), Some(reason))
                     }
                 };
                 self.drained.push(DrainedFrame {
@@ -2169,16 +2185,19 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     root_hash = %hex_root(&batch_hash),
                     applied = applied_count,
                     rejected = rejected_count,
+                    nops = nop_count,
                     "block committed"
                 );
             } else {
-                // the member counts ride it: an "idle block" carrying rejected
-                // members is a REAL op silently dying, not the heartbeat nop.
+                // the member counts ride it: the heartbeat nop is `nops` (its
+                // rejection is the design), so an "idle block" with a non-zero
+                // `rejected` is a REAL op silently dying.
                 tracing::debug!(
                     target: "ducktape::consensus",
                     height,
                     view,
                     rejected = rejected_count,
+                    nops = nop_count,
                     "idle block"
                 );
             }

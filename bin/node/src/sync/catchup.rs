@@ -19,8 +19,56 @@ pub(crate) async fn apply_verified_suffix_frame(
     prepared: host::PreparedWork,
     code_source: &dyn host::CodeSource,
     witness: &mut dyn host::CommitWitness,
+    replay_window: &[(u64, node::FrameId)],
 ) -> Result<Vec<host::DispatchRecord>, String> {
     let expected = to_node_disposition(served.disposition);
+    // THE REPLAY WINDOW, read as the live drain and recovery's trailing
+    // roll-forward read it: a batch the window already holds was REFUSED at
+    // this height on every honest node — sealed Rejected, nothing applied,
+    // nothing realized — and the window is the one Rejected cause the frame
+    // alone does not carry. re-applying it would run every member's signed op
+    // a second time and land a seal no peer served.
+    let replayed = node::in_replay_window(replay_window, &node::frame_id(&served.frame));
+    let (outcome, dispatches) = if replayed {
+        (node::Disposition::Rejected, Vec::new())
+    } else {
+        apply_served_batch(host, served, prepared, code_source, witness).await?
+    };
+    if outcome != expected {
+        return Err(format!(
+            "served seal mismatch at height {}: replay landed as {outcome:?}, \
+             served as {expected:?}",
+            served.height
+        ));
+    }
+    let roots = host.module_roots();
+    if roots != served.roots {
+        return Err(format!(
+            "served seal mismatch at height {}: roots changed to {:?}, served {:?}",
+            served.height, roots, served.roots
+        ));
+    }
+    let root_hash = host.root_hash();
+    if root_hash != served.root_hash {
+        return Err(format!(
+            "served seal mismatch at height {}: root_hash {} != served {}",
+            served.height,
+            hex(&root_hash),
+            hex(&served.root_hash)
+        ));
+    }
+    Ok(dispatches)
+}
+
+/// realize the height's code swaps, then apply the served batch's members as
+/// ONE block — the path every frame outside the replay window takes.
+async fn apply_served_batch(
+    host: &mut Host,
+    served: &statesync::FinalizedFrame,
+    prepared: host::PreparedWork,
+    code_source: &dyn host::CodeSource,
+    witness: &mut dyn host::CommitWitness,
+) -> Result<(node::Disposition, Vec<host::DispatchRecord>), String> {
     // CODE-SWAP REALIZATION, mirroring the live drain and recovery replay: a
     // frame sealed after a code-registry swap executed on the NEW component, so
     // catch-up must swap before re-applying or the served roots cannot
@@ -33,7 +81,7 @@ pub(crate) async fn apply_verified_suffix_frame(
     // roots, and root-hash reproduce what the peer served. disposition is
     // DRAIN-based (any member applied, or a System injection ran), never
     // root-hash-based.
-    let (outcome, dispatches) = match node::decode_batch(&served.frame) {
+    let landed = match node::decode_batch(&served.frame) {
         Ok(members) => {
             let mut ops = Vec::new();
             for member in &members {
@@ -71,36 +119,23 @@ pub(crate) async fn apply_verified_suffix_frame(
         }
         Err(_) => (node::Disposition::Rejected, Vec::new()),
     };
-    if outcome != expected {
-        return Err(format!(
-            "served seal mismatch at height {}: replay landed as {outcome:?}, \
-             served as {expected:?}",
-            served.height
-        ));
-    }
-    let roots = host.module_roots();
-    if roots != served.roots {
-        return Err(format!(
-            "served seal mismatch at height {}: roots changed to {:?}, served {:?}",
-            served.height, roots, served.roots
-        ));
-    }
-    let root_hash = host.root_hash();
-    if root_hash != served.root_hash {
-        return Err(format!(
-            "served seal mismatch at height {}: root_hash {} != served {}",
-            served.height,
-            hex(&root_hash),
-            hex(&served.root_hash)
-        ));
-    }
-    Ok(dispatches)
+    Ok(landed)
 }
+
+/// every sealed catch-up height enters the window, refused or applied, as the
+/// live drain remembers it — bounded to the same protocol depth.
+fn remember_sealed(window: &mut Vec<(u64, node::FrameId)>, height: u64, batch: node::FrameId) {
+    window.push((height, batch));
+    let over = window.len().saturating_sub(node::REPLAY_WINDOW_HEIGHTS);
+    window.drain(..over);
+}
+
 pub(crate) async fn apply_and_journal_verified_frame<E>(
     recovery: &mut Recovery<E>,
     host: &mut Host,
     frame: &statesync::FinalizedFrame,
     fold: Option<&mut IndexFold<'_>>,
+    replay_window: &mut Vec<(u64, node::FrameId)>,
 ) -> Result<(), String>
 where
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
@@ -122,8 +157,15 @@ where
         .pre_apply_catchup(&frame.frame, &prepared, &expected)
         .await
         .map_err(|e| format!("catch-up WAL write: {e}"))?;
-    let dispatches =
-        apply_verified_suffix_frame(host, frame, prepared, code_source.as_ref(), recovery).await?;
+    let dispatches = apply_verified_suffix_frame(
+        host,
+        frame,
+        prepared,
+        code_source.as_ref(),
+        recovery,
+        replay_window,
+    )
+    .await?;
     let seal = node::BlockSeal {
         height: frame.height,
         disposition: to_node_disposition(frame.disposition),
@@ -133,6 +175,7 @@ where
     node::BlockSink::seal(recovery, &seal)
         .await
         .map_err(|e| format!("catch-up seal write: {e}"))?;
+    remember_sealed(replay_window, frame.height, node::frame_id(&frame.frame));
     if let Some(fold) = fold {
         use recovery::ReplaySink as _;
         fold.folded_block(&recovery::FoldedBlock {
@@ -156,6 +199,9 @@ pub(crate) struct SuffixCatchupApply {
 /// apply one fetched window's frames, then hand each frame's bytes to `store`
 /// as it lands — the window's bytes never accumulate past this call, so a
 /// full-run backlog never holds more than one window's worth at a time.
+/// `replay_window` is the replay guard this node holds at `from_height`; every
+/// frame this call seals enters it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_suffix_frames<E>(
     recovery: &mut Recovery<E>,
     host: &mut Host,
@@ -164,6 +210,7 @@ pub(crate) async fn apply_suffix_frames<E>(
     frames: Vec<statesync::FinalizedFrame>,
     mut fold: Option<&mut IndexFold<'_>>,
     store: &consensus::ContentStore,
+    replay_window: &mut Vec<(u64, node::FrameId)>,
 ) -> Result<SuffixCatchupApply, String>
 where
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
@@ -204,7 +251,14 @@ where
                 frame.height
             ));
         }
-        apply_and_journal_verified_frame(recovery, host, &frame, fold.as_deref_mut()).await?;
+        apply_and_journal_verified_frame(
+            recovery,
+            host,
+            &frame,
+            fold.as_deref_mut(),
+            replay_window,
+        )
+        .await?;
         last = frame.height;
         applied.applied += 1;
         store.put(frame.frame);
@@ -215,6 +269,10 @@ where
 #[derive(Debug)]
 pub(crate) struct SuffixCatchup {
     pub(crate) to_height: u64,
+    /// the replay guard at `to_height`: the boundary's window extended by
+    /// every frame the suffix sealed — what the node that folds on from here
+    /// must refuse with.
+    pub(crate) replay_window: Vec<(u64, node::FrameId)>,
 }
 
 #[derive(Debug)]
@@ -234,6 +292,7 @@ pub(crate) async fn catch_up_suffix_frames<C, E>(
     namespace: &[u8],
     anchor: TrustAnchor<'_>,
     store: &consensus::ContentStore,
+    mut replay_window: Vec<(u64, node::FrameId)>,
 ) -> Result<SuffixCatchup, SuffixCatchupError>
 where
     C: statesync::SyncClient + SourceRotate,
@@ -277,6 +336,7 @@ where
             );
             return Ok(SuffixCatchup {
                 to_height: current_height,
+                replay_window,
             });
         }
 
@@ -306,7 +366,8 @@ where
                     // indistinguishable from healthy catch-up — and so it read as boot
                     // noise for days. `permanent` is the word that ends the guessing: this
                     // does not heal by waiting, because the source can only prune FURTHER
-                    // ahead of us.
+                    // ahead of us — so the retry asks the next source, not this one.
+                    client.rotate_source();
                     tracing::error!(
                         target: "ducktape::statesync",
                         requested_after,
@@ -335,6 +396,7 @@ where
                 frames,
                 fold.as_deref_mut(),
                 store,
+                &mut replay_window,
             )
             .await
             .map_err(SuffixCatchupError::Fatal)?;
@@ -359,6 +421,7 @@ where
     );
     Ok(SuffixCatchup {
         to_height: current_height,
+        replay_window,
     })
 }
 

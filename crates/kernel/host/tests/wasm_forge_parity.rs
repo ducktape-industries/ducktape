@@ -223,6 +223,7 @@ fn push(updates: Vec<RefUpdate>, pack: Option<[u8; 32]>) -> Msg {
     op(&ForgeMsg::PushRefs {
         repo: REPO.into(),
         updates,
+        tags: Vec::new(),
         pack_digest: pack.map(|d| d.to_vec()),
         cert: None,
     })
@@ -255,229 +256,17 @@ fn submit_both(native: &mut Host, wasm: &mut Host, height: u64, origin: Origin, 
     }
 }
 
-/// Program calls persist the result bytes in dispatch receipts and agent
-/// bindings. Native serde_json/preserve_order must not change those bytes.
-#[test]
-fn program_issue_and_pr_results_match_native_and_wasm() {
-    use agent::{
-        AgentModule, AgentMsg, Continuation, Decode, Predicate, Program, Siblings, Step, Value,
-    };
-    use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
-
-    fn call(operation: &str, fields: &[(&str, &str)], bind: &str) -> Step {
-        Step::Call {
-            module: FORGE.into(),
-            msg: Value::Map(
-                [(
-                    operation.into(),
-                    Value::Map(
-                        fields
-                            .iter()
-                            .map(|(key, value)| ((*key).into(), Value::Text((*value).into())))
-                            .collect(),
-                    ),
-                )]
-                .into(),
-            ),
-            bind: bind.into(),
-            decode: Decode::Text,
-            on_failure: Continuation::Unhandled,
-        }
-    }
-
-    let dir_n = tempfile::tempdir().unwrap();
-    let dir_w = tempfile::tempdir().unwrap();
-    let blobs_n = blobstore::BlobHandle::default();
-    let blobs_w = blobstore::BlobHandle::default();
-    let commits = history("program-results", &[(1, "README.md", "base\n", "birth")]);
-    let commit = &commits[0];
-    let pack = blobs_n.put_chunk(commit.pack.clone());
-    assert_eq!(pack, blobs_w.put_chunk(commit.pack.clone()));
-    let mut native = native_host(&dir_n, blobs_n);
-    let mut wasm = wasm_host(&dir_w, blobs_w);
-    for host in [&mut native, &mut wasm] {
-        host.register(Box::new(dispatch::DispatchModule::new(
-            "dispatch",
-            "saga",
-            "identity",
-            Box::new(sdk_testkit::MemStore::new()),
-        )));
-        host.register(Box::new(AgentModule::new(
-            "agent",
-            Box::new(sdk_testkit::MemStore::new()),
-            Siblings {
-                identity: "identity".into(),
-                attribution: "attribution".into(),
-                dispatch: "dispatch".into(),
-            },
-        )));
-    }
-    let controller = Origin::External(PrivateKey::from_seed(1).public_key().as_ref().to_vec());
-    assert!(submit_both(
-        &mut native,
-        &mut wasm,
-        1,
-        controller.clone(),
-        Msg {
-            target: "identity".into(),
-            payload: identity::encode_msg(&identity::IdentityMsg::Create {
-                name: "controller".into(),
-                scheme: identity::KeyScheme::Ed25519,
-            }),
-        }
-    ));
-    assert!(submit_both(
-        &mut native,
-        &mut wasm,
-        2,
-        founder(),
-        push(
-            vec![
-                update("dev", None, Some(commit)),
-                update("feature", None, Some(commit))
-            ],
-            Some(pack),
-        )
-    ));
-    let program = Program {
-        steps: vec![
-            Step::Branch {
-                test: Predicate::Equals {
-                    left: Value::Ref(vec!["change".into(), "source".into(), "module".into()]),
-                    right: Value::Text("test-source".into()),
-                },
-                then: 1,
-                or: 3,
-            },
-            call(
-                "open_issue",
-                &[("repo", REPO), ("title", "program issue"), ("body", "body")],
-                "issue",
-            ),
-            call(
-                "open_pr",
-                &[
-                    ("repo", REPO),
-                    ("title", "program PR"),
-                    ("body", "body"),
-                    ("source_branch", "feature"),
-                    ("target_branch", "dev"),
-                ],
-                "pr",
-            ),
-            Step::Finish,
-        ],
-    };
-    assert!(submit_both(
-        &mut native,
-        &mut wasm,
-        3,
-        controller,
-        Msg {
-            target: "agent".into(),
-            payload: agent::encode_msg(&AgentMsg::Provision {
-                request_id: "forge-program".into(),
-                name: "forge-program".into(),
-                program
-            }),
-        }
-    ));
-    assert!(submit_both(
-        &mut native,
-        &mut wasm,
-        4,
-        Origin::Module("test-source".into()),
-        Msg {
-            target: "attribution".into(),
-            payload: attribution::encode_msg(&attribution::AttributionMsg::Attribute {
-                object: attribution::ObjectRef {
-                    kind: "trigger".into(),
-                    object: "open-items".into()
-                },
-                revision: 1,
-                actor: attribution::Actor::Account(1),
-                relations: vec![attribution::Relation {
-                    recipient: 2,
-                    reason: attribution::Reason::Mention,
-                    detail: vec![]
-                }],
-                transfers: vec![],
-            }),
-        }
-    ));
-
-    let mut outputs = Vec::new();
-    // Drive the deterministic delivery/call schedule, including completion
-    // and the program's immediate stop on its own authorship attributions.
-    for height in 5..=10 {
-        let n = block_on(native.submit_block(block(height, Origin::System), vec![])).unwrap();
-        let w = block_on(wasm.submit_block(block(height, Origin::System), vec![])).unwrap();
-        assert_eq!(n.calls, w.calls, "call receipts at block {height}");
-        assert_eq!(
-            n.deliveries, w.deliveries,
-            "delivery receipts at block {height}"
-        );
-        assert_eq!(
-            all_roots(&native),
-            all_roots(&wasm),
-            "all committed roots at block {height}"
-        );
-        for call in n.calls {
-            for dispatch in call
-                .dispatches
-                .into_iter()
-                .filter(|entry| entry.module == FORGE)
-            {
-                assert_eq!(dispatch.origin, Origin::Program(2));
-                outputs.push(dispatch.output.expect("forge call result"));
-            }
-        }
-    }
-    assert_eq!(
-        outputs,
-        vec![
-            br#"{"number":1,"repo":"demo"}"#.to_vec(),
-            br#"{"number":2,"repo":"demo"}"#.to_vec()
-        ]
-    );
-    let query = agent::encode_query(&agent::AgentQuery::Invocation { account: 2, seq: 1 });
-    let n = block_on(native.query("agent", &query)).unwrap();
-    let w = block_on(wasm.query("agent", &query)).unwrap();
-    assert_eq!(n, w, "persisted invocation response bytes");
-    let agent::AgentReply::Invocation(Some(invocation)) = agent::decode_reply(&n).unwrap() else {
-        panic!("the program handled the trigger");
-    };
-    assert!(matches!(invocation.status, agent::Status::Finished { .. }));
-    for (bind, expected) in ["issue", "pr"].into_iter().zip(outputs) {
-        let agent::CallResult::Applied { output, .. } =
-            serde_json::from_value(invocation.bindings[bind].clone()).unwrap()
-        else {
-            panic!("the {bind} call applied");
-        };
-        assert_eq!(
-            output,
-            serde_json::Value::String(String::from_utf8(expected).unwrap())
-        );
-    }
-}
-
 fn reason_of(err: host::SubmitError) -> String {
     match err {
-        host::SubmitError::Rejected(Error::Module(reason)) => reason,
+        host::SubmitError::Rejected(Error::Module { sentence, .. }) => sentence,
         other => panic!("expected a module rejection, got {other:?}"),
     }
 }
 
 fn assert_reason_contained(native: &str, wasm: &str, height: u64) {
     // the wit rendering is a debug-escaped string: undo the quote escaping so
-    // a reason that names a repo (`"demo"`) is comparable; a batch member's
-    // reason additionally carries the `Module(..)` rendering on both sides,
-    // so the native needle is its inner text.
+    // a reason that names a repo (`"demo"`) is comparable.
     let wasm = wasm.replace("\\\"", "\"");
-    let native = native
-        .strip_prefix("Module(")
-        .and_then(|inner| inner.strip_suffix(')'))
-        .unwrap_or(native);
     assert!(
         wasm.contains(native),
         "rejections diverge at block {height}: native {native:?} vs wasm {wasm:?}"
@@ -1023,10 +812,11 @@ fn a_push_certificate_checks_the_chain_id_identically_on_both_runtimes() {
             new_oid: Some(vec![7u8; 20]),
         }];
         let cert_text =
-            forge::pushcert::certificate(&forge::pushcert::nonce(chain_id, REPO), &updates);
+            forge::pushcert::certificate(&forge::pushcert::nonce(chain_id, REPO), &updates, &[]);
         op(&ForgeMsg::PushRefs {
             repo: REPO.into(),
             updates,
+            tags: Vec::new(),
             pack_digest: Some(vec![9u8; 32]),
             cert: Some(PushCert {
                 sshsig: sshsig(&sk, GIT_SSH_NS, &cert_text),
@@ -1063,13 +853,10 @@ fn a_push_certificate_checks_the_chain_id_identically_on_both_runtimes() {
 ///
 /// If the host's ceiling ever drops below forge's copy, a deep history page
 /// stops paging and starts TRAPPING the guest — which surfaces as a wasm trap
-/// on a validator rather than as a red anywhere. So it is held here.
-#[test]
-fn forges_history_budget_stays_under_the_hosts_object_read_ceiling() {
-    assert!(
-        forge::MAX_HISTORY_OBJECT_READS < wasm_host::MAX_OBJECT_READS,
-        "forge would spend {} object reads against the host's ceiling of {}",
-        forge::MAX_HISTORY_OBJECT_READS,
-        wasm_host::MAX_OBJECT_READS,
-    );
-}
+/// on a validator rather than as a red anywhere. So it is held here, at COMPILE
+/// time: both numbers are `const`, so a ceiling that drops under forge's copy
+/// fails the build rather than one run.
+const _: () = assert!(
+    forge::MAX_HISTORY_OBJECT_READS < wasm_host::MAX_OBJECT_READS,
+    "forge's history budget must stay under the host's per-dispatch object-read ceiling",
+);

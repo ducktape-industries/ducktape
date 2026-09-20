@@ -292,14 +292,16 @@ def refuses_a_head_the_node_did_not_take(root):
     server.shutdown()
 
 
-for check in (refuses_without_credential,
-              refuses_a_port_no_workspace_serves,
-              imports_into_the_workspace_forge_store,
-              reads_forge_history_out_of_the_store_on_disk,
-              refuses_a_head_the_node_did_not_take):
-    with tempfile.TemporaryDirectory(prefix='dogfood-forge-') as tmp:
-        check(Path(tmp))
+# guarded: forge-mirror-test.py imports this file for its stand-in node.
+if __name__ == '__main__':
+    for check in (refuses_without_credential,
+                  refuses_a_port_no_workspace_serves,
+                  imports_into_the_workspace_forge_store,
+                  reads_forge_history_out_of_the_store_on_disk,
+                  refuses_a_head_the_node_did_not_take):
+        with tempfile.TemporaryDirectory(prefix='dogfood-forge-') as tmp:
+            check(Path(tmp))
 
-print('dogfood-forge: credential refusal, unserved port, a real import into the '
-      'workspace forge store, history read back out of that store, and a head '
-      'the node never took all passed')
+    print('dogfood-forge: credential refusal, unserved port, a real import into the '
+          'workspace forge store, history read back out of that store, and a head '
+          'the node never took all passed')

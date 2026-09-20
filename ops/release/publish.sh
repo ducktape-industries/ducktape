@@ -19,13 +19,27 @@
 #
 #   ops/release/publish.sh --kind node --node http://127.0.0.1:8844 \
 #       --key ... --sequence 3 --display "2026.09.3+e6352411a" \
-#       --archive linux-x86_64=target/ducktape-linux-x86_64.tar.zst
+#       --archive linux-x86_64=target/ducktape-linux-x86_64.tar.zst \
+#       --verified-sha <sha256 a second build of that archive printed>
 #   ducktape release schedule --sha <archive sha256> --at <height>
+#
+# A node archive is built twice and published once: each --archive of
+# --kind node must hash to one --verified-sha, the sha256 `archive.sh`
+# printed for a second, independent build of the same commit, or nothing is
+# signed or landed (`archive_not_reproduced`). An app release takes no
+# --verified-sha: its macOS bundle's signature carries a timestamp no second
+# build repeats.
 #
 # The release wallet is an ordinary ducktape wallet minted into a workspace
 # of its own (`ducktape wallet new release --workspace ~/.ducktape/release`);
 # its public key (what `ducktape release sign` prints) is what an install
 # pins. Its password is read ONCE here and fed to each verb on stdin.
+#
+# An archive `ops/release/archive.sh --sequence --display` packed carries
+# `release.json` at its root, and an install made from it takes that sequence
+# as its pin. One that says another sequence or display than this publish is
+# refused by name (`release_identity_mismatch`) before anything is signed or
+# landed; an archive without one publishes as it is.
 #
 # Order: archives first, then the manifest, then the signature — a reader
 # never sees a manifest naming an archive that is not there yet. Between the
@@ -42,11 +56,12 @@ NOTES_URL=""
 OUT_DIR="${PUBLISH_OUT_DIR:-target/release-publish}"
 ARCHIVES=()
 EXTRA=()
+VERIFIED=""
 
 KIND="app"
 
 usage() {
-  sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
@@ -60,6 +75,7 @@ while [ $# -gt 0 ]; do
     --archive) ARCHIVES+=("$2"); shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     --kind) KIND="$2"; shift 2 ;;
+    --verified-sha) VERIFIED="$VERIFIED $2"; shift 2 ;;
     # forwarded to `release manifest` verbatim (--node-contract,
     # --successor-key, --successor-from)
     --node-contract|--successor-key|--successor-from) EXTRA+=("$1" "$2"); shift 2 ;;
@@ -80,6 +96,49 @@ case "$KIND" in
   node) CHANNEL="node" ;;
   *) echo "publish.sh: --kind takes app or node, not $KIND" >&2; exit 2 ;;
 esac
+
+sha256_of() {
+  if command -v sha256sum >/dev/null; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+# Build twice, publish once: a node archive is landed only when a second,
+# independent build of it hashed to the same bytes.
+case "$KIND" in
+  app)
+    [ -z "$VERIFIED" ] || { echo "publish.sh: --verified-sha checks a node archive; an app release is not reproducible" >&2; exit 2; }
+    ;;
+  node)
+    for archive in "${ARCHIVES[@]}"; do
+      path="${archive#*=}"
+      own=$(sha256_of "$path")
+      case "$VERIFIED " in
+        *" $own "*) ;;
+        *)
+          echo "publish.sh: archive_not_reproduced: $path hashes to $own, which no --verified-sha names — build it again from the same commit and pass the sha256 archive.sh prints" >&2
+          exit 1
+          ;;
+      esac
+    done
+    ;;
+esac
+
+# Each archive's own identity, if it carries one, is this publish's: the text
+# `archive.sh` writes for the same --sequence/--display, byte for byte.
+IDENTITY=$(printf '{"sequence":%s,"display":"%s"}' "$SEQUENCE" "$DISPLAY_TEXT")
+for archive in "${ARCHIVES[@]}"; do
+  path="${archive#*=}"
+  members=$(zstd -dcq "$path" | tar -tf -)
+  grep -qx release.json <<<"$members" || continue
+  carried=$(zstd -dcq "$path" | tar -xOf - release.json)
+  [ "$carried" = "$IDENTITY" ] || {
+    echo "publish.sh: release_identity_mismatch: $path carries $carried, this publish is $IDENTITY" >&2
+    exit 1
+  }
+done
 
 mkdir -p "$OUT_DIR"
 # The manifest's duckfs name IS its channel — `app_update::layout::Kind`.

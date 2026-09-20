@@ -119,6 +119,7 @@ pub(crate) fn select_candidate<K: PartialEq + Clone>(
 pub(crate) async fn watch_root_divergence<S>(
     client: crate::blob_fetch::ServeLaneBlobClient<S>,
     state_tx: futures::channel::mpsc::Sender<SyncStateRequest>,
+    metrics: noded::NodeMetrics,
     me: ed25519::PublicKey,
     label: String,
 ) where
@@ -129,14 +130,25 @@ pub(crate) async fn watch_root_divergence<S>(
     let mut state_tx = state_tx;
     loop {
         tokio::time::sleep(ROOT_POLL_TICK).await;
-        watch_once(&client, &mut state_tx, &mut cursor, &mut seen, &me, &label).await;
+        watch_once(
+            &client,
+            &mut state_tx,
+            &metrics,
+            &mut cursor,
+            &mut seen,
+            &me,
+            &label,
+        )
+        .await;
     }
 }
 
 /// one watch tick — the whole body, so it is reachable without a clock.
+#[allow(clippy::too_many_arguments)]
 async fn watch_once<S>(
     client: &crate::blob_fetch::ServeLaneBlobClient<S>,
     state_tx: &mut futures::channel::mpsc::Sender<SyncStateRequest>,
+    metrics: &noded::NodeMetrics,
     cursor: &mut usize,
     seen: &mut std::collections::BTreeMap<String, u64>,
     me: &ed25519::PublicKey,
@@ -184,6 +196,10 @@ async fn watch_once<S>(
         reason = "root_polled",
         "root divergence watch compared tips with a co-peer"
     );
+    // the same answer carries this node's LAG — what a co-validator has
+    // finalized against what we serve. the projection decides what the gap
+    // means; nothing here polls for it (#2498).
+    metrics.record_peer_tip(theirs.height);
     note_peer_root(
         mine,
         &noded::hex_bytes(peer.as_ref()),

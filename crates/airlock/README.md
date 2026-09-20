@@ -269,7 +269,7 @@ to the same port. Inside, the pipeline is one state machine
 (`Received → Validated → Signed → Notarized → Stapled`): the bundle's shape is
 checked before the identity is touched (one top-level `Ducktape.app/`, no
 escaping path or symlink, `CFBundleIdentifier` `dev.ducktape.app`,
-`Contents/MacOS` exactly `ducktape-launcher`, `ducktape-app`, `views`), then
+`Contents/MacOS` exactly `ducktape-launcher` and `ducktape-app`), then
 the p12, its password and the App Store Connect key are written 0600 into a
 0700 directory under the tmpfs work root for `rcodesign sign
 --code-signature-flags runtime --entitlements-xml-file …` (the launcher and

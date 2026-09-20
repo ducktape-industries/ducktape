@@ -7,6 +7,7 @@ use commonware_p2p::{
     AddressableManager as _, Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender,
 };
 use commonware_runtime::{IoBuf, Spawner, Supervisor};
+use reachability::CarryingPeers;
 
 use crate::config::{self, hex_bytes};
 use crate::constants::NUDGE_INTERVAL;
@@ -14,10 +15,46 @@ use crate::join_gate;
 
 /// Which doorbell an intro arrived on: the DIRECT UDP listener or the
 /// COORDINATED (rendezvous-punched, resolver-socket) receiver.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy)]
 pub(crate) enum IntroPath {
     Direct,
     Coordinated,
+}
+
+impl IntroPath {
+    fn as_str(self) -> &'static str {
+        match self {
+            IntroPath::Direct => "direct",
+            IntroPath::Coordinated => "coordinated",
+        }
+    }
+}
+
+/// an intro this member refused before installing anything, on its record.
+/// An honest joiner re-sends every poll, so the warn is latched per `reason`:
+/// the count IS the diagnosis. Not per joiner — an intro may name any key it
+/// likes, so a per-key latch would hand a flood one fresh line per datagram.
+fn log_intro_refused(
+    label: &str,
+    path: IntroPath,
+    joiner: &[u8],
+    reason: &'static str,
+    detail: &dyn std::fmt::Display,
+) {
+    static INTRO_REFUSED: noded::log::Latch = noded::log::Latch::new(100);
+    let Some(attempts) = INTRO_REFUSED.hit(reason) else {
+        return;
+    };
+    tracing::warn!(
+        target: "ducktape::join",
+        node = %label,
+        peer = %config::hex_bytes(&joiner[..joiner.len().min(4)]),
+        via = path.as_str(),
+        reason,
+        detail = %detail,
+        attempts,
+        "invite intro REFUSED before its gate"
+    );
 }
 
 /// One inviter-side intro datagram, shared by BOTH doorbells: OPEN → decode →
@@ -130,13 +167,6 @@ pub(crate) fn sweep_gate_outcomes(
     map.retain(|_, entry| now.duration_since(entry.settled_at).unwrap_or_default() <= window);
 }
 
-/// The handshake sampler's knowledge, published for the event pump: peer
-/// ULAs whose WireGuard tunnel is carrying traffic at the last sample. The
-/// sampler writes it once per tick; the pump reads it to keep a failed
-/// endpoint RESOLUTION from being reported as an unreachable peer.
-pub(crate) type CarryingPeers =
-    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<std::net::Ipv6Addr>>>;
-
 /// the caller-side halves of the plane's lane-reclaim seam (see
 /// `wire_reachability_plane`'s `lane_reclaim`): each resolves with its half
 /// of the CHANNEL_REACHABILITY pair once the plane exits.
@@ -183,29 +213,51 @@ where
         return true;
     };
     let nonce = msg.nonce.clone();
-    let verified = match join_gate::verify_intro(&msg, binding, nat_traversal::now_secs()) {
-        Ok(v) => v,
-        Err(_) => return true,
-    };
-    // past verification we hold the joiner's WG key: every reply from here is
-    // SEALED to it, so an `Admitted`'s coordinator capability never crosses the
-    // wire in the clear.
-    let joiner_wg = verified.wg_public_key;
-    let sealed_reply = |reply: join_gate::IntroReply| {
+    // every reply is SEALED to a WG key the joiner PROVED it holds, so an
+    // `Admitted`'s coordinator capability never crosses the wire in the clear.
+    let seal_reply = |wg: &[u8; 32], reply: join_gate::IntroReply| {
         let bytes = join_gate::encode_intro_ack(&join_gate::IntroAck {
             nonce: nonce.clone(),
             reply,
         });
-        reachability::seal(&joiner_wg, &bytes)
+        reachability::seal(wg, &bytes)
     };
-    // V4 expiry, on this member's wall clock (signature-covered field).
-    if nat_traversal::now_secs() >= msg.expires_unix_secs {
-        if path == IntroPath::Direct {
-            ack(sealed_reply(join_gate::IntroReply::Refused {
-                detail: "invite expired — ask the inviter for a fresh one".into(),
-            }))
-            .await;
+    let now = nat_traversal::now_secs();
+    let verified = match join_gate::verify_intro(&msg, binding, now) {
+        Ok(v) => v,
+        Err(refusal) => {
+            log_intro_refused(label, path, &msg.joiner, refusal.reason(), &refusal);
+            // every signature verified and only the clock did not: the key is
+            // proven, and the joiner is owed the one fix a new invite cannot make.
+            if let join_gate::IntroRefusal::Stale { wg_public_key } = refusal {
+                let detail = format!(
+                    "{}: your clock and this member's differ by {} s (the limit is {} s) — \
+                     set this machine's clock and join again",
+                    join_gate::INTRO_STALE,
+                    now.abs_diff(msg.issued_unix_secs),
+                    join_gate::INTRO_FRESHNESS_SECS
+                );
+                ack(seal_reply(
+                    &wg_public_key,
+                    join_gate::IntroReply::Refused { detail },
+                ))
+                .await;
+            }
+            return true;
         }
+    };
+    let joiner_wg = verified.wg_public_key;
+    let sealed_reply = |reply: join_gate::IntroReply| seal_reply(&joiner_wg, reply);
+    // V4 expiry, on this member's wall clock (signature-covered field). Both
+    // doorbells answer it: a coordinated joiner is as owed the reason as a
+    // direct one.
+    if now >= msg.expires_unix_secs {
+        let detail = "invite expired — ask the inviter for a fresh one";
+        log_intro_refused(label, path, &msg.joiner, "intro_invite_expired", &detail);
+        ack(sealed_reply(join_gate::IntroReply::Refused {
+            detail: detail.into(),
+        }))
+        .await;
         return true;
     }
     // V6/V7 need committed state — those run at the loop (`on_gate_forward`).
@@ -229,16 +281,12 @@ where
     static INSTALL_REFUSED: noded::log::Latch = noded::log::Latch::new(100);
     match reply_rx.await {
         Ok(Ok(())) => {
-            let via = match path {
-                IntroPath::Direct => "direct",
-                IntroPath::Coordinated => "coordinated",
-            };
             // per intro, and a racing joiner re-sends one every poll: debug.
             tracing::debug!(
                 target: "ducktape::join",
                 node = %label,
                 peer = %config::hex_bytes(&verified.joiner.as_ref()[..4]),
-                via,
+                via = path.as_str(),
                 "invite intro tunnel peer installed"
             );
             // THE GATE: the sealed intro IS the gate request. Forward it to
@@ -357,7 +405,7 @@ pub(crate) fn wire_reachability_plane<S, R>(
     wireguard_advertised: Option<Ingress>,
     coordinators: Vec<Ingress>,
     intro_listen: Option<std::net::SocketAddr>,
-    // the genesis-issued admission capability presented on every coordinator
+    // the validator-issued admission capability presented on every coordinator
     // request (private coordination); `None` for a genesis validator, a public
     // coordinator, or the dev shape.
     coord_cap: Option<nat_traversal::CoordCap>,
@@ -397,9 +445,9 @@ where
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityEvent>(256);
 
     // the sampler (inside the plane's own runtime) writes it; the out pump
-    // (on the node runtime) reads it. one allocation, shared across both.
-    let carrying: CarryingPeers =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    // (on the node runtime) and the rendezvous establish loop read it. one
+    // allocation, shared across all three.
+    let carrying = CarryingPeers::default();
     let thread_label = label.to_string();
     let reach_carrying = carrying.clone();
     let reach_signer = signer.clone();
@@ -480,6 +528,11 @@ where
                     }
                 }
                 if let Some(handback) = rx_handback {
+                    tracing::info!(
+                        target: "ducktape::reachability",
+                        event = "reach_lane_rx_handback",
+                        "reachability input lane returned"
+                    );
                     let _ = handback.send(reach_p2p_rx);
                 }
             });
@@ -747,6 +800,11 @@ where
                     }
                 }
                 if let Some(handback) = tx_handback {
+                    tracing::info!(
+                        target: "ducktape::reachability",
+                        event = "reach_lane_tx_handback",
+                        "reachability output lane returned"
+                    );
                     let _ = handback.send(tx);
                 }
             });
@@ -771,7 +829,12 @@ pub(crate) enum NetstackBoot {
     AwaitRegistry,
 }
 
-type Startup = tokio::sync::oneshot::Sender<Result<reachability::NetstackBackend, String>>;
+enum StartupOutcome {
+    Selected(reachability::NetstackBackend),
+    GuestLoadFailed(String),
+    Cancelled,
+}
+type Startup = tokio::sync::oneshot::Sender<StartupOutcome>;
 struct LivePlane {
     generation: u64,
     commands: tokio::sync::mpsc::WeakSender<reachability::ReachabilityCommand>,
@@ -784,6 +847,10 @@ impl LivePlane {
         }
         self.startup.take()
     }
+
+    fn cancel_start(&mut self) -> Option<Startup> {
+        self.startup.take()
+    }
 }
 static LIVE_PLANE: std::sync::RwLock<Option<LivePlane>> = std::sync::RwLock::new(None);
 
@@ -793,14 +860,36 @@ pub(crate) fn start_pending_netstack(
     generation: u64,
     backend: Result<reachability::NetstackBackend, String>,
 ) {
+    let outcome = match backend {
+        Ok(backend) => StartupOutcome::Selected(backend),
+        Err(error) => StartupOutcome::GuestLoadFailed(error),
+    };
     let start = LIVE_PLANE
         .write()
         .expect("live plane lock poisoned")
         .as_mut()
         .and_then(|live| live.take_start(generation));
     if let Some(start) = start {
-        let _ = start.send(backend);
+        let _ = start.send(outcome);
     }
+}
+
+/// Abort a standby plane that is still waiting for its registry-selected guest.
+/// Its command receiver cannot observe `Shutdown` until that selection arrives;
+/// resolving the startup gate is the direct cancellation seam for promotion.
+pub(crate) fn cancel_pending_netstack() -> bool {
+    LIVE_PLANE
+        .write()
+        .expect("live plane lock poisoned")
+        .as_mut()
+        .is_some_and(cancel_startup)
+}
+
+fn cancel_startup(live: &mut LivePlane) -> bool {
+    let Some(start) = live.cancel_start() else {
+        return false;
+    };
+    start.send(StartupOutcome::Cancelled).is_ok()
 }
 
 pub(crate) fn startup_pending(generation: u64) -> bool {
@@ -860,6 +949,7 @@ pub(crate) async fn observe_execution(metrics: noded::NodeMetrics) {
                 .status
                 .code_hash()
                 .map(|hash| crate::config::hex_bytes(&hash)),
+            plane_failure(),
         );
         if changes.changed().await.is_err() {
             return;
@@ -878,6 +968,9 @@ fn publish_live_plane(
         commands: cmds.downgrade(),
         startup: Some(startup),
     });
+    // a new plane owes the operator its OWN refusal: the previous one's reason
+    // would otherwise be read back against this generation's failure.
+    *PLANE_FAILURE.write().expect("plane failure lock poisoned") = None;
     execution().send_replace(PlaneExecution {
         generation,
         revision: 0,
@@ -898,11 +991,27 @@ fn record_execution(generation: u64, status: reachability::BackendStatus) {
 static PLANE_FAILURE: std::sync::RwLock<Option<(&'static str, String)>> =
     std::sync::RwLock::new(None);
 
-/// Refuse to start the plane, on the record. Every caller returns immediately
-/// after; the execution guard is the backstop for a path that does not.
-fn fail_plane(generation: u64, reason: &'static str, detail: String) {
+/// Refuse to start the plane, on the record AND in the log — one writer, so a
+/// site cannot say one thing to the operator reading stderr and another to
+/// `/v1/status`. Every caller returns immediately after; the execution guard is
+/// the backstop for a path that does not.
+///
+/// A plane that never starts leaves this node with NO overlay for the rest of
+/// the boot: no tunnels, no invite door, no join. It does not self-heal, so the
+/// refusal is `error` and it stands in the status projection until a plane runs.
+fn fail_plane(generation: u64, node: &str, reason: &'static str, detail: String) {
     *PLANE_FAILURE.write().expect("plane failure lock poisoned") = Some((reason, detail.clone()));
-    record_execution(generation, reachability::BackendStatus::Failed(detail));
+    record_execution(
+        generation,
+        reachability::BackendStatus::Failed(detail.clone()),
+    );
+    tracing::error!(
+        target: "ducktape::reachability",
+        node = %node,
+        reason,
+        detail = %detail,
+        "reachability plane NOT started — this node has no overlay for the rest of this boot"
+    );
 }
 
 /// Why the plane is not running, for a caller about to blame something else.
@@ -921,22 +1030,48 @@ pub(crate) fn plane_failure() -> Option<(&'static str, String)> {
     Some(named.unwrap_or(("plane_startup_failed", detail)))
 }
 
-/// The socket inodes bound to `port` in one `/proc/net/udp{,6}` table. The
-/// columns are fixed and positional: `local_address` (hex address, hex port)
-/// is the second, `inode` the tenth — the header's `tx_queue rx_queue` and
-/// `tr tm->when` are single colon-joined fields in every data row.
+/// One socket bound to the port asked about, as a `/proc/net/{tcp,udp}{,6}`
+/// row names it.
 #[cfg(target_os = "linux")]
-fn udp_inodes_in(table: &str, port: u16) -> Vec<String> {
+#[derive(Debug, PartialEq)]
+struct BoundSocket {
+    /// `socket:[<inode>]` — what the holding process's fd links to.
+    link: String,
+    /// `st` is `0A`, a TCP listener. Never in a udp table.
+    listening: bool,
+}
+
+/// The sockets bound to `port` in one `/proc/net/{tcp,udp}{,6}` table. The
+/// columns are fixed and positional: `local_address` (hex address, hex port)
+/// is the second, `st` the fourth, `inode` the tenth — the header's
+/// `tx_queue rx_queue` and `tr tm->when` are single colon-joined fields in
+/// every data row.
+#[cfg(target_os = "linux")]
+fn sockets_in(table: &str, port: u16) -> Vec<BoundSocket> {
     table
         .lines()
         .skip(1)
         .filter_map(|line| {
             let columns: Vec<&str> = line.split_whitespace().collect();
             let local = columns.get(1)?;
+            let state = columns.get(3)?;
             let inode = columns.get(9)?;
             let bound = u16::from_str_radix(local.rsplit_once(':')?.1, 16).ok()?;
-            (bound == port).then(|| (*inode).to_string())
+            (bound == port).then(|| BoundSocket {
+                link: format!("socket:[{inode}]"),
+                listening: *state == "0A",
+            })
         })
+        .collect()
+}
+
+/// The sockets bound to `port` across a transport's v4 and v6 tables.
+#[cfg(target_os = "linux")]
+fn bound_sockets(tables: [&str; 2], port: u16) -> Vec<BoundSocket> {
+    tables
+        .into_iter()
+        .filter_map(|table| std::fs::read_to_string(table).ok())
+        .flat_map(|text| sockets_in(&text, port))
         .collect()
 }
 
@@ -946,20 +1081,52 @@ fn udp_inodes_in(table: &str, port: u16) -> Vec<String> {
 /// Two nodes on one dev box are the same user, which is the case this serves.
 #[cfg(target_os = "linux")]
 fn udp_port_owner(port: u16) -> Option<String> {
-    let mut wanted: Vec<String> = Vec::new();
-    for table in ["/proc/net/udp", "/proc/net/udp6"] {
-        let Ok(text) = std::fs::read_to_string(table) else {
-            continue;
-        };
-        wanted.extend(
-            udp_inodes_in(&text, port)
-                .into_iter()
-                .map(|inode| format!("socket:[{inode}]")),
-        );
+    process_holding(&bound_sockets(["/proc/net/udp", "/proc/net/udp6"], port))
+}
+
+/// What holds a TCP port a listener could not bind, and the process behind it
+/// when `/proc` names one this user may inspect.
+pub(crate) enum PortHolder {
+    /// another server's listening socket.
+    Listener(Option<String>),
+    /// one end of a connection: an outbound one drew the port from the
+    /// kernel's ephemeral range as its source port, and it frees when that
+    /// connection closes. `None` is another user's, or a closed one waiting
+    /// out TIME_WAIT, which no process holds.
+    Connection(Option<String>),
+}
+
+/// What holds this TCP port, as far as `/proc` will say — the socket's state
+/// is world-readable, the process behind it only when it is this user's. A
+/// listener wins over a connection: two sockets on one port is a server with
+/// its accepted peers, and the server is the answer.
+#[cfg(target_os = "linux")]
+pub(crate) fn tcp_port_holder(port: u16) -> Option<PortHolder> {
+    let (listeners, connections): (Vec<_>, Vec<_>) =
+        bound_sockets(["/proc/net/tcp", "/proc/net/tcp6"], port)
+            .into_iter()
+            .partition(|socket| socket.listening);
+    if !listeners.is_empty() {
+        return Some(PortHolder::Listener(process_holding(&listeners)));
     }
-    if wanted.is_empty() {
+    if !connections.is_empty() {
+        return Some(PortHolder::Connection(process_holding(&connections)));
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn tcp_port_holder(_port: u16) -> Option<PortHolder> {
+    None
+}
+
+/// The first process with an fd on one of `sockets`, described.
+#[cfg(target_os = "linux")]
+fn process_holding(sockets: &[BoundSocket]) -> Option<String> {
+    if sockets.is_empty() {
         return None;
     }
+    let wanted: Vec<&str> = sockets.iter().map(|socket| socket.link.as_str()).collect();
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let pid = entry.file_name().to_string_lossy().into_owned();
         let is_process = !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit());
@@ -980,20 +1147,15 @@ fn udp_port_owner(port: u16) -> Option<String> {
     None
 }
 
-/// One process in terms an operator can act on: what it was started as, and
-/// the directory it runs in — which for a node started in its workspace IS the
-/// workspace.
+/// One process in terms an operator can act on: its name, and the directory it
+/// runs in — which for a node started in its workspace IS the workspace. The
+/// name and never the argv: the holder may be a `curl` or a CLI whose
+/// arguments carry a URL path, a token or an invite blob, and this sentence
+/// lands in the log ring.
 #[cfg(target_os = "linux")]
 fn describe_process(pid: &str) -> String {
-    let command = std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|raw| {
-            raw.split(|byte| *byte == 0)
-                .filter(|arg| !arg.is_empty())
-                .map(String::from_utf8_lossy)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default();
+    let command = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    let command = command.trim_end();
     match std::fs::read_link(format!("/proc/{pid}/cwd")) {
         Ok(cwd) => format!("pid {pid} ({command}) running in {}", cwd.display()),
         Err(_) => format!("pid {pid} ({command})"),
@@ -1113,7 +1275,7 @@ async fn reachability_plane(
     // the invite intro listener: where a fresh joiner announces its keys
     // (token-authenticated) so its tunnel exists before any p2p.
     intro_listen: Option<std::net::SocketAddr>,
-    // the genesis-issued admission capability presented on every coordinator
+    // the validator-issued admission capability presented on every coordinator
     // request (private coordination); `None` for a genesis validator, a public
     // coordinator, or the dev shape.
     coord_cap: Option<nat_traversal::CoordCap>,
@@ -1127,7 +1289,7 @@ async fn reachability_plane(
     // the handshake sampler's publication seam (see [`CarryingPeers`]).
     carrying: CarryingPeers,
     generation: u64,
-    startup: tokio::sync::oneshot::Receiver<Result<reachability::NetstackBackend, String>>,
+    startup: tokio::sync::oneshot::Receiver<StartupOutcome>,
 ) {
     use std::net::ToSocketAddrs as _;
     // Every early return marks this plane failed; successful shutdown is
@@ -1146,17 +1308,23 @@ async fn reachability_plane(
         }
     }
     let _execution_guard = ExecutionGuard(generation);
-    let backend = match startup
-        .await
-        .unwrap_or_else(|_| Err("netstack startup selection cancelled".into()))
-    {
-        Ok(backend) => backend,
-        Err(error) => {
-            record_execution(
+    let backend = match startup.await {
+        Ok(StartupOutcome::Selected(backend)) => backend,
+        Ok(StartupOutcome::Cancelled) => {
+            record_execution(generation, reachability::BackendStatus::Stopped);
+            return;
+        }
+        Ok(StartupOutcome::GuestLoadFailed(error)) => {
+            fail_plane(generation, &label, "netstack_guest_unreadable", error);
+            return;
+        }
+        Err(_) => {
+            fail_plane(
                 generation,
-                reachability::BackendStatus::Failed(error.clone()),
+                &label,
+                "netstack_guest_unreadable",
+                "netstack startup selection cancelled".into(),
             );
-            tracing::error!(target: "ducktape::reachability", reason = "netstack_guest_unreadable", error = %error, "reachability plane cannot start");
             return;
         }
     };
@@ -1184,16 +1352,14 @@ async fn reachability_plane(
             .and_then(underlay_addr),
     };
     let Some(control_addr) = resolve_ingress(&advertised) else {
-        // the plane never starts and the node runs on forever with NO overlay:
-        // no tunnels, no hub, every huddle failing with a string that names none
-        // of this. it does not self-heal and nothing else reports it.
-        tracing::error!(
-            target: "ducktape::reachability",
-            node = %label,
-            advertised = ?advertised,
-            reason = "advertised_unresolvable",
-            "reachability plane NOT started — this node has no overlay for the rest of \
-             this boot (set `advertised` to a resolvable address)"
+        fail_plane(
+            generation,
+            &label,
+            "advertised_unresolvable",
+            format!(
+                "advertised {advertised:?} resolves to no address — set `advertised` in \
+                 node.toml to a resolvable one"
+            ),
         );
         return;
     };
@@ -1205,13 +1371,14 @@ async fn reachability_plane(
     ) {
         Ok(endpoint) => endpoint,
         Err(err) => {
-            tracing::error!(
-                target: "ducktape::reachability",
-                node = %label,
-                error = ?err,
-                reason = "control_endpoint_rejected",
-                "reachability plane NOT started — this node has no overlay for the rest of \
-                 this boot (set `advertised` to a dialable address)"
+            fail_plane(
+                generation,
+                &label,
+                "control_endpoint_rejected",
+                format!(
+                    "the control endpoint {control_addr} was rejected ({err:?}) — set \
+                     `advertised` in node.toml to a dialable address"
+                ),
             );
             return;
         }
@@ -1224,11 +1391,11 @@ async fn reachability_plane(
     // without an endpoint and this node's own initiations complete it
     // (WireGuard roams to the authenticated source).
     if wireguard_listen.port() == 0 {
-        tracing::error!(
-            target: "ducktape::reachability",
-            node = %label,
-            reason = "wireguard_port_zero",
-            "reachability plane NOT started; wireguard_listen needs a concrete UDP port"
+        fail_plane(
+            generation,
+            &label,
+            "wireguard_port_zero",
+            "`wireguard_listen` needs a concrete UDP port, not 0".into(),
         );
         return;
     }
@@ -1246,23 +1413,21 @@ async fn reachability_plane(
             ) {
                 Ok(endpoint) => Some(endpoint),
                 Err(err) => {
-                    tracing::error!(
-                        target: "ducktape::reachability",
-                        node = %label,
-                        error = ?err,
-                        reason = "wireguard_advertised_rejected",
-                        "reachability plane NOT started"
+                    fail_plane(
+                        generation,
+                        &label,
+                        "wireguard_advertised_rejected",
+                        format!("`wireguard_advertised` {addr} was rejected ({err:?})"),
                     );
                     return;
                 }
             },
             None => {
-                tracing::error!(
-                    target: "ducktape::reachability",
-                    node = %label,
-                    advertised = ?ingress,
-                    reason = "wireguard_advertised_unresolvable",
-                    "reachability plane NOT started"
+                fail_plane(
+                    generation,
+                    &label,
+                    "wireguard_advertised_unresolvable",
+                    format!("`wireguard_advertised` {ingress:?} resolves to no address"),
                 );
                 return;
             }
@@ -1312,15 +1477,7 @@ async fn reachability_plane(
                  `--wireguard-listen 0.0.0.0:<free port>` on `node init`/`node join`, or \
                  set `wireguard_listen` in its node.toml."
             );
-            fail_plane(generation, "underlay_bind_failed", detail.clone());
-            tracing::error!(
-                target: "ducktape::reachability",
-                node = %label,
-                port,
-                error = %err,
-                reason = "underlay_bind_failed",
-                "reachability plane NOT started: {detail}"
-            );
+            fail_plane(generation, &label, "underlay_bind_failed", detail);
             return;
         }
     };
@@ -1331,7 +1488,7 @@ async fn reachability_plane(
     let (invite_intro_tx, mut invite_intro_rx) = (Some(invite_intro_tx), Some(invite_intro_rx));
     // authenticate every coordinator request: the node signs a
     // proof-of-possession with its identity key and, in private coordination,
-    // carries the genesis-issued cap. A fully-open coordinator ignores the
+    // carries the validator-issued cap. A fully-open coordinator ignores the
     // authenticator; a public/private one requires it. With no coordinators
     // configured `bind` short-circuits to pass-through and never touches this.
     let resolver = match &socket_underlay {
@@ -1359,6 +1516,7 @@ async fn reachability_plane(
                     client,
                     reachability::RENDEZVOUS_KEEPALIVE,
                     invite_intro_tx,
+                    carrying.clone(),
                 ),
                 // A LOCAL wiring failure of the shared-socket seam itself —
                 // not a network condition. Rendezvous cannot exist on this
@@ -1660,12 +1818,14 @@ async fn reachability_plane(
         })
         .await
     {
-        tracing::error!(
-            target: "ducktape::reachability",
-            node = %label,
-            error = %err,
-            "reachability plane EXITED — this node has no overlay for the rest of \
-             this boot"
+        // an orchestrator that returns is as dead as one that never started,
+        // and the execution status still says `guest` — the one state that
+        // reads as healthy. Put the exit on the record under its own token.
+        fail_plane(
+            generation,
+            &label,
+            "plane_exited",
+            format!("the reachability orchestrator exited ({err})"),
         );
     }
 }
@@ -1676,6 +1836,26 @@ pub(crate) fn netstack_backend() -> Result<reachability::NetstackBackend, String
     let dir = noded::services::founding_set()?;
     let path = workspace_config::netstack_component_path(&dir);
     load_netstack_backend(&path)
+}
+
+/// The boot's own read of the netstack guest, made where an unreadable one is
+/// a refusal by name. Inside the runtime the same failure is a plane that
+/// never starts on a node that otherwise looks healthy: it produces blocks
+/// while no tunnel, no invite and no join can ever work.
+pub(crate) fn preflight_netstack() -> Result<(), String> {
+    netstack_backend().map(drop).map_err(netstack_refusal)
+}
+
+/// Why a node whose netstack guest is unreadable does not boot: `error` names
+/// the file, the rest says what dies without it and what to do.
+fn netstack_refusal(error: String) -> String {
+    format!(
+        "refusing to boot: the netstack guest this node reaches its mesh with is unreadable \
+         ({error}). Without it no tunnel comes up — no member can reach this node, no invite it \
+         mints can be redeemed, and a workspace with no genesis yet cannot fetch one. Put the \
+         release's founding set beside this binary (or set $DUCKTAPE_MODULES_DIR) and start it \
+         again"
+    )
 }
 
 fn load_netstack_backend(path: &std::path::Path) -> Result<reachability::NetstackBackend, String> {
@@ -1854,12 +2034,47 @@ mod plane_failure_tests {
    2: 0000CA6C:0043 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 445566 2 0000000000000000 0
 ";
 
+    /// a real `/proc/net/tcp`, trimmed: a listener on `7080` (28800), the
+    /// connection it accepted, and that connection's client end, whose SOURCE
+    /// port `d431` (54321) is the one an outbound socket holds.
+    #[cfg(target_os = "linux")]
+    const TCP_TABLE: &str = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:7080 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 700001 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:7080 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 700002 1 0000000000000000 20 4 30 10 -1
+   2: 0100007F:D431 0100007F:7080 01 00000000:00000000 00:00000000 00000000  1000        0 700003 1 0000000000000000 20 4 30 10 -1
+";
+
+    #[cfg(target_os = "linux")]
+    fn socket(inode: &str, listening: bool) -> super::BoundSocket {
+        super::BoundSocket {
+            link: format!("socket:[{inode}]"),
+            listening,
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn the_port_column_names_its_socket_and_only_its_socket() {
-        assert_eq!(super::udp_inodes_in(TABLE, 51820), ["918273"]);
-        assert_eq!(super::udp_inodes_in(TABLE, 53), ["112233"]);
-        assert!(super::udp_inodes_in(TABLE, 9999).is_empty());
+        assert_eq!(super::sockets_in(TABLE, 51820), [socket("918273", false)]);
+        assert_eq!(super::sockets_in(TABLE, 53), [socket("112233", false)]);
+        assert!(super::sockets_in(TABLE, 9999).is_empty());
+    }
+
+    /// `st` `0A` is the listener; the accepted end shares its port and is not.
+    /// The client end is found by its LOCAL port only — the remote column
+    /// naming 54321 on the accepted row does not count.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_state_column_tells_a_listener_from_a_connection() {
+        assert_eq!(
+            super::sockets_in(TCP_TABLE, 28800),
+            [socket("700001", true), socket("700002", false)]
+        );
+        assert_eq!(
+            super::sockets_in(TCP_TABLE, 54321),
+            [socket("700003", false)]
+        );
     }
 
     /// this process holds a port it just bound, so the scan must find ITSELF —
@@ -1892,15 +2107,72 @@ mod plane_failure_tests {
             "a starting plane has not failed"
         );
 
-        super::fail_plane(77, "underlay_bind_failed", "port 51820 is taken".into());
+        super::fail_plane(77, "node", "underlay_bind_failed", "port 51820 is taken".into());
         let (reason, detail) = super::plane_failure().expect("the refusal is on the record");
         assert_eq!(reason, "underlay_bind_failed");
         assert_eq!(detail, "port 51820 is taken");
+
+        // EVERY SITE'S TOKEN SURVIVES THE SAME WAY, not just this one — a
+        // founder that cannot read its netstack guest keeps sealing blocks and
+        // keeps answering `/v1/status`, so what `observe_execution` carries
+        // into `operations.netstack.failure_reason` is the only standing trace
+        // its dead mesh leaves. Asserted in the ONE test that owns the global
+        // execution cell: a second test publishing planes would race this.
+        for (generation, reason) in [
+            (78u64, "netstack_guest_unreadable"),
+            (79, "advertised_unresolvable"),
+            (80, "plane_exited"),
+        ] {
+            super::execution().send_replace(super::PlaneExecution {
+                generation,
+                revision: 0,
+                status: reachability::BackendStatus::Starting,
+            });
+            super::fail_plane(generation, "node", reason, format!("{reason} happened"));
+            let named = super::plane_failure().expect("the refusal is on the record");
+            assert_eq!(named, (reason, format!("{reason} happened")));
+        }
+
+        // and a NEW plane owes its own reason: the last one's must not be read
+        // back against this generation's failure.
+        let (commands, _rx) = tokio::sync::mpsc::channel(1);
+        let (startup, _selected) = tokio::sync::oneshot::channel();
+        let generation = super::publish_live_plane(&commands, startup);
+        assert!(
+            super::plane_failure().is_none(),
+            "a fresh plane inherits no refusal"
+        );
+        super::record_execution(
+            generation,
+            reachability::BackendStatus::Failed("no site named it".into()),
+        );
+        assert_eq!(
+            super::plane_failure(),
+            Some(("plane_startup_failed", "no site named it".into()))
+        );
     }
 }
 
 #[cfg(test)]
 mod netstack_execution_tests {
+    /// A node whose netstack guest cannot be read refuses its boot naming the
+    /// file, instead of sealing blocks behind a mesh nobody can reach.
+    #[test]
+    fn an_unreadable_netstack_guest_refuses_the_boot_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = workspace_config::netstack_component_path(dir.path());
+        let refusal = super::load_netstack_backend(&path)
+            .map(drop)
+            .map_err(super::netstack_refusal)
+            .expect_err("no guest on disk");
+        assert!(refusal.starts_with("refusing to boot"), "{refusal}");
+        assert!(refusal.contains(&path.display().to_string()), "{refusal}");
+        assert!(refusal.contains("$DUCKTAPE_MODULES_DIR"), "{refusal}");
+
+        std::fs::write(&path, b"guest bytes").unwrap();
+        assert!(super::load_netstack_backend(&path).is_ok());
+    }
+
     #[tokio::test]
     async fn startup_selection_is_delivered_only_to_its_plane_generation() {
         let (commands, _receiver) = tokio::sync::mpsc::channel(1);
@@ -1914,14 +2186,33 @@ mod netstack_execution_tests {
         let start = live
             .take_start(2)
             .expect("the current generation is still gated");
-        start
-            .send(Err("designated component unavailable".into()))
-            .unwrap();
-        assert_eq!(
-            selected.await.unwrap().unwrap_err(),
-            "designated component unavailable"
-        );
+        assert!(start
+            .send(super::StartupOutcome::GuestLoadFailed(
+                "designated component unavailable".into(),
+            ))
+            .is_ok());
+        let super::StartupOutcome::GuestLoadFailed(error) = selected.await.unwrap() else {
+            panic!("startup failure was not delivered as a guest-load failure");
+        };
+        assert_eq!(error, "designated component unavailable");
         assert!(live.take_start(2).is_none());
+    }
+
+    #[tokio::test]
+    async fn standby_shutdown_cancels_a_pending_guest_selection() {
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        let (startup, selected) = tokio::sync::oneshot::channel();
+        let mut live = super::LivePlane {
+            generation: 3,
+            commands: commands.downgrade(),
+            startup: Some(startup),
+        };
+        assert!(super::cancel_startup(&mut live));
+        assert!(matches!(
+            selected.await.unwrap(),
+            super::StartupOutcome::Cancelled
+        ));
+        assert!(live.cancel_start().is_none());
     }
 
     #[test]

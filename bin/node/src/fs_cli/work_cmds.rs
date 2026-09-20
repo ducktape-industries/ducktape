@@ -8,12 +8,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use duckfs_client::api::ApiError;
 use duckfs_client::checkout::{CheckoutError, CheckoutOptions, checkout_with};
 use duckfs_client::commit::{CommitError, CommitOptions, commit_with};
 use duckfs_client::http::HttpNode;
 use duckfs_client::index::Index;
 
-use crate::fs_cli::args::{CliError, NodeAddr, resolve_node};
+use crate::fs_cli::args::{CliError, NodeAddr, api_err, resolve_node};
 use crate::fs_cli::{CheckoutArgs, CommitArgs, PinArgs, PutArgs, StatusArgs, UnpinArgs};
 
 /// resolve the node for a verb running inside `dir`: the shared addressing
@@ -52,7 +53,7 @@ fn signing_node(
     let _node_key = crate::node_http::pinned_node_key(&key_path, &url, trust_node)
         .map_err(|error| CliError::failed(error.to_string()))?;
     let mut stdin = std::io::BufReader::new(std::io::stdin());
-    let signer = crate::userkey_cli::load_user_signer(&key_path, &mut stdin)
+    let signer = crate::userkey_cli::load_user_signer_for(&url, &key_path, &mut stdin)
         .map_err(|e| CliError::failed(e.to_string()))?;
     Ok(
         HttpNode::new(url).with_frame_signer(Arc::new(move |target, payload| {
@@ -61,8 +62,25 @@ fn signing_node(
     )
 }
 
+/// a node failure goes through [`api_err`], the mapping every other verb uses,
+/// so a checkout refusal keeps both halves; the rest are this side's own.
 fn checkout_err(e: CheckoutError) -> CliError {
-    CliError::failed(e.to_string())
+    match e {
+        CheckoutError::Api(e) => api_err(e),
+        other => CliError::failed(other.to_string()),
+    }
+}
+
+/// a commit failure other than the conflict report `commit` prints itself. a
+/// refusal keeps both halves, and a node that stopped answering mid-commit is
+/// told in the same sentence, as [`api_err`] does.
+fn commit_err(e: CommitError) -> CliError {
+    match e {
+        CommitError::Nothing => CliError::failed("nothing to commit (the working copy is clean)"),
+        CommitError::Rejected { reason, sentence } => CliError::refused(reason, sentence),
+        CommitError::Unreachable { base } => api_err(ApiError::Unreachable { base }),
+        other => CliError::failed(other.to_string()),
+    }
 }
 
 /// `checkout <prefix> <dir> [--snapshot S]` — materialize the subtree and write
@@ -150,10 +168,7 @@ pub fn commit(args: CommitArgs) -> Result<(), CliError> {
             }
             Err(CliError::silent(2))
         }
-        Err(CommitError::Nothing) => Err(CliError::failed(
-            "nothing to commit (the working copy is clean)",
-        )),
-        Err(e) => Err(CliError::failed(e.to_string())),
+        Err(e) => Err(commit_err(e)),
     }
 }
 
@@ -167,18 +182,13 @@ pub fn commit(args: CommitArgs) -> Result<(), CliError> {
 /// prints the new snapshot id.
 pub fn put(args: PutArgs) -> Result<(), CliError> {
     use base64::Engine as _;
-    use duckfs_client::api::{ApiError, NodeApi};
+    use duckfs_client::api::NodeApi;
     use duckfs_client::chunk::chunk_ids;
     use duckfs_core::{CHUNK_SIZE, Change, Content, MAX_INLINE_COMMIT_BYTES, MAX_SYNC_IDS, to_hex};
 
     let bytes = std::fs::read(&args.local)
         .map_err(|e| CliError::failed(format!("read {}: {e}", args.local.display())))?;
     let node = signing_node(&args.addr, Path::new("."), args.key, args.trust_node)?;
-    let api_err = |e: ApiError| match e {
-        ApiError::NotFound => CliError::failed("not found"),
-        ApiError::Rejected(m) => CliError::failed(m),
-        ApiError::Transport(m) => CliError::failed(format!("cannot reach the node: {m}")),
-    };
 
     let rides_inline = bytes.len() <= MAX_INLINE_COMMIT_BYTES;
     let content = match rides_inline {
@@ -229,7 +239,7 @@ pub fn put(args: PutArgs) -> Result<(), CliError> {
     let receipt = node
         .commit(head.as_deref(), &message, vec![change])
         .map_err(api_err)?;
-    let snapshot = snapshot_of(&node, receipt.height, &message).map_err(api_err)?;
+    let snapshot = snapshot_of(&node, receipt.height, &message)?;
     println!("{snapshot}");
     Ok(())
 }
@@ -237,39 +247,34 @@ pub fn put(args: PutArgs) -> Result<(), CliError> {
 /// the snapshot id the commit at `height` with `message` produced. a block
 /// can hold several members' commits, so the height alone is ambiguous; the
 /// message is this verb's own and the newest-first window is short.
-fn snapshot_of(
-    node: &HttpNode,
-    height: u64,
-    message: &str,
-) -> Result<String, duckfs_client::api::ApiError> {
+fn snapshot_of(node: &HttpNode, height: u64, message: &str) -> Result<String, CliError> {
     use duckfs_client::api::NodeApi;
     use duckfs_core::MAX_PAGE;
 
-    let window = node.history(MAX_PAGE)?;
+    let window = node.history(MAX_PAGE).map_err(api_err)?;
     let ours = window
         .iter()
         .find(|entry| entry.height == height && entry.message == message)
         .map(|entry| entry.id.clone());
     match ours {
         Some(id) => Ok(id),
-        None => Err(duckfs_client::api::ApiError::Rejected(format!(
-            "files: the commit landed at height {height} but the history window does not show it"
-        ))),
+        // THIS side could not name what it just wrote; the node refused
+        // nothing, so the class is the CLI's own.
+        None => Err(CliError::refused(
+            "snapshot_unresolved",
+            format!("the commit landed at height {height} but the history window does not show it"),
+        )),
     }
 }
 
 /// `pin <snapshot> <name>` — pin a snapshot by name so gc keeps it reachable.
 pub fn pin(args: PinArgs) -> Result<(), CliError> {
-    use duckfs_client::api::{ApiError, NodeApi};
+    use duckfs_client::api::NodeApi;
 
     // pin runs against a node directly (default `.` so a checkout's index can
     // supply the node, but `--node`/env win).
     let node = signing_node(&args.addr, Path::new("."), args.key, args.trust_node)?;
-    node.pin(&args.snapshot, &args.name).map_err(|e| match e {
-        ApiError::NotFound => CliError::failed("snapshot not found"),
-        ApiError::Rejected(m) => CliError::failed(m),
-        ApiError::Transport(m) => CliError::failed(format!("cannot reach the node: {m}")),
-    })?;
+    node.pin(&args.snapshot, &args.name).map_err(api_err)?;
     println!("pinned {} as {}", args.snapshot, args.name);
     Ok(())
 }
@@ -277,14 +282,59 @@ pub fn pin(args: PinArgs) -> Result<(), CliError> {
 /// `unpin <name>` — release a pin so gc can reclaim it once nothing else roots
 /// it. any signer releases any pin.
 pub fn unpin(args: UnpinArgs) -> Result<(), CliError> {
-    use duckfs_client::api::{ApiError, NodeApi};
+    use duckfs_client::api::NodeApi;
 
     let node = signing_node(&args.addr, Path::new("."), args.key, args.trust_node)?;
-    node.unpin(&args.name).map_err(|e| match e {
-        ApiError::NotFound => CliError::failed("pin not found"),
-        ApiError::Rejected(m) => CliError::failed(m),
-        ApiError::Transport(m) => CliError::failed(format!("cannot reach the node: {m}")),
-    })?;
+    node.unpin(&args.name).map_err(api_err)?;
     println!("unpinned {}", args.name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs_cli::args::Message;
+
+    fn refused(reason: &str, sentence: &str) -> ApiError {
+        ApiError::Rejected {
+            reason: reason.to_string(),
+            sentence: sentence.to_string(),
+        }
+    }
+
+    /// `checkout` and `commit` refuse in the line every other verb does, and
+    /// keep both halves on the way: neither flattens a refusal through its
+    /// error's `Display` into one string.
+    #[test]
+    fn checkout_and_commit_refusals_keep_both_halves() {
+        let rows = [
+            (
+                checkout_err(CheckoutError::Api(refused(
+                    "files_query",
+                    "files: path not found",
+                ))),
+                "files_query",
+                "files: path not found",
+            ),
+            (
+                commit_err(CommitError::from(refused(
+                    "files_commit",
+                    "files: path must be absolute (start with '/')",
+                ))),
+                "files_commit",
+                "files: path must be absolute (start with '/')",
+            ),
+        ];
+        for (error, reason, sentence) in rows {
+            assert_eq!(error.code, 1);
+            assert_eq!(
+                error.message,
+                Message::Refused {
+                    reason: reason.to_string(),
+                    sentence: sentence.to_string(),
+                }
+            );
+            assert_eq!(error.line(), Some(format!("{sentence} [{reason}]")));
+        }
+    }
 }

@@ -9,6 +9,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -29,6 +30,61 @@ pub fn refuse_symlink(path: &Path) -> Result<(), Refusal> {
             format!("{} is a symlink", path.display()),
         )),
         false => Ok(()),
+    }
+}
+
+/// One supervisor's exclusive hold on a workspace, kept for as long as it
+/// supervises. Dropping it releases the lock, and so does the process dying
+/// however it died — which is why this is `flock` and not a pid file a killed
+/// launcher leaves behind for nobody to clear.
+#[derive(Debug)]
+pub struct Claim(fs::File);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        // SAFETY: our own descriptor, open until this struct is gone.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+/// Claim the workspace for this `run` or `install`, or refuse because another
+/// one holds it.
+///
+/// ONE WRITER PER WORKSPACE. `run` owns `state.json` and the install path, and
+/// a second one decides from the same files with its own memory of what it has
+/// already answered for: it re-stages a release the first rolled back from,
+/// and a qualify it passes flips `current` out from under the first's live
+/// node. Its own child cannot bind the node's listeners either, so besides
+/// that it does nothing but restart a node that dies on every boot. `install`
+/// rewrites both files whole, so under a live `run` it resets the phase that
+/// `run` is in the middle of, and beside a second install the two race the
+/// link. `service` mode claims nothing — several daemons share one workspace on
+/// purpose, and none of them writes.
+pub fn claim(path: &Path) -> Result<Claim, Refusal> {
+    refuse_symlink(path)?;
+    let parent = path.parent().ok_or_else(|| {
+        Refusal::new("claim_failed", format!("{} has no parent", path.display()))
+    })?;
+    fs::create_dir_all(parent).map_err(|error| Refusal::io("claim_failed", parent, &error))?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| Refusal::io("claim_failed", path, &error))?;
+    // SAFETY: `file` outlives the call; `flock` only takes a lock on its fd.
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    match taken {
+        true => Ok(Claim(file)),
+        false => Err(Refusal::new(
+            "workspace_locked",
+            format!(
+                "{} is held by another ducktape-node-launcher — a workspace has one writer; \
+                 stop the one running it first",
+                path.display()
+            ),
+        )),
     }
 }
 
@@ -119,6 +175,67 @@ pub fn digest_file(path: &Path) -> Result<Sha, Refusal> {
     Ok(Sha::from_bytes(hasher.finalize().into()))
 }
 
+/// The sha256 of the image this process runs. Read once, at start: the file an
+/// operator installed may be replaced on disk later, and the image running is
+/// still the one that started.
+pub fn running_image() -> Result<Sha, Refusal> {
+    let path = std::env::current_exe()
+        .map_err(|error| Refusal::new("launcher_image_unreadable", error.to_string()))?;
+    digest_file(&path)
+}
+
+/// The sha256 of the launcher a release ships, or `None` when it ships none.
+pub fn shipped_image(path: &Path) -> Result<Option<Sha>, Refusal> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Refusal::io("digest_failed", path, &error)),
+        Ok(_) => digest_file(path).map(Some),
+    }
+}
+
+/// Replace this process's image with the launcher at `path` — same pid, same
+/// argv — telling it through [`crate::RELAUNCHED_ENV`] that `image` is what
+/// this one exec'd. Returns only when the exec failed.
+pub fn exec_launcher(path: &Path, image: Sha) -> Refusal {
+    use std::os::unix::process::CommandExt as _;
+    let mut argv = std::env::args_os();
+    let mut command = std::process::Command::new(path);
+    if let Some(arg0) = argv.next() {
+        command.arg0(arg0);
+    }
+    let error = command
+        .args(argv)
+        .env(crate::RELAUNCHED_ENV, image.to_string())
+        .exec();
+    Refusal::io("launcher_exec_failed", path, &error)
+}
+
+/// Copy `from` into `to`, directories and regular files only — the founding
+/// set an install carries into the release it seeds. Anything else in the
+/// source (a link, a device) is skipped rather than followed: this launcher
+/// never follows a symlink it did not write.
+pub fn copy_tree(from: &Path, to: &Path) -> Result<(), Refusal> {
+    fs::create_dir_all(to).map_err(|error| Refusal::io("copy_failed", to, &error))?;
+    let entries = fs::read_dir(from).map_err(|error| Refusal::io("copy_failed", from, &error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| Refusal::io("copy_failed", from, &error))?;
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        let kind = entry
+            .file_type()
+            .map_err(|error| Refusal::io("copy_failed", &source, &error))?;
+        if kind.is_dir() {
+            copy_tree(&source, &target)?;
+            continue;
+        }
+        if !kind.is_file() {
+            continue;
+        }
+        fs::copy(&source, &target).map_err(|error| Refusal::io("copy_failed", &target, &error))?;
+    }
+    Ok(())
+}
+
 /// A release directory holds one executable `ducktape`, and it is a real
 /// directory this launcher extracted — never a link someone left there.
 pub fn require_release(dir: &Path) -> Result<(), Refusal> {
@@ -200,6 +317,15 @@ fn extract(archive: &Path, release_dir: &Path) -> Result<(), Refusal> {
                 "archive_entry_refused",
                 format!("{} is a {kind:?} entry", path.display()),
             ));
+        }
+        // A release carries the founding set in `modules/`, so entries are
+        // nested. `unpack` writes a file but never makes its parent, and
+        // whether a directory entry precedes its files is up to whichever tar
+        // wrote the archive — so the directory is made here, from a path every
+        // component of which `destination` has already checked is a plain name.
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| Refusal::io("extract_failed", parent, &error))?;
         }
         entry
             .unpack(&destination)
@@ -329,6 +455,30 @@ mod tests {
         stage(&archive, sha, &release).unwrap();
     }
 
+    /// A node release is THREE things, not one: the binary, this launcher, and
+    /// the founding set the binary founds and joins from (no binary carries
+    /// wasm). All of them land in the release directory, so the flipped
+    /// release is complete on a host that has nothing else.
+    #[test]
+    fn a_release_carries_the_launcher_and_the_founding_set_beside_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("release.tar.zst");
+        let bytes = tar_zst(&[
+            ("ducktape", b"#!/bin/sh\nexit 0\n", 0o755),
+            ("ducktape-node-launcher", b"#!/bin/sh\nexit 0\n", 0o755),
+            ("modules/netstack.component.wasm", b"\0asm", 0o644),
+            ("modules/.staged-by", b"abc1234", 0o644),
+        ]);
+        fs::write(&archive, &bytes).unwrap();
+        let release = dir.path().join("r");
+        stage(&archive, Sha::digest(&bytes), &release).unwrap();
+        assert!(release.join("ducktape-node-launcher").exists());
+        assert!(release.join("modules/netstack.component.wasm").exists());
+        // the set's owner record rides along: the binary beside it refuses a
+        // set another build staged, so a release without it refuses itself.
+        assert!(release.join("modules/.staged-by").exists());
+    }
+
     #[test]
     fn the_archive_identity_and_its_entries_are_both_checked() {
         let dir = tempfile::tempdir().unwrap();
@@ -372,6 +522,26 @@ mod tests {
                 .reason,
             "release_incomplete"
         );
+    }
+
+    /// ONE `run` per workspace. The second claim is refused by name and takes
+    /// nothing with it; the workspace is claimable again the moment the first
+    /// is released. (`flock` is per open file description, so two claims in
+    /// one process contend exactly as two launchers do.)
+    #[test]
+    fn a_workspace_holds_one_supervisor_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::of(dir.path());
+        let path = layout.lock_path();
+
+        let held = claim(&path).expect("the first run claims the workspace");
+        assert_eq!(
+            claim(&path).unwrap_err().reason,
+            "workspace_locked",
+            "a second run on a claimed workspace is refused"
+        );
+        drop(held);
+        claim(&path).expect("a released workspace is claimable again");
     }
 
     #[test]

@@ -1,6 +1,0 @@
-# Bundled desktop fonts and the native shell's default text size.
-[package]
-name = "design"
-edition = "2024"
-version = "0.1.0"
-publish = false

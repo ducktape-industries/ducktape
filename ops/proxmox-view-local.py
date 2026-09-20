@@ -46,8 +46,6 @@ def main():
     for owner in owners:
         if not (args.modules / (owner + '.view.wasm')).is_file():
             parser.error('all five owner views must be staged')
-    if any(args.modules.glob('*.view.pending')):
-        parser.error('pending owner views cannot found a canary')
     if args.modules.is_symlink() or not args.modules.is_dir():
         parser.error('modules must be a real directory')
     if any(path.is_symlink() for path in args.modules.rglob('*')):

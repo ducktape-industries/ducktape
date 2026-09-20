@@ -47,7 +47,7 @@ use duckfs_disk::{DiskRefs, DiskStore};
 use sdk::{Error, ModuleId};
 use wasm_host::{HostOdb, OdbBacking};
 
-use files::{commit_refs, persist_objects};
+use duckfs_disk::{commit_refs, persist_objects};
 
 // the files object-read consensus cap is single-sourced in `duckfs-core` (the
 // guest runs that core), but "core rejects strictly before the kernel trap" only
@@ -98,17 +98,18 @@ impl FilesOdbBacking {
     /// verbatim, minus the `sdk::Module` id (the wasm module carries that).
     pub fn open(id: impl Into<ModuleId>, dir: PathBuf) -> Result<Self, Error> {
         let id = id.into();
-        let refs_store = DiskRefs::open(dir.clone())
-            .map_err(|e| Error::Module(format!("files[{id}]: refs open: {e}")))?;
+        let refs_store = DiskRefs::open(dir.clone()).map_err(|e| {
+            Error::module("files_refs_open", format!("files[{id}]: refs open: {e}"))
+        })?;
         let (refs, durable_height, gc_watermark) = match refs_store
             .load()
-            .map_err(|e| Error::Module(format!("files[{id}]: refs load: {e}")))?
+            .map_err(|e| Error::module("files_refs_load", format!("files[{id}]: refs load: {e}")))?
         {
             Some((refs, height, gc_watermark)) => (refs, Some(height), gc_watermark),
             None => (Refs::default(), None, 0),
         };
         let store = DiskStore::open(dir.join("objects"))
-            .map_err(|e| Error::Module(format!("files[{id}]: odb open: {e}")))?;
+            .map_err(|e| Error::module("files_odb_open", format!("files[{id}]: odb open: {e}")))?;
         Ok(Self {
             fs: Fs::new(store, refs),
             refs_store,
@@ -181,8 +182,12 @@ impl OdbBacking for FilesOdbBacking {
     /// root-verified by [`wasm_host::WasmModule::install`]; the backing does not
     /// re-verify.
     fn adopt_refs(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        let refs = decode_refs(bytes)
-            .map_err(|e| Error::Module(format!("files: refs image decode: {e}")))?;
+        let refs = decode_refs(bytes).map_err(|e| {
+            Error::module(
+                "files_refs_image_decode",
+                format!("files: refs image decode: {e}"),
+            )
+        })?;
         self.gc_watermark = commit_refs(
             &mut self.fs,
             &mut self.refs_store,
@@ -219,8 +224,11 @@ impl OdbBacking for FilesOdbBacking {
     /// `Module::serve_sync` (`decode_sync_req` → `Fs::serve_sync` →
     /// `encode_sync_resp`), the duckfs object-possession protocol.
     fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let req = decode_sync_req(req).map_err(Error::Module)?;
-        let resp = self.fs.serve_sync(req).map_err(Error::Module)?;
+        let req = decode_sync_req(req).map_err(|e| Error::module("codec", e))?;
+        let resp = self
+            .fs
+            .serve_sync(req)
+            .map_err(|e| Error::module("files_serve_sync", e))?;
         Ok(encode_sync_resp(&resp))
     }
 

@@ -437,7 +437,7 @@ fn cmd_attach(args: AttachArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> Coll
     );
 
     // the OWNER signs: a scoped credential cannot authorize itself.
-    let owner = crate::userkey_cli::load_user_signer(&ctx.key_path()?, stdin)?;
+    let owner = ctx.signer(stdin)?;
     let height = submit(
         &base,
         &owner,
@@ -672,7 +672,7 @@ fn cmd_query(
     // pinned, never the node's own plain claim: the signature binds to this key,
     // so a proxy that could choose it could choose what we signed for.
     let node_key = crate::node_http::pinned_node_key(&key_path, &base, trust_node)?;
-    let signer = crate::userkey_cli::load_user_signer(&key_path, stdin)?;
+    let signer = crate::userkey_cli::load_user_signer_for(&base, &key_path, stdin)?;
     let reply = crate::node_http::query_as_reader(&base, &signer, &node_key, &args.target, query)?;
     println!("{reply}");
     Ok(())

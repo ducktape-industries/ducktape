@@ -151,12 +151,23 @@ pub fn build_identity_or_unknown() -> &'static str {
     build_identity().unwrap_or(UNKNOWN_BUILD)
 }
 
+/// The name `crates/noded/build.rs` staged this build's founding set under
+/// (`modules%<checkout path>`), baked in by the same run that staged it, so
+/// the set a binary resolves ([`workspace_config::modules_dir`]) is fixed at
+/// link time and no later build, in this checkout or a sibling sharing the
+/// target, can move it.
+pub const STAGED_SET: &str = env!(
+    "DUCKTAPE_STAGED_SET",
+    "no staged set name: a build script compiled from another checkout's source ran for this \
+     one (a shared target directory) — touch crates/noded/build.rs and rebuild"
+);
+
 /// What restages this checkout's founding set, verbatim, for the refusal below
 /// to print.
 ///
-/// The stager only runs when its own `rerun-if-changed` fires, so a sibling
-/// build that moves the pointer does not re-trigger it — the `touch` is the
-/// whole remedy and it is not guessable. Deliberately NOT automated: on a
+/// The stager only runs when its own `rerun-if-changed` fires, so a build
+/// that reuses a unit another run produced does not re-trigger it — the
+/// `touch` is the whole remedy and it is not guessable. Deliberately NOT automated: on a
 /// shared target directory the binary beside the set belongs to the last
 /// builder too, so a silent reclaim would hide the same fact one layer down.
 /// The refusal is the place that fact gets said out loud.
@@ -173,20 +184,20 @@ pub const RESTAGE_COMMAND: &str =
 /// The founding set THIS binary's build staged, refusing any other.
 ///
 /// `workspace_config::modules_dir` resolves a directory; this says whether it
-/// is ours. The distinction matters because a profile directory is shared by
-/// every checkout that shares the target: the pointer beside the binaries
-/// names one set, and a sibling's `cargo check -p noded` can move that pointer
-/// without relinking any binary. The set then belongs to a build this one is
-/// not, and founding from it means founding from another checkout's wasm —
-/// which reads as a stale guest three weeks after the fact, not as a mistake
-/// anyone made today.
+/// is ours. The distinction matters because a set is restaged without
+/// relinking every binary that reads it: this checkout's `cargo check -p
+/// noded` after a commit rewrites the set under the same name, and a binary
+/// linked before it then finds bytes a later build staged. Founding from
+/// them means founding from wasm this binary was never built with — which
+/// reads as a stale guest three weeks after the fact, not as a mistake anyone
+/// made today.
 ///
 /// It is a HARD refusal with no second door. `$DUCKTAPE_MODULES_DIR` is the
 /// one way to name a set deliberately, it is checked first and is not subject
 /// to this, and it is what an operator composing from someone else's artifacts
 /// already uses.
 pub fn founding_set() -> Result<std::path::PathBuf, String> {
-    let dir = workspace_config::modules_dir()?;
+    let dir = workspace_config::modules_dir(STAGED_SET)?;
     let named = std::env::var_os("DUCKTAPE_MODULES_DIR").is_some();
     let staged_by = workspace_config::staged_by(&dir);
     staged_set_verdict(&dir, named, staged_by.as_deref(), build_identity())?;
@@ -216,8 +227,8 @@ fn staged_set_verdict(
     }
     Err(format!(
         "reason=foreign_founding_set {} was staged by build {}, and this binary is build {} — \
-         every checkout sharing a target directory writes into that one profile directory, so \
-         the set beside a binary is whichever build passed through last.\n\
+         a build restaged the set after this binary was linked, so its wasm is not what this \
+         binary was built with.\n\
          \x20   restage this checkout:    {RESTAGE_COMMAND}\n\
          \x20   or name the set you mean: DUCKTAPE_MODULES_DIR=<dir>",
         dir.display(),
@@ -228,6 +239,12 @@ fn staged_set_verdict(
 
 /// the file a node writes its service-link secret into, next to `node.toml`.
 pub const LINK_TOKEN_FILE: &str = "service-link.token";
+
+/// the HTTP header a local service daemon presents that secret in, on the
+/// routes that are its own (`crate::signed_req`'s service-link lane:
+/// `POST /v1/services/hello`). The ws link carries the same secret in its
+/// attach frame instead.
+pub const LINK_TOKEN_HEADER: &str = "x-ducktape-service-link";
 
 /// Mint this node's service-link secret and write it 0600 next to `node.toml`.
 ///
@@ -357,7 +374,7 @@ impl HelloRefusal {
 
     /// the operator-facing sentence. It describes only what the CALLER sent or
     /// what this node's capacity is — never a fact about this node the caller
-    /// did not already have, since the route is unauthenticated.
+    /// did not already have.
     pub fn message(self) -> String {
         match self {
             HelloRefusal::Malformed(detail) => detail.to_string(),
@@ -546,34 +563,26 @@ fn expire(entries: &mut HashMap<String, Entry>, now: Instant) {
     });
 }
 
-// AUTH: a hello is DELIBERATELY the one write-shaped route with no credential —
-// it is not in the signed-write table (`crate::signed_req`) that `/v1/submit`
-// and `/v1/term/sessions` are, and it should not be. An entry grants NOTHING
-// (it is volatile presence that ages out on its own TTL; consent happens in
-// `ducktape service enable`), so the weakest gate on the surface is the right
-// one, and a daemon that has not yet read the node's workspace must still be
-// able to say it is up. What DOES run in front of it is the browser
-// `origin_guard` + CORS allowlist: the CLI sends no `Origin` and is allowed, a
-// browser must present an allowlisted one.
-//
-// NOTE the transport assumption: unlike `/v1/submit`, which carries a signed
-// frame and is therefore safe wherever it is reachable, a hello is
-// UNAUTHENTICATED — it is trusted only because `http_listen` is expected to
-// stay on loopback or a private tailnet. Binding the node's HTTP surface to a
-// public interface would let any reachable host occupy a kind in this catalog
-// (and so appear in `service list` for a user to enable). The cap and TTL
-// bound the damage; they do not replace keeping the surface private.
+// AUTH: a hello takes this node's SERVICE-LINK token, on the signed-write
+// table's service-link lane (`crate::signed_req`), and the handler below reads
+// nothing more: the lane is the whole gate. An entry grants nothing by itself
+// (volatile presence that ages out on its own TTL; consent happens in
+// `ducktape service enable`), but it lands in the catalog `service list` puts
+// in front of the operator to enable from, so "can dial the port" — any host
+// that reaches `http_listen` — must not be able to occupy a kind in it. The
+// daemon already holds the token: it reads the same 0600 file beside
+// `node.toml` to take its ws link. The browser `origin_guard` + CORS allowlist
+// still run in front of it.
 
 /// POST /v1/services/hello — a local service daemon declares (or refreshes)
 /// its presence. Returns the TTL it must re-signal within, and this node's own
 /// build so the daemon can name any skew between them.
 ///
-/// The build rides the OK body and never a refusal body — and NOT because a
-/// 200 authenticates anyone. It does not: this route is unauthenticated (see
-/// the AUTH note above), so any local process reads the stamp by posting a
-/// hello, exactly as it used to read it out of the old gate's 409. Nothing was
-/// closed by moving it, and nothing needed to be: a stamp is compiled into a
-/// binary any local process can already read.
+/// The build rides the OK body and never a refusal body, and a 200 is not what
+/// authenticates the caller: the service-link lane did that before this ran
+/// (see the AUTH note above). A stamp is compiled into a binary any local
+/// process can already read, so answering it to a daemon that holds the token
+/// closes nothing and opens nothing.
 ///
 /// The reason is that a body must answer the request it is on. A refusal
 /// describes what the CALLER sent or what this node's capacity is, and adding
@@ -874,11 +883,9 @@ mod build_is_metadata_not_a_gate {
 
     #[test]
     fn no_refusal_message_leaks_this_node_s_build() {
-        // the deleted `BuildMismatch` interpolated `build_identity()` into a
-        // message that `hello()` returned verbatim in the 409 body — handing
-        // an unauthenticated caller the correct stamp on its first wrong
-        // guess. Every surviving refusal describes the CALLER's input or this
-        // node's capacity, and nothing else.
+        // a refusal body answers the request it is on: every refusal describes
+        // the CALLER's input or this node's capacity, and never this node's
+        // own build stamp.
         let messages = [
             HelloRefusal::Malformed("kind must be 1..32 chars of [a-z0-9-]").message(),
             HelloRefusal::CatalogFull.message(),

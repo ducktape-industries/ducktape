@@ -12,11 +12,25 @@ ops/refound-net.sh --root ~/.ducktape/dognet --yes \
     --guest ~/.ducktape/guest --mirror ~/dev/ducktape/ducktape
 ```
 
+For an off-host or NAT rehearsal, give each node a routable WireGuard front:
+
+```sh
+ops/refound-net.sh --root ~/.ducktape/dognet --yes \
+    --founder-advertised founder.example:46700 \
+    --resident-advertised resident.example:46710
+```
+
+The defaults are loopback fronts for a local rehearsal. The advertised
+`HOST:PORT` values must be reachable by the other nodes and forwarded to the
+corresponding WireGuard listener.
+
 It stops what is running, archives the workspaces, founds a validator, joins a
 resident, installs the agent executors, mints the workspace wallet and founds
-its account, starts the service daemons, mirrors a repo into the forge,
-rebuilds the app, proves a mention still reaches an agent, and prints the
-ports, chain id and contract an operator needs.
+its account, commits the node release key so a member that joins later — which
+can learn it no other way — pins the channel the founders pin at install
+instead of following none, starts the service daemons, mirrors a repo into the
+forge, rebuilds the app, proves a mention still reaches an agent, and prints
+the ports, chain id and contract an operator needs.
 
 ## The target is explicit
 
@@ -62,10 +76,18 @@ enumerates it and the printed path is the only way back to it.
 | `--binary PATH` | a node binary. Default: build one from this checkout. |
 | `--guest DIR` | a guest image (`vmlinux`, `rootfs.ext4`) installed as the workspace's own. |
 | `--mirror REPO` | a git checkout to import into the network's forge. |
-| `--port-offset N` | add N to every port. |
-| `--wallet-name`, `--wallet-password` | the workspace's active wallet and the account founded for it. |
+| `--port-offset N` | add N to every port. The TCP block (28800–28831) plus N must stay below 32768, where the kernel starts handing ports to outbound connections. |
+| `--founder-http PORT` | the founder's http listen outright, so a network already served on a port is re-founded on it instead of on the default and edited afterwards; every other port still follows `--port-offset`. |
+| `--resident-http PORT` | the resident's http listen outright, under the same rule. |
+| `--founder-advertised HOST:PORT` | the founder's advertised WireGuard front; default `127.0.0.1:<founder's WireGuard port>`. |
+| `--resident-advertised HOST:PORT` | the resident's advertised WireGuard front; default `127.0.0.1:<resident's WireGuard port>`. |
+| `--wallet-name` | the workspace's active wallet and the account founded for it. |
+| `--wallet-password PASSWORD` | its password. An argv value is visible to other processes; prefer `--wallet-password-file`. Left out entirely, one is generated and written `0600` to `<workspace>/wallet-<name>.password`. |
+| `--wallet-password-file FILE` | read the wallet password from the file's first line without putting it in argv. |
+| `--wallet-mnemonic-file FILE` | restore the wallet from the mnemonic line in this file; requires a password. |
 | `--skip-app` | do not rebuild the desktop app. |
 | `--no-smoke` | do not seed an agent and mention it at the end. |
+| `--keep-stage` | retain the temporary staged binary, founding set and init homes for diagnosis; the default removes them on exit. |
 | `--yes` | proceed past stopping and archiving an existing root. |
 
 ## What the script encodes, and why
@@ -77,19 +99,13 @@ straight from one may belong to a sibling whose wire has already moved; the
 copy must prove its ancestry (`git merge-base --is-ancestor`) against this
 checkout's HEAD before anything is founded with it. A binary built from a tree
 with tracked changes stamps `<short sha>-<diff digest>`; the digest is not a
-rev, so it comes off before the test and stays in the printed line. The set is
-checked for `*.pending` markers, which are views whose staging was
-interrupted, and the report names the set the genesis was composed from.
+rev, so it comes off before the test and stays in the printed line. The
+report names the set the genesis was composed from.
 
-**The launcher's child needs the set too.** `ducktape-node-launcher` runs
-`<workspace>/current/ducktape`, and a node resolves its founding set beside its
-own binary — so under the launcher there is nothing beside it to find. The
-workspace keeps its own copy and the child is pointed at it with
-`DUCKTAPE_MODULES_DIR`, which also survives a release flip moving the binary to
-a new directory. Without it the failure is not a genesis error: the reachability
-plane refuses with `netstack_guest_unreadable`, WireGuard and the invite
-listener never bind, and a joiner that cannot redeem its invite dials the p2p
-port forever and is answered `PeerRejected`.
+**The workspace copy seeds the first installed release.**
+`ducktape-node-launcher` runs `<workspace>/current/ducktape`, and every launcher
+child resolves its module set from `<workspace>/current/modules`. A release
+flip therefore moves the binary and its set together.
 
 **The launcher supervises, so it is stopped first.** It restarts its child when
 the child exits, and its own executable lives outside the workspace it runs. A
@@ -124,22 +140,31 @@ lost grant is visible.
 **A fresh workspace has no wallet, and a fresh chain has no account.** Every
 keyless verb signs with the active wallet and the service daemons refuse to
 boot without one. `wallet new` prints a mnemonic, so the script writes it to a
-`0600` file in the workspace and never to its own output. The key is minted
-before anything runs, because the install below pins its public key; the
-account is the on-chain identity that key belongs to, and `account create` is
-a submitted transaction, so that half runs against the serving founder.
+`0600` file in the workspace and never to its own output. Its password gets
+the same treatment: this key is what the network's node releases are signed
+with, so there is no default password to bake into the script — without
+`--wallet-password` one is generated and written `0600` beside the mnemonic,
+and the report names both paths. The release lane reads it straight back:
+`RELEASE_WALLET_PASSWORD=$(cat <workspace>/wallet-<name>.password)`. The key
+is minted before anything runs, because the install below pins its public key;
+the account is the on-chain identity that key belongs to, and `account create`
+is a submitted transaction, so that half runs against the serving founder.
 Without it a daemon does not stop at the grant: it enables, announces, and
 then exits `FATAL: the active wallet key is on no account`.
 
 **A workspace that pins no release key follows no release channel.** The pin
 is `<workspace>/updates/keys/release.pub`, and its absence is what "this node
 does not self-update" looks like on disk: the launcher supervises and restarts
-the node forever, refuses every designation with `no_release_key`, and the
-only way to move that node onto a new binary is to found the network again.
-Nothing else reports it, so the report reads the file back and prints
-`release key  pinned <hex>` or names the node that has none. The key is read
-once per node life, so `ducktape-node-launcher install --release-key` runs
-before the first `run` — pinning it later costs a restart.
+the node, and refuses every designation with `no_release_key` until the
+network commits a node key (`ducktape release key set --kind node`), which it
+then pins on its first read. The report reads the file back and prints
+`release key  pinned <hex>` or names the node that has none, and beside it
+prints the key the running founder says the network committed; a founding
+whose committed key is not the one it pinned is refused, naming both. A key
+pinned by `ducktape-node-launcher install --release-key` is read once per node
+life, and an install refuses a workspace a running launcher holds
+(`workspace_locked`), so that install runs before the first `run` — pinning it
+that way later means stopping the launcher first.
 
 **A grant line is not a live daemon.** `announced at height N` is printed
 before the daemon has finished booting, so the script waits out the exit

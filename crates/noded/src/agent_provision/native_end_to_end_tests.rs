@@ -6,6 +6,7 @@
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use commonware_cryptography::ed25519;
+use crate::testkit::committed_module;
 use host::{BlockContext, Host};
 use sdk::{Msg, Origin};
 use serde_json::{Value, json};
@@ -17,6 +18,9 @@ use tokio::io::AsyncWriteExt as _;
 #[path = "../../../../bin/node/src/chief_cli/plan.rs"]
 mod plan;
 
+/// the chain id this composition's identity plane is scoped to, and the value
+/// the `runs` guest reads out of its genesis `__config` record.
+const CHAIN_ID: &str = "connected-chief";
 const TASK: &str = "connected-task";
 const JOB: &str = "connected-dispatch";
 const REPORT: &str = "Connected worker evidence: native Pi published this authenticated report. 🦆";
@@ -67,35 +71,14 @@ impl Network {
         validators.seed(key(8)).await.unwrap();
         validators.finish_seed().await.unwrap();
         let host = Host::genesis(vec![
-            Box::new(identity::Identity::new(
-                "identity",
-                store(),
-                "connected-chief".into(),
-            )),
+            Box::new(identity::Identity::new("identity", store(), CHAIN_ID.into())),
             Box::new(
                 attribution::AttributionModule::new("attribution", store())
                     .with_subscribers(["agent"]),
             ),
-            Box::new(agent::AgentModule::new(
-                "agent",
-                store(),
-                agent::Siblings {
-                    identity: "identity".into(),
-                    attribution: "attribution".into(),
-                    dispatch: "dispatch".into(),
-                },
-            )),
-            Box::new(
-                chat::Chat::new("chat", store())
-                    .with_identity("identity")
-                    .with_attribution("attribution"),
-            ),
-            Box::new(
-                pages::Pages::new("pages", store())
-                    .with_identity("identity")
-                    .with_attribution("attribution")
-                    .with_files("files"),
-            ),
+            Box::new(committed_module("agent", store(), CHAIN_ID).await),
+            Box::new(committed_module("chat", store(), CHAIN_ID).await),
+            Box::new(committed_module("pages", store(), CHAIN_ID).await),
             Box::new(validators),
             Box::new(capability::CapabilityRegistry::new(
                 "capability",
@@ -115,28 +98,9 @@ impl Network {
                 "identity",
                 store(),
             )),
-            Box::new(tasks::Tasks::new(
-                "tasks",
-                "identity",
-                "attribution",
-                store(),
-            )),
+            Box::new(committed_module("tasks", store(), CHAIN_ID).await),
             Box::new(files::Files::open("files", root.join("files")).unwrap()),
-            Box::new(
-                runs::RunsModule::new(
-                    "runs",
-                    "chat",
-                    "saga",
-                    "attribution",
-                    "dispatch",
-                    "agent",
-                    Some("tasks".into()),
-                    Some("tasks".into()),
-                )
-                .with_pages_module("pages")
-                .with_files_module("files")
-                .with_time_unit(sdk::genesis_config::TimeUnit::Height),
-            ),
+            Box::new(committed_module("runs", store(), CHAIN_ID).await),
         ])
         .unwrap();
         let (handle, commands, hub) = crate::NodeHandle::channel();

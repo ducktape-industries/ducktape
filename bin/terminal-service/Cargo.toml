@@ -7,6 +7,8 @@ version.workspace = true
 rand.workspace = true
 agent-service.workspace = true
 gateway.workspace = true
+# the handle-plane value types the gateway wire carries but does not re-export.
+duckdns.workspace = true
 ducktape-rpc.workspace = true
 futures.workspace = true
 serde.workspace = true

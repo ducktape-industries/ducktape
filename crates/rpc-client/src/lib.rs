@@ -5,10 +5,10 @@ use std::fmt;
 use std::time::Duration;
 
 use futures::{SinkExt as _, StreamExt as _};
-use reqwest::{Response, Url};
 /// Re-exported with [`refusal`], which takes one: a caller that reads a `/v1`
 /// route itself should not have to pin this client's reqwest to say so.
 pub use reqwest::StatusCode;
+use reqwest::{Response, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -34,7 +34,7 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(7_500);
 /// and then clip the whole thing, so every character of framing was a character
 /// cut off the END of the module's own sentence, which is the half that says
 /// what to do about it.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     reason: String,
     message: String,
@@ -137,7 +137,11 @@ pub enum SubmitFailure {
     /// The node answered, and its answer was no — a malformed frame, an
     /// unknown module, a module that refused the op. This is a verdict, and
     /// it is the only failure a caller may relay to a user as a refusal.
-    Refused(String),
+    ///
+    /// It carries the node's refusal WHOLE — the refusing module's own token
+    /// in [`Error::reason`] and its sentence in [`Error::message`] — so a
+    /// caller branches on the token instead of sniffing the prose.
+    Refused(Error),
     /// The exchange never completed: the connection failed, the budget ran
     /// out, or the receipt did not parse. The op's fate is UNKNOWN. Report it
     /// as an error, never as a refusal, and re-read before retrying.
@@ -147,7 +151,8 @@ pub enum SubmitFailure {
 impl fmt::Display for SubmitFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Refused(detail) | Self::Unresolved(detail) => formatter.write_str(detail),
+            Self::Refused(error) => formatter.write_str(error.message()),
+            Self::Unresolved(detail) => formatter.write_str(detail),
         }
     }
 }
@@ -365,6 +370,28 @@ fn snapshot_from_frame(text: &str, want: &str) -> Option<Result<serde_json::Valu
 pub struct Status {
     pub height: u64,
     pub public_key: String,
+}
+
+/// `POST /v1/invite`'s answer: the paste blob, and every note the mint left on
+/// it (empty when it could do everything).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct MintedInvite {
+    pub invite: String,
+    /// A mint with nothing to say sends no notes; an answer without the
+    /// field reads as that, not as a malformed invite.
+    #[serde(default)]
+    pub notes: Vec<InviteNote>,
+}
+
+/// One thing a mint could not do. Never a refusal — the blob still admits a
+/// joiner — but it changes what the blob can do, so it belongs beside the
+/// blob wherever the blob is shown: `reason` is a stable snake_case token
+/// (`invite_not_dialable_off_box`, `invite_no_mesh_state`, …), `sentence` what
+/// to do about it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct InviteNote {
+    pub reason: String,
+    pub sentence: String,
 }
 
 /// An HTTP(S) origin serving Ducktape's `/v1` endpoints.
@@ -619,7 +646,9 @@ impl Client {
         };
         let response = sign("POST", QUERY_READER_PATH, &digest)
             .into_iter()
-            .fold(request, |request, (name, value)| request.header(name, value))
+            .fold(request, |request, (name, value)| {
+                request.header(name, value)
+            })
             .send()
             .await
             .map_err(|error| Error::new(format!("{target} authenticated query failed: {error}")))?;
@@ -936,9 +965,7 @@ impl Client {
                 SubmitFailure::Unresolved(format!("transaction submission failed: {error}"))
             })?;
         if !response.status().is_success() {
-            return Err(SubmitFailure::Refused(
-                response_error(response).await.to_string(),
-            ));
+            return Err(SubmitFailure::Refused(response_error(response).await));
         }
         #[derive(Deserialize)]
         struct Receipt {
@@ -977,14 +1004,16 @@ impl Client {
         Ok(receipt.height)
     }
 
-    /// Mint one bearer invite valid for `ttl_days` and answer the paste blob.
+    /// Mint one bearer invite valid for `ttl_days` and answer the paste blob
+    /// with the notes the mint left on it.
     ///
     /// The NODE mints it, not the caller: minting folds this member's dial hint
     /// into the network descriptor and SAVES it, and reads the persisted mesh
     /// state for the member fronts a joiner can bring its tunnel up against —
-    /// both files the running daemon owns. A daemon with no workspace (an
-    /// embedder that wired no minter) answers 503.
-    pub async fn mint_invite(&self, ttl_days: u64) -> Result<String> {
+    /// both files the running daemon owns. A node still starting answers 503
+    /// with reason `node_starting`; a daemon with no workspace (an embedder
+    /// that wired no minter) answers 503.
+    pub async fn mint_invite(&self, ttl_days: u64) -> Result<MintedInvite> {
         let response = self
             .credentialed(self.http.post(self.url("v1/invite")?))
             .json(&serde_json::json!({ "ttl_days": ttl_days }))
@@ -994,12 +1023,7 @@ impl Client {
         if !response.status().is_success() {
             return Err(response_error(response).await);
         }
-        #[derive(Deserialize)]
-        struct Minted {
-            invite: String,
-        }
-        let minted: Minted = decode_json(response).await?;
-        Ok(minted.invite)
+        decode_json(response).await
     }
 
     /// Mint this node's `node_proof` for a `JoinHuddle`: its own mesh-identity
@@ -1368,6 +1392,34 @@ mod tests {
         }
     }
 
+    /// THE NOTES RIDE BESIDE THE BLOB. The body is the node's own, verbatim:
+    /// noded's `the_invite_route_mints_refuses_and_says_when_it_cannot` pins
+    /// that `/v1/invite` serves exactly these fields, so this fails if either
+    /// side moves.
+    #[test]
+    fn a_minted_invite_decodes_with_its_notes() {
+        let body = r#"{"invite":"duck-invite-for-7-days","notes":[{"reason":"invite_not_dialable_off_box","sentence":"this invite is reachable on this machine only"}]}"#;
+        let minted: MintedInvite = serde_json::from_str(body).expect("the node's body");
+        assert_eq!(
+            minted,
+            MintedInvite {
+                invite: "duck-invite-for-7-days".into(),
+                notes: vec![InviteNote {
+                    reason: "invite_not_dialable_off_box".into(),
+                    sentence: "this invite is reachable on this machine only".into(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn a_minted_invite_without_notes_decodes_as_no_notes() {
+        let body = r#"{"invite":"duck-invite-for-7-days"}"#;
+        let minted: MintedInvite = serde_json::from_str(body).expect("decodes");
+        assert_eq!(minted.invite, "duck-invite-for-7-days");
+        assert!(minted.notes.is_empty());
+    }
+
     #[tokio::test]
     async fn rejects_view_path_injection_before_transport() {
         let client = Client::new("http://127.0.0.1:1").unwrap();
@@ -1532,10 +1584,18 @@ mod tests {
     /// may relay; `Unresolved` means nobody said no and the op may be landing.
     #[test]
     fn only_an_answered_submit_reads_as_a_refusal() {
-        let refused = SubmitFailure::Refused("forge: non-fast-forward".into());
+        let refused = SubmitFailure::Refused(Error::refused(
+            "non_fast_forward",
+            "forge: non-fast-forward",
+        ));
         let unresolved = SubmitFailure::Unresolved("transaction submission failed".into());
         assert_ne!(refused, unresolved);
-        assert!(matches!(refused, SubmitFailure::Refused(_)));
+        // the refusing module's own token survives the lane — a caller branches
+        // on it instead of reading the sentence.
+        let SubmitFailure::Refused(error) = &refused else {
+            panic!("a refusal is a refusal");
+        };
+        assert_eq!(error.reason(), "non_fast_forward");
         assert!(matches!(unresolved, SubmitFailure::Unresolved(_)));
         // both render as their detail — the distinction is the variant, so a
         // caller that only prints one cannot accidentally branch on prose.

@@ -20,6 +20,12 @@ use crate::config::{self, hex_bytes};
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
 
+/// how long a stage waits on the node's answer. the node answers only once its
+/// fan-out to every validator settles and sets no deadline of its own, so this
+/// is the one bound on a wedged push; it has to cover a full-size component
+/// reaching the slowest validator.
+const STAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// the `module` family's verbs.
 #[derive(Debug, clap::Subcommand)]
 pub enum ModuleCmd {
@@ -284,6 +290,14 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
             return Ok(());
         }
     }
+    let bindings = crate::host_state::NetworkBindings {
+        invite: &resolved.namespace,
+        identity_chain_id: &resolved.service.chain_id,
+    }
+    .compose();
+    check_start(verb, kind, &args.id, || {
+        noded::compose::check_admission(&args.id, &bytes, &bindings)
+    })?;
 
     // 2. the ceremony, BEFORE the bytes move: join an open proposal for the
     //    same (verb, id, hash, lead) or propose; cast yes; execute when
@@ -494,6 +508,30 @@ fn registry_precheck(
     }
 }
 
+/// `register` runs the admission its activation will run, here and before
+/// anything is proposed — `start` is that run over scratch state
+/// (`noded::compose::check_admission`). A module that does not start is
+/// refused ready by every validator and could never activate. `update` asks
+/// nothing: a swap keeps the running module's state and never initializes it
+/// (whether the running module takes the bytes is each validator's readiness
+/// question), and a view entry seats no core.
+fn check_start(
+    verb: Verb,
+    kind: modules::Kind,
+    id: &str,
+    start: impl FnOnce() -> Result<(), sdk::Error>,
+) -> Result<(), String> {
+    match (verb, kind) {
+        (Verb::Update, _) | (Verb::Register, modules::Kind::View) => Ok(()),
+        (Verb::Register, modules::Kind::Module) => start().map_err(|refusal| {
+            format!(
+                "module {id} does not start ({refusal}): every validator would refuse it ready, \
+                 so it could never activate — nothing was proposed"
+            )
+        }),
+    }
+}
+
 /// the registry's schedule rules, for a refusal it does not narrate itself.
 fn registry_rules() -> String {
     format!(
@@ -634,7 +672,7 @@ fn open_code_proposals(views: &[governance::ProposalView]) -> Vec<OpenCodePropos
 
 /// the modules registry over the generic query lane — the same shape
 /// `read_members` uses for governance.
-fn read_module_status(rpc_addr: &str) -> Result<Vec<modules::ModuleCode>, String> {
+pub(crate) fn read_module_status(rpc_addr: &str) -> Result<Vec<modules::ModuleCode>, String> {
     use modules::{ModulesQuery, ModulesReply, decode_reply, encode_query};
     let raw = rpc_query(
         rpc_addr,
@@ -684,7 +722,7 @@ fn stage_component(
     // the node answers only once the fan-out settles, and it awaits that with
     // no deadline of its own; a wedged push must surface here, not hang.
     let resp = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(STAGE_TIMEOUT)
         .build()
         .map_err(|e| format!("stage client: {e}"))?
         .post(format!("{http_base}{PATH}?fanout=true"))
@@ -1046,6 +1084,41 @@ mod tests {
         ]);
         let members = vec![me.clone(), other_validator];
         assert!(holdout_rows(&reply, &members, &hex_bytes(&me)).is_empty());
+    }
+
+    #[test]
+    fn a_register_whose_module_does_not_start_is_refused_before_anything_is_proposed() {
+        let refused = || {
+            Err(sdk::Error::module(
+                "module_seat",
+                "kanban initializes: not_configured: no board to start from",
+            ))
+        };
+        let err = check_start(Verb::Register, modules::Kind::Module, "kanban", refused)
+            .expect_err("a module that does not start is refused");
+        assert!(err.contains("module kanban does not start"), "{err}");
+        assert!(
+            err.contains("kanban initializes"),
+            "the admission's own words: {err}"
+        );
+        assert!(err.contains("nothing was proposed"), "{err}");
+
+        let started = || Ok(());
+        assert_eq!(
+            check_start(Verb::Register, modules::Kind::Module, "kanban", started),
+            Ok(())
+        );
+        // only an admission is started: a swap never initializes, and a view
+        // entry seats no core.
+        let never = || -> Result<(), sdk::Error> { panic!("only an admission is started") };
+        assert_eq!(
+            check_start(Verb::Update, modules::Kind::Module, "kanban", never),
+            Ok(())
+        );
+        assert_eq!(
+            check_start(Verb::Register, modules::Kind::View, "kanban", never),
+            Ok(())
+        );
     }
 
     #[test]

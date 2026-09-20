@@ -45,19 +45,13 @@
 #[cfg(all(feature = "guest", target_arch = "wasm32"))]
 mod guest;
 
-mod interface;
-pub use interface::*;
+pub use modules_wire::*;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
 };
-
-/// the minimum lead (in blocks) between the scheduling block and a swap's
-/// `activation_height`, so `H` is strictly in every node's future — long enough
-/// to fetch + verify the out-of-band bytes before the boundary.
-pub const MIN_SWAP_LEAD: u64 = 3;
 
 /// registered modules retained at once (the roster count cap). the registry
 /// is governance/genesis-authored, so this sits far above any real set;
@@ -235,7 +229,7 @@ impl Modules {
     {
         match self.staged.get(key).await? {
             Some(bytes) => Ok(Some(
-                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+                borsh::from_slice(&bytes).map_err(|e| Error::module("codec", e.to_string()))?,
             )),
             None => Ok(None),
         }
@@ -249,7 +243,7 @@ impl Modules {
     {
         match self.staged.get_committed(key).await? {
             Some(bytes) => Ok(Some(
-                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+                borsh::from_slice(&bytes).map_err(|e| Error::module("codec", e.to_string()))?,
             )),
             None => Ok(None),
         }
@@ -286,10 +280,10 @@ impl Modules {
     {
         let bytes = borsh::to_vec(value).expect("modules value is serializable");
         if bytes.len() > cap {
-            return Err(Error::Module(format!(
-                "{what} record too large: {} > {cap} bytes",
-                bytes.len()
-            )));
+            return Err(Error::module(
+                "record_too_large",
+                format!("{what} record too large: {} > {cap} bytes", bytes.len()),
+            ));
         }
         self.staged.stage(key, bytes);
         Ok(())
@@ -304,7 +298,7 @@ impl Modules {
     async fn rostered_entry(&self, module_id: &str) -> Result<ModuleEntry, Error> {
         self.entry(module_id)
             .await?
-            .ok_or_else(|| Error::Module("missing module record".into()))
+            .ok_or_else(|| Error::module("missing_module_record", "missing module record"))
     }
 
     /// the module roster — every registered module id, sorted.
@@ -321,12 +315,16 @@ impl Modules {
         entry: &ModuleEntry,
     ) -> Result<(), Error> {
         let Err(position) = roster.binary_search(&module_id) else {
-            return Err(Error::Module(
-                "module roster carries an id with no record".into(),
+            return Err(Error::module(
+                "roster_corrupt",
+                "module roster carries an id with no record",
             ));
         };
         if roster.len() >= MAX_MODULES {
-            return Err(Error::Module(format!("module cap reached ({MAX_MODULES})")));
+            return Err(Error::module(
+                "module_cap",
+                format!("module cap reached ({MAX_MODULES})"),
+            ));
         }
         roster.insert(position, module_id.clone());
         self.store_bounded(
@@ -354,10 +352,14 @@ impl Modules {
         match &ctx.env().origin {
             Origin::Module(id) if *id == self.governance_id => Ok(()),
             Origin::System => Ok(()),
-            other => Err(Error::Module(format!(
-                "modules schedule/cancel/register only via the {} module or system origin, got {other:?}",
-                self.governance_id
-            ))),
+            other => Err(Error::module(
+                "not_governance",
+                format!(
+                    "modules schedule/cancel/register only via the {} module \
+                     or system origin, got {other:?}",
+                    self.governance_id
+                ),
+            )),
         }
     }
 
@@ -365,9 +367,10 @@ impl Modules {
     fn require_system(ctx: &dyn Ctx) -> Result<(), Error> {
         match &ctx.env().origin {
             Origin::System => Ok(()),
-            other => Err(Error::Module(format!(
-                "modules Advance is a system boundary tick, got {other:?}"
-            ))),
+            other => Err(Error::module(
+                "not_system",
+                format!("modules Advance is a system boundary tick, got {other:?}"),
+            )),
         }
     }
 
@@ -391,23 +394,33 @@ impl Modules {
             let reserved = RESERVED_LANE_IDS.contains(&decl.id);
             let out_of_range = decl.id == 0 || decl.id > MAX_LANE_ID;
             if reserved {
-                return Err(Error::Module(format!(
-                    "lane id {} is a kernel lane and is never declarable",
-                    decl.id
-                )));
+                return Err(Error::module(
+                    "reserved_lane_id",
+                    format!(
+                        "lane id {} is a kernel lane and is never declarable",
+                        decl.id
+                    ),
+                ));
             }
             if out_of_range {
-                return Err(Error::Module(format!(
-                    "lane id {} out of range: declarable ids are 1..={MAX_LANE_ID} \
-                     (above that a lane's stream port collides with another's datagram port)",
-                    decl.id
-                )));
+                return Err(Error::module(
+                    "bad_lane_id",
+                    format!(
+                        "lane id {} out of range: declarable ids are 1..={MAX_LANE_ID} \
+                         (above that a lane's stream port collides with another's datagram port)",
+                        decl.id
+                    ),
+                ));
             }
             if !lane_name_is_well_formed(&decl.name) {
-                return Err(Error::Module(format!(
-                    "lane name {:?} is malformed: 1..={MAX_LANE_NAME_BYTES} bytes of [a-z0-9_]",
-                    decl.name
-                )));
+                return Err(Error::module(
+                    "bad_lane_name",
+                    format!(
+                        "lane name {:?} is malformed: \
+                         1..={MAX_LANE_NAME_BYTES} bytes of [a-z0-9_]",
+                        decl.name
+                    ),
+                ));
             }
             // the NAME is what a host binds by, so a module with two lanes of
             // one name is a binding with no answer — refused like a taken id.
@@ -415,20 +428,23 @@ impl Modules {
                 .iter()
                 .any(|lane| lane.module_id == module_id && lane.name == decl.name);
             if name_taken {
-                return Err(Error::Module(format!(
-                    "module {module_id} already declares a lane named {:?}",
-                    decl.name
-                )));
+                return Err(Error::module(
+                    "lane_name_taken",
+                    format!(
+                        "module {module_id} already declares a lane named {:?}",
+                        decl.name
+                    ),
+                ));
             }
             let Err(position) = table.binary_search_by_key(&decl.id, |lane| lane.id) else {
                 let owner = table
                     .iter()
                     .find(|lane| lane.id == decl.id)
                     .map_or("", |lane| lane.module_id.as_str());
-                return Err(Error::Module(format!(
-                    "lane id {} is already declared by module {owner}",
-                    decl.id
-                )));
+                return Err(Error::module(
+                    "lane_id_taken",
+                    format!("lane id {} is already declared by module {owner}", decl.id),
+                ));
             };
             table.insert(
                 position,
@@ -476,10 +492,13 @@ impl Modules {
 
     fn require_hash_len(code_hash: &[u8]) -> Result<(), Error> {
         if code_hash.len() != CODE_HASH_LEN {
-            return Err(Error::Module(format!(
-                "code_hash must be {CODE_HASH_LEN} bytes, got {}",
-                code_hash.len()
-            )));
+            return Err(Error::module(
+                "bad_code_hash",
+                format!(
+                    "code_hash must be {CODE_HASH_LEN} bytes, got {}",
+                    code_hash.len()
+                ),
+            ));
         }
         Ok(())
     }
@@ -497,9 +516,13 @@ impl Modules {
         self.require_governance_or_system(ctx)?;
         Self::require_hash_len(&code_hash)?;
         if self.entry(&module_id).await?.is_some() {
-            return Err(Error::Module(format!(
-                "module {module_id} is already registered (code changes go through ScheduleSwap)"
-            )));
+            return Err(Error::module(
+                "already_registered",
+                format!(
+                    "module {module_id} is already registered \
+                     (code changes go through ScheduleSwap)"
+                ),
+            ));
         }
         // lanes FIRST: a refused declaration must leave no half-registered
         // module behind, and the roster write is the point of no return.
@@ -527,21 +550,27 @@ impl Modules {
         self.require_governance_or_system(ctx)?;
         Self::require_hash_len(&code_hash)?;
         let mut entry = self.entry(&module_id).await?.ok_or_else(|| {
-            Error::Module(format!(
-                "cannot schedule a swap for unregistered module {module_id}"
-            ))
+            Error::module(
+                "unknown_module",
+                format!("cannot schedule a swap for unregistered module {module_id}"),
+            )
         })?;
         // minimum lead: activation is strictly in the future, never retroactive.
         let floor = ctx.env().height.saturating_add(MIN_SWAP_LEAD);
         if activation_height <= floor {
-            return Err(Error::Module(format!(
-                "activation_height {activation_height} must exceed height+MIN_SWAP_LEAD ({floor})"
-            )));
+            return Err(Error::module(
+                "bad_activation_height",
+                format!(
+                    "activation_height {activation_height} must exceed \
+                     height+MIN_SWAP_LEAD ({floor})"
+                ),
+            ));
         }
         // a swap to the currently-active code is a no-op — reject it.
         if code_hash == entry.active_code_hash() {
-            return Err(Error::Module(
-                "scheduled code_hash equals the active code (no-op swap)".into(),
+            return Err(Error::module(
+                "swap_is_noop",
+                "scheduled code_hash equals the active code (no-op swap)",
             ));
         }
         // at most one pending swap per module — but a STALE pending (past its
@@ -552,9 +581,10 @@ impl Modules {
             .as_ref()
             .is_some_and(|pending| !pending.stale_at(ctx.env().height));
         if in_flight {
-            return Err(Error::Module(format!(
-                "module {module_id} already has a pending swap (cancel it first)"
-            )));
+            return Err(Error::module(
+                "swap_in_flight",
+                format!("module {module_id} already has a pending swap (cancel it first)"),
+            ));
         }
         entry.pending = Some(ScheduledSwap {
             name,
@@ -587,7 +617,10 @@ impl Modules {
         self.require_governance_or_system(ctx)?;
         Self::require_hash_len(&code_hash)?;
         if module_id.is_empty() {
-            return Err(Error::Module("module_id must not be empty".into()));
+            return Err(Error::module(
+                "empty_module_id",
+                "module_id must not be empty",
+            ));
         }
         // an id already LIVE on this host — native, genesis-wasm, or a prior
         // admission — may not be re-admitted. the registry set is consensus
@@ -595,20 +628,29 @@ impl Modules {
         // below still covers admission-pending ids, whose root does not exist
         // yet.)
         if ctx.module_root(&module_id).is_some() {
-            return Err(Error::Module(format!(
-                "module id {module_id} is already live on this host"
-            )));
+            return Err(Error::module(
+                "module_id_live",
+                format!("module id {module_id} is already live on this host"),
+            ));
         }
         if self.entry(&module_id).await?.is_some() {
-            return Err(Error::Module(format!(
-                "module {module_id} is already registered (code changes go through ScheduleSwap)"
-            )));
+            return Err(Error::module(
+                "already_registered",
+                format!(
+                    "module {module_id} is already registered \
+                     (code changes go through ScheduleSwap)"
+                ),
+            ));
         }
         let floor = ctx.env().height.saturating_add(MIN_SWAP_LEAD);
         if activation_height <= floor {
-            return Err(Error::Module(format!(
-                "activation_height {activation_height} must exceed height+MIN_SWAP_LEAD ({floor})"
-            )));
+            return Err(Error::module(
+                "bad_activation_height",
+                format!(
+                    "activation_height {activation_height} must exceed \
+                     height+MIN_SWAP_LEAD ({floor})"
+                ),
+            ));
         }
         self.declare_lanes(&module_id, lanes).await?;
         let roster = self.roster().await?;
@@ -637,13 +679,15 @@ impl Modules {
     ) -> Result<(), Error> {
         self.require_governance_or_system(ctx)?;
         let height = ctx.env().height;
-        let mut entry = self
-            .entry(&module_id)
-            .await?
-            .ok_or_else(|| Error::Module(format!("no such module {module_id}")))?;
+        let mut entry = self.entry(&module_id).await?.ok_or_else(|| {
+            Error::module("unknown_module", format!("no such module {module_id}"))
+        })?;
         let matching = entry.pending.as_ref().filter(|swap| swap.name == name);
         let Some(swap) = matching else {
-            return Err(Error::Module("no matching pending swap to cancel".into()));
+            return Err(Error::module(
+                "no_pending_swap",
+                "no matching pending swap to cancel",
+            ));
         };
         // never race an ARMING swap: one whose readiness latched and whose
         // activation height is reached is the boundary's business now. a stale
@@ -651,8 +695,9 @@ impl Modules {
         let due = swap.activation_height <= height;
         let cancellable = !due || swap.stale_at(height);
         if !cancellable {
-            return Err(Error::Module(
-                "cannot cancel: activation height already reached".into(),
+            return Err(Error::module(
+                "swap_arming",
+                "cannot cancel: activation height already reached",
             ));
         }
         entry.pending = None;
@@ -691,21 +736,22 @@ impl Modules {
         let pubkey = match &ctx.env().origin {
             Origin::External(key) => key.clone(),
             other => {
-                return Err(Error::Module(format!(
-                    "SwapReady requires an external validator submitter, got {other:?}"
-                )));
+                return Err(Error::module(
+                    "external_origin_required",
+                    format!("SwapReady requires an external validator submitter, got {other:?}"),
+                ));
             }
         };
         let members = self.members(ctx).await?;
         if !members.iter().any(|m| m == &pubkey) {
-            return Err(Error::Module(
-                "SwapReady submitter is not a current validator-set member".into(),
+            return Err(Error::module(
+                "not_a_member",
+                "SwapReady submitter is not a current validator-set member",
             ));
         }
-        let mut entry = self
-            .entry(&module_id)
-            .await?
-            .ok_or_else(|| Error::Module(format!("no such module {module_id}")))?;
+        let mut entry = self.entry(&module_id).await?.ok_or_else(|| {
+            Error::module("unknown_module", format!("no such module {module_id}"))
+        })?;
         // the signal names the BYTES it verified. a name alone cannot tell two
         // schedules apart — a stale pending is replaceable under the same name
         // — so a signal for any hash but the pending's own is refused rather
@@ -713,8 +759,9 @@ impl Modules {
         let swap = match &mut entry.pending {
             Some(swap) if swap.name == name && swap.code_hash == code_hash => swap,
             _ => {
-                return Err(Error::Module(
-                    "SwapReady does not match the pending swap (name/module/code_hash)".into(),
+                return Err(Error::module(
+                    "swap_mismatch",
+                    "SwapReady does not match the pending swap (name/module/code_hash)",
                 ));
             }
         };
@@ -866,13 +913,14 @@ impl Module for Modules {
         let config = sdk::genesis_config::decode_config(params)?;
         let roster: std::collections::BTreeMap<String, Seed> =
             match sdk::genesis_config::find(&config, "modules") {
-                Some(bytes) => sdk::wire::decode(bytes).map_err(Error::Module)?,
+                Some(bytes) => sdk::wire::decode(bytes).map_err(|e| Error::module("codec", e))?,
                 None => Default::default(),
             };
         for (id, seed) in roster {
             if seed.code_hash.len() != CODE_HASH_LEN {
-                return Err(Error::Module(
-                    "initial module code hash must be 32 bytes".into(),
+                return Err(Error::module(
+                    "bad_code_hash",
+                    "initial module code hash must be 32 bytes",
                 ));
             }
             self.seed(id, seed.kind, seed.code_hash, seed.lanes).await?;
@@ -881,7 +929,7 @@ impl Module for Modules {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        match decode_msg(&msg.payload).map_err(Error::Module)? {
+        match decode_msg(&msg.payload).map_err(|e| Error::module("codec", e))? {
             ModulesMsg::RegisterModule {
                 module_id,
                 kind,
@@ -938,7 +986,7 @@ impl Module for Modules {
 
     /// read projection — the module-code projections need no host routing.
     async fn query_with(&self, _ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match decode_query(req).map_err(Error::Module)? {
+        match decode_query(req).map_err(|e| Error::module("codec", e))? {
             ModulesQuery::ModuleStatus => Ok(encode_reply(&self.module_status().await?)),
             ModulesQuery::ArmedAt { height } => Ok(encode_reply(&self.armed_at(height).await?)),
             ModulesQuery::Lanes => Ok(encode_reply(&self.lanes().await?)),

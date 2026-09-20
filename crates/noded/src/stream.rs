@@ -102,9 +102,10 @@ pub enum ClientMsg {
         /// admission question.
         ///
         /// Absent on a caller that wants only the public families (committed
-        /// module events, the log ring, the metrics exposition): those admit
-        /// anyone the ws surface admits, because the same bytes already leave
-        /// this node over an unauthenticated HTTP route.
+        /// module events, the metrics exposition): those admit anyone the ws
+        /// surface admits, because the same bytes already leave this node over
+        /// an unauthenticated HTTP route. The log ring is not one of them: it
+        /// is the operator's, proved at the upgrade (see [`Topic::admission`]).
         #[serde(default)]
         token: Option<String>,
     },
@@ -119,21 +120,18 @@ pub enum ClientMsg {
     /// holds for work-intake hints. It is a publish, not a subscription, which
     /// is why it is a `ClientMsg` and not a topic.
     ///
-    /// Trust: the ws surface is unauthenticated by the trusted-local convention
-    /// (a local process can already read the node's key off disk), and a
-    /// run-output ring is a DISPLAY buffer no consensus decision reads. There is
-    /// deliberately NO subscription check on this publish, unlike the terminal
-    /// frames' [`holds_session`]: the publisher — the compute daemon — subscribes
-    /// to nothing (`bin/node/src/compute/link.rs`), and a run id names consensus
-    /// state a publisher legitimately learns from the chain, so subscription is
-    /// not evidence of authorship and gating on it would refuse the daemon its
-    /// own runs. Spoofing a line into another run's DISPLAY ring is the accepted
-    /// residual risk of the trusted-local surface.
+    /// Trust: honored ONLY on a connection that has taken the compute
+    /// attachment ([`Self::ComputeAttach`], this node's service-link token) —
+    /// the credential the one real publisher, the compute daemon
+    /// (`bin/node/src/compute/link.rs`), already presents before its first
+    /// line. Any other connection's line is refused with a `forbidden` error
+    /// frame and never reaches the ring, the same rule [`Self::AgentEvent`]
+    /// keeps for the agent link: a run id names consensus state anyone learns
+    /// from the chain, so knowing one is no evidence of executing it.
     ///
     /// READING that ring is a different question with a different answer:
-    /// `run-output:<id>` is [`Admission::Workspace`], because provider stdout is
-    /// the same class of bytes a pty carries. Write-open / read-gated is
-    /// deliberate asymmetry, not an oversight.
+    /// `run-output:<id>` is [`Admission::Run`] — the workspace secret, or the
+    /// run's own creator proved at the upgrade.
     ///
     /// What is NOT accepted is an unbounded or malformed one. `id` must be the
     /// 64-hex shape the agent data plane's `valid_event` enforces, because a
@@ -1090,11 +1088,18 @@ impl TopicState {
 
 /// Serve one ws connection.
 ///
-/// `reader_of` is the ONE capability this socket may have been given before it
-/// existed: the dispatch id whose output ring the caller proved it may read
-/// ([`admit_run_reader`]). It is set at the upgrade and never changes, so a
-/// connection cannot talk its way into another run's output mid-session.
-pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of: Option<String>) {
+/// `reader_of` and `operator` are the capabilities this socket may have been
+/// given before it existed: the dispatch id whose output ring the caller
+/// proved it may read ([`admit_run_reader`]), and whether the upgrade proved
+/// this node's operator ([`crate::signed_req::upgrade_is_operator`]). Both are
+/// set at the upgrade and never change, so a connection cannot talk its way
+/// into another run's output, or the operator's topics, mid-session.
+pub async fn stream_session(
+    mut socket: WebSocket,
+    handle: NodeHandle,
+    reader_of: Option<String>,
+    operator: bool,
+) {
     let hub = handle.stream_hub();
     let mut block_rx = hub.subscribe_blocks();
     let mut log_rx = hub.log_ring().subscribe();
@@ -1141,10 +1146,19 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of
                             Ok(ClientMsg::RunControlReply { id, result }) => {
                                 if let Some(worker) = &worker { worker.reply(id,result); }
                             }
-                            Ok(ClientMsg::RunOutput { id, stream, line }) => {
-                                if let Some(worker) = &worker { worker.observe(&id,&line); }
-                                handle_run_output(&hub, id, stream, line);
-                            }
+                            // a run's output is the compute daemon's to
+                            // publish, on the connection it attached.
+                            Ok(ClientMsg::RunOutput { id, stream, line }) => match &worker {
+                                Some(worker) => {
+                                    worker.observe(&id, &line);
+                                    handle_run_output(&hub, id, stream, line);
+                                }
+                                None => {
+                                    if !send_frame(&mut socket, unattached_run_output()).await {
+                                        return;
+                                    }
+                                }
+                            },
                             // a service daemon claiming this connection as its
                             // command link, and the events it publishes back.
                             Ok(ClientMsg::ServiceAttach { kind, token }) => {
@@ -1168,8 +1182,13 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of
                                 handle_agent_event(&handle, attached.is_some(), event);
                             }
                             Ok(msg) => {
-                                let frames =
-                                    handle_client_msg(&handle, &mut topics, reader_of.as_deref(), msg);
+                                let frames = handle_client_msg(
+                                    &handle,
+                                    &mut topics,
+                                    reader_of.as_deref(),
+                                    operator,
+                                    msg,
+                                );
                                 if !send_frames(&mut socket, frames).await {
                                     return;
                                 }
@@ -1394,6 +1413,7 @@ fn handle_client_msg(
     handle: &NodeHandle,
     topics: &mut BTreeMap<String, TopicState>,
     reader_of: Option<&str>,
+    operator: bool,
     msg: ClientMsg,
 ) -> Vec<ServerFrame> {
     match msg {
@@ -1408,6 +1428,7 @@ fn handle_client_msg(
             &resume,
             token.as_deref(),
             reader_of,
+            operator,
         ),
         ClientMsg::Unsubscribe { topics: requested } => {
             for topic in requested {
@@ -1431,6 +1452,27 @@ fn handle_client_msg(
 /// an oversized line repeats at the daemon's own output rate. First
 /// occurrence, then every 100th, carrying `occurrences`.
 static AGENT_WARN: crate::log::Latch = crate::log::Latch::new(100);
+
+/// Refuse one run-output line from a connection that never took the compute
+/// attachment: the frame back to the caller, and a latched `warn` — the
+/// sender repeats at its own line rate. See [`ClientMsg::RunOutput`].
+fn unattached_run_output() -> ServerFrame {
+    if let Some(occurrences) = AGENT_WARN.hit("unattached_publisher") {
+        tracing::warn!(
+            target: "ducktape::agent",
+            reason = "unattached_publisher",
+            occurrences,
+            "run output dropped"
+        );
+    }
+    ServerFrame::Error {
+        topic: String::new(),
+        code: StreamErrorCode::Forbidden,
+        detail: "run output is published by this node's compute daemon — send \
+                 `compute_attach` with the node's service-link token first"
+            .into(),
+    }
+}
 
 /// Admit one published run-output line, or drop it with a named reason.
 ///
@@ -1473,6 +1515,7 @@ fn subscribe_topics(
     resume: &BTreeMap<String, String>,
     token: Option<&str>,
     reader_of: Option<&str>,
+    operator: bool,
 ) -> Vec<ServerFrame> {
     // No caller ever legitimately needs more names in ONE message than the
     // connection may ever hold: at most `MAX_TOPICS_PER_CONNECTION` states
@@ -1512,6 +1555,7 @@ fn subscribe_topics(
             &topic,
             holds_workspace_secret,
             reader_of,
+            operator,
             resume.get(&topic),
             store.as_ref(),
         ) {
@@ -1596,15 +1640,21 @@ enum Topic<'a> {
 /// what a caller must have proved to hold a topic handle.
 ///
 /// Every value here has a MECHANISM behind it — a name without one would be a
-/// lattice pretending to be a gate. The ws surface has two pieces of evidence
-/// about a caller: whether it can read this node's workspace, and, for a run's
-/// output only, whether it signed the upgrade as that run's creator.
+/// lattice pretending to be a gate. The ws surface has three pieces of evidence
+/// about a caller: whether it can read this node's workspace, whether its
+/// upgrade proved this node's operator, and, for a run's output only, whether
+/// it signed the upgrade as that run's creator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Admission<'a> {
     /// nothing. The same bytes already leave this node over an HTTP route with
     /// no gate on it, so a check here would refuse an honest client and stop
     /// nobody.
     Public,
+    /// this node's OPERATOR, proved at the upgrade
+    /// ([`crate::signed_req::upgrade_is_operator`]): the operator credential
+    /// from a loopback peer, or a signature by the operator key — the same two
+    /// proofs `POST /v1/log-filter` takes to retune what feeds the ring.
+    Operator,
     /// ONE run's output ring: the workspace secret, or an upgrade signed by the
     /// key that CREATED this dispatch (`?run=<id>`, admitted in
     /// [`admit_run_reader`] before the socket exists).
@@ -1640,17 +1690,16 @@ impl<'a> Topic<'a> {
     /// What this family costs to hold. The whole authorization decision, in one
     /// place, with every family named.
     ///
-    /// The public three are public because gating them would be theater: an
+    /// The public families are public because gating them would be theater: an
     /// `Origin`-less caller already reads the identical bytes over
     /// `POST /v1/query` + `GET /v1/index/{module}/{ops,scan}` (`Module`,
-    /// `FilesWatch`) and `GET /metrics` (`Metrics`), neither of which this
-    /// change touches. `Logs` is public for a different reason and a weaker one,
-    /// named honestly: the ring is the app's Logs tab, the app reaches this node
-    /// by URL with no workspace handle to read a secret from, and the logging
-    /// doctrine already forbids a token, a URI or key material from ever
-    /// entering it. Its admin twin (`GET /v1/admin/logs/tail`) IS gated, so the
-    /// asymmetry is real and survives this change deliberately rather than
-    /// silently.
+    /// `FilesWatch`), `GET /metrics` (`Metrics`), `GET /v1/peers` (`Peers`) and
+    /// `GET /v1/status` (`Status`).
+    ///
+    /// `Logs` has no open twin: the ring is this operator's process log, and its
+    /// HTTP twin (`GET /v1/admin/logs/tail`) is operator-gated, so the ws topic
+    /// takes the operator's proofs too — the app's Logs tab presents the one it
+    /// already signs `POST /v1/log-filter` with.
     ///
     /// A run's stdout carries provider bytes with no unauthenticated HTTP twin
     /// at all, so it is gated — and a caller can reach it WITHOUT the workspace
@@ -1661,7 +1710,7 @@ impl<'a> Topic<'a> {
         match self {
             Self::Module(_) => Admission::Public,
             Self::FilesWatch => Admission::Public,
-            Self::Logs => Admission::Public,
+            Self::Logs => Admission::Operator,
             Self::Metrics => Admission::Public,
             Self::Peers => Admission::Public,
             Self::Status => Admission::Public,
@@ -1683,8 +1732,9 @@ enum TopicRefusal {
     /// module absent from THIS node's genesis set — and one token covering both
     /// would be uncountable.
     UnknownModule,
-    /// the family is workspace-gated and no matching secret was presented.
-    NotAdmitted,
+    /// an operator family ([`Admission::Operator`]) asked for on a connection
+    /// whose upgrade did not prove this node's operator.
+    NotOperator,
     /// a run's output ring, asked for by a connection that neither holds the
     /// workspace nor was admitted as this run's creator. Its own token because
     /// it sends the caller somewhere else entirely — sign the upgrade — and a
@@ -1699,7 +1749,7 @@ impl TopicRefusal {
         match self {
             Self::UnknownFamily => "unknown_topic",
             Self::UnknownModule => "unknown_module",
-            Self::NotAdmitted => "topic_not_admitted",
+            Self::NotOperator => "not_operator",
             Self::NotThisRunsReader => "not_this_runs_reader",
         }
     }
@@ -1707,7 +1757,7 @@ impl TopicRefusal {
     fn code(self) -> StreamErrorCode {
         match self {
             Self::UnknownFamily | Self::UnknownModule => StreamErrorCode::UnknownTopic,
-            Self::NotAdmitted | Self::NotThisRunsReader => StreamErrorCode::Forbidden,
+            Self::NotOperator | Self::NotThisRunsReader => StreamErrorCode::Forbidden,
         }
     }
 
@@ -1721,9 +1771,10 @@ impl TopicRefusal {
         match self {
             Self::UnknownFamily => "unknown stream topic",
             Self::UnknownModule => "this node indexes no such module",
-            Self::NotAdmitted => {
-                "this topic requires the node's service-link token — read it from \
-                 the workspace and send it as `token` on the subscribe"
+            Self::NotOperator => {
+                "this topic is the node operator's — open `/v1/ws` with the operator \
+                 credential (x-ducktape-admin-token, from the node's own host) or \
+                 signed by the operator key"
             }
             Self::NotThisRunsReader => {
                 "run output requires the workspace token, the requester, or its program \
@@ -1951,27 +2002,31 @@ pub(crate) async fn pending_runs(handle: &NodeHandle) -> Result<Vec<runs_wire::P
 ///
 /// `holds_workspace_secret` is the connection-wide secret compare, made once per
 /// subscribe frame by [`subscribe_topics`]; `reader_of` is the one dispatch this
-/// connection proved at its upgrade ([`admit_run_reader`]).
+/// connection proved at its upgrade ([`admit_run_reader`]), and `operator`
+/// whether that upgrade proved this node's operator.
 #[allow(clippy::result_large_err)]
 fn prepare_topic(
     topic: &str,
     holds_workspace_secret: bool,
     reader_of: Option<&str>,
+    operator: bool,
     resume: Option<&String>,
     store: Option<&Arc<indexer::IndexStore>>,
 ) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
     let Some(family) = Topic::parse(topic) else {
         return Err(refuse_topic(topic, TopicRefusal::UnknownFamily));
     };
-    let admitted = match family.admission() {
-        Admission::Public => true,
-        Admission::Run(id) => holds_workspace_secret || reader_of == Some(id),
+    // the refusal is the admission's own: each gated admission names the
+    // proof it wanted, so the caller is sent to the right one.
+    let refused = match family.admission() {
+        Admission::Public => None,
+        Admission::Operator => (!operator).then_some(TopicRefusal::NotOperator),
+        Admission::Run(id) => {
+            let reads_this_run = holds_workspace_secret || reader_of == Some(id);
+            (!reads_this_run).then_some(TopicRefusal::NotThisRunsReader)
+        }
     };
-    if !admitted {
-        let refusal = match family {
-            Topic::RunOutput(_) => TopicRefusal::NotThisRunsReader,
-            _ => TopicRefusal::NotAdmitted,
-        };
+    if let Some(refusal) = refused {
         return Err(refuse_topic(topic, refusal));
     }
     match family {
@@ -2710,6 +2765,10 @@ mod tests {
     /// a connection admitted as no run's creator — every caller but a remote
     /// app watching a run it asked for.
     const NO_RUN: Option<&str> = None;
+    /// a connection whose upgrade proved nothing about the operator.
+    const NOT_OPERATOR: bool = false;
+    /// a connection whose upgrade proved this node's operator.
+    const OPERATOR: bool = true;
     /// the workspace secret a test node mints.
     const TEST_SECRET: &str = "d3adb33fd3adb33fd3adb33fd3adb33f";
 
@@ -2879,8 +2938,15 @@ mod tests {
     fn fresh_module_subscribe_starts_at_live_tip() {
         let (_dir, store) = temp_store(&["chat"]);
         apply_chat(&store, 1, vec![json!({"one": 1})]);
-        let (state, lagged) =
-            prepare_topic("module:chat", NO_SECRET, NO_RUN, None, Some(&store)).expect("topic");
+        let (state, lagged) = prepare_topic(
+            "module:chat",
+            NO_SECRET,
+            NO_RUN,
+            NOT_OPERATOR,
+            None,
+            Some(&store),
+        )
+        .expect("topic");
         assert!(lagged.is_none());
         assert_eq!(state.cursor(), "op/0000000000000001/ffffffff");
         let mut state = state;
@@ -2901,6 +2967,7 @@ mod tests {
             "module:chat",
             NO_SECRET,
             NO_RUN,
+            NOT_OPERATOR,
             Some(&"op/0000000000000005/00000000".to_string()),
             Some(&store),
         )
@@ -2914,7 +2981,7 @@ mod tests {
     #[test]
     fn topic_refusals_are_per_topic() {
         assert!(matches!(
-            prepare_topic("module:chat", NO_SECRET, NO_RUN, None, None),
+            prepare_topic("module:chat", NO_SECRET, NO_RUN, NOT_OPERATOR, None, None),
             Err(ServerFrame::Error {
                 code: StreamErrorCode::Unavailable,
                 ..
@@ -2922,7 +2989,14 @@ mod tests {
         ));
         let (_dir, store) = temp_store(&["chat"]);
         assert!(matches!(
-            prepare_topic("module:nope", NO_SECRET, NO_RUN, None, Some(&store)),
+            prepare_topic(
+                "module:nope",
+                NO_SECRET,
+                NO_RUN,
+                NOT_OPERATOR,
+                None,
+                Some(&store)
+            ),
             Err(ServerFrame::Error {
                 code: StreamErrorCode::UnknownTopic,
                 ..
@@ -2933,6 +3007,7 @@ mod tests {
                 "logs",
                 NO_SECRET,
                 NO_RUN,
+                OPERATOR,
                 Some(&"not-a-seq".to_string()),
                 Some(&store)
             ),
@@ -3213,7 +3288,9 @@ mod tests {
         let decided = [
             (Topic::Module("chat"), Admission::Public),
             (Topic::FilesWatch, Admission::Public),
-            (Topic::Logs, Admission::Public),
+            // this operator's process log: its HTTP twin is operator-gated, so
+            // the topic takes the operator's proofs too.
+            (Topic::Logs, Admission::Operator),
             (Topic::Metrics, Admission::Public),
             // public for the SAME reason metrics is, and no weaker: the
             // identical sample already leaves this node over unauthenticated
@@ -3242,7 +3319,7 @@ mod tests {
         for unknown in ["", "term:s1", "logs2", "modules:chat", "files:watch2"] {
             assert_eq!(Topic::parse(unknown), None, "{unknown:?} owns no family");
             assert!(matches!(
-                prepare_topic(unknown, HOLDS_SECRET, NO_RUN, None, None),
+                prepare_topic(unknown, HOLDS_SECRET, NO_RUN, NOT_OPERATOR, None, None),
                 Err(ServerFrame::Error {
                     code: StreamErrorCode::UnknownTopic,
                     ..
@@ -3257,7 +3334,7 @@ mod tests {
         // the one family the workspace secret still gates: a run's output.
         const GATED: &str = "run-output:r1";
         let Err(ServerFrame::Error { code, detail, .. }) =
-            prepare_topic(GATED, NO_SECRET, NO_RUN, None, None)
+            prepare_topic(GATED, NO_SECRET, NO_RUN, NOT_OPERATOR, None, None)
         else {
             panic!("{GATED} must refuse a caller with no workspace secret");
         };
@@ -3272,10 +3349,28 @@ mod tests {
             "a refusal must never carry the secret: {detail}"
         );
         // and it admits the same caller once the secret matches.
-        assert!(prepare_topic(GATED, HOLDS_SECRET, NO_RUN, None, None).is_ok());
+        assert!(prepare_topic(GATED, HOLDS_SECRET, NO_RUN, NOT_OPERATOR, None, None).is_ok());
         // the public families need nothing, on the same call.
-        assert!(prepare_topic("logs", NO_SECRET, NO_RUN, None, None).is_ok());
-        assert!(prepare_topic("metrics", NO_SECRET, NO_RUN, None, None).is_ok());
+        assert!(prepare_topic("metrics", NO_SECRET, NO_RUN, NOT_OPERATOR, None, None).is_ok());
+    }
+
+    /// The log ring is the OPERATOR's: a connection whose upgrade proved
+    /// nothing is refused `forbidden` — and the workspace secret on the frame
+    /// is not the operator's proof, so it does not open it either — while the
+    /// same subscribe on an operator's connection is admitted.
+    #[test]
+    fn the_log_ring_is_refused_to_all_but_the_operator() {
+        for holds_secret in [NO_SECRET, HOLDS_SECRET] {
+            let Err(ServerFrame::Error { code, detail, .. }) =
+                prepare_topic("logs", holds_secret, NO_RUN, NOT_OPERATOR, None, None)
+            else {
+                panic!("logs must refuse a connection that did not prove the operator");
+            };
+            assert_eq!(code, StreamErrorCode::Forbidden);
+            assert_eq!(detail, TopicRefusal::NotOperator.detail());
+        }
+        assert_eq!(TopicRefusal::NotOperator.reason(), "not_operator");
+        assert!(prepare_topic("logs", NO_SECRET, NO_RUN, OPERATOR, None, None).is_ok());
     }
 
     #[tokio::test]
@@ -3450,6 +3545,119 @@ mod tests {
         actor.abort();
     }
 
+    /// The two gates this socket keeps for its callers, over a real upgrade:
+    /// the log ring answers only an upgrade the operator key signed, and a run
+    /// line lands only from a connection that took the compute attachment with
+    /// the service-link token. Every bare attempt is REFUSED with a
+    /// `forbidden` frame, never silently dropped.
+    #[tokio::test]
+    async fn the_log_ring_and_run_output_publish_take_their_callers_credentials() {
+        use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+        use futures::SinkExt as _;
+        use tokio_tungstenite::tungstenite::{
+            Message as WsMessage, client::IntoClientRequest as _,
+        };
+        let operator = PrivateKey::from_seed(93);
+        let stranger = PrivateKey::from_seed(94);
+        let node_key = vec![0xab; 32];
+        let handle = handle_with_secret().with_admin(crate::AdminConfig {
+            node_key: Some(node_key.clone()),
+            owner_key: Some(operator.public_key().as_ref().to_vec()),
+            ..Default::default()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = crate::router(handle.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let open = |signer: Option<&PrivateKey>| {
+            let mut request = format!("ws://{address}/v1/ws")
+                .into_client_request()
+                .unwrap();
+            if let Some(signer) = signer {
+                for (name, value) in
+                    ::node::signed_req::request_headers(signer, "GET", "/v1/ws", &node_key, b"")
+                {
+                    request.headers_mut().insert(name, value.parse().unwrap());
+                }
+            }
+            async move { tokio_tungstenite::connect_async(request).await.unwrap().0 }
+        };
+        // the next frame that is not the connection's own heartbeat.
+        async fn answer<S>(socket: &mut S) -> serde_json::Value
+        where
+            S: futures::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+                + Unpin,
+        {
+            loop {
+                let WsMessage::Text(text) = socket.next().await.expect("socket open").unwrap()
+                else {
+                    continue;
+                };
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if frame["type"] != "heartbeat" {
+                    return frame;
+                }
+            }
+        }
+        let subscribe_logs =
+            || WsMessage::Text(json!({"op": "subscribe", "topics": ["logs"]}).to_string());
+
+        // the log ring: refused to a bare upgrade and to a stranger's key ...
+        for signer in [None, Some(&stranger)] {
+            let mut socket = open(signer).await;
+            socket.send(subscribe_logs()).await.unwrap();
+            let refused = answer(&mut socket).await;
+            assert_eq!(refused["type"], "error", "{refused}");
+            assert_eq!(refused["topic"], "logs");
+            assert_eq!(refused["code"], "forbidden");
+            let subscribed = answer(&mut socket).await;
+            assert_eq!(subscribed, json!({"type": "subscribed", "topics": {}}));
+        }
+        // ... and held by the operator's signed upgrade.
+        let mut socket = open(Some(&operator)).await;
+        socket.send(subscribe_logs()).await.unwrap();
+        let subscribed = answer(&mut socket).await;
+        assert_eq!(subscribed["type"], "subscribed", "{subscribed}");
+        assert!(subscribed["topics"].get("logs").is_some(), "{subscribed}");
+
+        // a run line from a connection that never attached: refused, and the
+        // ring never sees it.
+        let run = "e".repeat(RUN_OUTPUT_ID_LEN);
+        let runs = handle.stream_hub().run_output();
+        let mut appended = runs.subscribe_appends();
+        let publish = |line: &str| {
+            WsMessage::Text(
+                json!({"op": "run_output", "id": run, "stream": "stdout", "line": line})
+                    .to_string(),
+            )
+        };
+        let mut socket = open(None).await;
+        socket.send(publish("spoofed")).await.unwrap();
+        let refused = answer(&mut socket).await;
+        assert_eq!(refused["type"], "error", "{refused}");
+        assert_eq!(refused["code"], "forbidden");
+        assert!(
+            runs.read_after(&run, 0, 8).0.is_empty(),
+            "the line was dropped"
+        );
+        // the same connection, once it presents the service-link token: lands.
+        socket
+            .send(WsMessage::Text(
+                json!({"op": "compute_attach", "token": TEST_SECRET}).to_string(),
+            ))
+            .await
+            .unwrap();
+        socket.send(publish("from the daemon")).await.unwrap();
+        let landed = appended.recv().await.unwrap();
+        assert_eq!(
+            (landed.id.as_str(), landed.line.as_str()),
+            (run.as_str(), "from the daemon")
+        );
+        server.abort();
+    }
+
     /// THE WHOLE REMOTE ADMISSION, END TO END: a real signature over the real
     /// path, against the committed pending set a real node would answer with.
     ///
@@ -3563,12 +3771,20 @@ mod tests {
     fn a_runs_creator_reads_that_run_and_no_other_gated_topic() {
         let mine = Some("dispatch-a");
         assert!(
-            prepare_topic("run-output:dispatch-a", NO_SECRET, mine, None, None).is_ok(),
+            prepare_topic(
+                "run-output:dispatch-a",
+                NO_SECRET,
+                mine,
+                NOT_OPERATOR,
+                None,
+                None
+            )
+            .is_ok(),
             "the run this connection proved must admit"
         );
         for someone_elses in ["run-output:dispatch-b", "run-output:"] {
             let Err(ServerFrame::Error { code, .. }) =
-                prepare_topic(someone_elses, NO_SECRET, mine, None, None)
+                prepare_topic(someone_elses, NO_SECRET, mine, NOT_OPERATOR, None, None)
             else {
                 panic!("{someone_elses} must refuse a connection admitted for dispatch-a");
             };
@@ -3576,9 +3792,14 @@ mod tests {
         }
         // and the refusal sends a remote reader to the proof it can actually
         // make, rather than to a workspace directory it does not have.
-        let Err(ServerFrame::Error { detail, .. }) =
-            prepare_topic("run-output:dispatch-b", NO_SECRET, mine, None, None)
-        else {
+        let Err(ServerFrame::Error { detail, .. }) = prepare_topic(
+            "run-output:dispatch-b",
+            NO_SECRET,
+            mine,
+            NOT_OPERATOR,
+            None,
+            None,
+        ) else {
             unreachable!("refused above");
         };
         assert!(detail.contains("?run="), "{detail}");
@@ -3598,6 +3819,7 @@ mod tests {
                 &BTreeMap::new(),
                 presented,
                 NO_RUN,
+                NOT_OPERATOR,
             );
             assert!(
                 states.is_empty(),
@@ -3614,6 +3836,7 @@ mod tests {
             &BTreeMap::new(),
             Some(TEST_SECRET),
             NO_RUN,
+            NOT_OPERATOR,
         );
         assert!(states.is_empty(), "a node with no link admits nobody");
 
@@ -3641,6 +3864,7 @@ mod tests {
                 &BTreeMap::new(),
                 Some(presented),
                 NO_RUN,
+                NOT_OPERATOR,
             );
             assert!(
                 states.is_empty(),
@@ -3663,6 +3887,7 @@ mod tests {
             &BTreeMap::new(),
             Some(TEST_SECRET),
             NO_RUN,
+            NOT_OPERATOR,
         );
         assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
         assert!(
@@ -3684,6 +3909,7 @@ mod tests {
             &BTreeMap::new(),
             Some(TEST_SECRET),
             NO_RUN,
+            NOT_OPERATOR,
         );
         assert_eq!(refused.len(), 1, "one summary refusal, not one per topic");
         assert!(matches!(
@@ -3704,6 +3930,7 @@ mod tests {
             &BTreeMap::new(),
             Some(TEST_SECRET),
             NO_RUN,
+            NOT_OPERATOR,
         );
         assert!(
             again
@@ -3732,6 +3959,7 @@ mod tests {
             &BTreeMap::new(),
             Some(TEST_SECRET),
             NO_RUN,
+            NOT_OPERATOR,
         );
         assert_eq!(
             frames.len(),
@@ -3787,6 +4015,7 @@ mod tests {
             "metrics",
             NO_SECRET,
             NO_RUN,
+            NOT_OPERATOR,
             Some(&"1752000000000".to_string()),
             None,
         )
@@ -3804,7 +4033,7 @@ mod tests {
             .status_cell()
             .wire_exposition(|| "ducktape_blocks_total 5\n".to_string());
         let (mut state, _) =
-            prepare_topic("metrics", NO_SECRET, NO_RUN, None, None).expect("topic");
+            prepare_topic("metrics", NO_SECRET, NO_RUN, NOT_OPERATOR, None, None).expect("topic");
         let result = catch_up_metrics("metrics", &mut state, &handle).await;
         assert!(!result.drop_topic);
         match &result.frames[..] {
@@ -3853,7 +4082,8 @@ mod tests {
                 builds: Default::default(),
             });
 
-        let (mut state, _) = prepare_topic("peers", NO_SECRET, NO_RUN, None, None).expect("topic");
+        let (mut state, _) =
+            prepare_topic("peers", NO_SECRET, NO_RUN, NOT_OPERATOR, None, None).expect("topic");
         let result = catch_up_peers("peers", &mut state, &handle).await;
         assert!(!result.drop_topic);
         match &result.frames[..] {
@@ -3942,7 +4172,8 @@ mod tests {
     #[tokio::test]
     async fn peers_catch_up_drops_the_topic_when_no_exposition_is_wired() {
         let (handle, _cmds, _hub) = crate::NodeHandle::channel();
-        let (mut state, _) = prepare_topic("peers", NO_SECRET, NO_RUN, None, None).expect("topic");
+        let (mut state, _) =
+            prepare_topic("peers", NO_SECRET, NO_RUN, NOT_OPERATOR, None, None).expect("topic");
         let result = catch_up_peers("peers", &mut state, &handle).await;
         assert!(result.drop_topic, "an unanswerable topic must be dropped");
         assert!(matches!(
@@ -4011,7 +4242,7 @@ mod tests {
         // topic drops with the same `unavailable` shape the http 503 carries.
         let (handle, _cmds, _hub) = crate::NodeHandle::channel();
         let (mut state, _) =
-            prepare_topic("metrics", NO_SECRET, NO_RUN, None, None).expect("topic");
+            prepare_topic("metrics", NO_SECRET, NO_RUN, NOT_OPERATOR, None, None).expect("topic");
         let result = catch_up_metrics("metrics", &mut state, &handle).await;
         assert!(result.drop_topic);
         assert!(matches!(

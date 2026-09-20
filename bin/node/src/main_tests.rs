@@ -122,7 +122,7 @@ impl Module for TestDiskModule {
         let value = *msg
             .payload
             .first()
-            .ok_or_else(|| Error::Module("missing test value".into()))?;
+            .ok_or_else(|| Error::module("missing_test_value", "missing test value"))?;
         self.staged = Some(value);
         ctx.emit_msg(Msg {
             target: "mem".into(),
@@ -159,10 +159,16 @@ impl TestMemoryModule {
 
     fn install(&mut self, bytes: &[u8], root: StateRoot) -> Result<(), Error> {
         let [value] = bytes else {
-            return Err(Error::Module("bad test memory snapshot".into()));
+            return Err(Error::module(
+                "bad_test_snapshot",
+                "bad test memory snapshot",
+            ));
         };
         if test_root(*value) != root {
-            return Err(Error::Module("test memory root mismatch".into()));
+            return Err(Error::module(
+                "test_root_mismatch",
+                "test memory root mismatch",
+            ));
         }
         self.value = *value;
         self.staged = None;
@@ -188,7 +194,7 @@ impl Module for TestMemoryModule {
         let value = *msg
             .payload
             .first()
-            .ok_or_else(|| Error::Module("missing test value".into()))?;
+            .ok_or_else(|| Error::module("missing_test_value", "missing test value"))?;
         self.staged = Some(value);
         Ok(())
     }
@@ -254,8 +260,10 @@ fn resident_manifest_fetch_retry_stays_resident_and_does_not_reannounce() {
     let retry = joiner_manifest_fetch_retry(
         "9f7bae44",
         true,
+        1,
         "server error: no finalized boundary to serve yet",
-    );
+    )
+    .expect("the first failure speaks");
 
     assert!(
         !retry.announce,
@@ -282,7 +290,8 @@ fn resident_manifest_fetch_retry_stays_resident_and_does_not_reannounce() {
 
 #[test]
 fn parked_manifest_fetch_retry_keeps_join_announce() {
-    let retry = joiner_manifest_fetch_retry("9f7bae44", false, "server error: bouncer rejected");
+    let retry = joiner_manifest_fetch_retry("9f7bae44", false, 1, "server error: bouncer rejected")
+        .expect("the first failure speaks");
 
     assert!(retry.announce, "a parked joiner must keep re-announcing");
     assert!(
@@ -292,6 +301,25 @@ fn parked_manifest_fetch_retry_keeps_join_announce() {
         "parked retry should keep the invite wording and source detail: {}",
         retry.log_line
     );
+}
+
+/// the boundary fetch retries forever, so its warn is paced: the first
+/// failure speaks at once (a sync that never starts says why), then every
+/// Nth — for a joiner and a resident alike.
+#[test]
+fn a_failing_boundary_fetch_warns_first_then_every_nth() {
+    let every = crate::constants::BOUNDARY_FETCH_WARN_EVERY;
+    for resident_standing in [false, true] {
+        let speaks =
+            |failures| joiner_manifest_fetch_retry("n", resident_standing, failures, "e").is_some();
+        assert!(speaks(1), "the first failure must be visible immediately");
+        for failures in 2..every {
+            assert!(!speaks(failures), "failure {failures} stays silent");
+        }
+        assert!(speaks(every));
+        assert!(!speaks(every + 1));
+        assert!(speaks(2 * every));
+    }
 }
 
 async fn served_directory_frame(
@@ -493,6 +521,7 @@ fn suffix_installer_rejects_mismatched_served_seal() {
             prepared,
             &host::NoCodeSource,
             &mut host::NoWitness,
+            &[],
         )
         .await
         .expect_err("served seal mismatch must abort");
@@ -500,6 +529,114 @@ fn suffix_installer_rejects_mismatched_served_seal() {
             err.contains("served seal"),
             "unexpected mismatch error: {err}"
         );
+    });
+}
+
+/// a batch served at a height its source REFUSED (`batch_replayed`): the
+/// catching-up host already applied it inside the window it seated with, so it
+/// lands Rejected with nothing applied — and only the window makes it so.
+#[test]
+fn suffix_installer_refuses_a_batch_its_boundary_window_holds() {
+    commonware_runtime::deterministic::Runner::default().start(|_| async move {
+        let signer = ed25519::PrivateKey::from_seed(84);
+        let mut host = fresh_directory_host();
+        let applied = served_directory_frame(&mut host, &signer, 1, 0, dir_set("a", "1")).await;
+        let roots = host.module_roots();
+        let root_hash = host.root_hash();
+        let served = statesync::FinalizedFrame {
+            height: 2,
+            disposition: statesync::FrameDisposition::Rejected,
+            ..applied.clone()
+        };
+        let window = [(1, node::frame_id(&applied.frame))];
+
+        let prepared = host.prepare_work(served.height).await.unwrap();
+        let dispatches = apply_verified_suffix_frame(
+            &mut host,
+            &served,
+            prepared,
+            &host::NoCodeSource,
+            &mut host::NoWitness,
+            &window,
+        )
+        .await
+        .expect("a replayed batch lands Rejected, as its source sealed it");
+        assert!(dispatches.is_empty());
+        assert_eq!(host.module_roots(), roots);
+        assert_eq!(host.root_hash(), root_hash);
+
+        // the window is the whole verdict: without it the batch re-applies.
+        let prepared = host.prepare_work(served.height).await.unwrap();
+        let err = apply_verified_suffix_frame(
+            &mut host,
+            &served,
+            prepared,
+            &host::NoCodeSource,
+            &mut host::NoWitness,
+            &[],
+        )
+        .await
+        .expect_err("outside the window the replayed batch re-applies");
+        assert!(err.contains("served seal mismatch"), "{err}");
+    });
+}
+
+/// the suffix's own frames enter the window as they seal, so a batch replayed
+/// WITHIN one catch-up run is refused too — and the window the run ends with
+/// is the one a restart restores off the same journal.
+#[test]
+fn suffix_catchup_refuses_a_batch_it_sealed_earlier_in_the_run() {
+    commonware_runtime::deterministic::Runner::default().start(|context| async move {
+        let signer = ed25519::PrivateKey::from_seed(85);
+        let mut expected = fresh_directory_host();
+        let applied = served_directory_frame(&mut expected, &signer, 1, 0, dir_set("a", "1")).await;
+        let replayed = statesync::FinalizedFrame {
+            height: 2,
+            disposition: statesync::FrameDisposition::Rejected,
+            ..applied.clone()
+        };
+
+        let mut host = fresh_directory_host();
+        let base = Manifest::capture(&host, None, 0, 0, vec![test_me()], vec![], None, 0, 1)
+            .expect("base manifest");
+        let mut recovery = Recovery::open(context.child("catchup_replayed"))
+            .await
+            .expect("open recovery");
+        recovery.write_manifest(&base).await.unwrap();
+        let store = consensus::ContentStore::new();
+        let mut window = Vec::new();
+        let caught = apply_suffix_frames(
+            &mut recovery,
+            &mut host,
+            0,
+            2,
+            vec![applied.clone(), replayed],
+            None,
+            &store,
+            &mut window,
+        )
+        .await
+        .expect("a replayed height must not stop catch-up");
+        assert_eq!(caught.applied, 2);
+        assert_eq!(host.root_hash(), expected.root_hash());
+        let batch = node::frame_id(&applied.frame);
+        assert_eq!(window, vec![(1, batch), (2, batch)]);
+        let journaled = recovery
+            .read_finalized_frames(0, 2, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(journaled[1].disposition, node::Disposition::Rejected);
+        drop(host);
+        drop(recovery);
+
+        let mut reopened = Recovery::open(context.child("reopen_catchup_replayed"))
+            .await
+            .unwrap();
+        let mut restarted = fresh_directory_host();
+        let recovered = reopened.recover(&mut restarted, &base).await.unwrap();
+        assert_eq!(recovered.height, Some(2));
+        assert_eq!(recovered.root_hash, expected.root_hash());
+        assert_eq!(recovered.applied_frames, window);
     });
 }
 
@@ -544,6 +681,7 @@ fn suffix_catchup_refuses_to_commit_without_its_execution_witness() {
             prepared,
             &host::NoCodeSource,
             &mut RefuseWitness,
+            &[],
         )
         .await
         .expect_err("an unjournaled execution must not commit");
@@ -568,10 +706,18 @@ fn suffix_catchup_applies_verifies_and_journals_served_frames() {
             .await
             .expect("open recovery");
         let store = consensus::ContentStore::new();
-        let applied =
-            apply_suffix_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None, &store)
-                .await
-                .expect("catch up");
+        let applied = apply_suffix_frames(
+            &mut recovery,
+            &mut host,
+            0,
+            2,
+            frames.clone(),
+            None,
+            &store,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("catch up");
 
         assert_eq!(applied.applied, 2);
         assert_eq!(host.root_hash(), expected.root_hash());
@@ -621,6 +767,7 @@ fn suffix_catchup_recovers_a_matching_unsealed_execution() {
             prepared,
             &host::NoCodeSource,
             &mut recovery,
+            &[],
         )
         .await
         .unwrap();
@@ -679,10 +826,18 @@ fn suffix_catchup_reconciles_mixed_durability_state() {
             .await
             .expect("write base manifest");
         let store = consensus::ContentStore::new();
-        let applied =
-            apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None, &store)
-                .await
-                .expect("catch up");
+        let applied = apply_suffix_frames(
+            &mut recovery,
+            &mut host,
+            0,
+            1,
+            vec![served],
+            None,
+            &store,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("catch up");
 
         assert_eq!(applied.applied, 1);
         assert_eq!(
@@ -738,10 +893,18 @@ fn suffix_catchup_aborts_on_mismatched_served_seal() {
                 .expect("open recovery");
             recovery.write_manifest(&base).await.unwrap();
             let store = consensus::ContentStore::new();
-            let err =
-                apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None, &store)
-                    .await
-                    .expect_err("seal mismatch must abort");
+            let err = apply_suffix_frames(
+                &mut recovery,
+                &mut host,
+                0,
+                1,
+                vec![served],
+                None,
+                &store,
+                &mut Vec::new(),
+            )
+            .await
+            .expect_err("seal mismatch must abort");
             assert!(err.contains("served seal"), "{err}");
             assert_eq!(dir_value(&host, "a").await.as_deref(), Some("1"));
             drop(host);
@@ -775,9 +938,18 @@ fn suffix_catchup_is_noop_when_there_is_no_gap() {
             .await
             .expect("open recovery");
         let store = consensus::ContentStore::new();
-        let applied = apply_suffix_frames(&mut recovery, &mut host, 5, 5, Vec::new(), None, &store)
-            .await
-            .expect("noop catch up");
+        let applied = apply_suffix_frames(
+            &mut recovery,
+            &mut host,
+            5,
+            5,
+            Vec::new(),
+            None,
+            &store,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("noop catch up");
 
         assert_eq!(applied.applied, 0);
         assert_eq!(host.root_hash(), before);
@@ -820,6 +992,7 @@ fn suffix_catchup_accepts_a_height_gap_from_a_discarded_view() {
             vec![served_1, served_3],
             None,
             &store,
+            &mut Vec::new(),
         )
         .await
         .expect("a skipped-view gap must not be refused");
@@ -886,6 +1059,7 @@ fn catch_up_suffix_frames_refuses_an_unanchored_tip_and_rotates_source() {
             b"ns",
             anchor,
             &store,
+            Vec::new(),
         )
         .await
         .expect_err("a tip naming an unanchored participant set must be refused");
@@ -897,6 +1071,153 @@ fn catch_up_suffix_frames_refuses_an_unanchored_tip_and_rotates_source() {
             rotations.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "an unanchored tip must rotate away from the source that served it"
+        );
+    });
+}
+
+/// serves `manifests` in order, one per request, repeating the last.
+#[derive(Clone)]
+struct SequencedManifestClient {
+    manifests: Vec<statesync::Manifest>,
+    served: Arc<std::sync::atomic::AtomicUsize>,
+    rotations: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl statesync::SyncClient for SequencedManifestClient {
+    fn request(
+        &self,
+        _req: statesync::SyncRequest,
+    ) -> impl std::future::Future<Output = Result<statesync::SyncResponse, statesync::SyncError>> + Send
+    {
+        let next = self
+            .served
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .min(self.manifests.len() - 1);
+        let manifest = self.manifests[next].clone();
+        async move { Ok(statesync::SyncResponse::Manifest(manifest)) }
+    }
+}
+
+impl crate::blob_fetch::SourceRotate for SequencedManifestClient {
+    fn rotate_source(&self) {
+        self.rotations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn sync_only_boot_adopts_only_a_manifest_tied_to_its_founding_anchor() {
+    let executor = commonware_runtime::deterministic::Runner::default();
+    executor.start(|context| async move {
+        // served bare, as a boundary at its epoch base is.
+        let anchored = test_manifest_with_base(2, 2, test_root(2), None);
+        let client = SequencedManifestClient {
+            manifests: vec![
+                // a boundary naming a participant set this node never trusted.
+                test_manifest_with_participants(1, test_root(1), None, vec![vec![9u8; 32]]),
+                anchored.clone(),
+            ],
+            served: Default::default(),
+            rotations: Default::default(),
+        };
+        let founding_participants = vec![test_me()];
+        let anchor = crate::sync::serve::TrustAnchor {
+            epoch: 0,
+            participants: &founding_participants,
+        };
+        let metrics = noded::NodeMetrics::register(&context);
+        let adopted = crate::boot::sync_only::fetch_anchored_manifest(
+            &context, &client, b"ns", anchor, &metrics, "test",
+        )
+        .await;
+        assert_eq!(
+            adopted.root_hash, anchored.root_hash,
+            "the sync-only boot must skip the unanchored boundary and adopt the anchored one"
+        );
+        assert_eq!(
+            client.rotations.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "an unanchored boundary must rotate away from the source that served it"
+        );
+    });
+}
+
+/// a source that serves an anchored tip but has pruned the frames below it.
+#[derive(Clone)]
+struct PrunedSourceClient {
+    manifest: statesync::Manifest,
+    rotations: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl statesync::SyncClient for PrunedSourceClient {
+    fn request(
+        &self,
+        req: statesync::SyncRequest,
+    ) -> impl std::future::Future<Output = Result<statesync::SyncResponse, statesync::SyncError>> + Send
+    {
+        let reply = match req {
+            statesync::SyncRequest::Manifest => {
+                statesync::SyncResponse::Manifest(self.manifest.clone())
+            }
+            _ => statesync::SyncResponse::RangePruned {
+                requested_after: 0,
+                retained_from: self.manifest.height,
+            },
+        };
+        async move { Ok(reply) }
+    }
+}
+
+impl crate::blob_fetch::SourceRotate for PrunedSourceClient {
+    fn rotate_source(&self) {
+        self.rotations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn catch_up_suffix_frames_rotates_away_from_a_source_that_pruned_past_us() {
+    let executor = commonware_runtime::deterministic::Runner::default();
+    executor.start(|context| async move {
+        let mut host = fresh_directory_host();
+        let mut recovery = Recovery::open(context.child("catchup_range_pruned"))
+            .await
+            .expect("open recovery");
+        let rotations = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let client = PrunedSourceClient {
+            // anchored (the founding set) and bare at its own epoch base, so
+            // the tip passes the trust gate and the frame fetch is reached.
+            manifest: test_manifest_with_base(5, 5, test_root(5), None),
+            rotations: rotations.clone(),
+        };
+        let founding_participants = vec![test_me()];
+        let anchor = crate::sync::serve::TrustAnchor {
+            epoch: 0,
+            participants: &founding_participants,
+        };
+        let store = consensus::ContentStore::new();
+        let err = crate::sync::catchup::catch_up_suffix_frames(
+            &client,
+            &mut recovery,
+            &mut host,
+            None,
+            0,
+            1,
+            b"ns",
+            anchor,
+            &store,
+            Vec::new(),
+        )
+        .await
+        .expect_err("a source that pruned past us cannot serve the suffix");
+        assert!(
+            matches!(err, crate::sync::catchup::SuffixCatchupError::Retry(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            rotations.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the retry must ask another source: this one can only prune further"
         );
     });
 }

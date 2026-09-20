@@ -12,9 +12,12 @@
 //!
 //! This crate holds the vocabulary ([`Phase`], [`Event`], [`Command`]), the
 //! decision ([`step`]), the signed release manifest ([`Manifest`],
-//! [`verify_manifest`]), its signature ([`release`]), the duckfs layout each
+//! [`verify_manifest`]), its signature ([`release`]), the identity an archive
+//! carries at its root ([`ReleaseIdentity`]), the duckfs layout each
 //! [`layout::Kind`] is published under ([`layout`]), the governance
-//! designation that says when a node cuts over ([`designation`]) and the
+//! designation that says when a node cuts over ([`designation`]), the
+//! governance signal that says which key signs each kind ([`release_key`]),
+//! the reading a running node gives of both ([`release_status`]) and the
 //! `state.json` codec ([`state`]). It performs no I/O, reads no clock and
 //! opens no socket: every effect is a [`Command`] for the calling process's
 //! executor.
@@ -24,20 +27,24 @@ pub mod layout;
 pub mod manifest;
 pub mod phase;
 pub mod release;
+pub mod release_key;
+pub mod release_status;
 pub mod sha;
 pub mod state;
 pub mod step;
 pub mod verify;
 pub mod workspace;
 
-pub use designation::Designation;
+pub use designation::{Designation, ReleaseSignal};
 pub use layout::Kind;
-pub use manifest::{Artifact, Manifest, Platform, Release, SCHEMA, SuccessorKey};
+pub use manifest::{Artifact, Manifest, Platform, Release, ReleaseIdentity, SCHEMA, SuccessorKey};
 pub use phase::{
     Command, Downloading, Event, Idle, PendingHealthy, Phase, RollbackReason, RolledBack, Staged,
     SwapState, Swapping, UpdateBanner,
 };
 pub use release::{PublicKey, RELEASE_NS, Signature};
+pub use release_key::{ReleaseKey, ReleaseKeys};
+pub use release_status::ReleaseStatus;
 pub use sha::Sha;
 pub use step::step;
 pub use verify::{Refusal, SignedManifest, TrustedKeys, VerifiedManifest, verify_manifest};
@@ -56,6 +63,8 @@ mod lint {
             ("manifest.rs", include_str!("manifest.rs")),
             ("phase.rs", include_str!("phase.rs")),
             ("release.rs", include_str!("release.rs")),
+            ("release_key.rs", include_str!("release_key.rs")),
+            ("release_status.rs", include_str!("release_status.rs")),
             ("sha.rs", include_str!("sha.rs")),
             ("state.rs", include_str!("state.rs")),
             ("step.rs", include_str!("step.rs")),

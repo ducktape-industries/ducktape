@@ -8,6 +8,7 @@
 //! without booting a node.
 
 use crate::NodeHandle;
+use runs_wire as runs;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -234,7 +235,7 @@ pub(super) fn files_reply(
         // the verbatim module contract string the engine's taxonomy keys on.
         FilesQuery::Read { .. } => Err(crate::Refused::new(
             "module",
-            "files: chunk not available",
+            "chunk not available",
         )),
         other => panic!("the checkout asked for {other:?}"),
     }
@@ -262,7 +263,8 @@ fn file_entry(path: &str, bytes: &[u8]) -> EntryInfo {
 /// consensus, so a test that asserted the session bind carried THAT would pass
 /// on an id `runs` can never resolve — which is exactly how the write plane
 /// shipped dead. the end-to-end proof that these two ids stay distinct and the
-/// right one is bound lives in [`super::session_boundary_tests`].
+/// right one is bound stands the native runs module up, so it ships from
+/// ducktape-modules.
 fn consensus_run_id() -> String {
     runs::run_id_for("general", 1, "quackbot")
 }
@@ -368,6 +370,25 @@ async fn a_run_gets_the_node_base_its_agent_id_and_the_tool_bin_dir_on_path() {
         !dir.exists() && !ro.exists(),
         "W5: both trees are the run's debris"
     );
+}
+
+/// a duckfs run pinned no repo, so it has authority over NONE: its lane lends
+/// the operator credential to no push at all. The credential is still held —
+/// that is how the lane knows which header name to strip off a guest's own
+/// request.
+#[tokio::test]
+async fn a_duckfs_run_offers_no_pushable_repo_to_the_push_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (handle, rx, _hub) = NodeHandle::channel();
+    let _actor = spawn_files_actor(rx, skill_tree(), false);
+    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
+        .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
+        .await
+        .expect("provision");
+
+    assert_eq!(ws.forge_repo(), None);
+    assert!(ws.operator_credential().is_some());
+    ws.cleanup().await;
 }
 
 #[tokio::test]

@@ -10,8 +10,9 @@
 //! same way. POST /v1/admin/shutdown is how a client retires it: no pid handshake,
 //! the port IS the daemon's identity.
 //!
-//! run: `cargo run -p noded-bin -- [--listen 127.0.0.1:8844] [--storage <dir>]
-//! [--modules <dir>]`
+//! run: `cargo run -p noded-bin -- [--listen <addr>] [--storage <dir>]
+//! [--modules <dir>]` — `--listen` defaults to
+//! [`workspace_config::DEFAULT_NODED_LISTEN`].
 //!
 //! without `--storage` state lives in a fresh temp dir (clean run each boot).
 //! with it, qmdb modules, the forge repo, and the per-module index persist;
@@ -46,7 +47,7 @@ use topology::TOPOLOGY;
 const MODULE_IDS: &[&str] = topology::SIM_BASE;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut listen: SocketAddr = "127.0.0.1:8844".parse()?;
+    let mut listen: SocketAddr = workspace_config::DEFAULT_NODED_LISTEN.parse()?;
     let mut storage: Option<PathBuf> = None;
     let mut modules: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);

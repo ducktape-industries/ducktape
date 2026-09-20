@@ -76,6 +76,7 @@ mod drain_actions;
 mod executors;
 mod explorer;
 mod first_contact_join;
+mod forge_cli;
 mod fs_cli;
 mod gateway_plane;
 mod gateway_routes;
@@ -297,7 +298,8 @@ enum Family {
     /// sandboxed provider sessions (pty attach, sched runs) and run control
     /// (cancel, reassign)
     Agent(agent_cli::AgentArgs),
-    /// cross-device agent collaboration: authenticated reads of a conversation
+    /// cross-device agent collaboration: authenticated reads of a
+    /// conversation, and signed writes into it
     Collab(collab_cli::CollabArgs),
     /// live code swaps: update, register, status
     #[command(subcommand)]
@@ -305,11 +307,25 @@ enum Family {
     /// the desktop app's release: manifest sign/verify, bundle signing through the airlock gateway
     #[command(subcommand)]
     Release(release_cli::ReleaseCmd),
+    /// git over `duck://<network>/forge/<owner>/<repo>` addresses: put the
+    /// `git-remote-duck` helper on PATH
+    #[command(subcommand)]
+    Forge(forge_cli::ForgeCmd),
     /// the agent tool plane over stdio, for driving it by hand
+    ///
+    /// It reads who it is from the environment. DUCKTAPE_NODE is the http
+    /// base url of the node its tools read and write through, e.g.
+    /// http://127.0.0.1:8844. DUCKTAPE_RUN_AGENT is the agent id it acts for;
+    /// unset, it acts for no agent: reads work and ducktape_whoami says so.
     Mcp,
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // git runs this binary as `git-remote-duck <remote> <url>` for a
+    // `duck://` remote: a mode of the one binary, with git's argv, not ours.
+    if forge_cli::invoked_as_helper() {
+        return forge_cli::run_helper();
+    }
     let cli = <Cli as clap::Parser>::parse();
     match cli.family {
         // `fs` owns a 0/1/2 exit-code contract, so it exits directly (after
@@ -341,6 +357,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Family::Service(cmd) => services::run(cmd),
         Family::Module(cmd) => module_cli::run(cmd),
         Family::Release(cmd) => release_cli::run(cmd),
+        Family::Forge(cmd) => forge_cli::run(cmd),
         Family::Node(cli_args::NodeCmd::Run(args)) => run_node_verb(args),
         Family::Node(cli_args::NodeCmd::Op(op)) => cli::run(op),
     }
@@ -366,14 +383,44 @@ fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Erro
     // workspace was founded with cannot instantiate the network's components.
     // Without this guard the failure is a "type-checking export func `shape`"
     // deep inside the restore compose — hours of reading the wrong plane.
-    // Refused by name, with no tolerance window: rebuild or re-found.
-    config::guard_founding_binary(
-        &resolved.service.workspace,
-        &resolved.service.chain_id,
-        noded::services::build_identity_or_unknown(),
-        wasm_host::module_world_digest(),
-    )?;
+    // Refused by name, with no tolerance window; the remedy is the role's own.
+    //
+    // One boot is not held to the record: the release a launcher flipped to
+    // and awaits health from. The network designated it and the launcher
+    // qualified it against this very checkpoint before the flip, so a world
+    // that moved is the release's, not a stranger's; the launcher records it
+    // once the release comes up (`node record-world`), and a flip that rolls
+    // back boots the release the record still names.
+    let held_to_the_record = !launcher_awaits_health(&resolved.service.workspace);
+    if held_to_the_record {
+        let founded_here = resolved.validators.contains(&resolved.signer.public_key());
+        let role = match founded_here {
+            true => config::WorkspaceRole::Founder,
+            false => config::WorkspaceRole::Member,
+        };
+        config::guard_founding_binary(
+            &resolved.service.workspace,
+            &resolved.service.chain_id,
+            role,
+            noded::services::build_identity_or_unknown(),
+            wasm_host::module_world_digest(),
+        )?;
+    }
     run_node(resolved, cfg_path, sync_only, log_ring)
+}
+
+/// Whether `workspace`'s launcher flipped to a release and waits for it to
+/// come up (`PendingHealthy` in its state file). No state file, or one that
+/// does not decode, is a node no launcher is flipping.
+fn launcher_awaits_health(workspace: &std::path::Path) -> bool {
+    let state = app_update::workspace::launcher_state_path(workspace);
+    let Ok(text) = std::fs::read_to_string(state) else {
+        return false;
+    };
+    matches!(
+        app_update::state::decode(&text),
+        Ok(app_update::Phase::PendingHealthy(_))
+    )
 }
 
 /// Put the startup open-file raise ([`main`]) in `daemon.log`, ONCE, now that
@@ -535,6 +582,17 @@ fn run_node(
     // made a missing hypervisor, or a missing guest image, a fatal BOOT error
     // on a node that never needed one.
 
+    // THE NETSTACK, BEFORE ANY SOCKET. Every node that runs a reachability
+    // plane reaches its mesh through the netstack guest in the founding set
+    // beside this binary (`reachability_plane::netstack_backend`) — a founder
+    // too, whose genesis carries no netstack, and a workspace with no genesis
+    // yet, which fetches one over that mesh. The same read the plane makes is
+    // made here, where an unreadable guest refuses the boot by name.
+    let runs_a_reachability_plane = wireguard_listen.is_some();
+    if runs_a_reachability_plane {
+        reachability_plane::preflight_netstack()?;
+    }
+
     // THE MESH LISTENER, taken for a moment while a bind failure can still be
     // a sentence. Everything below this line runs inside commonware's runtime,
     // where the same failure is an unwinding panic in a worker thread.
@@ -684,19 +742,30 @@ fn run_node(
         // member's dial hint into the network descriptor and saves it, and
         // reads the persisted mesh for the fronts the blob carries: both are
         // this process's files, so a second process doing it races us over
-        // them. The route hands the work to a blocking thread.
+        // them. The route hands the work to a blocking thread, and answers
+        // every note beside the blob — the app says them next to its Copy
+        // button the way the CLI prints them after the blob.
         let invite_config = cfg_path.clone();
         status.wire_invite_minter(move |ttl_days| {
             let (blob, notes) =
                 cli::mint_invite_blob(&invite_config, ttl_days).map_err(|why| why.to_string())?;
-            for note in notes {
+            for note in &notes {
                 tracing::warn!(
                     target: "ducktape::join",
                     reason = note.reason(),
                     "the minted invite carries fewer paths than a full mesh would give it"
                 );
             }
-            Ok(blob)
+            Ok(noded::MintedInvite {
+                invite: blob,
+                notes: notes
+                    .iter()
+                    .map(|note| noded::InviteNote {
+                        reason: note.reason().to_string(),
+                        sentence: note.to_string(),
+                    })
+                    .collect(),
+            })
         });
         // the netstack plane's operator trigger and its status field. Both
         // exist only where a reachability plane will: `wireguard_listen` is
@@ -898,6 +967,18 @@ fn run_node(
             // THE PROMOTION SEAT: the park loop returned the baton — the
             // validator role continues INSIDE this process, over the mesh
             // and planes the parked role already runs.
+            // the cap that admits this node arrives with its admission, which
+            // can postdate boot: read it now, so the seat presents it at a
+            // private coordinator and mints joiners' caps under it.
+            let coord_cap = config::load_coord_cap(&workspace).unwrap_or_else(|error| {
+                tracing::warn!(
+                    target: "ducktape::join",
+                    %error,
+                    reason = "coord_cap_unreadable",
+                    "the promoted seat runs without a coordinator capability"
+                );
+                None
+            });
             validator::run_promoted(
                 baton,
                 oracle,

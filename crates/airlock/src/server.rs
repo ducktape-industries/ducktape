@@ -34,6 +34,11 @@ use crate::wire::{
     SessionResponse, WorkRef,
 };
 
+/// Where `airlock-gateway serve` binds when `--listen` is absent: loopback,
+/// so nothing outside the confidential VM reaches the gateway unless the
+/// operator binds it wider on purpose.
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:9100";
+
 /// How the gateway proves its seal key to the broker.
 #[derive(Clone)]
 pub enum AttestMode {
@@ -711,10 +716,29 @@ async fn attestation(State(st): State<Arc<AppState>>) -> Json<AttestationRespons
     })
 }
 
+/// The refusal an upload under a name the store already holds answers. An
+/// upload only ever CREATES: this gateway serves no route that replaces or
+/// removes a credential, and holds them in memory only, so a held name stays
+/// exactly what was first uploaded under it until the gateway restarts.
+fn credential_exists(name: &str) -> AppErr {
+    AppErr(
+        StatusCode::CONFLICT,
+        format!(
+            "credential_exists: a credential named {name:?} is already held here; an upload \
+             never replaces one, so upload under another name"
+        ),
+    )
+}
+
 async fn credential(
     State(st): State<Arc<AppState>>,
     Json(up): Json<CredentialUpload>,
 ) -> Result<StatusCode, AppErr> {
+    // refused before anything else runs: the refresh probe below would spend
+    // the uploader's refresh token upstream for an upload that cannot land.
+    if st.creds.lock().unwrap().contains_key(&up.name) {
+        return Err(credential_exists(&up.name));
+    }
     let blob = BASE64
         .decode(up.sealed_b64)
         .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("bad base64: {e}")))?;
@@ -745,8 +769,14 @@ async fn credential(
             )
         })?;
     }
-    log_credential_added(&up.name, entry.kind);
-    st.creds.lock().unwrap().insert(up.name, entry);
+    // asked again under the lock: two uploads of one name may both have passed
+    // the check above while the probe ran.
+    let kind = entry.kind;
+    match st.creds.lock().unwrap().entry(up.name.clone()) {
+        std::collections::hash_map::Entry::Occupied(_) => return Err(credential_exists(&up.name)),
+        std::collections::hash_map::Entry::Vacant(slot) => slot.insert(entry),
+    };
+    log_credential_added(&up.name, kind);
     Ok(StatusCode::OK)
 }
 
@@ -1883,6 +1913,37 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "session B's open must not have wiped session A's replay set"
         );
+    }
+
+    /// an upload only creates: a name the store already holds is refused by
+    /// name, and what it holds stays exactly what it was. A new name lands.
+    #[tokio::test]
+    async fn an_upload_under_a_held_name_is_refused_and_changes_nothing() {
+        let st = test_state("a", 8);
+        let held = st.creds.lock().unwrap().get("a").cloned().unwrap();
+        let upload = |name: &str| {
+            let pt = serde_json::to_vec(&CredentialPayload::Bearer {
+                access_token: "other".into(),
+            })
+            .unwrap();
+            credential(
+                State(st.clone()),
+                Json(CredentialUpload {
+                    name: name.into(),
+                    kind: CredentialKind::Claude,
+                    sealed_b64: BASE64.encode(seal::seal(&st.seal_kp.public_bytes(), &pt)),
+                }),
+            )
+        };
+
+        let AppErr(status, message) = upload("a").await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(message.starts_with("credential_exists"), "{message}");
+        let now = st.creds.lock().unwrap().get("a").cloned().unwrap();
+        assert!(Arc::ptr_eq(&held, &now), "the held credential is untouched");
+
+        assert_eq!(upload("b").await.unwrap(), StatusCode::OK);
+        assert!(st.creds.lock().unwrap().contains_key("b"));
     }
 
     // -------- apple-codesign admission through the upload door --------

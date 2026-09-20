@@ -25,6 +25,12 @@ use crate::util::fatal;
 
 use super::OverlayCtx;
 
+/// the pause between first-contact rounds for a restarting member whose every
+/// offered path failed. it holds standing, so it never gives up: this paces a
+/// forever-retry against an inviter that may be down for minutes, and the
+/// every-10th retry warn then lands once per five minutes.
+const FIRST_CONTACT_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// phase 6a's output: every channel/handle phase 6b–6d needs, handed to
 /// [`super::park::park`] as one bundle. `network.start()` has already run by
 /// the time this exists — no further registration is legal on this mesh.
@@ -331,18 +337,20 @@ pub(super) async fn wire(
                             cap: coord_cap.clone(),
                         })
                     };
-                    // an exhausted race is honest-terminal ONLY for a fresh
-                    // join (no checkpoint): a bad invite must exit loudly,
-                    // never spin silently. a RESTART with standing (the
-                    // checkpoint exists) is a different animal — its paths
-                    // are known-good and merely dark (machine woke before
-                    // its network, coordinator briefly down), so dying at
-                    // 90s turns every offline boot into a dead node the
-                    // operator must resurrect by hand. it re-races forever,
-                    // loudly, instead.
+                    // an exhausted race ends a FRESH join (no checkpoint)
+                    // only on an answer that says it can never succeed
+                    // (`after_exhausted_round`): a dead local plane, a member's
+                    // refusal, an issuer that stays unknown. an inviter that
+                    // never answered is re-raced, loudly — it comes back, and
+                    // the invite was never the problem. a RESTART with standing
+                    // (the checkpoint exists) re-races whatever it heard: its
+                    // paths are known-good and merely dark (machine woke before
+                    // its network, coordinator briefly down).
+                    use first_contact_join::AfterRound;
                     let restart_with_standing = manifest.is_some();
                     context.child("first_contact").spawn(move |_ctx| async move {
                         let mut round = 0u32;
+                        let mut issuer_unknown_rounds = 0u32;
                         loop {
                             round += 1;
                             let outcome = first_contact_join::drive_first_contact(
@@ -424,25 +432,44 @@ pub(super) async fn wire(
                                     // R2: a terminal refusal means this invite can
                                     // NEVER redeem — stop loudly instead of
                                     // spinning candidates toward the same answer.
-                                    fatal!(race_label, "join gate refused \
-                                         ({code:?}): {detail} — this invite cannot be \
-                                         redeemed. ask the inviter for a fresh invite and \
-                                         re-join with the new blob.");
+                                    // NOT `fatal!`: its exit status is the one a
+                                    // supervisor reads as "do not start me again",
+                                    // because every restart asks the same question.
+                                    tracing::error!(
+                                        target: "ducktape::join",
+                                        node = %race_label,
+                                        reason = "invite_unredeemable",
+                                        "FATAL: join gate refused ({code:?}): {detail} — this \
+                                         invite cannot be redeemed. ask the inviter for a \
+                                         fresh invite and re-join with the new blob."
+                                    );
+                                    std::process::exit(i32::from(
+                                        app_update::release_status::EXIT_INVITE_UNREDEEMABLE,
+                                    ));
                                 }
                                 first_contact_join::FirstContactOutcome::Terminal {
                                     tried,
                                     reason,
+                                    refused,
                                 } => {
-                                    if !restart_with_standing {
-                                        // THE INVITE IS THE LAST THING TO SUSPECT. A
-                                        // plane that never started took every offered
-                                        // path down with it before any of them was
-                                        // tried, and an operator sent back to the
-                                        // inviter spends a credential that was never
-                                        // the problem — then fails identically.
-                                        if let Some((reason, detail)) =
-                                            crate::reachability_plane::plane_failure()
-                                        {
+                                    let issuer_unknown = matches!(
+                                        refused,
+                                        Some(first_contact_join::MemberAnswer::IssuerUnknown(_))
+                                    );
+                                    issuer_unknown_rounds += u32::from(issuer_unknown);
+                                    let next = match restart_with_standing {
+                                        true => AfterRound::InviterUnreachable,
+                                        false => first_contact_join::after_exhausted_round(
+                                            crate::reachability_plane::plane_failure(),
+                                            refused,
+                                            issuer_unknown_rounds,
+                                        ),
+                                    };
+                                    // NOT `fatal!` on the exits below: 3 is a join that
+                                    // ran out of paths, 77 an invite that can never
+                                    // redeem, and callers read the code.
+                                    match next {
+                                        AfterRound::PlaneDown { reason, detail } => {
                                             tracing::error!(
                                                 target: "ducktape::join",
                                                 node = %race_label,
@@ -457,36 +484,77 @@ pub(super) async fn wire(
                                             );
                                             std::process::exit(3);
                                         }
-                                        // NOT `fatal!`: this path exits 3, not 1 — a
-                                        // join that ran out of paths is distinct from a
-                                        // node that broke, and callers read the code.
-                                        tracing::error!(
-                                            target: "ducktape::join",
-                                            node = %race_label,
-                                            tried,
-                                            reason = "first_contact_terminal",
-                                            detail = %reason,
-                                            "FATAL: first contact failed across all offered \
-                                             path(s) — ask the inviter for a fresh invite once \
-                                             the mesh is reachable"
-                                        );
-                                        std::process::exit(3);
+                                        AfterRound::Refused(refusal) => {
+                                            tracing::error!(
+                                                target: "ducktape::join",
+                                                node = %race_label,
+                                                tried,
+                                                reason = "first_contact_refused",
+                                                detail = %refusal,
+                                                "FATAL: first contact failed across all \
+                                                 offered path(s) — the network was reached: \
+                                                 a member ANSWERED, and refused this join. \
+                                                 `detail` is its reason and names the fix."
+                                            );
+                                            std::process::exit(3);
+                                        }
+                                        AfterRound::IssuerNotAValidator(detail) => {
+                                            tracing::error!(
+                                                target: "ducktape::join",
+                                                node = %race_label,
+                                                attempts = issuer_unknown_rounds,
+                                                reason = "invite_unredeemable",
+                                                detail = %detail,
+                                                "FATAL: join gate refused (IssuerUnknown) for \
+                                                 {issuer_unknown_rounds} rounds — the member \
+                                                 that minted this invite is not a validator of \
+                                                 this network (removed, or never seated), so \
+                                                 this invite cannot be redeemed. ask a current \
+                                                 member for a fresh invite and re-join with \
+                                                 the new blob."
+                                            );
+                                            std::process::exit(i32::from(
+                                                app_update::release_status::EXIT_INVITE_UNREDEEMABLE,
+                                            ));
+                                        }
+                                        // bounded by ISSUER_UNKNOWN_ROUNDS: said every time.
+                                        AfterRound::IssuerNotYetKnown(detail) => {
+                                            tracing::warn!(
+                                                target: "ducktape::join",
+                                                node = %race_label,
+                                                attempts = issuer_unknown_rounds,
+                                                reason = "issuer_unknown",
+                                                detail = %detail,
+                                                "the members that answered do not know this \
+                                                 invite's issuer as a validator yet — their \
+                                                 view may lag its admission; asking again in \
+                                                 {}s",
+                                                FIRST_CONTACT_RETRY.as_secs()
+                                            );
+                                        }
+                                        AfterRound::InviterUnreachable => {
+                                            let should_log =
+                                                round == 1 || round.is_multiple_of(10);
+                                            if should_log {
+                                                tracing::warn!(
+                                                    target: "ducktape::join",
+                                                    node = %race_label,
+                                                    attempts = round,
+                                                    tried,
+                                                    reason = "inviter_unreachable",
+                                                    detail = %reason,
+                                                    "the inviter is unreachable: none of the \
+                                                     {tried} offered path(s) answered — its \
+                                                     node is down, or its reachability plane \
+                                                     is not running (`operations.netstack` in \
+                                                     its /v1/status says which). The invite is \
+                                                     not what failed; retrying in {}s",
+                                                    FIRST_CONTACT_RETRY.as_secs()
+                                                );
+                                            }
+                                        }
                                     }
-                                    let should_log = round == 1 || round.is_multiple_of(10);
-                                    if should_log {
-                                        tracing::warn!(
-                                            target: "ducktape::join",
-                                            node = %race_label,
-                                            attempts = round,
-                                            tried,
-                                            reason = "first_contact_retry",
-                                            detail = %reason,
-                                            "first contact failed across all offered paths; \
-                                             retrying in 30s"
-                                        );
-                                    }
-                                    tokio::time::sleep(std::time::Duration::from_secs(30))
-                                        .await;
+                                    tokio::time::sleep(FIRST_CONTACT_RETRY).await;
                                 }
                             }
                         }
@@ -529,19 +597,15 @@ pub(super) async fn wire(
     }
 }
 
-/// TCP/443: the relay lane's deployed port — the one port every network
-/// forwards, which is the whole reason the lane exists.
-const RELAY_FALLBACK_PORT: u16 = 443;
-
-/// the relay endpoint derived from one coordinator ingress: SAME host,
-/// TCP/443. `SocketAddr`'s Display brackets an IPv6 ip, so the derived string
-/// stays `to_socket_addrs`-parseable.
+/// the relay endpoint derived from one coordinator ingress: SAME host, on the
+/// relay port ([`nat_traversal::RELAY_PORT`]). `SocketAddr`'s Display brackets
+/// an IPv6 ip, so the derived string stays `to_socket_addrs`-parseable.
 fn relay_endpoint_of(ingress: &Ingress) -> String {
     match ingress {
         Ingress::Socket(addr) => {
-            std::net::SocketAddr::new(addr.ip(), RELAY_FALLBACK_PORT).to_string()
+            std::net::SocketAddr::new(addr.ip(), nat_traversal::RELAY_PORT).to_string()
         }
-        Ingress::Dns { host, .. } => format!("{host}:{RELAY_FALLBACK_PORT}"),
+        Ingress::Dns { host, .. } => format!("{host}:{}", nat_traversal::RELAY_PORT),
     }
 }
 
@@ -549,7 +613,7 @@ fn relay_endpoint_of(ingress: &Ingress) -> String {
 /// REPLACES the derived list outright; its disable sentinels mirror
 /// `primary_coordinator`'s exactly (`"none"`/`"off"`/`"direct"`, and
 /// blank = absent); absent derives one relay per ambient coordinator at
-/// [`RELAY_FALLBACK_PORT`].
+/// [`nat_traversal::RELAY_PORT`].
 fn coordinator_relays(override_raw: Option<&str>, coordinators: &[Ingress]) -> Vec<String> {
     match override_raw.map(str::trim).filter(|s| !s.is_empty()) {
         Some("none" | "off" | "direct") => Vec::new(),

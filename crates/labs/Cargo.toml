@@ -10,15 +10,18 @@ version = "0.1.0"
 #
 # labs is a STANDALONE crate: EXCLUDED from the root workspace (see the root
 # Cargo.toml `exclude`) with its own [workspace] table and Cargo.lock, so the
-# revm dep tree stops taxing every workspace gate. The sibling crates below are
-# path deps into the root workspace and stay members there (they resolve their
-# own workspace inheritance against the root). The direct-pinned external deps
-# mirror the versions that used to live in the root [workspace.dependencies].
+# revm dep tree stops taxing every workspace gate. The module contract (sdk,
+# index-guest, sdk-testkit) comes from ducktape-sdk by the same git spec the
+# root workspace uses, so both graphs resolve one `sdk`. The sibling crates
+# below are path deps into the root workspace and stay members there (they
+# resolve their own workspace inheritance against the root). The direct-pinned
+# external deps mirror the versions that used to live in the root
+# [workspace.dependencies].
 [dependencies]
-sdk = { path = "../kernel/sdk" }
+sdk = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "sdk" }
 kv = { path = "../modules/system/kv" }
 valset = { path = "../modules/system/valset" }
-index_guest = { path = "../kernel/index-guest", package = "index-guest" }
+index_guest = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "index-guest" }
 revm = { version = "41", default-features = false, features = ["std"] }
 alloy-primitives = { version = "1.6", default-features = false, features = ["std", "k256"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
@@ -30,7 +33,7 @@ sha2 = "0.10"
 
 [dev-dependencies]
 host = { path = "../kernel/host" }
-sdk-testkit = { path = "../kernel/sdk-testkit" }
+sdk-testkit = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "sdk-testkit" }
 # the tests drive the EVM module the way a host does: construct the concrete
 # QmdbStore on the deterministic runtime and inject it as `Box<dyn MerkleStore>`.
 statesync = { path = "../kernel/statesync" }

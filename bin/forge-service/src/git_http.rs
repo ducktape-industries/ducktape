@@ -5,6 +5,7 @@ use axum::extract::rejection::BytesRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use futures::StreamExt as _;
 use serde::Deserialize;
 
 use crate::{ServiceState, error_response};
@@ -23,10 +24,14 @@ const GIT_RECEIVE_PACK_CAPS: &str =
 /// the capabilities forge's upload-pack (fetch/clone) advertises. `side-band-64k`
 /// muxes the packfile onto band 1 of the reply — git clients request it by
 /// default; `multi_ack_detailed` is the modern negotiation, `thin-pack`/
-/// `ofs-delta` are standard pack encodings. no fetch-side extras (shallow /
-/// filter): the answer is either the full closure or a have-bounded delta.
-const GIT_UPLOAD_PACK_CAPS: &str =
-    "multi_ack_detailed side-band-64k thin-pack ofs-delta agent=ducktape-forge/0.1";
+/// `ofs-delta` are standard pack encodings. `allow-reachable-sha1-in-want`
+/// lets a client want any commit a ref reaches, not only a tip — without it
+/// stock git refuses to even send `git fetch <url> <sha>` for a pinned commit
+/// (see [`admit_upload_pack`] for the admission rule). no other fetch-side
+/// extras (shallow / filter): the answer is either the full closure or a
+/// have-bounded delta.
+const GIT_UPLOAD_PACK_CAPS: &str = "multi_ack_detailed side-band-64k thin-pack ofs-delta \
+     allow-reachable-sha1-in-want agent=ducktape-forge/0.1";
 /// what a git request that is NOT a push may carry: a fetch's want/have
 /// negotiation and a merge request are lists of oids, not content. A push has
 /// no limit at all — see the receive-pack route.
@@ -47,9 +52,22 @@ const GIT_MAX_INFLATE_RATIO: u64 = 64;
 /// id, plus the 4-byte pkt length header, this yields a 65520-byte line — git's
 /// `LARGE_PACKET_MAX`, the ceiling a side-band-64k client accepts.
 const GIT_SIDE_BAND_CHUNK: usize = 65515;
-/// the ref namespace pushes may touch: any branch. a command outside
-/// `refs/heads/*` (tags, notes) is refused with a per-ref `ng`.
-const GIT_HEADS_PREFIX: &str = "refs/heads/";
+/// side-band band 1 carries pack bytes; band 3 a fatal error git prints.
+const GIT_BAND_PACK: u8 = 0x01;
+const GIT_BAND_ERROR: u8 = 0x03;
+/// git's own upload-pack keepalive: an empty band-1 line.
+const GIT_KEEPALIVE_PKT: &[u8] = b"0005\x01";
+/// how long an upload-pack answer may go without a byte while libgit2 counts
+/// and deltifies before [`GIT_KEEPALIVE_PKT`] goes out (git's
+/// `uploadpack.keepAlive` default). The Gateway drops a publisher silent for
+/// its own ceiling, which the node asserts stays well above this.
+pub const GIT_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// side-band lines of one clone's pack queued between the builder thread and
+/// the socket. With the line being filled, a streamed pack holds at most
+/// `(PACK_LINES_IN_FLIGHT + 1) × 65520` bytes ≈ 1.1 MiB this side of libgit2 —
+/// never the pack. (libgit2's own working set is bounded by the repository's
+/// `pack.*` settings — its delta cache and the largest single object.)
+const PACK_LINES_IN_FLIGHT: usize = 16;
 /// 40 ascii zeros: git's "null" oid — the old value of a ref being created, and
 /// the head advertised for an unborn repo.
 const GIT_ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -215,11 +233,33 @@ fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// the heads an advertisement offers — NOT the same set for the two services.
+/// one ref line an advertisement offers: the full refname, its oid, and — for
+/// an annotated tag on the fetch side — the commit it peels to, which git reads
+/// off a `<oid> <refname>^{}` line to follow tags into a plain `git fetch`.
+#[derive(Debug, PartialEq, Eq)]
+struct AdvertisedRef {
+    refname: String,
+    oid: String,
+    peeled: Option<String>,
+}
+
+impl AdvertisedRef {
+    fn new(name: forge::refs::RefName, oid: String) -> Self {
+        Self {
+            refname: name.full(),
+            oid,
+            peeled: None,
+        }
+    }
+}
+
+/// the refs an advertisement offers, branches then tags — NOT the same set for
+/// the two services.
 ///
-/// PUSH advertises forge's COMMITTED heads: the client builds its ref commands
+/// PUSH advertises forge's COMMITTED refs: the client builds its ref commands
 /// against what it is shown and consensus gates each as a CAS against the
-/// committed head, so advertising anything else mints a doomed push.
+/// committed head, so advertising anything else mints a doomed push. a tag it
+/// is not shown, it re-sends as a create, which consensus refuses whole.
 ///
 /// FETCH advertises what this node can actually SERVE — its ON-DISK refs. the
 /// two diverge on a node whose objects have not caught up yet (a resident, or
@@ -233,7 +273,7 @@ async fn advertised_refs(
     handle: &ServiceState,
     repo: &str,
     service: GitService,
-) -> Result<Vec<forge::RefHead>, Response> {
+) -> Result<Vec<AdvertisedRef>, Response> {
     match service {
         GitService::Receive => forge_refs(handle, repo).await,
         GitService::Upload => servable_refs(handle, repo)
@@ -242,48 +282,74 @@ async fn advertised_refs(
 }
 
 /// the fetch half of [`advertised_refs`], reading the same on-disk repo
-/// [`build_upload_pack`] packs from.
-fn servable_refs(handle: &ServiceState, repo: &str) -> Result<Vec<forge::RefHead>, String> {
+/// [`write_pack`] packs from.
+fn servable_refs(handle: &ServiceState, repo: &str) -> Result<Vec<AdvertisedRef>, String> {
     on_disk_refs(&handle.forge_repo, repo).map_err(|e| format!("read forge refs: {e}"))
 }
 
-/// this node's on-disk branches for `repo`. a repo dir nothing has
+/// this node's on-disk branches and tags for `repo`. a repo dir nothing has
 /// materialized here yet is an empty listing, which advertises as an empty
 /// repository — the same answer an unborn repo gives.
-fn on_disk_refs(base: &std::path::Path, repo: &str) -> Result<Vec<forge::RefHead>, git2::Error> {
+fn on_disk_refs(base: &std::path::Path, repo: &str) -> Result<Vec<AdvertisedRef>, git2::Error> {
+    use forge::refs::RefName;
     let dir = base.join(repo);
     if !dir.join(".git").exists() {
         return Ok(Vec::new());
     }
     let repo = git2::Repository::open(&dir)?;
-    Ok(forge::list_branches(&repo)?
+    let branches = forge::list_branches(&repo)?
         .into_iter()
-        .map(|(name, head)| forge::RefHead {
-            name,
-            head: head.to_string(),
-        })
-        .collect())
+        .map(|(name, oid)| AdvertisedRef::new(RefName::Branch(name), oid.to_string()));
+    let mut refs: Vec<AdvertisedRef> = branches.collect();
+    for (name, oid) in forge::list_tags(&repo)? {
+        let annotated = repo.find_tag(oid).is_ok();
+        let peeled = match annotated {
+            true => Some(
+                repo.find_object(oid, None)?
+                    .peel_to_commit()?
+                    .id()
+                    .to_string(),
+            ),
+            false => None,
+        };
+        refs.push(AdvertisedRef {
+            peeled,
+            ..AdvertisedRef::new(RefName::Tag(name), oid.to_string())
+        });
+    }
+    Ok(refs)
 }
 
-/// query the forge module for a repo's committed branches (`[]` == unborn).
-/// errors surface as an http `Response` so callers can early-return them.
-async fn forge_refs(handle: &ServiceState, repo: &str) -> Result<Vec<forge::RefHead>, Response> {
-    let result = handle
-        .client
-        .query(
-            &handle.module,
-            &forge::ForgeQuery::ListRefs {
-                repo: repo.to_string(),
-            },
-        )
-        .await;
-    match result {
-        Ok(forge::ForgeReply::Refs(refs)) => Ok(refs),
-        Ok(_) => Err(error_response(
+/// query the forge module for a repo's committed branches and tags (`[]` ==
+/// unborn). errors surface as an http `Response` so callers can early-return
+/// them.
+async fn forge_refs(handle: &ServiceState, repo: &str) -> Result<Vec<AdvertisedRef>, Response> {
+    use forge::refs::RefName;
+    let list_refs = forge::ForgeQuery::ListRefs {
+        repo: repo.to_string(),
+    };
+    let list_tags = forge::ForgeQuery::ListTags {
+        repo: repo.to_string(),
+    };
+    let branches = handle.client.query(&handle.module, &list_refs).await;
+    let tags = handle.client.query(&handle.module, &list_tags).await;
+    match (branches, tags) {
+        (Ok(forge::ForgeReply::Refs(branches)), Ok(forge::ForgeReply::Tags(tags))) => {
+            let branches = branches
+                .into_iter()
+                .map(|r| AdvertisedRef::new(RefName::Branch(r.name), r.head));
+            let tags = tags
+                .into_iter()
+                .map(|t| AdvertisedRef::new(RefName::Tag(t.name), t.oid));
+            Ok(branches.chain(tags).collect())
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            Err(error_response(StatusCode::BAD_GATEWAY, &error.to_string()))
+        }
+        _ => Err(error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "unexpected ListRefs reply",
+            "unexpected ListRefs/ListTags reply",
         )),
-        Err(error) => Err(error_response(StatusCode::BAD_GATEWAY, &error.to_string())),
     }
 }
 
@@ -351,17 +417,22 @@ fn parse_push_commands(
             certificate.nonce
         ));
     }
-    let cmds = certificate
-        .updates
-        .iter()
-        .map(|u| {
-            (
-                oid_hex(u.prev_oid.as_deref()),
-                oid_hex(u.new_oid.as_deref()),
-                format!("{GIT_HEADS_PREFIX}{}", u.ref_name),
-            )
-        })
-        .collect();
+    use forge::refs::RefName;
+    let branches = certificate.updates.iter().map(|u| {
+        (
+            oid_hex(u.prev_oid.as_deref()),
+            oid_hex(u.new_oid.as_deref()),
+            RefName::Branch(u.ref_name.clone()).full(),
+        )
+    });
+    let tags = certificate.tags.iter().map(|t| {
+        (
+            oid_hex(None),
+            oid_hex(Some(&t.oid)),
+            RefName::Tag(t.name.clone()).full(),
+        )
+    });
+    let cmds = branches.chain(tags).collect();
     Ok(PushCommands {
         cmds,
         cert: Some(forge::PushCert {
@@ -407,6 +478,63 @@ fn command_triple(line: &str) -> Result<(String, String, String), String> {
         return Err("malformed ref-update command".into());
     };
     Ok((old.to_string(), new.to_string(), refname.to_string()))
+}
+
+/// why a push's command list cannot become a `PushRefs` op.
+#[derive(Debug, PartialEq, Eq)]
+enum CommandRefusal {
+    /// a command outside `refs/heads/*` and `refs/tags/*`.
+    OutsideHeadsOrTags,
+    /// an `old` or `new` oid that is neither the null oid nor 40 hex.
+    MalformedOid(&'static str),
+    /// a command that moves or deletes a tag. a tag is created once and never
+    /// moves, and `TagCreate` has no way to say anything else.
+    TagImmutable,
+}
+
+/// split a push's `(old, new, refname)` commands into the op's branch moves
+/// and tag creations. each command is classified ONCE, by
+/// [`forge::refs::RefName::classify`] — the same namespace rule consensus
+/// reads a certificate by — and that one answer both refuses the push and
+/// picks the list a command lands in. the null oid means "create"
+/// (`prev_oid` None) / "delete" (`new_oid` None); a tag command must create,
+/// and name validation and a tag name already taken stay with consensus.
+fn push_updates(
+    cmds: &[(String, String, String)],
+) -> Result<(Vec<forge::RefUpdate>, Vec<forge::TagCreate>), CommandRefusal> {
+    use forge::refs::RefName;
+    let classified: Option<Vec<RefName>> = cmds
+        .iter()
+        .map(|(_, _, refname)| RefName::classify(refname))
+        .collect();
+    let names = classified.ok_or(CommandRefusal::OutsideHeadsOrTags)?;
+    let mut updates = Vec::new();
+    let mut tags = Vec::new();
+    for ((old, new, _), name) in cmds.iter().zip(names) {
+        let prev_oid = command_oid(old).ok_or(CommandRefusal::MalformedOid("old"))?;
+        let new_oid = command_oid(new).ok_or(CommandRefusal::MalformedOid("new"))?;
+        match (name, prev_oid, new_oid) {
+            (RefName::Branch(ref_name), prev_oid, new_oid) => updates.push(forge::RefUpdate {
+                ref_name,
+                prev_oid,
+                new_oid,
+            }),
+            (RefName::Tag(name), None, Some(oid)) => tags.push(forge::TagCreate { name, oid }),
+            (RefName::Tag(_), _, _) => return Err(CommandRefusal::TagImmutable),
+        }
+    }
+    Ok((updates, tags))
+}
+
+/// one command oid: the null oid is `Some(None)`, 40 hex is its raw bytes,
+/// anything else is `None` (malformed).
+fn command_oid(hex: &str) -> Option<Option<Vec<u8>>> {
+    if hex == GIT_ZERO_OID {
+        return Some(None);
+    }
+    hex_to_bytes(hex)
+        .filter(|bytes| bytes.len() == GIT_OID_RAW_LEN)
+        .map(Some)
 }
 
 fn oid_hex(oid: Option<&[u8]>) -> String {
@@ -553,8 +681,11 @@ pub(crate) async fn git_info_refs(
 /// it is the same question. A repo seeded on `dev` has no `main` at all, and a
 /// client told nothing falls back to a `refs/heads/main` that does not exist —
 /// it clones every ref and lands on an UNBORN HEAD.
-fn default_branch(refs: &[forge::RefHead]) -> Option<&forge::RefHead> {
-    let named = |branch: &'static str| refs.iter().find(move |r| r.name == branch);
+fn default_branch(refs: &[AdvertisedRef]) -> Option<&AdvertisedRef> {
+    let named = |branch: &str| {
+        let refname = forge::refs::RefName::Branch(branch.to_string()).full();
+        refs.iter().find(move |r| r.refname == refname)
+    };
     named(forge::refs::INTEGRATION_BRANCH).or_else(|| named(forge::refs::MAIN_BRANCH))
 }
 
@@ -562,9 +693,10 @@ fn default_branch(refs: &[forge::RefHead]) -> Option<&forge::RefHead> {
 /// flush, the ref line(s), then a flush. an unborn repo advertises the null oid
 /// against the magic `capabilities^{}` ref (so caps ride along with no real ref)
 /// — a clone then reports an empty repository. a born repo advertises EVERY
-/// committed branch; a fetch advertisement leads with a `HEAD` line at the
-/// [`default_branch`]'s oid so `git clone` resolves the branch to check out.
-/// capabilities ride the first emitted line after a NUL, per the v0 protocol.
+/// branch and tag (an annotated tag followed by its peeled line); a fetch
+/// advertisement leads with a `HEAD` line at the [`default_branch`]'s oid so
+/// `git clone` resolves the branch to check out. capabilities ride the first
+/// emitted line after a NUL, per the v0 protocol.
 async fn git_advertise_refs(handle: &ServiceState, repo: &str, service: GitService) -> Response {
     let refs = match advertised_refs(handle, repo, service).await {
         Ok(refs) => refs,
@@ -580,7 +712,7 @@ async fn git_advertise_refs(handle: &ServiceState, repo: &str, service: GitServi
     // from the default sits on that same oid until its first commit — so the
     // guess is wrong exactly when a run has just branched.
     let caps = match default {
-        Some(r) => format!("{caps} symref=HEAD:{GIT_HEADS_PREFIX}{}", r.name),
+        Some(r) => format!("{caps} symref=HEAD:{}", r.refname),
         None => caps,
     };
 
@@ -596,10 +728,13 @@ async fn git_advertise_refs(handle: &ServiceState, repo: &str, service: GitServi
     } else {
         let mut lines: Vec<String> = Vec::new();
         if let Some(r) = default {
-            lines.push(format!("{} HEAD", r.head));
+            lines.push(format!("{} HEAD", r.oid));
         }
         for r in &refs {
-            lines.push(format!("{} {GIT_HEADS_PREFIX}{}", r.head, r.name));
+            lines.push(format!("{} {}", r.oid, r.refname));
+            if let Some(peeled) = &r.peeled {
+                lines.push(format!("{peeled} {}^{{}}", r.refname));
+            }
         }
         for (i, line) in lines.iter().enumerate() {
             if i == 0 {
@@ -775,7 +910,7 @@ fn decode_git_body(headers: &HeaderMap, body: &[u8], cap: usize) -> Result<Vec<u
 /// one refused push, on the forge plane. the http funnel already records the
 /// status at `debug`; this is the plane's own line, with a `reason` an
 /// operator greps and counts. never the pack, never a path.
-fn push_refused(_repo: &str, reason: &'static str, _detail: &str) {
+fn push_refused(_repo: &str, reason: &str, _detail: &str) {
     tracing::warn!(
         target: "ducktape::forge",
         event = "forge_push_refused",
@@ -790,6 +925,7 @@ fn push_refused(_repo: &str, reason: &'static str, _detail: &str) {
 /// so they sit ahead of that catch-all.
 fn push_refusal_reason(message: &str) -> &'static str {
     const KNOWN: &[(&str, &str)] = &[
+        ("moves or deletes a tag", "tag_immutable"),
         ("non-fast-forward", "non_fast_forward"),
         ("requires an authenticated external origin", "unsigned"),
         ("offered no push-cert", "push_cert_unoffered"),
@@ -907,59 +1043,41 @@ pub(crate) async fn git_receive_pack(
         }
     };
 
-    // only branches are pushable (no tags/notes). consume-and-refuse: the pack
-    // was fully received; reporting `ng` (not an http error) lets git print a
-    // clean per-ref reason.
-    if cmds
-        .iter()
-        .any(|(_, _, r)| !r.starts_with(GIT_HEADS_PREFIX))
-    {
-        push_refused(&repo, "ref_outside_heads", "only refs/heads/* is supported");
-        let results: Vec<(String, Option<String>)> = cmds
-            .into_iter()
-            .map(|(_, _, r)| (r, Some(format!("only {GIT_HEADS_PREFIX}* is supported"))))
-            .collect();
-        return git_report_status(&results);
-    }
-
-    // old/new == the null oid mean "create" (prev_oid None) / "delete" (new_oid
-    // None); otherwise 40-hex oids the forge per-branch CAS must match.
-    let mut updates = Vec::new();
-    for (old, new, refname) in &cmds {
-        let prev_oid = if old == GIT_ZERO_OID {
-            None
-        } else {
-            match hex_to_bytes(old).filter(|b| b.len() == GIT_OID_RAW_LEN) {
-                Some(bytes) => Some(bytes),
-                None => {
-                    push_refused(&repo, "malformed_oid", "malformed old oid");
-                    return error_response(StatusCode::BAD_REQUEST, "malformed old oid");
-                }
-            }
-        };
-        let new_oid = if new == GIT_ZERO_OID {
-            None
-        } else {
-            match hex_to_bytes(new).filter(|b| b.len() == GIT_OID_RAW_LEN) {
-                Some(bytes) => Some(bytes),
-                None => {
-                    push_refused(&repo, "malformed_oid", "malformed new oid");
-                    return error_response(StatusCode::BAD_REQUEST, "malformed new oid");
-                }
-            }
-        };
-        updates.push(forge::RefUpdate {
-            ref_name: refname[GIT_HEADS_PREFIX.len()..].to_string(),
-            prev_oid,
-            new_oid,
-        });
-    }
+    // only branches and tags are pushable (no notes, no remotes).
+    // consume-and-refuse: the pack was fully received; reporting `ng` (not an
+    // http error) lets git print a clean per-ref reason.
+    let (updates, tags) = match push_updates(&cmds) {
+        Ok(split) => split,
+        Err(CommandRefusal::OutsideHeadsOrTags) => {
+            const REASON: &str = "only refs/heads/* and refs/tags/* are supported";
+            push_refused(&repo, "ref_outside_heads_or_tags", REASON);
+            let results: Vec<(String, Option<String>)> = cmds
+                .into_iter()
+                .map(|(_, _, r)| (r, Some(REASON.to_string())))
+                .collect();
+            return git_report_status(&results);
+        }
+        Err(CommandRefusal::MalformedOid(which)) => {
+            let reason = format!("malformed {which} oid");
+            push_refused(&repo, "malformed_oid", &reason);
+            return error_response(StatusCode::BAD_REQUEST, &reason);
+        }
+        Err(CommandRefusal::TagImmutable) => {
+            const REASON: &str = "a tag is created once and never moves or is deleted";
+            push_refused(&repo, "tag_immutable", REASON);
+            let results: Vec<(String, Option<String>)> = cmds
+                .into_iter()
+                .map(|(_, _, r)| (r, Some(REASON.to_string())))
+                .collect();
+            return git_report_status(&results);
+        }
+    };
 
     // a signed push is refused HERE with the reason consensus would give — a
     // clean per-ref `ng` instead of a rejected block. every validator
     // re-verifies; this node is not trusted for it.
     if let Some(cert) = &cert
-        && let Err(reason) = forge::pushcert::signer(cert, &handle.chain_id, &repo, &updates)
+        && let Err(reason) = forge::pushcert::signer(cert, &handle.chain_id, &repo, &updates, &tags)
     {
         push_refused(&repo, push_refusal_reason(&reason), &reason);
         let results: Vec<(String, Option<String>)> = cmds
@@ -975,7 +1093,8 @@ pub(crate) async fn git_receive_pack(
     // stream from the spool file straight into the node's store — neither end
     // ever holds the pack.
     let pack_bytes = spooled.len.saturating_sub(pack_offset);
-    let pack_digest = if updates.iter().any(|u| u.new_oid.is_some()) {
+    let carries_objects = !tags.is_empty() || updates.iter().any(|u| u.new_oid.is_some());
+    let pack_digest = if carries_objects {
         match handle
             .client
             .put_blob_file(&spooled.path, pack_offset)
@@ -994,10 +1113,12 @@ pub(crate) async fn git_receive_pack(
         None
     };
 
-    // CAS every branch through ONE atomic PushRefs op and await the block.
+    // CAS every branch and create every tag through ONE atomic PushRefs op and
+    // await the block.
     let payload = forge::encode_msg(&forge::ForgeMsg::PushRefs {
         repo: repo.clone(),
         updates,
+        tags,
         pack_digest: pack_digest.map(|digest| digest.to_vec()),
         cert,
     });
@@ -1028,16 +1149,17 @@ pub(crate) async fn git_receive_pack(
             push_refused(&repo, "unresolved", &detail);
             error_response(StatusCode::BAD_GATEWAY, &detail)
         }
-        Err(ducktape_rpc::SubmitFailure::Refused(reason)) => {
-            push_refused(&repo, push_refusal_reason(&reason), &reason);
-            // a CAS mismatch's rejection carries "non-fast-forward" — surface
-            // exactly that token so git prints its standard "fetch first" hint.
-            // any other rejection passes through as a single-line reason. the
+        Err(ducktape_rpc::SubmitFailure::Refused(refusal)) => {
+            // the refusing module named its own class: log THAT, never a guess
+            // read back out of its sentence.
+            push_refused(&repo, refusal.reason(), refusal.message());
+            // a CAS mismatch refuses with `non_fast_forward` — surface git's
+            // own spelling of it so it prints its standard "fetch first" hint.
+            // any other rejection passes through as a single-line sentence. the
             // op is atomic, so every ref shares the fate.
-            let reason = if reason.contains("non-fast-forward") {
-                "non-fast-forward".to_string()
-            } else {
-                reason.replace('\n', " ")
+            let reason = match refusal.reason() {
+                "non_fast_forward" => "non-fast-forward".to_string(),
+                _ => refusal.message().replace('\n', " "),
             };
             let results: Vec<(String, Option<String>)> = refnames
                 .into_iter()
@@ -1054,7 +1176,8 @@ pub(crate) async fn git_receive_pack(
 /// `<forge_repo>/{repo}` READ-ONLY, and after `done` answer with the pack on
 /// side-band-64k band 1: a have-bounded delta behind `ACK <common>` when the
 /// repo knows any of the client's haves, or the full closure behind NAK when
-/// it knows none (see [`build_upload_pack`]).
+/// it knows none (see [`admit_upload_pack`], [`write_pack`]). The head goes
+/// out once the request is admitted; the pack streams as libgit2 writes it.
 pub(crate) async fn git_upload_pack(
     State(handle): State<ServiceState>,
     Path(repo): Path<String>,
@@ -1107,8 +1230,10 @@ pub(crate) async fn git_upload_pack(
             .into_response();
     }
 
-    // the pack build is blocking git2 IO over a non-Send `Repository`; run it off
-    // the async worker, moving only Send data (the dir + hex oids) across.
+    // admission and the pack build are blocking git2 IO; both run on ONE
+    // blocking thread, which answers the admission first and then streams the
+    // pack into `lines` — so the head below goes out before a single object is
+    // counted, however long the pack takes to build.
     let repo_dir = forge_repo.join(&repo);
     let UploadPackRequest {
         wants,
@@ -1116,71 +1241,75 @@ pub(crate) async fn git_upload_pack(
         side_band,
         ..
     } = request;
-    let (pack, common) =
-        match tokio::task::spawn_blocking(move || build_upload_pack(&repo_dir, &wants, &haves))
-            .await
-        {
-            Ok(Ok(built)) => built,
-            Ok(Err(UploadPackError::RepoUnavailable(e))) => {
-                // the git2 detail (which carries the node's absolute forge
-                // path) never reaches the client or the warn-level ring; an
-                // absent/unopenable repo dir is just a 404 to the outside.
-                tracing::debug!(
-                    target: "ducktape::forge",
-                    repo = %repo,
-                    error = %e,
-                    "forge repo unavailable for upload-pack"
-                );
-                return error_response(StatusCode::NOT_FOUND, "no such repo");
-            }
-            Ok(Err(UploadPackError::WantNotAdvertised(hex))) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    &format!("want {hex} is not one of this repo's advertised refs"),
-                );
-            }
-            Ok(Err(UploadPackError::Other(msg))) => {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg);
-            }
-            Err(_) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "git pack builder task panicked",
-                );
-            }
-        };
+    let (admitted_tx, admitted) = tokio::sync::oneshot::channel();
+    let (lines_tx, lines) = tokio::sync::mpsc::channel(PACK_LINES_IN_FLIGHT);
+    tokio::task::spawn_blocking(move || {
+        produce_upload_pack(&repo_dir, &wants, &haves, admitted_tx, lines_tx, side_band)
+    });
+    let common = match admitted.await {
+        Ok(Ok(common)) => common,
+        Ok(Err(UploadPackError::RepoUnavailable(e))) => {
+            // the git2 detail (which carries the node's absolute forge
+            // path) never reaches the client or the warn-level ring; an
+            // absent/unopenable repo dir is just a 404 to the outside.
+            tracing::debug!(
+                target: "ducktape::forge",
+                repo = %repo,
+                error = %e,
+                "forge repo unavailable for upload-pack"
+            );
+            return error_response(StatusCode::NOT_FOUND, "no such repo");
+        }
+        // git's own upload-pack refusal shape (`ERR upload-pack: not our
+        // ref`): an `ERR` pkt-line in a 200 answer is what git prints as
+        // `fatal: remote error: <reason>`. An HTTP error status here reaches
+        // the user as a bare "HTTP 400", with the reason lost.
+        Ok(Err(UploadPackError::WantUnreachable(hex))) => {
+            let refusal = format!("ERR commit {hex} is not reachable from any ref of {repo}\n");
+            return (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/x-git-upload-pack-result"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                pkt_line(refusal.as_bytes()),
+            )
+                .into_response();
+        }
+        Ok(Err(UploadPackError::Other(msg))) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg);
+        }
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "git pack builder task panicked",
+            );
+        }
+    };
 
     tracing::debug!(
         target: "ducktape::forge",
         repo = %repo,
-        pack_bytes = pack.len(),
         delta = common.is_some(),
-        "upload-pack served"
+        "upload-pack admitted"
     );
 
-    let mut out = Vec::new();
     // the terminal negotiation line, valid in every v0 multi_ack mode: a bare
     // `ACK <oid>` names the common base the pack builds on (the delta answer),
     // NAK means no usable have was found (the pack is then the full closure).
     // either way a PLAIN pkt-line, BEFORE any side-band framing begins.
-    match &common {
-        Some(oid) => out.extend_from_slice(&pkt_line(format!("ACK {oid}\n").as_bytes())),
-        None => out.extend_from_slice(&pkt_line(b"NAK\n")),
-    }
-    if side_band {
-        // band 1 = pack data, chunked to the side-band-64k ceiling.
-        for chunk in pack.chunks(GIT_SIDE_BAND_CHUNK) {
-            let mut framed = Vec::with_capacity(chunk.len() + 1);
-            framed.push(0x01);
-            framed.extend_from_slice(chunk);
-            out.extend_from_slice(&pkt_line(&framed));
-        }
-        out.extend_from_slice(GIT_FLUSH_PKT);
-    } else {
-        // the client didn't request side-band: the raw pack follows NAK directly
-        // (no band framing, no trailing flush — the pack trailer ends the stream).
-        out.extend_from_slice(&pack);
-    }
+    let negotiated = match &common {
+        Some(oid) => pkt_line(format!("ACK {oid}\n").as_bytes()),
+        None => pkt_line(b"NAK\n"),
+    };
+    let pack = futures::stream::unfold(lines, move |mut lines| async move {
+        next_pack_line(&mut lines, side_band)
+            .await
+            .map(|line| (line, lines))
+    });
+    let body = futures::stream::once(std::future::ready(negotiated))
+        .chain(pack)
+        .map(Ok::<_, std::convert::Infallible>);
 
     (
         StatusCode::OK,
@@ -1188,59 +1317,266 @@ pub(crate) async fn git_upload_pack(
             (header::CONTENT_TYPE, "application/x-git-upload-pack-result"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        out,
+        axum::body::Body::from_stream(body),
     )
         .into_response()
 }
 
-/// [`build_upload_pack`]'s failure modes. `RepoUnavailable` carries the raw
+/// the next line of a streamed upload-pack answer. A builder still counting or
+/// deltifying sends nothing for as long as that takes, so after
+/// [`GIT_KEEPALIVE_INTERVAL`] of silence this answers git's own keepalive — an
+/// empty band-1 line, which every side-band client reads as zero pack bytes —
+/// and every hop sees the exchange alive. Without side-band there is no line a
+/// keepalive could ride; that answer waits as it is.
+async fn next_pack_line(
+    lines: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    side_band: bool,
+) -> Option<Vec<u8>> {
+    if !side_band {
+        return lines.recv().await;
+    }
+    tokio::time::timeout(GIT_KEEPALIVE_INTERVAL, lines.recv())
+        .await
+        .unwrap_or_else(|_silent| Some(GIT_KEEPALIVE_PKT.to_vec()))
+}
+
+/// the blocking half of an upload-pack: admit the request, tell the handler
+/// (which then sends the head), and build the pack straight into `lines`.
+/// The caller hanging up ends the build at libgit2's next progress report or
+/// write, not at its end.
+fn produce_upload_pack(
+    repo_dir: &std::path::Path,
+    want_hexes: &[String],
+    have_hexes: &[String],
+    admitted: tokio::sync::oneshot::Sender<Result<Option<String>, UploadPackError>>,
+    lines: tokio::sync::mpsc::Sender<Vec<u8>>,
+    side_band: bool,
+) {
+    let plan = match admit_upload_pack(repo_dir, want_hexes, have_hexes) {
+        Ok(plan) => plan,
+        Err(refused) => {
+            let _ = admitted.send(Err(refused));
+            return;
+        }
+    };
+    let ack = plan.common.first().map(git2::Oid::to_string);
+    if admitted.send(Ok(ack)).is_err() {
+        return;
+    }
+    pack_gate::wait(repo_dir);
+    let mut sink = PackLines::new(lines, side_band);
+    match write_pack(&plan, &mut sink) {
+        Ok(()) => sink.finish(),
+        Err(error) => sink.fail(&error),
+    }
+}
+
+/// what an admitted upload-pack packs: the wants' closure, minus everything
+/// the `common` bases (the client's haves this repo knows) already reach.
+struct UploadPlan {
+    repo: git2::Repository,
+    wants: Vec<git2::Oid>,
+    common: Vec<git2::Oid>,
+}
+
+/// the packfile answering `plan`, handed to `sink` as libgit2 writes it: every
+/// have this repo knows as a commit hides its closure from the walk, so a
+/// mirror refresh downloads only what moved, and a client with NO usable
+/// common base gets the full self-contained closure. A revwalk PEELS a tag to
+/// its commit, so an annotated tag a want names is put in by hand — or a
+/// receiver's closure check of that want fails on the one object it never got.
+fn write_pack(plan: &UploadPlan, sink: &mut PackLines) -> Result<(), git2::Error> {
+    let repo = &plan.repo;
+    let mut builder = repo.packbuilder()?;
+    // pack bytes are transport-only, so a large pack uses every worker.
+    builder.set_threads(0);
+    let caller = sink.lines.clone();
+    builder.set_progress_callback(move |_stage, _done, _total| !caller.is_closed())?;
+    let mut walk = repo.revwalk()?;
+    for want in &plan.wants {
+        walk.push(*want)?;
+    }
+    for base in &plan.common {
+        walk.hide(*base)?;
+    }
+    builder.insert_walk(&mut walk)?;
+    for want in &plan.wants {
+        let mut oid = *want;
+        while let Ok(tag) = repo.find_tag(oid) {
+            builder.insert_object(oid, None)?;
+            oid = tag.target_id();
+        }
+    }
+    builder.foreach(|bytes| sink.push(bytes))
+}
+
+/// the pack as the wire carries it: libgit2's output cut into side-band-64k
+/// band-1 lines (raw when the client asked for no side-band), handed to the
+/// socket through a channel [`PACK_LINES_IN_FLIGHT`] deep. A full channel
+/// parks the builder thread, so the pack is produced at the pace the caller
+/// reads it: one line filling here plus the queued ones is all of it this
+/// side of libgit2 ever holds.
+struct PackLines {
+    lines: tokio::sync::mpsc::Sender<Vec<u8>>,
+    side_band: bool,
+    filling: Vec<u8>,
+}
+
+impl PackLines {
+    fn new(lines: tokio::sync::mpsc::Sender<Vec<u8>>, side_band: bool) -> Self {
+        Self {
+            lines,
+            side_band,
+            filling: Vec::with_capacity(GIT_SIDE_BAND_CHUNK),
+        }
+    }
+
+    /// take `bytes` of pack; false once the caller is gone, which stops
+    /// libgit2's write.
+    fn push(&mut self, mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() {
+            let room = GIT_SIDE_BAND_CHUNK - self.filling.len();
+            let (now, rest) = bytes.split_at(room.min(bytes.len()));
+            self.filling.extend_from_slice(now);
+            bytes = rest;
+            let line_full = self.filling.len() == GIT_SIDE_BAND_CHUNK;
+            if line_full && !self.send_filling() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn send_filling(&mut self) -> bool {
+        let data = std::mem::replace(&mut self.filling, Vec::with_capacity(GIT_SIDE_BAND_CHUNK));
+        let line = if self.side_band {
+            band_line(GIT_BAND_PACK, &data)
+        } else {
+            data
+        };
+        self.lines.blocking_send(line).is_ok()
+    }
+
+    /// the pack is whole: its last partial line, then the flush that ends a
+    /// side-band answer (a raw pack's own trailer ends the stream).
+    fn finish(mut self) {
+        let partial = !self.filling.is_empty();
+        if partial && !self.send_filling() {
+            return;
+        }
+        if self.side_band {
+            let _ = self.lines.blocking_send(GIT_FLUSH_PKT.to_vec());
+        }
+    }
+
+    /// the build failed after the head went out. Band 3 is git's fatal remote
+    /// error, which a side-band client prints and aborts on; a raw pack just
+    /// ends short, which git refuses as a truncated pack. A caller that hung
+    /// up is not a failure.
+    fn fail(self, error: &git2::Error) {
+        if error.code() == git2::ErrorCode::User {
+            tracing::debug!(
+                target: "ducktape::forge",
+                reason = "caller_gone",
+                "upload-pack stopped"
+            );
+            return;
+        }
+        tracing::warn!(
+            target: "ducktape::forge",
+            reason = "pack_build_failed",
+            error = %error.message(),
+            "upload-pack failed mid-pack"
+        );
+        if self.side_band {
+            let _ = self
+                .lines
+                .blocking_send(band_line(GIT_BAND_ERROR, b"pack build failed\n"));
+        }
+    }
+}
+
+/// one side-band-64k line: the band byte, then `data`.
+fn band_line(band: u8, data: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(data.len() + 1);
+    framed.push(band);
+    framed.extend_from_slice(data);
+    pkt_line(&framed)
+}
+
+/// a test's hold on the pack builder: it waits, after the head has gone out,
+/// until the test lets a repository's pack be built — a build as slow as the
+/// test says, on no clock. Outside tests it is nothing.
+pub(crate) mod pack_gate {
+    #[cfg(not(test))]
+    pub(super) fn wait(_repo_dir: &std::path::Path) {}
+
+    #[cfg(test)]
+    pub(crate) static GATES: std::sync::Mutex<
+        Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
+    > = std::sync::Mutex::new(Vec::new());
+
+    #[cfg(test)]
+    pub(super) fn wait(repo_dir: &std::path::Path) {
+        let gate = {
+            let mut gates = GATES.lock().unwrap();
+            let held = gates.iter().position(|(dir, _)| dir == repo_dir);
+            held.map(|index| gates.swap_remove(index).1)
+        };
+        if let Some(gate) = gate {
+            let _ = gate.recv();
+        }
+    }
+}
+
+/// [`admit_upload_pack`]'s failure modes. `RepoUnavailable` carries the raw
 /// git2 error — libgit2 puts the repo's absolute path verbatim in that
 /// message (`repository.c`'s "could not find repository at '%s'"), so it is
 /// NEVER surfaced to the client or put in the log ring's warn line; the
 /// handler answers a fixed 404 and logs this variant's detail at `debug`
-/// only. `WantNotAdvertised` is a refusal, not a server error: the client
-/// asked for an oid this node does not currently advertise as a branch tip.
+/// only. `WantUnreachable` is a refusal, not a server error: the client asked
+/// for an oid that is not a commit any of this node's branches or tags
+/// reaches, and the handler answers it as a git `ERR` line naming that oid.
 /// `Other` covers everything past those two (a bad want oid, a pack-write
 /// failure) and is not path-bearing.
 #[derive(Debug)]
 enum UploadPackError {
     RepoUnavailable(git2::Error),
-    WantNotAdvertised(String),
+    WantUnreachable(String),
     Other(String),
 }
 
-/// build the packfile answering `want_hexes`, bounded by the client's haves:
-/// every have this repo knows as a commit hides its closure from the walk
-/// (forge's `pack_delta`), so a mirror refresh downloads only what moved. a
-/// client with NO usable common base still gets the FULL self-contained
-/// closure (forge's `pack_closure_many` — ONE packing implementation for the
-/// module's snapshot pack and this fetch lane). returns the pack plus the
-/// first usable common base, which the handler ACKs.
+/// admit a fetch of `want_hexes` bounded by `have_hexes`: the repo opens, every
+/// want parses and is reachable, and the haves this repo knows as commits
+/// become the common bases [`write_pack`] hides (the first is what the handler
+/// ACKs). Cheap next to the pack — a walk of commits, no trees or blobs — so
+/// it runs before the head goes out and a refusal is still a status.
 ///
-/// every want must equal one of this repo's current branch tips — the same
-/// anti-amplifier `forge::build_objects` enforces on the peer lane ("that
-/// guard is the whole anti-amplifier"): a caller may only ask for history
-/// this node still advertises, never an arbitrary walk of its object
-/// database by oid.
-fn build_upload_pack(
+/// every want must be a commit reachable from one of this repo's current
+/// branch or tag tips — git's `uploadpack.allowReachableSHA1InWant`, so a
+/// client can fetch the exact commit a `Cargo.lock` pins. that is still only
+/// history this node advertises: a want's closure lies inside some tip's
+/// closure, which a clone of that tip ships anyway. an arbitrary walk of the
+/// object database by oid stays refused — an unknown oid, a tree or blob, or
+/// a commit only a deleted or force-pushed-away branch reached.
+fn admit_upload_pack(
     repo_dir: &std::path::Path,
     want_hexes: &[String],
     have_hexes: &[String],
-) -> Result<(Vec<u8>, Option<String>), UploadPackError> {
+) -> Result<UploadPlan, UploadPackError> {
     let repo = git2::Repository::open(repo_dir).map_err(UploadPackError::RepoUnavailable)?;
-    let tips: Vec<git2::Oid> = forge::list_branches(&repo)
-        .map_err(|e| UploadPackError::Other(format!("read refs: {e}")))?
-        .into_iter()
-        .map(|(_, oid)| oid)
-        .collect();
+    let tips =
+        forge::ref_tips(&repo).map_err(|e| UploadPackError::Other(format!("read refs: {e}")))?;
     let mut oids = Vec::with_capacity(want_hexes.len());
     for hex in want_hexes {
         let oid = git2::Oid::from_str(hex)
             .map_err(|e| UploadPackError::Other(format!("bad want oid {hex}: {e}")))?;
-        if !tips.contains(&oid) {
-            return Err(UploadPackError::WantNotAdvertised(hex.clone()));
-        }
         oids.push(oid);
+    }
+    let unreachable = first_unreachable(&repo, &tips, &oids)
+        .map_err(|e| UploadPackError::Other(format!("walk refs: {e}")))?;
+    if let Some(oid) = unreachable {
+        return Err(UploadPackError::WantUnreachable(oid.to_string()));
     }
     // only haves this repo KNOWS as commits can bound the walk — a have from
     // history this node never saw simply doesn't help (and never errors).
@@ -1253,15 +1589,44 @@ fn build_upload_pack(
             common.push(oid);
         }
     }
-    if common.is_empty() {
-        return forge::pack_closure_many(&repo, &oids)
-            .map(|pack| (pack, None))
-            .map_err(|e| UploadPackError::Other(format!("build pack: {e}")));
+    Ok(UploadPlan {
+        repo,
+        wants: oids,
+        common,
+    })
+}
+
+/// the first of `wants`, in request order, that no revwalk from `tips` visits;
+/// `None` admits them all. a tip is admitted without walking (every want of a
+/// plain clone). the rest share ONE walk from every tip that stops at the last
+/// outstanding want: each commit the refs reach is visited at most once,
+/// whatever the number of wants or tips — `graph_descendant_of` per
+/// (tip, want) pair would repeat a merge-base walk per pair instead. the walk
+/// yields only commits, so a tree or blob oid is never admitted.
+fn first_unreachable(
+    repo: &git2::Repository,
+    tips: &[git2::Oid],
+    wants: &[git2::Oid],
+) -> Result<Option<git2::Oid>, git2::Error> {
+    let mut pending: std::collections::HashSet<git2::Oid> = wants
+        .iter()
+        .filter(|want| !tips.contains(want))
+        .copied()
+        .collect();
+    if pending.is_empty() {
+        return Ok(None);
     }
-    let ack = common[0].to_string();
-    forge::pack_delta(&repo, &oids, &common)
-        .map(|pack| (pack, Some(ack)))
-        .map_err(|e| UploadPackError::Other(format!("build delta pack: {e}")))
+    let mut walk = repo.revwalk()?;
+    for tip in tips {
+        walk.push(*tip)?;
+    }
+    for seen in walk {
+        pending.remove(&seen?);
+        if pending.is_empty() {
+            return Ok(None);
+        }
+    }
+    Ok(wants.iter().copied().find(|want| pending.contains(want)))
 }
 
 #[cfg(test)]
@@ -1317,8 +1682,14 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
 -----END SSH SIGNATURE-----\n";
 
     fn signed_commands() -> Vec<Vec<u8>> {
+        signed_commands_over(CERT)
+    }
+
+    /// `cert` framed as a signed push, under [`ARMORED`] — which only verifies
+    /// over [`CERT`] itself; the parse never checks it, `signer` does.
+    fn signed_commands_over(cert: &str) -> Vec<Vec<u8>> {
         let mut lines = vec![b"push-cert\0report-status agent=git/2.43.0\n".to_vec()];
-        for line in CERT.split_inclusive('\n') {
+        for line in cert.split_inclusive('\n') {
             lines.push(line.as_bytes().to_vec());
         }
         for line in ARMORED.split_inclusive('\n') {
@@ -1349,7 +1720,90 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
             prev_oid: None,
             new_oid: Some(hex_to_bytes("ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2").unwrap()),
         }];
-        forge::pushcert::signer(&cert, "chain-a", "lab", &updates).expect("verifies");
+        forge::pushcert::signer(&cert, "chain-a", "lab", &updates, &[]).expect("verifies");
+    }
+
+    #[test]
+    fn a_signed_tag_comes_back_out_under_its_own_namespace() {
+        let offered = forge::pushcert::nonce("chain-a", "lab");
+        let tagged = CERT.replace("refs/heads/main", "refs/tags/v1");
+        let parsed = parse_push_commands(&signed_commands_over(&tagged), Some(&offered)).unwrap();
+        assert_eq!(parsed.cmds[0].2, "refs/tags/v1");
+        let (updates, tags) = push_updates(&parsed.cmds).unwrap();
+        assert!(updates.is_empty());
+        assert_eq!(tags[0].name, "v1");
+        // the fixture signature is over the branch certificate, not this one.
+        let refused =
+            forge::pushcert::signer(&parsed.cert.unwrap(), "chain-a", "lab", &updates, &tags)
+                .unwrap_err();
+        assert!(refused.contains("does not verify"), "{refused}");
+    }
+
+    fn cmd(old: &str, new: &str, refname: &str) -> (String, String, String) {
+        (old.to_string(), new.to_string(), refname.to_string())
+    }
+
+    /// one classification refuses a push and splits it: a branch and a tag in
+    /// one push land in their own lists, and a push naming anything outside
+    /// `refs/heads/*` and `refs/tags/*`, or moving or deleting a tag, is
+    /// refused whole.
+    #[test]
+    fn a_push_splits_into_branch_moves_and_tag_creations_and_refuses_the_rest() {
+        const TIP: &str = "ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2";
+        let tip = hex_to_bytes(TIP).unwrap();
+        let (updates, tags) = push_updates(&[
+            cmd(GIT_ZERO_OID, TIP, "refs/heads/main"),
+            cmd(GIT_ZERO_OID, TIP, "refs/tags/v1"),
+            cmd(TIP, GIT_ZERO_OID, "refs/heads/old"),
+        ])
+        .unwrap();
+        assert_eq!(
+            updates,
+            vec![
+                forge::RefUpdate {
+                    ref_name: "main".into(),
+                    prev_oid: None,
+                    new_oid: Some(tip.clone()),
+                },
+                forge::RefUpdate {
+                    ref_name: "old".into(),
+                    prev_oid: Some(tip.clone()),
+                    new_oid: None,
+                },
+            ]
+        );
+        assert_eq!(
+            tags,
+            vec![forge::TagCreate {
+                name: "v1".into(),
+                oid: tip,
+            }]
+        );
+        const NEXT: &str = "0000000000000000000000000000000000000001";
+        for (old, new) in [(TIP, NEXT), (TIP, GIT_ZERO_OID)] {
+            let refused = push_updates(&[
+                cmd(GIT_ZERO_OID, TIP, "refs/heads/main"),
+                cmd(old, new, "refs/tags/v1"),
+            ]);
+            assert_eq!(
+                refused.unwrap_err(),
+                CommandRefusal::TagImmutable,
+                "{old} -> {new}"
+            );
+        }
+        for outside in ["refs/notes/commits", "refs/remotes/origin/main", "HEAD"] {
+            let refused = push_updates(&[
+                cmd(GIT_ZERO_OID, TIP, "refs/heads/main"),
+                cmd(GIT_ZERO_OID, TIP, outside),
+            ]);
+            assert_eq!(
+                refused.unwrap_err(),
+                CommandRefusal::OutsideHeadsOrTags,
+                "{outside}"
+            );
+        }
+        let malformed = push_updates(&[cmd("zz", TIP, "refs/tags/v1")]);
+        assert_eq!(malformed.unwrap_err(), CommandRefusal::MalformedOid("old"));
     }
 
     #[test]
@@ -1361,8 +1815,8 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
         assert!(unoffered.contains("offered no push-cert"), "{unoffered}");
         let mut cut = signed_commands();
         cut.pop();
-        let cut = parse_push_commands(&cut, Some(&forge::pushcert::nonce("chain-a", "lab")))
-            .unwrap_err();
+        let cut =
+            parse_push_commands(&cut, Some(&forge::pushcert::nonce("chain-a", "lab"))).unwrap_err();
         assert!(cut.contains("push-cert-end"), "{cut}");
     }
 
@@ -1410,6 +1864,70 @@ mod upload_pack_tests {
     const WANT: &str = "1111111111111111111111111111111111111111";
     const HAVE: &str = "2222222222222222222222222222222222222222";
 
+    /// the whole pack [`write_pack`] streams for an admitted request, read
+    /// raw (no side-band) off its line channel, plus the base the handler ACKs.
+    fn build_upload_pack(
+        repo_dir: &std::path::Path,
+        wants: &[String],
+        haves: &[String],
+    ) -> Result<(Vec<u8>, Option<String>), UploadPackError> {
+        let plan = admit_upload_pack(repo_dir, wants, haves)?;
+        let ack = plan.common.first().map(git2::Oid::to_string);
+        let (lines, mut read) = tokio::sync::mpsc::channel(PACK_LINES_IN_FLIGHT);
+        let writer = std::thread::spawn(move || {
+            let mut sink = PackLines::new(lines, false);
+            write_pack(&plan, &mut sink).map(|()| sink.finish())
+        });
+        let mut pack = Vec::new();
+        while let Some(line) = read.blocking_recv() {
+            pack.extend_from_slice(&line);
+        }
+        writer
+            .join()
+            .unwrap()
+            .map_err(|e| UploadPackError::Other(format!("build pack: {e}")))?;
+        Ok((pack, ack))
+    }
+
+    /// THE BOUND: the builder is never more than [`PACK_LINES_IN_FLIGHT`]
+    /// lines ahead of the reader, so a pack many times that size is never
+    /// held whole. With the reader stopped `PACK_LINES_IN_FLIGHT + 1` lines
+    /// short of the end, the writer cannot have finished — it holds a line
+    /// no free slot will take until the reader moves.
+    #[test]
+    fn a_pack_bigger_than_the_bound_is_held_one_bound_at_a_time() {
+        let bound = (PACK_LINES_IN_FLIGHT + 1) * (GIT_SIDE_BAND_CHUNK + 5);
+        assert!(bound < 1200 * 1024, "the stated bound is ~1.1 MiB: {bound}");
+        let total_lines = PACK_LINES_IN_FLIGHT * 8;
+        let pack = vec![0x5a; total_lines * GIT_SIDE_BAND_CHUNK];
+        let (lines, mut read) = tokio::sync::mpsc::channel(PACK_LINES_IN_FLIGHT);
+        let writer = std::thread::spawn(move || {
+            let mut sink = PackLines::new(lines, true);
+            // libgit2 hands over whatever it wrote: one call of the whole pack
+            // is the worst case, and it still leaves in lines.
+            assert!(sink.push(&pack));
+            sink.finish();
+        });
+        let mut received = Vec::new();
+        for _ in 0..total_lines - PACK_LINES_IN_FLIGHT - 1 {
+            received.push(read.blocking_recv().expect("a pack line"));
+        }
+        assert!(
+            !writer.is_finished(),
+            "the writer ran more than {PACK_LINES_IN_FLIGHT} lines ahead of its reader"
+        );
+        while let Some(line) = read.blocking_recv() {
+            received.push(line);
+        }
+        writer.join().unwrap();
+        assert_eq!(received.pop().as_deref(), Some(GIT_FLUSH_PKT));
+        assert_eq!(received.len(), total_lines);
+        for line in &received {
+            assert_eq!(line.len(), GIT_SIDE_BAND_CHUNK + 5, "a full side-band line");
+            assert_eq!(line[4], GIT_BAND_PACK);
+        }
+    }
+
     fn request_tail(tail: &[u8]) -> Vec<u8> {
         let mut body =
             pkt_line(format!("want {WANT} multi_ack_detailed side-band-64k\n").as_bytes());
@@ -1444,11 +1962,13 @@ mod upload_pack_tests {
     }
 
     /// a fetch advertisement offers exactly what this node can pack: nothing
-    /// for a repo it has never materialized, and afterwards the ON-DISK heads
+    /// for a repo it has never materialized, and afterwards the ON-DISK refs
     /// — never a committed head whose objects have not arrived, which would
-    /// take the whole clone down instead of just lagging one branch.
+    /// take the whole clone down instead of just lagging one branch. an
+    /// annotated tag carries the commit it peels to; a lightweight one needs
+    /// none.
     #[test]
-    fn on_disk_refs_offer_only_the_branches_this_node_can_pack() {
+    fn on_disk_refs_offer_only_the_branches_and_tags_this_node_can_pack() {
         let base = tempfile::tempdir().unwrap();
         assert!(
             on_disk_refs(base.path(), "demo").unwrap().is_empty(),
@@ -1466,14 +1986,48 @@ mod upload_pack_tests {
             .unwrap();
         repo.reference("refs/heads/feature/x", head, true, "test")
             .unwrap();
+        repo.reference("refs/tags/light", head, true, "test")
+            .unwrap();
+        let commit = repo.find_object(head, None).unwrap();
+        let annotated = repo.tag("v1", &commit, &sig, "release one", false).unwrap();
 
         let refs = on_disk_refs(base.path(), "demo").unwrap();
 
-        let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["feature/x", "main"], "every born branch, sorted");
-        for r in &refs {
-            assert_eq!(r.head, head.to_string(), "at its on-disk oid");
+        let names: Vec<&str> = refs.iter().map(|r| r.refname.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "refs/heads/feature/x",
+                "refs/heads/main",
+                "refs/tags/light",
+                "refs/tags/v1"
+            ],
+            "every born branch, then every tag, each sorted"
+        );
+        let head = head.to_string();
+        for r in &refs[..3] {
+            assert_eq!((r.oid.as_str(), r.peeled.as_deref()), (head.as_str(), None));
         }
+        assert_eq!(refs[3].oid, annotated.to_string(), "the tag object itself");
+        assert_eq!(
+            refs[3].peeled.as_deref(),
+            Some(head.as_str()),
+            "and the commit"
+        );
+
+        // the want-guard takes a tag tip, and the pack carries the tag object.
+        let dir = base.path().join("demo");
+        let (pack, _) = build_upload_pack(&dir, &[annotated.to_string()], &[]).unwrap();
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = git2::Repository::init_bare(clone_dir.path()).unwrap();
+        let odb = clone.odb().unwrap();
+        let mut writer = odb.packwriter().unwrap();
+        std::io::Write::write_all(&mut writer, &pack).unwrap();
+        writer.commit().unwrap();
+        assert_eq!(
+            clone.find_tag(annotated).unwrap().target_id().to_string(),
+            head
+        );
     }
 
     /// two commits at the origin; a client that has the first must get a pack
@@ -1491,11 +2045,6 @@ mod upload_pack_tests {
         let tree1 = origin.find_tree(tb.write().unwrap()).unwrap();
         let first = origin
             .commit(Some("refs/heads/dev"), &sig, &sig, "one", &tree1, &[])
-            .unwrap();
-        // keep `first` an advertised tip (a second branch) after `dev` moves
-        // to `second` below — the want-guard only packs an advertised tip.
-        origin
-            .reference("refs/heads/base", first, true, "test")
             .unwrap();
 
         let blob_b = origin.blob(b"two").unwrap();
@@ -1577,42 +2126,87 @@ mod upload_pack_tests {
         assert!(over.contains("too many pkt-lines in request"), "{over}");
     }
 
-    /// a want naming an oid still in the ODB but no longer any branch's tip
-    /// (the branch moved past it, or was force-pushed away) is refused, not
-    /// packed — the anti-amplifier guard `build_upload_pack` shares with the
-    /// peer lane's `forge::build_objects`. the current tip still packs fine.
-    #[test]
-    fn a_want_off_every_advertised_tip_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init(dir.path()).unwrap();
+    /// `main`: root ← pinned ← tip, plus a commit `gone` that only the deleted
+    /// branch `scratch` ever reached (it stays in the ODB, as after a real
+    /// branch delete or force-push). returns `(root, pinned, tip, gone)`.
+    fn history_with_a_deleted_branch(
+        dir: &std::path::Path,
+    ) -> (git2::Oid, git2::Oid, git2::Oid, git2::Oid) {
+        let repo = git2::Repository::init(dir).unwrap();
         let sig = git2::Signature::now("test", "test@example.com").unwrap();
-
-        let blob = repo.blob(b"one").unwrap();
-        let mut tb = repo.treebuilder(None).unwrap();
-        tb.insert("a.txt", blob, 0o100644).unwrap();
-        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
-        let orphaned = repo
-            .commit(Some("refs/heads/main"), &sig, &sig, "one", &tree, &[])
+        let commit_on = |branch: &str, file: &str, parent: Option<git2::Oid>| {
+            let blob = repo.blob(file.as_bytes()).unwrap();
+            let mut tb = repo.treebuilder(None).unwrap();
+            tb.insert(file, blob, 0o100644).unwrap();
+            let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = parent
+                .map(|p| repo.find_commit(p).unwrap())
+                .into_iter()
+                .collect();
+            let parents: Vec<&git2::Commit> = parents.iter().collect();
+            repo.commit(Some(branch), &sig, &sig, file, &tree, &parents)
+                .unwrap()
+        };
+        let root = commit_on("refs/heads/main", "root", None);
+        let pinned = commit_on("refs/heads/main", "pinned", Some(root));
+        let tip = commit_on("refs/heads/main", "tip", Some(pinned));
+        let gone = commit_on("refs/heads/scratch", "gone", Some(root));
+        repo.find_reference("refs/heads/scratch")
+            .unwrap()
+            .delete()
             .unwrap();
-        let orphaned_commit = repo.find_commit(orphaned).unwrap();
-        let tip = repo
-            .commit(
-                Some("refs/heads/main"),
-                &sig,
-                &sig,
-                "two",
-                &tree,
-                &[&orphaned_commit],
-            )
-            .unwrap();
+        (root, pinned, tip, gone)
+    }
 
-        let err = build_upload_pack(dir.path(), &[orphaned.to_string()], &[]).unwrap_err();
-        assert!(
-            matches!(err, UploadPackError::WantNotAdvertised(hex) if hex == orphaned.to_string())
-        );
+    /// a commit behind a tip — the one a `Cargo.lock` pins — packs its own
+    /// closure, and the tip still packs as before.
+    #[test]
+    fn a_want_reachable_from_a_ref_is_packed_tip_or_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, pinned, tip, _) = history_with_a_deleted_branch(dir.path());
 
-        build_upload_pack(dir.path(), &[tip.to_string()], &[])
-            .expect("a want for the current tip still packs");
+        for want in [pinned, tip] {
+            let (pack, ack) = build_upload_pack(dir.path(), &[want.to_string()], &[])
+                .unwrap_or_else(|e| panic!("want {want} must pack: {e:?}"));
+            assert_eq!(ack, None);
+            let clone_dir = tempfile::tempdir().unwrap();
+            let clone = git2::Repository::init_bare(clone_dir.path()).unwrap();
+            let odb = clone.odb().unwrap();
+            let mut pw = odb.packwriter().unwrap();
+            std::io::Write::write_all(&mut pw, &pack).unwrap();
+            pw.commit().unwrap();
+            assert!(clone.find_commit(want).is_ok(), "the pack carries {want}");
+        }
+    }
+
+    /// no ref reaches an unknown oid or a commit only a deleted branch held:
+    /// both are refused by name, and a request mixing one with a reachable
+    /// want is refused whole.
+    #[test]
+    fn a_want_no_ref_reaches_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, pinned, _, gone) = history_with_a_deleted_branch(dir.path());
+
+        for want in [gone.to_string(), WANT.to_string()] {
+            let wants = [pinned.to_string(), want.clone()];
+            let err = build_upload_pack(dir.path(), &wants, &[]).unwrap_err();
+            assert!(
+                matches!(&err, UploadPackError::WantUnreachable(hex) if *hex == want),
+                "{want}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_want_oid_is_refused() {
+        let mut body = pkt_line(b"want not-an-oid side-band-64k\n");
+        body.extend_from_slice(GIT_FLUSH_PKT);
+
+        let err = parse_upload_pack_request(&body)
+            .err()
+            .expect("a non-oid want must fail");
+
+        assert!(err.contains("want line carried an invalid oid"), "{err}");
     }
 
     /// an absent repo dir maps to the path-bearing git2 error variant, not

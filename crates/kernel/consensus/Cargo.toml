@@ -58,7 +58,7 @@ statesync = { workspace = true }
 # commonware network, each wrapping a host::Host with a qmdb kv module.
 host = { workspace = true }
 sdk = { workspace = true }
-kv = { workspace = true }
+kv = { path = "../../modules/system/kv" }
 directory = { workspace = true }
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }

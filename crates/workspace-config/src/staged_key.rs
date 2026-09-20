@@ -5,10 +5,8 @@
 //! `CARGO_TARGET_DIR` (that is the point of a shared target: one dependency
 //! build for every worktree), and then that profile directory is a directory
 //! several builds write. A set is not a shared thing: it says which wasm a
-//! `node init` from THIS checkout founds with, and a checkout that has not
-//! built its views says so by leaving `<id>.view.pending` in it — a statement
-//! about one build, sitting in a directory every build reads. One worktree's
-//! `cargo check` then made every other worktree's founding set refuse.
+//! `node init` from THIS checkout founds with — a statement about one
+//! checkout's committed artifacts, sitting in a directory every build reads.
 //!
 //! So the directory carries the checkout in its NAME: `modules-<key>` and
 //! `sim-modules-<key>`, where the key is the checkout's own path. Two
@@ -27,36 +25,24 @@
 //! and `crates/noded/build.rs` includes it by path so the build script that
 //! writes a set and the code that reads one can never disagree about the name.
 //!
-//! This crate deliberately has NO build script. It used to stamp the name in
-//! as a constant, which is unsound on a shared target directory for the reason
-//! [`STAGED_POINTER`] gives: the crates that share a target share it because
-//! their source is identical, so cargo shares the compiled unit, and a unit
-//! that encodes where it was compiled speaks for whichever checkout got there
-//! first.
+//! This crate deliberately has NO build script. The name a binary reads is
+//! baked into noded by the build-script run that stages the set
+//! (`noded::services::STAGED_SET`), never by a second unit: the crates that
+//! share a target share it because their source is identical, so cargo shares
+//! the compiled unit, and a stamp compiled into a unit OTHER than the stager's
+//! speaks for whichever checkout last built that unit while the set beside it
+//! is whichever checkout last staged — measured, when this crate carried the
+//! stamp. Nor is it a file in the profile directory: every checkout's build
+//! rewrites that directory, so a binary reading a name from it at boot follows
+//! the last build onto a set that is not its own.
 
 /// A path component that cannot appear in a path, so the encoding is
 /// unambiguous: `/` becomes this and nothing else does.
 const SEPARATOR: char = '%';
 
-/// The file in the profile directory naming the set the LAST build staged.
-///
-/// The key cannot be a compile-time constant. Several checkouts share one
-/// target directory precisely because their SOURCE is identical, so cargo
-/// shares the compiled unit — and a build script that bakes its own location
-/// into a shared unit hands every other checkout the first builder's answer.
-/// Measured: forcing a rebuild from a second checkout FLIPS the stamp in the
-/// same `build/workspace-config-*/output`, leaving the first checkout reading
-/// a set it does not own.
-///
-/// So the name is written HERE, next to the binaries, by the same `cargo
-/// build` that links them. `target/<profile>/ducktape` is likewise whichever
-/// build ran last, so the binary and this pointer are written by one
-/// invocation and always agree.
-pub const STAGED_POINTER: &str = ".staged-modules";
-
 /// The file inside a staged set naming the build that wrote it, so a reader
-/// can refuse a set that is not its own ([`STAGED_POINTER`] can be moved by a
-/// sibling's `cargo check` without relinking any binary).
+/// can refuse a set that is not its own: a checkout restages its set without
+/// relinking every binary that reads it (`cargo check -p noded`).
 pub const STAGED_OWNER: &str = ".staged-by";
 
 /// What [`STAGED_OWNER`] holds when the build had no git to identify itself
@@ -69,7 +55,7 @@ pub const UNIDENTIFIED_BUILD: &str = "unknown";
 /// `checkout`: the base, then the checkout's absolute path with `/` written
 /// as `%`. A relative or empty path is the unkeyed name — nothing to say.
 ///
-/// Callers pass an ABSOLUTE path (both build scripts derive it from
+/// Callers pass an ABSOLUTE path (the build script derives it from
 /// `CARGO_MANIFEST_DIR`, which cargo always gives absolute). The encoding
 /// keeps every byte of it, so a very deep checkout can exceed a filesystem's
 /// 255-byte name limit; the build then fails on `create_dir_all` naming the

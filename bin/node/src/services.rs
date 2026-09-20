@@ -1461,7 +1461,7 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // the FIRST hello must land: a daemon that cannot signal has nothing to
     // offer and must not sit in a retry loop pretending otherwise. A down node
     // is a loud exit, not a silent spin.
-    let skew = send_hello(&base, &hello)?;
+    let skew = send_hello(&base, &service.workspace, &hello)?;
     write_err(&format!(
         "{} {} · signaling to {} · offering {}\n",
         paint(GREEN, "●"),
@@ -1781,11 +1781,22 @@ fn discover_hello(
 /// When either side cannot identify its build the answer is
 /// [`Skew::Unknown`] — which says nothing and warns about nothing, rather than
 /// inventing a disagreement out of two "unknown"s.
-fn send_hello(base: &str, hello: &noded::services::Hello) -> Result<Skew, String> {
+///
+/// The hello carries the node's service-link token, read out of `workspace`
+/// per call and never latched: a node restart mints a fresh one, and a
+/// heartbeat holding a stale token would be refused until the daemon
+/// restarted.
+fn send_hello(
+    base: &str,
+    workspace: &std::path::Path,
+    hello: &noded::services::Hello,
+) -> Result<Skew, String> {
+    let token = noded::services::read_link_token(workspace)?;
     let body = crate::node_http::post_json(
         base,
         "/v1/services/hello",
         &serde_json::to_value(hello).unwrap(),
+        (noded::services::LINK_TOKEN_HEADER, &token),
     )
     .map_err(|error| error.to_string())?;
     Ok(Skew::between(
@@ -2066,7 +2077,7 @@ fn heartbeat(
     loop {
         std::thread::sleep(HEARTBEAT);
         watch.refresh(&mut hello);
-        match send_hello(base, &hello) {
+        match send_hello(base, &watch.service.workspace, &hello) {
             Ok(observed) => {
                 if failures > 0 {
                     tracing::info!(target: "ducktape::service", kind = %hello.kind, "signal restored");
@@ -3568,6 +3579,53 @@ mod tests {
             assert!(
                 !said.contains("none enabled") && !said.contains("nothing is signaling"),
                 "it must not assert what it failed to establish: {said}"
+            );
+        }
+    }
+
+    /// #2511, end to end through both read verbs: a workspace whose node is
+    /// not running is refused in the not-running sentence at a non-zero exit
+    /// (an `Err` out of the verb), never rendered as a healthy node with
+    /// nothing enabled at exit 0.
+    #[test]
+    fn a_stopped_node_is_refused_by_both_read_verbs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // bound only to learn a port, then closed: the connect is REFUSED.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind loopback")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let config = dir.path().join("node.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "id = 7\nlisten = \"127.0.0.1:0\"\nnamespace = \"demo\"\npeer_seeds = [7]\n\
+                 storage_dir = {:?}\nhttp_listen = \"127.0.0.1:{port}\"\n",
+                dir.path().display().to_string()
+            ),
+        )
+        .expect("write node.toml");
+        for (name, verb) in [("list", list as fn(_) -> _), ("status", status)] {
+            let args = ReadArgs {
+                kind: None,
+                workspace: WorkspaceArgs {
+                    config: Some(config.clone()),
+                    workspace: None,
+                    network: None,
+                },
+                json: false,
+            };
+            let refused = verb(args)
+                .expect_err("a node that did not answer is not an answer")
+                .to_string();
+            assert!(
+                refused.contains("the node is not running"),
+                "service {name}: {refused}"
+            );
+            assert!(
+                !refused.contains("none enabled"),
+                "service {name}: {refused}"
             );
         }
     }

@@ -157,7 +157,7 @@ impl Module for Fanout {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let (k, v) = parse_set(&msg.payload).ok_or(Error::Module("bad set".into()))?;
+        let (k, v) = parse_set(&msg.payload).ok_or(Error::module("bad_set", "bad set"))?;
         // stage our own write AND fan out the same write to the disk substrate,
         // so ONE block touches both modules.
         self.pending.push((k.clone(), v.clone()));
@@ -168,7 +168,8 @@ impl Module for Fanout {
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let key = String::from_utf8(req.to_vec()).map_err(|_| Error::Module("bad key".into()))?;
+        let key =
+            String::from_utf8(req.to_vec()).map_err(|_| Error::module("bad_key", "bad key"))?;
         Ok(self
             .committed
             .get(&key)
@@ -251,13 +252,14 @@ impl Module for Diskish {
     }
 
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let (k, v) = parse_set(&msg.payload).ok_or(Error::Module("bad set".into()))?;
+        let (k, v) = parse_set(&msg.payload).ok_or(Error::module("bad_set", "bad set"))?;
         self.pending.push((k, v)); // stage only — no durable write in execute.
         Ok(())
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let key = String::from_utf8(req.to_vec()).map_err(|_| Error::Module("bad key".into()))?;
+        let key =
+            String::from_utf8(req.to_vec()).map_err(|_| Error::module("bad_key", "bad key"))?;
         Ok(self
             .cell
             .borrow()
@@ -773,7 +775,7 @@ impl Module for FanoutTwo {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let (k, v) = parse_set(&msg.payload).ok_or(Error::Module("bad set".into()))?;
+        let (k, v) = parse_set(&msg.payload).ok_or(Error::module("bad_set", "bad set"))?;
         self.pending.push((k.clone(), v.clone()));
         ctx.emit_msg(set("diskA", &k, &v));
         ctx.emit_msg(set("diskB", &k, &v));
@@ -781,7 +783,8 @@ impl Module for FanoutTwo {
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let key = String::from_utf8(req.to_vec()).map_err(|_| Error::Module("bad key".into()))?;
+        let key =
+            String::from_utf8(req.to_vec()).map_err(|_| Error::module("bad_key", "bad key"))?;
         Ok(self
             .committed
             .get(&key)
@@ -983,13 +986,14 @@ impl Module for Containerish {
     }
 
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let (k, v) = parse_set(&msg.payload).ok_or(Error::Module("bad set".into()))?;
+        let (k, v) = parse_set(&msg.payload).ok_or(Error::module("bad_set", "bad set"))?;
         self.pending.push((k, v));
         Ok(())
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let key = String::from_utf8(req.to_vec()).map_err(|_| Error::Module("bad key".into()))?;
+        let key =
+            String::from_utf8(req.to_vec()).map_err(|_| Error::module("bad_key", "bad key"))?;
         Ok(self
             .cell
             .borrow()
@@ -1301,7 +1305,11 @@ fn a_module_admitted_after_the_checkpoint_recovers(kind: Admitted) {
         assert_eq!(node.drain_delivered().await.expect("drain"), 4);
         let tip = node.finalized().expect("boundary");
         let tip_hash = node.root_hash();
-        assert_eq!(cell_d.borrow().counter, 4, "the pre-existing store, per block");
+        assert_eq!(
+            cell_d.borrow().counter,
+            4,
+            "the pre-existing store, per block"
+        );
 
         // the crash: memory dies, both durable cells survive.
         drop(node);
@@ -1339,7 +1347,11 @@ fn a_module_admitted_after_the_checkpoint_recovers(kind: Admitted) {
             durable_newmod,
             "the admitted module's own block was never re-applied to it"
         );
-        assert_eq!(cell_d.borrow().counter, 4, "the pre-existing store, untouched");
+        assert_eq!(
+            cell_d.borrow().counter,
+            4,
+            "the pre-existing store, untouched"
+        );
         for key in [b"k1", b"k2", b"k3"] {
             assert_eq!(
                 host.query("newmod", key).await.expect("query"),
@@ -1473,7 +1485,11 @@ fn a_store_admitted_after_the_checkpoint_replays_when_its_own_commit_was_lost() 
             3,
             "each sealed block from the admission on replayed into it exactly once"
         );
-        assert_eq!(cell_d.borrow().counter, 4, "the pre-existing store, untouched");
+        assert_eq!(
+            cell_d.borrow().counter,
+            4,
+            "the pre-existing store, untouched"
+        );
         for key in [b"k1", b"k2", b"k3"] {
             assert_eq!(
                 host.query("newmod", key).await.expect("query"),

@@ -17,6 +17,7 @@ guest = ["dep:ducktape-module-sdk"]
 index-guest = ["index_guest/guest"]
 
 [dependencies]
+saga-wire = { workspace = true }
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
 ducktape-module-sdk = { workspace = true, optional = true }
@@ -37,6 +38,9 @@ async-trait = { workspace = true }
 index_guest = { workspace = true }
 
 [dev-dependencies]
+# `valset` is a shipping dep of this crate (its wire), so the native module the
+# host-callback suite composes enters under its own name.
+valset-module = { path = "../valset", package = "valset" }
 futures = { workspace = true }
 host = { workspace = true }
 sdk-testkit = { workspace = true }

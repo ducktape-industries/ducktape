@@ -4,6 +4,7 @@ use commonware_runtime::Runner as _;
 use host::{BlockContext, Host};
 use noded::bundle::{DirCodeSource, qmdb_stores};
 use noded::compose::{Bindings, Boot, Substrates, compose};
+use runs_wire as runs;
 use sdk::{Msg, Origin};
 use serde_json::{Value, json};
 
@@ -52,7 +53,7 @@ fn committed_guests_deliver_a_model_reply_to_chat() {
         let config = commonware_runtime::tokio::Config::default()
             .with_storage_directory(scratch.path().join("storage"));
         commonware_runtime::tokio::Runner::new(config).start(|context| async move {
-            let dir = workspace_config::modules_dir().unwrap();
+            let dir = workspace_config::modules_dir(noded::services::STAGED_SET).unwrap();
             let (code, bundle) = DirCodeSource::open(
                 &dir, &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
             ).unwrap();

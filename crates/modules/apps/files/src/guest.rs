@@ -125,7 +125,7 @@ pub async fn dispatch<S: ObjectStore>(
     let height = ctx.env().height;
     let index = match block_objects {
         None => BTreeMap::new(),
-        Some(bytes) => decode_block_objects(bytes).map_err(Error::Module)?,
+        Some(bytes) => decode_block_objects(bytes).map_err(|e| Error::module("codec", e))?,
     };
     fs.seed_block_objects(height, index);
     crate::adapter::apply_op(fs, ctx, payload).await?;
@@ -139,7 +139,9 @@ pub async fn dispatch<S: ObjectStore>(
     // boundary (`StateBacking::Odb::commit_block`).
     let store = fs.store_mut();
     for (kind, body) in &objects {
-        store.put(*kind, body).map_err(Error::Module)?;
+        store
+            .put(*kind, body)
+            .map_err(|e| Error::module("files_object_put", e))?;
     }
     Ok(Dispatched {
         refs_image: encode_refs(&refs),
@@ -155,7 +157,7 @@ pub async fn dispatch<S: ObjectStore>(
 mod entry {
     use super::{BLOCK_OBJECTS_KEY, REFS_KEY, dispatch};
     use duckfs_core::{Fs, Refs, decode_refs};
-    use ducktape_module_sdk::{GuestOdb, WitCtx, block_on, error_to_wit, host};
+    use ducktape_module_sdk::{GuestOdb, WitCtx, block_on, error_to_wit, host, rejected};
 
     /// the wasm-facing entry surface. all object I/O rides [`GuestOdb`]; the
     /// refs image rides the host `state-*` lane under [`REFS_KEY`]. a zero-sized
@@ -171,7 +173,7 @@ mod entry {
             let refs = match host::state_get(REFS_KEY) {
                 None => Refs::default(),
                 Some(bytes) => decode_refs(&bytes)
-                    .map_err(|e| host::Error::Rejected(format!("files: refs image decode: {e}")))?,
+                    .map_err(|e| rejected("files_refs_load", format!("files: refs load: {e}")))?,
             };
             Ok(Fs::new(GuestOdb, refs))
         }
@@ -198,8 +200,10 @@ mod entry {
 
         /// Project committed refs and objects through the same pure core as native.
         pub fn query(req: Vec<u8>) -> Result<Vec<u8>, host::Error> {
-            let query = duckfs_core::decode_query(&req).map_err(host::Error::Rejected)?;
-            let reply = Self::load()?.query(query).map_err(host::Error::Rejected)?;
+            let query = duckfs_core::decode_query(&req).map_err(|e| rejected("codec", e))?;
+            let reply = Self::load()?
+                .query(query)
+                .map_err(|e| rejected("files_query", e))?;
             Ok(duckfs_core::encode_reply(&reply))
         }
     }
@@ -603,7 +607,8 @@ mod tests {
             .dispatch(1, 1, &commit_chunks("/a", 12, &phantom))
             .expect_err("an unstaged chunk must reject");
         assert!(
-            matches!(&err, Error::Module(m) if m.contains("chunk not available")),
+            matches!(&err, Error::Module { reason, sentence }
+                if reason == "files_commit" && sentence.contains("chunk not available")),
             "expected the availability reject, got {err:?}"
         );
     }
@@ -674,7 +679,8 @@ mod tests {
             .dispatch(2, 2, &commit_chunks("/b", content.len() as u64, &chunk_hex))
             .expect_err("a prior-block inline chunk is not referenceable by hash");
         assert!(
-            matches!(&err, Error::Module(m) if m.contains("chunk not available")),
+            matches!(&err, Error::Module { reason, sentence }
+                if reason == "files_commit" && sentence.contains("chunk not available")),
             "expected the availability reject across the block boundary, got {err:?}"
         );
     }

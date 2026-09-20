@@ -146,7 +146,7 @@ dependencies = [
 [[package]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "cc",
  "glob",
@@ -185,15 +185,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
-name = "capability"
+name = "capability-wire"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
- "async-trait",
- "borsh",
  "sdk",
  "serde",
- "valset",
 ]
 
 [[package]]
@@ -681,13 +678,14 @@ dependencies = [
 [[package]]
 name = "dispatch"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape#56cf140a59a13369924bdbecb536e25146a0aff9"
 dependencies = [
  "async-trait",
  "borsh",
- "capability",
+ "capability-wire",
+ "dispatch-wire",
  "ducktape-module-sdk",
- "identity",
+ "identity-wire",
  "saga",
  "sdk",
  "serde",
@@ -703,9 +701,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dispatch-wire"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+dependencies = [
+ "borsh",
+ "saga-wire",
+ "sdk",
+ "serde",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "ducktape-module-sdk"
 version = "0.0.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "async-trait",
  "sdk",
@@ -981,17 +991,17 @@ dependencies = [
 [[package]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 
 [[package]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 
 [[package]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "rand_core 0.10.1",
 ]
@@ -1087,23 +1097,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
-name = "identity"
+name = "identity-wire"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
- "async-trait",
  "borsh",
- "commonware-cryptography",
  "keyscheme",
  "sdk",
  "serde",
- "serde_json",
 ]
 
 [[package]]
 name = "index-guest"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "borsh",
  "serde",
@@ -1172,7 +1179,7 @@ dependencies = [
 [[package]]
 name = "keyscheme"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "base64",
  "borsh",
@@ -1613,6 +1620,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "refusal-class"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+
+[[package]]
 name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1650,17 +1662,28 @@ dependencies = [
 [[package]]
 name = "saga"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape#56cf140a59a13369924bdbecb536e25146a0aff9"
 dependencies = [
  "async-trait",
  "borsh",
- "capability",
+ "capability-wire",
  "index-guest",
+ "saga-wire",
  "sdk",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "valset",
+ "valset-wire",
+]
+
+[[package]]
+name = "saga-wire"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+dependencies = [
+ "borsh",
+ "sdk",
+ "serde",
 ]
 
 [[package]]
@@ -1672,10 +1695,11 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "async-trait",
  "borsh",
+ "refusal-class",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2074,17 +2098,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
 
 [[package]]
-name = "valset"
+name = "valset-wire"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#889f58365dc479b0858bdb79e04a966673f76ab5"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
- "async-trait",
- "borsh",
- "commonware-codec",
- "commonware-cryptography",
  "sdk",
  "serde",
- "serde_json",
 ]
 
 [[package]]

@@ -351,7 +351,78 @@ impl Msg {
     }
 }
 
-use crate::auth::{Authenticator, CoordCap};
+use crate::auth::{Authenticator, CoordCap, MAX_CAP_CHAIN};
+
+/// One cap-chain link on the wire: issuer, not_after, issuer_sig.
+const CAP_LINK_LEN: usize = 32 + 8 + 64;
+/// An optional cap chain on the wire: a link count (0 = no cap), then each
+/// link, the one naming the subject first and the root last.
+pub(crate) const MAX_CAP_LEN: usize = 1 + MAX_CAP_CHAIN * CAP_LINK_LEN;
+
+/// Write an optional cap chain. A chain deeper than [`MAX_CAP_CHAIN`] — one
+/// neither `delegate_coord_cap` nor the decoder produces — is written cut to
+/// its first links, a chain admission judges like any other.
+pub(crate) fn put_cap<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, cap: Option<&CoordCap>) {
+    let links = || {
+        cap.into_iter()
+            .flat_map(CoordCap::links)
+            .take(MAX_CAP_CHAIN)
+    };
+    out.push(links().count() as u8);
+    for link in links() {
+        put(out, link.issuer.as_ref());
+        put_u64(out, link.not_after);
+        put(out, link.issuer_sig.as_ref());
+    }
+}
+
+impl Reader<'_> {
+    /// Read an optional cap chain, refusing one deeper than
+    /// [`MAX_CAP_CHAIN`] before reading any link.
+    pub(crate) fn cap(&mut self) -> Result<Option<CoordCap>, WireError> {
+        let count = usize::from(self.take(1)?[0]);
+        if count > MAX_CAP_CHAIN {
+            return Err(WireError::BadCrypto);
+        }
+        let mut links = ArrayVec::<_, MAX_CAP_CHAIN>::new();
+        for _ in 0..count {
+            links.push((self.pubkey()?, self.u64()?, self.sig()?));
+        }
+        // assembled from the root down, so no step recurses on what the peer sent.
+        let cap = links
+            .into_iter()
+            .rev()
+            .fold(None, |parent, (issuer, not_after, issuer_sig)| {
+                Some(CoordCap {
+                    issuer,
+                    not_after,
+                    issuer_sig,
+                    parent: parent.map(Box::new),
+                })
+            });
+        Ok(cap)
+    }
+}
+
+impl CoordCap {
+    /// This chain as bytes: the link count, then each link.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = ArrayVec::<u8, MAX_CAP_LEN>::new();
+        put_cap(&mut out, Some(self));
+        out.to_vec()
+    }
+
+    /// Whole-buffer inverse of [`CoordCap::encode`]: an empty chain, one
+    /// deeper than [`MAX_CAP_CHAIN`], or trailing bytes is refused.
+    pub fn decode(buf: &[u8]) -> Result<CoordCap, WireError> {
+        let mut r = Reader::new(buf);
+        let cap = r.cap()?.ok_or(WireError::BadCrypto)?;
+        if r.pos != buf.len() {
+            return Err(WireError::Trailing);
+        }
+        Ok(cap)
+    }
+}
 
 /// An authenticated wrapper around one request `Msg`, carrying the per-request
 /// authenticator. Wire tag `TAG_AUTH_REQUEST`. Only the four request shapes are wrappable.
@@ -374,7 +445,7 @@ impl AuthRequest {
     /// `Msg`. Valid request inners are smaller; the broader bound also covers
     /// malformed response inners so they can still be encoded for rejection
     /// tests without an allocation fallback.
-    pub const MAX_ENCODED_LEN: usize = 1 + 32 + Msg::MAX_ENCODED_LEN + 8 + 64 + 1 + 32 + 8 + 64;
+    pub const MAX_ENCODED_LEN: usize = 1 + 32 + Msg::MAX_ENCODED_LEN + 8 + 64 + MAX_CAP_LEN;
 
     /// Encode into a stack-backed, fixed-capacity vector.
     pub fn encode_inline(&self) -> ArrayVec<u8, { Self::MAX_ENCODED_LEN }> {
@@ -384,15 +455,7 @@ impl AuthRequest {
         self.inner.write(&mut out);
         put_u64(&mut out, self.auth.timestamp);
         put(&mut out, self.auth.pop_sig.as_ref());
-        match &self.auth.cap {
-            None => out.push(0),
-            Some(cap) => {
-                out.push(1);
-                put(&mut out, cap.issuer.as_ref());
-                put_u64(&mut out, cap.not_after);
-                put(&mut out, cap.issuer_sig.as_ref());
-            }
-        }
+        put_cap(&mut out, self.auth.cap.as_ref());
         out
     }
 
@@ -413,15 +476,7 @@ impl AuthRequest {
         }
         let timestamp = r.u64()?;
         let pop_sig = r.sig()?;
-        let cap = match r.take(1)?[0] {
-            0 => None,
-            1 => Some(CoordCap {
-                issuer: r.pubkey()?,
-                not_after: r.u64()?,
-                issuer_sig: r.sig()?,
-            }),
-            _ => return Err(WireError::BadCrypto),
-        };
+        let cap = r.cap()?;
         if r.pos != buf.len() {
             return Err(WireError::Trailing);
         }
@@ -581,8 +636,12 @@ mod tests {
             },
         ];
         for inner in inners {
-            // With and without a cap.
-            for cap in [None, Some(mint_coord_cap(&g, subject, 9_999_999))] {
+            // Without a cap, with a root cap, and with the deepest chain.
+            let root = mint_coord_cap(&g, subject, 9_999_999);
+            let deepest = (1..MAX_CAP_CHAIN).fold(root.clone(), |parent, _| {
+                crate::auth::delegate_coord_cap(&parent, &g, subject, 9_999_999).unwrap()
+            });
+            for cap in [None, Some(root), Some(deepest)] {
                 let auth = sign_authenticator(&node, &inner.encode(), 1234, cap);
                 // caller is the authenticating identity — for a cross-peer
                 // Lookup it deliberately differs from the inner key.

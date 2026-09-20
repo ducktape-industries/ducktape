@@ -100,12 +100,17 @@ The coordinator is keyless in every mode:
 - **Default public mode** — no auth flag. Requests must carry proof of
   possession for the node key they claim.
 - **Private mode** — `--genesis-set <network.toml>`. The coordinator reads only
-  the public `validators = [...]` keys from that descriptor and admits genesis
-  validators or holder-presented caps rooted in that set.
+  the public `validators = [...]` keys from that descriptor and dials no node.
+  It admits a genesis validator, and a node presenting an unexpired cap chain
+  a genesis validator roots: a genesis validator seating a joiner signs it a
+  cap, and any other validator seating one signs a cap that carries its own
+  cap, so the coordinator walks the chain — at most four links, every link
+  unexpired and signed by the key the next link admits — until it reaches a
+  genesis key.
 
 Malformed `--listen`, `--relay-listen`, `--workers`, `--metrics-interval`, and
-malformed/value-less `--genesis-set` are hard errors, not silent fallbacks to a
-weaker policy.
+a malformed/value-less `--genesis-set` are hard errors, not silent fallbacks to
+a weaker policy.
 
 ## Authentication workers
 
@@ -214,7 +219,7 @@ sudo cp ops/coordinator/ducktape-coordinator.service /etc/systemd/system/
 
 # Optional: edit /etc/ducktape/coordinator.env to choose a bind address and auth
 # mode. The supplied file binds the TCP relay lane on 0.0.0.0:443, selects four
-# auth workers and public proof-of-possession. For private mode use:
+# auth workers and public proof-of-possession. For private mode, use:
 # COORDINATOR_ARGS=--relay-listen 0.0.0.0:443 --workers 4 --metrics-interval 10 --genesis-set /etc/ducktape/network.toml
 
 # 4. Start it.

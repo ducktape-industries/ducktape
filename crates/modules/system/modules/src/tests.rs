@@ -192,7 +192,7 @@ fn a_non_governance_module_authors_nothing() {
     ];
     for m in &refused {
         assert!(
-            matches!(run(&mut lc, &mut chat, m), Err(Error::Module(_))),
+            matches!(run(&mut lc, &mut chat, m), Err(Error::Module { ref reason, .. }) if reason == "not_governance"),
             "a chat-module origin authored {m:?}"
         );
     }
@@ -226,7 +226,7 @@ fn register_and_schedule_origin_gate() {
                 lanes: Vec::new()
             })
         ),
-        Err(Error::Module(_))
+        Err(Error::Module { ref reason, .. }) if reason == "not_governance"
     ));
     let mut gov = ctx(Origin::Module("governance".into()), 0);
     run(
@@ -248,7 +248,7 @@ fn register_and_schedule_origin_gate() {
             &mut ext,
             &schedule_swap("hello", "replacement", 10, 2)
         ),
-        Err(Error::Module(_))
+        Err(Error::Module { ref reason, .. }) if reason == "not_governance"
     ));
     run(
         &mut lc,
@@ -267,7 +267,7 @@ fn advance_is_system_only() {
     let mut gov = ctx(Origin::Module("governance".into()), 10);
     assert!(matches!(
         run(&mut lc, &mut gov, &advance()),
-        Err(Error::Module(_))
+        Err(Error::Module { ref reason, .. }) if reason == "not_system"
     ));
 }
 
@@ -1167,9 +1167,14 @@ fn a_second_module_cannot_take_a_declared_lane_id() {
     register_with_lanes(&mut lc, "chat", vec![lane(2)]).unwrap();
     commit(&mut lc);
     let err = register_with_lanes(&mut lc, "agent", vec![lane(2)]).unwrap_err();
-    let Error::Module(text) = err else {
+    let Error::Module {
+        reason,
+        sentence: text,
+    } = err
+    else {
         panic!("expected a module error")
     };
+    assert_eq!(reason, "lane_id_taken");
     assert!(
         text.contains("already declared by module chat"),
         "the refusal must name the OWNER, or an operator cannot tell who took it: {text}"
@@ -1189,9 +1194,14 @@ fn one_module_cannot_declare_two_lanes_of_one_name() {
         vec![named_lane(2, "voice"), named_lane(3, "voice")],
     )
     .unwrap_err();
-    let Error::Module(text) = err else {
+    let Error::Module {
+        reason,
+        sentence: text,
+    } = err
+    else {
         panic!("expected a module error")
     };
+    assert_eq!(reason, "lane_name_taken");
     assert!(text.contains("already declares a lane named"), "{text}");
     commit(&mut lc);
     assert!(lanes_of(&lc).is_empty(), "the refused op left nothing");
@@ -1213,9 +1223,14 @@ fn a_malformed_lane_name_is_refused() {
     let too_long = "a".repeat(MAX_LANE_NAME_BYTES + 1);
     for bad in ["", "Voice", "voice-lane", "voice lane", "보이스", &too_long] {
         let err = register_with_lanes(&mut lc, "chat", vec![named_lane(2, bad)]).unwrap_err();
-        let Error::Module(text) = err else {
+        let Error::Module {
+            reason,
+            sentence: text,
+        } = err
+        else {
             panic!("expected a module error")
         };
+        assert_eq!(reason, "bad_lane_name");
         assert!(text.contains("malformed"), "name {bad:?}: {text}");
     }
     // the longest legal name still lands
@@ -1230,9 +1245,14 @@ fn a_kernel_lane_id_is_never_declarable() {
     let mut lc = fresh();
     for id in RESERVED_LANE_IDS {
         let err = register_with_lanes(&mut lc, "squatter", vec![lane(*id)]).unwrap_err();
-        let Error::Module(text) = err else {
+        let Error::Module {
+            reason,
+            sentence: text,
+        } = err
+        else {
             panic!("expected a module error")
         };
+        assert_eq!(reason, "reserved_lane_id");
         assert!(text.contains("kernel lane"), "id {id}: {text}");
     }
 }
@@ -1247,9 +1267,14 @@ fn a_lane_id_above_the_cap_is_refused_because_the_port_ranges_would_overlap() {
     let mut lc = fresh();
     for bad in [0u8, MAX_LANE_ID + 1, 255] {
         let err = register_with_lanes(&mut lc, "squatter", vec![lane(bad)]).unwrap_err();
-        let Error::Module(text) = err else {
+        let Error::Module {
+            reason,
+            sentence: text,
+        } = err
+        else {
             panic!("expected a module error")
         };
+        assert_eq!(reason, "bad_lane_id");
         assert!(text.contains("out of range"), "id {bad}: {text}");
     }
     // the last good id still lands

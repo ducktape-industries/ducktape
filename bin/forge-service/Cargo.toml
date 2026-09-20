@@ -11,7 +11,9 @@ commonware-codec.workspace = true
 commonware-cryptography.workspace = true
 ducktape-rpc.workspace = true
 flate2 = "1"
-forge.workspace = true
+# the module crate, not its wire: the service IS forge's git substrate
+# (pushcert, refs, packing) and forge is core-resident.
+forge = { path = "../../crates/modules/apps/forge" }
 # a push's body is read frame by frame onto disk rather than collected.
 futures.workspace = true
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
@@ -30,6 +32,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+# a slow pack build is a held builder on the paused clock.
+tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
-forge-view = { path = "../../crates/views/forge" }
-ducktape-view-guest = { path = "../../crates/views/support/guest" }

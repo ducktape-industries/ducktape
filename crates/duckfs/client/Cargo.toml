@@ -11,6 +11,8 @@ version.workspace = true
 # id is byte-identical to what a validator derives.
 [dependencies]
 duckfs-core = { workspace = true }
+# the class an unframed refusal is filed under, the word the node uses.
+refusal-class = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }

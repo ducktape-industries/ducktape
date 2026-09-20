@@ -1,4 +1,5 @@
-//! Signed people -> native Chat/Runs/Agent -> independent Jobs and protected Pages.
+//! Signed people -> the committed Chat/Runs/Agent guests -> independent Jobs and
+//! protected Pages.
 //! The shipping initializer and Agent program execute on the real Host queue.
 //! Model decisions and native history bytes are deterministic fixtures: this
 //! does not execute Chief's TypeScript package, Pi, a VM, or a network transport.
@@ -12,9 +13,13 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
 use host::{BlockContext, Host};
+use noded::testkit::committed_module;
 use sdk::{Msg, Origin};
 use sha2::{Digest as _, Sha256};
 
+/// this composition's identity chain id — and the value the `runs` guest reads
+/// out of its genesis `__config` record.
+const CHAIN_ID: &str = "chief-test";
 const CHIEF: u64 = 4;
 const WORKER: u64 = 3;
 const JOB: &str = "chief-independent-job";
@@ -90,63 +95,43 @@ struct Network {
     height: u64,
     trace: Vec<host::DispatchRecord>,
 }
+/// how one composition comes up. Block zero seeds the validator set; a restart
+/// finds it — and every other module's committed state — in the store it
+/// reopens, so it seeds nothing.
+enum Boot {
+    Genesis,
+    Restart,
+}
+
 impl Network {
-    async fn compose(
-        stores: &mut Stores,
-        directory: &std::path::Path,
-        snapshot: Option<(&[u8], sdk::StateRoot)>,
-    ) -> Host {
+    /// agent, chat, pages, tasks and runs are the COMMITTED guests this repo
+    /// ships (`crates/modules/apps/<id>/component.wasm`): their source lives in
+    /// ducktape-modules, and the sibling wiring a native constructor used to
+    /// take as arguments is compiled into each guest. The system modules and
+    /// files are core-resident and still native.
+    async fn compose(stores: &mut Stores, directory: &std::path::Path, boot: Boot) -> Host {
         let mut validators = valset::Valset::new("valset", store(stores, "valset"), "governance");
-        if snapshot.is_none() {
-            validators.seed(key(8)).await.unwrap();
-            validators.seed(key(7)).await.unwrap();
-            validators.finish_seed().await.unwrap();
-        }
-        let mut runs = runs::RunsModule::new(
-            "runs",
-            "chat",
-            "saga",
-            "attribution",
-            "dispatch",
-            "agent",
-            Some("tasks".into()),
-            Some("tasks".into()),
-        )
-        .with_pages_module("pages")
-        .with_files_module("files");
-        if let Some((bytes, root)) = snapshot {
-            runs.install(bytes, root).unwrap();
+        match boot {
+            Boot::Genesis => {
+                validators.seed(key(8)).await.unwrap();
+                validators.seed(key(7)).await.unwrap();
+                validators.finish_seed().await.unwrap();
+            }
+            Boot::Restart => {}
         }
         Host::genesis(vec![
             Box::new(identity::Identity::new(
                 "identity",
                 store(stores, "identity"),
-                "chief-test".into(),
+                CHAIN_ID.into(),
             )),
             Box::new(
                 attribution::AttributionModule::new("attribution", store(stores, "attribution"))
                     .with_subscribers(["agent"]),
             ),
-            Box::new(agent::AgentModule::new(
-                "agent",
-                store(stores, "agent"),
-                agent::Siblings {
-                    identity: "identity".into(),
-                    attribution: "attribution".into(),
-                    dispatch: "dispatch".into(),
-                },
-            )),
-            Box::new(
-                chat::Chat::new("chat", store(stores, "chat"))
-                    .with_identity("identity")
-                    .with_attribution("attribution"),
-            ),
-            Box::new(
-                pages::Pages::new("pages", store(stores, "pages"))
-                    .with_identity("identity")
-                    .with_attribution("attribution")
-                    .with_files("files"),
-            ),
+            Box::new(committed_module("agent", store(stores, "agent"), CHAIN_ID).await),
+            Box::new(committed_module("chat", store(stores, "chat"), CHAIN_ID).await),
+            Box::new(committed_module("pages", store(stores, "pages"), CHAIN_ID).await),
             Box::new(validators),
             Box::new(capability::CapabilityRegistry::new(
                 "capability",
@@ -166,21 +151,16 @@ impl Network {
                 "identity",
                 store(stores, "dispatch"),
             )),
-            Box::new(tasks::Tasks::new(
-                "tasks",
-                "identity",
-                "attribution",
-                store(stores, "tasks"),
-            )),
+            Box::new(committed_module("tasks", store(stores, "tasks"), CHAIN_ID).await),
             Box::new(files::Files::open("files", directory.to_path_buf()).unwrap()),
-            Box::new(runs),
+            Box::new(committed_module("runs", store(stores, "runs"), CHAIN_ID).await),
         ])
         .unwrap()
     }
     async fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let mut stores = Stores::new();
-        let host = Self::compose(&mut stores, directory.path(), None).await;
+        let host = Self::compose(&mut stores, directory.path(), Boot::Genesis).await;
         Self {
             host,
             stores,
@@ -242,10 +222,6 @@ impl Network {
                 .capture_current_snapshot(self.height, host::CapturePayloads::All, || {
                     std::time::Duration::ZERO
                 });
-        let runs = snapshot.module("runs").unwrap();
-        let sdk::StateSyncHandle::SnapshotBytes(bytes) = &runs.state_sync else {
-            panic!("Runs snapshot bytes")
-        };
         let mut stores = self
             .stores
             .iter()
@@ -258,13 +234,12 @@ impl Network {
             .collect();
         let pending = self.host.has_pending_work().await.unwrap();
         drop(self.host);
-        let mut host =
-            Self::compose(&mut stores, self.directory.path(), Some((bytes, runs.root))).await;
+        let mut host = Self::compose(&mut stores, self.directory.path(), Boot::Restart).await;
         host.restore_committed(self.height, self.height);
         assert_eq!(
             host.root_hash(),
             snapshot.root_hash,
-            "every native module recovered its committed state"
+            "every module recovered its committed state"
         );
         assert_eq!(host.has_pending_work().await.unwrap(), pending);
         Self {

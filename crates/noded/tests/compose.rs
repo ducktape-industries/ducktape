@@ -20,6 +20,16 @@ fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../kernel/host/tests/fixtures")
 }
 
+/// the object-storage tenant fixture, committed here rather than read out of
+/// the kernel fixture set: `declared_shapes` pins that directory to the set the
+/// host composes, and this guest is a test tenant no network founds.
+fn object_component() -> Vec<u8> {
+    std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/object.component.wasm"),
+    )
+    .unwrap()
+}
+
 /// one `SnapshotSource` call's future.
 type SnapshotFut<'a> = BoxFut<'a, Result<Option<(Vec<u8>, StateRoot)>, String>>;
 
@@ -289,6 +299,46 @@ fn genesis_refuses_unsafe_ids() {
     });
 }
 
+/// a guest built against a `ducktape:module/host` world this build has moved
+/// past: the real forge component from before the host widened
+/// `git-object-read`'s commit record from two fields to five. The fault is in
+/// the fixture's own bytes — nothing here plants one.
+fn stale_host_wit() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stale-host-wit")
+}
+
+/// [`compose::load`] IS the linker gate, and it is the WHOLE of what a lock-free
+/// preflight can ask a binary: no store, no substrate, no byte of state — just
+/// whether the components a network runs still link. So a component whose
+/// imports this build's world no longer satisfies must be refused HERE, in the
+/// sentence a boot would print, or `release schedule`'s preflight has nothing
+/// to read and every launcher pays a node stop to learn the same answer.
+#[test]
+fn a_component_built_against_another_host_world_does_not_load() {
+    let stale = workspace_config::read_module_artifact(&stale_host_wit(), "forge")
+        .unwrap()
+        .encode();
+    let Err(refusal) = noded::compose::load("forge", &stale) else {
+        panic!("a component built against another host world must not load");
+    };
+    assert!(
+        refusal.starts_with("forge component loads: "),
+        "the compose sentence, verbatim: {refusal}"
+    );
+    assert!(
+        refusal.contains("a matching implementation was not found in the linker"),
+        "{refusal}"
+    );
+    assert!(refusal.contains("git-object-read"), "{refusal}");
+
+    // and the set this build DOES run links, so the gate is a gate and not a
+    // wall.
+    let current = workspace_config::read_module_artifact(&fixtures(), "forge")
+        .unwrap()
+        .encode();
+    assert!(noded::compose::load("forge", &current).is_ok());
+}
+
 /// a code source that answers EVERY hash with one fixed component's bytes.
 /// a `DirCodeSource` keys itself by what it hashed, so it cannot lie by
 /// construction — the composer's re-hash needs a source that can.
@@ -381,11 +431,7 @@ fn admissions_build_through_the_one_wasm_path() {
     run(|context, dir| {
         Box::pin(async move {
             let hello = std::fs::read(fixtures().join("hello.component.wasm")).unwrap();
-            let object = std::fs::read(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../kernel/wasm-host/tests/fixtures/object.component.wasm"),
-            )
-            .unwrap();
+            let object = object_component();
             let substrates = substrates(&dir);
             let admissions = Admissions::new(&context, &substrates, &BINDINGS);
             let admitted = host::ModuleFactory::instantiate(
@@ -447,6 +493,38 @@ fn admissions_build_through_the_one_wasm_path() {
     });
 }
 
+/// the question a validator answers before it signals an admission ready: the
+/// admission itself, run to the end over scratch state. Every module the
+/// kernel fixture set carries starts there, whatever backing it declares — a
+/// refusal here would keep a sound module from ever activating — and a guest
+/// that cannot start is refused in the admission's own words.
+#[test]
+fn an_admission_check_starts_the_module_over_scratch_state() {
+    run(|context, dir| {
+        Box::pin(async move {
+            let admissions = Admissions::new(&context, &substrates(&dir), &BINDINGS);
+            for entry in std::fs::read_dir(fixtures()).unwrap() {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_str().unwrap();
+                let id = name.strip_suffix(".component.wasm").unwrap();
+                let bytes = module_artifact::Artifact::module(std::fs::read(&path).unwrap());
+                host::ModuleFactory::check(&admissions, id, &bytes.encode())
+                    .unwrap_or_else(|refusal| panic!("{id} starts: {refusal}"));
+            }
+
+            let stale = workspace_config::read_module_artifact(&stale_host_wit(), "forge")
+                .unwrap()
+                .encode();
+            let refusal = host::ModuleFactory::check(&admissions, "forge", &stale)
+                .expect_err("a guest that cannot start is not ready");
+            assert!(
+                refusal.to_string().contains("forge component loads"),
+                "the admission's own words: {refusal}"
+            );
+        })
+    });
+}
+
 /// an ODB-BACKED tenant reads its network's chain id through the same
 /// `sdk::genesis_config` seam a Map/Store tenant does — the kernel half of
 /// #1773: `compose::wasm_module` used to skip the `Backing::Odb` arm
@@ -456,11 +534,7 @@ fn admissions_build_through_the_one_wasm_path() {
 fn an_odb_backed_module_reads_its_chain_id_from_genesis_config() {
     run(|context, dir| {
         Box::pin(async move {
-            let object = std::fs::read(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../kernel/wasm-host/tests/fixtures/object.component.wasm"),
-            )
-            .unwrap();
+            let object = object_component();
             let substrates = substrates(&dir);
             let mut stores = qmdb_stores(&context);
             let bindings = Bindings {

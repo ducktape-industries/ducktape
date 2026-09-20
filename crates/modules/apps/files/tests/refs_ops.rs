@@ -139,11 +139,17 @@ fn ext(who: &[u8]) -> sdk::Origin {
 
 fn assert_module_err(err: &sdk::Error, needle: &str) {
     match err {
-        sdk::Error::Module(m) => assert!(
-            m.contains(needle),
-            "expected error to contain {needle:?}, got {m:?}"
-        ),
-        other => panic!("expected Error::Module({needle:?}), got {other:?}"),
+        sdk::Error::Module { reason, sentence } => {
+            assert!(
+                reason.starts_with("files_"),
+                "expected a files step token, got {reason:?}"
+            );
+            assert!(
+                sentence.contains(needle),
+                "expected error to contain {needle:?}, got {sentence:?}"
+            );
+        }
+        other => panic!("expected a module refusal carrying {needle:?}, got {other:?}"),
     }
 }
 
@@ -310,7 +316,7 @@ fn pin_quota_follows_the_account_share_and_exact_key_admission() {
     let before = core.pending_refs().clone();
     assert_eq!(
         core.pin(&admitted, 2, head.clone(), "over-quota".into()),
-        Err("files: pin quota exceeded".into())
+        Err("pin quota exceeded".into())
     );
     assert_eq!(core.pending_refs(), &before);
 
@@ -322,7 +328,7 @@ fn pin_quota_follows_the_account_share_and_exact_key_admission() {
     let before = core.pending_refs().clone();
     assert_eq!(
         core.pin(&sibling, 2, head.clone(), "account-over-quota".into()),
-        Err("files: pin quota exceeded".into())
+        Err("pin quota exceeded".into())
     );
     assert_eq!(core.pending_refs(), &before);
     core.unpin(&sibling, 2, "before-admission".into()).unwrap();
@@ -337,7 +343,7 @@ fn pin_quota_follows_the_account_share_and_exact_key_admission() {
     let before = core.pending_refs().clone();
     assert_eq!(
         core.pin(&program, 2, head.clone(), "program-over-quota".into()),
-        Err("files: pin quota exceeded".into())
+        Err("pin quota exceeded".into())
     );
     assert_eq!(core.pending_refs(), &before);
     core.unpin(&program, 2, "program-0".into()).unwrap();

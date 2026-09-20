@@ -25,9 +25,10 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::SystemTime;
 
 use commonware_cryptography::ed25519;
-use commonware_p2p::{Recipients, Sender as P2pSender};
+use commonware_p2p::Sender as P2pSender;
 use commonware_runtime::IoBuf;
 use statesync::{SyncClient, SyncError, SyncRequest, SyncResponse};
 
@@ -218,9 +219,7 @@ pub(crate) const PACK_BUILD_LOST: &str = "forge_pack_build_lost";
 /// in the budget is refused by the clock, which calibrates itself to the box;
 /// a byte ceiling would have to be guessed, and guessed low it makes a large
 /// repo permanently unsyncable rather than slow.
-const PACK_BUDGET: std::time::Duration = std::time::Duration::from_secs(
-    statesync::p2p::RETRY_WINDOWS[0].as_secs() + statesync::p2p::RETRY_WINDOWS[1].as_secs(),
-);
+const PACK_BUDGET: std::time::Duration = statesync::p2p::WINDOWS_BEFORE_LAST_ATTEMPT;
 
 /// answer a peer's [`SyncRequest::ForgeObjects`]: build the pack that carries
 /// `head`'s objects (bounded by the `bases` the peer already holds), stage it,
@@ -235,6 +234,9 @@ const PACK_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// `None` is an honest miss — this node does not hold the head either. it
 /// never packs a walk it has not itself committed to (see
 /// [`forge::build_objects`]), so the lane cannot be turned into an amplifier.
+///
+/// `seat` is the requesting peer's: a build this ask starts holds it until the
+/// build settles, past the answer that started it.
 pub async fn serve_forge_objects(
     forge_repo: &std::path::Path,
     blobs: &blobstore::BlobHandle,
@@ -242,6 +244,7 @@ pub async fn serve_forge_objects(
     repo: &str,
     head: [u8; statesync::FORGE_OID_LEN],
     bases: &[[u8; statesync::FORGE_OID_LEN]],
+    seat: Arc<crate::code_plane::PeerSeat<ed25519::PublicKey>>,
 ) -> SyncResponse {
     let miss = SyncResponse::ForgeObjects { digest: None };
     let (Ok(name), Ok(oid)) = (forge::norm_repo(repo), forge::Oid::from_bytes(&head)) else {
@@ -266,8 +269,10 @@ pub async fn serve_forge_objects(
     };
     let ask: PackAsk = (name, head, known);
     let building = ask.clone();
-    let outcome = one_pack_per_ask(ask, PACK_BUDGET, move || {
-        build_and_stage(staging, building, oid)
+    let build_seat = Arc::clone(&seat);
+    let outcome = one_pack_per_ask(ask, PACK_BUDGET, move || async move {
+        let _seat = build_seat;
+        build_and_stage(staging, building, oid).await
     })
     .await;
 
@@ -718,12 +723,18 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> ServeLaneBlobClient<S> {
             },
         );
         let frame = statesync::encode_rpc(&requester, &proof, id, &statesync::encode_request(&req));
-        let attempted = sender.send(Recipients::One(peer), IoBuf::from(frame), false);
-        if attempted.is_empty() {
+        // the limiter's "admits at" is on the commonware tokio runtime's
+        // clock, which is the wall clock.
+        let sent = statesync::p2p::send_within_quota(&mut sender, peer, IoBuf::from(frame), |at| {
+            tokio::time::sleep(at.duration_since(SystemTime::now()).unwrap_or_default())
+        })
+        .await;
+        if let Err(refused) = sent {
             pending.lock().expect("pending blob lock").remove(&id);
-            return Err(SyncError::Transport(
-                "blob source unreachable (send attempted no recipients)".into(),
-            ));
+            return Err(SyncError::Transport(format!(
+                "the local mesh refused the blob request ({})",
+                refused.reason()
+            )));
         }
         match tokio::time::timeout(COCLIENT_TIMEOUT, rx).await {
             Ok(Ok(resp)) => Ok(resp),
@@ -889,7 +900,7 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
                 target: "ducktape::forge",
                 node = %label,
                 repo = %pending.repo,
-                branch = %pending.branch,
+                refname = %pending.refname,
                 "pulled a forge pack this node was missing"
             );
             continue;
@@ -903,7 +914,7 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
                     target: "ducktape::forge",
                     node = %label,
                     repo = %pending.repo,
-                    branch = %pending.branch,
+                    refname = %pending.refname,
                     head = %pending.head,
                     "a peer rebuilt the objects for a head whose pack is gone"
                 );
@@ -916,7 +927,7 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
                     node = %label,
                     reason = "objects_fetch_failed",
                     repo = %pending.repo,
-                    branch = %pending.branch,
+                    refname = %pending.refname,
                     error = %e,
                     "neither the pushed pack nor a rebuilt one arrived"
                 );
@@ -1388,6 +1399,7 @@ mod tests {
                     prev_oid: None,
                     new_oid: Some(vec![7u8; 20]),
                 }],
+                tags: Vec::new(),
                 pack_digest: Some(digest.to_vec()),
                 cert: None,
             }),

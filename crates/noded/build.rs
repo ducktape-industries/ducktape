@@ -23,16 +23,17 @@
 //! that run no network compose directly from). `cargo build` is what puts
 //! that set where a freshly built binary looks — beside the binary, under the
 //! name THIS checkout owns (`target/<profile>/modules%<checkout path>`, see
-//! `staged_key.rs`; `workspace_config::modules_dir` resolves it) — so a built
-//! node is complete without an install step, and a second checkout sharing
-//! the target speaks only for its own set. The set is the checkout's committed
-//! artifacts (`make wasm-modules` refreshes them): one component per wasm
-//! module the topology names, plus one index guest per module whose crate
-//! declares one by carrying `src/index_guest.rs`. A declared artifact the
-//! checkout lacks fails the build here, naming the path, instead of `node
-//! init` later. Desktop view declarations instead leave a pending marker when
-//! output is missing: compilation succeeds and deployment preparation refuses
-//! the incomplete set until `make views` and restaging complete.
+//! `staged_key.rs`), a name this same run bakes into noded as
+//! `DUCKTAPE_STAGED_SET` (`noded::services::STAGED_SET`, which
+//! `workspace_config::modules_dir` resolves beside the executable) — so a
+//! built node is complete without an install step, and a second checkout
+//! sharing the target speaks only for its own set. The set is the checkout's committed
+//! artifacts (`make wasm-modules`, `make modules-sync` and `make views-sync`
+//! refresh them): one component per wasm module the topology names, plus one
+//! index guest per module that declares one by carrying a committed
+//! `index.wasm`, plus one view per founding id that declares one by carrying
+//! a committed `crates/views/<id>/view.wasm`. A declared artifact the checkout
+//! lacks fails the build here, naming the path, instead of `node init` later.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -79,7 +80,12 @@ fn stage_founding_set() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let checkout = staged_key::checkout_of_crate(&manifest);
     let modules = staged_dir(profile_dir, "modules", &checkout);
-    stage_preset(&checkout, &modules, topology::PRODUCTION, topology::VIEWS);
+    stage_preset(
+        &checkout,
+        &modules,
+        topology::PRODUCTION,
+        &topology::views(),
+    );
     let simulation: Vec<&str> = topology::TOPOLOGY
         .modules
         .iter()
@@ -92,31 +98,41 @@ fn stage_founding_set() {
         &[],
     );
     sweep_abandoned_sets(profile_dir);
-    name_the_staged_set(profile_dir, &modules);
+    record_the_staging_build(&modules);
+    println!("cargo:rustc-env={}", staged_set_env(&modules));
 }
 
-/// Point the profile directory at the set this build just staged, and record
-/// in the set which build wrote it.
+/// The `rustc-env` that names the set this run staged, baked into noded.
 ///
-/// THE POINTER IS THE ANSWER TO A SHARED PROFILE DIRECTORY, and it has to be a
-/// file rather than a constant. Checkouts sharing a target dir share it
-/// BECAUSE their source is identical, so cargo shares the compiled unit — and
-/// a build script baking its own location into a shared unit gives every other
-/// checkout the first builder's answer, silently, for as long as nothing
-/// invalidates it. `target/<profile>/ducktape` is likewise whichever build ran
-/// last, so writing the name here, in the same invocation that links it, is
-/// what makes a binary and its set agree.
+/// The name reaches a binary COMPILED IN, by the same build-script run that
+/// staged the set, and never through a file in the profile directory: that
+/// directory is shared by every checkout building into the target, so a file
+/// there is rewritten by whichever of them builds next — and a binary reading
+/// it at boot, a test suite already running included, follows the rewrite
+/// onto another checkout's set.
 ///
-/// The owner record is the belt to that braces: a sibling's `cargo check -p
-/// noded` moves the pointer without relinking any binary, and only a stamp
-/// inside the set can catch that.
-pub(crate) fn name_the_staged_set(profile_dir: &Path, modules: &Path) {
+/// One run writes the set's bytes, its owner record, this name and
+/// `DUCKTAPE_BUILD`, so the four cannot disagree. A checkout whose build
+/// reuses a noded unit another checkout's run produced links that checkout's
+/// noded, name and stamp together: the set it resolves is the one its noded
+/// was staged beside, which is cargo's shared-unit freshness to fix
+/// (`noded::services::RESTAGE_COMMAND`), not a resolution a sibling can move
+/// after the link.
+pub(crate) fn staged_set_env(modules: &Path) -> String {
     let name = modules
         .file_name()
         .and_then(|name| name.to_str())
         .expect("a staged set has a utf-8 directory name");
-    let pointer = profile_dir.join(staged_key::STAGED_POINTER);
-    write_without_truncating(&pointer, name.as_bytes());
+    format!("DUCKTAPE_STAGED_SET={name}")
+}
+
+/// Record in the set which build wrote it.
+///
+/// A checkout restages its OWN set without relinking every binary that reads
+/// it (`cargo check -p noded` after a commit), so a binary linked earlier can
+/// find newer bytes under its name; only a stamp inside the set can catch
+/// that, and `noded::services::founding_set` refuses on it.
+pub(crate) fn record_the_staging_build(modules: &Path) {
     let owner = modules.join(staged_key::STAGED_OWNER);
     let build = build_id().unwrap_or_else(|| staged_key::UNIDENTIFIED_BUILD.to_owned());
     write_without_truncating(&owner, build.as_bytes());
@@ -160,7 +176,7 @@ fn sweep_abandoned_sets(profile_dir: &Path) {
 /// is the poisoning path this keying removed — one checkout writing a set
 /// every other checkout reads — and
 /// `a_staging_destination_is_always_keyed_to_the_checkout` (in
-/// `tests/view_staging.rs`) reads this file and fails if one comes back.
+/// `tests/staged_destination.rs`) reads this file and fails if one comes back.
 pub(crate) fn staged_dir(profile_dir: &Path, base: &str, checkout: &Path) -> PathBuf {
     profile_dir.join(staged_key::staged_set_name(base, checkout))
 }
@@ -181,7 +197,6 @@ pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str], views: &[
             .strip_suffix(".component.wasm")
             .or_else(|| name.strip_suffix(".index.wasm"))
             .or_else(|| name.strip_suffix(".view.wasm"))
-            .or_else(|| name.strip_suffix(".view.pending"))
             .or_else(|| name.strip_suffix(".assets"))
             .or_else(|| name.strip_suffix(".lanes"));
         let obsolete = artifact_id
@@ -209,10 +224,10 @@ pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str], views: &[
         view_staging::stage_view(checkout, dest, id).expect("stage module view");
         stage_lane_declaration(&module_dir, dest, spec.id);
         let ships_guest = declares_index_guest(&module_dir);
-        // The catalog and source declaration must agree for build presets.
+        // The catalog and the committed artifacts must agree for build presets.
         assert_eq!(
             ships_guest, spec.has_index_guest,
-            "module {}: crates/noded/build.rs sees src/index_guest.rs = {ships_guest} but \
+            "module {}: crates/noded/build.rs sees a committed index.wasm = {ships_guest} but \
              topology::TOPOLOGY says has_index_guest = {} — update crates/topology/src/lib.rs \
              to match",
             spec.id, spec.has_index_guest
@@ -232,6 +247,15 @@ pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str], views: &[
         assert!(
             topology::TOPOLOGY.spec(id).is_none(),
             "view {id} is also a module in the topology"
+        );
+        // a view-only entry has nothing but its view: topology::views() declares
+        // it, so a checkout lacking the artifact fails here like a missing
+        // component, rather than founding a network without it.
+        let view = view_staging::committed_view(checkout, id);
+        assert!(
+            view.is_file(),
+            "view {id} is in topology::views() but {} is not committed (run `make views-sync`)",
+            view.display()
         );
         view_staging::stage_view(checkout, dest, id).expect("stage founding view");
     }
@@ -265,15 +289,16 @@ fn stage_lane_declaration(module_dir: &Path, dest: &Path, id: &str) {
     }
 }
 
-/// a module declares its index guest by carrying the guest's engine shell:
-/// `src/index_guest.rs` (built by `guest-builder --index` into the crate's
-/// committed `index.wasm`). the file is the declaration, so a module cannot
-/// ship a mapper the founding set omits or be declared to ship one it lacks.
-/// the file is a rerun trigger too: adding or removing the shell re-stages.
+/// a module declares its index guest by carrying the committed artifact:
+/// `index.wasm` beside its `component.wasm`. the artifact is the declaration
+/// because this repo holds artifacts, not module source — an app module's
+/// crate lives in ducktape-modules — so a module cannot ship a mapper the
+/// founding set omits or be declared to ship one it lacks. the file is a rerun
+/// trigger too: adding or removing the mapper re-stages.
 fn declares_index_guest(module_dir: &Path) -> bool {
-    let shell = module_dir.join("src/index_guest.rs");
-    println!("cargo:rerun-if-changed={}", shell.display());
-    shell.is_file()
+    let mapper = module_dir.join("index.wasm");
+    println!("cargo:rerun-if-changed={}", mapper.display());
+    mapper.is_file()
 }
 
 /// the checkout directory a module's committed artifacts live in: the
@@ -303,7 +328,7 @@ fn module_dir(checkout: &Path, id: &str) -> PathBuf {
 /// give `dest` the source's mtime so a staged file never reads as newer than
 /// this run to cargo's rerun check. Both paths are rerun triggers: a changed
 /// artifact re-stages, and so does a deleted staged copy.
-fn stage(src: &Path, dest: &Path) {
+pub(crate) fn stage(src: &Path, dest: &Path) {
     println!("cargo:rerun-if-changed={}", src.display());
     println!("cargo:rerun-if-changed={}", dest.display());
     let bytes = std::fs::read(src)
@@ -335,7 +360,7 @@ fn stage(src: &Path, dest: &Path) {
 /// Same reason inside one build: `stage` is called for forty artifacts while
 /// another checkout may be reading the same directory.
 fn write_without_truncating(path: &Path, bytes: &[u8]) {
-    // `.staged-by` and `.staged-modules` carry no extension, so this appends
+    // `.staged-by` carries no extension, so this appends
     // rather than replaces — and the pid keeps two builds passing through one
     // profile directory off each other's temporaries.
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));

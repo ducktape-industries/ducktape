@@ -120,12 +120,11 @@
 //!   cutover moves no committed state.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
-mod tracker_iface;
-pub use tracker_iface::*;
+pub use forge_wire::*;
+// the wire crate under the two names the module's own files reach it by.
+pub(crate) use forge_wire as interface;
+pub(crate) use forge_wire as tracker_iface;
 
-pub mod client;
 mod codec;
 #[cfg(feature = "native")]
 mod git;
@@ -134,16 +133,16 @@ mod git;
 /// `pack_closure_many` is the self-contained closure; `pack_delta` bounds it
 /// by the client's common bases (the incremental fetch answer).
 #[cfg(feature = "native")]
-pub use git::{list_branches, pack_closure_many, pack_delta};
+pub use git::{list_branches, list_tags, pack_closure_many, pack_delta, ref_tips};
 pub mod oid;
 pub use oid::Oid;
 #[cfg(feature = "native")]
 mod module;
 pub mod pushcert;
-pub mod refs;
-pub mod state;
 #[cfg(any(feature = "native", feature = "guest"))]
 mod query;
+pub mod refs;
+pub mod state;
 #[cfg(feature = "native")]
 pub use module::{
     COMPACT_PACK_LIMIT, Forge, PendingBranch, build_objects, compact_repos, install_objects,
@@ -190,23 +189,28 @@ pub fn norm_repo(repo: &str) -> Result<String, Error> {
         return Ok(DEFAULT_REPO.to_string());
     }
     if repo.len() > MAX_REPO_NAME_LEN {
-        return Err(Error::Module(format!(
-            "forge: repo name too long ({} bytes, max {MAX_REPO_NAME_LEN})",
-            repo.len()
-        )));
+        return Err(Error::module(
+            "bad_repo_name",
+            format!(
+                "forge: repo name too long ({} bytes, max {MAX_REPO_NAME_LEN})",
+                repo.len()
+            ),
+        ));
     }
     if repo.starts_with('.') {
-        return Err(Error::Module(
-            "forge: repo name may not start with '.'".into(),
+        return Err(Error::module(
+            "bad_repo_name",
+            "forge: repo name may not start with '.'",
         ));
     }
     if !repo
         .bytes()
         .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
     {
-        return Err(Error::Module(format!(
-            "forge: repo name {repo:?} must match [a-z0-9._-]"
-        )));
+        return Err(Error::module(
+            "bad_repo_name",
+            format!("forge: repo name {repo:?} must match [a-z0-9._-]"),
+        ));
     }
     Ok(repo.to_string())
 }

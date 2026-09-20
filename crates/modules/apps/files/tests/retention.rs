@@ -669,7 +669,7 @@ impl Module for RetentionOwner {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let effects: Vec<FilesMsg> = serde_json::from_slice(&msg.payload)
-            .map_err(|error| Error::Module(error.to_string()))?;
+            .map_err(|error| Error::module("codec", error.to_string()))?;
         self.pending = Some(self.pending.unwrap_or(self.committed) + 1);
         for effect in effects {
             ctx.emit_msg(crate::msg(effect));
@@ -700,12 +700,12 @@ fn host_fixture(dir: &tempfile::TempDir) -> (Host, String) {
     let host = Host::genesis(vec![
         Box::new(files),
         Box::new(RetentionOwner::default()),
-        Box::new(identity::Identity::new(
+        Box::new(identity_module::Identity::new(
             "identity",
             Box::new(sdk_testkit::MemStore::new()),
             "retention-test".into(),
         )),
-        Box::new(attribution::AttributionModule::new(
+        Box::new(attribution_module::AttributionModule::new(
             "attribution",
             Box::new(sdk_testkit::MemStore::new()),
         )),
@@ -775,7 +775,7 @@ fn real_dispatch_applied_summary_preserves_projected_id_in_assigned() {
     let dir = tempfile::tempdir().unwrap();
     let (mut host, source) = host_fixture(&dir);
     host.register(Box::new(ProjectionCaller));
-    host.register(Box::new(dispatch::DispatchModule::new(
+    host.register(Box::new(dispatch_module::DispatchModule::new(
         "dispatch",
         "saga",
         "identity",

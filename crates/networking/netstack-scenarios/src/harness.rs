@@ -170,6 +170,9 @@ struct Node {
     /// The last persisted snapshot (what a restart reads back).
     persisted: Option<Vec<u8>>,
     observed: Vec<ReachabilityEvent>,
+    /// The peer set of the node's last accepted interface push — the live
+    /// interface as the host would hold it.
+    interface: Vec<PeerTunnelConfig>,
 }
 
 enum Pending {
@@ -288,6 +291,7 @@ impl Net {
                     restore: None,
                     persisted: None,
                     observed: Vec::new(),
+                    interface: Vec::new(),
                 }
             })
             .collect();
@@ -402,6 +406,18 @@ impl Net {
 
     pub fn key(&self, node: usize) -> PublicKey {
         self.nodes[node].key.clone()
+    }
+
+    /// Does `node`'s live interface carry a tunnel to `peer`? The peer set
+    /// of the last accepted push — what the host's WireGuard interface
+    /// holds, and so what an inbound handshake initiation from `peer`
+    /// would be answered against.
+    pub fn tunneled(&self, node: usize, peer: usize) -> bool {
+        let key = self.nodes[peer].wg;
+        self.nodes[node]
+            .interface
+            .iter()
+            .any(|entry| entry.wireguard_public_key == key)
     }
 
     pub fn saw(&self, node: usize, pred: impl Fn(&ReachabilityEvent) -> bool) -> bool {
@@ -679,7 +695,8 @@ impl Net {
             match effect {
                 Effect::MeshSend { to, bytes } => self.route(node, to, bytes),
                 Effect::Observe(observed) => self.nodes[node].observed.push(observed),
-                Effect::WgApply { req, .. } => {
+                Effect::WgApply { req, peers, .. } => {
+                    self.nodes[node].interface = peers;
                     let more = self.step(
                         &mut machine,
                         node,
@@ -690,7 +707,7 @@ impl Net {
                     );
                     stack.push(more.into_iter());
                 }
-                Effect::WgRemove => {}
+                Effect::WgRemove => self.nodes[node].interface.clear(),
                 Effect::ResolveStart { req, peer, .. } => {
                     let target = self.node_by_key(peer);
                     let answer = target

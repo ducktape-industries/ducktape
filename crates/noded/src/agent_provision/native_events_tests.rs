@@ -3,6 +3,7 @@ use super::*;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::routing::{get, post};
+use runs_wire as runs;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 #[path = "native_reports_tests.rs"]

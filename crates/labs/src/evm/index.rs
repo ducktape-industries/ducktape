@@ -318,6 +318,9 @@ mod tests {
                 time: 44,
                 origin: OriginTag::module("evm"),
                 payload: encode_msg(&receipt()),
+                // the evm module assigns no stamp; the fold derives everything
+                // it indexes from the receipt payload.
+                assigned: Vec::new(),
             },
             &map,
         )

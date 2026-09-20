@@ -47,8 +47,8 @@ const TRACKER_FILE: &str = ".tracker.bin";
 /// rewritten atomically at every commit, removed once nothing is outstanding.
 const PENDING_FILE: &str = ".pending.bin";
 
-/// the node-local, ADVISORY list of pending branches this node is stuck on
-/// (see [`refs::RepoState::stuck_branches`]) — one `<repo>\t<branch>` line
+/// the node-local, ADVISORY list of pending refs this node is stuck on
+/// (see [`refs::RepoState::stuck_refs`]) — one `<repo>\t<full refname>` line
 /// each, rewritten with [`PENDING_FILE`].
 ///
 /// it carries no consensus state, so unlike the pending map a missing or
@@ -75,7 +75,12 @@ pub(crate) const FORGE_SNAPSHOT_MAGIC: &[u8; 4] = b"FGv1";
 fn decode_pending(bytes: &[u8]) -> Result<BTreeMap<String, refs::PendingMap>, Error> {
     let body = bytes
         .strip_prefix(FORGE_PENDING_MAGIC.as_slice())
-        .ok_or_else(|| Error::Module("forge pending file: missing the FGP1 magic".into()))?;
+        .ok_or_else(|| {
+            Error::module(
+                "pending_decode",
+                "forge pending file: missing the FGP1 magic",
+            )
+        })?;
     let mut r = codec::Reader::new(body);
     let count = r.u32()?;
     let mut out = BTreeMap::new();
@@ -85,14 +90,16 @@ fn decode_pending(bytes: &[u8]) -> Result<BTreeMap<String, refs::PendingMap>, Er
             .insert(name.clone(), refs::take_pending(&mut r)?)
             .is_some()
         {
-            return Err(Error::Module(format!(
-                "forge pending file: duplicate repo {name}"
-            )));
+            return Err(Error::module(
+                "pending_decode",
+                format!("forge pending file: duplicate repo {name}"),
+            ));
         }
     }
     if !r.done() {
-        return Err(Error::Module(
-            "forge pending file: trailing bytes after the map".into(),
+        return Err(Error::module(
+            "pending_decode",
+            "forge pending file: trailing bytes after the map",
         ));
     }
     Ok(out)
@@ -105,7 +112,12 @@ fn read_pending(base: &std::path::Path) -> Result<BTreeMap<String, refs::Pending
     let bytes = match std::fs::read(base.join(PENDING_FILE)) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(Error::Module(format!("forge: read pending file: {e}"))),
+        Err(e) => {
+            return Err(Error::module(
+                "pending_file_read",
+                format!("forge: read pending file: {e}"),
+            ));
+        }
     };
     decode_pending(&bytes)
 }
@@ -116,20 +128,20 @@ fn read_pending(base: &std::path::Path) -> Result<BTreeMap<String, refs::Pending
 /// [`git::compact`] for the measured cost of letting them pile up).
 pub const COMPACT_PACK_LIMIT: usize = 50;
 
-/// the advisory stuck list as `repo -> branches`. an absent or unreadable file
-/// is an empty map — the hint is never authority.
+/// the advisory stuck list as `repo -> full refnames`. an absent or unreadable
+/// file is an empty map — the hint is never authority.
 fn read_stuck(base: &std::path::Path) -> BTreeMap<String, BTreeSet<String>> {
     let Ok(text) = std::fs::read_to_string(base.join(STUCK_FILE)) else {
         return BTreeMap::new();
     };
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for line in text.lines() {
-        let Some((repo, branch)) = line.split_once('\t') else {
+        let Some((repo, refname)) = line.split_once('\t') else {
             continue;
         };
         out.entry(repo.to_string())
             .or_default()
-            .insert(branch.to_string());
+            .insert(refname.to_string());
     }
     out
 }
@@ -154,29 +166,36 @@ pub fn compact_repos(base: &std::path::Path, min_packs: usize) -> Result<usize, 
     let entries = match std::fs::read_dir(base) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(Error::Module(format!("forge: read repo base: {e}"))),
+        Err(e) => {
+            return Err(Error::module(
+                "repo_base_read",
+                format!("forge: read repo base: {e}"),
+            ));
+        }
     };
     let mut reclaimed = 0;
     for entry in entries {
         let dir = entry
-            .map_err(|e| Error::Module(format!("forge: read repo base: {e}")))?
+            .map_err(|e| Error::module("repo_base_read", format!("forge: read repo base: {e}")))?
             .path();
         let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
         let is_repo = dir.join(".git").exists();
-        let no_branch_stuck = BTreeSet::new();
-        let stuck_here = stuck.get(name).unwrap_or(&no_branch_stuck);
+        let no_ref_stuck = BTreeSet::new();
+        let stuck_here = stuck.get(name).unwrap_or(&no_ref_stuck);
         let waiting = pending
             .get(name)
-            .is_some_and(|branches| branches.keys().any(|branch| !stuck_here.contains(branch)));
+            .is_some_and(|refs| refs.keys().any(|r| !stuck_here.contains(&r.full())));
         if !is_repo || waiting {
             continue;
         }
-        let repo = git::open(&dir)
-            .map_err(|e| Error::Module(format!("forge: open repo {name:?}: {e}")))?;
-        let packs = git::compact(&repo, min_packs)
-            .map_err(|e| Error::Module(format!("forge: compact repo {name:?}: {e}")))?;
+        let repo = git::open(&dir).map_err(|e| {
+            Error::module("git_open_repo", format!("forge: open repo {name:?}: {e}"))
+        })?;
+        let packs = git::compact(&repo, min_packs).map_err(|e| {
+            Error::module("git_compact", format!("forge: compact repo {name:?}: {e}"))
+        })?;
         if packs == 0 {
             continue;
         }
@@ -197,9 +216,9 @@ pub fn compact_repos(base: &std::path::Path, min_packs: usize) -> Result<usize, 
 /// it is gone from every store.
 ///
 /// `None` when this node cannot answer: no such repo here, or `head` is not
-/// one of the branch heads it holds. that guard is the whole anti-amplifier:
-/// a peer can only make this node pack history it has itself materialized,
-/// never an arbitrary walk of its object database.
+/// one of the branch or tag tips it holds. that guard is the whole
+/// anti-amplifier: a peer can only make this node pack history it has itself
+/// materialized, never an arbitrary walk of its object database.
 pub fn build_objects(
     base: &std::path::Path,
     repo: &str,
@@ -211,12 +230,17 @@ pub fn build_objects(
     if !dir.join(".git").exists() {
         return Ok(None);
     }
-    let repo = git::open(&dir).map_err(|e| Error::Module(format!("forge: open {name:?}: {e}")))?;
+    let repo = git::open(&dir)
+        .map_err(|e| Error::module("git_open_repo", format!("forge: open {name:?}: {e}")))?;
     let want: git2::Oid = head.into();
-    let serves_head = git::list_branches(&repo)
-        .map_err(|e| Error::Module(format!("forge: read refs of {name:?}: {e}")))?
-        .iter()
-        .any(|(_, oid)| *oid == want);
+    let serves_head = git::ref_tips(&repo)
+        .map_err(|e| {
+            Error::module(
+                "git_list_branches",
+                format!("forge: read refs of {name:?}: {e}"),
+            )
+        })?
+        .contains(&want);
     if !serves_head {
         return Ok(None);
     }
@@ -232,7 +256,7 @@ pub fn build_objects(
         false => git::pack_delta(&repo, &[want], &known),
     };
     pack.map(Some)
-        .map_err(|e| Error::Module(format!("forge: pack {name:?}: {e}")))
+        .map_err(|e| Error::module("git_pack_closure", format!("forge: pack {name:?}: {e}")))
 }
 
 /// this node's own branch heads for `repo` — what a catch-up request sends as
@@ -244,9 +268,15 @@ pub fn on_disk_heads(base: &std::path::Path, repo: &str) -> Result<Vec<Oid>, Err
     if !dir.join(".git").exists() {
         return Ok(Vec::new());
     }
-    let repo = git::open(&dir).map_err(|e| Error::Module(format!("forge: open {name:?}: {e}")))?;
+    let repo = git::open(&dir)
+        .map_err(|e| Error::module("git_open_repo", format!("forge: open {name:?}: {e}")))?;
     Ok(git::list_branches(&repo)
-        .map_err(|e| Error::Module(format!("forge: read refs of {name:?}: {e}")))?
+        .map_err(|e| {
+            Error::module(
+                "git_list_branches",
+                format!("forge: read refs of {name:?}: {e}"),
+            )
+        })?
         .into_iter()
         .map(|(_, oid)| Oid::from(oid))
         .collect())
@@ -267,28 +297,37 @@ pub fn install_objects(
 ) -> Result<(), Error> {
     let name = norm_repo(repo)?;
     let repo = refs::open_or_init_repo(base, &name)?;
-    git::install_pack(&repo, pack)
-        .map_err(|e| Error::Module(format!("forge: install objects for {name:?}: {e}")))?;
-    git::verify_closure(&repo, head.into())
-        .map_err(|e| Error::Module(format!("forge: objects do not close {head}: {e}")))
+    git::install_pack(&repo, pack).map_err(|e| {
+        Error::module(
+            "git_install_pack",
+            format!("forge: install objects for {name:?}: {e}"),
+        )
+    })?;
+    git::verify_closure(&repo, head.into()).map_err(|e| {
+        Error::module(
+            "git_verify_closure",
+            format!("forge: objects do not close {head}: {e}"),
+        )
+    })
 }
 
-/// one branch a forge workspace is still waiting on.
+/// one ref — a branch or a tag — a forge workspace is still waiting on.
 ///
 /// the digest is the pack the push named — exact, and the cheap route while
-/// some node still holds those bytes. the head is what makes the branch
+/// some node still holds those bytes. the head is what makes the ref
 /// recoverable WITHOUT them: any peer that materialized it can rebuild the
 /// objects, and the requester verifies the result against this very oid,
 /// which consensus already committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingBranch {
     pub repo: String,
-    pub branch: String,
+    /// the FULL refname (`refs/heads/main`, `refs/tags/v1`).
+    pub refname: String,
     pub head: Oid,
     pub digest: [u8; 32],
 }
 
-/// every branch a forge workspace is still waiting on, read from
+/// every ref a forge workspace is still waiting on, read from
 /// [`PENDING_FILE`] WITHOUT opening the module.
 ///
 /// this is the node's pull handle. the catch-up map is node-local possession,
@@ -304,9 +343,9 @@ pub fn pending_branches(base: &std::path::Path) -> Result<Vec<PendingBranch>, Er
         .flat_map(|(repo, pending)| {
             pending
                 .into_iter()
-                .map(move |(branch, (head, digest))| PendingBranch {
+                .map(move |(name, (head, digest))| PendingBranch {
                     repo: repo.clone(),
-                    branch,
+                    refname: name.full(),
                     head,
                     digest,
                 })
@@ -396,17 +435,18 @@ impl Forge {
         blobs: blobstore::BlobHandle,
     ) -> Result<Self, Error> {
         let base = base_dir.into();
-        std::fs::create_dir_all(&base)
-            .map_err(|e| Error::Module(format!("forge: create base dir: {e}")))?;
+        std::fs::create_dir_all(&base).map_err(|e| {
+            Error::module("base_dir_create", format!("forge: create base dir: {e}"))
+        })?;
 
         let mut repos = BTreeMap::new();
         for entry in std::fs::read_dir(&base)
-            .map_err(|e| Error::Module(format!("forge: scan base dir: {e}")))?
+            .map_err(|e| Error::module("base_dir_read", format!("forge: scan base dir: {e}")))?
         {
-            let entry = entry.map_err(|e| Error::Module(e.to_string()))?;
+            let entry = entry.map_err(|e| Error::module("base_dir_read", e.to_string()))?;
             if !entry
                 .file_type()
-                .map_err(|e| Error::Module(e.to_string()))?
+                .map_err(|e| Error::module("base_dir_read", e.to_string()))?
                 .is_dir()
             {
                 continue;
@@ -423,16 +463,28 @@ impl Forge {
             if !dir.join(".git").exists() {
                 continue;
             }
-            let repo = git::open(&dir).map_err(|e| Error::Module(e.to_string()))?;
-            let branches = git::list_branches(&repo).map_err(|e| Error::Module(e.to_string()))?;
-            let refs = branches
-                .into_iter()
-                .map(|(branch, oid)| (branch, Oid::from(oid)))
-                .collect();
-            repos.insert(name, RepoState::with_refs(refs));
+            let repo =
+                git::open(&dir).map_err(|e| Error::module("git_open_repo", e.to_string()))?;
+            let adopt = |listed: Vec<(String, git2::Oid)>| -> BTreeMap<String, Oid> {
+                listed
+                    .into_iter()
+                    .map(|(short, oid)| (short, Oid::from(oid)))
+                    .collect()
+            };
+            let committed = refs::RepoRefs {
+                branches: adopt(
+                    git::list_branches(&repo)
+                        .map_err(|e| Error::module("git_list_branches", e.to_string()))?,
+                ),
+                tags: adopt(
+                    git::list_tags(&repo)
+                        .map_err(|e| Error::module("git_list_tags", e.to_string()))?,
+                ),
+            };
+            repos.insert(name, RepoState::with_committed(committed));
         }
 
-        // re-adopt the catch-up map BEFORE the tracker: it carries the branches
+        // re-adopt the catch-up map BEFORE the tracker: it carries the refs
         // whose committed head runs ahead of the ref cache the loop above just
         // read, so it is the authority wherever the two disagree. a corrupt
         // file is FAIL-STOP for the same reason the tracker is — booting on a
@@ -446,8 +498,12 @@ impl Forge {
         // wrong root and fork this node at its first root-hash check anyway.
         let tracker_path = base.join(TRACKER_FILE);
         let tracker = if tracker_path.exists() {
-            let bytes = std::fs::read(&tracker_path)
-                .map_err(|e| Error::Module(format!("forge: read tracker file: {e}")))?;
+            let bytes = std::fs::read(&tracker_path).map_err(|e| {
+                Error::module(
+                    "tracker_file_read",
+                    format!("forge: read tracker file: {e}"),
+                )
+            })?;
             Tracker::decode(&bytes)?
         } else {
             Tracker::default()
@@ -507,23 +563,31 @@ impl Forge {
     pub(crate) fn persist_tracker(&self) -> Result<(), Error> {
         let path = self.base.join(TRACKER_FILE);
         let tmp = self.base.join(".tracker.bin.tmp");
-        std::fs::write(&tmp, self.state.tracker.canonical_bytes())
-            .map_err(|e| Error::Module(format!("forge: write tracker file: {e}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| Error::Module(format!("forge: publish tracker file: {e}")))?;
+        std::fs::write(&tmp, self.state.tracker.canonical_bytes()).map_err(|e| {
+            Error::module(
+                "tracker_file_write",
+                format!("forge: write tracker file: {e}"),
+            )
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            Error::module(
+                "tracker_file_write",
+                format!("forge: publish tracker file: {e}"),
+            )
+        })?;
         Ok(())
     }
 
     /// atomically publish the advisory [`STUCK_FILE`], or remove it once no
-    /// branch is stuck. read only by [`compact_repos`].
+    /// ref is stuck. read only by [`compact_repos`].
     fn persist_stuck(&self) -> Result<(), Error> {
         let path = self.base.join(STUCK_FILE);
         let mut out = String::new();
         for (name, state) in &self.state.repos {
-            for branch in state.stuck_branches() {
+            for stuck in state.stuck_refs() {
                 out.push_str(name);
                 out.push('\t');
-                out.push_str(branch);
+                out.push_str(&stuck.full());
                 out.push('\n');
             }
         }
@@ -531,14 +595,22 @@ impl Forge {
             return match std::fs::remove_file(&path) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(Error::Module(format!("forge: clear stuck file: {e}"))),
+                Err(e) => Err(Error::module(
+                    "stuck_file_write",
+                    format!("forge: clear stuck file: {e}"),
+                )),
             };
         }
         let tmp = self.base.join(".stuck.txt.tmp");
-        std::fs::write(&tmp, &out)
-            .map_err(|e| Error::Module(format!("forge: write stuck file: {e}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| Error::Module(format!("forge: publish stuck file: {e}")))?;
+        std::fs::write(&tmp, &out).map_err(|e| {
+            Error::module("stuck_file_write", format!("forge: write stuck file: {e}"))
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            Error::module(
+                "stuck_file_write",
+                format!("forge: publish stuck file: {e}"),
+            )
+        })?;
         Ok(())
     }
 
@@ -559,7 +631,10 @@ impl Forge {
             return match std::fs::remove_file(&path) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(Error::Module(format!("forge: clear pending file: {e}"))),
+                Err(e) => Err(Error::module(
+                    "pending_file_write",
+                    format!("forge: clear pending file: {e}"),
+                )),
             };
         }
         let mut out = FORGE_PENDING_MAGIC.to_vec();
@@ -569,10 +644,18 @@ impl Forge {
             refs::put_pending(&mut out, pending);
         }
         let tmp = self.base.join(".pending.bin.tmp");
-        std::fs::write(&tmp, &out)
-            .map_err(|e| Error::Module(format!("forge: write pending file: {e}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| Error::Module(format!("forge: publish pending file: {e}")))?;
+        std::fs::write(&tmp, &out).map_err(|e| {
+            Error::module(
+                "pending_file_write",
+                format!("forge: write pending file: {e}"),
+            )
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            Error::module(
+                "pending_file_write",
+                format!("forge: publish pending file: {e}"),
+            )
+        })?;
         Ok(())
     }
 
@@ -745,6 +828,11 @@ mod tests {
 
     use sdk_testkit::TestCtx;
 
+    /// a branch's full refname, as the on-disk repo stores it.
+    fn heads_ref(branch: &str) -> String {
+        refs::RefName::Branch(branch.into()).full()
+    }
+
     // forge's execute reads only env (consensus_time / origin) and CAPTURES
     // emitted follow-ups; the shared TestCtx captures them (read via `msgs()`).
     // no `identity` handler is registered, so a principal resolves to the
@@ -784,7 +872,7 @@ mod tests {
 
     fn query_reply(forge: &Forge, query: ForgeQuery) -> Result<ForgeReply, Error> {
         let bytes = futures::executor::block_on(forge.query(&encode_query(&query)))?;
-        decode_reply(&bytes).map_err(Error::Module)
+        decode_reply(&bytes).map_err(|e| Error::module("codec", e))
     }
 
     /// Test-fixture plumbing only: put real objects and a ref directly on disk
@@ -812,7 +900,7 @@ mod tests {
         let tree_oid = git::build_tree(&git_repo, base_tree.as_ref(), path, blob).unwrap();
         let tree = git_repo.find_tree(tree_oid).unwrap();
         let oid = git::commit(&git_repo, &tree, parent.as_ref(), message, t).unwrap();
-        git::update_ref(&git_repo, &refs::full_ref(MAIN_BRANCH), oid).unwrap();
+        git::update_ref(&git_repo, &heads_ref(MAIN_BRANCH), oid).unwrap();
         state.refs.insert(MAIN_BRANCH.to_string(), oid.into());
     }
 
@@ -829,6 +917,7 @@ mod tests {
                     new_oid: Some(new.as_bytes().to_vec()),
                 }],
                 pack_digest: Some(vec![7u8; 32]),
+                tags: Vec::new(),
                 cert: None,
             },
         );
@@ -1009,7 +1098,10 @@ mod tests {
         .unwrap();
         assert_eq!(result.patch, "");
         assert!(!result.truncated);
-        assert_eq!((result.files_changed, result.additions, result.deletions), (0, 0, 0));
+        assert_eq!(
+            (result.files_changed, result.additions, result.deletions),
+            (0, 0, 0)
+        );
         assert!(result.files.is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1103,7 +1195,10 @@ mod tests {
         // the index carries every one of them, ordered by path, and the
         // preflight's shapes survive into it.
         assert_eq!(
-            diff.files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            diff.files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
             paths
         );
         let status_of = |path: &str| {
@@ -1112,7 +1207,10 @@ mod tests {
                 .find(|file| file.path == path)
                 .map(|file| file.status)
         };
-        assert_eq!(status_of("added.txt"), Some(git_primitives::GitFileStatus::Added));
+        assert_eq!(
+            status_of("added.txt"),
+            Some(git_primitives::GitFileStatus::Added)
+        );
         assert_eq!(
             status_of("removed.txt"),
             Some(git_primitives::GitFileStatus::Deleted)
@@ -1313,7 +1411,10 @@ mod tests {
         };
         // the index is COMPLETE: both paths, ordered by path.
         assert_eq!(
-            diff.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            diff.files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
             ["huge.bin", "small.txt"]
         );
         assert_eq!(diff.files_changed, 2);
@@ -1417,16 +1518,15 @@ mod tests {
     }
 
     fn history_of(forge: &Forge, path: &str, after: &str, limit: u64) -> CommitPage {
-        let bytes = futures::executor::block_on(forge.query(&encode_query(
-            &ForgeQuery::ListCommits {
+        let bytes =
+            futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::ListCommits {
                 repo: "demo".into(),
                 rev: String::new(),
                 path: path.into(),
                 after: after.into(),
                 limit,
-            },
-        )))
-        .expect("a history page");
+            })))
+            .expect("a history page");
         let ForgeReply::Commits(page) = decode_reply(&bytes).unwrap() else {
             panic!("expected a Commits reply");
         };
@@ -1522,18 +1622,17 @@ mod tests {
     fn a_cursor_off_the_walked_chain_is_refused_rather_than_read() {
         let base = tmp_base("history-bad-cursor");
         let forge = five_commits(&base);
-        let err = futures::executor::block_on(forge.query(&encode_query(
-            &ForgeQuery::ListCommits {
+        let err =
+            futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::ListCommits {
                 repo: "demo".into(),
                 rev: String::new(),
                 path: String::new(),
                 // a syntactically valid oid that is not on this history.
                 after: "0".repeat(40),
                 limit: 2,
-            },
-        )))
-        .unwrap_err()
-        .to_string();
+            })))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("is not on the first-parent chain"), "{err}");
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1567,7 +1666,51 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["shared.txt"]
         );
-        assert!(commit.diff.patch.contains("body 5"), "{}", commit.diff.patch);
+        assert!(
+            commit.diff.patch.contains("body 5"),
+            "{}",
+            commit.diff.patch
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// the substrate hands over git's own bytes and nothing else: what a commit
+    /// MEANS is decided over `raw` by `git_primitives::parse_commit`, and a read
+    /// the ceiling refused answers with the size alone.
+    #[test]
+    fn a_commit_object_crosses_raw_and_a_refused_read_keeps_its_size() {
+        let base = tmp_base("object-raw");
+        let forge = five_commits(&base);
+        let head = git_head_oid(&base, "demo");
+
+        let object = forge
+            .git_object_read("demo", head.as_bytes(), 256 * 1024)
+            .expect("the head commit object");
+        assert_eq!(object.kind, git_primitives::KIND_COMMIT);
+        assert_eq!(
+            object.raw.len() as u64,
+            object.size,
+            "a body inside the ceiling crosses whole"
+        );
+
+        let commit = git_primitives::parse_commit(&object.raw).expect("a commit body");
+        assert_eq!(commit.message, "commit 5\n\nthe body of 5");
+        assert_eq!(commit.author, "ducktape <ducktape@localhost>");
+        // the COMMITTER's epoch seconds, which `seed_materialized_commit` set
+        // to the commit's own number.
+        assert_eq!(commit.committed_at, 5);
+        assert_eq!(commit.parents.len(), 1, "a linear history");
+        assert_eq!(commit.tree.len(), 20, "an oid is 20 stored bytes");
+
+        // one byte short of the body: the size is still the truth, and the body
+        // is simply not there.
+        let refused = forge
+            .git_object_read("demo", head.as_bytes(), object.size - 1)
+            .expect("a refused read is an answer, not an error");
+        assert_eq!(refused.kind, object.kind);
+        assert_eq!(refused.size, object.size);
+        assert!(refused.raw.is_empty(), "a refused body crosses empty");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1594,7 +1737,7 @@ mod tests {
         let tree_oid = git::build_tree(&git_repo, Some(&one), "b.txt", beta).unwrap();
         let tree = git_repo.find_tree(tree_oid).unwrap();
         let oid = git::commit(&git_repo, &tree, None, "the first commit", 1).unwrap();
-        git::update_ref(&git_repo, &refs::full_ref(MAIN_BRANCH), oid).unwrap();
+        git::update_ref(&git_repo, &heads_ref(MAIN_BRANCH), oid).unwrap();
         forge
             .state
             .repos
@@ -1607,7 +1750,10 @@ mod tests {
             .commits
             .pop()
             .expect("the oldest commit on the page");
-        assert!(root.parents.is_empty(), "the fixture's only commit is a root");
+        assert!(
+            root.parents.is_empty(),
+            "the fixture's only commit is a root"
+        );
 
         let bytes = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::Commit {
             repo: "demo".into(),
@@ -1619,12 +1765,21 @@ mod tests {
         };
 
         assert_eq!(
-            commit.diff.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            commit
+                .diff
+                .files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
             ["a.txt", "b.txt"],
             "the root commit's whole tree, not an empty diff"
         );
         assert!(
-            commit.diff.files.iter().all(|f| f.status == FileStatus::Added),
+            commit
+                .diff
+                .files
+                .iter()
+                .all(|f| f.status == FileStatus::Added),
             "against nothing, every path is an addition: {:?}",
             commit.diff.files,
         );
@@ -1723,10 +1878,11 @@ mod tests {
             .unwrap()
             .with_chain_id("chain-a");
         let signed = |seed: u8, updates: Vec<RefUpdate>| {
-            let cert = pushcert::certificate(&pushcert::nonce("chain-a", "lab"), &updates);
+            let cert = pushcert::certificate(&pushcert::nonce("chain-a", "lab"), &updates, &[]);
             ForgeMsg::PushRefs {
                 repo: "lab".into(),
                 pack_digest: Some(vec![9u8; 32]),
+                tags: Vec::new(),
                 cert: Some(PushCert {
                     sshsig: sshsig(&ssh_key(seed), GIT_SSH_NS, &cert),
                     cert,
@@ -1777,10 +1933,12 @@ mod tests {
         // certified push (#1773 — no more "pin whichever chain arrives
         // first").
         let updates = vec![main_to(Some('b'), 'c')];
-        let cert = pushcert::certificate(&pushcert::nonce("some-other-chain", "lab"), &updates);
+        let cert =
+            pushcert::certificate(&pushcert::nonce("some-other-chain", "lab"), &updates, &[]);
         let cross_chain = ForgeMsg::PushRefs {
             repo: "lab".into(),
             pack_digest: Some(vec![9u8; 32]),
+            tags: Vec::new(),
             cert: Some(PushCert {
                 sshsig: sshsig(&ssh_key(ALICE), GIT_SSH_NS, &cert),
                 cert,
@@ -1807,7 +1965,8 @@ mod tests {
             &signed(ALICE, vec![main_to(Some('b'), 'c')]),
         );
         let refused_stale = signed(ALICE, vec![main_to(Some('b'), 'd')]);
-        assert!(refused(&mut forge, 9, &refused_stale).contains("non-fast-forward"));
+        // the CAS names its own class: the token, not a prefix on the sentence.
+        assert!(refused(&mut forge, 9, &refused_stale).contains("non_fast_forward"));
     }
 
     // #1773: forge learns its own chain id through the genesis-config seam
@@ -1825,10 +1984,11 @@ mod tests {
             .unwrap()
             .with_chain_id("home");
         let signed = |chain: &str, repo: &str, seed: u8, updates: Vec<RefUpdate>| {
-            let cert = pushcert::certificate(&pushcert::nonce(chain, repo), &updates);
+            let cert = pushcert::certificate(&pushcert::nonce(chain, repo), &updates, &[]);
             ForgeMsg::PushRefs {
                 repo: repo.into(),
                 pack_digest: Some(vec![9u8; 32]),
+                tags: Vec::new(),
                 cert: Some(PushCert {
                     sshsig: sshsig(&ssh_key(seed), GIT_SSH_NS, &cert),
                     cert,
@@ -1918,6 +2078,161 @@ mod tests {
     // multi-branch: an atomic PushRefs births branches, CASes per branch,
     // deletes non-main branches, and refuses main deletion — all reflected in
     // root() without any pack materialized (the determinism invariant).
+    /// a tag is a ref forge tracks: created beside a branch in ONE atomic push,
+    /// listed by `ListTags` while `ListRefs` stays the branches, part of the
+    /// root, re-adopted across a restart — and refused BY NAME for every later
+    /// move, delete or re-create.
+    #[test]
+    fn a_tag_is_created_once_listed_apart_from_branches_and_never_moves() {
+        let base = tmp_base("tags");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let update = |name: &str, prev: Option<char>, new: Option<char>| RefUpdate {
+            ref_name: name.into(),
+            prev_oid: prev.map(|c| oid(c).as_bytes().to_vec()),
+            new_oid: new.map(|c| oid(c).as_bytes().to_vec()),
+        };
+        let create = |name: &str, c: char| TagCreate {
+            name: name.into(),
+            oid: oid(c).as_bytes().to_vec(),
+        };
+        let push = |updates: Vec<RefUpdate>, tags: Vec<TagCreate>| ForgeMsg::PushRefs {
+            repo: "demo".into(),
+            updates,
+            tags,
+            pack_digest: Some(vec![7u8; 32]),
+            cert: None,
+        };
+        let branch_only = forge.root();
+        exec_commit(
+            &mut forge,
+            &mut ctx_at(1),
+            &push(
+                vec![update("main", None, Some('a'))],
+                vec![create("v1", 'a')],
+            ),
+        );
+        let tagged = forge.root();
+        assert_ne!(tagged, branch_only);
+
+        let ForgeReply::Tags(tags) = query_reply(
+            &forge,
+            ForgeQuery::ListTags {
+                repo: "demo".into(),
+            },
+        )
+        .unwrap() else {
+            panic!("wrong reply")
+        };
+        assert_eq!(
+            tags,
+            vec![TagRef {
+                name: "v1".into(),
+                oid: oid('a').to_string(),
+            }]
+        );
+        let ForgeReply::Refs(refs) = query_reply(
+            &forge,
+            ForgeQuery::ListRefs {
+                repo: "demo".into(),
+            },
+        )
+        .unwrap() else {
+            panic!("wrong reply")
+        };
+        assert_eq!(
+            refs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["main"],
+            "ListRefs lists the branches and nothing else"
+        );
+        let ForgeReply::Tags(none) = query_reply(
+            &forge,
+            ForgeQuery::ListTags {
+                repo: "nowhere".into(),
+            },
+        )
+        .unwrap() else {
+            panic!("wrong reply")
+        };
+        assert!(none.is_empty(), "an unknown repo has no tags");
+
+        // a re-create at another oid (what a move would be) and at the same one.
+        for (t, c) in [(2, 'b'), (3, 'a')] {
+            let err = exec(
+                &mut forge,
+                &mut ctx_at(t),
+                &push(Vec::new(), vec![create("v1", c)]),
+            )
+            .unwrap_err();
+            futures::executor::block_on(forge.abort_block()).unwrap();
+            assert!(
+                matches!(&err, Error::Module { reason, .. } if reason == sdk::refusal::ALREADY_EXISTS),
+                "{c}: {err:?}"
+            );
+        }
+        assert_eq!(forge.root(), tagged, "no refusal moved the root");
+
+        // no pack ever arrived, so the tag is re-adopted from the pending
+        // file rather than from an on-disk ref.
+        drop(forge);
+        let reopened = Forge::init("forge", base.clone()).unwrap();
+        assert_eq!(reopened.root(), tagged);
+        assert_eq!(reopened.state.repos["demo"].tags["v1"], oid('a'));
+    }
+
+    /// one certificate can sign a branch move and a tag creation together:
+    /// both apply. a signed re-create of a held tag is refused by name like
+    /// any other.
+    #[test]
+    fn a_signed_push_creates_a_tag_beside_a_branch() {
+        use crate::pushcert;
+        use keyscheme::sshsig::GIT_SSH_NS;
+        use keyscheme::testkit::{ssh_key, sshsig};
+        let mut forge = Forge::init("forge", tmp_base("signed-tag"))
+            .unwrap()
+            .with_chain_id("chain-a");
+        let update = |name: &str, prev: Option<char>, new: char| RefUpdate {
+            ref_name: name.into(),
+            prev_oid: prev.map(|c| oid(c).as_bytes().to_vec()),
+            new_oid: Some(oid(new).as_bytes().to_vec()),
+        };
+        let create = |name: &str, c: char| TagCreate {
+            name: name.into(),
+            oid: oid(c).as_bytes().to_vec(),
+        };
+        let signed = |updates: Vec<RefUpdate>, tags: Vec<TagCreate>| {
+            let cert = pushcert::certificate(&pushcert::nonce("chain-a", "lab"), &updates, &tags);
+            ForgeMsg::PushRefs {
+                repo: "lab".into(),
+                updates,
+                tags,
+                pack_digest: Some(vec![9u8; 32]),
+                cert: Some(PushCert {
+                    sshsig: sshsig(&ssh_key(5), GIT_SSH_NS, &cert),
+                    cert,
+                }),
+            }
+        };
+        exec_commit(
+            &mut forge,
+            &mut ctx_at(1),
+            &signed(vec![update("main", None, 'a')], vec![create("v1", 'a')]),
+        );
+        let lab = &forge.state.repos["lab"];
+        assert_eq!(lab.refs["main"], oid('a'));
+        assert_eq!(lab.tags["v1"], oid('a'));
+
+        let moved = exec(
+            &mut forge,
+            &mut ctx_at(2),
+            &signed(Vec::new(), vec![create("v1", 'b')]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&moved, Error::Module { reason, .. } if reason == sdk::refusal::ALREADY_EXISTS),
+            "{moved:?}"
+        );
+    }
+
     #[test]
     fn push_refs_multi_branch_flow() {
         let base = tmp_base("multi-branch");
@@ -1944,6 +2259,7 @@ mod tests {
                     },
                 ],
                 pack_digest: Some(digest.clone()),
+                tags: Vec::new(),
                 cert: None,
             },
         );
@@ -1978,6 +2294,7 @@ mod tests {
                         new_oid: Some(oid('c').as_bytes().to_vec()),
                     }],
                     pack_digest: Some(digest.clone()),
+                    tags: Vec::new(),
                     cert: None,
                 },
             )
@@ -1997,6 +2314,7 @@ mod tests {
                     new_oid: Some(oid('c').as_bytes().to_vec()), // force-ish move
                 }],
                 pack_digest: Some(digest.clone()),
+                tags: Vec::new(),
                 cert: None,
             },
         );
@@ -2017,6 +2335,7 @@ mod tests {
                         new_oid: None,
                     }],
                     pack_digest: None,
+                    tags: Vec::new(),
                     cert: None,
                 },
             )
@@ -2036,6 +2355,7 @@ mod tests {
                     new_oid: None,
                 }],
                 pack_digest: None,
+                tags: Vec::new(),
                 cert: None,
             },
         );
@@ -2090,6 +2410,7 @@ mod tests {
                     },
                 ],
                 pack_digest: Some(digest.clone()),
+                tags: Vec::new(),
                 cert: None,
             },
         );
@@ -2296,6 +2617,7 @@ mod tests {
                         new_oid: Some(oid('a').as_bytes().to_vec()),
                     }],
                     pack_digest: Some(vec![1u8; 32]),
+                    tags: Vec::new(),
                     cert: None,
                 },
             );
@@ -2432,7 +2754,7 @@ mod tests {
         );
 
         reopened.state.repos.get_mut("demo").unwrap().adopt_pending(
-            [("feature".to_string(), (oid('f'), [9; 32]))]
+            [(refs::RefName::Branch("feature".into()), (oid('f'), [9; 32]))]
                 .into_iter()
                 .collect(),
         );
@@ -2504,6 +2826,7 @@ mod tests {
                     new_oid: Some(head.as_bytes().to_vec()),
                 }],
                 pack_digest: Some(vec![3u8; 32]),
+                tags: Vec::new(),
                 cert: None,
             },
         );
@@ -2569,6 +2892,7 @@ mod tests {
                     new_oid: Some(new.as_bytes().to_vec()),
                 }],
                 pack_digest: Some(vec![7u8; 32]),
+                tags: Vec::new(),
                 cert: None,
             },
         );
@@ -2614,6 +2938,7 @@ mod tests {
                         },
                     ],
                     pack_digest: Some(digest.clone()),
+                    tags: Vec::new(),
                     cert: None,
                 },
             );
@@ -2736,7 +3061,7 @@ mod tests {
         let root_oid = root.write().unwrap();
         let tree = repo.find_tree(root_oid).unwrap();
         let first = git::commit(&repo, &tree, None, "first", 1).unwrap();
-        git::update_ref(&repo, &refs::full_ref(MAIN_BRANCH), first).unwrap();
+        git::update_ref(&repo, &heads_ref(MAIN_BRANCH), first).unwrap();
         forge
             .state
             .repos
@@ -2842,8 +3167,8 @@ mod tests {
         let stray_tree = repo.find_tree(root.write().unwrap()).unwrap();
         let on_no_branch =
             git::commit(&repo, &stray_tree, Some(&first_commit), "stray", 3).unwrap();
-        git::update_ref(&repo, &refs::full_ref(MAIN_BRANCH), first).unwrap();
-        git::update_ref(&repo, &refs::full_ref("agent/poem"), on_branch).unwrap();
+        git::update_ref(&repo, &heads_ref(MAIN_BRANCH), first).unwrap();
+        git::update_ref(&repo, &heads_ref("agent/poem"), on_branch).unwrap();
         let state = forge.state.repos.entry("demo".into()).or_default();
         state.refs.insert(MAIN_BRANCH.into(), first.into());
         state.refs.insert("agent/poem".into(), on_branch.into());
@@ -2989,7 +3314,7 @@ mod tests {
         let tree_oid = builder.write().unwrap();
         let non_utf8_tree = repo.find_tree(tree_oid).unwrap();
         let visible_head = git::commit(&repo, &non_utf8_tree, Some(&head), "visible", 3).unwrap();
-        git::update_ref(&repo, &refs::full_ref(MAIN_BRANCH), visible_head).unwrap();
+        git::update_ref(&repo, &heads_ref(MAIN_BRANCH), visible_head).unwrap();
         forge
             .state
             .repos
@@ -3093,7 +3418,7 @@ mod tests {
         let tree_oid = builder.write().unwrap();
         let tree = repo.find_tree(tree_oid).unwrap();
         let head = git::commit(&repo, &tree, None, "wide", 1).unwrap();
-        git::update_ref(&repo, &refs::full_ref(MAIN_BRANCH), head).unwrap();
+        git::update_ref(&repo, &heads_ref(MAIN_BRANCH), head).unwrap();
         forge
             .state
             .repos
@@ -3182,7 +3507,7 @@ mod tests {
             head = Some(oid.into());
         }
         let head = head.expect("three commits");
-        git::update_ref(&dest, &refs::full_ref(MAIN_BRANCH), head.into()).unwrap();
+        git::update_ref(&dest, &heads_ref(MAIN_BRANCH), head.into()).unwrap();
         head
     }
 
@@ -3236,7 +3561,7 @@ mod tests {
             .parent(0)
             .unwrap()
             .id();
-        git::update_ref(&repo, &refs::full_ref(MAIN_BRANCH), behind).unwrap();
+        git::update_ref(&repo, &heads_ref(MAIN_BRANCH), behind).unwrap();
 
         let mut forge = Forge::init("forge", base.clone()).unwrap();
         forge
@@ -3245,7 +3570,7 @@ mod tests {
             .get_mut("demo")
             .expect("the on-disk repo is adopted")
             .adopt_pending(refs::PendingMap::from([(
-                MAIN_BRANCH.to_string(),
+                refs::RefName::Branch(MAIN_BRANCH.into()),
                 (head, [7u8; 32]),
             )]));
         // nothing in the blob store answers for that digest, and nothing ever will.
@@ -3280,7 +3605,7 @@ mod tests {
         let seed = git::pack_closure_many(&holder, &[first]).unwrap();
         let catching_up = refs::open_or_init_repo(&behind, "demo").unwrap();
         git::install_pack(&catching_up, &seed).unwrap();
-        git::update_ref(&catching_up, &refs::full_ref(MAIN_BRANCH), first).unwrap();
+        git::update_ref(&catching_up, &heads_ref(MAIN_BRANCH), first).unwrap();
 
         let bases = on_disk_heads(&behind, "demo").unwrap();
         assert_eq!(bases, vec![Oid::from(first)], "its own head is the base");
@@ -3365,7 +3690,7 @@ mod tests {
             .get_mut("demo")
             .expect("the on-disk repo is adopted")
             .adopt_pending(refs::PendingMap::from([(
-                MAIN_BRANCH.to_string(),
+                refs::RefName::Branch(MAIN_BRANCH.into()),
                 (head, [7u8; 32]),
             )]));
         forge.persist_pending().unwrap();

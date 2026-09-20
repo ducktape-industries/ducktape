@@ -119,6 +119,14 @@ pub enum AttemptResult {
         code: join_gate::RejectCode,
         detail: String,
     },
+    /// a member ANSWERED and refused this intro before its gate (an expired
+    /// invite, a clock too far off, a full join window): the race fails over
+    /// like `Failed`, but this is an answer, and the one that names the fix.
+    Refused(String),
+    /// a member's gate does not know the invite's issuer as a validator: the
+    /// race fails over (another member's view may be ahead), and the answer
+    /// is kept, because enough of them in a row are the network's word.
+    IssuerUnknown(String),
     /// the attempt exhausted its window, was refused non-terminally, or the
     /// plane went away — the race fails over to the next candidate.
     Failed(String),
@@ -147,8 +155,85 @@ pub enum FirstContactOutcome {
         detail: String,
     },
     /// every offered path was exhausted. HONEST: the caller must surface this
-    /// and exit non-zero rather than proceed as if joined.
-    Terminal { tried: usize, reason: String },
+    /// rather than proceed as if joined ([`after_exhausted_round`] decides
+    /// how). `refused` is the last answer a member gave, if any did — then the
+    /// mesh was reached, and it is the answer that says what to fix.
+    Terminal {
+        tried: usize,
+        reason: String,
+        refused: Option<MemberAnswer>,
+    },
+}
+
+/// What a member ANSWERED that was neither an admission nor a terminal
+/// refusal. It outlives the race — an out-slot the caller's window cannot
+/// drop — because the answer, not the dark paths around it, says what to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemberAnswer {
+    /// refused before its gate: an expired invite, a clock too far off, a full
+    /// join window. The detail names the fix.
+    Refused(String),
+    /// the invite's issuer is not in the member's committed validator set:
+    /// the member's view lags the issuer's admission, or the issuer is not —
+    /// or no longer — a validator. Only more rounds tell the two apart.
+    IssuerUnknown(String),
+}
+
+/// How many exhausted rounds may answer [`MemberAnswer::IssuerUnknown`]
+/// before the joiner takes it as the network's word. A validator-set change
+/// commits on every member within a few blocks, and rounds are tens of
+/// seconds apart, so an issuer that the answering members still do not know
+/// after these is not a validator: removed, or never seated. Retrying longer
+/// asks the same question of the same state.
+pub const ISSUER_UNKNOWN_ROUNDS: u32 = 3;
+
+/// What an exhausted first-contact round leaves a fresh joiner to do.
+#[derive(Debug, PartialEq)]
+pub enum AfterRound {
+    /// race again: nothing answered on any offered path, so the inviter (and
+    /// every front) is unreachable — down, or its plane is not running. The
+    /// invite is not what failed, and the inviter coming back admits it.
+    InviterUnreachable,
+    /// race again: the issuer is unknown to the members that answered, which
+    /// a view lagging its admission explains for [`ISSUER_UNKNOWN_ROUNDS`].
+    IssuerNotYetKnown(String),
+    /// exit 3: this node's own reachability plane never started, so every
+    /// offered path was dead before it was tried.
+    PlaneDown {
+        reason: &'static str,
+        detail: String,
+    },
+    /// exit 3: a member answered and refused this join before its gate.
+    Refused(String),
+    /// the terminal refusal class: the issuer stayed unknown for every round
+    /// of the bound, so this invite can never redeem.
+    IssuerNotAValidator(String),
+}
+
+/// Decide what an exhausted round leaves a fresh joiner to do. Pure: the
+/// caller performs it. `plane_failure` is this node's own reachability-plane
+/// refusal, `answer` the round's `FirstContactOutcome::Terminal { refused }`,
+/// and `issuer_unknown_rounds` how many rounds (this one included) answered
+/// [`MemberAnswer::IssuerUnknown`].
+pub fn after_exhausted_round(
+    plane_failure: Option<(&'static str, String)>,
+    answer: Option<MemberAnswer>,
+    issuer_unknown_rounds: u32,
+) -> AfterRound {
+    // the invite is the last thing to suspect: a plane that never started
+    // took every path down before any was tried.
+    if let Some((reason, detail)) = plane_failure {
+        return AfterRound::PlaneDown { reason, detail };
+    }
+    let issuer_bound_spent = issuer_unknown_rounds >= ISSUER_UNKNOWN_ROUNDS;
+    match answer {
+        None => AfterRound::InviterUnreachable,
+        Some(MemberAnswer::Refused(detail)) => AfterRound::Refused(detail),
+        Some(MemberAnswer::IssuerUnknown(detail)) => match issuer_bound_spent {
+            true => AfterRound::IssuerNotAValidator(detail),
+            false => AfterRound::IssuerNotYetKnown(detail),
+        },
+    }
 }
 
 /// the inviter as a first-contact candidate (its own WireGuard bootstrap).
@@ -285,9 +370,15 @@ fn is_v4_shared_address(ip: Ipv4Addr) -> bool {
 /// cancelled (their futures are dropped). Exhaustion ⇒ an honest
 /// [`FirstContactOutcome::Terminal`]. Pure over the attempt function so the
 /// selection logic is unit-testable without a live plane.
+///
+/// Every refusal a member answers with is logged as it lands and written to
+/// `refused` — an out-slot, not the return value, because the caller's window
+/// may drop this race mid-flight and the refusal must outlive it.
 pub async fn race_first_contact<F, Fut>(
     candidates: Vec<Candidate>,
     attempt: F,
+    label: &str,
+    refused: &mut Option<MemberAnswer>,
 ) -> FirstContactOutcome
 where
     F: Fn(Candidate) -> Fut,
@@ -300,6 +391,7 @@ where
             reason: "no reachable first-contact paths in the invite (inviter + fronts all \
                      filtered out for this effect mode)"
                 .into(),
+            refused: refused.clone(),
         };
     }
     let mut inflight = futures::stream::FuturesUnordered::new();
@@ -327,12 +419,47 @@ where
             AttemptResult::Rejected { code, detail } => {
                 return FirstContactOutcome::Rejected { code, detail };
             }
+            AttemptResult::Refused(detail) => {
+                // once per candidate per race, but a joiner that already
+                // holds standing re-races forever: latched.
+                static REFUSED: noded::log::Latch = noded::log::Latch::new(10);
+                if let Some(attempts) = REFUSED.hit("first_contact_refused") {
+                    tracing::warn!(
+                        target: "ducktape::join",
+                        node = %label,
+                        peer = %noded::hex_bytes(&key.as_ref()[..4]),
+                        via = %via,
+                        reason = "first_contact_refused",
+                        detail = %detail,
+                        attempts,
+                        "a member REFUSED this join — failing over to the next path"
+                    );
+                }
+                last_reason = detail.clone();
+                *refused = Some(MemberAnswer::Refused(detail));
+            }
+            // once per candidate per race; the round's own retry line counts
+            // the rounds, so this one stays at debug.
+            AttemptResult::IssuerUnknown(detail) => {
+                tracing::debug!(
+                    target: "ducktape::join",
+                    node = %label,
+                    peer = %noded::hex_bytes(&key.as_ref()[..4]),
+                    via = %via,
+                    reason = "issuer_unknown",
+                    detail = %detail,
+                    "a member does not know this invite's issuer — failing over to the next path"
+                );
+                last_reason = detail.clone();
+                *refused = Some(MemberAnswer::IssuerUnknown(detail));
+            }
             AttemptResult::Failed(reason) => last_reason = reason,
         }
     }
     FirstContactOutcome::Terminal {
         tried,
         reason: last_reason,
+        refused: refused.clone(),
     }
 }
 
@@ -349,7 +476,7 @@ pub struct RelayFallback {
     /// this node's identity signer — every [`nat_traversal::RelayIntro`]
     /// carries a fresh proof-of-possession it signs.
     pub signer: ed25519::PrivateKey,
-    /// the genesis-issued coordinator capability, when the network's relay
+    /// the validator-issued coordinator capability, when the network's relay
     /// gates privately (the same cap every rendezvous request presents).
     pub cap: Option<nat_traversal::CoordCap>,
 }
@@ -407,26 +534,33 @@ pub async fn drive_first_contact(
             }
         }
     };
+    // what any member refused, across BOTH lanes and past either window.
+    let mut refused = None;
     // The window is a HARD bound, not just loop pacing: an attempt parked on
     // a reply the plane never sends (its command loop stalled) would
     // otherwise hang the race forever — no Terminal, no exit, no log line.
-    let udp_outcome =
-        match tokio::time::timeout(window, race_first_contact(candidates.clone(), attempt)).await {
-            Ok(outcome) => outcome,
-            Err(_elapsed) => FirstContactOutcome::Terminal {
-                tried,
-                reason: format!(
-                    "join window ({}s) elapsed with no candidate acked — every path stayed dark \
-                     (reachability plane unresponsive or peers unreachable)",
-                    window.as_secs()
-                ),
-            },
-        };
+    let udp_outcome = match tokio::time::timeout(
+        window,
+        race_first_contact(candidates.clone(), attempt, &label, &mut refused),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => FirstContactOutcome::Terminal {
+            tried,
+            reason: format!(
+                "join window ({}s) elapsed with no candidate acked — every path stayed dark \
+                 (reachability plane unresponsive or peers unreachable)",
+                window.as_secs()
+            ),
+            refused: None,
+        },
+    };
     // the gate SETTLED over UDP (admitted, or terminally refused): the relay
     // lane exists only for the exhausted case, never to second-guess an
     // authoritative answer.
     let (udp_tried, udp_reason) = match udp_outcome {
-        FirstContactOutcome::Terminal { tried, reason } => (tried, reason),
+        FirstContactOutcome::Terminal { tried, reason, .. } => (tried, reason),
         settled => return settled,
     };
     // an empty candidate set gives the relay nothing to reach either.
@@ -434,6 +568,7 @@ pub async fn drive_first_contact(
         return FirstContactOutcome::Terminal {
             tried: udp_tried,
             reason: udp_reason,
+            refused,
         };
     };
     // once-per-race lifecycle fact: the join changed lanes.
@@ -464,7 +599,7 @@ pub async fn drive_first_contact(
     // ever comes back) must not hang the join past its window.
     let fallback_outcome = match tokio::time::timeout(
         RELAY_WINDOW,
-        race_first_contact(candidates, relay_attempt_of),
+        race_first_contact(candidates, relay_attempt_of, &label, &mut refused),
     )
     .await
     {
@@ -475,6 +610,7 @@ pub async fn drive_first_contact(
                 "relay window ({}s) elapsed with no candidate acked through any relay",
                 RELAY_WINDOW.as_secs()
             ),
+            refused: None,
         },
     };
     match fallback_outcome {
@@ -492,6 +628,7 @@ pub async fn drive_first_contact(
             FirstContactOutcome::Terminal {
                 tried,
                 reason: format!("udp: {udp_reason}; relay: {reason}"),
+                refused,
             }
         }
         settled => settled,
@@ -529,14 +666,22 @@ fn ack_resolution(reply: join_gate::IntroReply) -> Option<AttemptResult> {
             detail,
             terminal: true,
         } => Some(AttemptResult::Rejected { code, detail }),
-        // a non-terminal refusal (issuer view lag, member busy) fails THIS
-        // candidate over — the race tries the next one.
+        // an issuer this member's view does not know fails THIS candidate
+        // over, and is kept: a lagging view explains it for a few rounds, the
+        // network's own state for good (`after_exhausted_round`).
+        join_gate::IntroReply::Rejected {
+            code: join_gate::RejectCode::IssuerUnknown,
+            detail,
+            terminal: false,
+        } => Some(AttemptResult::IssuerUnknown(detail)),
+        // a member too busy to settle the gate in time fails THIS candidate
+        // over — the race tries the next one.
         join_gate::IntroReply::Rejected {
             code,
             detail,
             terminal: false,
         } => Some(AttemptResult::Failed(format!("{code:?}: {detail}"))),
-        join_gate::IntroReply::Refused { detail } => Some(AttemptResult::Failed(detail)),
+        join_gate::IntroReply::Refused { detail } => Some(AttemptResult::Refused(detail)),
     }
 }
 
@@ -1090,16 +1235,21 @@ mod tests {
                 intro: None,
             },
         ];
-        let outcome = race_first_contact(candidates, |c| async move {
-            match c.endpoint.as_deref() {
-                Some("win") => AttemptResult::Admitted {
-                    height: 7,
-                    cap: Some(vec![1, 2, 3]),
-                },
-                // the loser never resolves; the race must not wait on it.
-                _ => std::future::pending::<AttemptResult>().await,
-            }
-        })
+        let outcome = race_first_contact(
+            candidates,
+            |c| async move {
+                match c.endpoint.as_deref() {
+                    Some("win") => AttemptResult::Admitted {
+                        height: 7,
+                        cap: Some(vec![1, 2, 3]),
+                    },
+                    // the loser never resolves; the race must not wait on it.
+                    _ => std::future::pending::<AttemptResult>().await,
+                }
+            },
+            "test",
+            &mut None,
+        )
         .await;
         match outcome {
             FirstContactOutcome::Admitted {
@@ -1138,15 +1288,20 @@ mod tests {
                 intro: None,
             },
         ];
-        let outcome = race_first_contact(candidates, |c| async move {
-            match c.endpoint.as_deref() {
-                Some("reject") => AttemptResult::Rejected {
-                    code: join_gate::RejectCode::Spent,
-                    detail: "invite already redeemed".into(),
-                },
-                _ => std::future::pending::<AttemptResult>().await,
-            }
-        })
+        let outcome = race_first_contact(
+            candidates,
+            |c| async move {
+                match c.endpoint.as_deref() {
+                    Some("reject") => AttemptResult::Rejected {
+                        code: join_gate::RejectCode::Spent,
+                        detail: "invite already redeemed".into(),
+                    },
+                    _ => std::future::pending::<AttemptResult>().await,
+                }
+            },
+            "test",
+            &mut None,
+        )
         .await;
         match outcome {
             FirstContactOutcome::Rejected { code, detail } => {
@@ -1196,7 +1351,16 @@ mod tests {
             ack_resolution(join_gate::IntroReply::Refused {
                 detail: "no".into()
             }),
-            Some(AttemptResult::Failed(_))
+            Some(AttemptResult::Refused(_))
+        ));
+        // an unknown issuer fails over too, but as its own answer.
+        assert!(matches!(
+            ack_resolution(join_gate::IntroReply::Rejected {
+                code: join_gate::RejectCode::IssuerUnknown,
+                detail: "not in this view".into(),
+                terminal: false,
+            }),
+            Some(AttemptResult::IssuerUnknown(_))
         ));
     }
 
@@ -1246,20 +1410,135 @@ mod tests {
                 intro: None,
             },
         ];
-        let outcome = race_first_contact(candidates, |_c| async move {
-            AttemptResult::Failed("nope".into())
-        })
+        let outcome = race_first_contact(
+            candidates,
+            |_c| async move { AttemptResult::Failed("nope".into()) },
+            "test",
+            &mut None,
+        )
         .await;
         match outcome {
-            FirstContactOutcome::Terminal { tried, reason } => {
+            FirstContactOutcome::Terminal {
+                tried,
+                reason,
+                refused,
+            } => {
                 assert_eq!(tried, 2);
                 assert!(
                     reason.contains("nope"),
                     "reason names the failure: {reason}"
                 );
+                assert_eq!(refused, None, "no member answered, so none refused");
             }
             other => panic!("expected Terminal, got {other:?}"),
         }
+    }
+
+    /// a member that answers with a refusal fails its candidate over, but the
+    /// refusal is what reaches the terminal — and it survives a caller's
+    /// window cutting the race while a dark twin is still waiting.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_reaches_the_terminal_and_outlives_a_cut_race() {
+        let attempt = |c: Candidate| async move {
+            match c.endpoint.as_deref() {
+                Some("refuse") => AttemptResult::Refused("invite expired".into()),
+                Some("fail") => AttemptResult::Failed("no ack".into()),
+                _ => std::future::pending::<AttemptResult>().await,
+            }
+        };
+        let answered = vec![
+            direct_candidate("refuse", None),
+            direct_candidate("fail", None),
+        ];
+        let expired = Some(MemberAnswer::Refused("invite expired".into()));
+        let mut refused = None;
+        match race_first_contact(answered, attempt, "test", &mut refused).await {
+            FirstContactOutcome::Terminal { refused, .. } => {
+                assert_eq!(refused, expired);
+            }
+            other => panic!("expected Terminal, got {other:?}"),
+        }
+
+        let with_dark_twin = vec![
+            direct_candidate("refuse", None),
+            direct_candidate("dark", None),
+        ];
+        let mut refused = None;
+        let cut = tokio::time::timeout(
+            Duration::from_secs(90),
+            race_first_contact(with_dark_twin, attempt, "test", &mut refused),
+        )
+        .await;
+        assert!(
+            cut.is_err(),
+            "the dark twin holds the race open past the window"
+        );
+        assert_eq!(refused, expired);
+    }
+
+    /// An issuer a member does not know fails its candidate over like any
+    /// non-terminal answer, but the answer reaches the terminal as what it is.
+    #[tokio::test]
+    async fn an_unknown_issuer_reaches_the_terminal_as_its_own_answer() {
+        let attempt = |c: Candidate| async move {
+            match c.endpoint.as_deref() {
+                Some("lagging") => AttemptResult::IssuerUnknown("not in this view".into()),
+                _ => AttemptResult::Failed("no ack".into()),
+            }
+        };
+        let candidates = vec![
+            direct_candidate("dark", None),
+            direct_candidate("lagging", None),
+        ];
+        let mut refused = None;
+        let outcome = race_first_contact(candidates, attempt, "test", &mut refused).await;
+        let unknown = Some(MemberAnswer::IssuerUnknown("not in this view".into()));
+        assert!(
+            matches!(&outcome, FirstContactOutcome::Terminal { refused, .. } if *refused == unknown),
+            "{outcome:?}"
+        );
+    }
+
+    /// A fresh joiner whose round heard nothing races again and says the
+    /// inviter is unreachable; an unknown issuer is waited out for the bound
+    /// and then ends in the terminal class; the node's own dead plane and a
+    /// member's refusal still end the join, the plane first.
+    #[test]
+    fn an_exhausted_round_retries_an_unreachable_inviter_and_ends_an_unknown_issuer() {
+        let unknown = || Some(MemberAnswer::IssuerUnknown("not a validator".into()));
+        assert_eq!(
+            after_exhausted_round(None, None, 0),
+            AfterRound::InviterUnreachable
+        );
+        for rounds in 1..ISSUER_UNKNOWN_ROUNDS {
+            assert_eq!(
+                after_exhausted_round(None, unknown(), rounds),
+                AfterRound::IssuerNotYetKnown("not a validator".into())
+            );
+        }
+        assert_eq!(
+            after_exhausted_round(None, unknown(), ISSUER_UNKNOWN_ROUNDS),
+            AfterRound::IssuerNotAValidator("not a validator".into())
+        );
+        assert_eq!(
+            after_exhausted_round(
+                None,
+                Some(MemberAnswer::Refused("invite expired".into())),
+                0
+            ),
+            AfterRound::Refused("invite expired".into())
+        );
+        assert_eq!(
+            after_exhausted_round(
+                Some(("netstack_guest_unreadable", "gone".into())),
+                unknown(),
+                ISSUER_UNKNOWN_ROUNDS
+            ),
+            AfterRound::PlaneDown {
+                reason: "netstack_guest_unreadable",
+                detail: "gone".into()
+            }
+        );
     }
 
     fn direct_candidate(endpoint: &str, intro: Option<&str>) -> Candidate {
@@ -1367,12 +1646,17 @@ mod tests {
     async fn empty_candidate_set_is_terminal_not_a_hang() {
         // an invite that offers no contactable candidate leaves nothing to
         // race — an immediate honest terminal, never a hang.
-        let outcome = race_first_contact(Vec::new(), |_c| async move {
-            AttemptResult::Admitted {
-                height: 1,
-                cap: None,
-            }
-        })
+        let outcome = race_first_contact(
+            Vec::new(),
+            |_c| async move {
+                AttemptResult::Admitted {
+                    height: 1,
+                    cap: None,
+                }
+            },
+            "test",
+            &mut None,
+        )
         .await;
         assert!(matches!(
             outcome,
@@ -1643,7 +1927,7 @@ mod tests {
         )
         .await;
         match outcome {
-            FirstContactOutcome::Terminal { tried, reason } => {
+            FirstContactOutcome::Terminal { tried, reason, .. } => {
                 assert_eq!(tried, 1);
                 assert!(
                     reason.contains("target_unregistered"),

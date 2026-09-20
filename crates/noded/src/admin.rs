@@ -368,8 +368,12 @@ async fn resolve_owner(
 /// `ConnectInfo` (an embedder that forgot `into_make_service_with_connect_info`)
 /// is NOT treated as loopback — an unknown peer must never inherit local trust.
 /// every real serve path (noded, bin/node, simnode) threads connect-info.
-pub(crate) fn peer_is_loopback(req: &axum::extract::Request) -> bool {
-    req.extensions()
+///
+/// Takes the request's EXTENSIONS rather than the request, so a handler that
+/// extracted its parts (the `/v1/ws` upgrade) asks the same question the same
+/// way.
+pub(crate) fn peer_is_loopback(extensions: &axum::http::Extensions) -> bool {
+    extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip().is_loopback())
         .unwrap_or(false)
@@ -482,7 +486,7 @@ struct Presented {
 impl Presented {
     fn of(req: &axum::extract::Request) -> Self {
         Self {
-            peer_is_loopback: peer_is_loopback(req),
+            peer_is_loopback: peer_is_loopback(req.extensions()),
             method: req.method().as_str().to_string(),
             path_and_query: req
                 .uri()

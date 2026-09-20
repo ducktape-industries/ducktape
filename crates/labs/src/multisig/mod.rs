@@ -48,7 +48,9 @@ use alloy_primitives::{Address, B256, U256};
 use safe::{SafeTx, exec_transaction_calldata, pack_signatures, recover_owner, safe_tx_hash};
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
-use valset::{ValsetQuery, decode_reply as valset_decode_reply, encode_query as valset_encode_query};
+use valset::{
+    ValsetQuery, decode_reply as valset_decode_reply, encode_query as valset_encode_query,
+};
 
 /// Calldata ceiling for one proposal. A Safe transaction carries a contract
 /// call, not a payload — this keeps one hostile proposal from ballooning every
@@ -131,13 +133,15 @@ impl Multisig {
     /// external default is refused so it cannot either.
     fn external_origin(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
         match &ctx.env().origin {
-            Origin::External(key) if key.is_empty() => Err(Error::Module(
-                "multisig: ops require a non-empty external submitter".into(),
+            Origin::External(key) if key.is_empty() => Err(Error::module(
+                "empty_origin_key",
+                "multisig: ops require a non-empty external submitter",
             )),
             Origin::External(key) => Ok(key.clone()),
-            other => Err(Error::Module(format!(
-                "multisig: ops require an external submitter, got {other:?}"
-            ))),
+            other => Err(Error::module(
+                "external_origin_required",
+                format!("multisig: ops require an external submitter, got {other:?}"),
+            )),
         }
     }
 
@@ -156,31 +160,39 @@ impl Multisig {
     // attestation if a byzantine validator stalling a vault becomes real.
     async fn require_validator(&self, ctx: &dyn Ctx, who: &[u8]) -> Result<(), Error> {
         let reply = valset_decode_reply(
-            &ctx.query(&self.valset_id, &valset_encode_query(&ValsetQuery::Validators))
-                .await?,
+            &ctx.query(
+                &self.valset_id,
+                &valset_encode_query(&ValsetQuery::Validators),
+            )
+            .await?,
         )
-        .map_err(Error::Module)?;
+        .map_err(|e| Error::module("valset_reply_decode", e))?;
         let is_validator = match reply {
             valset::ValsetReply::Validators(keys) => keys.iter().any(|k| k == who),
             other => {
-                return Err(Error::Module(format!(
-                    "multisig: valset answered Validators with {other:?}"
-                )));
+                return Err(Error::module(
+                    "unexpected_valset_reply",
+                    format!("multisig: valset answered Validators with {other:?}"),
+                ));
             }
         };
         if is_validator {
             Ok(())
         } else {
-            Err(Error::Module(
-                "multisig: chain facts may only be recorded by a validator".into(),
+            Err(Error::module(
+                "not_a_validator",
+                "multisig: chain facts may only be recorded by a validator",
             ))
         }
     }
 
     fn vault_mut(&mut self, vault_id: &str) -> Result<Vault, Error> {
-        self.get(vault_id)
-            .cloned()
-            .ok_or_else(|| Error::Module(format!("multisig: no such vault: {vault_id}")))
+        self.get(vault_id).cloned().ok_or_else(|| {
+            Error::module(
+                "unknown_vault",
+                format!("multisig: no such vault: {vault_id}"),
+            )
+        })
     }
 
     fn executable_of(vault_id: &str, v: &Vault, hash: &B256, p: &Proposal) -> ExecutableView {
@@ -304,7 +316,10 @@ impl Multisig {
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let decoded = decode_state(bytes)?;
         if Self::root_of(&decoded) != expected {
-            return Err(Error::Module("multisig: snapshot root mismatch".into()));
+            return Err(Error::module(
+                "snapshot_root_mismatch",
+                "multisig: snapshot root mismatch",
+            ));
         }
         self.vaults = decoded;
         self.pending.clear();
@@ -329,7 +344,7 @@ impl Module for Multisig {
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let who = Self::external_origin(ctx)?;
         let now = ctx.env().consensus_time;
-        match decode_msg(&msg.payload).map_err(Error::Module)? {
+        match decode_msg(&msg.payload).map_err(|e| Error::module("codec", e))? {
             MultisigMsg::RegisterVault {
                 vault_id,
                 chain_id,
@@ -340,18 +355,21 @@ impl Module for Multisig {
             } => {
                 sdk::require_non_empty("vault_id", &vault_id)?;
                 if self.get(&vault_id).is_some() {
-                    return Err(Error::Module(format!(
-                        "multisig: vault already exists: {vault_id}"
-                    )));
+                    return Err(Error::module(
+                        "vault_exists",
+                        format!("multisig: vault already exists: {vault_id}"),
+                    ));
                 }
                 if owners.is_empty() || owners.len() > MAX_OWNERS {
-                    return Err(Error::Module(format!(
-                        "multisig: a vault needs 1..={MAX_OWNERS} owners"
-                    )));
+                    return Err(Error::module(
+                        "bad_owner_count",
+                        format!("multisig: a vault needs 1..={MAX_OWNERS} owners"),
+                    ));
                 }
                 if threshold == 0 || usize::from(threshold) > owners.len() {
-                    return Err(Error::Module(
-                        "multisig: threshold must be within 1..=owners".into(),
+                    return Err(Error::module(
+                        "bad_threshold",
+                        "multisig: threshold must be within 1..=owners",
                     ));
                 }
                 let safe = address_of(&safe_address)?;
@@ -360,7 +378,10 @@ impl Module for Multisig {
                     .map(|o| address_of(o))
                     .collect::<Result<_, _>>()?;
                 if owner_set.len() != owners.len() {
-                    return Err(Error::Module("multisig: duplicate owner address".into()));
+                    return Err(Error::module(
+                        "duplicate_owner",
+                        "multisig: duplicate owner address",
+                    ));
                 }
 
                 // Possession: whoever registers must hold one of the declared
@@ -370,8 +391,9 @@ impl Module for Multisig {
                     register_preimage(&vault_id, chain_id, &safe_address, &owners, threshold);
                 let signer = recover_prehashed(&preimage, &signature)?;
                 if !owner_set.contains(&signer) {
-                    return Err(Error::Module(
-                        "multisig: registration must be signed by a declared owner".into(),
+                    return Err(Error::module(
+                        "not_a_declared_owner",
+                        "multisig: registration must be signed by a declared owner",
                     ));
                 }
 
@@ -403,14 +425,16 @@ impl Module for Multisig {
                 let mut vault = self.vault_mut(&vault_id)?;
                 let addr = address_of(&address)?;
                 if !vault.owners.contains(&addr) {
-                    return Err(Error::Module(
-                        "multisig: address is not an owner of this vault".into(),
+                    return Err(Error::module(
+                        "not_an_owner",
+                        "multisig: address is not an owner of this vault",
                     ));
                 }
                 let preimage = bind_preimage(&vault_id, &address, &who);
                 if recover_prehashed(&preimage, &possession)? != addr {
-                    return Err(Error::Module(
-                        "multisig: possession proof does not recover to the claimed address".into(),
+                    return Err(Error::module(
+                        "possession_unverified",
+                        "multisig: possession proof does not recover to the claimed address",
                     ));
                 }
                 vault.bindings.insert(addr, who);
@@ -428,27 +452,37 @@ impl Module for Multisig {
             } => {
                 let mut vault = self.vault_mut(&vault_id)?;
                 if vault.drifted {
-                    return Err(Error::Module(
-                        "multisig: vault mirror disagrees with the chain; re-register it before proposing".into(),
+                    return Err(Error::module(
+                        "vault_drifted",
+                        "multisig: vault mirror disagrees with the chain; re-register it before \
+                         proposing",
                     ));
                 }
                 if data.len() > MAX_DATA_LEN {
-                    return Err(Error::Module(format!(
-                        "multisig: calldata exceeds the {MAX_DATA_LEN}-byte ceiling"
-                    )));
+                    return Err(Error::module(
+                        "calldata_too_large",
+                        format!("multisig: calldata exceeds the {MAX_DATA_LEN}-byte ceiling"),
+                    ));
                 }
                 // A Safe nonce is strictly sequential: below the chain's nonce
                 // it can never execute, and far above it can only pin state.
                 if nonce < vault.chain_nonce {
-                    return Err(Error::Module(format!(
-                        "multisig: nonce {nonce} is below the chain nonce {}",
-                        vault.chain_nonce
-                    )));
+                    return Err(Error::module(
+                        "nonce_below_chain",
+                        format!(
+                            "multisig: nonce {nonce} is below the chain nonce {}",
+                            vault.chain_nonce
+                        ),
+                    ));
                 }
                 if nonce > vault.chain_nonce + MAX_NONCE_LOOKAHEAD {
-                    return Err(Error::Module(format!(
-                        "multisig: nonce {nonce} is more than {MAX_NONCE_LOOKAHEAD} past the chain nonce"
-                    )));
+                    return Err(Error::module(
+                        "nonce_too_far_ahead",
+                        format!(
+                            "multisig: nonce {nonce} is more than {MAX_NONCE_LOOKAHEAD} past the \
+                             chain nonce"
+                        ),
+                    ));
                 }
                 let pending = vault
                     .proposals
@@ -456,28 +490,34 @@ impl Module for Multisig {
                     .filter(|p| p.executed.is_none())
                     .count();
                 if pending >= MAX_PENDING_PROPOSALS {
-                    return Err(Error::Module(format!(
-                        "multisig: vault already holds {MAX_PENDING_PROPOSALS} unexecuted proposals"
-                    )));
+                    return Err(Error::module(
+                        "proposal_cap",
+                        format!(
+                            "multisig: vault already holds {MAX_PENDING_PROPOSALS} unexecuted \
+                             proposals"
+                        ),
+                    ));
                 }
 
                 let tx = SafeTx::call(address_of(&to)?, u256_of(&value)?, data, nonce);
-                tx.validate().map_err(Error::Module)?;
+                tx.validate().map_err(|e| Error::module("bad_safe_tx", e))?;
                 // COMPUTED here, never taken from the proposer: this is what
                 // stops a proposer showing owners one transaction and having
                 // them sign another.
                 let hash = safe_tx_hash(vault.chain_id, vault.safe_address, &tx);
 
                 let proposer = recover_owner(hash, &signature_of(&signature)?)
-                    .map_err(|e| Error::Module(format!("multisig: {e}")))?;
+                    .map_err(|e| Error::module("signature_recover", format!("multisig: {e}")))?;
                 if !vault.owners.contains(&proposer) {
-                    return Err(Error::Module(
-                        "multisig: proposal must be signed by a current owner".into(),
+                    return Err(Error::module(
+                        "not_a_current_owner",
+                        "multisig: proposal must be signed by a current owner",
                     ));
                 }
                 if vault.proposals.contains_key(&hash) {
-                    return Err(Error::Module(
-                        "multisig: an identical proposal already exists".into(),
+                    return Err(Error::module(
+                        "proposal_exists",
+                        "multisig: an identical proposal already exists",
                     ));
                 }
 
@@ -512,18 +552,25 @@ impl Module for Multisig {
                 let sig = signature_of(&signature)?;
 
                 let signer = recover_owner(hash, &sig)
-                    .map_err(|e| Error::Module(format!("multisig: {e}")))?;
+                    .map_err(|e| Error::module("signature_recover", format!("multisig: {e}")))?;
                 if !vault.owners.contains(&signer) {
-                    return Err(Error::Module(
-                        "multisig: approval must be signed by a current owner".into(),
+                    return Err(Error::module(
+                        "not_a_current_owner",
+                        "multisig: approval must be signed by a current owner",
                     ));
                 }
 
                 let Some(proposal) = vault.proposals.get_mut(&hash) else {
-                    return Err(Error::Module("multisig: no such proposal".into()));
+                    return Err(Error::module(
+                        "no_such_proposal",
+                        "multisig: no such proposal",
+                    ));
                 };
                 if proposal.executed.is_some() {
-                    return Err(Error::Module("multisig: proposal already executed".into()));
+                    return Err(Error::module(
+                        "proposal_already_executed",
+                        "multisig: proposal already executed",
+                    ));
                 }
                 // Keyed by owner: re-approving is a no-op, and one owner can
                 // never be counted twice toward the threshold.
@@ -578,12 +625,16 @@ impl Module for Multisig {
                 let mut vault = self.vault_mut(&vault_id)?;
                 let hash = b256_of(&hash_bytes)?;
                 if chain_tx_hash.len() != 32 {
-                    return Err(Error::Module(
-                        "multisig: chain tx hash must be 32 bytes".into(),
+                    return Err(Error::module(
+                        "bad_chain_tx_hash",
+                        "multisig: chain tx hash must be 32 bytes",
                     ));
                 }
                 let Some(proposal) = vault.proposals.get_mut(&hash) else {
-                    return Err(Error::Module("multisig: no such proposal".into()));
+                    return Err(Error::module(
+                        "no_such_proposal",
+                        "multisig: no such proposal",
+                    ));
                 };
                 if proposal.executed.is_some() {
                     return Ok(());
@@ -606,7 +657,7 @@ impl Module for Multisig {
             }
             m
         };
-        match decode_query(req).map_err(Error::Module)? {
+        match decode_query(req).map_err(|e| Error::module("codec", e))? {
             MultisigQuery::Vaults => Ok(encode_reply(&MultisigReply::Vaults(
                 merged.iter().map(|(id, v)| Self::view_of(id, v)).collect(),
             ))),
@@ -676,35 +727,41 @@ fn emit_executable(
 // ---- byte-field validation (untrusted op bytes) -----------------------------
 
 fn address_of(bytes: &[u8]) -> Result<Address, Error> {
-    let raw: [u8; 20] = bytes
-        .try_into()
-        .map_err(|_| Error::Module(format!("multisig: address must be 20 bytes, got {}", bytes.len())))?;
+    let raw: [u8; 20] = bytes.try_into().map_err(|_| {
+        Error::module(
+            "bad_address",
+            format!("multisig: address must be 20 bytes, got {}", bytes.len()),
+        )
+    })?;
     Ok(Address::from(raw))
 }
 
 fn b256_of(bytes: &[u8]) -> Result<B256, Error> {
-    let raw: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| Error::Module(format!("multisig: hash must be 32 bytes, got {}", bytes.len())))?;
+    let raw: [u8; 32] = bytes.try_into().map_err(|_| {
+        Error::module(
+            "bad_hash",
+            format!("multisig: hash must be 32 bytes, got {}", bytes.len()),
+        )
+    })?;
     Ok(B256::from(raw))
 }
 
 fn u256_of(bytes: &[u8]) -> Result<U256, Error> {
     let raw: [u8; 32] = bytes.try_into().map_err(|_| {
-        Error::Module(format!(
-            "multisig: uint256 must be 32 bytes, got {}",
-            bytes.len()
-        ))
+        Error::module(
+            "bad_uint256",
+            format!("multisig: uint256 must be 32 bytes, got {}", bytes.len()),
+        )
     })?;
     Ok(U256::from_be_bytes(raw))
 }
 
 fn signature_of(bytes: &[u8]) -> Result<[u8; 65], Error> {
     bytes.try_into().map_err(|_| {
-        Error::Module(format!(
-            "multisig: signature must be 65 bytes, got {}",
-            bytes.len()
-        ))
+        Error::module(
+            "bad_signature",
+            format!("multisig: signature must be 65 bytes, got {}", bytes.len()),
+        )
     })
 }
 
@@ -714,7 +771,7 @@ fn signature_of(bytes: &[u8]) -> Result<[u8; 65], Error> {
 fn recover_prehashed(preimage: &[u8], signature: &[u8]) -> Result<Address, Error> {
     let sig = signature_of(signature)?;
     recover_owner(alloy_primitives::keccak256(preimage), &sig)
-        .map_err(|e| Error::Module(format!("multisig: {e}")))
+        .map_err(|e| Error::module("signature_recover", format!("multisig: {e}")))
 }
 
 fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -726,7 +783,10 @@ fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 
 fn take_u64(buf: &mut &[u8]) -> Result<u64, Error> {
     let Some((head, rest)) = buf.split_first_chunk::<8>() else {
-        return Err(Error::Module("multisig: snapshot truncated".into()));
+        return Err(Error::module(
+            "snapshot_decode",
+            "multisig: snapshot truncated",
+        ));
     };
     *buf = rest;
     Ok(u64::from_le_bytes(*head))
@@ -734,7 +794,10 @@ fn take_u64(buf: &mut &[u8]) -> Result<u64, Error> {
 
 fn take_u8(buf: &mut &[u8]) -> Result<u8, Error> {
     let Some((head, rest)) = buf.split_first() else {
-        return Err(Error::Module("multisig: snapshot truncated".into()));
+        return Err(Error::module(
+            "snapshot_decode",
+            "multisig: snapshot truncated",
+        ));
     };
     *buf = rest;
     Ok(*head)
@@ -742,7 +805,10 @@ fn take_u8(buf: &mut &[u8]) -> Result<u8, Error> {
 
 fn take_array<const N: usize>(buf: &mut &[u8]) -> Result<[u8; N], Error> {
     let Some((head, rest)) = buf.split_first_chunk::<N>() else {
-        return Err(Error::Module("multisig: snapshot truncated".into()));
+        return Err(Error::module(
+            "snapshot_decode",
+            "multisig: snapshot truncated",
+        ));
     };
     *buf = rest;
     Ok(*head)
@@ -751,7 +817,10 @@ fn take_array<const N: usize>(buf: &mut &[u8]) -> Result<[u8; N], Error> {
 fn take_vec(buf: &mut &[u8]) -> Result<Vec<u8>, Error> {
     let len = take_u64(buf)? as usize;
     if buf.len() < len {
-        return Err(Error::Module("multisig: snapshot truncated".into()));
+        return Err(Error::module(
+            "snapshot_decode",
+            "multisig: snapshot truncated",
+        ));
     }
     let (head, rest) = buf.split_at(len);
     *buf = rest;
@@ -760,14 +829,17 @@ fn take_vec(buf: &mut &[u8]) -> Result<Vec<u8>, Error> {
 
 fn take_string(buf: &mut &[u8]) -> Result<String, Error> {
     String::from_utf8(take_vec(buf)?)
-        .map_err(|_| Error::Module("multisig: snapshot holds invalid utf-8".into()))
+        .map_err(|_| Error::module("snapshot_decode", "multisig: snapshot holds invalid utf-8"))
 }
 
 fn take_bool(buf: &mut &[u8]) -> Result<bool, Error> {
     match take_u8(buf)? {
         0 => Ok(false),
         1 => Ok(true),
-        _ => Err(Error::Module("multisig: snapshot holds a non-boolean".into())),
+        _ => Err(Error::module(
+            "snapshot_decode",
+            "multisig: snapshot holds a non-boolean",
+        )),
     }
 }
 
@@ -781,7 +853,10 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Vault>, Error> {
         let safe_address = Address::from(take_array::<20>(&mut buf)?);
         let owner_count = take_u64(&mut buf)?;
         if owner_count as usize > MAX_OWNERS {
-            return Err(Error::Module("multisig: snapshot owner count exceeds the cap".into()));
+            return Err(Error::module(
+                "snapshot_decode",
+                "multisig: snapshot owner count exceeds the cap",
+            ));
         }
         let mut owners = BTreeSet::new();
         for _ in 0..owner_count {
@@ -792,9 +867,10 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Vault>, Error> {
             0 => Backend::Safe,
             1 => Backend::ThresholdEcdsa,
             other => {
-                return Err(Error::Module(format!(
-                    "multisig: snapshot holds an unknown backend tag {other}"
-                )));
+                return Err(Error::module(
+                    "snapshot_decode",
+                    format!("multisig: snapshot holds an unknown backend tag {other}"),
+                ));
             }
         };
         let chain_nonce = take_u64(&mut buf)?;
@@ -810,15 +886,17 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Vault>, Error> {
             let value = U256::from_be_bytes(take_array::<32>(&mut buf)?);
             let data = take_vec(&mut buf)?;
             if data.len() > MAX_DATA_LEN {
-                return Err(Error::Module(
-                    "multisig: snapshot proposal exceeds the calldata ceiling".into(),
+                return Err(Error::module(
+                    "snapshot_decode",
+                    "multisig: snapshot proposal exceeds the calldata ceiling",
                 ));
             }
             let proposer = Address::from(take_array::<20>(&mut buf)?);
             let approval_count = take_u64(&mut buf)?;
             if approval_count as usize > MAX_OWNERS {
-                return Err(Error::Module(
-                    "multisig: snapshot approval count exceeds the owner cap".into(),
+                return Err(Error::module(
+                    "snapshot_decode",
+                    "multisig: snapshot approval count exceeds the owner cap",
                 ));
             }
             let mut approvals = BTreeMap::new();
@@ -826,8 +904,9 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Vault>, Error> {
                 let owner = Address::from(take_array::<20>(&mut buf)?);
                 let sig = take_vec(&mut buf)?;
                 if sig.len() != 65 {
-                    return Err(Error::Module(
-                        "multisig: snapshot holds a malformed signature".into(),
+                    return Err(Error::module(
+                        "snapshot_decode",
+                        "multisig: snapshot holds a malformed signature",
                     ));
                 }
                 approvals.insert(owner, sig);
@@ -837,8 +916,9 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Vault>, Error> {
                 1 => {
                     let chain_tx_hash = take_vec(&mut buf)?;
                     if chain_tx_hash.len() != 32 {
-                        return Err(Error::Module(
-                            "multisig: snapshot holds a malformed chain tx hash".into(),
+                        return Err(Error::module(
+                            "snapshot_decode",
+                            "multisig: snapshot holds a malformed chain tx hash",
                         ));
                     }
                     let success = take_bool(&mut buf)?;
@@ -848,8 +928,9 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Vault>, Error> {
                     })
                 }
                 _ => {
-                    return Err(Error::Module(
-                        "multisig: snapshot holds a non-boolean execution tag".into(),
+                    return Err(Error::module(
+                        "snapshot_decode",
+                        "multisig: snapshot holds a non-boolean execution tag",
                     ));
                 }
             };
@@ -893,8 +974,9 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Vault>, Error> {
         );
     }
     if !buf.is_empty() {
-        return Err(Error::Module(
-            "multisig: snapshot has trailing bytes".into(),
+        return Err(Error::module(
+            "snapshot_decode",
+            "multisig: snapshot has trailing bytes",
         ));
     }
     Ok(vaults)

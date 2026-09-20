@@ -19,7 +19,7 @@ use identity::{
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sdk_testkit::MemStore;
-use valset::Valset;
+use valset_module::Valset;
 
 fn key(seed: u8) -> Vec<u8> {
     let seed = [seed; 32];
@@ -87,11 +87,14 @@ impl Module for IdentityStub {
     }
 
     async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
-        Err(Error::Module("identity test stub is read-only".into()))
+        Err(Error::module(
+            "read_only",
+            "identity test stub is read-only",
+        ))
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let reply = match identity_decode_query(req).map_err(Error::Module)? {
+        let reply = match identity_decode_query(req).map_err(|e| Error::module("codec", e))? {
             IdentityQuery::All { from, limit } => IdentityReply::Accounts(
                 self.accounts
                     .range(from..)
@@ -113,7 +116,10 @@ impl Module for IdentityStub {
             }
             IdentityQuery::Controlled { .. } => IdentityReply::Accounts(Vec::new()),
             IdentityQuery::Resolve { .. } => {
-                return Err(Error::Module("unexpected bulk identity query".into()));
+                return Err(Error::module(
+                    "unexpected_query",
+                    "unexpected bulk identity query",
+                ));
             }
         };
         Ok(identity_encode_reply(&reply))
@@ -301,7 +307,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         .await
         .expect_err("a key of no account cannot propose in share mode");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("no Identity account")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "no_identity_account"),
             "rejection names the missing account, got {err:?}"
         );
 
@@ -724,7 +730,7 @@ fn a_non_validator_key_is_refused_in_validator_mode() {
         .await
         .expect_err("an account key that is no validator cannot propose");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("member node")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "not_a_member"),
             "rejection names the missing membership, got {err:?}"
         );
 
@@ -744,7 +750,7 @@ fn a_non_validator_key_is_refused_in_validator_mode() {
         .await
         .expect_err("a non-member stranger cannot propose");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("member node")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "not_a_member"),
             "rejection names the missing membership, got {err:?}"
         );
 
@@ -773,7 +779,7 @@ fn a_non_validator_key_is_refused_in_validator_mode() {
         .await
         .expect_err("a non-validator key holds no ballot");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("frozen electorate")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "not_in_electorate"),
             "rejection names the electorate, got {err:?}"
         );
     });

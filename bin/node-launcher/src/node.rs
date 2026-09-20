@@ -12,8 +12,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use app_update::Designation;
-use serde::Deserialize;
+use app_update::ReleaseStatus;
 
 use crate::refusal::Refusal;
 
@@ -22,31 +21,6 @@ use crate::refusal::Refusal;
 /// into a journal replay on the way back up.
 const STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// What the running node answers `release status` with: where it serves, who
-/// it is, where the chain is, and what the network has designated.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct ReleaseStatus {
-    /// The node's own http base — what `fs cat` dials.
-    pub base: String,
-    /// Empty until the node has published its mesh identity. A service daemon
-    /// started before then exits fatal, so this is the supervisor's wait seam
-    /// and the flipped release's healthy signal alike.
-    #[serde(default)]
-    pub public_key: String,
-    #[serde(default)]
-    pub height: u64,
-    /// The release this network runs, and from which block. `None` until
-    /// governance has passed one.
-    #[serde(default)]
-    pub designation: Option<Designation>,
-}
-
-impl ReleaseStatus {
-    pub fn identity_published(&self) -> bool {
-        !self.public_key.is_empty()
-    }
-}
 
 /// A `ducktape` binary, pointed at one workspace.
 #[derive(Debug, Clone)]
@@ -70,8 +44,10 @@ impl Ducktape {
         command
     }
 
-    /// The running node's answer, or a refusal naming how the ask failed —
-    /// which is also how "the node is not up yet" reads.
+    /// The running node's answer — where it serves, who it is, where the
+    /// chain is, and what the network has designated and keyed — or a refusal
+    /// naming how the ask failed, which is also how "the node is not up yet"
+    /// reads.
     pub fn status(&self) -> Result<ReleaseStatus, Refusal> {
         let output = self
             .verb(&["release", "status", "--json"])
@@ -125,7 +101,7 @@ impl Ducktape {
     /// checkpoint and recomposes the committed root hash, which is exactly the
     /// restart path a live node takes. Its first stdout line is the reason
     /// when it cannot.
-    pub fn qualify(staged: &Path, config: &Path) -> Result<(), Refusal> {
+    pub fn qualify(staged: &Path, config: &Path) -> Result<(), Unqualified> {
         let output = Command::new(staged)
             .args(["node", "qualify"])
             .arg("--config")
@@ -134,21 +110,52 @@ impl Ducktape {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|error| Refusal::io("qualify_spawn_failed", staged, &error))?;
+            .map_err(|error| {
+                Unqualified::from(Refusal::io("qualify_spawn_failed", staged, &error))
+            })?;
         if output.status.success() {
             return Ok(());
         }
-        let printed = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string);
-        let detail = printed.unwrap_or_else(|| match output.status.code() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let printed = stdout.lines().next().map(str::trim).unwrap_or_default();
+        let ended = match output.status.code() {
             Some(code) => format!("exited {code}"),
             None => "killed".to_string(),
-        });
-        Err(Refusal::new("qualify_refused", detail))
+        };
+        // The binary's stderr already reached this launcher's log; its token
+        // is the part only it can name.
+        let gave_a_token = is_token(printed);
+        match gave_a_token {
+            true => Err(Unqualified {
+                reason: printed.to_string(),
+                detail: ended,
+            }),
+            false => Err(Unqualified {
+                reason: "qualify_refused".to_string(),
+                detail: format!("{ended}; printed {printed:?}"),
+            }),
+        }
+    }
+
+    /// Have `release` record the module world it speaks as the one this
+    /// workspace holds — the founding record its next boot is checked against.
+    pub fn record_world(release: &Path, config: &Path) -> Result<(), Refusal> {
+        let output = Command::new(release)
+            .args(["node", "record-world"])
+            .arg("--config")
+            .arg(config)
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| Refusal::io("record_world_spawn_failed", release, &error))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let said = String::from_utf8_lossy(&output.stderr);
+        Err(Refusal::new(
+            "world_unrecorded",
+            said.lines().next().unwrap_or("no output").to_string(),
+        ))
     }
 
     /// Start the child this launcher supervises: the install path's binary,
@@ -162,6 +169,33 @@ impl Ducktape {
             .map_err(|error| Refusal::io("spawn_failed", &self.exe, &error))?;
         Ok(Child { inner })
     }
+}
+
+/// Why a staged binary will not run this workspace. `reason` is the binary's
+/// OWN snake_case token — `node qualify` prints one on its first stdout line,
+/// by contract — or this launcher's `qualify_refused` when it gave none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unqualified {
+    pub reason: String,
+    pub detail: String,
+}
+
+impl From<Refusal> for Unqualified {
+    fn from(refusal: Refusal) -> Self {
+        Unqualified {
+            reason: refusal.reason.to_string(),
+            detail: refusal.detail,
+        }
+    }
+}
+
+/// A `reason` field is a stable snake_case token, never prose: what a staged
+/// binary prints is trusted as one only when it is one.
+fn is_token(line: &str) -> bool {
+    let token_bytes = line
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    !line.is_empty() && token_bytes
 }
 
 /// The supervised process.
@@ -231,5 +265,30 @@ mod tests {
         assert_eq!(designation.sha256, sha);
         assert!(!designation.armed_at(designated.height));
         assert!(designation.armed_at(1200));
+        assert_eq!(
+            designated.release_keys,
+            app_update::ReleaseKeys::default(),
+            "a reading without release keys commits none"
+        );
+    }
+
+    /// `release status --json` as a node that knows the network's release
+    /// keys answers it — `pinned` included, which this launcher reads off its
+    /// own disk instead and ignores here.
+    #[test]
+    fn a_status_answer_decodes_the_release_keys_the_network_committed() {
+        let node_key = "ab".repeat(32);
+        let reading: ReleaseStatus = serde_json::from_str(&format!(
+            r#"{{"base":"http://127.0.0.1:8844","public_key":"ab12","height":900,
+                 "root_hash":"00","designation":null,
+                 "release_keys":{{"node":"{node_key}","app":null}},
+                 "pinned":null}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            reading.release_keys.of(app_update::Kind::Node),
+            Some(node_key.parse().unwrap())
+        );
+        assert_eq!(reading.release_keys.of(app_update::Kind::App), None);
     }
 }

@@ -1,10 +1,10 @@
-//! Coordinator policy selection — the ONLY new decision the untrusted
-//! coordinator makes at boot: which [`nat_traversal::AuthPolicy`] to serve.
+//! Coordinator policy selection — the ONLY decision the untrusted coordinator
+//! makes at boot: which [`nat_traversal::AuthPolicy`] to serve.
 //!
 //! Factored out of `main.rs` so it is unit-testable without spawning the
-//! process. The coordinator stays keyless: `--genesis-set` reads ONLY the
-//! PUBLIC validator pubkeys out of a `network.toml` (never a secret, never
-//! written back), and every other input is a bare CLI flag.
+//! process. The coordinator stays keyless and dials nothing: `--genesis-set`
+//! reads ONLY the PUBLIC validator pubkeys out of a `network.toml` (never a
+//! secret, never written back), and every other input is a bare CLI flag.
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
@@ -84,7 +84,8 @@ struct GenesisPin {
 }
 
 /// Select the authorization policy from CLI flags:
-/// `--genesis-set <path>` => Private (pinned to that network.toml's valset);
+/// `--genesis-set <path>` => Private (the genesis set of that network.toml
+///                           roots every cap chain it admits);
 /// otherwise              => public with proof-of-possession.
 pub fn select_policy(args: &[String]) -> std::io::Result<nat_traversal::AuthPolicy> {
     // `--genesis-set` presence is detected SEPARATELY from its value: a present

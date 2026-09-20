@@ -166,7 +166,7 @@ fn a_promoted_validator_converges_the_overlay_mesh() {
     // the plane exists only with wireguard on. This line IS the regression.
     cluster.wireguard = true;
     // hermetic: without this every node dials the LIVE public coordinator
-    // (`DEFAULT_PRIMARY_COORDINATOR`) from inside the test.
+    // (`default_primary_coordinator()`) from inside the test.
     cluster
         .extra_toml
         .push("primary_coordinator = \"none\"".into());

@@ -1,21 +1,22 @@
 # The fast lane: what a push to `dev` proves in minutes, with nothing
-# that builds a wasm guest, bundles a view, or boots a topology. CI is not a
-# merge gate — a PR merges on review — so this runs after the merge, on `dev`,
+# that builds a wasm guest, bundles a view, or boots a topology. The `unit`
+# job is required for PRs into `dev`. It also runs after a push to `dev`
 # and on demand for a branch (`gh workflow run ci.yml --ref <branch>`).
 #
-# Two jobs, one cache each. `unit` restores one `target/` for everything the
+# One job, one cache. `unit` restores one `target/` for everything the
 # workspace compiles: the artifact checks are text (`cmp` + `grep`), clippy
 # is check-mode over the workspace, and `--lib` runs every crate's unit
-# tests — the kernel, the modules, the netstack, duckfs. `views` is its own
-# cargo workspace (`crates/views/Cargo.toml`), so it gets its own cache.
+# tests — the kernel, the modules, the netstack, duckfs.
 #
-# Everything heavier — `make views` and the tests that mount it, the simnode
-# topologies, the wasm/native parity proofs, the guest rebuild — is
-# `nightly.yml`.
+# Everything heavier — the simnode topologies, the wasm/native parity proofs,
+# the guest rebuild — is `nightly.yml`.
 name: ci
 
 on:
   push:
+    branches: [dev]
+  # `unit` is a required check on dev, so it must also run on the PR head.
+  pull_request:
     branches: [dev]
   workflow_dispatch:
 
@@ -41,34 +42,15 @@ jobs:
       # ubuntu-latest ships rustup; the checkout's rust-toolchain.toml pins
       # the exact channel + targets, so this just makes rustup install it.
       - run: rustup show
-      # the committed guest bytes agree with their fixture copies, and no
-      # binary embeds one — the binary is not the module set. The first is a
-      # text check; the second is a source-parsing lint over the whole tree,
-      # which this job builds two steps below anyway.
-      - run: make wasm-modules-check wasm-embed-check
+      # no binary embeds a wasm guest — the binary is not the module set. A
+      # source-parsing lint over the whole tree, which this job builds two
+      # steps below anyway.
+      - run: make wasm-embed-check
       # airlock's signing-route tests sign a fixture bundle with the pinned
       # `rcodesign` the enclave image carries (ops/airlock-gateway/); the
       # test refuses to skip without it.
       - run: ops/airlock-gateway/install-rcodesign.sh --prefix "$HOME/.local" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      # simnode's lib tests boot the sim, which mounts the view bundle; the
-      # whole crate runs in nightly.yml after `make views`.
+      # simnode's lib tests boot the full sim topology; the whole crate runs
+      # in nightly.yml instead.
       - run: cargo test --locked --workspace --lib --exclude simnode --no-fail-fast
       - run: cargo clippy --locked --workspace --tests --no-deps -- -D warnings
-
-  # The module-owned views (crates/views) are their own workspace, so the
-  # job above never sees them: their wire tests and lints run here,
-  # natively — the wasm bundle itself is `make views`, a nightly build step.
-  views:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/views
-      - run: rustup show
-      # Format the views workspace, including its shared design source; the
-      # desktop host workspace is checked independently.
-      - run: rustfmt --edition 2024 --check $(git ls-files 'crates/views/*.rs')
-      - run: cargo test --locked --manifest-path crates/views/Cargo.toml
-      - run: cargo clippy --locked --manifest-path crates/views/Cargo.toml --tests --no-deps -- -D warnings

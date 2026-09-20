@@ -11,9 +11,12 @@
 //! WHAT a release is, the release key says. WHEN a network runs a node
 //! release is a network decision: `release schedule` drives a governance
 //! proposal carrying an `app_update::Designation` (artifact sha + activation
-//! height) and `release status` reads back what a running node's committed
-//! state designates — which is the whole interface `ducktape-node-launcher`
-//! has to the chain.
+//! height), `release withdraw` one that takes a designation back, and
+//! `release status` reads back what a running node's committed state
+//! designates — which is the whole interface `ducktape-node-launcher` has to
+//! the chain. WHICH key signs each kind is the network's word too:
+//! `release key set` passes it on the same carrier, so a member that joined
+//! by invite learns the key from the chain it synced, never out of band.
 //!
 //! The manifest (`app_update::Manifest`, one JSON file per channel) names
 //! each platform's archive by sha256 and size and seals itself with
@@ -46,7 +49,8 @@ use airlock::client::Gateway;
 use airlock::wire::WorkRef;
 use airlock::{bodyseal, sign};
 use app_update::{
-    Artifact, Designation, Kind, Manifest, PublicKey, Release, SCHEMA, Sha, Signature, SuccessorKey,
+    Artifact, Designation, Kind, Manifest, PublicKey, Release, ReleaseKey, ReleaseSignal,
+    ReleaseStatus, SCHEMA, Sha, Signature, SuccessorKey,
 };
 
 use crate::cli_args::NodeAddr;
@@ -67,8 +71,16 @@ pub(crate) enum ReleaseCmd {
     /// propose, vote and execute the governance decision that runs a node
     /// release from a height (every member passes the same --sha and --at)
     Schedule(ScheduleArgs),
-    /// what a RUNNING node's network designates, and where that node is —
-    /// the node launcher's whole view of the chain
+    /// propose, vote and execute the governance decision that takes back a
+    /// designated node release — a refused one, say (every member passes the
+    /// same --sha)
+    Withdraw(WithdrawArgs),
+    /// the network's word on which key signs its releases
+    #[command(subcommand)]
+    Key(KeyCmd),
+    /// what a RUNNING node's network designates, the release keys it
+    /// commits, and where that node is — the node launcher's whole view of
+    /// the chain
     Status(StatusArgs),
     /// sign, notarize and staple an UNSIGNED `Ducktape.app` through the
     /// airlock gateway holding an `apple-codesign` credential; writes the
@@ -169,9 +181,79 @@ pub(crate) struct ScheduleArgs {
     pub sha: Sha,
     /// the block from which every validator runs it. ABSOLUTE, and the same
     /// number for every member co-signing this proposal — it is inside the
-    /// text they join each other by
-    #[arg(long, value_name = "HEIGHT")]
-    pub at: u64,
+    /// text they join each other by. Refused (`activation_lead_too_short`)
+    /// when it leads the height this proposal is made at — after the
+    /// preflight — by less than one launcher poll of blocks
+    #[arg(
+        long,
+        value_name = "HEIGHT",
+        required_unless_present = "lead",
+        conflicts_with = "lead"
+    )]
+    pub at: Option<u64>,
+    /// propose `--at` as BLOCKS past the height this proposal is made at,
+    /// measured after the preflight so its time is not spent out of the lead.
+    /// For the member who proposes: every other member co-signs with the
+    /// `--at` this prints
+    #[arg(long, value_name = "BLOCKS")]
+    pub lead: Option<u64>,
+    /// propose without asking the archive whether it can link the components
+    /// this network runs. The preflight is the only thing standing between a
+    /// WIT change and every validator stopping its node to learn the same
+    /// refusal, so say it out loud: the module swap that matches this binary
+    /// is already scheduled ahead of `--at`
+    #[arg(long)]
+    pub skip_preflight_i_know_the_wit_moved: bool,
+    #[command(flatten)]
+    pub selector: crate::cli_args::Selector,
+}
+
+impl ScheduleArgs {
+    fn preflight(&self) -> Preflight {
+        match self.skip_preflight_i_know_the_wit_moved {
+            true => Preflight::Skipped,
+            false => Preflight::Compose,
+        }
+    }
+}
+
+/// whether this designation is checked against the modules the network runs
+/// before it becomes a ballot.
+enum Preflight {
+    /// the default: the archive is fetched and asked to link them.
+    Compose,
+    /// the operator says the WIT moved on purpose.
+    Skipped,
+}
+
+/// `release withdraw --sha <hex>`: the governance half, taken back.
+#[derive(Debug, clap::Args)]
+pub(crate) struct WithdrawArgs {
+    /// the designated node archive's sha256 — the `--sha` it was scheduled
+    /// with
+    #[arg(long, value_name = "HEX")]
+    pub sha: Sha,
+    #[command(flatten)]
+    pub selector: crate::cli_args::Selector,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub(crate) enum KeyCmd {
+    /// propose, vote and execute the governance decision that names the key
+    /// one kind's releases are signed with (every member passes the same
+    /// --kind and --pubkey). Each member's launcher pins it on first read.
+    Set(KeySetArgs),
+}
+
+/// `release key set --kind node|app --pubkey <hex>`.
+#[derive(Debug, clap::Args)]
+pub(crate) struct KeySetArgs {
+    /// which releases the key signs
+    #[arg(long, value_enum)]
+    pub kind: ArtifactKind,
+    /// the release public key, 64 hex characters (what `release sign` printed)
+    #[arg(long, value_name = "HEX")]
+    pub pubkey: PublicKey,
     #[command(flatten)]
     pub selector: crate::cli_args::Selector,
 }
@@ -213,6 +295,8 @@ pub(crate) fn run(cmd: ReleaseCmd) -> CommandResult {
         ReleaseCmd::Sign(args) => sign(args, &mut stdin),
         ReleaseCmd::Verify(args) => verify(args),
         ReleaseCmd::Schedule(args) => schedule(args),
+        ReleaseCmd::Withdraw(args) => withdraw(args),
+        ReleaseCmd::Key(KeyCmd::Set(args)) => key_set(args),
         ReleaseCmd::Status(args) => status(args),
         ReleaseCmd::SignBundle(args) => sign_bundle(args),
     }
@@ -401,23 +485,13 @@ fn verify(args: VerifyArgs) -> CommandResult {
 }
 
 // ============================================================================
-// the node channel's governance half: schedule and status
+// the node channel's governance half: schedule, withdraw and status
 // ============================================================================
 
-/// The proposal-id space a node-release designation is minted in. It carries
-/// NO proposer key on purpose: a settled proposal leaves the open roster, so
-/// the only way a launcher can read a passed designation back is to walk ids
-/// it can predict. `release status` walks `node-release:0`, `node-release:1`,
-/// … to the first id no record exists under.
-const DESIGNATION_PREFIX: &str = "node-release";
-
-/// How far that walk goes. A network that has designated this many node
-/// releases has outgrown a linear probe, not this plane.
+/// How far `release withdraw`'s walk of the designation id space goes. A
+/// network that has designated this many node releases has outgrown a linear
+/// probe, not this plane.
 const MAX_DESIGNATIONS: u64 = 1024;
-
-fn designation_id(nth: u64) -> String {
-    format!("{DESIGNATION_PREFIX}:{nth}")
-}
 
 /// `release schedule --sha <hex> --at <height>` — the network decides WHICH
 /// node release it runs and FROM WHEN.
@@ -431,82 +505,372 @@ fn designation_id(nth: u64) -> String {
 ///
 /// `--at` is ABSOLUTE and the same number for every member: it is inside the
 /// text they join each other's proposal by.
+///
+/// The lead is measured from the committed height AFTER the preflight: the
+/// preflight takes as long as fetching and linking the archive takes, and a
+/// lead counted from before it is spent while it runs.
 fn schedule(args: ScheduleArgs) -> CommandResult {
-    let designation = Designation {
-        sha256: args.sha,
-        activation_height: args.at,
-    };
     let cfg_path = args.selector.config_path()?;
     let resolved = crate::config::resolve(&cfg_path)?;
     let node = crate::cli::DrivenNode::of(&resolved, "release schedule")?;
-    let signer = crate::cli::gov_signer(node.rpc(), &cfg_path, &resolved)?;
-    let pubkey_hex = crate::module_cli::signer_pubkey_hex(&signer);
-    let wanted = governance::GovAction::Signal {
-        text: designation.signal_text(),
+    match args.preflight() {
+        Preflight::Compose => preflight(node.http_base(), &cfg_path, &args.sha)?,
+        Preflight::Skipped => {}
+    }
+    let proposed_at = committed_height(node.http_base())?;
+    let at = match (args.at, args.lead) {
+        (Some(at), _) => at,
+        (None, Some(lead)) => proposed_at.saturating_add(lead),
+        (None, None) => {
+            return Err("release schedule needs --at <HEIGHT> or --lead <BLOCKS>".into());
+        }
     };
-    let same_action = {
-        let wanted = wanted.clone();
-        move |action: &governance::GovAction| *action == wanted
+    let block_time_ms = u64::try_from(resolved.cadence.block_time.as_millis()).unwrap_or(u64::MAX);
+    if let Err(refusal) = check_lead(proposed_at, at, block_time_ms) {
+        tracing::warn!(
+            target: "ducktape::update",
+            event = "release_schedule_refused",
+            reason = "activation_lead_too_short",
+            release = %args.sha,
+            proposed_at,
+            at,
+            "the activation height is inside one launcher poll of the proposal; nothing was proposed"
+        );
+        return Err(refusal.into());
+    }
+    let designation = Designation {
+        sha256: args.sha,
+        activation_height: at,
     };
-    let outcome = crate::cli::drive_proposal_ceremony(
+    let outcome = pass_signal(
         &node,
-        &signer,
-        &pubkey_hex,
-        // EMPTY seed: this proposal must be findable by id from any node.
-        "",
+        &cfg_path,
+        &resolved,
         "release schedule",
-        DESIGNATION_PREFIX,
-        wanted,
-        &same_action,
+        app_update::designation::PROPOSAL_PREFIX,
+        ReleaseSignal::Designate(designation).signal_text(),
     )?;
     match outcome {
         crate::cli::CeremonyOutcome::Passed => {
             println!(
-                "designated {} from height {}; track with: ducktape release status",
-                args.sha, args.at
+                "designated {} from height {at}; track with: ducktape release status",
+                args.sha
             );
             Ok(())
         }
-        crate::cli::CeremonyOutcome::AwaitingBallots => Ok(()),
+        crate::cli::CeremonyOutcome::AwaitingBallots => {
+            println!(
+                "proposed {} from height {at}; every other member co-signs with --at {at}",
+                args.sha
+            );
+            Ok(())
+        }
     }
 }
 
-/// `release status [--json]` — what a RUNNING node's network designates, and
-/// where that node is. This is the whole interface `ducktape-node-launcher`
-/// has to the chain: the http base it reads duckfs through, the mesh identity
-/// whose absence kills a service daemon, the committed height an activation
-/// is measured against, and the designation itself.
+/// The committed height this node reports — where a designation's lead is
+/// measured from.
+fn committed_height(base: &str) -> Result<u64, String> {
+    let status = crate::node_http::get_json(base, "/v1/status")
+        .map_err(|error| format!("read this node's status: {error}"))?;
+    status["height"]
+        .as_u64()
+        .ok_or_else(|| "this node's status carries no height".to_string())
+}
+
+/// Refuse an activation height that leads `proposed_at` by less than
+/// [`Designation::min_lead`]: a designation no launcher polling at its default
+/// can be counted on to stage before the height, so a validator would run the
+/// release from whenever it happened to notice rather than from `at`.
+fn check_lead(proposed_at: u64, at: u64, block_time_ms: u64) -> Result<(), String> {
+    let min = Designation::min_lead(block_time_ms);
+    let lead = at.saturating_sub(proposed_at);
+    if lead >= min {
+        return Ok(());
+    }
+    Err(format!(
+        "activation_lead_too_short: activation height {at} leads height {proposed_at}, where \
+         this proposal is made, by {lead} blocks — a launcher polls every {poll} ms, which is {min} blocks at \
+         this network's {block_time_ms} ms beat, so nothing was proposed. Pass --at {earliest} \
+         or later, or --lead <BLOCKS> to count from the proposal height.",
+        poll = app_update::designation::LAUNCHER_POLL_MS,
+        earliest = proposed_at.saturating_add(min),
+    ))
+}
+
+/// `release withdraw --sha <hex>` — the network takes back a release it
+/// designated: every launcher refused it at qualify, say, and a joiner would
+/// otherwise fetch it and refuse it again. The same ceremony `schedule` runs,
+/// under the same id walk, carrying the withdrawal document; once it passes,
+/// `release status` no longer answers with that release (it answers with the
+/// designation before it that nothing withdrew, or with none).
+///
+/// There is no preflight: nothing is linked or run. What is checked is that
+/// the network designates `--sha` at all, so a mistyped sha is refused before
+/// it becomes a ballot rather than passing as a signal that changes nothing.
+fn withdraw(args: WithdrawArgs) -> CommandResult {
+    let cfg_path = args.selector.config_path()?;
+    let resolved = crate::config::resolve(&cfg_path)?;
+    let node = crate::cli::DrivenNode::of(&resolved, "release withdraw")?;
+    let designated_now = standing(node.http_base())?
+        .iter()
+        .any(|designation| designation.sha256 == args.sha);
+    if !designated_now {
+        return Err(format!(
+            "not_designated: this network designates no release {} — nothing was proposed \
+             (`ducktape release status` names the one it does)",
+            args.sha
+        )
+        .into());
+    }
+    let outcome = pass_signal(
+        &node,
+        &cfg_path,
+        &resolved,
+        "release withdraw",
+        app_update::designation::PROPOSAL_PREFIX,
+        ReleaseSignal::Withdraw { withdraw: args.sha }.signal_text(),
+    )?;
+    match outcome {
+        crate::cli::CeremonyOutcome::Passed => {
+            println!("withdrew {}; track with: ducktape release status", args.sha);
+            Ok(())
+        }
+        crate::cli::CeremonyOutcome::AwaitingBallots => {
+            println!(
+                "proposed withdrawing {}; every other member co-signs with --sha {}",
+                args.sha, args.sha
+            );
+            Ok(())
+        }
+    }
+}
+
+/// `release key set --kind <kind> --pubkey <hex>` — the network names the key
+/// that signs one kind's releases, on the same carrier a designation rides.
+///
+/// A member that joined by invite has no other way to learn it: its launcher
+/// reads the passed signal back through `release status` and pins it on first
+/// read. An install that already pins a different key keeps its own and
+/// refuses by name — this verb never moves a pin.
+fn key_set(args: KeySetArgs) -> CommandResult {
+    let committed = ReleaseKey {
+        kind: args.kind.into(),
+        pubkey: args.pubkey,
+    };
+    let cfg_path = args.selector.config_path()?;
+    let resolved = crate::config::resolve(&cfg_path)?;
+    let node = crate::cli::DrivenNode::of(&resolved, "release key set")?;
+    let outcome = pass_signal(
+        &node,
+        &cfg_path,
+        &resolved,
+        "release key set",
+        app_update::release_key::PROPOSAL_PREFIX,
+        committed.signal_text(),
+    )?;
+    match outcome {
+        crate::cli::CeremonyOutcome::Passed => {
+            println!(
+                "committed {} as the {} release key; track with: ducktape release status",
+                committed.pubkey,
+                committed.kind.channel()
+            );
+            Ok(())
+        }
+        crate::cli::CeremonyOutcome::AwaitingBallots => {
+            println!(
+                "proposed {} as the {} release key; every other member co-signs with the same \
+                 --kind and --pubkey",
+                committed.pubkey,
+                committed.kind.channel()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Drive the governance `Signal` carrying `text` through this member's
+/// running node, in the keyless id space `prefix` names.
+///
+/// The carrier is deliberate: a `Signal` has no on-chain effect beyond its
+/// recorded outcome, so no module id, no registry entry and no new action is
+/// added to the consensus surface — a release decision can neither halt a
+/// block nor wedge a boundary.
+fn pass_signal(
+    node: &crate::cli::DrivenNode,
+    cfg_path: &Path,
+    resolved: &crate::config::Resolved,
+    verb: &str,
+    prefix: &str,
+    text: String,
+) -> Result<crate::cli::CeremonyOutcome, Box<dyn std::error::Error>> {
+    let signer = crate::cli::gov_signer(node.rpc(), cfg_path, resolved)?;
+    let pubkey_hex = crate::module_cli::signer_pubkey_hex(&signer);
+    let wanted = governance::GovAction::Signal { text };
+    let same_action = {
+        let wanted = wanted.clone();
+        move |action: &governance::GovAction| *action == wanted
+    };
+    crate::cli::drive_proposal_ceremony(
+        node,
+        &signer,
+        &pubkey_hex,
+        // EMPTY seed: this proposal must be findable by id from any node.
+        "",
+        verb,
+        prefix,
+        wanted,
+        &same_action,
+    )
+}
+
+/// Ask the archive being designated whether it can link the components this
+/// network RUNS — before a ballot exists.
+///
+/// A node binary carries the host half of the module WIT world; the
+/// components carry the other half, and only the code registry moves those.
+/// Nothing about publishing or designating a binary whose world moved says
+/// so: every launcher stages it, arms it at the activation height, STOPS its
+/// node, and only then hears its qualify refuse — on a designation that stays
+/// the network's until another one replaces it or `release withdraw` takes it
+/// back. The same answer costs a second here. The archive is read off the
+/// network's own duckfs, which is where every launcher will read it, so what
+/// is asked is the bytes that will actually run and not a local file that
+/// claims to be them; the executable it carries then reads the roster off
+/// this node's rpc and the components out of its blob files. Nothing is
+/// locked and the node is never stopped.
+fn preflight(base: &str, config: &Path, sha: &Sha) -> Result<(), Box<dyn std::error::Error>> {
+    let scratch = tempfile::tempdir()?;
+    let exe = node_exe(&archive(base, sha)?, scratch.path())?;
+    let said = std::process::Command::new(&exe)
+        .args(["node", "qualify", "--compose-only"])
+        .arg("--config")
+        .arg(config)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("run {}: {error}", exe.display()))?;
+    if said.status.success() {
+        return Ok(());
+    }
+    // the child's contract: the snake_case reason on stdout, the sentence on
+    // stderr. Both are the operator's answer here — there is no launcher
+    // between them and it.
+    let refusal = String::from_utf8_lossy(&said.stdout).trim().to_string();
+    let detail = String::from_utf8_lossy(&said.stderr).trim().to_string();
+    tracing::warn!(
+        target: "ducktape::update",
+        event = "release_schedule_refused",
+        reason = "preflight_compose_refused",
+        release = %sha,
+        refusal = %refusal,
+        "the release being designated cannot link the modules this network runs; nothing was proposed"
+    );
+    Err(format!(
+        "preflight_compose_refused: {sha} did not pass the compose preflight — nothing was \
+         proposed.\n{detail}\nA release that moves the module WIT ships AFTER the module swap \
+         that matches it (`ducktape module update <id> <component.wasm>`)."
+    )
+    .into())
+}
+
+/// the designated node archive, read off the network's duckfs at the path the
+/// launchers read, and checked against the sha it is named by.
+fn archive(base: &str, sha: &Sha) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use duckfs_client::api::NodeApi as _;
+    let path = app_update::Kind::Node.archive_path(sha, &app_update::Platform::HOST.key());
+    let node = duckfs_client::http::HttpNode::new(base.to_string());
+    let mut bytes = Vec::new();
+    loop {
+        let (page, eof) = node
+            .read(&path, None, bytes.len() as u64, duckfs_core::MAX_READ_BYTES)
+            .map_err(|error| format!("read {path}: {error}"))?;
+        let empty = page.is_empty();
+        bytes.extend_from_slice(&page);
+        if eof || empty {
+            break;
+        }
+    }
+    let landed = Sha::digest(&bytes);
+    let is_the_designation = landed == *sha;
+    if !is_the_designation {
+        return Err(format!("{path} hashes to {landed}, not {sha}").into());
+    }
+    Ok(bytes)
+}
+
+/// the one executable a node archive carries, unpacked into `scratch`. Every
+/// other entry is ignored rather than written: this is a scratch copy the
+/// preflight runs once and throws away, so `ducktape` at the root is the only
+/// thing it has any use for.
+fn node_exe(archive: &[u8], scratch: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let decoder = zstd::Decoder::new(archive)?;
+    let mut tar = tar::Archive::new(decoder);
+    tar.set_preserve_permissions(false);
+    tar.set_preserve_ownerships(false);
+    let out = scratch.join("ducktape");
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        let is_the_executable =
+            entry.header().entry_type().is_file() && entry.path()?.as_os_str() == "ducktape";
+        if !is_the_executable {
+            continue;
+        }
+        let mut file = std::fs::File::create(&out)?;
+        std::io::copy(&mut entry, &mut file)?;
+        drop(file);
+        #[cfg(unix)]
+        std::fs::set_permissions(&out, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+        return Ok(out);
+    }
+    Err("the node archive carries no `ducktape` executable at its root".into())
+}
+
+/// `release status [--json]` — what a RUNNING node's network designates, the
+/// release keys it commits, and where that node is. This is the whole
+/// interface `ducktape-node-launcher` has to the chain: the http base it reads
+/// duckfs through, the mesh identity whose absence kills a service daemon,
+/// the committed height an activation is measured against, the designation,
+/// and the key its first read pins.
+///
+/// The document is the node's own `GET /v1/release` ([`ReleaseStatus`]) with
+/// the base this verb read it from; `--json` adds `pinned`, the node release
+/// key THIS workspace pins, so a pin that disagrees with the network is
+/// visible beside the key it disagrees with.
 fn status(args: StatusArgs) -> CommandResult {
     let cfg_path = args.selector.config_path()?;
     // The KEYLESS read: a launcher asks this once a poll, and it has no
     // business opening the node's identity or rehashing the founding set to
     // find out where the node serves.
     let service = crate::config::resolve_service(&cfg_path)?;
-    let http_listen = service.http_listen.as_deref().ok_or(
-        "release status reads the node's app surface — set `http_listen` in node.toml",
-    )?;
+    let http_listen = service
+        .http_listen
+        .as_deref()
+        .ok_or("release status reads the node's app surface — set `http_listen` in node.toml")?;
     let base = crate::config::http_base_of(http_listen);
-    let live = crate::node_http::get_json(&base, "/v1/status")
-        .map_err(|error| format!("read this node's status: {error}"))?;
-    let public_key = live["public_key"].as_str().unwrap_or_default().to_string();
-    let height = live["height"].as_u64().unwrap_or_default();
-    let root_hash = live["root_hash"].as_str().unwrap_or_default().to_string();
-    // A node that is up but whose governance module cannot answer yet is
-    // still a node the launcher must hear about: the identity seam is the
-    // half that matters first, so a designation read that fails reports as
-    // "none" rather than failing the whole verb.
-    let designation = designated(&base).unwrap_or(None);
+    let answer = crate::node_http::get_json(&base, "/v1/release")
+        .map_err(|error| format!("read this node's release status: {error}"))?;
+    let reading = ReleaseStatus {
+        base,
+        ..serde_json::from_value(answer)?
+    };
+    let workspace = cfg_path.parent().unwrap_or(Path::new("."));
+    let pinned = pinned_node_key(workspace);
     if args.json {
-        let reading = serde_json::json!({
-            "base": base,
-            "public_key": public_key,
-            "height": height,
-            "root_hash": root_hash,
-            "designation": designation,
-        });
-        println!("{reading}");
+        let mut json = serde_json::to_value(&reading)?;
+        json["pinned"] = serde_json::to_value(pinned)?;
+        println!("{json}");
         return Ok(());
     }
+    let ReleaseStatus {
+        base,
+        public_key,
+        height,
+        root_hash,
+        checkpoint_height,
+        designation,
+        release_keys,
+    } = reading;
     println!("base\t{base}");
     println!(
         "node\t{}",
@@ -517,6 +881,17 @@ fn status(args: StatusArgs) -> CommandResult {
     );
     println!("height\t{height}");
     println!("root_hash\t{root_hash}");
+    // What a staged binary would reopen to qualify itself; 0 until this node
+    // has written one, which is when a designation can first be flipped to.
+    println!("checkpoint\t{checkpoint_height}");
+    for kind in [Kind::Node, Kind::App] {
+        let committed = release_keys
+            .of(kind)
+            .map_or_else(|| "(none committed)".to_string(), |key| key.to_string());
+        println!("release_key {}\t{committed}", kind.channel());
+    }
+    let pin = pinned.map_or_else(|| "(none)".to_string(), |key| key.to_string());
+    println!("pinned\t{pin}");
     match designation {
         Some(designation) => println!(
             "designated\t{} from height {} ({})",
@@ -527,26 +902,26 @@ fn status(args: StatusArgs) -> CommandResult {
                 false => "pending",
             }
         ),
-        None => println!("designated\t(none — this network runs whatever each node was installed with)"),
+        None => {
+            println!("designated\t(none — this network runs whatever each node was installed with)")
+        }
     }
     Ok(())
 }
 
-/// The designation this network's committed governance carries: the LAST
-/// passed `node-release:<n>` whose signal text decodes. The walk stops at the
-/// first id with no record, which is exactly where the ceremony's own mint
-/// stops.
-fn designated(base: &str) -> Result<Option<Designation>, Box<dyn std::error::Error>> {
-    let mut latest = None;
+/// Every designation no later withdrawal took back, oldest first, out of the
+/// PASSED `node-release:<n>` signals in id order. The walk stops at the first
+/// id with no record, which is exactly where the ceremony's own mint stops.
+fn standing(base: &str) -> Result<Vec<Designation>, Box<dyn std::error::Error>> {
+    let mut passed = Vec::new();
     for nth in 0..MAX_DESIGNATIONS {
-        let Some(view) = read_proposal(base, &designation_id(nth))? else {
+        let id = app_update::designation::proposal_id(nth);
+        let Some(view) = read_proposal(base, &id)? else {
             break;
         };
-        if let Some(designation) = passed_designation(&view) {
-            latest = Some(designation);
-        }
+        passed.extend(passed_signal(&view));
     }
-    Ok(latest)
+    Ok(app_update::designation::standing(passed))
 }
 
 fn read_proposal(
@@ -563,9 +938,9 @@ fn read_proposal(
     }
 }
 
-/// A settled proposal's designation — `None` for everything that is not a
+/// A settled proposal's release signal — `None` for everything that is not a
 /// PASSED node-release signal, including one still being voted on.
-fn passed_designation(view: &governance::ProposalView) -> Option<Designation> {
+fn passed_signal(view: &governance::ProposalView) -> Option<ReleaseSignal> {
     let decided = view.status == governance::ProposalStatus::Passed;
     if !decided {
         return None;
@@ -573,7 +948,17 @@ fn passed_designation(view: &governance::ProposalView) -> Option<Designation> {
     let governance::GovAction::Signal { text } = &view.action else {
         return None;
     };
-    Designation::from_signal_text(text)
+    ReleaseSignal::from_signal_text(text)
+}
+
+/// The node release key `workspace` pins — the file the launcher writes on
+/// its first read of a committed key, or `install --release-key` wrote. `None`
+/// when there is none, or when what is there is not a key (the launcher
+/// refuses that one by name at boot).
+fn pinned_node_key(workspace: &Path) -> Option<PublicKey> {
+    let path =
+        app_update::workspace::keys_dir(workspace).join(app_update::workspace::RELEASE_KEY_FILE);
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 // ============================================================================
@@ -615,17 +1000,16 @@ struct SigningGateway {
 }
 
 /// What a bundle IS, independent of its signature: the identity and version
-/// its `Info.plist` names, the executables it carries and the views it ships.
-/// Signing adds `_CodeSignature/` and rewrites the Mach-Os; it changes none of
-/// these, so the reply is checked to carry the same shape as the request.
-/// Signature validity itself is the host's `codesign`/`spctl` call in
-/// `ops/release/archive.sh`, never this side.
+/// its `Info.plist` names and the executables it carries — never a view, which
+/// the network serves out of its genesis. Signing adds `_CodeSignature/` and
+/// rewrites the Mach-Os; it changes none of these, so the reply is checked to
+/// carry the same shape as the request. Signature validity itself is the
+/// host's `codesign`/`spctl` call in `ops/release/archive.sh`, never this side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BundleShape {
     bundle_id: String,
     versions: BTreeMap<&'static str, Option<String>>,
     macos: BTreeSet<String>,
-    views: BTreeSet<String>,
 }
 
 impl BundleShape {
@@ -636,6 +1020,7 @@ impl BundleShape {
         sign::unpack_bundle(archive, scratch.path())
             .map_err(|refusal| format!("{what} archive: {refusal}"))?;
         let bundle = scratch.path().join(sign::BUNDLE_NAME);
+        refuse_views(&bundle).map_err(|e| format!("{what} bundle: {e}"))?;
         sign::validate_layout(&bundle).map_err(|refusal| format!("{what} bundle: {refusal}"))?;
         Self::of_bundle(&bundle).map_err(|e| format!("{what} bundle: {e}").into())
     }
@@ -650,14 +1035,28 @@ impl BundleShape {
             .map(|key| (*key, sign::plist_string(&plist, key)))
             .collect();
         let macos = entry_names(&bundle.join("Contents/MacOS"))?;
-        let views = entry_names(&bundle.join("Contents/Resources/views"))?;
         Ok(Self {
             bundle_id,
             versions,
             macos,
-            views,
         })
     }
+}
+
+/// An app release carries no view: the network serves every view the app
+/// draws out of its genesis. A `views` entry is refused by name here, before
+/// the layout check would refuse it anonymously.
+fn refuse_views(bundle: &Path) -> Result<(), String> {
+    for views in ["Contents/MacOS/views", "Contents/Resources/views"] {
+        let present = std::fs::symlink_metadata(bundle.join(views)).is_ok();
+        if present {
+            return Err(format!(
+                "views_in_app_release: {views} — the network serves every view out of its \
+                 genesis; an app release carries none"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn entry_names(dir: &Path) -> Result<BTreeSet<String>, String> {
@@ -1021,6 +1420,78 @@ mod tests {
         cmd: ReleaseCmd,
     }
 
+    /// A lead of one launcher poll is the floor; a block less is refused by
+    /// name, with the three numbers an operator needs to pick again.
+    #[test]
+    fn a_lead_inside_one_launcher_poll_is_refused_with_its_heights() {
+        // 100 ms beat: one 2000 ms poll is 20 blocks.
+        assert_eq!(check_lead(1000, 1020, 100), Ok(()));
+        let refusal = check_lead(1000, 1019, 100).expect_err("19 blocks is inside the poll");
+        assert!(
+            refusal.starts_with("activation_lead_too_short:"),
+            "{refusal}"
+        );
+        for number in [
+            "activation height 1019",
+            "leads height 1000",
+            "by 19 blocks",
+            "20 blocks",
+            "--at 1020",
+        ] {
+            assert!(
+                refusal.contains(number),
+                "{number:?} missing from: {refusal}"
+            );
+        }
+        // a height already passed leads by nothing, not by a wrapped u64.
+        let passed = check_lead(1000, 900, 100).expect_err("a passed height");
+        assert!(passed.contains("by 0 blocks"), "{passed}");
+    }
+
+    /// `--at` and `--lead` name one height two ways: exactly one is taken.
+    #[test]
+    fn schedule_takes_at_or_lead_never_both() {
+        let sha = "ab".repeat(32);
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["release", "schedule", "--sha", sha.as_str()];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let Ok(Cli {
+            cmd: ReleaseCmd::Schedule(lead),
+        }) = parse(&["--lead", "150"])
+        else {
+            panic!("--lead alone parses");
+        };
+        assert_eq!((lead.at, lead.lead), (None, Some(150)));
+        assert!(parse(&["--at", "9"]).is_ok());
+        assert!(parse(&[]).is_err(), "one of the two is required");
+        assert!(parse(&["--at", "9", "--lead", "150"]).is_err());
+    }
+
+    #[test]
+    fn withdraw_parses_the_sha_it_takes_back() {
+        let sha = Sha::digest(b"a refused node archive");
+        let cli = Cli::try_parse_from([
+            "release",
+            "withdraw",
+            "--sha",
+            &sha.to_string(),
+            "--config",
+            "ws/node.toml",
+        ])
+        .unwrap();
+        let ReleaseCmd::Withdraw(args) = cli.cmd else {
+            panic!("parsed another verb");
+        };
+        assert_eq!(args.sha, sha);
+        assert_eq!(args.selector.config, Some(PathBuf::from("ws/node.toml")));
+        assert!(
+            Cli::try_parse_from(["release", "withdraw", "-n", "chain-1"]).is_err(),
+            "--sha is required"
+        );
+    }
+
     #[test]
     fn sign_bundle_parses_its_flags() {
         let cli = Cli::try_parse_from([
@@ -1079,17 +1550,12 @@ mod tests {
 
     /// A bundle of the staged shape with no Mach-O in it: the shape check
     /// reads names and the plist, never the executables' bytes.
-    fn stage(root: &Path, bundle_id: &str, version: &str, views: &[&str]) -> PathBuf {
+    fn stage(root: &Path, bundle_id: &str, version: &str) -> PathBuf {
         let bundle = root.join(sign::BUNDLE_NAME);
         let contents = bundle.join("Contents");
         std::fs::create_dir_all(contents.join("MacOS")).unwrap();
-        std::fs::create_dir_all(contents.join("Resources/views")).unwrap();
         for executable in ["ducktape-launcher", "ducktape-app"] {
             std::fs::write(contents.join("MacOS").join(executable), b"\xcf\xfa\xed\xfe").unwrap();
-        }
-        std::os::unix::fs::symlink("../Resources/views", contents.join("MacOS/views")).unwrap();
-        for view in views {
-            std::fs::write(contents.join("Resources/views").join(view), b"\0asm").unwrap();
         }
         let mut plist = std::fs::File::create(contents.join("Info.plist")).unwrap();
         write!(
@@ -1104,16 +1570,16 @@ mod tests {
         bundle
     }
 
-    fn shape_of(bundle_id: &str, version: &str, views: &[&str]) -> BundleShape {
+    fn shape_of(bundle_id: &str, version: &str) -> BundleShape {
         let root = tempfile::tempdir().unwrap();
-        let bundle = stage(root.path(), bundle_id, version, views);
+        let bundle = stage(root.path(), bundle_id, version);
         let archive = sign::pack_bundle(&bundle).unwrap();
         BundleShape::of_archive(&archive, "test").unwrap()
     }
 
     #[test]
-    fn the_shape_is_identity_version_executables_and_views() {
-        let shape = shape_of(sign::BUNDLE_ID, "2026.9.2", &["chat.wasm", "forge.wasm"]);
+    fn the_shape_is_identity_version_and_executables() {
+        let shape = shape_of(sign::BUNDLE_ID, "2026.9.2");
         assert_eq!(shape.bundle_id, sign::BUNDLE_ID);
         assert_eq!(
             shape.versions,
@@ -1124,25 +1590,34 @@ mod tests {
         );
         assert_eq!(
             shape.macos,
-            BTreeSet::from([
-                "ducktape-launcher".into(),
-                "ducktape-app".into(),
-                "views".into()
-            ])
+            BTreeSet::from(["ducktape-launcher".into(), "ducktape-app".into()])
         );
-        assert_eq!(
-            shape.views,
-            BTreeSet::from(["chat.wasm".into(), "forge.wasm".into()])
-        );
+    }
+
+    /// The network serves every view, so a bundle carrying one — the views
+    /// directory or the `MacOS/views` link to it — is refused by name.
+    #[test]
+    fn a_bundle_carrying_views_is_refused_by_name() {
+        for views in ["Contents/Resources/views", "Contents/MacOS/views"] {
+            let root = tempfile::tempdir().unwrap();
+            let bundle = stage(root.path(), sign::BUNDLE_ID, "1");
+            std::fs::create_dir_all(bundle.join(views)).unwrap();
+            std::fs::write(bundle.join(views).join("chat.wasm"), b"\0asm").unwrap();
+            let error = BundleShape::of_archive(&sign::pack_bundle(&bundle).unwrap(), "unsigned")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("views_in_app_release"), "{views}: {error}");
+            assert!(error.starts_with("unsigned bundle"), "{error}");
+        }
     }
 
     #[test]
     fn a_signed_reply_with_the_same_shape_matches_what_was_sent() {
-        let sent = shape_of(sign::BUNDLE_ID, "2026.9.2", &["chat.wasm"]);
+        let sent = shape_of(sign::BUNDLE_ID, "2026.9.2");
         // signing adds _CodeSignature and rewrites the executables: neither
         // is part of the shape, so a re-staged bundle reads the same.
         let root = tempfile::tempdir().unwrap();
-        let bundle = stage(root.path(), sign::BUNDLE_ID, "2026.9.2", &["chat.wasm"]);
+        let bundle = stage(root.path(), sign::BUNDLE_ID, "2026.9.2");
         std::fs::create_dir_all(bundle.join("Contents/_CodeSignature")).unwrap();
         std::fs::write(
             bundle.join("Contents/_CodeSignature/CodeResources"),
@@ -1156,19 +1631,15 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_with_another_version_or_view_set_does_not_match() {
-        let sent = shape_of(sign::BUNDLE_ID, "2026.9.2", &["chat.wasm"]);
-        assert_ne!(shape_of(sign::BUNDLE_ID, "2026.9.3", &["chat.wasm"]), sent);
-        assert_ne!(
-            shape_of(sign::BUNDLE_ID, "2026.9.2", &["chat.wasm", "extra.wasm"]),
-            sent
-        );
+    fn a_reply_with_another_version_does_not_match() {
+        let sent = shape_of(sign::BUNDLE_ID, "2026.9.2");
+        assert_ne!(shape_of(sign::BUNDLE_ID, "2026.9.3"), sent);
     }
 
     #[test]
     fn a_reply_of_another_bundle_id_is_refused_by_the_layout_check() {
         let root = tempfile::tempdir().unwrap();
-        let bundle = stage(root.path(), "dev.example.other", "1", &["a.wasm"]);
+        let bundle = stage(root.path(), "dev.example.other", "1");
         let error = BundleShape::of_archive(&sign::pack_bundle(&bundle).unwrap(), "signed")
             .unwrap_err()
             .to_string();
@@ -1192,7 +1663,7 @@ mod tests {
             error.contains("is a directory but not Ducktape.app"),
             "{error}"
         );
-        let bundle = stage(root.path(), sign::BUNDLE_ID, "1", &["a.wasm"]);
+        let bundle = stage(root.path(), sign::BUNDLE_ID, "1");
         let packed = load_unsigned_archive(&bundle).unwrap();
         assert_eq!(packed, sign::pack_bundle(&bundle).unwrap());
         // the same bytes on disk are sent as they are
@@ -1296,7 +1767,7 @@ mod tests {
     #[test]
     fn unpack_replacing_swaps_the_staged_bundle_and_keeps_it_on_refusal() {
         let dir = tempfile::tempdir().unwrap();
-        let staged = stage(dir.path(), sign::BUNDLE_ID, "1", &["a.wasm"]);
+        let staged = stage(dir.path(), sign::BUNDLE_ID, "1");
         std::fs::write(staged.join("Contents/MacOS/ducktape-app"), b"unsigned").unwrap();
         let error = unpack_replacing(b"not zstd", dir.path())
             .unwrap_err()
@@ -1308,7 +1779,7 @@ mod tests {
         );
 
         let other = tempfile::tempdir().unwrap();
-        let signed = stage(other.path(), sign::BUNDLE_ID, "1", &["a.wasm"]);
+        let signed = stage(other.path(), sign::BUNDLE_ID, "1");
         std::fs::write(signed.join("Contents/MacOS/ducktape-app"), b"signed").unwrap();
         let archive = sign::pack_bundle(&signed).unwrap();
         let replaced = unpack_replacing(&archive, dir.path()).unwrap();
@@ -1317,7 +1788,6 @@ mod tests {
             std::fs::read(staged.join("Contents/MacOS/ducktape-app")).unwrap(),
             b"signed"
         );
-        assert!(std::fs::read_link(staged.join("Contents/MacOS/views")).is_ok());
         // nothing but the bundle is left in the directory
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()

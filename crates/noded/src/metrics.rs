@@ -9,9 +9,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    ConsensusOperationalStatus, IndexOperationalStatus, NetstackSwap, NetstackSwapOutcome,
-    NodeHandle, NodePhase, NodeRole, OperationalStatus, StoreOperationalStatus,
-    SyncOperationalStatus,
+    ConsensusOperationalStatus, FollowOperationalStatus, IndexOperationalStatus, NetstackSwap,
+    NetstackSwapOutcome, NodeHandle, NodePhase, NodeRole, OperationalStatus,
+    StoreOperationalStatus, SyncOperationalStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -126,6 +126,66 @@ const RETAINED_STORES: [&str; 2] = ["blobstore", "index"];
 /// on a node's own task.
 const STORE_FOOTPRINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// how long a node may sit below a tip it has heard, with its OWN height
+/// unmoved, before the projection stops calling it `serving`.
+///
+/// THREE consecutive tip polls. Both lanes that hear a peer's `TipCoords` poll
+/// on a 12-second tick — the validator's `sync::divergence::ROOT_POLL_TICK` and
+/// the parked resident's `constants::RESIDENT_FALLBACK_POLL` — so one silent
+/// tick is an unreachable peer, two is a block landing between two polls, and
+/// three that all report a tip above us while our own height never moved is
+/// not a race. It is a node that has stopped following, and every later poll
+/// says the same thing.
+///
+/// Not a knob: an operator who could tune this could tune away the only
+/// sentence that tells a user why their screen is stale.
+const BEHIND_AFTER_SECONDS: u64 = 36;
+
+/// The phase one peer-tip reading implies, given the phase this node is in.
+///
+/// ONLY the serving↔behind pair moves. Every other phase is a lifecycle fact
+/// the node asserted about ITSELF — recovering, joining, syncing, validating,
+/// draining, halted — and a peer's tip is an observation, never evidence
+/// against one of those.
+fn phase_after_tip(phase: NodePhase, behind_by: u64, stalled_for: u64) -> NodePhase {
+    let follows_a_tip = matches!(phase, NodePhase::Serving | NodePhase::Behind);
+    if !follows_a_tip {
+        return phase;
+    }
+    let below_the_tip = behind_by > 0;
+    let stopped_advancing = stalled_for >= BEHIND_AFTER_SECONDS;
+    if below_the_tip && stopped_advancing {
+        return NodePhase::Behind;
+    }
+    NodePhase::Serving
+}
+
+/// The phase this node's overlay standing implies, given the phase it asserted.
+///
+/// Only the phases that FOLLOW the network move — `serving`, `behind`,
+/// `isolated` — because what they serve arrives over the overlay: with none
+/// (the netstack plane refused to start, or exited) the node serves a copy it
+/// cannot advance, and says `isolated` until a plane runs again. Every other
+/// phase is a lifecycle fact the node asserted about ITSELF, and `validating`
+/// is its own consensus seat: a sole validator seals blocks with no overlay.
+fn phase_with_overlay(phase: NodePhase, overlay_down: bool) -> NodePhase {
+    let follows_the_network = matches!(
+        phase,
+        NodePhase::Serving | NodePhase::Behind | NodePhase::Isolated
+    );
+    if !follows_the_network {
+        return phase;
+    }
+    if overlay_down {
+        return NodePhase::Isolated;
+    }
+    let overlay_came_back = phase == NodePhase::Isolated;
+    if overlay_came_back {
+        return NodePhase::Serving;
+    }
+    phase
+}
+
 /// the low-cardinality trigger KIND of a dispatch origin — the metrics label.
 fn origin_kind(origin: &sdk::Origin) -> &'static str {
     match origin {
@@ -161,6 +221,8 @@ pub struct NodeMetrics {
     sync_retries: Registered<raw::Counter>,
     sync_failures: Registered<raw::Counter>,
     sync_last_progress_at: Registered<raw::Gauge>,
+    network_height: Registered<raw::Gauge>,
+    behind_by: Registered<raw::Gauge>,
     checkpoint_height: Registered<raw::Gauge>,
     index_poisoned: Registered<raw::Gauge>,
     index_height: Registered<raw::Family<ModuleLabels, raw::Gauge>>,
@@ -277,6 +339,14 @@ impl NodeMetrics {
                 "ducktape_statesync_last_progress_timestamp_seconds",
                 "unix timestamp of the latest local state-sync progress",
             ),
+            network_height: context.gauge(
+                "ducktape_network_height",
+                "finalized height the peer this node last polled answered with",
+            ),
+            behind_by: context.gauge(
+                "ducktape_behind_by",
+                "heights between this node's served height and the peer tip it last heard",
+            ),
             checkpoint_height: context.gauge(
                 "ducktape_checkpoint_height",
                 "height of the latest durable recovery checkpoint",
@@ -378,8 +448,30 @@ impl NodeMetrics {
     /// Change the bounded lifecycle coordinates and update the status snapshot
     /// and phase metric together. Old coordinates remain present at zero so a
     /// dashboard does not retain a stale `1` after a transition.
-    pub fn set_role_phase(&self, role: NodeRole, phase: NodePhase) {
+    ///
+    /// The phase a caller asserts passes through [`phase_with_overlay`] first:
+    /// a role loop that declares `serving` on a node with no overlay gets
+    /// `isolated`, however often it declares it. Answers the phase WRITTEN,
+    /// which is the one a caller's transition event must name.
+    pub fn set_role_phase(&self, role: NodeRole, phase: NodePhase) -> NodePhase {
         let mut status = self.operations.write().expect("operations lock poisoned");
+        self.write_role_phase(&mut status, role, phase)
+    }
+
+    /// THE phase writer, under the caller's lock, so the overlay standing it
+    /// reads and the phase it writes are one moment — `set_role_phase` and
+    /// the netstack writer both land here. Answers the phase written.
+    fn write_role_phase(
+        &self,
+        status: &mut OperationalStatus,
+        role: NodeRole,
+        asserted: NodePhase,
+    ) -> NodePhase {
+        let overlay_down = status
+            .netstack
+            .as_ref()
+            .is_some_and(|netstack| netstack.failure_reason.is_some());
+        let phase = phase_with_overlay(asserted, overlay_down);
         let old = PhaseLabels {
             role: status.role.as_str().to_string(),
             phase: status.phase.as_str().to_string(),
@@ -396,6 +488,7 @@ impl NodeMetrics {
                 phase: phase.as_str().to_string(),
             })
             .set(1);
+        phase
     }
 
     pub fn operational_status(&self) -> OperationalStatus {
@@ -464,6 +557,59 @@ impl NodeMetrics {
         if let Some(consensus) = status.consensus.as_mut() {
             consensus.block_beat_stalled_seconds = seconds;
         }
+    }
+
+    /// Fold one peer's answered tip into the follow projection, and let it move
+    /// this node between `serving` and `behind`.
+    ///
+    /// The two lanes that already poll a peer's `TipCoords` call this with what
+    /// came back — the validator's root-divergence watch and the parked
+    /// resident's fallback poll — so a node's own lag costs the mesh nothing it
+    /// was not already spending. A node serving state the network left behind
+    /// is otherwise indistinguishable from a healthy one on every surface a
+    /// user can see.
+    pub fn record_peer_tip(&self, network_height: u64) {
+        self.fold_peer_tip(network_height, unix_seconds());
+    }
+
+    /// [`Self::record_peer_tip`] with the clock handed in — the seam a test
+    /// drives the stall window through without sleeping through it.
+    fn fold_peer_tip(&self, network_height: u64, now: u64) {
+        let behind_by = network_height.saturating_sub(self.block_height());
+        self.network_height.set(network_height as i64);
+        self.behind_by.set(behind_by as i64);
+        let (role, phase, stalled_for) = {
+            let mut status = self.operations.write().expect("operations lock poisoned");
+            status.follow = Some(FollowOperationalStatus {
+                network_height,
+                behind_by,
+                heard_at: now,
+            });
+            // the last time this node's OWN height moved. a node that has
+            // finalized nothing since the phase began is measured from the
+            // phase change instead, so entering `serving` grants the same
+            // window rather than reading as an instant stall.
+            let progressed_at = status.last_finalized_at.unwrap_or(status.phase_since);
+            (status.role, status.phase, now.saturating_sub(progressed_at))
+        };
+        let next = phase_after_tip(phase, behind_by, stalled_for);
+        if next == phase {
+            return;
+        }
+        self.set_role_phase(role, next);
+        // at most once per crossing (the early return above is the latch), so
+        // this stays a lifecycle fact even on a 12-second poll.
+        tracing::info!(
+            target: "ducktape::statesync",
+            event = "node_phase_transition",
+            role = role.as_str(),
+            phase = next.as_str(),
+            reason = "peer_tip",
+            network_height,
+            behind_by,
+            stalled_for,
+            "a peer's answered tip moved this node's follow phase"
+        );
     }
 
     pub fn begin_sync(&self, source: Option<String>, target_height: u64) {
@@ -558,11 +704,42 @@ impl NodeMetrics {
     /// Name the machine the reachability plane runs on — at boot, and again
     /// after every swap that took. A refused swap does NOT call this: the
     /// current machine keeps running, so the name must not move.
-    pub fn set_netstack_execution(&self, backend: impl Into<String>, code_hash: Option<String>) {
+    ///
+    /// `failure` is why this node has no overlay at all, and travels WITH the
+    /// name for the same reason a name without it is useless: `failed` alone
+    /// sends an operator back to the logs of a boot twelve minutes gone. It
+    /// moves the phase too ([`phase_with_overlay`]): a node with no overlay
+    /// does not read `serving`.
+    pub fn set_netstack_execution(
+        &self,
+        backend: impl Into<String>,
+        code_hash: Option<String>,
+        failure: Option<(&'static str, String)>,
+    ) {
+        let (reason, detail) = failure.unzip();
         let mut status = self.operations.write().expect("operations lock poisoned");
         let netstack = status.netstack.get_or_insert_with(Default::default);
         netstack.backend = backend.into();
         netstack.code_hash = code_hash;
+        netstack.failure_reason = reason.map(str::to_string);
+        netstack.failure_detail = detail;
+        // and the phase that standing implies: a plane that dies under a
+        // serving node isolates it, and one that comes back releases it.
+        let (role, before) = (status.role, status.phase);
+        let after = self.write_role_phase(&mut status, role, before);
+        if after == before {
+            return;
+        }
+        // at most once per crossing (the early return above is the latch).
+        tracing::info!(
+            target: "ducktape::reachability",
+            event = "node_phase_transition",
+            role = role.as_str(),
+            phase = after.as_str(),
+            reason = "netstack_plane",
+            failure = reason.unwrap_or_default(),
+            "the netstack plane's standing moved this node's follow phase"
+        );
     }
 
     /// Record one swap attempt's outcome against the height it landed at.
@@ -709,14 +886,15 @@ mod tests {
             let metrics = NodeMetrics::register(&context);
             assert!(metrics.operational_status().netstack.is_none());
 
-            metrics.set_netstack_execution("starting", None);
+            metrics.set_netstack_execution("starting", None, None);
             let netstack = metrics.operational_status().netstack.unwrap();
             assert_eq!(netstack.backend, "starting");
             assert_eq!(netstack.code_hash, None);
             assert!(netstack.last_swap.is_none());
+            assert!(netstack.failure_reason.is_none());
 
             metrics.record_height(7);
-            metrics.set_netstack_execution("guest", Some("abc".into()));
+            metrics.set_netstack_execution("guest", Some("abc".into()), None);
             metrics.record_netstack_swap(NetstackSwapOutcome::Swapped, None);
             let netstack = metrics.operational_status().netstack.unwrap();
             assert_eq!(netstack.backend, "guest");
@@ -737,10 +915,27 @@ mod tests {
             let netstack = metrics.operational_status().netstack.unwrap();
             assert_eq!(netstack.backend, "guest", "a refusal must not move backend");
             assert_eq!(netstack.code_hash.as_deref(), Some("abc"));
-            metrics.set_netstack_execution("failed", None);
+            // A PLANE THAT CANNOT START SAYS WHY, for as long as it is down: a
+            // node with no overlay keeps sealing blocks and keeps answering
+            // this route, so `failed` alone sends an operator back to the logs
+            // of a boot long since evicted from the ring.
+            metrics.set_netstack_execution(
+                "failed",
+                None,
+                Some((
+                    "netstack_guest_unreadable",
+                    "no founding set beside the binary".into(),
+                )),
+            );
+            let netstack = metrics.operational_status().netstack.unwrap();
+            assert_eq!(netstack.code_hash, None);
             assert_eq!(
-                metrics.operational_status().netstack.unwrap().code_hash,
-                None
+                netstack.failure_reason.as_deref(),
+                Some("netstack_guest_unreadable")
+            );
+            assert_eq!(
+                netstack.failure_detail.as_deref(),
+                Some("no founding set beside the binary")
             );
             assert_eq!(
                 netstack.last_swap,
@@ -750,6 +945,13 @@ mod tests {
                     at_height: 9,
                 })
             );
+
+            // and a plane that comes back clears it: the field is the mesh's
+            // standing NOW, never a scar from an earlier execution.
+            metrics.set_netstack_execution("guest", Some("abc".into()), None);
+            let netstack = metrics.operational_status().netstack.unwrap();
+            assert_eq!(netstack.failure_reason, None);
+            assert_eq!(netstack.failure_detail, None);
         });
     }
 
@@ -903,6 +1105,151 @@ mod tests {
             ] {
                 assert!(scrape.contains(sample), "missing {sample:?}:\n{scrape}");
             }
+        });
+    }
+
+    /// A node that has heard a tip above its own and has not advanced for the
+    /// window stops calling itself `serving` — and carries the gap it means.
+    ///
+    /// No clock is waited on: the stall is handed to the fold seam, which is
+    /// the same value the poll would have computed 36 seconds later.
+    #[test]
+    fn a_node_below_a_tip_it_heard_reads_behind_once_its_own_height_stops_moving() {
+        use commonware_runtime::{Metrics as _, Runner as _};
+
+        // the pure verdict first, over the whole window: only a node that is
+        // BOTH below the tip and no longer advancing is behind, and only the
+        // serving pair moves at all.
+        assert_eq!(
+            phase_after_tip(NodePhase::Serving, 601, BEHIND_AFTER_SECONDS),
+            NodePhase::Behind
+        );
+        assert_eq!(
+            phase_after_tip(NodePhase::Serving, 601, BEHIND_AFTER_SECONDS - 1),
+            NodePhase::Serving,
+            "a gap alone is a node one poll behind a busy chain, not a wedge"
+        );
+        assert_eq!(
+            phase_after_tip(NodePhase::Serving, 0, BEHIND_AFTER_SECONDS * 10),
+            NodePhase::Serving,
+            "an idle chain nobody is advancing is not a node that stopped following"
+        );
+        assert_eq!(
+            phase_after_tip(NodePhase::Behind, 0, BEHIND_AFTER_SECONDS),
+            NodePhase::Serving,
+            "catching up releases the phase"
+        );
+        for asserted in [
+            NodePhase::Recovering,
+            NodePhase::Joining,
+            NodePhase::Syncing,
+            NodePhase::Validating,
+            NodePhase::Draining,
+            NodePhase::Halted,
+        ] {
+            assert_eq!(
+                phase_after_tip(asserted, 601, BEHIND_AFTER_SECONDS * 10),
+                asserted,
+                "a peer's tip is not evidence against a phase the node asserted"
+            );
+        }
+
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
+            let metrics = NodeMetrics::register(&context);
+            metrics.set_role_phase(NodeRole::Resident, NodePhase::Serving);
+            // the dognet resident: frozen at 155 while the founder passed 756.
+            metrics.record_height(155);
+            let froze_at = metrics
+                .operational_status()
+                .last_finalized_at
+                .expect("a folded height stamps progress");
+
+            metrics.fold_peer_tip(756, froze_at + BEHIND_AFTER_SECONDS - 1);
+            let status = metrics.operational_status();
+            assert_eq!(status.phase, NodePhase::Serving);
+            assert_eq!(
+                status.follow,
+                Some(FollowOperationalStatus {
+                    network_height: 756,
+                    behind_by: 601,
+                    heard_at: froze_at + BEHIND_AFTER_SECONDS - 1,
+                }),
+                "the gap is reported from the first poll, before the phase moves"
+            );
+
+            metrics.fold_peer_tip(756, froze_at + BEHIND_AFTER_SECONDS);
+            let status = metrics.operational_status();
+            assert_eq!(status.phase, NodePhase::Behind);
+            assert_eq!(status.role, NodeRole::Resident, "the role does not move");
+            assert_eq!(status.follow.expect("a tip was heard").behind_by, 601);
+
+            let scrape = context.encode();
+            for sample in [
+                "ducktape_network_height 756",
+                "ducktape_behind_by 601",
+                r#"ducktape_node_phase{role="resident",phase="behind"} 1"#,
+            ] {
+                assert!(scrape.contains(sample), "missing {sample:?}:\n{scrape}");
+            }
+
+            // and following again clears it, on the very next poll.
+            metrics.record_height(756);
+            metrics.fold_peer_tip(756, froze_at + BEHIND_AFTER_SECONDS * 4);
+            let status = metrics.operational_status();
+            assert_eq!(status.phase, NodePhase::Serving);
+            assert_eq!(status.follow.expect("a tip was heard").behind_by, 0);
+        });
+    }
+
+    /// A NODE WITH NO OVERLAY IS NOT SERVING. The release-2 resident whose
+    /// netstack guest was unreadable recovered to `serving` and froze there:
+    /// no tunnel, no peer, no tip poll to move it to `behind`, and the one
+    /// field that said why (`netstack.failure_reason`) sat beside a phase that
+    /// said all was well. The phase is read off the wire the app reads.
+    #[test]
+    fn a_node_whose_overlay_is_down_reads_isolated_not_serving() {
+        use commonware_runtime::{Metrics as _, Runner as _};
+
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
+            let metrics = NodeMetrics::register(&context);
+            let phase = |metrics: &NodeMetrics| {
+                serde_json::to_value(metrics.operational_status()).expect("status serializes")
+                    ["phase"]
+                    .clone()
+            };
+
+            // the plane refuses at boot, THEN recovery declares the node serving.
+            metrics.set_netstack_execution(
+                "failed",
+                None,
+                Some((
+                    "netstack_guest_unreadable",
+                    "no founding set beside the binary".into(),
+                )),
+            );
+            metrics.set_role_phase(NodeRole::Resident, NodePhase::Serving);
+            assert_eq!(phase(&metrics), "isolated");
+            let scrape = context.encode();
+            let isolated = r#"ducktape_node_phase{role="resident",phase="isolated"} 1"#;
+            assert!(scrape.contains(isolated), "missing {isolated:?}:\n{scrape}");
+
+            // a plane that comes back releases it; one that dies under a
+            // serving node isolates it, whichever order the two facts land in.
+            metrics.set_netstack_execution("guest", Some("abc".into()), None);
+            assert_eq!(phase(&metrics), "serving");
+            metrics.set_netstack_execution(
+                "failed",
+                None,
+                Some(("plane_exited", "the orchestrator exited".into())),
+            );
+            assert_eq!(phase(&metrics), "isolated");
+
+            // only the phases that follow the network move: a lifecycle phase
+            // the node asserts, and a validator's own seat, stand as asserted.
+            metrics.set_role_phase(NodeRole::Resident, NodePhase::Draining);
+            assert_eq!(phase(&metrics), "draining");
+            metrics.set_role_phase(NodeRole::Validator, NodePhase::Validating);
+            assert_eq!(phase(&metrics), "validating");
         });
     }
 

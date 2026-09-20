@@ -42,7 +42,11 @@ ID="${DEMO_WORKSPACE_ID:-demo}"
 DUCK="${DUCKTAPE_HOME:-$HOME/.ducktape}"
 WSDIR="$DUCK/$ID"
 USERKEY="$WSDIR/keys/demo.key"    # the app signs writes with THIS local key
-DEMO_PASSWORD="${DEMO_KEY_PASSWORD:-ducktape}"  # unlock password for the demo identity
+# Unlock password for the demo identity. The default says what it is: this
+# wallet exists only in the demo workspace and the seed prints it in the clear
+# at the end. A network an operator keeps is founded by ops/refound-net.sh,
+# which has no default at all.
+DEMO_PASSWORD="${DEMO_KEY_PASSWORD:-scratch-only-password}"
 
 # DEV_LISTEN widens the p2p mesh + HTTP API binds so a second machine can
 # reach this node: default stays 127.0.0.1 (a localhost-only dev loop);

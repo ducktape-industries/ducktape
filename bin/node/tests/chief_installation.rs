@@ -1,7 +1,7 @@
 //! The shipping initializer on the real Host queue: no timer or boot hook.
 #[path = "../src/chief_cli/plan.rs"]
 mod plan;
-#[path = "../../../crates/modules/apps/runs/tests/support/mod.rs"]
+#[path = "chief_support/mod.rs"]
 mod support;
 
 use futures::executor::block_on;
@@ -91,24 +91,12 @@ async fn invocations(network: &Network) -> Vec<agent::InvocationEntry> {
     };
     entries
 }
+/// The bed this suite runs on. The committed `runs` guest compiles its whole
+/// sibling wiring in — chat, saga, attribution, dispatch, agent, tasks, files,
+/// forge, pages — so there is nothing here to re-register on top of the genesis
+/// [`Network`] composes.
 async fn network() -> Network {
     let mut network = Network::new().await;
-    network.host.register(Box::new(files::Files::in_mem()));
-    network.host.register(Box::new(
-        runs::RunsModule::new(
-            "runs",
-            "chat",
-            "saga",
-            "attribution",
-            "dispatch",
-            "agent",
-            Some("tasks".into()),
-            Some("tasks".into()),
-        )
-        .with_pages_module("pages")
-        .with_files_module("files")
-        .with_sink_forge("forge"),
-    ));
     network
         .submit(
             member(),
@@ -773,7 +761,21 @@ fn resume_recovers_an_interrupted_native_turn_from_its_committed_checkpoint() {
             )
             .await;
         network.drain().await;
-        for attempt in 0..runs::RUN_MAX_ATTEMPTS {
+        // the attempt budget comes off the saga the module actually registered,
+        // never a constant this suite carries: `runs` sets it on the recipe, and
+        // reading it back is the only place it is true.
+        let saga::SagaReply::Saga(Some(registered)) = query(
+            &network,
+            "saga",
+            saga::SagaQuery::Get {
+                saga_id: saga_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("saga view")
+        };
+        for attempt in 0..registered.max_attempts {
             if attempt > 0 {
                 network
                     .submit(

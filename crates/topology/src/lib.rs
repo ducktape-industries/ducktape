@@ -11,7 +11,7 @@
 pub struct ModuleSpec {
     /// The consensus-visible module id (the key in the host registry / root-hash).
     pub id: &'static str,
-    /// Whether this module's crate carries an index guest (`src/index_guest.rs`,
+    /// Whether this module ships an index guest (a committed `index.wasm`,
     /// staged by `crates/noded/build.rs` as `<id>.index.wasm`). This is a build
     /// consistency check; operator-supplied directories discover their own files.
     pub has_index_guest: bool,
@@ -126,13 +126,30 @@ pub const PRODUCTION: &[&str] = &[
     "boards",
 ];
 
-/// The founding VIEW-ONLY entries: registry entries of `Kind::View` with no
-/// consensus code, staged beside the production set as `<id>.view.wasm` +
-/// `<id>.assets` out of `target/views` (built by `make views` from
-/// `crates/views/<id>`), and composed by `node init` into the same genesis.
-/// A view here draws a tab in the app off the registry alone; it must not
-/// also be a module id.
-pub const VIEWS: &[&str] = &["home", "canvas"];
+/// Every BASIC view: the views the app draws, each founded into a network's
+/// genesis and served by it — none ships beside the app. A production
+/// module's view rides in that module's entry; any other id is a view-only
+/// entry of its own ([`views`]).
+///
+/// `crates/topology/basic-views` holds the ids, one per line, and is the ONE
+/// list: `make views-sync` builds and commits exactly these into
+/// `crates/views`, `node init` refuses a founding set lacking one
+/// (`founding_view_missing`), and `ops/release/archive.sh --kind node` refuses
+/// to pack such a set.
+pub fn basic_views() -> impl Iterator<Item = &'static str> {
+    include_str!("../basic-views").split_whitespace()
+}
+
+/// The founding VIEW-ONLY entries: the basic views that are no module's,
+/// registry entries of `Kind::View` with no consensus code, staged beside the
+/// production set as `<id>.view.wasm` + `<id>.assets` out of the committed
+/// `crates/views/<id>`, and composed by `node init` into the same genesis.
+/// A view here draws a tab in the app off the registry alone.
+pub fn views() -> Vec<&'static str> {
+    basic_views()
+        .filter(|id| TOPOLOGY.spec(id).is_none())
+        .collect()
+}
 
 /// the DEFAULT set (16) simnode and the noded daemon compose at genesis —
 /// `bin/noded/tests/daemon_e2e.rs` pins the same `sim_base` against noded.
@@ -302,14 +319,16 @@ mod tests {
         );
     }
 
-    /// a founding view is a registry entry beside the modules, under one id
-    /// space: a view id that is also a module id would collide at genesis.
+    /// a basic view is a production module's own view or a registry entry
+    /// beside the modules, under one id space: a view named for a module the
+    /// production set leaves out would be neither.
     #[test]
-    fn founding_views_are_not_module_ids() {
-        assert_eq!(VIEWS, &["home", "canvas"], "the founding view set");
-        assert!(!has_dups(VIEWS), "views has a duplicate id");
-        for id in VIEWS {
-            assert!(TOPOLOGY.spec(id).is_none(), "view {id} is also a module");
+    fn a_basic_view_is_a_production_modules_or_view_only() {
+        let basic: Vec<&str> = basic_views().collect();
+        assert!(!has_dups(&basic), "basic-views has a duplicate id");
+        for id in &basic {
+            let founded = PRODUCTION.contains(id) || TOPOLOGY.spec(id).is_none();
+            assert!(founded, "basic view {id} is a module outside production");
         }
     }
 
@@ -324,8 +343,8 @@ mod tests {
         assert_eq!(TOPOLOGY.wasm_ids(SIM_VALSET), SIM_VALSET);
     }
 
-    /// pins today's index-guest-shipping set — the same 5 crates that carry
-    /// `src/index_guest.rs` and that `crates/noded/build.rs` cross-checks this
+    /// pins today's index-guest-shipping set — the same 6 modules that carry a
+    /// committed `index.wasm`, which `crates/noded/build.rs` cross-checks this
     /// flag against at every build.
     #[test]
     fn index_guest_ids_selects_only_the_declared_shippers() {

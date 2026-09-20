@@ -76,8 +76,7 @@
 //! caps.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+pub use capability_wire::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -180,7 +179,7 @@ impl CapabilityRegistry {
     {
         match self.staged.get(key).await? {
             Some(bytes) => Ok(Some(
-                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+                borsh::from_slice(&bytes).map_err(|e| Error::module("codec", e.to_string()))?,
             )),
             None => Ok(None),
         }
@@ -213,10 +212,10 @@ impl CapabilityRegistry {
     {
         let bytes = borsh::to_vec(value).expect("capability value is serializable");
         if bytes.len() > cap {
-            return Err(Error::Module(format!(
-                "{what} record too large: {} > {cap} bytes",
-                bytes.len()
-            )));
+            return Err(Error::module(
+                "record_too_large",
+                format!("{what} record too large: {} > {cap} bytes", bytes.len()),
+            ));
         }
         self.staged.stage(key, bytes);
         Ok(())
@@ -231,7 +230,7 @@ impl CapabilityRegistry {
     async fn rostered_entry(&self, node: &[u8]) -> Result<NodeEntry, Error> {
         self.entry(node)
             .await?
-            .ok_or_else(|| Error::Module("missing node record".into()))
+            .ok_or_else(|| Error::module("missing_node_record", "missing node record"))
     }
 
     /// An empty roster has no standing to check. This also lets a network
@@ -274,14 +273,17 @@ impl CapabilityRegistry {
     /// bytes, so every validator rejects identically.
     fn validate_tags(tags: Vec<String>) -> Result<BTreeSet<String>, Error> {
         if tags.len() > MAX_CAPABILITIES {
-            return Err(Error::Module(format!(
-                "too many capabilities: {} exceeds the {MAX_CAPABILITIES} cap",
-                tags.len()
-            )));
+            return Err(Error::module(
+                "capability_cap",
+                format!(
+                    "too many capabilities: {} exceeds the {MAX_CAPABILITIES} cap",
+                    tags.len()
+                ),
+            ));
         }
         let mut set = BTreeSet::new();
         for tag in tags {
-            validate_tag(&tag).map_err(Error::Module)?;
+            validate_tag(&tag).map_err(|e| Error::module("bad_capability_tag", e))?;
             set.insert(tag);
         }
         Ok(set)
@@ -305,13 +307,19 @@ impl CapabilityRegistry {
         // their own to speak for, and an empty key is a malformed origin.
         let node = match &ctx.env().origin {
             Origin::External(key) if key.is_empty() => {
-                return Err(Error::Module("external origin key is empty".into()));
+                return Err(Error::module(
+                    "empty_origin_key",
+                    "external origin key is empty",
+                ));
             }
             Origin::External(key) => key.clone(),
             other => {
-                return Err(Error::Module(format!(
-                    "capability announcements require an external submitter, got {other:?}"
-                )));
+                return Err(Error::module(
+                    "external_origin_required",
+                    format!(
+                        "capability announcements require an external submitter, got {other:?}"
+                    ),
+                ));
             }
         };
         if let Some(valset_id) = self.valset_id.clone() {
@@ -322,17 +330,18 @@ impl CapabilityRegistry {
                 .await?
                 .contains(&node)
             {
-                return Err(Error::Module(
-                    "capability announcer holds no current standing (validator or resident)"
-                        .into(),
+                return Err(Error::module(
+                    "no_standing",
+                    "capability announcer holds no current standing (validator or resident)",
                 ));
             }
         }
         let tags = Self::validate_tags(capabilities)?;
-        validate_resources(&resources).map_err(Error::Module)?;
+        validate_resources(&resources).map_err(|e| Error::module("bad_resources", e))?;
         if tags.is_empty() && !resources.is_empty() {
-            return Err(Error::Module(
-                "resources without capabilities (announce at least one tag)".into(),
+            return Err(Error::module(
+                "resources_without_tags",
+                "resources without capabilities (announce at least one tag)",
             ));
         }
 
@@ -367,14 +376,16 @@ impl CapabilityRegistry {
         if !announced {
             let mut roster = self.node_roster().await?;
             let Err(position) = roster.binary_search(&node) else {
-                return Err(Error::Module(
-                    "node roster carries a key with no record".into(),
+                return Err(Error::module(
+                    "roster_corrupt",
+                    "node roster carries a key with no record",
                 ));
             };
             if roster.len() >= MAX_ANNOUNCED_NODES {
-                return Err(Error::Module(format!(
-                    "announced-node cap reached ({MAX_ANNOUNCED_NODES})"
-                )));
+                return Err(Error::module(
+                    "node_cap",
+                    format!("announced-node cap reached ({MAX_ANNOUNCED_NODES})"),
+                ));
             }
             roster.insert(position, node.clone());
             self.store_bounded(
@@ -401,30 +412,40 @@ impl CapabilityRegistry {
         let module = match &ctx.env().origin {
             Origin::Module(id) => id.clone(),
             other => {
-                return Err(Error::Module(format!(
-                    "a class is claimed by the module that serves it \
-                     (module origin required), got {other:?}"
-                )));
+                return Err(Error::module(
+                    "module_origin_required",
+                    format!(
+                        "a class is claimed by the module that serves it \
+                         (module origin required), got {other:?}"
+                    ),
+                ));
             }
         };
-        validate_class(&class).map_err(Error::Module)?;
+        validate_class(&class).map_err(|e| Error::module("bad_class", e))?;
         match self.class_owner(&class).await? {
-            Some(owner) if owner != module => Err(Error::Module(format!(
-                "class {class:?} is already claimed by module {owner:?} \
-                 (first claim wins)"
-            ))),
+            Some(owner) if owner != module => Err(Error::module(
+                "class_already_claimed",
+                format!(
+                    "class {class:?} is already claimed by module {owner:?} \
+                     (first claim wins)"
+                ),
+            )),
             // a re-claim by the owning module is an idempotent no-op: nothing
             // is staged, so the root cannot move.
             Some(_) => Ok(()),
             None => {
                 let mut roster = self.class_roster().await?;
                 let Err(position) = roster.binary_search(&class) else {
-                    return Err(Error::Module(
-                        "class roster carries a name with no record".into(),
+                    return Err(Error::module(
+                        "roster_corrupt",
+                        "class roster carries a name with no record",
                     ));
                 };
                 if roster.len() >= MAX_CLASSES {
-                    return Err(Error::Module(format!("class cap reached ({MAX_CLASSES})")));
+                    return Err(Error::module(
+                        "class_cap",
+                        format!("class cap reached ({MAX_CLASSES})"),
+                    ));
                 }
                 roster.insert(position, class.clone());
                 self.store_bounded(
@@ -469,7 +490,7 @@ impl Module for CapabilityRegistry {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        match decode_msg(&msg.payload).map_err(Error::Module)? {
+        match decode_msg(&msg.payload).map_err(|e| Error::module("codec", e))? {
             CapabilityMsg::Announce {
                 capabilities,
                 resources,
@@ -493,36 +514,38 @@ impl Module for CapabilityRegistry {
         let Some(valset_id) = self.valset_id.clone() else {
             return self.query(req).await;
         };
-        Ok(match decode_query(req).map_err(Error::Module)? {
-            CapabilityQuery::Providers { capability } => {
-                let mut providers = Vec::new();
-                for node in self.standing_nodes(ctx, &valset_id).await? {
-                    let has_capability =
-                        self.rostered_entry(&node).await?.tags.contains(&capability);
-                    if has_capability {
-                        providers.push(node);
+        Ok(
+            match decode_query(req).map_err(|e| Error::module("codec", e))? {
+                CapabilityQuery::Providers { capability } => {
+                    let mut providers = Vec::new();
+                    for node in self.standing_nodes(ctx, &valset_id).await? {
+                        let has_capability =
+                            self.rostered_entry(&node).await?.tags.contains(&capability);
+                        if has_capability {
+                            providers.push(node);
+                        }
                     }
+                    encode_reply(&CapabilityReply::Providers(providers))
                 }
-                encode_reply(&CapabilityReply::Providers(providers))
-            }
-            CapabilityQuery::CapableProviders {
-                capability,
-                demands,
-            } => {
-                let mut providers = Vec::new();
-                for node in self.standing_nodes(ctx, &valset_id).await? {
-                    let entry = self.rostered_entry(&node).await?;
-                    let covers = demands
-                        .iter()
-                        .all(|(k, v)| entry.resources.get(k).is_some_and(|have| have >= v));
-                    if entry.tags.contains(&capability) && covers {
-                        providers.push(node);
+                CapabilityQuery::CapableProviders {
+                    capability,
+                    demands,
+                } => {
+                    let mut providers = Vec::new();
+                    for node in self.standing_nodes(ctx, &valset_id).await? {
+                        let entry = self.rostered_entry(&node).await?;
+                        let covers = demands
+                            .iter()
+                            .all(|(k, v)| entry.resources.get(k).is_some_and(|have| have >= v));
+                        if entry.tags.contains(&capability) && covers {
+                            providers.push(node);
+                        }
                     }
+                    encode_reply(&CapabilityReply::Providers(providers))
                 }
-                encode_reply(&CapabilityReply::Providers(providers))
-            }
-            _ => return self.query(req).await,
-        })
+                _ => return self.query(req).await,
+            },
+        )
     }
 
     /// read projection — committed plus this block's staged changes (the
@@ -533,70 +556,75 @@ impl Module for CapabilityRegistry {
     /// stays the ungated (no-valset) fallback plus a plain point-read path
     /// for the same-crate tests.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        Ok(match decode_query(req).map_err(Error::Module)? {
-            CapabilityQuery::Providers { capability } => {
-                let mut providers = Vec::new();
-                for node in self.node_roster().await? {
-                    if self.rostered_entry(&node).await?.tags.contains(&capability) {
-                        providers.push(node);
+        Ok(
+            match decode_query(req).map_err(|e| Error::module("codec", e))? {
+                CapabilityQuery::Providers { capability } => {
+                    let mut providers = Vec::new();
+                    for node in self.node_roster().await? {
+                        if self.rostered_entry(&node).await?.tags.contains(&capability) {
+                            providers.push(node);
+                        }
                     }
+                    encode_reply(&CapabilityReply::Providers(providers))
                 }
-                encode_reply(&CapabilityReply::Providers(providers))
-            }
-            CapabilityQuery::Node { node } => {
-                let tags = self
-                    .entry(&node)
-                    .await?
-                    .map(|e| e.tags.into_iter().collect())
-                    .unwrap_or_default();
-                encode_reply(&CapabilityReply::Node(tags))
-            }
-            CapabilityQuery::CapableProviders {
-                capability,
-                demands,
-            } => {
-                let mut providers = Vec::new();
-                for node in self.node_roster().await? {
-                    let entry = self.rostered_entry(&node).await?;
-                    let covers = demands
-                        .iter()
-                        .all(|(k, v)| entry.resources.get(k).is_some_and(|have| have >= v));
-                    if entry.tags.contains(&capability) && covers {
-                        providers.push(node);
+                CapabilityQuery::Node { node } => {
+                    let tags = self
+                        .entry(&node)
+                        .await?
+                        .map(|e| e.tags.into_iter().collect())
+                        .unwrap_or_default();
+                    encode_reply(&CapabilityReply::Node(tags))
+                }
+                CapabilityQuery::CapableProviders {
+                    capability,
+                    demands,
+                } => {
+                    let mut providers = Vec::new();
+                    for node in self.node_roster().await? {
+                        let entry = self.rostered_entry(&node).await?;
+                        let covers = demands
+                            .iter()
+                            .all(|(k, v)| entry.resources.get(k).is_some_and(|have| have >= v));
+                        if entry.tags.contains(&capability) && covers {
+                            providers.push(node);
+                        }
                     }
+                    encode_reply(&CapabilityReply::Providers(providers))
                 }
-                encode_reply(&CapabilityReply::Providers(providers))
-            }
-            CapabilityQuery::Resources { node } => {
-                let resources = self
-                    .entry(&node)
-                    .await?
-                    .map(|e| e.resources)
-                    .unwrap_or_default();
-                encode_reply(&CapabilityReply::Resources(resources))
-            }
-            CapabilityQuery::All => {
-                let mut all = Vec::new();
-                for node in self.node_roster().await? {
-                    let entry = self.rostered_entry(&node).await?;
-                    all.push((node, entry.tags.into_iter().collect()));
+                CapabilityQuery::Resources { node } => {
+                    let resources = self
+                        .entry(&node)
+                        .await?
+                        .map(|e| e.resources)
+                        .unwrap_or_default();
+                    encode_reply(&CapabilityReply::Resources(resources))
                 }
-                encode_reply(&CapabilityReply::All(all))
-            }
-            CapabilityQuery::ResolveClass { class } => {
-                encode_reply(&CapabilityReply::ClassOwner(self.class_owner(&class).await?))
-            }
-            CapabilityQuery::Classes => {
-                let mut classes = Vec::new();
-                for class in self.class_roster().await? {
-                    let owner = self.class_owner(&class).await?.ok_or_else(|| {
-                        Error::Module("class roster carries a name with no record".into())
-                    })?;
-                    classes.push((class, owner));
+                CapabilityQuery::All => {
+                    let mut all = Vec::new();
+                    for node in self.node_roster().await? {
+                        let entry = self.rostered_entry(&node).await?;
+                        all.push((node, entry.tags.into_iter().collect()));
+                    }
+                    encode_reply(&CapabilityReply::All(all))
                 }
-                encode_reply(&CapabilityReply::Classes(classes))
-            }
-        })
+                CapabilityQuery::ResolveClass { class } => encode_reply(
+                    &CapabilityReply::ClassOwner(self.class_owner(&class).await?),
+                ),
+                CapabilityQuery::Classes => {
+                    let mut classes = Vec::new();
+                    for class in self.class_roster().await? {
+                        let owner = self.class_owner(&class).await?.ok_or_else(|| {
+                            Error::module(
+                                "roster_corrupt",
+                                "class roster carries a name with no record",
+                            )
+                        })?;
+                        classes.push((class, owner));
+                    }
+                    encode_reply(&CapabilityReply::Classes(classes))
+                }
+            },
+        )
     }
 
     /// publish the block's staged writes in ONE store batch. no-op (and no
@@ -627,7 +655,7 @@ mod tests {
         residents: Option<Vec<Vec<u8>>>,
     ) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
         move |req| {
-            let q = valset::decode_query(req).map_err(Error::Module)?;
+            let q = valset::decode_query(req).map_err(|e| Error::module("codec", e))?;
             match (q, &members, &residents) {
                 (ValsetQuery::Validators, Some(m), _) => {
                     Ok(valset_encode_reply(&ValsetReply::Validators(m.clone())))
@@ -843,7 +871,7 @@ mod tests {
             let err = futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"])))
                 .unwrap_err();
             assert!(
-                matches!(err, Error::Module(ref m) if m.contains("external submitter")),
+                matches!(err, Error::Module { ref reason, .. } if reason == "external_origin_required"),
                 "got {err:?}"
             );
         }
@@ -859,7 +887,7 @@ mod tests {
         let err =
             futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("origin key is empty")),
+            matches!(err, Error::Module { ref reason, .. } if reason == "empty_origin_key"),
             "got {err:?}"
         );
         futures::executor::block_on(c.commit_block()).unwrap();
@@ -879,7 +907,7 @@ mod tests {
         let err = futures::executor::block_on(c.execute(&mut outsider, &announce(&["codex"])))
             .unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("no current standing")),
+            matches!(err, Error::Module { ref reason, .. } if reason == "no_standing"),
             "got {err:?}"
         );
 
@@ -910,7 +938,7 @@ mod tests {
         let err =
             futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("no current standing")),
+            matches!(err, Error::Module { ref reason, .. } if reason == "no_standing"),
             "got {err:?}"
         );
     }
@@ -980,7 +1008,10 @@ mod tests {
             let mut ctx = ctx_external(&me);
             let err =
                 futures::executor::block_on(c.execute(&mut ctx, &announce(&[bad]))).unwrap_err();
-            assert!(matches!(err, Error::Module(_)), "got {err:?} for {bad:?}");
+            assert!(
+                matches!(err, Error::Module { ref reason, .. } if reason == "bad_capability_tag"),
+                "got {err:?} for {bad:?}"
+            );
         }
         // too many tags rejects too.
         let many: Vec<String> = (0..=MAX_CAPABILITIES).map(|i| format!("t{i}")).collect();
@@ -988,7 +1019,10 @@ mod tests {
         let mut ctx = ctx_external(&me);
         let err =
             futures::executor::block_on(c.execute(&mut ctx, &announce(&many_refs))).unwrap_err();
-        assert!(matches!(err, Error::Module(_)), "got {err:?}");
+        assert!(
+            matches!(err, Error::Module { ref reason, .. } if reason == "capability_cap"),
+            "got {err:?}"
+        );
         futures::executor::block_on(c.commit_block()).unwrap();
         assert_eq!(c.root(), empty, "rejected announcements staged nothing");
     }
@@ -1151,7 +1185,7 @@ mod tests {
         let err = futures::executor::block_on(c.execute(&mut module_ctx("saga"), &claim("agent")))
             .unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("already claimed")),
+            matches!(err, Error::Module { ref reason, .. } if reason == "class_already_claimed"),
             "got {err:?}"
         );
 
@@ -1162,7 +1196,7 @@ mod tests {
         let err = futures::executor::block_on(c.execute(&mut module_ctx("saga"), &claim("agent")))
             .unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("already claimed")),
+            matches!(err, Error::Module { ref reason, .. } if reason == "class_already_claimed"),
             "got {err:?}"
         );
         // ...while a re-claim by the OWNER is an idempotent no-op.
@@ -1186,7 +1220,7 @@ mod tests {
             let err =
                 futures::executor::block_on(c.execute(&mut ctx, &claim("agent"))).unwrap_err();
             assert!(
-                matches!(err, Error::Module(ref m) if m.contains("module that serves it")),
+                matches!(err, Error::Module { ref reason, .. } if reason == "module_origin_required"),
                 "got {err:?}"
             );
         }
@@ -1211,7 +1245,10 @@ mod tests {
             let err =
                 futures::executor::block_on(c.execute(&mut module_ctx("dispatch"), &claim(bad)))
                     .unwrap_err();
-            assert!(matches!(err, Error::Module(_)), "got {err:?} for {bad:?}");
+            assert!(
+                matches!(err, Error::Module { ref reason, .. } if reason == "bad_class"),
+                "got {err:?} for {bad:?}"
+            );
         }
         futures::executor::block_on(c.commit_block()).unwrap();
         assert_eq!(c.root(), empty, "rejected claims staged nothing");
@@ -1280,7 +1317,10 @@ mod tests {
         let err =
             futures::executor::block_on(c.execute(&mut ctx, &announce_with(&[], &[("cores", 8)])))
                 .unwrap_err();
-        assert!(matches!(err, Error::Module(_)), "got {err:?}");
+        assert!(
+            matches!(err, Error::Module { ref reason, .. } if reason == "resources_without_tags"),
+            "got {err:?}"
+        );
         // zero value / bad key reject via validate_resources.
         assert!(
             futures::executor::block_on(

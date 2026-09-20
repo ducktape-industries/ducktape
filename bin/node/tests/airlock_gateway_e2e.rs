@@ -289,7 +289,7 @@ async fn boot_signing_gateway(
             sign: Some(airlock::sign::Tools {
                 rcodesign: airlock::sign::fixture::rcodesign(),
                 entitlements: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../app/packaging/entitlements.plist"),
+                    .join("../../crates/airlock/tests/fixtures/entitlements.plist"),
                 work_root: work_root.to_path_buf(),
                 notary: airlock::sign::Notary::Stub(notary),
             }),
@@ -687,11 +687,12 @@ fn release_sign_bundle_round_trips_through_the_node() {
     assert!(!output.contains("registered release-sign-2"), "{output}");
 
     // A release-size bundle: the fixture's shape carrying 48 MB of
-    // incompressible views, well past the model lane's 16 MiB.
+    // incompressible resources, well past the model lane's 16 MiB.
     let stage = tempfile::tempdir().unwrap();
     let unsigned = fixture::stage_bundle(stage.path(), sign::BUNDLE_ID);
+    std::fs::create_dir_all(unsigned.join("Contents/Resources")).unwrap();
     std::fs::write(
-        unsigned.join("Contents/Resources/views/huge.wasm"),
+        unsigned.join("Contents/Resources/huge.bin"),
         incompressible(48 * 1024 * 1024),
     )
     .unwrap();
@@ -759,7 +760,7 @@ fn release_sign_bundle_round_trips_through_the_node() {
     let signed_archive = std::fs::read(&out).unwrap();
     assert!(
         signed_archive.len() >= 48 * 1024 * 1024,
-        "the signed archive carries the views back ({} bytes)",
+        "the signed archive carries the resources back ({} bytes)",
         signed_archive.len()
     );
 
@@ -768,7 +769,7 @@ fn release_sign_bundle_round_trips_through_the_node() {
     let signed_app = std::fs::read(signed.join("Contents/MacOS/ducktape-app")).unwrap();
     assert_ne!(signed_app, unsigned_app, "the executable came back signed");
     assert_eq!(
-        std::fs::metadata(signed.join("Contents/Resources/views/huge.wasm"))
+        std::fs::metadata(signed.join("Contents/Resources/huge.bin"))
             .unwrap()
             .len(),
         48 * 1024 * 1024
@@ -786,11 +787,6 @@ fn release_sign_bundle_round_trips_through_the_node() {
             String::from_utf8_lossy(&verify.stderr)
         );
     }
-    assert_eq!(
-        std::fs::read_link(signed.join("Contents/MacOS/views")).unwrap(),
-        std::path::PathBuf::from("../Resources/views"),
-        "the views link survives the round trip"
-    );
     assert!(
         std::fs::read_dir(work.path()).unwrap().next().is_none(),
         "the enclave's work dir is empty after the request"

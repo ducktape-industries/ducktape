@@ -109,7 +109,25 @@ pub fn join_workspace(
     // Computed BEFORE anything lands on disk, so a corrupt existing node.toml
     // aborts the join instead of leaving a half-written directory.
     let fresh_workspace = !dir.join("node.toml").exists();
-    let mut plumbing = merged_plumbing(&dir, overrides)?;
+    // a FRESH workspace rendezvouses where the inviter does: the invite's
+    // coordinator (or "none") stands in for the compiled default, which is
+    // somebody else's relay on a network that runs its own coordinator or
+    // none. An explicit flag still wins, and an existing node.toml keeps its
+    // value like every other key.
+    let invited_coordinator = fresh_workspace.then(|| {
+        invite
+            .coordinator
+            .clone()
+            .unwrap_or_else(|| "none".to_string())
+    });
+    let overrides = PlumbingOverrides {
+        primary_coordinator: overrides
+            .primary_coordinator
+            .clone()
+            .or(invited_coordinator),
+        ..overrides.clone()
+    };
+    let mut plumbing = merged_plumbing(&dir, &overrides)?;
     // A FRESH joining workspace gets the same compute detection as `init`: the
     // platform runtime on PATH ⇒ a live `[sandbox]` table (announce stays off),
     // so agent runs and the terminal plane work without a config edit. A
@@ -359,16 +377,8 @@ mod tests {
         assert!(!target.exists(), "a refused join left a directory behind");
     }
 
-    /// THE beat test: a joiner with NO flags at all — the desktop app's only
-    /// shape (`join_workspace(&blob, None, &Default::default())`) — comes up on
-    /// the founder's cadence, not the compiled default. The beat is a genesis
-    /// fact carried by the invite, so there is nothing left in `node.toml` for
-    /// a member to disagree about.
-    #[test]
-    fn a_joiner_inherits_the_founders_beat_with_no_flag() {
-        const FOUNDING_BEAT: u64 = 250;
-        assert_ne!(FOUNDING_BEAT, crate::DEFAULT_BLOCK_TIME_MS);
-
+    /// a founder's invite on `block_time_ms`, naming `coordinator`.
+    fn founder_invite(block_time_ms: u64, coordinator: Option<&str>) -> String {
         let issuer = ed25519::PrivateKey::from_seed(31);
         let founder = issuer.public_key();
         let mut descriptor = crate::NetworkDescriptor {
@@ -377,7 +387,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
-            block_time_ms: FOUNDING_BEAT,
+            block_time_ms,
             genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
@@ -390,8 +400,60 @@ mod tests {
             intro: None,
             mesh_port: 52200,
         };
-        let blob = crate::encode_invite(&descriptor, &token, &wireguard, &[], &issuer)
-            .expect("encode the invite");
+        crate::encode_invite(&descriptor, &token, &wireguard, &[], coordinator, &issuer)
+            .expect("encode the invite")
+    }
+
+    /// the coordinator keys of the node.toml a join wrote.
+    fn joined_coordinator(dir: &Path) -> (String, String) {
+        let (raw, _) = crate::load_node_toml(&dir.join("node.toml")).expect("node.toml");
+        (raw.primary_coordinator, raw.coordinator_relay)
+    }
+
+    /// A flagless joiner rendezvouses where its inviter does: a founder on its
+    /// own coordinator hands that coordinator (and its relay) to the joiner, a
+    /// founder with coordination off hands "none" — never the compiled public
+    /// default. An explicit `--primary-coordinator` still wins.
+    #[test]
+    fn a_joiner_takes_the_inviters_coordinator_not_the_default() {
+        let beat = crate::DEFAULT_BLOCK_TIME_MS;
+        let root = tempfile::tempdir().unwrap();
+        let join = |name: &str, coordinator: Option<&str>, overrides: &PlumbingOverrides| {
+            let blob = founder_invite(beat, coordinator);
+            join_workspace(&blob, Some(root.path().join(name)), overrides).expect("join")
+        };
+
+        let own = join("own", Some("coord.example.net:3478"), &Default::default());
+        let relay = format!("coord.example.net:{}", nat_traversal::RELAY_PORT);
+        assert_eq!(
+            joined_coordinator(&own.dir),
+            ("coord.example.net:3478".to_string(), relay)
+        );
+
+        let off = join("off", None, &Default::default());
+        assert_eq!(
+            joined_coordinator(&off.dir),
+            ("none".to_string(), "none".to_string())
+        );
+
+        let flagged = PlumbingOverrides {
+            primary_coordinator: Some("mine.example.net:3478".into()),
+            ..Default::default()
+        };
+        let chosen = join("chosen", None, &flagged);
+        assert_eq!(joined_coordinator(&chosen.dir).0, "mine.example.net:3478");
+    }
+
+    /// THE beat test: a joiner with NO flags at all — the desktop app's only
+    /// shape (`join_workspace(&blob, None, &Default::default())`) — comes up on
+    /// the founder's cadence, not the compiled default. The beat is a genesis
+    /// fact carried by the invite, so there is nothing left in `node.toml` for
+    /// a member to disagree about.
+    #[test]
+    fn a_joiner_inherits_the_founders_beat_with_no_flag() {
+        const FOUNDING_BEAT: u64 = 250;
+        assert_ne!(FOUNDING_BEAT, crate::DEFAULT_BLOCK_TIME_MS);
+        let blob = founder_invite(FOUNDING_BEAT, None);
 
         let root = tempfile::tempdir().unwrap();
         let joined = join_workspace(

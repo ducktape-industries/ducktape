@@ -173,7 +173,7 @@ async fn owner_airlock_authority<F: Future<Output = Result<Vec<u8>, String>>>(
         let reply = query(gateway::encode_query(
             &gateway::GatewayQuery::Registrations {
                 from,
-                limit: gateway::MAX_QUERY_LIMIT,
+                limit: duckdns::MAX_QUERY_LIMIT,
             },
         ))
         .await?;
@@ -188,7 +188,7 @@ async fn owner_airlock_authority<F: Future<Output = Result<Vec<u8>, String>>>(
             return Ok(format!("airlock.{}.duck", registration.handle));
         }
         let page_len = page.len() as u64;
-        let listing_exhausted = page_len < gateway::MAX_QUERY_LIMIT;
+        let listing_exhausted = page_len < duckdns::MAX_QUERY_LIMIT;
         if listing_exhausted {
             return Err("credential owner has no registered duck handle".into());
         }
@@ -288,15 +288,15 @@ mod tests {
                         )))
                     }
                     gateway::GatewayQuery::Registrations { from, limit } => {
-                        assert_eq!(limit, gateway::MAX_QUERY_LIMIT);
+                        assert_eq!(limit, duckdns::MAX_QUERY_LIMIT);
                         let registrations = match from {
                             0 => (0..limit)
-                                .map(|number| gateway::HandleRegistration {
+                                .map(|number| duckdns::HandleRegistration {
                                     account_id: 1,
                                     handle: format!("other{number}"),
                                 })
                                 .collect(),
-                            gateway::MAX_QUERY_LIMIT => vec![gateway::HandleRegistration {
+                            duckdns::MAX_QUERY_LIMIT => vec![duckdns::HandleRegistration {
                                 account_id: 42,
                                 handle: "lender".into(),
                             }],

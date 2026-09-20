@@ -107,7 +107,7 @@
 //!       [--auto] [--persona local|networked] [--echo-oracle]
 //!       [--with-valset <hex>[,<hex>...]] [--invite-binding <string>]
 //!       [--node-key <64-hex>] [--modules <dir>]`
-//! — `--listen` defaults to [`DEFAULT_LISTEN`].
+//! — `--listen` defaults to [`workspace_config::DEFAULT_SIMNODE_LISTEN`].
 //!
 //! block-on-reject (validator parity): a rejected SINGLE op JOURNALS a block
 //! here, exactly like the ordered validator — the op rides the drain, seals its
@@ -153,17 +153,6 @@ use topology::TOPOLOGY;
 // re-pins here and at node/demo. the composer below builds exactly those ids,
 // the same way bin/node does.
 const PEER_ORIGIN: &[u8] = b"peer";
-
-/// where the binary serves `/v1` when `--listen` is absent — the ONE spelling
-/// of the sim's default port.
-///
-/// It sits outside the real node's operator block (HTTP 8844, admin RPC 8845,
-/// mesh 8846) on purpose, and that is a correctness property rather than
-/// tidiness: the sim is a dev tool run BESIDE a node, so a shared port makes
-/// the second process to boot die on its bind, and makes a client on that port
-/// reach whichever daemon won — answering an admin-RPC caller with `/v1` http.
-/// Keep any new default out of 8844..=8846; a test below pins it.
-pub const DEFAULT_LISTEN: &str = "127.0.0.1:8850";
 
 /// the logical clock: `consensus_time = SIM_EPOCH_MS + height * SIM_BLOCK_MS`.
 /// a fixed epoch keeps module timestamps (message sent_at, task created_at)
@@ -383,7 +372,7 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     // checkout that built it has that set.
     let modules_dir = match modules_dir {
         Some(dir) => dir,
-        None => workspace_config::sim_modules_dir()?,
+        None => workspace_config::sim_modules_dir(noded::services::STAGED_SET)?,
     };
 
     // the status module list and the index tier both extend only under valset
@@ -1740,25 +1729,6 @@ mod tests {
             Some(BlockDisposition::Rejected)
         );
         assert_eq!(block_disposition(node::Disposition::Discarded), None);
-    }
-
-    /// the sim binary and a real node are run side by side all day, so their
-    /// eagerly-bound defaults must not overlap. `workspace-config` owns the
-    /// node's operator block — HTTP 8844, admin RPC 8845, mesh 8846 — and this
-    /// crate deliberately does not link it, so the block is restated here as
-    /// the thing [`DEFAULT_LISTEN`] must stay clear of. A default back inside
-    /// it means the second process to boot dies on its bind, and a client on
-    /// that port reaches whichever daemon won, speaking the wrong protocol.
-    #[test]
-    fn the_default_listen_avoids_the_nodes_operator_ports() {
-        let node_operator_ports = 8844..=8846;
-        let addr: SocketAddr = DEFAULT_LISTEN.parse().expect("DEFAULT_LISTEN parses");
-        let clear_of_the_node = !node_operator_ports.contains(&addr.port());
-        assert!(
-            clear_of_the_node,
-            "the sim default {addr} is inside the node's operator block \
-             {node_operator_ports:?} — it will fight a real node for the bind"
-        );
     }
 
     /// WHERE the status snapshot is published is load-bearing, and the bug it

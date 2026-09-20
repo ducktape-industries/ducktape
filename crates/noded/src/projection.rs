@@ -18,12 +18,11 @@ use crate::{
     index_block_ops, payload_preview,
 };
 
-/// the idle-chain heartbeat filler's target — a module that deliberately does
-/// not exist, so the nop rejects identically on every validator and leaves no
-/// state. the projection hides a block whose only op is this nop. the heartbeat
-/// SUBMITS with this exact target (`bin/node`'s constants re-export it), so the
-/// submit and this filter can never drift.
-pub const NOP_TARGET: &str = "consensus.nop";
+/// the idle-chain heartbeat filler's target, owned by the kernel (its drain
+/// counts the nop apart from real rejections); the projection hides a block
+/// whose only op is it, and the heartbeat submits with it, all through this
+/// one constant.
+pub use node::NOP_TARGET;
 
 /// build one explorer row op ([`RootOp`]) from a block member's decoded parts —
 /// THE RootOp assembly seam, shared by the live drain, the boot fold, and (as

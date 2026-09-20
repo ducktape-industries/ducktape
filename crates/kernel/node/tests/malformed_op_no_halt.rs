@@ -29,7 +29,10 @@ impl Module for Picky {
     }
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         if msg.payload == b"poison" {
-            return Err(Error::Module("byzantine/malformed op rejected".into()));
+            return Err(Error::module(
+                "malformed_op",
+                "byzantine/malformed op rejected",
+            ));
         }
         self.seen.lock().unwrap().push(msg.payload.clone());
         Ok(())

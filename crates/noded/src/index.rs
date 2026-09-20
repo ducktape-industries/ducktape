@@ -29,8 +29,13 @@ const BLOCKS_DEFAULT_LIMIT: usize = 256;
 /// installed until [`converge_host_modules`] runs. The split is what lets a
 /// node bring its index routes up before it holds a genesis (a joiner
 /// fetches its genesis off the mesh after the surfaces start). an open
-/// failure is fatal-with-remedy for the caller: the tier is rebuildable, so
-/// the fix is always "delete the directory".
+/// failure is fatal-with-remedy for the caller, and there are exactly two
+/// remedies: a tier nobody holds is rebuildable, so "delete the directory" —
+/// but a tier another process HOLDS is a healthy one owned by a running
+/// node, and deleting it would take the derived tier out from under a live
+/// validator. Every caller of this function reaches both cases (the node's
+/// own boot races a second node; `node qualify` runs against a workspace
+/// whose node was never stopped), so the split is here and not in any of them.
 pub fn open_index_store<S: AsRef<str>>(
     storage: &std::path::Path,
     module_ids: &[S],
@@ -39,11 +44,17 @@ pub fn open_index_store<S: AsRef<str>>(
     let ids: Vec<&str> = module_ids.iter().map(AsRef::as_ref).collect();
     indexer::IndexStore::open_bare(&index_dir, &ids)
         .map(Arc::new)
-        .map_err(|err| {
-            format!(
+        .map_err(|err| match err.is_store_locked() {
+            true => format!(
+                "a node is already running on this workspace and holds the module index at {} \
+                 — stop that node first (^C the `ducktape node run`, or stop the unit that \
+                 supervises it)",
+                index_dir.display()
+            ),
+            false => format!(
                 "open module index at {}: {err} (derived tier — delete the directory to rebuild)",
                 index_dir.display()
-            )
+            ),
         })
 }
 
@@ -665,6 +676,33 @@ pub(crate) async fn blocks(
 
 #[cfg(test)]
 mod tests {
+    /// The one condition `node qualify` documents — "the node must be
+    /// STOPPED" — is the one its refusal used to mis-name: the locked index
+    /// took the same "delete the directory to rebuild" clause as a damaged
+    /// one, and an operator who follows it deletes the derived tier of a
+    /// LIVE validator. A held lock says a node owns this workspace; the only
+    /// remedy is to stop it.
+    ///
+    /// `flock` is per open file description, so a second open in THIS process
+    /// conflicts exactly as another process's would.
+    #[test]
+    fn a_locked_index_names_the_running_node_and_never_offers_the_delete() {
+        let storage = tempfile::tempdir().expect("scratch storage");
+        let _held = super::open_index_store::<&str>(storage.path(), &[]).expect("first open owns");
+        let refused = super::open_index_store::<&str>(storage.path(), &[])
+            .err()
+            .expect("a second open cannot take the lock");
+        assert!(
+            refused.contains("a node is already running on this workspace"),
+            "{refused}"
+        );
+        assert!(refused.contains("stop that node first"), "{refused}");
+        assert!(
+            !refused.contains("delete the directory"),
+            "the delete remedy is for a tier nobody holds: {refused}"
+        );
+    }
+
     /// #1809: a payload over [`super::MAX_INLINE_PAYLOAD_BYTES`] ships as
     /// `payload_bytes` + `payload_truncated` instead of a multi-megabyte hex
     /// string — the full bytes stay reachable by op id, this row just stops

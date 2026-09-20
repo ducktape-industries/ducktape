@@ -281,8 +281,9 @@ impl From<PopError> for WriteRefusal {
 }
 
 /// which mutating lane a request path belongs to — the ONE discriminant
-/// [`Lane::mutates`] branches on. `Open` is everything else: reads, the
-/// self-authenticating `/v1/submit/frame`, the volatile service-hello, the
+/// [`Lane::authority`] branches on. `Open` is everything else: reads, the
+/// self-authenticating routes (`/v1/submit/frame`, whose frame carries its own
+/// signature, and `/v1/gateway/proxy`, whose head carries its caller's), the
 /// websocket upgrades, and `/v1/admin/*` (which carries its own gate).
 ///
 /// Two of those websocket upgrades are NOT actually unauthenticated:
@@ -307,6 +308,9 @@ enum Lane {
     NodeLevel,
     /// Operator-authenticated application HTTP and WebSocket requests.
     GatewayOperator,
+    /// `/v1/services/hello` ([`SERVICE_HELLO_PATH`]) — a local service daemon
+    /// signals its presence into the catalog `service list` shows the operator.
+    ServiceHello,
     /// `/v1/huddle/node-proof` ([`HUDDLE_PROOF_PATH`]) — this node signs that it
     /// will route the SIGNER's huddle media. the handler reads [`SignedBy`]
     /// and binds exactly that key, so possession is the right bar here:
@@ -326,11 +330,24 @@ enum Authority {
     /// actually decides — so an unknown key gets a refusal from the module, not
     /// from this gate.
     Acting,
+    /// a MEMBER of this network: the verified key holds an account in committed
+    /// identity state. for a route whose effect lands on THIS node (disk, not
+    /// module state), so no module downstream decides who may ask; the key
+    /// rides on as [`SignedBy`] and the handler decides per object.
+    Member,
     /// this node's OPERATOR. the handler reads no acting identity, so there is
     /// no second decider downstream and possession proves nothing: only the
     /// operator credential, or a PoP by [`crate::AdminConfig::owner_key`], gets
     /// through.
     Operator,
+    /// this node's SERVICE LINK: the 0600 secret beside `node.toml`
+    /// ([`crate::services::LINK_TOKEN_FILE`]) in
+    /// [`crate::services::LINK_TOKEN_HEADER`] — what a local service daemon
+    /// already reads to take its ws link, and the whole of what it holds. Never
+    /// a signature: possession of a self-minted key is exactly what a caller
+    /// with no workspace can present. The operator credential still admits, as
+    /// it does on every lane.
+    ServiceLink,
 }
 
 /// the exact mutating POST paths that mutate the NODE rather than module state:
@@ -347,9 +364,12 @@ pub(crate) const HUDDLE_PROOF_PATH: &str = "/v1/huddle/node-proof";
 
 /// the frameless op lane. an EXACT match, not a prefix: `/v1/submit/frame`
 /// carries its own signature inside the frame and stays open, and the other
-/// POSTs that read (`/v1/query`, `/v1/index/{m}/view`, `/v1/gateway/proxy`) are
-/// in neither table.
+/// POSTs that read (`/v1/query`, `/v1/index/{m}/view`) or carry their own
+/// caller proof (`/v1/gateway/proxy`) are in neither table.
 const SUBMIT_PATH: &str = "/v1/submit";
+
+/// the service daemons' presence signal ([`Lane::ServiceHello`]).
+const SERVICE_HELLO_PATH: &str = "/v1/services/hello";
 
 const WORKSPACE_PREFIX: &str = "/v1/fs/workspaces";
 const BLOB_PATH: &str = "/v1/files/blob";
@@ -381,6 +401,9 @@ fn lane_of(path: &str) -> Lane {
     if path == HUDDLE_PROOF_PATH {
         return Lane::HuddleProof;
     }
+    if path == SERVICE_HELLO_PATH {
+        return Lane::ServiceHello;
+    }
     match path == SUBMIT_PATH {
         true => Lane::Submit,
         false => Lane::Open,
@@ -395,13 +418,11 @@ impl Lane {
         let posts = *method == Method::POST;
         let removes = *method == Method::DELETE;
         match self {
-            // POST creates and commits a managed checkout AS the acting key
-            // (`workspaces::acting_origin` → the duckfs authority check).
-            // DELETE `remove_dir_all`s the dir and reads no identity at all, so
-            // possession would let any caller wipe another run's checkout.
-            Lane::Workspace => posts
-                .then_some(Authority::Acting)
-                .or(removes.then_some(Authority::Operator)),
+            // a managed checkout is a directory on THIS node's disk, so create,
+            // commit and delete all take a member, never a bare key; the handler
+            // then admits only the workspace's creator (or the operator) to
+            // commit or delete it, and caps how many one creator holds.
+            Lane::Workspace => (posts || removes).then_some(Authority::Member),
             Lane::Blob => posts.then_some(Authority::Acting),
             // `/v1/submit` is the FRAMELESS lane: unlike Files/Workspace, the
             // verified `SignedBy` key does NOT ride on as the op's origin — the
@@ -423,6 +444,10 @@ impl Lane {
                 let exchange = posts || *method == Method::GET;
                 exchange.then_some(Authority::Operator)
             }
+            // an entry lands in the catalog `service list` shows the operator
+            // to enable from, so "can dial the port" must not be enough to put
+            // one there.
+            Lane::ServiceHello => posts.then_some(Authority::ServiceLink),
             Lane::Open => None,
         }
     }
@@ -448,12 +473,16 @@ impl Lane {
             Lane::GatewayOperator => {
                 crate::gateway_http::JSON_LANE_REQUEST_BYTES * 2 + gateway::MAX_PROXY_HEAD_BYTES
             }
-            // json bodies and the log-filter string. `Open` never reaches here
-            // (the guard returns before asking), and takes the small cap so a
-            // table that ever disagreed fails closed rather than wide.
-            Lane::Workspace | Lane::Submit | Lane::NodeLevel | Lane::HuddleProof | Lane::Open => {
-                DEFAULT_JSON_BODY_BYTES
-            }
+            // json bodies and the log-filter string. `Open` and `ServiceHello`
+            // never reach here (the guard returns before asking), and take the
+            // small cap so a table that ever disagreed fails closed rather than
+            // wide.
+            Lane::Workspace
+            | Lane::Submit
+            | Lane::NodeLevel
+            | Lane::HuddleProof
+            | Lane::ServiceHello
+            | Lane::Open => DEFAULT_JSON_BODY_BYTES,
             Lane::RunControl => 64 * 1024,
         }
     }
@@ -500,6 +529,15 @@ pub enum WriteRefusal {
     /// a VALID signature, by a key this node does not know as its operator's,
     /// on a route that changes the node rather than module state.
     NotOperator,
+    /// a VALID signature, by a key that holds no account on this network, on a
+    /// route that admits members ([`Authority::Member`]).
+    NotMember,
+    /// this node could not read its identity state to answer whether the key
+    /// holds an account.
+    MembershipUnreadable,
+    /// no service-link token, or not this boot's, on a local service daemon's
+    /// route ([`Authority::ServiceLink`]).
+    ServiceLinkMissing,
     /// the body is larger than any gated route accepts (or its stream broke).
     BodyOverCap,
     /// this node carries no consensus key to salt the signature with — an
@@ -518,6 +556,9 @@ impl WriteRefusal {
             Self::SignatureMalformed => "signature_malformed",
             Self::SignatureInvalid => "signature_invalid",
             Self::NotOperator => "not_operator",
+            Self::NotMember => "key_without_account",
+            Self::MembershipUnreadable => "membership_unreadable",
+            Self::ServiceLinkMissing => "service_link_missing",
             Self::BodyOverCap => "body_over_cap",
             Self::NodeUnidentified => "node_unidentified",
         }
@@ -532,9 +573,11 @@ impl WriteRefusal {
             Self::SignatureMissing
             | Self::SignatureStale
             | Self::SignatureMalformed
-            | Self::SignatureInvalid => StatusCode::UNAUTHORIZED,
-            Self::NotOperator => StatusCode::FORBIDDEN,
+            | Self::SignatureInvalid
+            | Self::ServiceLinkMissing => StatusCode::UNAUTHORIZED,
+            Self::NotOperator | Self::NotMember => StatusCode::FORBIDDEN,
             Self::BodyOverCap => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::MembershipUnreadable => StatusCode::SERVICE_UNAVAILABLE,
             // this node's own condition, not a defect in what the caller
             // presented — retrying with any signature cannot fix it.
             Self::NodeUnidentified => StatusCode::INTERNAL_SERVER_ERROR,
@@ -555,6 +598,18 @@ impl WriteRefusal {
             Self::NotOperator => {
                 "this route changes the node itself, so it requires this node's operator \
                  credential or a signature by its operator key"
+            }
+            Self::NotMember => {
+                "this route acts for a member of this network, so the signing key must \
+                 hold an account on it"
+            }
+            Self::MembershipUnreadable => {
+                "this node could not read its identity state to check the signing key's account"
+            }
+            Self::ServiceLinkMissing => {
+                "this route is a local service daemon's, so it requires this node's \
+                 service-link token (x-ducktape-service-link), read from the file \
+                 beside node.toml"
             }
             Self::BodyOverCap => "the request body is larger than this node accepts",
             Self::NodeUnidentified => {
@@ -601,6 +656,26 @@ pub(crate) fn operator_key_matches(cfg: &crate::AdminConfig, acting: &[u8]) -> b
     cfg.owner_key.as_deref() == Some(acting)
 }
 
+/// is this websocket upgrade this node's OPERATOR? The two proofs every
+/// [`Authority::Operator`] route admits, and only those: the operator
+/// credential from a loopback peer, or a signature by
+/// [`crate::AdminConfig::owner_key`] over `GET` + the exact path and query +
+/// an empty body — the shape a run reader's upgrade already signs. It decides
+/// the operator's TOPICS, not the upgrade: a caller that proves nothing still
+/// opens the socket and holds what is public.
+pub(crate) fn upgrade_is_operator(
+    handle: &NodeHandle,
+    headers: &HeaderMap,
+    path_and_query: &str,
+    on_box: bool,
+) -> bool {
+    if operator_credential_matches(&handle.admin, headers, on_box) {
+        return true;
+    }
+    verify_signed_request(handle, &Method::GET, path_and_query, headers, b"")
+        .is_ok_and(|acting| operator_key_matches(&handle.admin, &acting))
+}
+
 /// the ONE gate over every mutating `/v1` route: decide, then run or refuse.
 /// an open (read) route is passed straight through, body untouched.
 pub(crate) async fn signed_write_guard(
@@ -610,7 +685,7 @@ pub(crate) async fn signed_write_guard(
 ) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let on_box = crate::admin::peer_is_loopback(&req);
+    let on_box = crate::admin::peer_is_loopback(req.extensions());
     let is_operator = operator_credential_matches(&handle.admin, req.headers(), on_box);
     let lane = lane_of(&path);
     let Some(authority) = lane.authority(&method) else {
@@ -621,6 +696,16 @@ pub(crate) async fn signed_write_guard(
     // middleware.
     if is_operator {
         return next.run(req).await;
+    }
+    // the service-link lane's proof is the secret itself, not a signature:
+    // one compare, no body to read.
+    if authority == Authority::ServiceLink {
+        let holds_link = header_str(req.headers(), crate::services::LINK_TOKEN_HEADER)
+            .is_some_and(|token| handle.workspace_secret_matches(token));
+        return match holds_link {
+            true => next.run(req).await,
+            false => refuse(&path, WriteRefusal::ServiceLinkMissing),
+        };
     }
     // the blob lane's body is UNBOUNDED and streams to disk, so this gate
     // cannot hold it to hash it. The proof travels to the handler instead,
@@ -664,19 +749,47 @@ pub(crate) async fn signed_write_guard(
         Ok(key) => key,
         Err(refusal) => return refuse(&path, refusal),
     };
-    // possession is the WHOLE proof on an `Acting` lane, because the module
-    // downstream reads the key and decides. a node-level handler reads nothing,
-    // so the key itself has to be one this node recognises.
-    let admitted = match authority {
-        Authority::Acting => true,
-        Authority::Operator => operator_key_matches(&handle.admin, &acting),
-    };
-    if !admitted {
-        return refuse(&path, WriteRefusal::NotOperator);
+    if let Err(refusal) = admit_key(&handle, authority, &acting).await {
+        return refuse(&path, refusal);
     }
     let mut req = axum::extract::Request::from_parts(parts, axum::body::Body::from(body));
     req.extensions_mut().insert(SignedBy(acting));
     next.run(req).await
+}
+
+/// does a VERIFIED key clear `authority`? possession is the WHOLE proof on an
+/// `Acting` lane, because the module downstream reads the key and decides. A
+/// `Member` lane lands on this node, so the key must hold an account in
+/// committed identity state. A node-level handler reads nothing, so the key
+/// itself has to be one this node recognises as its operator's. The
+/// service-link lane answered in the guard on its secret; a signature is never
+/// its credential, so it fails closed here.
+async fn admit_key(
+    handle: &NodeHandle,
+    authority: Authority,
+    acting: &[u8],
+) -> Result<(), WriteRefusal> {
+    match authority {
+        Authority::Acting => Ok(()),
+        Authority::Member => admit_member(handle, acting).await,
+        Authority::Operator => admit_operator(handle, acting),
+        Authority::ServiceLink => Err(WriteRefusal::NotOperator),
+    }
+}
+
+async fn admit_member(handle: &NodeHandle, acting: &[u8]) -> Result<(), WriteRefusal> {
+    match crate::handle::account_of_key(handle, acting.to_vec()).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(WriteRefusal::NotMember),
+        Err(_) => Err(WriteRefusal::MembershipUnreadable),
+    }
+}
+
+fn admit_operator(handle: &NodeHandle, acting: &[u8]) -> Result<(), WriteRefusal> {
+    match operator_key_matches(&handle.admin, acting) {
+        true => Ok(()),
+        false => Err(WriteRefusal::NotOperator),
+    }
 }
 
 /// the data-plane PoP over ONE request, answering the key that signed it.
@@ -935,20 +1048,23 @@ mod tests {
     /// authority it demands, and the reads that must not be dragged in with
     /// them. the pairs that matter most are the ones that share a path with
     /// their own read — `/v1/files/blob` (POST writes, GET fetches) and `/v1/submit` vs
-    /// `/v1/submit/frame` — and the DELETE that shares its prefix with two
-    /// module-bound POSTs on the workspace lane.
+    /// `/v1/submit/frame` — and the workspace lane, whose DELETE takes the same
+    /// member bar as the POST that creates.
     #[test]
     fn the_gate_covers_every_mutating_route() {
         let gated: &[(Method, &str, Authority)] = &[
             // module-bound: the acting key rides on as `SignedBy` and the
             // module decides.
-            (Method::POST, "/v1/fs/workspaces", Authority::Acting),
+            (Method::POST, "/v1/files/blob", Authority::Acting),
+            // a managed checkout is this node's disk: create, commit and delete
+            // alike take a member, and the handler admits only the creator.
+            (Method::POST, "/v1/fs/workspaces", Authority::Member),
             (
                 Method::POST,
                 "/v1/fs/workspaces/abc/commit",
-                Authority::Acting,
+                Authority::Member,
             ),
-            (Method::POST, "/v1/files/blob", Authority::Acting),
+            (Method::DELETE, "/v1/fs/workspaces/abc", Authority::Member),
             // node-level: the handler reads no identity, so possession of a
             // self-chosen key must not be enough.
             (Method::POST, "/v1/log-filter", Authority::Operator),
@@ -967,7 +1083,9 @@ mod tests {
                 "/v1/submit/raw/new-product",
                 Authority::Operator,
             ),
-            (Method::DELETE, "/v1/fs/workspaces/abc", Authority::Operator),
+            // a local daemon's presence lands in the catalog the operator
+            // enables from: the service-link token, never a signature.
+            (Method::POST, "/v1/services/hello", Authority::ServiceLink),
         ];
         for (method, path, wanted) in gated {
             assert_eq!(
@@ -978,13 +1096,17 @@ mod tests {
         }
         let open: &[(Method, &str)] = &[
             (Method::GET, "/v1/status"),
+            (Method::GET, "/v1/release"),
             (Method::GET, "/v1/files/blob/aa"),
             (Method::POST, "/v1/query"),
             (Method::POST, "/v1/index/chat/view"),
-            (Method::POST, "/v1/gateway/proxy"),
-            // self-authenticating: the frame carries its own signature.
+            // self-authenticating: the frame carries its own signature, and the
+            // proxy head its caller's (`gateway_http::gateway_proxy` verifies
+            // it and refuses a head that carries none).
             (Method::POST, "/v1/submit/frame"),
-            (Method::POST, "/v1/services/hello"),
+            (Method::POST, "/v1/gateway/proxy"),
+            (Method::GET, "/v1/services"),
+            // the upgrade proves its own topics (`upgrade_is_operator`).
             (Method::GET, "/v1/ws"),
         ];
         for (method, path) in open {
@@ -1016,6 +1138,59 @@ mod tests {
             &no_wallet,
             operator.public_key().as_ref()
         ));
+    }
+
+    /// a ws upgrade proves the operator with exactly the two proofs an
+    /// operator route takes, and nothing weaker: the credential from a
+    /// loopback peer, or the operator key's signature over THIS upgrade.
+    #[test]
+    fn an_upgrade_proves_the_operator_by_the_operator_lanes_two_proofs() {
+        const TOKEN: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+        let operator = key(13);
+        let stranger = key(14);
+        let (mut handle, _commands, _hub) = crate::NodeHandle::channel();
+        handle.admin = crate::AdminConfig {
+            operator_token: Some(TOKEN.into()),
+            node_key: Some(NODE.to_vec()),
+            owner_key: Some(operator.public_key().as_ref().to_vec()),
+            ..Default::default()
+        };
+        let path = "/v1/ws";
+        let signed = |signer: &ed25519::PrivateKey, path: &str| {
+            let mut headers = HeaderMap::new();
+            for (name, value) in request_headers(signer, "GET", path, &NODE, b"") {
+                headers.insert(name, value.parse().unwrap());
+            }
+            headers
+        };
+        let mut credential = HeaderMap::new();
+        credential.insert(crate::admin::ADMIN_TOKEN_HEADER, TOKEN.parse().unwrap());
+
+        // nothing presented, or a key that is not the operator's: no.
+        assert!(!upgrade_is_operator(&handle, &HeaderMap::new(), path, true));
+        assert!(!upgrade_is_operator(
+            &handle,
+            &signed(&stranger, path),
+            path,
+            true
+        ));
+        // the operator key, but over another upgrade: no.
+        assert!(!upgrade_is_operator(
+            &handle,
+            &signed(&operator, "/v1/ws?run=x"),
+            path,
+            true
+        ));
+        // the credential off the box: no — the same bar every operator lane sets.
+        assert!(!upgrade_is_operator(&handle, &credential, path, false));
+        // either proof, presented the way the operator lanes take it: yes.
+        assert!(upgrade_is_operator(
+            &handle,
+            &signed(&operator, path),
+            path,
+            false
+        ));
+        assert!(upgrade_is_operator(&handle, &credential, path, true));
     }
 
     /// the hashing cap is reached by an UNAUTHENTICATED caller, so no lane may

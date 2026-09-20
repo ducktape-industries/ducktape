@@ -21,7 +21,7 @@ use sha2::Digest;
 
 use host::{Admitted, BlockContext, CodeSource, Host, MODULES_ID, ModuleFactory};
 use modules::{Modules, ModulesMsg, ModulesQuery, ModulesReply};
-use sdk::{Error, Msg, Origin, StateRoot};
+use sdk::{Error, Module, Msg, Origin, StateRoot};
 
 const COMPONENT: &[u8] = include_bytes!("fixtures/hello.component.wasm");
 
@@ -89,6 +89,11 @@ impl ModuleFactory for WasmFactory {
                 false => Ok(Admitted::ForeignAbi),
             },
         }
+    }
+
+    // an admission over a map touches nothing but itself: it is its own scratch.
+    fn check(&self, id: &str, bytes: &[u8]) -> Result<(), Error> {
+        futures::executor::block_on(self.instantiate(id, bytes)).map(drop)
     }
 }
 
@@ -542,7 +547,10 @@ struct FlakyStore {
 impl sdk::MerkleStore for FlakyStore {
     async fn get(&self, key: &[u8; sdk::ROOT_LEN]) -> Result<Option<Vec<u8>>, Error> {
         if self.failing.get() {
-            return Err(Error::Module("injected registry read failure".into()));
+            return Err(Error::module(
+                "injected_fault",
+                "injected registry read failure",
+            ));
         }
         self.inner.get(key).await
     }
@@ -622,6 +630,107 @@ fn a_failed_registry_query_stalls_the_boundary() {
     realize(&mut host, H, &src).expect("the retry realizes the admission");
     submit(&mut host, H, Origin::External(vec![9; 32]), inc_msg());
     assert_eq!(count(&host), 1, "and the block applies");
+}
+
+/// a module that loads fine and refuses once it is started.
+struct RefusesToStart;
+
+#[async_trait::async_trait(?Send)]
+impl Module for RefusesToStart {
+    fn id(&self) -> sdk::ModuleId {
+        "kanban".into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot([0; 32])
+    }
+
+    async fn execute(&mut self, _ctx: &mut dyn sdk::Ctx, _msg: &Msg) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn initialize(&mut self, _params: &[u8]) -> Result<(), Error> {
+        Err(Error::module("not_configured", "no board to start from"))
+    }
+}
+
+/// the node's factory in miniature (`noded::compose::Admissions`): an
+/// admission is seated only once its `initialize` has run, and a refusal there
+/// is the admission's refusal.
+struct StartingFactory;
+
+#[async_trait::async_trait(?Send)]
+impl ModuleFactory for StartingFactory {
+    async fn instantiate(&self, id: &str, _bytes: &[u8]) -> Result<Admitted, Error> {
+        let mut module = RefusesToStart;
+        module
+            .initialize(&[])
+            .await
+            .map_err(|e| Error::module("module_seat", format!("{id} initializes: {e}")))?;
+        Ok(Admitted::Module(Box::new(module)))
+    }
+
+    fn check(&self, id: &str, bytes: &[u8]) -> Result<(), Error> {
+        futures::executor::block_on(self.instantiate(id, bytes)).map(drop)
+    }
+}
+
+/// AN ADMISSION THAT CANNOT START NEVER ARMS. `initialize` runs when an
+/// admission is seated at its boundary, identically on every node — so a guest
+/// that refuses there stops every node at that height, retrying forever. The
+/// readiness question each validator asks before it signals is that same
+/// admission over scratch state: it refuses, nobody signals, the admission
+/// never arms, and every block past its height applies on every node.
+#[test]
+fn an_admission_whose_initialize_fails_never_arms_and_every_block_applies() {
+    let run_node = || {
+        let mut host = bare_host(false);
+        host.register(Box::new(directory::Directory::new("directory")));
+        host.set_module_factory(Box::new(StartingFactory));
+        let src = MapSource::with(&[COMPONENT]);
+        submit(&mut host, 3, Origin::System, schedule_register_msg());
+
+        // the validator's readiness question, as its node asks it: only a
+        // ready answer signs `SwapReady`.
+        let ready = host.check_module_replacement("kanban", &deployment(COMPONENT));
+        if ready.is_ok() {
+            submit(
+                &mut host,
+                4,
+                Origin::External(MEMBER.to_vec()),
+                signal_ready_msg(),
+            );
+        }
+        for height in H - 1..=H + 2 {
+            realize(&mut host, height, &src).expect("every boundary realizes");
+            submit(
+                &mut host,
+                height,
+                Origin::External(vec![9; 32]),
+                Msg {
+                    target: "directory".into(),
+                    payload: directory::encode_msg(&directory::DirMsg::Set {
+                        key: format!("block-{height}"),
+                        value: "applied".into(),
+                    }),
+                },
+            );
+        }
+        assert!(host.module_root("kanban").is_none(), "nothing seated");
+        let (active, pending) = kanban_entry(&host).expect("the admission stays recorded");
+        assert!(active.is_empty(), "never activated");
+        assert!(
+            pending,
+            "still pending, never ready — governance can cancel it"
+        );
+        let refusal = ready.expect_err("an admission that cannot start is not ready");
+        assert!(
+            refusal.to_string().contains("kanban initializes"),
+            "the refusal names the module and the step: {refusal}"
+        );
+        host.root_hash()
+    };
+    assert_eq!(run_node(), run_node(), "every node lands on the same root");
 }
 
 /// an admission that never latches ready never arms — however high the height.

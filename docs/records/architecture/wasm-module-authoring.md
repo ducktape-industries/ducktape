@@ -1,5 +1,15 @@
 # Authoring wasm modules
 
+The module SDK, the guest builder and the kernel-fixture guest crates this
+document names now live in
+[ducktape-sdk](https://github.com/ducktape-industries/ducktape-sdk); the
+desktop views it references live in
+[ducktape-app](https://github.com/ducktape-industries/ducktape-app) and
+[ducktape-views](https://github.com/ducktape-industries/ducktape-views).
+Paths below are relative to those repositories unless the crate is one this
+repository still carries (a system module, `forge`, `files`, or
+`crates/kernel/host`, which consumes `wasm-host` from ducktape-sdk).
+
 How to write, build, and live-update a Ducktape wasm module. The runtime is
 `crates/kernel/wasm-host` (wasmtime, pinned `=46.0.3`); the authoring contract is
 the `ducktape:module` WIT world (`crates/module-sdk/wit/module.wit`, inside the
@@ -304,25 +314,20 @@ module ids remain supported. `Genesis::compose` and runtime artifact reads
 share the same preparation checks. A `<id>.view.pending` marker blocks both,
 even when an older view file is still present.
 
-`make views` bundles the packages declared under `crates/views/`, with fixed
-source-path prefixes and explicit unoptimized output independent of PATH. It
-compiles through `/var/tmp/ducktape-view-root`, a symlink to the checkout: a
-view reaches module crates outside the `crates/views` workspace, and cargo
-hashes such a dependency's absolute location into its `-C metadata` and so into
-every symbol it emits, which would tie a view's bytes to where the checkout
-lives. One build owns that name at a time.
-`make views-repro-check` builds the committed HEAD snapshot in two isolated
-roots, compares all view bytes, and rejects embedded builder-home paths.
-The consensus guest `wasm-rebuild-check` does not cover these views. The noded
-build stages module views for governance, files, pages, chat, and forge when
-that owner's `crates/views/<id>/Cargo.toml` exists. Other desktop views remain
-desktop resources. Missing or empty declared view output leaves a pending
-marker; compiling noded succeeds, but founding or packing that deployment
-fails. Run `make views` and rebuild noded to prepare the founding set. A
-restored view clears pending after its assets are synchronized. Removing the
-owner declaration removes staged view files and assets; removing only a build
-output does not. Asset files removed from a restored source tree are removed
-from staging as well.
+The founding views are committed artifacts: `crates/views/<id>/view.wasm`,
+with the view's `assets/` beside it, for the governance, files, pages, chat,
+forge and inbox modules and the view-only `topology::VIEWS` entries. The
+committed artifact is the declaration: the noded build stages
+`<id>.view.wasm` and `<id>.assets/` for exactly the ids that carry one,
+removes a staged view whose artifact is gone, and fails when a
+`topology::VIEWS` id carries none. Other desktop views remain desktop
+resources. `make views-sync VIEWS_DIR=<ducktape-views checkout>
+VIEWS_REV=<commit>` is the one step that moves them: it builds the founding
+views out of a `git archive` of that commit with ducktape-views' own
+`ops/build-views.sh` (which ducktape-views' `ops/views-repro-check.sh` holds
+reproducible), copies them in, and writes `crates/views/views.lock`, the
+commit and each view's sha256, which `crates/noded/tests/founding_views.rs`
+holds against the bytes.
 
 Agents commit the artifact and request `modules.update` through their final response
 (see [dogfood](../../dogfood.md)). The operator CLI packages the same unit,

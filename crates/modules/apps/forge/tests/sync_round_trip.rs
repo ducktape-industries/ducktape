@@ -68,6 +68,7 @@ fn push(forge: &mut Forge, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) {
                 new_oid: Some(new.to_vec()),
             }],
             pack_digest: Some(digest.to_vec()),
+            tags: Vec::new(),
             cert: None,
         }),
     };
@@ -108,13 +109,16 @@ fn first_oid_offset(bytes: &[u8]) -> usize {
     p + 4 + branch_len
 }
 
-/// byte offset of the FIRST repo's pack (after its oid + a 4-byte pack length).
+/// byte offset of the FIRST repo's pack in a one-branch, tag-less container
+/// with nothing pending: after its oid, the tag count (4), the pending count
+/// (4) and the pack length (4).
 fn first_pack_offset(bytes: &[u8]) -> usize {
-    first_oid_offset(bytes) + OID_LEN + 4
+    first_oid_offset(bytes) + OID_LEN + 12
 }
 
 /// assemble a one-repo, one-branch (`main`) container with an EMPTY tracker
-/// section: `FGv1 [count=1][name][ref_count=1]["main" oid][pack_len pack][tracker]`.
+/// section: `FGv1 [count=1][name][branch_count=1]["main" oid][tag_count=0]
+/// [pending_count=0][pack_len pack][tracker]`.
 fn build_container(name: &str, oid: &[u8], pack: &[u8]) -> Vec<u8> {
     let mut out = b"FGv1".to_vec();
     out.extend_from_slice(&1u32.to_le_bytes());
@@ -124,6 +128,8 @@ fn build_container(name: &str, oid: &[u8], pack: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&4u32.to_le_bytes());
     out.extend_from_slice(b"main");
     out.extend_from_slice(oid);
+    out.extend_from_slice(&0u32.to_le_bytes()); // tag count: none
+    out.extend_from_slice(&0u32.to_le_bytes()); // pending-map count: none
     out.extend_from_slice(&(pack.len() as u32).to_le_bytes());
     out.extend_from_slice(pack);
     out.extend_from_slice(&empty_tracker_section());
@@ -216,7 +222,7 @@ fn tampered_head_oid_is_rejected_before_anything_is_written() {
     let dst_base = tmp_base("tamper-dst");
     let mut dst = Forge::init("forge", dst_base.clone()).unwrap();
     let err = dst.install(&bytes, root).unwrap_err();
-    assert!(matches!(err, Error::Module(_)));
+    assert!(matches!(err, Error::Module { ref reason, .. } if reason == "snapshot_root_mismatch"));
     assert_eq!(
         dst.root(),
         StateRoot::ZERO,
@@ -364,8 +370,8 @@ fn a_partial_closure_pack_is_rejected_before_the_ref_moves() {
     let mut dst = Forge::init("forge", dst_base.clone()).unwrap();
     let err = dst.install(&bytes, expected).unwrap_err();
     assert!(
-        matches!(err, Error::Module(_)),
-        "incomplete closure errs with Module"
+        matches!(err, Error::Module { ref reason, .. } if reason == "git_verify_closure"),
+        "an incomplete pack is refused by the closure check: {err:?}"
     );
     assert_eq!(dst.root(), StateRoot::ZERO, "the ref never moved");
     assert_eq!(on_disk_head(&dst_base), None, "the ref never moved");

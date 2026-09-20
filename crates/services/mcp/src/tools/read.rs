@@ -35,7 +35,7 @@ use runs::{ModelQuery, RunsQuery};
 use tasks::{JobsQuery, TaskQuery, WorkQuery};
 
 use super::{Tool, arg_str, opt_u64, schema};
-use crate::identity::{Run, TARGET_MODEL, TARGET_RUNS};
+use crate::identity::{ENV_AGENT, Run, TARGET_MODEL, TARGET_RUNS};
 use crate::node::{NodeError, Result};
 
 const TARGET_CHAT: &str = "chat";
@@ -57,7 +57,8 @@ pub(super) fn tools() -> Vec<Tool> {
             name: "ducktape_whoami",
             description: "Who you are in Ducktape: your run id, agent id, display name, owner, \
                           program account, your workspace directory, and where your skills are \
-                          mounted. Call this first if you are unsure who you are acting as.",
+                          mounted. Call this first if you are unsure who you are acting as. \
+                          A server started for no agent answers that too.",
             schema: || schema(&[]),
             handler: whoami,
         },
@@ -312,9 +313,28 @@ fn query_schema() -> Value {
 }
 
 /// the agent's own committed record, plus the host facts it cannot read off the
-/// chain: its run id, workspace, and skill mount.
+/// chain: its run id, workspace, and skill mount. a server acting for no agent
+/// answers too — nobody, with every agent field null — and names what supplies
+/// an identity, because this is the call a client is told to make first.
 fn whoami(run: &Run, _args: &Value) -> Result<Value> {
-    let record = run.record()?;
+    let Some(record) = run.record()? else {
+        return Ok(json!({
+            "account": null,
+            "agent_id": null,
+            "display_name": null,
+            "owner": null,
+            "capability": null,
+            "status": null,
+            "skills": null,
+            "run_id": run.run_id(),
+            "workspace_dir": run.workspace,
+            "skills_dir": run.skills,
+            "unbound": format!(
+                "no agent identity: this MCP server was started without {ENV_AGENT}, so it \
+                 acts for no agent. Reads are not gated."
+            ),
+        }));
+    };
     Ok(json!({
         "account": record.account,
         "agent_id": record.agent_id,
@@ -975,6 +995,54 @@ fn encode<Q: serde::Serialize>(query: &Q) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::tests::{fake_node, standing_record};
+    use crate::identity::{ENV_NODE, ENV_RUN_ID};
+
+    #[test]
+    fn whoami_answers_for_no_agent_and_reports_a_bound_one_unchanged() {
+        // the documented first call: with no agent it answers nobody, never
+        // refuses, and names what supplies an identity. it asks no node.
+        let unbound =
+            whoami(&Run::from_vars(&|_| None), &json!({})).expect("an unbound whoami answers");
+        for field in [
+            "account",
+            "agent_id",
+            "display_name",
+            "owner",
+            "capability",
+            "status",
+            "skills",
+            "run_id",
+        ] {
+            assert!(unbound[field].is_null(), "{field}: {unbound}");
+        }
+        let hint = unbound["unbound"].as_str().expect("the identity hint");
+        assert!(hint.contains(ENV_AGENT), "{hint}");
+
+        let node = fake_node(vec![json!({"model": {"agent": standing_record()}})]);
+        let bound = Run::from_vars(&|key| match key {
+            ENV_NODE => Some(node.clone()),
+            ENV_AGENT => Some("worker".into()),
+            ENV_RUN_ID => Some("run-1".into()),
+            _ => None,
+        });
+        let record = standing_record();
+        assert_eq!(
+            whoami(&bound, &json!({})).expect("a bound whoami answers"),
+            json!({
+                "account": record.account,
+                "agent_id": record.agent_id,
+                "display_name": record.display_name,
+                "owner": record.owner,
+                "capability": record.capability,
+                "status": record.status,
+                "skills": record.skills,
+                "run_id": "run-1",
+                "workspace_dir": null,
+                "skills_dir": null,
+            })
+        );
+    }
 
     #[test]
     fn queries_encode_to_the_modules_own_wire_shapes() {

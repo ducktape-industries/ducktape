@@ -19,6 +19,18 @@
 //! asks the process to exit gracefully — the managing app has no pid, only
 //! this port.
 
+// The app modules' wire crates under the module's OWN name, for the suites
+// only. Core links them as `agent-wire` / `runs-wire` (the native modules ship
+// from ducktape-modules), while bin/node links the same crates bare — and the
+// provisioning suites `#[path]`-include bin/node's chief planner, whose `use
+// agent::…` / `use runs::…` resolve against the crate root. One alias here is
+// what lets that one source file compile in both crates; cargo refuses the
+// same package twice under two names, so it cannot be a second dependency.
+#[cfg(test)]
+extern crate agent_wire as agent;
+#[cfg(test)]
+extern crate runs_wire as runs;
+
 // the owner-gated control namespace: `/v1/admin/*` on the same
 // listener, PoP-gated to the node owner. shutdown + module-code moved here off
 // the unauthenticated public surface.
@@ -73,8 +85,8 @@ pub use gateway_http::{
 // the node-actor command lane and the router's shared state handle.
 mod handle;
 pub use handle::{
-    NetstackSwapRequest, NetstackSwapper, NodeCommand, NodeHandle, PeersStanding, Refused,
-    StatusCell,
+    InviteNote, MintedInvite, NetstackSwapRequest, NetstackSwapper, NodeCommand, NodeHandle,
+    PeersStanding, Refused, StatusCell,
 };
 
 mod module_code;
@@ -104,6 +116,8 @@ pub use index::{
 };
 // the ducktape_* Prometheus series + GET /metrics.
 mod metrics;
+// GET /v1/release: the release plane's reading, for the launcher and the app.
+mod release;
 pub use metrics::{NodeMetrics, spawn_store_footprint_sampler};
 // the block-projection seam: RootOp assembly + explorer-row bytes, shared by
 // the validator drain, the replica park loop, and (as later tasks adopt it) the
@@ -116,9 +130,12 @@ pub use projection::{BlockProjection, NOP_TARGET, project_block, project_root_op
 // metrics exposition.
 pub mod peers;
 
-// the in-process daemon testkit (a real Host + router on loopback threads) for
-// e2e harnesses. dev-only: gated so the shipping node never compiles it.
-#[cfg(feature = "testkit")]
+// the in-process daemon testkit (a real Host + router on loopback threads, and
+// the committed app guests read off the checkout) for e2e harnesses. dev-only:
+// gated so the shipping node never compiles it. `test` compiles it too, so this
+// crate's own suites reach the same harness a consumer's do rather than keeping
+// a second copy of it.
+#[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
 use axum::body::Bytes;
@@ -290,7 +307,7 @@ pub fn block_row(record: &BlockRecord) -> Vec<u8> {
 /// EQUALITY: never a tolerance window, never "N-1 still works" — that would be
 /// the compat the repository forbids. Nothing on the node reads it, no peer
 /// sees it, and no code branches on its value; the app alone compares.
-pub const NODE_CONTRACT: u32 = 6;
+pub const NODE_CONTRACT: u32 = 7;
 
 /// The surface [`NODE_CONTRACT`] names, fingerprinted: FNV-1a over the sorted
 /// `/v1` route paths of `lib.rs` + `admin.rs` and the ws topic/prefix names
@@ -299,7 +316,7 @@ pub const NODE_CONTRACT: u32 = 6;
 /// `EXPECTED_NODE_CONTRACT` together, then repin this to the value the
 /// failing assertion prints. Repinning WITHOUT the bump is the defect the
 /// test exists to catch.
-pub const NODE_CONTRACT_SURFACE: u64 = 0x3ab4_2d02_809c_f369;
+pub const NODE_CONTRACT_SURFACE: u64 = 0x58f1_ce29_a683_9115;
 
 /// the status projection: daemon build version, global root-hash, and each
 /// registered module's root. `Default` is the pre-first-publish snapshot in
@@ -396,6 +413,16 @@ pub enum NodePhase {
     Syncing,
     Validating,
     Serving,
+    /// Serving, but below a tip a peer answered with, and not advancing.
+    /// A node stuck here answers `/v1` from state that is no longer the
+    /// network's, which `serving` alone cannot tell a reader; the gap and the
+    /// tip it was measured against ride in [`OperationalStatus::follow`].
+    Behind,
+    /// Serving, with NO overlay: the reachability plane refused to start or
+    /// exited, so this node answers `/v1` from a copy it can no longer follow,
+    /// reaches no peer and admits no joiner — and it does not self-heal this
+    /// boot. Why rides in [`OperationalStatus::netstack`]'s `failure_reason`.
+    Isolated,
     Draining,
     Halted,
 }
@@ -409,6 +436,8 @@ impl NodePhase {
             Self::Syncing => "syncing",
             Self::Validating => "validating",
             Self::Serving => "serving",
+            Self::Behind => "behind",
+            Self::Isolated => "isolated",
             Self::Draining => "draining",
             Self::Halted => "halted",
         }
@@ -431,11 +460,41 @@ pub struct OperationalStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncOperationalStatus>,
     pub storage: StorageOperationalStatus,
+    /// What this node last heard about the network's tip, and how far its own
+    /// served height is from it. Absent until a peer answers a tip poll —
+    /// a node that has heard nothing reports nothing rather than a zero gap
+    /// it never measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow: Option<FollowOperationalStatus>,
     /// Which machine the reachability plane runs on, and how the last swap
     /// went. Absent on a node with no reachability plane at all (no
     /// `wireguard_listen`) — there is no backend to name there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub netstack: Option<NetstackOperationalStatus>,
+}
+
+/// This node's own lag, off the tip poll it already runs.
+///
+/// The numbers come from the `TipCoords` answer the validator's root-divergence
+/// watch and the parked resident's fallback poll already fetch every tick —
+/// no reader has to ask the mesh anything to learn that a node stopped
+/// following. Pair it with [`OperationalStatus::last_finalized_at`] for the
+/// other half of the sentence: how long it has been since this node's own
+/// height moved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FollowOperationalStatus {
+    /// the finalized height the peer this node LAST polled answered with —
+    /// the latest reading, never a high-water mark. The poll round-robins over
+    /// the current members, so a remembered maximum would pin this to whichever
+    /// peer was once furthest ahead long after it left.
+    pub network_height: u64,
+    /// `network_height` minus this node's own served height at the moment the
+    /// tip landed, floored at 0 — a node AHEAD of the peer it polled is not
+    /// behind by a negative amount, it is simply not behind.
+    pub behind_by: u64,
+    /// Unix seconds when that tip landed. A frozen `heard_at` means the poll
+    /// itself stopped answering, which is a different fault from a gap.
+    pub heard_at: u64,
 }
 
 /// The netstack plane's operator-visible standing: the backend name
@@ -450,6 +509,19 @@ pub struct NetstackOperationalStatus {
     /// `null` until this process swaps once. A refused swap is recorded here
     /// AND leaves `backend` unchanged: the running machine continues.
     pub last_swap: Option<NetstackSwap>,
+    /// Why this node has NO overlay, for as long as it has none: the stable
+    /// snake_case token the plane refused to start with (or exited under).
+    /// Absent while the plane is starting, running or stopped.
+    ///
+    /// A node whose plane never started keeps producing blocks and answering
+    /// this route, so nothing else on the surface says the mesh is dead —
+    /// every join, every tunnel and every overlay service is gone while this
+    /// is set, and it does not self-heal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    /// The sentence behind `failure_reason`: what an operator does about it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
 }
 
 /// One swap attempt's outcome — the projection half of the
@@ -749,6 +821,10 @@ pub fn router(handle: NodeHandle) -> Router {
         // a module can serve content it would refuse an anonymous reader.
         .route("/v1/query/reader", post(query_as_reader))
         .route("/v1/status", get(status))
+        // the release plane's reading: the designation and the release keys
+        // governance committed — what the node launcher and the desktop app
+        // follow.
+        .route("/v1/release", get(release::release))
         .route("/v1/peers", get(peers))
         .route("/v1/blocks", get(blocks))
         // the derived read-model tier: snapshot reads of the per-module
@@ -1291,7 +1367,9 @@ async fn huddle_node_proof(
 }
 
 /// POST /v1/invite `{"ttl_days": N}` — mint one bearer invite and answer
-/// `{"invite": "🦆…"}`. `ttl_days` defaults to and is bounded by the ONE
+/// `{"invite": "🦆…", "notes": [{"reason", "sentence"}]}` ([`MintedInvite`]),
+/// the notes being what `ducktape node invite` prints on stderr after the
+/// blob. `ttl_days` defaults to and is bounded by the ONE
 /// policy every door shares (`workspace_config::{DEFAULT_INVITE_TTL_DAYS,
 /// INVITE_TTL_DAYS}`), so this route and `ducktape node invite` mint the same
 /// invite for the same request.
@@ -1302,8 +1380,7 @@ async fn huddle_node_proof(
 /// joiner brings its tunnel up against. Doing that from a second process races
 /// the daemon over both.
 ///
-/// 503 when the embedder wired no minter — a daemon with no workspace has no
-/// descriptor to fold a hint into.
+/// 503 when no minter is wired: see [`no_invite_minter`].
 ///
 /// AUTH: a bearer invite is a real capability — a right to join this mesh for
 /// up to 365 days — and this handler reads no acting identity, so possession of
@@ -1340,19 +1417,38 @@ async fn mint_invite(
         );
     };
     let Some(minted) = minted else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no invite minter is wired on this daemon",
-        );
+        return no_invite_minter(handle.status_cell().current().operations.phase);
     };
     match minted {
-        Ok(invite) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "invite": invite })),
-        )
-            .into_response(),
+        Ok(minted) => (StatusCode::OK, Json(minted)).into_response(),
         Err(why) => error_response(StatusCode::BAD_REQUEST, &why),
     }
+}
+
+/// The 503 `/v1/invite` answers with no minter to call, in the node's terms.
+///
+/// The full node wires its minter with its mesh identity, well after its http
+/// surface binds, and `/v1/status` answers `starting` all the way through that
+/// window — so a caller that saw the node answer is told it is starting, as a
+/// `node_starting` token beside the sentence, not how the daemon is wired
+/// inside. Past `starting` nothing wires one any more: that is an embedder
+/// with no workspace to mint from (the embedded daemon, simnode).
+fn no_invite_minter(phase: NodePhase) -> Response {
+    let still_starting = phase == NodePhase::Starting;
+    if still_starting {
+        return refused_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &Refused::new(
+                "node_starting",
+                "this node is still starting and mints invites once its mesh identity is up — \
+                 ask again when /v1/status no longer says starting",
+            ),
+        );
+    }
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no invite minter is wired on this daemon",
+    )
 }
 
 /// body cap for the op-receipt blob lane. a receipt-lane bound only —
@@ -1475,17 +1571,18 @@ struct WsParams {
 async fn ws(
     State(handle): State<NodeHandle>,
     OriginalUri(uri): OriginalUri,
+    extensions: axum::http::Extensions,
     headers: HeaderMap,
     Query(params): Query<WsParams>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    let path_and_query = uri.path_and_query().map_or(uri.path(), |pq| pq.as_str());
     // A RUN ASK IS PROVED BEFORE THE UPGRADE. An unadmitted caller gets an HTTP
     // refusal and no socket — it never reaches a state where a subscribe could
     // be tried, and it learns nothing about whether the run exists.
     let reader_of = match params.run {
         None => None,
         Some(run) => {
-            let path_and_query = uri.path_and_query().map_or(uri.path(), |pq| pq.as_str());
             if let Err(refused) =
                 stream::admit_run_reader(&handle, &run, &headers, path_and_query).await
             {
@@ -1494,13 +1591,18 @@ async fn ws(
             Some(run)
         }
     };
-    // unauthenticated surface: cap the frame/message tungstenite otherwise
-    // defaults to 64 MiB, so a single frame cannot force a large buffer before
-    // any handler gets to look at it (see `stream::MAX_WS_MESSAGE_BYTES`).
+    // so is the OPERATOR: the operator's topics (`logs`) are decided on what
+    // this upgrade carried, never on anything a frame can say later.
+    let on_box = admin::peer_is_loopback(&extensions);
+    let operator = signed_req::upgrade_is_operator(&handle, &headers, path_and_query, on_box);
+    // a surface any caller can open: cap the frame/message tungstenite
+    // otherwise defaults to 64 MiB, so a single frame cannot force a large
+    // buffer before any handler gets to look at it (see
+    // `stream::MAX_WS_MESSAGE_BYTES`).
     upgrade
         .max_message_size(stream::MAX_WS_MESSAGE_BYTES)
         .max_frame_size(stream::MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| stream::stream_session(socket, handle, reader_of))
+        .on_upgrade(move |socket| stream::stream_session(socket, handle, reader_of, operator))
 }
 
 #[cfg(test)]

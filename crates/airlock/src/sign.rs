@@ -81,9 +81,9 @@ pub const BUNDLE_NAME: &str = "Ducktape.app";
 pub const BUNDLE_ID: &str = "dev.ducktape.app";
 
 /// Exactly what `Contents/MacOS` holds: the launcher (the
-/// `CFBundleExecutable`), the app beside it, and the `views` link into
-/// `Resources` (`ops/bundle-app-macos.sh`).
-pub const MACOS_ENTRIES: [&str; 3] = ["ducktape-launcher", "ducktape-app", "views"];
+/// `CFBundleExecutable`) and the app beside it. No view: the network serves
+/// every view the app draws out of its genesis.
+pub const MACOS_ENTRIES: [&str; 2] = ["ducktape-launcher", "ducktape-app"];
 
 /// The nested executable that gets the same runtime flag and entitlements
 /// as the main one (`ops/bundle-app-macos.sh` signs it first, then the bundle).
@@ -669,8 +669,8 @@ fn plain_bundle_path(path: &Path) -> Option<PathBuf> {
 
 /// `path` with `.` dropped and `..` resolved, if it stays under
 /// `Ducktape.app/` (the bundle directory itself included) — what a symlink
-/// target is checked with, since `../Resources/views` is the shape's own
-/// link. `None` for an absolute path, a prefix, a `..` that climbs out, or
+/// target is checked with, since a relative link inside the bundle is
+/// legitimate. `None` for an absolute path, a prefix, a `..` that climbs out, or
 /// any other top-level name.
 fn normalized_inside_bundle(path: &Path) -> Option<PathBuf> {
     let mut out: Vec<&OsStr> = Vec::new();
@@ -749,7 +749,7 @@ pub fn plist_string(plist: &str, key: &str) -> Option<String> {
 }
 
 /// Archive the finished bundle as `Ducktape.app/…` in a `.tar.zst`, symlinks
-/// kept as symlinks (the `views` link), owners and times zeroed as
+/// kept as symlinks, owners and times zeroed as
 /// `ops/release/archive.sh` does. The client packs an unsigned bundle with
 /// the same function, so what it sends is what this side unpacks.
 pub fn pack_bundle(bundle: &Path) -> io::Result<Vec<u8>> {
@@ -887,22 +887,17 @@ pub mod fixture {
     }
 
     /// Stage an unsigned `Ducktape.app` of the release shape under `root`:
-    /// two stub executables, the `views` link into `Resources`, one view
-    /// file, and the plist. Returns the bundle path.
+    /// two stub executables and the plist. Returns the bundle path.
     pub fn stage_bundle(root: &Path, bundle_id: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let app = root.join(BUNDLE_NAME);
         let macos = app.join("Contents/MacOS");
-        let views = app.join("Contents/Resources/views");
         std::fs::create_dir_all(&macos).unwrap();
-        std::fs::create_dir_all(&views).unwrap();
         for executable in ["ducktape-launcher", "ducktape-app"] {
             let path = macos.join(executable);
             std::fs::write(&path, stub_macho()).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        std::os::unix::fs::symlink("../Resources/views", macos.join("views")).unwrap();
-        std::fs::write(views.join("chat.wasm"), b"\0asm").unwrap();
         std::fs::write(app.join("Contents/Info.plist"), info_plist(bundle_id)).unwrap();
         app
     }
@@ -1193,7 +1188,7 @@ mod tests {
         Tools {
             rcodesign,
             entitlements: Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../app/packaging/entitlements.plist"),
+                .join("tests/fixtures/entitlements.plist"),
             work_root: work_root.to_path_buf(),
             notary,
         }

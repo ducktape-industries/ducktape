@@ -59,7 +59,9 @@ pub(crate) fn submit(
         base,
         "/v1/submit",
         &serde_json::json!({ "target": target, "payload": payload }),
-        operator.as_deref(),
+        operator
+            .as_deref()
+            .map(|token| (noded::admin::ADMIN_TOKEN_HEADER, token)),
     )?;
     receipt_height(&body)
 }
@@ -341,8 +343,9 @@ impl std::fmt::Display for ReadFailure {
 /// keeps failing is in the launcher's log, which nothing used to mention.
 pub(crate) enum NotRunning {
     /// no launcher has ever installed against this workspace — starting the
-    /// node is the operator's own to do.
-    Unsupervised,
+    /// node is the operator's own to do, with the workspace selection they made
+    /// on this command line ([`invoked_selector`]), or none when they made none.
+    Unsupervised(Option<String>),
     /// a launcher owns this workspace and its output is in a file that is
     /// there right now.
     Supervised(std::path::PathBuf),
@@ -362,7 +365,10 @@ impl std::fmt::Display for NotRunning {
         // a reader came here for is that nothing answered.
         write!(f, "the node is not running — ")?;
         match self {
-            NotRunning::Unsupervised => write!(f, "start it with `ducktape node run`"),
+            NotRunning::Unsupervised(None) => write!(f, "start it with `ducktape node run`"),
+            NotRunning::Unsupervised(Some(selector)) => {
+                write!(f, "start it with `ducktape node run {selector}`")
+            }
             NotRunning::Supervised(log) => {
                 write!(f, "{SUPERVISED}the last FATAL line in {}", log.display())
             }
@@ -394,11 +400,11 @@ const LAUNCHER_LOG: &str = "launcher.log";
 /// case.
 pub(crate) fn not_running_in(workspace: Option<&std::path::Path>) -> NotRunning {
     let Some(workspace) = workspace else {
-        return NotRunning::Unsupervised;
+        return NotRunning::Unsupervised(invoked_selector());
     };
     let supervised = app_update::workspace::launcher_state_path(workspace).is_file();
     if !supervised {
-        return NotRunning::Unsupervised;
+        return NotRunning::Unsupervised(invoked_selector());
     }
     let log = workspace.join(LAUNCHER_LOG);
     match log.is_file() {
@@ -408,17 +414,69 @@ pub(crate) fn not_running_in(workspace: Option<&std::path::Path>) -> NotRunning 
 }
 
 /// [`not_running_in`] for a caller holding the node's http base rather than
-/// its directory — every `/v1` lane, which dials a url and never knew the
-/// workspace behind it.
+/// its directory — every `/v1` lane and the `fs` verbs' duckfs client, which
+/// dial a url and never knew the workspace behind it.
 ///
 /// The registry can answer "none" (a `--node` url pointing off this box) or
 /// "several" (two networks both left on the default `http_listen`), and both
 /// fall back to the plain sentence: a wrong launcher's log is worse than no
 /// launcher's. A caller that HAS the directory should pass it to
 /// [`not_running_in`] and skip this — `services::catalog_now` does.
-fn not_running_at(base: &str) -> NotRunning {
+pub(crate) fn not_running_at(base: &str) -> NotRunning {
     let workspace = crate::cli_args::workspace_for_base(base).ok();
     not_running_in(workspace.as_deref())
+}
+
+/// The workspace selection the operator made on THIS command line, spelled
+/// the way `ducktape node run` takes it — `--config <path>` or `-n <chain-id>`
+/// — or `None` when they made none.
+///
+/// A bare `ducktape node run` is advice that fails on every box with a second
+/// workspace, and the verb that gives it was usually told which one: `-n demo`.
+/// That is read back out of argv through the CLI's own grammar rather than
+/// threaded down, because the sentence is rendered several frames below the
+/// verb, where the only handle left is an address — and two workspaces left on
+/// the default ports share one, so the registry cannot say which was meant.
+///
+/// Every `--config` and `-n/--network` in this CLI selects a workspace, so the
+/// leaf command's two ids mean the same thing in every family.
+// ponytail: `--workspace <dir>` and `--node <url>` have no `node run` spelling
+// and fall back to the bare form; map them if an operator trips on it.
+fn invoked_selector() -> Option<String> {
+    selector_in(std::env::args_os())
+}
+
+/// [`invoked_selector`] over an explicit argv, so a test can drive it.
+fn selector_in(argv: impl IntoIterator<Item = std::ffi::OsString>) -> Option<String> {
+    let matches = <crate::Cli as clap::CommandFactory>::command()
+        .try_get_matches_from(argv)
+        .ok()?;
+    let mut leaf = &matches;
+    while let Some((_, sub)) = leaf.subcommand() {
+        leaf = sub;
+    }
+    // `--config` first: it is the one selection that separates two workspaces
+    // sharing a chain id, and the rung every ladder here ranks above `-n`.
+    if let Ok(Some(config)) = leaf.try_get_one::<std::path::PathBuf>("config") {
+        return Some(format!("--config {}", config.display()));
+    }
+    let network = leaf.try_get_one::<String>("network").ok().flatten()?;
+    Some(format!("-n {network}"))
+}
+
+/// Refuse, in the not-running sentence, when nothing answers on `base` — for a
+/// verb about to ask the operator for something before it dials, a password
+/// above all. Asking for the secret and THEN finding the node down reports the
+/// wrong failure and spends the one thing typed by hand.
+///
+/// Only a node nothing answered for refuses: an error status or a timeout
+/// means something is there, and the verb's own request names that failure
+/// better than this probe could.
+pub(crate) fn require_answering(base: &str) -> Result<(), String> {
+    match get_json(base, "/v1/status") {
+        Err(ReadFailure::Unreachable(next)) => Err(next.to_string()),
+        Ok(_) | Err(ReadFailure::Rejected(_)) => Ok(()),
+    }
 }
 
 /// Why a request never produced a response — ONE discriminant over the only
@@ -497,14 +555,22 @@ pub(crate) fn get_json(base: &str, path: &str) -> Result<serde_json::Value, Read
     })
 }
 
-/// POST one node-local JSON surface and return the decoded reply (the `/v1`
-/// routes that are not module submits, e.g. service signaling).
+/// POST one node-local JSON surface carrying `credential` — a header name and
+/// the secret it takes — and return the decoded reply (the `/v1` routes that
+/// are not module submits, e.g. service signaling under the service-link
+/// token).
 pub(crate) fn post_json(
     base: &str,
     path: &str,
     body: &serde_json::Value,
+    credential: (&str, &str),
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    Ok(serde_json::from_str(&post(base, path, body)?)?)
+    Ok(serde_json::from_str(&post_with(
+        base,
+        path,
+        body,
+        Some(credential),
+    )?)?)
 }
 
 /// One blocking POST of a JSON body, returning the response text or the node's
@@ -517,21 +583,22 @@ fn post(
     post_with(base, path, body, None)
 }
 
-/// [`post`] carrying the node's operator credential — what a MUTATING route
-/// wants from a caller that acts as the node rather than as a person.
+/// [`post`] carrying the credential a MUTATING route wants — a header name and
+/// its secret: the operator credential from a caller that acts as the node,
+/// the service-link token from a service daemon.
 fn post_with(
     base: &str,
     path: &str,
     body: &serde_json::Value,
-    operator_token: Option<&str>,
+    credential: Option<(&str, &str)>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // the SAME classifier the read lane uses: `submit`/`query` are how every
     // `user`/`agent`/`cred` verb reaches the node, and a down node used to
     // surface here as a raw `POST http://…: error sending request for url (…)`
     // while `service list` — one function away — said "the node is not running".
     let mut request = client()?.post(format!("{base}{path}")).json(body);
-    if let Some(token) = operator_token {
-        request = request.header(noded::admin::ADMIN_TOKEN_HEADER, token);
+    if let Some((header, secret)) = credential {
+        request = request.header(header, secret);
     }
     let resp = request
         .send()
@@ -669,6 +736,102 @@ mod tests {
             said,
             "the node is not running — start it with `ducktape node run`"
         );
+    }
+
+    fn argv(line: &str) -> Vec<std::ffi::OsString> {
+        line.split(' ').map(std::ffi::OsString::from).collect()
+    }
+
+    /// THE BUG (#2512). `node status -n demo` answered "start it with
+    /// `ducktape node run`", which on a box with a second workspace refuses
+    /// with "several are registered — pick one with -n". The verb was told
+    /// which one; the advice has to hand that on.
+    #[test]
+    fn the_run_hint_carries_the_selection_the_operator_made() {
+        for (line, selector) in [
+            ("ducktape node status -n demo", "-n demo"),
+            ("ducktape node log-filter info --network demo", "-n demo"),
+            ("ducktape service list -n demo", "-n demo"),
+            ("ducktape fs ls / -n demo", "-n demo"),
+            (
+                "ducktape service status --config /w/node.toml",
+                "--config /w/node.toml",
+            ),
+            (
+                "ducktape account show --config /w/node.toml",
+                "--config /w/node.toml",
+            ),
+        ] {
+            let found = selector_in(argv(line));
+            assert_eq!(found.as_deref(), Some(selector), "{line}");
+            assert_eq!(
+                NotRunning::Unsupervised(found).to_string(),
+                format!("the node is not running — start it with `ducktape node run {selector}`"),
+            );
+        }
+    }
+
+    /// ...and the bare form only when the operator selected nothing: there is
+    /// then no selection to hand on.
+    #[test]
+    fn no_selection_keeps_the_bare_run_hint() {
+        for line in [
+            "ducktape node status",
+            "ducktape service list",
+            // not a command line this CLI parses — e.g. the test harness's own.
+            "ducktape-test --test-threads 4",
+        ] {
+            let found = selector_in(argv(line));
+            assert_eq!(found, None, "{line}");
+            assert_eq!(
+                NotRunning::Unsupervised(found).to_string(),
+                "the node is not running — start it with `ducktape node run`"
+            );
+        }
+    }
+
+    /// The pre-prompt probe (#2511): a node nothing answers for is refused in
+    /// the not-running sentence, and one that answers at all — even with an
+    /// error — is let through to the verb's own request.
+    #[test]
+    fn the_probe_refuses_only_a_node_that_did_not_answer() {
+        let refused = require_answering(&a_dead_port()).expect_err("nothing listens");
+        assert!(refused.starts_with("the node is not running"), "{refused}");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let serving = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut conn, _) = listener.accept().expect("the client connects");
+            let mut scratch = [0u8; 1024];
+            let _ = conn.read(&mut scratch);
+            let _ = conn
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n\r\nnope");
+        });
+        let answered = require_answering(&base);
+        serving.join().expect("the serve thread finishes");
+        assert_eq!(answered, Ok(()), "a node that answered is up");
+    }
+
+    /// THE BUG (#2511): `node log-filter` against a stopped node took the
+    /// wallet password first and only then said the node was down. Every verb
+    /// that signs for a node unlocks through this one helper, so it is the one
+    /// place that must not touch stdin until the node has answered.
+    #[test]
+    fn a_password_is_never_asked_for_while_the_node_is_down() {
+        let mut stdin = std::io::Cursor::new(b"hunter2\n".to_vec());
+        let refused = crate::userkey_cli::load_user_signer_for(
+            &a_dead_port(),
+            std::path::Path::new("/nonexistent/user.key"),
+            &mut stdin,
+        )
+        .expect_err("nothing listens")
+        .to_string();
+        assert!(
+            refused.starts_with("the node is not running"),
+            "the failure the operator is in is the one they are told: {refused}"
+        );
+        assert_eq!(stdin.position(), 0, "the password was never read");
     }
 
     /// The SHUTDOWN WINDOW, which `is_connect()` alone gets wrong: the socket

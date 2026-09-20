@@ -159,6 +159,10 @@ pub fn one_shot_body(body: Vec<u8>) -> GatewayRequestBody {
 /// alone is not enough: a saturated plane stops draining the lane, and an
 /// un-deadlined `send` there hangs the axum handler with no response at all.
 const LANE_ADMIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a gateway request waits on the node actor to answer one query (an
+/// authorization read, a `.duck` resolve). A page load sits behind it, so a
+/// stalled actor turns into `Unavailable` within this, not a hung page.
+const GATEWAY_QUERY_DEADLINE: Duration = Duration::from_secs(5);
 /// How long a SILENT publisher may stay silent before its caller gives up on
 /// the response head. It is a ceiling on silence, never on duration: a request
 /// body has no declared size any more, so the head cannot arrive until the
@@ -304,7 +308,7 @@ async fn gateway_query(
 ) -> Result<Vec<u8>, GatewayFailure> {
     let (reply, rx) = oneshot::channel();
     let mut commands = commands.clone();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(GATEWAY_QUERY_DEADLINE, async {
         commands
             .send(NodeCommand::Query {
                 target: target.into(),
@@ -318,7 +322,7 @@ async fn gateway_query(
             .map_err(|refused| GatewayFailure::Unavailable(refused.message))
     })
     .await
-    .map_err(|_| GatewayFailure::Unavailable("gateway authorization query timed out".into()))?
+    .map_err(|_| GatewayFailure::Unavailable("gateway query timed out".into()))?
 }
 
 async fn current_route(
@@ -430,6 +434,14 @@ async fn proxy_authorized(
     Ok(response)
 }
 
+/// `POST /v1/gateway/proxy` — the node API's application door, for SIGNED
+/// callers only: the head must carry its caller's proof ([`gateway::UserPop`],
+/// the one the app stamps on every application call) and that proof must
+/// resolve to an Identity account here, before any overlay work — the bar
+/// `/v1/gateway/stream` already sets for an upgrade. A request that proves no
+/// caller would otherwise leave this node over the overlay as this node's own,
+/// for anyone who can reach the port; a browser page reaches routes through
+/// the dedicated browser-gateway listener instead.
 pub(crate) async fn gateway_proxy(
     State(handle): State<NodeHandle>,
     headers: HeaderMap,
@@ -439,13 +451,51 @@ pub(crate) async fn gateway_proxy(
     if let Some(response) = gateway_api_origin_guard(&headers) {
         return response;
     }
+    if request.head.user_pop.is_none() {
+        return crate::refused_response(
+            StatusCode::UNAUTHORIZED,
+            &crate::handle::Refused::new(
+                "caller_proof_missing",
+                "the gateway proxy requires a signed caller — stamp the head's user_pop \
+                 with an Identity account key",
+            ),
+        );
+    }
     let body = match base64::engine::general_purpose::STANDARD.decode(request.body_b64) {
         Ok(body) => body,
         Err(error) => {
             return error_response(StatusCode::BAD_REQUEST, &format!("body_b64: {error}"));
         }
     };
+    if let Err(failure) = signed_caller(&handle, &request.head, &body).await {
+        return gateway_failure_response(failure);
+    }
     buffered_proxy_reply(proxy_current(&handle, request.head, one_shot_body(body)).await).await
+}
+
+/// Verify the caller proof a `/v1/gateway/proxy` head carries, against the
+/// route it names and the exact body it came with — the SAME check the
+/// publisher repeats before any upstream I/O ([`gateway_caller_account`]).
+/// A proof that resolves to no account is refused, never proxied anonymously.
+async fn signed_caller(
+    handle: &NodeHandle,
+    head: &gateway::ProxyRequestHead,
+    body: &[u8],
+) -> Result<(), GatewayFailure> {
+    let record = current_route(handle, head.account_id, &head.name).await?;
+    let caller = gateway_caller_account(
+        &handle.cmds,
+        head,
+        &record.statement,
+        &gateway::body_digest(body),
+    )
+    .await?;
+    match caller {
+        Some(_account) => Ok(()),
+        None => Err(GatewayFailure::Forbidden(
+            "gateway caller proof is missing".into(),
+        )),
+    }
 }
 
 /// The signed-write guard admits exactly the existing node operator credentials.
@@ -746,25 +796,16 @@ async fn resolve_duck_authority(
     };
     name.validate().map_err(GatewayFailure::Invalid)?;
 
-    let (reply, rx) = oneshot::channel();
-    let mut commands = handle.cmds.clone();
-    commands
-        .send(NodeCommand::Query {
-            target: "gateway".into(),
-            req: gateway::encode_query(&gateway::GatewayQuery::Resolve {
-                name: gateway::DuckDnsName {
-                    handle: alias.to_string(),
-                },
-            }),
-            reply,
-        })
-        .await
-        .map_err(|_| GatewayFailure::Unavailable("node actor is gone".into()))?;
-    let bytes = tokio::time::timeout(Duration::from_secs(5), rx)
-        .await
-        .map_err(|_| GatewayFailure::Unavailable("gateway resolve timed out".into()))?
-        .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
-        .map_err(|refused| GatewayFailure::Unavailable(refused.message))?;
+    let bytes = gateway_query(
+        &handle.cmds,
+        "gateway",
+        gateway::encode_query(&gateway::GatewayQuery::Resolve {
+            name: gateway::DuckDnsName {
+                handle: alias.to_string(),
+            },
+        }),
+    )
+    .await?;
     match gateway::decode_reply(&bytes) {
         Ok(gateway::GatewayReply::Resolved(Some(account))) => Ok((account.account_id, name)),
         Ok(gateway::GatewayReply::Resolved(None)) => Err(GatewayFailure::NotFound(format!(
@@ -1386,6 +1427,34 @@ mod tests {
         assert!(
             matches!(result, Err(GatewayFailure::Unavailable(reason)) if reason.contains("timed out"))
         );
+    }
+
+    /// A `.duck` page load resolves its authority through the same queue: a
+    /// saturated actor answers `Unavailable` at the deadline, never a hang.
+    #[tokio::test(start_paused = true)]
+    async fn a_duck_resolve_behind_a_full_queue_gives_up_at_the_deadline() {
+        let (handle, _receiver, _hub) = NodeHandle::channel();
+        let mut filler = handle.cmds.clone();
+        let mut parked = Vec::new();
+        loop {
+            let (reply, answer) = oneshot::channel();
+            let command = NodeCommand::Query {
+                target: "gateway".into(),
+                req: vec![],
+                reply,
+            };
+            if filler.try_send(command).is_err() {
+                break;
+            }
+            parked.push(answer);
+        }
+        let started = tokio::time::Instant::now();
+        let result = resolve_duck_authority(&handle, "app.alice.duck").await;
+        assert!(
+            matches!(result, Err(GatewayFailure::Unavailable(reason)) if reason == "gateway query timed out")
+        );
+        assert_eq!(started.elapsed(), GATEWAY_QUERY_DEADLINE);
+        assert!(!parked.is_empty());
     }
 
     #[tokio::test]

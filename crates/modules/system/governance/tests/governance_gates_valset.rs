@@ -19,11 +19,11 @@ use governance::{
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
-use valset::Valset;
 use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode,
     encode_msg as valset_encode, encode_query as valset_query,
 };
+use valset_module::Valset;
 
 fn member_key(seed: u8) -> Vec<u8> {
     let seed = [seed; 32];
@@ -196,7 +196,7 @@ fn a_passing_proposal_admits_the_validator_and_direct_writes_are_refused() {
         .await
         .expect_err("external valset write must be refused");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("governance")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "not_governance"),
             "got {err:?}"
         );
         assert_eq!(validators(&host).await.len(), 2, "membership untouched");
@@ -572,7 +572,7 @@ fn a_member_leaves_by_removing_itself_pending_the_remaining_majority() {
         .await
         .expect_err("a lone leave ballot is not a deciding majority");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("not decidable")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "not_decidable_yet"),
             "got {err:?}"
         );
         assert_eq!(
@@ -676,7 +676,7 @@ fn a_single_member_ballot_is_a_deciding_majority() {
         .await
         .expect_err("no ballots -> not decidable early");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("not decidable"))
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "not_decidable_yet")
         );
 
         submit_as(
@@ -827,7 +827,7 @@ fn a_direct_module_origin_leave_of_the_last_validator_is_refused() {
             .await
             .expect_err("emptying the set must be refused");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("last validator")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "last_validator"),
             "got {err:?}"
         );
         assert_eq!(
@@ -858,7 +858,9 @@ fn non_members_cannot_propose_or_vote_and_minority_rejects() {
         )
         .await
         .expect_err("outsider propose must be refused");
-        assert!(matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("member")));
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "not_a_member")
+        );
 
         // ...a member proposes, an outsider cannot vote...
         submit_as(
@@ -887,7 +889,7 @@ fn non_members_cannot_propose_or_vote_and_minority_rejects() {
         .await
         .expect_err("outsider vote must be refused");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("frozen electorate"))
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "not_in_electorate")
         );
 
         // ...one yes of two members is NOT a strict majority: not decidable
@@ -916,7 +918,7 @@ fn non_members_cannot_propose_or_vote_and_minority_rejects() {
         .await
         .expect_err("not decidable before the deadline without a majority");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("not decidable"))
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "not_decidable_yet")
         );
 
         // past the deadline (proposed at 2, period 10 -> deadline 12).
@@ -997,7 +999,9 @@ fn votes_close_at_the_deadline_and_ballots_are_per_member() {
         )
         .await
         .expect_err("vote at the deadline is closed");
-        assert!(matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("closed")));
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "voting_closed")
+        );
 
         // tally: zero CURRENT yes-ballots -> rejected.
         submit_as(
@@ -1289,7 +1293,7 @@ fn a_submitter_at_its_open_cap_is_refused_while_another_member_is_admitted() {
         .await
         .expect_err("m1 is already at its open-proposal cap");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("open proposals")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "submitter_proposal_cap"),
             "got {err:?}"
         );
 

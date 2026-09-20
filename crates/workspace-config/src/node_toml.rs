@@ -12,13 +12,14 @@
 //!   surface.
 
 use std::fmt::Write as _;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize as _;
 
-use super::DEFAULT_CHECKPOINT_BLOCKS;
-use super::DEFAULT_PRIMARY_COORDINATOR;
+use super::default_primary_coordinator;
 use super::PlumbingOverrides;
+use super::DEFAULT_CHECKPOINT_BLOCKS;
 
 /// the generated defaults: a fresh init/join with no flags yields a node
 /// with every surface up. Loopback for the operator surfaces (HTTP app
@@ -50,6 +51,21 @@ pub const DEFAULT_GATEWAY_LISTEN: &str = "127.0.0.1:0";
 /// bind failure with a logged retry rather than a panic — so the trade the mesh
 /// port made does not apply here.
 pub const DEFAULT_WIREGUARD_LISTEN: &str = "0.0.0.0:51820";
+/// `ducktape-noded`'s bind when `--listen` is absent: the node's HTTP port on
+/// loopback only. The desktop shell spawns that daemon and dials it where it
+/// dials a node, [`DEFAULT_APP_RPC`], so the two ports are one.
+pub const DEFAULT_NODED_LISTEN: &str = "127.0.0.1:8844";
+/// `ducktape-simnode`'s bind when `--listen` is absent. It sits outside the
+/// node's operator block (HTTP, admin RPC, mesh) on purpose, and that is a
+/// correctness property rather than tidiness: the sim is a dev tool run BESIDE
+/// a node, so a shared port makes the second process to boot die on its bind,
+/// and makes a client on that port reach whichever daemon won, answering an
+/// admin-RPC caller with `/v1` http.
+pub const DEFAULT_SIMNODE_LISTEN: &str = "127.0.0.1:8850";
+/// where a client on this machine (the desktop app) finds a node started with
+/// the defaults: [`DEFAULT_HTTP_LISTEN`] as a co-located process dials it
+/// (`http_base_of`). A CLIENT default: no node.toml key reads it.
+pub const DEFAULT_APP_RPC: &str = "http://127.0.0.1:8844";
 
 /// The bottom of Linux's default `ip_local_port_range` (32768–60999). A
 /// listener whose default port sits above this is racing every outbound
@@ -289,8 +305,13 @@ pub fn merged_plumbing(dir: &Path, overrides: &PlumbingOverrides) -> Result<Plum
     let primary_coordinator = primary_coordinator
         .map(str::to_string)
         .or_else(|| e.map(|r| r.primary_coordinator.clone()))
-        .unwrap_or_else(|| DEFAULT_PRIMARY_COORDINATOR.into());
+        .unwrap_or_else(default_primary_coordinator);
     let derived_relay = derive_coordinator_relay(&primary_coordinator);
+    let gateway_listen = gateway_listen
+        .map(str::to_string)
+        .or_else(|| e.map(|r| r.gateway_listen.clone()))
+        .unwrap_or_else(|| DEFAULT_GATEWAY_LISTEN.into());
+    validate_gateway_listen(&gateway_listen)?;
     Ok(Plumbing {
         advertised: advertised
             .map(str::to_string)
@@ -301,10 +322,7 @@ pub fn merged_plumbing(dir: &Path, overrides: &PlumbingOverrides) -> Result<Plum
             .map(str::to_string)
             .or_else(|| e.map(|r| r.http_listen.clone()))
             .unwrap_or_else(|| DEFAULT_HTTP_LISTEN.into()),
-        gateway_listen: gateway_listen
-            .map(str::to_string)
-            .or_else(|| e.map(|r| r.gateway_listen.clone()))
-            .unwrap_or_else(|| DEFAULT_GATEWAY_LISTEN.into()),
+        gateway_listen,
         rpc_listen: rpc_listen
             .map(str::to_string)
             .or_else(|| e.map(|r| r.rpc_listen.clone()))
@@ -332,6 +350,19 @@ pub fn merged_plumbing(dir: &Path, overrides: &PlumbingOverrides) -> Result<Plum
     })
 }
 
+fn validate_gateway_listen(gateway_listen: &str) -> Result<(), String> {
+    let address: SocketAddr = gateway_listen.parse().map_err(|error| {
+        format!("invalid gateway_listen {gateway_listen:?} (expected 127.0.0.1:<port>): {error}")
+    })?;
+    let is_exact_loopback = address.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST);
+    if !is_exact_loopback {
+        return Err(format!(
+            "gateway_listen must bind exactly 127.0.0.1, got {gateway_listen:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// the intro listener default: `wireguard_listen`'s port + 1, computed at
 /// GENERATION time — the file always carries the concrete value.
 fn derive_invite_listen(wireguard_listen: &str) -> Result<String, String> {
@@ -345,8 +376,9 @@ fn derive_invite_listen(wireguard_listen: &str) -> Result<String, String> {
     Ok(format!("0.0.0.0:{intro_port}"))
 }
 
-/// the relay default: the coordinator's host on TCP/443, or `"none"` when
-/// coordination itself is off — computed at GENERATION time.
+/// the relay default: the coordinator's host on the relay port
+/// ([`nat_traversal::RELAY_PORT`]), or `"none"` when coordination itself is
+/// off — computed at GENERATION time.
 fn derive_coordinator_relay(primary_coordinator: &str) -> String {
     let coordination_off = matches!(primary_coordinator, "none" | "off" | "direct");
     if coordination_off {
@@ -356,7 +388,7 @@ fn derive_coordinator_relay(primary_coordinator: &str) -> String {
         .rsplit_once(':')
         .map(|(host, _)| host)
         .unwrap_or(primary_coordinator);
-    format!("{host}:443")
+    format!("{host}:{}", nat_traversal::RELAY_PORT)
 }
 
 /// one entry: a `# note` line ABOVE its live `key = value` line, blank-line
@@ -593,7 +625,6 @@ mod tests {
         merged_plumbing(dir, &PlumbingOverrides::default()).expect("fresh merge")
     }
 
-    /// the generated file round-trips through the strict parser and its
     /// No TCP listener a node binds EAGERLY may default into the ephemeral
     /// range, because the kernel hands those ports out to outbound connections
     /// and the loser of that race is a node that will not start.
@@ -607,17 +638,46 @@ mod tests {
     /// 51820 that firewalls and NAT forwards are written against, and answers a
     /// failed bind with a logged retry rather than a panic — so it is named
     /// here as a deliberate exclusion instead of quietly not being checked.
+    ///
+    /// The re-found routine's set is a default too — every network it founds
+    /// runs on it, and it names its ports explicitly, so the constants never
+    /// reach that node.toml. It sat at 32989+, and a resident restarting there
+    /// lost its http port to an outbound socket for 25 s.
     #[test]
     fn no_tcp_default_sits_in_the_ephemeral_range() {
-        for (key, value) in [
+        let flagless = [
             ("listen", DEFAULT_MESH_LISTEN),
             ("http_listen", DEFAULT_HTTP_LISTEN),
             ("rpc_listen", DEFAULT_RPC_LISTEN),
-        ] {
+        ]
+        .map(|(key, value)| (key, value.rsplit_once(':').map_or(value, |(_, port)| port)));
+        // `F_HTTP=28800 F_GATEWAY=…`: the founder's (F_) and the resident's
+        // (J_) tcp surfaces. WG and INVITE are the UDP exclusion above.
+        let refound = include_str!("../../../ops/refound-net.sh");
+        assert!(
+            !refound.contains("DUCKTAPE_MODULES_DIR="),
+            "refound launcher/service invocations must use current/modules from each release"
+        );
+        let routine: Vec<(&str, &str)> = refound
+            .split_whitespace()
+            .filter_map(|word| word.split_once('='))
+            .filter(|(key, _)| {
+                let surface = key.strip_prefix("F_").or_else(|| key.strip_prefix("J_"));
+                surface.is_some_and(|surface| ["HTTP", "GATEWAY", "RPC", "P2P"].contains(&surface))
+            })
+            .filter(|(_, value)| {
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            .collect();
+        assert_eq!(
+            routine.len(),
+            8,
+            "four tcp surfaces each for the founder and the resident: {routine:?}"
+        );
+        for (key, value) in flagless.into_iter().chain(routine) {
             let port = value
-                .rsplit_once(':')
-                .and_then(|(_, port)| port.parse::<u16>().ok())
-                .unwrap_or_else(|| panic!("{key} default {value:?} names a port"));
+                .parse::<u16>()
+                .unwrap_or_else(|_| panic!("{key} default {value:?} names a port"));
             assert!(
                 port < EPHEMERAL_FLOOR,
                 "{key} defaults to {port}, inside the kernel's ephemeral range \
@@ -627,6 +687,32 @@ mod tests {
         // the gateway is the one exception and it is the SAFE direction: port 0
         // asks the kernel for a free port instead of racing for a fixed one.
         assert!(DEFAULT_GATEWAY_LISTEN.ends_with(":0"));
+    }
+
+    /// the sim binary and a real node are run side by side all day, so their
+    /// eagerly-bound defaults must not overlap. A sim default back inside the
+    /// node's operator block means the second process to boot dies on its
+    /// bind, and a client on that port reaches whichever daemon won, speaking
+    /// the wrong protocol.
+    #[test]
+    fn the_sim_default_avoids_the_nodes_operator_ports() {
+        let port = |addr: &str| addr.parse::<std::net::SocketAddr>().expect("parses").port();
+        let node_operator_ports =
+            [DEFAULT_HTTP_LISTEN, DEFAULT_RPC_LISTEN, DEFAULT_MESH_LISTEN].map(port);
+        let sim = port(DEFAULT_SIMNODE_LISTEN);
+        assert!(
+            !node_operator_ports.contains(&sim),
+            "the sim default {DEFAULT_SIMNODE_LISTEN} is inside the node's operator block \
+             {node_operator_ports:?}: it will fight a real node for the bind"
+        );
+    }
+
+    /// the app's default reaches a node started with the defaults, and the
+    /// local daemon the app spawns in its place serves that same port.
+    #[test]
+    fn the_client_defaults_name_the_nodes_http_port() {
+        assert_eq!(DEFAULT_APP_RPC, crate::http_base_of(DEFAULT_HTTP_LISTEN));
+        assert_eq!(DEFAULT_APP_RPC, crate::http_base_of(DEFAULT_NODED_LISTEN));
     }
 
     /// flagless defaults are a WORKING node: every surface up, every
@@ -645,15 +731,64 @@ mod tests {
         assert_eq!(raw.wireguard_listen, DEFAULT_WIREGUARD_LISTEN);
         assert_eq!(raw.invite_listen, "0.0.0.0:51821");
         assert_eq!(raw.wireguard_advertised, "auto");
-        assert_eq!(raw.primary_coordinator, DEFAULT_PRIMARY_COORDINATOR);
+        assert_eq!(raw.primary_coordinator, default_primary_coordinator());
         assert_eq!(
             raw.coordinator_relay,
-            derive_coordinator_relay(DEFAULT_PRIMARY_COORDINATOR)
+            derive_coordinator_relay(&default_primary_coordinator())
         );
         assert_eq!(raw.checkpoint_blocks, DEFAULT_CHECKPOINT_BLOCKS);
         // no [sandbox] table by default: a fresh node is consensus-only, and
         // the commented example in the file must not parse as a live table.
         assert_eq!(raw.sandbox, None);
+    }
+
+    #[test]
+    fn gateway_must_be_exact_ipv4_loopback_before_config_is_written() {
+        for (gateway, error_start) in [
+            (
+                "0.0.0.0:39102",
+                "gateway_listen must bind exactly 127.0.0.1",
+            ),
+            ("[::1]:39102", "gateway_listen must bind exactly 127.0.0.1"),
+            ("not-an-address", "invalid gateway_listen"),
+        ] {
+            let dir = tmp("gateway-refused");
+            let result = merged_plumbing(
+                &dir,
+                &PlumbingOverrides {
+                    gateway: Some(gateway.into()),
+                    ..Default::default()
+                },
+            );
+            let Err(err) = result else {
+                panic!("non-IPv4-loopback gateway must fail");
+            };
+            assert!(err.starts_with(error_start), "{err}");
+            assert!(!dir.join("node.toml").exists());
+        }
+
+        let dir = tmp("gateway-accepted");
+        let plumbing = merged_plumbing(
+            &dir,
+            &PlumbingOverrides {
+                http: Some("0.0.0.0:39103".into()),
+                ..Default::default()
+            },
+        )
+        .expect("remote HTTP with the default gateway is valid");
+        assert_eq!(plumbing.http_listen, "0.0.0.0:39103");
+        assert_eq!(plumbing.gateway_listen, DEFAULT_GATEWAY_LISTEN);
+
+        let dir = tmp("gateway-loopback");
+        let plumbing = merged_plumbing(
+            &dir,
+            &PlumbingOverrides {
+                gateway: Some("127.0.0.1:39104".into()),
+                ..Default::default()
+            },
+        )
+        .expect("IPv4 loopback gateway is valid");
+        assert_eq!(plumbing.gateway_listen, "127.0.0.1:39104");
     }
 
     /// nothing optional: a file missing ANY key refuses to parse, and the

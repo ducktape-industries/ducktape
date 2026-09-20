@@ -40,12 +40,12 @@ fn open_host_with_attribution(dir: &tempfile::TempDir, attribution: harness::Sha
     let m = files::Files::open(FILES, dir.path().to_path_buf()).expect("open files");
     Host::genesis(vec![
         Box::new(m),
-        Box::new(identity::Identity::new(
+        Box::new(identity_module::Identity::new(
             "identity",
             Box::new(sdk_testkit::MemStore::new()),
             "test".into(),
         )),
-        Box::new(attribution::AttributionModule::new(
+        Box::new(attribution_module::AttributionModule::new(
             "attribution",
             Box::new(attribution),
         )),
@@ -562,7 +562,7 @@ fn assert_rejected(host: &mut Host, height: u64, origin: Origin, msg: Msg, label
         "{label}: must be a deterministic rejection, got {err:?}"
     );
     assert!(
-        matches!(err.rejected(), Some(Error::Module(_))),
+        matches!(err.rejected(), Some(Error::Module { .. })),
         "{label}: module-level rejection, got {err:?}"
     );
     assert_eq!(

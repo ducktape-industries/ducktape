@@ -275,6 +275,24 @@ mod sim_carrier {
 /// through module state sync, not per-op fetch.
 pub const PAYLOAD_CACHE_CAP: usize = 16_384;
 
+/// cap on the total BYTES of CACHED entries. the count cap alone let a peer
+/// flooding max-size messages hold [`PAYLOAD_CACHE_CAP`] × 2 MiB ≈ 32 GiB; this
+/// bounds the same FIFO window by what it weighs, evicting oldest first. at
+/// honest frame sizes the count cap binds first and this never does.
+pub const PAYLOAD_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+/// how long the payload resolver waits on one peer for a finalized op's bytes
+/// before it blames that peer and asks another. short on purpose: a starved
+/// node's apply prefix waits on every miss, so a dead peer must cost little.
+const PAYLOAD_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+/// how long a payload fetch that found no peer to ask sits in the resolver's
+/// pending queue before it is tried again.
+const PAYLOAD_FETCH_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+/// how long simplex waits on one peer to answer a backfill request for a
+/// missed view's certificates before it asks another. fixed, not a
+/// [`Cadence`] multiple: it bounds a peer's round trip, not a block.
+const CERTIFICATE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// digest->bytes map: resolves the opaque digests simplex finalizes back into
 /// the frame bytes the host applies. cloning shares the backing store (`Arc`),
 /// so the automaton, reporter, and submit handle all hold the SAME content — the
@@ -286,7 +304,8 @@ pub const PAYLOAD_CACHE_CAP: usize = 16_384;
 ///   peers resolve them via fetch), so they are exempt from eviction. the
 ///   reporter demotes a digest to cached on finalization.
 /// - CACHED — peer-relayed / fetched bytes ([`ContentStore::put`]): best-effort,
-///   FIFO-bounded at [`PAYLOAD_CACHE_CAP`]. content-addressing keeps a flood
+///   FIFO-bounded at [`PAYLOAD_CACHE_CAP`] entries and [`PAYLOAD_CACHE_BYTES`]
+///   bytes, whichever binds first. content-addressing keeps a flood
 ///   inert for CORRECTNESS (garbage can never match a finalized digest); the cap
 ///   keeps it inert for MEMORY.
 #[derive(Clone, Default)]
@@ -298,8 +317,11 @@ pub struct ContentStore {
 struct StoreInner {
     /// own in-flight submissions — never evicted; demoted on finalization.
     pinned: HashMap<Digest, Vec<u8>>,
-    /// best-effort cache, FIFO-bounded by `order` at [`PAYLOAD_CACHE_CAP`].
+    /// best-effort cache, FIFO-bounded by `order` at [`PAYLOAD_CACHE_CAP`]
+    /// entries and [`PAYLOAD_CACHE_BYTES`] bytes.
     cached: HashMap<Digest, Vec<u8>>,
+    /// total length of every value in `cached`.
+    cached_bytes: usize,
     /// insertion order of `cached` keys — the FIFO eviction queue.
     order: VecDeque<Digest>,
 }
@@ -311,16 +333,27 @@ impl StoreInner {
         if self.pinned.contains_key(&digest) || self.cached.contains_key(&digest) {
             return;
         }
+        self.cached_bytes += bytes.len();
         self.cached.insert(digest, bytes);
         self.order.push_back(digest);
-        while self.cached.len() > PAYLOAD_CACHE_CAP {
+        loop {
+            let over_count = self.cached.len() > PAYLOAD_CACHE_CAP;
+            let over_bytes = self.cached_bytes > PAYLOAD_CACHE_BYTES;
+            if !(over_count || over_bytes) {
+                return;
+            }
             // pop until an entry still live in `cached` is found: `order` may
             // carry keys a demote raced in (harmless — each pop shrinks it).
-            if let Some(old) = self.order.pop_front() {
-                self.cached.remove(&old);
-            } else {
-                break;
-            }
+            let Some(old) = self.order.pop_front() else {
+                return;
+            };
+            self.remove_cached(&old);
+        }
+    }
+
+    fn remove_cached(&mut self, digest: &Digest) {
+        if let Some(bytes) = self.cached.remove(digest) {
+            self.cached_bytes -= bytes.len();
         }
     }
 }
@@ -338,7 +371,7 @@ impl ContentStore {
         let mut inner = self.inner.lock().expect("content store poisoned");
         // already cached (e.g. a peer relayed our identical frame first): lift
         // it into the pinned class so eviction can no longer drop it.
-        inner.cached.remove(&digest);
+        inner.remove_cached(&digest);
         inner.pinned.insert(digest, bytes);
         digest
     }
@@ -404,6 +437,14 @@ impl ContentStore {
             .expect("content store poisoned")
             .cached
             .len()
+    }
+
+    /// total bytes of CACHED entries — bounded by [`PAYLOAD_CACHE_BYTES`].
+    pub fn cached_bytes(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("content store poisoned")
+            .cached_bytes
     }
 }
 
@@ -966,7 +1007,6 @@ where
     FR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
 {
     use commonware_utils::NZUsize;
-    use std::time::Duration;
 
     let fetch_cfg = ResolverConfig {
         peer_provider: provider,
@@ -978,8 +1018,8 @@ where
         producer: PayloadProducer { store },
         mailbox_size: NZUsize!(1024),
         me: Some(me),
-        timeout: Duration::from_millis(400),
-        fetch_retry_timeout: Duration::from_millis(100),
+        timeout: PAYLOAD_FETCH_TIMEOUT,
+        fetch_retry_timeout: PAYLOAD_FETCH_RETRY,
         priority_requests: false,
         priority_responses: false,
     };
@@ -1303,6 +1343,10 @@ pub struct SimplexReporter<S> {
     store: ContentStore,
     pending: Arc<PendingProposals>,
     inbox: FinalizedInbox,
+    /// the configured restart floor. Commonware reports this certificate once
+    /// during voter startup; it is already applied by the recovered host and
+    /// must not re-enter the application release gate.
+    floor_view: Option<u64>,
     /// the shared retained-certificate window (see [`RetainedFinalizations`]).
     retained: RetainedFinalizations,
     /// the catch-up fetch seam, wired only via
@@ -1323,11 +1367,13 @@ impl<S> SimplexReporter<S> {
         inbox: FinalizedInbox,
         mailbox: Option<PayloadMailbox>,
         retained: RetainedFinalizations,
+        floor_view: Option<u64>,
     ) -> Self {
         Self {
             store,
             pending,
             inbox,
+            floor_view,
             retained,
             fetcher: PayloadFetcher::new(mailbox),
             _marker: std::marker::PhantomData,
@@ -1351,10 +1397,21 @@ where
         if let Activity::Finalization(finalization) = activity {
             let digest = finalization.proposal.payload;
             let view = finalization.proposal.round.view().get();
+            let is_at_or_below_floor = self.floor_view.is_some_and(|floor| view <= floor);
             // committed: drop it from the pending FIFO so `propose` (peek-only)
             // advances and never re-proposes it (removal is by value — see
             // [`PendingProposals::remove`]).
             self.pending.remove(&digest);
+            // Commonware reports the configured floor once while seeding its
+            // voter. The recovered host already applied this block, and the
+            // checkpoint may have no corresponding payload in this epoch's
+            // fresh store, so do not create application work for it. Keep the
+            // certificate for the next checkpoint's floor bookkeeping.
+            if is_at_or_below_floor {
+                retain_finalization(&self.retained, view, finalization.encode().to_vec());
+                self.store.demote(&digest);
+                return Feedback::Ok;
+            }
             // buffer for the async drain in ascending-view order (deduped). a
             // store HIT resolves NOW (the eager path, unchanged); a MISS with a
             // resolver enabled logs an AWAITING slot and we fetch the bytes —
@@ -1580,7 +1637,6 @@ impl SimplexOrderer {
         use commonware_parallel::Sequential;
         use commonware_runtime::buffer::paged::CacheRef;
         use commonware_utils::{NZU16, NZUsize};
-        use std::time::Duration;
 
         // this validator's consensus triple over the ONE shared store: the
         // automaton peeks the FIFO, the submit handle pushes onto it, the reporter
@@ -1593,12 +1649,16 @@ impl SimplexOrderer {
         let handle = automaton.handle(store.clone());
         let (mailbox, fetch_handle) = fetch.unzip();
         let retained = RetainedFinalizations::default();
+        let floor_view = floor
+            .as_ref()
+            .map(|finalization| finalization.proposal.round.view().get());
         let reporter = SimplexReporter::<S>::new(
             store.clone(),
             automaton.pending(),
             inbox.clone(),
             mailbox,
             retained.clone(),
+            floor_view,
         );
 
         // page cache borrows the pooler context BEFORE we hand a child to Engine.
@@ -1625,7 +1685,7 @@ impl SimplexOrderer {
             leader_timeout: cadence.leader_timeout(),
             certification_timeout: cadence.certification_timeout(),
             timeout_retry: cadence.timeout_retry(),
-            fetch_timeout: Duration::from_secs(1),
+            fetch_timeout: CERTIFICATE_FETCH_TIMEOUT,
             view_retention: ViewDelta::new(10),
             skip: SkipPolicy::Enabled {
                 timeout: cadence.skip_timeout(),
@@ -2286,6 +2346,125 @@ mod tests {
         );
     }
 
+    fn test_finalization(
+        view: u64,
+        frame: &[u8],
+    ) -> commonware_consensus::simplex::types::Finalization<
+        commonware_consensus::simplex::scheme::ed25519::Scheme,
+        Digest,
+    > {
+        use commonware_consensus::simplex::{
+            scheme::ed25519 as simplex_ed25519,
+            types::{Finalize, Proposal},
+        };
+        use commonware_consensus::types::{Epoch, Round, View};
+        use commonware_cryptography::{Signer as _, certificate::Scheme as _, ed25519};
+        use commonware_parallel::Sequential;
+        use commonware_utils::{iter::NonEmpty, ordered::Set};
+
+        let key = ed25519::PrivateKey::from_seed(7);
+        let participants = Set::try_from(vec![key.public_key()]).expect("one participant");
+        let scheme = simplex_ed25519::Scheme::signer(b"floor-reporter-test", participants, key)
+            .expect("signer belongs to the participant set");
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(3), View::new(view)),
+            View::new(view.saturating_sub(1)),
+            digest_of(frame),
+        );
+        let finalize = Finalize::sign(&scheme, proposal.clone()).expect("sign finalization");
+        let certificate = scheme
+            .assemble(
+                NonEmpty::new(finalize.attestation, std::iter::empty()),
+                &Sequential,
+            )
+            .expect("assemble finalization");
+
+        commonware_consensus::simplex::types::Finalization {
+            proposal,
+            certificate,
+        }
+    }
+
+    #[test]
+    fn configured_floor_report_is_not_gated_but_later_finalization_is_delivered() {
+        use std::time::Duration;
+
+        use commonware_consensus::{Reporter as _, simplex::types::Activity};
+        use commonware_cryptography::{Signer as _, ed25519};
+        use commonware_p2p::simulated;
+        use commonware_runtime::{Quota, Runner as _, Supervisor as _, deterministic};
+        use commonware_utils::{NZU32, NZUsize};
+
+        deterministic::Runner::timed(Duration::from_secs(5)).start(|context| async move {
+            let me = ed25519::PrivateKey::from_seed(8).public_key();
+            let (network, oracle) = simulated::Network::new_with_peers(
+                context.child("network"),
+                simulated::Config {
+                    max_size: 1024 * 1024,
+                    disconnect_on_block: true,
+                    max_peers_per_set: NZUsize!(8),
+                    tracked_peer_sets: NZUsize!(1),
+                },
+                vec![me.clone()],
+            )
+            .await;
+            network.start();
+
+            let fetch = oracle
+                .control(me.clone())
+                .register(0, Quota::per_second(NZU32!(128)))
+                .await
+                .expect("register resolver fetch");
+            let store = ContentStore::new();
+            let inbox = FinalizedInbox::new();
+            let retained = RetainedFinalizations::default();
+            let (mailbox, fetch_handle) = spawn_payload_fetch(
+                &context,
+                oracle.control(me.clone()),
+                oracle.manager(),
+                me,
+                store.clone(),
+                inbox.clone(),
+                fetch,
+            );
+            let mut reporter =
+                SimplexReporter::<commonware_consensus::simplex::scheme::ed25519::Scheme>::new(
+                    store.clone(),
+                    Arc::new(PendingProposals::default()),
+                    inbox.clone(),
+                    Some(mailbox),
+                    retained.clone(),
+                    Some(9),
+                );
+
+            let floor = test_finalization(9, b"checkpointed floor");
+            reporter.report(Activity::Finalization(floor.clone()));
+            assert_eq!(
+                inbox.min_unreleased_view(),
+                None,
+                "the configured floor must not create an awaiting application slot"
+            );
+            assert_eq!(
+                newest_finalization_at_or_below(&retained, 9),
+                Some((9, floor.encode().to_vec())),
+                "the floor certificate remains available for checkpointing"
+            );
+
+            let later_bytes = b"later finalized frame".to_vec();
+            let later_digest = store.put(later_bytes.clone());
+            let later = test_finalization(10, &later_bytes);
+            assert_eq!(later.proposal.payload, later_digest);
+            reporter.report(Activity::Finalization(later));
+            assert_eq!(
+                inbox.drain(),
+                vec![(10, later_bytes)],
+                "a later finalization still reaches ordered application delivery"
+            );
+
+            fetch_handle.abort();
+        });
+    }
+
     #[test]
     fn a_released_views_certificate_stays_persistable_while_newer_certs_arrive() {
         // the busy-chain floor-persistence shape: view 1 released (applied),
@@ -2415,6 +2594,41 @@ mod tests {
         );
         let last = digest_of(format!("blob-{:08}", PAYLOAD_CACHE_CAP - 1).as_bytes());
         assert!(store.get(&last).is_some(), "the newest entry survives");
+    }
+
+    #[test]
+    fn cached_entries_evict_fifo_at_the_byte_cap() {
+        // max-size messages fill the byte cap long before the count cap: the
+        // cache's weight never exceeds it, and the OLDEST entries go first.
+        const MESSAGE: usize = 2 * 1024 * 1024;
+        let blob = |i: usize| {
+            let mut bytes = vec![0u8; MESSAGE];
+            bytes[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            bytes
+        };
+        let store = ContentStore::new();
+        let flood = PAYLOAD_CACHE_BYTES / MESSAGE + 16;
+        for i in 0..flood {
+            store.put(blob(i));
+            assert!(
+                store.cached_bytes() <= PAYLOAD_CACHE_BYTES,
+                "the cache outgrew its byte cap at insert {i}"
+            );
+        }
+        assert_eq!(store.cached_len(), PAYLOAD_CACHE_BYTES / MESSAGE);
+        assert_eq!(store.cached_bytes(), PAYLOAD_CACHE_BYTES);
+        assert!(
+            !store.contains(&digest_of(&blob(0))),
+            "the oldest was evicted"
+        );
+        assert!(
+            store.contains(&digest_of(&blob(flood - 1))),
+            "the newest survives"
+        );
+
+        // pinning a cached entry takes its weight out of the cached total.
+        store.pin(blob(flood - 1));
+        assert_eq!(store.cached_bytes(), PAYLOAD_CACHE_BYTES - MESSAGE);
     }
 
     #[test]

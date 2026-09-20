@@ -293,13 +293,22 @@ impl Machine {
     /// epoch (or the superseded boot restore) and is dropped; the retarget
     /// either lands an epoch now, suspends behind the boot restore, or
     /// stands the node down.
+    ///
+    /// The superseded epoch's accepted standby records cross over: the new
+    /// epoch's apply rebuilds the interface, and a standby cannot re-offer
+    /// its record over the overlay that apply carries. The new epoch's own
+    /// standby set is what gates them.
     fn on_retarget(
         &mut self,
         event: MeshEpochEvent,
         persisted: Option<Vec<u8>>,
     ) -> Result<(), UpgradeError> {
         self.driver.abandon_pending();
-        self.epoch = self.driver.retarget(event, persisted)?;
+        let carried = match &self.epoch {
+            Some(state) => state.standby_records.values().cloned().collect(),
+            None => Vec::new(),
+        };
+        self.epoch = self.driver.retarget(event, persisted, carried)?;
         Ok(())
     }
 

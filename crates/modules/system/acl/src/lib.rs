@@ -31,8 +31,7 @@
 //! store (the qmdb resolver lane, like every store-backed sibling).
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+pub use acl_wire::*;
 
 // the wasm-guest port: the dispatch shell that adapts this module to the
 // ducktape:module world. compiled only by the guest-builder's synthesized
@@ -48,9 +47,6 @@ use sdk::{
 /// policy entries retained (the count cap). targets are module ids, so this
 /// sits far above any real composition; a set past it refuses loudly.
 pub const MAX_POLICY_ENTRIES: usize = 256;
-/// byte bound on one target id — module ids are short; anything longer is
-/// junk, refused before it can bloat the record.
-pub const MAX_TARGET_LEN: usize = 64;
 
 /// the committed policy table's record key: the strictly-target-sorted
 /// `(target, standing)` list, borsh-encoded. absent = empty table = open.
@@ -90,7 +86,7 @@ impl Acl {
         let Some(bytes) = self.staged.get(POLICY_KEY).await? else {
             return Ok(Vec::new());
         };
-        borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))
+        borsh::from_slice(&bytes).map_err(|e| Error::module("codec", e.to_string()))
     }
 
     /// stage the policy record. an EMPTY table stages a DELETE — absence is
@@ -114,14 +110,16 @@ impl Acl {
     ) -> Result<(), Error> {
         let trimmed_is_original = !target.is_empty() && target.trim() == target;
         if !trimmed_is_original {
-            return Err(Error::Module(
-                "acl target must be a non-empty, untrimmed module id".into(),
+            return Err(Error::module(
+                "bad_acl_target",
+                "acl target must be a non-empty, untrimmed module id",
             ));
         }
         if target.len() > MAX_TARGET_LEN {
-            return Err(Error::Module(format!(
-                "acl target exceeds {MAX_TARGET_LEN} bytes"
-            )));
+            return Err(Error::module(
+                "bad_acl_target",
+                format!("acl target exceeds {MAX_TARGET_LEN} bytes"),
+            ));
         }
         let mut table = self.table().await?;
         let position = table.binary_search_by(|(t, _)| t.as_str().cmp(target.as_str()));
@@ -136,9 +134,10 @@ impl Acl {
             (Err(_), None) => return Ok(()),
             (Err(i), Some(s)) => {
                 if table.len() >= MAX_POLICY_ENTRIES {
-                    return Err(Error::Module(format!(
-                        "acl policy cap reached ({MAX_POLICY_ENTRIES})"
-                    )));
+                    return Err(Error::module(
+                        "policy_cap",
+                        format!("acl policy cap reached ({MAX_POLICY_ENTRIES})"),
+                    ));
                 }
                 table.insert(i, (target, s));
             }
@@ -200,13 +199,16 @@ impl Module for Acl {
             Origin::Module(id) if *id == self.governance_id => {}
             Origin::System => {}
             other => {
-                return Err(Error::Module(format!(
-                    "acl policy changes only via governance (the {} module), got {other:?}",
-                    self.governance_id
-                )));
+                return Err(Error::module(
+                    "not_governance",
+                    format!(
+                        "acl policy changes only via governance (the {} module), got {other:?}",
+                        self.governance_id
+                    ),
+                ));
             }
         }
-        match decode_msg(&msg.payload).map_err(Error::Module)? {
+        match decode_msg(&msg.payload).map_err(|e| Error::module("codec", e))? {
             AclMsg::SetPolicy { target, standing } => {
                 self.handle_set_policy(target, standing).await
             }
@@ -215,7 +217,7 @@ impl Module for Acl {
 
     /// read projection — the committed table plus this block's staged changes.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match decode_query(req).map_err(Error::Module)? {
+        match decode_query(req).map_err(|e| Error::module("codec", e))? {
             AclQuery::Policy => Ok(encode_reply(&AclReply::Policy(self.table().await?))),
             AclQuery::PolicyFor { target } => Ok(encode_reply(&AclReply::PolicyFor(
                 self.policy_for(&target).await?,
@@ -336,7 +338,7 @@ mod tests {
         assert!(
             matches!(
                 run(&mut a, &mut chat, &set("valset", Some(Standing::Validator))),
-                Err(Error::Module(_))
+                Err(Error::Module { ref reason, .. }) if reason == "not_governance"
             ),
             "a chat-module origin set acl policy"
         );
@@ -434,7 +436,7 @@ mod tests {
         let mut ctx = ext_ctx();
         let err = run(&mut a, &mut ctx, &set("chat", Some(Standing::Validator))).unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("only via governance")),
+            matches!(err, Error::Module { ref reason, .. } if reason == "not_governance"),
             "got {err:?}"
         );
         assert!(table(&a).is_empty());
@@ -446,7 +448,10 @@ mod tests {
         let mut ctx = gov_ctx();
         for bad in ["", " chat", "chat "] {
             let err = run(&mut a, &mut ctx, &set(bad, Some(Standing::Open))).unwrap_err();
-            assert!(matches!(err, Error::Module(_)), "{bad:?} must refuse");
+            assert!(
+                matches!(err, Error::Module { ref reason, .. } if reason == "bad_acl_target"),
+                "{bad:?} must refuse"
+            );
         }
         let err = run(
             &mut a,
@@ -455,7 +460,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("exceeds")),
+            matches!(err, Error::Module { ref reason, .. } if reason == "bad_acl_target"),
             "got {err:?}"
         );
 
@@ -469,7 +474,7 @@ mod tests {
         }
         let err = run(&mut a, &mut ctx, &set("one-more", Some(Standing::Open))).unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("cap reached")),
+            matches!(err, Error::Module { ref reason, .. } if reason == "policy_cap"),
             "got {err:?}"
         );
     }

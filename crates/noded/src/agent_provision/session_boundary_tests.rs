@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use attribution::AttributionModule;
 use capability::CapabilityMsg;
-use chat::{Block, Chat, ChatMsg, Mark, PostPolicy, Span};
+use chat::{Block, ChatMsg, Mark, PostPolicy, Span};
 use commonware_runtime::{Runner as _, Supervisor as _};
 use compute_service::{DeliverFn, DispatchPool, SpawnFn};
 use dispatch::DispatchModule;
@@ -43,11 +43,11 @@ use host::{BlockContext, Host};
 use runs::ModelMsg;
 use saga::SagaModule;
 use sdk::{Event, Msg, Origin};
-use tasks::Tasks;
 
 use super::plane_tests::{committed_block, files_reply};
 use super::*;
 use crate::NodeCommand;
+use crate::testkit::committed_module;
 use statesync::qmdb::QmdbStore;
 
 /// the agent under test, and the node that will claim its run's lease. the node
@@ -121,21 +121,31 @@ fn alice() -> Origin {
     Origin::External(vec![1; 32])
 }
 
+/// the chain id this composition's identity plane is scoped to — the same
+/// value the `runs` guest reads out of its genesis `__config` record.
+const CHAIN_ID: &str = "session-boundary";
+
 /// the genesis set the collaboration loop runs on — chat + the attribution plane +
 /// the dispatch plane + the registry + runs.
 /// `files_root` is where this composition's Files module keeps its objects:
 /// runs is wired to `files`, so every genesis that runs a conversation needs
 /// the module that wiring names.
+///
+/// chat, agent, runs and tasks are the COMMITTED guests this repo ships
+/// (`crates/modules/apps/<id>/component.wasm`) — their source lives in
+/// ducktape-modules, and the wiring a native constructor used to take as
+/// arguments is compiled into each guest, which is why none is passed here.
+/// The system modules and files are still core-resident and still native.
 pub(in crate::agent_provision) async fn genesis(
     context: commonware_runtime::tokio::Context,
     files_root: &Path,
 ) -> Host {
-    let chat = Chat::new(
+    let chat = committed_module(
         "chat",
         Box::new(QmdbStore::init(context.child("chat"), "chat").await),
+        CHAIN_ID,
     )
-    .with_identity("identity")
-    .with_attribution("attribution");
+    .await;
     // `Accept`'s standing gate needs a real valset to admit a claim against,
     // and a tagged saga (this run's agent carries `CAPABILITY`) needs the
     // capability registry too — see PR #1738. `WORKER_NODE` is the only node
@@ -156,7 +166,7 @@ pub(in crate::agent_provision) async fn genesis(
         Box::new(identity::Identity::new(
             "identity",
             Box::new(sdk_testkit::MemStore::new()),
-            "session-boundary".into(),
+            CHAIN_ID.into(),
         )),
         Box::new(
             AttributionModule::new("attribution", Box::new(sdk_testkit::MemStore::new()))
@@ -181,31 +191,9 @@ pub(in crate::agent_provision) async fn genesis(
             "identity",
             Box::new(sdk_testkit::MemStore::new()),
         )),
-        Box::new(agent::AgentModule::new(
-            "agent",
-            Box::new(sdk_testkit::MemStore::new()),
-            agent::Siblings {
-                identity: "identity".into(),
-                attribution: "attribution".into(),
-                dispatch: "dispatch".into(),
-            },
-        )),
-        Box::new(runs::RunsModule::new(
-            "runs",
-            "chat",
-            "saga",
-            "attribution",
-            "dispatch",
-            "agent",
-            Some("tasks".into()),
-            Some("tasks".into()),
-        ).with_files_module("files")),
-        Box::new(Tasks::new(
-            "tasks",
-            "identity",
-            "attribution",
-            Box::new(sdk_testkit::MemStore::new()),
-        )),
+        Box::new(committed_module("agent", Box::new(sdk_testkit::MemStore::new()), CHAIN_ID).await),
+        Box::new(committed_module("runs", Box::new(sdk_testkit::MemStore::new()), CHAIN_ID).await),
+        Box::new(committed_module("tasks", Box::new(sdk_testkit::MemStore::new()), CHAIN_ID).await),
         Box::new(files::Files::open("files", files_root.join("files")).expect("files module")),
     ])
     .expect("genesis")

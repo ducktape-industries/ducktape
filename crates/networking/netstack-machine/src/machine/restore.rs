@@ -34,10 +34,14 @@ impl Driver {
     /// now, or from the restore's settlement. `Ok(None)` is a node that is
     /// neither a member nor a standby (stood down), or a retarget suspended
     /// behind its restore.
+    ///
+    /// `carried` is the superseded epoch's accepted standby records — empty
+    /// at boot, where the persisted bytes play that part.
     pub(crate) fn retarget(
         &mut self,
         event: MeshEpochEvent,
         persisted: Option<Vec<u8>>,
+        carried: Vec<SignedEndpointRecord>,
     ) -> Result<Option<EpochState>, UpgradeError> {
         self.view = self.view.max(event.current_view);
         let identities: Vec<ValidatorIdentity> =
@@ -82,7 +86,7 @@ impl Driver {
             ),
         }
         match persisted {
-            None => Ok(Some(self.retarget_tail(event, role, Vec::new())?)),
+            None => Ok(Some(self.retarget_tail(event, role, carried)?)),
             Some(bytes) => self.begin_restore(event, role, bytes),
         }
     }
@@ -392,14 +396,26 @@ impl Driver {
             pk_of,
             own.clone(),
         );
-        // the restored standby records seed the boot epoch's pre-warm layer
-        // as if just delivered — the epoch's own apply REPLACES the restored
-        // interface, and a parked standby cannot re-deliver its record over
-        // the dead overlay it is parked behind. Nonces stay unseeded so the
-        // owner's live re-offer re-runs the full accept path: an idempotent
-        // reinstall plus the first-contact gossip-back it heals by.
+        // the carried standby records seed this epoch's pre-warm layer as if
+        // just delivered — the epoch's own apply REPLACES whatever the
+        // interface held, and a standby cannot re-deliver its record over
+        // the overlay that apply just rebuilt. That holds for BOTH sources:
+        // the boot restore's persisted records (the node forgot the standby
+        // across a reboot) and a live cutover's superseded epoch (the node
+        // would forget it across the cutover, and an endpoint-less standby
+        // — every NATed one — has no other way back in: only it can
+        // initiate, and the member it initiates to must already carry its
+        // key). Nonces stay unseeded so the owner's live re-offer re-runs
+        // the full accept path: an idempotent reinstall plus the
+        // first-contact gossip-back it heals by.
+        //
+        // The epoch's own standby set gates them: a resident that left is
+        // dead weight, and a promoted one assembles a member tunnel instead.
         for signed in restored_standbys {
             let identity = signed.record.validator_identity;
+            if !state.standbys.contains(&identity) {
+                continue;
+            }
             state
                 .prewarm_peers
                 .insert(identity, self.standby_peer_config(&signed.record));

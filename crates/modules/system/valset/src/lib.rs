@@ -55,10 +55,7 @@
 #[cfg(all(feature = "guest", target_arch = "wasm32"))]
 mod guest;
 
-mod interface;
-pub use interface::*;
-
-use std::collections::BTreeSet;
+pub use valset_wire::*;
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
@@ -70,10 +67,6 @@ use sdk::{
 /// a 32-byte ed25519 public key encoding.
 const KEY_LEN: usize = 32;
 
-/// members retained per tier (the count cap). membership is genesis- and
-/// governance-authored, so this sits far above any real set; a join/grant
-/// past it refuses loudly at execute.
-pub const MAX_MEMBERS: usize = 1024;
 /// serialized tier-record byte bound — the uniform poison backstop on top of
 /// the count cap.
 const MAX_TIER_RECORD_BYTES: usize = 512 * 1024;
@@ -191,20 +184,26 @@ impl Valset {
     /// (ZIP215: must decompress to a point on the twisted Edwards curve).
     fn validate_key(key: &[u8]) -> Result<(), Error> {
         if key.len() != KEY_LEN {
-            return Err(Error::Module(format!(
-                "invalid ed25519 public key: expected {KEY_LEN} bytes, got {}",
-                key.len()
-            )));
+            return Err(Error::module(
+                "bad_key",
+                format!(
+                    "invalid ed25519 public key: expected {KEY_LEN} bytes, got {}",
+                    key.len()
+                ),
+            ));
         }
         PublicKey::decode(key)
-            .map_err(|e| Error::Module(format!("invalid ed25519 public key: {e}")))?;
+            .map_err(|e| Error::module("bad_key", format!("invalid ed25519 public key: {e}")))?;
         Ok(())
     }
 
     /// the count cap shared by both tiers.
     fn require_capacity(tier: &[Vec<u8>], what: &str) -> Result<(), Error> {
         if tier.len() >= MAX_MEMBERS {
-            return Err(Error::Module(format!("{what} cap reached ({MAX_MEMBERS})")));
+            return Err(Error::module(
+                "member_cap",
+                format!("{what} cap reached ({MAX_MEMBERS})"),
+            ));
         }
         Ok(())
     }
@@ -218,7 +217,7 @@ impl Valset {
         let Some(bytes) = self.staged.get(key).await? else {
             return Ok(Vec::new());
         };
-        borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))
+        borsh::from_slice(&bytes).map_err(|e| Error::module("codec", e.to_string()))
     }
 
     async fn validators(&self) -> Result<Vec<Vec<u8>>, Error> {
@@ -239,10 +238,13 @@ impl Valset {
         }
         let bytes = borsh::to_vec(tier).expect("a member list is serializable");
         if bytes.len() > MAX_TIER_RECORD_BYTES {
-            return Err(Error::Module(format!(
-                "tier record too large: {} > {MAX_TIER_RECORD_BYTES} bytes",
-                bytes.len()
-            )));
+            return Err(Error::module(
+                "record_too_large",
+                format!(
+                    "tier record too large: {} > {MAX_TIER_RECORD_BYTES} bytes",
+                    bytes.len()
+                ),
+            ));
         }
         self.staged.stage(key.to_vec(), bytes);
         Ok(())
@@ -256,7 +258,7 @@ impl Valset {
         let Some(bytes) = self.staged.get(GENERATION_KEY).await? else {
             return Ok(GENESIS_GENERATION);
         };
-        borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))
+        borsh::from_slice(&bytes).map_err(|e| Error::module("codec", e.to_string()))
     }
 
     fn stage_generation_counter(&mut self, generation: u64) {
@@ -276,10 +278,13 @@ impl Valset {
         let bytes =
             borsh::to_vec(&(validators, residents)).expect("a member snapshot is serializable");
         if bytes.len() > MAX_TIER_RECORD_BYTES {
-            return Err(Error::Module(format!(
-                "generation snapshot too large: {} > {MAX_TIER_RECORD_BYTES} bytes",
-                bytes.len()
-            )));
+            return Err(Error::module(
+                "record_too_large",
+                format!(
+                    "generation snapshot too large: {} > {MAX_TIER_RECORD_BYTES} bytes",
+                    bytes.len()
+                ),
+            ));
         }
         self.staged.stage(generation_set_key(generation), bytes);
         Ok(())
@@ -342,7 +347,7 @@ impl Valset {
                 continue;
             };
             let (validators, residents): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
-                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?;
+                borsh::from_slice(&bytes).map_err(|e| Error::module("codec", e.to_string()))?;
             window.push(GenerationSet {
                 generation,
                 validators,
@@ -388,8 +393,9 @@ impl Valset {
         // of the caller. the guard reads the staged-over-committed tier, so a
         // second leave in the same block cannot slip past it.
         if validators.len() == 1 {
-            return Err(Error::Module(
-                "refusing to remove the last validator: the set must never be empty".into(),
+            return Err(Error::module(
+                "last_validator",
+                "refusing to remove the last validator: the set must never be empty",
             ));
         }
         validators.remove(position);
@@ -402,8 +408,9 @@ impl Valset {
         // standing would only smear the promote/demote edges.
         let validators = self.validators().await?;
         if validators.binary_search(&key).is_ok() {
-            return Err(Error::Module(
-                "key is a current validator — resident standing is the pre-promotion tier".into(),
+            return Err(Error::module(
+                "already_a_validator",
+                "key is a current validator — resident standing is the pre-promotion tier",
             ));
         }
         let mut residents = self.residents().await?;
@@ -423,59 +430,6 @@ impl Valset {
         residents.remove(position);
         self.store_tier(RESIDENTS_KEY, &residents)
     }
-}
-
-/// the CURRENT member set of the valset module at `valset`: its
-/// staged-over-committed Validators projection, via the host-routed read lane.
-/// the one shared read every membership-gated module (governance, upgrade, …)
-/// funnels through.
-pub async fn members(ctx: &dyn Ctx, valset: &str) -> Result<Vec<Vec<u8>>, Error> {
-    let reply = ctx
-        .query(valset, &encode_query(&ValsetQuery::Validators))
-        .await?;
-    match decode_reply(&reply).map_err(Error::Module)? {
-        ValsetReply::Validators(members) => Ok(members),
-        other => Err(Error::Module(format!(
-            "valset answered a Validators query with {other:?}"
-        ))),
-    }
-}
-
-/// the CURRENT validator set UNION resident set of the valset module at
-/// `valset`, both queried live from its staged-over-committed projection — an
-/// op is admitted for EITHER standing, so a joined (not-yet-promoted) resident
-/// still passes. the shared read behind identity's and capability's bind gates.
-pub async fn members_and_residents(
-    ctx: &dyn Ctx,
-    valset: &str,
-) -> Result<BTreeSet<Vec<u8>>, Error> {
-    let validators = match decode_reply(
-        &ctx.query(valset, &encode_query(&ValsetQuery::Validators))
-            .await?,
-    )
-    .map_err(Error::Module)?
-    {
-        ValsetReply::Validators(v) => v,
-        other => {
-            return Err(Error::Module(format!(
-                "valset answered a Validators query with {other:?}"
-            )));
-        }
-    };
-    let residents = match decode_reply(
-        &ctx.query(valset, &encode_query(&ValsetQuery::Residents))
-            .await?,
-    )
-    .map_err(Error::Module)?
-    {
-        ValsetReply::Residents(o) => o,
-        other => {
-            return Err(Error::Module(format!(
-                "valset answered a Residents query with {other:?}"
-            )));
-        }
-    };
-    Ok(validators.into_iter().chain(residents).collect())
 }
 
 #[async_trait::async_trait(?Send)]
@@ -510,13 +464,14 @@ impl Module for Valset {
     async fn initialize(&mut self, params: &[u8]) -> Result<(), Error> {
         let config = sdk::genesis_config::decode_config(params)?;
         let validators: Vec<Vec<u8>> = match sdk::genesis_config::find(&config, "validators") {
-            Some(bytes) => sdk::wire::decode(bytes).map_err(Error::Module)?,
+            Some(bytes) => sdk::wire::decode(bytes).map_err(|e| Error::module("codec", e))?,
             None => Vec::new(),
         };
         for key in validators {
             if key.len() != KEY_LEN {
-                return Err(Error::Module(
-                    "initial validator key must be 32 bytes".into(),
+                return Err(Error::module(
+                    "bad_key",
+                    "initial validator key must be 32 bytes",
                 ));
             }
             self.seed(key).await?;
@@ -540,13 +495,17 @@ impl Module for Valset {
             sdk::Origin::Module(id) if *id == self.governance_id => {}
             sdk::Origin::System => {}
             other => {
-                return Err(Error::Module(format!(
-                    "valset membership changes only via governance (the {} module), got {other:?}",
-                    self.governance_id
-                )));
+                return Err(Error::module(
+                    "not_governance",
+                    format!(
+                        "valset membership changes only via governance (the {} module), \
+                         got {other:?}",
+                        self.governance_id
+                    ),
+                ));
             }
         }
-        match decode_msg(&msg.payload).map_err(Error::Module)? {
+        match decode_msg(&msg.payload).map_err(|e| Error::module("codec", e))? {
             ValsetMsg::Join { key } => self.handle_join(key).await,
             ValsetMsg::Leave { key } => self.handle_leave(key).await,
             ValsetMsg::Grant { key } => self.handle_grant(key).await,
@@ -556,7 +515,7 @@ impl Module for Valset {
 
     /// read projection — the committed tiers plus this block's staged changes.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match decode_query(req).map_err(Error::Module)? {
+        match decode_query(req).map_err(|e| Error::module("codec", e))? {
             ValsetQuery::Validators => Ok(encode_reply(&ValsetReply::Validators(
                 self.validators().await?,
             ))),
@@ -703,7 +662,7 @@ mod tests {
         let mut chat = module_ctx("chat");
         for m in [join(&k), leave(&k), grant(&k), revoke(&k)] {
             assert!(
-                matches!(run(&mut v, &mut chat, &m), Err(Error::Module(_))),
+                matches!(run(&mut v, &mut chat, &m), Err(Error::Module { ref reason, .. }) if reason == "not_governance"),
                 "a chat-module origin staged a membership change"
             );
         }
@@ -778,7 +737,7 @@ mod tests {
 
         let err = run(&mut v, &mut ctx, &leave(&solo)).unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("last validator")),
+            matches!(err, Error::Module { ref reason, .. } if reason == "last_validator"),
             "got {err:?}"
         );
         // read-your-writes: nothing was staged, so the sole validator remains.
@@ -802,7 +761,7 @@ mod tests {
         run(&mut v, &mut ctx, &leave(&a)).unwrap();
         let err = run(&mut v, &mut ctx, &leave(&b)).unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("last validator")),
+            matches!(err, Error::Module { ref reason, .. } if reason == "last_validator"),
             "got {err:?}"
         );
     }
@@ -817,7 +776,7 @@ mod tests {
         let bad = vec![0u8; 16];
         let err = run(&mut v, &mut ctx, &join(&bad)).unwrap_err();
         assert!(
-            matches!(err, Error::Module(_)),
+            matches!(err, Error::Module { ref reason, .. } if reason == "bad_key"),
             "malformed key errs with Module"
         );
         commit(&mut v);
@@ -953,7 +912,7 @@ mod tests {
         }
         let err = run(&mut v, &mut ctx, &join(&valid_key(MAX_MEMBERS as u16))).unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("cap reached")),
+            matches!(err, Error::Module { ref reason, .. } if reason == "member_cap"),
             "got {err:?}"
         );
         commit(&mut v);
@@ -1097,7 +1056,7 @@ mod tests {
 
         let err = run(&mut v, &mut ctx, &grant(&k)).unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("current validator")),
+            matches!(err, Error::Module { ref reason, .. } if reason == "already_a_validator"),
             "got {err:?}"
         );
         assert!(residents(&v).is_empty());

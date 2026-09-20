@@ -2,6 +2,7 @@
 //! address to. The addressing flags and the resolution ladder itself are
 //! [`crate::cli_args::NodeAddr`] — ONE ladder for every family.
 
+use duckfs_client::api::{ApiError, refusal_line};
 use unicode_normalization::UnicodeNormalization as _;
 
 pub use crate::cli_args::NodeAddr;
@@ -21,13 +22,24 @@ pub fn nfc_path(raw: &str) -> Result<String, std::convert::Infallible> {
 
 /// a CLI failure carrying the process exit code. code 2 is a usage error (an
 /// unresolved node) and a commit conflict; code 1 is a general operational
-/// failure (and a dirty `status`). an EMPTY message prints nothing — `status`
-/// writes its own A/M/D lines and then exits non-zero without a redundant error
-/// line.
+/// failure (and a dirty `status`).
 #[derive(Debug)]
 pub struct CliError {
     pub code: u8,
-    pub message: String,
+    pub message: Message,
+}
+
+/// what a failed verb says on stderr.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Message {
+    /// nothing: the verb already wrote its own output (a dirty `status`'s
+    /// A/M/D lines, a commit conflict's report).
+    Silent,
+    /// this CLI's own sentence.
+    Said(String),
+    /// a refusal, its two halves kept apart until [`CliError::line`] renders
+    /// them — nothing downstream ever re-parses one out of a joined string.
+    Refused { reason: String, sentence: String },
 }
 
 impl CliError {
@@ -35,15 +47,28 @@ impl CliError {
     pub fn usage(m: impl Into<String>) -> Self {
         CliError {
             code: 2,
-            message: m.into(),
+            message: Message::Said(m.into()),
         }
     }
 
-    /// a general operational failure (exit 1): a node rejection, an io error.
+    /// a general operational failure (exit 1): an io error, an unreachable node.
     pub fn failed(m: impl Into<String>) -> Self {
         CliError {
             code: 1,
-            message: m.into(),
+            message: Message::Said(m.into()),
+        }
+    }
+
+    /// a refusal (exit 1): the class token and the words whoever refused
+    /// wrote. every `ducktape fs` verb refuses through here, so `cat`, `ls` and
+    /// `stat` cannot disagree about what a missing path looks like.
+    pub fn refused(reason: impl Into<String>, sentence: impl Into<String>) -> Self {
+        CliError {
+            code: 1,
+            message: Message::Refused {
+                reason: reason.into(),
+                sentence: sentence.into(),
+            },
         }
     }
 
@@ -53,8 +78,35 @@ impl CliError {
     pub fn silent(code: u8) -> Self {
         CliError {
             code,
-            message: String::new(),
+            message: Message::Silent,
         }
+    }
+
+    /// the stderr line this failure prints after `ducktape fs: `, or `None`
+    /// when the verb already wrote its own. a refusal renders through
+    /// [`refusal_line`]: the sentence first, the class token last in brackets.
+    pub fn line(&self) -> Option<String> {
+        match &self.message {
+            Message::Silent => None,
+            Message::Said(m) => Some(m.clone()),
+            Message::Refused { reason, sentence } => Some(refusal_line(reason, sentence)),
+        }
+    }
+}
+
+/// map a transport failure to a CLI failure — the ONE mapping every `ducktape
+/// fs` verb uses. a refusal keeps both halves it arrived in; a connection
+/// failure is THIS side's and says so, because the two are not the caller's to
+/// fix in the same way. a node nothing answered for is told in the sentence
+/// every other family uses for it.
+pub fn api_err(e: ApiError) -> CliError {
+    match e {
+        ApiError::Rejected { reason, sentence } => CliError::refused(reason, sentence),
+        ApiError::Unreachable { base } => {
+            CliError::failed(crate::node_http::not_running_at(&base).to_string())
+        }
+        ApiError::NotFound => CliError::refused("not_found", "the node has no such route"),
+        ApiError::Transport(m) => CliError::failed(format!("cannot reach the node: {m}")),
     }
 }
 
@@ -259,7 +311,7 @@ mod tests {
 
     /// `--node` binds through the shared addressing group. The PRECEDENCE it
     /// sits at the top of is pinned once, in
-    /// `cli_args::tests::the_node_address_ladder_ranks_flag_network_env_context_registry`
+    /// `cli_args::tests::the_node_address_ladder_ranks_flag_config_network_env_context_registry`
     /// — not re-asserted per family, which is how four of them drifted apart.
     #[test]
     fn dash_dash_node_binds_its_url() {

@@ -22,6 +22,10 @@ pub(crate) const MAX_GENESIS_BYTES: u64 = 8 * MAX_MODULE_CODE_BYTES;
 /// many further drain passes, for a host query that keeps erroring (#1820).
 /// shared by the validator drain and the replica park loop.
 pub(crate) const VALSET_READ_WARN_EVERY: u64 = 600;
+/// one warning when a parked node's boundary fetch first fails, then one per
+/// this many further failures: about a minute apart at the joiner's
+/// [`JOINER_POLL`], so a sync that never starts says why in the log.
+pub(crate) const BOUNDARY_FETCH_WARN_EVERY: u64 = 30;
 /// how many source conversations a code-blob fetch tries before reporting
 /// the miss (each conversation resumes the staged prefix, so retries only
 /// ever pay for bytes not yet landed).
@@ -200,11 +204,19 @@ pub(crate) const CHANNEL_ENGINE_FETCH: u64 = 10;
 
 /// how long a booting validator keeps re-asking peers for the frame above its
 /// recovered floor while the mesh is still forming. a WALL-CLOCK budget, not
-/// an attempt count: one attempt costs nothing when the link is not up yet
-/// (the send fails immediately with no recipients) but a full request timeout
-/// when it is up and the peer does not answer, so only a deadline bounds the
-/// wait either way. it has to cover a returning node re-forming its p2p and
-/// overlay links, which is seconds, not milliseconds.
+/// an attempt count. the p2p router accepts a send to a peer it holds no link
+/// to and drops it, so an attempt made before the link is up costs the same
+/// as one to a peer that never answers: the statesync client's full
+/// `RETRY_WINDOWS` ride (3s + 6s + 12s, ~30s worst case with reaper rounding).
+/// only the router's own refusal (`lane_closed`, `lane_backpressure`) comes
+/// back at once. the
+/// ride re-sends the same request at each window, so a link that forms a few
+/// seconds into the first attempt is reached by that attempt's next re-send.
+/// the value holds because it is checked between attempts, not inside one: it
+/// buys at least one full ride (every re-send of it) and caps the wait at the
+/// budget plus the one ride in flight when it expires. it has to cover a
+/// returning node re-forming its p2p and overlay links, which is seconds, not
+/// milliseconds.
 ///
 /// bounded ON PURPOSE, unlike the resident's re-bootstrap loop: this runs
 /// BEFORE the engine and before the loop that answers other nodes' probes, so
@@ -217,3 +229,14 @@ pub(crate) const BOOT_PROBE_BUDGET: Duration = Duration::from_secs(30);
 
 /// the pause between boot catch-up probes (see [`BOOT_PROBE_BUDGET`]).
 pub(crate) const BOOT_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// how long the operator rpc server waits on the run loop's answer before it
+/// replies `node unresponsive` itself. the loop answers within a drain tick, so
+/// this long is a wedged node, and an operator's console must not park on one
+/// forever.
+pub(crate) const RPC_REPLY_WAIT: Duration = Duration::from_secs(10);
+/// how long a CLI verb waits on the operator rpc's reply line. it outlasts
+/// [`RPC_REPLY_WAIT`] so a slow node still answers in its own words
+/// (`node unresponsive`) before the client gives up on the socket.
+pub(crate) const RPC_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const _: () = assert!(RPC_CLIENT_READ_TIMEOUT.as_millis() > RPC_REPLY_WAIT.as_millis());

@@ -89,8 +89,12 @@ fn node(
     let client = NatClient::with_socket(NatSocket::Simulated(sock), key, coords, signer, None)
         .expect("client over the simulated socket");
     let (datagram_tx, datagram_rx) = mpsc::channel(16);
-    let resolver =
-        NatResolver::from_client_with_datagram_sink(client, keepalive, Some(datagram_tx));
+    let resolver = NatResolver::from_client_with_datagram_sink(
+        client,
+        keepalive,
+        Some(datagram_tx),
+        reachability::CarryingPeers::default(),
+    );
     SimNode {
         resolver,
         key,

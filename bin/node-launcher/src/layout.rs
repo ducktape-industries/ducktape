@@ -6,6 +6,7 @@
 //! ```text
 //! <workspace>/node.toml                      the node's own config (or --config)
 //! <workspace>/updates/state.json             the update machine's phase
+//! <workspace>/updates/launcher.lock          the one writer's claim: a `run`, an `install`
 //! <workspace>/updates/keys/release.pub       the pinned release key
 //! <workspace>/updates/keys/successor.json    a key rotation this install saw
 //! <workspace>/updates/releases/<sha>/ducktape
@@ -30,9 +31,23 @@ use app_update::workspace;
 /// The one executable a node release archive carries.
 pub const NODE_EXE: &str = "ducktape";
 
+/// The founding set that rides beside it — `<id>.component.wasm` and the
+/// netstack guest, which a node resolves next to its own executable. No
+/// binary carries wasm, so a release without this directory starts a node
+/// that cannot reach the mesh at all.
+pub const MODULES_DIR: &str = "modules";
+
+/// This launcher, as a node release archive ships it beside the binary.
+pub const LAUNCHER_EXE: &str = "ducktape-node-launcher";
+
 /// The node's own config, which is this launcher's alone — the update tree is
 /// shared, a config file name is not.
 const CONFIG_FILE: &str = "node.toml";
+
+/// The supervisor's exclusive claim on the workspace. This launcher's alone:
+/// nothing on the node side reads it, so the name stays here rather than in
+/// the tree both binaries share.
+const LOCK_FILE: &str = "launcher.lock";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
@@ -72,6 +87,12 @@ impl Layout {
 
     pub fn state_path(&self) -> PathBuf {
         workspace::launcher_state_path(&self.workspace)
+    }
+
+    /// What a `run` holds for as long as it supervises this workspace, and an
+    /// `install` for as long as it writes.
+    pub fn lock_path(&self) -> PathBuf {
+        self.updates().join(LOCK_FILE)
     }
 
     /// The pinned release key, hex. Its absence is what "this node does not
@@ -123,6 +144,12 @@ impl Layout {
     pub fn exe(&self) -> PathBuf {
         self.current_link().join(NODE_EXE)
     }
+
+    /// The launcher the install path's release ships — the image a `run`
+    /// becomes before it starts that release's node.
+    pub fn launcher(&self) -> PathBuf {
+        self.current_link().join(LAUNCHER_EXE)
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +166,10 @@ mod tests {
             PathBuf::from("/srv/net/updates/state.json")
         );
         assert_eq!(
+            layout.lock_path(),
+            PathBuf::from("/srv/net/updates/launcher.lock")
+        );
+        assert_eq!(
             layout.release_key_path(),
             PathBuf::from("/srv/net/updates/keys/release.pub")
         );
@@ -147,6 +178,10 @@ mod tests {
             PathBuf::from(format!("/srv/net/updates/releases/{sha}/ducktape"))
         );
         assert_eq!(layout.exe(), PathBuf::from("/srv/net/current/ducktape"));
+        assert_eq!(
+            layout.launcher(),
+            PathBuf::from("/srv/net/current/ducktape-node-launcher")
+        );
         assert_eq!(
             Layout::link_target(sha),
             PathBuf::from(format!("updates/releases/{sha}"))

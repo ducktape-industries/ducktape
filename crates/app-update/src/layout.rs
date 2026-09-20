@@ -33,7 +33,11 @@ pub const NODE_CHANNEL: &str = "node";
 
 /// Which artifact a manifest publishes. The channel is inside the signed
 /// body, so a signature can never be replayed from one onto the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// On the wire (a [`crate::ReleaseKey`] names the kind it signs for) it is
+/// `"app"` or `"node"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Kind {
     /// `Ducktape.app` / the Linux app release directory.
     App,

@@ -37,6 +37,10 @@ pub enum Refusal {
     SequenceNotNewer,
     /// The manifest ships no artifact for this (os, arch).
     NoArtifactForPlatform,
+    /// The network designates a release the manifest does not name for this
+    /// (os, arch) — not published yet, published for another platform, or
+    /// superseded on the channel by a later publish.
+    DesignatedReleaseUnpublished,
 }
 
 impl fmt::Display for Refusal {
@@ -51,6 +55,7 @@ impl fmt::Display for Refusal {
             Refusal::Sha256IdMismatch => "sha256_id_mismatch",
             Refusal::SequenceNotNewer => "sequence_not_newer",
             Refusal::NoArtifactForPlatform => "no_artifact_for_platform",
+            Refusal::DesignatedReleaseUnpublished => "designated_release_unpublished",
         };
         f.write_str(reason)
     }

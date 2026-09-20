@@ -44,20 +44,22 @@ OUT="${OUT:?set OUT=<workspace>/guest — a guest is built per workspace}"
 # one, and re-fetching 250 MB per lap is not a rebuild), and never under /tmp,
 # which on this class of host is both memory-backed and periodically reaped.
 WORK="${WORK:-$HERE/target/guest-build}"
+# the guest builder, built in ducktape-sdk — same default as the Makefile's.
+GUEST_BUILDER="${GUEST_BUILDER:-$HERE/../ducktape-sdk/target/release/guest-builder}"
 # This build's OWN cargo target directory, never the one a host config shares
-# between worktrees. `guest-builder` bakes its platform root in at compile time,
-# so the binary sitting in a shared target belongs to whichever worktree built
-# it last: run it and you vendor a sibling's dependency set, or bake a sibling's
-# init as PID 1, and nothing in the output says which tree it came from. Under
-# $WORK it is warm on the second lap and wrong on none.
+# between worktrees: the init below is baked into the image as PID 1, and a
+# shared target hands you whichever worktree built it last with nothing in the
+# output saying so. Under $WORK it is warm on the second lap and wrong on none.
 export CARGO_TARGET_DIR="$WORK/cargo"
 
 if [[ -z "${ROOTFS_SETUP+x}" && "$(uname -s)" == "Linux" ]]; then
   ROOTFS_SETUP="$HERE/ops/guest-rust-tools.sh"
   RUST_CHANNEL="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$HERE/rust-toolchain.toml")"
   # the componentizer's release: `wasm-tools 1.x.y` ships with the
-  # `wit-component 0.x.y` guest-builder pins, and writes the same bytes.
-  WASM_TOOLS_VERSION="1.$(sed -n 's/^wit-component = "=0\.\([0-9.]*\)".*/\1/p' "$HERE/bin/guest-builder/Cargo.toml")"
+  # `wit-component 0.x.y` guest-builder pins, and writes the same bytes. The
+  # builder is another repository's crate now, so its pin is not readable from
+  # here — move this with it.
+  WASM_TOOLS_VERSION="${WASM_TOOLS_VERSION:-1.253.0}"
   set -- "$RUST_CHANNEL" "$WASM_TOOLS_VERSION"
 fi
 # The setup step is the ONLY one that needs to be root inside the tree, and a
@@ -218,7 +220,7 @@ if [[ -n "${ROOTFS_SETUP:-}" ]]; then
   # synthesis and the wasm32 patch stubs, and a second implementation of any of
   # those is one that drifts.
   say "vendoring the guest registry"
-  (cd "$HERE" && cargo run -q -p guest-builder -- \
+  (cd "$HERE" && "$GUEST_BUILDER" \
     vendor --out "$TREE$GUEST_VENDOR_ROOT" --directory "$GUEST_VENDOR_ROOT/vendor")
   # `/.cargo/config.toml`, not `$CARGO_HOME`'s: the rootfs is READ-ONLY, so a
   # run must point CARGO_HOME at somewhere writable for the package-cache lock,
