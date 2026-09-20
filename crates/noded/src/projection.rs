@@ -24,6 +24,119 @@ use crate::{
 /// one constant.
 pub use node::NOP_TARGET;
 
+fn log_provider_result_tail(height: u64, dispatches: &[host::DispatchRecord]) -> bool {
+    let mut observed = false;
+    for dispatch in dispatches {
+        match dispatch.module.as_str() {
+            "saga" => {
+                let Ok(saga::SagaMsg::OracleResult {
+                    saga_id, attempt, ..
+                }) = saga::decode_msg(&dispatch.payload)
+                else {
+                    continue;
+                };
+                observed = true;
+                tracing::debug!(
+                    target: "ducktape::provider",
+                    event = "provider_result_tail",
+                    phase = "result_canonical",
+                    saga = %saga_id,
+                    attempt,
+                    height,
+                    "provider result reached canonical module state"
+                );
+            }
+            "runs" => {
+                let Ok(dispatch::Delivery::Result(result)) =
+                    dispatch::decode_delivery(&dispatch.payload)
+                else {
+                    continue;
+                };
+                observed = true;
+                tracing::debug!(
+                    target: "ducktape::provider",
+                    event = "provider_result_tail",
+                    phase = "runs_published",
+                    dispatch = %result.dispatch_id,
+                    height,
+                    "Runs published the provider result"
+                );
+            }
+            "attribution" => match attribution::decode_msg(&dispatch.payload) {
+                Ok(attribution::AttributionMsg::Attribute { object, .. })
+                    if object.kind == "message" =>
+                {
+                    let Some(dispatch_id) = object.object.strip_prefix("agent/") else {
+                        continue;
+                    };
+                    let dispatch_id = dispatch_id.split('/').next().unwrap_or(dispatch_id);
+                    observed = true;
+                    tracing::debug!(
+                        target: "ducktape::provider",
+                        event = "provider_result_tail",
+                        phase = "attribution_published",
+                        dispatch = %dispatch_id,
+                        message = %object.object,
+                        height,
+                        "attribution published the message relation"
+                    );
+                }
+                Ok(attribution::AttributionMsg::AttributeBatch { updates }) => {
+                    for update in updates {
+                        if update.object.kind != "message" {
+                            continue;
+                        }
+                        let Some(dispatch_id) = update.object.object.strip_prefix("agent/") else {
+                            continue;
+                        };
+                        let dispatch_id = dispatch_id.split('/').next().unwrap_or(dispatch_id);
+                        observed = true;
+                        tracing::debug!(
+                            target: "ducktape::provider",
+                            event = "provider_result_tail",
+                            phase = "attribution_published",
+                            dispatch = %dispatch_id,
+                            message = %update.object.object,
+                            height,
+                            "attribution published the message relation"
+                        );
+                    }
+                }
+                Ok(attribution::AttributionMsg::Attribute { .. })
+                | Ok(attribution::AttributionMsg::Subscribe {})
+                | Err(_) => {}
+            },
+            "chat" => {
+                let Ok(chat::ChatMsg::PostMessage {
+                    channel_id,
+                    message_id,
+                    ..
+                }) = chat::decode_msg(&dispatch.payload)
+                else {
+                    continue;
+                };
+                let Some(dispatch_id) = message_id.strip_prefix("agent/") else {
+                    continue;
+                };
+                let dispatch_id = dispatch_id.split('/').next().unwrap_or(dispatch_id);
+                observed = true;
+                tracing::debug!(
+                    target: "ducktape::provider",
+                    event = "provider_result_tail",
+                    phase = "chat_message_published",
+                    dispatch = %dispatch_id,
+                    channel = %channel_id,
+                    message = %message_id,
+                    height,
+                    "Chat committed the provider message"
+                );
+            }
+            _ => {}
+        }
+    }
+    observed
+}
+
 /// build one explorer row op ([`RootOp`]) from a block member's decoded parts —
 /// THE RootOp assembly seam, shared by the live drain, the boot fold, and (as
 /// later tasks adopt it) the noded submit lane and simnode, so every writer
@@ -210,6 +323,7 @@ pub fn apply_block_to_index(
     dispatches: &[host::DispatchRecord],
     host: &host::Host,
 ) {
+    let provider_tail_observed = log_provider_result_tail(height, dispatches);
     // a poisoned store refuses every write until an operator rebuilds it, and
     // the ONE error below named that remedy when it happened. re-logging it
     // per block is a log bomb (8k lines in an hour on a real network) that
@@ -237,15 +351,25 @@ pub fn apply_block_to_index(
         record,
         ..index_block_ops(height, consensus_time, dispatches)
     };
-    if let Err(err) = index.apply_block(&ops) {
-        tracing::error!(
-            target: "ducktape::consensus",
-            event = "node_index_poisoned",
+    match index.apply_block(&ops) {
+        Ok(()) if provider_tail_observed => tracing::debug!(
+            target: "ducktape::provider",
+            event = "provider_result_tail",
+            phase = "index_published",
             height,
-            error = %err,
-            "module index apply failed — the app's views are now STALE; wipe \
-             <storage>/index to rebuild"
-        );
+            "derived index published the committed block"
+        ),
+        Ok(()) => {}
+        Err(err) => {
+            tracing::error!(
+                target: "ducktape::consensus",
+                event = "node_index_poisoned",
+                height,
+                error = %err,
+                "module index apply failed — the app's views are now STALE; wipe \
+                 <storage>/index to rebuild"
+            );
+        }
     }
 }
 
