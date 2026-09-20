@@ -81,8 +81,8 @@ fn run_refuses_a_binary_whose_module_world_is_not_the_founding_one() {
     let err = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
         err.contains(&format!("refusing to boot {chain_id}"))
-            && err.contains("founded by fc4ad8d5a")
-            && err.contains("module world differs"),
+            && err.contains("founded here by fc4ad8d5a")
+            && err.contains("module world is not the one this workspace holds"),
         "run stderr: {err:?}"
     );
 }
@@ -245,22 +245,23 @@ fn one_workspace_needs_no_selector_in_any_family() {
     let home = tempfile::tempdir().expect("tempdir");
     let chain_id = init(home.path(), "solonet");
 
-    // `service` reads grants off disk and renders an unreachable node calmly,
-    // so this answers with no node running at all.
+    // `service` cannot claim the catalog is empty when the node never
+    // answered; it refuses with the unread reason instead.
     let out = ducktape_raw(home.path(), &["service", "list"]);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
-        out.status.success(),
-        "service list must infer the lone workspace:\n{stderr}"
+        !out.status.success(),
+        "service list must refuse an unread catalog:\n{stderr}"
     );
     assert!(
         !stderr.contains("node.toml/"),
         "the workspace DIR was resolved, not its node.toml path: {stderr}"
     );
     assert!(
-        stdout.contains("none enabled") || stdout.contains("KIND"),
-        "service list rendered nothing: {stdout:?} {stderr:?}"
+        stderr.contains("this workspace holds no grants on disk")
+            && stderr.contains("what is SIGNALING could not be read")
+            && stderr.contains("the node is not running"),
+        "service list names the unread catalog: {stderr:?}"
     );
 
     // and the KIND filter every other service verb takes is accepted here too.
