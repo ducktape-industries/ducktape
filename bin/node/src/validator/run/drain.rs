@@ -9,6 +9,7 @@ use commonware_utils::ordered::Set;
 use consensus::ContentStore;
 use recovery::Manifest;
 use sdk::Msg;
+use crate::wire::{runs, tasks};
 use tasks::{TaskQuery, TaskReply, decode_task_reply, encode_task_query};
 
 use super::ValidatorRuntime;
@@ -1903,6 +1904,7 @@ fn conversation_input_crank(height: u64, due: Option<u64>) -> Option<Msg> {
 #[cfg(test)]
 mod conversation_crank_tests {
     use super::conversation_input_crank;
+    use crate::wire::runs;
 
     #[test]
     fn no_timer_or_a_future_consensus_deadline_does_not_submit() {

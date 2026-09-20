@@ -45,10 +45,10 @@ async fn apply(host: &mut Host, height: &mut u64, origin: Origin, msg: Msg) -> V
     events
 }
 
-fn runs_msg(message: runs::RunsMsg) -> Msg {
+fn runs_msg(message: crate::runs::RunsMsg) -> Msg {
     Msg {
         target: "runs".into(),
-        payload: runs::encode_msg(&message),
+        payload: crate::runs::encode_msg(&message),
     }
 }
 
@@ -75,13 +75,13 @@ async fn read_conversation(host: &Host, id: &str) -> ConversationView {
     let reply = host
         .query(
             "runs",
-            &runs::encode_query(&runs::RunsQuery::Conversation {
+            &crate::runs::encode_query(&crate::runs::RunsQuery::Conversation {
                 conversation_id: id.into(),
             }),
         )
         .await
         .unwrap();
-    let runs::RunsReply::Conversation(Some(view)) = runs::decode_reply(&reply).unwrap() else {
+    let crate::runs::RunsReply::Conversation(Some(view)) = crate::runs::decode_reply(&reply).unwrap() else {
         panic!("the real committed conversation must exist");
     };
     view
@@ -117,7 +117,7 @@ async fn provision_native(
         host,
         height,
         Origin::External(WORKER_NODE.to_vec()),
-        runs_msg(runs::RunsMsg::OpenAgentSession {
+        runs_msg(crate::runs::RunsMsg::OpenAgentSession {
             run_id: execution.run_id.clone(),
             attempt: execution.attempt,
             session_key: signer.public_key().to_vec(),
@@ -170,18 +170,18 @@ fn real_runs_queue_and_explicit_retry_cross_the_native_host_with_one_logical_tur
             Msg { target:"identity".into(), payload:identity::encode_msg(&identity::IdentityMsg::Create {
                 name:"Alice".into(), scheme:identity::KeyScheme::Ed25519,
             }) },
-            Msg { target:"agent".into(), payload:agent::encode_msg(&agent::AgentMsg::Provision {
-                request_id:RESIDENT.into(), name:"Resident".into(), program:runs::model_program(RESIDENT),
+            Msg { target:"agent".into(), payload:crate::agent::encode_msg(&crate::agent::AgentMsg::Provision {
+                request_id:RESIDENT.into(), name:"Resident".into(), program:crate::runs::model_program(RESIDENT),
             }) },
-            runs_msg(runs::RunsMsg::ConfigureModel { operation:runs::ModelMsg::RegisterModel {
+            runs_msg(crate::runs::RunsMsg::ConfigureModel { operation:crate::runs::ModelMsg::RegisterModel {
                 account:2, agent_id:RESIDENT.into(), display_name:"Resident".into(), capability:CAPABILITY.into(), recipe_hash:None, skills:None,
             } }),
-            runs_msg(runs::RunsMsg::ConfigureConversation {
-                conversation_id:CONVERSATION.into(), agent_id:RESIDENT.into(), source:runs::ConversationSource::Detached,
+            runs_msg(crate::runs::RunsMsg::ConfigureConversation {
+                conversation_id:CONVERSATION.into(), agent_id:RESIDENT.into(), source:crate::runs::ConversationSource::Detached,
                 history_prefix:"/resident/native-boundary/history".into(), session_path:"sessions/resident.jsonl".into(), packages:vec![],
             }),
-            runs_msg(runs::RunsMsg::AppendConversationInput {
-                conversation_id:CONVERSATION.into(), operation_id:"first-input".into(), input:runs::ConversationInput::Control {content:"hello".into()},
+            runs_msg(crate::runs::RunsMsg::AppendConversationInput {
+                conversation_id:CONVERSATION.into(), operation_id:"first-input".into(), input:crate::runs::ConversationInput::Control {content:"hello".into()},
             }),
         ];
         for msg in setup { apply(&mut host, &mut height, controller(), msg).await; }
@@ -190,7 +190,7 @@ fn real_runs_queue_and_explicit_retry_cross_the_native_host_with_one_logical_tur
                 capabilities:vec![CAPABILITY.into()], resources:Default::default(),
             }),
         }).await;
-        let first = worker_request(apply(&mut host, &mut height, controller(), runs_msg(runs::RunsMsg::ActivateConversation {
+        let first = worker_request(apply(&mut host, &mut height, controller(), runs_msg(crate::runs::RunsMsg::ActivateConversation {
             conversation_id:CONVERSATION.into(), operation_id:"activate".into(), active:true,
         })).await);
         let first_spec = workspace(&first);
@@ -219,7 +219,7 @@ fn real_runs_queue_and_explicit_retry_cross_the_native_host_with_one_logical_tur
         let ended = conversation(&host).await;
         assert_eq!(ended.completed_cursor, 0);
         assert_eq!(ended.active_turn.as_ref().unwrap().phase, ConversationTurnPhase::Draining);
-        let retry = worker_request(apply(&mut host, &mut height, controller(), runs_msg(runs::RunsMsg::RetryConversationTurn {
+        let retry = worker_request(apply(&mut host, &mut height, controller(), runs_msg(crate::runs::RunsMsg::RetryConversationTurn {
             conversation_id:CONVERSATION.into(), operation_id:"explicit-retry".into(),
         })).await);
         let retry_spec = workspace(&retry);

@@ -6,6 +6,8 @@
 #[allow(dead_code)]
 #[path = "../src/chief_cli/plan.rs"]
 mod plan;
+#[path = "../src/wire.rs"]
+mod wire;
 
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
@@ -16,6 +18,7 @@ use host::{BlockContext, Host};
 use noded::testkit::committed_module;
 use sdk::{Msg, Origin};
 use sha2::{Digest as _, Sha256};
+use wire::{agent, chat, pages, runs, tasks};
 
 /// this composition's identity chain id — and the value the `runs` guest reads
 /// out of its genesis `__config` record.

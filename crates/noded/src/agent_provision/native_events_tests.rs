@@ -3,7 +3,6 @@ use super::*;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::routing::{get, post};
-use runs_wire as runs;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 #[path = "native_reports_tests.rs"]
@@ -11,10 +10,10 @@ mod semantic_reports;
 
 struct Fixture {
     view: tokio::sync::Mutex<ConversationView>,
-    events: tokio::sync::Mutex<Vec<runs::ConversationEvent>>,
+    events: tokio::sync::Mutex<Vec<crate::runs::ConversationEvent>>,
     pages: tokio::sync::Mutex<Vec<(u64, u64)>>,
-    worker: tokio::sync::Mutex<Option<runs::WorkerControls>>,
-    submissions: tokio::sync::Mutex<Vec<runs::RunsMsg>>,
+    worker: tokio::sync::Mutex<Option<crate::runs::WorkerControls>>,
+    submissions: tokio::sync::Mutex<Vec<crate::runs::RunsMsg>>,
     signer: Vec<u8>,
     lease_attempt: AtomicU32,
     queries: AtomicU32,
@@ -77,35 +76,35 @@ async fn query(State(fixture): State<Arc<Fixture>>, Json(body): Json<Value>) -> 
     fixture.queries.fetch_add(1, Ordering::SeqCst);
     let bytes = serde_json::to_vec(&body["query"]).unwrap();
     let reply = match body["target"].as_str().unwrap() {
-        "runs" => match runs::decode_query(&bytes).unwrap() {
-            runs::RunsQuery::Conversation { conversation_id } => {
+        "runs" => match crate::runs::decode_query(&bytes).unwrap() {
+            crate::runs::RunsQuery::Conversation { conversation_id } => {
                 assert_eq!(conversation_id, "resident");
                 let view = fixture.view.lock().await.clone();
                 fixture.queried.notify_one();
-                serde_json::to_value(runs::RunsReply::Conversation(Some(view))).unwrap()
+                serde_json::to_value(crate::runs::RunsReply::Conversation(Some(view))).unwrap()
             }
-            runs::RunsQuery::WorkerControls { run_id } => {
+            crate::runs::RunsQuery::WorkerControls { run_id } => {
                 assert_eq!(run_id, RUN_ID);
                 let submitted = fixture
                     .submissions
                     .lock()
                     .await
                     .iter()
-                    .any(|message| matches!(message, runs::RunsMsg::ReportJob { .. }));
+                    .any(|message| matches!(message, crate::runs::RunsMsg::ReportJob { .. }));
                 if submitted {
                     fixture.report_read.notify_one();
                 }
-                serde_json::to_value(runs::RunsReply::WorkerControls(
+                serde_json::to_value(crate::runs::RunsReply::WorkerControls(
                     fixture.worker.lock().await.clone(),
                 ))
                 .unwrap()
             }
-            runs::RunsQuery::AgentSessions => {
-                serde_json::to_value(runs::RunsReply::AgentSessions(vec![runs::AgentSession {
+            crate::runs::RunsQuery::AgentSessions => {
+                serde_json::to_value(crate::runs::RunsReply::AgentSessions(vec![crate::runs::AgentSession {
                     run_id: RUN_ID.into(),
                     agent_id: "resident".into(),
                     session_key: fixture.signer.clone(),
-                    lease: runs::ExecutionLease {
+                    lease: crate::runs::ExecutionLease {
                         holder: vec![7; 32],
                         attempt: 1,
                     },
@@ -114,7 +113,7 @@ async fn query(State(fixture): State<Arc<Fixture>>, Json(body): Json<Value>) -> 
                 }]))
                 .unwrap()
             }
-            runs::RunsQuery::ConversationEvents {
+            crate::runs::RunsQuery::ConversationEvents {
                 conversation_id,
                 from,
                 limit,
@@ -129,7 +128,7 @@ async fn query(State(fixture): State<Arc<Fixture>>, Json(body): Json<Value>) -> 
                     .filter(|event| event.sequence >= from && event.sequence < from + limit)
                     .cloned()
                     .collect();
-                serde_json::to_value(runs::RunsReply::ConversationEvents(events)).unwrap()
+                serde_json::to_value(crate::runs::RunsReply::ConversationEvents(events)).unwrap()
             }
             other => panic!("unexpected Runs query: {other:?}"),
         },
@@ -138,12 +137,12 @@ async fn query(State(fixture): State<Arc<Fixture>>, Json(body): Json<Value>) -> 
                 dispatch::decode_query(&bytes).unwrap(),
                 dispatch::DispatchQuery::Dispatch {
                     receiver: "runs".into(),
-                    dispatch_id: runs::dispatch_id_for(RUN_ID),
+                    dispatch_id: crate::runs::dispatch_id_for(RUN_ID),
                 }
             );
             serde_json::to_value(dispatch::DispatchReply::Dispatch(Some(
                 dispatch::DispatchView {
-                    dispatch_id: runs::dispatch_id_for(RUN_ID),
+                    dispatch_id: crate::runs::dispatch_id_for(RUN_ID),
                     recipe_id: "resident".into(),
                     receiver: "runs".into(),
                     cause: sdk::Cause::Direct,
@@ -196,11 +195,11 @@ async fn submit_frame(
 ) -> Json<Value> {
     let (origin, message) = node::decode_frame(&bytes).unwrap();
     assert_eq!(origin, sdk::Origin::External(fixture.signer.clone()));
-    let message = runs::decode_msg(&message.payload).unwrap();
+    let message = crate::runs::decode_msg(&message.payload).unwrap();
     let mut worker = fixture.worker.lock().await;
     let worker = worker.as_mut().unwrap();
     match &message {
-        runs::RunsMsg::AcknowledgeJobControl {
+        crate::runs::RunsMsg::AcknowledgeJobControl {
             run_id,
             attempt,
             operation_id,
@@ -213,13 +212,13 @@ async fn submit_frame(
                 .find(|control| &control.operation_id == operation_id)
                 .unwrap()
                 .acknowledgements
-                .push(tasks::ControlAcknowledgement {
-                    worker: tasks::Party::Module("runs".into()),
+                .push(crate::tasks::ControlAcknowledgement {
+                    worker: crate::tasks::Party::Module("runs".into()),
                     attempt: worker.job_attempt,
                     height: 2,
                 });
         }
-        runs::RunsMsg::SettleJobCancellation {
+        crate::runs::RunsMsg::SettleJobCancellation {
             run_id,
             attempt,
             operation_id,
@@ -239,13 +238,13 @@ async fn submit_frame(
                     .any(|ack| ack.attempt == worker.job_attempt),
                 "settlement must follow committed ACK"
             );
-            worker.job_status = tasks::JobStatus::Cancelled;
-            worker.result = Some(tasks::JobResult {
+            worker.job_status = crate::tasks::JobStatus::Cancelled;
+            worker.result = Some(crate::tasks::JobResult {
                 ok: false,
                 payload: payload.clone(),
             });
         }
-        runs::RunsMsg::ReportJob {
+        crate::runs::RunsMsg::ReportJob {
             run_id, attempt, ..
         } => {
             assert_eq!(run_id, RUN_ID);
@@ -253,7 +252,7 @@ async fn submit_frame(
         }
         other => panic!("unexpected signed native message: {other:?}"),
     }
-    let report = matches!(message, runs::RunsMsg::ReportJob { .. });
+    let report = matches!(message, crate::runs::RunsMsg::ReportJob { .. });
     fixture.submissions.lock().await.push(message);
     if report {
         fixture.report_submitted.notify_one();
@@ -351,11 +350,11 @@ async fn frozen_event_query_pages_the_exact_active_cursor_range_with_authenticat
     let mut configuration = view();
     configuration.active_turn.as_mut().unwrap().through_cursor = 65;
     *node.fixture.events.lock().await = (1..=65)
-        .map(|sequence| runs::ConversationEvent {
+        .map(|sequence| crate::runs::ConversationEvent {
             sequence,
             operation_id: format!("operation-{sequence}"),
             actor: sdk::Origin::Module("tasks".into()),
-            input: runs::ConversationInput::Event {
+            input: crate::runs::ConversationInput::Event {
                 kind: "report".into(),
                 content: json!({"sequence":sequence}),
             },
@@ -433,7 +432,7 @@ async fn cancellation_is_acknowledged_then_settled_only_from_an_accepted_native_
     let signer = ed25519::PrivateKey::from_seed(1);
     let node = TestNode::start(&signer).await;
     let mut worker = worker_controls_fixture("job-a", "cancel-1", "");
-    worker.controls[0].input = tasks::JobControlInput::Cancel;
+    worker.controls[0].input = crate::tasks::JobControlInput::Cancel;
     *node.fixture.worker.lock().await = Some(worker);
     let native = native(root.path());
     let state = ActionState {
@@ -471,18 +470,18 @@ async fn cancellation_is_acknowledged_then_settled_only_from_an_accepted_native_
     let submissions = node.fixture.submissions.lock().await;
     assert!(matches!(
         submissions[0],
-        runs::RunsMsg::AcknowledgeJobControl { .. }
+        crate::runs::RunsMsg::AcknowledgeJobControl { .. }
     ));
     assert!(matches!(
         submissions[1],
-        runs::RunsMsg::SettleJobCancellation { .. }
+        crate::runs::RunsMsg::SettleJobCancellation { .. }
     ));
     assert_eq!(submissions.len(), 2);
     drop(submissions);
     let worker = node.fixture.worker.lock().await;
     assert_eq!(
         worker.as_ref().unwrap().job_status,
-        tasks::JobStatus::Cancelled
+        crate::tasks::JobStatus::Cancelled
     );
     assert!(!worker.as_ref().unwrap().result.as_ref().unwrap().ok);
     drop(worker);
@@ -574,7 +573,7 @@ async fn an_oversized_checkpoint_leaves_the_accepted_head_and_cursor_untouched()
     *node.fixture.view.lock().await = accepted.clone();
     let mut native = native(root.path());
     native.configuration = accepted.clone();
-    native.context.turn_id = runs::conversation_turn_id(1, 2);
+    native.context.turn_id = crate::runs::conversation_turn_id(1, 2);
     native.context.revision = 8;
     *node.fixture.worker.lock().await =
         Some(worker_controls_fixture("job-a", "steer-1", "focus here"));

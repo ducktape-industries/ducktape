@@ -1,7 +1,15 @@
 //! Pure, network-persisted installation identity and the explicit initializer.
 use std::collections::BTreeMap;
 
+#[cfg(noded_wire_contracts)]
+use crate::module_contracts::{agent, runs};
+#[cfg(not(noded_wire_contracts))]
+use crate::wire::{agent, runs};
 use agent::{Continuation, Decode, Predicate, Program, Step, Value};
+#[cfg(noded_wire_contracts)]
+type ConversationPackage = crate::module_contracts::runs::ConversationPackage;
+#[cfg(not(noded_wire_contracts))]
+type ConversationPackage = run_envelope::ConversationPackage;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -232,7 +240,7 @@ fn equals(left: Value, right: Value) -> Predicate {
 /// Only Agent's explicit initialization attribution enters this prefix. Every
 /// call waits for its actual outcome. The final activation uses a fixed Runs
 /// operation identity, so a later initialization never undoes a human pause.
-pub(crate) fn program(plan: &Plan, package: &run_envelope::ConversationPackage) -> (Program, u64) {
+pub(crate) fn program(plan: &Plan, package: &ConversationPackage) -> (Program, u64) {
     let mut steps = vec![Step::Branch {
         test: Predicate::All(vec![
             equals(

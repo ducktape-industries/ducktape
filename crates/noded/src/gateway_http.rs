@@ -27,6 +27,66 @@ use serde::{Deserialize, Serialize};
 use crate::gateway_ws_token::WsTokenStore;
 use crate::{NodeCommand, NodeHandle, error_response};
 
+mod resolve_contract {
+    use serde::{Deserialize, Serialize};
+
+    // Golden bytes were produced by gateway-wire from ducktape-sdk
+    // 736865710dcfa7c56f9834747287881c1c25d45d. This local contract carries
+    // only the account resolution query and reply used by this HTTP surface.
+    #[cfg(test)]
+    const QUERY_GOLDEN: &[u8] = br#"{"resolve":{"name":{"handle":"alice"}}}"#;
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    enum Query {
+        Resolve { name: DuckDnsName },
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    enum Reply {
+        Resolved(Option<ResolvedAccount>),
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    struct DuckDnsName {
+        handle: String,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    struct ResolvedAccount {
+        account_id: u64,
+    }
+
+    pub(super) fn query(handle: &str) -> Vec<u8> {
+        sdk::wire::encode(&Query::Resolve {
+            name: DuckDnsName {
+                handle: handle.into(),
+            },
+        })
+    }
+
+    pub(super) fn account_id(bytes: &[u8]) -> Result<Option<u64>, String> {
+        match sdk::wire::decode::<Reply>(bytes)? {
+            Reply::Resolved(account) => Ok(account.map(|account| account.account_id)),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{QUERY_GOLDEN, account_id, query};
+
+        #[test]
+        fn resolve_contract_matches_golden_and_refuses_other_variants() {
+            assert_eq!(query("alice"), QUERY_GOLDEN);
+            assert_eq!(account_id(br#"{"resolved":{"account_id":7}}"#), Ok(Some(7)));
+            assert_eq!(account_id(br#"{"resolved":null}"#), Ok(None));
+            assert!(account_id(br#"{"registrations":[]}"#).is_err());
+            assert!(account_id(br#"{"resolved":{"account_id":7,"extra":true}}"#).is_ok());
+        }
+    }
+}
+
 /// One invocation through a globally signed gateway route. The full node drains
 /// this lane through `Service::Gateway`; the embedded daemon leaves it unwired
 /// because it has no authenticated network transport. `publisher_node` and the
@@ -796,24 +856,12 @@ async fn resolve_duck_authority(
     };
     name.validate().map_err(GatewayFailure::Invalid)?;
 
-    let bytes = gateway_query(
-        &handle.cmds,
-        "gateway",
-        gateway::encode_query(&gateway::GatewayQuery::Resolve {
-            name: gateway::DuckDnsName {
-                handle: alias.to_string(),
-            },
-        }),
-    )
-    .await?;
-    match gateway::decode_reply(&bytes) {
-        Ok(gateway::GatewayReply::Resolved(Some(account))) => Ok((account.account_id, name)),
-        Ok(gateway::GatewayReply::Resolved(None)) => Err(GatewayFailure::NotFound(format!(
+    let bytes = gateway_query(&handle.cmds, "gateway", resolve_contract::query(alias)).await?;
+    match resolve_contract::account_id(&bytes) {
+        Ok(Some(account_id)) => Ok((account_id, name)),
+        Ok(None) => Err(GatewayFailure::NotFound(format!(
             "{alias}.duck is not registered"
         ))),
-        Ok(_) => Err(GatewayFailure::Unavailable(
-            "gateway returned an unexpected reply".into(),
-        )),
         Err(error) => Err(GatewayFailure::Unavailable(error)),
     }
 }

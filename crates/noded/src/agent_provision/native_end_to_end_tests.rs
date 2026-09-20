@@ -290,11 +290,11 @@ impl Network {
             .unwrap();
         sdk::wire::decode(&bytes).unwrap()
     }
-    async fn conversation(&self, id: &str) -> runs::ConversationView {
+    async fn conversation(&self, id: &str) -> crate::runs::ConversationView {
         let value = self
             .query(
                 "runs",
-                runs::RunsQuery::Conversation {
+                crate::runs::RunsQuery::Conversation {
                     conversation_id: id.into(),
                 },
             )
@@ -305,7 +305,7 @@ impl Network {
         let value = self
             .query(
                 "pages",
-                pages::PageQuery::Records {
+                crate::pages::PageQuery::Records {
                     page_id: plan.board_page_id.clone(),
                     after: None,
                     limit: 32,
@@ -330,7 +330,7 @@ impl Network {
         let row = self
             .query(
                 "pages",
-                pages::PageQuery::RecordState {
+                crate::pages::PageQuery::RecordState {
                     page_id: plan.board_page_id.clone(),
                     key: format!("chief-{id}-part-0"),
                 },
@@ -346,11 +346,11 @@ impl Network {
         );
         serde_json::from_slice(&STANDARD.decode(chunk["bytes"].as_str().unwrap()).unwrap()).unwrap()
     }
-    async fn worker_controls(&self, child: &Child) -> runs::WorkerControls {
+    async fn worker_controls(&self, child: &Child) -> crate::runs::WorkerControls {
         let value = self
             .query(
                 "runs",
-                runs::RunsQuery::WorkerControls {
+                crate::runs::RunsQuery::WorkerControls {
                     run_id: child.spec.agent.as_ref().unwrap().run_id.clone(),
                 },
             )
@@ -360,10 +360,10 @@ impl Network {
     async fn session_actions(&self, child: &Child) -> u32 {
         let bytes = self
             .host
-            .query("runs", &runs::encode_query(&runs::RunsQuery::AgentSessions))
+            .query("runs", &crate::runs::encode_query(&crate::runs::RunsQuery::AgentSessions))
             .await
             .unwrap();
-        let runs::RunsReply::AgentSessions(sessions) = runs::decode_reply(&bytes).unwrap() else {
+        let crate::runs::RunsReply::AgentSessions(sessions) = crate::runs::decode_reply(&bytes).unwrap() else {
             panic!("real AgentSessions");
         };
         sessions
@@ -375,7 +375,7 @@ impl Network {
     async fn revision(&self, plan: &plan::Plan) -> u64 {
         self.query(
             "pages",
-            pages::PageQuery::RecordCollection {
+            crate::pages::PageQuery::RecordCollection {
                 page_id: plan.board_page_id.clone(),
             },
         )
@@ -756,10 +756,10 @@ async fn bootstrap(network: &mut Network, repo: &Path) -> plan::Plan {
         .submit(
             1,
             "agent",
-            agent::AgentMsg::Provision {
+            crate::agent::AgentMsg::Provision {
                 request_id: "worker".into(),
                 name: "Independent worker".into(),
-                program: runs::model_program("worker"),
+                program: crate::runs::model_program("worker"),
             },
         )
         .await;
@@ -767,8 +767,8 @@ async fn bootstrap(network: &mut Network, repo: &Path) -> plan::Plan {
         .submit(
             1,
             "runs",
-            runs::RunsMsg::ConfigureModel {
-                operation: runs::ModelMsg::RegisterModel {
+            crate::runs::RunsMsg::ConfigureModel {
+                operation: crate::runs::ModelMsg::RegisterModel {
                     account: 3,
                     agent_id: "worker".into(),
                     display_name: "Independent worker".into(),
@@ -780,7 +780,7 @@ async fn bootstrap(network: &mut Network, repo: &Path) -> plan::Plan {
         )
         .await;
     network
-        .submit(1, "runs", runs::RunsMsg::EnableJobWorker { enabled: true })
+        .submit(1, "runs", crate::runs::RunsMsg::EnableJobWorker { enabled: true })
         .await;
     let plan = plan::Plan::new(1, "connected", None, "worker").unwrap();
     let prefix = format!("{}/package", plan.root());
@@ -827,7 +827,7 @@ async fn bootstrap(network: &mut Network, repo: &Path) -> plan::Plan {
         )
         .await;
     let refs = network.query("files", files::FilesQuery::Refs {}).await;
-    let package = run_envelope::ConversationPackage {
+    let package = crate::runs::ConversationPackage {
         name: "chief".into(),
         source_prefix: prefix,
         source_snapshot: refs["refs"]["head"].as_str().unwrap().into(),
@@ -837,7 +837,7 @@ async fn bootstrap(network: &mut Network, repo: &Path) -> plan::Plan {
         .submit(
             1,
             "agent",
-            agent::AgentMsg::Provision {
+            crate::agent::AgentMsg::Provision {
                 request_id: plan.namespace.clone(),
                 name: "Chief".into(),
                 program,
@@ -848,7 +848,7 @@ async fn bootstrap(network: &mut Network, repo: &Path) -> plan::Plan {
         .submit(
             1,
             "agent",
-            agent::AgentMsg::Initialize {
+            crate::agent::AgentMsg::Initialize {
                 account: 4,
                 request_id: "connected-initialize".into(),
             },
@@ -903,10 +903,10 @@ async fn actual_chief_and_independent_native_worker_share_one_real_host() {
             network.height,
             &message(
                 "chat",
-                chat::ChatMsg::PostMessage {
+                crate::chat::ChatMsg::PostMessage {
                     channel_id: plan.channel_id.clone(),
                     message_id: id.into(),
-                    blocks: vec![chat::Block::paragraph(text)],
+                    blocks: vec![crate::chat::Block::paragraph(text)],
                     thread: None,
                 },
             ),
@@ -998,10 +998,10 @@ async fn actual_chief_and_independent_native_worker_share_one_real_host() {
         .submit(
             2,
             "chat",
-            chat::ChatMsg::EditMessage {
+            crate::chat::ChatMsg::EditMessage {
                 channel_id: plan.channel_id.clone(),
                 seq: 2,
-                blocks: vec![chat::Block::paragraph("MUTATED AFTER FROZEN ADMISSION")],
+                blocks: vec![crate::chat::Block::paragraph("MUTATED AFTER FROZEN ADMISSION")],
                 base_rev: None,
             },
         )

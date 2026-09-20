@@ -698,3 +698,138 @@ fn init_refuses_an_empty_module_directory() {
     assert!(error.contains("holds no module components"), "{error}");
     assert!(error.contains(empty.to_str().unwrap()), "{error}");
 }
+
+/// Supervisor discovery is exact: a loaded fake unit whose argv names another
+/// workspace cannot be controlled, while the matching unit can be stopped and
+/// then disabled for leave. The fake commands never start a process.
+#[test]
+#[cfg(unix)]
+fn stop_and_leave_control_only_the_exact_fake_systemd_workspace() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let first = init(home.path(), "first");
+    let second = init(home.path(), "second");
+    let second_workspace = home.path().join(&second);
+    let second_config = second_workspace.join("node.toml");
+    let identity = std::fs::read(second_workspace.join("identity.key")).expect("identity");
+    let payload = b"workspace data stays here";
+    std::fs::write(second_workspace.join("payload.bin"), payload).expect("payload");
+
+    let fake_bin = tempfile::tempdir().expect("fake bin dir");
+    let fake_log = home.path().join("supervisor.log");
+    let systemd_escape = fake_bin.path().join("systemd-escape");
+    std::fs::write(&systemd_escape, "#!/bin/sh\nprintf '%s\\n' \"$1\"\n").expect("systemd-escape");
+    std::fs::set_permissions(&systemd_escape, std::fs::Permissions::from_mode(0o755))
+        .expect("systemd-escape executable");
+    let systemctl = fake_bin.path().join("systemctl");
+    std::fs::write(
+        &systemctl,
+        "#!/bin/sh\n\
+if [ \"$1\" = \"--user\" ]; then\n\
+  if [ \"$FAKE_USER\" != \"1\" ]; then exit 1; fi\n\
+  shift\n\
+fi\n\
+if [ \"$1\" = \"show\" ]; then\n\
+  printf 'LoadState=loaded\\n'\n\
+  printf 'ExecStart={ path=/fake/launcher ; argv[]=/fake/launcher run --workspace %s --config %s ; ignore_errors=no }\\n' \"$FAKE_WORKSPACE\" \"$FAKE_CONFIG\"\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"stop\" ] || [ \"$1\" = \"disable\" ]; then\n\
+  printf '%s\\n' \"$*\" >> \"$FAKE_LOG\"\n\
+  exit 0\n\
+fi\n\
+exit 1\n",
+    )
+    .expect("systemctl");
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
+        .expect("systemctl executable");
+
+    let run = |verb: &str, selected: &Path, fake_user: &str| {
+        common::ducktape()
+            .args(["node", verb, "--config"])
+            .arg(selected)
+            .env("DUCKTAPE_HOME", home.path())
+            .env("HOME", home.path())
+            .env("PATH", fake_bin.path())
+            .env("FAKE_WORKSPACE", &second_workspace)
+            .env("FAKE_CONFIG", &second_config)
+            .env("FAKE_LOG", &fake_log)
+            .env("FAKE_USER", fake_user)
+            .output()
+            .expect("run lifecycle command")
+    };
+
+    let refused = run("stop", &home.path().join(&first).join("node.toml"), "0");
+    assert!(
+        !refused.status.success(),
+        "a mismatched unit was controlled"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("no supported supervisor"),
+        "refusal: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!fake_log.exists(), "discovery must not issue a stop");
+
+    let ambiguous = run("stop", &second_config, "1");
+    assert!(!ambiguous.status.success(), "ambiguous ownership was controlled");
+    assert!(
+        String::from_utf8_lossy(&ambiguous.stderr).contains("ambiguous supervisor ownership"),
+        "ambiguity: {}",
+        String::from_utf8_lossy(&ambiguous.stderr)
+    );
+    assert!(!fake_log.exists(), "ambiguous discovery must not issue a stop");
+
+    let stopped = run("stop", &second_config, "0");
+    assert!(
+        stopped.status.success(),
+        "stop failed:\n{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(second_workspace.is_dir(), "stop preserves the workspace");
+    assert!(
+        String::from_utf8_lossy(&std::fs::read(&fake_log).expect("stop log"))
+            .contains("stop ducktape-node@"),
+        "stop action was not sent to the exact unit"
+    );
+
+    let left = run("leave", &second_config, "0");
+    assert!(
+        left.status.success(),
+        "leave failed:\n{}",
+        String::from_utf8_lossy(&left.stderr)
+    );
+    assert!(
+        !second_workspace.exists(),
+        "leave unregisters by moving the directory"
+    );
+    let archive_root = home.path().join(workspace_config::ARCHIVED_WORKSPACES_DIR);
+    let archive = std::fs::read_dir(&archive_root)
+        .expect("archive root")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("archived workspace");
+    assert_eq!(
+        std::fs::read(archive.join("identity.key")).unwrap(),
+        identity
+    );
+    assert_eq!(std::fs::read(archive.join("payload.bin")).unwrap(), payload);
+    let action_bytes = std::fs::read(&fake_log).expect("leave log");
+    let actions = String::from_utf8_lossy(&action_bytes);
+    assert!(
+        actions.contains("disable --now ducktape-node@"),
+        "leave action: {actions}"
+    );
+    let listing = ducktape(home.path(), &["list"]);
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(
+        listing.contains(&first),
+        "other workspace remains registered: {listing}"
+    );
+    assert!(
+        !listing.contains(&second),
+        "left workspace remains registered: {listing}"
+    );
+}

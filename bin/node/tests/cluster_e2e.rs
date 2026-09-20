@@ -25,10 +25,11 @@ mod common;
 
 use std::time::Duration;
 
-use chat::{Party, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy};
+use common::wire::{chat, tasks};
+use common::wire::chat::{Party, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy};
 use common::Cluster;
 use governance::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
-use tasks::{TaskMsg, TaskQuery, TaskReply};
+use common::wire::tasks::{TaskMsg, TaskQuery, TaskReply};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.

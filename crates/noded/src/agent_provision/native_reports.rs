@@ -2,7 +2,7 @@
 use super::*;
 
 fn job_id(native: &NativeState) -> Result<&str, String> {
-    let runs_wire::ConversationSource::Job { job_id } = &native.configuration.source else {
+    let crate::runs::ConversationSource::Job { job_id } = &native.configuration.source else {
         return Err("native conversation is not a worker".into());
     };
     if !native.context.job_reporting {
@@ -14,8 +14,8 @@ fn job_id(native: &NativeState) -> Result<&str, String> {
 async fn current_worker(
     state: &ActionState,
     native: &NativeState,
-    expected: Option<&runs_wire::WorkerControls>,
-) -> Result<runs_wire::WorkerControls, String> {
+    expected: Option<&crate::runs::WorkerControls>,
+) -> Result<crate::runs::WorkerControls, String> {
     let job_id = job_id(native)?;
     let view = conversation(&state.node, &native.context.conversation_id).await?;
     validate_active(&view, &native.configuration, &state.run_id)?;
@@ -28,7 +28,7 @@ async fn current_worker(
     let worker = controls::worker_controls(state)
         .await?
         .ok_or_else(|| "native worker job is unavailable".to_string())?;
-    let current = worker.job_id == job_id && worker.job_status == tasks::JobStatus::Processing;
+    let current = worker.job_id == job_id && worker.job_status == crate::tasks::JobStatus::Processing;
     if !current {
         return Err("native worker job is no longer processing".into());
     }
@@ -42,11 +42,11 @@ async fn current_worker(
 }
 
 fn matching_report(
-    worker: &runs_wire::WorkerControls,
+    worker: &crate::runs::WorkerControls,
     operation_id: &str,
-    kind: &tasks::WorkerReportKind,
+    kind: &crate::tasks::WorkerReportKind,
     payload: &str,
-) -> Result<Option<tasks::WorkerReport>, String> {
+) -> Result<Option<crate::tasks::WorkerReport>, String> {
     let Some(report) = worker
         .reports
         .iter()
@@ -54,7 +54,7 @@ fn matching_report(
     else {
         return Ok(None);
     };
-    let exact = report.worker == tasks::Party::Module(RUNS_MODULE.into())
+    let exact = report.worker == crate::tasks::Party::Module(RUNS_MODULE.into())
         && report.attempt == worker.job_attempt
         && report.kind == *kind
         && report.payload == payload;
@@ -68,12 +68,13 @@ pub(super) async fn report(
     state: &ActionState,
     native: &NativeState,
     operation_id: String,
-    kind: tasks::WorkerReportKind,
+    kind: crate::tasks::WorkerReportKind,
     payload: String,
 ) -> Result<Value, String> {
-    sdk::validate_id("operation_id", &operation_id, tasks::MAX_JOB_ID)
+    sdk::validate_id("operation_id", &operation_id, crate::tasks::MAX_JOB_ID)
         .map_err(|error| format!("{error:?}"))?;
-    let valid_payload = !payload.trim().is_empty() && payload.len() <= tasks::MAX_WORKER_TEXT_BYTES;
+    let valid_payload =
+        !payload.trim().is_empty() && payload.len() <= crate::tasks::MAX_WORKER_TEXT_BYTES;
     if !valid_payload {
         return Err("worker report requires bounded nonempty text".into());
     }
@@ -97,7 +98,7 @@ pub(super) async fn report(
     // Runs' durable operation receipt suppresses duplicate Tasks emits/charges.
     let message = sdk::Msg {
         target: RUNS_MODULE.into(),
-        payload: runs_wire::encode_msg(&runs_wire::RunsMsg::ReportJob {
+        payload: crate::runs::encode_msg(&crate::runs::RunsMsg::ReportJob {
             run_id: state.run_id.clone(),
             attempt: native.attempt,
             operation_id: operation_id.clone(),

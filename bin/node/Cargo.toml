@@ -63,13 +63,9 @@ compute-service = { workspace = true }
 # forge is core-resident (the git substrate is a node service): the module
 # crate, not its wire.
 forge = { path = "../../crates/modules/apps/forge" }
-pages = { workspace = true }
-chat = { workspace = true }
 # the huddle media planes the voice hub runs: Opus engine, video wire, call-socket framing.
-tasks = { workspace = true }
 # `ducktape collab` constructs the module's own ops, so a shape change is a
 # compile error here rather than a hand-rolled json payload that drifts.
-collaboration = { workspace = true }
 identity = { path = "../../crates/modules/system/identity" }
 # the passkey enrollment challenge — the same bytes `KeyScheme::Secp256r1` verifies.
 keyscheme = { workspace = true }
@@ -112,11 +108,8 @@ workspace-config = { workspace = true }
 # `git-remote-duck`: the `duck://` address and forge's `<owner>/<repo>` half
 # of it, parsed where the sdk parses them.
 duck-address = { workspace = true }
-forge-wire = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
-agent = { workspace = true }
-runs = { workspace = true }
 run-envelope = { workspace = true }
 borsh = { workspace = true }
 # the staged node-driven WireGuard plane: the reachability executor runs

@@ -53,17 +53,13 @@ wasm-host = { workspace = true }
 files-odb = { workspace = true }
 # the git substrate `open_odb` hands a wasm forge tenant, on the same grounds.
 forge-odb = { workspace = true }
-chat = { workspace = true }
 # the `/v1/call/ws` framing (the webview leg of a huddle) and the voice frame size.
-tasks = { workspace = true }
 identity = { path = "../modules/system/identity" }
 # `GET /v1/release` walks the passed governance signals the release plane
 # rides (wire types only) and answers in the document the launcher and the
 # desktop app both decode.
 app-update = { workspace = true }
 gateway = { path = "../modules/system/gateway" }
-agent-wire = { workspace = true }
-runs-wire = { workspace = true }
 dispatch = { path = "../modules/system/dispatch" }
 attribution = { path = "../modules/system/attribution" }
 compute-service = { workspace = true }
@@ -153,9 +149,6 @@ governance = { path = "../modules/system/governance" }
 # stand the COMMITTED guest up through `testkit::committed_module` and speak to
 # it over these types.
 run-envelope = { workspace = true }
-# the pages wire surface: the connected end-to-end provisioning run reads the
-# record page its agent published back out of the committed `pages` guest.
-pages = { workspace = true }
 wat = "1"
 # the native files module: the provisioning suites stand a native `Files` up.
 files = { path = "../modules/apps/files" }
