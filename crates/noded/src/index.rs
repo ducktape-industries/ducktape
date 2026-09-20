@@ -1,6 +1,6 @@
 //! the derived-index tier: shared store construction (each module's index
 //! guest installed from the network's genesis, or from a founding set for a
-//! daemon that runs no network), boundary stamping, and the `/v1/index/*` +
+//! daemon that runs no network), the owed ledger, and the `/v1/index/*` +
 //! `/v1/blocks` snapshot read lane.
 
 use std::sync::Arc;
@@ -188,42 +188,28 @@ pub fn index_block_ops(
     }
 }
 
-/// stamp every module whose watermark trails `boundary` as backfilled: its
-/// feed and views honestly BEGIN at the boundary, visibly via the floor
-/// (`/v1/index/status` reports it). call wherever canonical state advanced
-/// without the op stream — after state-sync installs a boundary, after
-/// recovery skipped re-executing durable blocks, or over a wiped index
-/// directory. history below a boundary re-enters only by replaying blocks
-/// through the feed, or by the joiner's op-row backfill pulling the source's
-/// stored rows in below the stamp (indexable spec §7). returns the stamped ids.
-pub fn stamp_stale_modules(
+/// record what every module whose watermark trails `boundary` owes: the
+/// heights between the two, as a persisted debt (`/v1/index/status` reports
+/// it). nothing is wiped and the module keeps serving what it holds. call
+/// wherever canonical state advanced without the op stream — after
+/// state-sync installs a boundary, after recovery skipped re-executing
+/// durable blocks, or over a wiped index directory. the rows re-enter by
+/// replaying blocks through the feed or by pulling a source's stored rows
+/// (indexable spec §7). returns the ids that now owe something.
+pub fn owe_stale_modules(
     index: &indexer::IndexStore,
     boundary: u64,
 ) -> Result<Vec<String>, indexer::Error> {
-    let stale = stale_modules(index, boundary)?;
-    for module in &stale {
-        index.mark_backfilled(module, boundary)?;
-    }
-    Ok(stale)
-}
-
-/// every module whose op feed trails `boundary` — the stamp's candidates,
-/// listed WITHOUT stamping them. a caller that can pull the missing rows
-/// decides per module whether the feed is resumable (extend it and keep the
-/// views under it) or has to be stamped and rebuilt from the boundary down.
-pub fn stale_modules(
-    index: &indexer::IndexStore,
-    boundary: u64,
-) -> Result<Vec<String>, indexer::Error> {
-    let modules = index.module_ids();
-    let mut stale = Vec::new();
-    for module in modules {
-        if index.applied_height(&module)? >= boundary {
+    let mut owing = Vec::new();
+    for module in index.module_ids() {
+        let watermark = index.applied_height(&module)?;
+        if watermark >= boundary {
             continue;
         }
-        stale.push(module);
+        index.owe(&module, watermark + 1, boundary)?;
+        owing.push(module);
     }
-    Ok(stale)
+    Ok(owing)
 }
 
 // ---------------------------------------------------------------------------
@@ -349,13 +335,13 @@ where
 }
 
 /// GET /v1/index/status — each module's applied watermark (the op FEED, not
-/// the derived view), the poison flag, backfill floors, and every fold
+/// the derived view), the poison flag, owed ranges, and every fold
 /// trigger's health (`pending` backlog + last drain error): the watermark
 /// vouches for the feed, the fold trails it observably. a poisoned index
 /// keeps serving (stale but consistent) reads; the remedy is a rebuild,
-/// which this surface makes visible. boundary-stamped modules also report
-/// their backfill floor: content below it was never in the feed — the gap
-/// stays visible instead of papered over.
+/// which this surface makes visible. a module whose feed owes heights
+/// reports the ranges (`owed`): the gap stays visible instead of papered
+/// over, until a source's rows fill it.
 ///
 /// `fold_status` per module costs fluent31 an iteration over that trigger's
 /// whole pending-queue range (no cheap counter exists — see the "ASKING IS
@@ -383,7 +369,7 @@ pub(crate) async fn index_status(State(handle): State<NodeHandle>) -> Response {
 /// `result_large_err`, since a `Response` dwarfs the `Ok` payload.
 fn index_status_body(store: &indexer::IndexStore) -> Result<serde_json::Value, Box<Response>> {
     let mut modules = serde_json::Map::new();
-    let mut backfilled = serde_json::Map::new();
+    let mut owed = serde_json::Map::new();
     let mut fold = serde_json::Map::new();
     for id in store.module_ids() {
         match store.applied_height(&id) {
@@ -392,11 +378,15 @@ fn index_status_body(store: &indexer::IndexStore) -> Result<serde_json::Value, B
             }
             Err(err) => return Err(Box::new(index_error(err))),
         }
-        match store.backfill_height(&id) {
-            Ok(Some(floor)) => {
-                backfilled.insert(id.to_string(), floor.into());
+        match store.owed(&id) {
+            Ok(ranges) if ranges.is_empty() => {}
+            Ok(ranges) => {
+                let ranges: Vec<serde_json::Value> = ranges
+                    .into_iter()
+                    .map(|(from, to)| serde_json::json!({ "from": from, "to": to }))
+                    .collect();
+                owed.insert(id.to_string(), ranges.into());
             }
-            Ok(None) => {}
             Err(err) => return Err(Box::new(index_error(err))),
         }
         match store.fold_status(&id) {
@@ -418,7 +408,7 @@ fn index_status_body(store: &indexer::IndexStore) -> Result<serde_json::Value, B
     Ok(serde_json::json!({
         "poisoned": store.is_poisoned(),
         "modules": modules,
-        "backfilled": backfilled,
+        "owed": owed,
         "fold": fold,
     }))
 }
@@ -475,7 +465,7 @@ pub(crate) async fn index_ops(
 
 /// the fold watermark a view reply carries: `"{height}:{seq}"`, the op row the
 /// module's fold had consumed when the reply was served. ABSENT when the
-/// module has no tip (fresh database, boundary stamp, a guest reinstalled
+/// module has no tip (fresh database, a refold in flight, a guest reinstalled
 /// without a refold) — absent means unknown, never zero.
 ///
 /// a HEADER, not an envelope: the module reply enums are the modules' own wire

@@ -707,9 +707,6 @@ pub(crate) async fn run_promoted(
             .await;
     }
 
-    // re-derive whatever the parked fold could not have indexed — the cold
-    // seat's synced boundary above all; exact indexes make this a no-op.
-    crate::explorer::heal_index(&index, height, &label);
     // code-registry swaps realize through the serve-lane fetching source
     // for the rest of this validator's life, exactly the fresh boot.
     recovery.set_code_source(std::sync::Arc::new(

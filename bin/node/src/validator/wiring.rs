@@ -18,7 +18,7 @@ use host::Host;
 use crate::blob_fetch;
 use crate::config;
 use crate::constants::*;
-use crate::explorer::heal_index;
+use crate::explorer::owe_index;
 use crate::host_reads::{read_valset_residents, resume_member_keys};
 use crate::join_gate;
 use crate::reachability_plane::{wire_reachability_plane, GateHook, GateOutcomes};
@@ -106,13 +106,12 @@ pub(super) async fn finish(
     sync_rx: super::MeshReceiver,
     relay_rx: super::MeshReceiver,
 ) -> RuntimeWiring {
-    // the FINAL index heal, at the boot tip every path converged on:
-    // whatever the replay/catch-up fold could not reproduce (opaque
-    // blocks, a state-sync jump, a stopped fold) re-derives here from
-    // state that has verified against the boundary root-hash.
+    // whatever the replay/catch-up fold could not reproduce (opaque blocks,
+    // a state-sync jump, a stopped fold) is owed at the boot tip every path
+    // converged on; the runtime's repair loop pays it off a peer.
     drop(boot_fold);
     if let Some(boot_height) = resumed.as_ref().and_then(|r| r.height) {
-        heal_index(index, boot_height, &label);
+        owe_index(index, boot_height, &label);
     }
 
     let member_keys = match resume_member_keys(resumed, validators) {

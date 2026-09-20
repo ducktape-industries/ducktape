@@ -105,7 +105,7 @@ pub mod node_link;
 mod index;
 pub use index::{
     BlocksParams, FOLDED_HEADER, IndexScanParams, converge_host_modules, index_block_ops,
-    index_host_modules, index_origin, open_index_store, stale_modules, stamp_stale_modules,
+    index_host_modules, index_origin, open_index_store, owe_stale_modules,
 };
 // the ducktape_* Prometheus series + GET /metrics.
 mod metrics;

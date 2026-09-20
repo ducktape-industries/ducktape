@@ -384,7 +384,7 @@ fn serve_index_ops(
             })
             .flatten(),
         rows,
-        source_floor: source.backfill_height(module).expect("floor"),
+        source_floor: source.vouched_floor(module).expect("floor"),
         applied_height: source.applied_height(module).expect("watermark"),
     }
 }
@@ -497,17 +497,17 @@ fn backfill(
     backfill_after(client, joiner, boundary, None)
 }
 
-/// THE CRATE-LEVEL PROOF OF SPEC §7: a joiner stamped at a boundary pulls the
+/// THE CRATE-LEVEL PROOF OF SPEC §7: a joiner owing a boundary pulls the
 /// source's op rows below it OVER THE WIRE, page by page, and ends up with the
 /// source's rows — feed and watermark included — instead of an empty view.
 #[test]
-fn a_stamped_joiner_backfills_the_sources_op_rows_over_the_wire() {
+fn a_joiner_owing_a_boundary_backfills_the_sources_op_rows_over_the_wire() {
     let src_dir = tempfile::tempdir().expect("src dir");
     let dst_dir = tempfile::tempdir().expect("dst dir");
     let source = std::sync::Arc::new(store(src_dir.path()));
     feed(&source, 1..=9);
     let joiner = store(dst_dir.path());
-    joiner.mark_backfilled("chat", 9).expect("stamp");
+    joiner.owe("chat", 1, 9).expect("owe");
     assert_eq!(
         joiner
             .scan("chat", indexer::OP_PREFIX.as_bytes(), None, 100)
@@ -527,11 +527,12 @@ fn a_stamped_joiner_backfills_the_sources_op_rows_over_the_wire() {
     };
     let floor = backfill(&client, &joiner, 9).expect("backfill");
     assert_eq!(floor, None, "a source that reaches genesis has no floor");
-    // the join seam's closing move, in its order: drain the fold the writes
-    // triggered, THEN lower the floor over rows that are actually derived.
+    // the repair's closing move, in its order: drain the fold the writes
+    // triggered, THEN settle the debt over rows that are actually derived.
     joiner.wait_folds_drained().expect("joiner folds drain");
     source.wait_folds_drained().expect("source folds drain");
-    joiner.set_backfill_floor("chat", floor).expect("floor");
+    joiner.settle_owed("chat", 1, 9).expect("settle");
+    joiner.advance_watermark("chat", 9).expect("watermark");
 
     let rows = |s: &indexer::IndexStore| {
         s.scan("chat", indexer::OP_PREFIX.as_bytes(), None, 1024)
@@ -540,7 +541,7 @@ fn a_stamped_joiner_backfills_the_sources_op_rows_over_the_wire() {
     };
     assert_eq!(rows(&source), rows(&joiner), "op rows byte-identical");
     assert_eq!(joiner.applied_height("chat").unwrap(), 9);
-    assert_eq!(joiner.backfill_height("chat").unwrap(), None);
+    assert_eq!(joiner.vouched_floor("chat").unwrap(), None);
 
     // THE POINT OF THE LANE: the rows that crossed the wire were FOLDED, so
     // the joiner's derived view answers for pre-boundary history exactly as
@@ -571,20 +572,20 @@ fn a_stamped_joiner_backfills_the_sources_op_rows_over_the_wire() {
     assert_eq!(joiner.fold_tip("chat").unwrap(), Some((9, 0)));
 }
 
-/// A SOURCE'S OWN TRUNCATION COMPOSES INTO THE JOINER'S. The source joined
-/// late too, so it has no rows below ITS floor — inheriting that floor is the
-/// only honest answer, and claiming genesis would be a lie the joiner told
-/// about content nobody has.
+/// A SOURCE'S OWN DEBT TRAVELS AS ITS FLOOR. The source joined late too, so
+/// it has no rows at or below what IT owes — the joiner settles only what
+/// the source vouched for and keeps owing the rest, since claiming genesis
+/// would be a lie the joiner told about content nobody has.
 #[test]
-fn the_sources_floor_composes_into_the_joiners() {
+fn the_sources_floor_bounds_what_the_joiner_may_settle() {
     let src_dir = tempfile::tempdir().expect("src dir");
     let dst_dir = tempfile::tempdir().expect("dst dir");
     let source = std::sync::Arc::new(store(src_dir.path()));
     // the source itself joined at 4, then folded 5..=9.
-    source.mark_backfilled("chat", 4).expect("source stamp");
+    source.owe("chat", 1, 4).expect("source owes");
     feed(&source, 5..=9);
     let joiner = store(dst_dir.path());
-    joiner.mark_backfilled("chat", 9).expect("stamp");
+    joiner.owe("chat", 1, 9).expect("owe");
 
     let client = IndexOpsClient {
         source: source.clone(),
@@ -593,8 +594,9 @@ fn the_sources_floor_composes_into_the_joiners() {
     };
     let floor = backfill(&client, &joiner, 9).expect("backfill");
     assert_eq!(floor, Some(4), "the source's truncation travels");
-    joiner.set_backfill_floor("chat", floor).expect("floor");
-    assert_eq!(joiner.backfill_height("chat").unwrap(), Some(4));
+    joiner.settle_owed("chat", 5, 9).expect("settle what the source vouched for");
+    assert_eq!(joiner.owed("chat").unwrap(), vec![(1, 4)]);
+    assert_eq!(joiner.vouched_floor("chat").unwrap(), Some(4));
     assert_eq!(
         joiner
             .scan("chat", indexer::OP_PREFIX.as_bytes(), None, 100)
@@ -606,18 +608,18 @@ fn the_sources_floor_composes_into_the_joiners() {
     );
 }
 
-/// A PAGE THAT FAILS STRUCTURAL VALIDATION ABORTS THE MODULE, AND THE
-/// BOUNDARY FLOOR STANDS. These rows are unverifiable by design, so the one
-/// thing the trust boundary can still refuse is garbage — and refusing it has
-/// to leave the joiner exactly as honest as it was before it asked.
+/// A PAGE THAT FAILS STRUCTURAL VALIDATION ABORTS THE MODULE, AND THE DEBT
+/// STANDS. These rows are unverifiable by design, so the one thing the trust
+/// boundary can still refuse is garbage — and refusing it has to leave the
+/// joiner exactly as honest as it was before it asked.
 #[test]
-fn a_corrupt_page_aborts_the_backfill_and_keeps_the_boundary_floor() {
+fn a_corrupt_page_aborts_the_backfill_and_keeps_the_debt() {
     let src_dir = tempfile::tempdir().expect("src dir");
     let dst_dir = tempfile::tempdir().expect("dst dir");
     let source = std::sync::Arc::new(store(src_dir.path()));
     feed(&source, 1..=9);
     let joiner = store(dst_dir.path());
-    joiner.mark_backfilled("chat", 9).expect("stamp");
+    joiner.owe("chat", 1, 9).expect("owe");
 
     let client = IndexOpsClient {
         source,
@@ -629,9 +631,9 @@ fn a_corrupt_page_aborts_the_backfill_and_keeps_the_boundary_floor() {
         matches!(&err, SyncError::Module { reason, .. } if reason.contains("borsh")),
         "want a structural refusal, got {err}"
     );
-    // the floor setter is never reached, so the stamp stands — the joiner
-    // still says, honestly, that everything below 9 is absent.
-    assert_eq!(joiner.backfill_height("chat").unwrap(), Some(9));
+    // the settle is never reached, so the debt stands — the joiner still
+    // says, honestly, that everything below 9 is absent.
+    assert_eq!(joiner.vouched_floor("chat").unwrap(), Some(9));
 }
 
 /// A SOURCE THAT FOLDED LESS THAN IT IS ASKED FOR IS REFUSED. Writing its rows
@@ -644,7 +646,7 @@ fn a_source_behind_the_boundary_is_refused_before_a_hole_can_form() {
     let source = std::sync::Arc::new(store(src_dir.path()));
     feed(&source, 1..=4);
     let joiner = store(dst_dir.path());
-    joiner.mark_backfilled("chat", 9).expect("stamp");
+    joiner.owe("chat", 1, 9).expect("owe");
 
     let client = IndexOpsClient {
         source,
@@ -656,25 +658,25 @@ fn a_source_behind_the_boundary_is_refused_before_a_hole_can_form() {
         matches!(&err, SyncError::Module { reason, .. } if reason.contains("hole")),
         "want the hole refusal, got {err}"
     );
-    assert_eq!(joiner.backfill_height("chat").unwrap(), Some(9));
+    assert_eq!(joiner.vouched_floor("chat").unwrap(), Some(9));
 }
 
 /// A SOURCE WHOSE FLOOR ROSE ABOVE THE BOUNDARY IS REFUSED, NOT COMPOSED. It
-/// state-synced forward past the range it is being asked for, so it holds none
-/// of it — and inheriting a floor of 20 under a watermark of 9 would leave the
-/// joiner claiming more missing than it has. The stamp is the honest answer.
+/// state-synced forward past the range it is being asked for, so it vouches
+/// for none of it — and inheriting a floor of 20 under a watermark of 9 would
+/// leave the joiner claiming more missing than it has. The debt stands.
 #[test]
-fn a_source_that_restamped_past_the_boundary_is_refused_not_composed() {
+fn a_source_owing_past_the_boundary_is_refused_not_composed() {
     let src_dir = tempfile::tempdir().expect("src dir");
     let dst_dir = tempfile::tempdir().expect("dst dir");
     let source = std::sync::Arc::new(store(src_dir.path()));
     feed(&source, 1..=9);
-    // the source jumped to a boundary ABOVE the one the joiner is asking about,
-    // which wiped every row the joiner wants.
-    source.mark_backfilled("chat", 20).expect("source restamp");
+    // the source jumped to a boundary ABOVE the one the joiner is asking about
+    // and owes everything up to it: it vouches for none of what the joiner wants.
+    source.owe("chat", 10, 20).expect("source owes");
     feed(&source, 21..=22);
     let joiner = store(dst_dir.path());
-    joiner.mark_backfilled("chat", 9).expect("stamp");
+    joiner.owe("chat", 1, 9).expect("owe");
 
     let client = IndexOpsClient {
         source,
@@ -686,7 +688,7 @@ fn a_source_that_restamped_past_the_boundary_is_refused_not_composed() {
         matches!(&err, SyncError::Module { reason, .. } if reason.contains("rose above")),
         "want the risen-floor refusal, got {err}"
     );
-    assert_eq!(joiner.backfill_height("chat").unwrap(), Some(9));
+    assert_eq!(joiner.vouched_floor("chat").unwrap(), Some(9));
 }
 
 /// A RESUMED WALK IS ANCHORED AT ITS CURSOR. `after` is not a hint the source

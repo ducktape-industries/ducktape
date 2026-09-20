@@ -9,7 +9,7 @@ use commonware_utils::ordered::Set;
 use host::Host;
 use recovery::{Manifest, Recovery};
 
-use crate::explorer::{IndexFold, heal_index};
+use crate::explorer::{IndexFold, owe_index};
 use crate::host_state::{NetworkBindings, NodeSubstrates, genesis_host, restore_host};
 use crate::sync::catchup::advance_next_seq_from_frames;
 use crate::sync::serve::SyncStateRequest;
@@ -122,13 +122,11 @@ pub(super) async fn restore(
                     fatal!(label, "checkpoint restore: {e}");
                 }
             };
-            // heal the derived index against the CHECKPOINT boundary
-            // BEFORE replay: a wiped or trailing per-module database
-            // re-derives from the verified checkpoint state, so the
-            // journal-suffix fold lands contiguously on top instead of
-            // folding forward over a pre-checkpoint hole.
+            // record what the derived index owes up to the CHECKPOINT
+            // boundary BEFORE replay, so the journal-suffix fold lands above
+            // a visible hole instead of folding forward over a silent one.
             if let Some(ckpt_height) = manifest.height {
-                heal_index(index, ckpt_height, label);
+                owe_index(index, ckpt_height, label);
             }
             let rec = match recovery
                 .recover_with_sink(&mut host, &manifest, Some(boot_fold))
@@ -571,19 +569,9 @@ where
         .await
     };
     let CatchUp::Rebootstrap { retained_from } = decide_catch_up(&probes) else {
-        // THE ONE SEAM ON THE VALIDATOR RESTART LANE THAT HOLDS A SOURCE, and
-        // the same helper the resident restart runs (`replica::park`) at the
-        // same point in its own boot: after the replay's fold, before this
-        // node serves anything. A validator that restarts over a wiped or
-        // poisoned index directory lands here holding nothing but the floor
-        // `restore` stamped at the checkpoint, and the op journal is pruned
-        // per checkpoint — so the history below it is reachable only from a
-        // peer, and only here. Every module keeps its floor when no source
-        // holds that history, and the boot never aborts on it (#1309).
-        // the validator lane has no retry pump: a walk refused here is owed
-        // to the next boot seam, not to a poll this loop does not run.
-        let _owed =
-            crate::explorer::heal_and_backfill_index(index, client, local_height, label).await;
+        // whatever the replay's fold could not cover up to this tip is owed;
+        // the runtime's repair loop pays it off a peer once this node serves.
+        owe_index(index, local_height, label);
         return seat;
     };
     tracing::warn!(
@@ -755,14 +743,9 @@ where
     if let Err(e) = crate::sync::serve::reopen_preflight_synced_host(&host, boundary.root_hash) {
         fatal!(label, "validator re-bootstrap preflight: {e}");
     }
-    // re-derive whatever the local fold could not have indexed: this is the
-    // one moment a sync client exists on the validator lane, exactly as the
-    // promotion seat backfills before `run_promoted` heals against the same
-    // boundary.
-    // same as the restart arm above: no retry pump on this tier, so a refused
-    // walk stands until the next boot seam asks again.
-    let _owed =
-        crate::explorer::heal_and_backfill_index(index, client, boundary.height, label).await;
+    // the index owes everything up to the synced boundary; the runtime's
+    // repair loop pays it off a peer once this node serves.
+    owe_index(index, boundary.height, label);
     let pos = crate::sync::serve::write_boundary_checkpoint(
         recovery,
         &host,

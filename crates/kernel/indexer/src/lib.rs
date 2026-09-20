@@ -69,14 +69,14 @@
 //!
 //! when canonical state advances WITHOUT the op stream — state-sync installs
 //! a boundary, an index directory is wiped, a crash tears the index tail off
-//! a suffix recovery re-execution skipped — the module is stamped BACKFILLED
-//! at the boundary ([`IndexStore::mark_backfilled`]): its op log and views
-//! honestly BEGIN there, visibly via `meta/backfill`, instead of a watermark
-//! that silently claims pre-boundary coverage the feed never saw. history
-//! below a boundary re-enters only by replaying blocks (the node's journal /
-//! frame catch-up drives [`IndexStore::apply_block`] again) or by BACKFILLING
-//! the source's own op rows below it ([`IndexStore::write_backfill_rows`] +
-//! [`IndexStore::set_backfill_floor`], the joiner's inline join-seam walk).
+//! a suffix recovery re-execution skipped — the module OWES the heights the
+//! feed skipped ([`IndexStore::owe`], persisted under `meta/owed`): nothing
+//! is wiped, the rows it holds stay served, and the debt is visible until a
+//! source's own op rows fill it ([`IndexStore::write_backfill_rows`] +
+//! [`IndexStore::refold`] + [`IndexStore::settle_owed`]). what a module
+//! vouches for is the contiguous run above its highest owed range
+//! ([`IndexStore::vouched_floor`]); everything below is absent, visibly,
+//! instead of a watermark that silently claims pre-boundary coverage.
 //!
 //! A mapper changes at its module's deployment activation. The op feed stays
 //! available: [`converge_guest`] clears the derived
@@ -121,9 +121,9 @@ const GUEST_NAME: &str = "index";
 const FOLD_TRIGGER: &str = "fold";
 /// the per-module watermark key: 8-byte big-endian height.
 const META_HEIGHT: &str = "meta/height";
-/// the backfill floor: 8-byte big-endian height, present only after a
-/// boundary stamp — everything below it is absent from the feed, visibly.
-const META_BACKFILL: &str = "meta/backfill";
+/// the heights this module's feed owes: borsh `Vec<(u64, u64)>` of inclusive
+/// ranges, sorted and disjoint, absent when nothing is owed.
+const META_OWED: &str = "meta/owed";
 /// the guest-converge marker (borsh [`GuestMarker`]): which artifact this
 /// database is converged on. a warm boot that finds a matching marker skips
 /// every wasm compile.
@@ -687,8 +687,7 @@ impl IndexStore {
     /// the height the node's block counter must resume ABOVE: the max
     /// watermark across all modules and the blocks database. every module
     /// advances on every applied block, so the max only differs per module
-    /// when a database was wiped or added — exactly the modules
-    /// [`IndexStore::mark_backfilled`] stamps. the blocks watermark can lag
+    /// when a database was wiped or added. the blocks watermark can lag
     /// them all: it only advances when a block carries an explorer row.
     pub fn resume_height(&self) -> Result<u64> {
         let mut max = read_height(&self.blocks)?;
@@ -713,8 +712,7 @@ impl IndexStore {
     /// means the derived rows for that op are committed. it is NOT general
     /// freshness — the fold advances only on op traffic, so a quiet module
     /// keeps an old tip while being perfectly current, and `None` (fresh
-    /// database, boundary stamp, a mapper refold still in flight) means
-    /// UNKNOWN, never zero.
+    /// database, a mapper refold still in flight) means UNKNOWN, never zero.
     pub fn fold_tip(&self, module: &str) -> Result<Option<(u64, u32)>> {
         let db = self.db(module)?;
         Ok(db
@@ -722,11 +720,53 @@ impl IndexStore {
             .map(|v| v.as_deref().and_then(index_guest::decode_fold_tip))?)
     }
 
-    /// the backfill floor: when present, the module was stamped at a boundary
-    /// — its op feed (and everything derived) visibly begins above it.
-    pub fn backfill_height(&self, module: &str) -> Result<Option<u64>> {
+    /// the inclusive height ranges this module's feed owes, sorted and
+    /// disjoint; empty when the feed is contiguous from genesis up.
+    pub fn owed(&self, module: &str) -> Result<Vec<(u64, u64)>> {
         let db = self.db(module)?;
-        Ok(read_backfill(&db)?)
+        read_owed(&db)
+    }
+
+    /// the floor this feed vouches for: the top of its highest owed range,
+    /// `None` when nothing is owed. everything at or below it is absent or
+    /// unvouched; the run above it up to the watermark is contiguous. what a
+    /// serving node reports to a puller as its floor.
+    pub fn vouched_floor(&self, module: &str) -> Result<Option<u64>> {
+        let db = self.db(module)?;
+        Ok(read_owed(&db)?.last().map(|(_, to)| *to))
+    }
+
+    /// record that `from..=to` is missing from a module's feed: merged into
+    /// what it already owes. nothing else moves — no wipe, no watermark.
+    /// failures poison, like every other feed write.
+    pub fn owe(&self, module: &str, from: u64, to: u64) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        if from > to {
+            return Ok(());
+        }
+        let db = self.db(module)?;
+        let out = (|| -> Result<()> {
+            let mut ranges = read_owed(&db)?;
+            ranges.push((from, to));
+            write_owed(&db, merge_ranges(ranges))
+        })();
+        self.poison_on_err("owe", out)
+    }
+
+    /// record that `from..=to` landed in a module's feed: subtracted from what
+    /// it owes. failures poison, like every other feed write.
+    pub fn settle_owed(&self, module: &str, from: u64, to: u64) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let db = self.db(module)?;
+        let out = (|| -> Result<()> {
+            let ranges = read_owed(&db)?;
+            write_owed(&db, subtract_range(ranges, from, to))
+        })();
+        self.poison_on_err("settle_owed", out)
     }
 
     /// the fold trigger's backlog + last drain error, `None` for a module
@@ -831,10 +871,9 @@ impl IndexStore {
 
     /// store one explorer row at `height` WITHOUT a dispatch feed — the write
     /// side for a follower that observes state boundaries, never sealed
-    /// blocks. the module read models are the caller's problem (they are
-    /// stamped at the boundary, [`IndexStore::mark_backfilled`]); this keeps
-    /// the blocks database honest about the one thing such a caller DID
-    /// observe: the boundary itself. same discipline as the fold's record
+    /// blocks. the module read models are the caller's problem (they owe the
+    /// boundary, [`IndexStore::owe`]); this keeps the blocks database honest
+    /// about the one thing such a caller DID observe: the boundary itself. same discipline as the fold's record
     /// write — idempotent skip at or below the blocks watermark, row and
     /// watermark in one atomic batch, failures poison.
     pub fn apply_block_record(&self, height: u64, record: Vec<u8>) -> Result<()> {
@@ -876,66 +915,20 @@ impl IndexStore {
         Ok(rows)
     }
 
-    /// stamp a module as backfilled at a boundary: clear the database and set
-    /// the watermark + backfill floor. this is the honest answer when
-    /// canonical state advanced without the op stream — the module's feed and
-    /// views simply BEGIN at the boundary, visibly via the floor, instead of
-    /// a watermark that silently claims pre-boundary coverage the feed never
-    /// saw. crash story: watermark falls first, failures poison.
-    ///
-    /// the fold trigger is torn down for the wipe and re-registered after:
-    /// its pending events describe rows the wipe deletes, and the wipe's own
-    /// deletes must never reach the guest as feed traffic. `delete_trigger`
-    /// discards pending events with the registration — exactly the clean
-    /// slate a boundary stamp means.
-    pub fn mark_backfilled(&self, module: &str, height: u64) -> Result<()> {
-        if self.is_poisoned() {
-            return Err(Error::Poisoned);
-        }
-        let m = self.module(module)?;
-        let out = (|| -> Result<()> {
-            if m.folds() {
-                m.db.delete_trigger(FOLD_TRIGGER)?;
-            }
-            let mut drop_mark = WriteBatch::new();
-            drop_mark.delete(META_HEIGHT);
-            m.db.write(drop_mark)?;
-            clear_db(&m.db)?;
-            let mut stamp = WriteBatch::new();
-            stamp.put(META_HEIGHT, height.to_be_bytes());
-            stamp.put(META_BACKFILL, height.to_be_bytes());
-            m.db.write(stamp)?;
-            if m.folds() {
-                create_fold_trigger(&m.db)?;
-            }
-            Ok(())
-        })();
-        self.poison_on_err("mark_backfilled", out)
-    }
-
     /// write verbatim op rows into a module's feed WITHOUT touching the
-    /// watermark — the joiner's backfill of history below a boundary stamp
-    /// (indexable spec §7). rows are `(op key, borsh row bytes)` exactly as
-    /// the source stored them; batches flush by size like the refold's.
-    ///
-    /// # the ascending-order invariant this rests on
+    /// watermark — the backfill of heights the feed owes (indexable spec §7).
+    /// rows are `(op key, borsh row bytes)` exactly as the source stored them;
+    /// batches flush by size like the refold's.
     ///
     /// the fold trigger is a CHANGES-mode trigger, so it delivers committed
-    /// writes in commit order and the guest folds them in that order. these
-    /// rows are therefore only correct if COMMIT ORDER IS KEY ORDER — which
-    /// the caller guarantees by writing strictly ascending `(height, seq)`,
-    /// pre-serving, on a node with no live folds, no ws subscribers, and no
-    /// view readers. under that discipline the guest sees exactly the
-    /// block-and-drain sequence a live feed would have delivered, and the
-    /// fold tip advances monotonically to the last backfilled row. writing
-    /// these out of order (or concurrently with live block folds) would hand
-    /// the guest history backwards and is a defect, not a slow path.
+    /// writes in commit order and the guest folds them in that order. rows
+    /// landing below what the fold already consumed reach the guest out of
+    /// height order, so the caller re-derives the read model afterwards with
+    /// [`IndexStore::refold`].
     ///
-    /// [`META_HEIGHT`] is deliberately untouched: the heal already stamped it
-    /// at the boundary, and it vouches for the FEED's contiguity from the
-    /// floor up. the FLOOR is what says "incomplete below" — lower it with
-    /// [`IndexStore::set_backfill_floor`] once the walk completes, never here.
-    /// only puts, so the delete-side contract (a failing feed row never
+    /// [`META_HEIGHT`] is deliberately untouched, and so is the debt: settle
+    /// it with [`IndexStore::settle_owed`] once the walk completes, never
+    /// here. only puts, so the delete-side contract (a failing feed row never
     /// vanishes) is untouched.
     pub fn write_backfill_rows(&self, module: &str, rows: &[(String, Vec<u8>)]) -> Result<()> {
         if self.is_poisoned() {
@@ -959,24 +952,6 @@ impl IndexStore {
             Ok(())
         })();
         self.poison_on_err("write_backfill_rows", out)
-    }
-
-    /// set (or clear) a module's backfill floor and NOTHING else — no wipe, no
-    /// trigger teardown, unlike [`IndexStore::mark_backfilled`]. the closing
-    /// move of a completed op-row backfill: `Some(floor)` composes the
-    /// source's own truncation into this node's honesty (a late-joined source
-    /// has no rows below its floor either), `None` clears it outright — the
-    /// feed reaches genesis and nothing is missing.
-    pub fn set_backfill_floor(&self, module: &str, floor: Option<u64>) -> Result<()> {
-        if self.is_poisoned() {
-            return Err(Error::Poisoned);
-        }
-        let db = self.db(module)?;
-        let out = match floor {
-            Some(height) => db.put(META_BACKFILL, height.to_be_bytes()),
-            None => db.delete(META_BACKFILL),
-        };
-        self.poison_on_err("set_backfill_floor", out.map_err(Error::from))
     }
 
     /// re-derive a module's read model from the op feed it already holds:
@@ -1041,12 +1016,11 @@ impl IndexStore {
     }
 
     /// advance a module's feed watermark to `height` and NOTHING else — the
-    /// closing move of a RESUMED backfill, where the rows between the old
+    /// closing move of a settled backfill, where the rows between the old
     /// watermark and the boundary just landed verbatim, so the feed honestly
-    /// covers them. no wipe, no floor change, no trigger teardown (unlike
-    /// [`IndexStore::mark_backfilled`]); a watermark already at or past
-    /// `height` stands, so this is idempotent. failures poison, like every
-    /// other feed write.
+    /// covers them. no wipe, no floor change, no trigger teardown; a
+    /// watermark already at or past `height` stands, so this is idempotent.
+    /// failures poison, like every other feed write.
     pub fn advance_watermark(&self, module: &str, height: u64) -> Result<()> {
         if self.is_poisoned() {
             return Err(Error::Poisoned);
@@ -1186,9 +1160,8 @@ struct GuestMarker {
 /// derived rows are the OUTPUT of a mapper, so a database whose mapper changed
 /// holds rows no installed code would produce — while its fold tip happily
 /// vouches for them (`indexable-spec.md` §3.2.4: a mapper upgrade leaves a
-/// PRESENT tip standing over the previous mapper's work). the honest fixes are
-/// a boundary stamp — which throws away the op feed and lies about coverage —
-/// or a replay. the feed is right there: `op/` is never wiped by a converge,
+/// PRESENT tip standing over the previous mapper's work). the honest fix is
+/// a replay. the feed is right there: `op/` is never wiped by a converge,
 /// so a replay is a clear of the DERIVED keyspace plus a re-drive of the fold
 /// over rows the database already holds.
 ///
@@ -1256,8 +1229,7 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     }
 
     // the feed goes down FIRST: its pending events describe the previous
-    // mapper's work, and `delete_trigger` discards them with the registration
-    // — the same clean slate a boundary stamp takes, minus the amnesia.
+    // mapper's work, and `delete_trigger` discards them with the registration.
     if fold_registered {
         db.delete_trigger(FOLD_TRIGGER)?;
     }
@@ -1380,8 +1352,8 @@ fn fold_stuck_message(module: &str, pending: u64, last_error: Option<&str>) -> S
 /// an error would otherwise spin here forever — and this now runs inside a
 /// joining node's seam, not just a sim.
 fn drain_fold(db: &Db, module: &str) -> Result<()> {
-    // NOT the backfill floor — the fewest events ever seen queued, which is
-    // what "still shrinking" is measured against.
+    // the fewest events ever seen queued, which is what "still shrinking" is
+    // measured against.
     let mut fewest_pending = u64::MAX;
     let mut since_progress = std::time::Instant::now();
     // ASKING IS NOT FREE: `list_triggers` counts the queue by iterating it, so
@@ -1428,8 +1400,8 @@ fn drain_fold(db: &Db, module: &str) -> Result<()> {
 
 /// delete every DERIVED key: everything a mapper wrote (its own rows plus the
 /// shell's `fold/` tip), leaving the host-reserved `op/` feed and `meta/`
-/// bookkeeping — the watermark and the backfill floor — untouched. those two
-/// answer for the FEED, which a mapper change does not touch.
+/// bookkeeping — the watermark and the debt — untouched. those two answer
+/// for the FEED, which a mapper change does not touch.
 fn clear_derived(db: &Db) -> Result<()> {
     let snap = db.snapshot();
     let iter = db.iter_at(None, None, false, &snap)?;
@@ -1460,7 +1432,7 @@ fn clear_derived(db: &Db) -> Result<()> {
 /// and none per row: a boot that replays a chain's history used to do so in
 /// silence, from the last `open` line until it returned.
 fn refold_feed(db: &Db, module: &str) -> Result<()> {
-    let from_height = read_backfill(db)?.unwrap_or(0);
+    let from_height = read_owed(db)?.last().map(|(_, to)| *to).unwrap_or(0);
     let to_height = read_height(db)?;
     tracing::info!(
         target: "ducktape::index",
@@ -1573,31 +1545,6 @@ fn collect_page(iter: fluent31::DbIterator, limit: usize) -> Result<Page> {
     })
 }
 
-/// delete every user key in the database, in bounded batches, off one MVCC
-/// snapshot — readers holding older snapshots keep serving while the sweep
-/// runs. the engine keyspace (installed guest, trigger state) is invisible to
-/// this iterator by construction and survives. the caller has already dropped
-/// the watermark, so a crash mid-sweep re-triggers the stamp rather than
-/// leaving a half-empty index live.
-fn clear_db(db: &Db) -> Result<()> {
-    let snap = db.snapshot();
-    let iter = db.iter_at(None, None, false, &snap)?;
-    let mut batch = WriteBatch::new();
-    let mut staged = 0usize;
-    for kv in iter {
-        let (key, _) = kv?;
-        batch.delete(key);
-        staged += 1;
-        if staged >= CLEAR_FLUSH_EVERY {
-            db.write(std::mem::replace(&mut batch, WriteBatch::new()))?;
-            staged = 0;
-        }
-    }
-    if staged > 0 {
-        db.write(batch)?;
-    }
-    Ok(())
-}
 
 fn read_height(db: &Db) -> fluent31::Result<u64> {
     Ok(db
@@ -1607,12 +1554,58 @@ fn read_height(db: &Db) -> fluent31::Result<u64> {
         .unwrap_or(0))
 }
 
-/// the backfill floor, when a boundary stamp set one.
-fn read_backfill(db: &Db) -> fluent31::Result<Option<u64>> {
-    Ok(db
-        .get(META_BACKFILL.as_bytes())?
-        .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
-        .map(u64::from_be_bytes))
+fn read_owed(db: &Db) -> Result<Vec<(u64, u64)>> {
+    let Some(bytes) = db.get(META_OWED.as_bytes())? else {
+        return Ok(Vec::new());
+    };
+    Ok(borsh::from_slice::<Vec<(u64, u64)>>(&bytes)?)
+}
+
+fn write_owed(db: &Db, ranges: Vec<(u64, u64)>) -> Result<()> {
+    if ranges.is_empty() {
+        db.delete(META_OWED)?;
+        return Ok(());
+    }
+    db.put(META_OWED, borsh::to_vec(&ranges)?)?;
+    Ok(())
+}
+
+/// sorted, disjoint inclusive ranges: overlapping or adjacent inputs merge.
+fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges {
+        let Some((_, last_to)) = merged.last_mut() else {
+            merged.push((from, to));
+            continue;
+        };
+        let touches = from <= last_to.saturating_add(1);
+        if touches {
+            *last_to = (*last_to).max(to);
+            continue;
+        }
+        merged.push((from, to));
+    }
+    merged
+}
+
+/// every range with `from..=to` cut out of it.
+fn subtract_range(ranges: Vec<(u64, u64)>, from: u64, to: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::with_capacity(ranges.len() + 1);
+    for (lo, hi) in ranges {
+        let disjoint = hi < from || lo > to;
+        if disjoint {
+            out.push((lo, hi));
+            continue;
+        }
+        if lo < from {
+            out.push((lo, from - 1));
+        }
+        if hi > to {
+            out.push((to + 1, hi));
+        }
+    }
+    out
 }
 
 /// the smallest byte string greater than every key with `prefix`: increment

@@ -54,7 +54,7 @@ pub(crate) fn read_index_ops(
         // store's own limit still owes rows.
         has_more: served == scanned && page.has_more,
         source_floor: index
-            .backfill_height(module)
+            .vouched_floor(module)
             .map_err(|e| format!("index floor for {module}: {e}"))?,
         applied_height: index
             .applied_height(module)

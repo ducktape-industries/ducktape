@@ -306,19 +306,18 @@ fn run_node(
                 "noded module index resumed"
             );
         }
-        // stamp modules whose watermark trails the resume floor — a wiped (or
-        // torn) per-module database that forward folding can never refill,
-        // because its heights are already spent above it. its feed and views
-        // start over at the boundary, visibly via /v1/index/status; history
-        // below it re-enters only by replaying blocks through the feed.
-        match noded::stamp_stale_modules(&index, height) {
-            Ok(stamped) => {
-                for module in stamped {
+        // modules whose watermark trails the resume floor — a wiped (or torn)
+        // per-module database that forward folding can never refill, because
+        // its heights are already spent above it — owe the gap, visibly via
+        // /v1/index/status; the rows re-enter only by replaying blocks.
+        match noded::owe_stale_modules(&index, height) {
+            Ok(owing) => {
+                for module in owing {
                     tracing::info!(
                         target: "ducktape::modules",
                         module,
                         height,
-                        "noded module index stamped backfilled at the boundary"
+                        "noded module index owes heights up to the boundary"
                     );
                 }
             }
