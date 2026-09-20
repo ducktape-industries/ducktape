@@ -4782,9 +4782,7 @@ dependencies = [
 name = "noded-bin"
 version = "0.1.0"
 dependencies = [
- "agent-wire",
  "async-trait",
- "attribution-wire",
  "base64 0.22.1",
  "commonware-cryptography",
  "commonware-runtime",
@@ -4796,6 +4794,7 @@ dependencies = [
  "node",
  "noded",
  "sdk",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -5616,7 +5615,6 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "run-envelope",
- "runs-wire",
  "sandbox-host",
  "serde",
  "serde_json",
