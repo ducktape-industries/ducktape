@@ -15,6 +15,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -229,6 +230,7 @@ struct SessionSummaryReply {
 #[derive(Clone, Debug, Serialize)]
 struct SessionsReply {
     kind: &'static str,
+    refresh: &'static str,
     identity: StoreIdentityReply,
     sessions: Vec<SessionSummaryReply>,
     next_cursor: Option<String>,
@@ -238,6 +240,7 @@ struct SessionsReply {
 #[derive(Clone, Debug, Serialize)]
 struct EventsReply {
     kind: &'static str,
+    refresh: &'static str,
     identity: StoreIdentityReply,
     session_id: String,
     events: Vec<SessionEvent>,
@@ -314,6 +317,42 @@ struct Inner {
 pub struct SessionRecordStore(Arc<Inner>);
 
 impl SessionRecordStore {
+    /// Open a local store with a stable machine identifier. The identifier is
+    /// generated once beside the journal and reused on every restart; it is
+    /// opaque and carries no account or credential material.
+    pub fn open_machine(
+        root: impl Into<PathBuf>,
+        network_id: impl Into<String>,
+    ) -> Result<Self, StoreError> {
+        let root = root.into();
+        let machine_path = root.join("machine-id");
+        let machine_id = match fs::read_to_string(&machine_path) {
+            Ok(value) => value.trim().to_owned(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut bytes = [0_u8; 16];
+                rand::thread_rng().fill_bytes(&mut bytes);
+                let value = hex(&bytes);
+                fs::create_dir_all(&root)?;
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&machine_path)?;
+                file.write_all(value.as_bytes())?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
+                value
+            }
+            Err(error) => return Err(StoreError::Io(error)),
+        };
+        Self::open(
+            root,
+            StoreIdentity {
+                machine_id,
+                network_id: network_id.into(),
+            },
+        )
+    }
+
     pub fn open(root: impl Into<PathBuf>, identity: StoreIdentity) -> Result<Self, StoreError> {
         let root = root.into();
         let sessions = root.join("sessions");
@@ -719,9 +758,12 @@ impl SessionRecordStore {
 /// closed run's steer, interrupt, approve, or deny capability.
 pub async fn query(
     State(handle): State<crate::NodeHandle>,
-    axum::Extension(crate::SignedBy(signer)): axum::Extension<crate::SignedBy>,
+    signer: Option<axum::Extension<crate::SignedBy>>,
     request: Result<Json<RunRecordsQuery>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Some(axum::Extension(crate::SignedBy(signer))) = signer else {
+        return query_refusal(StatusCode::FORBIDDEN, "not_found_or_unauthorized");
+    };
     let Json(request) = match request {
         Ok(request) => request,
         Err(_) => return query_refusal(StatusCode::BAD_REQUEST, "wrong_kind"),
@@ -812,6 +854,7 @@ fn query_sessions(
         .map(|cursor| wrap_cursor(cursor, signer, &scope));
     let reply = SessionsReply {
         kind: "sessions",
+        refresh: "poll",
         identity: StoreIdentityReply {
             machine_id: store.identity().machine_id.clone(),
             network_id: store.identity().network_id.clone(),
@@ -862,6 +905,7 @@ fn query_events(
     };
     let mut reply = EventsReply {
         kind: "events",
+        refresh: "poll",
         identity: StoreIdentityReply {
             machine_id: store.identity().machine_id.clone(),
             network_id: store.identity().network_id.clone(),

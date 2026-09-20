@@ -105,6 +105,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     noded::log::init(Some(log_ring.clone()), Some(storage.join("daemon.log")));
 
     let (handle, cmd_rx, stream_hub) = NodeHandle::channel_with_log_ring(log_ring);
+    let records = noded::run_records::SessionRecordStore::open_machine(
+        storage.join("session-records"),
+        LOCAL_CHAIN_ID,
+    )?;
     let handle = handle
         // persist node-local blobs (op receipts, agent prompt pins) under
         // <storage>/blobstore so a daemon restart keeps serving them.
@@ -114,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the duckfs workspace RPC materializes managed checkouts here (disk
         // state, separate from the module's own `<storage>/duckfs` dir).
         .with_duckfs_workspaces(storage.join("duckfs-workspaces"))
+        .with_session_records(records)
         // the single-writer daemon has no consensus and no on-chain owner, so
         // admin is operator-gated: the credential minted into
         // <storage>/admin.token 0600 is what a client presents — and what the

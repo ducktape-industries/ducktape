@@ -33,6 +33,7 @@ pub(crate) struct Surfaces {
 pub(crate) struct BindConfig<'a> {
     pub(crate) sync_only: bool,
     pub(crate) label: &'a str,
+    pub(crate) network_id: &'a str,
     pub(crate) storage: &'a std::path::Path,
     /// the config dir where `gateway-routes.json` lives (= `storage` in the dev
     /// shape). A serving daemon registers its loopback port there so the
@@ -129,6 +130,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     let BindConfig {
         sync_only,
         label,
+        network_id,
         storage,
         workspace,
         rpc_listen,
@@ -219,6 +221,13 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // point the http handle at this node's forge repo base (the same
     // `storage/forge-repo` the host materializes into) so the git upload-pack
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
+    let records = noded::run_records::SessionRecordStore::open(
+        storage.join("session-records"),
+        noded::run_records::StoreIdentity {
+            machine_id: hex::encode(&node_key),
+            network_id: network_id.to_owned(),
+        },
+    )?;
     let http_handle = http_handle
         // persist node-local blobs (op receipts, agent prompt pins) under
         // <storage>/blobstore so a daemon restart keeps serving them.
@@ -231,6 +240,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         // the duckfs workspace RPC's managed-checkout root (disk state, separate
         // from the module's own `<storage>/duckfs` dir).
         .with_duckfs_workspaces(storage.join("duckfs-workspaces"))
+        .with_session_records(records)
         // the owner-gated control namespace: this node's own key
         // salts the owner PoP, and the operator's active wallet key names the
         // account that may present one (identity binds no node to anyone);
