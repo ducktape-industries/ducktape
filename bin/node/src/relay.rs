@@ -74,16 +74,14 @@ const _: () = assert!(
 );
 
 /// The extra hold a blob transfer earns on top of `SUBMIT_HOLD`,
-/// budgeted at a 512 KiB/s floor over the bytes that actually cross the wire:
+/// budgeted at a 1 MiB/s floor over the bytes that actually cross the wire:
 /// chunks ride hex-encoded (2x), and every target's copy crosses the same
 /// uplink, so the budget counts the fan-out width whether the windows are
 /// filled one after another or side by side. The base hold alone assumed the
 /// pack lands within an app-submit budget — structurally impossible for a
-/// repository-sized pack crossing a WAN validator link. The floor leaves room
-/// for local validation and disk scheduling around the measured 1 MiB/s wire
-/// rate of the two-validator scratch lane.
+/// repository-sized pack crossing a WAN validator link.
 pub fn blob_transfer_allowance(total: u64, targets: usize) -> std::time::Duration {
-    const FLOOR_BYTES_PER_SEC: u64 = 512 * 1024;
+    const FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
     const HEX_INFLATION: u64 = 2;
     let wire_bytes = total
         .saturating_mul(HEX_INFLATION)
@@ -406,12 +404,12 @@ mod tests {
         assert_eq!(blob_transfer_allowance(1, 1), Duration::from_secs(1));
         assert_eq!(
             blob_transfer_allowance(4 * 1024 * 1024, 1),
-            Duration::from_secs(16),
-            "a 4 MiB pack crosses one link as 8 MiB of hex: 16s on top of the base hold"
+            Duration::from_secs(8),
+            "a 4 MiB pack crosses one link as 8 MiB of hex: 8s on top of the base hold"
         );
         assert_eq!(
             blob_transfer_allowance(4 * 1024 * 1024, 3),
-            Duration::from_secs(48),
+            Duration::from_secs(24),
             "three serial targets each take the whole transfer in turn"
         );
         assert!(
@@ -421,7 +419,7 @@ mod tests {
         );
         assert_eq!(
             blob_transfer_allowance(127 * 1024 * 1024, 1),
-            Duration::from_secs(508),
+            Duration::from_secs(254),
             "a pack's allowance is the bytes it actually puts on the wire, hex included"
         );
     }

@@ -38,14 +38,6 @@ const PROXY_IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// its serve task for good. It bounds each READ, never the exchange: a body
 /// has no size any more, so the only honest deadline is one on progress.
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// A Git receive-pack response waits for the forge block that materializes the
-/// uploaded pack. That wait starts only after the caller has finished sending
-/// the body, so the ordinary one-minute silent-upstream ceiling turns a large
-/// but healthy push into HTTP 502. The 217 MiB ducktape mirror measured about
-/// 5m42s through the two-validator scratch lane (including that false 502),
-/// so this route gets a bounded 15-minute response wait while every other
-/// loopback route keeps the one-minute ceiling.
-const GIT_RECEIVE_PACK_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 // One number, named on both sides of the door: what noded publishes as the
 // ceiling on a silent publisher IS this ceiling, because this plane is the hop
 // that applies it.
@@ -336,13 +328,8 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                         )
                                         .await;
                                     });
-                                    read_streamed_response_for_request(
-                                        &budget,
-                                        caller_end,
-                                        max_response_bytes,
-                                        &head,
-                                    )
-                                    .await
+                                    read_streamed_response(&budget, caller_end, max_response_bytes)
+                                        .await
                                 } else {
                                     proxy_remote(
                                         &budget,
@@ -620,7 +607,7 @@ async fn proxy_remote(
     push_frame(&mut stream, &gateway::ProxyFrame::End)
         .await
         .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-    read_streamed_response_for_request(budget, stream, max_response_bytes, head).await
+    read_streamed_response(budget, stream, max_response_bytes).await
 }
 
 /// What serving a route needs of THIS node, shared by the HTTP proxy and the
@@ -770,39 +757,10 @@ fn charge_drain(
 /// body's life, independent of whatever permit the far side (self-serve
 /// server or remote publisher) is charged. Returns AT the head — the returned
 /// `GatewayResponse.body` streams.
-#[cfg(test)]
 async fn read_streamed_response<S: AsyncRead + Unpin + Send + 'static>(
-    budget: &Arc<GatewayBudget>,
-    stream: S,
-    max_response_bytes: u64,
-) -> Result<GatewayResponse, GatewayFailure> {
-    read_streamed_response_with_timeout(budget, stream, max_response_bytes, BODY_IDLE_TIMEOUT).await
-}
-
-/// The caller side of a request keeps the same route-specific idle bound as
-/// the publisher side. A remote publisher can be healthy while its
-/// receive-pack is committing, so the caller must not cut the overlay stream
-/// at the ordinary one-minute head deadline either.
-async fn read_streamed_response_for_request<S: AsyncRead + Unpin + Send + 'static>(
-    budget: &Arc<GatewayBudget>,
-    stream: S,
-    max_response_bytes: u64,
-    request: &gateway::ProxyRequestHead,
-) -> Result<GatewayResponse, GatewayFailure> {
-    read_streamed_response_with_timeout(
-        budget,
-        stream,
-        max_response_bytes,
-        proxy_idle_timeout(request),
-    )
-    .await
-}
-
-async fn read_streamed_response_with_timeout<S: AsyncRead + Unpin + Send + 'static>(
     budget: &Arc<GatewayBudget>,
     mut stream: S,
     max_response_bytes: u64,
-    idle_timeout: Duration,
 ) -> Result<GatewayResponse, GatewayFailure> {
     let mut buf = Vec::new();
     // The HEAD under the idle ceiling, not the request one: the publisher
@@ -810,7 +768,7 @@ async fn read_streamed_response_with_timeout<S: AsyncRead + Unpin + Send + 'stat
     // push's upstream spends that time unpacking. Silence is the failure, not
     // duration — and it is the same ceiling the publisher holds its own
     // upstream to. The body past the head is bounded per frame by the pump.
-    let head = tokio::time::timeout(idle_timeout, read_proxy_head(&mut stream, &mut buf))
+    let head = tokio::time::timeout(BODY_IDLE_TIMEOUT, read_proxy_head(&mut stream, &mut buf))
         .await
         .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))??;
     let Some(permit) = budget.admit_stream() else {
@@ -1289,10 +1247,9 @@ async fn proxy_loopback(
         });
         upstream = upstream.body(reqwest::Body::wrap_stream(frames));
     }
-    let idle_timeout = proxy_idle_timeout(head);
     let response = tokio::select! {
         sent = upstream.send() => sent.map_err(|error| GatewayFailure::Unavailable(error.to_string()))?,
-        () = upstream_made_no_progress(Arc::clone(&progress), idle_timeout) => {
+        () = upstream_made_no_progress(Arc::clone(&progress)) => {
             return Err(GatewayFailure::Unavailable(
                 "loopback upstream neither took the request nor answered".into(),
             ));
@@ -1367,7 +1324,6 @@ async fn proxy_loopback(
     // (0 = unbounded, the declared-SSE case). The head returns immediately.
     let cap = route.policy.max_response_bytes;
     let is_head_method = head.method == gateway::RouteMethod::Head;
-    let body_idle_timeout = proxy_idle_timeout(head);
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(16);
     tokio::spawn(async move {
         if is_head_method {
@@ -1378,7 +1334,7 @@ async fn proxy_loopback(
         loop {
             // Per-chunk, not per-body: a declared SSE stream is answered for as
             // long as it likes, an upstream that goes quiet mid-body is not.
-            let chunk = match tokio::time::timeout(body_idle_timeout, chunks.next()).await {
+            let chunk = match tokio::time::timeout(BODY_IDLE_TIMEOUT, chunks.next()).await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => return,
                 Err(_) => {
@@ -1437,29 +1393,11 @@ async fn proxy_loopback(
 /// exchange can only be bounded on progress — the same shape as
 /// [`ws_idle_deadline`]. A request with no body never notifies, which makes
 /// this the plain "answer within [`BODY_IDLE_TIMEOUT`]" deadline it should be.
-async fn upstream_made_no_progress(progress: Arc<tokio::sync::Notify>, idle_timeout: Duration) {
-    while tokio::time::timeout(idle_timeout, progress.notified())
+async fn upstream_made_no_progress(progress: Arc<tokio::sync::Notify>) {
+    while tokio::time::timeout(BODY_IDLE_TIMEOUT, progress.notified())
         .await
         .is_ok()
     {}
-}
-
-/// The forge service answers `git-receive-pack` only after the submitted pack
-/// reaches a committed block. Keep that one loopback exchange open long enough
-/// for the measured pack transfer and commit, while retaining the normal
-/// silent-upstream bound for every other route.
-fn proxy_idle_timeout(head: &gateway::ProxyRequestHead) -> Duration {
-    let path = head
-        .path_and_query
-        .split_once('?')
-        .map_or(head.path_and_query.as_str(), |(path, _)| path);
-    let is_receive_pack =
-        head.method == gateway::RouteMethod::Post && path.ends_with("/git-receive-pack");
-    if is_receive_pack {
-        GIT_RECEIVE_PACK_IDLE_TIMEOUT
-    } else {
-        BODY_IDLE_TIMEOUT
-    }
 }
 
 /// DuckFS reads are windowed at 1 MiB; a manifest (≤ 4 MiB) or a file

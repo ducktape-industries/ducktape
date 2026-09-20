@@ -5,11 +5,16 @@ use http_body_util::BodyExt as _;
 use tower::ServiceExt as _;
 
 fn application() -> (tempfile::TempDir, axum::Router) {
+    application_on("test-chain", "http://127.0.0.1:1")
+}
+
+/// the service for `chain_id`, fronting the node at `node_url`.
+fn application_on(chain_id: &str, node_url: &str) -> (tempfile::TempDir, axum::Router) {
     let directory = tempfile::tempdir().unwrap();
     let config = Config {
-        node_url: "http://127.0.0.1:1".into(),
+        node_url: node_url.into(),
         node_key: "01".repeat(32),
-        chain_id: "test-chain".into(),
+        chain_id: chain_id.into(),
         account: 1,
         label: "git".into(),
         module: "forge".into(),
@@ -60,12 +65,143 @@ fn pkt(payload: &str) -> String {
 /// a stock (UNSIGNED) receive-pack body: one ref-update command, the flush that
 /// ends the command list, and an empty pack.
 fn unsigned_push_body() -> String {
+    unsigned_push_body_with_caps("report-status")
+}
+
+fn unsigned_push_body_with_caps(caps: &str) -> String {
     let zero = "0".repeat(40);
     let one = "1".repeat(40);
     format!(
         "{}0000",
-        pkt(&format!("{zero} {one} refs/heads/main\0report-status\n"))
+        pkt(&format!("{zero} {one} refs/heads/main\0{caps}\n"))
     )
+}
+
+/// a SIGNED receive-pack body over the `chain-a`/`lab` fixture certificate,
+/// framed as `git push --signed` frames it, followed by `pack` as the packfile.
+fn signed_push_body(caps: &str, pack: &[u8]) -> Vec<u8> {
+    use crate::git_http::receive_pack_tests::{ARMORED, CERT};
+    let mut body = pkt(&format!("push-cert\0{caps}\n")).into_bytes();
+    for line in CERT.split_inclusive('\n').chain(ARMORED.split_inclusive('\n')) {
+        body.extend_from_slice(pkt(line).as_bytes());
+    }
+    body.extend_from_slice(pkt("push-cert-end\n").as_bytes());
+    body.extend_from_slice(b"0000");
+    body.extend_from_slice(pack);
+    body
+}
+
+/// the pkt-lines of a side-band-64k answer, split by band: `(band 1, band 3)`
+/// payloads concatenated, keepalives counted. Panics on a plain line — a
+/// side-band client reads every byte through its demuxer.
+fn demux(answer: &[u8]) -> (Vec<u8>, Vec<u8>, usize) {
+    let (mut pack, mut errors, mut keepalives) = (Vec::new(), Vec::new(), 0);
+    let mut at = answer;
+    loop {
+        let len = usize::from_str_radix(std::str::from_utf8(&at[..4]).unwrap(), 16).unwrap();
+        if len == 0 {
+            assert_eq!(at.len(), 4, "the flush ends the answer");
+            return (pack, errors, keepalives);
+        }
+        let payload = &at[5..len];
+        match at[4] {
+            1 if payload.is_empty() => keepalives += 1,
+            1 => pack.extend_from_slice(payload),
+            3 => errors.extend_from_slice(payload),
+            band => panic!("unexpected band {band}"),
+        }
+        at = &at[len..];
+    }
+}
+
+/// A side-band client reads its refusal on band 1 — the same report, muxed,
+/// because once the client asked for side-band a plain line is a protocol
+/// error to it.
+#[tokio::test]
+async fn a_side_band_push_reads_its_report_on_band_1() {
+    let (_directory, router) = application();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/lab/git-receive-pack")
+        .body(Body::from(unsigned_push_body_with_caps(
+            "report-status side-band-64k",
+        )))
+        .unwrap();
+    let response = router.oneshot(authenticated(request)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let (report, errors, keepalives) = demux(&bytes);
+    let report = String::from_utf8_lossy(&report);
+    assert!(report.contains("unpack ok"), "{report}");
+    assert!(report.contains("ng refs/heads/main "), "{report}");
+    assert!(errors.is_empty() && keepalives == 0);
+}
+
+/// A PUSH'S ANSWER STARTS BEFORE ITS BLOCK. The node holds a blob-bearing
+/// submit until the pack has fanned out to every validator and the block
+/// commits — minutes for a repository-sized pack — while every hop between
+/// git and this service (the browser Gateway's 60 s silent-upstream ceiling
+/// above all) cuts an exchange that goes quiet. With side-band-64k the head
+/// goes out as soon as the push is admitted and keepalives ride band 1 until
+/// the fate lands, so the exchange is bounded on progress, never on the size
+/// of the pack (#2791). Here the node never answers at all: the keepalives
+/// outlast the ceiling many times over, and the fate arrives as a band-3
+/// error — nobody said no, so no ref is reported rejected.
+#[tokio::test(start_paused = true)]
+async fn a_push_held_past_the_gateway_ceiling_keeps_its_answer_alive() {
+    use futures::StreamExt as _;
+    const GATEWAY_SILENCE_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
+    // a node that accepts the connection and never answers.
+    let node = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_url = format!("http://{}", node.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = node.accept().await {
+            held.push(socket);
+        }
+    });
+    let (_directory, router) = application_on("chain-a", &node_url);
+    let response = router
+        .oneshot(authenticated(
+            Request::builder()
+                .method("POST")
+                .uri("/lab/git-receive-pack")
+                .body(Body::from(signed_push_body(
+                    "report-status side-band-64k",
+                    b"PACK",
+                )))
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "the head is out");
+    let mut answer = response.into_body().into_data_stream();
+    let mut lines = Vec::new();
+    loop {
+        let next = answer.next();
+        tokio::pin!(next);
+        assert!(
+            futures::poll!(&mut next).is_pending(),
+            "nothing is due before the keepalive interval"
+        );
+        tokio::time::advance(GIT_KEEPALIVE_INTERVAL).await;
+        let line = next.await.unwrap().unwrap();
+        let is_keepalive = &line[..] == b"0005\x01";
+        lines.extend_from_slice(&line);
+        if !is_keepalive {
+            break;
+        }
+    }
+    while let Some(chunk) = answer.next().await {
+        lines.extend_from_slice(&chunk.unwrap());
+    }
+    let (report, errors, keepalives) = demux(&lines);
+    assert!(
+        GIT_KEEPALIVE_INTERVAL * keepalives as u32 > GATEWAY_SILENCE_CEILING,
+        "{keepalives} keepalives do not outlast the gateway ceiling"
+    );
+    assert!(report.is_empty(), "no ref was reported on: {report:?}");
+    assert!(!errors.is_empty(), "the unresolved fate rides band 3");
 }
 
 /// A PUSH MUST PROVE ITSELF. An unsigned push used to be accepted and re-signed

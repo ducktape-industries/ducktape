@@ -19,8 +19,15 @@ use crate::{ServiceState, error_response};
 /// `side-band-64k`, so the client sends the report-status back as plain
 /// pkt-lines (not muxed onto a side channel) — the minimal wire this bridge
 /// needs to read.
-const GIT_RECEIVE_PACK_CAPS: &str =
-    "report-status report-status-v2 delete-refs ofs-delta agent=ducktape-forge/0.1";
+///
+/// `side-band-64k` is what lets a push's answer START before the block that
+/// lands it: the report rides band 1 behind [`GIT_KEEPALIVE_PKT`] lines, so
+/// every hop (the browser Gateway bounds a silent upstream on progress) sees
+/// the exchange alive for as long as a repository-sized pack takes to fan out
+/// to every validator and commit. Without it the report is one plain answer
+/// that can only be sent once the block exists.
+const GIT_RECEIVE_PACK_CAPS: &str = "report-status report-status-v2 delete-refs ofs-delta \
+     side-band-64k agent=ducktape-forge/0.1";
 /// the capabilities forge's upload-pack (fetch/clone) advertises. `side-band-64k`
 /// muxes the packfile onto band 1 of the reply — git clients request it by
 /// default; `multi_ack_detailed` is the modern negotiation, `thin-pack`/
@@ -374,6 +381,20 @@ fn push_may_carry_proof(commands: &[Vec<u8>]) -> bool {
         .is_some_and(|first| command_text(first) == PUSH_CERT_LINE)
 }
 
+/// whether the client asked for its answer on side-band-64k: the capability
+/// list rides after the NUL on the FIRST command line (plain or `push-cert`).
+fn push_side_band(commands: &[Vec<u8>]) -> bool {
+    let Some(first) = commands.first() else {
+        return false;
+    };
+    let Some(nul) = first.iter().position(|&b| b == 0) else {
+        return false;
+    };
+    String::from_utf8_lossy(&first[nul + 1..])
+        .split_ascii_whitespace()
+        .any(|cap| cap == "side-band-64k")
+}
+
 /// decode the command list. a stock push sends `<old> <new> <refname>` lines
 /// (capabilities after a NUL on the first). a signed push (send-pack.c
 /// `generate_push_cert`) sends `push-cert\0<caps>` instead, then every line
@@ -549,17 +570,36 @@ fn oid_hex(oid: Option<&[u8]>) -> String {
 /// == ng)`. forge's PushRefs is ATOMIC, so callers report one shared fate for
 /// every ref of a push. the pack is always received by the time we answer, so
 /// `unpack ok` is unconditional (we don't verify closure here).
-fn git_report_status(results: &[(String, Option<String>)]) -> Response {
-    let mut body = Vec::new();
-    body.extend_from_slice(&pkt_line(b"unpack ok\n"));
+fn git_report_status(results: &[(String, Option<String>)], side_band: bool) -> Response {
+    receive_pack_response(axum::body::Body::from(report_status_bytes(results, side_band)))
+}
+
+/// the `report-status` pkt-lines for a push's shared fate, muxed onto band 1
+/// when the client asked for side-band-64k (a client that did reads every
+/// byte through the demuxer, so a plain report would be a protocol error).
+fn report_status_bytes(results: &[(String, Option<String>)], side_band: bool) -> Vec<u8> {
+    let mut report = Vec::new();
+    report.extend_from_slice(&pkt_line(b"unpack ok\n"));
     for (refname, err) in results {
         let status_line = match err {
             None => format!("ok {refname}\n"),
             Some(reason) => format!("ng {refname} {reason}\n"),
         };
-        body.extend_from_slice(&pkt_line(status_line.as_bytes()));
+        report.extend_from_slice(&pkt_line(status_line.as_bytes()));
+    }
+    report.extend_from_slice(GIT_FLUSH_PKT);
+    if !side_band {
+        return report;
+    }
+    let mut body = Vec::new();
+    for piece in report.chunks(GIT_SIDE_BAND_CHUNK) {
+        body.extend_from_slice(&band_line(GIT_BAND_PACK, piece));
     }
     body.extend_from_slice(GIT_FLUSH_PKT);
+    body
+}
+
+fn receive_pack_response(body: axum::body::Body) -> Response {
     (
         StatusCode::OK,
         [
@@ -981,6 +1021,7 @@ pub(crate) async fn git_receive_pack(
             );
         }
     };
+    let side_band = push_side_band(&commands);
     if commands.is_empty() {
         // a push whose pack exceeds git's `http.postBuffer` (1 MiB default) is
         // preceded by a flush-only PROBE POST (Content-Length: 4, body `0000`,
@@ -1028,7 +1069,7 @@ pub(crate) async fn git_receive_pack(
             .into_iter()
             .map(|(_, _, refname)| (refname, Some(REFUSAL.to_string())))
             .collect();
-        return git_report_status(&results);
+        return git_report_status(&results, side_band);
     }
 
     // the command list: plain `<old> <new> <refname>` lines, or — a signed
@@ -1055,7 +1096,7 @@ pub(crate) async fn git_receive_pack(
                 .into_iter()
                 .map(|(_, _, r)| (r, Some(REASON.to_string())))
                 .collect();
-            return git_report_status(&results);
+            return git_report_status(&results, side_band);
         }
         Err(CommandRefusal::MalformedOid(which)) => {
             let reason = format!("malformed {which} oid");
@@ -1069,7 +1110,7 @@ pub(crate) async fn git_receive_pack(
                 .into_iter()
                 .map(|(_, _, r)| (r, Some(REASON.to_string())))
                 .collect();
-            return git_report_status(&results);
+            return git_report_status(&results, side_band);
         }
     };
 
@@ -1084,14 +1125,105 @@ pub(crate) async fn git_receive_pack(
             .into_iter()
             .map(|(_, _, r)| (r, Some(reason.clone())))
             .collect();
-        return git_report_status(&results);
+        return git_report_status(&results, side_band);
     }
 
-    // stash the WHOLE packfile as one node-local blob, keyed by its sha256;
-    // forge materializes it by this digest (the bytes never cross consensus).
-    // a delete-only push carries no objects, so nothing is stashed. The bytes
-    // stream from the spool file straight into the node's store — neither end
-    // ever holds the pack.
+    let refnames: Vec<String> = cmds.into_iter().map(|(_, _, r)| r).collect();
+    let land = land_push(
+        handle,
+        repo,
+        spooled,
+        pack_offset,
+        updates,
+        tags,
+        cert,
+        refnames,
+    );
+    if !side_band {
+        // no band a keepalive could ride: the answer waits, as one plain
+        // report, for the block.
+        return match land.await {
+            PushFate::Report(results) => git_report_status(&results, false),
+            PushFate::Unresolved(detail) => error_response(StatusCode::BAD_GATEWAY, &detail),
+        };
+    }
+    // the head goes out NOW; the pack fans out to every validator and commits
+    // behind keepalives, so no hop between git and this service ever sees a
+    // silent exchange, however big the pack. The fate lands as the report on
+    // band 1, or — nobody said no — as a band-3 error, which git prints and
+    // fails the push on without claiming any ref was rejected.
+    let (lines_tx, lines_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    tokio::spawn(async move {
+        let mut land = std::pin::pin!(land);
+        loop {
+            let line = tokio::select! {
+                fate = &mut land => {
+                    let _ = lines_tx.send(fate_bytes(fate)).await;
+                    return;
+                }
+                () = tokio::time::sleep(GIT_KEEPALIVE_INTERVAL) => GIT_KEEPALIVE_PKT.to_vec(),
+            };
+            if lines_tx.send(line).await.is_err() {
+                // the caller hung up: the op is in flight and its fate is
+                // recorded by the node; a re-push re-reads the refs.
+                land.await;
+                return;
+            }
+        }
+    });
+    let body = futures::stream::unfold(lines_rx, |mut lines| async move {
+        lines.recv().await.map(|line| (line, lines))
+    })
+    .map(Ok::<_, std::convert::Infallible>);
+    receive_pack_response(axum::body::Body::from_stream(body))
+}
+
+/// a push's shared fate once the pack is in the node's store and the
+/// `PushRefs` op has been submitted.
+enum PushFate {
+    /// forge answered: every ref landed, or every ref was refused for the
+    /// named reason (the op is atomic).
+    Report(Vec<(String, Option<String>)>),
+    /// NOT a refusal: nobody said no. The node holds the submit until the
+    /// block commits, so an exchange that did not complete leaves the op's
+    /// fate unknown — it may be committing right now. Answering git a
+    /// per-ref `ng` here would report a landing push as rejected, and the
+    /// operator's retry would then collide with the ref it installed. So git
+    /// is told the transfer failed, which is what happened.
+    Unresolved(String),
+}
+
+/// the side-band tail of a push's answer: the report on band 1, or the
+/// unresolved detail on band 3 (git prints it as `remote error:` and fails
+/// the push without a per-ref verdict), then the flush.
+fn fate_bytes(fate: PushFate) -> Vec<u8> {
+    match fate {
+        PushFate::Report(results) => report_status_bytes(&results, true),
+        PushFate::Unresolved(detail) => {
+            let mut body = band_line(GIT_BAND_ERROR, detail.as_bytes());
+            body.extend_from_slice(GIT_FLUSH_PKT);
+            body
+        }
+    }
+}
+
+/// stash the WHOLE packfile as one node-local blob, keyed by its sha256
+/// (forge materializes it by this digest; the bytes never cross consensus),
+/// then CAS every branch and create every tag through ONE atomic `PushRefs`
+/// op and await its block. A delete-only push carries no objects, so nothing
+/// is stashed. The bytes stream from the spool file straight into the node's
+/// store — neither end ever holds the pack.
+#[allow(clippy::too_many_arguments)]
+async fn land_push(
+    handle: ServiceState,
+    repo: String,
+    spooled: SpooledPush,
+    pack_offset: u64,
+    updates: Vec<forge::RefUpdate>,
+    tags: Vec<forge::TagCreate>,
+    cert: Option<forge::PushCert>,
+    refnames: Vec<String>,
+) -> PushFate {
     let pack_bytes = spooled.len.saturating_sub(pack_offset);
     let carries_objects = !tags.is_empty() || updates.iter().any(|u| u.new_oid.is_some());
     let pack_digest = if carries_objects {
@@ -1105,16 +1237,14 @@ pub(crate) async fn git_receive_pack(
                 .and_then(|raw| <[u8; 32]>::try_from(raw).ok())
             {
                 Some(digest) => Some(digest),
-                None => return error_response(StatusCode::BAD_GATEWAY, "invalid blob digest"),
+                None => return PushFate::Unresolved("invalid blob digest".into()),
             },
-            Err(error) => return error_response(StatusCode::BAD_GATEWAY, &error.to_string()),
+            Err(error) => return PushFate::Unresolved(error.to_string()),
         }
     } else {
         None
     };
 
-    // CAS every branch and create every tag through ONE atomic PushRefs op and
-    // await the block.
     let payload = forge::encode_msg(&forge::ForgeMsg::PushRefs {
         repo: repo.clone(),
         updates,
@@ -1122,9 +1252,7 @@ pub(crate) async fn git_receive_pack(
         pack_digest: pack_digest.map(|digest| digest.to_vec()),
         cert,
     });
-    let submitted = handle.submit(payload, pack_digest, pack_bytes).await;
-    let refnames: Vec<String> = cmds.into_iter().map(|(_, _, r)| r).collect();
-    match submitted {
+    match handle.submit(payload, pack_digest, pack_bytes).await {
         Ok(height) => {
             tracing::info!(
                 target: "ducktape::forge",
@@ -1135,19 +1263,11 @@ pub(crate) async fn git_receive_pack(
                 height,
                 "push landed"
             );
-            let results: Vec<(String, Option<String>)> =
-                refnames.into_iter().map(|r| (r, None)).collect();
-            git_report_status(&results)
+            PushFate::Report(refnames.into_iter().map(|r| (r, None)).collect())
         }
-        // NOT a refusal: nobody said no. The node holds the submit until the
-        // block commits, so an exchange that did not complete leaves the op's
-        // fate unknown — it may be committing right now. Answering git a
-        // per-ref `ng` here would report a landing push as rejected, and the
-        // operator's retry would then collide with the ref it installed. A
-        // 502 makes git say the transfer failed, which is what happened.
         Err(ducktape_rpc::SubmitFailure::Unresolved(detail)) => {
             push_refused(&repo, "unresolved", &detail);
-            error_response(StatusCode::BAD_GATEWAY, &detail)
+            PushFate::Unresolved(detail)
         }
         Err(ducktape_rpc::SubmitFailure::Refused(refusal)) => {
             // the refusing module named its own class: log THAT, never a guess
@@ -1161,11 +1281,12 @@ pub(crate) async fn git_receive_pack(
                 "non_fast_forward" => "non-fast-forward".to_string(),
                 _ => refusal.message().replace('\n', " "),
             };
-            let results: Vec<(String, Option<String>)> = refnames
-                .into_iter()
-                .map(|r| (r, Some(reason.clone())))
-                .collect();
-            git_report_status(&results)
+            PushFate::Report(
+                refnames
+                    .into_iter()
+                    .map(|r| (r, Some(reason.clone())))
+                    .collect(),
+            )
         }
     }
 }
@@ -1663,7 +1784,7 @@ mod decode_git_body_tests {
 }
 
 #[cfg(test)]
-mod receive_pack_tests {
+pub(crate) mod receive_pack_tests {
     use super::*;
 
     /// the real `ssh-keygen -Y sign -n git` fixture keyscheme and forge pin,
@@ -1673,8 +1794,8 @@ mod receive_pack_tests {
     /// certificate this bridge parses and one consensus verifies are one
     /// artifact. SPELLED, not computed, so a change to the nonce rule has to
     /// re-mint a signature rather than quietly re-sign itself.
-    const CERT: &str = "certificate version 0.1\npusher key::ssh-ed25519 AAAA 1756332000 +0000\npushee http://127.0.0.1:8844/forge/lab\nnonce 594586ec8545839343436a12f8c85fe8ca603c2a050cb9130f31c78cabcdecd9/lab\n\n0000000000000000000000000000000000000000 ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 refs/heads/main\n";
-    const ARMORED: &str = "-----BEGIN SSH SIGNATURE-----\n\
+    pub(crate) const CERT: &str = "certificate version 0.1\npusher key::ssh-ed25519 AAAA 1756332000 +0000\npushee http://127.0.0.1:8844/forge/lab\nnonce 594586ec8545839343436a12f8c85fe8ca603c2a050cb9130f31c78cabcdecd9/lab\n\n0000000000000000000000000000000000000000 ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 refs/heads/main\n";
+    pub(crate) const ARMORED: &str = "-----BEGIN SSH SIGNATURE-----\n\
 U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgVMCTLbeHvqm1iVUMxR1FbRxp6L\n\
 /FUdZm0jg3wdq6tLMAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5\n\
 AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\

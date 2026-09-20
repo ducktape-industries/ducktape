@@ -1339,3 +1339,62 @@ fn compiled_wasm_merge_updates_the_real_forge_branch() {
         format!("{target} {source}")
     );
 }
+
+/// The 502 class (#2791) on the real hops: the browser Gateway of node #1,
+/// the overlay to publisher node #0, its loopback to the service, the node's
+/// blob put, the relay fan-out to the other validator, the block. A pack this
+/// size takes the fan-out minutes past the Gateway's 60 s silent-upstream
+/// ceiling, so before receive-pack rode side-band keepalives the push was
+/// answered 502 after the body had been consumed. Incompressible bytes, so
+/// the pack IS the size. Minutes long, so ignored: the fast regression is the
+/// service's paused-clock `a_push_held_past_the_gateway_ceiling_keeps_its_answer_alive`.
+/// `LARGE_PACK_MIB` picks the size (default 128).
+#[test]
+#[ignore = "minutes-long large-pack push through the two-node lane"]
+fn a_repository_sized_pack_pushes_and_clones_back_byte_exact() {
+    if skip_without_git("a_repository_sized_pack_pushes_and_clones_back_byte_exact").is_some() {
+        return;
+    }
+    let mib: usize = std::env::var("LARGE_PACK_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    let daemon = GatewayGit::start();
+    let url = daemon.forge_url("big");
+    let work = tempfile::TempDir::new().unwrap();
+    let wd = work.path();
+    git_ok(wd, &["init"]);
+    // xorshift bytes: incompressible, so the pack is the file.
+    let mut blob = vec![0u8; mib * 1024 * 1024];
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for b in blob.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = x as u8;
+    }
+    std::fs::write(wd.join("blob.bin"), &blob).unwrap();
+    git_ok(wd, &["add", "blob.bin"]);
+    git_ok(wd, &["commit", "-q", "-m", "big"]);
+    git_ok(wd, &["remote", "add", "ducktape", &url]);
+    let started = std::time::Instant::now();
+    let push = git_push(&daemon, wd, &["push", "ducktape", "main"]);
+    eprintln!(
+        "[large-pack] {mib} MiB push took {:?}: {}",
+        started.elapsed(),
+        push.status
+    );
+    assert!(push.status.success(), "{}", render(&push));
+    assert_eq!(forge_head(&daemon, "big"), Some(rev_parse_head(wd)));
+
+    let clones = tempfile::TempDir::new().unwrap();
+    let started = std::time::Instant::now();
+    git_ok(clones.path(), &["clone", "-q", &url, "back"]);
+    eprintln!("[large-pack] clone back took {:?}", started.elapsed());
+    let back = clones.path().join("back");
+    assert_eq!(rev_parse_head(&back), rev_parse_head(wd));
+    assert!(
+        std::fs::read(back.join("blob.bin")).unwrap() == blob,
+        "the cloned blob differs from the pushed one"
+    );
+}
