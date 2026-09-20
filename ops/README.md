@@ -81,6 +81,11 @@ manifest, process contract, and install/activate/stop/restart commands.
 - `dogfood-forge.sh` (`make dogfood-forge`) — mirror GitHub `origin/dev` into
   the local node's Forge `dev` without moving release-only `main`; needs a
   running node.
+- `forge-org-mirror.sh` — plan or explicitly execute a whole GitHub
+  organization's default-branch-and-tags mirror into Forge. It discovers
+  repositories with paginated `gh api`, refuses divergent branches and tag
+  changes, and never contacts a node in plan mode; its focused fixture gate is
+  `forge-org-mirror-test.py`.
 - `forge-mirror.sh` — mirror GitHub branches into a node's Forge on a timer
   (`node/ducktape-forge-mirror.{service,timer}`), fast-forward only: a
   non-fast-forward fails the pass and names which side moved. Its test is
