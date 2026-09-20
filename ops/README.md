@@ -84,7 +84,11 @@ manifest, process contract, and install/activate/stop/restart commands.
 - `forge-org-mirror.sh` — plan or explicitly execute a whole GitHub
   organization's default-branch-and-tags mirror into Forge. It discovers
   repositories with paginated `gh api`, refuses divergent branches and tag
-  changes, and never contacts a node in plan mode; its focused fixture gate is
+  changes, and never contacts a node in plan mode; `--execute` verifies the
+  node's chain id and the writing account before any write, re-reads every
+  pushed repository from Forge, and needs an SSH key already admitted to that
+  account (`ducktape account key add --ssh`) because the push certificate, not
+  the wallet, authorizes a Forge ref update. Its focused fixture gate is
   `forge-org-mirror-test.py`.
 - `forge-mirror.sh` — mirror GitHub branches into a node's Forge on a timer
   (`node/ducktape-forge-mirror.{service,timer}`), fast-forward only: a

@@ -3,6 +3,8 @@
 # Plan mode is the default and never contacts a node. --execute is the only
 # mode that verifies a node or writes Forge. Existing tags must match exactly;
 # branches may only fast-forward. No force refspec, deletion, or tag rewrite.
+# Every push is re-read from Forge afterwards: a push that exits zero without
+# landing its refs fails the run.
 set -euo pipefail
 
 readonly SCRIPT_NAME="${0##*/}"
@@ -13,9 +15,10 @@ usage() {
 Usage: ops/forge-org-mirror.sh [options]
 
 Plan mode is the default. It uses `gh api --paginate` and local source fetches,
-but never contacts a Forge node. --execute verifies the node/account and then
-pushes with signed Git HTTP. The wallet password is read by ducktape's masked
-stdin prompt; this script never accepts, stores, or prints it.
+but never contacts a Forge node. --execute verifies the node's network and the
+writing account, then pushes with signed Git HTTP. The wallet password is read
+by ducktape's masked stdin prompt; this script never accepts, stores, or prints
+it.
 
   --execute                  verify the node/account and push to Forge
   --org ORG                  GitHub organization (required)
@@ -25,7 +28,11 @@ stdin prompt; this script never accepts, stores, or prints it.
   --owner-account NUMBER     writing account number (required with --execute)
   --owner-handle HANDLE      Forge owner handle (required with --execute)
   --key PATH                 encrypted ducktape wallet key (required with --execute)
-  --git-signing-key PATH     SSH key for `git push --signed` (required with --execute)
+  --git-signing-key PATH     OpenSSH key for `git push --signed` (required with
+                             --execute); its public key must already be a member
+                             key of --owner-account (`ducktape account key add
+                             --ssh`), because the push certificate, not the
+                             wallet, authorizes a Forge ref update
   --ensure-owner             set the handle and publish its Git route if absent
   --work-dir PATH            retain local source staging
   -h, --help                 show this help
@@ -60,6 +67,11 @@ done
 [ -n "$ORG" ] || die "--org is required"
 case "$ORG" in */*|*" "*) die "--org must be one organization name" ;; esac
 
+# The public half of the signing key: `git push --signed` signs with the
+# private key, and the account membership check needs the public one. A
+# `.pub` beside the private key is how `ducktape account key add --ssh`
+# names the same pair.
+SIGNING_PUB=""
 if [ "$EXECUTE" -eq 1 ]; then
     [ -n "$NODE" ] || die "--execute requires --node"
     [ -n "$NETWORK" ] || die "--execute requires --network"
@@ -69,7 +81,15 @@ if [ "$EXECUTE" -eq 1 ]; then
     [ -n "$GIT_SIGNING_KEY" ] || die "--execute requires --git-signing-key"
     [ -r "$KEY_PATH" ] || die "wallet key is not readable"
     [ -r "$GIT_SIGNING_KEY" ] || die "Git signing key is not readable"
-    case "$NETWORK" in *#*) ;; *) die "--network must contain #" ;; esac
+    case "$GIT_SIGNING_KEY" in
+        *.pub) SIGNING_PUB="$GIT_SIGNING_KEY" ;;
+        *) SIGNING_PUB="$GIT_SIGNING_KEY.pub" ;;
+    esac
+    [ -r "$SIGNING_PUB" ] || die "the signing key's public half $SIGNING_PUB is not readable"
+    # `<label>#<salt-hex>` as duck-address spells a chain id; the salt is an
+    # even number of lowercase hex digits and the label carries no '#'.
+    network_shape='^[a-z0-9][a-z0-9-]*#([0-9a-f][0-9a-f])+$'
+    [[ "$NETWORK" =~ $network_shape ]] || die "--network must be <label>#<salt-hex>"
     case "$OWNER_ACCOUNT" in ''|*[!0-9]*) die "--owner-account must be decimal" ;; esac
     case "$OWNER_HANDLE" in ''|*[!a-z0-9._-]*) die "--owner-handle has unsupported characters" ;; esac
 fi
@@ -85,6 +105,7 @@ SOURCE_BASE="${SOURCE_BASE%/}"
 mkdir -p "$WORK_DIR/repos"
 command -v "$GH_BIN" >/dev/null 2>&1 || die "gh is required"
 command -v "$GIT_BIN" >/dev/null 2>&1 || die "git is required"
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
 
 inventory_json="$WORK_DIR/github-pages.json"
 if ! "$GH_BIN" api --paginate --slurp --method GET \
@@ -151,6 +172,8 @@ fetch_source_repo() {
         if ! "$GIT_BIN" -C "$repo_dir" fetch -q --no-tags "$source" "$ref" 2>"$error_file"; then
             die "$repo: cannot fetch tag $tag"
         fi
+        # The tag's own object id, annotated or not: it is pushed and later
+        # verified as the id the source names, never a peeled commit.
         "$GIT_BIN" -C "$repo_dir" cat-file -e "$oid^{object}" 2>"$error_file" || die "$repo: source tag unavailable"
         "$GIT_BIN" -C "$repo_dir" update-ref "$ref" "$oid"
         printf '%s\t%s\n' "$oid" "$ref" >>"$WORK_DIR/$1.source-refs.tsv"
@@ -173,32 +196,106 @@ done <"$inventory"
 [ "$EXECUTE" -eq 1 ] || exit 0
 
 command -v "$DUCKTAPE_BIN" >/dev/null 2>&1 || die "ducktape is required for --execute"
+
+# The network the node actually serves, read off the same unauthenticated
+# `/v1/status` field `ducktape forge setup --node` registers a workspace by
+# (`status_chain_id` in bin/node/src/forge_cli.rs). It is compared for exact
+# equality: a chain id that merely contains the requested one is a different
+# network. This is the FIRST node contact, before any account read, owner
+# write, or ref push.
+node_chain_id() {
+    python3 - "$1" <<'PY'
+import json, sys, urllib.request
+base = sys.argv[1].rstrip("/")
+with urllib.request.urlopen(f"{base}/v1/status", timeout=30) as reply:
+    status = json.load(reply)
+chain_id = status.get("chain_id")
+if not isinstance(chain_id, str) or not chain_id:
+    raise SystemExit("the node serves no chain")
+print(chain_id)
+PY
+}
+verify_network() {
+    local served
+    served="$(node_chain_id "$NODE")" || die "cannot read the network of the node at $NODE"
+    [ "$served" = "$NETWORK" ] || die "the node at $NODE serves network $served, not $NETWORK"
+}
+verify_network
+
+# `ducktape user key status --key` prints `encrypted <pubkey-hex>` without a
+# password (bin/node/src/userkey_cli.rs).
 wallet_status="$WORK_DIR/wallet.status"
 if ! "$DUCKTAPE_BIN" user key status --key "$KEY_PATH" >"$wallet_status" 2>/dev/null; then
     die "wallet key status failed"
 fi
-wallet_pubkey="$(awk '$1 == "encrypted" {print $2; exit}' "$wallet_status")"
-[ -n "$wallet_pubkey" ] || die "wallet key is not encrypted"
+wallet_pubkey="$(awk 'NF == 2 && $1 == "encrypted" {print $2; exit}' "$wallet_status")"
+[ -n "$wallet_pubkey" ] || die "wallet key is not an encrypted ducktape key"
+
+# The raw ed25519 public key inside an OpenSSH `ssh-ed25519 <base64>` line —
+# the same bytes `ducktape account key add --ssh` admits as a member key
+# (`keyscheme::sshsig::authorized_key`), so the membership test below compares
+# the signer git will actually use against the account's own key list.
+signing_pubkey="$(python3 - "$SIGNING_PUB" <<'PY'
+import base64, sys
+fields = open(sys.argv[1], encoding="utf-8").read().split()
+if len(fields) < 2 or fields[0] != "ssh-ed25519":
+    raise SystemExit("not an ssh-ed25519 public key")
+blob = base64.b64decode(fields[1], validate=True)
+def take(buf):
+    size = int.from_bytes(buf[:4], "big")
+    return buf[4:4 + size], buf[4 + size:]
+kind, rest = take(blob)
+key, rest = take(rest)
+if kind != b"ssh-ed25519" or len(key) != 32 or rest:
+    raise SystemExit("malformed ssh-ed25519 public key")
+print(key.hex())
+PY
+)" || die "cannot read the ed25519 public key in $SIGNING_PUB"
+
+# `ducktape account show --number` prints `number=<n> name=<name>` and one
+# `key=<scheme> <hex> <label>` line per member key (bin/node/src/account_cli.rs).
 account_output="$WORK_DIR/account.txt"
-if ! "$DUCKTAPE_BIN" account show --number "$OWNER_ACCOUNT" --node "$NODE" --key "$KEY_PATH" >"$account_output" 2>/dev/null; then
+if ! "$DUCKTAPE_BIN" account show --number "$OWNER_ACCOUNT" --node "$NODE" >"$account_output" 2>/dev/null; then
     die "owner account lookup failed"
 fi
-grep -Eq "^number=${OWNER_ACCOUNT} name=" "$account_output" || die "endpoint did not resolve the requested account"
-grep -F "key=ed25519 $wallet_pubkey" "$account_output" >/dev/null 2>&1 || die "wallet key is not in the requested account"
+account_number="$(awk -F'[= ]' 'NR == 1 && $1 == "number" {print $2; exit}' "$account_output")"
+[ "$account_number" = "$OWNER_ACCOUNT" ] || die "the node answered for account ${account_number:-none}, not $OWNER_ACCOUNT"
+member_key() { awk -v want="$1" '$1 == "key=ed25519" && $2 == want {found = 1} END {exit !found}' "$account_output"; }
+member_key "$wallet_pubkey" || die "the wallet key is not a member key of account $OWNER_ACCOUNT"
+member_key "$signing_pubkey" || die "the signing key in $SIGNING_PUB is not a member key of account $OWNER_ACCOUNT — only a push certificate signed by a member key authorizes a Forge ref update, so admit it first with \`ducktape account key add --ssh $SIGNING_PUB\`"
 
 # forge setup is the source CLI's real endpoint/status/network/Git-door
 # resolver. Its isolated registry is local process state, not an account switch.
 DUCKTAPE_HOME="$WORK_DIR/ducktape-home"; export DUCKTAPE_HOME
+network_authority="${NETWORK%#*}-${NETWORK##*#}"
 setup_output="$WORK_DIR/forge-setup.txt"; setup_ok=0
 if "$DUCKTAPE_BIN" forge setup --node "$NODE" >"$setup_output" 2>/dev/null; then setup_ok=1; fi
-grep -F "$NETWORK" "$setup_output" >/dev/null 2>&1 || die "endpoint did not verify the requested network"
-owner_door() { grep -F "for owner $OWNER_HANDLE" "$setup_output" >/dev/null 2>&1; }
+
+# One door line per network: `duck://<authority>/forge/<owner>/<repo> goes
+# through <workspace> for owner <handle>, <handle>` (`Door`'s Display in
+# bin/node/src/forge_cli.rs). The handle must be one whole entry of that list,
+# on this network's authority — not a substring of another handle.
+owner_door() {
+    python3 - "$setup_output" "$network_authority" "$OWNER_HANDLE" <<'PY'
+import sys
+path, authority, handle = sys.argv[1], sys.argv[2], sys.argv[3]
+address = f"duck://{authority}/forge/<owner>/<repo>"
+for line in open(path, encoding="utf-8"):
+    head, _, tail = line.rstrip("\n").partition(" goes through ")
+    if head != address or " for owner " not in tail:
+        continue
+    owners = tail.rsplit(" for owner ", 1)[1].split(", ")
+    if handle in owners:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
 if [ "$setup_ok" -eq 0 ] || ! owner_door; then
     [ "$ENSURE_OWNER" -eq 1 ] || die "owner has no Git door; use --ensure-owner to create it"
     "$DUCKTAPE_BIN" account set-handle --handle "$OWNER_HANDLE" --node "$NODE" --key "$KEY_PATH" || die "owner handle write failed"
     "$DUCKTAPE_BIN" forge publish --node "$NODE" --key "$KEY_PATH" || die "owner Git route write failed"
+    verify_network
     "$DUCKTAPE_BIN" forge setup --node "$NODE" >"$setup_output" 2>/dev/null || die "owner resolution failed after owner writes"
-    grep -F "$NETWORK" "$setup_output" >/dev/null 2>&1 || die "endpoint network changed during owner setup"
     owner_door || die "owner has no Git door after owner setup"
 else
     # This idempotent owner write uses the existing masked wallet prompt and
@@ -206,7 +303,6 @@ else
     "$DUCKTAPE_BIN" forge publish --node "$NODE" --key "$KEY_PATH" || die "owner Git route verification failed"
 fi
 
-network_authority="${NETWORK/\#/-}"
 FORGE_BASE="duck://${network_authority}/forge/${OWNER_HANDLE}"
 ducktape_path="$(command -v "$DUCKTAPE_BIN")"
 ducktape_dir="$(dirname "$ducktape_path")"
@@ -250,6 +346,26 @@ for_repo() {
     done <"$source_file"
 }
 
+# A push's own exit status says only that git was satisfied. Every repository
+# is re-read from Forge afterwards and every expected ref — the default branch
+# and each source tag's own object id — must be there, exactly. A push that
+# exits zero without landing fails here.
+verify_landed() {
+    local repo="$1" branch="$2" remote_url="$FORGE_BASE/$1"
+    local landed_file="$WORK_DIR/$1.landed-refs.tsv" error_file="$WORK_DIR/$1.verify.error"
+    local oid ref landed
+    if ! "$GIT_BIN" ls-remote --refs "$remote_url" "refs/heads/$branch" 'refs/tags/*' >"$landed_file" 2>"$error_file"; then
+        die "$repo: cannot re-read Forge refs after the push"
+    fi
+    while IFS=$'\t' read -r oid ref; do
+        [ -n "${ref:-}" ] || continue
+        landed="$(awk -v want="$ref" '$2 == want {print $1; exit}' "$landed_file")"
+        [ -n "$landed" ] || die "$repo: $ref is not on Forge after the push"
+        [ "$landed" = "$oid" ] || die "$repo: $ref is $landed on Forge, not the expected $oid"
+        printf 'landed\t%s\t%s\t%s\n' "$repo" "$ref" "$oid"
+    done <"$WORK_DIR/$repo.source-refs.tsv"
+}
+
 # Validate every repository before the first push. A divergence or tag
 # collision therefore stops the run without a ref overwrite.
 while IFS=$'\t' read -r repo branch; do
@@ -260,13 +376,15 @@ done <"$inventory"
 while IFS=$'\t' read -r repo branch; do
     [ -n "${repo:-}" ] || continue
     push_file="$WORK_DIR/$repo.push-refs"
-    [ -s "$push_file" ] || continue
-    mapfile -t refspecs <"$push_file"
-    printf 'push\t%s\t%s\n' "$repo" "${#refspecs[@]}"
-    GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=3 \
-    GIT_CONFIG_KEY_0=gpg.format GIT_CONFIG_VALUE_0=ssh \
-    GIT_CONFIG_KEY_1=user.signingkey GIT_CONFIG_VALUE_1="$GIT_SIGNING_KEY" \
-    GIT_CONFIG_KEY_2=push.gpgSign GIT_CONFIG_VALUE_2=true \
-        "$GIT_BIN" -C "$WORK_DIR/repos/$repo.git" push --porcelain --signed "$FORGE_BASE/$repo" "${refspecs[@]}" || die "$repo: signed Forge push failed"
+    if [ -s "$push_file" ]; then
+        mapfile -t refspecs <"$push_file"
+        printf 'push\t%s\t%s\n' "$repo" "${#refspecs[@]}"
+        GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=3 \
+        GIT_CONFIG_KEY_0=gpg.format GIT_CONFIG_VALUE_0=ssh \
+        GIT_CONFIG_KEY_1=user.signingkey GIT_CONFIG_VALUE_1="$GIT_SIGNING_KEY" \
+        GIT_CONFIG_KEY_2=push.gpgSign GIT_CONFIG_VALUE_2=true \
+            "$GIT_BIN" -C "$WORK_DIR/repos/$repo.git" push --porcelain --signed "$FORGE_BASE/$repo" "${refspecs[@]}" || die "$repo: signed Forge push failed"
+    fi
+    verify_landed "$repo" "$branch"
 done <"$inventory"
 printf 'complete\t%s\n' "$ORG"
