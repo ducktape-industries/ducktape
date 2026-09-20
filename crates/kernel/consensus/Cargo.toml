@@ -4,7 +4,10 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+abi = { workspace = true }
 node = { workspace = true }
+host = { workspace = true }
+commonware-broadcast = "2026.9.0"
 commonware-consensus = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-p2p = { workspace = true }
@@ -12,26 +15,20 @@ commonware-parallel = { workspace = true }
 commonware-utils = { workspace = true }
 commonware-actor = { workspace = true }
 commonware-runtime = { workspace = true }
-commonware-resolver = { workspace = true }
+commonware-storage = { workspace = true }
 commonware-codec = { workspace = true }
-tracing = { workspace = true }
-bytes = "1"
-rand_core = { workspace = true }
 futures = { workspace = true }
-tokio = { workspace = true }
+rand_core = { workspace = true }
+thiserror = { workspace = true }
 
 [features]
 sim = []
 
 [dev-dependencies]
 consensus = { path = ".", features = ["sim"] }
-abi = { workspace = true }
-host = { workspace = true }
 fixture-modules = { path = "../fixtures/modules" }
 fixture-probe = { path = "../fixtures/probe" }
 fixture-relay = { path = "../fixtures/relay" }
 fixture-valset = { path = "../fixtures/valset" }
-commonware-consensus = { workspace = true, features = ["mocks"] }
-commonware-cryptography = { workspace = true, features = ["mocks"] }
-commonware-storage = { workspace = true }
 tempfile = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
