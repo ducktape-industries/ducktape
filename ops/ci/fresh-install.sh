@@ -6,22 +6,17 @@ cd "$ROOT"
 say() { echo "==> $*"; }
 as_root() { if (( EUID == 0 )); then "$@"; else sudo "$@"; fi; }
 
-case "$(uname -s)" in
-  Linux)
-    say "installing README Linux prerequisites"
-    as_root apt-get update
-    as_root apt-get install -y curl build-essential pkg-config libclang-dev libasound2-dev \
-      libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev
-    HOST_IP=${FRESH_INSTALL_HOST:-$(hostname -I | tr ' ' '\n' | awk '$0 !~ /:/ && $0 !~ /^127\./ { print; exit }')}
-    ;;
-  Darwin)
-    say "installing README macOS prerequisites"
-    xcode-select -p >/dev/null 2>&1 || xcode-select --install
-    command -v brew >/dev/null && brew install pkg-config
-    HOST_IP=${FRESH_INSTALL_HOST:-$(ipconfig getifaddr en0)}
-    ;;
-  *) echo "unsupported host: $(uname -s)" >&2; exit 1 ;;
-esac
+[[ "$(uname -s)" == Linux ]] || { echo "Linux only: macOS is deliberately excluded (owner, 2026-09-20)" >&2; exit 1; }
+say "installing README Linux prerequisites"
+as_root apt-get update
+as_root apt-get install -y ca-certificates curl git build-essential pkg-config libclang-dev libasound2-dev \
+  libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev
+if ! command -v rustup >/dev/null; then
+  say "installing rustup (the checkout's rust-toolchain.toml picks the channel)"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+HOST_IP=${FRESH_INSTALL_HOST:-$(hostname -I | tr ' ' '\n' | awk '$0 !~ /:/ && $0 !~ /^127\./ { print; exit }')}
 
 [[ -n "$HOST_IP" && "$HOST_IP" != 127.* && "$HOST_IP" != "::1" ]] || {
   echo "could not find a non-loopback IPv4 address" >&2
@@ -51,20 +46,12 @@ say "starting the node in the background"
 ducktape node run >"$NODE_LOG" 2>&1 & NODE_PID=$!
 HEALTH_URL="http://$HOST_IP:8844/v1/status"
 say "waiting up to 60 seconds for Ready at $HEALTH_URL"
-for attempt in {1..60}; do
-  status=$(curl --fail --silent --max-time 2 "$HEALTH_URL" 2>/dev/null || true)
-  if grep -Eq '"phase"[[:space:]]*:[[:space:]]*"(validating|serving)"' <<<"$status"; then
-    echo "Ready"
-    break
-  fi
-  if ! kill -0 "$NODE_PID" 2>/dev/null; then
-    echo "node exited before Ready" >&2
-    tail -100 "$NODE_LOG" >&2
-    exit 1
-  fi
-  (( attempt == 60 )) && { echo "node was not Ready within 60 seconds" >&2; tail -100 "$NODE_LOG" >&2; exit 1; }
-  sleep 1
-done
+# one bounded client retry (curl's own), not a hand-rolled poll loop
+status=$(curl --fail --silent --max-time 2 --retry 60 --retry-delay 1 --retry-connrefused --retry-all-errors "$HEALTH_URL") || {
+  echo "node was not reachable within 60 seconds" >&2; tail -100 "$NODE_LOG" >&2; exit 1; }
+grep -Eq '"phase"[[:space:]]*:[[:space:]]*"(validating|serving)"' <<<"$status" || {
+  echo "node reachable but not Ready: $status" >&2; tail -100 "$NODE_LOG" >&2; exit 1; }
+echo "Ready"
 
 say "creating an invite without logging its contents"
 if ducktape node invite >/dev/null 2>&1; then invite_status=0; else invite_status=$?; fi
