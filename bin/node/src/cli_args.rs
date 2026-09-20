@@ -841,10 +841,13 @@ pub struct PlumbingArgs {
     /// the address other members dial (or "overlay")
     #[arg(long, value_name = "ADDR", hide_short_help = true)]
     pub advertised: Option<String>,
-    /// node HTTP API listen address
+    /// node HTTP API listen address; for a remote App use
+    /// `0.0.0.0:<port>` here, then enter the node's reachable host URL in
+    /// Connect remote (never `0.0.0.0`)
     #[arg(long, value_name = "ADDR", hide_short_help = true)]
     pub http: Option<String>,
-    /// browser gateway listen address
+    /// local-only browser gateway listen address; must be exactly
+    /// `127.0.0.1:<port>`; remote App connections use `--http`, not this
     #[arg(long, value_name = "ADDR", hide_short_help = true)]
     pub gateway: Option<String>,
     /// local operator rpc listen address
