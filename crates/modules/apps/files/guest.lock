@@ -835,7 +835,7 @@ checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 [[package]]
 name = "files"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#03e15e66c12e54d0a58c0566aee7af211ba5e18b"
+source = "git+https://github.com/ducktape-industries/ducktape#c065f33e0c85e385a734e7966bfd269a5cb0314c"
 dependencies = [
  "duckfs-core",
  "ducktape-module-sdk",
