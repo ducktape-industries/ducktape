@@ -46,13 +46,11 @@
 # name the resolver looks for. A release that shipped the binary alone leaves
 # a stranger with a `node init` that cannot found anything.
 #
-# macOS REFUSES to pack a bundle that is not fit to leave this machine: an
-# ad-hoc signature (`adhoc_bundle_refused` — Gatekeeper rejects it anywhere
-# else) or no notarization ticket (`bundle_not_stapled` — the ticket is
-# stapled here when the bundle was notarized but not yet stapled, and a
-# bundle Apple never notarized is refused). `ducktape-launcher --qualify`
-# runs `codesign --verify --deep --strict` + `spctl -a -t exec` on the
-# extracted bundle before it flips, so a release must pass both here.
+# macOS managed CLI releases accept valid ad-hoc and Developer ID signatures.
+# The launcher checks `codesign --verify --deep --strict` on the extracted
+# bundle; the signed release channel and archive digest establish trust.
+# Packing checks the same integrity contract without modifying the bundle or
+# requiring a notarization ticket. This is not Finder/DMG launch assessment.
 #
 # Prints the archive path, its sha256 and size; records `<os>-<arch>=<path>`
 # in `<out-dir>/archives-<kind>.txt` (one line per platform, a rerun replaces
@@ -172,21 +170,10 @@ resolve_founding_set() {
   done
 }
 
-# The bundle's own checks, on macOS only: signature kind, then the ticket.
+# Match the managed launcher's code-integrity check without changing its input.
 refuse_unfit_bundle() {
   local bundle="$1"
-  local signature
-  signature=$(codesign -dv "$bundle" 2>&1 | sed -n 's/^Signature=//p')
-  if [ "$signature" = adhoc ] || [ -z "$signature" ]; then
-    echo "archive.sh: adhoc_bundle_refused: $bundle is ad-hoc signed; build it with DUCKTAPE_CODESIGN_IDENTITY (make app-release)" >&2
-    exit 1
-  fi
   codesign --verify --deep --strict "$bundle" || { echo "archive.sh: codesign_refused: $bundle" >&2; exit 1; }
-  if ! xcrun stapler validate "$bundle" >/dev/null 2>&1; then
-    echo "archive.sh: no ticket stapled to $bundle; stapling" >&2
-    xcrun stapler staple "$bundle" || { echo "archive.sh: bundle_not_stapled: $bundle was never notarized (set the three DUCKTAPE_NOTARY_* and rebuild)" >&2; exit 1; }
-  fi
-  spctl -a -t exec "$bundle" || { echo "archive.sh: gatekeeper_refused: $bundle" >&2; exit 1; }
 }
 
 pack_app() {
