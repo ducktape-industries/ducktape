@@ -1115,10 +1115,13 @@ mod tests {
                 .map(|hash| {
                     let first_activation =
                         hello.history.first().map(|activation| activation.height);
-                    let seat = first_activation
-                        .is_some_and(|activation| activation <= height)
-                        .then_some(Seat::Resume)
-                        .unwrap_or(Seat::Fresh);
+                    let was_activated =
+                        first_activation.is_some_and(|activation| activation <= height);
+                    let seat = if was_activated {
+                        Seat::Resume
+                    } else {
+                        Seat::Fresh
+                    };
                     (hash, seat)
                 });
             assert_eq!(hash, want, "reopen at {height}");
