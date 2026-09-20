@@ -65,15 +65,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
-name = "capability-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "sdk",
- "serde",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -294,19 +285,16 @@ source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736
 [[package]]
 name = "saga"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#56cf140a59a13369924bdbecb536e25146a0aff9"
+source = "git+https://github.com/ducktape-industries/ducktape#95fb4a60457eddbf3dc56bffab66721eed5642b3"
 dependencies = [
  "async-trait",
  "borsh",
- "capability-wire",
  "ducktape-module-sdk",
  "index-guest",
- "saga-wire",
  "sdk",
  "serde",
  "serde_json",
  "sha2",
- "valset-wire",
 ]
 
 [[package]]
@@ -321,16 +309,6 @@ name = "saga-index"
 version = "0.0.0"
 dependencies = [
  "saga",
-]
-
-[[package]]
-name = "saga-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "sdk",
- "serde",
 ]
 
 [[package]]
@@ -475,15 +453,6 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
-
-[[package]]
-name = "valset-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "sdk",
- "serde",
-]
 
 [[package]]
 name = "version_check"
