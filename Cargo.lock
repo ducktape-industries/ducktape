@@ -365,16 +365,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "attribution-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "sdk",
- "serde",
-]
-
-[[package]]
 name = "authpage"
 version = "0.1.0"
 dependencies = [
@@ -888,31 +878,6 @@ dependencies = [
  "chacha20 0.10.2",
  "cipher 0.5.2",
  "poly1305 0.9.1",
-]
-
-[[package]]
-name = "chat-message"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "serde",
-]
-
-[[package]]
-name = "chat-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "chat-message",
- "identity-wire",
- "index-guest",
- "sdk",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "unicode-normalization",
 ]
 
 [[package]]
@@ -2921,17 +2886,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "forge-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "chat-wire",
- "duck-address",
- "sdk",
- "serde",
-]
-
-[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3087,19 +3041,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
-]
-
-[[package]]
-name = "gateway-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "duckdns",
- "sdk",
- "serde",
- "serde_json",
- "sha2 0.10.9",
 ]
 
 [[package]]

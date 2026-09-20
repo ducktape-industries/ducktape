@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "native")]
 use std::path::Path;
 
-use chat::Party;
+use crate::chat_contract::Party;
 #[cfg(feature = "native")]
 use git2::Repository;
 use sdk::{Error, refusal};
