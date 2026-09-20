@@ -15,8 +15,8 @@ use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_modules::Change;
 use fixture_probe::Step;
 use host::{
-    BLOBS, Block, Delivered, Error, Founding, Genesis, Host, Layer, Limits, NETWORK, QUEUE,
-    Receipt, SIGNERS, Submission,
+    BLOBS, Block, BlockId, Delivered, Error, Founding, Genesis, Host, Layer, Limits, NETWORK,
+    QUEUE, Receipt, SIGNERS, Submission, Tip,
 };
 use sha2::Digest as _;
 use state::{Commitment, SyncTarget, commitment_name};
@@ -27,6 +27,7 @@ const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const SIGNER: &[u8] = b"signer";
+const EPOCH_LENGTH: u64 = 4;
 const TIME: u64 = 1_700_000_000;
 
 type Ctx = deterministic::Context;
@@ -53,6 +54,7 @@ fn genesis(programs: Vec<Founding>) -> Genesis {
         validators: vec![member(b"v1", "v1:1")],
         programs,
         limits: Limits::default(),
+        epoch_length: EPOCH_LENGTH,
         time: TIME,
     }
 }
@@ -66,7 +68,10 @@ fn standard() -> Genesis {
 }
 
 async fn found(context: Ctx, name: &str, dir: &Path, genesis: Genesis) -> Host<Ctx> {
-    Host::found(context, name, dir, genesis).await.unwrap().0
+    Host::found(context, name, dir, block_id(0), genesis)
+        .await
+        .unwrap()
+        .0
 }
 
 fn script(steps: Vec<Step>) -> Vec<u8> {
@@ -97,9 +102,16 @@ fn submit(seq: u64, target: &str, payload: Vec<u8>) -> Submission {
     }
 }
 
+fn block_id(height: u64) -> BlockId {
+    let mut id = [0u8; 32];
+    id[..8].copy_from_slice(&height.to_be_bytes());
+    id
+}
+
 fn block(height: u64, submissions: Vec<Submission>) -> Block {
     Block {
         height,
+        id: block_id(height),
         time: TIME + height,
         submissions,
     }
@@ -183,9 +195,15 @@ fn change(program: &str, code: BlobId, params: Vec<u8>) -> Vec<u8> {
 fn founding_admits_every_program_and_the_host_reopens() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (host, applied) = Host::found(context.child("found"), "net", dir.path(), standard())
-            .await
-            .unwrap();
+        let (host, applied) = Host::found(
+            context.child("found"),
+            "net",
+            dir.path(),
+            block_id(0),
+            standard(),
+        )
+        .await
+        .unwrap();
         assert_eq!(applied.height, 0);
         let admitted: Vec<&str> = applied.roster.iter().map(|r| r.program.as_str()).collect();
         assert_eq!(admitted, ["modules", "valset", "ping", "pong", "probe"]);
@@ -202,8 +220,17 @@ fn founding_admits_every_program_and_the_host_reopens() {
         assert_eq!(programs["ping"], programs["pong"]);
         assert_ne!(programs["ping"], programs["probe"]);
         assert_eq!(
-            host.validators(TIME).await.unwrap(),
-            Ok(vec![b"v1".to_vec()])
+            host.epoch_members(0).unwrap(),
+            Some(vec![member(b"v1", "v1:1")])
+        );
+        assert_eq!(host.epoch_members(1).unwrap(), None);
+        assert_eq!(host.epoch_length().unwrap(), EPOCH_LENGTH);
+        assert_eq!(
+            host.tip().unwrap(),
+            Tip {
+                height: 0,
+                id: block_id(0)
+            }
         );
         assert_eq!(host.height().unwrap(), 0);
         assert_eq!(host.root().unwrap(), applied.root);
@@ -212,6 +239,7 @@ fn founding_admits_every_program_and_the_host_reopens() {
             host.view(Layer::Confirmed).get(NETWORK, b"limits").unwrap(),
             Some(abi::encode(&Limits::default()))
         );
+        let host_tip = host.tip().unwrap();
         drop(host);
 
         let reopened = Host::open(context.child("reopen"), "net", dir.path())
@@ -220,9 +248,10 @@ fn founding_admits_every_program_and_the_host_reopens() {
         assert_eq!(reopened.root().unwrap(), applied.root);
         assert_eq!(reopened.programs().unwrap(), programs);
         assert_eq!(
-            reopened.validators(TIME).await.unwrap(),
-            Ok(vec![b"v1".to_vec()])
+            reopened.epoch_members(0).unwrap(),
+            Some(vec![member(b"v1", "v1:1")])
         );
+        assert_eq!(reopened.tip().unwrap(), host_tip);
         let env = ask(&reopened, Layer::Confirmed, "probe", vec![op(HostOp::Env)]).await;
         assert_eq!(
             env,
@@ -246,8 +275,14 @@ fn founding_refuses_a_program_that_does_not_admit() {
             PROBE,
             script(vec![Step::Fail("no".into())]),
         )]);
-        let Err(Error::Genesis { program, refusal }) =
-            Host::found(context.child("refusing"), "a", dir.path(), refusing).await
+        let Err(Error::Genesis { program, refusal }) = Host::found(
+            context.child("refusing"),
+            "a",
+            dir.path(),
+            block_id(0),
+            refusing,
+        )
+        .await
         else {
             panic!("a refusing founder was admitted");
         };
@@ -260,7 +295,7 @@ fn founding_refuses_a_program_that_does_not_admit() {
             founding("ping", RELAY, Vec::new()),
         ]);
         let Err(Error::Genesis { program, refusal }) =
-            Host::found(context.child("twice"), "b", dir.path(), twice).await
+            Host::found(context.child("twice"), "b", dir.path(), block_id(0), twice).await
         else {
             panic!("a duplicate founder was admitted");
         };
@@ -269,8 +304,14 @@ fn founding_refuses_a_program_that_does_not_admit() {
 
         let dir = tempfile::tempdir().unwrap();
         let reserved = genesis(vec![founding("$ping", RELAY, Vec::new())]);
-        let Err(Error::Genesis { program, .. }) =
-            Host::found(context.child("reserved"), "c", dir.path(), reserved).await
+        let Err(Error::Genesis { program, .. }) = Host::found(
+            context.child("reserved"),
+            "c",
+            dir.path(),
+            block_id(0),
+            reserved,
+        )
+        .await
         else {
             panic!("a reserved founder was admitted");
         };
@@ -527,7 +568,8 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
             rejected(&applied.submissions[0]),
             &Refusal::new("probe", "nope")
         );
-        assert!(applied.writes.is_empty());
+        let touched: Vec<&str> = applied.writes.programs.keys().map(String::as_str).collect();
+        assert_eq!(touched, [NETWORK]);
         assert_eq!(
             host.view(Layer::Confirmed).get("probe", b"k").unwrap(),
             None
@@ -610,6 +652,44 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
             }))]
         );
         assert_eq!(host.blob(&staged).unwrap(), Some(b"note 1\0x".to_vec()));
+    });
+}
+
+#[test]
+fn an_epoch_is_recorded_as_the_block_ending_the_one_before_commits() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let founding = vec![member(b"v1", "v1:1")];
+        let seated = vec![member(b"v1", "v1:1"), member(b"v2", "v2:2")];
+
+        host.apply(block(1, Vec::new())).await.unwrap();
+        let applied = host
+            .apply(block(2, vec![submit(0, "valset", abi::encode(&seated))]))
+            .await
+            .unwrap();
+        assert_eq!(applied.submissions[0].outcome, ok(b""));
+        assert_eq!(host.epoch_members(0).unwrap(), Some(founding.clone()));
+        assert_eq!(host.epoch_members(1).unwrap(), None);
+
+        host.apply(block(3, Vec::new())).await.unwrap();
+        assert_eq!(host.epoch_members(0).unwrap(), Some(founding));
+        assert_eq!(host.epoch_members(1).unwrap(), Some(seated.clone()));
+        assert_eq!(host.epoch_members(2).unwrap(), None);
+        assert_eq!(
+            host.tip().unwrap(),
+            Tip {
+                height: 3,
+                id: block_id(3)
+            }
+        );
+
+        for height in 4..=6 {
+            host.apply(block(height, Vec::new())).await.unwrap();
+            assert_eq!(host.epoch_members(2).unwrap(), None);
+        }
+        host.apply(block(7, Vec::new())).await.unwrap();
+        assert_eq!(host.epoch_members(2).unwrap(), Some(seated));
     });
 }
 
@@ -997,8 +1077,14 @@ fn fuel_is_a_network_parameter() {
             fuel: Some(10),
             memory_bytes: None,
         };
-        let Err(Error::Genesis { program, refusal }) =
-            Host::found(context.child("starved"), "starved", dir.path(), metered).await
+        let Err(Error::Genesis { program, refusal }) = Host::found(
+            context.child("starved"),
+            "starved",
+            dir.path(),
+            block_id(0),
+            metered,
+        )
+        .await
         else {
             panic!("founding ran a program on ten fuel");
         };

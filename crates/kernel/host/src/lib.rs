@@ -56,12 +56,15 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub type BlockId = [u8; 32];
+
 pub struct Genesis {
     pub modules: Vec<u8>,
     pub valset: Vec<u8>,
     pub validators: Vec<validators::Member>,
     pub programs: Vec<Founding>,
     pub limits: Limits,
+    pub epoch_length: u64,
     pub time: u64,
 }
 
@@ -73,8 +76,15 @@ pub struct Founding {
 
 pub struct Block {
     pub height: u64,
+    pub id: BlockId,
     pub time: u64,
     pub submissions: Vec<Submission>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tip {
+    pub height: u64,
+    pub id: BlockId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +142,7 @@ where
         context: E,
         name: &str,
         dir: &Path,
+        block: BlockId,
         genesis: Genesis,
     ) -> Result<(Host<E>, Applied)> {
         let storage = Storage::open(&dir.join(STATE_DIR))?;
@@ -149,6 +160,11 @@ where
             NETWORK,
             namespace::LIMITS.to_vec(),
             abi::encode(&genesis.limits),
+        );
+        overlay.set(
+            NETWORK,
+            namespace::EPOCH_LENGTH.to_vec(),
+            abi::encode(&genesis.epoch_length),
         );
         let mut entries = vec![
             roster::Entry {
@@ -197,8 +213,20 @@ where
             }
             receipts.push(receipt);
         }
+        host.record_epoch(0, 0, genesis.time, &mut overlay, &stage)
+            .await?;
         let applied = host
-            .commit(0, overlay, stage, receipts, Vec::new(), Vec::new())
+            .commit(
+                Tip {
+                    height: 0,
+                    id: block,
+                },
+                overlay,
+                stage,
+                receipts,
+                Vec::new(),
+                Vec::new(),
+            )
             .await?;
         Ok((host, applied))
     }
@@ -273,6 +301,34 @@ where
 
     fn next_height(&self) -> Result<u64> {
         Ok(self.store.height()?.map_or(0, |height| height + 1))
+    }
+
+    pub fn tip(&self) -> Result<Tip> {
+        let height = self.height()?;
+        let bytes = self
+            .store
+            .view(Vec::new())
+            .get(NETWORK, namespace::TIP)?
+            .ok_or_else(|| Error::Corrupt("the network records no tip".into()))?;
+        let id = abi::decode(&bytes).map_err(corrupt)?;
+        Ok(Tip { height, id })
+    }
+
+    pub fn epoch_length(&self) -> Result<u64> {
+        let bytes = self
+            .store
+            .view(Vec::new())
+            .get(NETWORK, namespace::EPOCH_LENGTH)?
+            .ok_or_else(|| Error::Corrupt("the network records no epoch length".into()))?;
+        abi::decode(&bytes).map_err(corrupt)
+    }
+
+    pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<validators::Member>>> {
+        self.store
+            .view(Vec::new())
+            .get(NETWORK, &namespace::epoch(epoch))?
+            .map(|bytes| abi::decode(&bytes).map_err(corrupt))
+            .transpose()
     }
 
     pub fn root(&self) -> Result<Root> {
@@ -378,52 +434,34 @@ where
         .await
     }
 
-    pub async fn validators(
+    async fn record_epoch(
         &self,
+        epoch: u64,
+        height: u64,
         time: u64,
-    ) -> Result<std::result::Result<Vec<Vec<u8>>, Refusal>> {
-        let reply = self
-            .query(
-                Layer::Confirmed,
-                time,
-                Origin::System,
-                validators::PROGRAM,
-                abi::encode(&validators::Query::Validators),
-            )
-            .await?;
-        Ok(reply.and_then(|bytes| {
-            let validators::Reply::Validators(validators) = abi::decode(&bytes)? else {
-                return Err(Refusal::new(
-                    reason::PROTOCOL,
-                    "valset answered Validators with another reply",
-                ));
-            };
-            Ok(validators)
-        }))
-    }
-
-    pub async fn members(
-        &self,
-        time: u64,
-    ) -> Result<std::result::Result<Vec<validators::Member>, Refusal>> {
-        let reply = self
-            .query(
-                Layer::Confirmed,
-                time,
-                Origin::System,
-                validators::PROGRAM,
-                abi::encode(&validators::Query::Members),
-            )
-            .await?;
-        Ok(reply.and_then(|bytes| {
-            let validators::Reply::Members(members) = abi::decode(&bytes)? else {
-                return Err(Refusal::new(
-                    reason::PROTOCOL,
-                    "valset answered Members with another reply",
-                ));
-            };
-            Ok(members)
-        }))
+        overlay: &mut Overlay,
+        stage: &Stage,
+    ) -> Result<()> {
+        let reply = unit::query(
+            self.world(height, time),
+            vec![&*overlay],
+            stage,
+            &[],
+            Origin::System,
+            validators::PROGRAM.to_owned(),
+            abi::encode(&validators::Query::Members),
+        )
+        .await?;
+        let bytes = reply.map_err(|refusal| {
+            Error::Corrupt(format!("valset refused the members query: {refusal}"))
+        })?;
+        let validators::Reply::Members(members) = abi::decode(&bytes).map_err(corrupt)? else {
+            return Err(Error::Corrupt(
+                "valset answered Members with another reply".into(),
+            ));
+        };
+        overlay.set(NETWORK, namespace::epoch(epoch), abi::encode(&members));
+        Ok(())
     }
 
     pub fn deliveries_due(&self) -> Result<bool> {
@@ -481,8 +519,18 @@ where
                 .await?;
             submissions.push(receipt);
         }
+        let epoch_length = self.epoch_length()?;
+        let ends_an_epoch = (block.height + 1).is_multiple_of(epoch_length);
+        if ends_an_epoch {
+            let next_epoch = (block.height + 1) / epoch_length;
+            self.record_epoch(next_epoch, block.height, block.time, &mut overlay, &stage)
+                .await?;
+        }
         self.commit(
-            block.height,
+            Tip {
+                height: block.height,
+                id: block.id,
+            },
             overlay,
             stage,
             roster,
@@ -771,19 +819,20 @@ where
 
     async fn commit(
         &mut self,
-        height: u64,
-        overlay: Overlay,
+        tip: Tip,
+        mut overlay: Overlay,
         stage: Stage,
         roster: Vec<Receipt>,
         deliveries: Vec<Delivered>,
         submissions: Vec<Receipt>,
     ) -> Result<Applied> {
+        overlay.set(NETWORK, namespace::TIP.to_vec(), abi::encode(&tip.id));
         let writes = overlay.into_writes();
         self.blobs.promote(stage)?;
-        self.store.commit(height, writes.clone()).await?;
+        self.store.commit(tip.height, writes.clone()).await?;
         self.preconfirmed = Overlay::default();
         Ok(Applied {
-            height,
+            height: tip.height,
             roster,
             deliveries,
             submissions,
