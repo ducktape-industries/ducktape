@@ -51,3 +51,56 @@ pub fn verify_join_proof(
     let message = [binding, token.nonce.as_slice(), joiner.as_ref()].concat();
     joiner.verify(INVITE_JOIN_NAMESPACE, &message, proof)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_cryptography::Signer as _;
+
+    const BINDING: &[u8] = b"net#00000000@feedface";
+
+    fn mint(issuer: &ed25519::PrivateKey, binding: &[u8]) -> InviteToken {
+        let nonce = [7u8; INVITE_NONCE_LEN];
+        let expires = 4_102_444_800; // 2100-01-01
+        let message = grant_preimage(binding, &nonce, expires);
+        InviteToken {
+            issuer: issuer.public_key(),
+            nonce,
+            expires_unix_secs: expires,
+            sig: issuer.sign(INVITE_GRANT_NAMESPACE, &message),
+        }
+    }
+
+    #[test]
+    fn a_token_binds_network_and_expiry() {
+        let issuer = ed25519::PrivateKey::from_seed(1);
+        let token = mint(&issuer, BINDING);
+        assert!(verify_invite_token(&token, BINDING));
+        assert!(!verify_invite_token(&token, b"other-net"));
+
+        let mut tampered = token.clone();
+        tampered.expires_unix_secs += 1;
+        assert!(!verify_invite_token(&tampered, BINDING));
+    }
+
+    #[test]
+    fn the_join_proof_binds_the_redeeming_key() {
+        let issuer = ed25519::PrivateKey::from_seed(1);
+        let redeemer = ed25519::PrivateKey::from_seed(2);
+        let token = mint(&issuer, BINDING);
+
+        let proof = sign_join_proof(&redeemer, BINDING, &token);
+        assert!(verify_join_proof(
+            &redeemer.public_key(),
+            BINDING,
+            &token,
+            &proof
+        ));
+        assert!(!verify_join_proof(
+            &ed25519::PrivateKey::from_seed(3).public_key(),
+            BINDING,
+            &token,
+            &proof
+        ));
+    }
+}

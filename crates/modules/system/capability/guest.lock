@@ -67,11 +67,10 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "capability"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape#30a4064576a1553768973f012a10612aa4c028a7"
+source = "git+https://github.com/ducktape-industries/ducktape#95fb4a60457eddbf3dc56bffab66721eed5642b3"
 dependencies = [
  "async-trait",
  "borsh",
- "capability-wire",
  "ducktape-module-sdk",
  "sdk",
  "serde",
@@ -82,15 +81,6 @@ name = "capability-component"
 version = "0.0.0"
 dependencies = [
  "capability",
-]
-
-[[package]]
-name = "capability-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "sdk",
- "serde",
 ]
 
 [[package]]

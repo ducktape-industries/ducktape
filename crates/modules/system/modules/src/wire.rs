@@ -181,6 +181,10 @@ pub fn decode_reply(bytes: &[u8]) -> Result<ModulesReply, String> {
 mod tests {
     use super::*;
 
+    fn rt_msg(m: ModulesMsg) {
+        assert_eq!(decode_msg(&encode_msg(&m)).unwrap(), m);
+    }
+
     #[test]
     fn golden_wire_shapes() {
         assert_eq!(sdk::wire::encode(&Kind::Module), br#""module""#);
@@ -198,5 +202,133 @@ mod tests {
             sdk::wire::encode(&seed),
             br#"{"kind":"view","code_hash":[1,2],"lanes":[]}"#
         );
+    }
+
+    #[test]
+    fn msg_query_reply_round_trip_every_variant() {
+        rt_msg(ModulesMsg::RegisterModule {
+            module_id: "hello".into(),
+            kind: Kind::Module,
+            code_hash: vec![1u8; CODE_HASH_LEN],
+            lanes: Vec::new(),
+        });
+        rt_msg(ModulesMsg::ScheduleSwap {
+            name: "swap-hello".into(),
+            module_id: "hello".into(),
+            activation_height: 10,
+            code_hash: vec![2u8; CODE_HASH_LEN],
+        });
+        rt_msg(ModulesMsg::ScheduleRegister {
+            name: "admit-kanban".into(),
+            module_id: "kanban".into(),
+            kind: Kind::Module,
+            activation_height: 10,
+            code_hash: vec![5u8; CODE_HASH_LEN],
+            lanes: vec![LaneDecl {
+                id: 7,
+                name: "board_sync".into(),
+                stream: Some(LaneStream {
+                    pacing: LanePacing::Shared,
+                    accept_backlog: 32,
+                }),
+            }],
+        });
+        rt_msg(ModulesMsg::ScheduleRegister {
+            name: "admit-home".into(),
+            module_id: "home".into(),
+            kind: Kind::View,
+            activation_height: 10,
+            code_hash: vec![6u8; CODE_HASH_LEN],
+            lanes: Vec::new(),
+        });
+        rt_msg(ModulesMsg::CancelSwap {
+            name: "swap-hello".into(),
+            module_id: "hello".into(),
+        });
+        rt_msg(ModulesMsg::SwapReady {
+            name: "swap-hello".into(),
+            module_id: "hello".into(),
+            code_hash: vec![2u8; CODE_HASH_LEN],
+        });
+        rt_msg(ModulesMsg::Advance);
+
+        for q in [
+            ModulesQuery::ModuleStatus,
+            ModulesQuery::ArmedAt { height: 9 },
+            ModulesQuery::Lanes,
+        ] {
+            assert_eq!(decode_query(&encode_query(&q)).unwrap(), q);
+        }
+
+        let lanes = ModulesReply::Lanes {
+            lanes: vec![
+                LaneRecord {
+                    id: 2,
+                    module_id: "chat".into(),
+                    name: "voice".into(),
+                    stream: None,
+                },
+                LaneRecord {
+                    id: 5,
+                    module_id: "agent".into(),
+                    name: "telemetry".into(),
+                    stream: Some(LaneStream {
+                        pacing: LanePacing::Local {
+                            bulk_bytes_per_sec: 24 * 1024 * 1024,
+                            bulk_burst_bytes: 512 * 1024,
+                        },
+                        accept_backlog: 16,
+                    }),
+                },
+            ],
+        };
+        assert_eq!(decode_reply(&encode_reply(&lanes)).unwrap(), lanes);
+
+        let reply = ModulesReply::ModuleStatus {
+            modules: vec![ModuleCode {
+                module_id: "hello".into(),
+                kind: Kind::Module,
+                active_code_hash: vec![1u8; CODE_HASH_LEN],
+                pending: None,
+                history: vec![Activation {
+                    height: 0,
+                    code_hash: vec![1u8; CODE_HASH_LEN],
+                }],
+            }],
+        };
+        assert_eq!(decode_reply(&encode_reply(&reply)).unwrap(), reply);
+    }
+
+    #[test]
+    fn kind_is_snake_case_on_the_wire() {
+        assert_eq!(sdk::wire::encode(&Kind::Module), br#""module""#);
+        assert_eq!(sdk::wire::encode(&Kind::View), br#""view""#);
+        assert_eq!(borsh::to_vec(&Kind::Module).unwrap(), [0]);
+        assert_eq!(borsh::to_vec(&Kind::View).unwrap(), [1]);
+        let seed = Seed {
+            kind: Kind::View,
+            code_hash: vec![7u8; CODE_HASH_LEN],
+            lanes: Vec::new(),
+        };
+        assert_eq!(
+            sdk::wire::decode::<Seed>(&sdk::wire::encode(&seed)).unwrap(),
+            seed
+        );
+        let bare: Seed = sdk::wire::decode(br#"{"kind":"view","code_hash":[]}"#).unwrap();
+        assert!(bare.lanes.is_empty());
+    }
+
+    #[test]
+    fn a_lane_name_is_a_bounded_snake_case_token() {
+        for good in ["voice", "video", "gateway", "telemetry", "run_output2"] {
+            assert!(lane_name_is_well_formed(good), "{good}");
+        }
+        for bad in ["", "Voice", "voice-lane", "voice lane", "보이스", "v.1"] {
+            assert!(!lane_name_is_well_formed(bad), "{bad:?}");
+        }
+        assert!(lane_name_is_well_formed(&"a".repeat(MAX_LANE_NAME_BYTES)));
+        assert!(!lane_name_is_well_formed(
+            &"a".repeat(MAX_LANE_NAME_BYTES + 1)
+        ));
     }
 }

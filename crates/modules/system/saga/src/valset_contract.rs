@@ -1,11 +1,10 @@
-use std::collections::BTreeSet;
-
-use sdk::{Ctx, Error};
 use serde::{Deserialize, Serialize};
+
+use sdk::{Ctx, Error, wire};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum ValsetQuery {
+pub enum ValsetQuery {
     Validators,
     Residents,
     MeshWindow,
@@ -13,38 +12,45 @@ pub(crate) enum ValsetQuery {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum ValsetReply {
+pub enum ValsetReply {
     Validators(Vec<Vec<u8>>),
     Residents(Vec<Vec<u8>>),
+    MeshWindow(Vec<GenerationSet>),
 }
 
-pub(crate) fn encode_query(value: &ValsetQuery) -> Vec<u8> {
-    sdk::wire::encode(value)
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationSet {
+    pub generation: u64,
+    pub validators: Vec<Vec<u8>>,
+    pub residents: Vec<Vec<u8>>,
 }
 
-#[cfg(test)]
-pub(crate) fn decode_query(bytes: &[u8]) -> Result<ValsetQuery, String> {
-    sdk::wire::decode(bytes)
+pub fn encode_query(query: &ValsetQuery) -> Vec<u8> {
+    wire::encode(query)
 }
 
-#[cfg(test)]
-pub(crate) fn encode_reply(value: &ValsetReply) -> Vec<u8> {
-    sdk::wire::encode(value)
+pub fn decode_query(bytes: &[u8]) -> Result<ValsetQuery, String> {
+    wire::decode(bytes)
 }
 
-pub(crate) fn decode_reply(bytes: &[u8]) -> Result<ValsetReply, String> {
-    sdk::wire::decode(bytes)
+pub fn encode_reply(reply: &ValsetReply) -> Vec<u8> {
+    wire::encode(reply)
 }
 
-pub(crate) async fn members_and_residents(
+pub fn decode_reply(bytes: &[u8]) -> Result<ValsetReply, String> {
+    wire::decode(bytes)
+}
+
+pub async fn members_and_residents(
     ctx: &dyn Ctx,
     valset: &str,
-) -> Result<BTreeSet<Vec<u8>>, Error> {
+) -> Result<std::collections::BTreeSet<Vec<u8>>, Error> {
     let validators = match decode_reply(
         &ctx.query(valset, &encode_query(&ValsetQuery::Validators))
             .await?,
     )
-    .map_err(|error| Error::module(sdk::refusal::UNEXPECTED_REPLY, error))?
+    .map_err(|e| Error::module(sdk::refusal::UNEXPECTED_REPLY, e))?
     {
         ValsetReply::Validators(keys) => keys,
         other => {
@@ -58,7 +64,7 @@ pub(crate) async fn members_and_residents(
         &ctx.query(valset, &encode_query(&ValsetQuery::Residents))
             .await?,
     )
-    .map_err(|error| Error::module(sdk::refusal::UNEXPECTED_REPLY, error))?
+    .map_err(|e| Error::module(sdk::refusal::UNEXPECTED_REPLY, e))?
     {
         ValsetReply::Residents(keys) => keys,
         other => {
@@ -76,7 +82,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn valset_contract_keeps_canonical_query_bytes() {
-        assert_eq!(encode_query(&ValsetQuery::Residents), br#""residents""#);
+    fn owning_valset_query_encoder_matches_fixture() {
+        assert_eq!(
+            encode_query(&ValsetQuery::Validators),
+            include_bytes!("../tests/fixtures/valset-query.json")
+                .strip_suffix(b"\n")
+                .unwrap()
+        );
     }
 }

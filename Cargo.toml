@@ -470,80 +470,7 @@ rand_core = "0.10.1"
 [profile.dev.build-override]
 opt-level = 2
 
-[profile.dev.package.fontdb]
-opt-level = 2
-
-[profile.dev.package.rustybuzz]
-opt-level = 2
-
-[profile.dev.package.ttf-parser]
-opt-level = 2
-
-[profile.dev.package.swash]
-opt-level = 2
-
-[profile.dev.package.zeno]
-opt-level = 2
-
-[profile.dev.package.yazi]
-opt-level = 2
-
-[profile.dev.package.unicode-bidi]
-opt-level = 2
-
-[profile.dev.package.unicode-script]
-opt-level = 2
-
 [profile.dev.package.unicode-segmentation]
-opt-level = 2
-
-[profile.dev.package.wgpu]
-opt-level = 2
-
-[profile.dev.package.wgpu-core]
-opt-level = 2
-
-[profile.dev.package.wgpu-hal]
-opt-level = 2
-
-[profile.dev.package.wgpu-types]
-opt-level = 2
-
-[profile.dev.package.naga]
-opt-level = 2
-
-[profile.dev.package.tiny-skia]
-opt-level = 2
-
-[profile.dev.package.tiny-skia-path]
-opt-level = 2
-
-[profile.dev.package.lyon]
-opt-level = 2
-
-[profile.dev.package.lyon_algorithms]
-opt-level = 2
-
-[profile.dev.package.lyon_geom]
-opt-level = 2
-
-[profile.dev.package.lyon_path]
-opt-level = 2
-
-[profile.dev.package.lyon_tessellation]
-opt-level = 2
-
-[profile.dev.package.kurbo]
-opt-level = 2
-
-[profile.dev.package.resvg]
-opt-level = 2
-
-[profile.dev.package.usvg]
-opt-level = 2
-
-# The native document readers parse Markdown on their presentation path.
-[profile.dev.package.pulldown-cmark]
 opt-level = 2
 
 [profile.dev.package.regex-automata]
@@ -599,21 +526,3 @@ opt-level = 3
 
 [profile.dev.package.zune-core]
 opt-level = 3
-
-[profile.dev.package.mozjpeg]
-opt-level = 3
-
-[profile.dev.package.mozjpeg-sys]
-opt-level = 3
-
-[profile.dev.package.nokhwa]
-opt-level = 2
-
-[profile.dev.package.nokhwa-core]
-opt-level = 2
-
-[profile.dev.package.nokhwa-bindings-linux]
-opt-level = 2
-
-[profile.dev.package.nokhwa-bindings-macos]
-opt-level = 2

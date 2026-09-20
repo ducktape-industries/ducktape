@@ -1086,6 +1086,8 @@ fn udp_port_owner(port: u16) -> Option<String> {
 
 /// What holds a TCP port a listener could not bind, and the process behind it
 /// when `/proc` names one this user may inspect.
+// Only the Linux `tcp_port_holder` constructs these; elsewhere it answers `None`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum PortHolder {
     /// another server's listening socket.
     Listener(Option<String>),

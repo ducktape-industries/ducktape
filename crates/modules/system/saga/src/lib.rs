@@ -157,10 +157,13 @@
 //! construct this native module, `bin/node` loads the component — so they must
 //! agree op for op, not just block for block.
 
-// the wire surface: this module's shared types, flattened at the crate root.
-pub use saga_wire::*;
-mod valset_contract;
-use crate::valset_contract as valset;
+mod capability_contract;
+pub mod valset_contract;
+mod wire;
+
+// the wire surface belongs to this module. Keep its codec at the crate root
+// so host consumers use the same bytes without an SDK wire crate.
+pub use wire::*;
 
 // the usage ledger: the PURE decision core (fold + view over
 // index_guest::StateRead), compiled everywhere and unit-tested natively.
@@ -178,7 +181,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use capability::{
+use capability_contract::{
     CapabilityQuery, CapabilityReply, decode_reply as capability_decode_reply,
     encode_query as capability_encode_query, validate_resources,
 };
@@ -187,7 +190,7 @@ use sdk::{
     StateRoot, StateSyncHandle,
 };
 use sha2::{Digest, Sha256};
-use valset::{
+use valset_contract::{
     ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_query as valset_encode_query,
 };
@@ -1215,7 +1218,7 @@ impl SagaModule {
             .valset
             .as_deref()
             .ok_or_else(|| Error::module("accept_no_standing", "no valset is configured"))?;
-        let standing = valset::members_and_residents(ctx, valset).await?;
+        let standing = valset_contract::members_and_residents(ctx, valset).await?;
         if !standing.contains(key) {
             return Err(Error::module(
                 "accept_no_standing",
@@ -2160,13 +2163,15 @@ mod tests {
                 // configured at all.
                 "valset" => match &self.validators {
                     Some(v) => {
-                        match valset::decode_query(req).map_err(|e| Error::module("codec", e))? {
-                            ValsetQuery::Validators => {
-                                Ok(valset::encode_reply(&ValsetReply::Validators(v.clone())))
-                            }
-                            ValsetQuery::Residents => {
-                                Ok(valset::encode_reply(&ValsetReply::Residents(Vec::new())))
-                            }
+                        match valset_contract::decode_query(req)
+                            .map_err(|e| Error::module("codec", e))?
+                        {
+                            ValsetQuery::Validators => Ok(valset_contract::encode_reply(
+                                &ValsetReply::Validators(v.clone()),
+                            )),
+                            ValsetQuery::Residents => Ok(valset_contract::encode_reply(
+                                &ValsetReply::Residents(Vec::new()),
+                            )),
                             ValsetQuery::MeshWindow => Err(Error::QueryUnsupported),
                         }
                     }
@@ -2177,16 +2182,16 @@ mod tests {
                 // from the full announced pool — mirrors the real registry's
                 // "empty demands degrade to Providers" contract.
                 "capability" => {
-                    let query =
-                        capability::decode_query(req).map_err(|e| Error::module("codec", e))?;
+                    let query = capability_contract::decode_query(req)
+                        .map_err(|e| Error::module("codec", e))?;
                     let pool = match query {
                         CapabilityQuery::CapableProviders { .. } => &self.capable_providers,
                         _ => &self.providers,
                     };
                     match pool {
-                        Some(p) => Ok(capability::encode_reply(&CapabilityReply::Providers(
-                            p.clone(),
-                        ))),
+                        Some(p) => Ok(capability_contract::encode_reply(
+                            &CapabilityReply::Providers(p.clone()),
+                        )),
                         None => Err(Error::QueryUnsupported),
                     }
                 }
@@ -4729,7 +4734,7 @@ mod tests {
         let mut ctx = CaptureCtx::new();
 
         // validate_resources is THE rule: too many dimensions...
-        let too_many: BTreeMap<String, u64> = (0..=capability::MAX_RESOURCE_DIMS)
+        let too_many: BTreeMap<String, u64> = (0..=capability_contract::MAX_RESOURCE_DIMS)
             .map(|i| (format!("d{i}"), 1))
             .collect();
         let err = exec(

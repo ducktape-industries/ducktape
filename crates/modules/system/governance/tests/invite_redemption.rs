@@ -23,13 +23,13 @@ use governance::{
     encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
-use identity_module::Identity;
+use identity::Identity;
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
+use valset_module::Valset;
 use valset_module::{
     ValsetQuery, ValsetReply, decode_reply as valset_decode, encode_query as valset_query,
 };
-use valset_module::Valset;
 
 const BINDING: &[u8] = b"testnet#00000000@feedface";
 

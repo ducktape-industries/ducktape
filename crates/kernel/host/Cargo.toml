@@ -65,13 +65,11 @@ greeter = { workspace = true }
 keyscheme = { workspace = true, features = ["testkit"] }
 p256 = { workspace = true }
 base64 = { workspace = true }
+serde = { workspace = true }
 # the delivery drain-injection test stands the real dispatch + saga modules
 # next to a stub receiver.
 saga = { path = "../../modules/system/saga" }
 attribution = { path = "../../modules/system/attribution" }
-# the receipt-cost proof reads the runs module's query shapes; it drives the
-# WASM port, so the wire crate is all it needs.
-runs = { workspace = true }
 files = { path = "../../modules/apps/files" }
 # the wasm files tenant commits through its host-side odb substrate, which is a
 # service crate now — `files` itself names no kernel host.

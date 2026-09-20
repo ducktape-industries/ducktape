@@ -89,6 +89,7 @@
 // the wire surface: this module's shared types, flattened at the crate root.
 mod wire;
 pub use wire::*;
+mod identity_contract;
 mod module_contracts;
 
 use std::collections::BTreeMap;
@@ -96,7 +97,7 @@ use std::collections::BTreeMap;
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
-use identity::{
+use identity_contract::{
     IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
     encode_query as identity_encode_query,
 };
@@ -541,18 +542,13 @@ impl Governance {
         &self,
         ctx: &dyn Ctx,
         query: IdentityQuery,
-    ) -> Result<Option<identity::AccountView>, Error> {
+    ) -> Result<Option<identity_contract::AccountView>, Error> {
         let reply = ctx
             .query(&self.identity_id, &identity_encode_query(&query))
             .await?;
-        match identity_decode_reply(&reply)
-            .map_err(|e| Error::module("identity_reply_decode", e))?
-        {
-            IdentityReply::Account(account) => Ok(account),
-            IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => Err(
-                Error::module("unexpected_identity_reply", "unexpected identity reply"),
-            ),
-        }
+        let IdentityReply::Account(account) =
+            identity_decode_reply(&reply).map_err(|e| Error::module("identity_reply_decode", e))?;
+        Ok(account)
     }
 
     async fn require_account(&self, ctx: &dyn Ctx, number: u64) -> Result<(), Error> {
@@ -655,10 +651,10 @@ impl Governance {
             let total = Self::total_power(&shares)?;
             let powers = shares
                 .into_iter()
-                .map(|(number, shares)| (identity::account_principal(number), shares))
+                .map(|(number, shares)| (identity_contract::account_principal(number), shares))
                 .collect();
             return Ok((
-                identity::account_principal(number),
+                identity_contract::account_principal(number),
                 Electorate {
                     voter_kind: VoterKind::Account,
                     rule: Self::threshold_rule(total, action, true),
@@ -1119,7 +1115,7 @@ impl Governance {
         let voter = match electorate.voter_kind {
             VoterKind::ValidatorNode => submitter,
             VoterKind::Account => {
-                identity::account_principal(self.submitter_account(ctx, &submitter).await?)
+                identity_contract::account_principal(self.submitter_account(ctx, &submitter).await?)
             }
         };
         let in_electorate = electorate.powers.contains_key(&voter);

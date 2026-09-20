@@ -115,6 +115,8 @@ pub async fn members_and_residents(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
+    use sdk_testkit::TestCtx;
 
     #[test]
     fn golden_wire_shapes() {
@@ -126,6 +128,30 @@ mod tests {
         assert_eq!(
             encode_reply(&ValsetReply::Validators(vec![vec![3, 4]])),
             br#"{"validators":[[3,4]]}"#
+        );
+    }
+
+    #[test]
+    fn a_member_read_names_its_refusal() {
+        let garbled = TestCtx::at_height(1).on_query("valset", |_| Ok(b"not a reply".to_vec()));
+        let err = block_on(members(&garbled, "valset")).expect_err("undecodable reply");
+        let Error::Module { reason, sentence } = err else {
+            panic!("a decode failure is a module refusal, got {err:?}");
+        };
+        assert_eq!(reason, sdk::refusal::UNEXPECTED_REPLY);
+        assert!(!sentence.starts_with("valset answered"), "{sentence}");
+
+        let wrong = TestCtx::at_height(1).on_query("valset", |_| {
+            Ok(encode_reply(&ValsetReply::Residents(vec![])))
+        });
+        let err = block_on(members(&wrong, "valset")).expect_err("the wrong reply arm");
+        let Error::Module { reason, sentence } = err else {
+            panic!("a mismatched reply is a module refusal, got {err:?}");
+        };
+        assert_eq!(reason, sdk::refusal::UNEXPECTED_REPLY);
+        assert!(
+            sentence.starts_with("valset answered a Validators query with"),
+            "{sentence}"
         );
     }
 }

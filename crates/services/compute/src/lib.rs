@@ -25,10 +25,15 @@
 
 use std::collections::BTreeMap;
 
-use dispatch::{AdmissionPolicy, WorkSpec, decode_work_spec};
 use provider_host::{ProviderOutput, ProviderSet};
-use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
 use sdk::{Event, Msg};
+
+mod module_contracts;
+
+use module_contracts::{
+    AdmissionPolicy, SagaMsg, TokenUsage, WorkSpec, WorkerRequest, decode_work_spec,
+    decode_worker_request, encode_saga_msg,
+};
 
 pub mod envelope;
 mod ledger;
@@ -73,13 +78,13 @@ pub(crate) struct ExecJob {
 
 pub(crate) struct AttemptOutput {
     pub bytes: Vec<u8>,
-    pub usage: Option<saga::TokenUsage>,
+    pub usage: Option<TokenUsage>,
 }
 
 fn attempt_output(output: ProviderOutput, bytes: Vec<u8>) -> AttemptOutput {
     AttemptOutput {
         bytes,
-        usage: output.usage.map(|usage| saga::TokenUsage {
+        usage: output.usage.map(|usage| TokenUsage {
             input_tokens: usage.input_tokens,
             cached_input_tokens: usage.cached_input_tokens,
             cache_write_input_tokens: usage.cache_write_input_tokens,
@@ -254,11 +259,11 @@ fn oracle_result_with_usage(
     saga_id: &str,
     attempt: u32,
     outcome: Result<Vec<u8>, String>,
-    usage: Option<saga::TokenUsage>,
+    usage: Option<TokenUsage>,
 ) -> Msg {
     Msg {
         target: "saga".into(),
-        payload: encode_msg(&SagaMsg::OracleResult {
+        payload: encode_saga_msg(&SagaMsg::OracleResult {
             saga_id: saga_id.into(),
             attempt,
             outcome,
@@ -270,7 +275,7 @@ fn oracle_result_with_usage(
 fn renew_lease(saga_id: &str, attempt: u32) -> Msg {
     Msg {
         target: "saga".into(),
-        payload: encode_msg(&SagaMsg::RenewLease {
+        payload: encode_saga_msg(&SagaMsg::RenewLease {
             saga_id: saga_id.into(),
             attempt,
         }),
@@ -282,7 +287,7 @@ fn renew_lease(saga_id: &str, attempt: u32) -> Msg {
 fn accept_op(request: &WorkerRequest) -> Msg {
     Msg {
         target: "saga".into(),
-        payload: encode_msg(&SagaMsg::Accept {
+        payload: encode_saga_msg(&SagaMsg::Accept {
             saga_id: request.saga_id.clone(),
             attempt: request.attempt,
         }),
@@ -307,8 +312,9 @@ fn clean_error(error: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dispatch::{WORK_SPEC_KIND, WorkSpec, encode_work_spec};
-    use saga::encode_worker_request;
+    use crate::module_contracts::{
+        WORK_SPEC_KIND, decode_saga_msg, encode_work_spec, encode_worker_request,
+    };
 
     /// a provider surface with one loaded mock spec and NO installed
     /// binaries — enough for every non-live test; no executor is named.
@@ -400,7 +406,7 @@ format = "text"
             &effect_for(work_spec(), Some(b"me")),
         ) {
             Gated::Immediate(msg) => {
-                let SagaMsg::OracleResult { outcome, .. } = saga::decode_msg(&msg.payload).unwrap()
+                let SagaMsg::OracleResult { outcome, .. } = decode_saga_msg(&msg.payload).unwrap()
                 else {
                     panic!("expected an oracle result");
                 };
@@ -439,7 +445,7 @@ format = "text"
             &bare_ledger(),
             &effect_for(work_spec(), None),
         ) {
-            Gated::Immediate(msg) => match saga::decode_msg(&msg.payload).unwrap() {
+            Gated::Immediate(msg) => match decode_saga_msg(&msg.payload).unwrap() {
                 SagaMsg::Accept { saga_id, attempt } => {
                     assert_eq!(saga_id, "s");
                     assert_eq!(attempt, 0);
@@ -481,7 +487,7 @@ format = "text"
             &effect_for(spec, Some(b"me")),
         ) {
             Gated::Immediate(msg) => {
-                let SagaMsg::OracleResult { outcome, .. } = saga::decode_msg(&msg.payload).unwrap()
+                let SagaMsg::OracleResult { outcome, .. } = decode_saga_msg(&msg.payload).unwrap()
                 else {
                     panic!("expected an oracle result");
                 };
@@ -631,21 +637,21 @@ format = "text"
     }
 
     #[test]
-    fn omitted_sandbox_dimensions_become_full_capacity_demands() {
+    fn omitted_sandbox_dimensions_become_the_small_default_demands() {
         let providers = servable_providers();
         let capacity = demands(&[("cores", 8), ("mem_gb", 16)]);
-        let ledger = ResourceLedger::new(capacity.clone());
+        let ledger = ResourceLedger::new(capacity);
         let Gated::Execute(job) = gate(
             &providers,
             b"me",
             &ledger,
             &effect_for(work_spec(), Some(b"me")),
         ) else {
-            panic!("a demandless sandbox run should execute with full accounting")
+            panic!("a demandless sandbox run should execute with the default size")
         };
-        assert_eq!(job.demands, capacity);
+        assert_eq!(job.demands, demands(&[("cores", 2), ("mem_gb", 2)]));
 
-        let partial = work_spec_with_demands(demands(&[("cores", 2)]));
+        let partial = work_spec_with_demands(demands(&[("cores", 6)]));
         let Gated::Execute(job) = gate(
             &providers,
             b"me",
@@ -654,7 +660,7 @@ format = "text"
         ) else {
             panic!("a partial sandbox run should fill its omitted dimensions")
         };
-        assert_eq!(job.demands, demands(&[("cores", 2), ("mem_gb", 16)]));
+        assert_eq!(job.demands, demands(&[("cores", 6), ("mem_gb", 2)]));
     }
 
     #[test]

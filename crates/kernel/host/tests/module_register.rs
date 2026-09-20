@@ -16,11 +16,14 @@
 
 use std::collections::BTreeMap;
 
+#[path = "support/modules_status_contract.rs"]
+mod modules_status_contract;
+
 use futures::executor::block_on;
 use sha2::Digest;
 
 use host::{Admitted, BlockContext, CodeSource, Host, MODULES_ID, ModuleFactory};
-use modules::{Modules, ModulesMsg, ModulesQuery, ModulesReply};
+use modules::{Modules, ModulesMsg};
 use sdk::{Error, Module, Msg, Origin, StateRoot};
 
 const COMPONENT: &[u8] = include_bytes!("fixtures/hello.component.wasm");
@@ -175,15 +178,13 @@ fn count(host: &Host) -> u64 {
 }
 
 fn kanban_entry(host: &Host) -> Option<(Vec<u8>, bool)> {
-    let req = modules::encode_query(&ModulesQuery::ModuleStatus);
+    let req = modules_status_contract::status_query();
     let bytes = block_on(host.query(MODULES_ID, &req)).expect("status");
-    match modules::decode_reply(&bytes).expect("decode") {
-        ModulesReply::ModuleStatus { modules } => modules
-            .iter()
-            .find(|m| m.module_id == "kanban")
-            .map(|m| (m.active_code_hash.clone(), m.pending.is_some())),
-        other => panic!("expected Status, got {other:?}"),
-    }
+    let modules = modules_status_contract::decode_status(&bytes).expect("decode");
+    modules
+        .iter()
+        .find(|m| m.module_id == "kanban")
+        .map(|m| (m.active_code_hash.clone(), m.pending.is_some()))
 }
 
 fn realize(host: &mut Host, height: u64, src: &dyn CodeSource) -> Result<(), Error> {
@@ -453,12 +454,9 @@ fn a_foreign_abi_record_is_skipped_and_the_boundary_keeps_sealing() {
     // the whole point of committing it there.
     submit(&mut host, H, Origin::External(vec![9; 32]), inc_msg());
     assert_eq!(count(&host), 1, "the block applied");
-    let req = modules::encode_query(&ModulesQuery::ModuleStatus);
+    let req = modules_status_contract::status_query();
     let bytes = block_on(host.query(MODULES_ID, &req)).expect("status");
-    let ModulesReply::ModuleStatus { modules } = modules::decode_reply(&bytes).expect("decode")
-    else {
-        panic!("expected ModuleStatus")
-    };
+    let modules = modules_status_contract::decode_status(&bytes).expect("decode");
     let netstack = modules
         .iter()
         .find(|m| m.module_id == "netstack")
