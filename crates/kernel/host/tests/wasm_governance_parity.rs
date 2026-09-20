@@ -26,6 +26,8 @@
 //! registry that live-updates the other wasm tenants.
 
 use commonware_cryptography::Signer as _;
+#[path = "support/modules_status_contract.rs"]
+mod modules_status_contract;
 use commonware_cryptography::ed25519::PrivateKey;
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use governance::invite::{INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof};
@@ -34,10 +36,7 @@ use governance::{
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use identity::{Identity, IdentityMsg, KeyScheme, account_principal};
-use modules::{
-    Modules, ModulesQuery, ModulesReply, decode_reply as modules_decode_reply,
-    encode_query as modules_encode_query,
-};
+use modules::Modules;
 use sdk::{Error, MerkleStore as _, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
 use valset::{
@@ -608,16 +607,10 @@ async fn same_ops_inner(context: &deterministic::Context) {
     // decoded proof on BOTH hosts: the registry now carries the pending swap.
     for host in [&native, &wasm] {
         let reply = host
-            .query(
-                "modules",
-                &modules_encode_query(&ModulesQuery::ModuleStatus),
-            )
+            .query("modules", &modules_status_contract::status_query())
             .await
             .expect("modules registry status");
-        let ModulesReply::ModuleStatus { modules } = modules_decode_reply(&reply).expect("decode")
-        else {
-            panic!("expected Status reply");
-        };
+        let modules = modules_status_contract::decode_status(&reply).expect("decode");
         let hello = modules
             .iter()
             .find(|m| m.module_id == "hello")

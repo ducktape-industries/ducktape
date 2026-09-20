@@ -9,16 +9,12 @@ version.workspace = true
 # no output parsing opinions, no credential handling — contract enforcement
 # is the dispatch module's consensus-side validation.
 [dependencies]
-# Share model configuration and its validation bounds with the run composer.
-runs = { workspace = true }
 async-trait = { workspace = true }
 provider-host = { workspace = true }
-dispatch = { workspace = true }
 # the pool's spawn/deliver/resolver seams are boxed futures; the semaphore
 # caps concurrent provider runs (tokio::sync is runtime-agnostic).
 futures = { workspace = true }
 host = { workspace = true }
-saga = { workspace = true }
 sdk = { workspace = true }
 # the run envelope's magic + headless composer. The SCHEMA is shared with
 # programs that must not link this crate (a GUI submitting a run would drag

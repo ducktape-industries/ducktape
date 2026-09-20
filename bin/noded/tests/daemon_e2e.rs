@@ -464,10 +464,13 @@ fn media_product_route_is_absent_and_presence_without_overlay_refuses() {
     assert_eq!(status, 404);
 
     let (status, raw) = daemon.ws_upgrade_refusal("/v1/presence/ws?page=page-1");
-    assert_eq!(status, 503, "no realtime hub → presence refused: {raw}");
+    assert_eq!(
+        status, 500,
+        "keyless daemon refuses presence before the no-hub check: {raw}"
+    );
     assert!(
-        raw.contains("no mesh realtime hub"),
-        "refusal says WHY: {raw}"
+        raw.contains("node_unidentified"),
+        "keyless presence refusal says WHY: {raw}"
     );
 
     let (status, _raw) = daemon.ws_upgrade_refusal("/v1/voice/ws?channel=general");
@@ -718,6 +721,7 @@ fn programmable_user_calls_and_reports_failure_through_onchain_attribution() {
         (
             "agent",
             serde_json::json!({ "provision": {
+                "request_id": "taskbot",
                 "name": "taskbot", "program": program,
             }}),
         ),
@@ -1103,23 +1107,23 @@ fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
     let (code, _) = daemon.request_bytes("GET", &format!("/v1/files/blob/{upper}"), &[]);
     assert_eq!(code, 400, "digest must be lowercase hex");
 
-    // the receipt-lane body cap is 4 MiB inclusive: exactly 4 MiB lands...
+    // The receipt lane streams to disk and has no 4 MiB body ceiling: a
+    // repository packfile may be larger than the old buffered limit.
     let max = vec![0xABu8; 4 * 1024 * 1024];
     let (code, _) = daemon.request_bytes("POST", "/v1/files/blob", &max);
-    assert_eq!(code, 200, "a body of exactly the cap must land");
-    // ...and one byte more is a 413 in the daemon's error envelope.
+    assert_eq!(code, 200, "a 4 MiB body must land");
     let over = vec![0xCDu8; 4 * 1024 * 1024 + 1];
     let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", &over);
     assert_eq!(
         code,
-        413,
-        "oversized body must be rejected: {}",
+        200,
+        "a body beyond the old buffered ceiling must land: {}",
         String::from_utf8_lossy(&body)
     );
-    let err: serde_json::Value = serde_json::from_slice(&body).expect("413 body is json");
+    let over_reply: serde_json::Value = serde_json::from_slice(&body).expect("upload reply json");
     assert!(
-        err["error"].is_string(),
-        "413 uses the error envelope: {err}"
+        over_reply["digest"] == digest_hex(&over),
+        "the streamed oversized upload is addressed by its exact digest: {over_reply}"
     );
 
     // the whole blob lane is off-consensus: no blocks, no root-hash movement.
