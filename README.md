@@ -25,24 +25,21 @@ On macOS, `xcode-select --install`. `make` checks the prerequisites up front.
 ```sh
 git clone https://github.com/ducktape-industries/ducktape.git
 cd ducktape
-make install-node
+make install
+ducktape node init --name mynet
 ```
 
-This puts the `ducktape` CLI and the founding module set in `~/.cargo/bin`.
-The desktop app builds and installs from its own repository,
-[ducktape-app](https://github.com/ducktape-industries/ducktape-app).
+This puts the `ducktape` CLI and the founding module set in `~/.cargo/bin`,
+then delegates the desktop installation to the pinned
+[ducktape-app](https://github.com/ducktape-industries/ducktape-app) checkout.
+The app's `make install` output names its installed files and destinations.
 
 ## Quick start
 
-Every line runs as written on a machine with one network on it:
+After installation, initialize a network:
 
 ```sh
 ducktape node init --name mynet     # found your own network here
-ducktape node join <invite>         # ...or join someone else's
-ducktape node run                   # start it (^C checkpoints and exits)
-ducktape wallet new <you>           # mint your user key
-ducktape account create --name <you>   # found your account on it
-ducktape node status                # its height, and how far behind the network
 ```
 
 Then, to run agents on it:
