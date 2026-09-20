@@ -51,11 +51,12 @@
 //! merkle-verified against the root consensus agreed on — the root, not the
 //! serving peer, stays the trust anchor.
 
-// the wire surface: this module's shared types, flattened at the crate root.
+// the wire surface: this module's types, flattened at the crate root.
 #[cfg(all(feature = "guest", target_arch = "wasm32"))]
 mod guest;
 
-pub use valset_wire::*;
+mod wire;
+pub use wire::*;
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;

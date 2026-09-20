@@ -7864,7 +7864,6 @@ dependencies = [
  "serde",
  "serde_json",
  "statesync",
- "valset-wire",
 ]
 
 [[package]]
