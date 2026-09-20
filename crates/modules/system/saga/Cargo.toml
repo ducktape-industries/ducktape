@@ -27,7 +27,6 @@ sdk = { workspace = true }
 borsh = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-valset = { workspace = true }
 capability = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }

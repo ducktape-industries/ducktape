@@ -27,8 +27,8 @@
 //! are the ones that reach real consensus.
 
 use crate::NodeHandle;
-use std::path::Path;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use attribution::AttributionModule;

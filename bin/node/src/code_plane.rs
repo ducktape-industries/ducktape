@@ -43,6 +43,7 @@ use data_plane::{
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::constants::MAX_MODULE_CODE_BYTES;
+use crate::module_contracts::{governance, modules};
 use crate::overlay_book::{BIND_RETRY, LaneSource, OverlayBook, OverlayPeers, Plane, StreamPlane};
 
 const INTENT_PUSH: u8 = 1;
@@ -1072,7 +1073,7 @@ mod tests {
     /// reclaimable.
     #[test]
     fn an_open_module_proposal_names_its_digest() {
-        use governance::{GovAction, ProposalStatus};
+        use crate::module_contracts::governance::{GovAction, ProposalStatus};
         let register = [7u8; 32];
         let update = [8u8; 32];
         let rejected = [9u8; 32];

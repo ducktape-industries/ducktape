@@ -14,8 +14,10 @@ mod harness;
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
-use governance::invite::{INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof};
 use harness::Sim;
+use harness::module_contracts::{
+    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof,
+};
 use serde_json::{Value, json};
 use std::path::Path;
 

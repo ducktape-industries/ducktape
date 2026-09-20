@@ -299,8 +299,7 @@ impl<'a> EpochActions<'a> {
 /// the operator's question is not "how many windows" but "is this chain dead".
 /// `AGENTS.md` reserves `error` for "stopped and will not self-heal"; a minute
 /// with no block, on a heartbeat that promises one per second, is that.
-pub(crate) const STALL_IS_AN_ERROR_AFTER: std::time::Duration =
-    std::time::Duration::from_secs(60);
+pub(crate) const STALL_IS_AN_ERROR_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How loudly a drain turn owes the log a word about the block beat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,19 +561,24 @@ mod tests {
     #[test]
     fn a_stall_past_the_threshold_is_an_error_and_stays_one() {
         let reports = silence_for(600);
-        let (warns, errors): (Vec<&BlockBeat>, Vec<&BlockBeat>) = reports
-            .iter()
-            .partition(|r| r.voice == StallVoice::Warn);
+        let (warns, errors): (Vec<&BlockBeat>, Vec<&BlockBeat>) =
+            reports.iter().partition(|r| r.voice == StallVoice::Warn);
         assert_eq!(
             warns.len(),
             1,
             "only the 30s report is under the 60s threshold"
         );
         assert!(
-            errors.iter().all(|r| r.stalled_for >= STALL_IS_AN_ERROR_AFTER),
+            errors
+                .iter()
+                .all(|r| r.stalled_for >= STALL_IS_AN_ERROR_AFTER),
             "nothing is an error before the threshold"
         );
-        assert_eq!(errors.len(), 19, "a dead chain keeps saying so, once a window");
+        assert_eq!(
+            errors.len(),
+            19,
+            "a dead chain keeps saying so, once a window"
+        );
     }
 
     #[test]
@@ -658,9 +662,6 @@ mod tests {
         );
         // a frame that finalized and changed nothing refused nothing, and must
         // not borrow the vocabulary of one that did.
-        assert_eq!(
-            settled_submit(true, None),
-            Err(NO_REASON_GIVEN.to_string())
-        );
+        assert_eq!(settled_submit(true, None), Err(NO_REASON_GIVEN.to_string()));
     }
 }

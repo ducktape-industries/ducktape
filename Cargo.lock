@@ -6,7 +6,6 @@ version = 4
 name = "acl"
 version = "0.1.0"
 dependencies = [
- "acl-wire",
  "async-trait",
  "borsh",
  "commonware-cryptography",
@@ -795,7 +794,6 @@ dependencies = [
  "sdk-testkit",
  "serde",
  "statesync",
- "valset-wire",
 ]
 
 [[package]]
@@ -3267,7 +3265,6 @@ name = "governance"
 version = "0.1.0"
 dependencies = [
  "acl",
- "acl-wire",
  "async-trait",
  "borsh",
  "commonware-codec",
@@ -3275,18 +3272,16 @@ dependencies = [
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
- "governance-wire",
  "host",
  "identity",
  "identity-wire",
+ "module-artifact",
  "modules",
- "modules-wire",
  "sdk",
  "sdk-testkit",
  "serde",
  "statesync",
  "valset",
- "valset-wire",
 ]
 
 [[package]]
@@ -3547,7 +3542,6 @@ name = "host"
 version = "0.1.0"
 dependencies = [
  "acl",
- "acl-wire",
  "async-trait",
  "attribution",
  "base64 0.22.1",
@@ -3580,6 +3574,7 @@ dependencies = [
  "saga",
  "sdk",
  "sdk-testkit",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "source-lint",
@@ -4185,7 +4180,6 @@ dependencies = [
  "commonware-runtime",
  "ducktape-module-sdk",
  "host",
- "kv-wire",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -4446,12 +4440,10 @@ dependencies = [
  "ducktape-module-sdk",
  "futures",
  "module-artifact",
- "modules-wire",
  "sdk",
  "sdk-testkit",
  "serde",
  "statesync",
- "valset-wire",
 ]
 
 [[package]]
@@ -4755,7 +4747,7 @@ dependencies = [
  "futures",
  "gateway",
  "git2",
- "governance-wire",
+ "governance",
  "host",
  "http-body-util",
  "identity",
@@ -6354,7 +6346,6 @@ dependencies = [
  "statesync",
  "tempfile",
  "valset",
- "valset-wire",
 ]
 
 [[package]]
@@ -6791,7 +6782,6 @@ dependencies = [
  "files-wire",
  "futures",
  "gateway-wire",
- "governance-wire",
  "host",
  "identity",
  "indexer",
@@ -7889,16 +7879,6 @@ dependencies = [
  "serde",
  "serde_json",
  "statesync",
- "valset-wire",
-]
-
-[[package]]
-name = "valset-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "sdk",
- "serde",
 ]
 
 [[package]]
@@ -8870,7 +8850,6 @@ dependencies = [
  "duck-address",
  "duckfs-core",
  "ducktape-home",
- "governance-wire",
  "identity-wire",
  "module-artifact",
  "nat-traversal",

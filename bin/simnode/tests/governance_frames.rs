@@ -17,7 +17,7 @@ mod harness;
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
-use governance::{GovAction, GovMsg, encode_msg as gov_encode};
+use harness::module_contracts::{GovAction, GovMsg, encode_msg as gov_encode};
 use harness::{Sim, create};
 use sdk::Msg;
 use serde_json::{Value, json};

@@ -19,7 +19,53 @@ use modules::{
 use sdk::{Env, Error, MerkleStore as _, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
-use valset::{ValsetQuery, ValsetReply, encode_reply as valset_encode_reply};
+
+mod valset_contract {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum ValsetQuery {
+        Validators,
+        Residents,
+        MeshWindow,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct GenerationSet {
+        pub generation: u64,
+        pub validators: Vec<Vec<u8>>,
+        pub residents: Vec<Vec<u8>>,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum ValsetReply {
+        Validators(Vec<Vec<u8>>),
+        Residents(Vec<Vec<u8>>),
+        MeshWindow(Vec<GenerationSet>),
+    }
+
+    pub fn decode_query(bytes: &[u8]) -> Result<ValsetQuery, String> {
+        sdk::wire::decode(bytes)
+    }
+
+    pub fn encode_reply(value: &ValsetReply) -> Vec<u8> {
+        sdk::wire::encode(value)
+    }
+
+    #[test]
+    fn golden_wire_shapes() {
+        assert_eq!(sdk::wire::encode(&ValsetQuery::Validators), br#"\"validators\"#);
+        assert_eq!(
+            encode_reply(&ValsetReply::Residents(vec![vec![1, 2]])),
+            br#"{\"residents\":[[1,2]]}"#
+        );
+    }
+}
+
+use valset_contract::{ValsetQuery, ValsetReply, decode_query, encode_reply as valset_encode_reply};
 
 const MEMBER: [u8; 32] = [7; 32];
 
@@ -38,7 +84,7 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
         cause: sdk::Cause::Direct,
     })
     .on_query("valset", |req| {
-        match valset::decode_query(req).map_err(|e| Error::module("codec", e))? {
+        match decode_query(req).map_err(|e| Error::module("codec", e))? {
             ValsetQuery::Validators => Ok(valset_encode_reply(&ValsetReply::Validators(vec![
                 MEMBER.to_vec(),
             ]))),

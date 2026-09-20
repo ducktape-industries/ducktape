@@ -83,7 +83,9 @@ impl GuestArch {
         match std::env::consts::ARCH {
             "aarch64" => Ok(Self::Aarch64),
             "x86_64" => Ok(Self::X86_64),
-            other => Err(format!("no agent CLIs are published for guest arch {other}")),
+            other => Err(format!(
+                "no agent CLIs are published for guest arch {other}"
+            )),
         }
     }
 
@@ -276,7 +278,9 @@ fn manifest_checksum(manifest: &str, platform: &str) -> Result<String, String> {
         return Err(format!("no checksum published for platform {platform}"));
     };
     if !is_sha256_hex(checksum) {
-        return Err(format!("the checksum for {platform} is not a sha256: {checksum:?}"));
+        return Err(format!(
+            "the checksum for {platform} is not a sha256: {checksum:?}"
+        ));
     }
     Ok(checksum.to_string())
 }
@@ -502,11 +506,7 @@ pub(crate) fn run(args: InstallArgs, workspace: &Path) -> InstallResult {
             return Ok(());
         }
         // `--yes` is the approval given up front, for the whole checklist.
-        if args.yes {
-            offered
-        } else {
-            choose(&offered)?
-        }
+        if args.yes { offered } else { choose(&offered)? }
     } else {
         survey
             .iter()
@@ -539,7 +539,10 @@ fn print_status(dir: &Path, arch: GuestArch, survey: &[Surveyed]) {
                 println!("          sha256 {}", latest.sha256);
             }
             Installed::Behind { installed } => {
-                println!("  BUMP    {name:<8} {installed} -> {} (latest)", latest.version);
+                println!(
+                    "  BUMP    {name:<8} {installed} -> {} (latest)",
+                    latest.version
+                );
                 println!("          {}", latest.url);
                 println!("          sha256 {}", latest.sha256);
             }
@@ -1358,7 +1361,11 @@ mod tests {
                 .unwrap_err()
                 .contains("not a sha256")
         );
-        assert!(manifest_checksum("{", "linux-x64").unwrap_err().contains("not a manifest"));
+        assert!(
+            manifest_checksum("{", "linux-x64")
+                .unwrap_err()
+                .contains("not a manifest")
+        );
 
         let sums = format!(
             "{}  codex-package-aarch64-apple-darwin.tar.gz\n\
@@ -1670,12 +1677,21 @@ mod tests {
                     .unwrap();
                 assert!(!latest.version.is_empty(), "{} {arch:?}", provider.token());
                 assert!(latest.url.starts_with("https://"), "{}", latest.url);
-                assert!(is_sha256_hex(&latest.sha256), "{} {arch:?}", provider.token());
+                assert!(
+                    is_sha256_hex(&latest.sha256),
+                    "{} {arch:?}",
+                    provider.token()
+                );
                 assert!(
                     latest.files().contains(&provider.token()),
                     "the release delivers the binary named for its provider"
                 );
-                eprintln!("{} {arch:?}: {} {}", provider.token(), latest.version, latest.url);
+                eprintln!(
+                    "{} {arch:?}: {} {}",
+                    provider.token(),
+                    latest.version,
+                    latest.url
+                );
             }
         }
     }

@@ -21,7 +21,6 @@ sdk = { workspace = true }
 serde = { workspace = true }
 # the store-record codec: compact, canonical, deterministic. wire stays sdk::wire.
 borsh = { workspace = true }
-valset = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]

@@ -52,12 +52,12 @@ use commonware_runtime::{Metrics as _, Runner, Supervisor};
 mod account_cli;
 mod agent;
 mod agent_cli;
-mod chief_cli;
 mod agent_plane;
 mod airlock;
 mod announce;
 mod blob_fetch;
 mod boot;
+mod chief_cli;
 mod cli;
 mod cli_args;
 mod code_plane;
@@ -92,6 +92,7 @@ mod mesh_book;
 mod mesh_lanes;
 mod mesh_window;
 mod module_cli;
+mod module_contracts;
 mod netstack_governance;
 mod node_http;
 mod overlay_book;
@@ -786,7 +787,9 @@ fn run_node(
                     // to the operator exactly like one a machine refused.
                     match answer {
                         SwapAnswer::Swapped(backend) => Ok(backend),
-                        SwapAnswer::Refused(reason) | SwapAnswer::Unattempted(reason) => Err(reason),
+                        SwapAnswer::Refused(reason) | SwapAnswer::Unattempted(reason) => {
+                            Err(reason)
+                        }
                     }
                 })
             });

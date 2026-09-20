@@ -18,6 +18,7 @@ use crate::drain_actions::{
     observe_block_beat,
 };
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
+use crate::module_contracts::modules;
 use crate::util::{Presence, fatal, hex, participant_bytes, resident_bytes, unix_ms};
 
 /// One warning when the workspace mark goes missing, then one per this many
@@ -1559,15 +1560,18 @@ impl ValidatorRuntime<'_> {
             // module's state shape — or, for an admission, start over scratch
             // state, since the boundary initializes it; a view's bytes must
             // speak the view ABI, and no running module is asked about them.
-            let realizable = noded::compose::validate_deployment(
-                module_id, entry.kind, &bytes, index,
-            )
-            .and_then(|()| match entry.kind {
-                modules::Kind::Module => node
-                    .check_module_replacement(module_id, &bytes)
-                    .map_err(|error| error.to_string()),
-                modules::Kind::View => Ok(()),
-            });
+            let deployment_kind = match entry.kind {
+                modules::Kind::Module => noded::module_contracts::modules::Kind::Module,
+                modules::Kind::View => noded::module_contracts::modules::Kind::View,
+            };
+            let realizable =
+                noded::compose::validate_deployment(module_id, deployment_kind, &bytes, index)
+                    .and_then(|()| match entry.kind {
+                        modules::Kind::Module => node
+                            .check_module_replacement(module_id, &bytes)
+                            .map_err(|error| error.to_string()),
+                        modules::Kind::View => Ok(()),
+                    });
             match realizable {
                 Ok(()) => CodeVerdict::Loadable,
                 // the first line only: a wasmtime error carries a multi-line

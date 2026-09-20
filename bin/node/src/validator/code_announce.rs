@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use sdk::Msg;
 
 use crate::blob_fetch::{BlobFetchError, SourceRotate, fetch_blob};
+use crate::module_contracts::{governance, modules};
 
 /// the ceiling on the fetch backoff, in DRAIN TICKS (the pump runs once per
 /// `DRAIN_TICK`, so 600 is a minute). Nobody serving the bytes is not a

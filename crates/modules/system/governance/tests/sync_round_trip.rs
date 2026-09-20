@@ -25,7 +25,7 @@ use governance::{
 use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
-use valset::{
+use valset_module::{
     ValsetQuery, ValsetReply, decode_query as valset_decode_query,
     encode_reply as valset_encode_reply,
 };

@@ -15,6 +15,7 @@ use futures::channel::oneshot;
 
 use app_update::{ReleaseKeys, ReleaseSignal, ReleaseStatus};
 
+use crate::module_contracts::governance;
 use crate::{NodeCommand, NodeHandle};
 
 /// How far one walk goes. A network that has passed this many decisions in
@@ -69,9 +70,7 @@ async fn passed_signals(handle: &NodeHandle, id: fn(u64) -> String) -> Vec<Strin
             }
         };
         let decided = view.status == governance::ProposalStatus::Passed;
-        let governance::GovAction::Signal { text } = view.action else {
-            continue;
-        };
+        let governance::GovAction::Signal { text } = view.action;
         if decided {
             passed.push(text);
         }
@@ -96,8 +95,6 @@ async fn proposal(
         .await
         .map_err(|_| "reply dropped".to_string())?
         .map_err(|refused| refused.message)?;
-    match governance::decode_reply(&bytes)? {
-        governance::GovReply::Proposal(view) => Ok(view),
-        other => Err(format!("unexpected governance reply: {other:?}")),
-    }
+    let governance::GovReply::Proposal(view) = governance::decode_reply(&bytes)?;
+    Ok(view)
 }

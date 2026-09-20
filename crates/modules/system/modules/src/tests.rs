@@ -8,13 +8,13 @@ use sdk_testkit::TestCtx;
 fn validators(members: Vec<Vec<u8>>) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
     move |req| {
         let is_validators = matches!(
-            valset::decode_query(req),
-            Ok(valset::ValsetQuery::Validators)
+            crate::valset_contract::decode_query(req),
+            Ok(crate::valset_contract::ValsetQuery::Validators)
         );
         if is_validators {
-            return Ok(valset::encode_reply(&valset::ValsetReply::Validators(
-                members.clone(),
-            )));
+            return Ok(crate::valset_contract::encode_reply(
+                &crate::valset_contract::ValsetReply::Validators(members.clone()),
+            ));
         }
         Err(Error::QueryUnsupported)
     }

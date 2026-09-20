@@ -43,6 +43,7 @@ pub mod signed_req;
 pub use signed_req::{SignedBy, WriteRefusal};
 
 pub mod blobs;
+pub mod module_contracts;
 // the pieces every process needs AROUND the composer: the on-disk component
 // bundle (naming, hashing, a code source over it), the qmdb store source, and
 // the `Host` finisher.
@@ -814,7 +815,10 @@ pub fn router(handle: NodeHandle) -> Router {
         // receipt out. distinct from `/v1/submit` above, whose `origin` is a
         // caller-supplied string.
         .route("/v1/submit/frame", post(submit_frame))
-        .route("/v1/submit/raw/{target}", post(submit_raw).layer(DefaultBodyLimit::max(node::MAX_PAYLOAD_BYTES)))
+        .route(
+            "/v1/submit/raw/{target}",
+            post(submit_raw).layer(DefaultBodyLimit::max(node::MAX_PAYLOAD_BYTES)),
+        )
         .route("/v1/query", post(query))
         // the AUTHENTICATED read lane, to `/v1/query` what `/v1/submit/frame`
         // is to `/v1/submit`: the caller's own proof decides who is asking, so
@@ -902,13 +906,15 @@ pub fn router(handle: NodeHandle) -> Router {
     // unmatched path must 404 rather than be told it needs a signature.
     // `signed_req::lane_of` is the whole table — a new mutating route is added
     // THERE, never gated at its own call site.
-    let public = public.route_layer(axum::middleware::from_fn_with_state(
-        handle.clone(),
-        signed_req::signed_write_guard,
-    )).route_layer(axum::middleware::from_fn_with_state(
-        std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
-        limit_blob_uploads,
-    ));
+    let public = public
+        .route_layer(axum::middleware::from_fn_with_state(
+            handle.clone(),
+            signed_req::signed_write_guard,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+            limit_blob_uploads,
+        ));
     // the owner-gated `/v1/admin/*` namespace — merged only when exposure is
     // enabled, so `Disabled` leaves the control surface simply ABSENT (a 404),
     // not a gated-but-present route. its own PoP middleware is baked in.
@@ -1002,7 +1008,9 @@ async fn submit_raw(
     body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
     let bounded_target = !target.is_empty() && target.len() <= node::MAX_TARGET_BYTES;
-    if !bounded_target { return error_response(StatusCode::BAD_REQUEST, "invalid module target"); }
+    if !bounded_target {
+        return error_response(StatusCode::BAD_REQUEST, "invalid module target");
+    }
     let body = match body {
         Ok(body) => body,
         Err(error) => return error_response(error.status(), &error.body_text()),
@@ -1458,11 +1466,16 @@ async fn limit_blob_uploads(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let uploads_blob = request.method() == axum::http::Method::POST
-        && request.uri().path() == "/v1/files/blob";
-    if !uploads_blob { return next.run(request).await; }
+    let uploads_blob =
+        request.method() == axum::http::Method::POST && request.uri().path() == "/v1/files/blob";
+    if !uploads_blob {
+        return next.run(request).await;
+    }
     let Ok(_permit) = slots.try_acquire() else {
-        return error_response(StatusCode::SERVICE_UNAVAILABLE, "blob upload capacity exhausted");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "blob upload capacity exhausted",
+        );
     };
     next.run(request).await
 }

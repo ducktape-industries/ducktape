@@ -38,6 +38,7 @@ use futures::SinkExt as _;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::module_contracts::modules;
 use crate::reachability_plane::SwapAnswer;
 
 /// the module code registry id the reachability component is committed under.
@@ -557,7 +558,11 @@ mod tests {
         let next = [8; 32];
         const REDESIGNATION: u64 = 40;
         let mut replaced = entry(Some(next), &[]);
-        replaced.pending.as_mut().expect("pending").activation_height = REDESIGNATION;
+        replaced
+            .pending
+            .as_mut()
+            .expect("pending")
+            .activation_height = REDESIGNATION;
         let roster = vec![replaced];
         assert_eq!(
             step(&roster, REDESIGNATION - 1, Some(&spent)),

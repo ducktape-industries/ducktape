@@ -3,6 +3,8 @@ use commonware_cryptography::ed25519;
 
 use host::Host;
 
+use crate::module_contracts::{governance, valset};
+
 /// read the valset module's current membership projection (committed state —
 /// called between drains, outside any block).
 ///
@@ -11,7 +13,7 @@ use host::Host;
 /// distinguishable to the cutover step, so this returns `Err` on either the
 /// query or the decode failing rather than degrading both to `Vec::new()`.
 pub(crate) async fn read_valset_members(host: &Host) -> Result<Vec<Vec<u8>>, String> {
-    use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    use crate::module_contracts::valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let reply = host
         .query("valset", &encode_query(&ValsetQuery::Validators))
         .await
@@ -26,7 +28,7 @@ pub(crate) async fn read_valset_members(host: &Host) -> Result<Vec<Vec<u8>>, Str
 /// called between drains, outside any block; same read point as
 /// [`read_valset_members`], so a boundary read sees one frozen state).
 pub(crate) async fn read_valset_residents(host: &Host) -> Vec<Vec<u8>> {
-    use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    use crate::module_contracts::valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let Ok(reply) = host
         .query("valset", &encode_query(&ValsetQuery::Residents))
         .await
@@ -44,7 +46,7 @@ pub(crate) async fn read_valset_residents(host: &Host) -> Vec<Vec<u8>> {
 /// [`read_valset_members`]). unreadable degrades to EMPTY: callers treat an
 /// empty window per their role (a validator fail-stops, a poller retries).
 pub(crate) async fn read_valset_mesh_window(host: &Host) -> Vec<valset::GenerationSet> {
-    use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    use crate::module_contracts::valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let Ok(reply) = host
         .query("valset", &encode_query(&ValsetQuery::MeshWindow))
         .await
@@ -82,7 +84,7 @@ pub(crate) async fn read_redemption_from_host(
     host: &Host,
     nonce: &[u8],
 ) -> Option<governance::RedemptionView> {
-    use governance::{GovQuery, GovReply, decode_reply, encode_query};
+    use crate::module_contracts::governance::{GovQuery, GovReply, decode_reply, encode_query};
     let reply = host
         .query(
             "governance",
@@ -162,7 +164,9 @@ mod tests {
         }
 
         async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-            use valset::{ValsetQuery, ValsetReply, decode_query, encode_reply};
+            use crate::module_contracts::valset::{
+                ValsetQuery, ValsetReply, decode_query, encode_reply,
+            };
             match decode_query(req) {
                 Ok(ValsetQuery::Validators) => match &self.0 {
                     Ok(keys) => Ok(encode_reply(&ValsetReply::Validators(keys.clone()))),

@@ -7,6 +7,8 @@
 //! expected — hence the file-wide dead_code allow.
 #![allow(dead_code)]
 
+pub mod module_contracts;
+
 use std::io::{BufRead as _, BufReader};
 use std::net::SocketAddr;
 use std::path::Path;

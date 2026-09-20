@@ -11,14 +11,11 @@ version.workspace = true
 # module non-determinism is the most fork-relevant event the kernel can see.
 tracing = { workspace = true }
 sdk = { workspace = true }
+serde = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
-# WIRE-TYPES-ONLY dep: the drain's boundary code-swap realization reads the
-# modules registry's committed active/pending hashes and injects the shared
-# `Advance` tick. host uses only the crate-root wire types — it never
-# constructs or registers the module impl (same shape as governance reading
-# valset's wire types).
-modules = { path = "../../modules/system/modules" }
+# The host declares the small acl, valset, and modules wire views it consumes
+# in `src/module_contracts.rs`; native implementations remain test-only.
 # the drain's delivery injection reads the dispatch module's committed
 # mailbox count between blocks.
 dispatch = { path = "../../modules/system/dispatch" }
@@ -26,14 +23,15 @@ dispatch = { path = "../../modules/system/dispatch" }
 # resolves the submitting origin's principal against the valset tiers and the
 # identity ownership indexes. system modules are CORE-RESIDENT: the kernel
 # links the module crate itself (its workspace name resolves to the wire).
-acl = { workspace = true }
-valset = { path = "../../modules/system/valset" }
 identity = { path = "../../modules/system/identity" }
 # the journal codec for a block's prepared internal work (`PreparedWork`),
 # the uniform record codec every module already persists with.
 borsh = { workspace = true }
 
 [dev-dependencies]
+modules = { path = "../../modules/system/modules" }
+valset = { path = "../../modules/system/valset" }
+acl = { path = "../../modules/system/acl" }
 module-artifact = { workspace = true }
 # the fail-closed proof asserts the OPERATOR-facing line the boundary emits
 # before it errors: a capturing subscriber, not a log-shaped comment.
@@ -52,9 +50,6 @@ wasm-host = { workspace = true }
 # the parity suites run the NATIVE modules against their guests, so the module
 # crates below are named by path: the workspace key resolves to a module's wire.
 kv = { path = "../../modules/system/kv" }
-# `acl` is a normal dep of the host (its wire), so the native module the gate
-# parity proof stands beside the guest enters under its own name.
-acl-module = { path = "../../modules/system/acl", package = "acl" }
 directory = { workspace = true }
 index_guest = { workspace = true }
 capability = { path = "../../modules/system/capability" }

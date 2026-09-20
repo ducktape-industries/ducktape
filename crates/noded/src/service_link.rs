@@ -373,7 +373,10 @@ mod tests {
         let link = ServiceLink::new(Some(TEST_TOKEN.into()));
         let first = link.attach(TEST_TOKEN);
         assert!(first.is_some());
-        assert!(link.attach(TEST_TOKEN).is_none(), "the link is already held");
+        assert!(
+            link.attach(TEST_TOKEN).is_none(),
+            "the link is already held"
+        );
         // and it is reclaimable once the holder goes.
         drop(first);
         assert!(link.attach(TEST_TOKEN).is_some());

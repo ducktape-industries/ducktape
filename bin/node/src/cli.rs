@@ -12,6 +12,7 @@ use crate::cli_args::{
     ResidentCmd, Selector, SelectorArgs, StatusArgs, WorkCmd, WorkTargetArgs,
 };
 use crate::config;
+use crate::module_contracts::governance;
 use crate::work_admission::{self, AdmitTarget, WorkAdmission};
 use config::{hex_bytes, unhex};
 
@@ -1382,7 +1383,7 @@ fn rpc_submit(addr: &str, target: &str, payload: &[u8]) -> Result<(), String> {
 }
 
 pub(super) fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
-    use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    use crate::module_contracts::valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Validators))?;
     match decode_reply(&raw)? {
         ValsetReply::Validators(v) => Ok(v),
@@ -1391,7 +1392,7 @@ pub(super) fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
 }
 
 fn read_residents(addr: &str) -> Result<Vec<Vec<u8>>, String> {
-    use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    use crate::module_contracts::valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Residents))?;
     match decode_reply(&raw)? {
         ValsetReply::Residents(v) => Ok(v),
@@ -1417,7 +1418,7 @@ fn account_of_key(addr: &str, key: &[u8]) -> Result<Option<u64>, String> {
 }
 
 fn read_shares(addr: &str) -> Result<governance::SharesView, String> {
-    use governance::{GovQuery, GovReply, decode_reply, encode_query};
+    use crate::module_contracts::governance::{GovQuery, GovReply, decode_reply, encode_query};
     let raw = rpc_query(addr, "governance", &encode_query(&GovQuery::Shares))?;
     match decode_reply(&raw)? {
         GovReply::Shares(view) => Ok(view),
@@ -1613,7 +1614,7 @@ fn cmd_join_state(args: SelectorArgs) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 fn read_proposal(addr: &str, id: &str) -> Result<Option<governance::ProposalView>, String> {
-    use governance::{GovQuery, GovReply, decode_reply, encode_query};
+    use crate::module_contracts::governance::{GovQuery, GovReply, decode_reply, encode_query};
     let raw = rpc_query(
         addr,
         "governance",
@@ -1750,7 +1751,7 @@ fn cast_yes_once(
     opened: governance::ProposalView,
     signer: &GovSigner,
 ) -> Result<governance::ProposalView, String> {
-    use governance::{GovMsg, ProposalStatus};
+    use crate::module_contracts::governance::{GovMsg, ProposalStatus};
 
     if opened.status != ProposalStatus::Open {
         return Ok(opened);
@@ -1869,8 +1870,8 @@ pub(super) fn drive_proposal_ceremony(
         matches(&wanted),
         "the matcher must accept the action it proposes"
     );
-    use governance::{GovMsg, ProposalStatus};
-    use governance::{GovQuery, GovReply, decode_reply, encode_query};
+    use crate::module_contracts::governance::{GovMsg, ProposalStatus};
+    use crate::module_contracts::governance::{GovQuery, GovReply, decode_reply, encode_query};
     let proposals = match decode_reply(&rpc_query(
         node.rpc(),
         "governance",
@@ -1969,7 +1970,7 @@ pub(super) fn drive_proposal_ceremony(
 /// state on a stride cadence. promotion into the quorum is the separate,
 /// deliberate `member promote` verb — run it once the resident is warm.
 fn cmd_invite_accept(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use governance::GovAction;
+    use crate::module_contracts::governance::GovAction;
 
     let pubkey_hex = &args.pubkey;
     let key = config::decode_key(pubkey_hex)?;
@@ -2071,7 +2072,7 @@ pub(super) fn precheck_promotion(
 /// the only way in: consensus refuses a promotion of a key it has never met,
 /// and [`precheck_promotion`] says so before this verb submits anything.
 fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use governance::GovAction;
+    use crate::module_contracts::governance::GovAction;
 
     let pubkey_hex = &args.pubkey;
     let key = config::decode_key(pubkey_hex)?;
@@ -2162,7 +2163,7 @@ pub(super) fn precheck_resident_removal(
 /// `member remove`'s job — standing never overlaps (Grant refuses validators,
 /// Join clears standing).
 fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use governance::GovAction;
+    use crate::module_contracts::governance::GovAction;
 
     let pubkey_hex = &args.pubkey;
     let key = config::decode_key(pubkey_hex)?;
@@ -2221,7 +2222,7 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
 /// run that lands the deciding ballot executes. the passing proposal's valset
 /// Leave schedules the epoch cutover that drops the key from the tracked set.
 fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use governance::{GovAction, GovMsg, ProposalStatus};
+    use crate::module_contracts::governance::{GovAction, GovMsg, ProposalStatus};
 
     let pubkey_hex = &args.pubkey;
     let key = config::decode_key(pubkey_hex)?;
@@ -2242,7 +2243,7 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
     // adopt an existing OPEN proposal for exactly this action, else mint an
     // unused id (settled proposals keep their ids forever — a re-removed key
     // gets a fresh suffix).
-    use governance::{GovQuery, GovReply, decode_reply, encode_query};
+    use crate::module_contracts::governance::{GovQuery, GovReply, decode_reply, encode_query};
     let proposals = match decode_reply(&rpc_query(
         node.rpc(),
         "governance",
@@ -2532,6 +2533,8 @@ mod json_output_tests {
 mod tests {
     use std::collections::BTreeSet;
 
+    use crate::module_contracts::modules;
+
     /// Minting never refuses a LAN invite, but it says which paths only work
     /// from the same LAN or tailnet, and whether anything reaches from outside:
     /// a LAN-only invite says nobody elsewhere gets in, a mixed one names the
@@ -2632,7 +2635,10 @@ mod tests {
         let (reason, detail) =
             super::netstack_failure_in_section(&down).expect("the section names its failure");
         let refusal = super::mesh_down_refusal(&reason, &detail);
-        assert!(refusal.contains("reason=netstack_guest_unreadable"), "{refusal}");
+        assert!(
+            refusal.contains("reason=netstack_guest_unreadable"),
+            "{refusal}"
+        );
         assert!(refusal.contains("never be redeemed"), "{refusal}");
 
         // a running plane names no failure, and nothing is refused.
@@ -2973,7 +2979,9 @@ mod tests {
     #[test]
     fn open_proposal_matching_ignores_fields_the_matcher_ignores() {
         use super::open_proposal_matching;
-        use governance::{GovAction, ProposalStatus, ProposalView, VoterKind, VotingRule};
+        use crate::module_contracts::governance::{
+            GovAction, ProposalStatus, ProposalView, VoterKind, VotingRule,
+        };
         let view = |id: &str, status: ProposalStatus, action: GovAction| ProposalView {
             proposal_id: id.into(),
             action,
@@ -3041,7 +3049,9 @@ mod tests {
     #[test]
     fn a_ceremony_never_votes_on_a_record_that_carries_another_action() {
         use super::require_own_action;
-        use governance::{GovAction, ProposalStatus, ProposalView, VoterKind, VotingRule};
+        use crate::module_contracts::governance::{
+            GovAction, ProposalStatus, ProposalView, VoterKind, VotingRule,
+        };
         let view = |text: &str| ProposalView {
             proposal_id: "node-release:0".into(),
             action: GovAction::Signal { text: text.into() },
@@ -3200,7 +3210,10 @@ mod tests {
         let refusal = precheck_promotion(hex, &stranger, &members, &residents)
             .expect_err("a key in neither tier has nothing to be promoted out of");
         assert!(refusal.starts_with("not_a_resident: "), "{refusal}");
-        assert!(refusal.contains(hex), "the refusal names the key: {refusal}");
+        assert!(
+            refusal.contains(hex),
+            "the refusal names the key: {refusal}"
+        );
         assert!(
             refusal.contains("ducktape node resident accept"),
             "and the command that fixes it: {refusal}"

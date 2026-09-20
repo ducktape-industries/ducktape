@@ -54,6 +54,7 @@ use app_update::{
 };
 
 use crate::cli_args::NodeAddr;
+use crate::module_contracts::governance;
 use crate::userkey_cli;
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;

@@ -11,6 +11,7 @@ use crate::config::{hex_bytes, unhex};
 use crate::constants::{GATE_SETTLE_TIMEOUT, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
 use crate::drain_actions::ShutdownCause;
 use crate::host_reads::{read_redemption_from_host, read_valset_members, read_valset_residents};
+use crate::module_contracts::governance;
 use crate::rpc::{JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus};
 use crate::util::{hex, unix_ms};
 use crate::{config, join_gate, relay, relay_runtime};

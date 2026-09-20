@@ -54,7 +54,8 @@ use crate::node_link::NodeLink;
 /// the module that owns the session registry.
 const RUNS_MODULE: &str = "runs";
 const ACTION_HEADER: &str = "x-ducktape-run-action";
-const MAX_ACTION_REQUEST_BYTES: usize = runs_wire::MAX_ACTIONS_BYTES + runs_wire::MAX_DELEGATIONS_BYTES;
+const MAX_ACTION_REQUEST_BYTES: usize =
+    runs_wire::MAX_ACTIONS_BYTES + runs_wire::MAX_DELEGATIONS_BYTES;
 
 pub(super) const ENV_ACTION_URL: &str = "DUCKTAPE_RUN_ACTION_URL";
 pub(super) const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
@@ -284,7 +285,9 @@ async fn action_result(
         return Ok(None);
     };
     match &request.status {
-        runs_wire::ActionStatus::AwaitingProgram | runs_wire::ActionStatus::Claimed { .. } => Ok(None),
+        runs_wire::ActionStatus::AwaitingProgram | runs_wire::ActionStatus::Claimed { .. } => {
+            Ok(None)
+        }
         runs_wire::ActionStatus::Rejected { reason } => Ok(Some(Err(reason.clone()))),
         runs_wire::ActionStatus::Completed { outcome, .. } => match outcome {
             dispatch::CallOutcomeSummary::Applied { .. } => Ok(Some(Ok(request))),

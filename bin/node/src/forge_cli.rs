@@ -1334,8 +1334,10 @@ mod tests {
             !dir.path().join("config.toml").exists(),
             "a config.toml beside it would orphan the operator's config"
         );
-        assert!(std::fs::read_to_string(dir.path().join("config"))
-            .unwrap()
-            .contains("git-fetch-with-cli = true"));
+        assert!(
+            std::fs::read_to_string(dir.path().join("config"))
+                .unwrap()
+                .contains("git-fetch-with-cli = true")
+        );
     }
 }

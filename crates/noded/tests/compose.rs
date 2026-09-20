@@ -8,10 +8,12 @@ use std::time::Duration;
 
 use commonware_runtime::Runner as _;
 use host::CapturePayloads;
+use host::module_contracts::modules as host_modules;
 use noded::bundle::{DirCodeSource, qmdb_stores};
 use noded::compose::{
     Admissions, Bindings, Boot, BoxFut, Start, Substrates, check_realizable, compose, wasm_module,
 };
+use noded::module_contracts::modules;
 use sdk::{Module, StateRoot, StateSyncHandle};
 use sdk_testkit::TestCtx;
 use wasm_host::{Backing, Shape};
@@ -711,7 +713,7 @@ fn a_view_entry_composes_no_module_and_the_boundary_leaves_it_alone() {
             assert_eq!(ids, ["modules", "valset"]);
             let status = host.module_status().await.unwrap().unwrap();
             let entry = status.iter().find(|m| m.module_id == "home").unwrap();
-            assert_eq!(entry.kind, modules::Kind::View);
+            assert_eq!(entry.kind, host_modules::Kind::View);
             assert_eq!(entry.active_code_hash, home.to_vec());
             assert_eq!(entry.history.len(), 1, "seeded active at genesis");
 
@@ -766,7 +768,7 @@ fn a_view_entry_composes_no_module_and_the_boundary_leaves_it_alone() {
             assert!(host.module_root("dashboard").is_none());
             let status = host.module_status().await.unwrap().unwrap();
             let entry = status.iter().find(|m| m.module_id == "dashboard").unwrap();
-            assert_eq!(entry.kind, modules::Kind::View);
+            assert_eq!(entry.kind, host_modules::Kind::View);
             assert_eq!(entry.active_code_hash, dashboard.to_vec());
             assert!(entry.pending.is_none(), "the view activated at its height");
 
@@ -796,7 +798,7 @@ fn a_view_entry_composes_no_module_and_the_boundary_leaves_it_alone() {
             let status = reopened.module_status().await.unwrap().unwrap();
             let views: Vec<&str> = status
                 .iter()
-                .filter(|m| m.kind == modules::Kind::View)
+                .filter(|m| m.kind == host_modules::Kind::View)
                 .map(|m| m.module_id.as_str())
                 .collect();
             assert_eq!(views, ["dashboard", "home"]);
@@ -1409,7 +1411,7 @@ fn wasm_registry_activates_view_assets_and_reopens_after_view_removal() {
                 .find(|entry| entry.module_id == "pages")
                 .unwrap();
             for (height, selected) in [(19, 0), (20, 1), (29, 1), (30, 2), (39, 2), (40, 3)] {
-                assert_eq!(modules::code_at(pages, height).unwrap(), hashes[selected]);
+                assert_eq!(host_modules::code_at(pages, height).unwrap(), hashes[selected]);
             }
             codes.insert("pages".into(), hashes[3]);
             let root = host.root_hash();

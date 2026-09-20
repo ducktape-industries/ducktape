@@ -10,13 +10,14 @@
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
-use governance::Governance;
+use governance::{Governance, Kind as GovernanceKind};
 use governance::{
     GovAction, GovMsg, GovQuery, GovReply, ProposalStatus, decode_reply as gov_decode,
     encode_msg as gov_encode, encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
-use modules::{
+use modules_module as modules;
+use modules_module::{
     ModulesMsg, ModulesQuery, ModulesReply, decode_reply as modules_decode,
     encode_msg as modules_encode, encode_query as modules_query,
 };
@@ -508,7 +509,7 @@ fn a_passing_register_module_admits_a_new_pending_entry() {
             GovAction::RegisterModule {
                 name: "kanban-v1".into(),
                 module_id: "kanban".into(),
-                kind: modules::Kind::Module,
+                kind: GovernanceKind::Module,
                 activation_lead: 500,
                 code_hash: hash(7),
                 lanes: Vec::new(),
@@ -543,7 +544,7 @@ fn a_passing_cancel_removes_an_admission_entry_entirely() {
             GovAction::RegisterModule {
                 name: "kanban-v1".into(),
                 module_id: "kanban".into(),
-                kind: modules::Kind::Module,
+                kind: GovernanceKind::Module,
                 activation_lead: 500,
                 code_hash: hash(7),
                 lanes: Vec::new(),
@@ -588,7 +589,7 @@ fn register_module_of_an_existing_id_fails_execute_atomically() {
                 action: GovAction::RegisterModule {
                     name: "hello-again".into(),
                     module_id: "hello".into(),
-                    kind: modules::Kind::Module,
+                    kind: GovernanceKind::Module,
                     activation_lead: 500,
                     code_hash: hash(9),
                     lanes: Vec::new(),

@@ -45,7 +45,9 @@
 #[cfg(all(feature = "guest", target_arch = "wasm32"))]
 mod guest;
 
-pub use modules_wire::*;
+mod wire;
+pub use wire::*;
+mod valset_contract;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use sdk::{
@@ -340,7 +342,7 @@ impl Modules {
     /// the CURRENT boundary member set: the valset module's staged-over-committed
     /// projection, via the shared `valset::members` read.
     async fn members(&self, ctx: &dyn Ctx) -> Result<Vec<Vec<u8>>, Error> {
-        valset::members(ctx, &self.valset_id).await
+        valset_contract::members(ctx, &self.valset_id).await
     }
 
     /// register/schedule/cancel are GOVERNANCE/system-authored, never external

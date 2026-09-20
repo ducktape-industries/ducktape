@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use crate::module_contracts::modules;
 use host::Host;
 use sdk::{MerkleStore, Module, StateRoot};
 use sha2::Digest as _;
@@ -312,12 +313,38 @@ async fn registry_active_set(host: &Host, height: u64) -> Result<Vec<ActiveCode>
     };
     Ok(roster
         .into_iter()
-        .filter(|entry| match entry.kind {
-            modules::Kind::Module => true,
-            // a view is a registry entry with nothing to seat.
-            modules::Kind::View => false,
-        })
         .filter_map(|entry| {
+            let host::module_contracts::modules::ModuleCode {
+                module_id,
+                kind,
+                active_code_hash,
+                pending,
+                history,
+            } = entry;
+            // a view is a registry entry with nothing to seat.
+            let host_kind_is_module = matches!(kind, host::module_contracts::modules::Kind::Module);
+            if !host_kind_is_module {
+                return None;
+            }
+            let entry = modules::ModuleCode {
+                module_id,
+                kind: modules::Kind::Module,
+                active_code_hash,
+                pending: pending.map(|swap| modules::ScheduledSwap {
+                    name: swap.name,
+                    activation_height: swap.activation_height,
+                    code_hash: swap.code_hash,
+                    readiness: swap.readiness,
+                    ready_at: swap.ready_at,
+                }),
+                history: history
+                    .into_iter()
+                    .map(|activation| modules::Activation {
+                        height: activation.height,
+                        code_hash: activation.code_hash,
+                    })
+                    .collect(),
+            };
             let (hash, seat) = seat_at(&entry, height)?;
             Some(ActiveCode {
                 id: entry.module_id,

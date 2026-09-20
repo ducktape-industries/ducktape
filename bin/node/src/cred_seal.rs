@@ -418,7 +418,9 @@ fn resolve_credential(
     if seal.token_stdin {
         let token = crate::userkey_cli::prompt_stdin_line(stdin, "token")?;
         return Ok(match seal.cred_kind {
-            SealKind::Bearer => CredentialPayload::Bearer { access_token: token },
+            SealKind::Bearer => CredentialPayload::Bearer {
+                access_token: token,
+            },
             SealKind::Refresh => CredentialPayload::Refresh {
                 refresh_token: token,
                 access_token: String::new(),

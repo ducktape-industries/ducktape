@@ -31,7 +31,8 @@
 //! store (the qmdb resolver lane, like every store-backed sibling).
 
 // the wire surface: this module's shared types, flattened at the crate root.
-pub use acl_wire::*;
+mod wire;
+pub use wire::*;
 
 // the wasm-guest port: the dispatch shell that adapts this module to the
 // ducktape:module world. compiled only by the guest-builder's synthesized

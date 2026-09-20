@@ -65,8 +65,12 @@ pub fn validate_founding_set(
         let kind = noded::compose::artifact_kind(&module.bytes)
             .map_err(|error| format!("{} {}: {error}", source.display(), module.id))?;
         let file = match kind {
-            modules::Kind::Module => workspace_config::component_path(source, &module.id),
-            modules::Kind::View => source.join(format!("{}.view.wasm", module.id)),
+            noded::module_contracts::modules::Kind::Module => {
+                workspace_config::component_path(source, &module.id)
+            }
+            noded::module_contracts::modules::Kind::View => {
+                source.join(format!("{}.view.wasm", module.id))
+            }
         };
         noded::compose::validate_deployment(&module.id, kind, &module.bytes, &index)
             .map_err(|error| format!("{}: {error}", file.display()))

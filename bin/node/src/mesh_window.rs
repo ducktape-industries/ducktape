@@ -39,6 +39,7 @@ use commonware_utils::ordered::Set;
 
 use crate::constants::MAX_PEERS_PER_SET;
 use crate::mesh_book::MeshAddressBook;
+use crate::module_contracts::valset;
 
 /// the genesis window index — generation 0.
 const GENESIS_INDEX: u64 = 0;

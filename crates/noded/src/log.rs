@@ -324,20 +324,13 @@ const CLAIM_GRACE_BLOCKS: u64 = 12;
 /// `(saga_id, attempt) -> (first_height, last_height)`. Bounded by pruning on
 /// every sighting — a request that gets claimed simply stops re-firing, and its
 /// entry ages out one grace window later.
-static PENDING_REQUESTS: std::sync::Mutex<
-    std::collections::BTreeMap<(String, u32), (u64, u64)>,
-> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PENDING_REQUESTS: std::sync::Mutex<std::collections::BTreeMap<(String, u32), (u64, u64)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// One unclaimed WorkerRequest at `height`. Reports only the ones that have been
 /// unclaimed for longer than the grace window — the rest are ordinary runs whose
 /// claim has not landed yet.
-fn worker_request_unclaimed(
-    saga_id: &str,
-    attempt: u32,
-    height: u64,
-    source: &str,
-    bytes: usize,
-) {
+fn worker_request_unclaimed(saga_id: &str, attempt: u32, height: u64, source: &str, bytes: usize) {
     let pending_blocks = record_unclaimed(saga_id, attempt, height);
     let still_within_grace = pending_blocks < CLAIM_GRACE_BLOCKS;
     if still_within_grace {
@@ -420,7 +413,10 @@ mod tests {
     #[test]
     fn an_unclaimed_request_is_only_stuck_after_the_grace_window() {
         let quiet = |height| record_unclaimed("saga-fresh", 0, height) >= CLAIM_GRACE_BLOCKS;
-        assert!(!quiet(100), "the trigger's own block is not evidence of a stall");
+        assert!(
+            !quiet(100),
+            "the trigger's own block is not evidence of a stall"
+        );
         for block in 1..CLAIM_GRACE_BLOCKS {
             assert!(!quiet(100 + block), "still inside the grace window");
         }
@@ -443,7 +439,10 @@ mod tests {
             "the stale entry was pruned, so this is a fresh window"
         );
         // a different attempt of the same saga is tracked on its own.
-        assert_eq!(record_unclaimed("saga-requeued", 1, 502 + CLAIM_GRACE_BLOCKS), 0);
+        assert_eq!(
+            record_unclaimed("saga-requeued", 1, 502 + CLAIM_GRACE_BLOCKS),
+            0
+        );
     }
 
     #[test]

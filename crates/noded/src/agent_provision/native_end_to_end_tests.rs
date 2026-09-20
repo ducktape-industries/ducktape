@@ -4,9 +4,9 @@
 //! Requires an installed Pi and a current `ducktape` MCP executable; opt-in so
 //! ordinary noded unit tests do not silently depend on those external binaries.
 use super::*;
+use crate::testkit::committed_module;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use commonware_cryptography::ed25519;
-use crate::testkit::committed_module;
 use host::{BlockContext, Host};
 use sdk::{Msg, Origin};
 use serde_json::{Value, json};
@@ -71,7 +71,11 @@ impl Network {
         validators.seed(key(8)).await.unwrap();
         validators.finish_seed().await.unwrap();
         let host = Host::genesis(vec![
-            Box::new(identity::Identity::new("identity", store(), CHAIN_ID.into())),
+            Box::new(identity::Identity::new(
+                "identity",
+                store(),
+                CHAIN_ID.into(),
+            )),
             Box::new(
                 attribution::AttributionModule::new("attribution", store())
                     .with_subscribers(["agent"]),

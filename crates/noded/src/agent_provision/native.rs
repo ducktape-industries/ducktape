@@ -89,7 +89,8 @@ pub(super) async fn prepare(
     let same_configuration = view.conversation_id == descriptor.conversation_id
         && view.agent_id == agent.agent_id
         && view.active_turn.as_ref().is_some_and(|turn| {
-            descriptor.turn_id == runs_wire::conversation_turn_id(turn.from_cursor, turn.through_cursor)
+            descriptor.turn_id
+                == runs_wire::conversation_turn_id(turn.from_cursor, turn.through_cursor)
         })
         && view.history_prefix == descriptor.history_prefix
         && view.session_path == descriptor.session_path
@@ -250,7 +251,8 @@ async fn frozen_events(
                 }),
             )
             .await?;
-        let runs_wire::RunsReply::ConversationEvents(events) = runs_wire::decode_reply(&bytes)? else {
+        let runs_wire::RunsReply::ConversationEvents(events) = runs_wire::decode_reply(&bytes)?
+        else {
             return Err("unexpected native conversation events reply".into());
         };
         let contiguous = events.len() as u64 == limit

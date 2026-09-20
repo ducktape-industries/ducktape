@@ -11,7 +11,6 @@ version.workspace = true
 guest = ["dep:ducktape-module-sdk"]
 
 [dependencies]
-valset-wire = { workspace = true }
 ducktape-module-sdk = { workspace = true, optional = true }
 sdk = { workspace = true }
 # the store-record codec: compact, canonical, deterministic. wire stays sdk::wire.

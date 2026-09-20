@@ -19,7 +19,7 @@ use governance::{
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
-use valset::{
+use valset_module::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode,
     encode_msg as valset_encode, encode_query as valset_query,
 };

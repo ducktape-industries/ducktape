@@ -77,6 +77,8 @@
 
 // the wire surface: this module's shared types, flattened at the crate root.
 pub use capability_wire::*;
+mod valset_contract;
+use crate::valset_contract as valset;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -642,6 +644,7 @@ impl Module for CapabilityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::valset_contract as valset;
     use crate::{MAX_CLASS_LEN, MAX_TAG_LEN, encode_msg, encode_query};
     use valset::{ValsetQuery, ValsetReply, encode_reply as valset_encode_reply};
 

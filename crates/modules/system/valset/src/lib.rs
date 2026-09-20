@@ -55,7 +55,8 @@
 #[cfg(all(feature = "guest", target_arch = "wasm32"))]
 mod guest;
 
-pub use valset_wire::*;
+mod wire;
+pub use wire::*;
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;

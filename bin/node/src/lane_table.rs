@@ -14,7 +14,9 @@
 //! table. It says which key it is waiting for, on the forever-retry cadence.
 
 use data_plane::{BulkPacer, PlaneConfig, Service, StreamPacing, StreamPolicy};
+use module_artifact::LanePacing;
 
+use crate::module_contracts::modules;
 use crate::overlay_book::{LaneKey, LaneSource};
 
 /// what a plane needs out of the table to bind: the id its ports derive from,
@@ -37,8 +39,8 @@ impl LaneBinding {
     pub fn stream_spec(&self, shared: &BulkPacer) -> Option<(StreamPacing, StreamPolicy)> {
         let stream = self.stream.as_ref()?;
         let pacing = match stream.pacing {
-            modules::LanePacing::Shared => StreamPacing::Shared(shared.clone()),
-            modules::LanePacing::Local {
+            LanePacing::Shared => StreamPacing::Shared(shared.clone()),
+            LanePacing::Local {
                 bulk_bytes_per_sec,
                 bulk_burst_bytes,
             } => StreamPacing::Local(PlaneConfig {

@@ -352,29 +352,13 @@ module-artifact = { git = "https://github.com/ducktape-industries/ducktape-sdk",
 node-work = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "node-work" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
-# internal — module impl crates
-# A MODULE'S NAME RESOLVES TO ITS WIRE CRATE. `identity = { workspace = true }`
-# links `identity-wire` — the types and codecs — under the name `identity`, so
-# the kernel, the daemon, a service, a view and a sibling module all speak a
-# module's format without linking the module. Nothing outside `crates/modules`
-# links a module crate itself except a test that runs the native module (a
-# parity suite), and that names it by path, never through this table:
-# `crates/topology/tests/sdk_shaped.rs` holds the line.
-# EVERY WIRE CRATE LIVES IN ducktape-sdk. The names below are unchanged, so a
-# consumer still writes `identity = { workspace = true }` and still links
-# `identity-wire`; only where the bytes come from moved.
-kv = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "kv-wire" }
-kv-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "kv-wire" }
-acl = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "acl-wire" }
-acl-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "acl-wire" }
-valset = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "valset-wire" }
-valset-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "valset-wire" }
-governance = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "governance-wire" }
-governance-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "governance-wire" }
+# internal — platform contract crates
+# Platform-wide contracts remain in ducktape-sdk. The five system module
+# contracts migrated in this unit are owned by their producer crates and are
+# intentionally absent from this table; consumers keep their small, local
+# wire views. Other entries below retain their existing ownership.
 identity = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "identity-wire" }
 identity-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "identity-wire" }
-modules = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "modules-wire" }
-modules-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "modules-wire" }
 saga = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "saga-wire" }
 saga-wire = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "saga-wire" }
 capability = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "capability-wire" }

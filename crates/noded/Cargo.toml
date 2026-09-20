@@ -48,9 +48,6 @@ topology = { workspace = true }
 wasm-host = { workspace = true }
 # system modules are CORE-RESIDENT: the daemon links the module crates by
 # path (a workspace name resolves to a module's wire crate).
-valset = { path = "../modules/system/valset" }
-modules = { path = "../modules/system/modules" }
-kv = { path = "../modules/system/kv" }
 # the disk odb `open_odb` hands a wasm files tenant. a service crate, not the
 # module: `files` names no kernel host.
 files-odb = { workspace = true }
@@ -63,7 +60,6 @@ identity = { path = "../modules/system/identity" }
 # `GET /v1/release` walks the passed governance signals the release plane
 # rides (wire types only) and answers in the document the launcher and the
 # desktop app both decode.
-governance = { workspace = true }
 app-update = { workspace = true }
 gateway = { path = "../modules/system/gateway" }
 agent-wire = { workspace = true }
@@ -148,6 +144,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 topology = { workspace = true }
 
 [dev-dependencies]
+valset = { path = "../modules/system/valset" }
+modules = { path = "../modules/system/modules" }
+kv = { path = "../modules/system/kv" }
+governance = { path = "../modules/system/governance" }
 # the run wire surface. The native module behind it ships from
 # ducktape-modules, so no suite here composes one: the provisioning suites
 # stand the COMMITTED guest up through `testkit::committed_module` and speak to

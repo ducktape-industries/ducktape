@@ -38,6 +38,7 @@ use sha2::Digest as _;
 use crate::cli_args::QualifyArgs;
 use crate::config;
 use crate::host_state::{BlobCodeSource, NetworkBindings, NodeSubstrates, restore_host};
+use crate::module_contracts::modules;
 use crate::util::hex;
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;

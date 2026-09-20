@@ -887,6 +887,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
 mod tests {
     use commonware_runtime::Runner as _;
 
+    use crate::module_contracts::modules;
+
     use super::*;
 
     /// The bindings the composition below runs under. Fixed values, and
@@ -988,8 +990,8 @@ mod tests {
 
     /// a modules registry that activated `hello` on `first` at 10 and on
     /// `second` at 50 — the shape a restart finds after a live swap.
-    fn registry_ahead(first: [u8; 32], second: [u8; 32]) -> modules::Modules {
-        use modules::{Modules, ModulesMsg, encode_msg};
+    fn registry_ahead(first: [u8; 32], second: [u8; 32]) -> modules_module::Modules {
+        use modules_module::{Modules, ModulesMsg, encode_msg};
         use sdk::{Module as _, Origin};
         let member = vec![7u8; 32];
         let one_member = {
@@ -1023,7 +1025,7 @@ mod tests {
                 10,
                 ModulesMsg::RegisterModule {
                     module_id: "hello".into(),
-                    kind: modules::Kind::Module,
+                    kind: modules_module::Kind::Module,
                     code_hash: first.to_vec(),
                     lanes: Vec::new(),
                 },
@@ -1078,7 +1080,7 @@ mod tests {
     /// at or past it resumes.
     #[test]
     fn a_reopen_seats_the_code_at_its_height_and_starts_fresh_before_the_first_activation() {
-        use noded::compose::{Seat, seat_at};
+        use noded::compose::Seat;
         use sdk::Module as _;
         let first = [1u8; 32];
         let second = [2u8; 32];
@@ -1108,7 +1110,18 @@ mod tests {
             (50, Some((second, Seat::Resume))),
             (70, Some((second, Seat::Resume))),
         ] {
-            assert_eq!(seat_at(hello, height), want, "reopen at {height}");
+            let hash = modules::code_at(hello, height)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(|hash| {
+                    let first_activation =
+                        hello.history.first().map(|activation| activation.height);
+                    let seat = first_activation
+                        .is_some_and(|activation| activation <= height)
+                        .then_some(Seat::Resume)
+                        .unwrap_or(Seat::Fresh);
+                    (hash, seat)
+                });
+            assert_eq!(hash, want, "reopen at {height}");
         }
     }
 

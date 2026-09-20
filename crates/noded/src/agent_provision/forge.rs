@@ -31,12 +31,12 @@
 //! ONLY a genuine rebase conflict degrades the receipt (`commit_error` +
 //! `Status::Degraded` via the pool), never the reply (R4).
 
+use super::forge_publication::{ModulePublication, Publication};
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::sync::Arc;
-use super::forge_publication::{Publication, ModulePublication};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use compute_service::{
     ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec, assemble_context_doc,

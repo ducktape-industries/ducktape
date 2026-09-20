@@ -4,10 +4,10 @@ edition.workspace = true
 version.workspace = true
 
 # member-gated governance over the validator set: proposals, ballots, and
-# deterministic tally at a consensus-time deadline. depends only on `sdk` plus
-# types-only interface crates (its own, valset's — membership checks go through
-# host-routed queries, execution through emitted follow-up msgs), per the
-# module-isolation rule. state is pure logic over a host-injected qmdb
+# deterministic tally at a consensus-time deadline. Sibling wire contracts
+# are declared in this crate's local module_contracts layer; membership checks
+# go through host-routed queries and execution through emitted follow-up msgs.
+# State is pure logic over a host-injected qmdb
 # MerkleStore (StagedStore records); the module root IS the store's merkle
 # root.
 [features]
@@ -17,24 +17,20 @@ version.workspace = true
 guest = ["dep:ducktape-module-sdk"]
 
 [dependencies]
-governance-wire = { workspace = true }
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
 ducktape-module-sdk = { workspace = true, optional = true }
 sdk = { workspace = true }
+module-artifact = { workspace = true }
 serde = { workspace = true }
 # the store-record codec: compact, canonical, deterministic — the same
 # envelope the derived tier's fold feed already uses. wire stays sdk::wire.
 borsh = { workspace = true }
-valset = { workspace = true }
-# types-only: a passing ScheduleUpgrade/CancelUpgrade emits the upgrade op, and a
-# passing UpdateModule/CancelModuleUpdate emits the code-swap op, both as
-# follow-ups into the one modules registry; governance never registers it.
-modules = { workspace = true }
+# a passing UpdateModule/CancelModuleUpdate emits the code-swap op as a
+# follow-up into the one modules registry; governance never registers it.
 identity = { workspace = true }
-# the acl sibling's wire types: SetAclPolicy proposals validate and emit its
-# SetPolicy op (the same wire-types-only shape as the valset/modules deps).
-acl = { workspace = true }
+# SetAclPolicy proposals validate and emit the acl SetPolicy op through the
+# local contract declared in module_contracts.
 async-trait = { workspace = true }
 # the invite capability (token + join-proof verification) is governance's own
 # admission surface: minted by a member, redeemed in-consensus by `Redeem`.

@@ -251,7 +251,13 @@ async fn an_unreadable_policy_refuses_without_reading_anything() {
     let dir = scratch("broken");
     std::fs::write(policy_path(&dir), "admit = \"not-a-list\"\n").expect("write");
     assert_eq!(
-        admit(&NoReads, &dir, b"me", &SagaOrigin::External(b"stranger".to_vec())).await,
+        admit(
+            &NoReads,
+            &dir,
+            b"me",
+            &SagaOrigin::External(b"stranger".to_vec())
+        )
+        .await,
         WorkVerdict::Refused(WorkRefusal::PolicyUnreadable)
     );
 }
@@ -481,7 +487,10 @@ fn the_submit_lane_still_resigns_with_the_node_key() {
         code.contains("origin: _,"),
         "the validator submit lane must IGNORE the caller's claimed origin"
     );
-    let compact: String = code.chars().filter(|character| !character.is_whitespace()).collect();
+    let compact: String = code
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
     assert!(
         compact.contains("node::encode_frame_with_blob(&self.signer,"),
         "the validator submit lane must re-sign with this node's own signer"

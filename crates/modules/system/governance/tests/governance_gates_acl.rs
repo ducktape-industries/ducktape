@@ -9,14 +9,15 @@
 //! exactly the composition a live network runs.
 
 use acl_module::{
-    Acl, AclQuery, AclReply, Standing, decode_reply as acl_decode, encode_query as acl_query,
+    Acl, AclQuery, AclReply, Standing as AclStanding, decode_reply as acl_decode,
+    encode_query as acl_query,
 };
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
 use governance::Governance;
 use governance::{
-    GovAction, GovMsg, GovQuery, GovReply, ProposalStatus, decode_reply as gov_decode,
+    GovAction, GovMsg, GovQuery, GovReply, ProposalStatus, Standing, decode_reply as gov_decode,
     encode_msg as gov_encode, encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
@@ -92,7 +93,7 @@ async fn proposal_status(host: &Host, id: &str) -> Option<ProposalStatus> {
     }
 }
 
-async fn policy_for(host: &Host, target: &str) -> Option<Standing> {
+async fn policy_for(host: &Host, target: &str) -> Option<AclStanding> {
     let reply = host
         .query(
             "acl",
@@ -235,7 +236,7 @@ fn a_satisfiable_policy_on_governance_and_any_policy_elsewhere_still_pass() {
             proposal_status(&host, "tighten-governance").await,
             Some(ProposalStatus::Passed)
         );
-        assert_eq!(policy_for(&host, "governance").await, Some(Standing::Node));
+                assert_eq!(policy_for(&host, "governance").await, Some(AclStanding::Node));
 
         run_to_execute(
             &mut host,
@@ -248,6 +249,6 @@ fn a_satisfiable_policy_on_governance_and_any_policy_elsewhere_still_pass() {
         )
         .await
         .expect("a policy on an unrelated target is never gated by this rule");
-        assert_eq!(policy_for(&host, "chat").await, Some(Standing::User));
+        assert_eq!(policy_for(&host, "chat").await, Some(AclStanding::User));
     });
 }

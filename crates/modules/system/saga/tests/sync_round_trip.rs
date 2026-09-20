@@ -32,7 +32,7 @@ use saga::{
 use sdk::{Env, Error, MerkleStore as _, Module, Msg, Origin, StateRoot, StateSyncHandle};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
-use valset::{ValsetReply, encode_reply as valset_encode_reply};
+use valset_module::{ValsetReply, encode_reply as valset_encode_reply};
 
 const SAGA: &str = "saga";
 

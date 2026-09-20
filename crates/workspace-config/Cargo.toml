@@ -39,7 +39,6 @@ duckfs-core = { workspace = true }
 duck-address = { workspace = true }
 # the invite token's mint/verify, shared verbatim with the validator that
 # admits a redemption (`governance::invite`).
-governance = { workspace = true }
 # the member proof an identity file's owner signs — the wire types only.
 identity = { workspace = true }
 # the coordinator capability a workspace persists beside its invite.

@@ -78,12 +78,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync",
 
 [dev-dependencies]
 # the module crates the SCENARIOS speak with — wire types and constants only
-# (`gateway::RouteDefinition`, `tasks::MAX_ATTEMPTS`, `governance::GovMsg`,
+# (`gateway::RouteDefinition`, `tasks::MAX_ATTEMPTS`, the local governance
+# contract,
 # `runs::MAX_ACTIONS_PER_SESSION`, `files::Change`). a test composes the same
 # wasm genesis the binary does; these encode what it submits to it.
 files = { workspace = true }
 gateway = { workspace = true }
-governance = { workspace = true }
 runs = { workspace = true }
 tasks = { workspace = true }
 # the shared raw-http/port/poll harness helpers (was a local copy in harness/).

@@ -1968,12 +1968,16 @@ async fn indexed_run_reader(
                     )
                 })
         }
-        runs_wire::view::RunsViewReply::Run(None) | runs_wire::view::RunsViewReply::Runs(_) => Ok(false),
+        runs_wire::view::RunsViewReply::Run(None) | runs_wire::view::RunsViewReply::Runs(_) => {
+            Ok(false)
+        }
     }
 }
 
 /// every run `runs` has pending, as committed state.
-pub(crate) async fn pending_runs(handle: &NodeHandle) -> Result<Vec<runs_wire::PendingRun>, String> {
+pub(crate) async fn pending_runs(
+    handle: &NodeHandle,
+) -> Result<Vec<runs_wire::PendingRun>, String> {
     let (reply, rx) = futures::channel::oneshot::channel();
     handle
         .send(crate::NodeCommand::Query {
@@ -3400,8 +3404,8 @@ mod tests {
                     continue;
                 };
                 let bytes = match target.as_str() {
-                    "runs" => {
-                        runs_wire::encode_reply(&runs_wire::RunsReply::PendingRuns(vec![runs_wire::PendingRun {
+                    "runs" => runs_wire::encode_reply(&runs_wire::RunsReply::PendingRuns(vec![
+                        runs_wire::PendingRun {
                             run_id: "attributed/3/chiefduck".into(),
                             dispatch_id: id.clone(),
                             agent_id: "chiefduck".into(),
@@ -3412,8 +3416,8 @@ mod tests {
                             job_claim_height: 0,
                             requester: sdk::Origin::Program(42),
                             created_at: 0,
-                        }]))
-                    }
+                        },
+                    ])),
                     "identity" => {
                         let account = match identity::decode_query(&req).unwrap() {
                             identity::IdentityQuery::Get { number: 42 } => {
@@ -3697,9 +3701,9 @@ mod tests {
                 let crate::NodeCommand::Query { reply, .. } = command else {
                     continue;
                 };
-                let _ = reply.send(Ok(runs_wire::encode_reply(&runs_wire::RunsReply::PendingRuns(vec![
-                    pending.clone(),
-                ]))));
+                let _ = reply.send(Ok(runs_wire::encode_reply(
+                    &runs_wire::RunsReply::PendingRuns(vec![pending.clone()]),
+                )));
             }
         });
 
@@ -3849,8 +3853,7 @@ mod tests {
         // that function turns "this node minted no secret" into "this node
         // admits EVERYBODY", and only this case can see it.
         let (unminted, _cmds, _hub) = crate::NodeHandle::channel();
-        let unminted =
-            unminted.with_service_link(crate::service_link::ServiceLink::new(None));
+        let unminted = unminted.with_service_link(crate::service_link::ServiceLink::new(None));
         for presented in ["", TEST_SECRET] {
             assert!(
                 !unminted.workspace_secret_matches(presented),
@@ -4230,10 +4233,7 @@ mod tests {
         let Err(refusal) = take_service_link(&handle, crate::services::AGENT_KIND, "any") else {
             panic!("a handle with no service link has nothing to give");
         };
-        assert!(
-            refusal.contains("service link is not enabled"),
-            "{refusal}"
-        );
+        assert!(refusal.contains("service link is not enabled"), "{refusal}");
     }
 
     #[tokio::test]

@@ -1034,7 +1034,9 @@ mod tests {
             );
 
             assert!(
-                context.encode().contains("ducktape_block_beat_stalled_seconds 600"),
+                context
+                    .encode()
+                    .contains("ducktape_block_beat_stalled_seconds 600"),
                 "the gauge a dashboard draws the outage from"
             );
 
@@ -1049,7 +1051,9 @@ mod tests {
                 0
             );
             assert!(
-                context.encode().contains("ducktape_block_beat_stalled_seconds 0")
+                context
+                    .encode()
+                    .contains("ducktape_block_beat_stalled_seconds 0")
             );
         });
     }

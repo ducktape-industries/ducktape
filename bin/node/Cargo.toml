@@ -43,12 +43,9 @@ statesync = { workspace = true }
 # crate is linked only for its native types.)
 # system modules are CORE-RESIDENT: the node links the module crates by path
 # (a workspace name resolves to a module's wire crate).
-valset = { path = "../../crates/modules/system/valset" }
-governance = { path = "../../crates/modules/system/governance" }
 # the resident-accept verb drives governance ops through the local rpc.
 # the network module-code registry. Height-gated live code swaps are realized
 # through the blobstore-backed CodeSource.
-modules = { path = "../../crates/modules/system/modules" }
 wasm-host = { workspace = true }
 saga = { path = "../../crates/modules/system/saga" }
 # the network-wide node-capability registry + its wire surface; the host-side
@@ -252,6 +249,9 @@ nettest = { path = "../../crates/testing/nettest" }
 # tool lookup the sandbox itself uses.
 sandbox-host = { workspace = true }
 kv = { path = "../../crates/modules/system/kv" }
+valset = { path = "../../crates/modules/system/valset" }
+governance = { path = "../../crates/modules/system/governance" }
+modules-module = { path = "../../crates/modules/system/modules", package = "modules" }
 # `directory` left the production genesis set; the example crate survives only
 # as a test tenant (the cfg(test) query codec in main.rs).
 directory = { workspace = true }

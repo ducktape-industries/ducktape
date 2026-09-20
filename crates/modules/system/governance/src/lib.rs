@@ -87,7 +87,9 @@
 //! rides state-sync like any other record. this module never writes that key.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-pub use governance_wire::*;
+mod wire;
+pub use wire::*;
+mod module_contracts;
 
 use std::collections::BTreeMap;
 
@@ -98,6 +100,7 @@ use identity::{
     IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
     encode_query as identity_encode_query,
 };
+use module_contracts::{acl, modules, valset};
 use modules::{ModulesMsg, encode_msg as modules_encode_msg};
 use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
@@ -1003,7 +1006,7 @@ impl Governance {
             // brick the network permanently, with no repair proposal able to
             // reach the door that just closed on it.
             let share_mode = self.share_mode().await?;
-            if !Self::electorate_can_still_submit(share_mode, &self.id, target, *standing) {
+            if !Self::electorate_can_still_submit(share_mode, &self.id, target, standing.clone()) {
                 return Err(Error::module(
                     "electorate_lockout",
                     "acl policy would lock the current electorate out of governance itself",
@@ -1403,14 +1406,17 @@ impl Governance {
                         // guarantee about who submits AFTER this lands.
                         let share_mode = self.share_mode().await?;
                         let safe = Self::electorate_can_still_submit(
-                            share_mode, &self.id, target, *standing,
+                            share_mode,
+                            &self.id,
+                            target,
+                            standing.clone(),
                         );
                         if safe {
                             ctx.emit_msg(Msg {
                                 target: acl_id.clone(),
                                 payload: acl::encode_msg(&acl::AclMsg::SetPolicy {
                                     target: target.clone(),
-                                    standing: *standing,
+                                    standing: standing.clone(),
                                 }),
                             });
                         } else {

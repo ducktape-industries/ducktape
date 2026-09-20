@@ -2083,7 +2083,10 @@ mod plane_failure_tests {
     #[test]
     fn a_bound_port_names_the_process_holding_it() {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a scratch udp port");
-        let port = socket.local_addr().expect("the socket has an address").port();
+        let port = socket
+            .local_addr()
+            .expect("the socket has an address")
+            .port();
         let owner = super::udp_port_owner(port).expect("this process holds it");
         assert!(
             owner.contains(&format!("pid {}", std::process::id())),
@@ -2107,7 +2110,12 @@ mod plane_failure_tests {
             "a starting plane has not failed"
         );
 
-        super::fail_plane(77, "node", "underlay_bind_failed", "port 51820 is taken".into());
+        super::fail_plane(
+            77,
+            "node",
+            "underlay_bind_failed",
+            "port 51820 is taken".into(),
+        );
         let (reason, detail) = super::plane_failure().expect("the refusal is on the record");
         assert_eq!(reason, "underlay_bind_failed");
         assert_eq!(detail, "port 51820 is taken");
@@ -2186,11 +2194,13 @@ mod netstack_execution_tests {
         let start = live
             .take_start(2)
             .expect("the current generation is still gated");
-        assert!(start
-            .send(super::StartupOutcome::GuestLoadFailed(
-                "designated component unavailable".into(),
-            ))
-            .is_ok());
+        assert!(
+            start
+                .send(super::StartupOutcome::GuestLoadFailed(
+                    "designated component unavailable".into(),
+                ))
+                .is_ok()
+        );
         let super::StartupOutcome::GuestLoadFailed(error) = selected.await.unwrap() else {
             panic!("startup failure was not delivered as a guest-load failure");
         };

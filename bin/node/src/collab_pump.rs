@@ -552,9 +552,7 @@ impl Pump {
             };
             self.terminals
                 .send(wire::Command::MsgDeliver(Box::new(deliver(
-                    delivery,
-                    &message,
-                    credential,
+                    delivery, &message, credential,
                 ))))
                 .await;
             tracing::debug!(
@@ -1584,7 +1582,11 @@ mod tests {
         assert_eq!(frame.sender, handle(&party(1)));
         assert_eq!(frame.participant, handle(&party(2)));
         assert_eq!(frame.body, "ready?\ncargo test");
-        assert_eq!(frame.reply_to, Some(2), "the thread root is the reply target");
+        assert_eq!(
+            frame.reply_to,
+            Some(2),
+            "the thread root is the reply target"
+        );
         assert_eq!(frame.expires_at, 900, "the network's deadline, unconverted");
         assert_eq!(frame.network_now, 50, "the agreed clock at the request");
         assert!(

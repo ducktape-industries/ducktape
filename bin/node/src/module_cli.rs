@@ -17,6 +17,7 @@ use commonware_cryptography::Signer as _;
 use crate::cli::{CeremonyOutcome, GovSigner, rpc_call, rpc_query};
 use crate::cli_args::{Selector, StatusArgs};
 use crate::config::{self, hex_bytes};
+use crate::module_contracts::{governance, modules};
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -195,7 +196,7 @@ fn matches_module_action<'a>(
     code_hash: &'a [u8],
     activation_lead: u64,
 ) -> impl Fn(&governance::GovAction) -> bool + 'a {
-    use governance::GovAction;
+    use crate::module_contracts::governance::GovAction;
     move |action| match (verb, action) {
         (
             Verb::Update,
@@ -249,7 +250,11 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     )?;
     // the frame says what the entry is: a component makes a module frame, a
     // view alone a view frame — and the registry entry is registered as that.
-    let kind = noded::compose::artifact_kind(&artifact.encode())?;
+    let artifact_kind = noded::compose::artifact_kind(&artifact.encode())?;
+    let kind = match artifact_kind {
+        noded::module_contracts::modules::Kind::Module => modules::Kind::Module,
+        noded::module_contracts::modules::Kind::View => modules::Kind::View,
+    };
     // and it says which lanes the deployment asks for, for the same reason.
     let declared_lanes = noded::compose::artifact_lanes(&artifact.encode())?;
     let bytes = artifact.encode();
@@ -625,7 +630,7 @@ struct OpenCodeProposal {
 /// the open `UpdateModule` / `RegisterModule` proposals off the governance
 /// register, in the register's order.
 fn read_open_code_proposals(rpc_addr: &str) -> Result<Vec<OpenCodeProposal>, String> {
-    use governance::{GovQuery, GovReply, decode_reply, encode_query};
+    use crate::module_contracts::governance::{GovQuery, GovReply, decode_reply, encode_query};
     let raw = rpc_query(rpc_addr, "governance", &encode_query(&GovQuery::Proposals))?;
     match decode_reply(&raw)? {
         GovReply::Proposals(views) => Ok(open_code_proposals(&views)),
@@ -634,7 +639,7 @@ fn read_open_code_proposals(rpc_addr: &str) -> Result<Vec<OpenCodeProposal>, Str
 }
 
 fn open_code_proposals(views: &[governance::ProposalView]) -> Vec<OpenCodeProposal> {
-    use governance::{GovAction, ProposalStatus};
+    use crate::module_contracts::governance::{GovAction, ProposalStatus};
     views
         .iter()
         .filter(|view| view.status == ProposalStatus::Open)
@@ -673,7 +678,9 @@ fn open_code_proposals(views: &[governance::ProposalView]) -> Vec<OpenCodePropos
 /// the modules registry over the generic query lane — the same shape
 /// `read_members` uses for governance.
 pub(crate) fn read_module_status(rpc_addr: &str) -> Result<Vec<modules::ModuleCode>, String> {
-    use modules::{ModulesQuery, ModulesReply, decode_reply, encode_query};
+    use crate::module_contracts::modules::{
+        ModulesQuery, ModulesReply, decode_reply, encode_query,
+    };
     let raw = rpc_query(
         rpc_addr,
         "modules",
@@ -730,7 +737,9 @@ fn stage_component(
         .header("content-type", "application/octet-stream")
         .body(bytes.to_vec())
         .send()
-        .map_err(|error| crate::node_http::transport_failure(http_base, PATH, &error).to_string())?;
+        .map_err(|error| {
+            crate::node_http::transport_failure(http_base, PATH, &error).to_string()
+        })?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     let refused = !status.is_success();
@@ -951,11 +960,13 @@ fn short(hash: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use modules::{ModuleCode, ScheduledSwap};
+    use crate::module_contracts::modules::{ModuleCode, ScheduledSwap};
 
     #[test]
     fn status_lists_the_open_code_proposals_as_tasteable() {
-        use governance::{GovAction, ProposalStatus, ProposalView, VoterKind, VotingRule};
+        use crate::module_contracts::governance::{
+            GovAction, ProposalStatus, ProposalView, VoterKind, VotingRule,
+        };
         let view = |id: &str, action: GovAction, status: ProposalStatus| ProposalView {
             proposal_id: id.into(),
             action,
@@ -1360,10 +1371,7 @@ mod tests {
         // at the height itself the readiness never latched, so the swap can
         // no longer arm — an operator waiting on `ready 1` waits forever.
         let out = render_status(&modules, 120);
-        assert!(
-            out.contains("cdcdcdcdcdcd  DEAD  activation 120"),
-            "{out}"
-        );
+        assert!(out.contains("cdcdcdcdcdcd  DEAD  activation 120"), "{out}");
         assert!(
             render_status(&modules, 119).contains("ready 1"),
             "a swap still short of its height is in flight"

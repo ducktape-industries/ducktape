@@ -226,7 +226,12 @@ mod tests {
     fn the_receipt_address_sits_where_claude_code_binds_its_own() {
         use std::path::Path;
         assert_eq!(
-            claude_sockets_dir_from(Some(Path::new("/run/user/1000")), Path::new("/tmp"), 4242, 1000),
+            claude_sockets_dir_from(
+                Some(Path::new("/run/user/1000")),
+                Path::new("/tmp"),
+                4242,
+                1000
+            ),
             Path::new("/run/user/1000/cc-socks")
         );
         assert_eq!(

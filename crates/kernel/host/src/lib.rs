@@ -40,6 +40,8 @@ use sdk::{
 };
 use sha2::{Digest, Sha256};
 
+pub mod module_contracts;
+use module_contracts::{acl, modules, valset};
 pub mod worker;
 
 /// compute the global root-hash over `modules` — the composition consensus
@@ -1935,15 +1937,7 @@ impl Host {
                 format!("modules registry reply is unreadable: {e}"),
             )
         })?;
-        let modules = match reply {
-            modules::ModulesReply::ModuleStatus { modules } => modules,
-            other => {
-                return Err(Error::module(
-                    "unexpected_modules_reply",
-                    format!("modules registry answered ModuleStatus with {other:?}"),
-                ));
-            }
-        };
+        let modules::ModulesReply::ModuleStatus { modules } = reply;
         *self.status_cache.lock().expect("status cache") = Some((identity, modules.clone()));
         Ok(Some(modules))
     }

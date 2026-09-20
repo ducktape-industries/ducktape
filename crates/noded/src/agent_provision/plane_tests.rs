@@ -233,10 +233,7 @@ pub(super) fn files_reply(
             }))
         }
         // the verbatim module contract string the engine's taxonomy keys on.
-        FilesQuery::Read { .. } => Err(crate::Refused::new(
-            "module",
-            "chunk not available",
-        )),
+        FilesQuery::Read { .. } => Err(crate::Refused::new("module", "chunk not available")),
         other => panic!("the checkout asked for {other:?}"),
     }
 }
@@ -717,7 +714,9 @@ async fn tool_http_waits_for_the_actual_committed_outcome_and_surfaces_target_fa
         let link = test_link(handle).await;
         let workdir = tempfile::tempdir().unwrap();
         let session = super::session::open(
-            &link, &duckfs_spec(Some("quackbot"), Vec::new()), workdir.path(),
+            &link,
+            &duckfs_spec(Some("quackbot"), Vec::new()),
+            workdir.path(),
         )
         .await
         .unwrap()
@@ -800,7 +799,9 @@ async fn disconnecting_the_registered_receipt_stream_fails_the_pending_tool_requ
     let link =
         NodeLink::new(format!("http://{address}")).with_workspace_credential(directory.path());
     let session = super::session::open(
-        &link, &duckfs_spec(Some("quackbot"), Vec::new()), directory.path(),
+        &link,
+        &duckfs_spec(Some("quackbot"), Vec::new()),
+        directory.path(),
     )
     .await
     .unwrap()

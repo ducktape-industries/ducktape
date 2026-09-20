@@ -159,6 +159,8 @@
 
 // the wire surface: this module's shared types, flattened at the crate root.
 pub use saga_wire::*;
+mod valset_contract;
+use crate::valset_contract as valset;
 
 // the usage ledger: the PURE decision core (fold + view over
 // index_guest::StateRead), compiled everywhere and unit-tested natively.

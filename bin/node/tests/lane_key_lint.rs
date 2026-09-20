@@ -131,7 +131,7 @@ fn declared() -> BTreeSet<Key> {
                 .and_then(|name| name.to_str())
                 .expect("a module directory name")
                 .to_owned();
-            let decls: Vec<modules::LaneDecl> = serde_json::from_str(
+            let decls: Vec<module_artifact::LaneDecl> = serde_json::from_str(
                 &std::fs::read_to_string(&declaration).expect("read a lane declaration"),
             )
             .expect("a lane declaration parses");

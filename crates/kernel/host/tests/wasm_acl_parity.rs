@@ -17,7 +17,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use acl_module::{
+use acl::{
     Acl, AclMsg, AclQuery, MAX_TARGET_LEN, Standing, WILDCARD_TARGET, encode_msg, encode_query,
 };
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
