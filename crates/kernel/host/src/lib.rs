@@ -60,6 +60,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub type BlockId = [u8; 32];
 
 pub struct Genesis {
+    pub network: Vec<u8>,
     pub modules: Vec<u8>,
     pub valset: Vec<u8>,
     pub validators: Vec<validators::Member>,
@@ -131,6 +132,7 @@ where
 {
     store: Store<E>,
     blobs: Blobs,
+    network: Vec<u8>,
     loaded: Loaded,
     preconfirmed: Overlay,
 }
@@ -152,11 +154,13 @@ where
         let mut host = Host {
             store,
             blobs,
+            network: genesis.network.clone(),
             loaded: Loaded::new(genesis.limits),
             preconfirmed: Overlay::default(),
         };
         let mut overlay = Overlay::default();
         let mut stage = Stage::default();
+        overlay.set(NETWORK, namespace::ID.to_vec(), genesis.network);
         overlay.set(
             NETWORK,
             namespace::LIMITS.to_vec(),
@@ -259,9 +263,14 @@ where
             return Err(Error::Unfounded);
         }
         let limits = limits_of(&store.view(Vec::new()))?;
+        let network = store
+            .view(Vec::new())
+            .get(NETWORK, namespace::ID)?
+            .ok_or_else(|| Error::Corrupt("the network records no id".into()))?;
         let mut host = Host {
             store,
             blobs,
+            network,
             loaded: Loaded::new(limits),
             preconfirmed: Overlay::default(),
         };
@@ -294,6 +303,10 @@ where
 
     pub fn into_store(self) -> Store<E> {
         self.store
+    }
+
+    pub fn network(&self) -> &[u8] {
+        &self.network
     }
 
     pub fn height(&self) -> Result<u64> {
@@ -405,6 +418,7 @@ where
             store: &self.store,
             blobs: &self.blobs,
             loaded: &self.loaded,
+            network: &self.network,
             height,
             time,
         }
@@ -570,6 +584,7 @@ where
             abi::encode(&(submission.seq + 1)),
         );
         let env = Env {
+            network: self.network.clone(),
             height,
             time,
             me: submission.target.clone(),
@@ -678,6 +693,7 @@ where
         };
         self.loaded.admit(entry.program.clone(), entry.code, module);
         let env = Env {
+            network: self.network.clone(),
             height,
             time,
             me: entry.program.clone(),
@@ -764,6 +780,7 @@ where
                         item: queued.seq,
                     };
                     let env = Env {
+                        network: self.network.clone(),
                         height,
                         time,
                         me: message.target.clone(),
@@ -791,6 +808,7 @@ where
                 }
                 Item::Completion { item, by, outcome } => {
                     let env = Env {
+                        network: self.network.clone(),
                         height,
                         time,
                         me: item.source.clone(),

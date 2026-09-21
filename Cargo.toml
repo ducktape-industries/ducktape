@@ -135,13 +135,6 @@ smoltcp = { version = "0.13", default-features = false, features = [
 # ed25519 signer's); static_secrets because the key persists across boots.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
-p256 = "0.13"
-# secp256k1 with public-key RECOVERY: an Ethereum wallet's `personal_sign`
-# proof carries r‖s‖v and no pubkey, so verify = recover + compare.
-k256 = { version = "0.13", features = ["ecdsa"] }
-# raw (un-namespaced) ed25519 for OpenSSH `SSHSIG` verification — an SSH
-# key signs the SSHSIG blob directly, never commonware's namespaced preimage.
-ed25519-dalek = "2"
 # duckfs path normalization: NFC so visually-identical names collide instead
 # of coexisting (a consensus-determinism requirement, not cosmetics).
 unicode-normalization = "0.1"

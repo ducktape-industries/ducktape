@@ -12,9 +12,7 @@ commonware-codec = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-storage = { workspace = true }
-ed25519-dalek = { workspace = true }
-k256 = { workspace = true }
-p256 = { workspace = true }
+keyscheme = { workspace = true }
 runtime = { workspace = true }
 sha2 = { workspace = true }
 state = { workspace = true }
@@ -25,4 +23,5 @@ fixture-modules = { path = "../fixtures/modules" }
 fixture-probe = { path = "../fixtures/probe" }
 fixture-relay = { path = "../fixtures/relay" }
 fixture-valset = { path = "../fixtures/valset" }
+keyscheme = { workspace = true, features = ["testkit"] }
 tempfile = { workspace = true }

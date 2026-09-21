@@ -40,6 +40,8 @@ pub enum Error {
     Codec(#[from] commonware_codec::Error),
     #[error("the peer's head names a tip its anchor and state do not")]
     Head,
+    #[error("the adopted state belongs to another network")]
+    Network,
     #[error(
         "the tip's certificate does not verify against the validators seated for epoch {epoch}"
     )]
@@ -97,7 +99,11 @@ pub async fn join<E: Context, X: Exchange>(
         height: head.tip.height,
         commitments,
     };
-    let mut node = Node::adopt(context.child("node"), name, dir, network.clone(), synced).await?;
+    let mut node = Node::adopt(context.child("node"), name, dir, synced).await?;
+    let state_names_this_network = node.network() == network;
+    if !state_names_this_network {
+        return Err(Error::Network);
+    }
     let state_records_the_tip = node.tip()? == head.tip;
     if !state_records_the_tip {
         return Err(Error::Head);

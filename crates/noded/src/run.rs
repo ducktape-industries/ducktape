@@ -85,7 +85,6 @@ async fn found<E: Context>(mut context: E, workspace: &Workspace, founding: &Pat
         context.child("node"),
         &descriptor.network,
         workspace.dir(),
-        descriptor.id(),
         genesis,
     )
     .await?;
@@ -122,13 +121,7 @@ async fn start<E: Context>(
     let descriptor = workspace.descriptor()?;
     let identity = workspace.identity()?;
     let anchor = workspace.anchor()?;
-    let node = Node::open(
-        context.child("node"),
-        &descriptor.network,
-        workspace.dir(),
-        descriptor.id(),
-    )
-    .await?;
+    let node = Node::open(context.child("node"), &descriptor.network, workspace.dir()).await?;
     let network = Network {
         epoch_length: node.epoch_length()?,
         cadence: descriptor.cadence(),

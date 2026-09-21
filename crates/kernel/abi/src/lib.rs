@@ -134,6 +134,7 @@ pub enum Cause {
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Env {
+    pub network: Vec<u8>,
     pub height: u64,
     pub time: u64,
     pub me: ProgramId,
@@ -222,6 +223,7 @@ pub enum CryptoOp {
     Verify {
         scheme: Scheme,
         key: Vec<u8>,
+        namespace: Vec<u8>,
         message: Vec<u8>,
         signature: Vec<u8>,
     },
@@ -387,6 +389,7 @@ mod tests {
     #[test]
     fn every_envelope_round_trips() {
         let env = Env {
+            network: b"n".to_vec(),
             height: 7,
             time: 9,
             me: "a".into(),

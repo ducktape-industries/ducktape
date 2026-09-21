@@ -208,6 +208,7 @@ impl Founding {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Genesis {
+            network: self.network.as_bytes().to_vec(),
             modules: std::fs::read(base.join(&self.modules))?,
             valset: std::fs::read(base.join(&self.valset))?,
             validators,

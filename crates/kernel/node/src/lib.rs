@@ -62,38 +62,21 @@ where
         context: E,
         name: &str,
         dir: &Path,
-        network: Vec<u8>,
         genesis: Genesis,
     ) -> Result<(Node<E>, Block, Applied)> {
-        let block = Block::genesis(&network, genesis.time);
+        let block = Block::genesis(&genesis.network, genesis.time);
         let (host, applied) =
             Host::found(context.child("host"), name, dir, block.digest().0, genesis).await?;
-        let node = Node {
-            context,
-            host,
-            network,
-            pending: Vec::new(),
-        };
+        let node = Node::over(context, host);
         Ok((node, block, applied))
     }
 
-    pub async fn open(context: E, name: &str, dir: &Path, network: Vec<u8>) -> Result<Node<E>> {
+    pub async fn open(context: E, name: &str, dir: &Path) -> Result<Node<E>> {
         let host = Host::open(context.child("host"), name, dir).await?;
-        Ok(Node {
-            context,
-            host,
-            network,
-            pending: Vec::new(),
-        })
+        Ok(Node::over(context, host))
     }
 
-    pub async fn adopt(
-        context: E,
-        name: &str,
-        dir: &Path,
-        network: Vec<u8>,
-        synced: Synced<E>,
-    ) -> Result<Node<E>> {
+    pub async fn adopt(context: E, name: &str, dir: &Path, synced: Synced<E>) -> Result<Node<E>> {
         let host = Host::adopt(
             context.child("host"),
             name,
@@ -102,12 +85,17 @@ where
             synced.commitments,
         )
         .await?;
-        Ok(Node {
+        Ok(Node::over(context, host))
+    }
+
+    fn over(context: E, host: Host<E>) -> Node<E> {
+        let network = host.network().to_vec();
+        Node {
             context,
             host,
             network,
             pending: Vec::new(),
-        })
+        }
     }
 
     pub fn host(&self) -> &Host<E> {

@@ -135,6 +135,7 @@ where
     pub store: &'a Store<E>,
     pub blobs: &'a Blobs,
     pub loaded: &'a Loaded,
+    pub network: &'a [u8],
     pub height: u64,
     pub time: u64,
 }
@@ -322,6 +323,7 @@ where
         )));
     }
     let env = Env {
+        network: world.network.to_vec(),
         height: world.height,
         time: world.time,
         me: program.clone(),

@@ -18,6 +18,7 @@ struct Bench {
 
 fn env() -> Env {
     Env {
+        network: b"net".to_vec(),
         height: 12,
         time: 34,
         me: "probe".into(),

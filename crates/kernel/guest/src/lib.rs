@@ -88,6 +88,8 @@ pub fn host(op: &HostOp) -> HostReply {
 
 #[cfg(target_arch = "wasm32")]
 pub mod host_ops {
+    use borsh::{BorshDeserialize, BorshSerialize};
+
     use super::*;
 
     fn protocol(expected: &str, got: HostReply) -> ! {
@@ -253,12 +255,14 @@ pub mod host_ops {
     pub fn verify(
         scheme: Scheme,
         key: impl Into<Vec<u8>>,
+        namespace: impl Into<Vec<u8>>,
         message: impl Into<Vec<u8>>,
         signature: impl Into<Vec<u8>>,
     ) -> Result<bool, Refusal> {
         match host(&HostOp::Crypto(CryptoOp::Verify {
             scheme,
             key: key.into(),
+            namespace: namespace.into(),
             message: message.into(),
             signature: signature.into(),
         })) {
@@ -266,6 +270,32 @@ pub mod host_ops {
             HostReply::Refused(refusal) => Err(refusal),
             other => protocol("verdict", other),
         }
+    }
+
+    pub fn record<T: BorshDeserialize>(key: impl AsRef<[u8]>) -> Result<Option<T>, Refusal> {
+        get(key).map(|bytes| abi::decode(&bytes)).transpose()
+    }
+
+    pub fn put<T: BorshSerialize>(key: impl Into<Vec<u8>>, record: &T) {
+        set(key, abi::encode(record))
+    }
+
+    pub fn records<T: BorshDeserialize>(scan: Scan) -> Result<Vec<(Vec<u8>, T)>, Refusal> {
+        self::scan(scan)
+            .into_iter()
+            .map(|entry| Ok((entry.key, abi::decode(&entry.value)?)))
+            .collect()
+    }
+
+    pub fn ask<Q: BorshSerialize, R: BorshDeserialize>(
+        program: impl Into<ProgramId>,
+        request: &Q,
+    ) -> Result<R, Refusal> {
+        abi::decode(&query(program, abi::encode(request))?)
+    }
+
+    pub fn reply<R: BorshSerialize>(reply: &R) {
+        respond(abi::encode(reply))
     }
 }
 

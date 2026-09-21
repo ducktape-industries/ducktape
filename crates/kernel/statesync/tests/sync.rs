@@ -42,6 +42,7 @@ fn member(key: &ed25519::PrivateKey) -> validators::Member {
 
 fn genesis(members: &[validators::Member]) -> Genesis {
     Genesis {
+        network: NETWORK.to_vec(),
         modules: MODULES.to_vec(),
         valset: VALSET.to_vec(),
         validators: members.to_vec(),
@@ -173,7 +174,6 @@ async fn found(context: &Ctx) -> Network {
         context.child("source"),
         "source",
         dir.path(),
-        NETWORK.to_vec(),
         self::genesis(&members),
     )
     .await

@@ -2824,6 +2824,7 @@ name = "guest"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "borsh",
 ]
 
 [[package]]
@@ -3022,13 +3023,11 @@ dependencies = [
  "commonware-cryptography",
  "commonware-runtime",
  "commonware-storage",
- "ed25519-dalek",
  "fixture-modules",
  "fixture-probe",
  "fixture-relay",
  "fixture-valset",
- "k256",
- "p256 0.13.2",
+ "keyscheme",
  "runtime",
  "sha2 0.10.9",
  "state",

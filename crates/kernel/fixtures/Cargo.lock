@@ -90,6 +90,7 @@ name = "guest"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "borsh",
 ]
 
 [[package]]

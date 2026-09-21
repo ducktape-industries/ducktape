@@ -42,6 +42,7 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
 
 fn genesis(validators: Vec<validators::Member>) -> Genesis {
     Genesis {
+        network: NETWORK.to_vec(),
         modules: MODULES.to_vec(),
         valset: VALSET.to_vec(),
         validators,
@@ -57,15 +58,9 @@ fn genesis(validators: Vec<validators::Member>) -> Genesis {
 }
 
 async fn found(context: Ctx, dir: &Path) -> (TestNode, Block) {
-    let (node, block, _) = Node::found(
-        context,
-        "net",
-        dir,
-        NETWORK.to_vec(),
-        genesis(vec![member(&key(1), "v1:1")]),
-    )
-    .await
-    .unwrap();
+    let (node, block, _) = Node::found(context, "net", dir, genesis(vec![member(&key(1), "v1:1")]))
+        .await
+        .unwrap();
     (node, block)
 }
 
@@ -404,7 +399,7 @@ fn a_restart_reopens_at_the_tip() {
         let (second, _) = seal(&mut node).await;
         drop(node);
 
-        let mut node = Node::open(context.child("second"), "net", dir.path(), NETWORK.to_vec())
+        let mut node = Node::open(context.child("second"), "net", dir.path())
             .await
             .unwrap();
         assert_eq!(node.tip().unwrap(), second.tip());

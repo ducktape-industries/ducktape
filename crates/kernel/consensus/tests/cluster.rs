@@ -62,6 +62,7 @@ fn member(key: &ed25519::PrivateKey) -> validators::Member {
 
 fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
     Genesis {
+        network: NETWORK.to_vec(),
         modules: MODULES.to_vec(),
         valset: VALSET.to_vec(),
         validators: members.to_vec(),
@@ -207,7 +208,6 @@ impl Peer {
             context.child("node"),
             name,
             dir.path(),
-            NETWORK.to_vec(),
             genesis(members, network.epoch_length),
         )
         .await

@@ -10,7 +10,8 @@ use abi::{
 use commonware_codec::Encode as _;
 use commonware_cryptography::bls12381::primitives::group::{Private, Scalar};
 use commonware_cryptography::bls12381::primitives::ops;
-use commonware_cryptography::bls12381::primitives::variant::{MinPk, Variant as _};
+use commonware_cryptography::bls12381::primitives::variant::MinPk;
+use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_modules::Change;
 use fixture_probe::Step;
@@ -18,6 +19,7 @@ use host::{
     BLOBS, Block, BlockId, Delivered, Error, Founding, Genesis, Host, Layer, Limits, NETWORK,
     QUEUE, Receipt, SIGNERS, Submission, Tip,
 };
+use keyscheme::testkit;
 use sha2::Digest as _;
 use state::{Commitment, SyncTarget, commitment_name};
 
@@ -49,6 +51,7 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
 
 fn genesis(programs: Vec<Founding>) -> Genesis {
     Genesis {
+        network: b"net".to_vec(),
         modules: MODULES.to_vec(),
         valset: VALSET.to_vec(),
         validators: vec![member(b"v1", "v1:1")],
@@ -256,6 +259,7 @@ fn founding_admits_every_program_and_the_host_reopens() {
         assert_eq!(
             env,
             vec![HostReply::Env(Env {
+                network: b"net".to_vec(),
                 height: 0,
                 time: TIME,
                 me: "probe".into(),
@@ -452,6 +456,7 @@ fn a_delivery_sees_who_emitted_it() {
         .unwrap();
         let applied = host.apply(block(2, Vec::new())).await.unwrap();
         let env = Env {
+            network: b"net".to_vec(),
             height: 2,
             time: TIME + 2,
             me: "probe".into(),
@@ -740,6 +745,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
         assert_eq!(
             env,
             vec![HostReply::Env(Env {
+                network: b"net".to_vec(),
                 height: 5,
                 time: TIME,
                 me: "echo".into(),
@@ -863,6 +869,7 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
                 HostReply::Value(Some(b"1".to_vec())),
                 HostReply::Entries(vec![entry(b"a", b"1")]),
                 HostReply::Env(Env {
+                    network: b"net".to_vec(),
                     height: 1,
                     time: TIME,
                     me: "probe".into(),
@@ -879,6 +886,7 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
                 HostReply::Value(Some(b"1".to_vec())),
                 HostReply::Entries(vec![entry(b"a", b"2"), entry(b"b", b"3")]),
                 HostReply::Env(Env {
+                    network: b"net".to_vec(),
                     height: 2,
                     time: TIME,
                     me: "probe".into(),
@@ -949,6 +957,7 @@ fn sibling_queries_route_by_id_and_a_cycle_is_refused() {
                 HostReply::Query(Ok(abi::encode(&vec![
                     HostReply::Value(Some(b"v".to_vec())),
                     HostReply::Env(Env {
+                        network: b"net".to_vec(),
                         height: 1,
                         time: TIME,
                         me: "probe".into(),
@@ -1000,42 +1009,29 @@ fn crypto_verifies_every_scheme() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let host = found(context, "net", dir.path(), standard()).await;
+        let namespace = b"ducktape:test".to_vec();
         let message = b"the message".to_vec();
 
-        let ed = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
-        let ed_key = ed.verifying_key().to_bytes().to_vec();
-        let ed_sig = {
-            use ed25519_dalek::Signer as _;
-            ed.sign(&message).to_bytes().to_vec()
-        };
-        let (k_key, k_sig) = {
-            use k256::ecdsa::signature::Signer as _;
-            let signer = k256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
-            let signature: k256::ecdsa::Signature = signer.sign(&message);
-            (
-                signer.verifying_key().to_sec1_bytes().to_vec(),
-                signature.to_bytes().to_vec(),
-            )
-        };
-        let (p_key, p_sig) = {
-            use p256::ecdsa::signature::Signer as _;
-            let signer = p256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
-            let signature: p256::ecdsa::Signature = signer.sign(&message);
-            (
-                signer.verifying_key().to_sec1_bytes().to_vec(),
-                signature.to_bytes().to_vec(),
-            )
-        };
+        let ed = ed25519::PrivateKey::from_seed(7);
+        let ed_key = ed.public_key().as_ref().to_vec();
+        let ed_sig = testkit::ed25519_proof(&ed, &namespace, &message);
+        let eth = testkit::eth_key(7);
+        let k_key = testkit::eth_pubkey(&eth);
+        let k_sig = testkit::eth_proof(&eth, &namespace, &message);
+        let passkey = testkit::passkey(7);
+        let p_key = testkit::passkey_pubkey(&passkey);
+        let p_sig = testkit::passkey_proof(&passkey, "ducktape.test", &namespace, &message, true);
         let (b_key, b_sig) = {
             let private = Private::new(Scalar::from_u64(7));
             let public = ops::compute_public::<MinPk>(&private);
-            let signature = ops::sign::<MinPk>(&private, MinPk::MESSAGE, &message);
+            let signature = ops::sign_message::<MinPk>(&private, &namespace, &message);
             (public.encode().to_vec(), signature.encode().to_vec())
         };
         let verify = |scheme: Scheme, key: &[u8], message: &[u8], signature: &[u8]| {
             op(HostOp::Crypto(CryptoOp::Verify {
                 scheme,
                 key: key.to_vec(),
+                namespace: namespace.clone(),
                 message: message.to_vec(),
                 signature: signature.to_vec(),
             }))

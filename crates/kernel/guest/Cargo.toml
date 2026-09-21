@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 abi = { workspace = true }
+borsh = { workspace = true }
