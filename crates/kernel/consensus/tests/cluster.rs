@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use abi::{HostOp, Root, validators};
+use abi::{HostOp, Root, valset};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_p2p::simulated::{self, Link, Oracle};
 use commonware_runtime::{Quota, Runner as _, Spawner as _, Supervisor as _, deterministic};
@@ -53,14 +53,14 @@ fn key(seed: u64) -> ed25519::PrivateKey {
     ed25519::PrivateKey::from_seed(seed)
 }
 
-fn member(key: &ed25519::PrivateKey) -> validators::Member {
-    validators::Member {
+fn member(key: &ed25519::PrivateKey) -> valset::Member {
+    valset::Member {
         key: key.public_key().as_ref().to_vec(),
         address: format!("{}:1", key.public_key()),
     }
 }
 
-fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
+fn genesis(members: &[valset::Member], epoch_length: u64) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
         module_registry: MODULE_REGISTRY.to_vec(),
@@ -200,7 +200,7 @@ impl Peer {
         name: &'static str,
         oracle: &Oracle<ed25519::PublicKey, Ctx>,
         key: ed25519::PrivateKey,
-        members: &[validators::Member],
+        members: &[valset::Member],
         network: Network,
     ) -> Peer {
         let dir = tempfile::tempdir().unwrap();
@@ -353,7 +353,7 @@ async fn validators(
     context: &Ctx,
     oracle: &Oracle<ed25519::PublicKey, Ctx>,
     keys: &[ed25519::PrivateKey],
-    members: &[validators::Member],
+    members: &[valset::Member],
     network: &Network,
 ) -> Vec<Peer> {
     let mut peers = Vec::new();

@@ -1,6 +1,6 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 
-pub use abi::validators::{Genesis, Member, PROGRAM};
+pub use abi::valset::{Genesis, Member, PROGRAM};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Standing {

@@ -2,7 +2,7 @@ pub const KEY: &[u8] = b"members";
 
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::{Refusal, validators};
+    use abi::{Refusal, valset};
     use guest::Program;
 
     use crate::KEY;
@@ -11,27 +11,27 @@ mod program {
 
     impl Program for Valset {
         fn init(params: &[u8]) -> Result<(), Refusal> {
-            let genesis: validators::Genesis = abi::decode(params)?;
+            let genesis: valset::Genesis = abi::decode(params)?;
             guest::set(KEY, abi::encode(&genesis.validators));
             Ok(())
         }
 
         fn execute(payload: &[u8]) -> Result<(), Refusal> {
-            let members: Vec<validators::Member> = abi::decode(payload)?;
+            let members: Vec<valset::Member> = abi::decode(payload)?;
             guest::set(KEY, abi::encode(&members));
             Ok(())
         }
 
         fn query(request: &[u8]) -> Result<(), Refusal> {
-            let members: Vec<validators::Member> = match guest::get(KEY) {
+            let members: Vec<valset::Member> = match guest::get(KEY) {
                 Some(bytes) => abi::decode(&bytes)?,
                 None => Vec::new(),
             };
             let reply = match abi::decode(request)? {
-                validators::Query::Validators => validators::Reply::Validators(
+                valset::Query::Validators => valset::Reply::Validators(
                     members.into_iter().map(|member| member.key).collect(),
                 ),
-                validators::Query::Members => validators::Reply::Members(members),
+                valset::Query::Members => valset::Reply::Members(members),
             };
             guest::respond(abi::encode(&reply));
             Ok(())

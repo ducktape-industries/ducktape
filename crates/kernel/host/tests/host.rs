@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use abi::{
     Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
-    HostReply, ItemRef, Message, Origin, Outcome, Refusal, Scan, Scheme, reason, roster,
-    validators,
+    HostReply, ItemRef, Message, Origin, Outcome, Refusal, Scan, Scheme, module_registry, reason,
+    valset,
 };
 use commonware_codec::Encode as _;
 use commonware_cryptography::bls12381::primitives::group::{Private, Scalar};
@@ -34,8 +34,8 @@ const TIME: u64 = 1_700_000_000;
 
 type Ctx = deterministic::Context;
 
-fn member(key: &[u8], address: &str) -> validators::Member {
-    validators::Member {
+fn member(key: &[u8], address: &str) -> valset::Member {
+    valset::Member {
         key: key.to_vec(),
         address: address.to_owned(),
     }
@@ -187,7 +187,7 @@ fn ok(output: &[u8]) -> Outcome {
 }
 
 fn change(program: &str, code: BlobId, params: Vec<u8>) -> Vec<u8> {
-    abi::encode(&Change::Set(roster::Entry {
+    abi::encode(&Change::Set(module_registry::Entry {
         program: program.to_owned(),
         code,
         params,
@@ -208,13 +208,17 @@ fn founding_admits_every_program_and_the_host_reopens() {
         .await
         .unwrap();
         assert_eq!(applied.height, 0);
-        let admitted: Vec<&str> = applied.roster.iter().map(|r| r.program.as_str()).collect();
+        let admitted: Vec<&str> = applied
+            .admissions
+            .iter()
+            .map(|r| r.program.as_str())
+            .collect();
         assert_eq!(
             admitted,
             ["module-registry", "valset", "ping", "pong", "probe"]
         );
         assert!(applied.deliveries.is_empty());
-        for receipt in &applied.roster {
+        for receipt in &applied.admissions {
             assert!(
                 matches!(receipt.outcome, Outcome::Applied { .. }),
                 "{receipt:?}"
@@ -721,7 +725,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
         .await
         .unwrap();
         let applied = host.apply(block(2, Vec::new())).await.unwrap();
-        assert_eq!(applied.roster, vec![receipt("echo", ok(b""), vec![])]);
+        assert_eq!(applied.admissions, vec![receipt("echo", ok(b""), vec![])]);
         assert_eq!(host.programs().unwrap()["echo"], relay);
         let applied = host
             .apply(block(
@@ -746,7 +750,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
         .await
         .unwrap();
         let applied = host.apply(block(5, Vec::new())).await.unwrap();
-        assert_eq!(applied.roster, vec![receipt("echo", ok(b""), vec![])]);
+        assert_eq!(applied.admissions, vec![receipt("echo", ok(b""), vec![])]);
         assert_eq!(host.programs().unwrap()["echo"], probe);
         let env = ask(&host, Layer::Confirmed, "echo", vec![op(HostOp::Env)]).await;
         assert_eq!(
@@ -772,7 +776,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
         .await
         .unwrap();
         let applied = host.apply(block(7, Vec::new())).await.unwrap();
-        assert!(applied.roster.is_empty());
+        assert!(applied.admissions.is_empty());
         assert!(!host.programs().unwrap().contains_key("echo"));
         let applied = host
             .apply(block(8, vec![submit(4, "echo", script(Vec::new()))]))
@@ -809,7 +813,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
         .unwrap();
         let applied = host.apply(block(10, Vec::new())).await.unwrap();
         assert_eq!(
-            applied.roster,
+            applied.admissions,
             vec![receipt(
                 "bad",
                 Outcome::Rejected(Refusal::new("probe", "no")),
@@ -820,7 +824,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
         let ids: Vec<&str> = programs.keys().map(String::as_str).collect();
         assert_eq!(ids, ["module-registry", "ping", "pong", "probe", "valset"]);
         let applied = host.apply(block(11, Vec::new())).await.unwrap();
-        assert_eq!(applied.roster.len(), 1);
+        assert_eq!(applied.admissions.len(), 1);
     });
 }
 

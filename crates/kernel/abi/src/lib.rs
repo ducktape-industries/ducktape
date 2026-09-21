@@ -296,7 +296,7 @@ pub enum GuestCall {
 
 pub type GuestReply = Result<(), Refusal>;
 
-pub mod roster {
+pub mod module_registry {
     use super::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
 
     pub const PROGRAM: &str = "module-registry";
@@ -324,7 +324,7 @@ pub mod roster {
     }
 }
 
-pub mod validators {
+pub mod valset {
     use super::{BorshDeserialize, BorshSerialize};
 
     pub const PROGRAM: &str = "valset";

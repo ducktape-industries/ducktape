@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use abi::validators::Member;
+use abi::valset::Member;
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;

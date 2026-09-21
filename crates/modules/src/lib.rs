@@ -117,36 +117,36 @@ mod tests {
     #[test]
     fn the_host_contracts_are_prefixes_of_the_program_contracts() {
         assert_eq!(
-            abi::encode(&abi::validators::Query::Validators),
+            abi::encode(&abi::valset::Query::Validators),
             abi::encode(&valset::Query::Validators)
         );
         assert_eq!(
-            abi::encode(&abi::validators::Query::Members),
+            abi::encode(&abi::valset::Query::Members),
             abi::encode(&valset::Query::Members)
         );
-        let member = abi::validators::Member {
+        let member = abi::valset::Member {
             key: vec![1],
             address: "a".into(),
         };
         assert_eq!(
-            abi::encode(&abi::validators::Reply::Validators(vec![vec![1]])),
+            abi::encode(&abi::valset::Reply::Validators(vec![vec![1]])),
             abi::encode(&valset::Reply::Validators(vec![vec![1]]))
         );
         assert_eq!(
-            abi::encode(&abi::validators::Reply::Members(vec![member.clone()])),
+            abi::encode(&abi::valset::Reply::Members(vec![member.clone()])),
             abi::encode(&valset::Reply::Members(vec![member]))
         );
         assert_eq!(
-            abi::encode(&abi::roster::Query::At(9)),
+            abi::encode(&abi::module_registry::Query::At(9)),
             abi::encode(&module_registry::Query::At(9))
         );
-        let entry = abi::roster::Entry {
+        let entry = abi::module_registry::Entry {
             program: "p".into(),
             code: abi::BlobId::Sha256([1; 32]),
             params: vec![2],
         };
         assert_eq!(
-            abi::encode(&abi::roster::Reply::Programs(vec![entry.clone()])),
+            abi::encode(&abi::module_registry::Reply::Programs(vec![entry.clone()])),
             abi::encode(&module_registry::Reply::Programs(vec![entry]))
         );
     }

@@ -8,7 +8,7 @@ use std::path::Path;
 
 use abi::{
     BlobId, Cause, Env, GuestCall, HashKind, ItemRef, Origin, Outcome, ProgramId, Refusal, Root,
-    Scan, reason, roster, validators,
+    Scan, module_registry, reason, valset,
 };
 use blobs::{Blobs, Layered, Stage};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -34,7 +34,7 @@ pub enum Error {
     State(#[from] state::Error),
     #[error(transparent)]
     Blobs(#[from] blobs::Error),
-    #[error("blob {0:?} is in the roster but not on this node")]
+    #[error("blob {0:?} is recorded on chain but not on this node")]
     BlobUnavailable(BlobId),
     #[error("{program} runs {code:?}, which this node cannot load: {fault}")]
     Load {
@@ -63,7 +63,7 @@ pub struct Genesis {
     pub network: Vec<u8>,
     pub module_registry: Vec<u8>,
     pub valset: Vec<u8>,
-    pub validators: Vec<validators::Member>,
+    pub validators: Vec<valset::Member>,
     pub programs: Vec<Founding>,
     pub limits: Limits,
     pub epoch_length: u64,
@@ -113,7 +113,7 @@ pub struct Delivered {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Applied {
     pub height: u64,
-    pub roster: Vec<Receipt>,
+    pub admissions: Vec<Receipt>,
     pub deliveries: Vec<Delivered>,
     pub submissions: Vec<Receipt>,
     pub writes: Writes,
@@ -172,21 +172,21 @@ where
             abi::encode(&genesis.epoch_length),
         );
         let mut entries = vec![
-            roster::Entry {
-                program: roster::PROGRAM.to_owned(),
+            module_registry::Entry {
+                program: module_registry::PROGRAM.to_owned(),
                 code: put_code(&mut overlay, &mut stage, &genesis.module_registry),
                 params: Vec::new(),
             },
-            roster::Entry {
-                program: validators::PROGRAM.to_owned(),
+            module_registry::Entry {
+                program: valset::PROGRAM.to_owned(),
                 code: put_code(&mut overlay, &mut stage, &genesis.valset),
-                params: abi::encode(&validators::Genesis {
+                params: abi::encode(&valset::Genesis {
                     validators: genesis.validators,
                 }),
             },
         ];
         for founding in genesis.programs {
-            entries.push(roster::Entry {
+            entries.push(module_registry::Entry {
                 program: founding.program,
                 code: put_code(&mut overlay, &mut stage, &founding.code),
                 params: founding.params,
@@ -202,7 +202,7 @@ where
                 });
             }
         }
-        entries[0].params = abi::encode(&roster::Genesis {
+        entries[0].params = abi::encode(&module_registry::Genesis {
             programs: entries.clone(),
         });
         let mut receipts = Vec::new();
@@ -337,7 +337,7 @@ where
         abi::decode(&bytes).map_err(corrupt)
     }
 
-    pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<validators::Member>>> {
+    pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<valset::Member>>> {
         self.store
             .view(Vec::new())
             .get(NETWORK, &namespace::epoch(epoch))?
@@ -463,14 +463,14 @@ where
             stage,
             &[],
             Origin::System,
-            validators::PROGRAM.to_owned(),
-            abi::encode(&validators::Query::Members),
+            valset::PROGRAM.to_owned(),
+            abi::encode(&valset::Query::Members),
         )
         .await?;
         let bytes = reply.map_err(|refusal| {
             Error::Corrupt(format!("valset refused the members query: {refusal}"))
         })?;
-        let validators::Reply::Members(members) = abi::decode(&bytes).map_err(corrupt)? else {
+        let valset::Reply::Members(members) = abi::decode(&bytes).map_err(corrupt)? else {
             return Err(Error::Corrupt(
                 "valset answered Members with another reply".into(),
             ));
@@ -515,8 +515,8 @@ where
         self.ready()?;
         let mut overlay = Overlay::default();
         let mut stage = Stage::default();
-        let roster = self
-            .refresh_roster(block.height, block.time, &mut overlay, &mut stage)
+        let admissions = self
+            .refresh_programs(block.height, block.time, &mut overlay, &mut stage)
             .await?;
         let deliveries = self
             .deliver(block.height, block.time, &mut overlay, &mut stage)
@@ -548,7 +548,7 @@ where
             },
             overlay,
             stage,
-            roster,
+            admissions,
             deliveries,
             submissions,
         )
@@ -625,7 +625,7 @@ where
         .await
     }
 
-    async fn refresh_roster(
+    async fn refresh_programs(
         &mut self,
         height: u64,
         time: u64,
@@ -638,14 +638,16 @@ where
             &*stage,
             &[],
             Origin::System,
-            roster::PROGRAM.to_owned(),
-            abi::encode(&roster::Query::At(height)),
+            module_registry::PROGRAM.to_owned(),
+            abi::encode(&module_registry::Query::At(height)),
         )
         .await?;
         let Ok(bytes) = reply else {
             return Ok(Vec::new());
         };
-        let Ok(roster::Reply::Programs(entries)) = abi::decode::<roster::Reply>(&bytes) else {
+        let Ok(module_registry::Reply::Programs(entries)) =
+            abi::decode::<module_registry::Reply>(&bytes)
+        else {
             return Ok(Vec::new());
         };
         let running = programs_of(&View::new(self.store.storage(), vec![&*overlay]))?;
@@ -681,7 +683,7 @@ where
 
     async fn admit(
         &mut self,
-        entry: &roster::Entry,
+        entry: &module_registry::Entry,
         height: u64,
         time: u64,
         overlay: &mut Overlay,
@@ -725,7 +727,7 @@ where
 
     fn swap(
         &mut self,
-        entry: &roster::Entry,
+        entry: &module_registry::Entry,
         overlay: &mut Overlay,
         stage: &Stage,
     ) -> Result<Receipt> {
@@ -748,7 +750,7 @@ where
 
     fn load(
         &self,
-        entry: &roster::Entry,
+        entry: &module_registry::Entry,
         stage: &Stage,
     ) -> Result<std::result::Result<runtime::Code, Refusal>> {
         let layered = Layered {
@@ -841,7 +843,7 @@ where
         tip: Tip,
         mut overlay: Overlay,
         stage: Stage,
-        roster: Vec<Receipt>,
+        admissions: Vec<Receipt>,
         deliveries: Vec<Delivered>,
         submissions: Vec<Receipt>,
     ) -> Result<Applied> {
@@ -852,7 +854,7 @@ where
         self.preconfirmed = Overlay::default();
         Ok(Applied {
             height: tip.height,
-            roster,
+            admissions,
             deliveries,
             submissions,
             writes,

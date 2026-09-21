@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use abi::{BlobId, HostOp, Message, Origin, Outcome, Scheme, validators};
+use abi::{BlobId, HostOp, Message, Origin, Outcome, Scheme};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, deterministic};
@@ -33,8 +33,8 @@ fn public(seed: u64) -> Vec<u8> {
     key(seed).public_key().as_ref().to_vec()
 }
 
-fn member(seed: u64) -> validators::Member {
-    validators::Member {
+fn member(seed: u64) -> valset::Member {
+    valset::Member {
         key: public(seed),
         address: format!("v{seed}:1"),
     }
@@ -90,7 +90,7 @@ impl Net {
         let (host, applied) = Host::found(context, "net", dir, block_id(0), genesis)
             .await
             .unwrap();
-        for receipt in &applied.roster {
+        for receipt in &applied.admissions {
             assert!(
                 matches!(receipt.outcome, Outcome::Applied { .. }),
                 "{} did not admit: {:?}",
@@ -751,12 +751,12 @@ fn a_published_program_is_scheduled_by_governance_and_seated_at_its_height() {
         assert!(lands_at > net.height);
         while net.height + 1 < lands_at {
             let applied = net.tick().await;
-            assert!(applied.roster.is_empty());
+            assert!(applied.admissions.is_empty());
         }
         let applied = net.tick().await;
         assert_eq!(applied.height, lands_at);
-        assert_eq!(applied.roster.len(), 1);
-        assert_eq!(applied.roster[0].program, "kv2");
+        assert_eq!(applied.admissions.len(), 1);
+        assert_eq!(applied.admissions[0].program, "kv2");
         assert!(net.host.programs().unwrap().contains_key("kv2"));
         net.apply(
             &public(1),

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use abi::{HostOp, validators};
+use abi::{HostOp, valset};
 use commonware_consensus::marshal::Start;
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_consensus::simplex::types::{Finalization, Finalize, Proposal};
@@ -33,14 +33,14 @@ fn key(seed: u64) -> ed25519::PrivateKey {
     ed25519::PrivateKey::from_seed(seed)
 }
 
-fn member(key: &ed25519::PrivateKey) -> validators::Member {
-    validators::Member {
+fn member(key: &ed25519::PrivateKey) -> valset::Member {
+    valset::Member {
         key: key.public_key().as_ref().to_vec(),
         address: format!("{}:1", key.public_key()),
     }
 }
 
-fn genesis(members: &[validators::Member]) -> Genesis {
+fn genesis(members: &[valset::Member]) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
         module_registry: MODULE_REGISTRY.to_vec(),
@@ -84,11 +84,7 @@ async fn seal(node: &mut Node<Ctx>) -> Block {
     block
 }
 
-fn certify(
-    signers: &[ed25519::PrivateKey],
-    members: &[validators::Member],
-    tip: Tip,
-) -> Certificate {
+fn certify(signers: &[ed25519::PrivateKey], members: &[valset::Member], tip: Tip) -> Certificate {
     let validators = validators_of(members).unwrap();
     let epoch = tip.height / EPOCH_LENGTH;
     let proposal = Proposal::new(
@@ -161,7 +157,7 @@ impl Exchange for Refusing {
 
 struct Network {
     keys: Vec<ed25519::PrivateKey>,
-    members: Vec<validators::Member>,
+    members: Vec<valset::Member>,
     source: Arc<Source>,
     _dir: tempfile::TempDir,
 }

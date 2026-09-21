@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use abi::{HostOp, HostReply, Message, Outcome, reason, validators};
+use abi::{HostOp, HostReply, Message, Outcome, reason, valset};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -25,8 +25,8 @@ fn key(seed: u64) -> ed25519::PrivateKey {
     ed25519::PrivateKey::from_seed(seed)
 }
 
-fn member(key: &ed25519::PrivateKey, address: &str) -> validators::Member {
-    validators::Member {
+fn member(key: &ed25519::PrivateKey, address: &str) -> valset::Member {
+    valset::Member {
         key: key.public_key().as_ref().to_vec(),
         address: address.to_owned(),
     }
@@ -40,7 +40,7 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
     }
 }
 
-fn genesis(validators: Vec<validators::Member>) -> Genesis {
+fn genesis(validators: Vec<valset::Member>) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
         module_registry: MODULE_REGISTRY.to_vec(),

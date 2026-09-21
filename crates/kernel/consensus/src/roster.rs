@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use abi::validators::Member;
+use abi::valset::Member;
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_consensus::types::Epoch;

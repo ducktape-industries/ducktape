@@ -4,7 +4,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use abi::validators::Member;
+use abi::valset::Member;
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::authenticated::lookup::{Oracle, Receiver, Sender};

@@ -1,7 +1,7 @@
 use abi::ProgramId;
 use borsh::{BorshDeserialize, BorshSerialize};
 
-pub use abi::roster::{Entry, Genesis, PROGRAM};
+pub use abi::module_registry::{Entry, Genesis, PROGRAM};
 
 pub const CODE_KIND: &str = "program";
 

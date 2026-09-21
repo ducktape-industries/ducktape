@@ -1,9 +1,9 @@
-use abi::{ProgramId, roster};
+use abi::{ProgramId, module_registry};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 #[derive(BorshSerialize, BorshDeserialize)]
 pub enum Change {
-    Set(roster::Entry),
+    Set(module_registry::Entry),
     Remove(ProgramId),
 }
 
@@ -13,7 +13,7 @@ pub fn key(program: &str) -> Vec<u8> {
 
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::{Refusal, Scan, roster};
+    use abi::{Refusal, Scan, module_registry};
     use guest::Program;
 
     use crate::{Change, key};
@@ -22,7 +22,7 @@ mod program {
 
     impl Program for Modules {
         fn init(params: &[u8]) -> Result<(), Refusal> {
-            let genesis: roster::Genesis = abi::decode(params)?;
+            let genesis: module_registry::Genesis = abi::decode(params)?;
             for entry in genesis.programs {
                 guest::set(key(&entry.program), abi::encode(&entry));
             }
@@ -38,12 +38,12 @@ mod program {
         }
 
         fn query(request: &[u8]) -> Result<(), Refusal> {
-            let roster::Query::At(_) = abi::decode(request)?;
+            let module_registry::Query::At(_) = abi::decode(request)?;
             let programs = guest::scan(Scan::prefix(b"p/"))
                 .into_iter()
                 .map(|entry| abi::decode(&entry.value))
-                .collect::<Result<Vec<roster::Entry>, Refusal>>()?;
-            guest::respond(abi::encode(&roster::Reply::Programs(programs)));
+                .collect::<Result<Vec<module_registry::Entry>, Refusal>>()?;
+            guest::respond(abi::encode(&module_registry::Reply::Programs(programs)));
             Ok(())
         }
     }
