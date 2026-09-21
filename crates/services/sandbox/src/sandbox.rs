@@ -297,9 +297,11 @@ fn probe_vz(shim: &Path) -> Result<(), String> {
 /// the vz backend exists only where Virtualization.framework does.
 #[cfg(not(target_os = "macos"))]
 fn probe_vz(_shim: &Path) -> Result<(), String> {
-    Err("the vz sandbox runs only on macOS (it drives Virtualization.framework); \
+    Err(
+        "the vz sandbox runs only on macOS (it drives Virtualization.framework); \
          on Linux use runtime = \"firecracker\""
-        .into())
+            .into(),
+    )
 }
 
 #[cfg(test)]
@@ -320,7 +322,9 @@ mod tests {
             rootfs: dir.path().join("rootfs.ext4"),
             executors: dir.path().join("executors"),
         };
-        let error = backend.probe_images().expect_err("absent images must refuse");
+        let error = backend
+            .probe_images()
+            .expect_err("absent images must refuse");
         assert!(error.contains("kernel"), "names which image: {error}");
         assert!(
             error.contains("ops/build-guest-rootfs.sh"),

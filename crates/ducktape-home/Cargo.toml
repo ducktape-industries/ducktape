@@ -5,12 +5,11 @@ version.workspace = true
 
 # ONE resolution of this operator's on-disk root, and nothing else.
 #
-# A leaf with ZERO dependencies on purpose. Its readers are workspace-config
-# and the desktop app; workspace-config is a dependency of provider-host, a
-# dependency of agent-service and compute-service, whose manifests say they
-# must stay light. Anything added here lands in those graphs, so nothing is.
+# A leaf with ZERO dependencies on purpose. Its readers are the `ducktape`
+# CLI and the desktop app, and anything added here lands in both graphs, so
+# nothing is.
 #
 # The home holds one directory per workspace and nothing else; a workspace's
-# own layout (keys/, guest/, executors/, capabilities/, storage/) is
-# workspace-config's — this one knows only the root the workspaces hang off.
+# own layout is `noded::Workspace`'s — this one knows only the root the
+# workspaces hang off.
 [dependencies]

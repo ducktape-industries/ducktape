@@ -33,8 +33,6 @@ use airlock::wire::{CredentialKind, CredentialPayload};
 
 /// how long a scoped session token this gateway mints stays valid.
 const SESSION_TTL_SECS: u64 = 3600;
-/// how many upstream requests one session token may make.
-const MAX_REQUESTS: u32 = 4096;
 
 const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
 const OPENAI_BASE: &str = "https://chatgpt.com/backend-api/codex";
@@ -100,7 +98,7 @@ impl Store {
             oauth_token_url: env_or("DUCKTAPE_AIRLOCK_OAUTH_TOKEN_URL", OAUTH_TOKEN_URL),
             oauth_client_id: env_or("DUCKTAPE_AIRLOCK_OAUTH_CLIENT_ID", OAUTH_CLIENT_ID),
             session_ttl_secs: SESSION_TTL_SECS,
-            max_requests: MAX_REQUESTS,
+            clock: airlock::server::Clock::system(),
             // the self-host lender holds no `rcodesign`; the enclave image does.
             sign: None,
         };
@@ -347,7 +345,11 @@ fn claude_refresh_payload(dir: &Path) -> Option<CredentialPayload> {
         .to_string();
     let access_token = oauth["accessToken"].as_str().unwrap_or("").to_string();
     let expires_at = oauth["expiresAt"].as_u64().map(|ms| ms / 1000).unwrap_or(0);
-    Some(CredentialPayload::Refresh { refresh_token, access_token, expires_at })
+    Some(CredentialPayload::Refresh {
+        refresh_token,
+        access_token,
+        expires_at,
+    })
 }
 
 /// The access token out of a codex login artifact (`auth.json`,
@@ -359,7 +361,9 @@ fn codex_bearer_payload(dir: &Path) -> Option<CredentialPayload> {
     let token = json["tokens"]["access_token"]
         .as_str()
         .filter(|value| !value.is_empty())?;
-    Some(CredentialPayload::Bearer { access_token: token.to_string() })
+    Some(CredentialPayload::Bearer {
+        access_token: token.to_string(),
+    })
 }
 
 /// Load the store's seal keypair, minting and persisting it (0600) on first use.
@@ -370,13 +374,16 @@ pub fn load_or_create_seal_keypair(root: &Path) -> Result<SealKeypair, String> {
     match std::fs::read(&path) {
         Ok(bytes) => {
             let secret: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                format!("{}: seal.key must be 32 bytes, got {}", path.display(), bytes.len())
+                format!(
+                    "{}: seal.key must be 32 bytes, got {}",
+                    path.display(),
+                    bytes.len()
+                )
             })?;
             Ok(SealKeypair::from_secret_bytes(secret))
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(root)
-                .map_err(|e| format!("create {}: {e}", root.display()))?;
+            std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))?;
             let keypair = SealKeypair::generate();
             write_secret_0600(&path, &keypair.secret_bytes())?;
             Ok(keypair)
@@ -397,7 +404,9 @@ pub fn write_secret_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(0o600);
     }
-    let mut file = opts.open(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    let mut file = opts
+        .open(path)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
     if let Err(e) = std::io::Write::write_all(&mut file, bytes) {
         let _ = std::fs::remove_file(path);
         return Err(format!("write {}: {e}", path.display()));
@@ -442,16 +451,20 @@ mod tests {
     fn seed_codex(root: &Path, name: &str, access: &str) {
         let dir = root.join(name);
         write(&dir.join("kind"), "codex\n");
-        write(&dir.join("auth.json"), &format!(r#"{{"tokens":{{"access_token":"{access}"}}}}"#));
+        write(
+            &dir.join("auth.json"),
+            &format!(r#"{{"tokens":{{"access_token":"{access}"}}}}"#),
+        );
     }
 
     /// Move a file's mtime a minute into the future, so "the artifact changed"
     /// is a fact the test states rather than one it hopes the clock provides.
     fn stamp_forward(path: &Path) {
         let file = std::fs::File::options().write(true).open(path).unwrap();
-        let ahead = file.metadata().unwrap().modified().unwrap()
-            + std::time::Duration::from_secs(60);
-        file.set_times(std::fs::FileTimes::new().set_modified(ahead)).unwrap();
+        let ahead =
+            file.metadata().unwrap().modified().unwrap() + std::time::Duration::from_secs(60);
+        file.set_times(std::fs::FileTimes::new().set_modified(ahead))
+            .unwrap();
     }
 
     fn refresh_of(payload: &CredentialPayload) -> &str {
@@ -548,7 +561,9 @@ mod tests {
         let (name, kind, payload) = &seeds[0];
         assert_eq!(name, "alice-codex-1");
         assert_eq!(*kind, CredentialKind::Codex);
-        assert!(matches!(payload, CredentialPayload::Bearer { access_token } if access_token == "tok-codex"));
+        assert!(
+            matches!(payload, CredentialPayload::Bearer { access_token } if access_token == "tok-codex")
+        );
     }
 
     /// The node's boot diagnostic wants a COUNT. Taking `load_seeds` for it
@@ -560,14 +575,22 @@ mod tests {
     fn credentials_are_counted_without_opening_one() {
         let tmp = tempfile::tempdir().unwrap();
         let root = cred_store_root(tmp.path());
-        assert_eq!(count_credentials(&root), 0, "a store that does not exist lends nothing");
+        assert_eq!(
+            count_credentials(&root),
+            0,
+            "a store that does not exist lends nothing"
+        );
 
         load_or_create_seal_keypair(&root).unwrap(); // writes seal.key beside them
         seed_claude(&root, "alice-claude-1", "rt-alice");
         seed_codex(&root, "alice-codex-1", "tok-codex");
         write(&root.join("registered-but-broken").join("kind"), "claude\n");
 
-        assert_eq!(count_credentials(&root), 3, "seal.key is not a credential; a broken one is");
+        assert_eq!(
+            count_credentials(&root),
+            3,
+            "seal.key is not a credential; a broken one is"
+        );
         assert_eq!(
             load_seeds(&root).unwrap().len(),
             2,
@@ -582,7 +605,11 @@ mod tests {
         seed_claude(&root, "b", "rt-b");
         seed_claude(&root, "a", "rt-a");
         seed_codex(&root, "c", "tok-c");
-        let names: Vec<_> = load_seeds(&root).unwrap().into_iter().map(|(n, ..)| n).collect();
+        let names: Vec<_> = load_seeds(&root)
+            .unwrap()
+            .into_iter()
+            .map(|(n, ..)| n)
+            .collect();
         assert_eq!(names, vec!["a", "b", "c"]);
     }
 
@@ -594,7 +621,11 @@ mod tests {
         write(&root.join("broken").join("kind"), "claude\n");
         seed_claude(&root, "good", "rt-good");
         let seeds = load_seeds(&root).unwrap();
-        assert_eq!(seeds.len(), 1, "the broken dir is skipped, the good one survives");
+        assert_eq!(
+            seeds.len(),
+            1,
+            "the broken dir is skipped, the good one survives"
+        );
         assert_eq!(seeds[0].0, "good");
     }
 
@@ -626,7 +657,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = cred_store_root(tmp.path());
         load_or_create_seal_keypair(&root).unwrap();
-        let mode = std::fs::metadata(root.join("seal.key")).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(root.join("seal.key"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600);
     }
 
@@ -654,7 +689,10 @@ mod tests {
     fn an_empty_store_opens_and_mints_a_stable_seal_key() {
         let tmp = tempfile::tempdir().unwrap();
         let first = Store::open(tmp.path()).unwrap();
-        assert!(first.is_empty(), "an empty store is a serving state, not a failure");
+        assert!(
+            first.is_empty(),
+            "an empty store is a serving state, not a failure"
+        );
         let second = Store::open(tmp.path()).unwrap();
         assert_eq!(
             first.seal_pk(),
@@ -712,7 +750,10 @@ mod tests {
         assert!(matches!(reload("alice-claude-1"), StoreLoad::Loaded(..)));
 
         std::fs::remove_dir_all(root.join("alice-claude-1")).unwrap();
-        assert!(matches!(reload("alice-claude-1"), StoreLoad::Absent), "a removed dir is a removal");
+        assert!(
+            matches!(reload("alice-claude-1"), StoreLoad::Absent),
+            "a removed dir is a removal"
+        );
 
         // the same name added again is a credential the gateway does not hold.
         seed_claude(&root, "alice-claude-1", "rt-second");
@@ -736,7 +777,10 @@ mod tests {
         assert!(is_store_dir_name("alice-claude-1"));
         // the loader runs on a caller-supplied `sub`, BEFORE the grant gate.
         for escape in ["..", ".", "", "/etc", "../../etc", "a/b", "./a"] {
-            assert!(!is_store_dir_name(escape), "{escape:?} must not address the store");
+            assert!(
+                !is_store_dir_name(escape),
+                "{escape:?} must not address the store"
+            );
         }
     }
 }

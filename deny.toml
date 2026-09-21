@@ -11,13 +11,6 @@
 # today, and says what would clear it. Adding an entry here is a decision to
 # carry a known defect — write the reason for the person who reads it next.
 #
-# "cannot take" includes the two where cargo would resolve the fix in-range:
-# the lock reaches the wasm guest graph, so moving it rewrites every committed
-# component.wasm and index.wasm (measured — the pair below changes
-# crates/modules/system/saga/index.wasm). Those bytes are the descriptor's
-# module table, so that is a consensus-visible change and belongs in its own
-# PR, not in a lock bump.
-
 [advisories]
 # A yanked crate is a maintainer saying "do not use this build". The lock is
 # the artifact everything ships from, so it fails the gate rather than warning.
@@ -25,15 +18,11 @@ yanked = "deny"
 
 ignore = [
   # ── reachable in a node, no fix upstream ────────────────────────────────
-  { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 Marvin timing sidechannel, no fixed release. Reaches node-bin only through airlock's `verify` feature (dcap-qvl-webpki + sev); nothing signs with it, it verifies vendor certificate chains. Cleared by an rsa release with constant-time decryption, or by taking airlock/verify out of the default node graph — which bin/node cannot do alone: crates/services/broker enables airlock's `verify` unconditionally and calls verify_quote in its `--cred airlock` path, and node-bin depends on broker-host through provider-host, so feature unification keeps it (#1302)." },
+  { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 Marvin timing sidechannel, no fixed release. Reaches the workspace only through airlock's `verify` feature (dcap-qvl-webpki + sev), which crates/services/broker enables unconditionally for verify_quote; nothing signs with it, it verifies vendor certificate chains. Cleared by an rsa release with constant-time decryption." },
   { id = "RUSTSEC-2025-0055", reason = "tracing-subscriber 0.2 ANSI-escape log poisoning. Pulled by ark-relations 0.5, which requires ^0.2, under commonware's arkworks stack — unreachable from here (nothing in ducktape installs an arkworks subscriber). Cleared when commonware's arkworks deps move to tracing-subscriber 0.3." },
   { id = "RUSTSEC-2026-0008", reason = "git2 0.19 unsoundness (Buf deref); fixed in 0.20.4. forge and the app pin 0.19 and the bump is semver-major — a dependency upgrade with its own review, not a lock change." },
   { id = "RUSTSEC-2026-0183", reason = "git2 0.19 unsoundness (Remote::list); fixed in 0.21. Same bump as RUSTSEC-2026-0008." },
   { id = "RUSTSEC-2026-0184", reason = "git2 0.19 unsoundness (BlameHunk Signature); fixed in 0.21. Same bump as RUSTSEC-2026-0008." },
-
-  # ── fix resolves in-range, but the lock is guest-graph state ────────────
-  { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch 0.9.18 invalid pointer deref in the `fmt::Pointer` impl for Atomic/Shared; fixed in 0.9.20, which `cargo update -p crossbeam-epoch` resolves. Reaches node-bin through rayon under commonware-consensus, and nothing formats one of those pointers. Held because the update moves guest artifact bytes — see the header." },
-  { id = "RUSTSEC-2026-0253", reason = "lru 0.18.1 use-after-free when a `pop()` callback panics; fixed in 0.18.3, which `cargo update -p lru@0.18.1` resolves. Under nat-traversal. Held with RUSTSEC-2026-0204: the same lock bump." },
 
   # ── unmaintained crates nothing here depends on directly ────────────────
   # Each arrives under a third-party tree (iced's renderer/highlighter, or

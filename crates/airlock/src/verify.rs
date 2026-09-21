@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use anyhow::{anyhow, bail, Context, Result};
-use sev::certs::snp::{ca, Certificate, Chain, Verifiable};
+use anyhow::{Context, Result, anyhow, bail};
+use sev::certs::snp::{Certificate, Chain, Verifiable, ca};
 use sev::firmware::guest::AttestationReport;
 use sev::parser::Decoder;
 
@@ -47,7 +47,10 @@ impl SnpProduct {
             Self::Genoa => (genoa::ark(), genoa::ask()),
             Self::Turin => (turin::ark(), turin::ask()),
         };
-        Ok(ca::Chain { ark: ark.context("builtin ARK")?, ask: ask.context("builtin ASK")? })
+        Ok(ca::Chain {
+            ark: ark.context("builtin ARK")?,
+            ask: ask.context("builtin ASK")?,
+        })
     }
 }
 
@@ -83,7 +86,11 @@ pub struct SnpRoots {
 impl SnpRoots {
     /// Production roots: AMD's builtin ARK/ASK for `product`.
     pub fn amd(product: SnpProduct, vcek: VcekSource) -> Result<Self> {
-        Ok(Self { product, ca: product.builtin_ca()?, vcek })
+        Ok(Self {
+            product,
+            ca: product.builtin_ca()?,
+            vcek,
+        })
     }
 }
 
@@ -109,15 +116,15 @@ pub enum TrustRoots {
 /// embedded measurement (hex) and REPORTDATA. TOFU inspection only — the
 /// `ducktape user cred inspect` flow that pins a measurement for later verified use.
 /// Never a trust decision.
-pub fn peek_measurement(
-    mode: AttestMode,
-    quote: &[u8],
-) -> Result<(String, [u8; REPORT_DATA_LEN])> {
+pub fn peek_measurement(mode: AttestMode, quote: &[u8]) -> Result<(String, [u8; REPORT_DATA_LEN])> {
     match mode {
         AttestMode::Tdx => {
             let q = dcap_qvl::quote::Quote::parse(quote)
                 .map_err(|e| anyhow!("parse TDX quote: {e:?}"))?;
-            let td = q.report.as_td10().context("quote is not a TDX TD10 report")?;
+            let td = q
+                .report
+                .as_td10()
+                .context("quote is not a TDX TD10 report")?;
             let mut rd = [0u8; REPORT_DATA_LEN];
             rd.copy_from_slice(&td.report_data[..REPORT_DATA_LEN]);
             Ok((hex::encode(td.mr_td), rd))
@@ -214,7 +221,10 @@ pub fn accept_tdx_report(
             verified.advisory_ids
         );
     }
-    let td = verified.report.as_td10().context("quote is not a TDX TD10 report")?;
+    let td = verified
+        .report
+        .as_td10()
+        .context("quote is not a TDX TD10 report")?;
     let td_is_debuggable = td.td_attributes[0] & TDX_ATTR_DEBUG != 0;
     if td_is_debuggable {
         bail!("TDX TD ATTRIBUTES set DEBUG: the host VMM can read this TD's private memory");
@@ -262,7 +272,10 @@ async fn verify_snp(
     let vcek =
         Certificate::from_der(&vcek_der).map_err(|e| anyhow!("parse VCEK certificate: {e}"))?;
 
-    let chain = Chain { ca: roots.ca.clone(), vek: vcek };
+    let chain = Chain {
+        ca: roots.ca.clone(),
+        vek: vcek,
+    };
     (&chain, &report)
         .verify()
         .map_err(|e| anyhow!("SEV-SNP chain/report signature: {e}"))?;
@@ -371,5 +384,4 @@ mod tests {
         assert_eq!("TURIN".parse::<SnpProduct>().unwrap(), SnpProduct::Turin);
         assert!("rome".parse::<SnpProduct>().is_err());
     }
-
 }

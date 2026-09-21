@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, post};
 use axum::{Json, Router};
@@ -47,14 +47,23 @@ struct MockUpstream {
 async fn oauth(State(st): State<Arc<MockUpstream>>) -> Json<serde_json::Value> {
     let mut n = st.n.lock().unwrap();
     *n += 1;
-    Json(json!({ "access_token": format!("acc-{n}"), "refresh_token": format!("ref-{n}"), "expires_in": 3600 }))
+    Json(
+        json!({ "access_token": format!("acc-{n}"), "refresh_token": format!("ref-{n}"), "expires_in": 3600 }),
+    )
 }
 
 async fn messages(State(st): State<Arc<MockUpstream>>, headers: HeaderMap) -> Response {
     let want = format!("Bearer acc-{}", *st.n.lock().unwrap());
-    let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let got = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     if got != want {
-        return (StatusCode::UNAUTHORIZED, format!("want {want:?} got {got:?}")).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            format!("want {want:?} got {got:?}"),
+        )
+            .into_response();
     }
     let sse = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"AIRLOCK-OK\"}}\n\n\
                event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
@@ -83,7 +92,7 @@ async fn boot_gateway(upstream: &str, enclave: &Arc<SnpTestEnclave>) -> String {
             oauth_token_url: format!("{upstream}/oauth/token"),
             oauth_client_id: "test-client".into(),
             session_ttl_secs: 3600,
-            max_requests: 100,
+            clock: airlock::server::Clock::system(),
             sign: None,
         },
         "snp",
@@ -138,7 +147,11 @@ async fn full_custody_path_swaps_session_token_for_the_credential() {
         &seal_pk,
         "test-sub",
         CredentialKind::Claude,
-        &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into(), access_token: String::new(), expires_at: 0 },
+        &airlock::wire::CredentialPayload::Refresh {
+            refresh_token: "ref-seed".into(),
+            access_token: String::new(),
+            expires_at: 0,
+        },
     )
     .await
     .unwrap();
@@ -158,7 +171,10 @@ async fn full_custody_path_swaps_session_token_for_the_credential() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("AIRLOCK-OK"), "reply should stream back through the gateway: {body}");
+    assert!(
+        body.contains("AIRLOCK-OK"),
+        "reply should stream back through the gateway: {body}"
+    );
 }
 
 #[tokio::test]
@@ -187,8 +203,13 @@ async fn a_forged_gateway_cannot_mint_a_token_the_client_opens() {
     let gw = Gateway::local(gateway_url);
 
     let wrong_seal_pk = [0x42u8; 32]; // not the gateway's attested key
-    let err = gw.open_session(&wrong_seal_pk, "test-sub", &WorkRef::Direct).await;
-    assert!(err.is_err(), "a token derived against the wrong seal_pk must not open");
+    let err = gw
+        .open_session(&wrong_seal_pk, "test-sub", &WorkRef::Direct)
+        .await;
+    assert!(
+        err.is_err(),
+        "a token derived against the wrong seal_pk must not open"
+    );
 }
 
 #[tokio::test]
@@ -207,7 +228,10 @@ async fn sealed_session_carries_only_ciphertext_and_round_trips_plaintext() {
             post(move |headers: HeaderMap, body: axum::body::Bytes| {
                 let seen = seen.clone();
                 async move {
-                    let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+                    let got = headers
+                        .get(AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
                     if !got.starts_with("Bearer acc-") {
                         return (StatusCode::UNAUTHORIZED, format!("got {got:?}")).into_response();
                     }
@@ -216,7 +240,10 @@ async fn sealed_session_carries_only_ciphertext_and_round_trips_plaintext() {
                             .into_response();
                     }
                     seen.store(true, Ordering::SeqCst);
-                    ([("content-type", "text/event-stream")], "data: SEALED-OK\n\n")
+                    (
+                        [("content-type", "text/event-stream")],
+                        "data: SEALED-OK\n\n",
+                    )
                         .into_response()
                 }
             }),
@@ -233,7 +260,11 @@ async fn sealed_session_carries_only_ciphertext_and_round_trips_plaintext() {
         &seal_pk,
         "test-sub",
         CredentialKind::Claude,
-        &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into(), access_token: String::new(), expires_at: 0 },
+        &airlock::wire::CredentialPayload::Refresh {
+            refresh_token: "ref-seed".into(),
+            access_token: String::new(),
+            expires_at: 0,
+        },
     )
     .await
     .unwrap();
@@ -270,7 +301,10 @@ async fn sealed_session_carries_only_ciphertext_and_round_trips_plaintext() {
     );
     let mut opener = bodyseal::StreamOpener::new(&keys, &bodyseal::request_binding(&sealed_body));
     let items = opener.feed(&wire).unwrap();
-    assert!(opener.finished(), "the sealed stream must end with the Final marker");
+    assert!(
+        opener.finished(),
+        "the sealed stream must end with the Final marker"
+    );
     let plaintext: Vec<u8> = items
         .iter()
         .filter_map(|item| match item {
@@ -296,7 +330,11 @@ async fn a_sealed_session_refuses_a_plaintext_body() {
         &seal_pk,
         "test-sub",
         CredentialKind::Claude,
-        &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into(), access_token: String::new(), expires_at: 0 },
+        &airlock::wire::CredentialPayload::Refresh {
+            refresh_token: "ref-seed".into(),
+            access_token: String::new(),
+            expires_at: 0,
+        },
     )
     .await
     .unwrap();
@@ -386,9 +424,9 @@ async fn a_sealed_session_requires_a_sealed_body_even_on_a_bodyless_get() {
     );
 }
 
-/// The gateway's own `DefaultBodyLimit` must match the broker's
-/// `MAX_REQUEST_BYTES`, not axum's implicit 2 MiB default — a sealed body
-/// between the two (3 MiB) must reach the upstream, not 413 at the router.
+/// The gateway imposes no body limit of its own — not axum's implicit 2 MiB
+/// default — so a 3 MiB sealed body must reach the upstream, not 413 at the
+/// router.
 #[tokio::test]
 async fn a_3mib_sealed_body_reaches_proxy_inner() {
     use airlock::bodyseal;
@@ -470,18 +508,29 @@ async fn build_seeded_uses_the_initial_credential_without_upload() {
                 let oh = oh.clone();
                 async move {
                     oh.fetch_add(1, Ordering::SeqCst);
-                    (StatusCode::INTERNAL_SERVER_ERROR, "no oauth for a seeded bearer").into_response()
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "no oauth for a seeded bearer",
+                    )
+                        .into_response()
                 }
             }),
         )
         .route(
             "/v1/messages",
             post(|headers: HeaderMap| async move {
-                let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+                let got = headers
+                    .get(AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
                 if got != "Bearer seeded-tok" {
                     return (StatusCode::UNAUTHORIZED, format!("got {got:?}")).into_response();
                 }
-                ([("content-type", "text/event-stream")], "data: AIRLOCK-OK\n\n").into_response()
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: AIRLOCK-OK\n\n",
+                )
+                    .into_response()
             }),
         );
     let upstream = spawn(app).await;
@@ -496,7 +545,7 @@ async fn build_seeded_uses_the_initial_credential_without_upload() {
             oauth_token_url: format!("{upstream}/oauth/token"),
             oauth_client_id: "test-client".into(),
             session_ttl_secs: 3600,
-            max_requests: 100,
+            clock: airlock::server::Clock::system(),
             sign: None,
         },
         "snp",
@@ -504,7 +553,9 @@ async fn build_seeded_uses_the_initial_credential_without_upload() {
         vec![(
             "sub".into(),
             CredentialKind::Claude,
-            CredentialPayload::Bearer { access_token: "seeded-tok".into() },
+            CredentialPayload::Bearer {
+                access_token: "seeded-tok".into(),
+            },
         )],
     )
     .unwrap();
@@ -527,7 +578,11 @@ async fn build_seeded_uses_the_initial_credential_without_upload() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     assert!(resp.text().await.unwrap().contains("AIRLOCK-OK"));
-    assert_eq!(oauth_hits.load(Ordering::SeqCst), 0, "a seeded bearer must not OAuth-refresh");
+    assert_eq!(
+        oauth_hits.load(Ordering::SeqCst),
+        0,
+        "a seeded bearer must not OAuth-refresh"
+    );
 }
 
 #[tokio::test]
@@ -545,7 +600,10 @@ async fn static_bearer_credential_is_used_without_any_oauth_refresh() {
                 let oh = oh.clone();
                 async move {
                     oh.fetch_add(1, Ordering::SeqCst);
-                    (StatusCode::INTERNAL_SERVER_ERROR, "oauth must not be called for a static bearer")
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "oauth must not be called for a static bearer",
+                    )
                         .into_response()
                 }
             }),
@@ -553,11 +611,18 @@ async fn static_bearer_credential_is_used_without_any_oauth_refresh() {
         .route(
             "/v1/messages",
             post(|headers: HeaderMap| async move {
-                let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+                let got = headers
+                    .get(AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
                 if got != "Bearer static-access-xyz" {
                     return (StatusCode::UNAUTHORIZED, format!("got {got:?}")).into_response();
                 }
-                ([("content-type", "text/event-stream")], "data: AIRLOCK-OK\n\n").into_response()
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: AIRLOCK-OK\n\n",
+                )
+                    .into_response()
             }),
         );
     let upstream = spawn(app).await;
@@ -570,7 +635,9 @@ async fn static_bearer_credential_is_used_without_any_oauth_refresh() {
         &seal_pk,
         "test-sub",
         CredentialKind::Claude,
-        &airlock::wire::CredentialPayload::Bearer { access_token: "static-access-xyz".into() },
+        &airlock::wire::CredentialPayload::Bearer {
+            access_token: "static-access-xyz".into(),
+        },
     )
     .await
     .unwrap();
@@ -588,7 +655,10 @@ async fn static_bearer_credential_is_used_without_any_oauth_refresh() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("AIRLOCK-OK"), "static bearer should reach upstream: {body}");
+    assert!(
+        body.contains("AIRLOCK-OK"),
+        "static bearer should reach upstream: {body}"
+    );
     assert_eq!(
         oauth_hits.load(Ordering::SeqCst),
         0,
@@ -614,7 +684,7 @@ fn self_host_cfg(
         oauth_token_url: String::new(),
         oauth_client_id: String::new(),
         session_ttl_secs: 3600,
-        max_requests: 100,
+        clock: airlock::server::Clock::system(),
         sign: None,
     }
 }
@@ -632,7 +702,11 @@ fn self_host_cfg(
 /// third credential kind lands, not after the next bisect.
 async fn boot_echo_upstream() -> String {
     async fn echo(headers: HeaderMap) -> Response {
-        let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let got = headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         ([("content-type", "text/plain")], got).into_response()
     }
     spawn(
@@ -670,12 +744,20 @@ async fn sessions_route_to_the_named_credential() {
     let (app, vendor) = server::build_seeded(
         self_host_cfg(Some(kp), upstream.clone(), String::new()),
         vec![
-            ("a".into(), CredentialKind::Claude, CredentialPayload::Bearer {
-                access_token: "tok-a".into(),
-            }),
-            ("b".into(), CredentialKind::Claude, CredentialPayload::Bearer {
-                access_token: "tok-b".into(),
-            }),
+            (
+                "a".into(),
+                CredentialKind::Claude,
+                CredentialPayload::Bearer {
+                    access_token: "tok-a".into(),
+                },
+            ),
+            (
+                "b".into(),
+                CredentialKind::Claude,
+                CredentialPayload::Bearer {
+                    access_token: "tok-b".into(),
+                },
+            ),
         ],
     )
     .unwrap();
@@ -707,17 +789,20 @@ async fn a_removed_credential_stops_serving_the_sessions_already_open_on_it() {
     // operator removes it, and answering `Absent` from then on.
     let removed = Arc::new(AtomicBool::new(false));
     let store = removed.clone();
-    let reload: airlock::server::ReloadCredential = Arc::new(move |_name: &str| {
-        match store.load(Ordering::SeqCst) {
+    let reload: airlock::server::ReloadCredential =
+        Arc::new(move |_name: &str| match store.load(Ordering::SeqCst) {
             true => airlock::server::StoreLoad::Absent,
             false => airlock::server::StoreLoad::Unchanged,
-        }
-    });
+        });
     let (app, _) = server::build_self_host_reloadable(
         self_host_cfg(Some(kp), upstream.clone(), String::new()),
-        vec![("a".into(), CredentialKind::Claude, CredentialPayload::Bearer {
-            access_token: "tok-a".into(),
-        })],
+        vec![(
+            "a".into(),
+            CredentialKind::Claude,
+            CredentialPayload::Bearer {
+                access_token: "tok-a".into(),
+            },
+        )],
         None,
         reload,
     )
@@ -725,7 +810,10 @@ async fn a_removed_credential_stops_serving_the_sessions_already_open_on_it() {
     let gateway_url = spawn(app).await;
     let gw = Gateway::local(gateway_url.clone());
 
-    let token = gw.open_session(&seal_pk, "a", &WorkRef::Direct).await.unwrap();
+    let token = gw
+        .open_session(&seal_pk, "a", &WorkRef::Direct)
+        .await
+        .unwrap();
     let proxied = || {
         reqwest::Client::new()
             .post(format!("{gateway_url}/v1/messages"))
@@ -793,16 +881,23 @@ async fn codex_credential_proxies_to_the_openai_upstream() {
     // anthropic_base is a bogus URL: a codex session must never touch it.
     let (app, _) = server::build_seeded(
         self_host_cfg(Some(kp), "http://anthropic.invalid".into(), openai.clone()),
-        vec![("cx".into(), CredentialKind::Codex, CredentialPayload::Bearer {
-            access_token: "tok-codex".into(),
-        })],
+        vec![(
+            "cx".into(),
+            CredentialKind::Codex,
+            CredentialPayload::Bearer {
+                access_token: "tok-codex".into(),
+            },
+        )],
     )
     .unwrap();
     let gateway_url = spawn(app).await;
     let gw = Gateway::local(gateway_url.clone());
 
     let seen = round_trip_via(&gw, &gateway_url, &seal_pk, "cx").await;
-    assert_eq!(seen, "Bearer tok-codex", "a codex session hits the openai upstream with its bearer");
+    assert_eq!(
+        seen, "Bearer tok-codex",
+        "a codex session hits the openai upstream with its bearer"
+    );
 }
 
 // -------- the co-hosted lending gate --------
@@ -894,7 +989,9 @@ async fn boot_lender_behind_proxy(
         vec![(
             "a".into(),
             CredentialKind::Claude,
-            CredentialPayload::Bearer { access_token: "tok-a".into() },
+            CredentialPayload::Bearer {
+                access_token: "tok-a".into(),
+            },
         )],
         Some(stub_grant_check()),
     )
@@ -911,8 +1008,10 @@ async fn grant_gate_admits_what_the_authority_grants_and_refuses_the_rest() {
     // Granted caller: the session opens and the round-trip carries the real token.
     let url = boot_lender_behind_proxy(&upstream, secret, b"granted").await;
     let gw = Gateway::local(url.clone());
-    let token =
-        gw.open_session(&seal_pk, "a", &WorkRef::Direct).await.expect("granted session opens");
+    let token = gw
+        .open_session(&seal_pk, "a", &WorkRef::Direct)
+        .await
+        .expect("granted session opens");
     let seen = reqwest::Client::new()
         .post(format!("{url}/v1/messages"))
         .bearer_auth(&token)
@@ -930,8 +1029,14 @@ async fn grant_gate_admits_what_the_authority_grants_and_refuses_the_rest() {
     // an identity one.
     let url = boot_lender_behind_proxy(&upstream, secret, b"stranger").await;
     let gw = Gateway::local(url);
-    let err = gw.open_session(&seal_pk, "a", &WorkRef::Direct).await.unwrap_err();
-    assert!(err.to_string().contains("403"), "an ungranted caller must 403: {err}");
+    let err = gw
+        .open_session(&seal_pk, "a", &WorkRef::Direct)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("403"),
+        "an ungranted caller must 403: {err}"
+    );
 
     // The gate could not ASK its authority. That is NOT a refusal: a 403 sends
     // the borrower's operator to add a grant that already exists, so the one
@@ -993,7 +1098,10 @@ async fn a_session_request_cannot_name_an_account_at_all() {
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("403"), "an ungranted caller must 403: {err}");
+    assert!(
+        err.to_string().contains("403"),
+        "an ungranted caller must 403: {err}"
+    );
 }
 
 /// The same gate from the other direction: a caller that reached the listener
@@ -1008,7 +1116,9 @@ async fn a_session_no_proxy_vouched_for_is_refused() {
         vec![(
             "a".into(),
             CredentialKind::Claude,
-            CredentialPayload::Bearer { access_token: "tok-a".into() },
+            CredentialPayload::Bearer {
+                access_token: "tok-a".into(),
+            },
         )],
         Some(stub_grant_check()),
     )
@@ -1089,7 +1199,9 @@ async fn the_self_host_lender_serves_no_credential_upload() {
         vec![(
             "a".into(),
             CredentialKind::Claude,
-            CredentialPayload::Bearer { access_token: "tok-owner".into() },
+            CredentialPayload::Bearer {
+                access_token: "tok-owner".into(),
+            },
         )],
     )
     .unwrap();
@@ -1145,7 +1257,9 @@ async fn the_attested_gateway_still_accepts_a_sealed_upload() {
         &seal_pk,
         "test-sub",
         CredentialKind::Claude,
-        &CredentialPayload::Bearer { access_token: "enclave-tok".into() },
+        &CredentialPayload::Bearer {
+            access_token: "enclave-tok".into(),
+        },
     )
     .await
     .expect("the enclave path keeps its provisioning endpoint");
@@ -1155,11 +1269,18 @@ async fn the_attested_gateway_still_accepts_a_sealed_upload() {
 fn codex_refresh_seed_is_refused_at_build() {
     let result = server::build_seeded(
         self_host_cfg(None, String::new(), String::new()),
-        vec![("cx".into(), CredentialKind::Codex, CredentialPayload::Refresh {
-            refresh_token: "r".into(),
-            access_token: String::new(),
-            expires_at: 0,
-        })],
+        vec![(
+            "cx".into(),
+            CredentialKind::Codex,
+            CredentialPayload::Refresh {
+                refresh_token: "r".into(),
+                access_token: String::new(),
+                expires_at: 0,
+            },
+        )],
     );
-    assert!(result.is_err(), "codex refresh seeds must be rejected (bearer-only lane)");
+    assert!(
+        result.is_err(),
+        "codex refresh seeds must be rejected (bearer-only lane)"
+    );
 }

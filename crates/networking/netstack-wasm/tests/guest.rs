@@ -8,9 +8,9 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
-use netstack_machine::{Event, Machine, MachineConfig, MeshEpochEvent, NetstackMachine, StepError};
+use netstack_machine::{Event, Machine, MachineConfig, MeshEpochEvent, NetstackMachine};
 use netstack_scenarios::Backend;
-use netstack_wasm::{GuestError, NetstackGuest, STEP_FUEL};
+use netstack_wasm::{GuestError, NetstackGuest};
 use wireguard::{Endpoint, IdentitySigner, PortPolicy, Transport, X25519PublicKey};
 
 /// The canonical artifact, built by guest-builder from the machine crate and
@@ -27,7 +27,7 @@ fn guest_restore(
     snapshot: &[u8],
 ) -> Box<dyn NetstackMachine> {
     Box::new(
-        NetstackGuest::restore(COMPONENT, signer, config, snapshot, STEP_FUEL)
+        NetstackGuest::restore(COMPONENT, signer, config, snapshot)
             .expect("the guest restores the snapshot a scenario took"),
     )
 }
@@ -78,29 +78,6 @@ fn public_node(octet: u8) -> (PrivateKey, MachineConfig) {
     (signer, config)
 }
 
-/// A guest that exhausts its step budget is a FAULT — the executor's
-/// fail-over signal — never a protocol error, and never a silent no-op.
-#[test]
-fn an_exhausted_step_budget_is_a_fault() {
-    let (signer, config) = public_node(10);
-    let mut guest = NetstackGuest::with_fuel(COMPONENT, Box::new(signer), config, 1)
-        .expect("the configure call runs under the default budget");
-    let err = guest.step(Event::Nudge, 1_000).unwrap_err();
-    assert!(matches!(err, StepError::Fault(_)), "{err}");
-}
-
-/// After a fault the instance is not reused: a fresh guest over the same
-/// component steps normally.
-#[test]
-fn a_fresh_guest_steps_after_another_faulted() {
-    let (signer, config) = public_node(10);
-    let mut faulted =
-        NetstackGuest::with_fuel(COMPONENT, Box::new(signer.clone()), config.clone(), 1).unwrap();
-    assert!(faulted.step(Event::Nudge, 1_000).is_err());
-    let mut fresh = NetstackGuest::new(COMPONENT, Box::new(signer), config).unwrap();
-    assert!(fresh.step(Event::Nudge, 1_000).unwrap().is_empty());
-}
-
 /// A native machine mid-assembly: retargeted to a two-member epoch with
 /// its own record out and nothing back yet.
 fn assembling(seed: u8, peer: u8) -> (PrivateKey, MachineConfig, Machine) {
@@ -128,14 +105,9 @@ fn a_snapshot_crosses_the_boundary_both_ways() {
     let (signer, config, mut native) = assembling(10, 20);
     let taken = native.snapshot().unwrap();
 
-    let mut guest = NetstackGuest::restore(
-        COMPONENT,
-        Box::new(signer.clone()),
-        config.clone(),
-        &taken,
-        STEP_FUEL,
-    )
-    .unwrap();
+    let mut guest =
+        NetstackGuest::restore(COMPONENT, Box::new(signer.clone()), config.clone(), &taken)
+            .unwrap();
     assert_eq!(guest.snapshot().unwrap(), taken);
 
     let from_native = native.step(Event::Nudge, 3_000).unwrap();
@@ -157,8 +129,7 @@ fn a_foreign_snapshot_is_refused_by_the_guest() {
     } else {
         b'0'
     };
-    let err = match NetstackGuest::restore(COMPONENT, Box::new(signer), config, &foreign, STEP_FUEL)
-    {
+    let err = match NetstackGuest::restore(COMPONENT, Box::new(signer), config, &foreign) {
         Ok(_) => panic!("a foreign snapshot was accepted"),
         Err(err) => err,
     };

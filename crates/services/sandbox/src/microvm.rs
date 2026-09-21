@@ -20,12 +20,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::firecracker_api::{self, VmConfig};
@@ -40,14 +38,6 @@ use crate::guest_proto::{self, Frame};
 /// broken — a missing init, an unmountable workspace, a kernel panic — and the
 /// useful thing to do is fail with the VMM's console output rather than wait.
 const GUEST_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// a run's outstanding guest tunnel connections, past which an accepted
-/// socket is dropped rather than spliced.
-///
-/// Shared across every tunnel a run has, not per-port: the guest decides how
-/// many connections to hold and nothing on the guest side costs it anything
-/// to hold one open, so the ceiling has to be the host's. See #1873.
-const MAX_TUNNEL_CONNECTIONS: usize = 64;
 
 /// a spliced connection with no bytes moved in EITHER direction for this
 /// long is closed. The deadline is for the connection as a whole, not each
@@ -66,6 +56,9 @@ pub struct MicroVmIo {
     /// the guest's own exit frame. Distinct from the VMM process's status,
     /// which only says whether the hypervisor exited cleanly.
     pub exit: tokio::sync::oneshot::Receiver<i32>,
+    /// host-monotonic instant when the guest reported its provider child fork
+    /// immediately before exec.
+    pub spawn: tokio::sync::oneshot::Receiver<std::time::Instant>,
     pub pump: tokio::task::JoinHandle<()>,
     /// every host→guest frame goes out through here, which is why the resize
     /// lane exists at all: ONE task owns the socket's write half (it must, see
@@ -236,8 +229,11 @@ impl MicroVm {
                 .map_err(|e| format!("restrict {} permissions: {e}", cfg.manifest.display()))?;
         }
         crate::workspace_image::build_assets(assets, &cfg.assets, &run_dir.join("assets"))?;
-        let size = crate::workspace_image::sized_for(workdir)?;
-        crate::workspace_image::build(workdir, &cfg.workspace, size)?;
+        crate::workspace_image::build(
+            workdir,
+            &cfg.workspace,
+            crate::workspace_image::WORKSPACE_IMAGE_BYTES,
+        )?;
 
         // 2. listen BEFORE the VMM starts (see the module docs)
         //
@@ -262,7 +258,7 @@ impl MicroVm {
         // must declare each guest-outbound port to Virtualization.framework.
         let mut listen_ports = vec![guest_proto::VSOCK_PORT];
         let mut tunnels = Vec::with_capacity(manifest.tunnel_ports.len());
-        let tunnel_run = Arc::new(TunnelRun::new(MAX_TUNNEL_CONNECTIONS));
+        let tunnel_run = Arc::new(TunnelRun::new());
         for (index, port) in manifest.tunnel_ports.iter().enumerate() {
             let vsock_port = guest_proto::TUNNEL_PORT_BASE + index as u32;
             let path = vsock_port_path(&cfg.vsock_uds, vsock_port);
@@ -319,7 +315,7 @@ impl MicroVm {
             slot = %slot_of(run_dir),
             vcpus = cfg.vcpus,
             mem_mib = cfg.mem_mib,
-            workspace_bytes = size,
+            workspace_bytes = crate::workspace_image::WORKSPACE_IMAGE_BYTES,
             assets = assets.len(),
             tunnels = manifest.tunnel_ports.len(),
             "VMM spawned; waiting for the guest"
@@ -480,16 +476,12 @@ async fn serve_tunnel(listener: UnixListener, service_port: u16, run: Arc<Tunnel
         let Ok((guest, _)) = listener.accept().await else {
             return;
         };
-        let Ok(permit) = Arc::clone(&run.permits).try_acquire_owned() else {
-            run.refuse();
-            continue; // `guest` drops here, closing the socket we just accepted.
-        };
         let mut splices = run.splices.lock().unwrap();
         // opportunistic reap: a long-lived run's tunnel sees far more
-        // connections than its cap, and nothing else ever drains a finished
-        // task out of the set.
+        // connections than it holds at once, and nothing else ever drains a
+        // finished task out of the set.
         while splices.try_join_next().is_some() {}
-        splices.spawn(splice(guest, service_port, permit));
+        splices.spawn(splice(guest, service_port));
     }
 }
 
@@ -498,7 +490,7 @@ async fn serve_tunnel(listener: UnixListener, service_port: u16, run: Arc<Tunnel
 /// deadline decides the CONNECTION has been idle — a direction going quiet on
 /// its own (a request whose body ended while its response keeps streaming)
 /// never ends the splice by itself.
-async fn splice(guest: UnixStream, service_port: u16, _permit: tokio::sync::OwnedSemaphorePermit) {
+async fn splice(guest: UnixStream, service_port: u16) {
     let service = match TcpStream::connect(("127.0.0.1", service_port)).await {
         Ok(service) => service,
         // The guest asked for the one address this tunnel can dial and
@@ -595,36 +587,15 @@ async fn idle_watchdog(activity: &Activity, idle: std::time::Duration) {
 
 /// one run's guest-tunnel bookkeeping, shared across every tunnel the run has
 /// open: the guest picks how many connections to hold, not which port it
-/// holds them on, so the cap and the splice tasks it spends are per RUN.
+/// holds them on, so the splice tasks it spends are per RUN.
 struct TunnelRun {
-    permits: Arc<Semaphore>,
-    refused: AtomicU64,
     splices: Mutex<JoinSet<()>>,
 }
 
 impl TunnelRun {
-    fn new(max_connections: usize) -> Self {
+    fn new() -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(max_connections)),
-            refused: AtomicU64::new(0),
             splices: Mutex::new(JoinSet::new()),
-        }
-    }
-
-    /// record one more refusal, warning on the first and then every Nth: an
-    /// unconditional `warn!` here is a guest-controlled log bomb, and the
-    /// `attempts` count is itself the diagnosis.
-    fn refuse(&self) {
-        const LOG_EVERY: u64 = 100;
-        let attempts = self.refused.fetch_add(1, Ordering::Relaxed) + 1;
-        if attempts == 1 || attempts.is_multiple_of(LOG_EVERY) {
-            tracing::warn!(
-                target: "ducktape::sandbox",
-                reason = "tunnel_connection_refused",
-                attempts,
-                max_connections = MAX_TUNNEL_CONNECTIONS,
-                "a guest tunnel connection was refused; the run's connection cap is full"
-            );
         }
     }
 
@@ -795,16 +766,20 @@ fn spawn_pump(stream: UnixStream) -> MicroVmIo {
     let (out_task, stdout_host) = tokio::io::duplex(64 * 1024);
     let (err_task, stderr_host) = tokio::io::duplex(64 * 1024);
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    let (spawn_tx, spawn_rx) = tokio::sync::oneshot::channel();
     let (input_tx, input_rx) = tokio::sync::mpsc::channel(INPUT_QUEUE);
 
     tokio::spawn(frame_stdin(stdin_task, input_tx.clone()));
-    let pump = tokio::spawn(pump_frames(stream, input_rx, out_task, err_task, exit_tx));
+    let pump = tokio::spawn(pump_frames(
+        stream, input_rx, out_task, err_task, exit_tx, spawn_tx,
+    ));
 
     MicroVmIo {
         stdin: stdin_host,
         stdout: stdout_host,
         stderr: stderr_host,
         exit: exit_rx,
+        spawn: spawn_rx,
         pump,
         input: input_tx,
     }
@@ -838,6 +813,7 @@ async fn pump_frames(
     mut stdout: tokio::io::DuplexStream,
     mut stderr: tokio::io::DuplexStream,
     exit: tokio::sync::oneshot::Sender<i32>,
+    spawn: tokio::sync::oneshot::Sender<std::time::Instant>,
 ) {
     let (mut read_half, mut write_half) = stream.into_split();
 
@@ -878,6 +854,7 @@ async fn pump_frames(
     let mut pending: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut exit = Some(exit);
+    let mut spawn = Some(spawn);
     'outbound: loop {
         let n = match read_half.read(&mut buf).await {
             Ok(0) | Err(_) => break,
@@ -922,6 +899,11 @@ async fn pump_frames(
                         let _ = tx.send(code);
                     }
                     break 'outbound;
+                }
+                Frame::Spawn => {
+                    if let Some(tx) = spawn.take() {
+                        let _ = tx.send(std::time::Instant::now());
+                    }
                 }
                 // the guest never sends these; a stray one is not worth failing
                 // a finished run over.
@@ -1072,7 +1054,10 @@ mod tests {
         let (out_task, _stdout) = tokio::io::duplex(1024);
         let (err_task, _stderr) = tokio::io::duplex(1024);
         let (exit_tx, _exit_rx) = tokio::sync::oneshot::channel();
-        let pump = tokio::spawn(pump_frames(host, input_rx, out_task, err_task, exit_tx));
+        let (spawn_tx, _spawn_rx) = tokio::sync::oneshot::channel();
+        let pump = tokio::spawn(pump_frames(
+            host, input_rx, out_task, err_task, exit_tx, spawn_tx,
+        ));
 
         // a header claiming more than MAX_FRAME_BYTES: refused by `decode`
         // before a byte of payload is read.
@@ -1095,17 +1080,27 @@ mod tests {
         let (out_task, stdout) = tokio::io::duplex(1024);
         let (err_task, stderr) = tokio::io::duplex(1024);
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        let (spawn_tx, spawn_rx) = tokio::sync::oneshot::channel();
         drop(stdout);
         drop(stderr);
-        let pump = tokio::spawn(pump_frames(host, input_rx, out_task, err_task, exit_tx));
+        let pump = tokio::spawn(pump_frames(
+            host, input_rx, out_task, err_task, exit_tx, spawn_tx,
+        ));
         for frame in [
+            Frame::Spawn,
             Frame::Stdout(b"after result".to_vec()),
             Frame::Stderr(b"cleanup".to_vec()),
             Frame::Exit(0),
         ] {
             guest.write_all(&guest_proto::encode(&frame)).await.unwrap();
         }
-        assert_eq!(exit_rx.await.expect("guest exit survives closed readers"), 0);
+        spawn_rx
+            .await
+            .expect("guest spawn marker survives closed readers");
+        assert_eq!(
+            exit_rx.await.expect("guest exit survives closed readers"),
+            0
+        );
         pump.await.unwrap();
         input_tx.closed().await;
     }
@@ -1209,44 +1204,6 @@ mod tests {
         assert_eq!(&buf, b"x");
     }
 
-    /// #1873: a guest's tunnel connections are capped per run. The
-    /// (cap+1)th concurrent connection must be refused — closed with nothing
-    /// ever spliced to it — while the connections already under the cap keep
-    /// working.
-    #[tokio::test]
-    async fn a_connection_past_the_cap_is_refused_while_earlier_ones_stay_open() {
-        let service_port = spawn_echo_service().await;
-        let path = unique_socket_path("cap");
-        let listener = UnixListener::bind(&path).expect("bind tunnel socket");
-        let run = Arc::new(TunnelRun::new(2));
-        let accept = tokio::spawn(serve_tunnel(listener, service_port, Arc::clone(&run)));
-
-        let mut first = UnixStream::connect(&path).await.expect("connect 1");
-        assert_spliced(&mut first).await;
-        let mut second = UnixStream::connect(&path).await.expect("connect 2");
-        assert_spliced(&mut second).await;
-
-        // the cap is 2; a third concurrent connection must be refused.
-        let mut third = UnixStream::connect(&path).await.expect("connect 3");
-        let mut buf = [0u8; 1];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(5), third.read(&mut buf))
-            .await
-            .expect("the refused connection closes before the test timeout")
-            .expect("a closed socket reads Ok(0), not an error");
-        assert_eq!(n, 0, "the connection past the cap was not closed");
-        assert_eq!(
-            run.refused.load(Ordering::Relaxed),
-            1,
-            "the refusal was not counted"
-        );
-
-        // the connections under the cap were never touched by the refusal.
-        assert_spliced(&mut first).await;
-        assert_spliced(&mut second).await;
-
-        accept.abort();
-    }
-
     /// #1873: tearing a run down (what [`MicroVm`]'s own `Drop` calls) closes
     /// every splice it still has open, not just its accept loops.
     #[tokio::test]
@@ -1254,7 +1211,7 @@ mod tests {
         let service_port = spawn_echo_service().await;
         let path = unique_socket_path("shutdown");
         let listener = UnixListener::bind(&path).expect("bind tunnel socket");
-        let run = Arc::new(TunnelRun::new(4));
+        let run = Arc::new(TunnelRun::new());
         let accept = tokio::spawn(serve_tunnel(listener, service_port, Arc::clone(&run)));
 
         let mut a = UnixStream::connect(&path).await.expect("connect a");
@@ -1297,8 +1254,12 @@ mod tests {
 
         let path = unique_socket_path("silent-request");
         let tunnel_listener = UnixListener::bind(&path).expect("bind tunnel socket");
-        let run = Arc::new(TunnelRun::new(1));
-        let accept = tokio::spawn(serve_tunnel(tunnel_listener, service_port, Arc::clone(&run)));
+        let run = Arc::new(TunnelRun::new());
+        let accept = tokio::spawn(serve_tunnel(
+            tunnel_listener,
+            service_port,
+            Arc::clone(&run),
+        ));
 
         let mut guest = UnixStream::connect(&path).await.expect("connect guest");
         // the whole "request": sent once, then the guest→service direction
@@ -1358,7 +1319,7 @@ mod tests {
         let service_port = spawn_echo_service().await;
         let path = unique_socket_path("both-silent");
         let listener = UnixListener::bind(&path).expect("bind tunnel socket");
-        let run = Arc::new(TunnelRun::new(1));
+        let run = Arc::new(TunnelRun::new());
         let accept = tokio::spawn(serve_tunnel(listener, service_port, Arc::clone(&run)));
 
         let mut guest = UnixStream::connect(&path).await.expect("connect guest");

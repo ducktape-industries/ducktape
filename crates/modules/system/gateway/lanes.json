@@ -1,3 +1,0 @@
-[
-  { "id": 4, "name": "gateway", "stream": { "pacing": "shared", "accept_backlog": 16 } }
-]

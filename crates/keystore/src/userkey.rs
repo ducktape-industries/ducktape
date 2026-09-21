@@ -313,22 +313,8 @@ pub fn open_user_key(line: &str, password: &str) -> Result<ed25519::PrivateKey, 
     Ok(key)
 }
 
-/// The largest a key file is allowed to be before it is refused unread. One
-/// encrypted line is ~180 bytes; the cap exists because this path is handed
-/// paths from a pointer file and a `--key` flag, and slurping an arbitrary
-/// file into memory is not a thing a key reader should be able to be asked to
-/// do.
-pub const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
-
-/// `path`'s trimmed contents, refusing an oversized or empty file.
+/// `path`'s trimmed contents, refusing an empty file.
 fn read_key_line(path: &Path) -> Result<String, String> {
-    let oversized = std::fs::metadata(path)
-        .map_err(|e| format!("read {path:?}: {e}"))?
-        .len()
-        > MAX_KEY_FILE_BYTES;
-    if oversized {
-        return Err(format!("{path:?} is too large to be a key file"));
-    }
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
     let line = text.trim();
     if line.is_empty() {

@@ -8,10 +8,7 @@ use commonware_cryptography::ed25519;
 use lru::LruCache;
 
 use crate::AuthRequest;
-use crate::advert::{
-    Admission, AdmitEvent, AdvertBook, AdvertOutcome, MAX_ADVERTS, MAX_ADVERTS_PER_SOURCE_IP,
-    SharedAdverts,
-};
+use crate::advert::{AdvertBook, AdvertOutcome, SharedAdverts};
 use crate::auth::{AuthPolicy, CookieKey, DEFAULT_FRESHNESS_WINDOW_SECS, verify_request_using};
 use crate::{Latch, Msg, NodeKey, short_key};
 
@@ -32,36 +29,6 @@ fn resolve_auth_key(cache: &mut AuthKeyCache, key: NodeKey) -> Option<ed25519::P
         .get_or_insert_with(|| LruCache::new(AUTH_KEY_CACHE_SIZE))
         .put(key, parsed.clone());
     Some(parsed)
-}
-
-/// Emit the log line for an [`AdmitEvent`] latched by `AdvertBook::observe`
-/// or `readvertise`. Callers MUST call this only after dropping the
-/// `SharedAdverts` lock (`adverts.take_admit_event()` runs under it, but the
-/// actual tracing write — I/O — never should).
-fn log_admit_event(event: Option<AdmitEvent>) {
-    match event {
-        Some(AdmitEvent::SourceCapped {
-            source,
-            occurrences,
-        }) => tracing::warn!(
-            target: "ducktape::reachability",
-            event = "advert_refused",
-            reason = "advert_source_cap",
-            source = %source,
-            cap = MAX_ADVERTS_PER_SOURCE_IP,
-            occurrences,
-            "source IP at its per-source advert cap — new key refused"
-        ),
-        Some(AdmitEvent::BookFull { occurrences }) => tracing::warn!(
-            target: "ducktape::reachability",
-            event = "advert_evicted",
-            reason = "book_full",
-            capacity = MAX_ADVERTS,
-            occurrences,
-            "advert book at capacity — the newest registration lost its slot"
-        ),
-        None => {}
-    }
 }
 
 pub type CoordinatorReply = (SocketAddr, Msg);
@@ -356,10 +323,10 @@ impl Coordinator {
                 }
                 // The registered reflexive address IS the observed source: the
                 // coordinator never trusts a self-reported address.
-                let Admission { outcome, event } = self.adverts.lock().observe(key, from, now);
-                // The book is done with; a log write (stderr, and a node's
-                // LogRing) must not happen under its lock.
-                log_admit_event(event);
+                // The MutexGuard `.lock()` produces is a temporary scoped to
+                // this statement: the log write below (stderr, and a node's
+                // LogRing) never happens under the book's lock.
+                let outcome = self.adverts.lock().observe(key, from, now);
                 match outcome {
                     AdvertOutcome::Superseded => tracing::debug!(
                         target: "ducktape::reachability",
@@ -368,8 +335,6 @@ impl Coordinator {
                         reflexive = %from,
                         "registered a member at its observed source"
                     ),
-                    // the per-source cap already logged above via `admit_event`.
-                    AdvertOutcome::Refused => {}
                     // a live mapping already ahead of this bare Register (a
                     // superseding nonce, or a different source): nothing
                     // changed, so nothing was "registered".
@@ -380,11 +345,7 @@ impl Coordinator {
                 }
                 CoordinatorReplies::new()
             }
-            Msg::Readvertise {
-                key,
-                nonce,
-                cookie,
-            } => {
+            Msg::Readvertise { key, nonce, cookie } => {
                 // The wire-level rebind path AND the keepalive: a node re-runs
                 // STUN and republishes its reflexive (the observed `from`, never
                 // a self-reported address) under a strictly-higher `nonce`. The
@@ -399,11 +360,7 @@ impl Coordinator {
                 if !self.admit_write(key, from, now, &cookie) {
                     return CoordinatorReplies::new();
                 }
-                let Admission { outcome, event } =
-                    self.adverts.lock().readvertise(key, from, nonce, now);
-                // The book is done with; a log write must not happen under
-                // its lock.
-                log_admit_event(event);
+                let outcome = self.adverts.lock().readvertise(key, from, nonce, now);
                 match outcome {
                     // the 25 s keepalive of every member: per-frame traffic.
                     AdvertOutcome::Superseded => tracing::trace!(
@@ -434,8 +391,6 @@ impl Coordinator {
                         nonce,
                         "re-advertisement source differs from the live mapping"
                     ),
-                    // the per-source cap already logged above via `admit_event`.
-                    AdvertOutcome::Refused => {}
                     // `readvertise` never returns this — only `observe` does.
                     AdvertOutcome::NoOp => {}
                 }
@@ -546,12 +501,7 @@ impl Coordinator {
         nonce: u64,
         now: u64,
     ) -> AdvertOutcome {
-        // The MutexGuard `.lock()` produces is a temporary scoped to this
-        // statement — it drops before `log_admit_event` runs on the next
-        // line, so the log write still lands outside the book's lock.
-        let Admission { outcome, event } = self.adverts.lock().readvertise(key, src, nonce, now);
-        log_admit_event(event);
-        outcome
+        self.adverts.lock().readvertise(key, src, nonce, now)
     }
 }
 
@@ -648,25 +598,23 @@ mod tests {
         let attacker_src = addr(9, 6666);
 
         // Boot: A registers from its old mapping (implicit nonce 0).
-        assert!(
-            c.handle_verified(a, old, reg(&c, a, old, 0))
-                .is_empty()
-        );
+        assert!(c.handle_verified(a, old, reg(&c, a, old, 0)).is_empty());
         // B registers from its own source too — a Lookup is only answered to a
         // caller the coordinator has already bound to that source.
-        assert!(
-            c.handle_verified(b, b_src, reg(&c, b, b_src, 0))
-                .is_empty()
-        );
+        assert!(c.handle_verified(b, b_src, reg(&c, b, b_src, 0)).is_empty());
 
         // A keepalives from the SAME mapping over the wire under nonce 1.
         assert!(
-            c.handle_verified(a, old, Msg::Readvertise {
+            c.handle_verified(
+                a,
+                old,
+                Msg::Readvertise {
                     key: a,
                     nonce: 1,
                     cookie: [0u8; 32],
-                })
-                .is_empty()
+                }
+            )
+            .is_empty()
         );
         let out = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(
@@ -683,12 +631,16 @@ mod tests {
         // A DIFFERENT source replaying a captured, still-fresh higher-nonce
         // Readvertise cannot hijack the live mapping over the wire either.
         assert!(
-            c.handle_verified(a, attacker_src, Msg::Readvertise {
+            c.handle_verified(
+                a,
+                attacker_src,
+                Msg::Readvertise {
                     key: a,
                     nonce: 2,
                     cookie: [0u8; 32],
-                })
-                .is_empty()
+                }
+            )
+            .is_empty()
         );
         let out_attacker = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(
@@ -704,10 +656,7 @@ mod tests {
 
         // A duplicated/reordered/replayed Register from the OLD mapping arrives
         // late. It must NOT roll the fresh {old, nonce=1} mapping back to nonce 0.
-        assert!(
-            c.handle_verified(a, old, reg(&c, a, old, 0))
-                .is_empty()
-        );
+        assert!(c.handle_verified(a, old, reg(&c, a, old, 0)).is_empty());
         let out2 = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(
             out2.contains(&(
@@ -722,12 +671,16 @@ mod tests {
 
         // A wire Readvertise at an equal-or-lower nonce is likewise stale.
         assert!(
-            c.handle_verified(a, old, Msg::Readvertise {
+            c.handle_verified(
+                a,
+                old,
+                Msg::Readvertise {
                     key: a,
                     nonce: 1,
                     cookie: [0u8; 32],
-                })
-                .is_empty()
+                }
+            )
+            .is_empty()
         );
         let out3 = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(out3.contains(&(
@@ -746,7 +699,16 @@ mod tests {
         let caller = NodeKey([1u8; 32]);
         let out = c.handle_verified(caller, src, Msg::BindRequest { from: caller });
         let cookie = c.cookie_key.mint(src, 0);
-        assert_eq!(out, vec![(src, Msg::BindResponse { reflexive: src, cookie })]);
+        assert_eq!(
+            out,
+            vec![(
+                src,
+                Msg::BindResponse {
+                    reflexive: src,
+                    cookie
+                }
+            )]
+        );
     }
 
     #[test]
@@ -756,14 +718,8 @@ mod tests {
         let b_src = addr(2, 2222);
         let a = NodeKey([0xaa; 32]);
         let b = NodeKey([0xbb; 32]);
-        assert!(
-            c.handle_verified(a, a_src, reg(&c, a, a_src, 0))
-                .is_empty()
-        );
-        assert!(
-            c.handle_verified(b, b_src, reg(&c, b, b_src, 0))
-                .is_empty()
-        );
+        assert!(c.handle_verified(a, a_src, reg(&c, a, a_src, 0)).is_empty());
+        assert!(c.handle_verified(b, b_src, reg(&c, b, b_src, 0)).is_empty());
 
         // A looks up B: coordinator replies to A with B's reflexive AND tells
         // both sides to punch simultaneously.
@@ -798,10 +754,7 @@ mod tests {
         let a = NodeKey([0xaa; 32]);
         let missing = NodeKey([0xcc; 32]);
         // The caller must be bound to `a_src` before any Lookup is answered.
-        assert!(
-            c.handle_verified(a, a_src, reg(&c, a, a_src, 0))
-                .is_empty()
-        );
+        assert!(c.handle_verified(a, a_src, reg(&c, a, a_src, 0)).is_empty());
         let out = c.handle_verified(a, a_src, Msg::Lookup { key: missing });
         assert_eq!(
             out,
@@ -834,7 +787,10 @@ mod tests {
         let src = addr(1, 1111);
 
         // Authorized: joiner with a valid genesis cap registers -> mapping created.
-        let reg = Msg::Register { key: subject, cookie: c.cookie_key.mint(src, now) };
+        let reg = Msg::Register {
+            key: subject,
+            cookie: c.cookie_key.mint(src, now),
+        };
         let cap = mint_coord_cap(&g, subject, now + 3600);
         let auth = sign_authenticator(&node, &reg.encode(), now, Some(cap));
         let out = c.handle_auth(
@@ -879,7 +835,10 @@ mod tests {
         ob.copy_from_slice(outsider.public_key().as_ref());
         let osub = NodeKey(ob);
         let before = c.rejects();
-        let oreg = Msg::Register { key: osub, cookie: c.cookie_key.mint(addr(2, 2222), now) };
+        let oreg = Msg::Register {
+            key: osub,
+            cookie: c.cookie_key.mint(addr(2, 2222), now),
+        };
         let oauth = sign_authenticator(&outsider, &oreg.encode(), now, None);
         let out = c.handle_auth(
             addr(2, 2222),
@@ -996,7 +955,10 @@ mod tests {
         let b_src = addr(2, 2222);
 
         // Both register (self-ops, caller == inner key).
-        let a_reg = Msg::Register { key: a_key, cookie: c.cookie_key.mint(a_src, now) };
+        let a_reg = Msg::Register {
+            key: a_key,
+            cookie: c.cookie_key.mint(a_src, now),
+        };
         let a_auth = sign_authenticator(
             &a,
             &a_reg.encode(),
@@ -1015,7 +977,10 @@ mod tests {
             )
             .is_empty()
         );
-        let b_reg = Msg::Register { key: b_key, cookie: c.cookie_key.mint(b_src, now) };
+        let b_reg = Msg::Register {
+            key: b_key,
+            cookie: c.cookie_key.mint(b_src, now),
+        };
         let b_auth = sign_authenticator(
             &b,
             &b_reg.encode(),
@@ -1111,7 +1076,10 @@ mod tests {
         // Attacker (validly admitted for its OWN key) tries to Register the
         // victim's key. The PoP verifies against the caller, but the inner key
         // is the victim's — a self-op mismatch, rejected before dispatch.
-        let reg = Msg::Register { key: victim_key, cookie: c.cookie_key.mint(src, now) };
+        let reg = Msg::Register {
+            key: victim_key,
+            cookie: c.cookie_key.mint(src, now),
+        };
         let auth = sign_authenticator(
             &attacker,
             &reg.encode(),
@@ -1137,7 +1105,10 @@ mod tests {
         // The attacker legitimately registers its OWN key from `src` — needed
         // only so the Lookup below is answered at all (a Lookup is refused
         // outright from a caller the book has not bound to its source).
-        let self_reg = Msg::Register { key: attacker_key, cookie: c.cookie_key.mint(src, now) };
+        let self_reg = Msg::Register {
+            key: attacker_key,
+            cookie: c.cookie_key.mint(src, now),
+        };
         let self_auth = sign_authenticator(
             &attacker,
             &self_reg.encode(),
@@ -1247,20 +1218,30 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            c.handle_verified_at(a, a_src, Msg::Readvertise {
+            c.handle_verified_at(
+                a,
+                a_src,
+                Msg::Readvertise {
                     key: a,
                     nonce: 1,
                     cookie: [0u8; 32],
-                }, 1_100)
-                .is_empty()
+                },
+                1_100
+            )
+            .is_empty()
         );
         assert!(
-            c.handle_verified_at(a, a_src, Msg::Readvertise {
+            c.handle_verified_at(
+                a,
+                a_src,
+                Msg::Readvertise {
                     key: a,
                     nonce: 2,
                     cookie: [0u8; 32],
-                }, 1_200)
-                .is_empty()
+                },
+                1_200
+            )
+            .is_empty()
         );
         // B registers right before its Lookup — a Lookup is only answered to
         // a caller the book has bound to its source.

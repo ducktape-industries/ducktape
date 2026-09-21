@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 use tokio::sync::{broadcast, mpsc};
 
+mod chat_contract;
+use chat_contract as chat;
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -696,7 +699,9 @@ mod tests {
         let client = dial.await.unwrap().expect("client connects");
 
         assert!(
-            accepted.nodelay().expect("read the accepted socket's option"),
+            accepted
+                .nodelay()
+                .expect("read the accepted socket's option"),
             "an accepted call socket must not batch frames behind Nagle"
         );
         drop(client);
@@ -1231,7 +1236,9 @@ mod tests {
         const FRAMES: u64 = 2_000;
         const FRAME_BYTES: usize = 64 * 1024;
         println!("== fanout with every peer stalled ==");
-        println!("peers\tframes\trelay_p50_ns\trelay_p99_ns\tdistinct_mib\tsum_of_queues_mib\trss_delta_kib");
+        println!(
+            "peers\tframes\trelay_p50_ns\trelay_p99_ns\tdistinct_mib\tsum_of_queues_mib\trss_delta_kib"
+        );
         for peers in [2usize, 4, 8, 16] {
             let base = memory().0;
             let mut hub = Hub::default();
@@ -1258,13 +1265,15 @@ mod tests {
             }
             let rss = memory().0;
             samples.sort_unstable();
-            let percentile = |percent: usize| samples[(samples.len() * percent / 100).min(samples.len() - 1)];
+            let percentile =
+                |percent: usize| samples[(samples.len() * percent / 100).min(samples.len() - 1)];
             let queued: u64 = queues.iter_mut().map(queued_bytes).sum();
             println!(
                 "{peers}\t{FRAMES}\t{}\t{}\t{:.1}\t{:.1}\t{}",
                 percentile(50),
                 percentile(99),
-                (FRAMES as f64 * (FRAME_BYTES + media_service::call_wire::WS_VIDEO_PEER_HEADER) as f64)
+                (FRAMES as f64
+                    * (FRAME_BYTES + media_service::call_wire::WS_VIDEO_PEER_HEADER) as f64)
                     / (1024.0 * 1024.0),
                 queued as f64 / (1024.0 * 1024.0),
                 rss.saturating_sub(base)
@@ -1783,7 +1792,8 @@ mod tests {
                 .map(|item| item.sent as f64)
                 .sum::<f64>()
                 / samples.max(1.0);
-            let mean_delay = delays.iter().map(|delay| *delay as f64).sum::<f64>() / samples.max(1.0);
+            let mean_delay =
+                delays.iter().map(|delay| *delay as f64).sum::<f64>() / samples.max(1.0);
             let mut covariance = 0.0;
             let mut variance = 0.0;
             for (item, delay) in self.deliveries.iter().zip(&delays) {
@@ -1999,8 +2009,8 @@ mod tests {
         let mut failure = None;
         let deadline = clock + warmup + trial;
         while std::time::Instant::now() < deadline {
-            let due = clock
-                + std::time::Duration::from_nanos(FRAME_PERIOD_NS * u64::from(audio_seq));
+            let due =
+                clock + std::time::Duration::from_nanos(FRAME_PERIOD_NS * u64::from(audio_seq));
             tokio::time::sleep_until(due.into()).await;
             let counted = clock.elapsed() >= warmup;
             let now = clock.elapsed().as_nanos() as u64;
@@ -2019,9 +2029,11 @@ mod tests {
             let video_due = video_bytes > 0 && audio_seq.is_multiple_of(5);
             if video_due {
                 if let Err(error) = publisher
-                    .send(ClientMessage::Binary(
-                        stamped_video(video_seq, now, video_bytes),
-                    ))
+                    .send(ClientMessage::Binary(stamped_video(
+                        video_seq,
+                        now,
+                        video_bytes,
+                    )))
                     .await
                 {
                     failure = Some(error.to_string());

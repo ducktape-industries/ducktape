@@ -9,16 +9,16 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use axum::Json;
+pub use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, OriginalUri, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
-use axum::Json;
-pub use axum::Router;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand_core::OsRng;
 
@@ -66,7 +66,10 @@ pub struct GatewayConfig {
     pub oauth_token_url: String,
     pub oauth_client_id: String,
     pub session_ttl_secs: u64,
-    pub max_requests: u32,
+    /// Where the gateway reads the time: token issue and expiry, and OAuth
+    /// refresh. A test hands in a clock it advances; everything else runs on
+    /// the system clock.
+    pub clock: Clock,
     /// The signing toolchain, when this gateway serves `POST /sign/macos-bundle`.
     /// `None` mounts no signing route at all (see [`assemble`]): the model
     /// lenders — the self-host daemon, the node embed, tests — hold no
@@ -80,7 +83,6 @@ struct Config {
     oauth_token_url: String,
     oauth_client_id: String,
     session_ttl_secs: u64,
-    max_requests: u32,
 }
 
 struct Oauth {
@@ -172,13 +174,7 @@ struct AppState {
     /// The named credential store, keyed by credential name (== session `sub`).
     /// Seeded at build and/or filled by sealed `/credential` uploads.
     creds: Mutex<HashMap<String, Arc<CredEntry>>>,
-    /// Remaining request budget per session `sub` (credential NAME), refilled by
-    /// every `/session` open. Deliberately named for what it is: a per-credential
-    /// throttle shared by all of that credential's borrowers, NOT a per-session
-    /// cap and NOT an authorization boundary — reopening a session refills it.
-    /// The boundary is [`AppState::grant_check`], which decides who may open a
-    /// session at all.
-    budgets: Mutex<HashMap<String, u32>>,
+    clock: Clock,
     /// Sealed-request nonces already served — replay dedupe, keyed by
     /// `(sub, eph)`: the credential name PLUS the session's own ephemeral pk,
     /// not the name alone. A bearer minted for one session stays live for the
@@ -186,10 +182,9 @@ struct AppState {
     /// name sees, so the set a bearer's replays are checked against must only
     /// ever be cleared by that SAME session's own token expiring — never by a
     /// later, unrelated `/session` open (which mints a fresh `eph` and so gets
-    /// its own, empty entry here). An entry lands beside a spent request (the
-    /// nonce is recorded after the AEAD opened the blob and after the budget
-    /// spend), so each session's entry holds at most `max_requests` nonces;
-    /// recording an unauthenticated 12-byte prefix would let anyone holding a
+    /// its own, empty entry here). An entry lands beside an admitted request
+    /// (the nonce is recorded after the AEAD opened the blob), so each
+    /// session's entry holds one nonce per authentic request; recording an unauthenticated 12-byte prefix would let anyone holding a
     /// bearer grow this map for free, forever.
     /// ponytail: entries for a forgotten session are pruned only on
     /// credential removal, not on token expiry, so a credential lent to many
@@ -210,7 +205,30 @@ struct AppState {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// The gateway's source of time, in seconds since the epoch.
+#[derive(Clone)]
+pub struct Clock(Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl Clock {
+    /// The system clock.
+    pub fn system() -> Self {
+        Self(Arc::new(now_secs))
+    }
+
+    /// A clock the caller drives.
+    pub fn new(now: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    pub fn now(&self) -> u64 {
+        (self.0)()
+    }
 }
 
 /// Quote generation, injected. Production uses configfs-tsm; the testkit
@@ -409,7 +427,10 @@ fn build_with_quoter_gated(
     seeds: Vec<(String, CredentialKind, CredentialPayload)>,
     grant_check: Option<GrantCheck>,
 ) -> Result<(Router, String)> {
-    let seal_kp = cfg.seal_keypair.take().unwrap_or_else(SealKeypair::generate);
+    let seal_kp = cfg
+        .seal_keypair
+        .take()
+        .unwrap_or_else(SealKeypair::generate);
     let sess_sk = SigningKey::generate(&mut OsRng);
     let sess_pk = sess_sk.verifying_key();
 
@@ -437,7 +458,10 @@ fn build_self_host(
     grant_check: Option<GrantCheck>,
     reload: Option<ReloadCredential>,
 ) -> Result<(Router, String)> {
-    let seal_kp = cfg.seal_keypair.take().unwrap_or_else(SealKeypair::generate);
+    let seal_kp = cfg
+        .seal_keypair
+        .take()
+        .unwrap_or_else(SealKeypair::generate);
     let sess_sk = SigningKey::generate(&mut OsRng);
     let sess_pk = sess_sk.verifying_key();
     assemble(Assembly {
@@ -502,10 +526,9 @@ fn assemble(assembly: Assembly) -> Result<(Router, String)> {
             oauth_token_url: cfg.oauth_token_url,
             oauth_client_id: cfg.oauth_client_id,
             session_ttl_secs: cfg.session_ttl_secs,
-            max_requests: cfg.max_requests,
         },
         creds: Mutex::new(creds),
-        budgets: Mutex::new(HashMap::new()),
+        clock: cfg.clock,
         seen_nonces: Mutex::new(HashMap::new()),
         grant_check,
         reload,
@@ -519,15 +542,10 @@ fn assemble(assembly: Assembly) -> Result<(Router, String)> {
         // /v1/messages/count_tokens, not just messages).
         //
         // axum's `Bytes` extractor (the `proxy` handler's `body` argument)
-        // applies a 2 MiB default limit unless overridden — every neighbour
-        // in this lane (the broker in front of it, the route policy in front
-        // of that) is sized for real model traffic, so this must match the
-        // broker's cap or a lent-credential run 413s on a body the broker and
-        // the route policy both already accepted.
-        .route(
-            "/v1/{*rest}",
-            any(proxy).layer(DefaultBodyLimit::max(crate::MAX_REQUEST_BYTES)),
-        );
+        // applies a 2 MiB default limit unless overridden; the only ceiling
+        // on this lane is the route policy's signed `max_request_bytes`, one
+        // hop out, so the gateway itself imposes none.
+        .route("/v1/{*rest}", any(proxy).layer(DefaultBodyLimit::disable()));
     // NOT mounted-then-guarded: a route that exists and refuses is one bad
     // refactor away from a route that exists and accepts. See
     // [`CredentialUploads`] for why only the attested build has one.
@@ -536,10 +554,8 @@ fn assemble(assembly: Assembly) -> Result<(Router, String)> {
         CredentialUploads::Refused => app,
     };
     // Same rule for the signing route: mounted only where the image holds
-    // the toolchain. Its body is read by the handler under its own cap
-    // (`sign::MAX_BUNDLE_BYTES`) so the over-size answer is a named refusal,
-    // not the extractor's 413 text; it is not under `/v1`, which is the
-    // model surface.
+    // the toolchain. Its body is read whole by the handler; it is not under
+    // `/v1`, which is the model surface.
     let serves_signing = state.sign.is_some();
     let app = if serves_signing {
         app.route("/sign/macos-bundle", post(sign_macos_bundle))
@@ -655,7 +671,10 @@ fn tsm_gen_quote(
     report_data: &[u8; attest::REPORT_DATA_LEN],
 ) -> Result<(attest::AttestMode, Vec<u8>)> {
     use std::fs;
-    let dir = format!("/sys/kernel/config/tsm/report/airlock-{}", std::process::id());
+    let dir = format!(
+        "/sys/kernel/config/tsm/report/airlock-{}",
+        std::process::id()
+    );
     fs::create_dir(&dir)
         .with_context(|| format!("create {dir} (are we inside a TDX/SEV-SNP guest?)"))?;
     let result = (|| -> Result<(attest::AttestMode, Vec<u8>)> {
@@ -691,7 +710,10 @@ fn provider_to_mode(provider: &str) -> Result<attest::AttestMode> {
 /// generating a quote (the `auto` mode).
 fn tsm_probe_provider() -> Result<attest::AttestMode> {
     use std::fs;
-    let dir = format!("/sys/kernel/config/tsm/report/airlock-probe-{}", std::process::id());
+    let dir = format!(
+        "/sys/kernel/config/tsm/report/airlock-probe-{}",
+        std::process::id()
+    );
     fs::create_dir(&dir)
         .with_context(|| format!("create {dir} (are we inside a TDX/SEV-SNP guest?)"))?;
     let provider = fs::read_to_string(format!("{dir}/provider"));
@@ -762,12 +784,14 @@ async fn credential(
         CredMaterial::AppleCodesign(_) => None,
     };
     if let Some(state) = probe {
-        refresh_now(&st.cfg, &st.http, state).await.map_err(|e| {
-            AppErr(
-                StatusCode::BAD_GATEWAY,
-                format!("initial refresh failed: {e}"),
-            )
-        })?;
+        refresh_now(&st.cfg, &st.http, &st.clock, state)
+            .await
+            .map_err(|e| {
+                AppErr(
+                    StatusCode::BAD_GATEWAY,
+                    format!("initial refresh failed: {e}"),
+                )
+            })?;
     }
     // asked again under the lock: two uploads of one name may both have passed
     // the check above while the probe ran.
@@ -888,14 +912,15 @@ fn adopt_credential(st: &AppState, name: &str, kind: CredentialKind, payload: Cr
 }
 
 /// Drop every trace of a credential the store no longer holds: the parsed entry
-/// (which carries the live access and refresh tokens), the budget its sessions
-/// spend, and their replay set. The next proxied request on an outstanding
+/// (which carries the live access and refresh tokens) and their replay set. The next proxied request on an outstanding
 /// session finds no credential and is refused, so `user cred remove` stops the
 /// spend when the operator runs it rather than when the last token expires.
 fn forget_credential(st: &AppState, name: &str) {
     st.creds.lock().unwrap().remove(name);
-    st.budgets.lock().unwrap().remove(name);
-    st.seen_nonces.lock().unwrap().retain(|(sub, _eph), _| sub != name);
+    st.seen_nonces
+        .lock()
+        .unwrap()
+        .retain(|(sub, _eph), _| sub != name);
 }
 
 async fn session(
@@ -920,10 +945,16 @@ async fn session(
     match session_gate(&st.grant_check, &headers, &req).await {
         SessionGate::Open => {}
         SessionGate::CallerUnverified => {
-            return Err(AppErr(StatusCode::FORBIDDEN, "caller_node_unverified".into()));
+            return Err(AppErr(
+                StatusCode::FORBIDDEN,
+                "caller_node_unverified".into(),
+            ));
         }
         SessionGate::NotGranted => {
-            return Err(AppErr(StatusCode::FORBIDDEN, "credential_not_granted".into()));
+            return Err(AppErr(
+                StatusCode::FORBIDDEN,
+                "credential_not_granted".into(),
+            ));
         }
         SessionGate::AuthorityUnavailable => {
             return Err(AppErr(
@@ -942,7 +973,7 @@ async fn session(
         .ok_or_else(|| AppErr(StatusCode::BAD_REQUEST, "bad client_eph_pk".into()))?;
     let keys = handshake::enclave_session_keys(&st.seal_kp, &eph);
 
-    let now = now_secs();
+    let now = st.clock.now();
     let claims = Claims {
         sub: req.sub.clone(),
         iat: now,
@@ -950,18 +981,17 @@ async fn session(
         eph: req.client_eph_pk_b64.clone(),
         seal: req.body_seal,
     };
-    // The budget is shared per credential NAME and refills on every open, by
-    // design (see [`AppState::budgets`]). The replay set is NOT shared: it is
-    // keyed by `(sub, eph)`, and `req.client_eph_pk_b64` is freshly random per
-    // open, so this call only ever touches a brand-new, empty entry of its
-    // own — it must never clear another session's entry, because that
-    // session's already-issued bearer stays valid (and replayable against
-    // whatever it already recorded) for the rest of its TTL regardless of
-    // what this call does.
-    st.budgets.lock().unwrap().insert(req.sub.clone(), st.cfg.max_requests);
+    // The replay set is keyed by `(sub, eph)`, and `req.client_eph_pk_b64` is
+    // freshly random per open, so this call only ever touches a brand-new,
+    // empty entry of its own — it must never clear another session's entry,
+    // because that session's already-issued bearer stays valid (and
+    // replayable against whatever it already recorded) for the rest of its
+    // TTL regardless of what this call does.
     let token = token::issue(&st.sess_sk, &claims);
     let sealed = handshake::seal_token(&keys.session, token.as_bytes());
-    Ok(Json(SessionResponse { sealed_token_b64: BASE64.encode(sealed) }))
+    Ok(Json(SessionResponse {
+        sealed_token_b64: BASE64.encode(sealed),
+    }))
 }
 
 async fn proxy(
@@ -982,8 +1012,7 @@ async fn proxy(
 /// enclave. The session must be a SEALED one on a signing credential; the
 /// body is the `.tar.zst` of the bundle, the reply the `.tar.zst` of the
 /// finished one, sealed under the response stream key exactly as a proxied
-/// model reply is. One request = one signature; the session's `max_requests`
-/// caps signatures per session. Refusals are `sign::Refusal` tokens: before
+/// model reply is. One request = one signature. Refusals are `sign::Refusal` tokens: before
 /// the pipeline starts (the session, its kind, the body's admission) they
 /// are the HTTP status and body; once it runs the head is already committed
 /// and a refusal is the sealed stream's `Final` carrying the token.
@@ -1007,7 +1036,10 @@ async fn sign_macos_bundle_inner(
     headers: &HeaderMap,
     body: Body,
 ) -> Result<Response, AppErr> {
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(uri.path());
     let Some(tools) = st.sign.clone() else {
         // the route is only mounted with a toolchain (see `assemble`)
         return Err(AppErr(StatusCode::NOT_FOUND, "not_found".into()));
@@ -1025,9 +1057,12 @@ async fn sign_macos_bundle_inner(
             "airlock: signing requires a sealed session".into(),
         ));
     };
-    let body = axum::body::to_bytes(body, sign::MAX_BUNDLE_BYTES)
-        .await
-        .map_err(|_| AppErr(StatusCode::PAYLOAD_TOO_LARGE, "bundle_too_large".into()))?;
+    let body = axum::body::to_bytes(body, usize::MAX).await.map_err(|e| {
+        AppErr(
+            StatusCode::BAD_REQUEST,
+            format!("airlock: bundle body: {e}"),
+        )
+    })?;
     let AdmittedBody { body, binding } = admit_body(
         st,
         &claims,
@@ -1075,8 +1110,15 @@ async fn sign_macos_bundle_inner(
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/octet-stream")
-        .body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
-        .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")))
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .map_err(|e| {
+            AppErr(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("build response: {e}"),
+            )
+        })
 }
 
 /// What the signing audit lines name: the session and the request's
@@ -1121,7 +1163,11 @@ async fn stream_signing_reply(
         };
         match event {
             SignEvent::Keepalive => {
-                if tx.send(Ok(Bytes::from(sealer.seal_keepalive()))).await.is_err() {
+                if tx
+                    .send(Ok(Bytes::from(sealer.seal_keepalive())))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -1134,7 +1180,6 @@ async fn stream_signing_reply(
             let submission_id = match &refusal {
                 sign::Refusal::NotaryRejected { submission_id } => submission_id.clone(),
                 sign::Refusal::BundleShapeRefused
-                | sign::Refusal::BundleTooLarge
                 | sign::Refusal::CodesignFailed
                 | sign::Refusal::StapleFailed
                 | sign::Refusal::ToolMissing => None,
@@ -1149,7 +1194,9 @@ async fn stream_signing_reply(
                 submission_id = %submission_id.unwrap_or_default(),
                 "release signing refused"
             );
-            let _ = tx.send(Ok(Bytes::from(sealer.seal_refused(refusal.as_str())))).await;
+            let _ = tx
+                .send(Ok(Bytes::from(sealer.seal_refused(refusal.as_str()))))
+                .await;
             return;
         }
     };
@@ -1174,7 +1221,11 @@ async fn stream_signing_reply(
         "release bundle notarized and stapled"
     );
     for chunk in sign::response_chunks(&signed.archive) {
-        if tx.send(Ok(Bytes::from(sealer.seal_chunk(chunk)))).await.is_err() {
+        if tx
+            .send(Ok(Bytes::from(sealer.seal_chunk(chunk))))
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -1213,9 +1264,12 @@ fn resolve_session(st: &AppState, headers: &HeaderMap) -> Result<(Claims, Arc<Cr
     let claims = token::verify(&st.sess_pk, bearer)
         .map_err(|e| AppErr(StatusCode::UNAUTHORIZED, format!("bad session token: {e}")))?;
 
-    let now = now_secs();
+    let now = st.clock.now();
     if claims.exp < now {
-        return Err(AppErr(StatusCode::UNAUTHORIZED, "session token expired".into()));
+        return Err(AppErr(
+            StatusCode::UNAUTHORIZED,
+            "session token expired".into(),
+        ));
     }
     refresh_credential(st, &claims.sub);
     let entry = st
@@ -1251,9 +1305,9 @@ struct AdmittedBody {
     binding: Vec<u8>,
 }
 
-/// Open one request body under the session's rules and charge it to the
-/// session — the three admission steps every credential-spending route
-/// shares, in the one order that keeps each free of the others' abuse:
+/// Open one request body under the session's rules — the two admission
+/// steps every credential-spending route shares, in the one order that keeps
+/// each free of the other's abuse:
 ///
 /// 1. Sealed-body session (`seal_keys` from [`session_keys`]): unseal the
 ///    request, and REFUSE plaintext — a stolen bearer alone (visible to path
@@ -1262,12 +1316,10 @@ struct AdmittedBody {
 ///    replay-dedup key and (b) the binding the response stream key is
 ///    derived under, so an authentic response cannot be replayed as the
 ///    answer to a different request.
-/// 2. Budget spends only AFTER the sealed body validated — a path host
-///    feeding garbage blobs must not burn the session's requests.
-/// 3. Replay dedupe LAST: the AEAD proved the blob is this session's request,
-///    and the spend paid for it, so one entry here always costs one request
-///    of the budget. Recording the nonce first made an unauthenticated
-///    12-byte body a free, permanent allocation for any bearer holder.
+/// 2. Replay dedupe LAST: the AEAD proved the blob is this session's request,
+///    so one entry here always stands for one authentic request. Recording
+///    the nonce first made an unauthenticated 12-byte body a free, permanent
+///    allocation for any bearer holder.
 fn admit_body(
     st: &AppState,
     claims: &Claims,
@@ -1284,8 +1336,12 @@ fn admit_body(
     let binding = bodyseal::request_binding(&body);
     let body = match (seal_keys, sealed_request) {
         (Some(keys), true) => Bytes::from(
-            bodyseal::open_request(keys, &bodyseal::request_aad(method.as_str(), path_and_query), &body)
-                .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("airlock: {e}")))?,
+            bodyseal::open_request(
+                keys,
+                &bodyseal::request_aad(method.as_str(), path_and_query),
+                &body,
+            )
+            .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("airlock: {e}")))?,
         ),
         // A sealed session requires a sealed body on EVERY request, bodyless
         // ones included: `bodyseal::seal_request` seals an empty plaintext
@@ -1309,31 +1365,6 @@ fn admit_body(
         }
         (None, false) => body,
     };
-
-    {
-        let mut b = st.budgets.lock().unwrap();
-        let rem = b
-            .get_mut(&claims.sub)
-            .ok_or_else(|| AppErr(StatusCode::FORBIDDEN, "no budget for sub".into()))?;
-        // A spent budget ENDS the session, exactly as its TTL lapsing does, and
-        // the remedy is identical: open a new one. So it answers 401 like the
-        // expiry above, not 429.
-        //
-        // 429 said "back off and retry later", which is false — waiting never
-        // refills this session, the budget is per-session and only a new
-        // handshake resets it. Worse, the caller cannot tell that 429 from the
-        // VENDOR's rate-limit 429, which is relayed from upstream and MUST pass
-        // through untouched. So the broker's re-handshake-on-401 never fired
-        // here and a borrowed credential simply died at `max_requests`, with the
-        // sandbox seeing a rate limit that would never clear.
-        if *rem == 0 {
-            return Err(AppErr(
-                StatusCode::UNAUTHORIZED,
-                "session budget spent".into(),
-            ));
-        }
-        *rem -= 1;
-    }
 
     // This session's entry only ever grows while THIS bearer (this `sub`+`eph`
     // pair) is spending it, and only a credential removal or process restart
@@ -1363,13 +1394,15 @@ async fn proxy_inner(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppErr> {
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(uri.path());
     // The session's `sub` names the credential it draws on; resolve it now — its
     // kind selects the upstream and its own token state is what we refresh/spend.
     let (claims, entry) = resolve_session(st, headers)?;
     // Only a model credential has an upstream here. Decided before the body is
-    // opened or the budget spent: a signing identity pointed at `/v1/*` is
-    // refused by name, and costs the session nothing.
+    // opened: a signing identity pointed at `/v1/*` is refused by name.
     let (vendor, oauth) = entry.oauth()?;
     let seal_keys = session_keys(st, &claims)?;
     let AdmittedBody { body, binding } = admit_body(
@@ -1381,14 +1414,14 @@ async fn proxy_inner(
         headers,
         body,
     )?;
-    let now = now_secs();
+    let now = st.clock.now();
 
     let stale = {
         let o = oauth.oauth.lock().unwrap();
         o.access_token.is_empty() || o.expires_at <= now
     };
     if stale {
-        refresh_now(&st.cfg, &st.http, oauth)
+        refresh_now(&st.cfg, &st.http, &st.clock, oauth)
             .await
             .map_err(|e| AppErr(StatusCode::BAD_GATEWAY, format!("refresh: {e}")))?;
     }
@@ -1457,7 +1490,12 @@ async fn proxy_inner(
         }
         return builder
             .body(Body::from_stream(resp.bytes_stream()))
-            .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")));
+            .map_err(|e| {
+                AppErr(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("build response: {e}"),
+                )
+            });
     };
 
     // Sealed session: re-seal the upstream stream chunk by chunk. The inner
@@ -1483,7 +1521,11 @@ async fn proxy_inner(
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(chunk) => {
-                    if tx.send(Ok(Bytes::from(sealer.seal_chunk(&chunk)))).await.is_err() {
+                    if tx
+                        .send(Ok(Bytes::from(sealer.seal_chunk(&chunk))))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -1495,8 +1537,15 @@ async fn proxy_inner(
     Response::builder()
         .status(status.as_u16())
         .header("content-type", "application/octet-stream")
-        .body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
-        .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")))
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .map_err(|e| {
+            AppErr(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("build response: {e}"),
+            )
+        })
 }
 
 /// Read account routing metadata only from the credential we hold. This does
@@ -1520,12 +1569,17 @@ fn codex_account_id(access: &str) -> Option<String> {
 /// Exchange one credential's refresh token for a fresh access token (and rotated
 /// refresh token), single-flighted per credential so concurrent callers never
 /// double-spend it.
-async fn refresh_now(cfg: &Config, http: &reqwest::Client, entry: &OauthState) -> Result<()> {
+async fn refresh_now(
+    cfg: &Config,
+    http: &reqwest::Client,
+    clock: &Clock,
+    entry: &OauthState,
+) -> Result<()> {
     let _gate = entry.refresh_gate.lock().await;
     // Re-check under the gate — a caller we queued behind may have just done it.
     let refresh = {
         let o = entry.oauth.lock().unwrap();
-        if !o.access_token.is_empty() && o.expires_at > now_secs() {
+        if !o.access_token.is_empty() && o.expires_at > clock.now() {
             return Ok(());
         }
         o.refresh_token.clone()
@@ -1546,11 +1600,14 @@ async fn refresh_now(cfg: &Config, http: &reqwest::Client, entry: &OauthState) -
         bail!("oauth token endpoint {status}: {text}");
     }
     let j: serde_json::Value = serde_json::from_str(&text).context("oauth response json")?;
-    let access = j["access_token"].as_str().context("no access_token")?.to_string();
+    let access = j["access_token"]
+        .as_str()
+        .context("no access_token")?
+        .to_string();
     let new_refresh = j["refresh_token"].as_str().map(|s| s.to_string());
     let expires_in = j["expires_in"].as_u64().unwrap_or(3600);
 
-    let now = now_secs();
+    let now = clock.now();
     let mut o = entry.oauth.lock().unwrap();
     o.access_token = access;
     if let Some(r) = new_refresh {
@@ -1617,13 +1674,15 @@ mod tests {
     /// A gateway with one seeded bearer credential and an upstream that cannot
     /// be reached: every admission decision this module owns happens before the
     /// proxied call, so a dead upstream is the cheapest way to observe them.
-    fn test_state(name: &str, max_requests: u32) -> Arc<AppState> {
+    fn test_state(name: &str) -> Arc<AppState> {
         let seal_kp = SealKeypair::generate();
         let sess_sk = SigningKey::generate(&mut OsRng);
         let sess_pk = sess_sk.verifying_key();
         let entry = cred_entry(
             CredentialKind::Claude,
-            CredentialPayload::Bearer { access_token: "tok".into() },
+            CredentialPayload::Bearer {
+                access_token: "tok".into(),
+            },
         )
         .unwrap();
         Arc::new(AppState {
@@ -1641,10 +1700,9 @@ mod tests {
                 oauth_token_url: String::new(),
                 oauth_client_id: String::new(),
                 session_ttl_secs: 3600,
-                max_requests,
             },
             creds: Mutex::new(HashMap::from([(name.to_string(), Arc::new(entry))])),
-            budgets: Mutex::new(HashMap::new()),
+            clock: Clock::system(),
             seen_nonces: Mutex::new(HashMap::new()),
             grant_check: None,
             reload: None,
@@ -1673,7 +1731,7 @@ mod tests {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"real-account"}}"#);
         for access in [format!("e30.{payload}.sig"), "opaque-bearer".into()] {
-            let mut st = test_state("a", 8);
+            let mut st = test_state("a");
             Arc::get_mut(&mut st).unwrap().cfg.openai_base = url.clone();
             st.creds.lock().unwrap().insert(
                 "a".into(),
@@ -1760,10 +1818,16 @@ mod tests {
 
     async fn post_sealed(st: &Arc<AppState>, token: &str, body: Vec<u8>) -> StatusCode {
         let uri: axum::http::Uri = "/v1/messages".parse().unwrap();
-        proxy_inner(st, Method::POST, &uri, &sealed_headers(token), Bytes::from(body))
-            .await
-            .expect_err("the upstream is unreachable, so every call ends in an error")
-            .0
+        proxy_inner(
+            st,
+            Method::POST,
+            &uri,
+            &sealed_headers(token),
+            Bytes::from(body),
+        )
+        .await
+        .expect_err("the upstream is unreachable, so every call ends in an error")
+        .0
     }
 
     /// The replay set costs a request of the budget to grow and nothing else:
@@ -1774,7 +1838,7 @@ mod tests {
     /// bearer is live.
     #[tokio::test]
     async fn the_replay_set_only_grows_with_authenticated_spent_requests() {
-        let st = test_state("a", 8);
+        let st = test_state("a");
         let (client_eph_pk, keys) = handshake::client_handshake(&st.seal_kp.public_bytes());
         let eph_b64 = BASE64.encode(client_eph_pk);
         let open = |st: &Arc<AppState>| {
@@ -1789,7 +1853,10 @@ mod tests {
                 }),
             )
         };
-        assert!(open(&st).await.is_ok(), "a seeded credential opens a session");
+        assert!(
+            open(&st).await.is_ok(),
+            "a seeded credential opens a session"
+        );
         let claims = Claims {
             sub: "a".into(),
             iat: now_secs(),
@@ -1807,26 +1874,33 @@ mod tests {
             0,
             "an unauthenticated body must record nothing"
         );
-        assert_eq!(st.budgets.lock().unwrap()["a"], 8, "and must cost nothing");
 
-        // Authentic sealed bodies each record one nonce and spend one request.
+        // Authentic sealed bodies each record one nonce.
         let aad = bodyseal::request_aad("POST", "/v1/messages");
-        let blobs: Vec<Vec<u8>> =
-            (0..3u8).map(|i| bodyseal::seal_request(&keys, &aad, &[i; 16])).collect();
+        let blobs: Vec<Vec<u8>> = (0..3u8)
+            .map(|i| bodyseal::seal_request(&keys, &aad, &[i; 16]))
+            .collect();
         for blob in &blobs {
             let status = post_sealed(&st, &token, blob.clone()).await;
-            assert_eq!(status, StatusCode::BAD_GATEWAY, "admitted, then the upstream is dead");
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "admitted, then the upstream is dead"
+            );
         }
         assert_eq!(recorded_nonces(&st, "a", &eph_b64), 3);
-        assert_eq!(st.budgets.lock().unwrap()["a"], 5);
 
         // The same blob again is the replay this set exists to catch.
         let status = post_sealed(&st, &token, blobs[0].clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(recorded_nonces(&st, "a", &eph_b64), 3, "a replay adds nothing");
+        assert_eq!(
+            recorded_nonces(&st, "a", &eph_b64),
+            3,
+            "a replay adds nothing"
+        );
 
-        // Reopening the SAME session refills the budget but must NOT clear
-        // the nonces recorded under this `eph` — the original token is still
+        // Reopening the SAME session must NOT clear the nonces recorded
+        // under this `eph` — the original token is still
         // live and its already-spent nonces must stay blocked.
         assert!(open(&st).await.is_ok(), "the session reopens");
         assert_eq!(
@@ -1834,7 +1908,6 @@ mod tests {
             3,
             "a same-session reopen must not erase this bearer's replay history"
         );
-        assert_eq!(st.budgets.lock().unwrap()["a"], 8);
         let status = post_sealed(&st, &token, blobs[0].clone()).await;
         assert_eq!(
             status,
@@ -1850,7 +1923,7 @@ mod tests {
     /// bearer.
     #[tokio::test]
     async fn a_second_session_open_does_not_revive_the_first_sessions_replays() {
-        let st = test_state("a", 8);
+        let st = test_state("a");
         let (eph_a, keys_a) = handshake::client_handshake(&st.seal_kp.public_bytes());
         let eph_a_b64 = BASE64.encode(eph_a);
 
@@ -1884,7 +1957,11 @@ mod tests {
             b"request from A",
         );
         let status = post_sealed(&st, &token_a, blob_a.clone()).await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "admitted, then the upstream is dead");
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "admitted, then the upstream is dead"
+        );
 
         // Session B opens against the SAME credential with its own (any)
         // ephemeral key — e.g. the broker's automatic reauth on a 401.
@@ -1919,7 +1996,7 @@ mod tests {
     /// name, and what it holds stays exactly what it was. A new name lands.
     #[tokio::test]
     async fn an_upload_under_a_held_name_is_refused_and_changes_nothing() {
-        let st = test_state("a", 8);
+        let st = test_state("a");
         let held = st.creds.lock().unwrap().get("a").cloned().unwrap();
         let upload = |name: &str| {
             let pt = serde_json::to_vec(&CredentialPayload::Bearer {
@@ -1983,7 +2060,7 @@ mod tests {
     #[tokio::test]
     async fn a_valid_apple_codesign_upload_is_stored_under_its_kind() {
         use codesign::fixture::{self, Marker};
-        let st = test_state("a", 8);
+        let st = test_state("a");
         let payload = apple_payload(
             fixture::p12_b64(fixture::TEAM_ID, Marker::DeveloperIdApplication),
             fixture::api_key_json(),
@@ -2008,7 +2085,7 @@ mod tests {
     #[tokio::test]
     async fn each_apple_codesign_refusal_answers_with_its_token_and_stores_nothing() {
         use codesign::fixture::{self, Marker};
-        let st = test_state("a", 8);
+        let st = test_state("a");
         let good_p12 = fixture::p12_b64(fixture::TEAM_ID, Marker::DeveloperIdApplication);
         let cases = [
             (
@@ -2072,7 +2149,7 @@ mod tests {
     #[tokio::test]
     async fn the_model_proxy_refuses_an_apple_codesign_session_by_kind() {
         use codesign::fixture::{self, Marker};
-        let st = test_state("a", 8);
+        let st = test_state("a");
         let payload = apple_payload(
             fixture::p12_b64(fixture::TEAM_ID, Marker::DeveloperIdApplication),
             fixture::api_key_json(),
@@ -2116,10 +2193,5 @@ mod tests {
         .expect_err("refused");
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, "credential_kind_mismatch");
-        assert_eq!(
-            st.budgets.lock().unwrap().get("release-sign").copied(),
-            Some(8),
-            "the refusal spent nothing"
-        );
     }
 }

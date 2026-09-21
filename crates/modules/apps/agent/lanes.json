@@ -1,3 +1,0 @@
-[
-  { "id": 5, "name": "telemetry", "stream": { "pacing": "shared", "accept_backlog": 64 } }
-]

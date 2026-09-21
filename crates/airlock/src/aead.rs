@@ -3,11 +3,11 @@
 //! box) and `handshake` (session key) share these and differ ONLY in how they
 //! agree the key.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
-use rand_core::{OsRng, RngCore};
 use hkdf::Hkdf;
+use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 
 /// HKDF-SHA256 with an explicit salt (per-stream keys in `bodyseal`).
@@ -55,7 +55,10 @@ pub fn open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
     cipher
         .decrypt(
             Nonce::from_slice(&nonce),
-            Payload { msg: &blob[12..], aad },
+            Payload {
+                msg: &blob[12..],
+                aad,
+            },
         )
         .map_err(|_| anyhow::anyhow!("AEAD decryption failed (wrong key, aad, or tampered blob)"))
 }

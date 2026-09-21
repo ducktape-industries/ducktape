@@ -91,9 +91,7 @@ pub fn arg_str(args: &Value, name: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| {
-            crate::node::NodeError::Rejected(format!(
-                "this tool needs a string {name:?} argument"
-            ))
+            crate::node::NodeError::Rejected(format!("this tool needs a string {name:?} argument"))
         })
 }
 
@@ -105,6 +103,7 @@ pub fn opt_u64(args: &Value, name: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::module_contracts::producer_catalog_fixture as runs;
 
     #[test]
     fn every_tool_is_uniquely_named_and_declares_a_schema() {

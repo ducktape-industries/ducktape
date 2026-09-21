@@ -53,7 +53,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rand::RngCore as _;
 use serde_json::{Value, json};
@@ -69,31 +69,11 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 /// own callers.
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// mirrors [`saga::MAX_RESULT_BYTES`] (crates/modules/system/saga/src/interface.rs)
-/// without depending on it (a host-crate → consensus-module edge). This is
-/// the cap `compute::provision::assemble_runner_result` already truncates a
-/// run's parsed answer to, WITH a note, before it can land — a run that
-/// finishes with an oversized answer already completes today, just trimmed.
-const RECORDED_RESULT_CAP_BYTES: usize = 256 * 1024;
-/// hard cap on a run's accumulated stdout, checked as each chunk arrives.
-/// Deliberately NOT [`RECORDED_RESULT_CAP_BYTES`] itself: that cap is
-/// enforced downstream with truncation-plus-a-note, so a run whose full
-/// answer is a few hundred KiB over it still succeeds today. Killing the run
-/// at the same size would turn "completes, truncated" into "fails outright"
-/// for those runs — this cap exists only to stop UNBOUNDED accumulation from
-/// a firehose, not to enforce the result size, so it sits an order of
-/// magnitude above it. `codex`'s `jsonl-events` output in particular streams
-/// one JSON object per tool call/patch/diff for the whole turn, not just the
-/// final answer, and can legitimately run to several hundred KiB on an
-/// ordinary tool-calling turn. Past this line the run is TERMINATED outright
-/// — never truncated, since a truncated JSON/JSONL blob would parse into
-/// garbage and land as the run's answer.
-const MAX_RUN_OUTPUT_BYTES: usize = 16 * RECORDED_RESULT_CAP_BYTES; // 4 MiB
 /// hard cap on the accumulated stderr TAIL (oldest bytes drop first). stderr
 /// never becomes the run's answer — only [`excerpt`]'s 400-char slice of it
 /// ever leaves this function, and only on the failure path — so a few KiB of
-/// trailing context is ample; unlike stdout this is a rolling tail, not a
-/// termination trigger.
+/// trailing context is ample; this is a rolling tail, never a termination
+/// trigger.
 const MAX_RUN_STDERR_BYTES: usize = 16 * 1024;
 
 /// the ownership tag a provider set stamps on the runs it creates. Its VALUE
@@ -167,10 +147,24 @@ const UPSTREAM_CREDENTIAL_ENV: [&str; 4] = [
 
 /// the `-c` overrides that aim a codex invocation at this run's loopback broker:
 /// the model-provider block (base URL + [`BROKER_TOKEN_ENV`] bearer, retries
-/// off), the provider selector, and a workspace trust level. shared by the
-/// headless [`CliProvider::broker_argv`] (spliced after the subcommand) and the
+/// off), the provider selector, a workspace trust level, and the start-up work
+/// the guest cannot use switched off. shared by the headless
+/// [`CliProvider::broker_argv`] (spliced after the subcommand) and the
 /// interactive path (prepended — a TUI argv has no subcommand). the child gets a
 /// base URL and an opaque bearer; neither recovers the operator's credential.
+///
+/// The three `off` switches are session-start latency, measured with the
+/// `provider_session_milestone` events and a syscall trace of the CLI. Each
+/// names something codex does at `initialize` / `thread/start` that a guest
+/// with no network device, no D-Bus and a manifest-fixed environment can only
+/// fail at, after spending the time:
+/// - `features.plugins`: a `git ls-remote` + shallow clone of the plugin
+///   marketplace on GitHub, the guest's only outbound TLS attempt.
+/// - `features.shell_snapshot`: a `bash -lc` login-shell environment capture
+///   inside `thread/start`, which is the bulk of that milestone's CPU (the run
+///   environment IS the manifest env; there is no profile to snapshot).
+/// - `mcp_oauth_credentials_store`: `auto` probes the D-Bus secret service for
+///   MCP OAuth tokens; the ducktape tool plane takes none.
 fn broker_provider_overrides(broker: &broker::BrokerEndpoint, workdir: &Path) -> Vec<String> {
     // the workdir is a path, and codex keys `projects.<key>` by TOML string —
     // so it must be QUOTED as one (a bare path breaks the `-c` parse).
@@ -185,6 +179,12 @@ fn broker_provider_overrides(broker: &broker::BrokerEndpoint, workdir: &Path) ->
         "model_provider=\"ducktape\"".into(),
         "-c".into(),
         format!("projects.{project_key}.trust_level=\"untrusted\""),
+        "-c".into(),
+        "features.plugins=false".into(),
+        "-c".into(),
+        "features.shell_snapshot=false".into(),
+        "-c".into(),
+        "mcp_oauth_credentials_store=\"file\"".into(),
     ]
 }
 
@@ -247,7 +247,11 @@ fn mcp_argv(dialect: McpDialect, guest_node_url: &str) -> Vec<String> {
 /// marker) LAST. And never blindly after `argv[0]` either: a restricted claude
 /// TUI argv opens `--permission-mode plan`, and splitting a flag from its value
 /// is an argv the CLI rejects.
-fn with_mcp_argv(argv: &[String], dialect: Option<McpDialect>, guest_node_url: &str) -> Vec<String> {
+fn with_mcp_argv(
+    argv: &[String],
+    dialect: Option<McpDialect>,
+    guest_node_url: &str,
+) -> Vec<String> {
     let Some(dialect) = dialect else {
         return argv.to_vec();
     };
@@ -444,6 +448,11 @@ pub struct RunContext {
     /// set by the oracle pool before provider.run so the output sink can key
     /// a per-run ring the app subscribes as run-output:<dispatch_id>.
     pub run_key: Option<String>,
+    /// The durable machine record for this provider session. The node owns the
+    /// journal; this context only carries its producer metadata and a callback
+    /// that forwards append requests to that node.
+    pub session_record: Option<SessionRecordContext>,
+    pub session_record_sink: Option<SessionRecordSink>,
     /// host-local cancellation for this live run. `None` = the run cannot be
     /// cancelled (runs to completion); cancelling the token terminates the
     /// provider process tree and any live microVM.
@@ -507,6 +516,31 @@ pub struct RunContext {
     /// repo) refuses every push at the lane. Set by the provisioner from the
     /// committed spec, never by the guest.
     pub forge_repo: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRecordContext {
+    pub session_id: String,
+    pub summary: Value,
+}
+
+#[derive(Clone)]
+pub struct SessionRecordSink(Arc<dyn Fn(Value) + Send + Sync>);
+
+impl std::fmt::Debug for SessionRecordSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionRecordSink(..)")
+    }
+}
+
+impl SessionRecordSink {
+    pub fn new(callback: impl Fn(Value) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn emit(&self, record: Value) {
+        (self.0)(record);
+    }
 }
 
 /// which child stream produced one live output line.
@@ -590,13 +624,11 @@ pub trait Provider: Send + Sync {
         prompt: &str,
         ctx: &RunContext,
     ) -> Result<ProviderOutput, String> {
-        self.run(prompt, ctx)
-            .await
-            .map(|text| ProviderOutput {
-                text,
-                usage: None,
-                disposition: OutputDisposition::Answer,
-            })
+        self.run(prompt, ctx).await.map(|text| ProviderOutput {
+            text,
+            usage: None,
+            disposition: OutputDisposition::Answer,
+        })
     }
     /// spawn an INTERACTIVE, pty-backed session driving this executor's TUI (see
     /// [`crate::interactive`]). The default refuses; a spec with an
@@ -1513,7 +1545,10 @@ impl CliProvider {
         match self.spec.isolation.broker {
             Some(BrokerKind::Pi) => {
                 let Some(config) = auth.config_home else {
-                    return Err(format!("{}: Pi broker run has no config home", self.spec.tag));
+                    return Err(format!(
+                        "{}: Pi broker run has no config home",
+                        self.spec.tag
+                    ));
                 };
                 pi::configure(config, broker, &mut set)?;
             }
@@ -2852,6 +2887,32 @@ fn effective_provider_deadline(
         .min(hard)
 }
 
+fn described_exit_code(description: &str) -> Option<i32> {
+    description
+        .split_whitespace()
+        .last()
+        .and_then(|code| code.parse().ok())
+}
+
+fn session_error_outcome(error: &str) -> (&'static str, &'static str) {
+    if error.contains("cancelled") {
+        return ("cancelled", "run_cancelled");
+    }
+    if error.contains("timed out") || error.contains("timeout") {
+        return ("timeout", "provider_timeout");
+    }
+    if error.contains("refused") || error.contains("initialization failed") {
+        return ("refused", "provider_refused");
+    }
+    if error.contains("exited before")
+        || error.contains("input closed")
+        || error.starts_with("provider turn ")
+    {
+        return ("early_exit", "provider_ended_early");
+    }
+    ("error", "protocol_driver_failed")
+}
+
 impl CliProvider {
     /// one child process, start to parsed answer, with an explicit argv and
     /// working directory — the shared engine under the cold and resume paths.
@@ -2864,11 +2925,24 @@ impl CliProvider {
         config_home: Option<&Path>,
         broker: Option<&broker::RunBroker>,
     ) -> Result<Invocation, String> {
+        let session_protocol = match self.spec.output {
+            OutputFormat::CodexSession => Some(run_session::Protocol::Codex),
+            OutputFormat::ClaudeSession => Some(run_session::Protocol::Claude),
+            OutputFormat::PiJson
+            | OutputFormat::JsonlEvents
+            | OutputFormat::JsonResult
+            | OutputFormat::Text => None,
+        };
+        let mut timing = session_protocol
+            .map(|protocol| run_session::SessionTiming::new(protocol, ctx, Instant::now()));
         if ctx
             .cancellation
             .as_ref()
             .is_some_and(RunCancellation::is_cancelled)
         {
+            if let Some(timing) = &timing {
+                timing.finish("refused", "cancelled_before_spawn");
+            }
             return Err(format!("{} cancelled before spawn", self.bin.display()));
         }
         let broker_invocation = broker.map(broker::RunBroker::begin_invocation);
@@ -2890,16 +2964,26 @@ impl CliProvider {
         // knows how to wait for exit and terminate.
         type BoxRead = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
         type BoxWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
-        let (mut stdin, mut stdout_pipe, mut stderr_pipe, mut control): (
+        let (mut stdin, mut stdout_pipe, mut stderr_pipe, mut control, spawn_start): (
             BoxWrite,
             BoxRead,
             BoxRead,
             RunControl,
+            run_session::SpawnStart,
         ) = if matches!(self.backend, SandboxBackend::MicroVm { .. }) {
             let final_args = self.broker_argv(args, workdir, &auth);
-            let (vm, io, lanes) = self
+            let (vm, io, lanes) = match self
                 .microvm_boot(&final_args, workdir, ctx, &auth, GuestStdio::Pipes)
-                .await?;
+                .await
+            {
+                Ok(booted) => booted,
+                Err(error) => {
+                    if let Some(timing) = &timing {
+                        timing.finish("refused", "microvm_boot_failed");
+                    }
+                    return Err(error);
+                }
+            };
             (
                 Box::new(io.stdin),
                 Box::new(io.stdout),
@@ -2911,9 +2995,18 @@ impl CliProvider {
                     workdir: workdir.to_path_buf(),
                     _lanes: lanes,
                 })),
+                run_session::SpawnStart::Guest(io.spawn),
             )
         } else {
-            let mut command = self.prepared_command(args, workdir, ctx, &auth)?;
+            let mut command = match self.prepared_command(args, workdir, ctx, &auth) {
+                Ok(command) => command,
+                Err(error) => {
+                    if let Some(timing) = &timing {
+                        timing.finish("refused", "command_prepare_failed");
+                    }
+                    return Err(error);
+                }
+            };
             command
                 .current_dir(workdir)
                 .stdin(Stdio::piped())
@@ -2921,44 +3014,57 @@ impl CliProvider {
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
             configure_process_group(&mut command);
-            let child = command
-                .spawn()
-                .map_err(|e| format!("spawn {} failed: {e}", self.bin.display()))?;
+            let child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    if let Some(timing) = &timing {
+                        timing.finish("refused", "child_spawn_failed");
+                    }
+                    return Err(format!("spawn {} failed: {error}", self.bin.display()));
+                }
+            };
+            let spawned_at = Instant::now();
             let mut live = LiveChild::new(child);
-            let stdin = live
-                .child_mut()
-                .stdin
-                .take()
-                .ok_or_else(|| "child stdin was not piped".to_string())?;
-            let stdout = live
-                .child_mut()
-                .stdout
-                .take()
-                .ok_or_else(|| "child stdout was not piped".to_string())?;
-            let stderr = live
-                .child_mut()
-                .stderr
-                .take()
-                .ok_or_else(|| "child stderr was not piped".to_string())?;
+            let stdin = match live.child_mut().stdin.take() {
+                Some(stdin) => stdin,
+                None => {
+                    if let Some(timing) = &timing {
+                        timing.finish("refused", "child_stdin_not_piped");
+                    }
+                    return Err("child stdin was not piped".into());
+                }
+            };
+            let stdout = match live.child_mut().stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    if let Some(timing) = &timing {
+                        timing.finish("refused", "child_stdout_not_piped");
+                    }
+                    return Err("child stdout was not piped".into());
+                }
+            };
+            let stderr = match live.child_mut().stderr.take() {
+                Some(stderr) => stderr,
+                None => {
+                    if let Some(timing) = &timing {
+                        timing.finish("refused", "child_stderr_not_piped");
+                    }
+                    return Err("child stderr was not piped".into());
+                }
+            };
             (
                 Box::new(stdin),
                 Box::new(stdout),
                 Box::new(stderr),
                 RunControl::Local(live),
+                run_session::SpawnStart::Host(spawned_at),
             )
         };
 
-        let protocol = match self.spec.output {
-            OutputFormat::CodexSession => Some(run_session::Protocol::Codex),
-            OutputFormat::ClaudeSession => Some(run_session::Protocol::Claude),
-            // Pi is a one-shot `--print` run whose events arrive on stdout; it
-            // drives no bidirectional session protocol.
-            OutputFormat::PiJson
-            | OutputFormat::JsonlEvents
-            | OutputFormat::JsonResult
-            | OutputFormat::Text => None,
-        };
-        if let Some(protocol) = protocol {
+        if let Some(protocol) = session_protocol {
+            let timing = timing
+                .as_mut()
+                .expect("session timing exists for a session protocol");
             let result = run_session::drive(
                 protocol,
                 prompt,
@@ -2966,7 +3072,11 @@ impl CliProvider {
                 ctx,
                 self.output_sink.clone(),
                 (idle, hard),
-                broker_invocation.as_ref(),
+                run_session::SessionDriver {
+                    broker: broker_invocation.as_ref(),
+                    start: spawn_start,
+                    timing,
+                },
             )
             .await;
             if let Some(invocation) = &broker_invocation {
@@ -2974,6 +3084,9 @@ impl CliProvider {
             }
             if result.is_err() {
                 control.terminate().await;
+                let (outcome, reason) =
+                    session_error_outcome(result.as_ref().err().expect("the result is an error"));
+                timing.finish(outcome, reason);
                 return result;
             }
             let exited = tokio::time::timeout(
@@ -2983,18 +3096,27 @@ impl CliProvider {
             .await;
             match exited {
                 Ok(Ok((true, _))) => {
-                    control.collect_workspace().await?;
+                    timing.child_exit(Some(0));
+                    if let Err(error) = control.collect_workspace().await {
+                        timing.finish("error", "workspace_collect_failed");
+                        return Err(error);
+                    }
+                    timing.finish("completed", "turn_completed");
                     return result;
                 }
                 Ok(Ok((false, code))) => {
+                    timing.child_exit(described_exit_code(&code));
+                    timing.finish("early_exit", "child_nonzero_exit");
                     control.terminate().await;
                     return Err(format!("provider session exited unsuccessfully: {code:?}"));
                 }
                 Ok(Err(error)) => {
+                    timing.finish("early_exit", "child_wait_failed");
                     control.terminate().await;
                     return Err(error.to_string());
                 }
                 Err(_) => {
+                    timing.finish("timeout", "child_exit_wait_timeout");
                     control.terminate().await;
                     return Err("provider session did not exit after its result".into());
                 }
@@ -3054,25 +3176,6 @@ impl CliProvider {
                         out_bytes.extend_from_slice(&obuf[..n]);
                         forward_lines(&mut out_pending, &obuf[..n], OutputStream::Stdout, &output_sink, ctx);
                         last_activity = tokio::time::Instant::now();
-                        if out_bytes.len() > MAX_RUN_OUTPUT_BYTES {
-                            if let Some(invocation) = &broker_invocation {
-                                invocation.revoke();
-                            }
-                            control.terminate().await;
-                            tracing::warn!(
-                                target: "ducktape::provider",
-                                reason = "output_cap_exceeded",
-                                bin = %self.bin.display(),
-                                bytes = out_bytes.len(),
-                                cap = MAX_RUN_OUTPUT_BYTES,
-                                "run stdout exceeded the output cap (child killed)"
-                            );
-                            return Err(format!(
-                                "{} stdout exceeded the {MAX_RUN_OUTPUT_BYTES}-byte output cap \
-                                 (child killed): output_cap_exceeded",
-                                self.bin.display()
-                            ));
-                        }
                     }
                     Err(e) => {
                         if let Some(invocation) = &broker_invocation {
@@ -3285,8 +3388,8 @@ impl CliProvider {
                 unreachable!("session driver returned above")
             }
         };
-        let unexpected_native_terminal = disposition != OutputDisposition::Answer
-            && ctx.native_conversation.is_none();
+        let unexpected_native_terminal =
+            disposition != OutputDisposition::Answer && ctx.native_conversation.is_none();
         if unexpected_native_terminal {
             return Err("provider returned a native terminal result outside a conversation".into());
         }
@@ -3327,8 +3430,8 @@ impl CliProvider {
                 if self.spec.isolation.broker != Some(BrokerKind::Pi) {
                     return Err("native conversations require the Pi provider".into());
                 }
-                let config = config_home
-                    .ok_or("native conversation requires a fresh Pi config home")?;
+                let config =
+                    config_home.ok_or("native conversation requires a fresh Pi config home")?;
                 pi::prepare_conversation(config, conversation, prompt)?
             }
             None => self.prompt_with_context(prompt, ctx),
@@ -4389,6 +4492,14 @@ broker = "anthropic-messages"
             "{joined}"
         );
         assert!(joined.contains("model_provider=\"ducktape\""), "{joined}");
+        // the guest-unusable start-up work rides every codex argv, off.
+        for switch in [
+            "-c features.plugins=false",
+            "-c features.shell_snapshot=false",
+            "-c mcp_oauth_credentials_store=\"file\"",
+        ] {
+            assert!(joined.contains(switch), "{switch} missing: {joined}");
+        }
         assert!(
             joined.ends_with("--json -"),
             "the stdin marker stays last: {joined}"
@@ -4503,7 +4614,8 @@ broker = "anthropic-messages"
             .into_iter()
             .find(|spec| spec.tag == "pi")
             .unwrap();
-        let provider = CliProvider::from_spec(spec, PathBuf::from("/usr/bin/pi"), SandboxBackend::Bare);
+        let provider =
+            CliProvider::from_spec(spec, PathBuf::from("/usr/bin/pi"), SandboxBackend::Bare);
         let workdir = scratch("pi-config");
         for kind in [CredentialKind::Claude, CredentialKind::Codex] {
             let home = provider.prepare_config_home(&workdir).unwrap().unwrap();
@@ -4539,9 +4651,10 @@ broker = "anthropic-messages"
             let models: Value =
                 serde_json::from_slice(&std::fs::read(home.config().join("models.json")).unwrap())
                     .unwrap();
-            let settings: Value =
-                serde_json::from_slice(&std::fs::read(home.config().join("settings.json")).unwrap())
-                    .unwrap();
+            let settings: Value = serde_json::from_slice(
+                &std::fs::read(home.config().join("settings.json")).unwrap(),
+            )
+            .unwrap();
             let selected = match kind {
                 CredentialKind::Claude => "anthropic",
                 CredentialKind::Codex => "openai-codex",
@@ -5594,31 +5707,6 @@ printf '{"type":"turn.completed"}\n'"#,
         );
     }
 
-    #[tokio::test]
-    async fn a_run_writing_past_the_output_cap_is_terminated_not_truncated() {
-        // a continuously-writing guest must be TERMINATED at the cap, never
-        // truncated and parsed anyway — a truncated JSON/JSONL blob would
-        // otherwise land as the run's "answer". idle stays generous (5s) so
-        // the output cap fires first, not the idle/hard timeout.
-        let dir = scratch("output-cap");
-        let bin = fake_cli(
-            &dir,
-            "firehose",
-            // a 100_000-byte chunk per iteration (no per-byte forking) clears
-            // the 4 MiB cap in ~42 writes rather than thousands of small ones.
-            "cat > /dev/null\n\
-             big=$(printf '%0100000d' 0)\n\
-             while true; do printf '%s' \"$big\"; done",
-        );
-        let p = mock_provider("firehose", "text", bin, "output-cap-wd")
-            .with_timeout(Duration::from_secs(10));
-        let err = p.run("x", &RunContext::default()).await.unwrap_err();
-        assert!(
-            err.contains("output_cap_exceeded"),
-            "names the outcome: {err}"
-        );
-    }
-
     #[test]
     fn push_bounded_tail_keeps_the_last_bytes_only() {
         let mut buf = Vec::new();
@@ -5796,6 +5884,8 @@ printf '%s\n' "$PATH"
             agent_id: Some("bot".into()),
             native_conversation: None,
             run_key: None,
+            session_record: None,
+            session_record_sink: None,
             cancellation: None,
             executing_node: None,
             workdir_override: Some(override_dir.clone()),
@@ -6459,8 +6549,7 @@ format = "text"
         let configured: Value = serde_json::from_str(&claude[1]).expect("literal json");
         assert_eq!(configured["mcpServers"]["ducktape"]["type"], "http");
         assert_eq!(
-            configured["mcpServers"]["ducktape"]["url"],
-            "http://127.0.0.1:41999/mcp",
+            configured["mcpServers"]["ducktape"]["url"], "http://127.0.0.1:41999/mcp",
             "one slash, whatever the base carried"
         );
         assert!(
@@ -6509,7 +6598,10 @@ format = "text"
         // a flag-led argv (an interactive TUI one) takes it at the front, so a
         // flag is never separated from its value.
         let restricted = arg(&["--permission-mode", "plan"]);
-        assert_eq!(restricted[restricted.len() - 2..], ["--permission-mode", "plan"]);
+        assert_eq!(
+            restricted[restricted.len() - 2..],
+            ["--permission-mode", "plan"]
+        );
         assert_eq!(restricted[0], "-c");
 
         // an empty argv is the bare TUI launch, and gets the wiring alone.

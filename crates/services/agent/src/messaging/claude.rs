@@ -54,7 +54,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
 use super::{Offer, Outcome};
 use crate::wire::Capabilities;
@@ -545,16 +545,6 @@ pub struct Receipts {
     trusted_pids: std::sync::Mutex<std::collections::HashSet<u32>>,
 }
 
-/// the ceiling on one receipt line. A verdict is a small object; anything
-/// larger is not one, and reading it unbounded would let a local peer grow this
-/// daemon's memory by writing to a socket.
-const MAX_RECEIPT_LINE: u64 = 8 * 1024;
-
-/// how many verdict lines one connection may send before it is dropped. A
-/// verdict per outstanding delivery is the honest volume; far past that is a
-/// peer that has stopped making sense.
-const MAX_RECEIPT_LINES: usize = 256;
-
 impl Receipts {
     /// bind the receipt address and serve it until the process ends.
     ///
@@ -704,22 +694,8 @@ impl Receipts {
             );
             return;
         }
-        // bounded on both axes: a line is a small object, and a peer that
-        // sends more than a verdict per outstanding delivery has stopped
-        // making sense.
-        let mut lines =
-            BufReader::new(stream.take(MAX_RECEIPT_LINE * MAX_RECEIPT_LINES as u64)).lines();
-        let mut seen = 0usize;
+        let mut lines = BufReader::new(stream).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            seen += 1;
-            if seen > MAX_RECEIPT_LINES {
-                tracing::warn!(
-                    target: "ducktape::collab",
-                    reason = "receipt_line_flood",
-                    "dropped a receipt connection sending more verdicts than it can have"
-                );
-                return;
-            }
             let Ok(frame) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
@@ -1066,9 +1042,19 @@ mod tests {
         // the user's own, as the interface states: 0700 around 0600
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = |path: &Path| std::fs::metadata(path).expect("exists").permissions().mode() & 0o777;
+            let mode = |path: &Path| {
+                std::fs::metadata(path)
+                    .expect("exists")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
             assert_eq!(mode(&dir), 0o700, "the sockets dir is the user's own");
-            assert_eq!(mode(receipts.address()), 0o600, "the receipt address is the user's own");
+            assert_eq!(
+                mode(receipts.address()),
+                0o600,
+                "the receipt address is the user's own"
+            );
         }
         // the peer below is this process, and a verdict is only read from a
         // process a BINDING named. Without this the connection is dropped on

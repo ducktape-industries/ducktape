@@ -106,9 +106,8 @@ pub enum NetstackBackend {
     /// The deterministic scenario harness implementation; never selected by a node.
     #[cfg(feature = "native-tests")]
     Native,
-    /// The `ducktape:netstack` component these bytes carry, stepped under
-    /// `step_fuel` units of wasm fuel per event — exhaustion is a fault.
-    Guest { component: Vec<u8>, step_fuel: u64 },
+    /// The `ducktape:netstack` component these bytes carry.
+    Guest { component: Vec<u8> },
 }
 
 /// Host execution status. This is not part of the guest protocol ABI.
@@ -173,10 +172,7 @@ impl std::fmt::Debug for NetstackBackend {
         match self {
             #[cfg(feature = "native-tests")]
             Self::Native => f.write_str("Native"),
-            Self::Guest {
-                component,
-                step_fuel,
-            } => write!(f, "Guest({} bytes, {step_fuel} fuel/step)", component.len()),
+            Self::Guest { component } => write!(f, "Guest({} bytes)", component.len()),
         }
     }
 }
@@ -555,25 +551,17 @@ impl MachineFactory {
         match &self.backend {
             #[cfg(feature = "native-tests")]
             NetstackBackend::Native => Ok(self.native()),
-            NetstackBackend::Guest {
-                component,
-                step_fuel,
-            } => {
-                let guest = NetstackGuest::with_fuel(
-                    component,
-                    self.signer(),
-                    self.config.clone(),
-                    *step_fuel,
-                )
-                .map_err(|error| {
-                    tracing::error!(
-                        target: "ducktape::reachability",
-                        event = "netstack_guest_boot_failed",
-                        error = %error,
-                        "netstack guest could not start"
-                    );
-                    ReachabilityError::Backend(error.to_string())
-                })?;
+            NetstackBackend::Guest { component } => {
+                let guest = NetstackGuest::new(component, self.signer(), self.config.clone())
+                    .map_err(|error| {
+                        tracing::error!(
+                            target: "ducktape::reachability",
+                            event = "netstack_guest_boot_failed",
+                            error = %error,
+                            "netstack guest could not start"
+                        );
+                        ReachabilityError::Backend(error.to_string())
+                    })?;
                 Ok(Box::new(guest))
             }
         }
@@ -591,16 +579,12 @@ impl MachineFactory {
                 let machine = Machine::restore(self.signer(), self.config.clone(), snapshot)?;
                 Ok(Box::new(machine))
             }
-            NetstackBackend::Guest {
-                component,
-                step_fuel,
-            } => {
+            NetstackBackend::Guest { component } => {
                 let guest = NetstackGuest::restore(
                     component,
                     self.signer(),
                     self.config.clone(),
                     snapshot,
-                    *step_fuel,
                 )?;
                 Ok(Box::new(guest))
             }

@@ -239,11 +239,6 @@ fn advertised_service(query: &str) -> Option<&str> {
         .find_map(|pair| pair.strip_prefix("service="))
 }
 
-/// the largest MCP message this lane will read. A tool call is a few hundred
-/// bytes of arguments and the biggest legitimate one is a file write; the cap
-/// is what keeps a guest from making the daemon buffer its whole memory.
-const MAX_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
-
 impl Lane {
     /// the agent tool plane, over streamable HTTP: one JSON-RPC message in the
     /// POST body, one JSON response back — or `202` with no body when the
@@ -263,9 +258,9 @@ impl Lane {
             )
                 .into_response();
         }
-        let body = match axum::body::to_bytes(req.into_body(), MAX_MCP_MESSAGE_BYTES).await {
+        let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
             Ok(body) => body,
-            Err(_) => return self.refuse("mcp_message_too_large"),
+            Err(_) => return self.refuse("mcp_message_unreadable"),
         };
         let message = String::from_utf8_lossy(&body).into_owned();
         let env = self.mcp_env.clone();
@@ -643,7 +638,10 @@ mod tests {
     #[test]
     fn the_tool_plane_is_served_here_and_never_forwarded() {
         assert!(matches!(classify(MCP_PATH, "", Some("app")), Route::Mcp));
-        assert!(matches!(classify("/v1/query", "", Some("app")), Route::Pass));
+        assert!(matches!(
+            classify("/v1/query", "", Some("app")),
+            Route::Pass
+        ));
     }
 
     /// THE credential-scope gate: a run delegated with one repo draws the

@@ -38,14 +38,9 @@ INSTALL=~/bin bin/duck-vz-shim/build.sh        # ~/bin must be on PATH
 
 # 2. the workspace's guest artifacts (aarch64 kernel + rootfs; cross-builds
 #    the init with rust-lld, no musl toolchain needed). A guest is per
-#    workspace: after `ducktape node init`/`join`, W is that workspace
-#    (`ducktape node list`), and `ducktape node sandbox` prints this line
-#    for one that is missing them.
+#    workspace: W is the node's workspace (`--workspace`, default
+#    `$DUCKTAPE_HOME`).
 OUT=$W/guest ops/build-guest-rootfs.sh
-
-# 2b. the agent CLIs this workspace lends to runs (a checklist of what is
-#     missing, with each download's url and expected sha256)
-ducktape agent install -n <chain-id>
 
 # 3. the smoke: one microVM end to end — boot, stdio, exit code, workspace
 #    read-back. This is the first thing to run and the thing to bisect with;
@@ -96,8 +91,8 @@ entitlement (re-run `build.sh` — it codesigns), `kern.hv_support`, `mke2fs` /
   (SPM aborting, the newest SDK unparseable by its own compiler).
 - **Executors must be Linux aarch64 ELF binaries**, and they do not come from
   the host `PATH` — a Mac's own `claude`/`codex` is Mach-O and the guest cannot
-  exec it at all. `ducktape agent install <name> -n <chain-id>` fetches the
-  pinned linux/arm64 build into `<workspace>/executors`, and the node derives
+  exec it at all. The pinned linux/arm64 build lives in
+  `<workspace>/executors`, and the node derives
   a read-only image from that directory and mounts it at `/opt/duck/bin` for
   each run. The rootfs carries no CLI, so installing one needs no image
   rebuild.

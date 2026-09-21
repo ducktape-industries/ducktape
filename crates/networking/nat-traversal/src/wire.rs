@@ -243,11 +243,7 @@ impl Msg {
                 put_key(out, key);
                 put_cookie(out, cookie);
             }
-            Msg::Readvertise {
-                key,
-                nonce,
-                cookie,
-            } => {
+            Msg::Readvertise { key, nonce, cookie } => {
                 out.push(TAG_READVERTISE);
                 put_key(out, key);
                 put_u64(out, *nonce);

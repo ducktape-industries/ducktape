@@ -19,12 +19,16 @@ pub(crate) async fn verify(
     measurement: &str,
     attest: &str,
 ) -> Result<[u8; 32], String> {
-    let mode: AttestMode = attest.parse().map_err(|e| format!("airlock attest mode: {e}"))?;
+    let mode: AttestMode = attest
+        .parse()
+        .map_err(|e| format!("airlock attest mode: {e}"))?;
     let expected =
         Measurement::from_hex(measurement).map_err(|e| format!("airlock measurement: {e}"))?;
     let roots = trust_roots(cfg, mode)?;
-    let (quote, _vendor) =
-        gateway.fetch_quote().await.map_err(|e| format!("airlock fetch quote: {e}"))?;
+    let (quote, _vendor) = gateway
+        .fetch_quote()
+        .await
+        .map_err(|e| format!("airlock fetch quote: {e}"))?;
     let report_data = airlock::verify::verify_quote(&quote, &expected, &roots)
         .await
         .map_err(|e| format!("airlock verify: {e}"))?;
@@ -42,7 +46,9 @@ fn trust_roots(cfg: &AirlockConfig, mode: AttestMode) -> Result<TrustRoots, Stri
         return Ok(roots);
     }
     match mode {
-        AttestMode::Tdx => Ok(TrustRoots::Tdx(TdxRoots { pccs_url: cfg.pccs_url.clone() })),
+        AttestMode::Tdx => Ok(TrustRoots::Tdx(TdxRoots {
+            pccs_url: cfg.pccs_url.clone(),
+        })),
         AttestMode::Snp => {
             let product = cfg
                 .snp_product
@@ -53,7 +59,11 @@ fn trust_roots(cfg: &AirlockConfig, mode: AttestMode) -> Result<TrustRoots, Stri
                 })?
                 .parse::<SnpProduct>()
                 .map_err(|e| format!("airlock SNP product: {e}"))?;
-            let vcek = cfg.snp_vcek.clone().map(VcekSource::Der).unwrap_or(VcekSource::Kds);
+            let vcek = cfg
+                .snp_vcek
+                .clone()
+                .map(VcekSource::Der)
+                .unwrap_or(VcekSource::Kds);
             SnpRoots::amd(product, vcek)
                 .map(|r| TrustRoots::Snp(Box::new(r)))
                 .map_err(|e| format!("airlock SNP roots: {e}"))
@@ -111,7 +121,10 @@ mod tests {
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("");
                         if got != want {
-                            return (StatusCode::UNAUTHORIZED, format!("want {want:?} got {got:?}"))
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                format!("want {want:?} got {got:?}"),
+                            )
                                 .into_response();
                         }
                         (
@@ -161,7 +174,7 @@ mod tests {
                 oauth_token_url: format!("{upstream}/oauth/token"),
                 oauth_client_id: "test-client".into(),
                 session_ttl_secs: 3600,
-                max_requests: 100,
+                clock: airlock::server::Clock::system(),
                 sign: None,
             },
             "snp",
@@ -212,8 +225,12 @@ mod tests {
         // Computation Provider: build the Anthropic broker in AIRLOCK mode —
         // NO host credential, just a verified gateway + session token.
         let (auth, messages_url) = AnthropicAuth::airlock(AirlockConfig {
+            kind: airlock::wire::CredentialKind::Claude,
             gateway: AirlockGateway::Local { url: gateway_url },
-            trust: AirlockTrust::Attested { measurement: meas, attest: "snp".into() },
+            trust: AirlockTrust::Attested {
+                measurement: meas,
+                attest: "snp".into(),
+            },
             sub: "test-sub".into(),
             work: WorkRef::Direct,
             snp_product: None, // the test roots override supplies the chain
@@ -243,7 +260,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         let body = resp.text().await.unwrap();
-        assert!(body.contains("AIRLOCK-OK"), "custody path should stream the reply back: {body}");
+        assert!(
+            body.contains("AIRLOCK-OK"),
+            "custody path should stream the reply back: {body}"
+        );
         // the run bearer the sandbox holds is neither the session token nor the credential.
         assert_ne!(broker.endpoint.run_bearer, "ref-seed");
     }
@@ -256,6 +276,7 @@ mod tests {
         // Pin a DIFFERENT audited image; the attestation gate must reject the
         // gateway before any session is established or credential spent.
         let refused = AnthropicAuth::airlock(AirlockConfig {
+            kind: airlock::wire::CredentialKind::Claude,
             gateway: AirlockGateway::Local { url: gateway_url },
             trust: AirlockTrust::Attested {
                 measurement: "22".repeat(attest::MRTD_LEN),

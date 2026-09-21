@@ -1,0 +1,20 @@
+[package]
+name = "state"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+abi = { workspace = true }
+borsh = { workspace = true }
+commonware-codec = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-parallel = { workspace = true }
+commonware-runtime = { workspace = true }
+commonware-storage = { workspace = true }
+commonware-utils = { workspace = true }
+fluent31 = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
