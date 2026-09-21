@@ -225,6 +225,7 @@ mod tests {
         // Computation Provider: build the Anthropic broker in AIRLOCK mode —
         // NO host credential, just a verified gateway + session token.
         let (auth, messages_url) = AnthropicAuth::airlock(AirlockConfig {
+            kind: airlock::wire::CredentialKind::Claude,
             gateway: AirlockGateway::Local { url: gateway_url },
             trust: AirlockTrust::Attested {
                 measurement: meas,
@@ -275,6 +276,7 @@ mod tests {
         // Pin a DIFFERENT audited image; the attestation gate must reject the
         // gateway before any session is established or credential spent.
         let refused = AnthropicAuth::airlock(AirlockConfig {
+            kind: airlock::wire::CredentialKind::Claude,
             gateway: AirlockGateway::Local { url: gateway_url },
             trust: AirlockTrust::Attested {
                 measurement: "22".repeat(attest::MRTD_LEN),
