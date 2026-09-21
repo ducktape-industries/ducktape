@@ -9,4 +9,3 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 abi = { workspace = true }
 guest = { workspace = true }
-borsh = { workspace = true }

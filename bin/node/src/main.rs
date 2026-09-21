@@ -40,12 +40,8 @@ enum Verb {
     Identity,
     #[command(about = "found a network in this workspace from a founding file")]
     Init { founding: PathBuf },
-    #[command(about = "join a network: sync its state from a running node and enroll as a member")]
-    Join {
-        source: String,
-        #[arg(long, help = "the address peers dial this node at")]
-        address: SocketAddr,
-    },
+    #[command(about = "join a network by syncing its state from a running node")]
+    Join { source: String },
     #[command(about = "run the node")]
     Run {
         #[arg(long, help = "the address peers dial")]
@@ -170,8 +166,8 @@ fn execute(cli: Cli) -> Result<(), String> {
         Verb::Init { founding } => node_runtime(&workspace).start(|context| async move {
             noded::init(context, &workspace, &founding).await.sentence()
         }),
-        Verb::Join { source, address } => node_runtime(&workspace).start(|context| async move {
-            noded::join(context, &workspace, Client::new(source), address)
+        Verb::Join { source } => node_runtime(&workspace).start(|context| async move {
+            noded::join(context, &workspace, Client::new(source))
                 .await
                 .sentence()
         }),

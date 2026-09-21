@@ -40,13 +40,6 @@ fn member(key: &ed25519::PrivateKey) -> valset::Member {
     }
 }
 
-fn seated(validators: &[valset::Member]) -> valset::Seating {
-    valset::Seating {
-        validators: validators.iter().map(|member| member.key.clone()).collect(),
-        members: validators.to_vec(),
-    }
-}
-
 fn genesis(members: &[valset::Member]) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
@@ -92,7 +85,7 @@ async fn seal(node: &mut Node<Ctx>) -> Block {
 }
 
 fn certify(signers: &[ed25519::PrivateKey], members: &[valset::Member], tip: Tip) -> Certificate {
-    let validators = validators_of(&seated(members).validators).unwrap();
+    let validators = validators_of(members).unwrap();
     let epoch = tip.height / EPOCH_LENGTH;
     let proposal = Proposal::new(
         Round::new(Epoch::new(epoch), View::new(tip.height)),
@@ -259,8 +252,8 @@ fn a_joiner_adopts_the_state_at_a_finalized_tip() {
             Some(b"2".to_vec())
         );
         assert_eq!(
-            joined.node.epoch_seating(0).unwrap(),
-            Some(seated(&network.members))
+            joined.node.epoch_members(0).unwrap(),
+            Some(network.members.clone())
         );
         let Start::Floor(certificate) = joined.anchor.start() else {
             panic!("a finalized tip starts from its certificate");

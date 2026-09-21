@@ -128,8 +128,8 @@ fn verified<E: Context>(
     certificate: &Certificate,
 ) -> Result<()> {
     let epoch = certificate.round().epoch().get();
-    let seating = node.epoch_seating(epoch)?.unwrap_or_default();
-    let validators = validators_of(&seating.validators).ok_or(Error::Certificate { epoch })?;
+    let members = node.epoch_members(epoch)?.unwrap_or_default();
+    let validators = validators_of(&members).ok_or(Error::Certificate { epoch })?;
     let scheme = Scheme::verifier(network, validators);
     let verifies = certificate.verify(context, &scheme, &Sequential);
     if !verifies {

@@ -40,11 +40,6 @@ pub type Shared<E> = Arc<futures::lock::Mutex<Node<E>>>;
 pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("{}: {source}", .path.display())]
-    File {
-        path: std::path::PathBuf,
-        source: std::io::Error,
-    },
     #[error("the founding file does not parse: {0}")]
     Founding(#[from] toml::de::Error),
     #[error("not hex: {0}")]

@@ -166,17 +166,9 @@ pub struct Program {
     pub params: Option<PathBuf>,
 }
 
-fn named(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).map_err(|source| Error::File {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 impl Founding {
     pub fn read(path: &Path) -> Result<(Founding, PathBuf)> {
-        let text = String::from_utf8(named(path)?)
-            .map_err(|error| Error::Corrupt(format!("{}: {error}", path.display())))?;
+        let text = std::fs::read_to_string(path)?;
         let founding: Founding = toml::from_str(&text)?;
         let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
         Ok((founding, base))
@@ -206,20 +198,20 @@ impl Founding {
             .iter()
             .map(|program| {
                 let params = match &program.params {
-                    Some(path) => named(&base.join(path))?,
+                    Some(path) => std::fs::read(base.join(path))?,
                     None => Vec::new(),
                 };
                 Ok(FoundingProgram {
                     program: program.id.clone(),
-                    code: named(&base.join(&program.code))?,
+                    code: std::fs::read(base.join(&program.code))?,
                     params,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Genesis {
             network: self.network.as_bytes().to_vec(),
-            module_registry: named(&base.join(&self.module_registry))?,
-            valset: named(&base.join(&self.valset))?,
+            module_registry: std::fs::read(base.join(&self.module_registry))?,
+            valset: std::fs::read(base.join(&self.valset))?,
             validators,
             programs,
             limits: Limits {

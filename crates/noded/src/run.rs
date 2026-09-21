@@ -4,10 +4,9 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use abi::valset::Seating;
-use abi::{Outcome, admission};
+use abi::valset::Member;
 use commonware_cryptography::Signer as _;
-use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
+use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::authenticated::lookup::{Oracle, Receiver, Sender};
 use commonware_runtime::Handle;
 use commonware_utils::Acknowledgement as _;
@@ -17,8 +16,7 @@ use consensus::{
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use host::{Layer, SIGNERS};
-use node::{Block, Frame, Node, Sequenced};
+use node::{Block, Node, Sequenced};
 use tokio::sync::watch;
 
 use crate::mesh::{Mesh, Reach, track};
@@ -27,7 +25,7 @@ use crate::{Client, Context, Daemon, Error, Logs, Result, Shared};
 
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type Delivery = (Arc<Block>, Exact);
-type Seats<E> =
+type Seating<E> =
     Membership<E, Sender<PublicKey, E>, Receiver<PublicKey>, Oracle<PublicKey>, Participant<E>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,9 +63,8 @@ pub fn join<'a, E: Context>(
     context: E,
     workspace: &'a Workspace,
     source: Client,
-    address: SocketAddr,
 ) -> Boxed<'a, Result<()>> {
-    Box::pin(adopt(context, workspace, source, address))
+    Box::pin(adopt(context, workspace, source))
 }
 
 pub fn run<'a, E: Context>(
@@ -95,57 +92,24 @@ async fn found<E: Context>(mut context: E, workspace: &Workspace, founding: &Pat
     workspace.write_anchor(&Anchor::Genesis(block))
 }
 
-async fn adopt<E: Context>(
-    mut context: E,
-    workspace: &Workspace,
-    source: Client,
-    address: SocketAddr,
-) -> Result<()> {
+async fn adopt<E: Context>(mut context: E, workspace: &Workspace, source: Client) -> Result<()> {
     let status = source.status().await?;
     let descriptor = Descriptor {
         network: status.network,
         time: status.time,
         block_time_ms: status.block_time_ms,
     };
-    let identity = workspace.identity_or_create(&mut context)?;
+    workspace.identity_or_create(&mut context)?;
     let joined = statesync::join(
         context.child("join"),
         &descriptor.network,
         workspace.dir(),
         descriptor.id(),
-        source.clone(),
+        source,
     )
     .await?;
     workspace.write_descriptor(&descriptor)?;
-    workspace.write_anchor(&joined.anchor)?;
-    enroll(&source, &identity, &descriptor, address).await
-}
-
-async fn enroll(
-    source: &Client,
-    identity: &PrivateKey,
-    descriptor: &Descriptor,
-    address: SocketAddr,
-) -> Result<()> {
-    let signer = identity.public_key().as_ref().to_vec();
-    let sequence = match source.get(Layer::Preconfirmed, SIGNERS, &signer).await? {
-        Some(bytes) => abi::decode(&bytes).map_err(Error::Decode)?,
-        None => 0,
-    };
-    let frame = Frame::sign(
-        identity,
-        descriptor.network.as_bytes(),
-        sequence,
-        admission::PROGRAM,
-        abi::encode(&admission::Op::Enroll {
-            address: address.to_string(),
-        }),
-    );
-    let receipt = source.submit(frame.encode()).await?;
-    match receipt.outcome {
-        Outcome::Applied { .. } => Ok(()),
-        Outcome::Rejected(refusal) => Err(Error::Refused(refusal)),
-    }
+    workspace.write_anchor(&joined.anchor)
 }
 
 async fn start<E: Context>(
@@ -165,7 +129,7 @@ async fn start<E: Context>(
     let seated = recorded_epochs(&node)?;
     let tip = node.tip()?;
     let epoch = network.epoch_after(tip.height);
-    let seating = seated.get(&epoch).cloned().ok_or(Error::Corrupt(format!(
+    let members = seated.get(&epoch).cloned().ok_or(Error::Corrupt(format!(
         "the state seats nobody for epoch {epoch}"
     )))?;
 
@@ -177,10 +141,10 @@ async fn start<E: Context>(
         listen.reach,
     );
     let mut oracle = mesh.oracle();
-    track(&mut oracle, epoch, &seating.members);
+    track(&mut oracle, epoch, &members);
     let roster = Roster::new(descriptor.id(), Some(identity.clone()));
-    for (epoch, seating) in &seated {
-        let validators = validators_of(&seating.validators).ok_or(Error::Corrupt(format!(
+    for (epoch, members) in &seated {
+        let validators = validators_of(members).ok_or(Error::Corrupt(format!(
             "epoch {epoch} seats an undecodable key"
         )))?;
         roster.seat(*epoch, validators);
@@ -217,7 +181,7 @@ async fn start<E: Context>(
         &marshal,
         chain,
     );
-    let standing = membership.seat(tip, &seating).await?;
+    let standing = membership.seat(tip, &members).await?;
     tracing::info!(
         target: "ducktape::node",
         event = "node_started",
@@ -271,11 +235,13 @@ async fn start<E: Context>(
     })
 }
 
-fn recorded_epochs<E: Context>(node: &Node<E>) -> Result<std::collections::BTreeMap<u64, Seating>> {
+fn recorded_epochs<E: Context>(
+    node: &Node<E>,
+) -> Result<std::collections::BTreeMap<u64, Vec<Member>>> {
     let mut seated = std::collections::BTreeMap::new();
     let mut epoch = 0;
-    while let Some(seating) = node.epoch_seating(epoch)? {
-        seated.insert(epoch, seating);
+    while let Some(members) = node.epoch_members(epoch)? {
+        seated.insert(epoch, members);
         epoch += 1;
     }
     Ok(seated)
@@ -308,7 +274,7 @@ impl<E: Context> Chain for Participant<E> {
 
 async fn pump<E: Context>(
     daemon: Arc<Daemon<E>>,
-    mut membership: Seats<E>,
+    mut membership: Seating<E>,
     mut oracle: Oracle<PublicKey>,
     mut deliveries: mpsc::UnboundedReceiver<Delivery>,
 ) {
@@ -331,7 +297,7 @@ async fn pump<E: Context>(
 
 async fn applied<E: Context>(
     daemon: &Daemon<E>,
-    membership: &mut Seats<E>,
+    membership: &mut Seating<E>,
     oracle: &mut Oracle<PublicKey>,
     block: &Block,
 ) -> Result<()> {
@@ -343,11 +309,11 @@ async fn applied<E: Context>(
         return Ok(());
     }
     let epoch = daemon.network.epoch_after(block.height);
-    let seating = node.epoch_seating(epoch)?.ok_or(Error::Corrupt(format!(
+    let members = node.epoch_members(epoch)?.ok_or(Error::Corrupt(format!(
         "the boundary block records no epoch {epoch}"
     )))?;
     drop(node);
-    track(oracle, epoch, &seating.members);
-    membership.seat(block.tip(), &seating).await?;
+    track(oracle, epoch, &members);
+    membership.seat(block.tip(), &members).await?;
     Ok(())
 }

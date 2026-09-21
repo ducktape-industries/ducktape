@@ -20,7 +20,7 @@ use state::{Commitment, Overlay, Storage, Store, View, Writes, valid_program_id}
 
 use crate::unit::{Loaded, World, refusal_of};
 
-pub use namespace::{BLOBS, NETWORK, PROGRAMS, QUEUE, RESERVED, SIGNERS, epoch as epoch_key};
+pub use namespace::{BLOBS, NETWORK, PROGRAMS, QUEUE, RESERVED, SIGNERS};
 pub use queue::Item;
 pub use runtime::Limits;
 
@@ -337,7 +337,7 @@ where
         abi::decode(&bytes).map_err(corrupt)
     }
 
-    pub fn epoch_seating(&self, epoch: u64) -> Result<Option<valset::Seating>> {
+    pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<valset::Member>>> {
         self.store
             .view(Vec::new())
             .get(NETWORK, &namespace::epoch(epoch))?
@@ -457,52 +457,26 @@ where
         overlay: &mut Overlay,
         stage: &Stage,
     ) -> Result<()> {
-        let valset::Reply::Validators(validators) = self
-            .ask_valset(height, time, overlay, stage, valset::Query::Validators)
-            .await?
-        else {
-            return Err(Error::Corrupt(
-                "valset answered Validators with another reply".into(),
-            ));
-        };
-        let valset::Reply::Members(members) = self
-            .ask_valset(height, time, overlay, stage, valset::Query::Members)
-            .await?
-        else {
-            return Err(Error::Corrupt(
-                "valset answered Members with another reply".into(),
-            ));
-        };
-        let seating = valset::Seating {
-            validators,
-            members,
-        };
-        overlay.set(NETWORK, namespace::epoch(epoch), abi::encode(&seating));
-        Ok(())
-    }
-
-    async fn ask_valset(
-        &self,
-        height: u64,
-        time: u64,
-        overlay: &Overlay,
-        stage: &Stage,
-        query: valset::Query,
-    ) -> Result<valset::Reply> {
         let reply = unit::query(
             self.world(height, time),
-            vec![overlay],
+            vec![&*overlay],
             stage,
             &[],
             Origin::System,
             valset::PROGRAM.to_owned(),
-            abi::encode(&query),
+            abi::encode(&valset::Query::Members),
         )
         .await?;
         let bytes = reply.map_err(|refusal| {
-            Error::Corrupt(format!("valset refused the {query:?} query: {refusal}"))
+            Error::Corrupt(format!("valset refused the members query: {refusal}"))
         })?;
-        abi::decode(&bytes).map_err(corrupt)
+        let valset::Reply::Members(members) = abi::decode(&bytes).map_err(corrupt)? else {
+            return Err(Error::Corrupt(
+                "valset answered Members with another reply".into(),
+            ));
+        };
+        overlay.set(NETWORK, namespace::epoch(epoch), abi::encode(&members));
+        Ok(())
     }
 
     pub fn deliveries_due(&self) -> Result<bool> {

@@ -3,13 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
-use abi::valset::Seating;
 use abi::{HostOp, HostReply, Outcome, Scan};
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
 use fixture_probe::{Reply, Step};
 use futures::StreamExt as _;
-use host::{Layer, NETWORK as NETWORK_NAMESPACE, epoch_key};
+use host::Layer;
 use node::Frame;
 use noded::wire::Admin;
 use noded::{Client, Listen, Logs, Reach, Workspace};
@@ -19,7 +18,6 @@ const MODULE_REGISTRY: &[u8] =
 const VALSET: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_relay.wasm");
 const PROBE: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_probe.wasm");
-const ADMISSION: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_admission.wasm");
 
 const NETWORK: &str = "daemon";
 const TIME: u64 = 1_700_000_000;
@@ -73,14 +71,10 @@ impl Seat {
 
     fn join(&self, source: &Client) {
         runner(&self.workspace.runtime_dir()).start(|context| async move {
-            noded::join(context, &self.workspace, source.clone(), self.p2p)
+            noded::join(context, &self.workspace, source.clone())
                 .await
                 .unwrap();
         });
-    }
-
-    fn key(&self) -> Vec<u8> {
-        self.identity.public_key().as_ref().to_vec()
     }
 
     fn start(&self) -> Live {
@@ -128,7 +122,6 @@ fn founding(root: &Path, seats: &[&Seat]) -> PathBuf {
     std::fs::write(root.join("valset.wasm"), VALSET).unwrap();
     std::fs::write(root.join("relay.wasm"), RELAY).unwrap();
     std::fs::write(root.join("probe.wasm"), PROBE).unwrap();
-    std::fs::write(root.join("admission.wasm"), ADMISSION).unwrap();
     std::fs::write(root.join("params.bin"), abi::encode(&Vec::<Step>::new())).unwrap();
     let validators: String = seats.iter().map(|seat| seat.validator()).collect();
     let text = format!(
@@ -136,8 +129,7 @@ fn founding(root: &Path, seats: &[&Seat]) -> PathBuf {
          block_time_ms = {BLOCK_TIME_MS}\nmodule-registry = \"module_registry.wasm\"\nvalset = \"valset.wasm\"\n\
          {validators}\
          [[programs]]\nid = \"ping\"\ncode = \"relay.wasm\"\n\
-         [[programs]]\nid = \"probe\"\ncode = \"probe.wasm\"\nparams = \"params.bin\"\n\
-         [[programs]]\nid = \"admission\"\ncode = \"admission.wasm\"\n"
+         [[programs]]\nid = \"probe\"\ncode = \"probe.wasm\"\nparams = \"params.bin\"\n"
     );
     let path = root.join("genesis.toml");
     std::fs::write(&path, text).unwrap();
@@ -314,100 +306,6 @@ fn a_late_validator_joins_by_state_sync_and_follows() {
         }
     });
     for node in live.into_iter().chain(std::iter::once(joined)) {
-        node.thread.join().unwrap();
-    }
-}
-
-#[test]
-fn a_stranger_joins_by_enrolling_and_follows_without_a_seat() {
-    let root = tempfile::tempdir().unwrap();
-    let seats: Vec<Seat> = (0..4)
-        .map(|i| Seat::new(root.path(), &format!("n{i}")))
-        .collect();
-    let founding = founding(root.path(), &seats[..3].iter().collect::<Vec<_>>());
-    for seat in &seats[..3] {
-        seat.init(&founding);
-    }
-    let live: Vec<Live> = seats[..3].iter().map(Seat::start).collect();
-    let alice = ed25519::PrivateKey::from_seed(11);
-    let runtime = client_runtime();
-
-    let first = runtime.block_on(async {
-        let mut changes = live[0].client.changes("probe").await.unwrap();
-        live[0]
-            .client
-            .submit(frame(&alice, 0, vec![set(b"a", b"1")]))
-            .await
-            .unwrap();
-        changes.next().await.unwrap().unwrap()
-    });
-    assert!(first.height >= 1);
-
-    seats[3].join(&live[0].client);
-    let stranger = seats[3].start();
-    let synced = runtime.block_on(async {
-        let status = stranger.client.status().await.unwrap();
-        assert!(status.height >= first.height, "{status:?}");
-        let mut changes = stranger.client.changes("probe").await.unwrap();
-        live[1]
-            .client
-            .submit(frame(&alice, 1, vec![set(b"b", b"2")]))
-            .await
-            .unwrap();
-        changes.next().await.unwrap().unwrap()
-    });
-    assert_eq!(synced.writes, vec![(b"b".to_vec(), Some(b"2".to_vec()))]);
-
-    let seated = runtime.block_on(async {
-        let mut changes = stranger.client.changes("probe").await.unwrap();
-        let mut seq = 2;
-        loop {
-            let status = stranger.client.status().await.unwrap();
-            let epoch = status.epoch;
-            let bytes = stranger
-                .client
-                .get(Layer::Confirmed, NETWORK_NAMESPACE, &epoch_key(epoch))
-                .await
-                .unwrap()
-                .expect("the stranger holds the seating of its own epoch");
-            let seating: Seating = abi::decode(&bytes).unwrap();
-            let enrolled = seating
-                .members
-                .iter()
-                .any(|member| member.key == seats[3].key());
-            if enrolled {
-                break seating;
-            }
-            live[2]
-                .client
-                .submit(frame(&alice, seq, vec![set(b"tick", &seq.to_be_bytes())]))
-                .await
-                .unwrap();
-            seq += 1;
-            changes.next().await.unwrap().unwrap();
-        }
-    });
-    assert_eq!(seated.validators.len(), 3);
-    assert_eq!(seated.members.len(), 4);
-    assert!(!seated.validators.contains(&seats[3].key()));
-    assert!(
-        seated.members.iter().any(
-            |member| member.key == seats[3].key() && member.address == seats[3].p2p.to_string()
-        )
-    );
-
-    runtime.block_on(async {
-        for (seat, node) in seats
-            .iter()
-            .zip(live.iter().chain(std::iter::once(&stranger)))
-        {
-            node.client
-                .admin(seat.admin(Admin::Shutdown))
-                .await
-                .unwrap();
-        }
-    });
-    for node in live.into_iter().chain(std::iter::once(stranger)) {
         node.thread.join().unwrap();
     }
 }

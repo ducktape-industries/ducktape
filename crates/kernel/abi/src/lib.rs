@@ -383,23 +383,6 @@ pub mod valset {
     pub struct Genesis {
         pub validators: Vec<Member>,
     }
-
-    #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-    pub struct Seating {
-        pub validators: Vec<Vec<u8>>,
-        pub members: Vec<Member>,
-    }
-}
-
-pub mod admission {
-    use super::{BorshDeserialize, BorshSerialize};
-
-    pub const PROGRAM: &str = "admission";
-
-    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-    pub enum Op {
-        Enroll { address: String },
-    }
 }
 
 pub fn encode<T: BorshSerialize>(value: &T) -> Vec<u8> {
