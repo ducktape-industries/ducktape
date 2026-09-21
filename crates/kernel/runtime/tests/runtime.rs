@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
 use abi::{
-    Cause, CryptoOp, CryptoReply, Entry, Env, GuestCall, HostOp, HostReply, ItemRef, Message,
-    Origin, Refusal, Scan, reason,
+    Cause, CryptoOp, CryptoReply, Entry, Env, GuestCall, HostOp, HostReply, Invocation, ItemRef,
+    Message, Origin, Refusal, Scan, reason,
 };
-use fixture_probe::Step;
+use fixture_probe::{Reply, Step};
 use runtime::{Fault, Host, Limits, Runtime};
 use sha2::{Digest as _, Sha256};
 
@@ -31,7 +31,6 @@ fn env() -> Env {
 impl Host for Bench {
     async fn call(&mut self, op: HostOp) -> HostReply {
         let reply = match &op {
-            HostOp::Env => HostReply::Env(env()),
             HostOp::Get(key) | HostOp::CommittedGet(key) => {
                 HostReply::Value(self.state.get(key).cloned())
             }
@@ -84,7 +83,11 @@ fn script(steps: Vec<Step>) -> Vec<u8> {
     abi::encode(&steps)
 }
 
-fn replies(bench: &Bench) -> Vec<HostReply> {
+fn invocation(call: GuestCall) -> Invocation {
+    Invocation { env: env(), call }
+}
+
+fn replies(bench: &Bench) -> Vec<Reply> {
     let Some(HostOp::Output(bytes)) = bench.seen.last() else {
         panic!("the probe ends an execute with its replies as output");
     };
@@ -96,7 +99,11 @@ async fn execute(limits: Limits, steps: Vec<Step>) -> (Bench, Result<abi::GuestR
     let code = runtime.load(PROBE).unwrap();
     let mut bench = Bench::default();
     let verdict = runtime
-        .run(&code, GuestCall::Execute(script(steps)), &mut bench)
+        .run(
+            &code,
+            invocation(GuestCall::Execute(script(steps))),
+            &mut bench,
+        )
         .await;
     (bench, verdict)
 }
@@ -104,7 +111,7 @@ async fn execute(limits: Limits, steps: Vec<Step>) -> (Bench, Result<abi::GuestR
 #[tokio::test]
 async fn every_host_op_crosses_the_boundary_and_back() {
     let steps = vec![
-        Step::Op(HostOp::Env),
+        Step::Env,
         Step::Op(HostOp::Set {
             key: b"k/1".to_vec(),
             value: b"one".to_vec(),
@@ -136,34 +143,33 @@ async fn every_host_op_crosses_the_boundary_and_back() {
     ];
     let (bench, verdict) = execute(Limits::default(), steps).await;
     assert_eq!(verdict, Ok(Ok(())));
-    assert_eq!(bench.seen.len(), 14);
-    assert_eq!(
-        replies(&bench),
-        vec![
-            HostReply::Env(env()),
-            HostReply::Done,
-            HostReply::Done,
-            HostReply::Value(Some(b"one".to_vec())),
-            HostReply::Done,
-            HostReply::Value(None),
-            HostReply::Entries(vec![Entry {
-                key: b"k/2".to_vec(),
-                value: b"two".to_vec(),
-            }]),
-            HostReply::Query(Ok(vec![3, 2, 1])),
-            HostReply::Query(Err(Refusal::new(reason::UNKNOWN_PROGRAM, "nobody"))),
-            HostReply::Item(ItemRef {
-                source: "probe".into(),
-                item: 1,
-            }),
-            HostReply::Done,
-            HostReply::Crypto(CryptoReply::Digest(Sha256::digest(b"abc").into())),
-            HostReply::Refused(Refusal::new(
-                reason::UNSUPPORTED,
-                "the bench does not serve BlobStat(BlobId(Sha1:0000000000000000000000000000000000000000))",
-            )),
-        ]
-    );
+    assert_eq!(bench.seen.len(), 13);
+    let hosted: Vec<HostReply> = vec![
+        HostReply::Done,
+        HostReply::Done,
+        HostReply::Value(Some(b"one".to_vec())),
+        HostReply::Done,
+        HostReply::Value(None),
+        HostReply::Entries(vec![Entry {
+            key: b"k/2".to_vec(),
+            value: b"two".to_vec(),
+        }]),
+        HostReply::Query(Ok(vec![3, 2, 1])),
+        HostReply::Query(Err(Refusal::new(reason::UNKNOWN_PROGRAM, "nobody"))),
+        HostReply::Item(ItemRef {
+            source: "probe".into(),
+            item: 1,
+        }),
+        HostReply::Done,
+        HostReply::Crypto(CryptoReply::Digest(Sha256::digest(b"abc").into())),
+        HostReply::Refused(Refusal::new(
+            reason::UNSUPPORTED,
+            "the bench does not serve BlobStat(BlobId(Sha1:0000000000000000000000000000000000000000))",
+        )),
+    ];
+    let mut expected = vec![Reply::Env(env())];
+    expected.extend(hosted.into_iter().map(Reply::Host));
+    assert_eq!(replies(&bench), expected);
 }
 
 #[tokio::test]
@@ -174,14 +180,16 @@ async fn a_query_responds_with_bytes_and_sets_no_output() {
     bench.state.insert(b"a".to_vec(), b"1".to_vec());
     let steps = script(vec![Step::Op(HostOp::Get(b"a".to_vec()))]);
     let verdict = runtime
-        .run(&code, GuestCall::Query(steps), &mut bench)
+        .run(&code, invocation(GuestCall::Query(steps)), &mut bench)
         .await;
     assert_eq!(verdict, Ok(Ok(())));
     assert_eq!(
         bench.seen,
         vec![
             HostOp::Get(b"a".to_vec()),
-            HostOp::Respond(abi::encode(&vec![HostReply::Value(Some(b"1".to_vec()))])),
+            HostOp::Respond(abi::encode(&vec![Reply::Host(HostReply::Value(Some(
+                b"1".to_vec()
+            )))])),
         ]
     );
 }
@@ -195,7 +203,9 @@ async fn init_runs_the_program_once_with_its_parameters() {
         key: b"born".to_vec(),
         value: b"yes".to_vec(),
     })]);
-    let verdict = runtime.run(&code, GuestCall::Init(steps), &mut bench).await;
+    let verdict = runtime
+        .run(&code, invocation(GuestCall::Init(steps)), &mut bench)
+        .await;
     assert_eq!(verdict, Ok(Ok(())));
     assert_eq!(bench.state.get(b"born".as_slice()), Some(&b"yes".to_vec()));
 }
@@ -223,7 +233,11 @@ async fn an_undecodable_payload_is_refused_not_faulted() {
     let code = runtime.load(PROBE).unwrap();
     let mut bench = Bench::default();
     let verdict = runtime
-        .run(&code, GuestCall::Execute(vec![0xff; 3]), &mut bench)
+        .run(
+            &code,
+            invocation(GuestCall::Execute(vec![0xff; 3])),
+            &mut bench,
+        )
         .await
         .unwrap();
     assert_eq!(verdict.unwrap_err().reason, reason::PROTOCOL);
@@ -246,9 +260,9 @@ async fn fuel_is_only_metered_when_a_limit_is_set() {
         fuel: Some(10),
         memory_bytes: None,
     };
-    let (_, metered) = execute(limits, vec![Step::Op(HostOp::Env)]).await;
+    let (_, metered) = execute(limits, vec![Step::Env]).await;
     assert!(matches!(metered, Err(Fault::Trap(_))), "{metered:?}");
-    let (_, unmetered) = execute(Limits::default(), vec![Step::Op(HostOp::Env)]).await;
+    let (_, unmetered) = execute(Limits::default(), vec![Step::Env]).await;
     assert_eq!(unmetered, Ok(Ok(())));
 }
 
@@ -272,7 +286,7 @@ async fn bytes_that_are_not_a_program_do_not_load() {
     let code = runtime.load(&no_exports).unwrap();
     let mut bench = Bench::default();
     let verdict = runtime
-        .run(&code, GuestCall::Execute(vec![]), &mut bench)
+        .run(&code, invocation(GuestCall::Execute(vec![])), &mut bench)
         .await;
     assert!(matches!(verdict, Err(Fault::Load(_))), "{verdict:?}");
 }

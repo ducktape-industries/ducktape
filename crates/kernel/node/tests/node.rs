@@ -4,7 +4,7 @@ use abi::{HostOp, HostReply, Message, Outcome, reason, valset};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-use fixture_probe::Step;
+use fixture_probe::{Reply, Step};
 use host::{Founding, Genesis, Layer, Limits, SIGNERS, Tip};
 use keyscheme::KeyScheme;
 use node::{Block, Body, Error, Frame, NAMESPACE, Node, Sequenced};
@@ -140,7 +140,7 @@ fn a_frame_is_preconfirmed_built_and_applied_once() {
         assert_eq!(
             receipt.outcome,
             Outcome::Applied {
-                output: abi::encode(&vec![HostReply::Done])
+                output: abi::encode(&vec![Reply::Host(HostReply::Done)])
             }
         );
         assert_eq!(node.pending(), 1);

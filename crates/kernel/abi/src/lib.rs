@@ -109,14 +109,42 @@ impl core::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
+/// A refusal's `reason` names the class of failure, which is the same as
+/// naming how a caller recovers: two refusals share a token exactly when a
+/// caller does the same thing about them.
 pub mod reason {
+    /// the host: no program by that id runs on this network.
     pub const UNKNOWN_PROGRAM: &str = "unknown_program";
+    /// the host: the program faulted (a trap, the fuel or memory limit).
     pub const TRAP: &str = "trap";
+    /// the host: bytes that do not decode, or an op the call's kind refuses.
     pub const PROTOCOL: &str = "protocol";
-    pub const UNSUPPORTED: &str = "unsupported";
-    pub const INVALID_INPUT: &str = "invalid_input";
-    pub const NOT_FOUND: &str = "not_found";
+    /// the host: the frame's sequence is not the signer's next.
     pub const SEQUENCE: &str = "sequence";
+    /// naming a thing that exists (id, key, path, account, sibling program).
+    pub const NOT_FOUND: &str = "not_found";
+    /// creating under a different id, or treating the create as done.
+    pub const ALREADY_EXISTS: &str = "already_exists";
+    /// re-reading and retrying: what the caller sent is behind the program.
+    pub const STALE: &str = "stale";
+    /// changing the thing's state first: it exists, in a state that refuses this.
+    pub const WRONG_STATE: &str = "wrong_state";
+    /// fixing the request: retrying it unchanged can never succeed.
+    pub const INVALID_INPUT: &str = "invalid_input";
+    /// sending less or removing something: a count, size or work bound is hit.
+    pub const CAPACITY: &str = "capacity";
+    /// waiting: the same request succeeds after a point the sentence names.
+    pub const NOT_YET: &str = "not_yet";
+    /// nothing: a monotonic counter cannot advance again; permanent.
+    pub const EXHAUSTED: &str = "exhausted";
+    /// acting as someone else: the actor may not do this to this thing.
+    pub const UNAUTHORIZED: &str = "unauthorized";
+    /// configuring: the program or this deployment does not provide the op.
+    pub const UNSUPPORTED: &str = "unsupported";
+    /// an operator: stored state or an index failed an invariant.
+    pub const CORRUPT: &str = "corrupt";
+    /// an operator: a sibling program answered a shape or value this one refuses.
+    pub const UNEXPECTED_REPLY: &str = "unexpected_reply";
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -237,7 +265,6 @@ pub enum CryptoReply {
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum HostOp {
-    Env,
     Get(Vec<u8>),
     Set {
         key: Vec<u8>,
@@ -273,7 +300,6 @@ pub enum HostOp {
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum HostReply {
-    Env(Env),
     Value(Option<Vec<u8>>),
     Entries(Vec<Entry>),
     Done,
@@ -285,6 +311,12 @@ pub enum HostReply {
     Query(Result<Vec<u8>, Refusal>),
     Crypto(CryptoReply),
     Refused(Refusal),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Invocation {
+    pub env: Env,
+    pub call: GuestCall,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -407,12 +439,18 @@ mod tests {
             request: vec![1, 2],
         };
         let reply = HostReply::Query(Err(Refusal::new("r", "s")));
-        let call = GuestCall::Execute(vec![3]);
+        let invocation = Invocation {
+            env: env.clone(),
+            call: GuestCall::Execute(vec![3]),
+        };
         let guest_reply: GuestReply = Ok(());
         assert_eq!(decode::<Env>(&encode(&env)).unwrap(), env);
         assert_eq!(decode::<HostOp>(&encode(&op)).unwrap(), op);
         assert_eq!(decode::<HostReply>(&encode(&reply)).unwrap(), reply);
-        assert_eq!(decode::<GuestCall>(&encode(&call)).unwrap(), call);
+        assert_eq!(
+            decode::<Invocation>(&encode(&invocation)).unwrap(),
+            invocation
+        );
         assert_eq!(
             decode::<GuestReply>(&encode(&guest_reply)).unwrap(),
             guest_reply

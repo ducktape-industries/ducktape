@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use abi::{
-    BlobId, Cause, Env, GuestCall, HashKind, ItemRef, Origin, Outcome, ProgramId, Refusal, Root,
-    Scan, module_registry, reason, valset,
+    BlobId, Cause, Env, GuestCall, HashKind, Invocation, ItemRef, Origin, Outcome, ProgramId,
+    Refusal, Root, Scan, module_registry, reason, valset,
 };
 use blobs::{Blobs, Layered, Stage};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -619,8 +619,7 @@ where
             overlay,
             stage,
             program,
-            call,
-            env,
+            Invocation { env, call },
         )
         .await
     }

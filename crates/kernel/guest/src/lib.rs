@@ -1,25 +1,12 @@
 pub use abi;
 pub use abi::{
     Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, GuestCall, GuestReply,
-    HashKind, HostOp, HostReply, ItemRef, Message, Origin, Outcome, ProgramId, Refusal, Root, Scan,
-    Scheme, reason,
+    HashKind, HostOp, HostReply, Invocation, ItemRef, Message, Origin, Outcome, ProgramId, Refusal,
+    Root, Scan, Scheme, reason,
 };
 
-pub trait Program {
-    fn init(_params: &[u8]) -> Result<(), Refusal> {
-        Ok(())
-    }
-    fn execute(payload: &[u8]) -> Result<(), Refusal>;
-    fn query(request: &[u8]) -> Result<(), Refusal>;
-}
-
-pub fn dispatch<P: Program>(call: GuestCall) -> GuestReply {
-    match call {
-        GuestCall::Init(params) => P::init(&params),
-        GuestCall::Execute(payload) => P::execute(&payload),
-        GuestCall::Query(request) => P::query(&request),
-    }
-}
+#[cfg(target_arch = "wasm32")]
+pub use context::{Execute, Program, Query, Reads, dispatch};
 
 #[macro_export]
 macro_rules! program {
@@ -38,8 +25,9 @@ macro_rules! program {
     };
 }
 
+#[cfg(target_arch = "wasm32")]
 pub mod exports {
-    use super::{GuestCall, GuestReply, Program, Refusal, reason};
+    use super::{Invocation, Program, Refusal, dispatch, reason};
 
     pub fn alloc(len: u32) -> u32 {
         let mut buffer = Vec::<u8>::with_capacity(len as usize);
@@ -50,14 +38,14 @@ pub mod exports {
 
     pub fn call<P: Program>(ptr: u32, len: u32) -> u64 {
         let request = unsafe { Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize) };
-        let reply: GuestReply = match abi::decode::<GuestCall>(&request) {
-            Ok(call) => super::dispatch::<P>(call),
+        let reply = match abi::decode::<Invocation>(&request) {
+            Ok(invocation) => dispatch::<P>(invocation),
             Err(fault) => Err(Refusal::new(reason::PROTOCOL, fault.sentence)),
         };
         leak(abi::encode(&reply))
     }
 
-    pub fn leak(bytes: Vec<u8>) -> u64 {
+    fn leak(bytes: Vec<u8>) -> u64 {
         let len = bytes.len() as u64;
         let ptr = bytes.as_ptr() as u64;
         core::mem::forget(bytes);
@@ -66,238 +54,282 @@ pub mod exports {
 }
 
 #[cfg(target_arch = "wasm32")]
-mod imports {
-    #[link(wasm_import_module = "ducktape")]
-    unsafe extern "C" {
-        pub fn host_call(ptr: u32, len: u32) -> u32;
-        pub fn host_take(ptr: u32);
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-pub fn host(op: &HostOp) -> HostReply {
-    let request = abi::encode(op);
-    let len = unsafe { imports::host_call(request.as_ptr() as u32, request.len() as u32) };
-    let mut reply = vec![0u8; len as usize];
-    unsafe { imports::host_take(reply.as_mut_ptr() as u32) };
-    match abi::decode(&reply) {
-        Ok(reply) => reply,
-        Err(fault) => panic!("{fault}"),
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-pub mod host_ops {
+mod context {
     use borsh::{BorshDeserialize, BorshSerialize};
 
     use super::*;
+
+    #[link(wasm_import_module = "ducktape")]
+    unsafe extern "C" {
+        fn host_call(ptr: u32, len: u32) -> u32;
+        fn host_take(ptr: u32);
+    }
+
+    fn host(op: &HostOp) -> HostReply {
+        let request = abi::encode(op);
+        let len = unsafe { host_call(request.as_ptr() as u32, request.len() as u32) };
+        let mut reply = vec![0u8; len as usize];
+        unsafe { host_take(reply.as_mut_ptr() as u32) };
+        match abi::decode(&reply) {
+            Ok(reply) => reply,
+            Err(fault) => panic!("{fault}"),
+        }
+    }
 
     fn protocol(expected: &str, got: HostReply) -> ! {
         panic!("host answered {got:?} where {expected} was expected")
     }
 
-    pub fn env() -> Env {
-        match host(&HostOp::Env) {
-            HostReply::Env(env) => env,
-            other => protocol("env", other),
+    pub trait Program {
+        fn init(_ctx: &mut Execute, _env: &Env, _params: &[u8]) -> Result<(), Refusal> {
+            Ok(())
+        }
+        fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal>;
+        fn query(ctx: &mut Query, env: &Env, request: &[u8]) -> Result<(), Refusal>;
+    }
+
+    pub fn dispatch<P: Program>(invocation: Invocation) -> GuestReply {
+        let Invocation { env, call } = invocation;
+        match call {
+            GuestCall::Init(params) => P::init(&mut Execute(()), &env, &params),
+            GuestCall::Execute(payload) => P::execute(&mut Execute(()), &env, &payload),
+            GuestCall::Query(request) => P::query(&mut Query(()), &env, &request),
         }
     }
 
-    pub fn get(key: impl AsRef<[u8]>) -> Option<Vec<u8>> {
-        match host(&HostOp::Get(key.as_ref().to_vec())) {
-            HostReply::Value(value) => value,
-            other => protocol("value", other),
+    pub trait Reads {
+        fn host(&self, op: &HostOp) -> HostReply;
+
+        fn get(&self, key: impl AsRef<[u8]>) -> Option<Vec<u8>> {
+            match self.host(&HostOp::Get(key.as_ref().to_vec())) {
+                HostReply::Value(value) => value,
+                other => protocol("value", other),
+            }
+        }
+
+        fn scan(&self, scan: Scan) -> Vec<Entry> {
+            match self.host(&HostOp::Scan(scan)) {
+                HostReply::Entries(entries) => entries,
+                other => protocol("entries", other),
+            }
+        }
+
+        fn committed_get(&self, key: impl AsRef<[u8]>) -> Option<Vec<u8>> {
+            match self.host(&HostOp::CommittedGet(key.as_ref().to_vec())) {
+                HostReply::Value(value) => value,
+                other => protocol("value", other),
+            }
+        }
+
+        fn committed_scan(&self, scan: Scan) -> Vec<Entry> {
+            match self.host(&HostOp::CommittedScan(scan)) {
+                HostReply::Entries(entries) => entries,
+                other => protocol("entries", other),
+            }
+        }
+
+        fn record<T: BorshDeserialize>(&self, key: impl AsRef<[u8]>) -> Result<Option<T>, Refusal> {
+            self.get(key).map(|bytes| abi::decode(&bytes)).transpose()
+        }
+
+        fn records<T: BorshDeserialize>(&self, scan: Scan) -> Result<Vec<(Vec<u8>, T)>, Refusal> {
+            self.scan(scan)
+                .into_iter()
+                .map(|entry| Ok((entry.key, abi::decode(&entry.value)?)))
+                .collect()
+        }
+
+        fn blob_get(&self, id: BlobId) -> Option<Blob> {
+            match self.host(&HostOp::BlobGet(id)) {
+                HostReply::Blob(blob) => blob,
+                other => protocol("blob", other),
+            }
+        }
+
+        fn blob_stat(&self, id: BlobId) -> Option<BlobHeader> {
+            match self.host(&HostOp::BlobStat(id)) {
+                HostReply::BlobHeader(header) => header,
+                other => protocol("blob header", other),
+            }
+        }
+
+        fn blob_read(&self, id: BlobId, offset: u64, len: u64) -> Option<Vec<u8>> {
+            match self.host(&HostOp::BlobRead { id, offset, len }) {
+                HostReply::Value(bytes) => bytes,
+                other => protocol("value", other),
+            }
+        }
+
+        fn root(&self, program: impl Into<ProgramId>) -> Option<Root> {
+            match self.host(&HostOp::Root(program.into())) {
+                HostReply::Root(root) => root,
+                other => protocol("root", other),
+            }
+        }
+
+        fn query(
+            &self,
+            program: impl Into<ProgramId>,
+            request: impl Into<Vec<u8>>,
+        ) -> Result<Vec<u8>, Refusal> {
+            match self.host(&HostOp::Query {
+                program: program.into(),
+                request: request.into(),
+            }) {
+                HostReply::Query(answer) => answer,
+                other => protocol("query answer", other),
+            }
+        }
+
+        fn ask<Q: BorshSerialize, R: BorshDeserialize>(
+            &self,
+            program: impl Into<ProgramId>,
+            request: &Q,
+        ) -> Result<R, Refusal> {
+            abi::decode(&self.query(program, abi::encode(request))?)
+        }
+
+        fn sha256(&self, bytes: impl Into<Vec<u8>>) -> [u8; 32] {
+            match self.host(&HostOp::Crypto(CryptoOp::Sha256(bytes.into()))) {
+                HostReply::Crypto(CryptoReply::Digest(digest)) => digest,
+                other => protocol("digest", other),
+            }
+        }
+
+        fn verify(
+            &self,
+            scheme: Scheme,
+            key: impl Into<Vec<u8>>,
+            namespace: impl Into<Vec<u8>>,
+            message: impl Into<Vec<u8>>,
+            signature: impl Into<Vec<u8>>,
+        ) -> Result<bool, Refusal> {
+            match self.host(&HostOp::Crypto(CryptoOp::Verify {
+                scheme,
+                key: key.into(),
+                namespace: namespace.into(),
+                message: message.into(),
+                signature: signature.into(),
+            })) {
+                HostReply::Crypto(CryptoReply::Verified(valid)) => Ok(valid),
+                HostReply::Refused(refusal) => Err(refusal),
+                other => protocol("verdict", other),
+            }
         }
     }
 
-    pub fn set(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
-        match host(&HostOp::Set {
-            key: key.into(),
-            value: value.into(),
-        }) {
-            HostReply::Done => {}
-            other => protocol("done", other),
+    pub struct Execute(());
+
+    impl Reads for Execute {
+        fn host(&self, op: &HostOp) -> HostReply {
+            host(op)
         }
     }
 
-    pub fn delete(key: impl Into<Vec<u8>>) {
-        match host(&HostOp::Delete(key.into())) {
-            HostReply::Done => {}
-            other => protocol("done", other),
+    impl Execute {
+        pub fn set(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
+            match host(&HostOp::Set {
+                key: key.into(),
+                value: value.into(),
+            }) {
+                HostReply::Done => {}
+                other => protocol("done", other),
+            }
+        }
+
+        pub fn delete(&mut self, key: impl Into<Vec<u8>>) {
+            match host(&HostOp::Delete(key.into())) {
+                HostReply::Done => {}
+                other => protocol("done", other),
+            }
+        }
+
+        pub fn put<T: BorshSerialize>(&mut self, key: impl Into<Vec<u8>>, record: &T) {
+            self.set(key, abi::encode(record))
+        }
+
+        pub fn blob_put(
+            &mut self,
+            hash: HashKind,
+            kind: impl Into<String>,
+            body: impl Into<Vec<u8>>,
+        ) -> Result<BlobId, Refusal> {
+            match host(&HostOp::BlobPut {
+                hash,
+                kind: kind.into(),
+                body: body.into(),
+            }) {
+                HostReply::BlobId(id) => Ok(id),
+                HostReply::Refused(refusal) => Err(refusal),
+                other => protocol("blob id", other),
+            }
+        }
+
+        pub fn emit(
+            &mut self,
+            target: impl Into<ProgramId>,
+            payload: impl Into<Vec<u8>>,
+        ) -> ItemRef {
+            self.send(target, payload, false)
+        }
+
+        pub fn call(
+            &mut self,
+            target: impl Into<ProgramId>,
+            payload: impl Into<Vec<u8>>,
+        ) -> ItemRef {
+            self.send(target, payload, true)
+        }
+
+        fn send(
+            &mut self,
+            target: impl Into<ProgramId>,
+            payload: impl Into<Vec<u8>>,
+            reply: bool,
+        ) -> ItemRef {
+            match host(&HostOp::Emit(Message {
+                target: target.into(),
+                payload: payload.into(),
+                reply,
+            })) {
+                HostReply::Item(item) => item,
+                other => protocol("item", other),
+            }
+        }
+
+        pub fn event(&mut self, payload: impl Into<Vec<u8>>) {
+            match host(&HostOp::Event(payload.into())) {
+                HostReply::Done => {}
+                other => protocol("done", other),
+            }
+        }
+
+        pub fn output(&mut self, bytes: impl Into<Vec<u8>>) {
+            match host(&HostOp::Output(bytes.into())) {
+                HostReply::Done => {}
+                other => protocol("done", other),
+            }
         }
     }
 
-    pub fn scan(scan: Scan) -> Vec<Entry> {
-        match host(&HostOp::Scan(scan)) {
-            HostReply::Entries(entries) => entries,
-            other => protocol("entries", other),
+    pub struct Query(());
+
+    impl Reads for Query {
+        fn host(&self, op: &HostOp) -> HostReply {
+            host(op)
         }
     }
 
-    pub fn committed_get(key: impl AsRef<[u8]>) -> Option<Vec<u8>> {
-        match host(&HostOp::CommittedGet(key.as_ref().to_vec())) {
-            HostReply::Value(value) => value,
-            other => protocol("value", other),
+    impl Query {
+        pub fn respond(&mut self, bytes: impl Into<Vec<u8>>) {
+            match host(&HostOp::Respond(bytes.into())) {
+                HostReply::Done => {}
+                other => protocol("done", other),
+            }
         }
-    }
 
-    pub fn committed_scan(scan: Scan) -> Vec<Entry> {
-        match host(&HostOp::CommittedScan(scan)) {
-            HostReply::Entries(entries) => entries,
-            other => protocol("entries", other),
+        pub fn reply<R: BorshSerialize>(&mut self, reply: &R) {
+            self.respond(abi::encode(reply))
         }
-    }
-
-    pub fn blob_put(
-        hash: HashKind,
-        kind: impl Into<String>,
-        body: impl Into<Vec<u8>>,
-    ) -> Result<BlobId, Refusal> {
-        match host(&HostOp::BlobPut {
-            hash,
-            kind: kind.into(),
-            body: body.into(),
-        }) {
-            HostReply::BlobId(id) => Ok(id),
-            HostReply::Refused(refusal) => Err(refusal),
-            other => protocol("blob id", other),
-        }
-    }
-
-    pub fn blob_get(id: BlobId) -> Option<Blob> {
-        match host(&HostOp::BlobGet(id)) {
-            HostReply::Blob(blob) => blob,
-            other => protocol("blob", other),
-        }
-    }
-
-    pub fn blob_stat(id: BlobId) -> Option<BlobHeader> {
-        match host(&HostOp::BlobStat(id)) {
-            HostReply::BlobHeader(header) => header,
-            other => protocol("blob header", other),
-        }
-    }
-
-    pub fn blob_read(id: BlobId, offset: u64, len: u64) -> Option<Vec<u8>> {
-        match host(&HostOp::BlobRead { id, offset, len }) {
-            HostReply::Value(bytes) => bytes,
-            other => protocol("value", other),
-        }
-    }
-
-    pub fn root(program: impl Into<ProgramId>) -> Option<Root> {
-        match host(&HostOp::Root(program.into())) {
-            HostReply::Root(root) => root,
-            other => protocol("root", other),
-        }
-    }
-
-    pub fn query(
-        program: impl Into<ProgramId>,
-        request: impl Into<Vec<u8>>,
-    ) -> Result<Vec<u8>, Refusal> {
-        match host(&HostOp::Query {
-            program: program.into(),
-            request: request.into(),
-        }) {
-            HostReply::Query(answer) => answer,
-            other => protocol("query answer", other),
-        }
-    }
-
-    pub fn emit(target: impl Into<ProgramId>, payload: impl Into<Vec<u8>>) -> ItemRef {
-        send(target, payload, false)
-    }
-
-    pub fn call(target: impl Into<ProgramId>, payload: impl Into<Vec<u8>>) -> ItemRef {
-        send(target, payload, true)
-    }
-
-    fn send(target: impl Into<ProgramId>, payload: impl Into<Vec<u8>>, reply: bool) -> ItemRef {
-        match host(&HostOp::Emit(Message {
-            target: target.into(),
-            payload: payload.into(),
-            reply,
-        })) {
-            HostReply::Item(item) => item,
-            other => protocol("item", other),
-        }
-    }
-
-    pub fn event(payload: impl Into<Vec<u8>>) {
-        match host(&HostOp::Event(payload.into())) {
-            HostReply::Done => {}
-            other => protocol("done", other),
-        }
-    }
-
-    pub fn output(bytes: impl Into<Vec<u8>>) {
-        match host(&HostOp::Output(bytes.into())) {
-            HostReply::Done => {}
-            other => protocol("done", other),
-        }
-    }
-
-    pub fn respond(bytes: impl Into<Vec<u8>>) {
-        match host(&HostOp::Respond(bytes.into())) {
-            HostReply::Done => {}
-            other => protocol("done", other),
-        }
-    }
-
-    pub fn sha256(bytes: impl Into<Vec<u8>>) -> [u8; 32] {
-        match host(&HostOp::Crypto(CryptoOp::Sha256(bytes.into()))) {
-            HostReply::Crypto(CryptoReply::Digest(digest)) => digest,
-            other => protocol("digest", other),
-        }
-    }
-
-    pub fn verify(
-        scheme: Scheme,
-        key: impl Into<Vec<u8>>,
-        namespace: impl Into<Vec<u8>>,
-        message: impl Into<Vec<u8>>,
-        signature: impl Into<Vec<u8>>,
-    ) -> Result<bool, Refusal> {
-        match host(&HostOp::Crypto(CryptoOp::Verify {
-            scheme,
-            key: key.into(),
-            namespace: namespace.into(),
-            message: message.into(),
-            signature: signature.into(),
-        })) {
-            HostReply::Crypto(CryptoReply::Verified(valid)) => Ok(valid),
-            HostReply::Refused(refusal) => Err(refusal),
-            other => protocol("verdict", other),
-        }
-    }
-
-    pub fn record<T: BorshDeserialize>(key: impl AsRef<[u8]>) -> Result<Option<T>, Refusal> {
-        get(key).map(|bytes| abi::decode(&bytes)).transpose()
-    }
-
-    pub fn put<T: BorshSerialize>(key: impl Into<Vec<u8>>, record: &T) {
-        set(key, abi::encode(record))
-    }
-
-    pub fn records<T: BorshDeserialize>(scan: Scan) -> Result<Vec<(Vec<u8>, T)>, Refusal> {
-        self::scan(scan)
-            .into_iter()
-            .map(|entry| Ok((entry.key, abi::decode(&entry.value)?)))
-            .collect()
-    }
-
-    pub fn ask<Q: BorshSerialize, R: BorshDeserialize>(
-        program: impl Into<ProgramId>,
-        request: &Q,
-    ) -> Result<R, Refusal> {
-        abi::decode(&query(program, abi::encode(request))?)
-    }
-
-    pub fn reply<R: BorshSerialize>(reply: &R) {
-        respond(abi::encode(reply))
     }
 }
-
-#[cfg(target_arch = "wasm32")]
-pub use host_ops::*;

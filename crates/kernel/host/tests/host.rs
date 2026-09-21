@@ -14,7 +14,7 @@ use commonware_cryptography::bls12381::primitives::variant::MinPk;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_module_registry::Change;
-use fixture_probe::Step;
+use fixture_probe::{Reply, Step};
 use host::{
     BLOBS, Block, BlockId, Delivered, Error, Founding, Genesis, Host, Layer, Limits, NETWORK,
     QUEUE, Receipt, SIGNERS, Submission, Tip,
@@ -149,15 +149,15 @@ fn rejected(receipt: &Receipt) -> &Refusal {
     }
 }
 
-fn replies(receipt: &Receipt) -> Vec<HostReply> {
+fn replies(receipt: &Receipt) -> Vec<Reply> {
     abi::decode(output(receipt)).unwrap()
 }
 
-fn answers(bytes: &[u8]) -> Vec<HostReply> {
+fn answers(bytes: &[u8]) -> Vec<Reply> {
     abi::decode(bytes).unwrap()
 }
 
-async fn ask(host: &Host<Ctx>, layer: Layer, program: &str, steps: Vec<Step>) -> Vec<HostReply> {
+async fn ask(host: &Host<Ctx>, layer: Layer, program: &str, steps: Vec<Step>) -> Vec<Reply> {
     let answer = host
         .query(
             layer,
@@ -262,10 +262,10 @@ fn founding_admits_every_program_and_the_host_reopens() {
             Some(vec![member(b"v1", "v1:1")])
         );
         assert_eq!(reopened.tip().unwrap(), host_tip);
-        let env = ask(&reopened, Layer::Confirmed, "probe", vec![op(HostOp::Env)]).await;
+        let env = ask(&reopened, Layer::Confirmed, "probe", vec![Step::Env]).await;
         assert_eq!(
             env,
-            vec![HostReply::Env(Env {
+            vec![Reply::Env(Env {
                 network: b"net".to_vec(),
                 height: 0,
                 time: TIME,
@@ -454,7 +454,7 @@ fn a_delivery_sees_who_emitted_it() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
-        let probe_script = script(vec![op(HostOp::Env)]);
+        let probe_script = script(vec![Step::Env]);
         host.apply(block(
             1,
             vec![submit(0, "ping", message("probe", &probe_script, true))],
@@ -472,7 +472,7 @@ fn a_delivery_sees_who_emitted_it() {
         };
         assert_eq!(
             replies(&applied.deliveries[0].receipt),
-            vec![HostReply::Env(env.clone())]
+            vec![Reply::Env(env.clone())]
         );
         let applied = host.apply(block(3, Vec::new())).await.unwrap();
         assert_eq!(applied.deliveries[0].receipt.program, "ping");
@@ -480,7 +480,7 @@ fn a_delivery_sees_who_emitted_it() {
             host.view(Layer::Confirmed)
                 .get("ping", &fixture_relay::done(&item("ping", 0)))
                 .unwrap(),
-            Some(abi::encode(&ok(&abi::encode(&vec![HostReply::Env(env)]))))
+            Some(abi::encode(&ok(&abi::encode(&vec![Reply::Env(env)]))))
         );
     });
 }
@@ -597,7 +597,10 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
             .unwrap();
         assert_eq!(
             replies(&applied.submissions[0]),
-            vec![HostReply::Done, HostReply::BlobId(id)]
+            vec![
+                Reply::Host(HostReply::Done),
+                Reply::Host(HostReply::BlobId(id))
+            ]
         );
         assert!(applied.writes.programs.contains_key(BLOBS));
         assert_eq!(host.blob(&id).unwrap(), Some(b"page 4\0body".to_vec()));
@@ -623,17 +626,20 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
         assert_eq!(
             reads,
             vec![
-                HostReply::Blob(Some(Blob {
+                Reply::Host(HostReply::Blob(Some(Blob {
                     kind: "page".into(),
                     body: b"body".to_vec()
-                })),
-                HostReply::BlobHeader(Some(BlobHeader {
+                }))),
+                Reply::Host(HostReply::BlobHeader(Some(BlobHeader {
                     kind: "page".into(),
                     len: 4
-                })),
-                HostReply::Value(Some(b"od".to_vec())),
-                HostReply::BlobHeader(None),
-                HostReply::Refused(Refusal::new(reason::UNSUPPORTED, "a query does not write")),
+                }))),
+                Reply::Host(HostReply::Value(Some(b"od".to_vec()))),
+                Reply::Host(HostReply::BlobHeader(None)),
+                Reply::Host(HostReply::Refused(Refusal::new(
+                    reason::UNSUPPORTED,
+                    "a query does not write"
+                ))),
             ]
         );
 
@@ -658,10 +664,10 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
             .unwrap();
         assert_eq!(
             replies(&applied.submissions[1]),
-            vec![HostReply::BlobHeader(Some(BlobHeader {
+            vec![Reply::Host(HostReply::BlobHeader(Some(BlobHeader {
                 kind: "note".into(),
                 len: 1
-            }))]
+            })))]
         );
         assert_eq!(host.blob(&staged).unwrap(), Some(b"note 1\0x".to_vec()));
     });
@@ -752,10 +758,10 @@ fn the_roster_admits_swaps_and_drops_programs() {
         let applied = host.apply(block(5, Vec::new())).await.unwrap();
         assert_eq!(applied.admissions, vec![receipt("echo", ok(b""), vec![])]);
         assert_eq!(host.programs().unwrap()["echo"], probe);
-        let env = ask(&host, Layer::Confirmed, "echo", vec![op(HostOp::Env)]).await;
+        let env = ask(&host, Layer::Confirmed, "echo", vec![Step::Env]).await;
         assert_eq!(
             env,
-            vec![HostReply::Env(Env {
+            vec![Reply::Env(Env {
                 network: b"net".to_vec(),
                 height: 5,
                 time: TIME,
@@ -854,7 +860,7 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
             receipts,
             vec![receipt(
                 "probe",
-                ok(&abi::encode(&vec![HostReply::Done; 2])),
+                ok(&abi::encode(&vec![Reply::Host(HostReply::Done); 2])),
                 vec![]
             )]
         );
@@ -865,7 +871,7 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
                 get(b"b"),
                 op(HostOp::CommittedGet(b"a".to_vec())),
                 op(HostOp::Scan(Scan::prefix(b""))),
-                op(HostOp::Env),
+                Step::Env,
             ]
         };
         let entry = |key: &[u8], value: &[u8]| Entry {
@@ -875,11 +881,11 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
         assert_eq!(
             ask(&host, Layer::Confirmed, "probe", steps()).await,
             vec![
-                HostReply::Value(Some(b"1".to_vec())),
-                HostReply::Value(None),
-                HostReply::Value(Some(b"1".to_vec())),
-                HostReply::Entries(vec![entry(b"a", b"1")]),
-                HostReply::Env(Env {
+                Reply::Host(HostReply::Value(Some(b"1".to_vec()))),
+                Reply::Host(HostReply::Value(None)),
+                Reply::Host(HostReply::Value(Some(b"1".to_vec()))),
+                Reply::Host(HostReply::Entries(vec![entry(b"a", b"1")])),
+                Reply::Env(Env {
                     network: b"net".to_vec(),
                     height: 1,
                     time: TIME,
@@ -892,11 +898,14 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
         assert_eq!(
             ask(&host, Layer::Preconfirmed, "probe", steps()).await,
             vec![
-                HostReply::Value(Some(b"2".to_vec())),
-                HostReply::Value(Some(b"3".to_vec())),
-                HostReply::Value(Some(b"1".to_vec())),
-                HostReply::Entries(vec![entry(b"a", b"2"), entry(b"b", b"3")]),
-                HostReply::Env(Env {
+                Reply::Host(HostReply::Value(Some(b"2".to_vec()))),
+                Reply::Host(HostReply::Value(Some(b"3".to_vec()))),
+                Reply::Host(HostReply::Value(Some(b"1".to_vec()))),
+                Reply::Host(HostReply::Entries(vec![
+                    entry(b"a", b"2"),
+                    entry(b"b", b"3")
+                ])),
+                Reply::Env(Env {
                     network: b"net".to_vec(),
                     height: 2,
                     time: TIME,
@@ -921,8 +930,8 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
             )
             .await,
             vec![
-                HostReply::Value(Some(b"1".to_vec())),
-                HostReply::Value(None)
+                Reply::Host(HostReply::Value(Some(b"1".to_vec()))),
+                Reply::Host(HostReply::Value(None))
             ]
         );
     });
@@ -957,7 +966,7 @@ fn sibling_queries_route_by_id_and_a_cycle_is_refused() {
                 Layer::Confirmed,
                 "twin",
                 vec![
-                    query("probe", vec![get(b"k"), op(HostOp::Env)]),
+                    query("probe", vec![get(b"k"), Step::Env]),
                     query("nobody", Vec::new()),
                     op(HostOp::Root("ping".into())),
                     op(HostOp::Root("nobody".into())),
@@ -965,9 +974,9 @@ fn sibling_queries_route_by_id_and_a_cycle_is_refused() {
             )
             .await,
             vec![
-                HostReply::Query(Ok(abi::encode(&vec![
-                    HostReply::Value(Some(b"v".to_vec())),
-                    HostReply::Env(Env {
+                Reply::Host(HostReply::Query(Ok(abi::encode(&vec![
+                    Reply::Host(HostReply::Value(Some(b"v".to_vec()))),
+                    Reply::Env(Env {
                         network: b"net".to_vec(),
                         height: 1,
                         time: TIME,
@@ -975,10 +984,13 @@ fn sibling_queries_route_by_id_and_a_cycle_is_refused() {
                         origin: Origin::Program("twin".into()),
                         cause: Cause::Direct,
                     }),
-                ]))),
-                HostReply::Query(Err(Refusal::new(reason::UNKNOWN_PROGRAM, "nobody"))),
-                HostReply::Root(host.store().root("ping").unwrap()),
-                HostReply::Root(None),
+                ])))),
+                Reply::Host(HostReply::Query(Err(Refusal::new(
+                    reason::UNKNOWN_PROGRAM,
+                    "nobody"
+                )))),
+                Reply::Host(HostReply::Root(host.store().root("ping").unwrap())),
+                Reply::Host(HostReply::Root(None)),
             ]
         );
 
@@ -1004,13 +1016,16 @@ fn sibling_queries_route_by_id_and_a_cycle_is_refused() {
             "twin is already answering a query on this stack",
         );
         let innermost = vec![
-            HostReply::Value(Some(b"v2".to_vec())),
-            HostReply::Query(Err(cycle)),
+            Reply::Host(HostReply::Value(Some(b"v2".to_vec()))),
+            Reply::Host(HostReply::Query(Err(cycle))),
         ];
-        let twin = vec![HostReply::Query(Ok(abi::encode(&innermost)))];
+        let twin = vec![Reply::Host(HostReply::Query(Ok(abi::encode(&innermost))))];
         assert_eq!(
             replies(&applied.submissions[0]),
-            vec![HostReply::Done, HostReply::Query(Ok(abi::encode(&twin)))]
+            vec![
+                Reply::Host(HostReply::Done),
+                Reply::Host(HostReply::Query(Ok(abi::encode(&twin))))
+            ]
         );
     });
 }
@@ -1061,7 +1076,7 @@ fn crypto_verifies_every_scheme() {
             verify(Scheme::Bls12381, &ed_key, &message, &b_sig),
         ];
         let verdicts = ask(&host, Layer::Confirmed, "probe", steps).await;
-        let expected: Vec<HostReply> = std::iter::once(HostReply::Crypto(CryptoReply::Digest(
+        let expected: Vec<Reply> = std::iter::once(HostReply::Crypto(CryptoReply::Digest(
             sha2::Sha256::digest(b"abc").into(),
         )))
         .chain(
@@ -1070,6 +1085,7 @@ fn crypto_verifies_every_scheme() {
             ]
             .map(|valid| HostReply::Crypto(CryptoReply::Verified(valid))),
         )
+        .map(Reply::Host)
         .collect();
         assert_eq!(verdicts, expected);
     });
@@ -1114,7 +1130,7 @@ fn fuel_is_a_network_parameter() {
             .apply(block(
                 1,
                 vec![
-                    submit(0, "probe", script(vec![op(HostOp::Env)])),
+                    submit(0, "probe", script(vec![Step::Env])),
                     submit(1, "probe", script(vec![Step::Spin])),
                     submit(1, "probe", script(vec![Step::Grow(2048)])),
                 ],
@@ -1254,11 +1270,11 @@ fn a_joiner_adopts_synced_commitments_and_installs_the_blobs_it_lacks() {
         assert_eq!(
             replies(&applied.submissions[0]),
             vec![
-                HostReply::Value(Some(b"v".to_vec())),
-                HostReply::BlobHeader(Some(BlobHeader {
+                Reply::Host(HostReply::Value(Some(b"v".to_vec()))),
+                Reply::Host(HostReply::BlobHeader(Some(BlobHeader {
                     kind: "page".into(),
                     len: 4
-                })),
+                }))),
             ]
         );
     });
@@ -1283,10 +1299,16 @@ fn a_signer_submits_in_sequence_and_a_refusal_keeps_the_sequence() {
             .await
             .unwrap();
         assert_eq!(rejected(&applied.submissions[0]).reason, reason::SEQUENCE);
-        assert_eq!(replies(&applied.submissions[1]), vec![HostReply::Done]);
+        assert_eq!(
+            replies(&applied.submissions[1]),
+            vec![Reply::Host(HostReply::Done)]
+        );
         assert_eq!(rejected(&applied.submissions[2]).reason, reason::SEQUENCE);
         assert_eq!(rejected(&applied.submissions[3]).reason, "probe");
-        assert_eq!(replies(&applied.submissions[4]), vec![HostReply::Done]);
+        assert_eq!(
+            replies(&applied.submissions[4]),
+            vec![Reply::Host(HostReply::Done)]
+        );
         let view = host.view(Layer::Confirmed);
         assert_eq!(view.get("probe", b"k").unwrap(), Some(b"second".to_vec()));
         assert_eq!(view.get(SIGNERS, SIGNER).unwrap(), Some(abi::encode(&2u64)));
