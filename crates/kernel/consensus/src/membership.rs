@@ -1,4 +1,4 @@
-use abi::valset::Member;
+use abi::valset::Seating;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_runtime::Handle;
@@ -17,8 +17,8 @@ use crate::{Context, Network};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("epoch {epoch} names a member key no validator scheme decodes")]
-    Members { epoch: u64 },
+    #[error("epoch {epoch} seats a validator key no scheme decodes")]
+    Validators { epoch: u64 },
     #[error("epoch {epoch} has no floor: neither an anchor block nor a finalization names the tip")]
     Floor { epoch: u64 },
 }
@@ -96,9 +96,9 @@ where
         &self.roster
     }
 
-    pub async fn seat(&mut self, tip: Tip, members: &[Member]) -> Result<Standing, Error> {
+    pub async fn seat(&mut self, tip: Tip, seating: &Seating) -> Result<Standing, Error> {
         let epoch = self.network.epoch_after(tip.height);
-        let validators = validators_of(members).ok_or(Error::Members { epoch })?;
+        let validators = validators_of(&seating.validators).ok_or(Error::Validators { epoch })?;
         self.roster.seat(epoch, validators);
         let standing = self.engine(epoch, tip).await?;
         let _ = self.seats.unbounded_send(Signal::Seated(epoch));
