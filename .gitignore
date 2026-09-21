@@ -27,6 +27,7 @@ HANDOFF.md
 # the tree, wherever a command was run from.
 *.key
 
-# The kernel fixture programs are their own workspace (wasm32 only); its
-# build output lands beside it.
+# The kernel fixture programs and the system programs are their own
+# workspaces (wasm32 only); their build output lands beside them.
 /crates/kernel/fixtures/target/
+/crates/modules/system/target/

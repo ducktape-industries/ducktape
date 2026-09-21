@@ -7622,6 +7622,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wire"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "commonware-cryptography",
+ "commonware-runtime",
+ "fixture-probe",
+ "guest",
+ "host",
+ "keyscheme",
+ "tempfile",
+]
+
+[[package]]
 name = "wireguard"
 version = "0.1.0"
 dependencies = [

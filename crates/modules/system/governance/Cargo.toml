@@ -1,0 +1,13 @@
+[package]
+name = "governance"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+abi = { workspace = true }
+guest = { workspace = true }
+wire = { workspace = true }
+borsh = { workspace = true }

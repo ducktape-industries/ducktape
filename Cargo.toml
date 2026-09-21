@@ -36,6 +36,7 @@ members = [
     "crates/kernel/consensus",
     "crates/kernel/statesync",
     "crates/noded",
+    "crates/modules/wire",
     "crates/networking/wireguard",
     "crates/networking/nat-traversal",
     "crates/networking/netstack-machine",
@@ -65,7 +66,7 @@ members = [
     "bin/terminal-service",
     "bin/duck-guest-init",
 ]
-exclude = ["crates/kernel/fixtures"]
+exclude = ["crates/kernel/fixtures", "crates/modules/system"]
 
 [workspace.package]
 edition = "2024"
@@ -180,6 +181,10 @@ host = { path = "crates/kernel/host" }
 node = { path = "crates/kernel/node" }
 consensus = { path = "crates/kernel/consensus" }
 statesync = { path = "crates/kernel/statesync" }
+# internal — the system programs' contracts: the ops, queries and replies
+# every party speaks to them (the programs themselves are the wasm32
+# workspace at crates/modules/system, built by `make system-programs`).
+wire = { path = "crates/modules/wire" }
 # internal — off-chain service crates
 agent-service = { path = "crates/services/agent" }
 airlock-service = { path = "crates/services/airlock" }

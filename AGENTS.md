@@ -42,8 +42,9 @@ code cites by path (`docs/records/`) and the per-area READMEs (`ops/`,
   second copy of a program that only a rebuild can change, and a rebuild
   changing what a node founds or joins with is a silent network change.
 - Tests may `include_bytes!` a committed fixture
-  (`crates/kernel/fixtures/wasm/`, rebuilt by `make kernel-fixtures`) — a test
-  pins bytes on purpose. Nothing else may.
+  (`crates/kernel/fixtures/wasm/`, rebuilt by `make kernel-fixtures`) or a
+  committed system program (`crates/modules/system/wasm/`, rebuilt by
+  `make system-programs`) — a test pins bytes on purpose. Nothing else may.
 
 ## Assistant Guidance
 
@@ -117,11 +118,13 @@ code cites by path (`docs/records/`) and the per-area READMEs (`ops/`,
   merge commit can revert it.
 - **A fixture's bytes move with everything it compiles in.** The kernel
   suites run committed guests (`crates/kernel/fixtures/wasm/fixture_*.wasm`)
-  built out of `crates/kernel/fixtures/`. A change to a fixture crate, to the
-  `guest` crate they compile against, or to any shape a guest decodes (`abi`)
-  ships the rebuilt fixtures in the SAME PR: `make kernel-fixtures`, then
-  commit what changed. Even a deletion moves bytes: panic paths carry line
-  numbers.
+  built out of `crates/kernel/fixtures/`, and the `wire` suite runs the
+  committed system programs (`crates/modules/system/wasm/*.wasm`) built out
+  of `crates/modules/system/`. A change to a fixture or program crate, to the
+  `guest` or `wire` crate they compile against, or to any shape a guest
+  decodes (`abi`) ships the rebuilt artifacts in the SAME PR:
+  `make kernel-fixtures` or `make system-programs`, then commit what changed.
+  Even a deletion moves bytes: panic paths carry line numbers.
 - **Hold only what is really uncertain.** A PR stays open only when the
   author can name the risk in one sentence. "Waiting for CI", "waiting for
   review", or "someone else should look" are not risks.
