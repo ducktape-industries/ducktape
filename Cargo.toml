@@ -35,6 +35,12 @@ members = [
     "crates/kernel/node",
     "crates/kernel/consensus",
     "crates/kernel/statesync",
+    "crates/kernel/keyscheme",
+    "crates/services/sdk",
+    "crates/services/refusal-class",
+    "crates/services/duckfs-core",
+    "crates/services/run-envelope",
+    "crates/duckdns",
     "crates/noded",
     "crates/networking/wireguard",
     "crates/networking/nat-traversal",
@@ -86,6 +92,12 @@ lru = "0.18"
 libc = "0.2"
 smallvec = "1"
 sha2 = "0.10"
+sha3 = "0.10"
+# the wallet schemes keyscheme verifies: secp256r1 (WebAuthn) and secp256k1
+# (EIP-191) in pure Rust, and raw ed25519 for OpenSSH's SSHSIG envelope.
+p256 = "0.13"
+k256 = { version = "0.13", features = ["ecdsa"] }
+ed25519-dalek = "2"
 # release archives (`.tar.zst`): airlock's `codesign` lane packs a signing
 # request into one.
 tar = "0.4"
@@ -165,13 +177,10 @@ wasmtime = "=46.0.3"
 # own component port (its `guest` feature), compiled only on wasm32.
 wit-bindgen = "0.57"
 
-# internal — kernel crates (the platform), and the two leaves the services
-# and the node still take from ducktape-industries/ducktape-sdk: `sdk` (the
-# services' module types) and `keyscheme` (the key schemes a frame's signer
-# may use). Every package taken from the sdk is pinned to the last revision
-# that carries it; the sdk's `dev` branch has since dropped them all.
-sdk = { git = "https://github.com/ducktape-industries/ducktape-sdk", rev = "736865710dcfa7c56f9834747287881c1c25d45d", package = "sdk" }
-keyscheme = { git = "https://github.com/ducktape-industries/ducktape-sdk", rev = "736865710dcfa7c56f9834747287881c1c25d45d", package = "keyscheme" }
+# internal — kernel crates (the platform). `keyscheme` is the key schemes a
+# frame's signer may use, the one verification path the node and the host
+# share.
+keyscheme = { path = "crates/kernel/keyscheme" }
 abi = { path = "crates/kernel/abi" }
 guest = { path = "crates/kernel/guest" }
 runtime = { path = "crates/kernel/runtime" }
@@ -189,15 +198,19 @@ mcp-host = { path = "crates/services/mcp" }
 media-service = { path = "crates/services/media" }
 provider-host = { path = "crates/services/provider" }
 sandbox-host = { path = "crates/services/sandbox" }
+# internal — the services' module types (`sdk`, over `refusal-class`), the
+# object store the mcp service speaks (`duckfs-core`) and the run envelope
+# the provider service composes: linked by the services alone.
+sdk = { path = "crates/services/sdk" }
+refusal-class = { path = "crates/services/refusal-class" }
+duckfs-core = { path = "crates/services/duckfs-core" }
+run-envelope = { path = "crates/services/run-envelope" }
 # internal — cross-plane libraries: neither kernel nor service.
 # duckdns is the `.duck` naming library the terminal service validates names
 # through.
-duckdns = { git = "https://github.com/ducktape-industries/ducktape-sdk", rev = "736865710dcfa7c56f9834747287881c1c25d45d", package = "duckdns" }
+duckdns = { path = "crates/duckdns" }
 # the device keystore, linked by both the CLI and the desktop app.
 keystore = { path = "crates/keystore" }
-# the run envelope's magic + headless composer, linked by the provider
-# service and the desktop app.
-run-envelope = { git = "https://github.com/ducktape-industries/ducktape-sdk", rev = "736865710dcfa7c56f9834747287881c1c25d45d", package = "run-envelope" }
 # the app's update state machine, manifest + minisign verify and state.json
 # codec, shared with the desktop app.
 app-update = { path = "crates/app-update" }
@@ -205,7 +218,6 @@ app-update = { path = "crates/app-update" }
 ducktape-home = { path = "crates/ducktape-home" }
 # the daemon library the `ducktape` binary runs.
 noded = { path = "crates/noded" }
-duckfs-core = { git = "https://github.com/ducktape-industries/ducktape-sdk", rev = "736865710dcfa7c56f9834747287881c1c25d45d", package = "duckfs-core" }
 ducktape-rpc = { path = "crates/rpc-client" }
 # internal — networking crates
 wireguard = { path = "crates/networking/wireguard" }

@@ -1,0 +1,17 @@
+[package]
+name = "duckfs-core"
+edition.workspace = true
+version.workspace = true
+
+# Deterministic duckfs core: wire types/codecs, object model, path rules, refs,
+# pure Fs<S>, queries, GC, and memory stores. No sdk and no disk persistence.
+
+[dependencies]
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+unicode-normalization = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

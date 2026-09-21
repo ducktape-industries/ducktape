@@ -2192,7 +2192,6 @@ dependencies = [
 [[package]]
 name = "duckdns"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?rev=736865710dcfa7c56f9834747287881c1c25d45d#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "serde",
  "serde_json",
@@ -2201,12 +2200,12 @@ dependencies = [
 [[package]]
 name = "duckfs-core"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?rev=736865710dcfa7c56f9834747287881c1c25d45d#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "base64 0.22.1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "unicode-normalization",
 ]
 
@@ -3515,7 +3514,6 @@ dependencies = [
 [[package]]
 name = "keyscheme"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?rev=736865710dcfa7c56f9834747287881c1c25d45d#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "base64 0.22.1",
  "borsh",
@@ -3524,6 +3522,7 @@ dependencies = [
  "commonware-utils",
  "ed25519-dalek",
  "k256",
+ "keyscheme",
  "p256 0.13.2",
  "serde",
  "serde_json",
@@ -5057,7 +5056,6 @@ dependencies = [
 [[package]]
 name = "refusal-class"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?rev=736865710dcfa7c56f9834747287881c1c25d45d#736865710dcfa7c56f9834747287881c1c25d45d"
 
 [[package]]
 name = "regalloc2"
@@ -5248,7 +5246,6 @@ dependencies = [
 [[package]]
 name = "run-envelope"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?rev=736865710dcfa7c56f9834747287881c1c25d45d#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "serde",
  "serde_json",
@@ -5475,7 +5472,6 @@ dependencies = [
 [[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?rev=736865710dcfa7c56f9834747287881c1c25d45d#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "async-trait",
  "borsh",

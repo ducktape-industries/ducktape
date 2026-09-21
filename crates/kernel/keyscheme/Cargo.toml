@@ -1,0 +1,41 @@
+[package]
+name = "keyscheme"
+edition.workspace = true
+version.workspace = true
+
+# the CLOSED set of signature schemes a ducktape key can carry, and the one
+# `(scheme, pubkey, proof) -> verified?` dispatch every signed artifact rides:
+# op frames (kernel/node), account association proofs (identity), and later
+# request proofs and git push certificates. below modules on purpose — the
+# frame codec cannot depend on a module. pure, deterministic, wasm-clean.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+borsh = { workspace = true }
+# ed25519: commonware's namespaced EdDSA, the same verify the frame codec used.
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
+# union_unique — the exact namespaced preimage commonware's verify hashes,
+# reused as the EIP-191 message body so a wallet proof and an ed25519 proof
+# are domain-separated identically.
+commonware-utils = { workspace = true }
+# secp256r1 (WebAuthn assertion envelope) — pure-Rust p256 on every arch.
+p256 = { workspace = true }
+# secp256k1 (Ethereum wallet `personal_sign`) — recovery-based verify.
+k256 = { workspace = true }
+# OpenSSH `SSHSIG` (an SSH ed25519 key's `ssh-keygen -Y sign`) — raw ed25519
+# over the SSHSIG signed-data blob, which commonware's namespaced verify cannot
+# express.
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+sha3 = { workspace = true }
+# base64url-decoding the WebAuthn challenge out of clientDataJSON.
+base64 = { workspace = true }
+
+[features]
+# test-only SIGNING helpers (src/testkit.rs). consumers enable it as a
+# dev-dependency feature; a shipping build never compiles signing code here.
+testkit = []
+
+[dev-dependencies]
+keyscheme = { path = ".", features = ["testkit"] }

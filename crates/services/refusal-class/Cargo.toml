@@ -1,0 +1,11 @@
+# the refusal classes: the tokens a refusal carries and the rule for minting
+# one, as plain `&str` constants with NO dependencies. `sdk::refusal`
+# re-exports them, so a module writes `sdk::refusal::STALE`; a crate that must
+# not link sdk (boards-wire under a wasm view, duck-address as plain data)
+# names the same words from here.
+[package]
+name = "refusal-class"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
