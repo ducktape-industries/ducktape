@@ -12,7 +12,7 @@ LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all airlock-gateway-image rcodesign node coordinator coordinator-smoke install install-node install-coordinator test clean audit kernel-fixtures
+.PHONY: all airlock-gateway-image rcodesign node install install-node test clean audit kernel-fixtures
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -64,14 +64,6 @@ airlock-gateway-image:
 rcodesign:
 	ops/airlock-gateway/install-rcodesign.sh --prefix "$(patsubst %/,%,$(dir $(BIN_DEST)))"
 
-## release build of the untrusted UDP coordinator
-coordinator:
-	$(CARGO) build $(LOCKED) --release -p coordinator-bin
-
-## coordinator-only verification gate: CLI/policy tests + live UDP smoke
-coordinator-smoke:
-	$(CARGO) test $(LOCKED) -p coordinator-bin
-
 ## the `ducktape` binary into $(BIN_DEST). The binary embeds no wasm: a
 ## network's programs are files the founding file names, and a joiner receives
 ## them over state sync.
@@ -89,12 +81,6 @@ install: install-node
 .PHONY: install-app
 install-app:
 	@bash ops/app/install.sh
-
-## coordinator -> ~/.cargo/bin/ducktape-coordinator
-install-coordinator:
-	$(CARGO) build $(LOCKED) --release -p coordinator-bin
-	mkdir -p "$(BIN_DEST)"
-	install -m 755 target/release/coordinator "$(BIN_DEST)/ducktape-coordinator"
 
 ## the full LOCAL verification gate: the rust workspace (the daemon suites in
 ## crates/noded spawn real nodes over localhost TCP; the consensus suites run

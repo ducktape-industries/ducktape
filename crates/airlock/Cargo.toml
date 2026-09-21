@@ -1,6 +1,6 @@
 # airlock — the barrier between execution and auth. The pure attestation +
 # sealing + session-key handshake core, plus the async client (behind the
-# `client` feature). An off-consensus feature crate; like `reachability` it uses
+# `client` feature). An off-consensus feature crate; it uses
 # vetted RustCrypto primitives (x25519/chacha/sha2) directly rather than the
 # consensus identity stack, since none of this touches consensus signing.
 [package]

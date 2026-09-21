@@ -30,14 +30,6 @@ scripts back a `make` target; see the repository `Makefile`.
   enclave image root: the release `airlock-gateway`, `rcodesign`, and the
   entitlements plist at the binary's default paths.
 
-## Networking harnesses
-
-- `coordinator/` — systemd unit, env example, and Dockerfile for the UDP
-  coordinator (see `coordinator/README.md`).
-- `wg-smoke/` — WireGuard interop and bench harnesses (the `wg_interop`
-  probe binary in two rootless podman containers — podman is only this
-  harness's container runtime).
-
 ## Worktrees
 
 - `worktree-clean.sh` — removes task worktrees whose branch is fully merged
