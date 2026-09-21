@@ -2,28 +2,28 @@ pub const KEY: &[u8] = b"members";
 
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::{Refusal, valset};
-    use guest::Program;
+    use abi::{Env, Refusal, valset};
+    use guest::{Execute, Program, Query, Reads};
 
     use crate::KEY;
 
     struct Valset;
 
     impl Program for Valset {
-        fn init(params: &[u8]) -> Result<(), Refusal> {
+        fn init(ctx: &mut Execute, _env: &Env, params: &[u8]) -> Result<(), Refusal> {
             let genesis: valset::Genesis = abi::decode(params)?;
-            guest::set(KEY, abi::encode(&genesis.validators));
+            ctx.set(KEY, abi::encode(&genesis.validators));
             Ok(())
         }
 
-        fn execute(payload: &[u8]) -> Result<(), Refusal> {
+        fn execute(ctx: &mut Execute, _env: &Env, payload: &[u8]) -> Result<(), Refusal> {
             let members: Vec<valset::Member> = abi::decode(payload)?;
-            guest::set(KEY, abi::encode(&members));
+            ctx.set(KEY, abi::encode(&members));
             Ok(())
         }
 
-        fn query(request: &[u8]) -> Result<(), Refusal> {
-            let members: Vec<valset::Member> = match guest::get(KEY) {
+        fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {
+            let members: Vec<valset::Member> = match ctx.get(KEY) {
                 Some(bytes) => abi::decode(&bytes)?,
                 None => Vec::new(),
             };
@@ -33,7 +33,7 @@ mod program {
                 ),
                 valset::Query::Members => valset::Reply::Members(members),
             };
-            guest::respond(abi::encode(&reply));
+            ctx.respond(abi::encode(&reply));
             Ok(())
         }
     }

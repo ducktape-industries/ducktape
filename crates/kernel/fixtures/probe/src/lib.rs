@@ -1,47 +1,55 @@
-use abi::HostOp;
+use abi::{Env, HostOp, HostReply};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 #[derive(BorshSerialize, BorshDeserialize)]
 pub enum Step {
     Op(HostOp),
+    Env,
     Spin,
     Grow(u32),
     Fail(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Reply {
+    Host(HostReply),
+    Env(Env),
+}
+
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::{HostReply, Refusal};
-    use guest::Program;
+    use abi::{Env, Refusal};
+    use guest::{Execute, Program, Query, Reads};
 
-    use crate::Step;
+    use crate::{Reply, Step};
 
     struct Probe;
 
     impl Program for Probe {
-        fn init(params: &[u8]) -> Result<(), Refusal> {
-            Self::execute(params)
+        fn init(ctx: &mut Execute, env: &Env, params: &[u8]) -> Result<(), Refusal> {
+            Self::execute(ctx, env, params)
         }
 
-        fn execute(payload: &[u8]) -> Result<(), Refusal> {
-            let replies = run(payload)?;
-            guest::output(abi::encode(&replies));
+        fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal> {
+            let replies = run(ctx, env, payload)?;
+            ctx.output(abi::encode(&replies));
             Ok(())
         }
 
-        fn query(request: &[u8]) -> Result<(), Refusal> {
-            let replies = run(request)?;
-            guest::respond(abi::encode(&replies));
+        fn query(ctx: &mut Query, env: &Env, request: &[u8]) -> Result<(), Refusal> {
+            let replies = run(ctx, env, request)?;
+            ctx.respond(abi::encode(&replies));
             Ok(())
         }
     }
 
-    fn run(script: &[u8]) -> Result<Vec<HostReply>, Refusal> {
+    fn run(ctx: &impl Reads, env: &Env, script: &[u8]) -> Result<Vec<Reply>, Refusal> {
         let steps: Vec<Step> = abi::decode(script)?;
         let mut replies = Vec::new();
         for step in steps {
             match step {
-                Step::Op(op) => replies.push(guest::host(&op)),
+                Step::Op(op) => replies.push(Reply::Host(ctx.host(&op))),
+                Step::Env => replies.push(Reply::Env(env.clone())),
                 Step::Spin => loop {
                     core::hint::black_box(());
                 },

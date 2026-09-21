@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use abi::{
-    BlobId, Cause, Env, GuestCall, HostOp, HostReply, ItemRef, Message, Origin, Outcome, ProgramId,
-    Refusal, reason,
+    BlobId, Cause, Env, GuestCall, HostOp, HostReply, Invocation, ItemRef, Message, Origin,
+    Outcome, ProgramId, Refusal, reason,
 };
 use blobs::{Blobs, Layered, Stage};
 use commonware_runtime::Spawner;
@@ -215,7 +215,6 @@ where
     async fn serve(&self, op: HostOp) -> Result<HostReply> {
         let me = self.env.me.as_str();
         let reply = match op {
-            HostOp::Env => HostReply::Env(self.env.clone()),
             HostOp::Get(key) => HostReply::Value(self.view().get(me, &key)?),
             HostOp::Scan(scan) => HostReply::Entries(self.view().scan(me, &scan)?),
             HostOp::CommittedGet(key) => HostReply::Value(self.confirmed().get(me, &key)?),
@@ -332,6 +331,10 @@ where
     };
     let mut stack = stack.to_vec();
     stack.push(program);
+    let invocation = Invocation {
+        env: env.clone(),
+        call: GuestCall::Query(request),
+    };
     let mut unit = Query {
         world,
         env,
@@ -344,7 +347,7 @@ where
     let verdict = world
         .loaded
         .runtime()
-        .run(module, GuestCall::Query(request), &mut unit)
+        .run(module, invocation, &mut unit)
         .await;
     if let Some(fault) = unit.fault {
         return Err(fault);
@@ -451,8 +454,7 @@ pub async fn execute<E>(
     overlay: &mut Overlay,
     stage: &mut Stage,
     program: &str,
-    call: GuestCall,
-    env: Env,
+    invocation: Invocation,
 ) -> Result<Receipt>
 where
     E: Context + Spawner,
@@ -468,14 +470,18 @@ where
     let (verdict, events, output, fault) = {
         let mut unit = Execute {
             world,
-            env,
+            env: invocation.env.clone(),
             overlay: &mut *overlay,
             stage: &mut *stage,
             events: Vec::new(),
             output: Vec::new(),
             fault: None,
         };
-        let verdict = world.loaded.runtime().run(module, call, &mut unit).await;
+        let verdict = world
+            .loaded
+            .runtime()
+            .run(module, invocation, &mut unit)
+            .await;
         (verdict, unit.events, unit.output, unit.fault)
     };
     if let Some(fault) = fault {

@@ -22,51 +22,51 @@ fn key(kind: &str, item: &ItemRef) -> Vec<u8> {
 
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::{Cause, Message, Refusal, reason};
-    use guest::Program;
+    use abi::{Cause, Env, ItemRef, Message, Refusal, reason};
+    use guest::{Execute, Program, Query, Reads};
 
     use crate::{FAIL, done, got, sent};
 
     struct Relay;
 
     impl Program for Relay {
-        fn execute(payload: &[u8]) -> Result<(), Refusal> {
-            match guest::env().cause {
-                Cause::Direct => send(payload),
-                Cause::Delivery(item) => receive(&item, payload),
+        fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal> {
+            match &env.cause {
+                Cause::Direct => send(ctx, payload),
+                Cause::Delivery(item) => receive(ctx, item, payload),
                 Cause::Completion { item, outcome } => {
-                    guest::set(done(&item), abi::encode(&outcome));
+                    ctx.set(done(item), abi::encode(outcome));
                     Ok(())
                 }
             }
         }
 
-        fn query(request: &[u8]) -> Result<(), Refusal> {
-            guest::respond(abi::encode(&guest::get(request)));
+        fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {
+            ctx.respond(abi::encode(&ctx.get(request)));
             Ok(())
         }
     }
 
-    fn send(payload: &[u8]) -> Result<(), Refusal> {
+    fn send(ctx: &mut Execute, payload: &[u8]) -> Result<(), Refusal> {
         let message: Message = abi::decode(payload)?;
         let body = message.payload.clone();
         let item = match message.reply {
-            true => guest::call(message.target, message.payload),
-            false => guest::emit(message.target, message.payload),
+            true => ctx.call(message.target, message.payload),
+            false => ctx.emit(message.target, message.payload),
         };
-        guest::set(sent(&item), body);
-        guest::output(abi::encode(&item));
+        ctx.set(sent(&item), body);
+        ctx.output(abi::encode(&item));
         Ok(())
     }
 
-    fn receive(item: &abi::ItemRef, payload: &[u8]) -> Result<(), Refusal> {
+    fn receive(ctx: &mut Execute, item: &ItemRef, payload: &[u8]) -> Result<(), Refusal> {
         let asked_to_fail = payload == FAIL;
         if asked_to_fail {
             return Err(Refusal::new(reason::INVALID_INPUT, "asked to fail"));
         }
-        guest::set(got(item), payload.to_vec());
-        guest::event(payload.to_vec());
-        guest::output(payload.iter().rev().copied().collect::<Vec<u8>>());
+        ctx.set(got(item), payload.to_vec());
+        ctx.event(payload.to_vec());
+        ctx.output(payload.iter().rev().copied().collect::<Vec<u8>>());
         Ok(())
     }
 
