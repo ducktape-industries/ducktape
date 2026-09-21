@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use abi::{GuestCall, GuestReply, HostOp, HostReply};
+use abi::{GuestReply, HostOp, HostReply, Invocation};
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::future::{Either, select};
 use tokio::sync::{mpsc, oneshot};
@@ -86,7 +86,7 @@ impl Runtime {
     pub async fn run(
         &self,
         code: &Code,
-        call: GuestCall,
+        invocation: Invocation,
         host: &mut (impl Host + ?Sized),
     ) -> Result<GuestReply, Fault> {
         let (requests, mut inbox) = mpsc::unbounded_channel();
@@ -106,7 +106,7 @@ impl Runtime {
         if let Some(fuel) = self.limits.fuel {
             store.set_fuel(fuel).map_err(load)?;
         }
-        let mut guest = Box::pin(drive(&self.engine, &mut store, &code.module, call));
+        let mut guest = Box::pin(drive(&self.engine, &mut store, &code.module, invocation));
         loop {
             let request = Box::pin(inbox.recv());
             match select(guest, request).await {
@@ -127,7 +127,7 @@ async fn drive(
     engine: &Engine,
     store: &mut Store<Data>,
     module: &Module,
-    call: GuestCall,
+    invocation: Invocation,
 ) -> Result<GuestReply, Fault> {
     let mut linker = Linker::new(engine);
     linker
@@ -147,7 +147,7 @@ async fn drive(
     let entry = instance
         .get_typed_func::<(u32, u32), u64>(&mut *store, "call")
         .map_err(load)?;
-    let request = abi::encode(&call);
+    let request = abi::encode(&invocation);
     let ptr = alloc
         .call_async(&mut *store, request.len() as u32)
         .await

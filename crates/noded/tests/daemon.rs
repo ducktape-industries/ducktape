@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use abi::{HostOp, HostReply, Outcome, Scan};
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
-use fixture_probe::Step;
+use fixture_probe::{Reply, Step};
 use futures::StreamExt as _;
 use host::Layer;
 use node::Frame;
@@ -216,7 +216,7 @@ fn a_validator_serves_its_network_over_http() {
         let answer = client.query(Layer::Confirmed, query).await.unwrap();
         assert_eq!(
             answer,
-            abi::encode(&vec![HostReply::Value(Some(b"1".to_vec()))])
+            abi::encode(&vec![Reply::Host(HostReply::Value(Some(b"1".to_vec())))])
         );
 
         let programs = client.programs().await.unwrap();
