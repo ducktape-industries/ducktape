@@ -9,7 +9,7 @@ use host::{Applied, Block, BlockId, Founding, Genesis, Host, Layer, Limits, Rece
 use keyscheme::testkit;
 use modules::{
     AccountNumber, Page, acl, attribution, capability, dispatch, gateway, governance, identity, kv,
-    reason, roster, saga, valset,
+    module_registry, reason, saga, valset,
 };
 
 macro_rules! program {
@@ -64,7 +64,7 @@ impl Net {
     async fn found(context: Ctx, dir: &std::path::Path) -> Net {
         let genesis = Genesis {
             network: NETWORK.to_vec(),
-            modules: program!("modules").to_vec(),
+            module_registry: program!("module_registry").to_vec(),
             valset: program!("valset").to_vec(),
             validators: vec![member(1), member(2)],
             programs: vec![
@@ -300,7 +300,7 @@ fn founding_seats_the_validators_and_every_program_answers() {
         for program in [
             kv::PROGRAM,
             acl::PROGRAM,
-            roster::PROGRAM,
+            module_registry::PROGRAM,
             valset::PROGRAM,
             identity::PROGRAM,
             governance::PROGRAM,
@@ -689,14 +689,14 @@ fn a_published_program_is_scheduled_by_governance_and_seated_at_its_height() {
         let output = net
             .apply(
                 &public(1),
-                roster::PROGRAM,
-                &roster::Op::Publish {
+                module_registry::PROGRAM,
+                &module_registry::Op::Publish {
                     body: program!("kv").to_vec(),
                 },
             )
             .await;
         let code: BlobId = abi::decode(&output).unwrap();
-        let entry = roster::Entry {
+        let entry = module_registry::Entry {
             program: "kv2".into(),
             code,
             params: Vec::new(),
@@ -709,7 +709,7 @@ fn a_published_program_is_scheduled_by_governance_and_seated_at_its_height() {
                     id: "ghost".into(),
                     action: governance::Action::ScheduleProgram {
                         lead: 2,
-                        change: roster::Change::Set(roster::Entry {
+                        change: module_registry::Change::Set(module_registry::Entry {
                             program: "ghost".into(),
                             code: BlobId::Sha256([9; 32]),
                             params: Vec::new(),
@@ -725,7 +725,7 @@ fn a_published_program_is_scheduled_by_governance_and_seated_at_its_height() {
                 "add-kv2",
                 governance::Action::ScheduleProgram {
                     lead: 2,
-                    change: roster::Change::Set(entry.clone()),
+                    change: module_registry::Change::Set(entry.clone()),
                 },
                 &[1, 2],
             )
@@ -736,13 +736,17 @@ fn a_published_program_is_scheduled_by_governance_and_seated_at_its_height() {
                 effect: Some(governance::Effect::Applied)
             }
         );
-        let roster::Reply::Scheduled(scheduled) =
-            net.ask(roster::PROGRAM, &roster::Query::Scheduled).await
+        let module_registry::Reply::Scheduled(scheduled) = net
+            .ask(module_registry::PROGRAM, &module_registry::Query::Scheduled)
+            .await
         else {
             panic!()
         };
         assert_eq!(scheduled.len(), 1);
-        assert_eq!(scheduled[0].change, roster::Change::Set(entry.clone()));
+        assert_eq!(
+            scheduled[0].change,
+            module_registry::Change::Set(entry.clone())
+        );
         let lands_at = scheduled[0].height;
         assert!(lands_at > net.height);
         while net.height + 1 < lands_at {
@@ -768,7 +772,7 @@ fn a_published_program_is_scheduled_by_governance_and_seated_at_its_height() {
                 "drop-kv2",
                 governance::Action::ScheduleProgram {
                     lead: 1,
-                    change: roster::Change::Remove("kv2".into()),
+                    change: module_registry::Change::Remove("kv2".into()),
                 },
                 &[1, 2],
             )

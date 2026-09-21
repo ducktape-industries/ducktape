@@ -147,7 +147,7 @@ kernel-fixtures:
 	  crates/kernel/fixtures/wasm/
 
 ## rebuild the system programs (the wasm32 programs a network is founded
-## with: kv, acl, modules, valset, identity, governance, capability, saga,
+## with: kv, acl, module-registry, valset, identity, governance, capability, saga,
 ## dispatch, attribution, gateway) and refresh their committed bytes, which
 ## `ducktape init` reads from a founding file and the modules tests load.
 system-programs:

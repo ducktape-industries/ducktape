@@ -46,8 +46,8 @@ network = "mynet"
 time = 1700000000000          # the genesis block's time, unix milliseconds
 epoch_length = 64             # blocks per validator epoch
 block_time_ms = 1000
-modules = "modules.wasm"      # the program that registers and swaps programs
-valset = "valset.wasm"        # the program that seats each epoch's validators
+module-registry = "module_registry.wasm"   # the program that registers and swaps programs
+valset = "valset.wasm"                     # the program that seats each epoch's validators
 
 [[validators]]
 key = "…"                     # hex ed25519 public key: `ducktape identity`
@@ -110,7 +110,7 @@ verb's `--help` carries the rest.
 | Layer | Where | What |
 | --- | --- | --- |
 | Kernel | `crates/kernel/` | `abi` (the bytes ABI), `guest` (what a program compiles against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `blobs` (one content-addressed store), `host` (the sandbox: submit, query, deliver), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
-| Programs | `crates/modules/` | The `modules` crate: the contracts of the system programs (the ops, queries and replies each accepts) and the helpers a program builds on; `system/` is its own workspace of the wasm32 programs a network is founded with (`kv`, `acl`, `modules`, `valset`, `identity`, `governance`, `capability`, `saga`, `dispatch`, `attribution`, `gateway`), and the built programs are committed under `system/wasm/` |
+| Programs | `crates/modules/` | The `modules` crate: the contracts of the system programs (the ops, queries and replies each accepts) and the helpers a program builds on; `system/` is its own workspace of the wasm32 programs a network is founded with (`kv`, `acl`, `module-registry`, `valset`, `identity`, `governance`, `capability`, `saga`, `dispatch`, `attribution`, `gateway`), and the built programs are committed under `system/wasm/` |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
 | Networking | `crates/networking/` | WireGuard mesh, NAT traversal, reachability, overlay data plane |
 | Services | `crates/services/` | Off-chain executors: provider run loop, microVM sandbox, credential broker, airlock, media |

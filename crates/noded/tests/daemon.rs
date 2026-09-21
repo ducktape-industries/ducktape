@@ -13,7 +13,8 @@ use node::Frame;
 use noded::wire::Admin;
 use noded::{Client, Listen, Logs, Reach, Workspace};
 
-const MODULES: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_modules.wasm");
+const MODULE_REGISTRY: &[u8] =
+    include_bytes!("../../kernel/fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_relay.wasm");
 const PROBE: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_probe.wasm");
@@ -117,7 +118,7 @@ struct Live {
 }
 
 fn founding(root: &Path, seats: &[&Seat]) -> PathBuf {
-    std::fs::write(root.join("modules.wasm"), MODULES).unwrap();
+    std::fs::write(root.join("module_registry.wasm"), MODULE_REGISTRY).unwrap();
     std::fs::write(root.join("valset.wasm"), VALSET).unwrap();
     std::fs::write(root.join("relay.wasm"), RELAY).unwrap();
     std::fs::write(root.join("probe.wasm"), PROBE).unwrap();
@@ -125,7 +126,7 @@ fn founding(root: &Path, seats: &[&Seat]) -> PathBuf {
     let validators: String = seats.iter().map(|seat| seat.validator()).collect();
     let text = format!(
         "network = \"{NETWORK}\"\ntime = {TIME}\nepoch_length = {EPOCH_LENGTH}\n\
-         block_time_ms = {BLOCK_TIME_MS}\nmodules = \"modules.wasm\"\nvalset = \"valset.wasm\"\n\
+         block_time_ms = {BLOCK_TIME_MS}\nmodule-registry = \"module_registry.wasm\"\nvalset = \"valset.wasm\"\n\
          {validators}\
          [[programs]]\nid = \"ping\"\ncode = \"relay.wasm\"\n\
          [[programs]]\nid = \"probe\"\ncode = \"probe.wasm\"\nparams = \"params.bin\"\n"

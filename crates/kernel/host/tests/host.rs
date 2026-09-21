@@ -13,7 +13,7 @@ use commonware_cryptography::bls12381::primitives::ops;
 use commonware_cryptography::bls12381::primitives::variant::MinPk;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-use fixture_modules::Change;
+use fixture_module_registry::Change;
 use fixture_probe::Step;
 use host::{
     BLOBS, Block, BlockId, Delivered, Error, Founding, Genesis, Host, Layer, Limits, NETWORK,
@@ -23,7 +23,7 @@ use keyscheme::testkit;
 use sha2::Digest as _;
 use state::{Commitment, SyncTarget, commitment_name};
 
-const MODULES: &[u8] = include_bytes!("../../fixtures/wasm/fixture_modules.wasm");
+const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
@@ -52,7 +52,7 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
 fn genesis(programs: Vec<Founding>) -> Genesis {
     Genesis {
         network: b"net".to_vec(),
-        modules: MODULES.to_vec(),
+        module_registry: MODULE_REGISTRY.to_vec(),
         valset: VALSET.to_vec(),
         validators: vec![member(b"v1", "v1:1")],
         programs,
@@ -209,7 +209,10 @@ fn founding_admits_every_program_and_the_host_reopens() {
         .unwrap();
         assert_eq!(applied.height, 0);
         let admitted: Vec<&str> = applied.roster.iter().map(|r| r.program.as_str()).collect();
-        assert_eq!(admitted, ["modules", "valset", "ping", "pong", "probe"]);
+        assert_eq!(
+            admitted,
+            ["module-registry", "valset", "ping", "pong", "probe"]
+        );
         assert!(applied.deliveries.is_empty());
         for receipt in &applied.roster {
             assert!(
@@ -219,7 +222,7 @@ fn founding_admits_every_program_and_the_host_reopens() {
         }
         let programs = host.programs().unwrap();
         let ids: Vec<&str> = programs.keys().map(String::as_str).collect();
-        assert_eq!(ids, ["modules", "ping", "pong", "probe", "valset"]);
+        assert_eq!(ids, ["module-registry", "ping", "pong", "probe", "valset"]);
         assert_eq!(programs["ping"], programs["pong"]);
         assert_ne!(programs["ping"], programs["probe"]);
         assert_eq!(
@@ -709,7 +712,11 @@ fn the_roster_admits_swaps_and_drops_programs() {
 
         host.apply(block(
             1,
-            vec![submit(0, "modules", change("echo", relay, Vec::new()))],
+            vec![submit(
+                0,
+                "module-registry",
+                change("echo", relay, Vec::new()),
+            )],
         ))
         .await
         .unwrap();
@@ -732,7 +739,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
             4,
             vec![submit(
                 2,
-                "modules",
+                "module-registry",
                 change("echo", probe, script(Vec::new())),
             )],
         ))
@@ -758,7 +765,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
             6,
             vec![submit(
                 3,
-                "modules",
+                "module-registry",
                 abi::encode(&Change::Remove("echo".into())),
             )],
         ))
@@ -787,13 +794,13 @@ fn the_roster_admits_swaps_and_drops_programs() {
             vec![
                 submit(
                     4,
-                    "modules",
+                    "module-registry",
                     change("ghost", BlobId::Sha256([9; 32]), Vec::new()),
                 ),
-                submit(5, "modules", change("$evil", relay, Vec::new())),
+                submit(5, "module-registry", change("$evil", relay, Vec::new())),
                 submit(
                     6,
-                    "modules",
+                    "module-registry",
                     change("bad", probe, script(vec![Step::Fail("no".into())])),
                 ),
             ],
@@ -811,7 +818,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
         );
         let programs = host.programs().unwrap();
         let ids: Vec<&str> = programs.keys().map(String::as_str).collect();
-        assert_eq!(ids, ["modules", "ping", "pong", "probe", "valset"]);
+        assert_eq!(ids, ["module-registry", "ping", "pong", "probe", "valset"]);
         let applied = host.apply(block(11, Vec::new())).await.unwrap();
         assert_eq!(applied.roster.len(), 1);
     });
@@ -1084,7 +1091,7 @@ fn fuel_is_a_network_parameter() {
         else {
             panic!("founding ran a program on ten fuel");
         };
-        assert_eq!(program, "modules");
+        assert_eq!(program, "module-registry");
         assert_eq!(refusal.reason, reason::TRAP);
 
         let dir = tempfile::tempdir().unwrap();

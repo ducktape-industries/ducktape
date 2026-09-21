@@ -138,7 +138,8 @@ pub struct Founding {
     pub time: u64,
     pub epoch_length: u64,
     pub block_time_ms: u64,
-    pub modules: PathBuf,
+    #[serde(rename = "module-registry")]
+    pub module_registry: PathBuf,
     pub valset: PathBuf,
     pub validators: Vec<Validator>,
     pub programs: Vec<Program>,
@@ -209,7 +210,7 @@ impl Founding {
             .collect::<Result<Vec<_>>>()?;
         Ok(Genesis {
             network: self.network.as_bytes().to_vec(),
-            modules: std::fs::read(base.join(&self.modules))?,
+            module_registry: std::fs::read(base.join(&self.module_registry))?,
             valset: std::fs::read(base.join(&self.valset))?,
             validators,
             programs,

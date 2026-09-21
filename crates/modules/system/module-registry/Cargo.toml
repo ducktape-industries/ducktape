@@ -1,12 +1,12 @@
 [package]
-name = "fixture-modules"
+name = "module-registry"
 version.workspace = true
 edition.workspace = true
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [dependencies]
 abi = { workspace = true }
 guest = { workspace = true }
-borsh = { workspace = true }
+modules = { workspace = true }

@@ -1,8 +1,8 @@
 use abi::{HashKind, Refusal, Scan};
 use guest::Program;
 use modules::governance;
+use modules::module_registry::{CODE_KIND, Change, Entry, Genesis, Op, Query, Reply, Scheduled};
 use modules::program::{conflict, invalid, not_found, u64_key};
-use modules::roster::{CODE_KIND, Change, Entry, Genesis, Op, Query, Reply, Scheduled};
 
 const PROGRAM: &str = "p/";
 const SCHEDULE: &str = "s/";

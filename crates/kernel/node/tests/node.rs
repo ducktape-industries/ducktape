@@ -9,7 +9,7 @@ use host::{Founding, Genesis, Layer, Limits, SIGNERS, Tip};
 use keyscheme::KeyScheme;
 use node::{Block, Body, Error, Frame, NAMESPACE, Node, Sequenced};
 
-const MODULES: &[u8] = include_bytes!("../../fixtures/wasm/fixture_modules.wasm");
+const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
@@ -43,7 +43,7 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
 fn genesis(validators: Vec<validators::Member>) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        modules: MODULES.to_vec(),
+        module_registry: MODULE_REGISTRY.to_vec(),
         valset: VALSET.to_vec(),
         validators,
         programs: vec![

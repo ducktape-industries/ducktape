@@ -19,7 +19,7 @@ use futures::channel::mpsc;
 use host::{Founding, Genesis, Layer, Limits};
 use node::{Block, Frame, Node, Sequenced};
 
-const MODULES: &[u8] = include_bytes!("../../fixtures/wasm/fixture_modules.wasm");
+const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
@@ -63,7 +63,7 @@ fn member(key: &ed25519::PrivateKey) -> validators::Member {
 fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        modules: MODULES.to_vec(),
+        module_registry: MODULE_REGISTRY.to_vec(),
         valset: VALSET.to_vec(),
         validators: members.to_vec(),
         programs: vec![

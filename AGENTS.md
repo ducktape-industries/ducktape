@@ -38,7 +38,7 @@ code cites by path (`docs/records/`) and the per-area READMEs (`ops/`,
   and swaps independently of the binary that runs it: `ducktape init` reads
   every program the founding file names into the genesis block, a joiner
   receives the bytes as blobs over state sync, and a network swaps a program
-  at a block through its modules program. Bytes compiled into a binary are a
+  at a block through its module-registry program. Bytes compiled into a binary are a
   second copy of a program that only a rebuild can change, and a rebuild
   changing what a node founds or joins with is a silent network change.
 - Tests may `include_bytes!` a committed fixture

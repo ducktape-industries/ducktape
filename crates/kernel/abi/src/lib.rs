@@ -299,7 +299,7 @@ pub type GuestReply = Result<(), Refusal>;
 pub mod roster {
     use super::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
 
-    pub const PROGRAM: &str = "modules";
+    pub const PROGRAM: &str = "module-registry";
 
     #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
     pub struct Entry {

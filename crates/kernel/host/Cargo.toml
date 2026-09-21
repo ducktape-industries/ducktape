@@ -19,7 +19,7 @@ state = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-fixture-modules = { path = "../fixtures/modules" }
+fixture-module-registry = { path = "../fixtures/module-registry" }
 fixture-probe = { path = "../fixtures/probe" }
 fixture-relay = { path = "../fixtures/relay" }
 fixture-valset = { path = "../fixtures/valset" }

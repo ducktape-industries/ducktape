@@ -5,7 +5,7 @@ use modules::governance::{
     Query, Redemption, Reply, Rule, Shares, Status, Voter,
 };
 use modules::program::{bytes_key, conflict, invalid, not_found, u64_key, unauthorized};
-use modules::{AccountNumber, acl, identity, roster, valset};
+use modules::{AccountNumber, acl, identity, module_registry, valset};
 
 const PROPOSAL: &str = "p/";
 const REDEMPTION: &str = "r/";
@@ -211,7 +211,7 @@ fn admissible(shares: &Shares, action: &Action) -> Result<(), Refusal> {
                     "a program change lands at least one block after it is scheduled",
                 ));
             }
-            if let roster::Change::Set(entry) = change {
+            if let module_registry::Change::Set(entry) = change {
                 let published = guest::blob_stat(entry.code).is_some();
                 if !published {
                     return Err(not_found(format!("code {:?} is not published", entry.code)));
@@ -433,15 +433,15 @@ fn perform(env: &Env, action: &Action) -> Result<Effect, Refusal> {
             Effect::Applied
         }
         Action::ScheduleProgram { lead, change } => ask_for(
-            roster::PROGRAM,
-            &roster::Op::Schedule(roster::Scheduled {
+            module_registry::PROGRAM,
+            &module_registry::Op::Schedule(module_registry::Scheduled {
                 height: env.height + 1 + lead,
                 change: change.clone(),
             }),
         ),
         Action::CancelProgram { height, program } => ask_for(
-            roster::PROGRAM,
-            &roster::Op::Cancel {
+            module_registry::PROGRAM,
+            &module_registry::Op::Cancel {
                 height: *height,
                 program: program.clone(),
             },

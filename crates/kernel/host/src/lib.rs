@@ -61,7 +61,7 @@ pub type BlockId = [u8; 32];
 
 pub struct Genesis {
     pub network: Vec<u8>,
-    pub modules: Vec<u8>,
+    pub module_registry: Vec<u8>,
     pub valset: Vec<u8>,
     pub validators: Vec<validators::Member>,
     pub programs: Vec<Founding>,
@@ -174,7 +174,7 @@ where
         let mut entries = vec![
             roster::Entry {
                 program: roster::PROGRAM.to_owned(),
-                code: put_code(&mut overlay, &mut stage, &genesis.modules),
+                code: put_code(&mut overlay, &mut stage, &genesis.module_registry),
                 params: Vec::new(),
             },
             roster::Entry {
