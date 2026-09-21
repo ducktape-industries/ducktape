@@ -48,9 +48,7 @@ jobs:
 
   # The host against its guests, and the attested path:
   #   - the host suites run the committed fixture programs
-  #     (crates/kernel/fixtures/wasm) through the real wasm runtime, and the
-  #     modules suite runs the committed system programs
-  #     (crates/modules/system/wasm) the same way.
+  #     (crates/kernel/fixtures/wasm) through the real wasm runtime.
   #   - the attested path (crates/services/broker/src/attested.rs) only
   #     compiles under airlock's opt-in `verify` feature, which the default
   #     workspace build never enables, so it needs its own lint pass or it
@@ -66,5 +64,5 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
       - run: rustup show
-      - run: cargo test --locked -p host -p runtime -p modules --tests
+      - run: cargo test --locked -p host -p runtime --tests
       - run: cargo clippy --locked -p broker-host -p provider-host --tests --no-deps --features broker-host/verify,provider-host/verify -- -D warnings

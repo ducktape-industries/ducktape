@@ -30,4 +30,3 @@ HANDOFF.md
 # The kernel fixture programs and the system programs are their own
 # workspaces (wasm32 only); their build output lands beside them.
 /crates/kernel/fixtures/target/
-/crates/modules/system/target/

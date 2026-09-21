@@ -38,8 +38,10 @@ delegates the desktop installation to the pinned
 ## Found a network
 
 A founding file names the network, its cadence, its validators and the
-programs it starts with. Every path is relative to the file; the system
-programs (`make system-programs`) are under `crates/modules/system/wasm/`:
+programs it starts with. Every path is relative to the file; the programs a
+network boots with (`module-registry`, `valset`, `identity`) are built and
+committed in [modules](https://github.com/ducktape-industries/modules) under
+`crates/modules/system/wasm/`:
 
 ```toml
 network = "mynet"
@@ -110,7 +112,7 @@ verb's `--help` carries the rest.
 | Layer | Where | What |
 | --- | --- | --- |
 | Kernel | `crates/kernel/` | `abi` (the bytes ABI), `guest` (what a program compiles against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `blobs` (one content-addressed store), `host` (the sandbox: submit, query, deliver), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
-| Programs | `crates/modules/` | The `modules` crate: the contracts of the programs a network boots with (the ops, queries and replies each accepts) and the helpers a program builds on; `system/` is its own workspace of those wasm32 programs (`module-registry`, `valset`, `identity`), and the built programs are committed under `system/wasm/`. `valset` and `module-registry` take writes from the program named `modules::AUTHORITY` (`governance`); no program in this tree implements it, and the last one that did is archived with the other system modules at `ducktape-industries/ducktape-system-modules-archive` |
+| Programs | [`ducktape-industries/modules`](https://github.com/ducktape-industries/modules) | The contracts a program compiles against (`crates/sdk/abi`, `crates/sdk/guest`: copies of `crates/kernel/abi` and `crates/kernel/guest` here), the boot set (`crates/modules`: the `modules` contracts crate, the `module-registry`, `valset` and `identity` programs under `system/`, their committed bytes under `system/wasm/`, and the suite that drives them on this host) and the app modules. The eight system modules beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
 | Networking | `crates/networking/` | WireGuard mesh, NAT traversal, reachability, overlay data plane |
 | Services | `crates/services/` | Off-chain executors: provider run loop, microVM sandbox, credential broker, airlock, media |
@@ -120,9 +122,7 @@ verb's `--help` carries the rest.
 
 ```sh
 cargo test -p host -p node -p consensus -p statesync -p noded   # the kernel and the daemon
-cargo test -p modules                                           # the system programs on a real host
 make kernel-fixtures                                            # rebuild the wasm32 test programs
-make system-programs                                            # rebuild the system programs
 make test                                                       # everything the repo verifies locally
 ```
 

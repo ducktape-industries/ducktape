@@ -3759,21 +3759,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "modules"
-version = "0.1.0"
-dependencies = [
- "abi",
- "borsh",
- "commonware-cryptography",
- "commonware-runtime",
- "fixture-probe",
- "guest",
- "host",
- "keyscheme",
- "tempfile",
-]
-
-[[package]]
 name = "moka"
 version = "0.12.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"

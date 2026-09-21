@@ -12,7 +12,7 @@ LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all airlock-gateway-image rcodesign node coordinator coordinator-smoke install install-node install-coordinator test clean audit kernel-fixtures system-programs
+.PHONY: all airlock-gateway-image rcodesign node coordinator coordinator-smoke install install-node install-coordinator test clean audit kernel-fixtures
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -145,12 +145,3 @@ kernel-fixtures:
 	  --target wasm32-unknown-unknown --release
 	cp crates/kernel/fixtures/target/wasm32-unknown-unknown/release/fixture_*.wasm \
 	  crates/kernel/fixtures/wasm/
-
-## rebuild the system programs (the wasm32 programs a network boots with:
-## module-registry, valset, identity) and refresh their committed bytes, which
-## `ducktape init` reads from a founding file and the modules tests load.
-system-programs:
-	$(CARGO) build --manifest-path crates/modules/system/Cargo.toml \
-	  --target wasm32-unknown-unknown --release
-	cp crates/modules/system/target/wasm32-unknown-unknown/release/*.wasm \
-	  crates/modules/system/wasm/

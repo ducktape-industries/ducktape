@@ -5,9 +5,9 @@ version.workspace = true
 
 # host-side capability providers: spawn the operator's locally installed
 # executor CLIs (BYO — the node never holds or manages credentials; auth is
-# the CLI's own problem). the consensus-side twin is crates/modules/system/capability,
-# which replicates WHO provides what; this crate is the machine-local half
-# that actually provides it.
+# the CLI's own problem). a network's `capability` program replicates WHO
+# provides what; this crate is the machine-local half that actually provides
+# it.
 [dependencies]
 async-trait = { workspace = true }
 # the run's node read lane (src/read_lane.rs): a loopback proxy in front of the
