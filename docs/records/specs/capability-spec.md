@@ -14,7 +14,7 @@ Specs are the data half of the capability system:
 
 | Layer | Owns | Code |
 |---|---|---|
-| Consensus (`crates/modules/system/capability`) | *who provides what*, network-wide: node key → announced tag set | never reads specs |
+| Consensus (the `capability` program) | *who provides what*, network-wide: node key → announced tag set | never reads specs |
 | Host (`crates/services/provider`) | *actually running it*: spec loading, binary discovery, spawning, parsing | this document |
 
 The consensus registry only ever sees **tags**. The spec behind a tag is
@@ -96,7 +96,7 @@ Specs load in two passes:
    exact same code path as operator files and serve as the reference
    examples.
 2. **Workspace directory** — every `*.toml` in `<workspace>/capabilities`
-   (`workspace_config::capability_dir`), only if it exists (an absent
+   only if it exists (an absent
    directory simply means "no operator specs"). Per workspace: two networks
    on one host offer two spec sets.
 
@@ -201,7 +201,7 @@ fake CLI.
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `spec` | integer | yes | must be `1` |
-| `[source]` | table | no | the vendor release channel `ducktape agent install` resolves the latest build from — see [Source](#source--where-the-executable-comes-from) |
+| `[source]` | table | no | the vendor release channel an installer resolves the latest build from — see [Source](#source--where-the-executable-comes-from) |
 | `[isolation]` | table | no | host-owned auth broker + fresh executor config home — see [Isolation](#isolation--host-owned-auth) |
 | `[tools]` | table | no | argv injected into every argv the file produces — see [Tools](#tools--argv-injected-into-every-argv-the-file-produces) |
 | `[[variants]]` | array of tables | no | load-time expansion into finer tags — see [Variants](#variants--one-file-a-family-of-finer-tags) |
@@ -293,8 +293,8 @@ without counting streaming snapshots or repeated lifecycle events.
 ## Source — where the executable comes from
 
 `[source]` names the vendor channel the executor's **Linux build** comes
-from, which is what makes `ducktape agent install <tag>` able to fill the
-workspace's `executors/` directory with it. The verb resolves the channel's
+from, which is what lets an installer fill the workspace's `executors/`
+directory with it. The installer resolves the channel's
 **latest** release at install time, downloads that release's artifact for the
 guest's arch, verifies it against the checksum the vendor publishes **for
 that release**, lifts the declared files into the directory and writes a

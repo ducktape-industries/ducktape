@@ -6,10 +6,9 @@
 
 `docs/README.md` is the one index: one line per document, grouped by the
 question it answers. Load the document that answers the question, never the
-tree. It covers the operator runbooks (`docs/deploy/`, `docs/dogfood.md`,
-`docs/sandbox-macos.md`), the references code cites by path (`docs/records/`),
-the per-area READMEs (`ops/`, `crates/airlock/`) and the agent runbooks
-in `skills/` (`qa`, `sim-lane`).
+tree. It covers the operator runbook (`docs/sandbox-macos.md`), the references
+code cites by path (`docs/records/`) and the per-area READMEs (`ops/`,
+`crates/airlock/`).
 
 ## No Legacy, No Compat (until a live network exists)
 
@@ -29,34 +28,25 @@ in `skills/` (`qa`, `sim-lane`).
   gating, or migration machinery is an explicit, user-requested decision —
   never a side effect of a task.
 
-## No Embedded Wasm (the binary is not the module set)
+## No Embedded Wasm (the binary is not the program set)
 
 - A ducktape binary NEVER carries a wasm artifact in its bytes. No
-  `include_bytes!` or `include_str!` of a `component.wasm`, an `index.wasm`,
-  or any other guest, in any binary or library crate that a binary links —
-  not behind a feature, not behind an env var, not for "just this one".
-- The node is one artifact and the module set is another. A module ships,
-  pins and swaps independently of the binary that runs it: `node init` hashes
-  each `<id>.component.wasm` out of a directory into the descriptor, a member
-  `join` verifies its copy against those hashes, and the code registry swaps a
-  module at a block. Bytes compiled into a binary are a second copy of a module
-  that only a rebuild can change, and a rebuild changing what a node founds or
-  joins with is a silent network change.
-- Every wasm a node runs reaches it as a FILE it reads at runtime: a
-  network's from its workspace `genesis` file (`node init` composes it out of
-  the founding set `cargo build` stages beside the binary, resolved by
-  `workspace_config::modules_dir()`; a joiner installs it at `join --genesis`
-  or fetches it off the mesh at first boot). Getting the files there is a
-  build, install, or hydration step, never a compile step.
-- Tests may `include_bytes!` a committed fixture — a test pins bytes on
-  purpose. Nothing else may.
+  `include_bytes!` or `include_str!` of a program, in any binary or library
+  crate that a binary links — not behind a feature, not behind an env var,
+  not for "just this one".
+- The node is one artifact and a program is another. A program ships, pins
+  and swaps independently of the binary that runs it: `ducktape init` reads
+  every program the founding file names into the genesis block, a joiner
+  receives the bytes as blobs over state sync, and a network swaps a program
+  at a block through its modules program. Bytes compiled into a binary are a
+  second copy of a program that only a rebuild can change, and a rebuild
+  changing what a node founds or joins with is a silent network change.
+- Tests may `include_bytes!` a committed fixture
+  (`crates/kernel/fixtures/wasm/`, rebuilt by `make kernel-fixtures`) — a test
+  pins bytes on purpose. Nothing else may.
 
-## Internal Skills
+## Assistant Guidance
 
-- Keep repo-specific operational runbooks in `skills/` (`qa`, `sim-lane`).
-  Nothing else lives there: a prompt for an agent running inside a network is
-  product, not a runbook.
-- `.claude/skills` and `.codex/skills` both point to the shared `skills/` directory.
 - Keep assistant-facing repository guidance in this file; `CLAUDE.md` links here so both assistants read the same instructions.
 - Workflow helpers are user-global, not repo-tracked; the branching and
   delivery rules below still bind assistant work in this repo.
@@ -75,10 +65,10 @@ in `skills/` (`qa`, `sim-lane`).
   local working files: the directory is gitignored and nothing under it ships
   in a PR. When the PR merges the plan is done and the file is garbage, like
   its worktree.
-- `docs/` holds only what an operator executes (`deploy/`, `dogfood.md`,
-  `sandbox-macos.md`) and the few records code or a skill cites by path
-  (`records/`); `docs/README.md` is the index and every document is one hop
-  from it. A record nothing cites is deleted, not archived.
+- `docs/` holds only what an operator executes (`sandbox-macos.md`) and the
+  few records code cites by path (`records/`); `docs/README.md` is the index
+  and every document is one hop from it. A record nothing cites is deleted,
+  not archived.
 
 ## Branching and Delivery
 
@@ -125,25 +115,13 @@ in `skills/` (`qa`, `sim-lane`).
 - **Merged means gone.** Remove the worktree and delete the branch as soon as
   the PR merges. Then `git grep` your symbol on `origin/dev`: a sibling's
   merge commit can revert it.
-- **A module's bytes move with everything it compiles in.** A change to ANY
-  crate a guest compiles (a module crate's `src/`, a library a module wraps
-  such as `files`) or to any shape a guest decodes (`Seed`, a module's message
-  or query enum, a `deny_unknown_fields` record) ships the rebuilt
-  `component.wasm`, `index.wasm` and kernel fixture in the SAME PR, for EVERY
-  guest it reached. Even a deletion moves bytes: panic paths carry line
-  numbers. `grep -l 'name = "<crate>"' crates/modules/*/*/guest.lock` says
-  which guests compile a crate in. A lock names only what a guest COMPILES, so
-  it can never name the BUILDER: a change to the builder, to the
-  `[profile.release]` it synthesizes into the scratch workspace, to the
-  vendored registry seed, to the module WIT or to the toolchain pin moves every
-  guest at once and that grep finds nothing at all. Scope by the grep only after
-  ruling that case out; in it, the scope is all of them.
-  The module SDK, the guest builder and the app modules' source live in
-  ducktape-sdk and ducktape-modules; this repo carries the committed artifacts
-  those repos produce, and a rebuild crosses repositories.
-  The committed guest is what every composed genesis runs; a host that speaks a
-  field the guest never learned fails closed on every network founded from
-  that `dev`, and the failure surfaces as a stranger's red hours later.
+- **A fixture's bytes move with everything it compiles in.** The kernel
+  suites run committed guests (`crates/kernel/fixtures/wasm/fixture_*.wasm`)
+  built out of `crates/kernel/fixtures/`. A change to a fixture crate, to the
+  `guest` crate they compile against, or to any shape a guest decodes (`abi`)
+  ships the rebuilt fixtures in the SAME PR: `make kernel-fixtures`, then
+  commit what changed. Even a deletion moves bytes: panic paths carry line
+  numbers.
 - **Hold only what is really uncertain.** A PR stays open only when the
   author can name the risk in one sentence. "Waiting for CI", "waiting for
   review", or "someone else should look" are not risks.
@@ -165,20 +143,18 @@ in `skills/` (`qa`, `sim-lane`).
 ## Logging
 
 - Use `tracing`, never `println!`/`eprintln!`. An event reaches BOTH the node's
-  stderr (tee'd into `<workspace>/daemon.log`) and the in-memory `LogRing` the
-  app's Logs tab streams over the ws `logs` topic. A `println!` reaches NEITHER:
-  it is invisible in the app and unfilterable by `RUST_LOG`. Program output is
-  not logging — a CLI's stdout (`ducktape <subcommand>`, `ducktape fs`/`ducktape mcp` included)
-  stays `println!`.
+  stderr and the in-memory ring `noded::Logs` serves at `/v1/logs`
+  (`ducktape logs`). A `println!` reaches NEITHER: it is invisible to a reader
+  of the ring and unfilterable by `RUST_LOG`. Program output is not logging — a
+  CLI's stdout (`ducktape <verb>`) stays `println!`.
 - Two conventions coexist ON PURPOSE, and they are orthogonal — a `target` says
   WHERE an event came from, an `event` field says WHAT it is:
   - `target: "ducktape::<plane>"` — the filtering handle. `RUST_LOG=ducktape::join=debug`
     must light up a plane that spans several crates, which a crate-path target
     cannot express.
-  - `event = "<stable_name>"` — the operational-contract events (the node status
-    `operations` projection and the `ducktape_*` metrics). These are a MACHINE
-    contract: a dashboard keys on the name, so do not rename one without treating
-    it as a wire change.
+  - `event = "<stable_name>"` — the operational-contract events. These are a
+    MACHINE contract: a dashboard keys on the name, so do not rename one
+    without treating it as a wire change.
   Use both together on a contract event. Neither replaces the other.
 - **If it can fire more than once per block, it is not `info`.** The ring holds
   4096 lines; one `info!` per 100 ms drain tick evicts the whole thing every
@@ -190,26 +166,15 @@ in `skills/` (`qa`, `sim-lane`).
 - A forever-retry loop logs attempt 1, then every Nth, carrying an `attempts`
   field. An unconditional `warn!` in one is a log bomb that evicts the very
   evidence you need — and the counter IS the diagnosis.
-- Never log a URI path or query string (`/.duck/ws/{token}` carries a capability
-  token in the path, and the ring is visible in the app) or any key
-  material. A `reason` is a stable snake_case token, not prose — greppable and
-  countable.
+- Never log a URI path or query string, or any key material: the ring is served
+  to every reader of `/v1/logs`. A `reason` is a stable snake_case token, not
+  prose — greppable and countable.
 - Turn one plane up on a LIVE node rather than restarting it — a restart destroys
   the wedged state you restarted to look at:
-  `ducktape node log-filter 'info,ducktape::join=debug' -n <chain-id>`
-  (the route MUTATES the process — a `trace` filter fills the disk — so it takes
-  a credential like every other mutating `/v1` route: the verb signs with the
-  active wallet key, and a bare `curl` needs
-  `-H "x-ducktape-admin-token: $(cat <workspace>/admin.token)"`.)
-- The index engine (fluent31) and the index guests running inside it log
-  through the same subscriber, under the engine's crate-path targets
-  (`fluent31::db`, `fluent31::compaction`, `fluent31::trigger`, `fluent31::wasm`),
-  every line naming its store (`db{dir=…}`). Its `info` is lifecycle-level
-  (open, close, flush, compaction, value-log GC, a module or trigger added or
-  removed); its `warn` includes a fold run failing with its backoff, a wasm
-  trap, and a write stall beginning. A guest's `log` calls are `debug` under
-  `fluent31::wasm::guest` and stay silent until that one target is turned up
-  (`fluent31::wasm::guest=debug`, via `RUST_LOG` or the live filter route).
+  `ducktape log-filter 'info,ducktape::join=debug'`
+  (the route MUTATES the process — a `trace` filter fills the disk — so it is an
+  admin verb: the CLI signs it with the node's own identity key, and only the
+  workspace holding that key can send it.)
 
 ## Rust Gates
 
@@ -218,16 +183,13 @@ in `skills/` (`qa`, `sim-lane`).
   `--no-deps` is deliberate. Without it, a crate whose dev-deps pull
   host/dispatch/saga inherits ~a dozen pre-existing version-drift lints from
   those crates; a task is accountable only for lints in the crates it touched.
-- A crate with a bin target AND dev-dependencies (node-bin, simnode, the
-  service bins) also needs `cargo build -p <crate>` with no `--tests`: under
+- A crate with a bin target AND dev-dependencies (the service bins) also
+  needs `cargo build -p <crate>` with no `--tests`: under
   `--tests` every target sees the dev-dependency graph, so a source file that
   reaches a dev-only crate is green in clippy and fails the real binary.
 - Don't run `cargo fmt --all`: large bin files carry pre-existing fmt debt,
   and a tree-wide reformat forces painful rebases on in-flight branches. Only
   format code you touched; the mechanical whole-tree sweep is a dedicated PR.
-- The files crate's wasm-readiness gate:
-  `cargo check -p files --no-default-features` must stay green
-  (no `std::fs`/sdk leaks into the pure core).
 
 ## Rust House Rules (code style)
 

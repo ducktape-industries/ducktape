@@ -12,7 +12,7 @@
 # OUT is required and is a WORKSPACE's guest directory: a guest is per
 # workspace (two networks on one box share no image), and the workspace's
 # [sandbox] table names no path because `<workspace>/guest` is where its node
-# looks. `ducktape node sandbox` prints the exact invocation for a workspace.
+# looks.
 # Rootless, so it builds under the operator's own directories.
 #
 # ROOTLESS on purpose, start to finish. `unsquashfs -no-xattrs` extracts the
@@ -22,7 +22,7 @@
 #
 # NO AGENT CLI GOES IN, and that is the point: this image is a base, not an
 # install target. The CLIs a node lends live in `<workspace>/executors`
-# (`ducktape agent install`) and the node derives its own read-only image from
+# and the node derives its own read-only image from
 # that directory, mounted at /opt/duck/bin per run. Baking them in here instead
 # made this 500 MB build the unit of installation and gave "which CLIs does
 # this node have" a third answer that could disagree with the other two.

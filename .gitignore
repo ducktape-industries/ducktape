@@ -1,7 +1,4 @@
 /target
-# labs is a standalone workspace (excluded from the root), so its build output
-# lands outside the root-anchored /target above.
-/crates/labs/target
 /.worktree/
 # The guest kernel and rootfs ops/build-guest-rootfs.sh builds: ~900 MB of
 # fetched-and-assembled artifacts, rebuilt from the script on any host.
@@ -29,9 +26,6 @@ HANDOFF.md
 # Key material a node or wallet writes (identity.key, user.key) never enters
 # the tree, wherever a command was run from.
 *.key
-
-# wrangler local state (ops/auth-page)
-.wrangler/
 
 # The kernel fixture programs are their own workspace (wasm32 only); its
 # build output lands beside it.

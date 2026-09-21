@@ -11,6 +11,7 @@ use abi::{
     Scan, reason, roster, validators,
 };
 use blobs::{Blobs, Layered, Stage};
+use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
 use runtime::Fault;
@@ -95,7 +96,7 @@ pub struct Submission {
     pub payload: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Receipt {
     pub program: ProgramId,
     pub outcome: Outcome,
@@ -118,7 +119,7 @@ pub struct Applied {
     pub root: Root,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Layer {
     Confirmed,
     Preconfirmed,

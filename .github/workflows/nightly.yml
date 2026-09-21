@@ -1,11 +1,10 @@
-# The proofs: every suite that builds a wasm artifact or boots a node. They
-# take an hour-plus of runner time between them, so they run once a night
-# against `dev` and on demand (`gh workflow run nightly.yml --ref <branch>`),
-# never per push — `ci.yml` is the per-push lane.
+# The proofs: every suite that boots a node. They take real runner time
+# between them, so they run once a night against `dev` and on demand
+# (`gh workflow run nightly.yml --ref <branch>`), never per push — `ci.yml`
+# is the per-push lane.
 #
 # Two jobs, each a single sequential chain over ONE `target/`, so nothing is
 # built twice and the crates they share compile into one cache.
-# Wall-clock is not the point of a nightly; runner time and cache reuse are.
 #
 # A `schedule` fires only from the repository's default branch and runs on
 # that ref, so the cron checks out `dev` — the branch under test — by name; a
@@ -28,22 +27,15 @@ env:
 
 jobs:
   # The node proofs:
-  #   - `simnode`: every scenario, booting the 15-module `topology::SIM_BASE`
-  #     genesis. `topology_set.rs` pins the sim's composed module set against
-  #     the topology selection and this is the only place it runs.
-  #     DUCKTAPE_WASM_CACHE_DIR turns on wasmtime's compilation cache
-  #     (`simnode::boot` calls `wasm_host::enable_compilation_cache`) so the
-  #     test binaries compile the shared genesis once instead of once each;
-  #     a node never sets it, so production boot is unchanged. It lives
-  #     under `target/` so rust-cache persists it.
-  #   - the rpc client's blob round-trip
-  #   - `host_state`: the production genesis composes `topology::PRODUCTION`
-  #     and every module in it runs as wasm
+  #   - `noded`: the daemon suites, real nodes over localhost TCP — a
+  #     validator serving its network, a late validator joining by state
+  #     sync and catching up across epochs.
+  #   - `consensus`: the simulated cluster — agreement, backfill, epoch
+  #     boundaries, partitions, a validator epochs behind.
+  #   - `statesync` and `node`: the join protocol and the mempool.
   node:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-    env:
-      DUCKTAPE_WASM_CACHE_DIR: ${{ github.workspace }}/target/sim-wasm-cache
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,21 +43,16 @@ jobs:
       - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
-        with:
-          cache-directories: target/sim-wasm-cache
       - run: rustup show
-      - run: cargo test --locked -p simnode
-      - run: cargo test --locked -p ducktape-rpc --test blob
-      - run: cargo test --locked -p node-bin host_state
+      - run: cargo test --locked -p noded -p consensus -p statesync -p node
 
-  # The host against the guests:
-  #   - host parity (crates/kernel/host/tests/wasm_*_parity.rs): each op
-  #     sequence commits the identical root, replies and rejection reasons on
-  #     a native module and its wasm guest, block by block.
-  #   - the attested path (crates/services/broker/src/attested.rs,
-  #     bin/node/src/cred_seal.rs) only compiles under airlock's opt-in
-  #     `verify` feature, which the default workspace build never enables, so
-  #     it needs its own lint pass or it rots unnoticed.
+  # The host against its guests, and the attested path:
+  #   - the host suites run the committed fixture programs
+  #     (crates/kernel/fixtures/wasm) through the real wasm runtime.
+  #   - the attested path (crates/services/broker/src/attested.rs) only
+  #     compiles under airlock's opt-in `verify` feature, which the default
+  #     workspace build never enables, so it needs its own lint pass or it
+  #     rots unnoticed.
   wasm-and-host:
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -77,5 +64,5 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
       - run: rustup show
-      - run: cargo test --locked -p host --tests
-      - run: cargo clippy --locked -p node-bin -p broker-host -p provider-host --tests --no-deps --features node-bin/verify,broker-host/verify,provider-host/verify -- -D warnings
+      - run: cargo test --locked -p host -p runtime --tests
+      - run: cargo clippy --locked -p broker-host -p provider-host --tests --no-deps --features broker-host/verify,provider-host/verify -- -D warnings

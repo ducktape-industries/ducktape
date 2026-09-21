@@ -13,15 +13,9 @@
 //! <workspace>/previous -> updates/releases/<sha>
 //! ```
 //!
-//! ONE DEFINITION, because two binaries read this tree and only one writes it.
-//! `ducktape-node-launcher` owns it, and `ducktape` reads
-//! [`launcher_state_path`] to answer a question it cannot answer any other way:
-//! whether a node that did not respond is one an operator should start, or one
-//! a launcher is already restarting in a loop. node-bin does not link the
-//! launcher and the launcher deliberately links almost nothing, so before this
-//! the two spelled the path separately — and a move on the writing side would
-//! have turned the reader's answer silently into the wrong advice, with every
-//! test on both sides still green.
+//! ONE DEFINITION: the update machine writes this tree and every reader of it
+//! spells the path from here, so a move on the writing side cannot silently
+//! turn a reader's answer into the wrong one.
 
 use std::path::{Path, PathBuf};
 
@@ -48,14 +42,10 @@ pub fn updates_dir(workspace: &Path) -> PathBuf {
     workspace.join(UPDATES_DIR)
 }
 
-/// `<workspace>/updates/state.json` — the launcher's own state file.
+/// `<workspace>/updates/state.json` — the update machine's own state file.
 ///
-/// `install` writes it and `run` refuses without it, so its PRESENCE is the
-/// launcher saying it owns this workspace. That is what makes it the supervision
-/// signal: it is on disk, so answering needs no process scan — and a scan would
-/// be wrong twice over, finding an editor with the word in its command line and
-/// finding nothing at all in the window between a launcher's restarts, which is
-/// exactly the window someone is asking in.
+/// Its PRESENCE is the update machine saying it owns this workspace: an
+/// answer that lives on disk, so reading it needs no process scan.
 pub fn launcher_state_path(workspace: &Path) -> PathBuf {
     updates_dir(workspace).join(STATE_FILE)
 }
@@ -85,11 +75,11 @@ pub fn previous_link(workspace: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// The shape both binaries now read out of one place. Written out in full
+    /// The shape every reader takes from one place. Written out in full
     /// rather than composed from the constants, so a rename that moves the
     /// tree has to be typed here too and is a decision rather than a slip.
     #[test]
-    fn the_tree_is_where_both_binaries_think_it_is() {
+    fn the_tree_is_spelled_once() {
         let ws = Path::new("/srv/net");
         assert_eq!(
             launcher_state_path(ws),

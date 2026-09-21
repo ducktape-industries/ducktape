@@ -3,165 +3,37 @@ name = "noded"
 edition.workspace = true
 version.workspace = true
 
-# the ducktape node daemon LIBRARY: owns ONE embedded `host::Host` on a
-# dedicated actor thread (the host is deliberately non-Send) and exposes it to
-# clients over http + websocket — POST /v1/submit (one msg = one block), POST
-# /v1/query (read committed state), GET /v1/status (version + root-hash +
-# module roots), POST /v1/admin/shutdown (graceful exit), GET /v1/ws (a
-# block-finalized event stream). Three processes serve this surface: the
-# `ducktape-noded` daemon (bin/noded), the `ducktape` validator (bin/node) and
-# the deterministic simnode twin (bin/simnode); every ducktape app build is a
-# client of one of them.
-
-[features]
-# the in-process daemon testkit (`noded::testkit`): a real Host + router on
-# loopback threads, for e2e harnesses. dev-only — consumers enable it as a
-# dev-dependency feature, so it never compiles into the shipping node.
-testkit = ["dep:nettest"]
-# forwards to `provider-host/verify` (real TEE quote verification for the
-# airlock `Attested` trust arm, off by default) — `ducktape-noded` reaches
-# that arm through `provider-host`'s dispatch worker the same as `ducktape`
-# does, so it needs the same opt-in flag.
-verify = ["provider-host/verify"]
-
 [dependencies]
-# Static view readiness; no graphics or guest execution.
-view-wire = { workspace = true, features = ["manifest"] }
-wasmtime.workspace = true
-
-node-work = { workspace = true }
-# Committed-block receipt notifications for interactive program actions.
-tokio-tungstenite = "0.24"
-module-artifact = { workspace = true }
-# the shared raw-http/port/poll test client — only pulled by the `testkit`
-# feature (the in-proc daemon's readiness probe), never in a normal build.
-nettest = { path = "../testing/nettest", optional = true }
-# streamed gateway response bodies (GatewayBody chunks + Body::from_stream relay).
-bytes = "1"
-# the host-side qmdb store handle injected into disk-backed modules.
-statesync = { workspace = true }
-host = { workspace = true }
-sdk = { workspace = true }
-# The composer loads every deployment through wasm-host. Module crates also
-# supply wire types and host-side services; files/forge provide ODB substrates.
-topology = { workspace = true }
-wasm-host = { workspace = true }
-# system modules are CORE-RESIDENT: the daemon links the module crates by
-# path (a workspace name resolves to a module's wire crate).
-valset = { path = "../modules/system/valset" }
-modules = { path = "../modules/system/modules" }
-kv = { path = "../modules/system/kv" }
-# the disk odb `open_odb` hands a wasm files tenant. a service crate, not the
-# module: `files` names no kernel host.
-files-odb = { workspace = true }
-# the git substrate `open_odb` hands a wasm forge tenant, on the same grounds.
-forge-odb = { workspace = true }
-# the `/v1/call/ws` framing (the webview leg of a huddle) and the voice frame size.
-identity = { path = "../modules/system/identity" }
-# `GET /v1/release` walks the passed governance signals the release plane
-# rides (wire types only) and answers in the document the launcher and the
-# desktop app both decode.
-governance = { workspace = true }
-app-update = { workspace = true }
-gateway = { path = "../modules/system/gateway" }
-dispatch = { path = "../modules/system/dispatch" }
-attribution = { path = "../modules/system/attribution" }
-compute-service = { workspace = true }
-# the agent-daemon wire: the messaging bus this node's service link carries.
-# Linking the crate is how both sides agree on the protocol.
-agent-service = { workspace = true }
-# host-side provider discovery: the dispatch worker runs the operator's locally
-# installed executor CLIs (BYO), never any credential file.
-provider-host = { workspace = true }
-saga = { path = "../modules/system/saga" }
-# Forge wire types and native automation object storage primitives (forge is
-# core-resident: the git substrate is a node service).
-forge = { path = "../modules/apps/forge" }
-# Generic signed request verification.
-keyscheme = { workspace = true }
-# duckfs wire/path/object helpers used by the daemon's HTTP and workspace
-# adapter surfaces without depending on the module adapter re-export.
-duckfs-core = { workspace = true }
-# the node-local op-receipt blob store (the http blob lane): op payloads staged
-# at submit time, served back by digest. re-exported by `src/blobs.rs`.
-blobstore = { workspace = true }
-# the derived read-model tier: the actor feeds per-module fluent31 databases
-# as blocks commit; each module's bundled wasm index guest folds them and
-# serves its view endpoint. /v1/index/* serves snapshot reads.
-indexer = { workspace = true }
-# decoding the borsh op-row envelopes for the /v1/index/*/ops json projection.
-borsh = { workspace = true }
-# the ONE invite TTL policy (default + bounds) `/v1/invite` shares with the
-# `ducktape node invite` verb — two doors, one number.
-workspace-config = { workspace = true }
-# the duckfs checkout/commit engine: the workspace RPC (/v1/fs/workspaces) drives
-# it over an actor-lane `NodeApi` adapter, so the daemon manages checkouts with
-# no self-dial. NOT a consensus-path crate — a client engine, OS-side only.
-duckfs-client = { workspace = true }
-# the workspace RPC decodes file-read replies (base64) off the actor lane.
-base64 = { workspace = true }
-# forge attribution emails include a bounded sha256-derived suffix so distinct
-# committed agent ids cannot collapse onto the same synthetic address.
-sha2 = { workspace = true }
-# the op-frame codec. `/v1/submit/frame` VERIFIES an already-signed frame before
-# it reaches any actor, and the embedded daemon takes the op's origin from that
-# verification — never from a caller-supplied string. same codec every validator
-# runs, so one definition of "who signed this op".
-node = { workspace = true }
-# the per-run agent session keypair: minted with the SAME ed25519 types
-# `node::encode_frame` signs with (no second crypto stack, no hand-rolled key).
-commonware-cryptography = { workspace = true }
-commonware-codec = { workspace = true }
-
-commonware-runtime = { workspace = true }
-
-serde = { workspace = true }
-serde_json = { workspace = true }
-# the service-daemon lane (`node_link`): a daemon reaches its node over the
-# node's own /v1 surface, never the in-process actor channel.
-reqwest = { workspace = true }
-rand = "0.8"
-async-trait = { workspace = true }
-futures = "0.3"
-# the scratch substrate an admission check starts over (and the isolated
-# storage roots of the admin-token, git-lane and testkit tests).
-tempfile = "3"
+abi = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.6", features = ["cors"] }
-# Local automation worktree and pack construction primitives.
-git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
-# the log subscriber every bin installs (src/log.rs): ONE reloadable filter over
-# stderr + the ws-streamed LogRing. `reload` backs POST /v1/log-filter.
+borsh = { workspace = true }
+commonware-codec = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-p2p = { workspace = true }
+commonware-runtime = { workspace = true }
+commonware-utils = { workspace = true }
+consensus = { workspace = true }
+futures = { workspace = true }
+hex = "0.4"
+host = { workspace = true }
+node = { workspace = true }
+rand_core = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+state = { workspace = true }
+statesync = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+tokio-tungstenite = "0.24"
+toml = "0.8"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[build-dependencies]
-# the build script stages the FOUNDING SET beside the binaries this library
-# links into (`build.rs`): the topology says which module ships a component
-# and which an index guest, so a declared artifact the checkout lacks fails
-# the build here instead of `node init` later.
-topology = { workspace = true }
-
 [dev-dependencies]
-# the run wire surface. The native module behind it ships from
-# ducktape-modules, so no suite here composes one: the provisioning suites
-# stand the COMMITTED guest up through `testkit::committed_module` and speak to
-# it over these types.
-run-envelope = { workspace = true }
-wat = "1"
-# the native files module: the provisioning suites stand a native `Files` up.
-files = { path = "../modules/apps/files" }
-# MemStore: the in-memory MerkleStore double behind store-backed modules in
-# the in-crate provision tests.
-sdk-testkit = { workspace = true }
-# the capability registry: the session-boundary test wires saga with
-# `with_assignment`, so `Accept`'s capability gate needs a real registry to
-# announce a provider into.
-capability = { path = "../modules/system/capability" }
-# the shared raw-http/port/poll harness helpers (daemon_e2e was a local copy).
-nettest = { path = "../testing/nettest" }
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
-tokio = { version = "1", features = ["test-util"] }
-syn = { version = "2", features = ["full"] }
+blobs = { workspace = true }
+fixture-modules = { path = "../kernel/fixtures/modules" }
+fixture-probe = { path = "../kernel/fixtures/probe" }
+fixture-relay = { path = "../kernel/fixtures/relay" }
+fixture-valset = { path = "../kernel/fixtures/valset" }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
