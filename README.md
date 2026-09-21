@@ -39,9 +39,9 @@ delegates the desktop installation to the pinned
 
 A founding file names the network, its cadence, its validators and the
 programs it starts with. Every path is relative to the file; the programs a
-network boots with (`module-registry`, `valset`, `identity`) are built and
-committed in [modules](https://github.com/ducktape-industries/modules) under
-`crates/modules/system/wasm/`:
+network boots with (`module-registry`, `valset`, `admission`, `identity`) are
+built and committed in [modules](https://github.com/ducktape-industries/modules)
+under `crates/modules/system/wasm/`:
 
 ```toml
 network = "mynet"
@@ -56,7 +56,11 @@ key = "…"                     # hex ed25519 public key: `ducktape identity`
 address = "203.0.113.7:9000"  # where peers dial it
 
 [[programs]]
-id = "identity"               # one entry per system program, `id` = its contract's PROGRAM
+id = "admission"              # one entry per system program, `id` = its contract's PROGRAM
+code = "admission.wasm"       # the program that enrolls a joiner as a member
+
+[[programs]]
+id = "identity"
 code = "identity.wasm"
 
 [[programs]]
@@ -75,13 +79,22 @@ ducktape init genesis.toml                          # found the network in $DUCK
 ducktape run --listen 0.0.0.0:9000 --http 127.0.0.1:8844
 ```
 
-A validator named in the file joins by adopting the network's state from any
-running node, then runs like a founder:
+Any node joins by adopting the network's state from a running node and
+enrolling its key and address through the `admission` program, then runs like
+a founder. A validator named in the founding file keeps its seat; anyone else
+is a member the validators connect to and send blocks, without a vote. The
+address is the one peers dial: a validator accepts a member only from the IP
+it enrolled with, so it must be the address the node is reached at, not a
+loopback or a placeholder.
 
 ```sh
-ducktape join http://203.0.113.7:8844
+ducktape join http://203.0.113.7:8844 --address 198.51.100.4:9000
 ducktape run --listen 0.0.0.0:9000
 ```
+
+The enrollment lands in the next block and the validators track the new
+member from the epoch after it; until then the node's dials are refused and
+retried.
 
 The workspace (`--workspace`, default `$DUCKTAPE_HOME` else `~/.ducktape`)
 holds `identity.key`, the network descriptor, the anchor the node started
@@ -112,7 +125,7 @@ verb's `--help` carries the rest.
 | Layer | Where | What |
 | --- | --- | --- |
 | Kernel | `crates/kernel/` | `abi` (the bytes ABI), `guest` (what a program compiles against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `blobs` (one content-addressed store), `host` (the sandbox: submit, query, deliver), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
-| Programs | [`ducktape-industries/modules`](https://github.com/ducktape-industries/modules) | The contracts a program compiles against (`crates/sdk/abi`, `crates/sdk/guest`: copies of `crates/kernel/abi` and `crates/kernel/guest` here), the boot set (`crates/modules`: the `modules` contracts crate, the `module-registry`, `valset` and `identity` programs under `system/`, their committed bytes under `system/wasm/`, and the suite that drives them on this host) and the app modules. The eight system modules beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
+| Programs | [`ducktape-industries/modules`](https://github.com/ducktape-industries/modules) | The contracts a program compiles against (`crates/sdk/abi`, `crates/sdk/guest`: copies of `crates/kernel/abi` and `crates/kernel/guest` here), the boot set (`crates/modules`: the `modules` contracts crate, the `module-registry`, `valset`, `admission` and `identity` programs under `system/`, their committed bytes under `system/wasm/`, and the suite that drives them on this host) and the app modules. The eight system modules beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
 | Networking | `crates/networking/` | Off-consensus byte transport for the services; the WireGuard overlay and the coordinator are `ducktape-industries/tunnel` |
 | Services | `crates/services/` | Off-chain executors: provider run loop, microVM sandbox, credential broker, airlock, media |

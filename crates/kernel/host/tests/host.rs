@@ -41,6 +41,13 @@ fn member(key: &[u8], address: &str) -> valset::Member {
     }
 }
 
+fn seated(validators: &[valset::Member]) -> valset::Seating {
+    valset::Seating {
+        validators: validators.iter().map(|member| member.key.clone()).collect(),
+        members: validators.to_vec(),
+    }
+}
+
 fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
     Founding {
         program: program.to_owned(),
@@ -230,10 +237,10 @@ fn founding_admits_every_program_and_the_host_reopens() {
         assert_eq!(programs["ping"], programs["pong"]);
         assert_ne!(programs["ping"], programs["probe"]);
         assert_eq!(
-            host.epoch_members(0).unwrap(),
-            Some(vec![member(b"v1", "v1:1")])
+            host.epoch_seating(0).unwrap(),
+            Some(seated(&[member(b"v1", "v1:1")]))
         );
-        assert_eq!(host.epoch_members(1).unwrap(), None);
+        assert_eq!(host.epoch_seating(1).unwrap(), None);
         assert_eq!(host.epoch_length().unwrap(), EPOCH_LENGTH);
         assert_eq!(
             host.tip().unwrap(),
@@ -258,8 +265,8 @@ fn founding_admits_every_program_and_the_host_reopens() {
         assert_eq!(reopened.root().unwrap(), applied.root);
         assert_eq!(reopened.programs().unwrap(), programs);
         assert_eq!(
-            reopened.epoch_members(0).unwrap(),
-            Some(vec![member(b"v1", "v1:1")])
+            reopened.epoch_seating(0).unwrap(),
+            Some(seated(&[member(b"v1", "v1:1")]))
         );
         assert_eq!(reopened.tip().unwrap(), host_tip);
         let env = ask(&reopened, Layer::Confirmed, "probe", vec![Step::Env]).await;
@@ -679,21 +686,21 @@ fn an_epoch_is_recorded_as_the_block_ending_the_one_before_commits() {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
         let founding = vec![member(b"v1", "v1:1")];
-        let seated = vec![member(b"v1", "v1:1"), member(b"v2", "v2:2")];
+        let reseated = vec![member(b"v1", "v1:1"), member(b"v2", "v2:2")];
 
         host.apply(block(1, Vec::new())).await.unwrap();
         let applied = host
-            .apply(block(2, vec![submit(0, "valset", abi::encode(&seated))]))
+            .apply(block(2, vec![submit(0, "valset", abi::encode(&reseated))]))
             .await
             .unwrap();
         assert_eq!(applied.submissions[0].outcome, ok(b""));
-        assert_eq!(host.epoch_members(0).unwrap(), Some(founding.clone()));
-        assert_eq!(host.epoch_members(1).unwrap(), None);
+        assert_eq!(host.epoch_seating(0).unwrap(), Some(seated(&founding)));
+        assert_eq!(host.epoch_seating(1).unwrap(), None);
 
         host.apply(block(3, Vec::new())).await.unwrap();
-        assert_eq!(host.epoch_members(0).unwrap(), Some(founding));
-        assert_eq!(host.epoch_members(1).unwrap(), Some(seated.clone()));
-        assert_eq!(host.epoch_members(2).unwrap(), None);
+        assert_eq!(host.epoch_seating(0).unwrap(), Some(seated(&founding)));
+        assert_eq!(host.epoch_seating(1).unwrap(), Some(seated(&reseated)));
+        assert_eq!(host.epoch_seating(2).unwrap(), None);
         assert_eq!(
             host.tip().unwrap(),
             Tip {
@@ -704,10 +711,10 @@ fn an_epoch_is_recorded_as_the_block_ending_the_one_before_commits() {
 
         for height in 4..=6 {
             host.apply(block(height, Vec::new())).await.unwrap();
-            assert_eq!(host.epoch_members(2).unwrap(), None);
+            assert_eq!(host.epoch_seating(2).unwrap(), None);
         }
         host.apply(block(7, Vec::new())).await.unwrap();
-        assert_eq!(host.epoch_members(2).unwrap(), Some(seated));
+        assert_eq!(host.epoch_seating(2).unwrap(), Some(seated(&reseated)));
     });
 }
 

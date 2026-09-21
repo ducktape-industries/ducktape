@@ -32,6 +32,13 @@ fn member(key: &ed25519::PrivateKey, address: &str) -> valset::Member {
     }
 }
 
+fn seated(validators: &[valset::Member]) -> valset::Seating {
+    valset::Seating {
+        validators: validators.iter().map(|member| member.key.clone()).collect(),
+        members: validators.to_vec(),
+    }
+}
+
 fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
     Founding {
         program: program.to_owned(),
@@ -113,8 +120,8 @@ fn founding_seals_the_genesis_block_as_the_tip() {
         assert_eq!(node.tip().unwrap().height, 0);
         assert_eq!(node.epoch_length().unwrap(), EPOCH_LENGTH);
         assert_eq!(
-            node.epoch_members(0).unwrap(),
-            Some(vec![member(&key(1), "v1:1")])
+            node.epoch_seating(0).unwrap(),
+            Some(seated(&[member(&key(1), "v1:1")]))
         );
         assert!(!node.due().unwrap());
 
@@ -424,22 +431,22 @@ fn an_epoch_seats_the_members_the_boundary_block_leaves() {
         let (mut node, _) = found(context, dir.path()).await;
         let signer = key(7);
         let founding = vec![member(&key(1), "v1:1")];
-        let seated = vec![member(&key(1), "v1:1"), member(&key(2), "v2:1")];
+        let reseated = vec![member(&key(1), "v1:1"), member(&key(2), "v2:1")];
 
-        node.submit(frame(&signer, 0, "valset", abi::encode(&seated)))
+        node.submit(frame(&signer, 0, "valset", abi::encode(&reseated)))
             .await
             .unwrap()
             .unwrap();
         let (_, applied) = seal(&mut node).await;
         assert_eq!(applied.height, 1);
-        assert_eq!(node.epoch_members(0).unwrap(), Some(founding));
-        assert_eq!(node.epoch_members(1).unwrap(), Some(seated.clone()));
-        assert_eq!(node.epoch_members(2).unwrap(), None);
+        assert_eq!(node.epoch_seating(0).unwrap(), Some(seated(&founding)));
+        assert_eq!(node.epoch_seating(1).unwrap(), Some(seated(&reseated)));
+        assert_eq!(node.epoch_seating(2).unwrap(), None);
 
         seal(&mut node).await;
-        assert_eq!(node.epoch_members(2).unwrap(), None);
+        assert_eq!(node.epoch_seating(2).unwrap(), None);
         seal(&mut node).await;
-        assert_eq!(node.epoch_members(2).unwrap(), Some(seated));
+        assert_eq!(node.epoch_seating(2).unwrap(), Some(seated(&reseated)));
     });
 }
 
