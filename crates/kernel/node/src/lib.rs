@@ -114,8 +114,8 @@ where
         Ok(self.host.epoch_length()?)
     }
 
-    pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<valset::Member>>> {
-        Ok(self.host.epoch_members(epoch)?)
+    pub fn epoch_seating(&self, epoch: u64) -> Result<Option<valset::Seating>> {
+        Ok(self.host.epoch_seating(epoch)?)
     }
 
     pub fn pending(&self) -> usize {

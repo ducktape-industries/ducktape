@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use abi::valset::Member;
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_consensus::types::Epoch;
@@ -74,10 +73,10 @@ impl Provider for Roster {
     }
 }
 
-pub fn validators_of(members: &[Member]) -> Option<Set<PublicKey>> {
-    let keys: Vec<PublicKey> = members
+pub fn validators_of(validators: &[Vec<u8>]) -> Option<Set<PublicKey>> {
+    let keys: Vec<PublicKey> = validators
         .iter()
-        .map(|member| PublicKey::decode(member.key.as_slice()))
+        .map(|key| PublicKey::decode(key.as_slice()))
         .collect::<Result<_, _>>()
         .ok()?;
     Set::try_from(keys).ok()
