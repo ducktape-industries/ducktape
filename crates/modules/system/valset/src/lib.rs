@@ -1,6 +1,6 @@
 use abi::{Refusal, Scan};
 use guest::Program;
-use modules::governance;
+use modules::AUTHORITY;
 use modules::program::{bytes_key, conflict, invalid};
 use modules::valset::{Genesis, Membership, Op, Query, Reply, Standing};
 
@@ -29,7 +29,7 @@ impl Program for Valset {
 
     fn execute(payload: &[u8]) -> Result<(), Refusal> {
         let env = guest::env();
-        modules::program::from(&env, governance::PROGRAM)?;
+        modules::program::from(&env, AUTHORITY)?;
         match abi::decode(payload)? {
             Op::Set(membership) => set(membership),
             Op::Remove { key } => remove(&key),

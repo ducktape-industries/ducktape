@@ -54,8 +54,8 @@ key = "…"                     # hex ed25519 public key: `ducktape identity`
 address = "203.0.113.7:9000"  # where peers dial it
 
 [[programs]]
-id = "acl"                    # one entry per system program, `id` = its contract's PROGRAM
-code = "acl.wasm"
+id = "identity"               # one entry per system program, `id` = its contract's PROGRAM
+code = "identity.wasm"
 
 [[programs]]
 id = "ping"
@@ -110,7 +110,7 @@ verb's `--help` carries the rest.
 | Layer | Where | What |
 | --- | --- | --- |
 | Kernel | `crates/kernel/` | `abi` (the bytes ABI), `guest` (what a program compiles against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `blobs` (one content-addressed store), `host` (the sandbox: submit, query, deliver), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
-| Programs | `crates/modules/` | The `modules` crate: the contracts of the system programs (the ops, queries and replies each accepts) and the helpers a program builds on; `system/` is its own workspace of the wasm32 programs a network is founded with (`kv`, `acl`, `module-registry`, `valset`, `identity`, `governance`, `capability`, `saga`, `dispatch`, `attribution`, `gateway`), and the built programs are committed under `system/wasm/` |
+| Programs | `crates/modules/` | The `modules` crate: the contracts of the programs a network boots with (the ops, queries and replies each accepts) and the helpers a program builds on; `system/` is its own workspace of those wasm32 programs (`module-registry`, `valset`, `identity`), and the built programs are committed under `system/wasm/`. `valset` and `module-registry` take writes from the program named `modules::AUTHORITY` (`governance`), which lives in the `ducktape-modules` repository with the rest of the system modules |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
 | Networking | `crates/networking/` | WireGuard mesh, NAT traversal, reachability, overlay data plane |
 | Services | `crates/services/` | Off-chain executors: provider run loop, microVM sandbox, credential broker, airlock, media |

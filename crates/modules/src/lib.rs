@@ -1,24 +1,17 @@
-pub mod acl;
-pub mod attribution;
-pub mod capability;
-pub mod dispatch;
-pub mod gateway;
-pub mod governance;
 pub mod identity;
-pub mod kv;
 pub mod module_registry;
-pub mod saga;
 pub mod valset;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
 pub type AccountNumber = u64;
 
+pub const AUTHORITY: &str = "governance";
+
 pub mod reason {
     pub use abi::reason::*;
     pub const UNAUTHORIZED: &str = "unauthorized";
     pub const CONFLICT: &str = "conflict";
-    pub const CLOSED: &str = "closed";
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

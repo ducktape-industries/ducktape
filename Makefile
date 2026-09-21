@@ -146,9 +146,8 @@ kernel-fixtures:
 	cp crates/kernel/fixtures/target/wasm32-unknown-unknown/release/fixture_*.wasm \
 	  crates/kernel/fixtures/wasm/
 
-## rebuild the system programs (the wasm32 programs a network is founded
-## with: kv, acl, module-registry, valset, identity, governance, capability, saga,
-## dispatch, attribution, gateway) and refresh their committed bytes, which
+## rebuild the system programs (the wasm32 programs a network boots with:
+## module-registry, valset, identity) and refresh their committed bytes, which
 ## `ducktape init` reads from a founding file and the modules tests load.
 system-programs:
 	$(CARGO) build --manifest-path crates/modules/system/Cargo.toml \

@@ -1,6 +1,6 @@
 use abi::{HashKind, Refusal, Scan};
 use guest::Program;
-use modules::governance;
+use modules::AUTHORITY;
 use modules::module_registry::{CODE_KIND, Change, Entry, Genesis, Op, Query, Reply, Scheduled};
 use modules::program::{conflict, invalid, not_found, u64_key};
 
@@ -35,32 +35,36 @@ impl Program for Modules {
         let env = guest::env();
         fold(env.height)?;
         match abi::decode(payload)? {
-            Op::Publish { body } => publish(&env, body),
+            Op::Publish { body } => publish(body),
             Op::Schedule(scheduled) => schedule(&env, scheduled),
             Op::Cancel { height, program } => cancel(&env, height, &program),
         }
     }
 
     fn query(request: &[u8]) -> Result<(), Refusal> {
+        let env = guest::env();
         let reply = match abi::decode(request)? {
             Query::At(height) => Reply::Programs(at(height)?),
             Query::Scheduled => Reply::Scheduled(scheduled()?),
-            Query::Program(program) => Reply::Program(guest::record(program_key(&program))?),
+            Query::Program(program) => Reply::Program(
+                at(env.height)?
+                    .into_iter()
+                    .find(|entry| entry.program == program),
+            ),
         };
         guest::reply(&reply);
         Ok(())
     }
 }
 
-fn publish(env: &abi::Env, body: Vec<u8>) -> Result<(), Refusal> {
-    modules::acl::admit(env)?;
+fn publish(body: Vec<u8>) -> Result<(), Refusal> {
     let id = guest::blob_put(HashKind::Sha256, CODE_KIND, body)?;
     guest::output(abi::encode(&id));
     Ok(())
 }
 
 fn schedule(env: &abi::Env, scheduled: Scheduled) -> Result<(), Refusal> {
-    modules::program::from(env, governance::PROGRAM)?;
+    modules::program::from(env, AUTHORITY)?;
     let in_the_future = scheduled.height > env.height;
     if !in_the_future {
         return Err(invalid(format!(
@@ -88,7 +92,7 @@ fn schedule(env: &abi::Env, scheduled: Scheduled) -> Result<(), Refusal> {
 }
 
 fn cancel(env: &abi::Env, height: u64, program: &str) -> Result<(), Refusal> {
-    modules::program::from(env, governance::PROGRAM)?;
+    modules::program::from(env, AUTHORITY)?;
     let key = schedule_key(height, program);
     let pending = guest::get(&key).is_some();
     if !pending {

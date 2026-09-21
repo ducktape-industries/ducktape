@@ -145,7 +145,6 @@ fn named(name: String) -> Result<String, Refusal> {
 }
 
 fn create(env: &Env, name: String, scheme: Scheme) -> Result<(), Refusal> {
-    modules::acl::admit(env)?;
     let signer = modules::program::external(env)?;
     let number = next_number()?;
     admit_key(&signer, number)?;
@@ -172,7 +171,6 @@ fn add_key(
     label: Option<String>,
     consent: Consent,
 ) -> Result<(), Refusal> {
-    modules::acl::admit(env)?;
     let signer = modules::program::external(env)?;
     let mut account = account(consent.account)?;
     let Control::Keys(keys) = &mut account.control else {

@@ -10,24 +10,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "acl"
-version = "0.1.0"
-dependencies = [
- "abi",
- "guest",
- "modules",
-]
-
-[[package]]
-name = "attribution"
-version = "0.1.0"
-dependencies = [
- "abi",
- "guest",
- "modules",
-]
-
-[[package]]
 name = "borsh"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -58,54 +40,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
-name = "capability"
-version = "0.1.0"
-dependencies = [
- "abi",
- "guest",
- "modules",
-]
-
-[[package]]
 name = "cfg_aliases"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
-name = "dispatch"
-version = "0.1.0"
-dependencies = [
- "abi",
- "guest",
- "modules",
- "serde_json",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
-
-[[package]]
-name = "gateway"
-version = "0.1.0"
-dependencies = [
- "abi",
- "guest",
- "modules",
-]
-
-[[package]]
-name = "governance"
-version = "0.1.0"
-dependencies = [
- "abi",
- "borsh",
- "guest",
- "modules",
-]
 
 [[package]]
 name = "guest"
@@ -138,21 +82,6 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown",
-]
-
-[[package]]
-name = "itoa"
-version = "1.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
-name = "kv"
-version = "0.1.0"
-dependencies = [
- "abi",
- "guest",
- "modules",
 ]
 
 [[package]]
@@ -213,24 +142,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "saga"
-version = "0.1.0"
-dependencies = [
- "abi",
- "guest",
- "modules",
-]
-
-[[package]]
-name = "serde"
-version = "1.0.229"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
-dependencies = [
- "serde_core",
-]
-
-[[package]]
 name = "serde_core"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -248,19 +159,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "serde_json"
-version = "1.0.151"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
-dependencies = [
- "itoa",
- "memchr",
- "serde",
- "serde_core",
- "zmij",
 ]
 
 [[package]]
@@ -327,9 +225,3 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
 ]
-
-[[package]]
-name = "zmij"
-version = "1.0.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
