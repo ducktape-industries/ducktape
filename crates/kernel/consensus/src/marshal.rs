@@ -1,10 +1,10 @@
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
 use commonware_broadcast::buffered;
+use commonware_consensus::marshal::Config;
 use commonware_consensus::marshal::core::{Actor, Mailbox};
 use commonware_consensus::marshal::resolver::p2p as backfill;
 use commonware_consensus::marshal::standard::Standard;
-use commonware_consensus::marshal::{Config, Start};
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_consensus::simplex::types::Finalization;
 use commonware_consensus::types::{FixedEpocher, Height, ViewDelta};
@@ -18,6 +18,7 @@ use commonware_storage::archive::immutable;
 use commonware_utils::vec::NonEmptyVec;
 use node::{Block, Digest};
 
+use crate::anchor::Anchor;
 use crate::chain::{App, Chain};
 use crate::lanes::MarshalLanes;
 use crate::roster::Roster;
@@ -42,6 +43,7 @@ pub type MarshalMailbox = Mailbox<Scheme, Standard<Block>>;
 
 pub struct Marshal {
     mailbox: MarshalMailbox,
+    anchor: Anchor,
     actor: Handle<()>,
     broadcast: Handle<()>,
 }
@@ -66,7 +68,7 @@ impl Marshal {
         partition: &str,
         network: &Network,
         roster: Roster,
-        start: Start<Scheme, Digest, Block>,
+        anchor: Anchor,
         transport: Transport<S, R, P, B>,
         chain: C,
     ) -> Marshal
@@ -138,7 +140,7 @@ impl Marshal {
                 epocher: FixedEpocher::new(
                     NonZeroU64::new(network.epoch_length).expect("an epoch spans blocks"),
                 ),
-                start,
+                start: anchor.start(),
                 partition_prefix: format!("{partition}-marshal"),
                 mailbox_size: MAILBOX,
                 view_retention: ViewDelta::new(VIEW_RETENTION),
@@ -157,6 +159,7 @@ impl Marshal {
         let actor = actor.start(App::<E, C>::new(chain, cadence), buffer, resolver);
         Marshal {
             mailbox,
+            anchor,
             actor,
             broadcast,
         }
@@ -164,6 +167,10 @@ impl Marshal {
 
     pub fn mailbox(&self) -> &MarshalMailbox {
         &self.mailbox
+    }
+
+    pub fn anchor(&self) -> &Anchor {
+        &self.anchor
     }
 
     pub async fn processed(&self) -> Option<u64> {

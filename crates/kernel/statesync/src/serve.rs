@@ -8,7 +8,8 @@ use consensus::MarshalMailbox;
 use host::Tip;
 use node::Node;
 
-use crate::wire::{Anchor, Head, Request, Response};
+use crate::Anchor;
+use crate::wire::{Head, Request, Response};
 use crate::{Context, SyncRequest};
 
 pub trait Anchors: Send + Sync {

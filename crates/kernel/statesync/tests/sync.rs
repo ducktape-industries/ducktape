@@ -259,7 +259,7 @@ fn a_joiner_adopts_the_state_at_a_finalized_tip() {
             joined.node.epoch_members(0).unwrap(),
             Some(network.members.clone())
         );
-        let Start::Floor(certificate) = joined.start else {
+        let Start::Floor(certificate) = joined.anchor.start() else {
             panic!("a finalized tip starts from its certificate");
         };
         assert_eq!(certificate, network.source.certificates[&2]);
@@ -330,7 +330,7 @@ fn a_joiner_at_genesis_starts_from_the_genesis_block() {
         .await
         .unwrap();
         assert_eq!(joined.node.tip().unwrap(), network.source.genesis.tip());
-        let Start::Genesis(block) = joined.start else {
+        let Start::Genesis(block) = joined.anchor.start() else {
             panic!("a genesis tip starts from the genesis block");
         };
         assert_eq!(block, network.source.genesis);

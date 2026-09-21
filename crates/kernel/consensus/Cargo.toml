@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 abi = { workspace = true }
+borsh = { workspace = true }
 node = { workspace = true }
 host = { workspace = true }
 commonware-broadcast = "2026.9.0"

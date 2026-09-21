@@ -6,18 +6,18 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use abi::{BlobId, Refusal};
-use commonware_consensus::marshal::Start;
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_parallel::Sequential;
 use commonware_storage::qmdb::sync;
 use consensus::{Certificate, validators_of};
-use node::{Block, Digest, Node, Synced};
+use node::{Digest, Node, Synced};
 use state::{Commitment, commitment_name};
 
+pub use consensus::Anchor;
 pub use consensus::Context;
 pub use remote::Remote;
 pub use serve::{Anchors, serve};
-pub use wire::{Anchor, Head, Request, Response};
+pub use wire::{Head, Request, Response};
 
 pub type SyncRequest = sync::Request<state::Family>;
 pub type SyncResponse = sync::Response<state::Family, state::Op, Digest>;
@@ -61,7 +61,7 @@ pub trait Exchange: Clone + Send + Sync + 'static {
 
 pub struct Joined<E: Context> {
     pub node: Node<E>,
-    pub start: Start<Scheme, Digest, Block>,
+    pub anchor: Anchor,
 }
 
 pub async fn join<E: Context, X: Exchange>(
@@ -111,7 +111,7 @@ pub async fn join<E: Context, X: Exchange>(
     }
     Ok(Joined {
         node,
-        start: head.anchor.start(),
+        anchor: head.anchor,
     })
 }
 

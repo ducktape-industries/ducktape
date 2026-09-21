@@ -11,7 +11,7 @@ use commonware_utils::acknowledgement::Exact;
 use commonware_utils::vec::NonEmptyVec;
 use commonware_utils::{NZU32, NZUsize};
 use consensus::{
-    Chain, EngineMux, Marshal, Membership, Network, Roster, SimMesh, Standing, Start, Transport,
+    Anchor, Chain, EngineMux, Marshal, Membership, Network, Roster, SimMesh, Standing, Transport,
 };
 use fixture_probe::Step;
 use futures::StreamExt as _;
@@ -174,7 +174,7 @@ struct Participant {
 
 impl Chain for Participant {
     async fn propose(&mut self, parent: Arc<Block>, time: u64) -> Option<Block> {
-        let mut node = self.node.lock().await;
+        let node = self.node.lock().await;
         Some(node.build(parent.tip(), time))
     }
 
@@ -231,7 +231,7 @@ impl Peer {
             name,
             &network,
             roster.clone(),
-            Start::Genesis(genesis_block),
+            Anchor::Genesis(genesis_block.clone()),
             Transport {
                 me: key.public_key(),
                 provider: mesh.provider(),
@@ -252,16 +252,16 @@ impl Peer {
             network.clone(),
             roster.clone(),
             mux,
-            marshal.mailbox().clone(),
+            &marshal,
             chain,
         );
-        let standing = membership.seat(0, members).await.unwrap();
+        let standing = membership.seat(genesis_block.tip(), members).await.unwrap();
         assert_eq!(standing == Standing::Validator, roster.participates(0));
         context.child("pump").spawn({
             let node = node.clone();
             let roots = roots.clone();
-            let epoch_length = network.epoch_length;
-            move |_| pump(node, membership, deliveries, applied, roots, epoch_length)
+            let network = network.clone();
+            move |_| pump(node, membership, deliveries, applied, roots, network)
         });
         Peer {
             key,
@@ -315,16 +315,15 @@ async fn pump(
     mut deliveries: mpsc::UnboundedReceiver<Delivery>,
     applied: mpsc::UnboundedSender<u64>,
     roots: Roots,
-    epoch_length: u64,
+    network: Network,
 ) {
     while let Some((block, ack)) = deliveries.next().await {
         let mut node = node.lock().await;
         if let Sequenced::Applied(outcome) = node.apply(&block).await.unwrap() {
             roots.lock().unwrap().insert(block.height, outcome.root);
         }
-        let ends_an_epoch = (block.height + 1).is_multiple_of(epoch_length);
-        let seating = if ends_an_epoch {
-            let epoch = (block.height + 1) / epoch_length;
+        let seating = if network.closes_an_epoch(block.height) {
+            let epoch = network.epoch_after(block.height);
             let members = node
                 .epoch_members(epoch)
                 .unwrap()
@@ -334,8 +333,8 @@ async fn pump(
             None
         };
         drop(node);
-        if let Some((epoch, members)) = seating {
-            membership.seat(epoch, &members).await.unwrap();
+        if let Some((_, members)) = seating {
+            membership.seat(block.tip(), &members).await.unwrap();
         }
         ack.acknowledge();
         let _ = applied.unbounded_send(block.height);
@@ -475,6 +474,41 @@ fn a_follower_backfills_finalized_blocks_by_hint() {
             follower.confirmed("probe", b"seen").await,
             Some(b"by-followers".to_vec())
         );
+    });
+}
+
+#[test]
+fn a_validator_epochs_behind_catches_up_by_the_traffic_it_hears() {
+    runner().start(|context| async move {
+        let keys: Vec<_> = (1..=4).map(key).collect();
+        let members: Vec<_> = keys.iter().map(member).collect();
+        let oracle = mesh(&context, &keys).await;
+        let network = network(4);
+        let mut peers = validators(&context, &oracle, &keys[..3], &members, &network).await;
+        let alice = key(11);
+        peers[0]
+            .submit(frame(&alice, 0, vec![set(b"early", b"yes")]))
+            .await;
+        let ahead = peers[0].reached(11).await;
+
+        let mut late = Peer::spawn(
+            context.child(LABELS[3]),
+            LABELS[3],
+            &oracle,
+            keys[3].clone(),
+            &members,
+            network.clone(),
+        )
+        .await;
+        assert!(late.roster.participates(0));
+        let caught_up = late.reached(ahead).await;
+        assert_eq!(late.root_at(ahead), peers[0].root_at(ahead));
+        assert!(caught_up >= ahead);
+        assert_eq!(
+            late.confirmed("probe", b"early").await,
+            Some(b"yes".to_vec())
+        );
+        assert!(late.roster.participates(network.epoch_after(ahead)));
     });
 }
 

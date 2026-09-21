@@ -1,19 +1,20 @@
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
-use commonware_consensus::Epochable as _;
 use commonware_consensus::marshal::standard::Inline;
 use commonware_consensus::simplex::config::{Config, Floor, ForwardPolicy, SkipBudget, SkipPolicy};
 use commonware_consensus::simplex::elector::RoundRobin;
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_consensus::types::{Epoch as EpochNumber, FixedEpocher, Height, ViewDelta};
 use commonware_cryptography::ed25519::PublicKey;
-use commonware_cryptography::{Digestible as _, Sha256};
+use commonware_cryptography::{Sha256, sha256};
 use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_parallel::Sequential;
 use commonware_runtime::Handle;
 use commonware_runtime::buffer::paged::CacheRef;
+use host::Tip;
 use node::Digest;
 
+use crate::anchor::Anchor;
 use crate::chain::{App, Chain};
 use crate::lanes::EngineLanes;
 use crate::marshal::MarshalMailbox;
@@ -109,27 +110,23 @@ impl Engine {
     }
 }
 
-pub(crate) fn anchor(epoch_length: u64, epoch: u64) -> u64 {
-    (epoch * epoch_length).saturating_sub(1)
-}
-
 pub(crate) async fn floor(
     marshal: &MarshalMailbox,
-    epoch_length: u64,
-    epoch: u64,
+    anchor: &Anchor,
+    network: &Network,
+    tip: Tip,
 ) -> Option<EngineFloor> {
-    let anchor = anchor(epoch_length, epoch);
-    let last = (epoch + 1) * epoch_length - 1;
-    let processed = marshal.get_processed_height().await.map_or(0, Height::get);
-    let epoch_has_progressed = processed > anchor;
-    if epoch_has_progressed
-        && let Some(certificate) = marshal
-            .get_finalization(Height::new(processed.min(last)))
-            .await
-        && certificate.epoch().get() == epoch
-    {
+    let epoch = network.epoch_after(tip.height);
+    let tip_anchors_the_epoch = tip.height == network.anchor(epoch);
+    if tip_anchors_the_epoch {
+        return Some(Floor::Genesis(sha256::Digest(tip.id)));
+    }
+    if let Some(certificate) = marshal.get_finalization(Height::new(tip.height)).await {
         return Some(Floor::Finalized(certificate));
     }
-    let block = marshal.get_block(Height::new(anchor)).await?;
-    Some(Floor::Genesis(block.digest()))
+    let Anchor::Finalized(certificate) = anchor else {
+        return None;
+    };
+    let anchor_names_the_tip = certificate.proposal.payload.0 == tip.id;
+    anchor_names_the_tip.then(|| Floor::Finalized(certificate.clone()))
 }

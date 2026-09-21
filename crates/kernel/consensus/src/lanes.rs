@@ -1,6 +1,9 @@
-use commonware_p2p::utils::mux::{MuxHandle, Muxer, SubReceiver, SubSender};
-use commonware_p2p::{Receiver, Sender};
+use commonware_p2p::utils::mux::{Builder as _, MuxHandle, Muxer, SubReceiver, SubSender};
+use commonware_p2p::{Channel, Message, Receiver, Sender};
 use commonware_runtime::{Handle, Spawner};
+use commonware_utils::channel::mpsc;
+use futures::stream::{BoxStream, select_all, unfold};
+use futures::{Stream, StreamExt as _};
 
 const MAILBOX: usize = 1024;
 
@@ -23,19 +26,8 @@ pub(crate) struct EngineLanes<S, R, B> {
 }
 
 pub struct EngineMux<S: Sender, R: Receiver, B> {
-    vote: MuxHandle<S, R>,
-    certificate: MuxHandle<S, R>,
-    resolver: MuxHandle<S, R>,
-    blocker: B,
-    muxers: [Handle<Result<(), R::Error>>; 3],
-}
-
-impl<S: Sender, R: Receiver, B> Drop for EngineMux<S, R, B> {
-    fn drop(&mut self) {
-        for muxer in &self.muxers {
-            muxer.abort();
-        }
-    }
+    pub(crate) lanes: Lanes<S, R, B>,
+    pub(crate) heard: Heard<R::PublicKey>,
 }
 
 impl<S: Sender, R: Receiver, B: Clone> EngineMux<S, R, B> {
@@ -44,20 +36,44 @@ impl<S: Sender, R: Receiver, B: Clone> EngineMux<S, R, B> {
         channels: EngineChannels<S, R>,
         blocker: B,
     ) -> EngineMux<S, R, B> {
-        let (vote, vote_handle) = mux(context.child("vote"), channels.vote);
-        let (certificate, certificate_handle) =
+        let (vote, vote_handle, vote_heard) = mux(context.child("vote"), channels.vote);
+        let (certificate, certificate_handle, certificate_heard) =
             mux(context.child("certificate"), channels.certificate);
-        let (resolver, resolver_handle) = mux(context.child("resolver"), channels.resolver);
+        let (resolver, resolver_handle, resolver_heard) =
+            mux(context.child("resolver"), channels.resolver);
         EngineMux {
-            vote,
-            certificate,
-            resolver,
-            blocker,
-            muxers: [vote_handle, certificate_handle, resolver_handle],
+            lanes: Lanes {
+                vote,
+                certificate,
+                resolver,
+                blocker,
+                muxers: [vote_handle, certificate_handle, resolver_handle],
+            },
+            heard: Heard {
+                lanes: [vote_heard, certificate_heard, resolver_heard],
+            },
         }
     }
+}
 
-    pub(crate) async fn lanes(
+pub(crate) struct Lanes<S: Sender, R: Receiver, B> {
+    vote: MuxHandle<S, R>,
+    certificate: MuxHandle<S, R>,
+    resolver: MuxHandle<S, R>,
+    blocker: B,
+    muxers: [Handle<Result<(), R::Error>>; 3],
+}
+
+impl<S: Sender, R: Receiver, B> Drop for Lanes<S, R, B> {
+    fn drop(&mut self) {
+        for muxer in &self.muxers {
+            muxer.abort();
+        }
+    }
+}
+
+impl<S: Sender, R: Receiver, B: Clone> Lanes<S, R, B> {
+    pub(crate) async fn register(
         &mut self,
         epoch: u64,
     ) -> EngineLanes<SubSender<S>, SubReceiver<R>, B> {
@@ -70,11 +86,37 @@ impl<S: Sender, R: Receiver, B: Clone> EngineMux<S, R, B> {
     }
 }
 
-type Demux<S, R> = (MuxHandle<S, R>, Handle<Result<(), <R as Receiver>::Error>>);
+type Unrouted<P> = mpsc::Receiver<(Channel, Message<P>)>;
+
+pub(crate) struct Heard<P> {
+    lanes: [Unrouted<P>; 3],
+}
+
+impl<P: Send + 'static> Heard<P> {
+    pub(crate) fn into_stream(self) -> impl Stream<Item = (u64, P)> + Send + Unpin {
+        select_all(self.lanes.map(unrouted)).map(|(epoch, (peer, _))| (epoch, peer))
+    }
+}
+
+fn unrouted<P: Send + 'static>(lane: Unrouted<P>) -> BoxStream<'static, (Channel, Message<P>)> {
+    unfold(lane, |mut lane| async move {
+        let heard = lane.recv().await?;
+        Some((heard, lane))
+    })
+    .boxed()
+}
+
+type Demux<S, R> = (
+    MuxHandle<S, R>,
+    Handle<Result<(), <R as Receiver>::Error>>,
+    Unrouted<<R as Receiver>::PublicKey>,
+);
 
 fn mux<E: Spawner, S: Sender, R: Receiver>(context: E, (sender, receiver): (S, R)) -> Demux<S, R> {
-    let (muxer, handle) = Muxer::new(context, sender, receiver, MAILBOX);
-    (handle, muxer.start())
+    let (muxer, handle, heard) = Muxer::builder(context, sender, receiver, MAILBOX)
+        .with_backup()
+        .build();
+    (handle, muxer.start(), heard)
 }
 
 async fn subchannel<S: Sender, R: Receiver>(
@@ -86,6 +128,14 @@ async fn subchannel<S: Sender, R: Receiver>(
         .expect("an epoch's lanes register once")
 }
 
+pub mod channel {
+    pub const BROADCAST: u64 = 0;
+    pub const BACKFILL: u64 = 1;
+    pub const VOTE: u64 = 2;
+    pub const CERTIFICATE: u64 = 3;
+    pub const RESOLVER: u64 = 4;
+}
+
 #[cfg(feature = "sim")]
 pub use sim::SimMesh;
 
@@ -95,13 +145,8 @@ mod sim {
     use commonware_p2p::simulated::{Control, Manager, Oracle, Receiver, Sender};
     use commonware_runtime::{Clock, Quota};
 
+    use super::channel::{BACKFILL, BROADCAST, CERTIFICATE, RESOLVER, VOTE};
     use super::{EngineChannels, MarshalLanes};
-
-    const BROADCAST: u64 = 0;
-    const BACKFILL: u64 = 1;
-    const VOTE: u64 = 2;
-    const CERTIFICATE: u64 = 3;
-    const RESOLVER: u64 = 4;
 
     pub struct SimMesh<E: Clock> {
         oracle: Oracle<PublicKey, E>,
