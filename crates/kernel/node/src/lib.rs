@@ -9,7 +9,7 @@ use abi::{BlobId, Origin, Outcome, ProgramId, Refusal, validators};
 use commonware_cryptography::Digestible as _;
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
-use host::{Applied, Genesis, Host, Layer, Receipt, Tip};
+use host::{Applied, Genesis, Host, Layer, Receipt, Submission, Tip};
 use state::{Commitment, View};
 
 pub use block::{Block, Digest};
@@ -39,6 +39,11 @@ where
     pub commitments: BTreeMap<ProgramId, Commitment<E>>,
 }
 
+struct Pending {
+    frame: Vec<u8>,
+    submission: Submission,
+}
+
 pub struct Node<E>
 where
     E: Context + Spawner,
@@ -46,7 +51,7 @@ where
     context: E,
     host: Host<E>,
     network: Vec<u8>,
-    pending: Vec<Vec<u8>>,
+    pending: Vec<Pending>,
 }
 
 impl<E> Node<E>
@@ -174,16 +179,17 @@ where
             Err(refusal) => return Ok(Err(refusal)),
         };
         let time = self.now();
-        let mut receipts = self.host.preconfirm(time, vec![submission]).await?;
+        let mut receipts = self.host.preconfirm(time, vec![submission.clone()]).await?;
         let receipt = receipts.pop().expect("one submission yields one receipt");
         if let Outcome::Applied { .. } = receipt.outcome {
-            self.pending.push(frame);
+            self.pending.push(Pending { frame, submission });
         }
         Ok(Ok(receipt))
     }
 
-    pub fn build(&mut self, parent: Tip, time: u64) -> Block {
-        Block::next(parent, time, std::mem::take(&mut self.pending))
+    pub fn build(&self, parent: Tip, time: u64) -> Block {
+        let frames = self.pending.iter().map(|pending| pending.frame.clone());
+        Block::next(parent, time, frames.collect())
     }
 
     pub async fn apply(&mut self, block: &Block) -> Result<Sequenced> {
@@ -213,6 +219,26 @@ where
                 submissions,
             })
             .await?;
+        self.pending
+            .retain(|pending| !block.frames.contains(&pending.frame));
+        self.replay().await?;
         Ok(Sequenced::Applied(applied))
+    }
+
+    async fn replay(&mut self) -> Result<()> {
+        let time = self.now();
+        let pending = std::mem::take(&mut self.pending);
+        let submissions = pending
+            .iter()
+            .map(|pending| pending.submission.clone())
+            .collect();
+        let receipts = self.host.preconfirm(time, submissions).await?;
+        self.pending = pending
+            .into_iter()
+            .zip(receipts)
+            .filter(|(_, receipt)| matches!(receipt.outcome, Outcome::Applied { .. }))
+            .map(|(pending, _)| pending)
+            .collect();
+        Ok(())
     }
 }

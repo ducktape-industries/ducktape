@@ -200,6 +200,76 @@ fn a_frame_is_preconfirmed_built_and_applied_once() {
 }
 
 #[test]
+fn a_block_without_the_pending_frame_keeps_it_pending_and_preconfirmed() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut node, _) = found(context, dir.path()).await;
+        let signer = key(7);
+        node.submit(frame(&signer, 0, "probe", script(vec![set(b"k", b"v")])))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let tip = node.tip().unwrap();
+        let empty = Block::next(tip, TIME + 1, Vec::new());
+        assert!(matches!(
+            node.apply(&empty).await.unwrap(),
+            Sequenced::Applied(_)
+        ));
+        assert_eq!(node.pending(), 1);
+        assert!(node.due().unwrap());
+        assert_eq!(
+            node.view(Layer::Preconfirmed).get("probe", b"k").unwrap(),
+            Some(b"v".to_vec())
+        );
+        assert_eq!(
+            node.view(Layer::Confirmed).get("probe", b"k").unwrap(),
+            None
+        );
+
+        let (block, applied) = seal(&mut node).await;
+        assert_eq!(block.frames.len(), 1);
+        assert_eq!(applied.submissions.len(), 1);
+        assert_eq!(node.pending(), 0);
+        assert_eq!(
+            node.view(Layer::Confirmed).get("probe", b"k").unwrap(),
+            Some(b"v".to_vec())
+        );
+    });
+}
+
+#[test]
+fn a_block_that_spends_the_signers_sequence_elsewhere_drops_the_pending_frame() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut node, _) = found(context, dir.path()).await;
+        let signer = key(7);
+        node.submit(frame(&signer, 0, "probe", script(vec![set(b"k", b"v")])))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let tip = node.tip().unwrap();
+        let elsewhere = frame(&signer, 0, "probe", script(vec![set(b"k", b"w")]));
+        let block = Block::next(tip, TIME + 1, vec![elsewhere]);
+        let Sequenced::Applied(applied) = node.apply(&block).await.unwrap() else {
+            panic!("the block was already applied");
+        };
+        assert_eq!(applied.submissions.len(), 1);
+        assert_eq!(node.pending(), 0);
+        assert!(!node.due().unwrap());
+        assert_eq!(
+            node.view(Layer::Preconfirmed).get("probe", b"k").unwrap(),
+            Some(b"w".to_vec())
+        );
+        assert_eq!(
+            node.view(Layer::Confirmed).get("probe", b"k").unwrap(),
+            Some(b"w".to_vec())
+        );
+    });
+}
+
+#[test]
 fn a_frame_is_refused_when_it_names_another_network_or_lies_about_its_signer() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
