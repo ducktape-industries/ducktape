@@ -167,11 +167,12 @@ wasmtime = "=46.0.3"
 wit-bindgen = "0.57"
 
 # internal — kernel crates (the platform), and the two leaves the services
-# and the node still take from ducktape-industries/ducktape-sdk on its `dev`
-# branch: `sdk` (the services' module types) and `keyscheme` (the key schemes
-# a frame's signer may use).
-sdk = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "sdk" }
-keyscheme = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "keyscheme" }
+# and the node still take from ducktape-industries/ducktape-sdk: `sdk` (the
+# services' module types) and `keyscheme` (the key schemes a frame's signer
+# may use). Every package taken from the sdk is pinned to the last revision
+# that carries it; the sdk's `dev` branch has since dropped them all.
+sdk = { git = "https://github.com/ducktape-industries/ducktape-sdk", rev = "736865710dcfa7c56f9834747287881c1c25d45d", package = "sdk" }
+keyscheme = { git = "https://github.com/ducktape-industries/ducktape-sdk", rev = "736865710dcfa7c56f9834747287881c1c25d45d", package = "keyscheme" }
 abi = { path = "crates/kernel/abi" }
 guest = { path = "crates/kernel/guest" }
 runtime = { path = "crates/kernel/runtime" }
@@ -196,12 +197,12 @@ sandbox-host = { path = "crates/services/sandbox" }
 # internal — cross-plane libraries: neither kernel nor service.
 # duckdns is the `.duck` naming library the terminal service validates names
 # through.
-duckdns = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "duckdns" }
+duckdns = { git = "https://github.com/ducktape-industries/ducktape-sdk", rev = "736865710dcfa7c56f9834747287881c1c25d45d", package = "duckdns" }
 # the device keystore, linked by both the CLI and the desktop app.
 keystore = { path = "crates/keystore" }
 # the run envelope's magic + headless composer, linked by the provider
 # service and the desktop app.
-run-envelope = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "run-envelope" }
+run-envelope = { git = "https://github.com/ducktape-industries/ducktape-sdk", rev = "736865710dcfa7c56f9834747287881c1c25d45d", package = "run-envelope" }
 # the app's update state machine, manifest + minisign verify and state.json
 # codec, shared with the desktop app.
 app-update = { path = "crates/app-update" }
@@ -209,7 +210,7 @@ app-update = { path = "crates/app-update" }
 ducktape-home = { path = "crates/ducktape-home" }
 # the daemon library the `ducktape` binary runs.
 noded = { path = "crates/noded" }
-duckfs-core = { git = "https://github.com/ducktape-industries/ducktape-sdk", branch = "dev", package = "duckfs-core" }
+duckfs-core = { git = "https://github.com/ducktape-industries/ducktape-sdk", rev = "736865710dcfa7c56f9834747287881c1c25d45d", package = "duckfs-core" }
 ducktape-rpc = { path = "crates/rpc-client" }
 # internal — networking crates
 wireguard = { path = "crates/networking/wireguard" }
