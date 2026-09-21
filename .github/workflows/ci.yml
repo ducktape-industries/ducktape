@@ -1,15 +1,13 @@
-# The fast lane: what a push to `dev` proves in minutes, with nothing
-# that builds a wasm guest, bundles a view, or boots a topology. The `unit`
-# job is required for PRs into `dev`. It also runs after a push to `dev`
-# and on demand for a branch (`gh workflow run ci.yml --ref <branch>`).
+# The fast lane: what a push to `dev` proves in minutes. The `unit` job is
+# required for PRs into `dev`. It also runs after a push to `dev` and on
+# demand for a branch (`gh workflow run ci.yml --ref <branch>`).
 #
 # One job, one cache. `unit` restores one `target/` for everything the
-# workspace compiles: the artifact checks are text (`cmp` + `grep`), clippy
-# is check-mode over the workspace, and `--lib` runs every crate's unit
-# tests — the kernel, the modules, the netstack, duckfs.
+# workspace compiles: clippy is check-mode over the workspace, and `--lib`
+# runs every crate's unit tests.
 #
-# Everything heavier — the simnode topologies, the wasm/native parity proofs,
-# the guest rebuild — is `nightly.yml`.
+# Everything heavier — the daemon suites over real sockets, the consensus
+# simulation, the host against its guests — is `nightly.yml`.
 name: ci
 
 on:
@@ -42,15 +40,9 @@ jobs:
       # ubuntu-latest ships rustup; the checkout's rust-toolchain.toml pins
       # the exact channel + targets, so this just makes rustup install it.
       - run: rustup show
-      # no binary embeds a wasm guest — the binary is not the module set. A
-      # source-parsing lint over the whole tree, which this job builds two
-      # steps below anyway.
-      - run: make wasm-embed-check
       # airlock's signing-route tests sign a fixture bundle with the pinned
       # `rcodesign` the enclave image carries (ops/airlock-gateway/); the
       # test refuses to skip without it.
       - run: ops/airlock-gateway/install-rcodesign.sh --prefix "$HOME/.local" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      # simnode's lib tests boot the full sim topology; the whole crate runs
-      # in nightly.yml instead.
-      - run: cargo test --locked --workspace --lib --exclude simnode --no-fail-fast
+      - run: cargo test --locked --workspace --lib --no-fail-fast
       - run: cargo clippy --locked --workspace --tests --no-deps -- -D warnings

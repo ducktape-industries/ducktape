@@ -1,0 +1,11 @@
+[package]
+name = "fixture-valset"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+abi = { workspace = true }
+guest = { workspace = true }

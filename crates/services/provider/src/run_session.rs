@@ -1341,8 +1341,7 @@ mod tests {
         let ctx = RunContext::default();
         let started = Instant::now();
         let forked = started;
-        let mut timing =
-            SessionTiming::new(Protocol::Codex, &ctx, started).with_observer(observer);
+        let mut timing = SessionTiming::new(Protocol::Codex, &ctx, started).with_observer(observer);
         let (marker, spawn) = oneshot::channel();
         let run = drive(
             Protocol::Codex,

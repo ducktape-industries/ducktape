@@ -1,92 +1,77 @@
-//! strict little-endian wire primitives shared by every state-sync frame.
-//!
-//! every read is bounds-checked BEFORE any allocation (a forged length can
-//! never drive memory), and top-level decoders require the buffer to be fully
-//! consumed (`expect_empty`) so a given frame has exactly one valid encoding.
+use std::collections::BTreeMap;
+use std::io;
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum WireError {
-    #[error("frame truncated")]
-    Truncated,
-    #[error("frame carries trailing bytes")]
-    Trailing,
-    #[error("bad {0} tag: {1}")]
-    BadTag(&'static str, u8),
-    #[error("invalid utf-8 string")]
-    BadUtf8,
-    #[error("codec: {0}")]
-    Codec(String),
+use abi::{BlobId, ProgramId, Refusal};
+use borsh::{BorshDeserialize, BorshSerialize};
+use commonware_codec::{Decode, Encode, Read};
+use consensus::Anchor;
+use host::Tip;
+use state::SyncTarget;
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Request {
+    Head,
+    Sync {
+        program: ProgramId,
+        request: Vec<u8>,
+    },
+    Blob(BlobId),
 }
 
-pub fn take_u8(buf: &mut &[u8]) -> Result<u8, WireError> {
-    let Some((head, rest)) = buf.split_first() else {
-        return Err(WireError::Truncated);
-    };
-    let v = *head;
-    *buf = rest;
-    Ok(v)
+#[derive(Clone, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
+pub enum Response {
+    Head(Head),
+    Sync(Vec<u8>),
+    Blob(Option<Vec<u8>>),
+    Refused(Refusal),
 }
 
-pub fn take_u64(buf: &mut &[u8]) -> Result<u64, WireError> {
-    let Some((head, rest)) = buf.split_first_chunk::<8>() else {
-        return Err(WireError::Truncated);
-    };
-    let v = u64::from_le_bytes(*head);
-    *buf = rest;
-    Ok(v)
+#[derive(Clone, Debug, PartialEq)]
+pub struct Head {
+    pub tip: Tip,
+    pub anchor: Anchor,
+    pub targets: BTreeMap<ProgramId, SyncTarget>,
 }
 
-pub fn take_u32(buf: &mut &[u8]) -> Result<u32, WireError> {
-    let Some((head, rest)) = buf.split_first_chunk::<4>() else {
-        return Err(WireError::Truncated);
-    };
-    let v = u32::from_le_bytes(*head);
-    *buf = rest;
-    Ok(v)
-}
-
-pub fn take_array<const N: usize>(buf: &mut &[u8]) -> Result<[u8; N], WireError> {
-    let Some((head, rest)) = buf.split_first_chunk::<N>() else {
-        return Err(WireError::Truncated);
-    };
-    let v = *head;
-    *buf = rest;
-    Ok(v)
-}
-
-/// take a u64-length-prefixed byte slice. the length is checked against the
-/// remaining buffer BEFORE any slicing, so a forged length cannot allocate.
-pub fn take_bytes<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8], WireError> {
-    let len = take_u64(buf)?;
-    if len > buf.len() as u64 {
-        return Err(WireError::Truncated);
+impl BorshSerialize for Head {
+    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        self.tip.height.serialize(writer)?;
+        self.tip.id.serialize(writer)?;
+        self.anchor.serialize(writer)?;
+        let targets: Vec<(&ProgramId, Vec<u8>)> = self
+            .targets
+            .iter()
+            .map(|(program, target)| (program, codec(target)))
+            .collect();
+        targets.serialize(writer)
     }
-    let (head, rest) = buf.split_at(len as usize);
-    *buf = rest;
-    Ok(head)
 }
 
-pub fn take_str(buf: &mut &[u8]) -> Result<String, WireError> {
-    let bytes = take_bytes(buf)?;
-    String::from_utf8(bytes.to_vec()).map_err(|_| WireError::BadUtf8)
-}
-
-// the WRITE side IS the shared `sdk::codec` primitive verbatim (`u64`-LE length
-// prefix + bytes). re-export it rather than keep a second copy of the exact same
-// byte-producing code — this is the encoded-bytes contract, so byte-identity is
-// not merely preserved, it is the same function. the READ side below stays
-// statesync's own: it carries a typed [`WireError`] woven through ~40 sites and
-// >100 call sites, and every decoder already applies its own count cap
-// (`MAX_OPS_PER_BATCH`, `MAX_PROOF_DIGESTS`) — stricter than a generic cursor
-// bound — plus `expect_empty` trailing rejection, so converting the readers to
-// `sdk::codec::Cursor` would trade the typed error model for a stringly one with
-// zero byte benefit.
-pub use sdk::codec::{push_bytes as put_bytes, push_str as put_str};
-
-pub fn expect_empty(buf: &[u8]) -> Result<(), WireError> {
-    if buf.is_empty() {
-        Ok(())
-    } else {
-        Err(WireError::Trailing)
+impl BorshDeserialize for Head {
+    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Head> {
+        let height = u64::deserialize_reader(reader)?;
+        let id = <[u8; 32]>::deserialize_reader(reader)?;
+        let anchor = Anchor::deserialize_reader(reader)?;
+        let targets = Vec::<(ProgramId, Vec<u8>)>::deserialize_reader(reader)?
+            .into_iter()
+            .map(|(program, target)| Ok((program, decoded(&target, &())?)))
+            .collect::<io::Result<_>>()?;
+        Ok(Head {
+            tip: Tip { height, id },
+            anchor,
+            targets,
+        })
     }
+}
+
+fn codec<T: Encode>(value: &T) -> Vec<u8> {
+    value.encode().to_vec()
+}
+
+fn decoded<T: Read>(bytes: &[u8], cfg: &T::Cfg) -> io::Result<T> {
+    T::decode_cfg(bytes, cfg).map_err(invalid)
+}
+
+fn invalid(error: impl ToString) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }

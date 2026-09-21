@@ -1,4 +1,0 @@
-interface:
-  display_name: "QA"
-  short_description: "Verify the real native Iced app, managed node, and CEF Browser pane."
-  default_prompt: "Use $qa to build and verify Ducktape's staged native Iced desktop app, including workspace/node lifecycle and the isolated CEF Browser pane. Report the platform, package path, exact checks, and any skipped native gate."

@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["probe", "module-registry", "valset", "relay"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+abi = { path = "../abi" }
+guest = { path = "../guest" }
+borsh = { version = "1", default-features = false, features = ["derive", "std"] }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1

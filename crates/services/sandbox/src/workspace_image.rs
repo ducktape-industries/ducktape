@@ -670,7 +670,9 @@ mod tests {
         let image = root.join("ws.img");
         build(&src, &image, WORKSPACE_IMAGE_BYTES).expect("build");
 
-        let host_owner = std::fs::metadata(src.join("plain.txt")).expect("stat").uid();
+        let host_owner = std::fs::metadata(src.join("plain.txt"))
+            .expect("stat")
+            .uid();
         assert_ne!(
             host_owner,
             guest_paths::GUEST_RUN_UID,

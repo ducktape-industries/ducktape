@@ -98,9 +98,12 @@ pub fn try_http_headed(
     stream.read_to_end(&mut raw)?;
     // split head/body at the BYTE level — chunk bytes round-trip untouched and a
     // text body's own blank line can't be mistaken for the header terminator.
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "no http header terminator")
-    })?;
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "no http header terminator")
+        })?;
     let head = String::from_utf8_lossy(&raw[..split]).into_owned();
     let status = head
         .split_whitespace()
@@ -384,7 +387,11 @@ mod tests {
         let mut deduped = ports.clone();
         deduped.sort_unstable();
         deduped.dedup();
-        assert_eq!(deduped.len(), ports.len(), "alloc_ports handed back a duplicate");
+        assert_eq!(
+            deduped.len(),
+            ports.len(),
+            "alloc_ports handed back a duplicate"
+        );
     }
 
     /// A reserved port must be free on BOTH protocols: harnesses hand these
@@ -441,7 +448,10 @@ mod tests {
 
     #[test]
     fn a_missing_capability_skips_only_when_the_operator_asked() {
-        assert_eq!(decide_skip("a_test", true, Some("no widget".into())), Some(()));
+        assert_eq!(
+            decide_skip("a_test", true, Some("no widget".into())),
+            Some(())
+        );
     }
 
     #[test]

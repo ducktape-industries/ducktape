@@ -72,11 +72,20 @@ mod tests {
         let (client_eph_pk, client_keys) = client_handshake(&seal_pk);
         let enclave_keys = enclave_session_keys(&enclave, &client_eph_pk);
         assert_eq!(client_keys.session, enclave_keys.session, "ECDH must agree");
-        assert_eq!(client_keys.body, enclave_keys.body, "body key must agree too");
-        assert_ne!(client_keys.session, client_keys.body, "labels must separate the keys");
+        assert_eq!(
+            client_keys.body, enclave_keys.body,
+            "body key must agree too"
+        );
+        assert_ne!(
+            client_keys.session, client_keys.body,
+            "labels must separate the keys"
+        );
 
         let blob = seal_token(&enclave_keys.session, b"scoped.session.token");
-        assert_eq!(open_token(&client_keys.session, &blob).unwrap(), b"scoped.session.token");
+        assert_eq!(
+            open_token(&client_keys.session, &blob).unwrap(),
+            b"scoped.session.token"
+        );
     }
 
     #[test]

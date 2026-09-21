@@ -25,8 +25,8 @@
 //! logs per forwarded frame.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arrayvec::ArrayVec;
@@ -1176,5 +1176,4 @@ mod tests {
             "the mismatch closed the session"
         );
     }
-
 }

@@ -366,7 +366,10 @@ mod tests {
         let args = boot_args(Vmm::Vz);
         assert!(args.contains("DUCK_HALT=poweroff"), "{args}");
         assert!(!args.contains("reboot=k"), "{args}");
-        assert!(!args.contains("panic="), "a panic must park, not boot-loop: {args}");
+        assert!(
+            !args.contains("panic="),
+            "a panic must park, not boot-loop: {args}"
+        );
     }
 
     /// The two flavors present different virtual hardware, and each of these
@@ -565,7 +568,11 @@ mod tests {
             let args = config["boot-source"]["boot_args"]
                 .as_str()
                 .expect("boot args");
-            assert_eq!(args, boot_args(vmm), "the cmdline is the same for every run");
+            assert_eq!(
+                args,
+                boot_args(vmm),
+                "the cmdline is the same for every run"
+            );
             assert!(args.len() < 512, "{} bytes: {args}", args.len());
             for host_path in ["/srv/agents", "/run/ducktape", "/srv/guest"] {
                 assert!(!args.contains(host_path), "{host_path} leaked into {args}");
@@ -581,7 +588,13 @@ mod tests {
     #[test]
     fn listen_ports_reach_the_vz_shim_and_never_firecracker() {
         let ports = [1024, 1025, 1026];
-        let vz = boot_config(&VmConfig { vmm: Vmm::Vz, ..cfg() }, &ports);
+        let vz = boot_config(
+            &VmConfig {
+                vmm: Vmm::Vz,
+                ..cfg()
+            },
+            &ports,
+        );
         assert_eq!(vz["vsock"]["listen_ports"], serde_json::json!(ports));
 
         let firecracker = boot_config(&cfg(), &ports);

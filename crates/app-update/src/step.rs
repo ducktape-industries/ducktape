@@ -291,7 +291,10 @@ fn idle_designated(idle: Idle, designated: Sha) -> (Phase, Vec<Command>) {
     if kept_on_disk {
         return restage_previous(idle, designated);
     }
-    (Phase::Idle(idle), vec![Command::FetchDesignated(designated)])
+    (
+        Phase::Idle(idle),
+        vec![Command::FetchDesignated(designated)],
+    )
 }
 
 /// `previous` is a release this install ran, and it is still sealed under

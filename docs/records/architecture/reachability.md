@@ -8,8 +8,7 @@ WireGuard keystore, sealed envelopes, the persisted-mesh store); the decision
 core — the protocol state machine, per-epoch state, wire messages, derived
 bindings, the persisted-mesh codec — is `crates/networking/netstack-machine`.
 The signed record and handshake formats are
-`../../records/protocols/wireguard-tunnel-upgrade.md`; the operator side is
-`../../deploy/coordinator.md`.
+`../../records/protocols/wireguard-tunnel-upgrade.md`.
 
 ## 1. Two planes, composed orthogonally
 
@@ -63,12 +62,12 @@ registered-but-absent node costs consensus nothing.
 The invite blob IS the VPN credential, and the join window's carrier is the
 invite tunnel itself — there is no TCP ingress at all.
 
-1. A member runs `ducktape node invite`: the signed blob carries the network
+1. A member mints an invite: the signed blob carries the network
    descriptor, the member's WireGuard public key and underlay UDP endpoint,
    its UDP intro endpoint (`invite_listen`, default the WireGuard port + 1),
    its overlay mesh port, an expiry, and a single-use token — minting IS the
    admission decision.
-2. `ducktape node join <blob>` writes the workspace with WireGuard-shape
+2. Joining with the blob writes the workspace with WireGuard-shape
    defaults (own plane, dual-stack mesh listen, `advertised = "overlay"`, the
    inviter's overlay ULA as a direct dial hint) and the node starts: it
    installs the inviter as a join-window tunnel peer straight from the blob,
@@ -82,7 +81,7 @@ invite tunnel itself — there is no TCP ingress at all.
    member, and the joiner syncs (rotating across every serving validator)
    into a serving full node.
 4. Seating it in the quorum stays a separate, deliberate act
-   (`ducktape node member promote`) — the machinery of §4, unchanged.
+   (a member promotion) — the machinery of §4, unchanged.
 
 ### Fronts: every path the inviter offers
 
@@ -123,15 +122,12 @@ Because the blob names the inviter's reachable members (identities, WireGuard
 public keys, overlay ports, and public endpoints for host-capable ones), a
 leaked invite widens who sees that data from admitted members to whoever
 holds the blob. Invites are single-use and expire; treat one like the secret
-it is (`../../deploy/backup-and-keys.md`).
+it is.
 
 Bounds by design: a DIRECT candidate's intro listener is the peer's own UDP
 (`wg_port + 1`), so a direct path needs that member's port
 underlay-reachable (one forwarded UDP port suffices; the joiner needs
-nothing), while a coordinated path needs no forwarded port at all. The
-TCP-carrier halves of the join are proven by
-`bin/node/tests/join_request_e2e.rs`, and the whole ceremony on a live
-overlay by `bin/node/tests/wireguard_tunnel_e2e.rs`.
+nothing), while a coordinated path needs no forwarded port at all.
 
 ## 6. Cold restart
 
@@ -195,12 +191,5 @@ product, and this design needs none.
 
 - `crates/networking/reachability/tests/rendezvous_simnat.rs` — the
   production resolver punching over a simulated NAT topology.
-- `bin/node/tests/join_request_e2e.rs` — the TCP-carrier halves of the join.
-- `bin/node/tests/wireguard_tunnel_e2e.rs` — the tunnel-first invite end to
-  end on a live overlay, two nodes in their own network namespaces: the
-  `dt-*` interface up, the tunnel carrying at both members' ULAs, the mesh
-  dial at the joiner's ULA, no kernel TCP listener on the mesh port on either
-  side, and the joiner still folding blocks with every underlay TCP packet
-  between them rejected. Skips where `ip netns` is unavailable.
 - `crates/networking/wireguard/tests/tunnel_e2e.rs` — the fixed
   mesh-version vector every node must reproduce.

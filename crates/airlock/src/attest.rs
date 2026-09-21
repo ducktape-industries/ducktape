@@ -9,7 +9,7 @@
 //! `airlock::testkit` (feature `testkit`), whose minted chains verify only
 //! under their own roots.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 pub const REPORT_DATA_LEN: usize = 64;
 /// Launch-measurement length: TDX MRTD and AMD SEV-SNP measurement are both

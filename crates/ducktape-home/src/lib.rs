@@ -4,19 +4,18 @@
 //! One function in a zero-dependency leaf, so every reader resolves the same
 //! root and a set-but-empty override reads as unset everywhere. The home
 //! holds one directory per workspace and nothing else; what a workspace holds
-//! is `workspace-config`'s to say.
+//! is `noded::Workspace`'s to say.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// the directory this operator's workspaces live in: `$DUCKTAPE_HOME` when
-/// the override is set to a non-empty value (tests, portable setups, huddle
-/// lanes), else `~/.ducktape`.
+/// the override is set to a non-empty value (tests, portable setups), else
+/// `~/.ducktape`.
 ///
-/// set-but-empty is unset. That is how the shell readers beside this one spell
-/// it (`${DUCKTAPE_HOME:-$HOME/.ducktape}`), and honouring an empty value here
-/// would resolve every root under it to a RELATIVE path in whatever directory
-/// the process happened to start in.
+/// set-but-empty is unset: honouring an empty value would resolve every root
+/// under it to a RELATIVE path in whatever directory the process happened to
+/// start in.
 pub fn root() -> Result<PathBuf, String> {
     root_from(std::env::var_os("DUCKTAPE_HOME"), std::env::var_os("HOME"))
 }

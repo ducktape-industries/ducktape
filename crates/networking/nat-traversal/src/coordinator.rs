@@ -345,11 +345,7 @@ impl Coordinator {
                 }
                 CoordinatorReplies::new()
             }
-            Msg::Readvertise {
-                key,
-                nonce,
-                cookie,
-            } => {
+            Msg::Readvertise { key, nonce, cookie } => {
                 // The wire-level rebind path AND the keepalive: a node re-runs
                 // STUN and republishes its reflexive (the observed `from`, never
                 // a self-reported address) under a strictly-higher `nonce`. The
@@ -602,25 +598,23 @@ mod tests {
         let attacker_src = addr(9, 6666);
 
         // Boot: A registers from its old mapping (implicit nonce 0).
-        assert!(
-            c.handle_verified(a, old, reg(&c, a, old, 0))
-                .is_empty()
-        );
+        assert!(c.handle_verified(a, old, reg(&c, a, old, 0)).is_empty());
         // B registers from its own source too — a Lookup is only answered to a
         // caller the coordinator has already bound to that source.
-        assert!(
-            c.handle_verified(b, b_src, reg(&c, b, b_src, 0))
-                .is_empty()
-        );
+        assert!(c.handle_verified(b, b_src, reg(&c, b, b_src, 0)).is_empty());
 
         // A keepalives from the SAME mapping over the wire under nonce 1.
         assert!(
-            c.handle_verified(a, old, Msg::Readvertise {
+            c.handle_verified(
+                a,
+                old,
+                Msg::Readvertise {
                     key: a,
                     nonce: 1,
                     cookie: [0u8; 32],
-                })
-                .is_empty()
+                }
+            )
+            .is_empty()
         );
         let out = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(
@@ -637,12 +631,16 @@ mod tests {
         // A DIFFERENT source replaying a captured, still-fresh higher-nonce
         // Readvertise cannot hijack the live mapping over the wire either.
         assert!(
-            c.handle_verified(a, attacker_src, Msg::Readvertise {
+            c.handle_verified(
+                a,
+                attacker_src,
+                Msg::Readvertise {
                     key: a,
                     nonce: 2,
                     cookie: [0u8; 32],
-                })
-                .is_empty()
+                }
+            )
+            .is_empty()
         );
         let out_attacker = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(
@@ -658,10 +656,7 @@ mod tests {
 
         // A duplicated/reordered/replayed Register from the OLD mapping arrives
         // late. It must NOT roll the fresh {old, nonce=1} mapping back to nonce 0.
-        assert!(
-            c.handle_verified(a, old, reg(&c, a, old, 0))
-                .is_empty()
-        );
+        assert!(c.handle_verified(a, old, reg(&c, a, old, 0)).is_empty());
         let out2 = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(
             out2.contains(&(
@@ -676,12 +671,16 @@ mod tests {
 
         // A wire Readvertise at an equal-or-lower nonce is likewise stale.
         assert!(
-            c.handle_verified(a, old, Msg::Readvertise {
+            c.handle_verified(
+                a,
+                old,
+                Msg::Readvertise {
                     key: a,
                     nonce: 1,
                     cookie: [0u8; 32],
-                })
-                .is_empty()
+                }
+            )
+            .is_empty()
         );
         let out3 = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(out3.contains(&(
@@ -700,7 +699,16 @@ mod tests {
         let caller = NodeKey([1u8; 32]);
         let out = c.handle_verified(caller, src, Msg::BindRequest { from: caller });
         let cookie = c.cookie_key.mint(src, 0);
-        assert_eq!(out, vec![(src, Msg::BindResponse { reflexive: src, cookie })]);
+        assert_eq!(
+            out,
+            vec![(
+                src,
+                Msg::BindResponse {
+                    reflexive: src,
+                    cookie
+                }
+            )]
+        );
     }
 
     #[test]
@@ -710,14 +718,8 @@ mod tests {
         let b_src = addr(2, 2222);
         let a = NodeKey([0xaa; 32]);
         let b = NodeKey([0xbb; 32]);
-        assert!(
-            c.handle_verified(a, a_src, reg(&c, a, a_src, 0))
-                .is_empty()
-        );
-        assert!(
-            c.handle_verified(b, b_src, reg(&c, b, b_src, 0))
-                .is_empty()
-        );
+        assert!(c.handle_verified(a, a_src, reg(&c, a, a_src, 0)).is_empty());
+        assert!(c.handle_verified(b, b_src, reg(&c, b, b_src, 0)).is_empty());
 
         // A looks up B: coordinator replies to A with B's reflexive AND tells
         // both sides to punch simultaneously.
@@ -752,10 +754,7 @@ mod tests {
         let a = NodeKey([0xaa; 32]);
         let missing = NodeKey([0xcc; 32]);
         // The caller must be bound to `a_src` before any Lookup is answered.
-        assert!(
-            c.handle_verified(a, a_src, reg(&c, a, a_src, 0))
-                .is_empty()
-        );
+        assert!(c.handle_verified(a, a_src, reg(&c, a, a_src, 0)).is_empty());
         let out = c.handle_verified(a, a_src, Msg::Lookup { key: missing });
         assert_eq!(
             out,
@@ -788,7 +787,10 @@ mod tests {
         let src = addr(1, 1111);
 
         // Authorized: joiner with a valid genesis cap registers -> mapping created.
-        let reg = Msg::Register { key: subject, cookie: c.cookie_key.mint(src, now) };
+        let reg = Msg::Register {
+            key: subject,
+            cookie: c.cookie_key.mint(src, now),
+        };
         let cap = mint_coord_cap(&g, subject, now + 3600);
         let auth = sign_authenticator(&node, &reg.encode(), now, Some(cap));
         let out = c.handle_auth(
@@ -833,7 +835,10 @@ mod tests {
         ob.copy_from_slice(outsider.public_key().as_ref());
         let osub = NodeKey(ob);
         let before = c.rejects();
-        let oreg = Msg::Register { key: osub, cookie: c.cookie_key.mint(addr(2, 2222), now) };
+        let oreg = Msg::Register {
+            key: osub,
+            cookie: c.cookie_key.mint(addr(2, 2222), now),
+        };
         let oauth = sign_authenticator(&outsider, &oreg.encode(), now, None);
         let out = c.handle_auth(
             addr(2, 2222),
@@ -950,7 +955,10 @@ mod tests {
         let b_src = addr(2, 2222);
 
         // Both register (self-ops, caller == inner key).
-        let a_reg = Msg::Register { key: a_key, cookie: c.cookie_key.mint(a_src, now) };
+        let a_reg = Msg::Register {
+            key: a_key,
+            cookie: c.cookie_key.mint(a_src, now),
+        };
         let a_auth = sign_authenticator(
             &a,
             &a_reg.encode(),
@@ -969,7 +977,10 @@ mod tests {
             )
             .is_empty()
         );
-        let b_reg = Msg::Register { key: b_key, cookie: c.cookie_key.mint(b_src, now) };
+        let b_reg = Msg::Register {
+            key: b_key,
+            cookie: c.cookie_key.mint(b_src, now),
+        };
         let b_auth = sign_authenticator(
             &b,
             &b_reg.encode(),
@@ -1065,7 +1076,10 @@ mod tests {
         // Attacker (validly admitted for its OWN key) tries to Register the
         // victim's key. The PoP verifies against the caller, but the inner key
         // is the victim's — a self-op mismatch, rejected before dispatch.
-        let reg = Msg::Register { key: victim_key, cookie: c.cookie_key.mint(src, now) };
+        let reg = Msg::Register {
+            key: victim_key,
+            cookie: c.cookie_key.mint(src, now),
+        };
         let auth = sign_authenticator(
             &attacker,
             &reg.encode(),
@@ -1091,7 +1105,10 @@ mod tests {
         // The attacker legitimately registers its OWN key from `src` — needed
         // only so the Lookup below is answered at all (a Lookup is refused
         // outright from a caller the book has not bound to its source).
-        let self_reg = Msg::Register { key: attacker_key, cookie: c.cookie_key.mint(src, now) };
+        let self_reg = Msg::Register {
+            key: attacker_key,
+            cookie: c.cookie_key.mint(src, now),
+        };
         let self_auth = sign_authenticator(
             &attacker,
             &self_reg.encode(),
@@ -1201,20 +1218,30 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            c.handle_verified_at(a, a_src, Msg::Readvertise {
+            c.handle_verified_at(
+                a,
+                a_src,
+                Msg::Readvertise {
                     key: a,
                     nonce: 1,
                     cookie: [0u8; 32],
-                }, 1_100)
-                .is_empty()
+                },
+                1_100
+            )
+            .is_empty()
         );
         assert!(
-            c.handle_verified_at(a, a_src, Msg::Readvertise {
+            c.handle_verified_at(
+                a,
+                a_src,
+                Msg::Readvertise {
                     key: a,
                     nonce: 2,
                     cookie: [0u8; 32],
-                }, 1_200)
-                .is_empty()
+                },
+                1_200
+            )
+            .is_empty()
         );
         // B registers right before its Lookup — a Lookup is only answered to
         // a caller the book has bound to its source.

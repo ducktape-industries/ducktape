@@ -554,14 +554,14 @@ impl MachineFactory {
             NetstackBackend::Guest { component } => {
                 let guest = NetstackGuest::new(component, self.signer(), self.config.clone())
                     .map_err(|error| {
-                    tracing::error!(
-                        target: "ducktape::reachability",
-                        event = "netstack_guest_boot_failed",
-                        error = %error,
-                        "netstack guest could not start"
-                    );
-                    ReachabilityError::Backend(error.to_string())
-                })?;
+                        tracing::error!(
+                            target: "ducktape::reachability",
+                            event = "netstack_guest_boot_failed",
+                            error = %error,
+                            "netstack guest could not start"
+                        );
+                        ReachabilityError::Backend(error.to_string())
+                    })?;
                 Ok(Box::new(guest))
             }
         }
@@ -580,8 +580,12 @@ impl MachineFactory {
                 Ok(Box::new(machine))
             }
             NetstackBackend::Guest { component } => {
-                let guest =
-                    NetstackGuest::restore(component, self.signer(), self.config.clone(), snapshot)?;
+                let guest = NetstackGuest::restore(
+                    component,
+                    self.signer(),
+                    self.config.clone(),
+                    snapshot,
+                )?;
                 Ok(Box::new(guest))
             }
         }

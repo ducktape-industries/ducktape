@@ -1,0 +1,12 @@
+[package]
+name = "fixture-probe"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+abi = { workspace = true }
+guest = { workspace = true }
+borsh = { workspace = true }

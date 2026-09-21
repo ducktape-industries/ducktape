@@ -4,8 +4,8 @@
 //! expiring, and the host swaps it for the real access token upstream.
 
 use anyhow::{Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +48,9 @@ pub fn verify(sess_pk: &VerifyingKey, token: &str) -> Result<Claims> {
         .verify_strict(payload.as_bytes(), &Signature::from_bytes(&sig_bytes))
         .context("token signature invalid")?;
     let claims: Claims = serde_json::from_slice(
-        &URL_SAFE_NO_PAD.decode(payload).context("token payload base64")?,
+        &URL_SAFE_NO_PAD
+            .decode(payload)
+            .context("token payload base64")?,
     )
     .context("token claims json")?;
     Ok(claims)
@@ -83,9 +85,8 @@ mod tests {
         let (_, sig) = tok.split_once('.').unwrap();
         let forged = format!(
             "{}.{sig}",
-            URL_SAFE_NO_PAD.encode(
-                br#"{"sub":"attacker","iat":100,"exp":200,"eph":"AAAA","seal":false}"#
-            )
+            URL_SAFE_NO_PAD
+                .encode(br#"{"sub":"attacker","iat":100,"exp":200,"eph":"AAAA","seal":false}"#)
         );
         assert!(verify(&sk.verifying_key(), &forged).is_err());
     }

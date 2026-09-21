@@ -10,8 +10,8 @@
 //! handshake, which take an already-verified `seal_pk`.
 
 use anyhow::{Context, Result};
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::handshake;
 use crate::seal;
@@ -68,7 +68,11 @@ pub struct SessionRefusedBy {
 
 impl std::fmt::Display for SessionRefusedBy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the gateway refused the session ({}): {}", self.status, self.reason)
+        write!(
+            f,
+            "the gateway refused the session ({}): {}",
+            self.status, self.reason
+        )
     }
 }
 
@@ -109,13 +113,21 @@ pub struct Gateway {
 impl Gateway {
     /// Local: Credential Provider == Computation Provider (same-machine loopback).
     pub fn local(host: String) -> Self {
-        Self { base: host, authority: None, http: gateway_http_client() }
+        Self {
+            base: host,
+            authority: None,
+            http: gateway_http_client(),
+        }
     }
 
     /// Remote: reach `handle` (a duckdns name) through `via` (the local node's
     /// browser-gateway base URL), which routes it onto the overlay.
     pub fn remote(handle: String, via: String) -> Self {
-        Self { base: via, authority: Some(handle), http: gateway_http_client() }
+        Self {
+            base: via,
+            authority: Some(handle),
+            http: gateway_http_client(),
+        }
     }
 
     pub fn url(&self, path: &str) -> String {
@@ -207,10 +219,16 @@ impl Gateway {
         let status = response.status();
         if !status.is_success() {
             let reason = response.text().await.unwrap_or_default();
-            return Err(SessionRefusedBy { status: status.as_u16(), reason }.into());
+            return Err(SessionRefusedBy {
+                status: status.as_u16(),
+                reason,
+            }
+            .into());
         }
-        let resp: SessionResponse =
-            response.json().await.context(SessionResponseFault::Malformed)?;
+        let resp: SessionResponse = response
+            .json()
+            .await
+            .context(SessionResponseFault::Malformed)?;
         let sealed = BASE64
             .decode(&resp.sealed_token_b64)
             .context(SessionResponseFault::Malformed)?;

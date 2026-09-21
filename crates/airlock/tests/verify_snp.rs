@@ -3,7 +3,7 @@
 //! certificate-chain verify, and report-signature verify against it.
 #![cfg(feature = "testkit")]
 
-use airlock::attest::{self, Measurement, MRTD_LEN};
+use airlock::attest::{self, MRTD_LEN, Measurement};
 use airlock::testkit::SnpTestEnclave;
 use airlock::verify::verify_quote;
 
@@ -16,23 +16,37 @@ async fn minted_snp_quote_verifies_and_binds_report_data() {
     let enclave = SnpTestEnclave::new(&meas(0x11)).unwrap();
     let rd = attest::make_report_data(&[9u8; 32], &[8u8; 32]);
     let quote = enclave.quote(&rd).unwrap();
-    let out = verify_quote(&quote, &meas(0x11), &enclave.roots()).await.unwrap();
+    let out = verify_quote(&quote, &meas(0x11), &enclave.roots())
+        .await
+        .unwrap();
     assert_eq!(out, rd);
 }
 
 #[tokio::test]
 async fn wrong_measurement_is_rejected() {
     let enclave = SnpTestEnclave::new(&meas(0x11)).unwrap();
-    let quote = enclave.quote(&attest::make_report_data(&[9u8; 32], &[8u8; 32])).unwrap();
-    assert!(verify_quote(&quote, &meas(0x22), &enclave.roots()).await.is_err());
+    let quote = enclave
+        .quote(&attest::make_report_data(&[9u8; 32], &[8u8; 32]))
+        .unwrap();
+    assert!(
+        verify_quote(&quote, &meas(0x22), &enclave.roots())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
 async fn tampered_report_data_breaks_the_signature() {
     let enclave = SnpTestEnclave::new(&meas(0x11)).unwrap();
-    let mut quote = enclave.quote(&attest::make_report_data(&[9u8; 32], &[8u8; 32])).unwrap();
+    let mut quote = enclave
+        .quote(&attest::make_report_data(&[9u8; 32], &[8u8; 32]))
+        .unwrap();
     quote[0x50] ^= 1; // REPORT_DATA offset in the SNP report
-    assert!(verify_quote(&quote, &meas(0x11), &enclave.roots()).await.is_err());
+    assert!(
+        verify_quote(&quote, &meas(0x11), &enclave.roots())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -40,14 +54,20 @@ async fn a_quote_from_a_different_chain_is_rejected() {
     // Two independently minted enclaves: A's roots must refuse B's quote.
     let a = SnpTestEnclave::new(&meas(0x11)).unwrap();
     let b = SnpTestEnclave::new(&meas(0x11)).unwrap();
-    let quote = b.quote(&attest::make_report_data(&[9u8; 32], &[8u8; 32])).unwrap();
+    let quote = b
+        .quote(&attest::make_report_data(&[9u8; 32], &[8u8; 32]))
+        .unwrap();
     assert!(verify_quote(&quote, &meas(0x11), &a.roots()).await.is_err());
 }
 
 #[tokio::test]
 async fn garbage_quote_is_rejected() {
     let enclave = SnpTestEnclave::new(&meas(0x11)).unwrap();
-    assert!(verify_quote(&[0u8; 32], &meas(0x11), &enclave.roots()).await.is_err());
+    assert!(
+        verify_quote(&[0u8; 32], &meas(0x11), &enclave.roots())
+            .await
+            .is_err()
+    );
 }
 
 // ===== real AMD-signed fixture (vendored from virtee/sev test data) =========
@@ -73,9 +93,13 @@ fn milan_roots(product: SnpProduct) -> TrustRoots {
 
 #[tokio::test]
 async fn real_amd_signed_milan_report_verifies_against_builtin_roots() {
-    let rd = verify_quote(MILAN_REPORT, &milan_measurement(), &milan_roots(SnpProduct::Milan))
-        .await
-        .unwrap();
+    let rd = verify_quote(
+        MILAN_REPORT,
+        &milan_measurement(),
+        &milan_roots(SnpProduct::Milan),
+    )
+    .await
+    .unwrap();
     assert_eq!(rd.len(), 64);
 }
 
@@ -83,7 +107,12 @@ async fn real_amd_signed_milan_report_verifies_against_builtin_roots() {
 async fn milan_report_is_rejected_under_genoa_roots() {
     // The right product generation is part of the pinned trust: Genoa's
     // ARK/ASK must refuse the Milan VCEK.
-    let err = verify_quote(MILAN_REPORT, &milan_measurement(), &milan_roots(SnpProduct::Genoa)).await;
+    let err = verify_quote(
+        MILAN_REPORT,
+        &milan_measurement(),
+        &milan_roots(SnpProduct::Genoa),
+    )
+    .await;
     assert!(err.is_err());
 }
 
@@ -109,7 +138,10 @@ fn a_debug_or_non_vmpl0_snp_report_is_refused_although_the_honest_fixture_is_not
         accept_snp_report(&report, &milan_measurement()).is_ok(),
         "the real AMD fixture must not be caught by these gates"
     );
-    assert!(!report.policy.debug_allowed(), "the fixture starts non-debug");
+    assert!(
+        !report.policy.debug_allowed(),
+        "the fixture starts non-debug"
+    );
     assert_eq!(report.vmpl, 0, "the fixture starts at VMPL 0");
 
     let mut debuggable = report;

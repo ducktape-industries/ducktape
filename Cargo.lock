@@ -3,41 +3,10 @@
 version = 4
 
 [[package]]
-name = "acl"
+name = "abi"
 version = "0.1.0"
 dependencies = [
- "acl-wire",
- "async-trait",
  "borsh",
- "commonware-cryptography",
- "ducktape-module-sdk",
- "futures",
- "host",
- "identity",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
- "valset",
-]
-
-[[package]]
-name = "acl-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "sdk",
- "serde",
-]
-
-[[package]]
-name = "addr2line"
-version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b5d307320b3181d6d7954e663bd7c774a838b8220fe0593c86d9fb09f498b4b"
-dependencies = [
- "gimli 0.32.3",
 ]
 
 [[package]]
@@ -46,14 +15,8 @@ version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59317f77929f0e679d39364702289274de2f0f0b22cbf50b2b8cff2169a0b27a"
 dependencies = [
- "gimli 0.33.0",
+ "gimli",
 ]
-
-[[package]]
-name = "adler2"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aead"
@@ -348,51 +311,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
-name = "attribution"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "borsh",
- "commonware-runtime",
- "ducktape-module-sdk",
- "futures",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
- "statesync",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "attribution-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "sdk",
- "serde",
-]
-
-[[package]]
-name = "authpage"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "keyscheme",
- "node",
- "qrcode",
- "rand 0.8.6",
- "reqwest 0.12.28",
- "sdk",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -478,21 +396,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "backtrace"
-version = "0.3.76"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb531853791a215d7c62a30daf0dde835f381ab5de4589cfe7c649d2cbe92bd6"
-dependencies = [
- "addr2line 0.25.1",
- "cfg-if",
- "libc",
- "miniz_oxide",
- "object 0.37.3",
- "rustc-demangle",
- "windows-link",
-]
-
-[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -527,15 +430,6 @@ name = "basic-toml"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba62675e8242a4c4e806d12f11d136e626e6c8361d6b829310732241652a178a"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "bincode"
-version = "1.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
 dependencies = [
  "serde",
 ]
@@ -628,12 +522,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "blobstore"
+name = "blobs"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
+ "abi",
+ "sha1",
  "sha2 0.10.9",
- "tracing",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -661,15 +557,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
 dependencies = [
  "generic-array",
-]
-
-[[package]]
-name = "block2"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
-dependencies = [
- "objc2",
 ]
 
 [[package]]
@@ -763,21 +650,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f2d30e4173c4026932d51d31d6b0613b1fd3014bf3f9f8943d4ba139c437ba0"
 dependencies = [
  "serde_core",
-]
-
-[[package]]
-name = "capability"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "borsh",
- "commonware-runtime",
- "ducktape-module-sdk",
- "futures",
- "sdk",
- "sdk-testkit",
- "serde",
- "statesync",
 ]
 
 [[package]]
@@ -888,31 +760,6 @@ dependencies = [
  "chacha20 0.10.2",
  "cipher 0.5.2",
  "poly1305 0.9.1",
-]
-
-[[package]]
-name = "chat-message"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "serde",
-]
-
-[[package]]
-name = "chat-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "chat-message",
- "identity-wire",
- "index-guest",
- "sdk",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "unicode-normalization",
 ]
 
 [[package]]
@@ -1157,7 +1004,6 @@ dependencies = [
  "pin-project",
  "rand 0.10.2",
  "rand_core 0.10.1",
- "rand_distr",
  "rayon",
  "thiserror 2.0.18",
  "tracing",
@@ -1441,53 +1287,40 @@ dependencies = [
 ]
 
 [[package]]
-name = "compute-service"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "host",
- "provider-host",
- "run-envelope",
- "sdk",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "consensus"
 version = "0.1.0"
 dependencies = [
- "bytes",
+ "abi",
+ "borsh",
  "commonware-actor",
+ "commonware-broadcast",
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-p2p",
  "commonware-parallel",
- "commonware-resolver",
  "commonware-runtime",
+ "commonware-storage",
  "commonware-utils",
  "consensus",
- "directory",
+ "fixture-module-registry",
+ "fixture-probe",
+ "fixture-relay",
+ "fixture-valset",
  "futures",
  "host",
- "kv",
  "node",
  "rand_core 0.10.1",
- "sdk",
- "statesync",
- "tokio",
- "tracing",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "console"
-version = "0.16.4"
+version = "0.16.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fe5f465a4f6fee88fad41b85d990f84c835335e85b5d9e6e63e0d06d28cba7c"
+checksum = "e96a4956774c13c126a8b5af4daa79384f4d826534c95a02d76afb39e2ab64e3"
 dependencies = [
  "encode_unicode",
  "libc",
@@ -1684,7 +1517,7 @@ dependencies = [
  "cranelift-control",
  "cranelift-entity",
  "cranelift-isle",
- "gimli 0.33.0",
+ "gimli",
  "hashbrown 0.17.1",
  "libm",
  "log",
@@ -1857,9 +1690,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2244,11 +2077,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "design"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-
-[[package]]
 name = "dialoguer"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2256,6 +2084,7 @@ checksum = "25f104b501bf2364e78d0d3974cbc774f738f5865306ed128e1e0d7499c0ad96"
 dependencies = [
  "console",
  "shell-words",
+ "zeroize",
 ]
 
 [[package]]
@@ -2293,18 +2122,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "directory"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-modules?branch=dev#8d8b7a2922b2cd255136dcb16fb4fd45ac205f71"
-dependencies = [
- "async-trait",
- "sdk",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2337,35 +2154,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dispatch"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "borsh",
- "commonware-runtime",
- "ducktape-module-sdk",
- "futures",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "statesync",
-]
-
-[[package]]
-name = "dispatch-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "saga-wire",
- "sdk",
- "serde",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2393,14 +2181,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
 
 [[package]]
-name = "duck-address"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "refusal-class",
-]
-
-[[package]]
 name = "duck-guest-init"
 version = "0.1.0"
 dependencies = [
@@ -2412,85 +2192,22 @@ dependencies = [
 [[package]]
 name = "duckdns"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?rev=736865710dcfa7c56f9834747287881c1c25d45d#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "duckfs-client"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "duckfs-core",
- "files",
- "futures",
- "glob",
- "refusal-class",
- "reqwest 0.12.28",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "unicode-normalization",
 ]
 
 [[package]]
 name = "duckfs-core"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?rev=736865710dcfa7c56f9834747287881c1c25d45d#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "base64 0.22.1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "unicode-normalization",
-]
-
-[[package]]
-name = "duckfs-disk"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "duckfs-core",
- "sdk",
- "sha2 0.10.9",
- "tracing",
-]
-
-[[package]]
-name = "ducktape-forge-service"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "blobstore",
- "commonware-codec",
- "commonware-cryptography",
- "ducktape-rpc",
- "flate2",
- "forge",
- "futures",
- "git2",
- "hex",
- "http-body-util",
- "keyscheme",
- "libc",
- "node",
- "sdk",
- "serde",
- "serde_json",
- "subtle",
- "tempfile",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -2514,17 +2231,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.24.0",
  "tracing",
-]
-
-[[package]]
-name = "ducktape-module-sdk"
-version = "0.0.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "async-trait",
- "duckfs-core",
- "sdk",
- "wit-bindgen",
 ]
 
 [[package]]
@@ -2755,50 +2461,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
-name = "files"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "attribution",
- "attribution-wire",
- "base64 0.22.1",
- "commonware-cryptography",
- "dispatch",
- "dispatch-wire",
- "duckfs-core",
- "duckfs-disk",
- "ducktape-module-sdk",
- "futures",
- "host",
- "identity",
- "identity-wire",
- "sdk",
- "sdk-testkit",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "files-odb"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "duckfs-core",
- "duckfs-disk",
- "files",
- "futures",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "wasm-host",
-]
-
-[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2827,33 +2489,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
+name = "fixture-module-registry"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "guest",
+]
+
+[[package]]
+name = "fixture-probe"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "guest",
+]
+
+[[package]]
+name = "fixture-relay"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "guest",
+]
+
+[[package]]
+name = "fixture-valset"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "guest",
+]
+
+[[package]]
 name = "flagset"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
-
-[[package]]
-name = "flate2"
-version = "1.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
-dependencies = [
- "crc32fast",
- "miniz_oxide",
-]
-
-[[package]]
-name = "fluent-guest"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/fluent31?rev=76ba1867bc0ba9c09bb8387149c07844f1d2395c#76ba1867bc0ba9c09bb8387149c07844f1d2395c"
-dependencies = [
- "fluent-guest-macros",
-]
-
-[[package]]
-name = "fluent-guest-macros"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/fluent31?rev=76ba1867bc0ba9c09bb8387149c07844f1d2395c#76ba1867bc0ba9c09bb8387149c07844f1d2395c"
 
 [[package]]
 name = "fluent31"
@@ -2868,7 +2541,6 @@ dependencies = [
  "parking_lot",
  "sha2 0.10.9",
  "tracing",
- "wasmtime",
 ]
 
 [[package]]
@@ -2882,57 +2554,6 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
-name = "forge"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "attribution",
- "attribution-wire",
- "base64 0.22.1",
- "blobstore",
- "chat-wire",
- "ducktape-module-sdk",
- "forge",
- "forge-wire",
- "futures",
- "git-primitives",
- "git2",
- "host",
- "identity",
- "identity-wire",
- "keyscheme",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tracing",
-]
-
-[[package]]
-name = "forge-odb"
-version = "0.1.0"
-dependencies = [
- "blobstore",
- "forge",
- "git-primitives",
- "sdk",
- "sha2 0.10.9",
- "wasm-host",
-]
-
-[[package]]
-name = "forge-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "chat-wire",
- "duck-address",
- "sdk",
- "serde",
-]
 
 [[package]]
 name = "form_urlencoded"
@@ -3073,40 +2694,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gateway"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "borsh",
- "commonware-cryptography",
- "commonware-runtime",
- "duckdns",
- "ducktape-module-sdk",
- "futures",
- "gateway-wire",
- "identity-wire",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "statesync",
-]
-
-[[package]]
-name = "gateway-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "duckdns",
- "sdk",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3160,12 +2747,6 @@ dependencies = [
 
 [[package]]
 name = "gimli"
-version = "0.32.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
-
-[[package]]
-name = "gimli"
 version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf7f043f89559805f8c7cacc432749b2fa0d0a0a9ee46ce47164ed5ba7f126c"
@@ -3174,24 +2755,6 @@ dependencies = [
  "hashbrown 0.16.1",
  "indexmap",
  "stable_deref_trait",
-]
-
-[[package]]
-name = "git-primitives"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-
-[[package]]
-name = "git2"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b903b73e45dc0c6c596f2d37eccece7c1c8bb6e4407b001096387c63d0d93724"
-dependencies = [
- "bitflags 2.13.0",
- "libc",
- "libgit2-sys",
- "log",
- "url",
 ]
 
 [[package]]
@@ -3209,46 +2772,6 @@ dependencies = [
  "log",
  "plain",
  "scroll",
-]
-
-[[package]]
-name = "governance"
-version = "0.1.0"
-dependencies = [
- "acl",
- "acl-wire",
- "async-trait",
- "borsh",
- "commonware-codec",
- "commonware-cryptography",
- "commonware-runtime",
- "ducktape-module-sdk",
- "futures",
- "governance-wire",
- "host",
- "identity",
- "identity-wire",
- "modules",
- "modules-wire",
- "sdk",
- "sdk-testkit",
- "serde",
- "statesync",
- "valset",
- "valset-wire",
-]
-
-[[package]]
-name = "governance-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "acl-wire",
- "borsh",
- "commonware-cryptography",
- "modules-wire",
- "sdk",
- "serde",
 ]
 
 [[package]]
@@ -3275,17 +2798,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "greeter"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-modules?branch=dev#8d8b7a2922b2cd255136dcb16fb4fd45ac205f71"
-dependencies = [
- "async-trait",
- "directory",
- "kv-wire",
- "sdk",
-]
-
-[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3305,6 +2817,14 @@ dependencies = [
  "ff 0.14.0",
  "rand_core 0.10.1",
  "subtle",
+]
+
+[[package]]
+name = "guest"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
 ]
 
 [[package]]
@@ -3495,50 +3015,24 @@ dependencies = [
 name = "host"
 version = "0.1.0"
 dependencies = [
- "acl",
- "acl-wire",
+ "abi",
  "async-trait",
- "attribution",
- "base64 0.22.1",
- "blobstore",
+ "blobs",
  "borsh",
- "capability",
+ "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
- "directory",
- "dispatch",
- "duckdns",
- "files",
- "files-odb",
- "forge",
- "forge-odb",
- "futures",
- "gateway",
- "governance",
- "greeter",
- "identity",
- "index-guest",
+ "commonware-storage",
+ "fixture-module-registry",
+ "fixture-probe",
+ "fixture-relay",
+ "fixture-valset",
  "keyscheme",
- "kv",
- "module-artifact",
- "modules",
- "p256 0.13.2",
- "proc-macro2",
- "quote",
- "saga",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
+ "runtime",
  "sha2 0.10.9",
- "source-lint",
- "statesync",
- "syn 2.0.119",
+ "state",
  "tempfile",
- "tracing",
- "tracing-subscriber",
- "valset",
- "wasm-host",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3746,38 +3240,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
-name = "identity"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "borsh",
- "commonware-cryptography",
- "commonware-runtime",
- "ducktape-module-sdk",
- "futures",
- "identity-wire",
- "k256",
- "keyscheme",
- "p256 0.13.2",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
- "statesync",
-]
-
-[[package]]
-name = "identity-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "keyscheme",
- "sdk",
- "serde",
-]
-
-[[package]]
 name = "idna"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3807,32 +3269,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "index-guest"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "fluent-guest",
- "serde",
-]
-
-[[package]]
-name = "indexer"
-version = "0.1.0"
-dependencies = [
- "borsh",
- "fluent31",
- "index-guest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "wasmtime",
 ]
 
 [[package]]
@@ -4079,7 +3515,7 @@ dependencies = [
 [[package]]
 name = "keyscheme"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?rev=736865710dcfa7c56f9834747287881c1c25d45d#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "base64 0.22.1",
  "borsh",
@@ -4127,31 +3563,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
-name = "kv"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "commonware-runtime",
- "ducktape-module-sdk",
- "host",
- "kv-wire",
- "sdk",
- "sdk-testkit",
- "serde",
- "sha2 0.10.9",
- "statesync",
-]
-
-[[package]]
-name = "kv-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "sdk",
- "serde",
-]
-
-[[package]]
 name = "lane-wasm"
 version = "0.1.0"
 dependencies = [
@@ -4183,18 +3594,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
-name = "libgit2-sys"
-version = "0.17.0+1.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10472326a8a6477c3c20a64547b0059e4b0d086869eee31e6d7da728a8eb7224"
-dependencies = [
- "cc",
- "libc",
- "libz-sys",
- "pkg-config",
-]
-
-[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4207,18 +3606,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c943259e342f1e06ff2da7a83eabdfe7f92ce10262688dbf1895ff0b3e6e4652"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "libz-sys"
-version = "1.1.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85bc9657773828b90eeb625adff10eeac83cc21bbfd8e23a03eaa8a33c9e28d9"
-dependencies = [
- "cc",
- "libc",
- "pkg-config",
- "vcpkg",
 ]
 
 [[package]]
@@ -4250,9 +3637,9 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lru"
-version = "0.18.1"
+version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b6180140927ee907000b0aa540091f6ea512ead4447c92b8fc35bc72788a5a6"
+checksum = "ff9840bcc50b71349309900da0ce7279aa336ae71d73250b07998932c7d97c25"
 dependencies = [
  "hashbrown 0.17.1",
 ]
@@ -4361,16 +3748,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
-name = "miniz_oxide"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
-dependencies = [
- "adler2",
- "simd-adler32",
-]
-
-[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4379,45 +3756,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "module-artifact"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "serde",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "modules"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "borsh",
- "commonware-runtime",
- "ducktape-module-sdk",
- "futures",
- "module-artifact",
- "modules-wire",
- "sdk",
- "sdk-testkit",
- "serde",
- "statesync",
- "valset-wire",
-]
-
-[[package]]
-name = "modules-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "module-artifact",
- "sdk",
- "serde",
 ]
 
 [[package]]
@@ -4525,246 +3863,81 @@ dependencies = [
 name = "node"
 version = "0.1.0"
 dependencies = [
- "async-trait",
+ "abi",
+ "borsh",
+ "bytes",
+ "commonware-codec",
+ "commonware-consensus",
  "commonware-cryptography",
  "commonware-runtime",
- "directory",
- "futures",
+ "commonware-storage",
+ "fixture-module-registry",
+ "fixture-probe",
+ "fixture-relay",
+ "fixture-valset",
  "host",
  "keyscheme",
- "kv",
- "libc",
- "modules",
- "node",
- "saga",
- "sdk",
- "sdk-testkit",
- "sha2 0.10.9",
- "statesync",
+ "state",
  "tempfile",
  "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
 name = "node-bin"
 version = "0.1.0"
 dependencies = [
- "agent-service",
- "airlock",
- "airlock-service",
- "anstream",
- "anstyle",
- "anyhow",
- "app-update",
- "argon2",
- "async-trait",
- "attribution",
- "authpage",
- "axum",
- "base64 0.22.1",
- "bip39",
- "blobstore",
- "borsh",
- "bytes",
- "capability",
- "chacha20poly1305 0.10.1",
+ "abi",
+ "blobs",
  "clap",
- "commonware-actor",
- "commonware-codec",
- "commonware-consensus",
  "commonware-cryptography",
- "commonware-p2p",
- "commonware-parallel",
  "commonware-runtime",
- "commonware-utils",
- "compute-service",
- "consensus",
- "coordinator-bin",
- "data-plane",
  "dialoguer",
- "directory",
- "dispatch",
- "duck-address",
- "duckfs-client",
- "duckfs-core",
- "duckfs-disk",
- "ducktape-forge-service",
- "files",
- "flate2",
- "forge",
+ "ducktape-home",
  "futures",
- "gateway",
- "git2",
- "governance",
  "hex",
  "host",
- "identity",
- "indexer",
- "keyscheme",
  "keystore",
- "kv",
- "libc",
- "mcp-host",
- "module-artifact",
- "modules",
- "nat-traversal",
- "nettest",
  "node",
  "noded",
- "objc2-foundation",
- "overlay-net",
- "provider-host",
- "rand 0.8.6",
- "reachability",
- "recovery",
- "reqwest 0.12.28",
- "run-envelope",
- "saga",
- "sandbox-host",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "source-lint",
- "statesync",
- "syn 2.0.119",
- "tar",
- "tempfile",
+ "rand 0.10.2",
+ "rand_core 0.10.1",
  "tokio",
- "tokio-stream",
- "tokio-tungstenite 0.24.0",
- "toml 0.8.23",
- "topology",
- "tracing",
- "tracing-subscriber",
- "unicode-normalization",
- "valset",
- "wasm-host",
- "wireguard",
- "workspace-config",
- "x25519-dalek 2.0.1",
- "zeroize",
- "zstd",
-]
-
-[[package]]
-name = "node-launcher"
-version = "0.1.0"
-dependencies = [
- "app-update",
- "libc",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "tempfile",
- "tracing",
- "tracing-subscriber",
- "zstd",
-]
-
-[[package]]
-name = "node-work"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "serde",
 ]
 
 [[package]]
 name = "noded"
 version = "0.1.0"
 dependencies = [
- "agent-service",
- "app-update",
- "async-trait",
- "attribution",
+ "abi",
  "axum",
- "base64 0.22.1",
- "blobstore",
+ "blobs",
  "borsh",
- "bytes",
- "capability",
  "commonware-codec",
  "commonware-cryptography",
+ "commonware-p2p",
  "commonware-runtime",
- "compute-service",
- "dispatch",
- "duckfs-client",
- "duckfs-core",
- "files",
- "files-odb",
- "forge",
- "forge-odb",
+ "commonware-utils",
+ "consensus",
+ "fixture-module-registry",
+ "fixture-probe",
+ "fixture-relay",
+ "fixture-valset",
  "futures",
- "gateway",
- "git2",
- "governance-wire",
+ "hex",
  "host",
- "http-body-util",
- "identity",
- "indexer",
- "keyscheme",
- "kv",
- "module-artifact",
- "modules",
- "nettest",
  "node",
- "node-work",
- "provider-host",
- "rand 0.8.6",
+ "rand_core 0.10.1",
  "reqwest 0.12.28",
- "run-envelope",
- "saga",
- "sdk",
- "sdk-testkit",
  "serde",
- "serde_json",
- "sha2 0.10.9",
+ "state",
  "statesync",
- "syn 2.0.119",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.24.0",
- "topology",
- "tower",
- "tower-http",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
- "valset",
- "view-wire",
- "wasm-host",
- "wasmtime",
- "wat",
- "workspace-config",
-]
-
-[[package]]
-name = "noded-bin"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "commonware-cryptography",
- "commonware-runtime",
- "duckfs-client",
- "futures",
- "host",
- "indexer",
- "nettest",
- "node",
- "noded",
- "sdk",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "topology",
- "tracing",
- "workspace-config",
 ]
 
 [[package]]
@@ -4910,10 +4083,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.13.0",
- "block2",
- "libc",
  "objc2",
- "objc2-core-foundation",
 ]
 
 [[package]]
@@ -4935,15 +4105,6 @@ dependencies = [
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",
-]
-
-[[package]]
-name = "object"
-version = "0.37.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
-dependencies = [
- "memchr",
 ]
 
 [[package]]
@@ -5545,7 +4706,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -5598,12 +4759,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
-
-[[package]]
-name = "qrcode"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quanta"
@@ -5869,27 +5024,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "recovery"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "commonware-codec",
- "commonware-cryptography",
- "commonware-runtime",
- "commonware-storage",
- "commonware-utils",
- "directory",
- "futures",
- "host",
- "modules",
- "node",
- "sdk",
- "sha2 0.10.9",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5923,7 +5057,7 @@ dependencies = [
 [[package]]
 name = "refusal-class"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?rev=736865710dcfa7c56f9834747287881c1c25d45d#736865710dcfa7c56f9834747287881c1c25d45d"
 
 [[package]]
 name = "regalloc2"
@@ -6114,10 +5248,25 @@ dependencies = [
 [[package]]
 name = "run-envelope"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?rev=736865710dcfa7c56f9834747287881c1c25d45d#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "runtime"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "async-trait",
+ "borsh",
+ "fixture-probe",
+ "futures",
+ "sha2 0.10.9",
+ "tokio",
+ "wasmtime",
+ "wat",
 ]
 
 [[package]]
@@ -6243,36 +5392,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
-name = "saga"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "borsh",
- "commonware-runtime",
- "ducktape-module-sdk",
- "futures",
- "host",
- "index-guest",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "statesync",
- "tempfile",
-]
-
-[[package]]
-name = "saga-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "borsh",
- "sdk",
- "serde",
-]
-
-[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6356,23 +5475,13 @@ dependencies = [
 [[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
+source = "git+https://github.com/ducktape-industries/ducktape-sdk?rev=736865710dcfa7c56f9834747287881c1c25d45d#736865710dcfa7c56f9834747287881c1c25d45d"
 dependencies = [
  "async-trait",
  "borsh",
  "refusal-class",
  "serde",
  "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "sdk-testkit"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "async-trait",
- "sdk",
  "sha2 0.10.9",
 ]
 
@@ -6661,12 +5770,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "simd-adler32"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
-
-[[package]]
 name = "simd_cesu8"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6681,33 +5784,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "simnode"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "blobstore",
- "commonware-cryptography",
- "commonware-runtime",
- "duckfs-core",
- "futures",
- "host",
- "indexer",
- "nettest",
- "node",
- "noded",
- "sdk",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "topology",
- "tracing",
- "wasm-host",
- "workspace-config",
-]
 
 [[package]]
 name = "siphasher"
@@ -6761,13 +5837,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "source-lint"
-version = "0.1.0"
-dependencies = [
- "syn 2.0.119",
-]
-
-[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6815,33 +5884,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
-name = "statesync"
+name = "state"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "base64 0.22.1",
+ "abi",
  "borsh",
  "commonware-codec",
  "commonware-cryptography",
- "commonware-p2p",
  "commonware-parallel",
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
- "data-plane",
- "duckfs-core",
- "files",
- "futures",
- "host",
- "index-guest",
- "indexer",
- "kv",
- "sdk",
- "sdk-testkit",
+ "fluent31",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
- "tracing",
+]
+
+[[package]]
+name = "statesync"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "commonware-codec",
+ "commonware-consensus",
+ "commonware-cryptography",
+ "commonware-parallel",
+ "commonware-runtime",
+ "commonware-storage",
+ "commonware-utils",
+ "consensus",
+ "fixture-module-registry",
+ "fixture-probe",
+ "fixture-relay",
+ "fixture-valset",
+ "futures",
+ "host",
+ "node",
+ "state",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -6976,7 +6059,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -7120,7 +6203,6 @@ version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
 dependencies = [
- "backtrace",
  "bytes",
  "libc",
  "mio",
@@ -7316,14 +6398,6 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
-
-[[package]]
-name = "topology"
-version = "0.1.0"
-dependencies = [
- "source-lint",
- "syn 2.0.119",
-]
 
 [[package]]
 name = "tower"
@@ -7583,7 +6657,7 @@ dependencies = [
  "serde",
  "tempfile",
  "textwrap",
- "toml 0.8.23",
+ "toml 0.9.12+spec-1.1.0",
  "uniffi_internal_macros",
  "uniffi_meta",
  "uniffi_pipeline",
@@ -7639,7 +6713,7 @@ dependencies = [
  "quote",
  "serde",
  "syn 2.0.119",
- "toml 0.8.23",
+ "toml 0.9.12+spec-1.1.0",
  "uniffi_meta",
 ]
 
@@ -7761,64 +6835,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "valset"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "borsh",
- "commonware-codec",
- "commonware-cryptography",
- "commonware-runtime",
- "ducktape-module-sdk",
- "futures",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
- "statesync",
- "valset-wire",
-]
-
-[[package]]
-name = "valset-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "sdk",
- "serde",
-]
-
-[[package]]
 name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "vcpkg"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
-
-[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "view-wire"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "bincode",
- "design",
- "futures",
- "memchr",
- "serde",
- "unicode-segmentation",
- "wasmparser 0.251.0",
-]
 
 [[package]]
 name = "walkdir"
@@ -7957,19 +6983,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasm-host"
-version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/ducktape-sdk?branch=dev#736865710dcfa7c56f9834747287881c1c25d45d"
-dependencies = [
- "async-trait",
- "git-primitives",
- "module-artifact",
- "sdk",
- "sha2 0.10.9",
- "wasmtime",
-]
-
-[[package]]
 name = "wasm-metadata"
 version = "0.247.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8047,7 +7060,7 @@ version = "46.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d39226663bd765601279a79b88645a7c4a4d3c2fe73040afdc27bead02ee6659"
 dependencies = [
- "addr2line 0.26.1",
+ "addr2line",
  "async-trait",
  "bitflags 2.13.0",
  "bumpalo",
@@ -8056,13 +7069,13 @@ dependencies = [
  "encoding_rs",
  "futures",
  "fxprof-processed-profile",
- "gimli 0.33.0",
+ "gimli",
  "ittapi",
  "libc",
  "log",
  "mach2",
  "memfd",
- "object 0.39.1",
+ "object",
  "once_cell",
  "postcard",
  "pulley-interpreter",
@@ -8105,11 +7118,11 @@ dependencies = [
  "cranelift-bforest",
  "cranelift-bitset",
  "cranelift-entity",
- "gimli 0.33.0",
+ "gimli",
  "hashbrown 0.17.1",
  "indexmap",
  "log",
- "object 0.39.1",
+ "object",
  "postcard",
  "rustc-demangle",
  "semver",
@@ -8190,10 +7203,10 @@ dependencies = [
  "cranelift-entity",
  "cranelift-frontend",
  "cranelift-native",
- "gimli 0.33.0",
+ "gimli",
  "itertools 0.14.0",
  "log",
- "object 0.39.1",
+ "object",
  "pulley-interpreter",
  "smallvec",
  "target-lexicon",
@@ -8227,7 +7240,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7439956e78ba68e2cd766f34c3f056d625fad9a055eafb0c4569ac91c09e6b4"
 dependencies = [
  "cc",
- "object 0.39.1",
+ "object",
  "rustix",
  "wasmtime-internal-versioned-export-macros",
 ]
@@ -8253,7 +7266,7 @@ dependencies = [
  "cfg-if",
  "cranelift-codegen",
  "log",
- "object 0.39.1",
+ "object",
  "wasmtime-environ",
 ]
 
@@ -8742,35 +7755,6 @@ dependencies = [
  "group 0.14.0",
  "hybrid-array",
  "primefield",
-]
-
-[[package]]
-name = "workspace-config"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "borsh",
- "commonware-codec",
- "commonware-cryptography",
- "commonware-p2p",
- "commonware-utils",
- "duck-address",
- "duckfs-core",
- "ducktape-home",
- "keyscheme",
- "module-artifact",
- "nat-traversal",
- "rand 0.8.6",
- "reachability",
- "sandbox-host",
- "sdk",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "toml 0.8.23",
- "tracing",
- "wireguard",
 ]
 
 [[package]]
