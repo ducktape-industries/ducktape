@@ -1,11 +1,11 @@
 use abi::{Cause, Env, ItemRef, Outcome, Refusal, Scheme};
 use guest::Program;
-use wire::governance::{
+use modules::governance::{
     Action, Allocation, Ballot, Effect, Electorate, Grant, INVITE_NAMESPACE, Invite, Op, Proposal,
     Query, Redemption, Reply, Rule, Shares, Status, Voter,
 };
-use wire::program::{bytes_key, conflict, invalid, not_found, u64_key, unauthorized};
-use wire::{AccountNumber, acl, identity, modules, valset};
+use modules::program::{bytes_key, conflict, invalid, not_found, u64_key, unauthorized};
+use modules::{AccountNumber, acl, identity, roster, valset};
 
 const PROPOSAL: &str = "p/";
 const REDEMPTION: &str = "r/";
@@ -56,7 +56,7 @@ impl Program for Governance {
 
 fn direct(env: &Env, payload: &[u8]) -> Result<(), Refusal> {
     acl::admit(env)?;
-    let signer = wire::program::external(env)?;
+    let signer = modules::program::external(env)?;
     match abi::decode(payload)? {
         Op::Propose {
             id,
@@ -88,7 +88,7 @@ fn validators() -> Result<Vec<Vec<u8>>, Refusal> {
     match guest::ask(valset::PROGRAM, &valset::Query::Validators)? {
         valset::Reply::Validators(validators) => Ok(validators),
         other => Err(Refusal::new(
-            wire::reason::PROTOCOL,
+            modules::reason::PROTOCOL,
             format!("valset answered Validators with {other:?}"),
         )),
     }
@@ -211,7 +211,7 @@ fn admissible(shares: &Shares, action: &Action) -> Result<(), Refusal> {
                     "a program change lands at least one block after it is scheduled",
                 ));
             }
-            if let modules::Change::Set(entry) = change {
+            if let roster::Change::Set(entry) = change {
                 let published = guest::blob_stat(entry.code).is_some();
                 if !published {
                     return Err(not_found(format!("code {:?} is not published", entry.code)));
@@ -220,7 +220,7 @@ fn admissible(shares: &Shares, action: &Action) -> Result<(), Refusal> {
             Ok(())
         }
         Action::SetPolicy { target, standing } => {
-            let governs_governance = target == wire::governance::PROGRAM || target == acl::ANY;
+            let governs_governance = target == modules::governance::PROGRAM || target == acl::ANY;
             if !governs_governance {
                 return Ok(());
             }
@@ -278,14 +278,14 @@ fn vote(env: &Env, signer: Vec<u8>, id: &str, approve: bool) -> Result<(), Refus
     let mut proposal = proposal(id)?;
     if proposal.status != Status::Open {
         return Err(Refusal::new(
-            wire::reason::CLOSED,
+            modules::reason::CLOSED,
             format!("proposal {id} is settled"),
         ));
     }
     let closed = env.height >= proposal.deadline;
     if closed {
         return Err(Refusal::new(
-            wire::reason::CLOSED,
+            modules::reason::CLOSED,
             format!("voting on {id} has closed"),
         ));
     }
@@ -374,14 +374,14 @@ fn execute(env: &Env, id: &str) -> Result<(), Refusal> {
     let mut proposal = proposal(id)?;
     if proposal.status != Status::Open {
         return Err(Refusal::new(
-            wire::reason::CLOSED,
+            modules::reason::CLOSED,
             format!("proposal {id} is settled"),
         ));
     }
     proposal.status = match verdict(&proposal, env.height) {
         Verdict::Undecided => {
             return Err(Refusal::new(
-                wire::reason::CLOSED,
+                modules::reason::CLOSED,
                 format!(
                     "proposal {id} is not decidable before block {}",
                     proposal.deadline
@@ -433,15 +433,15 @@ fn perform(env: &Env, action: &Action) -> Result<Effect, Refusal> {
             Effect::Applied
         }
         Action::ScheduleProgram { lead, change } => ask_for(
-            modules::PROGRAM,
-            &modules::Op::Schedule(modules::Scheduled {
+            roster::PROGRAM,
+            &roster::Op::Schedule(roster::Scheduled {
                 height: env.height + 1 + lead,
                 change: change.clone(),
             }),
         ),
         Action::CancelProgram { height, program } => ask_for(
-            modules::PROGRAM,
-            &modules::Op::Cancel {
+            roster::PROGRAM,
+            &roster::Op::Cancel {
                 height: *height,
                 program: program.clone(),
             },

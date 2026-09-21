@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 
 use abi::{Env, ProgramId, Refusal, Scan};
 use guest::Program;
-use wire::capability::{
+use modules::capability::{
     Announcement, Claim, Op, Provider, Query, Reply, class_is_well_formed, tag_is_well_formed,
 };
-use wire::program::{bytes_key, conflict, invalid, unauthorized};
-use wire::valset;
+use modules::program::{bytes_key, conflict, invalid, unauthorized};
+use modules::valset;
 
 const NODE: &str = "n/";
 const CLASS: &str = "c/";
@@ -60,8 +60,8 @@ impl Program for Capability {
 }
 
 fn announce(env: &Env, announcement: Announcement) -> Result<(), Refusal> {
-    wire::acl::admit(env)?;
-    let node = wire::program::external(env)?;
+    modules::acl::admit(env)?;
+    let node = modules::program::external(env)?;
     let member = valset::standing(&node)?.is_some();
     if !member {
         return Err(unauthorized("only a member announces what it can run"));
@@ -94,7 +94,7 @@ fn announce(env: &Env, announcement: Announcement) -> Result<(), Refusal> {
 }
 
 fn claim(env: &Env, class: String) -> Result<(), Refusal> {
-    let program = wire::program::program(env)?;
+    let program = modules::program::program(env)?;
     if !class_is_well_formed(&class) {
         return Err(invalid(format!("{class:?} is not a capability class")));
     }

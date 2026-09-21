@@ -1,11 +1,11 @@
 use abi::{Env, Origin, Refusal, Scheme};
 use guest::Program;
-use wire::AccountNumber;
-use wire::identity::{
+use modules::AccountNumber;
+use modules::identity::{
     Account, Admission, CONSENT_NAMESPACE, Consent, Control, Key, Op, Query, Reference, Reply,
     Standing,
 };
-use wire::program::{bytes_key, conflict, invalid, not_found, u64_key, unauthorized};
+use modules::program::{bytes_key, conflict, invalid, not_found, u64_key, unauthorized};
 
 const ACCOUNT: &str = "a/";
 const OF_KEY: &str = "k/";
@@ -145,8 +145,8 @@ fn named(name: String) -> Result<String, Refusal> {
 }
 
 fn create(env: &Env, name: String, scheme: Scheme) -> Result<(), Refusal> {
-    wire::acl::admit(env)?;
-    let signer = wire::program::external(env)?;
+    modules::acl::admit(env)?;
+    let signer = modules::program::external(env)?;
     let number = next_number()?;
     admit_key(&signer, number)?;
     store(&Account {
@@ -172,8 +172,8 @@ fn add_key(
     label: Option<String>,
     consent: Consent,
 ) -> Result<(), Refusal> {
-    wire::acl::admit(env)?;
-    let signer = wire::program::external(env)?;
+    modules::acl::admit(env)?;
+    let signer = modules::program::external(env)?;
     let mut account = account(consent.account)?;
     let Control::Keys(keys) = &mut account.control else {
         return Err(conflict("a program account holds no keys"));
@@ -218,7 +218,7 @@ fn add_key(
 }
 
 fn remove_key(env: &Env, key: &[u8]) -> Result<(), Refusal> {
-    let signer = wire::program::external(env)?;
+    let signer = modules::program::external(env)?;
     let mut account = account_of_key(&signer)?;
     let Control::Keys(keys) = &mut account.control else {
         return Err(conflict("a program account holds no keys"));
@@ -295,7 +295,7 @@ fn set_profile(
 }
 
 fn create_program(env: &Env, name: String, controller: AccountNumber) -> Result<(), Refusal> {
-    let executor = wire::program::program(env)?;
+    let executor = modules::program::program(env)?;
     let controlling = account(controller)?;
     if !controlling.live() {
         return Err(conflict(format!("account {controller} is not live")));
@@ -319,7 +319,7 @@ fn create_program(env: &Env, name: String, controller: AccountNumber) -> Result<
 }
 
 fn set_standing(env: &Env, number: AccountNumber, standing: Standing) -> Result<(), Refusal> {
-    let program = wire::program::program(env)?;
+    let program = modules::program::program(env)?;
     let mut account = account(number)?;
     let Control::Program {
         executor,

@@ -54,7 +54,7 @@ key = "…"                     # hex ed25519 public key: `ducktape identity`
 address = "203.0.113.7:9000"  # where peers dial it
 
 [[programs]]
-id = "acl"                    # one entry per system program, `id` = its wire name
+id = "acl"                    # one entry per system program, `id` = its contract's PROGRAM
 code = "acl.wasm"
 
 [[programs]]
@@ -110,7 +110,7 @@ verb's `--help` carries the rest.
 | Layer | Where | What |
 | --- | --- | --- |
 | Kernel | `crates/kernel/` | `abi` (the bytes ABI), `guest` (what a program compiles against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `blobs` (one content-addressed store), `host` (the sandbox: submit, query, deliver), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
-| Programs | `crates/modules/` | `wire` (the contracts of the system programs: the ops, queries and replies each accepts, and the helpers a program builds on) and `system/`, its own workspace of the wasm32 programs a network is founded with (`kv`, `acl`, `modules`, `valset`, `identity`, `governance`, `capability`, `saga`, `dispatch`, `attribution`, `gateway`); the built programs are committed under `system/wasm/` |
+| Programs | `crates/modules/` | The `modules` crate: the contracts of the system programs (the ops, queries and replies each accepts) and the helpers a program builds on; `system/` is its own workspace of the wasm32 programs a network is founded with (`kv`, `acl`, `modules`, `valset`, `identity`, `governance`, `capability`, `saga`, `dispatch`, `attribution`, `gateway`), and the built programs are committed under `system/wasm/` |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
 | Networking | `crates/networking/` | WireGuard mesh, NAT traversal, reachability, overlay data plane |
 | Services | `crates/services/` | Off-chain executors: provider run loop, microVM sandbox, credential broker, airlock, media |
@@ -120,7 +120,7 @@ verb's `--help` carries the rest.
 
 ```sh
 cargo test -p host -p node -p consensus -p statesync -p noded   # the kernel and the daemon
-cargo test -p wire                                              # the system programs on a real host
+cargo test -p modules                                           # the system programs on a real host
 make kernel-fixtures                                            # rebuild the wasm32 test programs
 make system-programs                                            # rebuild the system programs
 make test                                                       # everything the repo verifies locally

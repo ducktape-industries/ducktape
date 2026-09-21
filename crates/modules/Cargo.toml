@@ -1,5 +1,5 @@
 [package]
-name = "wire"
+name = "modules"
 version.workspace = true
 edition.workspace = true
 
@@ -11,7 +11,7 @@ guest = { workspace = true }
 [dev-dependencies]
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
-fixture-probe = { path = "../../kernel/fixtures/probe" }
+fixture-probe = { path = "../kernel/fixtures/probe" }
 host = { workspace = true }
 keyscheme = { workspace = true, features = ["testkit"] }
 tempfile = { workspace = true }

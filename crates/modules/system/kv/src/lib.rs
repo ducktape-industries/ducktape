@@ -1,13 +1,13 @@
 use abi::Refusal;
 use guest::Program;
-use wire::kv::{Op, Query, Reply};
+use modules::kv::{Op, Query, Reply};
 
 struct Kv;
 
 impl Program for Kv {
     fn execute(payload: &[u8]) -> Result<(), Refusal> {
         let env = guest::env();
-        wire::acl::admit(&env)?;
+        modules::acl::admit(&env)?;
         match abi::decode(payload)? {
             Op::Set { key, value } => guest::set(key, value),
             Op::Delete { key } => guest::delete(key),

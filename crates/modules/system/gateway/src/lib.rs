@@ -1,11 +1,11 @@
 use abi::{Refusal, Scan};
 use guest::Program;
-use wire::gateway::{
+use modules::gateway::{
     Audience, Credential, CredentialKind, Definition, Handle, Op, Query, Reply, Route,
     handle_is_well_formed, label_is_well_formed,
 };
-use wire::program::{conflict, invalid, not_found, u64_key, unauthorized};
-use wire::{AccountNumber, identity};
+use modules::program::{conflict, invalid, not_found, u64_key, unauthorized};
+use modules::{AccountNumber, identity};
 
 const HANDLE: &str = "h/";
 const NAME: &str = "n/";
@@ -65,8 +65,8 @@ fn granted_key(to: AccountNumber, account: AccountNumber, name: &str) -> Vec<u8>
 impl Program for Gateway {
     fn execute(payload: &[u8]) -> Result<(), Refusal> {
         let env = guest::env();
-        wire::acl::admit(&env)?;
-        let signer = wire::program::external(&env)?;
+        modules::acl::admit(&env)?;
+        let signer = modules::program::external(&env)?;
         let account = identity::account_of(&signer)?
             .ok_or_else(|| unauthorized("this key holds no account"))?;
         match abi::decode(payload)? {

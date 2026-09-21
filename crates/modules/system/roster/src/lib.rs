@@ -1,8 +1,8 @@
 use abi::{HashKind, Refusal, Scan};
 use guest::Program;
-use wire::governance;
-use wire::modules::{CODE_KIND, Change, Entry, Genesis, Op, Query, Reply, Scheduled};
-use wire::program::{conflict, invalid, not_found, u64_key};
+use modules::governance;
+use modules::program::{conflict, invalid, not_found, u64_key};
+use modules::roster::{CODE_KIND, Change, Entry, Genesis, Op, Query, Reply, Scheduled};
 
 const PROGRAM: &str = "p/";
 const SCHEDULE: &str = "s/";
@@ -53,14 +53,14 @@ impl Program for Modules {
 }
 
 fn publish(env: &abi::Env, body: Vec<u8>) -> Result<(), Refusal> {
-    wire::acl::admit(env)?;
+    modules::acl::admit(env)?;
     let id = guest::blob_put(HashKind::Sha256, CODE_KIND, body)?;
     guest::output(abi::encode(&id));
     Ok(())
 }
 
 fn schedule(env: &abi::Env, scheduled: Scheduled) -> Result<(), Refusal> {
-    wire::program::from(env, governance::PROGRAM)?;
+    modules::program::from(env, governance::PROGRAM)?;
     let in_the_future = scheduled.height > env.height;
     if !in_the_future {
         return Err(invalid(format!(
@@ -88,7 +88,7 @@ fn schedule(env: &abi::Env, scheduled: Scheduled) -> Result<(), Refusal> {
 }
 
 fn cancel(env: &abi::Env, height: u64, program: &str) -> Result<(), Refusal> {
-    wire::program::from(env, governance::PROGRAM)?;
+    modules::program::from(env, governance::PROGRAM)?;
     let key = schedule_key(height, program);
     let pending = guest::get(&key).is_some();
     if !pending {

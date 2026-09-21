@@ -1,10 +1,10 @@
 use abi::{Env, Origin, Refusal, Scan};
 use guest::Program;
-use wire::program::{bytes_key, conflict, invalid, not_found, u64_key, unauthorized};
-use wire::saga::{
+use modules::program::{bytes_key, conflict, invalid, not_found, u64_key, unauthorized};
+use modules::saga::{
     Assignment, Callback, Op, Outcome, Query, Reply, Saga, Status, Trigger, Usage, Work, owns,
 };
-use wire::{capability, valset};
+use modules::{capability, valset};
 
 const SAGA: &str = "s/";
 const EXPIRY: &str = "x/";
@@ -38,7 +38,7 @@ fn assigned_key(node: &[u8], id: &str) -> Vec<u8> {
 impl Program for Sagas {
     fn execute(payload: &[u8]) -> Result<(), Refusal> {
         let env = guest::env();
-        wire::acl::admit(&env)?;
+        modules::acl::admit(&env)?;
         match abi::decode(payload)? {
             Op::Trigger(trigger) => start(&env, trigger),
             Op::Result {
@@ -165,7 +165,7 @@ fn pool(trigger: &Trigger) -> Result<Vec<Vec<u8>>, Refusal> {
         None => match guest::ask(valset::PROGRAM, &valset::Query::Validators)? {
             valset::Reply::Validators(validators) => Ok(validators),
             other => Err(Refusal::new(
-                wire::reason::PROTOCOL,
+                modules::reason::PROTOCOL,
                 format!("valset answered Validators with {other:?}"),
             )),
         },
@@ -240,7 +240,7 @@ fn pending(id: &str, attempt: u32) -> Result<Saga, Refusal> {
     let saga = saga(id)?;
     if saga.status != Status::Pending {
         return Err(Refusal::new(
-            wire::reason::CLOSED,
+            modules::reason::CLOSED,
             format!("saga {id} is settled"),
         ));
     }
@@ -331,7 +331,7 @@ fn reassign(env: &Env, id: &str, attempt: u32) -> Result<(), Refusal> {
 }
 
 fn accept(env: &Env, id: &str, attempt: u32) -> Result<(), Refusal> {
-    let node = wire::program::external(env)?;
+    let node = modules::program::external(env)?;
     let mut saga = pending(id, attempt)?;
     let open = saga.assignment == Assignment::Unassigned;
     if !open {

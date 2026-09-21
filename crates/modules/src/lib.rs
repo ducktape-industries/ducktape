@@ -6,7 +6,7 @@ pub mod gateway;
 pub mod governance;
 pub mod identity;
 pub mod kv;
-pub mod modules;
+pub mod roster;
 pub mod saga;
 pub mod valset;
 
@@ -138,7 +138,7 @@ mod tests {
         );
         assert_eq!(
             abi::encode(&abi::roster::Query::At(9)),
-            abi::encode(&modules::Query::At(9))
+            abi::encode(&roster::Query::At(9))
         );
         let entry = abi::roster::Entry {
             program: "p".into(),
@@ -147,7 +147,7 @@ mod tests {
         };
         assert_eq!(
             abi::encode(&abi::roster::Reply::Programs(vec![entry.clone()])),
-            abi::encode(&modules::Reply::Programs(vec![entry]))
+            abi::encode(&roster::Reply::Programs(vec![entry]))
         );
     }
 

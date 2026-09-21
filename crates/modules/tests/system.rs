@@ -7,18 +7,18 @@ use commonware_runtime::{Runner as _, deterministic};
 use fixture_probe::Step;
 use host::{Applied, Block, BlockId, Founding, Genesis, Host, Layer, Limits, Receipt, Submission};
 use keyscheme::testkit;
-use wire::{
+use modules::{
     AccountNumber, Page, acl, attribution, capability, dispatch, gateway, governance, identity, kv,
-    modules, reason, saga, valset,
+    reason, roster, saga, valset,
 };
 
 macro_rules! program {
     ($name:literal) => {
-        include_bytes!(concat!("../../system/wasm/", $name, ".wasm"))
+        include_bytes!(concat!("../system/wasm/", $name, ".wasm"))
     };
 }
 
-const PROBE: &[u8] = include_bytes!("../../../kernel/fixtures/wasm/fixture_probe.wasm");
+const PROBE: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_probe.wasm");
 const NETWORK: &[u8] = b"net";
 const EPOCH_LENGTH: u64 = 4;
 const TIME: u64 = 1_700_000_000_000;
@@ -300,7 +300,7 @@ fn founding_seats_the_validators_and_every_program_answers() {
         for program in [
             kv::PROGRAM,
             acl::PROGRAM,
-            modules::PROGRAM,
+            roster::PROGRAM,
             valset::PROGRAM,
             identity::PROGRAM,
             governance::PROGRAM,
@@ -689,14 +689,14 @@ fn a_published_program_is_scheduled_by_governance_and_seated_at_its_height() {
         let output = net
             .apply(
                 &public(1),
-                modules::PROGRAM,
-                &modules::Op::Publish {
+                roster::PROGRAM,
+                &roster::Op::Publish {
                     body: program!("kv").to_vec(),
                 },
             )
             .await;
         let code: BlobId = abi::decode(&output).unwrap();
-        let entry = modules::Entry {
+        let entry = roster::Entry {
             program: "kv2".into(),
             code,
             params: Vec::new(),
@@ -709,7 +709,7 @@ fn a_published_program_is_scheduled_by_governance_and_seated_at_its_height() {
                     id: "ghost".into(),
                     action: governance::Action::ScheduleProgram {
                         lead: 2,
-                        change: modules::Change::Set(modules::Entry {
+                        change: roster::Change::Set(roster::Entry {
                             program: "ghost".into(),
                             code: BlobId::Sha256([9; 32]),
                             params: Vec::new(),
@@ -725,7 +725,7 @@ fn a_published_program_is_scheduled_by_governance_and_seated_at_its_height() {
                 "add-kv2",
                 governance::Action::ScheduleProgram {
                     lead: 2,
-                    change: modules::Change::Set(entry.clone()),
+                    change: roster::Change::Set(entry.clone()),
                 },
                 &[1, 2],
             )
@@ -736,13 +736,13 @@ fn a_published_program_is_scheduled_by_governance_and_seated_at_its_height() {
                 effect: Some(governance::Effect::Applied)
             }
         );
-        let modules::Reply::Scheduled(scheduled) =
-            net.ask(modules::PROGRAM, &modules::Query::Scheduled).await
+        let roster::Reply::Scheduled(scheduled) =
+            net.ask(roster::PROGRAM, &roster::Query::Scheduled).await
         else {
             panic!()
         };
         assert_eq!(scheduled.len(), 1);
-        assert_eq!(scheduled[0].change, modules::Change::Set(entry.clone()));
+        assert_eq!(scheduled[0].change, roster::Change::Set(entry.clone()));
         let lands_at = scheduled[0].height;
         assert!(lands_at > net.height);
         while net.height + 1 < lands_at {
@@ -768,7 +768,7 @@ fn a_published_program_is_scheduled_by_governance_and_seated_at_its_height() {
                 "drop-kv2",
                 governance::Action::ScheduleProgram {
                     lead: 1,
-                    change: modules::Change::Remove("kv2".into()),
+                    change: roster::Change::Remove("kv2".into()),
                 },
                 &[1, 2],
             )

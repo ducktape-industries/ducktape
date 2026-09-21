@@ -9,4 +9,4 @@ crate-type = ["cdylib"]
 [dependencies]
 abi = { workspace = true }
 guest = { workspace = true }
-wire = { workspace = true }
+modules = { workspace = true }

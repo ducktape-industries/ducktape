@@ -1,12 +1,13 @@
 [package]
-name = "modules"
+name = "roster"
 version.workspace = true
 edition.workspace = true
 
 [lib]
+name = "modules"
 crate-type = ["cdylib"]
 
 [dependencies]
 abi = { workspace = true }
 guest = { workspace = true }
-wire = { workspace = true }
+modules = { workspace = true }

@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 
 use abi::{Cause, Env, ItemRef, Origin, ProgramId, Refusal};
 use guest::Program;
-use wire::dispatch::{
+use modules::dispatch::{
     Admission, Contract, Dispatch, Manifest, Op, Outcome, Query, Recipe, Reply, Routing, Spec,
     Status, saga_id,
 };
-use wire::program::{conflict, invalid, not_found, u64_key, unauthorized};
-use wire::{capability, saga};
+use modules::program::{conflict, invalid, not_found, u64_key, unauthorized};
+use modules::{capability, saga};
 
 const RECIPE: &str = "r/";
 const DISPATCH: &str = "d/";
@@ -74,7 +74,7 @@ fn delivered(env: &Env, payload: &[u8]) -> Result<(), Refusal> {
 }
 
 fn op(env: &Env, payload: &[u8]) -> Result<(), Refusal> {
-    wire::acl::admit(env)?;
+    modules::acl::admit(env)?;
     match abi::decode(payload)? {
         Op::SetRecipe { id, manifest } => set_recipe(env, id, manifest),
         Op::RemoveRecipe { id } => remove_recipe(env, &id),
@@ -152,7 +152,7 @@ fn dispatch(
     demands: BTreeMap<String, u64>,
     admission: Admission,
 ) -> Result<(), Refusal> {
-    let receiver = wire::program::program(env)?;
+    let receiver = modules::program::program(env)?;
     let recipe = recipe(recipe_id)?;
     for (dimension, amount) in &demands {
         if !capability::tag_is_well_formed(dimension) {
@@ -186,7 +186,7 @@ fn dispatch(
         abi::encode(&saga::Op::Trigger(saga::Trigger {
             id: saga.clone(),
             spec: abi::encode(&spec),
-            reply_to: Some(wire::dispatch::PROGRAM.into()),
+            reply_to: Some(modules::dispatch::PROGRAM.into()),
             correlation: abi::encode(&(receiver.clone(), id.clone())),
             deadline: recipe.manifest.deadline.map(|blocks| env.height + blocks),
             attempts: recipe.manifest.attempts,
@@ -212,7 +212,7 @@ fn dispatch(
 }
 
 fn running(env: &Env, id: &str) -> Result<Option<(Dispatch, String)>, Refusal> {
-    let receiver = wire::program::program(env)?;
+    let receiver = modules::program::program(env)?;
     let Some(dispatch) = guest::record::<Dispatch>(dispatch_key(&receiver, id))? else {
         return Ok(None);
     };

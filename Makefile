@@ -149,7 +149,7 @@ kernel-fixtures:
 ## rebuild the system programs (the wasm32 programs a network is founded
 ## with: kv, acl, modules, valset, identity, governance, capability, saga,
 ## dispatch, attribution, gateway) and refresh their committed bytes, which
-## `ducktape init` reads from a founding file and the wire tests load.
+## `ducktape init` reads from a founding file and the modules tests load.
 system-programs:
 	$(CARGO) build --manifest-path crates/modules/system/Cargo.toml \
 	  --target wasm32-unknown-unknown --release

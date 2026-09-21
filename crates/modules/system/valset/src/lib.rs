@@ -1,8 +1,8 @@
 use abi::{Refusal, Scan};
 use guest::Program;
-use wire::governance;
-use wire::program::{bytes_key, conflict, invalid};
-use wire::valset::{Genesis, Membership, Op, Query, Reply, Standing};
+use modules::governance;
+use modules::program::{bytes_key, conflict, invalid};
+use modules::valset::{Genesis, Membership, Op, Query, Reply, Standing};
 
 const MEMBER: &str = "m/";
 const KEY_LEN: usize = 32;
@@ -29,7 +29,7 @@ impl Program for Valset {
 
     fn execute(payload: &[u8]) -> Result<(), Refusal> {
         let env = guest::env();
-        wire::program::from(&env, governance::PROGRAM)?;
+        modules::program::from(&env, governance::PROGRAM)?;
         match abi::decode(payload)? {
             Op::Set(membership) => set(membership),
             Op::Remove { key } => remove(&key),

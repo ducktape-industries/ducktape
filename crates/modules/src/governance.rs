@@ -1,7 +1,7 @@
 use abi::{ItemRef, ProgramId, Refusal};
 use borsh::{BorshDeserialize, BorshSerialize};
 
-use crate::{AccountNumber, Page, acl, modules, valset};
+use crate::{AccountNumber, Page, acl, roster, valset};
 
 pub const PROGRAM: &str = "governance";
 pub const INVITE_NAMESPACE: &[u8] = b"ducktape:governance:invite";
@@ -33,7 +33,7 @@ pub enum Action {
     },
     ScheduleProgram {
         lead: u64,
-        change: modules::Change,
+        change: roster::Change,
     },
     CancelProgram {
         height: u64,

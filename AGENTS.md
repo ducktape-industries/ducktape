@@ -118,10 +118,10 @@ code cites by path (`docs/records/`) and the per-area READMEs (`ops/`,
   merge commit can revert it.
 - **A fixture's bytes move with everything it compiles in.** The kernel
   suites run committed guests (`crates/kernel/fixtures/wasm/fixture_*.wasm`)
-  built out of `crates/kernel/fixtures/`, and the `wire` suite runs the
+  built out of `crates/kernel/fixtures/`, and the `modules` suite runs the
   committed system programs (`crates/modules/system/wasm/*.wasm`) built out
   of `crates/modules/system/`. A change to a fixture or program crate, to the
-  `guest` or `wire` crate they compile against, or to any shape a guest
+  `guest` or `modules` crate they compile against, or to any shape a guest
   decodes (`abi`) ships the rebuilt artifacts in the SAME PR:
   `make kernel-fixtures` or `make system-programs`, then commit what changed.
   Even a deletion moves bytes: panic paths carry line numbers.

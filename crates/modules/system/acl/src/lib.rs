@@ -1,7 +1,7 @@
 use abi::{Refusal, Scan};
 use guest::Program;
-use wire::acl::{ANY, Op, Policy, Query, Reply, Standing};
-use wire::{governance, identity, valset};
+use modules::acl::{ANY, Op, Policy, Query, Reply, Standing};
+use modules::{governance, identity, valset};
 
 const POLICY: &str = "policy/";
 
@@ -14,7 +14,7 @@ fn key(target: &str) -> Vec<u8> {
 impl Program for Acl {
     fn execute(payload: &[u8]) -> Result<(), Refusal> {
         let env = guest::env();
-        wire::program::from(&env, governance::PROGRAM)?;
+        modules::program::from(&env, governance::PROGRAM)?;
         match abi::decode(payload)? {
             Op::SetPolicy {
                 target,

@@ -36,7 +36,7 @@ members = [
     "crates/kernel/consensus",
     "crates/kernel/statesync",
     "crates/noded",
-    "crates/modules/wire",
+    "crates/modules",
     "crates/networking/wireguard",
     "crates/networking/nat-traversal",
     "crates/networking/netstack-machine",
@@ -184,7 +184,7 @@ statesync = { path = "crates/kernel/statesync" }
 # internal — the system programs' contracts: the ops, queries and replies
 # every party speaks to them (the programs themselves are the wasm32
 # workspace at crates/modules/system, built by `make system-programs`).
-wire = { path = "crates/modules/wire" }
+modules = { path = "crates/modules" }
 # internal — off-chain service crates
 agent-service = { path = "crates/services/agent" }
 airlock-service = { path = "crates/services/airlock" }

@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 
 use abi::{Env, ProgramId, Refusal, Scan};
 use guest::Program;
-use wire::attribution::{
+use modules::attribution::{
     Actor, Change, Kind, Op, Query, Reason, Relation, Relations, Reply, Source, Transfer, Update,
 };
-use wire::program::{conflict, invalid, u64_key};
-use wire::{AccountNumber, Page};
+use modules::program::{conflict, invalid, u64_key};
+use modules::{AccountNumber, Page};
 
 const OBJECT: &str = "o/";
 const CHANGE: &str = "c/";
@@ -54,7 +54,7 @@ fn subscriber_key(program: &str) -> Vec<u8> {
 impl Program for Attribution {
     fn execute(payload: &[u8]) -> Result<(), Refusal> {
         let env = guest::env();
-        let program = wire::program::program(&env)?;
+        let program = modules::program::program(&env)?;
         match abi::decode(payload)? {
             Op::Attribute(update) => attribute(&env, &program, update),
             Op::AttributeBatch { updates } => {
