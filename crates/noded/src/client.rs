@@ -117,9 +117,11 @@ impl Client {
             self.base.replacen("http", "ws", 1),
             route::CHANGES
         );
-        let mut unbounded = WebSocketConfig::default();
-        unbounded.max_message_size = None;
-        unbounded.max_frame_size = None;
+        let unbounded = WebSocketConfig {
+            max_message_size: None,
+            max_frame_size: None,
+            ..WebSocketConfig::default()
+        };
         let (socket, _) =
             tokio_tungstenite::connect_async_with_config(url, Some(unbounded), false).await?;
         Ok(socket.filter_map(|message| {
