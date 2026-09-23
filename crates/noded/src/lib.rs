@@ -1,6 +1,7 @@
 mod client;
 mod logs;
 mod mesh;
+mod relay;
 mod run;
 mod server;
 pub mod wire;
@@ -88,6 +89,7 @@ pub struct Daemon<E: Context> {
     pub anchors: MarshalMailbox,
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
+    pub relay: relay::Relay<E>,
     subscribers: Mutex<Vec<(ProgramId, mpsc::UnboundedSender<Change>)>>,
 }
 

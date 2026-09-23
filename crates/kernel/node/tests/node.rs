@@ -7,7 +7,7 @@ use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_probe::{Reply, Step};
 use host::{Founding, Genesis, Layer, Limits, SIGNERS, Tip};
 use keyscheme::KeyScheme;
-use node::{Block, Body, Error, Frame, NAMESPACE, Node, Sequenced};
+use node::{BLOCK_BYTES, Block, Body, Error, Frame, NAMESPACE, Node, Sequenced};
 
 const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
@@ -272,7 +272,7 @@ fn a_block_that_spends_the_signers_sequence_elsewhere_drops_the_pending_frame() 
 }
 
 #[test]
-fn a_frame_is_refused_when_it_names_another_network_or_lies_about_its_signer() {
+fn a_frame_is_refused_when_it_names_another_network_lies_about_its_signer_or_outgrows_a_block() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let (mut node, _) = found(context, dir.path()).await;
@@ -289,6 +289,10 @@ fn a_frame_is_refused_when_it_names_another_network_or_lies_about_its_signer() {
 
         let refusal = node.submit(b"junk".to_vec()).await.unwrap().unwrap_err();
         assert_eq!(refusal.reason, reason::PROTOCOL);
+
+        let uncarried = vec![0; BLOCK_BYTES + 1];
+        let refusal = node.submit(uncarried).await.unwrap().unwrap_err();
+        assert_eq!(refusal.reason, reason::CAPACITY);
         assert_eq!(node.pending(), 0);
         assert!(!node.due().unwrap());
     });

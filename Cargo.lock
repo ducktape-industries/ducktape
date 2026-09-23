@@ -3536,6 +3536,7 @@ dependencies = [
  "commonware-cryptography",
  "commonware-runtime",
  "commonware-storage",
+ "commonware-utils",
  "fixture-module-registry",
  "fixture-probe",
  "fixture-relay",

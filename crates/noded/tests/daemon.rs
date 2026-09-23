@@ -502,7 +502,10 @@ fn a_member_promoted_at_an_epoch_boundary_votes_in_the_next_epoch() {
             .submit(frame(&alice, seq, vec![set(b"quorum", b"3 of 4")]))
             .await
             .unwrap();
-        assert!(matches!(receipt.outcome, Outcome::Applied { .. }), "{receipt:?}");
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
         let change = changes.next().await.unwrap().unwrap();
         assert!(change.height > status.height);
         change
@@ -521,6 +524,81 @@ fn a_member_promoted_at_an_epoch_boundary_votes_in_the_next_epoch() {
         }
     });
     for node in founders.into_iter().chain([promoted]) {
+        node.thread.join().unwrap();
+    }
+}
+
+#[test]
+fn a_follower_hands_what_it_accepts_to_the_validators() {
+    let root = tempfile::tempdir().unwrap();
+    let seats: Vec<Seat> = (0..4)
+        .map(|i| Seat::new(root.path(), &format!("n{i}")))
+        .collect();
+    let founding = founding(root.path(), &seats[..3].iter().collect::<Vec<_>>());
+    for seat in &seats[..3] {
+        seat.init(&founding);
+    }
+    let founders: Vec<Live> = seats[..3].iter().map(Seat::start).collect();
+    seats[3].join(&founders[0].client);
+    let follower = seats[3].start();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let bob = ed25519::PrivateKey::from_seed(12);
+    let runtime = client_runtime();
+
+    runtime.block_on(async {
+        let mut changes = follower.client.changes("probe").await.unwrap();
+        let mut seq = 0;
+        loop {
+            let seated = seating(&follower.client).await;
+            let a_member = seated.members.iter().any(|m| m.key == seats[3].key());
+            if a_member {
+                assert!(!seated.validators.contains(&seats[3].key()));
+                break;
+            }
+            let tick = founders[0]
+                .client
+                .submit(frame(&alice, seq, vec![set(b"tick", &seq.to_be_bytes())]))
+                .await
+                .unwrap();
+            assert!(matches!(tick.outcome, Outcome::Applied { .. }), "{tick:?}");
+            seq += 1;
+            changes.next().await.unwrap().unwrap();
+        }
+    });
+
+    let landed = runtime.block_on(async {
+        let mut changes = founders[1].client.changes("probe").await.unwrap();
+        let receipt = follower
+            .client
+            .submit(frame(&bob, 0, vec![set(b"relayed", b"by the follower")]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
+        loop {
+            let change = changes.next().await.unwrap().unwrap();
+            let relayed = change.writes.iter().any(|(key, _)| key == b"relayed");
+            if relayed {
+                break change;
+            }
+        }
+    });
+    assert_eq!(
+        landed.writes,
+        vec![(b"relayed".to_vec(), Some(b"by the follower".to_vec()))]
+    );
+
+    runtime.block_on(async {
+        for (seat, node) in seats.iter().zip(founders.iter().chain([&follower])) {
+            node.client
+                .admin(seat.admin(Admin::Shutdown))
+                .await
+                .unwrap();
+        }
+    });
+    for node in founders.into_iter().chain([follower]) {
         node.thread.join().unwrap();
     }
 }

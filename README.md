@@ -136,7 +136,12 @@ ducktape programs                       # every program and its code blob
 ducktape blob get sha256:…              # a blob's framed bytes
 ```
 
-Reads are open; writes are signed frames. `ducktape logs`,
+Reads are open; writes are signed frames. Any member's node takes a frame: it
+hands each frame it accepts to the epoch's validators over the mesh, and
+sends again what is still waiting at every epoch, so a frame submitted to a
+member without a vote lands like one submitted to a validator. A block holds
+as many waiting frames as fit one mesh message (`node::BLOCK_BYTES`); a frame
+no block can carry is refused. `ducktape logs`,
 `ducktape log-filter`, `ducktape metrics` and `ducktape shutdown` operate the
 node; the mutating ones are signed with the node's own identity key. Each
 verb's `--help` carries the rest.
