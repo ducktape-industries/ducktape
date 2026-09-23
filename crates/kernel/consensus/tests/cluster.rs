@@ -60,6 +60,13 @@ fn member(key: &ed25519::PrivateKey) -> valset::Member {
     }
 }
 
+fn seated(validators: &[valset::Member]) -> valset::Seating {
+    valset::Seating {
+        validators: validators.iter().map(|member| member.key.clone()).collect(),
+        members: validators.to_vec(),
+    }
+}
+
 fn genesis(members: &[valset::Member], epoch_length: u64) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
@@ -255,7 +262,10 @@ impl Peer {
             &marshal,
             chain,
         );
-        let standing = membership.seat(genesis_block.tip(), members).await.unwrap();
+        let standing = membership
+            .seat(genesis_block.tip(), &seated(members))
+            .await
+            .unwrap();
         assert_eq!(standing == Standing::Validator, roster.participates(0));
         context.child("pump").spawn({
             let node = node.clone();
@@ -324,17 +334,17 @@ async fn pump(
         }
         let seating = if network.closes_an_epoch(block.height) {
             let epoch = network.epoch_after(block.height);
-            let members = node
-                .epoch_members(epoch)
+            let seating = node
+                .epoch_seating(epoch)
                 .unwrap()
                 .expect("the boundary records the epoch");
-            Some((epoch, members))
+            Some(seating)
         } else {
             None
         };
         drop(node);
-        if let Some((_, members)) = seating {
-            membership.seat(block.tip(), &members).await.unwrap();
+        if let Some(seating) = seating {
+            membership.seat(block.tip(), &seating).await.unwrap();
         }
         ack.acknowledge();
         let _ = applied.unbounded_send(block.height);
@@ -517,7 +527,7 @@ fn an_epoch_boundary_reseats_the_validators() {
     runner().start(|context| async move {
         let keys: Vec<_> = (1..=4).map(key).collect();
         let founding: Vec<_> = keys[..3].iter().map(member).collect();
-        let seated: Vec<_> = keys.iter().map(member).collect();
+        let reseated: Vec<_> = keys.iter().map(member).collect();
         let public: Vec<_> = keys.iter().map(|k| k.public_key()).collect();
         let oracle = mesh(&context, &keys).await;
         let network = network(4);
@@ -529,7 +539,7 @@ fn an_epoch_boundary_reseats_the_validators() {
             .submit(frame(&alice, 0, vec![set(b"epoch", b"0")]))
             .await;
         peers[0]
-            .submit(Frame::sign(&alice, NETWORK, 1, "valset", abi::encode(&seated)).encode())
+            .submit(Frame::sign(&alice, NETWORK, 1, "valset", abi::encode(&reseated)).encode())
             .await;
 
         for peer in &mut peers[..3] {
@@ -539,8 +549,8 @@ fn an_epoch_boundary_reseats_the_validators() {
         peers[3].reached(3).await;
         for peer in &peers {
             assert_eq!(
-                peer.node.lock().await.epoch_members(1).unwrap(),
-                Some(seated.clone())
+                peer.node.lock().await.epoch_seating(1).unwrap(),
+                Some(seated(&reseated))
             );
             assert!(peer.roster.participates(1));
         }

@@ -2,8 +2,11 @@ use std::collections::BTreeMap;
 
 use abi::{BlobId, Entry, ProgramId, Refusal, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
+use commonware_cryptography::Signer as _;
+use commonware_cryptography::ed25519::PrivateKey;
 use futures::{Stream, StreamExt as _};
-use host::{Layer, Receipt};
+use host::{Layer, Receipt, SIGNERS};
+use node::Frame;
 use reqwest::StatusCode;
 use statesync::{Exchange, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
@@ -35,6 +38,22 @@ impl Client {
 
     pub async fn submit(&self, frame: Vec<u8>) -> Result<Receipt> {
         self.post_raw(route::SUBMIT, frame).await
+    }
+
+    pub async fn submit_signed(
+        &self,
+        key: &PrivateKey,
+        program: &str,
+        payload: Vec<u8>,
+    ) -> Result<Receipt> {
+        let status = self.status().await?;
+        let signer = key.public_key().as_ref().to_vec();
+        let sequence = match self.get(Layer::Preconfirmed, SIGNERS, &signer).await? {
+            Some(bytes) => abi::decode(&bytes).map_err(Error::Decode)?,
+            None => 0,
+        };
+        let frame = Frame::sign(key, status.network.as_bytes(), sequence, program, payload);
+        self.submit(frame.encode()).await
     }
 
     pub async fn query(&self, layer: Layer, frame: Vec<u8>) -> Result<Vec<u8>> {

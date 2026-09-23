@@ -17,8 +17,8 @@ use tokio::sync::watch;
 
 pub use client::Client;
 pub use logs::Logs;
-pub use mesh::{Mesh, Reach};
-pub use run::{Listen, Running, init, join, run};
+pub use mesh::{Mesh, PEERS_PER_SET, Reach, Tracked, tracked};
+pub use run::{Listen, Running, init, invite, join, run};
 pub use wire::{NODE_CONTRACT, Status};
 pub use workspace::{Descriptor, Founding, Workspace};
 
@@ -40,6 +40,11 @@ pub type Shared<E> = Arc<futures::lock::Mutex<Node<E>>>;
 pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("{}: {source}", .path.display())]
+    File {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
     #[error("the founding file does not parse: {0}")]
     Founding(#[from] toml::de::Error),
     #[error("not hex: {0}")]
