@@ -17,7 +17,7 @@ use tokio::sync::watch;
 
 pub use client::Client;
 pub use logs::Logs;
-pub use mesh::{Mesh, Reach};
+pub use mesh::{Mesh, PEERS_PER_SET, Reach, Tracked, tracked};
 pub use run::{Listen, Running, init, join, run};
 pub use wire::{NODE_CONTRACT, Status};
 pub use workspace::{Descriptor, Founding, Workspace};

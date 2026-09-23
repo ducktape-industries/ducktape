@@ -360,6 +360,7 @@ pub mod valset {
     use super::{BorshDeserialize, BorshSerialize};
 
     pub const PROGRAM: &str = "valset";
+    pub const MAX_MEMBERS: usize = 1024;
 
     #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
     pub struct Member {

@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use abi::valset::Member;
+use abi::valset::{self, Seating};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_p2p::authenticated::lookup::{Config, Network, Oracle, Receiver, Sender};
@@ -14,7 +14,7 @@ use consensus::{EngineChannels, MarshalLanes};
 use crate::Context;
 
 pub const MESSAGE_SIZE: u32 = 1 << 26;
-pub const PEERS_PER_SET: usize = 1024;
+pub const PEERS_PER_SET: usize = valset::MAX_MEMBERS + 1;
 pub const QUOTA_PER_SECOND: u32 = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,25 +90,67 @@ impl<E: Context> Mesh<E> {
     }
 }
 
-pub fn track(oracle: &mut Oracle<PublicKey>, epoch: u64, members: &[Member]) {
-    let peers: Vec<(PublicKey, Address)> = members
-        .iter()
-        .filter_map(|member| {
-            let key = PublicKey::decode(member.key.as_slice()).ok()?;
-            let address: SocketAddr = member.address.parse().ok()?;
-            Some((key, Address::Symmetric(address)))
-        })
-        .collect();
-    let unreachable = members.len() - peers.len();
-    if unreachable > 0 {
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Tracked {
+    pub peers: Vec<(PublicKey, SocketAddr)>,
+    pub unreachable: usize,
+    pub dropped: usize,
+}
+
+pub fn tracked(seating: &Seating, local: &[u8]) -> Tracked {
+    let is_validator = |key: &[u8]| seating.validators.iter().any(|seated| seated == key);
+    let validators = seating.members.iter().filter(|m| is_validator(&m.key));
+    let residents = seating.members.iter().filter(|m| !is_validator(&m.key));
+    let mut tracked = Tracked::default();
+    let mut others = 0;
+    for member in validators.chain(residents) {
+        let decoded = PublicKey::decode(member.key.as_slice()).ok();
+        let parsed: Option<SocketAddr> = member.address.parse().ok();
+        let (Some(key), Some(address)) = (decoded, parsed) else {
+            tracked.unreachable += 1;
+            continue;
+        };
+        let is_local = member.key == local;
+        if is_local {
+            tracked.peers.push((key, address));
+            continue;
+        }
+        let full = others == PEERS_PER_SET - 1;
+        if full {
+            tracked.dropped += 1;
+            continue;
+        }
+        others += 1;
+        tracked.peers.push((key, address));
+    }
+    tracked
+}
+
+pub fn track(oracle: &mut Oracle<PublicKey>, epoch: u64, seating: &Seating, local: &[u8]) {
+    let tracked = tracked(seating, local);
+    if tracked.unreachable > 0 {
         tracing::warn!(
             target: "ducktape::mesh",
             epoch,
-            unreachable,
+            unreachable = tracked.unreachable,
             reason = "member_address_unparsable",
             "some members of the epoch cannot be dialed"
         );
     }
+    if tracked.dropped > 0 {
+        tracing::warn!(
+            target: "ducktape::mesh",
+            event = "peer_set_truncated",
+            epoch,
+            dropped = tracked.dropped,
+            reason = "peer_set_full",
+            "the epoch seats more members than the mesh holds; the rest are not tracked"
+        );
+    }
+    let peers = tracked
+        .peers
+        .into_iter()
+        .map(|(key, address)| (key, Address::Symmetric(address)));
     let _ = oracle.track(
         epoch,
         AddressableTrackedPeers::from(Map::from_iter_dedup(peers)),

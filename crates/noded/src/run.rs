@@ -177,7 +177,7 @@ async fn start<E: Context>(
         listen.reach,
     );
     let mut oracle = mesh.oracle();
-    track(&mut oracle, epoch, &seating.members);
+    track(&mut oracle, epoch, &seating, identity.public_key().as_ref());
     let roster = Roster::new(descriptor.id(), Some(identity.clone()));
     for (epoch, seating) in &seated {
         let validators = validators_of(&seating.validators).ok_or(Error::Corrupt(format!(
@@ -347,7 +347,7 @@ async fn applied<E: Context>(
         "the boundary block records no epoch {epoch}"
     )))?;
     drop(node);
-    track(oracle, epoch, &seating.members);
+    track(oracle, epoch, &seating, &daemon.identity);
     membership.seat(block.tip(), &seating).await?;
     Ok(())
 }
