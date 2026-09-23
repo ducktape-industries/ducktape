@@ -581,7 +581,7 @@ fn a_follower_hands_what_it_accepts_to_the_validators() {
             .contains(&(b"early".to_vec(), Some(b"before a seat".to_vec())))
     );
 
-    let past_the_http_default = vec![3u8; 3 << 20];
+    let past_the_http_default = vec![3u8; (2 << 20) + (1 << 18)];
     let landed = runtime.block_on(async {
         let mut changes = founders[1].client.changes("probe").await.unwrap();
         let steps = vec![set(b"big", &past_the_http_default)];

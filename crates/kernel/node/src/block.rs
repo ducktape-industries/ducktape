@@ -7,9 +7,9 @@ use host::Tip;
 
 pub type Digest = sha256::Digest;
 
-pub const MESSAGE_BYTES: u32 = 1 << 26;
+pub const BLOCK_BYTES: usize = 16 << 20;
 const ENVELOPE_BYTES: usize = 1 << 17;
-pub const BLOCK_BYTES: usize = MESSAGE_BYTES as usize - ENVELOPE_BYTES;
+pub const MESSAGE_BYTES: u32 = (BLOCK_BYTES + ENVELOPE_BYTES) as u32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Block {
