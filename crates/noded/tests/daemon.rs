@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use abi::valset::{Member, Seating};
-use abi::{HostOp, HostReply, Outcome, Scan};
+use abi::{HostOp, HostReply, Outcome, Scan, reason};
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
 use fixture_probe::{Reply, Step};
@@ -545,16 +545,19 @@ fn a_follower_hands_what_it_accepts_to_the_validators() {
     let bob = ed25519::PrivateKey::from_seed(12);
     let runtime = client_runtime();
 
-    runtime.block_on(async {
-        let mut changes = follower.client.changes("probe").await.unwrap();
+    let early = runtime.block_on(async {
+        let receipt = follower
+            .client
+            .submit(frame(&bob, 0, vec![set(b"early", b"before a seat")]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
+        let mut changes = founders[1].client.changes("probe").await.unwrap();
         let mut seq = 0;
         loop {
-            let seated = seating(&follower.client).await;
-            let a_member = seated.members.iter().any(|m| m.key == seats[3].key());
-            if a_member {
-                assert!(!seated.validators.contains(&seats[3].key()));
-                break;
-            }
             let tick = founders[0]
                 .client
                 .submit(frame(&alice, seq, vec![set(b"tick", &seq.to_be_bytes())]))
@@ -562,33 +565,49 @@ fn a_follower_hands_what_it_accepts_to_the_validators() {
                 .unwrap();
             assert!(matches!(tick.outcome, Outcome::Applied { .. }), "{tick:?}");
             seq += 1;
-            changes.next().await.unwrap().unwrap();
+            let change = changes.next().await.unwrap().unwrap();
+            let landed = change.writes.iter().any(|(key, _)| key == b"early");
+            if landed {
+                break change;
+            }
         }
     });
+    let seated = runtime.block_on(seating(&follower.client));
+    assert!(seated.members.iter().any(|m| m.key == seats[3].key()));
+    assert!(!seated.validators.contains(&seats[3].key()));
+    assert!(
+        early
+            .writes
+            .contains(&(b"early".to_vec(), Some(b"before a seat".to_vec())))
+    );
 
+    let past_the_http_default = vec![3u8; 3 << 20];
     let landed = runtime.block_on(async {
         let mut changes = founders[1].client.changes("probe").await.unwrap();
-        let receipt = follower
-            .client
-            .submit(frame(&bob, 0, vec![set(b"relayed", b"by the follower")]))
-            .await
-            .unwrap();
+        let steps = vec![set(b"big", &past_the_http_default)];
+        let receipt = follower.client.submit(frame(&bob, 1, steps)).await.unwrap();
         assert!(
             matches!(receipt.outcome, Outcome::Applied { .. }),
             "{receipt:?}"
         );
         loop {
             let change = changes.next().await.unwrap().unwrap();
-            let relayed = change.writes.iter().any(|(key, _)| key == b"relayed");
-            if relayed {
+            let big = change.writes.iter().any(|(key, _)| key == b"big");
+            if big {
                 break change;
             }
         }
     });
     assert_eq!(
         landed.writes,
-        vec![(b"relayed".to_vec(), Some(b"by the follower".to_vec()))]
+        vec![(b"big".to_vec(), Some(past_the_http_default))]
     );
+
+    let refused = runtime.block_on(follower.client.submit(vec![0; node::BLOCK_BYTES + 1]));
+    let Err(noded::Error::Refused(refusal)) = refused else {
+        panic!("a frame no block carries is refused: {refused:?}");
+    };
+    assert_eq!(refusal.reason, reason::CAPACITY);
 
     runtime.block_on(async {
         for (seat, node) in seats.iter().zip(founders.iter().chain([&follower])) {

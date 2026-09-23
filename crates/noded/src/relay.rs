@@ -54,12 +54,13 @@ impl<E: Context> Relay<E> {
             .lock()
             .expect("the sender lock is never poisoned");
         for frame in frames {
-            let reached = sender.send(Recipients::Some(validators.clone()), frame.to_vec(), false);
+            let attempted =
+                sender.send(Recipients::Some(validators.clone()), frame.to_vec(), false);
             tracing::debug!(
                 target: "ducktape::relay",
                 bytes = frame.len(),
                 validators = validators.len(),
-                reached = reached.len(),
+                attempted = attempted.len(),
                 "relayed a frame"
             );
         }
