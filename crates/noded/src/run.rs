@@ -4,8 +4,9 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use abi::Outcome;
+use abi::admission::{self, Grant, Invite};
 use abi::valset::Seating;
-use abi::{Outcome, admission};
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_p2p::authenticated::lookup::{Oracle, Receiver, Sender};
@@ -17,8 +18,7 @@ use consensus::{
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use host::{Layer, SIGNERS};
-use node::{Block, Frame, Node, Sequenced};
+use node::{Block, Node, Sequenced};
 use tokio::sync::watch;
 
 use crate::mesh::{Mesh, Reach, track};
@@ -66,8 +66,9 @@ pub fn join<'a, E: Context>(
     workspace: &'a Workspace,
     source: Client,
     address: SocketAddr,
+    invite: Option<Invite>,
 ) -> Boxed<'a, Result<()>> {
-    Box::pin(adopt(context, workspace, source, address))
+    Box::pin(adopt(context, workspace, source, address, invite))
 }
 
 pub fn run<'a, E: Context>(
@@ -100,6 +101,7 @@ async fn adopt<E: Context>(
     workspace: &Workspace,
     source: Client,
     address: SocketAddr,
+    invite: Option<Invite>,
 ) -> Result<()> {
     let status = source.status().await?;
     let descriptor = Descriptor {
@@ -118,33 +120,37 @@ async fn adopt<E: Context>(
     .await?;
     workspace.write_descriptor(&descriptor)?;
     workspace.write_anchor(&joined.anchor)?;
-    enroll(&source, &identity, &descriptor, address).await
+    enroll(&source, &identity, address, invite).await
 }
 
 async fn enroll(
     source: &Client,
     identity: &PrivateKey,
-    descriptor: &Descriptor,
     address: SocketAddr,
+    invite: Option<Invite>,
 ) -> Result<()> {
-    let signer = identity.public_key().as_ref().to_vec();
-    let sequence = match source.get(Layer::Preconfirmed, SIGNERS, &signer).await? {
-        Some(bytes) => abi::decode(&bytes).map_err(Error::Decode)?,
-        None => 0,
+    let enroll = admission::Op::Enroll {
+        address: address.to_string(),
+        invite,
     };
-    let frame = Frame::sign(
-        identity,
-        descriptor.network.as_bytes(),
-        sequence,
-        admission::PROGRAM,
-        abi::encode(&admission::Op::Enroll {
-            address: address.to_string(),
-        }),
-    );
-    let receipt = source.submit(frame.encode()).await?;
+    let receipt = source
+        .submit_signed(identity, admission::PROGRAM, abi::encode(&enroll))
+        .await?;
     match receipt.outcome {
         Outcome::Applied { .. } => Ok(()),
         Outcome::Rejected(refusal) => Err(Error::Refused(refusal)),
+    }
+}
+
+pub fn invite(identity: &PrivateKey, grant: Grant) -> Invite {
+    let signature = identity
+        .sign(admission::INVITE_NAMESPACE, &grant.preimage())
+        .as_ref()
+        .to_vec();
+    Invite {
+        issuer: identity.public_key().as_ref().to_vec(),
+        grant,
+        signature,
     }
 }
 

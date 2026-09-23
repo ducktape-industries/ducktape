@@ -14,7 +14,12 @@ mod program {
                     format!("only a signed frame may enroll, not {:?}", env.origin),
                 ));
             };
-            let admission::Op::Enroll { address } = abi::decode(payload)?;
+            let admission::Op::Enroll { address, .. } = abi::decode(payload)? else {
+                return Err(Refusal::new(
+                    reason::UNSUPPORTED,
+                    "the fixture only enrolls",
+                ));
+            };
             let member = Member {
                 key: key.clone(),
                 address,

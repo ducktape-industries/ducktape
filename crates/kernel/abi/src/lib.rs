@@ -396,10 +396,50 @@ pub mod admission {
     use super::{BorshDeserialize, BorshSerialize};
 
     pub const PROGRAM: &str = "admission";
+    pub const INVITE_NAMESPACE: &[u8] = b"ducktape:invite";
 
     #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
     pub enum Op {
-        Enroll { address: String },
+        Enroll {
+            address: String,
+            invite: Option<Invite>,
+        },
+        Leave,
+        Vote(Motion),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub enum Motion {
+        Promote { key: Vec<u8> },
+        Demote { key: Vec<u8> },
+        Remove { key: Vec<u8> },
+        Door { open: bool },
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub enum Voted {
+        Counted { votes: u64, needed: u64 },
+        Enacted,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Grant {
+        pub network: Vec<u8>,
+        pub nonce: Vec<u8>,
+        pub expires: u64,
+    }
+
+    impl Grant {
+        pub fn preimage(&self) -> Vec<u8> {
+            super::encode(self)
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Invite {
+        pub issuer: Vec<u8>,
+        pub grant: Grant,
+        pub signature: Vec<u8>,
     }
 }
 

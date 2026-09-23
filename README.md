@@ -87,14 +87,35 @@ address is the one peers dial: a validator accepts a member only from the IP
 it enrolled with, so it must be the address the node is reached at, not a
 loopback or a placeholder.
 
+A network starts with its door closed: enrolling takes an invite a validator
+mints. An invite is signed by the validator's node key, names the network,
+expires, and admits one node.
+
 ```sh
-ducktape join http://203.0.113.7:8844 --address 198.51.100.4:9000
+ducktape invite --hours 72                      # on a validator; prints the invite
+ducktape join http://203.0.113.7:8844 --address 198.51.100.4:9000 --invite <invite>
 ducktape run --listen 0.0.0.0:9000
 ```
 
 The enrollment lands in the next block and the validators track the new
 member from the epoch after it; until then the node's dials are refused and
-retried.
+retried. The table holds at most 1024 members (`abi::valset::MAX_MEMBERS`).
+
+Validators decide everything else by vote, each from its own node; a motion
+passes when the BFT quorum of the current validators (`n - (n - 1) / 3`) has
+voted for it, and takes effect at the next epoch:
+
+```sh
+ducktape vote promote <key>    # a resident becomes a validator
+ducktape vote demote <key>     # a validator becomes a resident
+ducktape vote remove <key>     # a member is removed
+ducktape vote open             # anyone may enroll without an invite
+ducktape vote close            # enrolling takes an invite again
+ducktape leave                 # this node stops being a member
+```
+
+With two validators the quorum is both, so the chain stops while either is
+down.
 
 The workspace (`--workspace`, default `$DUCKTAPE_HOME` else `~/.ducktape`)
 holds `identity.key`, the network descriptor, the anchor the node started
