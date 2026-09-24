@@ -13,6 +13,7 @@ use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
 pub use anchor::Anchor;
 pub use cadence::Cadence;
 pub use chain::{App, Chain};
+pub use engine::proposer;
 pub use lanes::{EngineChannels, EngineMux, MarshalLanes, channel};
 pub use marshal::{Certificate, Marshal, MarshalMailbox, Transport};
 pub use membership::{Error as MembershipError, Membership, Standing};
