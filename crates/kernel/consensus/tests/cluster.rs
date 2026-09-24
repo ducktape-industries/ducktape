@@ -78,6 +78,7 @@ fn genesis(members: &[valset::Member], epoch_length: u64) -> Genesis {
                 params: abi::encode(&Vec::<Step>::new()),
             },
         ],
+        views: Vec::new(),
         limits: Limits::default(),
         epoch_length,
         time: TIME,

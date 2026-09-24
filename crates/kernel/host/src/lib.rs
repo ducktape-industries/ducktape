@@ -65,6 +65,9 @@ pub struct Genesis {
     pub valset: Vec<u8>,
     pub validators: Vec<valset::Member>,
     pub programs: Vec<Founding>,
+    /// Views with no program behind them: each blob is stored and listed by
+    /// the registry under its name; nothing is admitted.
+    pub views: Vec<FoundingView>,
     pub limits: Limits,
     pub epoch_length: u64,
     pub time: u64,
@@ -74,6 +77,11 @@ pub struct Founding {
     pub program: ProgramId,
     pub code: Vec<u8>,
     pub params: Vec<u8>,
+}
+
+pub struct FoundingView {
+    pub name: ProgramId,
+    pub view: Vec<u8>,
 }
 
 pub struct Block {
@@ -192,18 +200,31 @@ where
                 params: founding.params,
             });
         }
+        let views: Vec<module_registry::View> = genesis
+            .views
+            .into_iter()
+            .map(|founding| module_registry::View {
+                name: founding.name,
+                view: put_code(&mut overlay, &mut stage, &founding.view),
+            })
+            .collect();
         let mut seen = BTreeSet::new();
-        for entry in &entries {
-            let admissible = valid_program_id(&entry.program) && seen.insert(entry.program.clone());
+        let names = entries
+            .iter()
+            .map(|entry| &entry.program)
+            .chain(views.iter().map(|view| &view.name));
+        for name in names {
+            let admissible = valid_program_id(name) && seen.insert(name.clone());
             if !admissible {
                 return Err(Error::Genesis {
-                    program: entry.program.clone(),
+                    program: name.clone(),
                     refusal: Refusal::new(reason::INVALID_INPUT, "not a distinct program id"),
                 });
             }
         }
         entries[0].params = abi::encode(&module_registry::Genesis {
             programs: entries.clone(),
+            views,
         });
         let mut receipts = Vec::new();
         for entry in &entries {

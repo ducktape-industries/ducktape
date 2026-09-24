@@ -51,6 +51,7 @@ fn genesis(validators: Vec<valset::Member>) -> Genesis {
             founding("pong", RELAY, Vec::new()),
             founding("probe", PROBE, abi::encode(&Vec::<Step>::new())),
         ],
+        views: Vec::new(),
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
         time: TIME,
