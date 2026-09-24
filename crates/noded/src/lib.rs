@@ -10,6 +10,7 @@ mod workspace;
 use std::sync::{Arc, Mutex};
 
 use abi::{ProgramId, Refusal};
+use commonware_cryptography::Digestible as _;
 use consensus::{MarshalMailbox, Network};
 use futures::channel::mpsc;
 use host::Applied;
@@ -103,6 +104,7 @@ impl<E: Context> Daemon<E> {
             epoch: self.network.epoch_after(tip.height),
             identity: self.identity.clone(),
             contract: NODE_CONTRACT,
+            genesis: self.descriptor.genesis_block().digest().0,
         })
     }
 
