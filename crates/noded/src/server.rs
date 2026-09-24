@@ -14,7 +14,7 @@ use futures::channel::mpsc;
 use host::Receipt;
 use statesync::Request;
 
-use crate::wire::{Admin, BlobPut, Change, Get, Query, Range, route};
+use crate::wire::{Admin, BlobPut, BlockRef, Blocks, Change, Finalized, Get, Query, Range, route};
 use crate::{Context, Daemon};
 
 pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
@@ -32,6 +32,8 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
             &format!("{}/{{program}}", route::CHANGES),
             get(changes::<E>),
         )
+        .route(route::BLOCKS, post(blocks::<E>))
+        .route(route::BLOCK, post(block::<E>))
         .route(route::LOGS, get(logs::<E>))
         .route(route::ADMIN, post(admin::<E>))
         .route(route::SYNC, post(sync::<E>))
@@ -200,6 +202,34 @@ async fn stream(mut socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Chan
         if sent.is_err() {
             return;
         }
+    }
+}
+
+async fn blocks<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    body: Bytes,
+) -> Reply<Vec<Finalized>> {
+    let page: Blocks = match abi::decode(&body) {
+        Ok(page) => page,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    match daemon.blocks(page).await {
+        Ok(blocks) => Reply::Answered(blocks),
+        Err(error) => failed(error),
+    }
+}
+
+async fn block<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    body: Bytes,
+) -> Reply<Option<Finalized>> {
+    let by: BlockRef = match abi::decode(&body) {
+        Ok(by) => by,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    match daemon.block(by).await {
+        Ok(block) => Reply::Answered(block),
+        Err(error) => failed(error),
     }
 }
 

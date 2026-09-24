@@ -10,7 +10,7 @@ use fixture_probe::{Reply, Step};
 use futures::StreamExt as _;
 use host::Layer;
 use node::Frame;
-use noded::wire::Admin;
+use noded::wire::{Admin, BlockRef};
 use noded::{Client, Listen, Logs, Reach, Workspace};
 
 const MODULE_REGISTRY: &[u8] =
@@ -175,10 +175,8 @@ fn a_validator_serves_its_network_over_http() {
         assert_eq!(status.contract, noded::NODE_CONTRACT);
 
         let mut changes = client.changes("probe").await.unwrap();
-        let receipt = client
-            .submit(frame(&alice, 0, vec![set(b"a", b"1")]))
-            .await
-            .unwrap();
+        let submitted = frame(&alice, 0, vec![set(b"a", b"1")]);
+        let receipt = client.submit(submitted.clone()).await.unwrap();
         assert!(
             matches!(receipt.outcome, Outcome::Applied { .. }),
             "{receipt:?}"
@@ -204,6 +202,41 @@ fn a_validator_serves_its_network_over_http() {
         let status = client.status().await.unwrap();
         assert!(status.height >= change.height);
         assert_eq!(status.root, change.root);
+
+        // the block that wrote it, read back from the archive
+        let block = client
+            .block(BlockRef::Height(change.height))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.height, change.height);
+        assert_eq!(block.epoch, change.height / EPOCH_LENGTH);
+        let [tx] = block.txs.as_slice() else {
+            panic!("one frame in the block: {block:?}");
+        };
+        assert_eq!(tx.hash, noded::tx_hash(&submitted));
+        assert_eq!(tx.signer, alice.public_key().as_ref().to_vec());
+        assert_eq!((tx.seq, tx.target.as_str()), (0, "probe"));
+        assert_eq!(tx.payload, abi::encode(&vec![set(b"a", b"1")]));
+        assert_eq!(
+            block.proposer.as_deref(),
+            Some(seat.identity.public_key().as_ref())
+        );
+        let by_id = client.block(BlockRef::Id(block.id)).await.unwrap();
+        assert_eq!(by_id.as_ref(), Some(&block));
+        assert_eq!(client.block(BlockRef::Id([7; 32])).await.unwrap(), None);
+        let newest = client.blocks(None, 1_000).await.unwrap();
+        assert!(newest.len() as u32 <= noded::wire::MAX_BLOCKS);
+        assert!(
+            newest
+                .windows(2)
+                .all(|pair| pair[1].height + 1 == pair[0].height && pair[1].id == pair[0].parent)
+        );
+        assert!(newest.iter().any(|seen| seen == &block));
+        let below = client.blocks(Some(block.height), 2).await.unwrap();
+        assert_eq!(below[0].height, block.height - 1);
+        assert_eq!(below[0].id, block.parent);
+        assert!(client.blocks(Some(0), 5).await.unwrap().is_empty());
 
         let query = Frame::sign(
             &alice,

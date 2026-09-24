@@ -3577,6 +3577,7 @@ dependencies = [
  "blobs",
  "borsh",
  "commonware-codec",
+ "commonware-consensus",
  "commonware-cryptography",
  "commonware-p2p",
  "commonware-runtime",
