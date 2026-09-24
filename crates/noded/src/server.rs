@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use abi::{BlobId, Origin, ProgramId, Refusal, reason};
+use abi::{BlobId, Origin, Outcome, ProgramId, Refusal, reason};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -36,6 +36,7 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::ADMIN, post(admin::<E>))
         .route(route::SYNC, post(sync::<E>))
         .route(route::METRICS, get(metrics::<E>))
+        .layer(DefaultBodyLimit::disable())
         .with_state(daemon)
 }
 
@@ -73,7 +74,13 @@ async fn status<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<crate
 async fn submit<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) -> Reply<Receipt> {
     let mut node = daemon.node.lock().await;
     match node.submit(body.to_vec()).await {
-        Ok(Ok(receipt)) => Reply::Answered(receipt),
+        Ok(Ok(receipt)) => {
+            drop(node);
+            if let Outcome::Applied { .. } = receipt.outcome {
+                daemon.relay.send([body.as_ref()]);
+            }
+            Reply::Answered(receipt)
+        }
         Ok(Err(refusal)) => Reply::Refused(refusal),
         Err(error) => failed(error),
     }

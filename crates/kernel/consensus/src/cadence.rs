@@ -17,11 +17,11 @@ impl Cadence {
     }
 
     pub fn leader_timeout(self) -> Duration {
-        self.block_time * 2
+        self.block_time * 20
     }
 
     pub fn certification_timeout(self) -> Duration {
-        self.block_time * 3
+        self.block_time * 30
     }
 
     pub fn timeout_retry(self) -> Duration {
@@ -29,7 +29,7 @@ impl Cadence {
     }
 
     pub fn skip_timeout(self) -> Duration {
-        self.block_time * 11
+        self.block_time * 31
     }
 
     pub fn fetch_timeout(self) -> Duration {

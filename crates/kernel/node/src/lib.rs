@@ -5,14 +5,14 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-use abi::{BlobId, Origin, Outcome, ProgramId, Refusal, valset};
+use abi::{BlobId, Origin, Outcome, ProgramId, Refusal, reason, valset};
 use commonware_cryptography::Digestible as _;
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
 use host::{Applied, Genesis, Host, Layer, Receipt, Submission, Tip};
 use state::{Commitment, View};
 
-pub use block::{Block, Digest};
+pub use block::{BLOCK_BYTES, Block, Digest, MESSAGE_BYTES};
 pub use frame::{Body, Frame, NAMESPACE, verify};
 
 #[derive(Debug, thiserror::Error)]
@@ -162,6 +162,13 @@ where
         &mut self,
         frame: Vec<u8>,
     ) -> Result<std::result::Result<Receipt, Refusal>> {
+        if !Block::carries(&frame) {
+            let sentence = format!(
+                "the frame is {} bytes and a block carries at most {BLOCK_BYTES}",
+                frame.len()
+            );
+            return Ok(Err(Refusal::new(reason::CAPACITY, sentence)));
+        }
         let submission = match frame::verify(&frame, &self.network) {
             Ok(submission) => submission,
             Err(refusal) => return Ok(Err(refusal)),
@@ -176,8 +183,12 @@ where
     }
 
     pub fn build(&self, parent: Tip, time: u64) -> Block {
-        let frames = self.pending.iter().map(|pending| pending.frame.clone());
-        Block::next(parent, time, frames.collect())
+        let frames = self.pending.iter().map(|pending| &pending.frame);
+        Block::packed(parent, time, frames)
+    }
+
+    pub fn waiting(&self) -> impl Iterator<Item = &[u8]> {
+        self.pending.iter().map(|pending| pending.frame.as_slice())
     }
 
     pub async fn apply(&mut self, block: &Block) -> Result<Sequenced> {

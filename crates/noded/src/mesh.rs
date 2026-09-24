@@ -8,12 +8,11 @@ use commonware_p2p::{Address, AddressableManager as _, AddressableTrackedPeers};
 use commonware_runtime::{Handle, Quota};
 use commonware_utils::ordered::Map;
 use commonware_utils::{NZU32, NZUsize};
-use consensus::channel::{BACKFILL, BROADCAST, CERTIFICATE, RESOLVER, VOTE};
+use consensus::channel::{BACKFILL, BROADCAST, CERTIFICATE, RELAY, RESOLVER, VOTE};
 use consensus::{EngineChannels, MarshalLanes};
 
 use crate::Context;
 
-pub const MESSAGE_SIZE: u32 = 1 << 26;
 pub const PEERS_PER_SET: usize = valset::MAX_MEMBERS + 1;
 pub const QUOTA_PER_SECOND: u32 = 1024;
 
@@ -23,10 +22,13 @@ pub enum Reach {
     Private,
 }
 
+pub type Lane<E> = (Sender<PublicKey, E>, Receiver<PublicKey>);
+
 pub type Started<E> = (
     Mesh<E>,
     MarshalLanes<Sender<PublicKey, E>, Receiver<PublicKey>>,
     EngineChannels<Sender<PublicKey, E>, Receiver<PublicKey>>,
+    Lane<E>,
 );
 
 pub struct Mesh<E: Context> {
@@ -55,14 +57,14 @@ impl<E: Context> Mesh<E> {
                 namespace,
                 listen,
                 NZUsize!(PEERS_PER_SET),
-                MESSAGE_SIZE,
+                node::MESSAGE_BYTES,
             ),
             Reach::Private => Config::local(
                 identity,
                 namespace,
                 listen,
                 NZUsize!(PEERS_PER_SET),
-                MESSAGE_SIZE,
+                node::MESSAGE_BYTES,
             ),
         };
         let (mut network, oracle) = Network::new(context, config);
@@ -76,13 +78,14 @@ impl<E: Context> Mesh<E> {
             certificate: network.register(CERTIFICATE, quota),
             resolver: network.register(RESOLVER, quota),
         };
+        let relay = network.register(RELAY, quota);
         let running = network.start();
         let mesh = Mesh {
             oracle,
             running,
             _runtime: std::marker::PhantomData,
         };
-        (mesh, marshal, engine)
+        (mesh, marshal, engine, relay)
     }
 
     pub fn oracle(&self) -> Oracle<PublicKey> {

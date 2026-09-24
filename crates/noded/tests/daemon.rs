@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use abi::valset::{Member, Seating};
-use abi::{HostOp, HostReply, Outcome, Scan};
+use abi::{HostOp, HostReply, Outcome, Scan, reason};
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
 use fixture_probe::{Reply, Step};
@@ -502,7 +502,10 @@ fn a_member_promoted_at_an_epoch_boundary_votes_in_the_next_epoch() {
             .submit(frame(&alice, seq, vec![set(b"quorum", b"3 of 4")]))
             .await
             .unwrap();
-        assert!(matches!(receipt.outcome, Outcome::Applied { .. }), "{receipt:?}");
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
         let change = changes.next().await.unwrap().unwrap();
         assert!(change.height > status.height);
         change
@@ -521,6 +524,117 @@ fn a_member_promoted_at_an_epoch_boundary_votes_in_the_next_epoch() {
         }
     });
     for node in founders.into_iter().chain([promoted]) {
+        node.thread.join().unwrap();
+    }
+}
+
+#[test]
+fn a_follower_hands_what_it_accepts_to_the_validators() {
+    let root = tempfile::tempdir().unwrap();
+    let seats: Vec<Seat> = (0..4)
+        .map(|i| Seat::new(root.path(), &format!("n{i}")))
+        .collect();
+    let founding = founding(root.path(), &seats[..3].iter().collect::<Vec<_>>());
+    for seat in &seats[..3] {
+        seat.init(&founding);
+    }
+    let founders: Vec<Live> = seats[..3].iter().map(Seat::start).collect();
+    seats[3].join(&founders[0].client);
+    let follower = seats[3].start();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let bob = ed25519::PrivateKey::from_seed(12);
+    let runtime = client_runtime();
+
+    let early = runtime.block_on(async {
+        let receipt = follower
+            .client
+            .submit(frame(&bob, 0, vec![set(b"early", b"before a seat")]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
+        let mut changes = founders[1].client.changes("probe").await.unwrap();
+        let mut seq = 0;
+        loop {
+            let tick = founders[0]
+                .client
+                .submit(frame(&alice, seq, vec![set(b"tick", &seq.to_be_bytes())]))
+                .await
+                .unwrap();
+            assert!(matches!(tick.outcome, Outcome::Applied { .. }), "{tick:?}");
+            seq += 1;
+            let change = changes.next().await.unwrap().unwrap();
+            let landed = change.writes.iter().any(|(key, _)| key == b"early");
+            if landed {
+                break change;
+            }
+        }
+    });
+    let seated = runtime.block_on(seating(&follower.client));
+    assert!(seated.members.iter().any(|m| m.key == seats[3].key()));
+    assert!(!seated.validators.contains(&seats[3].key()));
+    assert!(
+        early
+            .writes
+            .contains(&(b"early".to_vec(), Some(b"before a seat".to_vec())))
+    );
+
+    let nearly_a_block = node::BLOCK_BYTES - (1 << 16);
+    let blocks: Vec<Vec<u8>> = (1..=2u8).map(|n| vec![n; nearly_a_block]).collect();
+    let heights = runtime.block_on(async {
+        let mut changes = founders[1].client.changes("probe").await.unwrap();
+        for (n, value) in blocks.iter().enumerate() {
+            let key = format!("block{n}");
+            let steps = vec![set(key.as_bytes(), value)];
+            let receipt = follower
+                .client
+                .submit(frame(&bob, 1 + n as u64, steps))
+                .await
+                .unwrap();
+            assert!(
+                matches!(receipt.outcome, Outcome::Applied { .. }),
+                "{receipt:?}"
+            );
+        }
+        let mut heights = Vec::new();
+        while heights.len() < blocks.len() {
+            let change = changes.next().await.unwrap().unwrap();
+            for (key, value) in change.writes {
+                let Some(n) = key.strip_prefix(b"block") else {
+                    continue;
+                };
+                let n = usize::from(n[0] - b'0');
+                assert_eq!(value.as_ref(), Some(&blocks[n]));
+                heights.push((n, change.height));
+            }
+        }
+        heights
+    });
+    let [(0, first), (1, second)] = heights[..] else {
+        panic!("the frames land in the order they were sent: {heights:?}");
+    };
+    assert!(
+        first < second,
+        "two nearly full frames share no block: {heights:?}"
+    );
+
+    let refused = runtime.block_on(follower.client.submit(vec![0; node::BLOCK_BYTES + 1]));
+    let Err(noded::Error::Refused(refusal)) = refused else {
+        panic!("a frame no block carries is refused: {refused:?}");
+    };
+    assert_eq!(refusal.reason, reason::CAPACITY);
+
+    runtime.block_on(async {
+        for (seat, node) in seats.iter().zip(founders.iter().chain([&follower])) {
+            node.client
+                .admin(seat.admin(Admin::Shutdown))
+                .await
+                .unwrap();
+        }
+    });
+    for node in founders.into_iter().chain([follower]) {
         node.thread.join().unwrap();
     }
 }

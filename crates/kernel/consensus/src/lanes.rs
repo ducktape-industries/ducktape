@@ -134,6 +134,7 @@ pub mod channel {
     pub const VOTE: u64 = 2;
     pub const CERTIFICATE: u64 = 3;
     pub const RESOLVER: u64 = 4;
+    pub const RELAY: u64 = 5;
 }
 
 #[cfg(feature = "sim")]
