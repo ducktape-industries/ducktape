@@ -16,8 +16,8 @@ use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_module_registry::Change;
 use fixture_probe::{Reply, Step};
 use host::{
-    BLOBS, Block, BlockId, Delivered, Error, Founding, Genesis, Host, Layer, Limits, NETWORK,
-    QUEUE, Receipt, SIGNERS, Submission, Tip,
+    BLOBS, Block, BlockId, Delivered, Error, Founding, FoundingView, Genesis, Host, Layer, Limits,
+    NETWORK, QUEUE, Receipt, SIGNERS, Submission, Tip,
 };
 use keyscheme::testkit;
 use sha2::Digest as _;
@@ -56,6 +56,7 @@ fn genesis(programs: Vec<Founding>) -> Genesis {
         valset: VALSET.to_vec(),
         validators: vec![member(b"v1", "v1:1")],
         programs,
+        views: Vec::new(),
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
         time: TIME,
@@ -198,12 +199,18 @@ fn change(program: &str, code: BlobId, params: Vec<u8>) -> Vec<u8> {
 fn founding_admits_every_program_and_the_host_reopens() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
+        let mut founded = standard();
+        // a view has no program behind it: it is listed, never admitted
+        founded.views.push(FoundingView {
+            name: "explorer".into(),
+            view: b"view".to_vec(),
+        });
         let (host, applied) = Host::found(
             context.child("found"),
             "net",
             dir.path(),
             block_id(0),
-            standard(),
+            founded,
         )
         .await
         .unwrap();
@@ -309,6 +316,26 @@ fn founding_refuses_a_program_that_does_not_admit() {
             Host::found(context.child("twice"), "b", dir.path(), block_id(0), twice).await
         else {
             panic!("a duplicate founder was admitted");
+        };
+        assert_eq!(program, "ping");
+        assert_eq!(refusal.reason, reason::INVALID_INPUT);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut shadowed = genesis(vec![founding("ping", RELAY, Vec::new())]);
+        shadowed.views.push(FoundingView {
+            name: "ping".into(),
+            view: b"view".to_vec(),
+        });
+        let Err(Error::Genesis { program, refusal }) = Host::found(
+            context.child("shadowed"),
+            "b2",
+            dir.path(),
+            block_id(0),
+            shadowed,
+        )
+        .await
+        else {
+            panic!("a view took a program's name");
         };
         assert_eq!(program, "ping");
         assert_eq!(refusal.reason, reason::INVALID_INPUT);

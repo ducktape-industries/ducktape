@@ -340,6 +340,14 @@ pub mod module_registry {
         pub params: Vec<u8>,
     }
 
+    /// A view with no program behind it: its name on the rail and the blob
+    /// that is the view itself.
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct View {
+        pub name: ProgramId,
+        pub view: BlobId,
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
     pub enum Query {
         At(u64),
@@ -353,6 +361,7 @@ pub mod module_registry {
     #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
     pub struct Genesis {
         pub programs: Vec<Entry>,
+        pub views: Vec<View>,
     }
 }
 

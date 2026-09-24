@@ -6,7 +6,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use consensus::{Anchor, Cadence};
-use host::{Founding as FoundingProgram, Genesis, Limits};
+use host::{Founding as FoundingProgram, FoundingView, Genesis, Limits};
 use node::Block;
 use rand_core::CryptoRng;
 use serde::Deserialize;
@@ -144,6 +144,8 @@ pub struct Founding {
     pub validators: Vec<Validator>,
     pub programs: Vec<Program>,
     #[serde(default)]
+    pub views: Vec<View>,
+    #[serde(default)]
     pub limits: Metering,
 }
 
@@ -164,6 +166,13 @@ pub struct Program {
     pub id: String,
     pub code: PathBuf,
     pub params: Option<PathBuf>,
+}
+
+/// A view with no program behind it, listed by the registry under `name`.
+#[derive(Debug, Deserialize)]
+pub struct View {
+    pub name: String,
+    pub code: PathBuf,
 }
 
 impl Founding {
@@ -208,12 +217,23 @@ impl Founding {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let views = self
+            .views
+            .iter()
+            .map(|view| {
+                Ok(FoundingView {
+                    name: view.name.clone(),
+                    view: std::fs::read(base.join(&view.code))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Genesis {
             network: self.network.as_bytes().to_vec(),
             module_registry: std::fs::read(base.join(&self.module_registry))?,
             valset: std::fs::read(base.join(&self.valset))?,
             validators,
             programs,
+            views,
             limits: Limits {
                 fuel: self.limits.fuel,
                 memory_bytes: self.limits.memory_bytes,
