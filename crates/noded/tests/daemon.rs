@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use abi::{HostOp, HostReply, Outcome, Scan};
-use commonware_cryptography::{Signer as _, ed25519};
+use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
 use fixture_probe::{Reply, Step};
 use futures::StreamExt as _;
@@ -173,6 +173,11 @@ fn a_validator_serves_its_network_over_http() {
             seat.identity.public_key().as_ref().to_vec()
         );
         assert_eq!(status.contract, noded::NODE_CONTRACT);
+        assert_eq!(
+            status.genesis,
+            node::Block::genesis(NETWORK.as_bytes(), TIME).digest().0,
+            "the genesis digest a client salts the network name with"
+        );
 
         let mut changes = client.changes("probe").await.unwrap();
         let submitted = frame(&alice, 0, vec![set(b"a", b"1")]);

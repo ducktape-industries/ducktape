@@ -36,6 +36,9 @@ pub struct Status {
     pub epoch: u64,
     pub identity: Vec<u8>,
     pub contract: u32,
+    /// The digest of this network's genesis block: what a client salts the
+    /// network's name with to name the chain (`<network>#<salt>`).
+    pub genesis: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
