@@ -581,26 +581,43 @@ fn a_follower_hands_what_it_accepts_to_the_validators() {
             .contains(&(b"early".to_vec(), Some(b"before a seat".to_vec())))
     );
 
-    let past_the_http_default = vec![3u8; (2 << 20) + (1 << 18)];
-    let landed = runtime.block_on(async {
+    let nearly_a_block = node::BLOCK_BYTES - (1 << 16);
+    let blocks: Vec<Vec<u8>> = (1..=2u8).map(|n| vec![n; nearly_a_block]).collect();
+    let heights = runtime.block_on(async {
         let mut changes = founders[1].client.changes("probe").await.unwrap();
-        let steps = vec![set(b"big", &past_the_http_default)];
-        let receipt = follower.client.submit(frame(&bob, 1, steps)).await.unwrap();
-        assert!(
-            matches!(receipt.outcome, Outcome::Applied { .. }),
-            "{receipt:?}"
-        );
-        loop {
+        for (n, value) in blocks.iter().enumerate() {
+            let key = format!("block{n}");
+            let steps = vec![set(key.as_bytes(), value)];
+            let receipt = follower
+                .client
+                .submit(frame(&bob, 1 + n as u64, steps))
+                .await
+                .unwrap();
+            assert!(
+                matches!(receipt.outcome, Outcome::Applied { .. }),
+                "{receipt:?}"
+            );
+        }
+        let mut heights = Vec::new();
+        while heights.len() < blocks.len() {
             let change = changes.next().await.unwrap().unwrap();
-            let big = change.writes.iter().any(|(key, _)| key == b"big");
-            if big {
-                break change;
+            for (key, value) in change.writes {
+                let Some(n) = key.strip_prefix(b"block") else {
+                    continue;
+                };
+                let n = usize::from(n[0] - b'0');
+                assert_eq!(value.as_ref(), Some(&blocks[n]));
+                heights.push((n, change.height));
             }
         }
+        heights
     });
-    assert_eq!(
-        landed.writes,
-        vec![(b"big".to_vec(), Some(past_the_http_default))]
+    let [(0, first), (1, second)] = heights[..] else {
+        panic!("the frames land in the order they were sent: {heights:?}");
+    };
+    assert!(
+        first < second,
+        "two nearly full frames share no block: {heights:?}"
     );
 
     let refused = runtime.block_on(follower.client.submit(vec![0; node::BLOCK_BYTES + 1]));
