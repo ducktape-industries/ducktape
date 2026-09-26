@@ -174,9 +174,12 @@ pub enum Outcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+/// Why a frame runs: a submission, a message another program emitted in
+/// this frame, or the outcome of a message this program emitted with a
+/// reply wanted.
 pub enum Cause {
     Direct,
-    Delivery(ItemRef),
+    Message(ItemRef),
     Completion { item: ItemRef, outcome: Outcome },
 }
 
@@ -194,6 +197,9 @@ pub struct Env {
     pub cause: Cause,
 }
 
+/// What a program emits: `target` runs `payload` in the same frame once
+/// the emitting handler returns, and with `reply` its outcome comes back
+/// as a [`Cause::Completion`].
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Message {
     pub target: ProgramId,

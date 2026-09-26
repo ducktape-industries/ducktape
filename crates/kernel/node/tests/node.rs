@@ -91,12 +91,13 @@ fn frame(key: &ed25519::PrivateKey, seq: u64, target: &str, payload: Vec<u8>) ->
     Frame::sign(key, NETWORK, seq, target, payload).encode()
 }
 
+/// A relay payload that has `target` note `payload` in the frame.
 fn message(target: &str, payload: &[u8], reply: bool) -> Vec<u8> {
-    abi::encode(&Message {
+    abi::encode(&fixture_relay::Script::Send(vec![Message {
         target: target.to_owned(),
-        payload: payload.to_vec(),
+        payload: abi::encode(&fixture_relay::Script::Note(payload.to_vec())),
         reply,
-    })
+    }]))
 }
 
 async fn seal(node: &mut TestNode) -> (Block, host::Applied) {
@@ -246,6 +247,43 @@ fn a_block_without_the_pending_frame_keeps_it_pending_and_preconfirmed() {
 }
 
 #[test]
+fn a_rejected_frame_rides_the_block_and_its_bytes_never_run_again() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut node, _) = found(context, dir.path()).await;
+        let signer = key(7);
+        let signer_key = signer.public_key().as_ref().to_vec();
+        let failing = frame(&signer, 0, "probe", script(vec![Step::Fail("no".into())]));
+
+        let receipt = node.submit(failing.clone()).await.unwrap().unwrap();
+        assert_eq!(rejected(&receipt), "probe");
+        assert_eq!(node.pending(), 1);
+        assert_eq!(
+            node.view(Layer::Preconfirmed)
+                .get(SIGNERS, &signer_key)
+                .unwrap(),
+            Some(abi::encode(&1u64))
+        );
+        let resubmitted = node.submit(failing.clone()).await.unwrap().unwrap();
+        assert_eq!(rejected(&resubmitted), reason::SEQUENCE);
+        assert_eq!(node.pending(), 1);
+
+        let (block, applied) = seal(&mut node).await;
+        assert_eq!(block.frames, vec![failing.clone()]);
+        assert_eq!(rejected(&applied.submissions[0]), "probe");
+        assert_eq!(
+            node.view(Layer::Confirmed)
+                .get(SIGNERS, &signer_key)
+                .unwrap(),
+            Some(abi::encode(&1u64))
+        );
+        let resubmitted = node.submit(failing).await.unwrap().unwrap();
+        assert_eq!(rejected(&resubmitted), reason::SEQUENCE);
+        assert_eq!(node.pending(), 0);
+    });
+}
+
+#[test]
 fn a_block_that_spends_the_signers_sequence_elsewhere_drops_the_pending_frame() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -295,6 +333,12 @@ fn a_frame_is_refused_when_it_names_another_network_or_lies_about_its_signer() {
         let refusal = node.submit(b"junk".to_vec()).await.unwrap().unwrap_err();
         assert_eq!(refusal.reason, reason::PROTOCOL);
         assert_eq!(node.pending(), 0);
+        assert_eq!(
+            node.view(Layer::Preconfirmed)
+                .get(SIGNERS, signer.public_key().as_ref())
+                .unwrap(),
+            None
+        );
         assert!(!node.due().unwrap());
     });
 }
@@ -364,7 +408,7 @@ fn a_block_must_link_to_the_tip() {
 }
 
 #[test]
-fn due_deliveries_make_empty_blocks_due_until_the_queue_drains() {
+fn a_message_lands_in_the_block_that_carries_its_frame() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let (mut node, _) = found(context, dir.path()).await;
@@ -373,22 +417,16 @@ fn due_deliveries_make_empty_blocks_due_until_the_queue_drains() {
             .await
             .unwrap()
             .unwrap();
+        assert!(node.due().unwrap());
 
         let (_, applied) = seal(&mut node).await;
         assert_eq!(applied.height, 1);
-        assert!(applied.deliveries.is_empty());
-        assert!(node.due().unwrap());
-
-        let (block, applied) = seal(&mut node).await;
-        assert!(block.frames.is_empty());
-        assert_eq!(applied.height, 2);
-        assert_eq!(applied.deliveries.len(), 1);
-        assert_eq!(applied.deliveries[0].receipt.program, "pong");
-        assert!(node.due().unwrap());
-
-        let (_, applied) = seal(&mut node).await;
-        assert_eq!(applied.height, 3);
-        assert_eq!(applied.deliveries[0].receipt.program, "ping");
+        let ran: Vec<&str> = applied.submissions[0]
+            .nested
+            .iter()
+            .map(|receipt| receipt.program.as_str())
+            .collect();
+        assert_eq!(ran, ["pong", "ping"]);
         assert!(!node.due().unwrap());
     });
 }
