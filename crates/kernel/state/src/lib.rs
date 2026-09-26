@@ -122,6 +122,17 @@ where
         Ok(())
     }
 
+    /// Removes a program's commitment and destroys what it holds on disk:
+    /// a program that no longer runs carries no root, and one admitted again
+    /// under the same id starts empty.
+    pub async fn remove_program(&mut self, program: &str) -> Result<()> {
+        let Some(commitment) = self.commitments.remove(program) else {
+            return Ok(());
+        };
+        commitment.into_db()?.destroy().await?;
+        Ok(())
+    }
+
     async fn reconcile(&mut self) -> Result<()> {
         let Some(height) = self.storage.height()? else {
             return Ok(());

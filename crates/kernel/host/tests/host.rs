@@ -104,6 +104,17 @@ async fn found(context: Ctx, name: &str, dir: &Path, genesis: Genesis) -> Host<C
         .0
 }
 
+/// Restarts `host` over its directory and asserts the restarted node's root
+/// is the running node's: a commitment the running node still holds that a
+/// reopened one would not open is a root the two disagree on.
+async fn restart(context: Ctx, dir: &Path, host: Host<Ctx>) -> Host<Ctx> {
+    let root = host.root().unwrap();
+    drop(host);
+    let reopened = Host::open(context, "net", dir).await.unwrap();
+    assert_eq!(reopened.root().unwrap(), root);
+    reopened
+}
+
 fn script(steps: Vec<Step>) -> Vec<u8> {
     abi::encode(&steps)
 }
@@ -890,7 +901,7 @@ fn an_epoch_is_recorded_as_the_block_ending_the_one_before_commits() {
 fn the_roster_admits_swaps_and_drops_programs() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
-        let mut host = found(context, "net", dir.path(), standard()).await;
+        let mut host = found(context.child("found"), "net", dir.path(), standard()).await;
         let programs = host.programs().unwrap();
         let relay = programs["ping"];
         let probe = programs["probe"];
@@ -969,6 +980,8 @@ fn the_roster_admits_swaps_and_drops_programs() {
         let applied = host.apply(block(7, Vec::new())).await.unwrap();
         assert!(applied.admissions.is_empty());
         assert!(!host.programs().unwrap().contains_key("echo"));
+        assert!(host.store().commitment("echo").is_none());
+        let mut host = restart(context.child("restart"), dir.path(), host).await;
         let applied = host
             .apply(block(8, vec![submit(4, "echo", script(Vec::new()))]))
             .await
@@ -1036,7 +1049,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
 fn a_program_identity_gives_no_account_is_not_admitted() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
-        let mut host = found(context, "net", dir.path(), standard()).await;
+        let mut host = found(context.child("found"), "net", dir.path(), standard()).await;
         let relay = host.programs().unwrap()["ping"];
         let closed = |seq, number: u64| {
             submit(
@@ -1068,8 +1081,10 @@ fn a_program_identity_gives_no_account_is_not_admitted() {
                 ]
             );
             assert!(!host.programs().unwrap().contains_key("late"));
+            assert!(host.store().commitment("late").is_none());
             assert_eq!(account_of(&host, "late").await, None);
         }
+        let mut host = restart(context.child("restart"), dir.path(), host).await;
         let applied = host
             .apply(block(
                 4,

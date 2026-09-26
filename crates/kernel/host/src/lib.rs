@@ -1032,6 +1032,18 @@ where
         let writes = overlay.into_writes();
         self.blobs.promote(stage)?;
         self.store.commit(tip.height, writes.clone()).await?;
+        // a commitment outlives neither its program's drop nor an undone
+        // admission: the root is over the programs a reopened node opens
+        let running: BTreeSet<ProgramId> = programs_in(self.store.storage())?.into_iter().collect();
+        let stale: Vec<ProgramId> = self
+            .store
+            .programs()
+            .filter(|program| !running.contains(*program))
+            .cloned()
+            .collect();
+        for program in stale {
+            self.store.remove_program(&program).await?;
+        }
         self.preconfirmed = Overlay::default();
         Ok(Applied {
             height: tip.height,
