@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use abi::{HostOp, Root, valset};
+use abi::{HostOp, Root, role::validators};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_p2p::simulated::{self, Link, Oracle};
 use commonware_runtime::{Quota, Runner as _, Spawner as _, Supervisor as _, deterministic};
@@ -16,7 +16,7 @@ use consensus::{
 use fixture_probe::Step;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use host::{Founding, Genesis, Layer, Limits};
+use host::{Founding, Genesis, Layer, Limits, Roles};
 use node::{Block, Frame, Node, Sequenced};
 
 const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
@@ -53,20 +53,38 @@ fn key(seed: u64) -> ed25519::PrivateKey {
     ed25519::PrivateKey::from_seed(seed)
 }
 
-fn member(key: &ed25519::PrivateKey) -> valset::Member {
-    valset::Member {
+fn member(key: &ed25519::PrivateKey) -> validators::Member {
+    validators::Member {
         key: key.public_key().as_ref().to_vec(),
         address: format!("{}:1", key.public_key()),
     }
 }
 
-fn genesis(members: &[valset::Member], epoch_length: u64) -> Genesis {
+fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        module_registry: MODULE_REGISTRY.to_vec(),
-        valset: VALSET.to_vec(),
+        roles: Roles {
+            registry: "module-registry".into(),
+            validators: "valset".into(),
+            identity: "identity".into(),
+        },
         validators: members.to_vec(),
         programs: vec![
+            Founding {
+                program: "module-registry".into(),
+                code: MODULE_REGISTRY.to_vec(),
+                params: Vec::new(),
+            },
+            Founding {
+                program: "valset".into(),
+                code: VALSET.to_vec(),
+                params: Vec::new(),
+            },
+            Founding {
+                program: "identity".into(),
+                code: RELAY.to_vec(),
+                params: Vec::new(),
+            },
             Founding {
                 program: "ping".into(),
                 code: RELAY.to_vec(),
@@ -201,7 +219,7 @@ impl Peer {
         name: &'static str,
         oracle: &Oracle<ed25519::PublicKey, Ctx>,
         key: ed25519::PrivateKey,
-        members: &[valset::Member],
+        members: &[validators::Member],
         network: Network,
     ) -> Peer {
         let dir = tempfile::tempdir().unwrap();
@@ -354,7 +372,7 @@ async fn validators(
     context: &Ctx,
     oracle: &Oracle<ed25519::PublicKey, Ctx>,
     keys: &[ed25519::PrivateKey],
-    members: &[valset::Member],
+    members: &[validators::Member],
     network: &Network,
 ) -> Vec<Peer> {
     let mut peers = Vec::new();

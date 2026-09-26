@@ -8,7 +8,8 @@ use std::path::Path;
 
 use abi::{
     BlobId, Cause, Env, GuestCall, HashKind, Invocation, ItemRef, Origin, Outcome, ProgramId,
-    Refusal, Root, Scan, module_registry, reason, valset,
+    Refusal, Root, Scan, reason,
+    role::{registry, validators},
 };
 use blobs::{Blobs, Layered, Stage};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -49,6 +50,11 @@ pub enum Error {
         program: ProgramId,
         refusal: Refusal,
     },
+    #[error("genesis binds the {role} role to {program:?}, which is not a founding program")]
+    Unbound {
+        role: &'static str,
+        program: ProgramId,
+    },
     #[error("no network was founded here")]
     Unfounded,
     #[error("host state is corrupt: {0}")]
@@ -61,9 +67,11 @@ pub type BlockId = [u8; 32];
 
 pub struct Genesis {
     pub network: Vec<u8>,
-    pub module_registry: Vec<u8>,
-    pub valset: Vec<u8>,
-    pub validators: Vec<valset::Member>,
+    pub roles: Roles,
+    /// The validators program's founding params: the kernel writes them.
+    pub validators: Vec<validators::Member>,
+    /// The registry's founding params are the kernel's too: every founding
+    /// program and view.
     pub programs: Vec<Founding>,
     /// Views with no program behind them: each blob is stored and listed by
     /// the registry under its name; nothing is admitted.
@@ -71,6 +79,16 @@ pub struct Genesis {
     pub limits: Limits,
     pub epoch_length: u64,
     pub time: u64,
+}
+
+/// The founding program that fills each role the kernel calls. A genesis
+/// that leaves a role empty, or names a program it does not found, is refused.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Roles {
+    pub registry: ProgramId,
+    pub validators: ProgramId,
+    /// Bound and required now; the kernel calls it from the next step on.
+    pub identity: ProgramId,
 }
 
 pub struct Founding {
@@ -141,6 +159,7 @@ where
     store: Store<E>,
     blobs: Blobs,
     network: Vec<u8>,
+    roles: Roles,
     loaded: Loaded,
     preconfirmed: Overlay,
 }
@@ -163,6 +182,7 @@ where
             store,
             blobs,
             network: genesis.network.clone(),
+            roles: genesis.roles.clone(),
             loaded: Loaded::new(genesis.limits),
             preconfirmed: Overlay::default(),
         };
@@ -179,31 +199,53 @@ where
             namespace::EPOCH_LENGTH.to_vec(),
             abi::encode(&genesis.epoch_length),
         );
-        let mut entries = vec![
-            module_registry::Entry {
-                program: module_registry::PROGRAM.to_owned(),
-                code: put_code(&mut overlay, &mut stage, &genesis.module_registry),
-                params: Vec::new(),
-            },
-            module_registry::Entry {
-                program: valset::PROGRAM.to_owned(),
-                code: put_code(&mut overlay, &mut stage, &genesis.valset),
-                params: abi::encode(&valset::Genesis {
-                    validators: genesis.validators,
-                }),
-            },
-        ];
-        for founding in genesis.programs {
-            entries.push(module_registry::Entry {
+        overlay.set(
+            NETWORK,
+            namespace::ROLES.to_vec(),
+            abi::encode(&genesis.roles),
+        );
+        let mut entries: Vec<registry::Entry> = genesis
+            .programs
+            .into_iter()
+            .map(|founding| registry::Entry {
                 program: founding.program,
                 code: put_code(&mut overlay, &mut stage, &founding.code),
                 params: founding.params,
-            });
+            })
+            .collect();
+        let roles = &genesis.roles;
+        for (role, program) in [
+            ("registry", &roles.registry),
+            ("validators", &roles.validators),
+            ("identity", &roles.identity),
+        ] {
+            let founded = entries.iter().any(|entry| entry.program == *program);
+            if !founded {
+                return Err(Error::Unbound {
+                    role,
+                    program: program.clone(),
+                });
+            }
         }
-        let views: Vec<module_registry::View> = genesis
+        // the registry, then the validators, are admitted before the rest
+        entries.sort_by_key(|entry| {
+            [&roles.registry, &roles.validators]
+                .iter()
+                .position(|role| **role == entry.program)
+                .unwrap_or(2)
+        });
+        let params = abi::encode(&validators::Genesis {
+            validators: genesis.validators,
+        });
+        for entry in entries.iter_mut() {
+            if entry.program == roles.validators {
+                entry.params = params.clone();
+            }
+        }
+        let views: Vec<registry::View> = genesis
             .views
             .into_iter()
-            .map(|founding| module_registry::View {
+            .map(|founding| registry::View {
                 name: founding.name,
                 view: put_code(&mut overlay, &mut stage, &founding.view),
             })
@@ -222,7 +264,7 @@ where
                 });
             }
         }
-        entries[0].params = abi::encode(&module_registry::Genesis {
+        entries[0].params = abi::encode(&registry::Genesis {
             programs: entries.clone(),
             views,
         });
@@ -288,10 +330,16 @@ where
             .view(Vec::new())
             .get(NETWORK, namespace::ID)?
             .ok_or_else(|| Error::Corrupt("the network records no id".into()))?;
+        let roles = store
+            .view(Vec::new())
+            .get(NETWORK, namespace::ROLES)?
+            .ok_or_else(|| Error::Corrupt("the network records no roles".into()))?;
+        let roles = abi::decode(&roles).map_err(corrupt)?;
         let mut host = Host {
             store,
             blobs,
             network,
+            roles,
             loaded: Loaded::new(limits),
             preconfirmed: Overlay::default(),
         };
@@ -358,7 +406,7 @@ where
         abi::decode(&bytes).map_err(corrupt)
     }
 
-    pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<valset::Member>>> {
+    pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<validators::Member>>> {
         self.store
             .view(Vec::new())
             .get(NETWORK, &namespace::epoch(epoch))?
@@ -484,16 +532,18 @@ where
             stage,
             &[],
             Origin::System,
-            valset::PROGRAM.to_owned(),
-            abi::encode(&valset::Query::Members),
+            self.roles.validators.clone(),
+            abi::encode(&validators::Query::Members),
         )
         .await?;
         let bytes = reply.map_err(|refusal| {
-            Error::Corrupt(format!("valset refused the members query: {refusal}"))
+            Error::Corrupt(format!(
+                "the validators program refused the members query: {refusal}"
+            ))
         })?;
-        let valset::Reply::Members(members) = abi::decode(&bytes).map_err(corrupt)? else {
+        let validators::Reply::Members(members) = abi::decode(&bytes).map_err(corrupt)? else {
             return Err(Error::Corrupt(
-                "valset answered Members with another reply".into(),
+                "the validators program answered Members with another reply".into(),
             ));
         };
         overlay.set(NETWORK, namespace::epoch(epoch), abi::encode(&members));
@@ -658,16 +708,14 @@ where
             &*stage,
             &[],
             Origin::System,
-            module_registry::PROGRAM.to_owned(),
-            abi::encode(&module_registry::Query::At(height)),
+            self.roles.registry.clone(),
+            abi::encode(&registry::Query::At(height)),
         )
         .await?;
         let Ok(bytes) = reply else {
             return Ok(Vec::new());
         };
-        let Ok(module_registry::Reply::Programs(entries)) =
-            abi::decode::<module_registry::Reply>(&bytes)
-        else {
+        let Ok(registry::Reply::Programs(entries)) = abi::decode::<registry::Reply>(&bytes) else {
             return Ok(Vec::new());
         };
         let running = programs_of(&View::new(self.store.storage(), vec![&*overlay]))?;
@@ -703,7 +751,7 @@ where
 
     async fn admit(
         &mut self,
-        entry: &module_registry::Entry,
+        entry: &registry::Entry,
         height: u64,
         time: u64,
         overlay: &mut Overlay,
@@ -747,7 +795,7 @@ where
 
     fn swap(
         &mut self,
-        entry: &module_registry::Entry,
+        entry: &registry::Entry,
         overlay: &mut Overlay,
         stage: &Stage,
     ) -> Result<Receipt> {
@@ -770,7 +818,7 @@ where
 
     fn load(
         &self,
-        entry: &module_registry::Entry,
+        entry: &registry::Entry,
         stage: &Stage,
     ) -> Result<std::result::Result<runtime::Code, Refusal>> {
         let layered = Layered {

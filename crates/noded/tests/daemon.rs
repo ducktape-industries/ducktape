@@ -126,8 +126,12 @@ fn founding(root: &Path, seats: &[&Seat]) -> PathBuf {
     let validators: String = seats.iter().map(|seat| seat.validator()).collect();
     let text = format!(
         "network = \"{NETWORK}\"\ntime = {TIME}\nepoch_length = {EPOCH_LENGTH}\n\
-         block_time_ms = {BLOCK_TIME_MS}\nmodule-registry = \"module_registry.wasm\"\nvalset = \"valset.wasm\"\n\
+         block_time_ms = {BLOCK_TIME_MS}\n\
+         [roles]\nregistry = \"module-registry\"\nvalidators = \"valset\"\nidentity = \"identity\"\n\
          {validators}\
+         [[programs]]\nid = \"module-registry\"\ncode = \"module_registry.wasm\"\n\
+         [[programs]]\nid = \"valset\"\ncode = \"valset.wasm\"\n\
+         [[programs]]\nid = \"identity\"\ncode = \"relay.wasm\"\n\
          [[programs]]\nid = \"ping\"\ncode = \"relay.wasm\"\n\
          [[programs]]\nid = \"probe\"\ncode = \"probe.wasm\"\nparams = \"params.bin\"\n"
     );

@@ -1,9 +1,9 @@
-use abi::{ProgramId, module_registry};
+use abi::{ProgramId, role::registry};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 #[derive(BorshSerialize, BorshDeserialize)]
 pub enum Change {
-    Set(module_registry::Entry),
+    Set(registry::Entry),
     Remove(ProgramId),
 }
 
@@ -13,7 +13,7 @@ pub fn key(program: &str) -> Vec<u8> {
 
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::{Env, Refusal, Scan, module_registry};
+    use abi::{Env, Refusal, Scan, role::registry};
     use guest::{Execute, Program, Query, Reads};
 
     use crate::{Change, key};
@@ -22,7 +22,7 @@ mod program {
 
     impl Program for Modules {
         fn init(ctx: &mut Execute, _env: &Env, params: &[u8]) -> Result<(), Refusal> {
-            let genesis: module_registry::Genesis = abi::decode(params)?;
+            let genesis: registry::Genesis = abi::decode(params)?;
             for entry in genesis.programs {
                 ctx.set(key(&entry.program), abi::encode(&entry));
             }
@@ -38,13 +38,13 @@ mod program {
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {
-            let module_registry::Query::At(_) = abi::decode(request)?;
+            let registry::Query::At(_) = abi::decode(request)?;
             let programs = ctx
                 .scan(Scan::prefix(b"p/"))
                 .into_iter()
                 .map(|entry| abi::decode(&entry.value))
-                .collect::<Result<Vec<module_registry::Entry>, Refusal>>()?;
-            ctx.respond(abi::encode(&module_registry::Reply::Programs(programs)));
+                .collect::<Result<Vec<registry::Entry>, Refusal>>()?;
+            ctx.respond(abi::encode(&registry::Reply::Programs(programs)));
             Ok(())
         }
     }

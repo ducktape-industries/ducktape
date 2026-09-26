@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use abi::valset::Member;
+use abi::role::validators::Member;
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_p2p::authenticated::lookup::{Config, Network, Oracle, Receiver, Sender};

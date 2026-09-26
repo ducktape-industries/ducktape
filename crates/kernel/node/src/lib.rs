@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-use abi::{BlobId, Origin, Outcome, ProgramId, Refusal, valset};
+use abi::{BlobId, Origin, Outcome, ProgramId, Refusal, role::validators};
 use commonware_cryptography::Digestible as _;
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
@@ -114,7 +114,7 @@ where
         Ok(self.host.epoch_length()?)
     }
 
-    pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<valset::Member>>> {
+    pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<validators::Member>>> {
         Ok(self.host.epoch_members(epoch)?)
     }
 

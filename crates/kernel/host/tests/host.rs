@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use abi::{
     Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
-    HostReply, ItemRef, Message, Origin, Outcome, Refusal, Scan, Scheme, module_registry, reason,
-    valset,
+    HostReply, ItemRef, Message, Origin, Outcome, Refusal, Scan, Scheme, reason,
+    role::{registry, validators},
 };
 use commonware_codec::Encode as _;
 use commonware_cryptography::bls12381::primitives::group::{Private, Scalar};
@@ -17,7 +17,7 @@ use fixture_module_registry::Change;
 use fixture_probe::{Reply, Step};
 use host::{
     BLOBS, Block, BlockId, Delivered, Error, Founding, FoundingView, Genesis, Host, Layer, Limits,
-    NETWORK, QUEUE, Receipt, SIGNERS, Submission, Tip,
+    NETWORK, QUEUE, Receipt, Roles, SIGNERS, Submission, Tip,
 };
 use keyscheme::testkit;
 use sha2::Digest as _;
@@ -34,8 +34,8 @@ const TIME: u64 = 1_700_000_000;
 
 type Ctx = deterministic::Context;
 
-fn member(key: &[u8], address: &str) -> valset::Member {
-    valset::Member {
+fn member(key: &[u8], address: &str) -> validators::Member {
+    validators::Member {
         key: key.to_vec(),
         address: address.to_owned(),
     }
@@ -49,13 +49,23 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
     }
 }
 
+/// The registry, the validators and a stand-in identity (the kernel does not
+/// call identity yet), then `programs`.
 fn genesis(programs: Vec<Founding>) -> Genesis {
+    let roles = vec![
+        founding("module-registry", MODULE_REGISTRY, Vec::new()),
+        founding("valset", VALSET, Vec::new()),
+        founding("identity", RELAY, Vec::new()),
+    ];
     Genesis {
         network: b"net".to_vec(),
-        module_registry: MODULE_REGISTRY.to_vec(),
-        valset: VALSET.to_vec(),
+        roles: Roles {
+            registry: "module-registry".into(),
+            validators: "valset".into(),
+            identity: "identity".into(),
+        },
         validators: vec![member(b"v1", "v1:1")],
-        programs,
+        programs: roles.into_iter().chain(programs).collect(),
         views: Vec::new(),
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
@@ -188,7 +198,7 @@ fn ok(output: &[u8]) -> Outcome {
 }
 
 fn change(program: &str, code: BlobId, params: Vec<u8>) -> Vec<u8> {
-    abi::encode(&Change::Set(module_registry::Entry {
+    abi::encode(&Change::Set(registry::Entry {
         program: program.to_owned(),
         code,
         params,
@@ -222,7 +232,14 @@ fn founding_admits_every_program_and_the_host_reopens() {
             .collect();
         assert_eq!(
             admitted,
-            ["module-registry", "valset", "ping", "pong", "probe"]
+            [
+                "module-registry",
+                "valset",
+                "identity",
+                "ping",
+                "pong",
+                "probe"
+            ]
         );
         assert!(applied.deliveries.is_empty());
         for receipt in &applied.admissions {
@@ -233,7 +250,17 @@ fn founding_admits_every_program_and_the_host_reopens() {
         }
         let programs = host.programs().unwrap();
         let ids: Vec<&str> = programs.keys().map(String::as_str).collect();
-        assert_eq!(ids, ["module-registry", "ping", "pong", "probe", "valset"]);
+        assert_eq!(
+            ids,
+            [
+                "identity",
+                "module-registry",
+                "ping",
+                "pong",
+                "probe",
+                "valset"
+            ]
+        );
         assert_eq!(programs["ping"], programs["pong"]);
         assert_ne!(programs["ping"], programs["probe"]);
         assert_eq!(
@@ -281,6 +308,23 @@ fn founding_admits_every_program_and_the_host_reopens() {
                 cause: Cause::Direct,
             })]
         );
+    });
+}
+
+#[test]
+fn founding_refuses_an_unbound_role() {
+    deterministic::Runner::default().start(|context| async move {
+        for (name, identity) in [("empty", ""), ("unfounded", "nobody")] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut unbound = standard();
+            unbound.roles.identity = identity.into();
+            let Err(Error::Unbound { role, program }) =
+                Host::found(context.child(name), name, dir.path(), block_id(0), unbound).await
+            else {
+                panic!("a genesis with identity bound to {identity:?} was founded");
+            };
+            assert_eq!((role, program.as_str()), ("identity", identity));
+        }
     });
 }
 
@@ -855,7 +899,17 @@ fn the_roster_admits_swaps_and_drops_programs() {
         );
         let programs = host.programs().unwrap();
         let ids: Vec<&str> = programs.keys().map(String::as_str).collect();
-        assert_eq!(ids, ["module-registry", "ping", "pong", "probe", "valset"]);
+        assert_eq!(
+            ids,
+            [
+                "identity",
+                "module-registry",
+                "ping",
+                "pong",
+                "probe",
+                "valset"
+            ]
+        );
         let applied = host.apply(block(11, Vec::new())).await.unwrap();
         assert_eq!(applied.admissions.len(), 1);
     });

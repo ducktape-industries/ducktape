@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use abi::valset::Member;
+use abi::role::validators::Member;
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use consensus::{Anchor, Cadence};
-use host::{Founding as FoundingProgram, FoundingView, Genesis, Limits};
+use host::{Founding as FoundingProgram, FoundingView, Genesis, Limits, Roles};
 use node::Block;
 use rand_core::CryptoRng;
 use serde::Deserialize;
@@ -138,15 +138,21 @@ pub struct Founding {
     pub time: u64,
     pub epoch_length: u64,
     pub block_time_ms: u64,
-    #[serde(rename = "module-registry")]
-    pub module_registry: PathBuf,
-    pub valset: PathBuf,
+    pub roles: RoleIds,
     pub validators: Vec<Validator>,
     pub programs: Vec<Program>,
     #[serde(default)]
     pub views: Vec<View>,
     #[serde(default)]
     pub limits: Metering,
+}
+
+/// Which founding program fills each role the kernel calls.
+#[derive(Debug, Deserialize)]
+pub struct RoleIds {
+    pub registry: String,
+    pub validators: String,
+    pub identity: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -229,8 +235,11 @@ impl Founding {
             .collect::<Result<Vec<_>>>()?;
         Ok(Genesis {
             network: self.network.as_bytes().to_vec(),
-            module_registry: std::fs::read(base.join(&self.module_registry))?,
-            valset: std::fs::read(base.join(&self.valset))?,
+            roles: Roles {
+                registry: self.roles.registry.clone(),
+                validators: self.roles.validators.clone(),
+                identity: self.roles.identity.clone(),
+            },
             validators,
             programs,
             views,

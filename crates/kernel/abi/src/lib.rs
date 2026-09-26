@@ -328,69 +328,73 @@ pub enum GuestCall {
 
 pub type GuestReply = Result<(), Refusal>;
 
-pub mod module_registry {
-    use super::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
+/// The kernel calls programs by role, never by id: genesis binds each role
+/// (registry, validators, identity) to a founding program. Each module here is
+/// the interface the kernel speaks to the program in that role. Identity's
+/// is not here yet: the kernel does not call it.
+pub mod role {
+    /// Which code runs at a height.
+    pub mod registry {
+        use crate::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
 
-    pub const PROGRAM: &str = "module-registry";
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Entry {
+            pub program: ProgramId,
+            pub code: BlobId,
+            pub params: Vec<u8>,
+        }
 
-    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-    pub struct Entry {
-        pub program: ProgramId,
-        pub code: BlobId,
-        pub params: Vec<u8>,
+        /// A view with no program behind it: its name on the rail and the blob
+        /// that is the view itself.
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct View {
+            pub name: ProgramId,
+            pub view: BlobId,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Query {
+            At(u64),
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Reply {
+            Programs(Vec<Entry>),
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Genesis {
+            pub programs: Vec<Entry>,
+            pub views: Vec<View>,
+        }
     }
 
-    /// A view with no program behind it: its name on the rail and the blob
-    /// that is the view itself.
-    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-    pub struct View {
-        pub name: ProgramId,
-        pub view: BlobId,
-    }
+    /// The consensus set.
+    pub mod validators {
+        use crate::{BorshDeserialize, BorshSerialize};
 
-    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-    pub enum Query {
-        At(u64),
-    }
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Member {
+            pub key: Vec<u8>,
+            pub address: String,
+        }
 
-    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-    pub enum Reply {
-        Programs(Vec<Entry>),
-    }
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Query {
+            Validators,
+            Members,
+        }
 
-    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-    pub struct Genesis {
-        pub programs: Vec<Entry>,
-        pub views: Vec<View>,
-    }
-}
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Reply {
+            Validators(Vec<Vec<u8>>),
+            Members(Vec<Member>),
+        }
 
-pub mod valset {
-    use super::{BorshDeserialize, BorshSerialize};
-
-    pub const PROGRAM: &str = "valset";
-
-    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-    pub struct Member {
-        pub key: Vec<u8>,
-        pub address: String,
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-    pub enum Query {
-        Validators,
-        Members,
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-    pub enum Reply {
-        Validators(Vec<Vec<u8>>),
-        Members(Vec<Member>),
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-    pub struct Genesis {
-        pub validators: Vec<Member>,
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Genesis {
+            pub validators: Vec<Member>,
+        }
     }
 }
 
