@@ -6,6 +6,7 @@ use futures::future::{Either, select};
 use tokio::sync::{mpsc, oneshot};
 use wasmtime::{
     Caller, Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
+    WasmBacktraceDetails,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -72,6 +73,9 @@ impl Runtime {
         let mut config = Config::new();
         config
             .consume_fuel(limits.fuel.is_some())
+            // a trap's sentence reaches a reply run's `Completion`, so state:
+            // it must not read the node's `WASMTIME_BACKTRACE_DETAILS`
+            .wasm_backtrace_details(WasmBacktraceDetails::Disable)
             .cranelift_nan_canonicalization(true)
             .wasm_simd(false)
             .wasm_relaxed_simd(false)
