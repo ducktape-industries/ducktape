@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use abi::{HostOp, valset};
+use abi::{HostOp, role::validators};
 use commonware_consensus::marshal::Start;
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_consensus::simplex::types::{Finalization, Finalize, Proposal};
@@ -13,13 +13,14 @@ use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use commonware_utils::iter::NonEmpty;
 use consensus::{Certificate, validators_of};
 use fixture_probe::Step;
-use host::{Founding, Genesis, Layer, Limits, Tip};
+use host::{Founding, Genesis, Layer, Limits, Roles, Tip};
 use node::{Block, Frame, Node, Sequenced};
 use statesync::{Anchor, Anchors, Error, Exchange, Request, Response, join, serve};
 
 const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
+const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"sync";
@@ -33,20 +34,38 @@ fn key(seed: u64) -> ed25519::PrivateKey {
     ed25519::PrivateKey::from_seed(seed)
 }
 
-fn member(key: &ed25519::PrivateKey) -> valset::Member {
-    valset::Member {
+fn member(key: &ed25519::PrivateKey) -> validators::Member {
+    validators::Member {
         key: key.public_key().as_ref().to_vec(),
         address: format!("{}:1", key.public_key()),
     }
 }
 
-fn genesis(members: &[valset::Member]) -> Genesis {
+fn genesis(members: &[validators::Member]) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        module_registry: MODULE_REGISTRY.to_vec(),
-        valset: VALSET.to_vec(),
+        roles: Roles {
+            registry: "module-registry".into(),
+            validators: "valset".into(),
+            identity: "identity".into(),
+        },
         validators: members.to_vec(),
         programs: vec![
+            Founding {
+                program: "module-registry".into(),
+                code: MODULE_REGISTRY.to_vec(),
+                params: Vec::new(),
+            },
+            Founding {
+                program: "valset".into(),
+                code: VALSET.to_vec(),
+                params: Vec::new(),
+            },
+            Founding {
+                program: "identity".into(),
+                code: IDENTITY.to_vec(),
+                params: abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
+            },
             Founding {
                 program: "ping".into(),
                 code: RELAY.to_vec(),
@@ -85,7 +104,11 @@ async fn seal(node: &mut Node<Ctx>) -> Block {
     block
 }
 
-fn certify(signers: &[ed25519::PrivateKey], members: &[valset::Member], tip: Tip) -> Certificate {
+fn certify(
+    signers: &[ed25519::PrivateKey],
+    members: &[validators::Member],
+    tip: Tip,
+) -> Certificate {
     let validators = validators_of(members).unwrap();
     let epoch = tip.height / EPOCH_LENGTH;
     let proposal = Proposal::new(
@@ -158,7 +181,7 @@ impl Exchange for Refusing {
 
 struct Network {
     keys: Vec<ed25519::PrivateKey>,
-    members: Vec<valset::Member>,
+    members: Vec<validators::Member>,
     source: Arc<Source>,
     _dir: tempfile::TempDir,
 }

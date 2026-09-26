@@ -17,6 +17,7 @@ const MODULE_REGISTRY: &[u8] =
     include_bytes!("../../kernel/fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_relay.wasm");
+const IDENTITY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_identity.wasm");
 const PROBE: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &str = "daemon";
@@ -122,12 +123,22 @@ fn founding(root: &Path, seats: &[&Seat]) -> PathBuf {
     std::fs::write(root.join("valset.wasm"), VALSET).unwrap();
     std::fs::write(root.join("relay.wasm"), RELAY).unwrap();
     std::fs::write(root.join("probe.wasm"), PROBE).unwrap();
+    std::fs::write(root.join("identity.wasm"), IDENTITY).unwrap();
+    std::fs::write(
+        root.join("holders.bin"),
+        abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
+    )
+    .unwrap();
     std::fs::write(root.join("params.bin"), abi::encode(&Vec::<Step>::new())).unwrap();
     let validators: String = seats.iter().map(|seat| seat.validator()).collect();
     let text = format!(
         "network = \"{NETWORK}\"\ntime = {TIME}\nepoch_length = {EPOCH_LENGTH}\n\
-         block_time_ms = {BLOCK_TIME_MS}\nmodule-registry = \"module_registry.wasm\"\nvalset = \"valset.wasm\"\n\
+         block_time_ms = {BLOCK_TIME_MS}\n\
+         [roles]\nregistry = \"module-registry\"\nvalidators = \"valset\"\nidentity = \"identity\"\n\
          {validators}\
+         [[programs]]\nid = \"module-registry\"\ncode = \"module_registry.wasm\"\n\
+         [[programs]]\nid = \"valset\"\ncode = \"valset.wasm\"\n\
+         [[programs]]\nid = \"identity\"\ncode = \"identity.wasm\"\nparams = \"holders.bin\"\n\
          [[programs]]\nid = \"ping\"\ncode = \"relay.wasm\"\n\
          [[programs]]\nid = \"probe\"\ncode = \"probe.wasm\"\nparams = \"params.bin\"\n"
     );

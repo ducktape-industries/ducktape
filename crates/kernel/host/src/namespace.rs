@@ -11,6 +11,7 @@ pub const ID: &[u8] = b"id";
 pub const LIMITS: &[u8] = b"limits";
 pub const EPOCH_LENGTH: &[u8] = b"epoch_length";
 pub const TIP: &[u8] = b"tip";
+pub const ROLES: &[u8] = b"roles";
 
 pub fn blob(id: &BlobId) -> Vec<u8> {
     abi::encode(id)

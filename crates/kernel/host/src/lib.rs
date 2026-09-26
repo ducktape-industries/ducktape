@@ -6,9 +6,13 @@ mod unit;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+/// The founding program that fills each role the kernel calls. A genesis
+/// that leaves a role empty, or names a program it does not found, is refused.
+pub use abi::Roles;
 use abi::{
-    BlobId, Cause, Env, GuestCall, HashKind, Invocation, ItemRef, Origin, Outcome, ProgramId,
-    Refusal, Root, Scan, module_registry, reason, valset,
+    BlobId, Cause, Env, GuestCall, HashKind, Invocation, ItemRef, Origin, Outcome, Principal,
+    ProgramId, Refusal, Root, Scan, reason,
+    role::{identity, registry, validators},
 };
 use blobs::{Blobs, Layered, Stage};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -49,6 +53,11 @@ pub enum Error {
         program: ProgramId,
         refusal: Refusal,
     },
+    #[error("genesis binds the {role} role to {program:?}, which is not a founding program")]
+    Unbound {
+        role: &'static str,
+        program: ProgramId,
+    },
     #[error("no network was founded here")]
     Unfounded,
     #[error("host state is corrupt: {0}")]
@@ -61,9 +70,11 @@ pub type BlockId = [u8; 32];
 
 pub struct Genesis {
     pub network: Vec<u8>,
-    pub module_registry: Vec<u8>,
-    pub valset: Vec<u8>,
-    pub validators: Vec<valset::Member>,
+    pub roles: Roles,
+    /// The validators program's founding params: the kernel writes them.
+    pub validators: Vec<validators::Member>,
+    /// The registry's founding params are the kernel's too: every founding
+    /// program and view.
     pub programs: Vec<Founding>,
     /// Views with no program behind them: each blob is stored and listed by
     /// the registry under its name; nothing is admitted.
@@ -141,6 +152,7 @@ where
     store: Store<E>,
     blobs: Blobs,
     network: Vec<u8>,
+    roles: Roles,
     loaded: Loaded,
     preconfirmed: Overlay,
 }
@@ -163,6 +175,7 @@ where
             store,
             blobs,
             network: genesis.network.clone(),
+            roles: genesis.roles.clone(),
             loaded: Loaded::new(genesis.limits),
             preconfirmed: Overlay::default(),
         };
@@ -179,31 +192,53 @@ where
             namespace::EPOCH_LENGTH.to_vec(),
             abi::encode(&genesis.epoch_length),
         );
-        let mut entries = vec![
-            module_registry::Entry {
-                program: module_registry::PROGRAM.to_owned(),
-                code: put_code(&mut overlay, &mut stage, &genesis.module_registry),
-                params: Vec::new(),
-            },
-            module_registry::Entry {
-                program: valset::PROGRAM.to_owned(),
-                code: put_code(&mut overlay, &mut stage, &genesis.valset),
-                params: abi::encode(&valset::Genesis {
-                    validators: genesis.validators,
-                }),
-            },
-        ];
-        for founding in genesis.programs {
-            entries.push(module_registry::Entry {
+        overlay.set(
+            NETWORK,
+            namespace::ROLES.to_vec(),
+            abi::encode(&genesis.roles),
+        );
+        let mut entries: Vec<registry::Entry> = genesis
+            .programs
+            .into_iter()
+            .map(|founding| registry::Entry {
                 program: founding.program,
                 code: put_code(&mut overlay, &mut stage, &founding.code),
                 params: founding.params,
-            });
+            })
+            .collect();
+        let roles = &genesis.roles;
+        for (role, program) in [
+            ("registry", &roles.registry),
+            ("validators", &roles.validators),
+            ("identity", &roles.identity),
+        ] {
+            let founded = entries.iter().any(|entry| entry.program == *program);
+            if !founded {
+                return Err(Error::Unbound {
+                    role,
+                    program: program.clone(),
+                });
+            }
         }
-        let views: Vec<module_registry::View> = genesis
+        // the registry, then the validators, are admitted before the rest
+        entries.sort_by_key(|entry| {
+            [&roles.registry, &roles.validators]
+                .iter()
+                .position(|role| **role == entry.program)
+                .unwrap_or(2)
+        });
+        let params = abi::encode(&validators::Genesis {
+            validators: genesis.validators,
+        });
+        for entry in entries.iter_mut() {
+            if entry.program == roles.validators {
+                entry.params = params.clone();
+            }
+        }
+        let views: Vec<registry::View> = genesis
             .views
             .into_iter()
-            .map(|founding| module_registry::View {
+            .map(|founding| registry::View {
                 name: founding.name,
                 view: put_code(&mut overlay, &mut stage, &founding.view),
             })
@@ -222,7 +257,7 @@ where
                 });
             }
         }
-        entries[0].params = abi::encode(&module_registry::Genesis {
+        entries[0].params = abi::encode(&registry::Genesis {
             programs: entries.clone(),
             views,
         });
@@ -230,6 +265,20 @@ where
         for entry in &entries {
             let receipt = host
                 .admit(entry, 0, genesis.time, &mut overlay, &mut stage)
+                .await?;
+            if let Outcome::Rejected(refusal) = &receipt.outcome {
+                return Err(Error::Genesis {
+                    program: entry.program.clone(),
+                    refusal: refusal.clone(),
+                });
+            }
+            receipts.push(receipt);
+        }
+        // every founding program has its account before any frame runs:
+        // the identity role is admitted by now
+        for entry in &entries {
+            let receipt = host
+                .register(&entry.program, 0, genesis.time, &mut overlay, &mut stage)
                 .await?;
             if let Outcome::Rejected(refusal) = &receipt.outcome {
                 return Err(Error::Genesis {
@@ -288,10 +337,16 @@ where
             .view(Vec::new())
             .get(NETWORK, namespace::ID)?
             .ok_or_else(|| Error::Corrupt("the network records no id".into()))?;
+        let roles = store
+            .view(Vec::new())
+            .get(NETWORK, namespace::ROLES)?
+            .ok_or_else(|| Error::Corrupt("the network records no roles".into()))?;
+        let roles = abi::decode(&roles).map_err(corrupt)?;
         let mut host = Host {
             store,
             blobs,
             network,
+            roles,
             loaded: Loaded::new(limits),
             preconfirmed: Overlay::default(),
         };
@@ -358,7 +413,7 @@ where
         abi::decode(&bytes).map_err(corrupt)
     }
 
-    pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<valset::Member>>> {
+    pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<validators::Member>>> {
         self.store
             .view(Vec::new())
             .get(NETWORK, &namespace::epoch(epoch))?
@@ -440,6 +495,7 @@ where
             blobs: &self.blobs,
             loaded: &self.loaded,
             network: &self.network,
+            roles: &self.roles,
             height,
             time,
         }
@@ -484,16 +540,18 @@ where
             stage,
             &[],
             Origin::System,
-            valset::PROGRAM.to_owned(),
-            abi::encode(&valset::Query::Members),
+            self.roles.validators.clone(),
+            abi::encode(&validators::Query::Members),
         )
         .await?;
         let bytes = reply.map_err(|refusal| {
-            Error::Corrupt(format!("valset refused the members query: {refusal}"))
+            Error::Corrupt(format!(
+                "the validators program refused the members query: {refusal}"
+            ))
         })?;
-        let valset::Reply::Members(members) = abi::decode(&bytes).map_err(corrupt)? else {
+        let validators::Reply::Members(members) = abi::decode(&bytes).map_err(corrupt)? else {
             return Err(Error::Corrupt(
-                "valset answered Members with another reply".into(),
+                "the validators program answered Members with another reply".into(),
             ));
         };
         overlay.set(NETWORK, namespace::epoch(epoch), abi::encode(&members));
@@ -598,6 +656,11 @@ where
                 ),
             ));
         }
+        let asked = identity::Query::Account(submission.signer.clone());
+        let account = match self.account(asked, height, time, overlay, stage).await? {
+            Ok(account) => account,
+            Err(refusal) => return Ok(rejected(&submission.target, refusal)),
+        };
         let checkpoint = overlay.checkpoint();
         overlay.set(
             SIGNERS,
@@ -610,6 +673,10 @@ where
             time,
             me: submission.target.clone(),
             origin: Origin::External(submission.signer),
+            // a key that holds no account still runs (identity's own
+            // create is such a frame); it acts as no one
+            sender: account.map(Principal::Account),
+            roles: self.roles.clone(),
             cause: Cause::Direct,
         };
         let receipt = self
@@ -625,6 +692,43 @@ where
             overlay.restore(checkpoint);
         }
         Ok(receipt)
+    }
+
+    /// The account the identity role says a frame acts as: the one a key
+    /// holds (`Account`), or a program's own (`OfModule`). The role's
+    /// refusal, or a reply that is not its interface's, rejects the frame.
+    async fn account(
+        &self,
+        asked: identity::Query,
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+    ) -> Result<std::result::Result<Option<identity::AccountNumber>, Refusal>> {
+        let reply = unit::query(
+            self.world(height, time),
+            vec![overlay],
+            stage,
+            &[],
+            Origin::System,
+            self.roles.identity.clone(),
+            abi::encode(&asked),
+        )
+        .await?;
+        Ok(reply.and_then(|bytes| match abi::decode(&bytes) {
+            Ok(identity::Reply::Account(account)) => Ok(account),
+            Ok(other) => Err(Refusal::new(
+                reason::UNEXPECTED_REPLY,
+                format!("the identity program answered {asked:?} with {other:?}"),
+            )),
+            Err(refusal) => Err(Refusal::new(
+                reason::UNEXPECTED_REPLY,
+                format!(
+                    "the identity program answered {asked:?} with {}",
+                    refusal.sentence
+                ),
+            )),
+        }))
     }
 
     async fn run(
@@ -658,16 +762,14 @@ where
             &*stage,
             &[],
             Origin::System,
-            module_registry::PROGRAM.to_owned(),
-            abi::encode(&module_registry::Query::At(height)),
+            self.roles.registry.clone(),
+            abi::encode(&registry::Query::At(height)),
         )
         .await?;
         let Ok(bytes) = reply else {
             return Ok(Vec::new());
         };
-        let Ok(module_registry::Reply::Programs(entries)) =
-            abi::decode::<module_registry::Reply>(&bytes)
-        else {
+        let Ok(registry::Reply::Programs(entries)) = abi::decode::<registry::Reply>(&bytes) else {
             return Ok(Vec::new());
         };
         let running = programs_of(&View::new(self.store.storage(), vec![&*overlay]))?;
@@ -688,7 +790,28 @@ where
             match running.get(&entry.program) {
                 Some(code) if *code == entry.code => {}
                 Some(_) => receipts.push(self.swap(&entry, overlay, stage)?),
-                None => receipts.push(self.admit(&entry, height, time, overlay, stage).await?),
+                None => {
+                    let checkpoint = overlay.checkpoint();
+                    let admitted = self.admit(&entry, height, time, overlay, stage).await?;
+                    let applied = matches!(admitted.outcome, Outcome::Applied { .. });
+                    receipts.push(admitted);
+                    if applied {
+                        let registered = self
+                            .register(&entry.program, height, time, overlay, stage)
+                            .await?;
+                        let refused = matches!(registered.outcome, Outcome::Rejected(_));
+                        receipts.push(registered);
+                        // a program runs only as its account: identity's
+                        // refusal undoes the admission as a rejected unit's
+                        // writes are undone, and the next height admits it
+                        // again
+                        if refused {
+                            overlay.restore(checkpoint);
+                            unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+                            self.loaded.unload(&entry.program);
+                        }
+                    }
+                }
             }
         }
         for program in running.keys() {
@@ -703,7 +826,7 @@ where
 
     async fn admit(
         &mut self,
-        entry: &module_registry::Entry,
+        entry: &registry::Entry,
         height: u64,
         time: u64,
         overlay: &mut Overlay,
@@ -720,6 +843,8 @@ where
             time,
             me: entry.program.clone(),
             origin: Origin::System,
+            sender: Some(Principal::System),
+            roles: self.roles.clone(),
             cause: Cause::Direct,
         };
         let receipt = self
@@ -745,9 +870,42 @@ where
         Ok(receipt)
     }
 
+    /// Gives an admitted program its account: the identity role's
+    /// `RegisterModule`, run as the system. A refusal is the receipt's.
+    async fn register(
+        &self,
+        program: &str,
+        height: u64,
+        time: u64,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+    ) -> Result<Receipt> {
+        let env = Env {
+            network: self.network.clone(),
+            height,
+            time,
+            me: self.roles.identity.clone(),
+            origin: Origin::System,
+            sender: Some(Principal::System),
+            roles: self.roles.clone(),
+            cause: Cause::Direct,
+        };
+        let op = identity::Op::RegisterModule {
+            module: program.to_owned(),
+        };
+        self.run(
+            &self.roles.identity,
+            GuestCall::Execute(abi::encode(&op)),
+            env,
+            overlay,
+            stage,
+        )
+        .await
+    }
+
     fn swap(
         &mut self,
-        entry: &module_registry::Entry,
+        entry: &registry::Entry,
         overlay: &mut Overlay,
         stage: &Stage,
     ) -> Result<Receipt> {
@@ -770,7 +928,7 @@ where
 
     fn load(
         &self,
-        entry: &module_registry::Entry,
+        entry: &registry::Entry,
         stage: &Stage,
     ) -> Result<std::result::Result<runtime::Code, Refusal>> {
         let layered = Layered {
@@ -801,23 +959,24 @@ where
                         source: source.clone(),
                         item: queued.seq,
                     };
-                    let env = Env {
-                        network: self.network.clone(),
-                        height,
-                        time,
-                        me: message.target.clone(),
-                        origin: Origin::Program(source),
-                        cause: Cause::Delivery(item.clone()),
+                    let asked = identity::Query::OfModule(source.clone());
+                    let receipt = match self.account(asked, height, time, overlay, stage).await? {
+                        Err(refusal) => rejected(&message.target, refusal),
+                        Ok(account) => {
+                            let env = Env {
+                                network: self.network.clone(),
+                                height,
+                                time,
+                                me: message.target.clone(),
+                                origin: Origin::Program(source),
+                                sender: account.map(Principal::Account),
+                                roles: self.roles.clone(),
+                                cause: Cause::Delivery(item.clone()),
+                            };
+                            let call = GuestCall::Execute(message.payload);
+                            self.run(&message.target, call, env, overlay, stage).await?
+                        }
                     };
-                    let receipt = self
-                        .run(
-                            &message.target,
-                            GuestCall::Execute(message.payload),
-                            env,
-                            overlay,
-                            stage,
-                        )
-                        .await?;
                     if message.reply {
                         let completion = Item::Completion {
                             item,
@@ -829,25 +988,27 @@ where
                     receipt
                 }
                 Item::Completion { item, by, outcome } => {
-                    let env = Env {
-                        network: self.network.clone(),
-                        height,
-                        time,
-                        me: item.source.clone(),
-                        origin: Origin::Program(by),
-                        cause: Cause::Completion {
-                            item: item.clone(),
-                            outcome,
-                        },
-                    };
-                    self.run(
-                        &item.source,
-                        GuestCall::Execute(Vec::new()),
-                        env,
-                        overlay,
-                        stage,
-                    )
-                    .await?
+                    let asked = identity::Query::OfModule(by.clone());
+                    match self.account(asked, height, time, overlay, stage).await? {
+                        Err(refusal) => rejected(&item.source, refusal),
+                        Ok(account) => {
+                            let env = Env {
+                                network: self.network.clone(),
+                                height,
+                                time,
+                                me: item.source.clone(),
+                                origin: Origin::Program(by),
+                                sender: account.map(Principal::Account),
+                                roles: self.roles.clone(),
+                                cause: Cause::Completion {
+                                    item: item.clone(),
+                                    outcome,
+                                },
+                            };
+                            let call = GuestCall::Execute(Vec::new());
+                            self.run(&item.source, call, env, overlay, stage).await?
+                        }
+                    }
                 }
             };
             delivered.push(Delivered {

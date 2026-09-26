@@ -48,15 +48,26 @@ network = "mynet"
 time = 1700000000000          # the genesis block's time, unix milliseconds
 epoch_length = 64             # blocks per validator epoch
 block_time_ms = 1000
-module-registry = "module_registry.wasm"   # the program that registers and swaps programs
-valset = "valset.wasm"                     # the program that seats each epoch's validators
+
+[roles]                       # the founding program the kernel calls in each role; all three required
+registry = "module-registry"  # registers and swaps programs
+validators = "valset"         # seats each epoch's validators
+identity = "identity"         # resolves a key or a program to its account
 
 [[validators]]
 key = "…"                     # hex ed25519 public key: `ducktape identity`
 address = "203.0.113.7:9000"  # where peers dial it
 
 [[programs]]
-id = "identity"               # one entry per system program, `id` = its contract's PROGRAM
+id = "module-registry"        # one entry per program; a role's params are the kernel's
+code = "module_registry.wasm"
+
+[[programs]]
+id = "valset"
+code = "valset.wasm"
+
+[[programs]]
+id = "identity"
 code = "identity.wasm"
 
 [[programs]]

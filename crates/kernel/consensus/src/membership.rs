@@ -1,4 +1,4 @@
-use abi::valset::Member;
+use abi::role::validators::Member;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_runtime::Handle;

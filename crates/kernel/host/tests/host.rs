@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use abi::{
     Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
-    HostReply, ItemRef, Message, Origin, Outcome, Refusal, Scan, Scheme, module_registry, reason,
-    valset,
+    HostReply, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, Scheme, reason,
+    role::{identity, registry, validators},
 };
 use commonware_codec::Encode as _;
 use commonware_cryptography::bls12381::primitives::group::{Private, Scalar};
@@ -17,7 +17,7 @@ use fixture_module_registry::Change;
 use fixture_probe::{Reply, Step};
 use host::{
     BLOBS, Block, BlockId, Delivered, Error, Founding, FoundingView, Genesis, Host, Layer, Limits,
-    NETWORK, QUEUE, Receipt, SIGNERS, Submission, Tip,
+    NETWORK, QUEUE, Receipt, Roles, SIGNERS, Submission, Tip,
 };
 use keyscheme::testkit;
 use sha2::Digest as _;
@@ -26,6 +26,7 @@ use state::{Commitment, SyncTarget, commitment_name};
 const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
+const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const SIGNER: &[u8] = b"signer";
@@ -34,8 +35,8 @@ const TIME: u64 = 1_700_000_000;
 
 type Ctx = deterministic::Context;
 
-fn member(key: &[u8], address: &str) -> valset::Member {
-    valset::Member {
+fn member(key: &[u8], address: &str) -> validators::Member {
+    validators::Member {
         key: key.to_vec(),
         address: address.to_owned(),
     }
@@ -49,13 +50,38 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
     }
 }
 
+/// The account [`SIGNER`] holds.
+const ACCOUNT: u64 = 1;
+
+fn roles() -> Roles {
+    Roles {
+        registry: "module-registry".into(),
+        validators: "valset".into(),
+        identity: "identity".into(),
+    }
+}
+
+/// The account identity gives `ping`, the fourth founding program
+/// ([`standard`]): programs are numbered from `MODULES_FROM` in order.
+const PING: u64 = fixture_identity::MODULES_FROM + 3;
+
+/// The registry, the validators and identity (where [`SIGNER`] holds
+/// [`ACCOUNT`]), then `programs`.
 fn genesis(programs: Vec<Founding>) -> Genesis {
+    let bound = vec![
+        founding("module-registry", MODULE_REGISTRY, Vec::new()),
+        founding("valset", VALSET, Vec::new()),
+        founding(
+            "identity",
+            IDENTITY,
+            abi::encode(&vec![(SIGNER.to_vec(), ACCOUNT)]),
+        ),
+    ];
     Genesis {
         network: b"net".to_vec(),
-        module_registry: MODULE_REGISTRY.to_vec(),
-        valset: VALSET.to_vec(),
+        roles: roles(),
         validators: vec![member(b"v1", "v1:1")],
-        programs,
+        programs: bound.into_iter().chain(programs).collect(),
         views: Vec::new(),
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
@@ -158,6 +184,26 @@ fn answers(bytes: &[u8]) -> Vec<Reply> {
     abi::decode(bytes).unwrap()
 }
 
+/// The account identity says `program` runs as.
+async fn account_of(host: &Host<Ctx>, program: &str) -> Option<u64> {
+    let asked = identity::Query::OfModule(program.into());
+    let reply = host
+        .query(
+            Layer::Confirmed,
+            TIME,
+            Origin::System,
+            "identity",
+            abi::encode(&asked),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    match abi::decode(&reply).unwrap() {
+        identity::Reply::Account(account) => account,
+        other => panic!("{other:?}"),
+    }
+}
+
 async fn ask(host: &Host<Ctx>, layer: Layer, program: &str, steps: Vec<Step>) -> Vec<Reply> {
     let answer = host
         .query(
@@ -188,7 +234,7 @@ fn ok(output: &[u8]) -> Outcome {
 }
 
 fn change(program: &str, code: BlobId, params: Vec<u8>) -> Vec<u8> {
-    abi::encode(&Change::Set(module_registry::Entry {
+    abi::encode(&Change::Set(registry::Entry {
         program: program.to_owned(),
         code,
         params,
@@ -220,10 +266,21 @@ fn founding_admits_every_program_and_the_host_reopens() {
             .iter()
             .map(|r| r.program.as_str())
             .collect();
-        assert_eq!(
-            admitted,
-            ["module-registry", "valset", "ping", "pong", "probe"]
-        );
+        let founded = [
+            "module-registry",
+            "valset",
+            "identity",
+            "ping",
+            "pong",
+            "probe",
+        ];
+        // each admission, then each program's account from identity
+        assert_eq!(admitted[..6], founded);
+        assert_eq!(admitted[6..], ["identity"; 6]);
+        for (at, program) in founded.into_iter().enumerate() {
+            let number = fixture_identity::MODULES_FROM + at as u64;
+            assert_eq!(account_of(&host, program).await, Some(number));
+        }
         assert!(applied.deliveries.is_empty());
         for receipt in &applied.admissions {
             assert!(
@@ -233,7 +290,17 @@ fn founding_admits_every_program_and_the_host_reopens() {
         }
         let programs = host.programs().unwrap();
         let ids: Vec<&str> = programs.keys().map(String::as_str).collect();
-        assert_eq!(ids, ["module-registry", "ping", "pong", "probe", "valset"]);
+        assert_eq!(
+            ids,
+            [
+                "identity",
+                "module-registry",
+                "ping",
+                "pong",
+                "probe",
+                "valset"
+            ]
+        );
         assert_eq!(programs["ping"], programs["pong"]);
         assert_ne!(programs["ping"], programs["probe"]);
         assert_eq!(
@@ -278,9 +345,28 @@ fn founding_admits_every_program_and_the_host_reopens() {
                 time: TIME,
                 me: "probe".into(),
                 origin: Origin::External(SIGNER.to_vec()),
+                sender: None,
+                roles: roles(),
                 cause: Cause::Direct,
             })]
         );
+    });
+}
+
+#[test]
+fn founding_refuses_an_unbound_role() {
+    deterministic::Runner::default().start(|context| async move {
+        for (name, identity) in [("empty", ""), ("unfounded", "nobody")] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut unbound = standard();
+            unbound.roles.identity = identity.into();
+            let Err(Error::Unbound { role, program }) =
+                Host::found(context.child(name), name, dir.path(), block_id(0), unbound).await
+            else {
+                panic!("a genesis with identity bound to {identity:?} was founded");
+            };
+            assert_eq!((role, program.as_str()), ("identity", identity));
+        }
     });
 }
 
@@ -495,6 +581,9 @@ fn a_delivery_sees_who_emitted_it() {
             time: TIME + 2,
             me: "probe".into(),
             origin: Origin::Program("ping".into()),
+            // ping's own account, which identity gave it at genesis
+            sender: Some(Principal::Account(PING)),
+            roles: roles(),
             cause: Cause::Delivery(item("ping", 0)),
         };
         assert_eq!(
@@ -508,6 +597,65 @@ fn a_delivery_sees_who_emitted_it() {
                 .get("ping", &fixture_relay::done(&item("ping", 0)))
                 .unwrap(),
             Some(abi::encode(&ok(&abi::encode(&vec![Reply::Env(env)]))))
+        );
+    });
+}
+
+#[test]
+fn a_submission_acts_as_the_account_its_signer_holds() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("net"), "net", dir.path(), standard()).await;
+        let stranger = |seq, target: &str, payload| Submission {
+            signer: b"stranger".to_vec(),
+            ..submit(seq, target, payload)
+        };
+        let sender = |receipt: &Receipt| match replies(receipt).as_slice() {
+            [Reply::Env(env)] => env.sender.clone(),
+            other => panic!("{other:?}"),
+        };
+        let env = || script(vec![Step::Env]);
+        let applied = host
+            .apply(block(
+                1,
+                vec![
+                    submit(0, "probe", env()),
+                    // a key that holds no account runs, as no one
+                    stranger(0, "probe", env()),
+                    // identity seats it; the next frame in the block sees it
+                    stranger(1, "identity", abi::encode(&(b"stranger".to_vec(), 2u64))),
+                    stranger(2, "probe", env()),
+                ],
+            ))
+            .await
+            .unwrap();
+        let senders: Vec<_> = [0, 1, 3].map(|at| sender(&applied.submissions[at])).into();
+        assert_eq!(
+            senders,
+            [
+                Some(Principal::Account(ACCOUNT)),
+                None,
+                Some(Principal::Account(2))
+            ]
+        );
+
+        // an identity that does not give programs their accounts founds
+        // nothing
+        let dir = tempfile::tempdir().unwrap();
+        let mut broken = standard();
+        broken.programs[2].code = RELAY.to_vec();
+        let founded = Host::found(
+            context.child("broken"),
+            "broken",
+            dir.path(),
+            block_id(0),
+            broken,
+        )
+        .await;
+        assert!(
+            matches!(founded, Err(Error::Genesis { .. })),
+            "{:?}",
+            founded.err()
         );
     });
 }
@@ -758,7 +906,15 @@ fn the_roster_admits_swaps_and_drops_programs() {
         .await
         .unwrap();
         let applied = host.apply(block(2, Vec::new())).await.unwrap();
-        assert_eq!(applied.admissions, vec![receipt("echo", ok(b""), vec![])]);
+        assert_eq!(
+            applied.admissions,
+            vec![
+                receipt("echo", ok(b""), vec![]),
+                receipt("identity", ok(b""), vec![]),
+            ]
+        );
+        let seventh = fixture_identity::MODULES_FROM + 6;
+        assert_eq!(account_of(&host, "echo").await, Some(seventh));
         assert_eq!(host.programs().unwrap()["echo"], relay);
         let applied = host
             .apply(block(
@@ -794,6 +950,8 @@ fn the_roster_admits_swaps_and_drops_programs() {
                 time: TIME,
                 me: "echo".into(),
                 origin: Origin::External(SIGNER.to_vec()),
+                sender: None,
+                roles: roles(),
                 cause: Cause::Direct,
             })]
         );
@@ -855,9 +1013,87 @@ fn the_roster_admits_swaps_and_drops_programs() {
         );
         let programs = host.programs().unwrap();
         let ids: Vec<&str> = programs.keys().map(String::as_str).collect();
-        assert_eq!(ids, ["module-registry", "ping", "pong", "probe", "valset"]);
+        assert_eq!(
+            ids,
+            [
+                "identity",
+                "module-registry",
+                "ping",
+                "pong",
+                "probe",
+                "valset"
+            ]
+        );
         let applied = host.apply(block(11, Vec::new())).await.unwrap();
         assert_eq!(applied.admissions.len(), 1);
+    });
+}
+
+/// A later install whose account identity refuses does not run: the
+/// admission is undone, both receipts say so, and the next height admits
+/// it again once identity gives it its account.
+#[test]
+fn a_program_identity_gives_no_account_is_not_admitted() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let relay = host.programs().unwrap()["ping"];
+        let closed = |seq, number: u64| {
+            submit(
+                seq,
+                "identity",
+                abi::encode(&(b"#closed/late".to_vec(), number)),
+            )
+        };
+        host.apply(block(
+            1,
+            vec![
+                closed(0, 1),
+                submit(1, "module-registry", change("late", relay, Vec::new())),
+            ],
+        ))
+        .await
+        .unwrap();
+        for height in [2, 3] {
+            let applied = host.apply(block(height, Vec::new())).await.unwrap();
+            assert_eq!(
+                applied.admissions,
+                vec![
+                    receipt("late", ok(b""), vec![]),
+                    receipt(
+                        "identity",
+                        Outcome::Rejected(Refusal::new("closed", "late")),
+                        vec![]
+                    ),
+                ]
+            );
+            assert!(!host.programs().unwrap().contains_key("late"));
+            assert_eq!(account_of(&host, "late").await, None);
+        }
+        let applied = host
+            .apply(block(
+                4,
+                vec![submit(2, "late", message("ping", b"hi", false))],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected(&applied.submissions[0]).reason,
+            reason::UNKNOWN_PROGRAM
+        );
+
+        // the refused submission kept the signer's sequence
+        host.apply(block(5, vec![closed(2, 0)])).await.unwrap();
+        let applied = host.apply(block(6, Vec::new())).await.unwrap();
+        assert_eq!(
+            applied.admissions,
+            vec![
+                receipt("late", ok(b""), vec![]),
+                receipt("identity", ok(b""), vec![]),
+            ]
+        );
+        assert_eq!(host.programs().unwrap()["late"], relay);
+        assert!(account_of(&host, "late").await.is_some());
     });
 }
 
@@ -918,6 +1154,8 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
                     time: TIME,
                     me: "probe".into(),
                     origin: Origin::External(SIGNER.to_vec()),
+                    sender: None,
+                    roles: roles(),
                     cause: Cause::Direct,
                 }),
             ]
@@ -938,6 +1176,8 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
                     time: TIME,
                     me: "probe".into(),
                     origin: Origin::External(SIGNER.to_vec()),
+                    sender: None,
+                    roles: roles(),
                     cause: Cause::Direct,
                 }),
             ]
@@ -1009,6 +1249,8 @@ fn sibling_queries_route_by_id_and_a_cycle_is_refused() {
                         time: TIME,
                         me: "probe".into(),
                         origin: Origin::Program("twin".into()),
+                        sender: None,
+                        roles: roles(),
                         cause: Cause::Direct,
                     }),
                 ])))),
@@ -1211,7 +1453,7 @@ fn a_joiner_adopts_synced_commitments_and_installs_the_blobs_it_lacks() {
             let id: BlobId = abi::decode(&entry.key).unwrap();
             framed.insert(id, upstream.blob(&id).unwrap().unwrap());
         }
-        assert_eq!(framed.len(), 5);
+        assert_eq!(framed.len(), 6);
         let targets: BTreeMap<String, SyncTarget> = upstream
             .store()
             .programs()

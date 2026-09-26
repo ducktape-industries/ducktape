@@ -1,17 +1,18 @@
 use std::path::Path;
 
-use abi::{HostOp, HostReply, Message, Outcome, reason, valset};
+use abi::{HostOp, HostReply, Message, Outcome, reason, role::validators};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_probe::{Reply, Step};
-use host::{Founding, Genesis, Layer, Limits, SIGNERS, Tip};
+use host::{Founding, Genesis, Layer, Limits, Roles, SIGNERS, Tip};
 use keyscheme::KeyScheme;
 use node::{Block, Body, Error, Frame, NAMESPACE, Node, Sequenced};
 
 const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
+const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"net";
@@ -25,8 +26,8 @@ fn key(seed: u64) -> ed25519::PrivateKey {
     ed25519::PrivateKey::from_seed(seed)
 }
 
-fn member(key: &ed25519::PrivateKey, address: &str) -> valset::Member {
-    valset::Member {
+fn member(key: &ed25519::PrivateKey, address: &str) -> validators::Member {
+    validators::Member {
         key: key.public_key().as_ref().to_vec(),
         address: address.to_owned(),
     }
@@ -40,13 +41,23 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
     }
 }
 
-fn genesis(validators: Vec<valset::Member>) -> Genesis {
+fn genesis(validators: Vec<validators::Member>) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        module_registry: MODULE_REGISTRY.to_vec(),
-        valset: VALSET.to_vec(),
+        roles: Roles {
+            registry: "module-registry".into(),
+            validators: "valset".into(),
+            identity: "identity".into(),
+        },
         validators,
         programs: vec![
+            founding("module-registry", MODULE_REGISTRY, Vec::new()),
+            founding("valset", VALSET, Vec::new()),
+            founding(
+                "identity",
+                IDENTITY,
+                abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
+            ),
             founding("ping", RELAY, Vec::new()),
             founding("pong", RELAY, Vec::new()),
             founding("probe", PROBE, abi::encode(&Vec::<Step>::new())),
