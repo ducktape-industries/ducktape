@@ -1,10 +1,10 @@
 //! The identity role as the kernel asks it, over a table of keys: founded
 //! with the keys each account holds (`Vec<(key, account)>`), and an execute
-//! adds one more holding.
+//! adds one more holding. It keeps no profiles.
 
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::{Env, Refusal, role::identity};
+    use abi::{Env, Refusal, reason, role::identity};
     use guest::{Execute, Program, Query, Reads};
 
     struct Identity;
@@ -25,7 +25,12 @@ mod program {
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {
-            let identity::Query::Account(key) = abi::decode(request)?;
+            let identity::Query::Account(key) = abi::decode(request)? else {
+                return Err(Refusal::new(
+                    reason::UNSUPPORTED,
+                    "this identity names no one",
+                ));
+            };
             let account = ctx.get(&key).map(|bytes| abi::decode(&bytes)).transpose()?;
             ctx.respond(abi::encode(&identity::Reply::Account(account)));
             Ok(())

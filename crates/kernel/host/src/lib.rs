@@ -709,6 +709,10 @@ where
         .await?;
         Ok(reply.and_then(|bytes| match abi::decode(&bytes) {
             Ok(identity::Reply::Account(account)) => Ok(account),
+            Ok(other) => Err(Refusal::new(
+                reason::UNEXPECTED_REPLY,
+                format!("the identity program answered Account with {other:?}"),
+            )),
             Err(refusal) => Err(Refusal::new(
                 reason::UNEXPECTED_REPLY,
                 format!(

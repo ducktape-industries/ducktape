@@ -408,21 +408,42 @@ pub mod role {
         }
     }
 
-    /// Who holds a key: the account a signed frame acts as.
+    /// Who holds a key (the account a signed frame acts as), and how each
+    /// account reads to the programs and views that name it.
     pub mod identity {
         use crate::{BorshDeserialize, BorshSerialize};
 
         pub type AccountNumber = u64;
 
+        /// An account as others show it: its name, and whether a program acts
+        /// through it (an agent, not a person).
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Profile {
+            pub number: AccountNumber,
+            pub name: String,
+            pub agent: bool,
+        }
+
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Query {
             /// The account that holds this signing key.
             Account(Vec<u8>),
+            /// Every account's profile, ascending by number from past
+            /// `after`, at most `limit` of them (the program may cap it).
+            Profiles {
+                after: Option<AccountNumber>,
+                limit: u32,
+            },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Reply {
             Account(Option<AccountNumber>),
+            /// `next` is the `after` of the following page; `None` at the end.
+            Profiles {
+                profiles: Vec<Profile>,
+                next: Option<AccountNumber>,
+            },
         }
     }
 }
