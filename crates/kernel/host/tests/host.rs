@@ -5,7 +5,7 @@ use std::sync::Arc;
 use abi::{
     Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
     HostReply, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, Scheme, reason,
-    role::{registry, validators},
+    role::{identity, registry, validators},
 };
 use commonware_codec::Encode as _;
 use commonware_cryptography::bls12381::primitives::group::{Private, Scalar};
@@ -53,10 +53,22 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
 /// The account [`SIGNER`] holds.
 const ACCOUNT: u64 = 1;
 
+fn roles() -> Roles {
+    Roles {
+        registry: "module-registry".into(),
+        validators: "valset".into(),
+        identity: "identity".into(),
+    }
+}
+
+/// The account identity gives `ping`, the fourth founding program
+/// ([`standard`]): programs are numbered from `MODULES_FROM` in order.
+const PING: u64 = fixture_identity::MODULES_FROM + 3;
+
 /// The registry, the validators and identity (where [`SIGNER`] holds
 /// [`ACCOUNT`]), then `programs`.
 fn genesis(programs: Vec<Founding>) -> Genesis {
-    let roles = vec![
+    let bound = vec![
         founding("module-registry", MODULE_REGISTRY, Vec::new()),
         founding("valset", VALSET, Vec::new()),
         founding(
@@ -67,13 +79,9 @@ fn genesis(programs: Vec<Founding>) -> Genesis {
     ];
     Genesis {
         network: b"net".to_vec(),
-        roles: Roles {
-            registry: "module-registry".into(),
-            validators: "valset".into(),
-            identity: "identity".into(),
-        },
+        roles: roles(),
         validators: vec![member(b"v1", "v1:1")],
-        programs: roles.into_iter().chain(programs).collect(),
+        programs: bound.into_iter().chain(programs).collect(),
         views: Vec::new(),
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
@@ -176,6 +184,26 @@ fn answers(bytes: &[u8]) -> Vec<Reply> {
     abi::decode(bytes).unwrap()
 }
 
+/// The account identity says `program` runs as.
+async fn account_of(host: &Host<Ctx>, program: &str) -> Option<u64> {
+    let asked = identity::Query::OfModule(program.into());
+    let reply = host
+        .query(
+            Layer::Confirmed,
+            TIME,
+            Origin::System,
+            "identity",
+            abi::encode(&asked),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    match abi::decode(&reply).unwrap() {
+        identity::Reply::Account(account) => account,
+        other => panic!("{other:?}"),
+    }
+}
+
 async fn ask(host: &Host<Ctx>, layer: Layer, program: &str, steps: Vec<Step>) -> Vec<Reply> {
     let answer = host
         .query(
@@ -238,17 +266,21 @@ fn founding_admits_every_program_and_the_host_reopens() {
             .iter()
             .map(|r| r.program.as_str())
             .collect();
-        assert_eq!(
-            admitted,
-            [
-                "module-registry",
-                "valset",
-                "identity",
-                "ping",
-                "pong",
-                "probe"
-            ]
-        );
+        let founded = [
+            "module-registry",
+            "valset",
+            "identity",
+            "ping",
+            "pong",
+            "probe",
+        ];
+        // each admission, then each program's account from identity
+        assert_eq!(admitted[..6], founded);
+        assert_eq!(admitted[6..], ["identity"; 6]);
+        for (at, program) in founded.into_iter().enumerate() {
+            let number = fixture_identity::MODULES_FROM + at as u64;
+            assert_eq!(account_of(&host, program).await, Some(number));
+        }
         assert!(applied.deliveries.is_empty());
         for receipt in &applied.admissions {
             assert!(
@@ -314,6 +346,7 @@ fn founding_admits_every_program_and_the_host_reopens() {
                 me: "probe".into(),
                 origin: Origin::External(SIGNER.to_vec()),
                 sender: None,
+                roles: roles(),
                 cause: Cause::Direct,
             })]
         );
@@ -548,7 +581,9 @@ fn a_delivery_sees_who_emitted_it() {
             time: TIME + 2,
             me: "probe".into(),
             origin: Origin::Program("ping".into()),
-            sender: Some(Principal::Program("ping".into())),
+            // ping's own account, which identity gave it at genesis
+            sender: Some(Principal::Account(PING)),
+            roles: roles(),
             cause: Cause::Delivery(item("ping", 0)),
         };
         assert_eq!(
@@ -604,18 +639,23 @@ fn a_submission_acts_as_the_account_its_signer_holds() {
             ]
         );
 
-        // an identity that does not answer its role rejects every signed frame
+        // an identity that does not give programs their accounts founds
+        // nothing
         let dir = tempfile::tempdir().unwrap();
         let mut broken = standard();
         broken.programs[2].code = RELAY.to_vec();
-        let mut host = found(context.child("broken"), "broken", dir.path(), broken).await;
-        let applied = host
-            .apply(block(1, vec![submit(0, "probe", env())]))
-            .await
-            .unwrap();
-        assert_eq!(
-            rejected(&applied.submissions[0]).reason,
-            reason::UNEXPECTED_REPLY
+        let founded = Host::found(
+            context.child("broken"),
+            "broken",
+            dir.path(),
+            block_id(0),
+            broken,
+        )
+        .await;
+        assert!(
+            matches!(founded, Err(Error::Genesis { .. })),
+            "{:?}",
+            founded.err()
         );
     });
 }
@@ -866,7 +906,15 @@ fn the_roster_admits_swaps_and_drops_programs() {
         .await
         .unwrap();
         let applied = host.apply(block(2, Vec::new())).await.unwrap();
-        assert_eq!(applied.admissions, vec![receipt("echo", ok(b""), vec![])]);
+        assert_eq!(
+            applied.admissions,
+            vec![
+                receipt("echo", ok(b""), vec![]),
+                receipt("identity", ok(b""), vec![]),
+            ]
+        );
+        let seventh = fixture_identity::MODULES_FROM + 6;
+        assert_eq!(account_of(&host, "echo").await, Some(seventh));
         assert_eq!(host.programs().unwrap()["echo"], relay);
         let applied = host
             .apply(block(
@@ -903,6 +951,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
                 me: "echo".into(),
                 origin: Origin::External(SIGNER.to_vec()),
                 sender: None,
+                roles: roles(),
                 cause: Cause::Direct,
             })]
         );
@@ -1038,6 +1087,7 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
                     me: "probe".into(),
                     origin: Origin::External(SIGNER.to_vec()),
                     sender: None,
+                    roles: roles(),
                     cause: Cause::Direct,
                 }),
             ]
@@ -1059,6 +1109,7 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
                     me: "probe".into(),
                     origin: Origin::External(SIGNER.to_vec()),
                     sender: None,
+                    roles: roles(),
                     cause: Cause::Direct,
                 }),
             ]
@@ -1131,6 +1182,7 @@ fn sibling_queries_route_by_id_and_a_cycle_is_refused() {
                         me: "probe".into(),
                         origin: Origin::Program("twin".into()),
                         sender: None,
+                        roles: roles(),
                         cause: Cause::Direct,
                     }),
                 ])))),

@@ -52,7 +52,7 @@ block_time_ms = 1000
 [roles]                       # the founding program the kernel calls in each role; all three required
 registry = "module-registry"  # registers and swaps programs
 validators = "valset"         # seats each epoch's validators
-identity = "identity"         # resolves a signing key to an account
+identity = "identity"         # resolves a key or a program to its account
 
 [[validators]]
 key = "…"                     # hex ed25519 public key: `ducktape identity`

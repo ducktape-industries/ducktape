@@ -6,6 +6,9 @@ mod unit;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+/// The founding program that fills each role the kernel calls. A genesis
+/// that leaves a role empty, or names a program it does not found, is refused.
+pub use abi::Roles;
 use abi::{
     BlobId, Cause, Env, GuestCall, HashKind, Invocation, ItemRef, Origin, Outcome, Principal,
     ProgramId, Refusal, Root, Scan, reason,
@@ -79,16 +82,6 @@ pub struct Genesis {
     pub limits: Limits,
     pub epoch_length: u64,
     pub time: u64,
-}
-
-/// The founding program that fills each role the kernel calls. A genesis
-/// that leaves a role empty, or names a program it does not found, is refused.
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct Roles {
-    pub registry: ProgramId,
-    pub validators: ProgramId,
-    /// Asked, once per signed frame, which account holds the signer's key.
-    pub identity: ProgramId,
 }
 
 pub struct Founding {
@@ -272,6 +265,20 @@ where
         for entry in &entries {
             let receipt = host
                 .admit(entry, 0, genesis.time, &mut overlay, &mut stage)
+                .await?;
+            if let Outcome::Rejected(refusal) = &receipt.outcome {
+                return Err(Error::Genesis {
+                    program: entry.program.clone(),
+                    refusal: refusal.clone(),
+                });
+            }
+            receipts.push(receipt);
+        }
+        // every founding program has its account before any frame runs:
+        // the identity role is admitted by now
+        for entry in &entries {
+            let receipt = host
+                .register(&entry.program, 0, genesis.time, &mut overlay, &mut stage)
                 .await?;
             if let Outcome::Rejected(refusal) = &receipt.outcome {
                 return Err(Error::Genesis {
@@ -488,6 +495,7 @@ where
             blobs: &self.blobs,
             loaded: &self.loaded,
             network: &self.network,
+            roles: &self.roles,
             height,
             time,
         }
@@ -648,10 +656,8 @@ where
                 ),
             ));
         }
-        let account = match self
-            .account_of(&submission.signer, height, time, overlay, stage)
-            .await?
-        {
+        let asked = identity::Query::Account(submission.signer.clone());
+        let account = match self.account(asked, height, time, overlay, stage).await? {
             Ok(account) => account,
             Err(refusal) => return Ok(rejected(&submission.target, refusal)),
         };
@@ -670,6 +676,7 @@ where
             // a key that holds no account still runs (identity's own
             // create is such a frame); it acts as no one
             sender: account.map(Principal::Account),
+            roles: self.roles.clone(),
             cause: Cause::Direct,
         };
         let receipt = self
@@ -687,11 +694,12 @@ where
         Ok(receipt)
     }
 
-    /// The account the identity role says holds `key`. The role's refusal,
-    /// or a reply that is not its interface's, rejects the frame.
-    async fn account_of(
+    /// The account the identity role says a frame acts as: the one a key
+    /// holds (`Account`), or a program's own (`OfModule`). The role's
+    /// refusal, or a reply that is not its interface's, rejects the frame.
+    async fn account(
         &self,
-        key: &[u8],
+        asked: identity::Query,
         height: u64,
         time: u64,
         overlay: &Overlay,
@@ -704,19 +712,19 @@ where
             &[],
             Origin::System,
             self.roles.identity.clone(),
-            abi::encode(&identity::Query::Account(key.to_vec())),
+            abi::encode(&asked),
         )
         .await?;
         Ok(reply.and_then(|bytes| match abi::decode(&bytes) {
             Ok(identity::Reply::Account(account)) => Ok(account),
             Ok(other) => Err(Refusal::new(
                 reason::UNEXPECTED_REPLY,
-                format!("the identity program answered Account with {other:?}"),
+                format!("the identity program answered {asked:?} with {other:?}"),
             )),
             Err(refusal) => Err(Refusal::new(
                 reason::UNEXPECTED_REPLY,
                 format!(
-                    "the identity program answered Account with {}",
+                    "the identity program answered {asked:?} with {}",
                     refusal.sentence
                 ),
             )),
@@ -782,7 +790,17 @@ where
             match running.get(&entry.program) {
                 Some(code) if *code == entry.code => {}
                 Some(_) => receipts.push(self.swap(&entry, overlay, stage)?),
-                None => receipts.push(self.admit(&entry, height, time, overlay, stage).await?),
+                None => {
+                    let admitted = self.admit(&entry, height, time, overlay, stage).await?;
+                    let applied = matches!(admitted.outcome, Outcome::Applied { .. });
+                    receipts.push(admitted);
+                    if applied {
+                        let registered = self
+                            .register(&entry.program, height, time, overlay, stage)
+                            .await?;
+                        receipts.push(registered);
+                    }
+                }
             }
         }
         for program in running.keys() {
@@ -815,6 +833,7 @@ where
             me: entry.program.clone(),
             origin: Origin::System,
             sender: Some(Principal::System),
+            roles: self.roles.clone(),
             cause: Cause::Direct,
         };
         let receipt = self
@@ -838,6 +857,39 @@ where
             Outcome::Rejected(_) => self.loaded.unload(&entry.program),
         }
         Ok(receipt)
+    }
+
+    /// Gives an admitted program its account: the identity role's
+    /// `RegisterModule`, run as the system. A refusal is the receipt's.
+    async fn register(
+        &self,
+        program: &str,
+        height: u64,
+        time: u64,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+    ) -> Result<Receipt> {
+        let env = Env {
+            network: self.network.clone(),
+            height,
+            time,
+            me: self.roles.identity.clone(),
+            origin: Origin::System,
+            sender: Some(Principal::System),
+            roles: self.roles.clone(),
+            cause: Cause::Direct,
+        };
+        let op = identity::Op::RegisterModule {
+            module: program.to_owned(),
+        };
+        self.run(
+            &self.roles.identity,
+            GuestCall::Execute(abi::encode(&op)),
+            env,
+            overlay,
+            stage,
+        )
+        .await
     }
 
     fn swap(
@@ -896,24 +948,24 @@ where
                         source: source.clone(),
                         item: queued.seq,
                     };
-                    let env = Env {
-                        network: self.network.clone(),
-                        height,
-                        time,
-                        me: message.target.clone(),
-                        origin: Origin::Program(source.clone()),
-                        sender: Some(Principal::Program(source)),
-                        cause: Cause::Delivery(item.clone()),
+                    let asked = identity::Query::OfModule(source.clone());
+                    let receipt = match self.account(asked, height, time, overlay, stage).await? {
+                        Err(refusal) => rejected(&message.target, refusal),
+                        Ok(account) => {
+                            let env = Env {
+                                network: self.network.clone(),
+                                height,
+                                time,
+                                me: message.target.clone(),
+                                origin: Origin::Program(source),
+                                sender: account.map(Principal::Account),
+                                roles: self.roles.clone(),
+                                cause: Cause::Delivery(item.clone()),
+                            };
+                            let call = GuestCall::Execute(message.payload);
+                            self.run(&message.target, call, env, overlay, stage).await?
+                        }
                     };
-                    let receipt = self
-                        .run(
-                            &message.target,
-                            GuestCall::Execute(message.payload),
-                            env,
-                            overlay,
-                            stage,
-                        )
-                        .await?;
                     if message.reply {
                         let completion = Item::Completion {
                             item,
@@ -925,26 +977,27 @@ where
                     receipt
                 }
                 Item::Completion { item, by, outcome } => {
-                    let env = Env {
-                        network: self.network.clone(),
-                        height,
-                        time,
-                        me: item.source.clone(),
-                        origin: Origin::Program(by.clone()),
-                        sender: Some(Principal::Program(by)),
-                        cause: Cause::Completion {
-                            item: item.clone(),
-                            outcome,
-                        },
-                    };
-                    self.run(
-                        &item.source,
-                        GuestCall::Execute(Vec::new()),
-                        env,
-                        overlay,
-                        stage,
-                    )
-                    .await?
+                    let asked = identity::Query::OfModule(by.clone());
+                    match self.account(asked, height, time, overlay, stage).await? {
+                        Err(refusal) => rejected(&item.source, refusal),
+                        Ok(account) => {
+                            let env = Env {
+                                network: self.network.clone(),
+                                height,
+                                time,
+                                me: item.source.clone(),
+                                origin: Origin::Program(by),
+                                sender: account.map(Principal::Account),
+                                roles: self.roles.clone(),
+                                cause: Cause::Completion {
+                                    item: item.clone(),
+                                    outcome,
+                                },
+                            };
+                            let call = GuestCall::Execute(Vec::new());
+                            self.run(&item.source, call, env, overlay, stage).await?
+                        }
+                    }
                 }
             };
             delivered.push(Delivered {

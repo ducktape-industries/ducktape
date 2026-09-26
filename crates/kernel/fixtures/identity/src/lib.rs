@@ -1,11 +1,21 @@
 //! The identity role as the kernel asks it, over a table of keys: founded
-//! with the keys each account holds (`Vec<(key, account)>`), and an execute
-//! adds one more holding. It keeps no profiles.
+//! with the keys each account holds (`Vec<(key, account)>`), and a signed
+//! execute adds one more holding. The system's `RegisterModule` gives a
+//! program the next account from [`MODULES_FROM`]. It keeps no profiles.
+
+/// The first account number a program is given.
+pub const MODULES_FROM: u64 = 1000;
 
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::{Env, Refusal, reason, role::identity};
+    use abi::{Env, Origin, Refusal, reason, role::identity};
     use guest::{Execute, Program, Query, Reads};
+
+    const NEXT: &[u8] = b"#next";
+
+    fn module_key(module: &str) -> Vec<u8> {
+        [b"#module/", module.as_bytes()].concat()
+    }
 
     struct Identity;
 
@@ -18,18 +28,32 @@ mod program {
             Ok(())
         }
 
-        fn execute(ctx: &mut Execute, _env: &Env, payload: &[u8]) -> Result<(), Refusal> {
+        fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal> {
+            if env.origin == Origin::System {
+                let identity::Op::RegisterModule { module } = abi::decode(payload)?;
+                let key = module_key(&module);
+                if ctx.get(&key).is_none() {
+                    let number: u64 = ctx.record(NEXT)?.unwrap_or(super::MODULES_FROM);
+                    ctx.put(NEXT, &(number + 1));
+                    ctx.put(key, &number);
+                }
+                return Ok(());
+            }
             let (key, account): (Vec<u8>, identity::AccountNumber) = abi::decode(payload)?;
             ctx.set(key, abi::encode(&account));
             Ok(())
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {
-            let identity::Query::Account(key) = abi::decode(request)? else {
-                return Err(Refusal::new(
-                    reason::UNSUPPORTED,
-                    "this identity names no one",
-                ));
+            let key = match abi::decode(request)? {
+                identity::Query::Account(key) => key,
+                identity::Query::OfModule(module) => module_key(&module),
+                identity::Query::Profiles { .. } => {
+                    return Err(Refusal::new(
+                        reason::UNSUPPORTED,
+                        "this identity names no one",
+                    ));
+                }
             };
             let account = ctx.get(&key).map(|bytes| abi::decode(&bytes)).transpose()?;
             ctx.respond(abi::encode(&identity::Reply::Account(account)));

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use abi::{
     BlobId, Cause, Env, GuestCall, HostOp, HostReply, Invocation, ItemRef, Message, Origin,
-    Outcome, ProgramId, Refusal, reason,
+    Outcome, ProgramId, Refusal, Roles, reason,
 };
 use blobs::{Blobs, Layered, Stage};
 use commonware_runtime::Spawner;
@@ -136,6 +136,7 @@ where
     pub blobs: &'a Blobs,
     pub loaded: &'a Loaded,
     pub network: &'a [u8],
+    pub roles: &'a Roles,
     pub height: u64,
     pub time: u64,
 }
@@ -329,6 +330,7 @@ where
         origin,
         // a query acts as no one: it reads, and its origin says who asks
         sender: None,
+        roles: world.roles.clone(),
         cause: Cause::Direct,
     };
     let mut stack = stack.to_vec();

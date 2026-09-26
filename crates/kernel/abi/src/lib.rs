@@ -80,14 +80,24 @@ pub enum Origin {
     System,
 }
 
-/// Who a frame acts as, resolved by the host once per frame: a signer's
-/// account (asked of the identity role), the program that sent a message, or
-/// the chain itself.
+/// Who a frame acts as, resolved by the host once per frame through the
+/// identity role: an account (the one a signer's key holds, or the account
+/// of the program that sent a message), or the chain itself.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
 pub enum Principal {
     Account(role::identity::AccountNumber),
-    Program(ProgramId),
     System,
+}
+
+/// The founding program that fills each role the kernel calls, as genesis
+/// bound them. Every frame's env carries them, so a program asks a role by
+/// its binding, never by a name it assumes.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Roles {
+    pub registry: ProgramId,
+    pub validators: ProgramId,
+    /// Asked, once per frame, which account the frame acts as.
+    pub identity: ProgramId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
@@ -177,8 +187,10 @@ pub struct Env {
     pub time: u64,
     pub me: ProgramId,
     pub origin: Origin,
-    /// `None` for a query, and for a signed frame whose key holds no account.
+    /// `None` for a query, and for a frame whose key or program holds no
+    /// account.
     pub sender: Option<Principal>,
+    pub roles: Roles,
     pub cause: Cause,
 }
 
@@ -408,25 +420,45 @@ pub mod role {
         }
     }
 
-    /// Who holds a key (the account a signed frame acts as), and how each
-    /// account reads to the programs and views that name it.
+    /// Who holds a key or runs as a program (the account a frame acts as),
+    /// and how each account reads to the programs and views that name it.
     pub mod identity {
-        use crate::{BorshDeserialize, BorshSerialize};
+        use crate::{BorshDeserialize, BorshSerialize, ProgramId};
 
         pub type AccountNumber = u64;
 
-        /// An account as others show it: its name, and whether a program acts
-        /// through it (an agent, not a person).
+        /// What an account's manager declares it to be. The enum only grows
+        /// at its end.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Category {
+            Agent,
+        }
+
+        /// An account as others show it: its name, what its manager declares
+        /// it (`category`), who manages it, and the program it is the
+        /// account of.
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub struct Profile {
             pub number: AccountNumber,
             pub name: String,
-            pub agent: bool,
+            pub category: Option<Category>,
+            pub manager: Option<AccountNumber>,
+            pub module: Option<ProgramId>,
+        }
+
+        /// The one write the kernel makes: as it admits a program, with the
+        /// `System` origin, it gives the program its account. Registering a
+        /// program that has one changes nothing.
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Op {
+            RegisterModule { module: ProgramId },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Query {
-            /// The account that holds this signing key.
+            /// The account a frame signed by this key acts as. Refused
+            /// (`unauthorized`) while that account is not live: suspended,
+            /// revoked, or managed by an account that is not live.
             Account(Vec<u8>),
             /// Every account's profile, ascending by number from past
             /// `after`, at most `limit` of them (the program may cap it).
@@ -434,6 +466,8 @@ pub mod role {
                 after: Option<AccountNumber>,
                 limit: u32,
             },
+            /// The account of a program, answered as `Account`.
+            OfModule(ProgramId),
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -489,7 +523,12 @@ mod tests {
             time: 9,
             me: "a".into(),
             origin: Origin::Program("b".into()),
-            sender: Some(Principal::Program("b".into())),
+            sender: Some(Principal::Account(4)),
+            roles: Roles {
+                registry: "r".into(),
+                validators: "v".into(),
+                identity: "i".into(),
+            },
             cause: Cause::Completion {
                 item: ItemRef {
                     source: "a".into(),

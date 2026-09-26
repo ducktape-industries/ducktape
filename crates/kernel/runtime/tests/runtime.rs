@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use abi::{
     Cause, CryptoOp, CryptoReply, Entry, Env, GuestCall, HostOp, HostReply, Invocation, ItemRef,
-    Message, Origin, Principal, Refusal, Scan, reason,
+    Message, Origin, Principal, Refusal, Roles, Scan, reason,
 };
 use fixture_probe::{Reply, Step};
 use runtime::{Fault, Host, Limits, Runtime};
@@ -24,6 +24,11 @@ fn env() -> Env {
         me: "probe".into(),
         origin: Origin::External(vec![7; 32]),
         sender: Some(Principal::Account(1)),
+        roles: Roles {
+            registry: "registry".into(),
+            validators: "validators".into(),
+            identity: "identity".into(),
+        },
         cause: Cause::Direct,
     }
 }
