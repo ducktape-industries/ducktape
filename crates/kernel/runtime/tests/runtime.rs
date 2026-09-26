@@ -279,9 +279,29 @@ async fn memory_past_the_limit_is_a_trap() {
         memory_bytes: Some(4 << 20),
     };
     let (_, verdict) = execute(limits, vec![Step::Grow(96)]).await;
-    assert!(matches!(verdict, Err(Fault::Trap(_))), "{verdict:?}");
+    assert_eq!(
+        verdict,
+        Err(Fault::Trap("the run trapped: unreachable".into()))
+    );
     let (_, within) = execute(limits, vec![Step::Grow(16)]).await;
     assert_eq!(within, Ok(Ok(())));
+}
+
+#[tokio::test]
+async fn a_trap_sentence_carries_no_backtrace() {
+    let limits = Limits {
+        fuel: None,
+        memory_bytes: Some(4 << 20),
+    };
+    // the probe panics into `unreachable` several frames deep
+    let (_, verdict) = execute(limits, vec![Step::Grow(96)]).await;
+    let Err(Fault::Trap(sentence)) = verdict else {
+        panic!("{verdict:?}");
+    };
+    assert!(
+        !sentence.contains("0x") && !sentence.contains('!') && !sentence.contains('\n'),
+        "{sentence}"
+    );
 }
 
 #[tokio::test]

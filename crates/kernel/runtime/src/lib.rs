@@ -74,7 +74,9 @@ impl Runtime {
         config
             .consume_fuel(limits.fuel.is_some())
             // a trap's sentence reaches a reply run's `Completion`, so state:
-            // it must not read the node's `WASMTIME_BACKTRACE_DETAILS`
+            // no backtrace is captured, nor read from the node's
+            // `WASMTIME_BACKTRACE_DETAILS`
+            .wasm_backtrace_max_frames(None)
             .wasm_backtrace_details(WasmBacktraceDetails::Disable)
             .cranelift_nan_canonicalization(true)
             .wasm_simd(false)
@@ -207,11 +209,25 @@ fn load(error: wasmtime::Error) -> Fault {
     Fault::Load(format!("{error:#}"))
 }
 
+/// A trap's sentence is the kernel's, keyed on the trap kind alone: it can
+/// reach state, so it never carries wasmtime's own text, which changes
+/// across wasmtime versions.
 fn trap(error: wasmtime::Error) -> Fault {
-    match error.downcast_ref::<wasmtime::Trap>() {
-        Some(wasmtime::Trap::OutOfFuel) => Fault::Trap(OUT_OF_FUEL.into()),
-        _ => Fault::Trap(format!("{error:#}")),
-    }
+    use wasmtime::Trap;
+    let sentence = match error.downcast_ref::<Trap>() {
+        Some(Trap::OutOfFuel) => OUT_OF_FUEL,
+        Some(Trap::UnreachableCodeReached) => "the run trapped: unreachable",
+        Some(Trap::MemoryOutOfBounds) => "the run trapped: out of bounds memory access",
+        Some(Trap::IntegerDivisionByZero) => "the run trapped: integer divide by zero",
+        Some(Trap::IntegerOverflow) => "the run trapped: integer overflow",
+        Some(Trap::BadConversionToInteger) => "the run trapped: invalid conversion to integer",
+        Some(Trap::StackOverflow) => "the run trapped: call stack exhausted",
+        Some(Trap::TableOutOfBounds) => "the run trapped: out of bounds table access",
+        Some(Trap::IndirectCallToNull) => "the run trapped: uninitialized table element",
+        Some(Trap::BadSignature) => "the run trapped: indirect call type mismatch",
+        _ => "the run trapped",
+    };
+    Fault::Trap(sentence.into())
 }
 
 fn host_call<'a>(
