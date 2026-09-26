@@ -33,9 +33,16 @@ impl core::fmt::Display for Fault {
 
 impl std::error::Error for Fault {}
 
+/// The sentence of the trap a run takes when its budget runs out, whether
+/// its own instructions spent it or the host charged it away.
+pub const OUT_OF_FUEL: &str = "the run spent its fuel";
+
 #[async_trait::async_trait]
 pub trait Host {
-    async fn call(&mut self, op: HostOp) -> HostReply;
+    /// Serves `op`. `fuel` is what the calling run has left (`None` when
+    /// the network meters none); what the host leaves there is what the run
+    /// resumes with, so the host charges its work to the run by lowering it.
+    async fn call(&mut self, op: HostOp, fuel: &mut Option<u64>) -> HostReply;
 }
 
 #[derive(Clone)]
@@ -48,7 +55,11 @@ pub struct Runtime {
     limits: Limits,
 }
 
-type Request = (HostOp, oneshot::Sender<HostReply>);
+type Request = (
+    HostOp,
+    Option<u64>,
+    oneshot::Sender<(HostReply, Option<u64>)>,
+);
 
 struct Data {
     requests: mpsc::UnboundedSender<Request>,
@@ -103,6 +114,9 @@ impl Runtime {
         host: &mut (impl Host + ?Sized),
         fuel: &mut Option<u64>,
     ) -> Result<GuestReply, Fault> {
+        if *fuel == Some(0) {
+            return Err(Fault::Trap(OUT_OF_FUEL.into()));
+        }
         let (requests, mut inbox) = mpsc::unbounded_channel();
         let mut builder = StoreLimitsBuilder::new();
         if let Some(bytes) = self.limits.memory_bytes {
@@ -126,9 +140,10 @@ impl Runtime {
                 let request = Box::pin(inbox.recv());
                 match select(guest, request).await {
                     Either::Left((verdict, _)) => break verdict,
-                    Either::Right((Some((op, reply_to)), resumed)) => {
+                    Either::Right((Some((op, mut left, reply_to)), resumed)) => {
                         guest = resumed;
-                        let _ = reply_to.send(host.call(op).await);
+                        let reply = host.call(op, &mut left).await;
+                        let _ = reply_to.send((reply, left));
                     }
                     Either::Right((None, _)) => {
                         unreachable!("the store holds the request sender for the whole run")
@@ -189,7 +204,10 @@ fn load(error: wasmtime::Error) -> Fault {
 }
 
 fn trap(error: wasmtime::Error) -> Fault {
-    Fault::Trap(format!("{error:#}"))
+    match error.downcast_ref::<wasmtime::Trap>() {
+        Some(wasmtime::Trap::OutOfFuel) => Fault::Trap(OUT_OF_FUEL.into()),
+        _ => Fault::Trap(format!("{error:#}")),
+    }
 }
 
 fn host_call<'a>(
@@ -201,14 +219,19 @@ fn host_call<'a>(
         let request = read(&memory, &caller, ptr, len)?;
         let op: HostOp = abi::decode(&request).map_err(|r| wasmtime::Error::msg(r.sentence))?;
         let (reply_to, reply) = oneshot::channel();
+        // an unmetered store has no fuel to read: the host sees `None`
+        let fuel = caller.get_fuel().ok();
         caller
             .data()
             .requests
-            .send((op, reply_to))
+            .send((op, fuel, reply_to))
             .map_err(|_| wasmtime::Error::msg("the kernel stopped listening"))?;
-        let reply = reply
+        let (reply, fuel) = reply
             .await
             .map_err(|_| wasmtime::Error::msg("the kernel stopped answering"))?;
+        if let Some(fuel) = fuel {
+            caller.set_fuel(fuel)?;
+        }
         let data = caller.data_mut();
         data.pending = abi::encode(&reply);
         Ok(data.pending.len() as u32)

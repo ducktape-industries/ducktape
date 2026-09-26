@@ -35,7 +35,7 @@ fn env() -> Env {
 
 #[async_trait::async_trait]
 impl Host for Bench {
-    async fn call(&mut self, op: HostOp) -> HostReply {
+    async fn call(&mut self, op: HostOp, _fuel: &mut Option<u64>) -> HostReply {
         let reply = match &op {
             HostOp::Get(key) | HostOp::CommittedGet(key) => {
                 HostReply::Value(self.state.get(key).cloned())
