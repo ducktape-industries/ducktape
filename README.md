@@ -39,9 +39,10 @@ delegates the desktop installation to the pinned
 
 A founding file names the network, its cadence, its validators and the
 programs it starts with. Every path is relative to the file; the programs a
-network boots with (`module-registry`, `valset`, `identity`) are built and
-committed in [modules](https://github.com/ducktape-industries/modules) under
-`crates/modules/system/wasm/`:
+network boots with (`module-registry`, `valset`, `identity`) are built in
+[modules](https://github.com/ducktape-industries/modules) (`make
+wasm-programs`, under `$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/`;
+nothing built is committed there):
 
 ```toml
 network = "mynet"
@@ -59,7 +60,7 @@ key = "…"                     # hex ed25519 public key: `ducktape identity`
 address = "203.0.113.7:9000"  # where peers dial it
 
 [[programs]]
-id = "module-registry"        # one entry per program; a role's params are the kernel's
+id = "module-registry"        # one entry per program; the registry's and validators' params are the kernel's
 code = "module_registry.wasm"
 
 [[programs]]
@@ -79,6 +80,17 @@ params = "ping.params"        # optional: the bytes the program's init receives
 fuel = 1000000000
 memory_bytes = 268435456
 ```
+
+The kernel calls programs by role, never by id. Founding refuses a role bound
+to a program the file does not list, and every frame's env carries the
+bindings (`Env.roles`). As the kernel admits a program, at founding or later
+off the registry, it gives the program an account: the identity role's
+`RegisterModule`, executed with the `System` origin. Once per frame the host
+asks the identity role who the frame acts as, `Account(key)` for a signed
+frame and `OfModule(program)` for a message or a reply, and passes the answer
+as `Env.sender`; a refusal rejects the frame, and a key that holds no account
+runs as no one (`None`). The interfaces are `abi::role::{registry,
+validators, identity}`; modules' `docs/roles.md` walks through them.
 
 ```sh
 ducktape identity                                   # mint this workspace's node key
@@ -123,7 +135,7 @@ verb's `--help` carries the rest.
 | Layer | Where | What |
 | --- | --- | --- |
 | Kernel | `crates/kernel/` | `abi` (the bytes ABI), `guest` (what a program compiles against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `blobs` (one content-addressed store), `host` (the sandbox: submit, query, deliver), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
-| Programs | [`ducktape-industries/modules`](https://github.com/ducktape-industries/modules) | The contracts a program compiles against (`crates/sdk/abi`, `crates/sdk/guest`: copies of `crates/kernel/abi` and `crates/kernel/guest` here), the boot set (`crates/modules`: the `modules` contracts crate, the `module-registry`, `valset` and `identity` programs under `system/`, their committed bytes under `system/wasm/`, and the suite that drives them on this host) and the app modules. The eight system modules beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
+| Programs | [`ducktape-industries/modules`](https://github.com/ducktape-industries/modules) | The contracts a program compiles against (`crates/sdk/abi`, a copy of `crates/kernel/abi` here, and `crates/sdk/guest`, the module SDK), the boot set (`crates/system/`: `module-registry`, `valset` and `identity`, whose suite founds this host over their bytes) and the app modules. The system modules beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
 | Networking | `crates/networking/` | Off-consensus byte transport for the services; the WireGuard overlay and the coordinator are `ducktape-industries/tunnel` |
 | Services | `crates/services/` | Off-chain executors: provider run loop, microVM sandbox, credential broker, airlock, media |
