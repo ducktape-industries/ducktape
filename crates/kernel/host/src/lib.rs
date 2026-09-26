@@ -117,8 +117,10 @@ pub struct Submission {
     pub payload: Vec<u8>,
 }
 
-/// One frame's run. A rejected receipt's frame wrote nothing: the outcome
+/// One frame's run. A rejected receipt's run wrote nothing: the outcome
 /// is the refusal of the run itself or, propagated, of a run nested in it.
+/// Only its admission, the signer's consumed sequence, stands
+/// (`Submitted::Admitted`).
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Receipt {
     pub program: ProgramId,
@@ -129,6 +131,31 @@ pub struct Receipt {
     /// A nested receipt's `Applied` and events stand only when every
     /// receipt above it was applied too: an ancestor's rejection undid it.
     pub nested: Vec<Receipt>,
+}
+
+/// A signed frame's fate. `Admitted` passed the checks before its run (in
+/// sequence, and an account the identity role gives its key) and consumed
+/// the signer's sequence, whether its run applied or was rejected: the
+/// same signed bytes never run twice. `Refused` failed one of those checks
+/// and consumed nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Submitted {
+    Admitted(Receipt),
+    Refused(Receipt),
+}
+
+impl Submitted {
+    pub fn receipt(&self) -> &Receipt {
+        match self {
+            Submitted::Admitted(receipt) | Submitted::Refused(receipt) => receipt,
+        }
+    }
+
+    pub fn into_receipt(self) -> Receipt {
+        match self {
+            Submitted::Admitted(receipt) | Submitted::Refused(receipt) => receipt,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -567,20 +594,20 @@ where
         &mut self,
         time: u64,
         submissions: Vec<Submission>,
-    ) -> Result<Vec<Receipt>> {
+    ) -> Result<Vec<Submitted>> {
         self.ready()?;
         let height = self.next_height()?;
         let mut overlay = std::mem::take(&mut self.preconfirmed);
         let mut stage = Stage::default();
-        let mut receipts = Vec::new();
+        let mut submitted = Vec::new();
         for submission in submissions {
-            let receipt = self
-                .submit(submission, height, time, &mut overlay, &mut stage)
-                .await?;
-            receipts.push(receipt);
+            submitted.push(
+                self.submit(submission, height, time, &mut overlay, &mut stage)
+                    .await?,
+            );
         }
         self.preconfirmed = overlay;
-        Ok(receipts)
+        Ok(submitted)
     }
 
     pub async fn apply(&mut self, block: Block) -> Result<Applied> {
@@ -600,7 +627,7 @@ where
             .await?;
         let mut submissions = Vec::new();
         for submission in block.submissions {
-            let receipt = self
+            let submitted = self
                 .submit(
                     submission,
                     block.height,
@@ -609,7 +636,7 @@ where
                     &mut stage,
                 )
                 .await?;
-            submissions.push(receipt);
+            submissions.push(submitted.into_receipt());
         }
         let epoch_length = self.epoch_length()?;
         let ends_an_epoch = (block.height + 1).is_multiple_of(epoch_length);
@@ -638,11 +665,11 @@ where
         time: u64,
         overlay: &mut Overlay,
         stage: &mut Stage,
-    ) -> Result<Receipt> {
+    ) -> Result<Submitted> {
         let expected = next_sequence(&self.store.view(vec![&*overlay]), &submission.signer)?;
         let in_sequence = submission.seq == expected;
         if !in_sequence {
-            return Ok(rejected(
+            return Ok(Submitted::Refused(rejected(
                 &submission.target,
                 Refusal::new(
                     reason::SEQUENCE,
@@ -651,7 +678,7 @@ where
                         submission.seq
                     ),
                 ),
-            ));
+            )));
         }
         let asked = identity::Query::Account(submission.signer.clone());
         let fuel = &mut self.loaded.limits().fuel;
@@ -660,14 +687,18 @@ where
             .await?
         {
             Ok(account) => account,
-            Err(refusal) => return Ok(rejected(&submission.target, refusal)),
+            Err(refusal) => {
+                return Ok(Submitted::Refused(rejected(&submission.target, refusal)));
+            }
         };
-        let checkpoint = overlay.checkpoint();
+        // admitted: the sequence is consumed outside the run's checkpoint,
+        // so a rejected run cannot hand the same signed bytes a second run
         overlay.set(
             SIGNERS,
             submission.signer.clone(),
             abi::encode(&(submission.seq + 1)),
         );
+        let checkpoint = overlay.checkpoint();
         let env = Env {
             network: self.network.clone(),
             height,
@@ -692,7 +723,7 @@ where
         if let Outcome::Rejected(_) = receipt.outcome {
             overlay.restore(checkpoint);
         }
-        Ok(receipt)
+        Ok(Submitted::Admitted(receipt))
     }
 
     /// The account the identity role says `program` runs as, for a frame

@@ -18,7 +18,7 @@ use fixture_probe::{Reply, Step};
 use fixture_relay::Script;
 use host::{
     BLOBS, Block, BlockId, Error, Founding, FoundingView, Genesis, Host, Layer, Limits, NETWORK,
-    Receipt, Roles, SIGNERS, Submission, Tip,
+    Receipt, Roles, SIGNERS, Submission, Submitted, Tip,
 };
 use keyscheme::testkit;
 use sha2::Digest as _;
@@ -716,7 +716,7 @@ fn a_rejected_message_without_a_reply_undoes_the_frame() {
                             message("pong", note(b"never"), false),
                         ]),
                     ),
-                    submit(0, "ping", send(vec![message("nobody", note(b"x"), false)])),
+                    submit(1, "ping", send(vec![message("nobody", note(b"x"), false)])),
                 ],
             ))
             .await
@@ -1095,8 +1095,9 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
             rejected(&applied.submissions[0]),
             &Refusal::new("probe", "nope")
         );
+        // only the admission stands: the signer's consumed sequence
         let touched: Vec<&str> = applied.writes.programs.keys().map(String::as_str).collect();
-        assert_eq!(touched, [NETWORK]);
+        assert_eq!(touched, [NETWORK, SIGNERS]);
         assert_eq!(
             host.view(Layer::Confirmed).get("probe", b"k").unwrap(),
             None
@@ -1106,7 +1107,7 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
         let applied = host
             .apply(block(
                 2,
-                vec![submit(0, "probe", script(vec![set(b"k", b"v"), put()]))],
+                vec![submit(1, "probe", script(vec![set(b"k", b"v"), put()]))],
             ))
             .await
             .unwrap();
@@ -1164,7 +1165,7 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
                 3,
                 vec![
                     submit(
-                        1,
+                        2,
                         "probe",
                         script(vec![op(HostOp::BlobPut {
                             hash: HashKind::Sha1,
@@ -1172,7 +1173,7 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
                             body: b"x".to_vec(),
                         })]),
                     ),
-                    submit(2, "probe", script(vec![op(HostOp::BlobStat(staged))])),
+                    submit(3, "probe", script(vec![op(HostOp::BlobStat(staged))])),
                 ],
             ))
             .await
@@ -1433,8 +1434,8 @@ fn a_program_identity_gives_no_account_is_not_admitted() {
             reason::UNKNOWN_PROGRAM
         );
 
-        // the refused submission kept the signer's sequence
-        host.apply(block(5, vec![closed(2, 0)])).await.unwrap();
+        // the rejected submission consumed the signer's sequence
+        host.apply(block(5, vec![closed(3, 0)])).await.unwrap();
         let applied = host.apply(block(6, Vec::new())).await.unwrap();
         assert_eq!(
             applied.admissions,
@@ -1472,11 +1473,11 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
             .unwrap();
         assert_eq!(
             receipts,
-            vec![receipt(
+            vec![Submitted::Admitted(receipt(
                 "probe",
                 ok(&abi::encode(&vec![Reply::Host(HostReply::Done); 2])),
                 vec![]
-            )]
+            ))]
         );
 
         let steps = || {
@@ -1752,7 +1753,7 @@ fn fuel_is_a_network_parameter() {
                 vec![
                     submit(0, "probe", script(vec![Step::Env])),
                     submit(1, "probe", script(vec![Step::Spin])),
-                    submit(1, "probe", script(vec![Step::Grow(2048)])),
+                    submit(2, "probe", script(vec![Step::Grow(2048)])),
                 ],
             ))
             .await
@@ -1901,7 +1902,7 @@ fn a_joiner_adopts_synced_commitments_and_installs_the_blobs_it_lacks() {
 }
 
 #[test]
-fn a_signer_submits_in_sequence_and_a_refusal_keeps_the_sequence() {
+fn a_signer_submits_in_sequence_and_a_rejected_run_consumes_its_sequence() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
@@ -1913,45 +1914,60 @@ fn a_signer_submits_in_sequence_and_a_refusal_keeps_the_sequence() {
                     submit(0, "probe", script(vec![set(b"k", b"first")])),
                     submit(0, "probe", script(vec![set(b"k", b"replay")])),
                     submit(1, "probe", script(vec![Step::Fail("no".into())])),
-                    submit(1, "probe", script(vec![set(b"k", b"second")])),
+                    submit(1, "probe", script(vec![Step::Fail("no".into())])),
+                    submit(2, "probe", script(vec![set(b"k", b"second")])),
                 ],
             ))
             .await
             .unwrap();
+        // out of sequence: refused before it runs, and consumes nothing
         assert_eq!(rejected(&applied.submissions[0]).reason, reason::SEQUENCE);
         assert_eq!(
             replies(&applied.submissions[1]),
             vec![Reply::Host(HostReply::Done)]
         );
         assert_eq!(rejected(&applied.submissions[2]).reason, reason::SEQUENCE);
+        // admitted and rejected by its run: the sequence is still consumed,
+        // so the same signed bytes are refused a second run
         assert_eq!(rejected(&applied.submissions[3]).reason, "probe");
+        assert_eq!(rejected(&applied.submissions[4]).reason, reason::SEQUENCE);
         assert_eq!(
-            replies(&applied.submissions[4]),
+            replies(&applied.submissions[5]),
             vec![Reply::Host(HostReply::Done)]
         );
         let view = host.view(Layer::Confirmed);
         assert_eq!(view.get("probe", b"k").unwrap(), Some(b"second".to_vec()));
-        assert_eq!(view.get(SIGNERS, SIGNER).unwrap(), Some(abi::encode(&2u64)));
+        assert_eq!(view.get(SIGNERS, SIGNER).unwrap(), Some(abi::encode(&3u64)));
 
-        let receipts = host
+        let submitted = host
             .preconfirm(
                 TIME,
                 vec![
-                    submit(2, "probe", script(Vec::new())),
-                    submit(2, "probe", script(Vec::new())),
+                    submit(3, "probe", script(vec![Step::Fail("no".into())])),
+                    submit(3, "probe", script(Vec::new())),
+                    submit(4, "probe", script(Vec::new())),
                 ],
             )
             .await
             .unwrap();
-        assert!(matches!(receipts[0].outcome, Outcome::Applied { .. }));
-        assert_eq!(rejected(&receipts[1]).reason, reason::SEQUENCE);
+        let admitted: Vec<bool> = submitted
+            .iter()
+            .map(|submitted| matches!(submitted, Submitted::Admitted(_)))
+            .collect();
+        assert_eq!(admitted, [true, false, true]);
+        assert_eq!(rejected(submitted[0].receipt()).reason, "probe");
+        assert_eq!(rejected(submitted[1].receipt()).reason, reason::SEQUENCE);
+        assert!(matches!(
+            submitted[2].receipt().outcome,
+            Outcome::Applied { .. }
+        ));
         assert_eq!(
             host.view(Layer::Preconfirmed).get(SIGNERS, SIGNER).unwrap(),
-            Some(abi::encode(&3u64))
+            Some(abi::encode(&5u64))
         );
         assert_eq!(
             host.view(Layer::Confirmed).get(SIGNERS, SIGNER).unwrap(),
-            Some(abi::encode(&2u64))
+            Some(abi::encode(&3u64))
         );
     });
 }

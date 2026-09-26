@@ -247,6 +247,43 @@ fn a_block_without_the_pending_frame_keeps_it_pending_and_preconfirmed() {
 }
 
 #[test]
+fn a_rejected_frame_rides_the_block_and_its_bytes_never_run_again() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut node, _) = found(context, dir.path()).await;
+        let signer = key(7);
+        let signer_key = signer.public_key().as_ref().to_vec();
+        let failing = frame(&signer, 0, "probe", script(vec![Step::Fail("no".into())]));
+
+        let receipt = node.submit(failing.clone()).await.unwrap().unwrap();
+        assert_eq!(rejected(&receipt), "probe");
+        assert_eq!(node.pending(), 1);
+        assert_eq!(
+            node.view(Layer::Preconfirmed)
+                .get(SIGNERS, &signer_key)
+                .unwrap(),
+            Some(abi::encode(&1u64))
+        );
+        let resubmitted = node.submit(failing.clone()).await.unwrap().unwrap();
+        assert_eq!(rejected(&resubmitted), reason::SEQUENCE);
+        assert_eq!(node.pending(), 1);
+
+        let (block, applied) = seal(&mut node).await;
+        assert_eq!(block.frames, vec![failing.clone()]);
+        assert_eq!(rejected(&applied.submissions[0]), "probe");
+        assert_eq!(
+            node.view(Layer::Confirmed)
+                .get(SIGNERS, &signer_key)
+                .unwrap(),
+            Some(abi::encode(&1u64))
+        );
+        let resubmitted = node.submit(failing).await.unwrap().unwrap();
+        assert_eq!(rejected(&resubmitted), reason::SEQUENCE);
+        assert_eq!(node.pending(), 0);
+    });
+}
+
+#[test]
 fn a_block_that_spends_the_signers_sequence_elsewhere_drops_the_pending_frame() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -296,6 +333,12 @@ fn a_frame_is_refused_when_it_names_another_network_or_lies_about_its_signer() {
         let refusal = node.submit(b"junk".to_vec()).await.unwrap().unwrap_err();
         assert_eq!(refusal.reason, reason::PROTOCOL);
         assert_eq!(node.pending(), 0);
+        assert_eq!(
+            node.view(Layer::Preconfirmed)
+                .get(SIGNERS, signer.public_key().as_ref())
+                .unwrap(),
+            None
+        );
         assert!(!node.due().unwrap());
     });
 }
