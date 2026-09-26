@@ -15,9 +15,10 @@ use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_module_registry::Change;
 use fixture_probe::{Reply, Step};
+use fixture_relay::Script;
 use host::{
-    BLOBS, Block, BlockId, Delivered, Error, Founding, FoundingView, Genesis, Host, Layer, Limits,
-    NETWORK, QUEUE, Receipt, Roles, SIGNERS, Submission, Tip,
+    BLOBS, Block, BlockId, Error, Founding, FoundingView, Genesis, Host, Layer, Limits, NETWORK,
+    Receipt, Roles, SIGNERS, Submission, Tip,
 };
 use keyscheme::testkit;
 use sha2::Digest as _;
@@ -30,6 +31,8 @@ const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.was
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const SIGNER: &[u8] = b"signer";
+/// Fuel that runs one relay handler and a message of it, not a chain of eight.
+const FRAME_FUEL: u64 = 100_000;
 const EPOCH_LENGTH: u64 = 4;
 const TIME: u64 = 1_700_000_000;
 
@@ -147,12 +150,44 @@ fn block(height: u64, submissions: Vec<Submission>) -> Block {
     }
 }
 
-fn message(target: &str, payload: &[u8], reply: bool) -> Vec<u8> {
-    abi::encode(&Message {
+/// A relay message: `target` runs `script` in the frame, replying or not.
+fn message(target: &str, script: Script, reply: bool) -> Message {
+    Message {
         target: target.to_owned(),
-        payload: payload.to_vec(),
+        payload: abi::encode(&script),
         reply,
-    })
+    }
+}
+
+/// A relay payload that emits `messages`.
+fn send(messages: Vec<Message>) -> Vec<u8> {
+    abi::encode(&Script::Send(messages))
+}
+
+fn note(bytes: &[u8]) -> Script {
+    Script::Note(bytes.to_vec())
+}
+
+fn fail(loud: bool) -> Script {
+    Script::Fail {
+        sentence: "asked to fail".into(),
+        loud,
+    }
+}
+
+/// The refusal a relay's `fail` is.
+fn refused() -> Refusal {
+    Refusal::new(reason::INVALID_INPUT, "asked to fail")
+}
+
+/// `receipt` with `nested` runs.
+fn nested(mut receipt: Receipt, nested: Vec<Receipt>) -> Receipt {
+    receipt.nested = nested;
+    receipt
+}
+
+fn stored(host: &Host<Ctx>, program: &str, key: &[u8]) -> Option<Vec<u8>> {
+    host.view(Layer::Confirmed).get(program, key).unwrap()
 }
 
 fn item(source: &str, item: u64) -> ItemRef {
@@ -224,6 +259,7 @@ fn receipt(program: &str, outcome: Outcome, events: Vec<&[u8]>) -> Receipt {
         program: program.to_owned(),
         outcome,
         events: events.into_iter().map(<[u8]>::to_vec).collect(),
+        nested: Vec::new(),
     }
 }
 
@@ -281,7 +317,6 @@ fn founding_admits_every_program_and_the_host_reopens() {
             let number = fixture_identity::MODULES_FROM + at as u64;
             assert_eq!(account_of(&host, program).await, Some(number));
         }
-        assert!(applied.deliveries.is_empty());
         for receipt in &applied.admissions {
             assert!(
                 matches!(receipt.outcome, Outcome::Applied { .. }),
@@ -474,7 +509,7 @@ fn blocks_apply_in_sequence_only() {
 }
 
 #[test]
-fn a_call_is_delivered_next_block_and_completes_the_block_after() {
+fn a_message_runs_in_the_frame_that_emits_it_and_replies_there() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
@@ -483,121 +518,370 @@ fn a_call_is_delivered_next_block_and_completes_the_block_after() {
         let applied = host
             .apply(block(
                 1,
-                vec![submit(0, "ping", message("pong", b"hello", true))],
+                vec![submit(
+                    0,
+                    "ping",
+                    send(vec![message("pong", note(b"hello"), true)]),
+                )],
             ))
             .await
             .unwrap();
         assert_eq!(
             applied.submissions,
-            vec![receipt("ping", ok(&abi::encode(&first)), vec![])]
+            vec![nested(
+                receipt("ping", ok(&abi::encode(&vec![first.clone()])), vec![]),
+                vec![
+                    receipt("pong", ok(b"olleh"), vec![b"hello"]),
+                    receipt("ping", ok(b""), vec![]),
+                ]
+            )]
         );
-        assert!(applied.deliveries.is_empty());
         assert_eq!(
-            host.view(Layer::Confirmed)
-                .get("ping", &fixture_relay::sent(&first))
-                .unwrap(),
+            stored(&host, "ping", &fixture_relay::sent(&first)),
+            Some(abi::encode(&note(b"hello")))
+        );
+        assert_eq!(
+            stored(&host, "pong", &fixture_relay::got(&first)),
             Some(b"hello".to_vec())
         );
-
-        let applied = host.apply(block(2, Vec::new())).await.unwrap();
         assert_eq!(
-            applied.deliveries,
-            vec![Delivered {
-                item: 0,
-                receipt: receipt("pong", ok(b"olleh"), vec![b"hello"]),
-            }]
-        );
-        assert_eq!(
-            host.view(Layer::Confirmed)
-                .get("pong", &fixture_relay::got(&first))
-                .unwrap(),
-            Some(b"hello".to_vec())
-        );
-
-        let applied = host.apply(block(3, Vec::new())).await.unwrap();
-        assert_eq!(
-            applied.deliveries,
-            vec![Delivered {
-                item: 1,
-                receipt: receipt("ping", ok(b""), vec![]),
-            }]
-        );
-        assert_eq!(
-            host.view(Layer::Confirmed)
-                .get("ping", &fixture_relay::done(&first))
-                .unwrap(),
+            stored(&host, "ping", &fixture_relay::done(&first)),
             Some(abi::encode(&ok(b"olleh")))
         );
 
-        let applied = host.apply(block(4, Vec::new())).await.unwrap();
-        assert!(applied.deliveries.is_empty());
-        assert!(
-            host.view(Layer::Confirmed)
-                .scan(QUEUE, &Scan::prefix(b"i/"))
-                .unwrap()
-                .is_empty()
-        );
-
+        // without a reply wanted, the target's run is all that nests
+        let again = item("ping", 0);
         let applied = host
             .apply(block(
-                5,
-                vec![submit(1, "ping", message("pong", b"again", false))],
+                2,
+                vec![submit(
+                    1,
+                    "ping",
+                    send(vec![message("pong", note(b"again"), false)]),
+                )],
             ))
             .await
             .unwrap();
         assert_eq!(
-            output(&applied.submissions[0]),
-            abi::encode(&item("ping", 2))
+            applied.submissions,
+            vec![nested(
+                receipt("ping", ok(&abi::encode(&vec![again.clone()])), vec![]),
+                vec![receipt("pong", ok(b"niaga"), vec![b"again"])]
+            )]
         );
-        let applied = host.apply(block(6, Vec::new())).await.unwrap();
-        assert_eq!(
-            applied.deliveries,
-            vec![Delivered {
-                item: 2,
-                receipt: receipt("pong", ok(b"niaga"), vec![b"again"]),
-            }]
-        );
-        let applied = host.apply(block(7, Vec::new())).await.unwrap();
-        assert!(applied.deliveries.is_empty());
     });
 }
 
 #[test]
-fn a_delivery_sees_who_emitted_it() {
+fn messages_run_in_emit_order_depth_first() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        // ping: [pong: [ping: a], pong: b]
+        let inner = Script::Send(vec![message("ping", note(b"a"), false)]);
+        let applied = host
+            .apply(block(
+                1,
+                vec![submit(
+                    0,
+                    "ping",
+                    send(vec![
+                        message("pong", inner, false),
+                        message("pong", note(b"b"), false),
+                    ]),
+                )],
+            ))
+            .await
+            .unwrap();
+        let items = |items: &[ItemRef]| ok(&abi::encode(&items.to_vec()));
+        assert_eq!(
+            applied.submissions,
+            vec![nested(
+                receipt("ping", items(&[item("ping", 0), item("ping", 1)]), vec![]),
+                vec![
+                    nested(
+                        receipt("pong", items(&[item("pong", 2)]), vec![]),
+                        vec![receipt("ping", ok(b"a"), vec![b"a"])]
+                    ),
+                    receipt("pong", ok(b"b"), vec![b"b"]),
+                ]
+            )]
+        );
+    });
+}
+
+#[test]
+fn a_message_sees_who_emitted_it() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
         let probe_script = script(vec![Step::Env]);
-        host.apply(block(
-            1,
-            vec![submit(0, "ping", message("probe", &probe_script, true))],
-        ))
-        .await
-        .unwrap();
-        let applied = host.apply(block(2, Vec::new())).await.unwrap();
+        let applied = host
+            .apply(block(
+                1,
+                vec![submit(
+                    0,
+                    "ping",
+                    send(vec![Message {
+                        target: "probe".into(),
+                        payload: probe_script,
+                        reply: true,
+                    }]),
+                )],
+            ))
+            .await
+            .unwrap();
         let env = Env {
             network: b"net".to_vec(),
-            height: 2,
-            time: TIME + 2,
+            height: 1,
+            time: TIME + 1,
             me: "probe".into(),
             origin: Origin::Program("ping".into()),
             // ping's own account, which identity gave it at genesis
             sender: Some(Principal::Account(PING)),
             roles: roles(),
-            cause: Cause::Delivery(item("ping", 0)),
+            cause: Cause::Message(item("ping", 0)),
         };
+        let [probed, replied] = applied.submissions[0].nested.as_slice() else {
+            panic!("{:?}", applied.submissions[0].nested);
+        };
+        assert_eq!(replies(probed), vec![Reply::Env(env.clone())]);
+        assert_eq!(replied, &receipt("ping", ok(b""), vec![]));
         assert_eq!(
-            replies(&applied.deliveries[0].receipt),
-            vec![Reply::Env(env.clone())]
-        );
-        let applied = host.apply(block(3, Vec::new())).await.unwrap();
-        assert_eq!(applied.deliveries[0].receipt.program, "ping");
-        assert_eq!(
-            host.view(Layer::Confirmed)
-                .get("ping", &fixture_relay::done(&item("ping", 0)))
-                .unwrap(),
+            stored(&host, "ping", &fixture_relay::done(&item("ping", 0))),
             Some(abi::encode(&ok(&abi::encode(&vec![Reply::Env(env)]))))
         );
+    });
+}
+
+#[test]
+fn a_rejected_message_without_a_reply_undoes_the_frame() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let applied = host
+            .apply(block(
+                1,
+                vec![
+                    submit(
+                        0,
+                        "ping",
+                        send(vec![
+                            message("pong", note(b"first"), false),
+                            message("pong", fail(false), false),
+                            message("pong", note(b"never"), false),
+                        ]),
+                    ),
+                    submit(0, "ping", send(vec![message("nobody", note(b"x"), false)])),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            applied.submissions,
+            vec![
+                nested(
+                    receipt("ping", Outcome::Rejected(refused()), vec![]),
+                    vec![
+                        receipt("pong", ok(b"tsrif"), vec![b"first"]),
+                        receipt("pong", Outcome::Rejected(refused()), vec![]),
+                    ]
+                ),
+                nested(
+                    receipt(
+                        "ping",
+                        Outcome::Rejected(Refusal::new(reason::UNKNOWN_PROGRAM, "nobody")),
+                        vec![]
+                    ),
+                    vec![receipt(
+                        "nobody",
+                        Outcome::Rejected(Refusal::new(reason::UNKNOWN_PROGRAM, "nobody")),
+                        vec![]
+                    )]
+                ),
+            ]
+        );
+        // the sender's and the applied target's writes are undone with it
+        assert_eq!(
+            stored(&host, "ping", &fixture_relay::sent(&item("ping", 0))),
+            None
+        );
+        assert_eq!(
+            stored(&host, "pong", &fixture_relay::got(&item("ping", 0))),
+            None
+        );
+        assert_eq!(
+            stored(&host, "pong", &fixture_relay::got(&item("ping", 2))),
+            None
+        );
+    });
+}
+
+#[test]
+fn a_rejected_reply_undoes_the_target_and_the_sender_absorbs_or_propagates() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        // pong writes, then fails without a reply: its frame is undone and
+        // ping, which wanted the reply, absorbs the rejection and goes on
+        let pong = Script::Send(vec![
+            message("ping", note(b"inner"), false),
+            message("ping", fail(false), false),
+        ]);
+        let applied = host
+            .apply(block(
+                1,
+                vec![submit(
+                    0,
+                    "ping",
+                    send(vec![
+                        message("pong", pong, true),
+                        message("pong", note(b"after"), false),
+                    ]),
+                )],
+            ))
+            .await
+            .unwrap();
+        let receipt_ = &applied.submissions[0];
+        assert_eq!(
+            receipt_.outcome,
+            ok(&abi::encode(&vec![item("ping", 0), item("ping", 1)]))
+        );
+        let programs: Vec<(&str, bool)> = receipt_
+            .nested
+            .iter()
+            .map(|r| {
+                (
+                    r.program.as_str(),
+                    matches!(r.outcome, Outcome::Applied { .. }),
+                )
+            })
+            .collect();
+        assert_eq!(programs, [("pong", false), ("ping", true), ("pong", true)]);
+        assert_eq!(receipt_.nested[0].outcome, Outcome::Rejected(refused()));
+        assert_eq!(
+            stored(&host, "pong", &fixture_relay::sent(&item("pong", 2))),
+            None
+        );
+        assert_eq!(
+            stored(&host, "ping", &fixture_relay::got(&item("pong", 2))),
+            None
+        );
+        assert_eq!(
+            stored(&host, "ping", &fixture_relay::done(&item("ping", 0))),
+            Some(abi::encode(&Outcome::Rejected(refused())))
+        );
+        assert_eq!(
+            stored(&host, "pong", &fixture_relay::got(&item("ping", 1))),
+            Some(b"after".to_vec())
+        );
+
+        // a reply run that refuses fails the whole frame
+        let applied = host
+            .apply(block(
+                2,
+                vec![submit(
+                    1,
+                    "ping",
+                    send(vec![
+                        message("pong", note(b"before"), false),
+                        message("pong", fail(true), true),
+                    ]),
+                )],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            applied.submissions,
+            vec![nested(
+                receipt("ping", Outcome::Rejected(refused()), vec![]),
+                vec![
+                    receipt("pong", ok(b"erofeb"), vec![b"before"]),
+                    receipt("pong", Outcome::Rejected(refused()), vec![]),
+                    receipt("ping", Outcome::Rejected(refused()), vec![]),
+                ]
+            )]
+        );
+        assert_eq!(
+            stored(&host, "pong", &fixture_relay::got(&item("ping", 0))),
+            None
+        );
+        assert_eq!(
+            stored(&host, "ping", &fixture_relay::done(&item("ping", 1))),
+            None
+        );
+    });
+}
+
+/// A chain of `depth` messages, ping to pong and back, ending in a note.
+fn chain(depth: u32) -> Script {
+    if depth == 0 {
+        return note(b"end");
+    }
+    let target = if depth.is_multiple_of(2) {
+        "ping"
+    } else {
+        "pong"
+    };
+    Script::Send(vec![message(target, chain(depth - 1), false)])
+}
+
+#[test]
+fn messages_nest_at_most_eight_deep() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let applied = host
+            .apply(block(
+                1,
+                vec![
+                    submit(0, "ping", abi::encode(&chain(8))),
+                    submit(1, "ping", abi::encode(&chain(9))),
+                ],
+            ))
+            .await
+            .unwrap();
+        let mut deepest = &applied.submissions[0];
+        let mut depth = 0;
+        while let Some(inner) = deepest.nested.first() {
+            deepest = inner;
+            depth += 1;
+        }
+        assert_eq!(depth, 8);
+        assert_eq!(deepest, &receipt("pong", ok(b"dne"), vec![b"end"]));
+        let refusal = rejected(&applied.submissions[1]);
+        assert_eq!(refusal.reason, reason::CAPACITY);
+        assert_eq!(refusal.sentence, "messages nest deeper than 8");
+    });
+}
+
+#[test]
+fn a_frame_runs_on_one_fuel_budget() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut metered = standard();
+        // enough for a run or two of relay, not for a chain of nine
+        metered.limits = Limits {
+            fuel: Some(FRAME_FUEL),
+            memory_bytes: None,
+        };
+        let mut host = found(context, "net", dir.path(), metered).await;
+        let applied = host
+            .apply(block(
+                1,
+                vec![
+                    submit(0, "ping", abi::encode(&chain(1))),
+                    submit(1, "ping", abi::encode(&chain(8))),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            matches!(applied.submissions[0].outcome, Outcome::Applied { .. }),
+            "{:?}",
+            applied.submissions[0]
+        );
+        assert_eq!(rejected(&applied.submissions[1]).reason, reason::TRAP);
     });
 }
 
@@ -643,7 +927,7 @@ fn a_submission_acts_as_the_account_its_signer_holds() {
         // nothing
         let dir = tempfile::tempdir().unwrap();
         let mut broken = standard();
-        broken.programs[2].code = RELAY.to_vec();
+        broken.programs[2].code = PROBE.to_vec();
         let founded = Host::found(
             context.child("broken"),
             "broken",
@@ -656,72 +940,6 @@ fn a_submission_acts_as_the_account_its_signer_holds() {
             matches!(founded, Err(Error::Genesis { .. })),
             "{:?}",
             founded.err()
-        );
-    });
-}
-
-#[test]
-fn a_refused_or_unroutable_delivery_completes_with_its_refusal() {
-    deterministic::Runner::default().start(|context| async move {
-        let dir = tempfile::tempdir().unwrap();
-        let mut host = found(context, "net", dir.path(), standard()).await;
-        let applied = host
-            .apply(block(
-                1,
-                vec![
-                    submit(0, "ping", message("pong", fixture_relay::FAIL, true)),
-                    submit(1, "ping", message("nobody", b"x", true)),
-                    submit(2, "nobody", b"x".to_vec()),
-                ],
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            rejected(&applied.submissions[2]),
-            &Refusal::new(reason::UNKNOWN_PROGRAM, "nobody")
-        );
-
-        let applied = host.apply(block(2, Vec::new())).await.unwrap();
-        let refused = Refusal::new(reason::INVALID_INPUT, "asked to fail");
-        assert_eq!(
-            applied.deliveries,
-            vec![
-                Delivered {
-                    item: 0,
-                    receipt: receipt("pong", Outcome::Rejected(refused.clone()), vec![]),
-                },
-                Delivered {
-                    item: 1,
-                    receipt: receipt(
-                        "nobody",
-                        Outcome::Rejected(Refusal::new(reason::UNKNOWN_PROGRAM, "nobody")),
-                        vec![],
-                    ),
-                },
-            ]
-        );
-        assert_eq!(
-            host.view(Layer::Confirmed)
-                .get("pong", &fixture_relay::got(&item("ping", 0)))
-                .unwrap(),
-            None
-        );
-
-        let applied = host.apply(block(3, Vec::new())).await.unwrap();
-        assert_eq!(applied.deliveries.len(), 2);
-        let view = host.view(Layer::Confirmed);
-        assert_eq!(
-            view.get("ping", &fixture_relay::done(&item("ping", 0)))
-                .unwrap(),
-            Some(abi::encode(&Outcome::Rejected(refused)))
-        );
-        assert_eq!(
-            view.get("ping", &fixture_relay::done(&item("ping", 1)))
-                .unwrap(),
-            Some(abi::encode(&Outcome::Rejected(Refusal::new(
-                reason::UNKNOWN_PROGRAM,
-                "nobody"
-            ))))
         );
     });
 }
@@ -919,13 +1137,17 @@ fn the_roster_admits_swaps_and_drops_programs() {
         let applied = host
             .apply(block(
                 3,
-                vec![submit(1, "echo", message("ping", b"hi", false))],
+                vec![submit(
+                    1,
+                    "echo",
+                    send(vec![message("ping", note(b"hi"), false)]),
+                )],
             ))
             .await
             .unwrap();
         assert_eq!(
             output(&applied.submissions[0]),
-            abi::encode(&item("echo", 0))
+            abi::encode(&vec![item("echo", 0)])
         );
 
         host.apply(block(
@@ -1073,7 +1295,11 @@ fn a_program_identity_gives_no_account_is_not_admitted() {
         let applied = host
             .apply(block(
                 4,
-                vec![submit(2, "late", message("ping", b"hi", false))],
+                vec![submit(
+                    2,
+                    "late",
+                    send(vec![message("ping", note(b"hi"), false)]),
+                )],
             ))
             .await
             .unwrap();

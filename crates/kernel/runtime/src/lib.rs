@@ -89,6 +89,20 @@ impl Runtime {
         invocation: Invocation,
         host: &mut (impl Host + ?Sized),
     ) -> Result<GuestReply, Fault> {
+        self.run_within(code, invocation, host, &mut self.limits.fuel.clone())
+            .await
+    }
+
+    /// [`Runtime::run`] on a budget: the run starts with `fuel` (`None`
+    /// when the network meters none) and leaves what it did not burn there,
+    /// so the runs of one frame share one budget.
+    pub async fn run_within(
+        &self,
+        code: &Code,
+        invocation: Invocation,
+        host: &mut (impl Host + ?Sized),
+        fuel: &mut Option<u64>,
+    ) -> Result<GuestReply, Fault> {
         let (requests, mut inbox) = mpsc::unbounded_channel();
         let mut builder = StoreLimitsBuilder::new();
         if let Some(bytes) = self.limits.memory_bytes {
@@ -103,23 +117,29 @@ impl Runtime {
             },
         );
         store.limiter(|data| &mut data.limiter);
-        if let Some(fuel) = self.limits.fuel {
+        if let Some(fuel) = *fuel {
             store.set_fuel(fuel).map_err(load)?;
         }
-        let mut guest = Box::pin(drive(&self.engine, &mut store, &code.module, invocation));
-        loop {
-            let request = Box::pin(inbox.recv());
-            match select(guest, request).await {
-                Either::Left((verdict, _)) => return verdict,
-                Either::Right((Some((op, reply_to)), resumed)) => {
-                    guest = resumed;
-                    let _ = reply_to.send(host.call(op).await);
-                }
-                Either::Right((None, _)) => {
-                    unreachable!("the store holds the request sender for the whole run")
+        let verdict = {
+            let mut guest = Box::pin(drive(&self.engine, &mut store, &code.module, invocation));
+            loop {
+                let request = Box::pin(inbox.recv());
+                match select(guest, request).await {
+                    Either::Left((verdict, _)) => break verdict,
+                    Either::Right((Some((op, reply_to)), resumed)) => {
+                        guest = resumed;
+                        let _ = reply_to.send(host.call(op).await);
+                    }
+                    Either::Right((None, _)) => {
+                        unreachable!("the store holds the request sender for the whole run")
+                    }
                 }
             }
+        };
+        if fuel.is_some() {
+            *fuel = Some(store.get_fuel().map_err(load)?);
         }
+        verdict
     }
 }
 

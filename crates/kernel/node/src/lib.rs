@@ -123,9 +123,7 @@ where
     }
 
     pub fn due(&self) -> Result<bool> {
-        let frames_wait = !self.pending.is_empty();
-        let deliveries_wait = self.host.deliveries_due()?;
-        Ok(frames_wait || deliveries_wait)
+        Ok(!self.pending.is_empty())
     }
 
     pub fn now(&self) -> u64 {
