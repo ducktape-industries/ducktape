@@ -22,6 +22,7 @@ use node::{Block, Frame, Node, Sequenced};
 const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
+const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"cluster";
@@ -82,8 +83,8 @@ fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
             },
             Founding {
                 program: "identity".into(),
-                code: RELAY.to_vec(),
-                params: Vec::new(),
+                code: IDENTITY.to_vec(),
+                params: abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
             },
             Founding {
                 program: "ping".into(),

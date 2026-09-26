@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use abi::{
     Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
-    HostReply, ItemRef, Message, Origin, Outcome, Refusal, Scan, Scheme, reason,
+    HostReply, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, Scheme, reason,
     role::{registry, validators},
 };
 use commonware_codec::Encode as _;
@@ -26,6 +26,7 @@ use state::{Commitment, SyncTarget, commitment_name};
 const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
+const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const SIGNER: &[u8] = b"signer";
@@ -49,13 +50,20 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
     }
 }
 
-/// The registry, the validators and a stand-in identity (the kernel does not
-/// call identity yet), then `programs`.
+/// The account [`SIGNER`] holds.
+const ACCOUNT: u64 = 1;
+
+/// The registry, the validators and identity (where [`SIGNER`] holds
+/// [`ACCOUNT`]), then `programs`.
 fn genesis(programs: Vec<Founding>) -> Genesis {
     let roles = vec![
         founding("module-registry", MODULE_REGISTRY, Vec::new()),
         founding("valset", VALSET, Vec::new()),
-        founding("identity", RELAY, Vec::new()),
+        founding(
+            "identity",
+            IDENTITY,
+            abi::encode(&vec![(SIGNER.to_vec(), ACCOUNT)]),
+        ),
     ];
     Genesis {
         network: b"net".to_vec(),
@@ -305,6 +313,7 @@ fn founding_admits_every_program_and_the_host_reopens() {
                 time: TIME,
                 me: "probe".into(),
                 origin: Origin::External(SIGNER.to_vec()),
+                sender: None,
                 cause: Cause::Direct,
             })]
         );
@@ -539,6 +548,7 @@ fn a_delivery_sees_who_emitted_it() {
             time: TIME + 2,
             me: "probe".into(),
             origin: Origin::Program("ping".into()),
+            sender: Some(Principal::Program("ping".into())),
             cause: Cause::Delivery(item("ping", 0)),
         };
         assert_eq!(
@@ -552,6 +562,60 @@ fn a_delivery_sees_who_emitted_it() {
                 .get("ping", &fixture_relay::done(&item("ping", 0)))
                 .unwrap(),
             Some(abi::encode(&ok(&abi::encode(&vec![Reply::Env(env)]))))
+        );
+    });
+}
+
+#[test]
+fn a_submission_acts_as_the_account_its_signer_holds() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("net"), "net", dir.path(), standard()).await;
+        let stranger = |seq, target: &str, payload| Submission {
+            signer: b"stranger".to_vec(),
+            ..submit(seq, target, payload)
+        };
+        let sender = |receipt: &Receipt| match replies(receipt).as_slice() {
+            [Reply::Env(env)] => env.sender.clone(),
+            other => panic!("{other:?}"),
+        };
+        let env = || script(vec![Step::Env]);
+        let applied = host
+            .apply(block(
+                1,
+                vec![
+                    submit(0, "probe", env()),
+                    // a key that holds no account runs, as no one
+                    stranger(0, "probe", env()),
+                    // identity seats it; the next frame in the block sees it
+                    stranger(1, "identity", abi::encode(&(b"stranger".to_vec(), 2u64))),
+                    stranger(2, "probe", env()),
+                ],
+            ))
+            .await
+            .unwrap();
+        let senders: Vec<_> = [0, 1, 3].map(|at| sender(&applied.submissions[at])).into();
+        assert_eq!(
+            senders,
+            [
+                Some(Principal::Account(ACCOUNT)),
+                None,
+                Some(Principal::Account(2))
+            ]
+        );
+
+        // an identity that does not answer its role rejects every signed frame
+        let dir = tempfile::tempdir().unwrap();
+        let mut broken = standard();
+        broken.programs[2].code = RELAY.to_vec();
+        let mut host = found(context.child("broken"), "broken", dir.path(), broken).await;
+        let applied = host
+            .apply(block(1, vec![submit(0, "probe", env())]))
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected(&applied.submissions[0]).reason,
+            reason::UNEXPECTED_REPLY
         );
     });
 }
@@ -838,6 +902,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
                 time: TIME,
                 me: "echo".into(),
                 origin: Origin::External(SIGNER.to_vec()),
+                sender: None,
                 cause: Cause::Direct,
             })]
         );
@@ -972,6 +1037,7 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
                     time: TIME,
                     me: "probe".into(),
                     origin: Origin::External(SIGNER.to_vec()),
+                    sender: None,
                     cause: Cause::Direct,
                 }),
             ]
@@ -992,6 +1058,7 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
                     time: TIME,
                     me: "probe".into(),
                     origin: Origin::External(SIGNER.to_vec()),
+                    sender: None,
                     cause: Cause::Direct,
                 }),
             ]
@@ -1063,6 +1130,7 @@ fn sibling_queries_route_by_id_and_a_cycle_is_refused() {
                         time: TIME,
                         me: "probe".into(),
                         origin: Origin::Program("twin".into()),
+                        sender: None,
                         cause: Cause::Direct,
                     }),
                 ])))),
@@ -1265,7 +1333,7 @@ fn a_joiner_adopts_synced_commitments_and_installs_the_blobs_it_lacks() {
             let id: BlobId = abi::decode(&entry.key).unwrap();
             framed.insert(id, upstream.blob(&id).unwrap().unwrap());
         }
-        assert_eq!(framed.len(), 5);
+        assert_eq!(framed.len(), 6);
         let targets: BTreeMap<String, SyncTarget> = upstream
             .store()
             .programs()

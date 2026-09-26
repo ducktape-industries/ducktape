@@ -12,6 +12,7 @@ use node::{Block, Body, Error, Frame, NAMESPACE, Node, Sequenced};
 const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
+const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"net";
@@ -52,7 +53,11 @@ fn genesis(validators: Vec<validators::Member>) -> Genesis {
         programs: vec![
             founding("module-registry", MODULE_REGISTRY, Vec::new()),
             founding("valset", VALSET, Vec::new()),
-            founding("identity", RELAY, Vec::new()),
+            founding(
+                "identity",
+                IDENTITY,
+                abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
+            ),
             founding("ping", RELAY, Vec::new()),
             founding("pong", RELAY, Vec::new()),
             founding("probe", PROBE, abi::encode(&Vec::<Step>::new())),

@@ -7,9 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use abi::{
-    BlobId, Cause, Env, GuestCall, HashKind, Invocation, ItemRef, Origin, Outcome, ProgramId,
-    Refusal, Root, Scan, reason,
-    role::{registry, validators},
+    BlobId, Cause, Env, GuestCall, HashKind, Invocation, ItemRef, Origin, Outcome, Principal,
+    ProgramId, Refusal, Root, Scan, reason,
+    role::{identity, registry, validators},
 };
 use blobs::{Blobs, Layered, Stage};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -87,7 +87,7 @@ pub struct Genesis {
 pub struct Roles {
     pub registry: ProgramId,
     pub validators: ProgramId,
-    /// Bound and required now; the kernel calls it from the next step on.
+    /// Asked, once per signed frame, which account holds the signer's key.
     pub identity: ProgramId,
 }
 
@@ -648,6 +648,13 @@ where
                 ),
             ));
         }
+        let account = match self
+            .account_of(&submission.signer, height, time, overlay, stage)
+            .await?
+        {
+            Ok(account) => account,
+            Err(refusal) => return Ok(rejected(&submission.target, refusal)),
+        };
         let checkpoint = overlay.checkpoint();
         overlay.set(
             SIGNERS,
@@ -660,6 +667,9 @@ where
             time,
             me: submission.target.clone(),
             origin: Origin::External(submission.signer),
+            // a key that holds no account still runs (identity's own
+            // create is such a frame); it acts as no one
+            sender: account.map(Principal::Account),
             cause: Cause::Direct,
         };
         let receipt = self
@@ -675,6 +685,38 @@ where
             overlay.restore(checkpoint);
         }
         Ok(receipt)
+    }
+
+    /// The account the identity role says holds `key`. The role's refusal,
+    /// or a reply that is not its interface's, rejects the frame.
+    async fn account_of(
+        &self,
+        key: &[u8],
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+    ) -> Result<std::result::Result<Option<identity::AccountNumber>, Refusal>> {
+        let reply = unit::query(
+            self.world(height, time),
+            vec![overlay],
+            stage,
+            &[],
+            Origin::System,
+            self.roles.identity.clone(),
+            abi::encode(&identity::Query::Account(key.to_vec())),
+        )
+        .await?;
+        Ok(reply.and_then(|bytes| match abi::decode(&bytes) {
+            Ok(identity::Reply::Account(account)) => Ok(account),
+            Err(refusal) => Err(Refusal::new(
+                reason::UNEXPECTED_REPLY,
+                format!(
+                    "the identity program answered Account with {}",
+                    refusal.sentence
+                ),
+            )),
+        }))
     }
 
     async fn run(
@@ -768,6 +810,7 @@ where
             time,
             me: entry.program.clone(),
             origin: Origin::System,
+            sender: Some(Principal::System),
             cause: Cause::Direct,
         };
         let receipt = self
@@ -854,7 +897,8 @@ where
                         height,
                         time,
                         me: message.target.clone(),
-                        origin: Origin::Program(source),
+                        origin: Origin::Program(source.clone()),
+                        sender: Some(Principal::Program(source)),
                         cause: Cause::Delivery(item.clone()),
                     };
                     let receipt = self
@@ -882,7 +926,8 @@ where
                         height,
                         time,
                         me: item.source.clone(),
-                        origin: Origin::Program(by),
+                        origin: Origin::Program(by.clone()),
+                        sender: Some(Principal::Program(by)),
                         cause: Cause::Completion {
                             item: item.clone(),
                             outcome,

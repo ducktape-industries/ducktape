@@ -327,6 +327,8 @@ where
         time: world.time,
         me: program.clone(),
         origin,
+        // a query acts as no one: it reads, and its origin says who asks
+        sender: None,
         cause: Cause::Direct,
     };
     let mut stack = stack.to_vec();

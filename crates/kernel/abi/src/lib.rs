@@ -80,6 +80,16 @@ pub enum Origin {
     System,
 }
 
+/// Who a frame acts as, resolved by the host once per frame: a signer's
+/// account (asked of the identity role), the program that sent a message, or
+/// the chain itself.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
+pub enum Principal {
+    Account(role::identity::AccountNumber),
+    Program(ProgramId),
+    System,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
 pub struct ItemRef {
     pub source: ProgramId,
@@ -167,6 +177,8 @@ pub struct Env {
     pub time: u64,
     pub me: ProgramId,
     pub origin: Origin,
+    /// `None` for a query, and for a signed frame whose key holds no account.
+    pub sender: Option<Principal>,
     pub cause: Cause,
 }
 
@@ -330,8 +342,7 @@ pub type GuestReply = Result<(), Refusal>;
 
 /// The kernel calls programs by role, never by id: genesis binds each role
 /// (registry, validators, identity) to a founding program. Each module here is
-/// the interface the kernel speaks to the program in that role. Identity's
-/// is not here yet: the kernel does not call it.
+/// the interface the kernel speaks to the program in that role.
 pub mod role {
     /// Which code runs at a height.
     pub mod registry {
@@ -396,6 +407,24 @@ pub mod role {
             pub validators: Vec<Member>,
         }
     }
+
+    /// Who holds a key: the account a signed frame acts as.
+    pub mod identity {
+        use crate::{BorshDeserialize, BorshSerialize};
+
+        pub type AccountNumber = u64;
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Query {
+            /// The account that holds this signing key.
+            Account(Vec<u8>),
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Reply {
+            Account(Option<AccountNumber>),
+        }
+    }
 }
 
 pub fn encode<T: BorshSerialize>(value: &T) -> Vec<u8> {
@@ -439,6 +468,7 @@ mod tests {
             time: 9,
             me: "a".into(),
             origin: Origin::Program("b".into()),
+            sender: Some(Principal::Program("b".into())),
             cause: Cause::Completion {
                 item: ItemRef {
                     source: "a".into(),
