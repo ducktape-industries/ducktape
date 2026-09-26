@@ -213,7 +213,8 @@ where
         read(&layered)?.map(Some).ok_or(Error::BlobUnavailable(*id))
     }
 
-    async fn serve(&self, op: HostOp) -> Result<HostReply> {
+    /// Serves a read. A query it makes runs on `fuel`, the caller's.
+    async fn serve(&self, op: HostOp, fuel: &mut Option<u64>) -> Result<HostReply> {
         let me = self.env.me.as_str();
         let reply = match op {
             HostOp::Get(key) => HostReply::Value(self.view().get(me, &key)?),
@@ -237,6 +238,7 @@ where
                     Origin::Program(self.env.me.clone()),
                     program,
                     request,
+                    fuel,
                 )
                 .await?,
             ),
@@ -273,7 +275,7 @@ impl<E> runtime::Host for Query<'_, E>
 where
     E: Context + Spawner,
 {
-    async fn call(&mut self, op: HostOp) -> HostReply {
+    async fn call(&mut self, op: HostOp, fuel: &mut Option<u64>) -> HostReply {
         let result = match op {
             HostOp::Respond(bytes) => {
                 self.response.extend(bytes);
@@ -287,7 +289,7 @@ where
                     env: &self.env,
                     stack: &self.stack,
                 };
-                reader.serve(other).await
+                reader.serve(other, fuel).await
             }
         };
         match result {
@@ -300,6 +302,10 @@ where
     }
 }
 
+/// Runs `program`'s query on `fuel`, leaving what it did not burn: a query
+/// made inside a frame runs on the frame's budget, one made from outside on
+/// a budget of its own.
+#[allow(clippy::too_many_arguments)]
 pub async fn query<'a, E>(
     world: World<'a, E>,
     layers: Vec<&'a Overlay>,
@@ -308,6 +314,7 @@ pub async fn query<'a, E>(
     origin: Origin,
     program: ProgramId,
     request: Vec<u8>,
+    fuel: &mut Option<u64>,
 ) -> Result<std::result::Result<Vec<u8>, Refusal>>
 where
     E: Context + Spawner,
@@ -351,7 +358,7 @@ where
     let verdict = world
         .loaded
         .runtime()
-        .run(module, invocation, &mut unit)
+        .run_within(module, invocation, &mut unit, fuel)
         .await;
     if let Some(fault) = unit.fault {
         return Err(fault);
@@ -362,6 +369,11 @@ where
         Err(fault) => Err(refusal_of(fault)),
     })
 }
+
+/// What the frame is charged for each message a run emits, on top of the
+/// run it causes: the kernel's own work of dispatching it, which a message
+/// refused before any run (an unknown target, too deep) costs too.
+pub const EMIT_FUEL: u64 = 1_000;
 
 /// What one submission's runs share: the fuel left of the network's limit,
 /// and the number the next emitted message takes, so every item of the
@@ -418,7 +430,7 @@ impl<E> runtime::Host for Execute<'_, E>
 where
     E: Context + Spawner,
 {
-    async fn call(&mut self, op: HostOp) -> HostReply {
+    async fn call(&mut self, op: HostOp, fuel: &mut Option<u64>) -> HostReply {
         let me = self.env.me.clone();
         let result = match op {
             HostOp::Set { key, value } => {
@@ -430,7 +442,10 @@ where
                 Ok(HostReply::Done)
             }
             HostOp::BlobPut { hash, kind, body } => Ok(self.put(hash, &kind, &body)),
-            HostOp::Emit(message) => Ok(self.emit(message)),
+            HostOp::Emit(message) => {
+                *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
+                Ok(self.emit(message))
+            }
             HostOp::Event(bytes) => {
                 self.events.push(bytes);
                 Ok(HostReply::Done)
@@ -451,7 +466,7 @@ where
                     env: &self.env,
                     stack: &[],
                 };
-                reader.serve(other).await
+                reader.serve(other, fuel).await
             }
         };
         match result {
@@ -542,4 +557,90 @@ pub(crate) fn discard_unrostered(
     }
     stage.retain(|id| kept.contains(id));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use abi::{Principal, Roles};
+    use commonware_runtime::{Runner as _, deterministic};
+    use runtime::Host as _;
+
+    use super::*;
+
+    #[test]
+    fn each_emitted_message_charges_the_frame() {
+        deterministic::Runner::default().start(|context| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = Storage::open(&dir.path().join("state")).unwrap();
+            let store = Store::open(context, "t", storage, Vec::new())
+                .await
+                .unwrap();
+            let blobs = Blobs::open(&dir.path().join("blobs")).unwrap();
+            let loaded = Loaded::new(Limits::default());
+            let roles = Roles {
+                registry: "registry".into(),
+                validators: "validators".into(),
+                identity: "identity".into(),
+            };
+            let world = World {
+                store: &store,
+                blobs: &blobs,
+                loaded: &loaded,
+                network: b"net",
+                roles: &roles,
+                height: 1,
+                time: 1,
+            };
+            let env = Env {
+                network: b"net".to_vec(),
+                height: 1,
+                time: 1,
+                me: "ping".into(),
+                origin: Origin::System,
+                sender: Some(Principal::System),
+                roles: roles.clone(),
+                cause: Cause::Direct,
+            };
+            let mut overlay = Overlay::default();
+            let mut stage = Stage::default();
+            let mut frame = Frame {
+                fuel: None,
+                next_item: 0,
+            };
+            let mut unit = Execute {
+                world,
+                env,
+                overlay: &mut overlay,
+                stage: &mut stage,
+                frame: &mut frame,
+                events: Vec::new(),
+                emitted: Vec::new(),
+                output: Vec::new(),
+                fault: None,
+            };
+            const K: u64 = 5;
+            let start = 100_000;
+            let mut fuel = Some(start);
+            for _ in 0..K {
+                let message = Message {
+                    target: "pong".into(),
+                    payload: Vec::new(),
+                    reply: false,
+                };
+                unit.call(HostOp::Emit(message), &mut fuel).await;
+            }
+            assert_eq!(unit.emitted.len(), K as usize);
+            assert_eq!(fuel, Some(start - K * EMIT_FUEL));
+
+            // an emit the run cannot pay for leaves it nothing
+            let mut fuel = Some(EMIT_FUEL - 1);
+            let message = Message {
+                target: "pong".into(),
+                payload: Vec::new(),
+                reply: false,
+            };
+            unit.call(HostOp::Emit(message), &mut fuel).await;
+            assert_eq!(fuel, Some(0));
+        });
+    }
 }

@@ -520,6 +520,7 @@ where
             origin,
             program.to_owned(),
             request,
+            &mut self.loaded.limits().fuel,
         )
         .await
     }
@@ -540,6 +541,7 @@ where
             Origin::System,
             self.roles.validators.clone(),
             abi::encode(&validators::Query::Members),
+            &mut self.loaded.limits().fuel,
         )
         .await?;
         let bytes = reply.map_err(|refusal| {
@@ -647,7 +649,11 @@ where
             ));
         }
         let asked = identity::Query::Account(submission.signer.clone());
-        let account = match self.account(asked, height, time, overlay, stage).await? {
+        let fuel = &mut self.loaded.limits().fuel;
+        let account = match self
+            .account(asked, height, time, overlay, stage, fuel)
+            .await?
+        {
             Ok(account) => account,
             Err(refusal) => return Ok(rejected(&submission.target, refusal)),
         };
@@ -685,7 +691,7 @@ where
     }
 
     /// The account the identity role says `program` runs as, for a frame
-    /// it causes.
+    /// it causes: asked on the frame's fuel.
     async fn account_of(
         &self,
         program: &str,
@@ -693,9 +699,12 @@ where
         time: u64,
         overlay: &Overlay,
         stage: &Stage,
+        frame: &mut Frame,
     ) -> Result<std::result::Result<Option<Principal>, Refusal>> {
         let asked = identity::Query::OfModule(program.to_owned());
-        let account = self.account(asked, height, time, overlay, stage).await?;
+        let account = self
+            .account(asked, height, time, overlay, stage, &mut frame.fuel)
+            .await?;
         Ok(account.map(|account| account.map(Principal::Account)))
     }
 
@@ -709,6 +718,7 @@ where
         time: u64,
         overlay: &Overlay,
         stage: &Stage,
+        fuel: &mut Option<u64>,
     ) -> Result<std::result::Result<Option<identity::AccountNumber>, Refusal>> {
         let reply = unit::query(
             self.world(height, time),
@@ -718,6 +728,7 @@ where
             Origin::System,
             self.roles.identity.clone(),
             abi::encode(&asked),
+            fuel,
         )
         .await?;
         Ok(reply.and_then(|bytes| match abi::decode(&bytes) {
@@ -791,6 +802,13 @@ where
             Invocation { env, call },
         )
         .await?;
+        // the emitter's account, asked once for all its messages
+        let emitter = if emitted.is_empty() {
+            Ok(None)
+        } else {
+            self.account_of(program, height, time, overlay, stage, frame)
+                .await?
+        };
         for (item, message) in emitted {
             let env = |me: &str, origin: &str, sender, cause| Env {
                 network: self.network.clone(),
@@ -802,10 +820,7 @@ where
                 roles: self.roles.clone(),
                 cause,
             };
-            let ran = match self
-                .account_of(program, height, time, overlay, stage)
-                .await?
-            {
+            let ran = match emitter.clone() {
                 Err(refusal) => rejected(&message.target, refusal),
                 Ok(sender) => {
                     let env = env(
@@ -835,7 +850,10 @@ where
                 (true, false) => outcome,
                 (_, true) => {
                     let by = &message.target;
-                    let replied = match self.account_of(by, height, time, overlay, stage).await? {
+                    let replied = match self
+                        .account_of(by, height, time, overlay, stage, frame)
+                        .await?
+                    {
                         Err(refusal) => rejected(program, refusal),
                         Ok(sender) => {
                             let cause = Cause::Completion { item, outcome };
@@ -884,6 +902,7 @@ where
             Origin::System,
             self.roles.registry.clone(),
             abi::encode(&registry::Query::At(height)),
+            &mut self.loaded.limits().fuel,
         )
         .await?;
         let Ok(bytes) = reply else {

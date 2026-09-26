@@ -885,6 +885,84 @@ fn a_frame_runs_on_one_fuel_budget() {
     });
 }
 
+/// A probe script that asks `probe`'s own query to spin, `times` times.
+fn spin_queries(times: usize) -> Vec<Step> {
+    let spin = || HostOp::Query {
+        program: "probe".into(),
+        request: script(vec![Step::Spin]),
+    };
+    (0..times).map(|_| op(spin())).collect()
+}
+
+/// The refusal of a run whose frame spent its fuel.
+fn spent() -> Refusal {
+    Refusal::new(reason::TRAP, runtime::OUT_OF_FUEL)
+}
+
+fn metered() -> Genesis {
+    let mut metered = standard();
+    metered.limits = Limits {
+        fuel: Some(FRAME_FUEL),
+        memory_bytes: None,
+    };
+    metered
+}
+
+#[test]
+fn a_query_inside_a_frame_runs_on_the_frame_budget() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), metered()).await;
+        // each spin would burn a whole budget of its own: the first spends
+        // the frame's, and the handler traps on what is left, nothing
+        let applied = host
+            .apply(block(1, vec![submit(0, "probe", script(spin_queries(3)))]))
+            .await
+            .unwrap();
+        assert_eq!(rejected(&applied.submissions[0]), &spent());
+        // a query from outside any frame still runs on its own budget
+        let asked = ask(&host, Layer::Confirmed, "probe", vec![Step::Env]).await;
+        assert_eq!(asked.len(), 1);
+    });
+}
+
+#[test]
+fn a_spent_frame_starts_no_further_run() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), metered()).await;
+        let spend = Message {
+            target: "probe".into(),
+            payload: script(spin_queries(1)),
+            reply: true,
+        };
+        let payload = send(vec![spend, message("pong", note(b"late"), false)]);
+        let applied = host
+            .apply(block(1, vec![submit(0, "ping", payload)]))
+            .await
+            .unwrap();
+        let frame = &applied.submissions[0];
+        assert_eq!(rejected(frame), &spent());
+        // the probe spends the frame; the reply it wanted, and pong after
+        // it, never start
+        assert_eq!(
+            frame.nested,
+            vec![
+                rejected_receipt("probe", spent()),
+                rejected_receipt("ping", spent()),
+            ]
+        );
+        assert_eq!(
+            stored(&host, "pong", &fixture_relay::got(&item("ping", 1))),
+            None
+        );
+    });
+}
+
+fn rejected_receipt(program: &str, refusal: Refusal) -> Receipt {
+    receipt(program, Outcome::Rejected(refusal), Vec::new())
+}
+
 #[test]
 fn a_submission_acts_as_the_account_its_signer_holds() {
     deterministic::Runner::default().start(|context| async move {
