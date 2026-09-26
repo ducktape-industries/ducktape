@@ -1029,6 +1029,74 @@ fn the_roster_admits_swaps_and_drops_programs() {
     });
 }
 
+/// A later install whose account identity refuses does not run: the
+/// admission is undone, both receipts say so, and the next height admits
+/// it again once identity gives it its account.
+#[test]
+fn a_program_identity_gives_no_account_is_not_admitted() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let relay = host.programs().unwrap()["ping"];
+        let closed = |seq, number: u64| {
+            submit(
+                seq,
+                "identity",
+                abi::encode(&(b"#closed/late".to_vec(), number)),
+            )
+        };
+        host.apply(block(
+            1,
+            vec![
+                closed(0, 1),
+                submit(1, "module-registry", change("late", relay, Vec::new())),
+            ],
+        ))
+        .await
+        .unwrap();
+        for height in [2, 3] {
+            let applied = host.apply(block(height, Vec::new())).await.unwrap();
+            assert_eq!(
+                applied.admissions,
+                vec![
+                    receipt("late", ok(b""), vec![]),
+                    receipt(
+                        "identity",
+                        Outcome::Rejected(Refusal::new("closed", "late")),
+                        vec![]
+                    ),
+                ]
+            );
+            assert!(!host.programs().unwrap().contains_key("late"));
+            assert_eq!(account_of(&host, "late").await, None);
+        }
+        let applied = host
+            .apply(block(
+                4,
+                vec![submit(2, "late", message("ping", b"hi", false))],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected(&applied.submissions[0]).reason,
+            reason::UNKNOWN_PROGRAM
+        );
+
+        // the refused submission kept the signer's sequence
+        host.apply(block(5, vec![closed(2, 0)])).await.unwrap();
+        let applied = host.apply(block(6, Vec::new())).await.unwrap();
+        assert_eq!(
+            applied.admissions,
+            vec![
+                receipt("late", ok(b""), vec![]),
+                receipt("identity", ok(b""), vec![]),
+            ]
+        );
+        assert_eq!(host.programs().unwrap()["late"], relay);
+        assert!(account_of(&host, "late").await.is_some());
+    });
+}
+
 #[test]
 fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
     deterministic::Runner::default().start(|context| async move {

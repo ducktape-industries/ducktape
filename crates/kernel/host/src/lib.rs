@@ -791,6 +791,7 @@ where
                 Some(code) if *code == entry.code => {}
                 Some(_) => receipts.push(self.swap(&entry, overlay, stage)?),
                 None => {
+                    let checkpoint = overlay.checkpoint();
                     let admitted = self.admit(&entry, height, time, overlay, stage).await?;
                     let applied = matches!(admitted.outcome, Outcome::Applied { .. });
                     receipts.push(admitted);
@@ -798,7 +799,17 @@ where
                         let registered = self
                             .register(&entry.program, height, time, overlay, stage)
                             .await?;
+                        let refused = matches!(registered.outcome, Outcome::Rejected(_));
                         receipts.push(registered);
+                        // a program runs only as its account: identity's
+                        // refusal undoes the admission as a rejected unit's
+                        // writes are undone, and the next height admits it
+                        // again
+                        if refused {
+                            overlay.restore(checkpoint);
+                            unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+                            self.loaded.unload(&entry.program);
+                        }
                     }
                 }
             }

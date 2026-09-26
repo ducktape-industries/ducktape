@@ -466,9 +466,10 @@ pub mod role {
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Query {
-            /// The account a frame signed by this key acts as. Refused
-            /// (`unauthorized`) while that account is not live: suspended,
-            /// revoked, or managed by an account that is not live.
+            /// The account a frame signed by this key acts as, `None` for a
+            /// key that holds none. Refused while that account does not act:
+            /// its [`Status`] or its manager's is not `Active`. The host
+            /// rejects a frame whose key is refused.
             Account(Vec<u8>),
             /// Every account's profile, ascending by number from past
             /// `after`, at most `limit` of them (the program may cap it).

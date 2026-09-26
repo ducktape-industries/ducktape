@@ -507,7 +507,11 @@ where
     })
 }
 
-fn discard_unrostered(storage: &Storage, overlay: &Overlay, stage: &mut Stage) -> Result<()> {
+pub(crate) fn discard_unrostered(
+    storage: &Storage,
+    overlay: &Overlay,
+    stage: &mut Stage,
+) -> Result<()> {
     let view = View::new(storage, vec![overlay]);
     let mut kept = Vec::new();
     for id in stage.ids() {

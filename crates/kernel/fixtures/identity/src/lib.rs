@@ -1,7 +1,8 @@
 //! The identity role as the kernel asks it, over a table of keys: founded
 //! with the keys each account holds (`Vec<(key, account)>`), and a signed
 //! execute adds one more holding. The system's `RegisterModule` gives a
-//! program the next account from [`MODULES_FROM`]. It keeps no profiles.
+//! program the next account from [`MODULES_FROM`], refused while the key
+//! `#closed/<module>` holds a nonzero number. It keeps no profiles.
 
 /// The first account number a program is given.
 pub const MODULES_FROM: u64 = 1000;
@@ -31,6 +32,10 @@ mod program {
         fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal> {
             if env.origin == Origin::System {
                 let identity::Op::RegisterModule { module } = abi::decode(payload)?;
+                let closed: Option<u64> = ctx.record([b"#closed/", module.as_bytes()].concat())?;
+                if closed.is_some_and(|number| number != 0) {
+                    return Err(Refusal::new("closed", module));
+                }
                 let key = module_key(&module);
                 if ctx.get(&key).is_none() {
                     let number: u64 = ctx.record(NEXT)?.unwrap_or(super::MODULES_FROM);
