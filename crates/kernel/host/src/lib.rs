@@ -126,6 +126,8 @@ pub struct Receipt {
     pub events: Vec<Vec<u8>>,
     /// The runs this one's messages caused, in order: each message's
     /// target, then, when a reply was wanted, this program's reply run.
+    /// A nested receipt's `Applied` and events stand only when every
+    /// receipt above it was applied too: an ancestor's rejection undid it.
     pub nested: Vec<Receipt>,
 }
 
@@ -219,12 +221,14 @@ where
                 });
             }
         }
-        // the registry, then the validators, are admitted before the rest
+        // the registry, the validators, then identity are admitted before
+        // the rest
+        let founding_roles = [&roles.registry, &roles.validators, &roles.identity];
         entries.sort_by_key(|entry| {
-            [&roles.registry, &roles.validators]
+            founding_roles
                 .iter()
                 .position(|role| **role == entry.program)
-                .unwrap_or(2)
+                .unwrap_or(founding_roles.len())
         });
         let params = abi::encode(&validators::Genesis {
             validators: genesis.validators,
@@ -260,32 +264,33 @@ where
             programs: entries.clone(),
             views,
         });
+        // the roles init before identity can give an account; every other
+        // program has its account before its init runs, so what it emits
+        // carries it
+        let is_role = |entry: &registry::Entry| founding_roles.contains(&&entry.program);
+        let (role_entries, rest) = entries.split_at(entries.partition_point(is_role));
         let mut receipts = Vec::new();
-        for entry in &entries {
+        for entry in role_entries {
             let receipt = host
                 .admit(entry, 0, genesis.time, &mut overlay, &mut stage)
                 .await?;
-            if let Outcome::Rejected(refusal) = &receipt.outcome {
-                return Err(Error::Genesis {
-                    program: entry.program.clone(),
-                    refusal: refusal.clone(),
-                });
-            }
-            receipts.push(receipt);
+            receipts.push(founded(entry, receipt)?);
         }
-        // every founding program has its account before any frame runs:
-        // the identity role is admitted by now
-        for entry in &entries {
+        for entry in role_entries {
             let receipt = host
                 .register(&entry.program, 0, genesis.time, &mut overlay, &mut stage)
                 .await?;
-            if let Outcome::Rejected(refusal) = &receipt.outcome {
-                return Err(Error::Genesis {
-                    program: entry.program.clone(),
-                    refusal: refusal.clone(),
-                });
-            }
-            receipts.push(receipt);
+            receipts.push(founded(entry, receipt)?);
+        }
+        for entry in rest {
+            let registered = host
+                .register(&entry.program, 0, genesis.time, &mut overlay, &mut stage)
+                .await?;
+            receipts.push(founded(entry, registered)?);
+            let admitted = host
+                .admit(entry, 0, genesis.time, &mut overlay, &mut stage)
+                .await?;
+            receipts.push(founded(entry, admitted)?);
         }
         host.record_epoch(0, 0, genesis.time, &mut overlay, &stage)
             .await?;
@@ -930,25 +935,26 @@ where
                 Some(code) if *code == entry.code => {}
                 Some(_) => receipts.push(self.swap(&entry, overlay, stage)?),
                 None => {
+                    // a program runs only as its account, its init too:
+                    // identity's refusal leaves it unadmitted, and the next
+                    // height registers it again
                     let checkpoint = overlay.checkpoint();
+                    let registered = self
+                        .register(&entry.program, height, time, overlay, stage)
+                        .await?;
+                    let refused = matches!(registered.outcome, Outcome::Rejected(_));
+                    receipts.push(registered);
+                    if refused {
+                        continue;
+                    }
                     let admitted = self.admit(&entry, height, time, overlay, stage).await?;
-                    let applied = matches!(admitted.outcome, Outcome::Applied { .. });
+                    let rejected = matches!(admitted.outcome, Outcome::Rejected(_));
                     receipts.push(admitted);
-                    if applied {
-                        let registered = self
-                            .register(&entry.program, height, time, overlay, stage)
-                            .await?;
-                        let refused = matches!(registered.outcome, Outcome::Rejected(_));
-                        receipts.push(registered);
-                        // a program runs only as its account: identity's
-                        // refusal undoes the admission as a rejected unit's
-                        // writes are undone, and the next height admits it
-                        // again
-                        if refused {
-                            overlay.restore(checkpoint);
-                            unit::discard_unrostered(self.store.storage(), overlay, stage)?;
-                            self.loaded.unload(&entry.program);
-                        }
+                    // a rejected init undoes the account with it, as a
+                    // rejected unit's writes are undone
+                    if rejected {
+                        overlay.restore(checkpoint);
+                        unit::discard_unrostered(self.store.storage(), overlay, stage)?;
                     }
                 }
             }
@@ -1102,6 +1108,17 @@ where
             writes,
             root: self.root()?,
         })
+    }
+}
+
+/// A founding run's receipt, or the refusal that stops the founding.
+fn founded(entry: &registry::Entry, receipt: Receipt) -> Result<Receipt> {
+    match &receipt.outcome {
+        Outcome::Applied { .. } => Ok(receipt),
+        Outcome::Rejected(refusal) => Err(Error::Genesis {
+            program: entry.program.clone(),
+            refusal: refusal.clone(),
+        }),
     }
 }
 

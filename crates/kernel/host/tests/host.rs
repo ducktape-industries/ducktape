@@ -310,9 +310,13 @@ fn founding_admits_every_program_and_the_host_reopens() {
             "pong",
             "probe",
         ];
-        // each admission, then each program's account from identity
-        assert_eq!(admitted[..6], founded);
-        assert_eq!(admitted[6..], ["identity"; 6]);
+        // the roles' admissions and accounts, then each other program's
+        // account before its admission
+        assert_eq!(admitted[..3], founded[..3]);
+        assert_eq!(admitted[3..6], ["identity"; 3]);
+        for (pair, program) in admitted[6..].chunks(2).zip(&founded[3..]) {
+            assert_eq!(pair, ["identity", *program]);
+        }
         for (at, program) in founded.into_iter().enumerate() {
             let number = fixture_identity::MODULES_FROM + at as u64;
             assert_eq!(account_of(&host, program).await, Some(number));
@@ -651,6 +655,46 @@ fn a_message_sees_who_emitted_it() {
             stored(&host, "ping", &fixture_relay::done(&item("ping", 0))),
             Some(abi::encode(&ok(&abi::encode(&vec![Reply::Env(env)]))))
         );
+    });
+}
+
+#[test]
+fn a_message_emitted_from_init_carries_the_program_account() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut founding_file = standard();
+        let emit = op(HostOp::Emit(Message {
+            target: "probe".into(),
+            payload: script(vec![Step::Env]),
+            reply: false,
+        }));
+        founding_file
+            .programs
+            .push(founding("emitter", PROBE, script(vec![emit])));
+        let (host, applied) = Host::found(context, "net", dir.path(), block_id(0), founding_file)
+            .await
+            .unwrap();
+        let account = account_of(&host, "emitter").await.unwrap();
+        let init = applied
+            .admissions
+            .iter()
+            .find(|receipt| receipt.program == "emitter" && !receipt.nested.is_empty())
+            .unwrap();
+        let [probed] = init.nested.as_slice() else {
+            panic!("{:?}", init.nested);
+        };
+        let env = Env {
+            network: b"net".to_vec(),
+            height: 0,
+            time: TIME,
+            me: "probe".into(),
+            origin: Origin::Program("emitter".into()),
+            // registered before its init ran
+            sender: Some(Principal::Account(account)),
+            roles: roles(),
+            cause: Cause::Message(item("emitter", 0)),
+        };
+        assert_eq!(replies(probed), vec![Reply::Env(env)]);
     });
 }
 
@@ -1205,8 +1249,8 @@ fn the_roster_admits_swaps_and_drops_programs() {
         assert_eq!(
             applied.admissions,
             vec![
-                receipt("echo", ok(b""), vec![]),
                 receipt("identity", ok(b""), vec![]),
+                receipt("echo", ok(b""), vec![]),
             ]
         );
         let seventh = fixture_identity::MODULES_FROM + 6;
@@ -1303,14 +1347,19 @@ fn the_roster_admits_swaps_and_drops_programs() {
         .await
         .unwrap();
         let applied = host.apply(block(10, Vec::new())).await.unwrap();
+        // bad's account is given, then undone with its refused init
         assert_eq!(
             applied.admissions,
-            vec![receipt(
-                "bad",
-                Outcome::Rejected(Refusal::new("probe", "no")),
-                vec![]
-            )]
+            vec![
+                receipt("identity", ok(b""), vec![]),
+                receipt(
+                    "bad",
+                    Outcome::Rejected(Refusal::new("probe", "no")),
+                    vec![]
+                ),
+            ]
         );
+        assert_eq!(account_of(&host, "bad").await, None);
         let programs = host.programs().unwrap();
         let ids: Vec<&str> = programs.keys().map(String::as_str).collect();
         assert_eq!(
@@ -1324,14 +1373,15 @@ fn the_roster_admits_swaps_and_drops_programs() {
                 "valset"
             ]
         );
+        // retried: registered and refused again
         let applied = host.apply(block(11, Vec::new())).await.unwrap();
-        assert_eq!(applied.admissions.len(), 1);
+        assert_eq!(applied.admissions.len(), 2);
     });
 }
 
-/// A later install whose account identity refuses does not run: the
-/// admission is undone, both receipts say so, and the next height admits
-/// it again once identity gives it its account.
+/// A later install whose account identity refuses does not run: its init
+/// never runs, the receipt says so, and the next height admits it once
+/// identity gives it its account.
 #[test]
 fn a_program_identity_gives_no_account_is_not_admitted() {
     deterministic::Runner::default().start(|context| async move {
@@ -1358,14 +1408,11 @@ fn a_program_identity_gives_no_account_is_not_admitted() {
             let applied = host.apply(block(height, Vec::new())).await.unwrap();
             assert_eq!(
                 applied.admissions,
-                vec![
-                    receipt("late", ok(b""), vec![]),
-                    receipt(
-                        "identity",
-                        Outcome::Rejected(Refusal::new("closed", "late")),
-                        vec![]
-                    ),
-                ]
+                vec![receipt(
+                    "identity",
+                    Outcome::Rejected(Refusal::new("closed", "late")),
+                    vec![]
+                )]
             );
             assert!(!host.programs().unwrap().contains_key("late"));
             assert_eq!(account_of(&host, "late").await, None);
@@ -1392,8 +1439,8 @@ fn a_program_identity_gives_no_account_is_not_admitted() {
         assert_eq!(
             applied.admissions,
             vec![
-                receipt("late", ok(b""), vec![]),
                 receipt("identity", ok(b""), vec![]),
+                receipt("late", ok(b""), vec![]),
             ]
         );
         assert_eq!(host.programs().unwrap()["late"], relay);
