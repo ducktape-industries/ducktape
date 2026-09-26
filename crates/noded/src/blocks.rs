@@ -42,7 +42,7 @@ impl<E: Context> Daemon<E> {
     }
 
     /// One finalized block by height or id; `None` where the archive holds
-    /// no finalized block by that name.
+    /// no finalized block by that name or this node has not applied it.
     pub async fn block(&self, by: BlockRef) -> Result<Option<Finalized>> {
         let block = match by {
             BlockRef::Height(height) => self.anchors.get_block(Height::new(height)).await,
@@ -60,10 +60,17 @@ impl<E: Context> Daemon<E> {
                 }
             }
         };
-        match block {
-            Some(block) => Ok(Some(self.finalized(block, &mut Seats::new()).await?)),
-            None => Ok(None),
+        // as `blocks`: a block above the applied tip has no receipts kept
+        // yet, and `None` there would read as never kept
+        let tip = self.node.lock().await.tip()?.height;
+        let Some(block) = block else {
+            return Ok(None);
+        };
+        let applied = block.height <= tip;
+        if !applied {
+            return Ok(None);
         }
+        Ok(Some(self.finalized(block, &mut Seats::new()).await?))
     }
 
     async fn finalized(&self, block: Block, seats: &mut Seats) -> Result<Finalized> {
