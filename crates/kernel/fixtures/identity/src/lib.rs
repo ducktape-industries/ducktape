@@ -53,7 +53,7 @@ mod program {
             let key = match abi::decode(request)? {
                 identity::Query::Account(key) => key,
                 identity::Query::OfModule(module) => module_key(&module),
-                identity::Query::Profiles { .. } => {
+                identity::Query::Profile(_) | identity::Query::Profiles { .. } => {
                     return Err(Refusal::new(
                         reason::UNSUPPORTED,
                         "this identity names no one",
