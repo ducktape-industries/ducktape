@@ -434,9 +434,18 @@ pub mod role {
             Agent,
         }
 
+        /// Whether an account acts. Only a manager changes it; `Revoked` is
+        /// final.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Status {
+            Active,
+            Suspended,
+            Revoked,
+        }
+
         /// An account as others show it: its name, what its manager declares
-        /// it (`category`), who manages it, and the program it is the
-        /// account of.
+        /// it (`category`), who manages it, the program it is the account
+        /// of, and whether it acts (`status`).
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub struct Profile {
             pub number: AccountNumber,
@@ -444,6 +453,7 @@ pub mod role {
             pub category: Option<Category>,
             pub manager: Option<AccountNumber>,
             pub module: Option<ProgramId>,
+            pub status: Status,
         }
 
         /// The one write the kernel makes: as it admits a program, with the
