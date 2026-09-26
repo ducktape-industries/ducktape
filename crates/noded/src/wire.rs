@@ -1,6 +1,6 @@
 use abi::{BlobId, ProgramId, Root, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
-use host::Layer;
+use host::{Layer, Receipt};
 
 pub const NODE_CONTRACT: u32 = 1;
 pub const ADMIN: &str = "$admin";
@@ -104,6 +104,12 @@ pub enum BlockRef {
 /// exact bytes as the block carries them (signature included), so the same
 /// signed frame has one hash wherever it is seen. A frame that does not
 /// verify was not applied and is left out.
+///
+/// `receipt` is the frame's run as this node recorded it when it applied
+/// the block: applied or rejected with its refusal, the events, the nested
+/// runs. It is node-local, derived data, not part of the block or its id,
+/// and `None` where this node never ran the block (one below its state-sync
+/// anchor) or stopped between applying it and keeping its receipts.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Tx {
     pub hash: [u8; 32],
@@ -111,6 +117,7 @@ pub struct Tx {
     pub seq: u64,
     pub target: String,
     pub payload: Vec<u8>,
+    pub receipt: Option<Receipt>,
 }
 
 /// A finalized block as the marshal archive keeps it. `proposer` is the

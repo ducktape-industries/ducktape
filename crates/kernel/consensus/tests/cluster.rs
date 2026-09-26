@@ -246,7 +246,7 @@ impl Peer {
             node: node.clone(),
             inbox,
         };
-        let marshal = Marshal::start(
+        let (marshal, _receipts) = Marshal::start(
             context.child("marshal"),
             name,
             &network,

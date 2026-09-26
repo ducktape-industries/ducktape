@@ -175,7 +175,7 @@ fn a_validator_serves_its_network_over_http() {
     let client = live.client.clone();
     let alice = ed25519::PrivateKey::from_seed(11);
 
-    client_runtime().block_on(async {
+    let kept = client_runtime().block_on(async {
         let status = client.status().await.unwrap();
         assert_eq!(status.network, NETWORK);
         assert_eq!(status.epoch_length, EPOCH_LENGTH);
@@ -191,7 +191,14 @@ fn a_validator_serves_its_network_over_http() {
         );
 
         let mut changes = client.changes("probe").await.unwrap();
-        let submitted = frame(&alice, 0, vec![set(b"a", b"1")]);
+        // admitted but rejected: it consumes seq 0 and rides a block at or
+        // before the one that writes
+        let failed = frame(&alice, 0, vec![Step::Fail("no".into())]);
+        let rejected = client.submit(failed.clone()).await.unwrap();
+        let Outcome::Rejected(refusal) = &rejected.outcome else {
+            panic!("the failing run is rejected: {rejected:?}");
+        };
+        let submitted = frame(&alice, 1, vec![set(b"a", b"1")]);
         let receipt = client.submit(submitted.clone()).await.unwrap();
         assert!(
             matches!(receipt.outcome, Outcome::Applied { .. }),
@@ -227,13 +234,38 @@ fn a_validator_serves_its_network_over_http() {
             .unwrap();
         assert_eq!(block.height, change.height);
         assert_eq!(block.epoch, change.height / EPOCH_LENGTH);
-        let [tx] = block.txs.as_slice() else {
-            panic!("one frame in the block: {block:?}");
-        };
+        let tx = block
+            .txs
+            .last()
+            .expect("the writing frame is the block's last");
         assert_eq!(tx.hash, noded::tx_hash(&submitted));
         assert_eq!(tx.signer, alice.public_key().as_ref().to_vec());
-        assert_eq!((tx.seq, tx.target.as_str()), (0, "probe"));
+        assert_eq!((tx.seq, tx.target.as_str()), (1, "probe"));
         assert_eq!(tx.payload, abi::encode(&vec![set(b"a", b"1")]));
+        assert_eq!(tx.receipt.as_ref(), Some(&receipt), "the kept receipt");
+        let fails = |tx: &&noded::wire::Tx| tx.hash == noded::tx_hash(&failed);
+        let holding = client.blocks(Some(block.height + 1), 3).await.unwrap();
+        let (holder, rejected_tx) = holding
+            .iter()
+            .find_map(|seen| Some((seen, seen.txs.iter().find(fails)?)))
+            .expect("the rejected frame rides a block");
+        let kept = rejected_tx.receipt.as_ref().expect("its receipt is kept");
+        assert_eq!(kept.outcome, Outcome::Rejected(refusal.clone()));
+        // the receipts ride beside the block: its id is the digest of its
+        // header and frames alone
+        let frames: Vec<Vec<u8>> = if holder.height == block.height {
+            vec![failed.clone(), submitted.clone()]
+        } else {
+            vec![submitted.clone()]
+        };
+        let parent = host::Tip {
+            height: block.height - 1,
+            id: block.parent,
+        };
+        assert_eq!(
+            node::Block::next(parent, block.time, frames).digest().0,
+            block.id
+        );
         assert_eq!(
             block.proposer.as_deref(),
             Some(seat.identity.public_key().as_ref())
@@ -290,6 +322,21 @@ fn a_validator_serves_its_network_over_http() {
             .admin(seat.admin(Admin::LogFilter("debug".into())))
             .await
             .unwrap();
+        client.admin(seat.admin(Admin::Shutdown)).await.unwrap();
+        (block, holder.clone())
+    });
+    live.thread.join().unwrap();
+
+    // reopened, the node answers the same receipts out of its archive: the
+    // host is past these blocks and runs neither again
+    let (block, holder) = kept;
+    let live = seat.start();
+    let client = live.client.clone();
+    client_runtime().block_on(async {
+        for seen in [&block, &holder] {
+            let again = client.block(BlockRef::Height(seen.height)).await.unwrap();
+            assert_eq!(again.as_ref(), Some(seen));
+        }
         client.admin(seat.admin(Admin::Shutdown)).await.unwrap();
     });
     live.thread.join().unwrap();

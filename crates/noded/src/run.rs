@@ -5,8 +5,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use abi::role::validators::Member;
-use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PublicKey;
+use commonware_cryptography::{Digestible as _, Signer as _};
 use commonware_p2p::authenticated::lookup::{Oracle, Receiver, Sender};
 use commonware_runtime::Handle;
 use commonware_utils::Acknowledgement as _;
@@ -156,7 +156,7 @@ async fn start<E: Context>(
         node: node.clone(),
         inbox,
     };
-    let marshal = Marshal::start(
+    let (marshal, receipts) = Marshal::start(
         context.child("marshal"),
         &descriptor.network,
         &network,
@@ -199,6 +199,7 @@ async fn start<E: Context>(
         network,
         identity: identity.public_key().as_ref().to_vec(),
         anchors: marshal.mailbox().clone(),
+        receipts,
         logs,
         shutdown,
         subscribers: Mutex::new(Vec::new()),
@@ -303,6 +304,10 @@ async fn applied<E: Context>(
 ) -> Result<()> {
     let mut node = daemon.node.lock().await;
     if let Sequenced::Applied(outcome) = node.apply(block).await? {
+        daemon
+            .receipts
+            .keep(block.height, block.digest(), &outcome.submissions)
+            .await?;
         daemon.publish(&outcome);
     }
     if !daemon.network.closes_an_epoch(block.height) {
