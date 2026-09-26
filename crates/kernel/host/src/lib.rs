@@ -309,7 +309,14 @@ where
     pub async fn open(context: E, name: &str, dir: &Path) -> Result<Host<E>> {
         let storage = Storage::open(&dir.join(STATE_DIR))?;
         let programs = programs_in(&storage)?;
-        let store = Store::open(context, name, storage, programs).await?;
+        let dropped = dropped_in(&storage)?;
+        let mut store = Store::open(context, name, storage, programs).await?;
+        // a node that died after the last block's writes landed and before
+        // `commit` removed the programs it dropped still holds their
+        // commitments and keys on disk
+        for program in &dropped {
+            store.remove_program(program).await?;
+        }
         let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
         Host::assemble(store, blobs)
     }
@@ -1079,6 +1086,21 @@ fn programs_in(storage: &Storage) -> Result<Vec<ProgramId>> {
         programs.push(program_id(key)?);
     }
     Ok(programs)
+}
+
+/// The programs the last committed block dropped from the roster.
+fn dropped_in(storage: &Storage) -> Result<Vec<ProgramId>> {
+    let Some(pending) = storage.pending()? else {
+        return Ok(Vec::new());
+    };
+    let Some(roster) = pending.programs.get(PROGRAMS) else {
+        return Ok(Vec::new());
+    };
+    roster
+        .iter()
+        .filter(|(_, slot)| slot.is_none())
+        .map(|(key, _)| program_id(key.clone()))
+        .collect()
 }
 
 fn programs_of(view: &View<'_>) -> Result<BTreeMap<ProgramId, BlobId>> {

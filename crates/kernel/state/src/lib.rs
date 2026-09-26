@@ -113,24 +113,34 @@ where
         if self.commitments.contains_key(program) {
             return Ok(());
         }
-        let context = self
-            .context
-            .child("program")
-            .with_attribute("program", program);
-        let commitment = Commitment::open(context, &commitment_name(&self.name, program)).await?;
+        let commitment =
+            Commitment::open(self.context(program), &commitment_name(&self.name, program)).await?;
         self.commitments.insert(program.to_owned(), commitment);
         Ok(())
     }
 
-    /// Removes a program's commitment and destroys what it holds on disk:
-    /// a program that no longer runs carries no root, and one admitted again
-    /// under the same id starts empty.
+    /// Removes a program's commitment and destroys what it holds on disk,
+    /// its storage keys with it: a program that no longer runs carries no
+    /// root, and one admitted again under the same id starts empty. A
+    /// commitment this store did not open is opened to be destroyed: a
+    /// node that died between a block's commit and this call left it there.
     pub async fn remove_program(&mut self, program: &str) -> Result<()> {
-        let Some(commitment) = self.commitments.remove(program) else {
-            return Ok(());
+        self.storage.clear(program)?;
+        let commitment = match self.commitments.remove(program) {
+            Some(commitment) => commitment,
+            None => {
+                Commitment::open(self.context(program), &commitment_name(&self.name, program))
+                    .await?
+            }
         };
         commitment.into_db()?.destroy().await?;
         Ok(())
+    }
+
+    fn context(&self, program: &str) -> E {
+        self.context
+            .child("program")
+            .with_attribute("program", program)
     }
 
     async fn reconcile(&mut self) -> Result<()> {

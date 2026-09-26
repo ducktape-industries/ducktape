@@ -1619,3 +1619,68 @@ fn a_signer_submits_in_sequence_and_a_refusal_keeps_the_sequence() {
         );
     });
 }
+
+/// A dropped program's keys leave storage with its commitment: admitted
+/// again under the same id it reads nothing, as a node that synced the
+/// empty commitment would.
+#[test]
+fn a_program_admitted_again_under_its_id_starts_empty() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("found"), "net", dir.path(), standard()).await;
+        let probe = host.programs().unwrap()["probe"];
+        let set = op(HostOp::Set {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        });
+        host.apply(block(
+            1,
+            vec![submit(
+                0,
+                "module-registry",
+                change("echo", probe, script(vec![set])),
+            )],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(2, Vec::new())).await.unwrap();
+        assert_eq!(
+            host.view(Layer::Confirmed).get("echo", b"k").unwrap(),
+            Some(b"v".to_vec())
+        );
+        host.apply(block(
+            3,
+            vec![submit(
+                1,
+                "module-registry",
+                abi::encode(&Change::Remove("echo".into())),
+            )],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(4, Vec::new())).await.unwrap();
+        assert!(host.store().commitment("echo").is_none());
+        assert_eq!(host.view(Layer::Confirmed).get("echo", b"k").unwrap(), None);
+        let mut host = restart(context.child("restart"), dir.path(), host).await;
+        host.apply(block(
+            5,
+            vec![submit(
+                2,
+                "module-registry",
+                change("echo", probe, script(Vec::new())),
+            )],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(6, Vec::new())).await.unwrap();
+        assert_eq!(host.view(Layer::Confirmed).get("echo", b"k").unwrap(), None);
+        let entries = host
+            .store()
+            .commitment("echo")
+            .unwrap()
+            .entries()
+            .await
+            .unwrap();
+        assert!(entries.is_empty());
+    });
+}
