@@ -1,6 +1,7 @@
 //! Finalized blocks read back from the marshal archive, where consensus
-//! already keeps every block and certificate it finalized. Nothing here is
-//! stored: a block is decoded on each read.
+//! already keeps every block and certificate it finalized, each frame with
+//! the receipt kept beside its block when this node applied it. Nothing
+//! here is stored: a block is decoded on each read.
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
@@ -12,7 +13,7 @@ use consensus::validators_of;
 use node::Block;
 
 use crate::wire::{BlockRef, Blocks, Finalized, MAX_BLOCKS, Tx};
-use crate::{Context, Daemon, Result};
+use crate::{Context, Daemon, Error, Result};
 
 type Seats = BTreeMap<u64, Option<Set<PublicKey>>>;
 
@@ -41,7 +42,7 @@ impl<E: Context> Daemon<E> {
     }
 
     /// One finalized block by height or id; `None` where the archive holds
-    /// no finalized block by that name.
+    /// no finalized block by that name or this node has not applied it.
     pub async fn block(&self, by: BlockRef) -> Result<Option<Finalized>> {
         let block = match by {
             BlockRef::Height(height) => self.anchors.get_block(Height::new(height)).await,
@@ -59,26 +60,46 @@ impl<E: Context> Daemon<E> {
                 }
             }
         };
-        match block {
-            Some(block) => Ok(Some(self.finalized(block, &mut Seats::new()).await?)),
-            None => Ok(None),
-        }
+        // as `blocks`: a block above the applied tip has no receipts kept
+        // yet, and `None` there would read as never kept
+        let tip = self.node.lock().await.tip()?.height;
+        let Some(block) = block.filter(|block| block.height <= tip) else {
+            return Ok(None);
+        };
+        Ok(Some(self.finalized(block, &mut Seats::new()).await?))
     }
 
     async fn finalized(&self, block: Block, seats: &mut Seats) -> Result<Finalized> {
         let network = self.descriptor.id();
-        let txs = block
+        // the host ran exactly the frames that verify, in block order, one
+        // receipt each
+        let verified: Vec<_> = block
             .frames
             .iter()
-            .filter_map(|frame| {
-                let submission = node::verify(frame, &network).ok()?;
-                Some(Tx {
-                    hash: tx_hash(frame),
-                    signer: submission.signer,
-                    seq: submission.seq,
-                    target: submission.target,
-                    payload: submission.payload,
-                })
+            .filter_map(|frame| Some((frame, node::verify(frame, &network).ok()?)))
+            .collect();
+        let receipts = match self.receipts.get(block.height).await? {
+            None => vec![None; verified.len()],
+            Some(kept) if kept.len() == verified.len() => kept.into_iter().map(Some).collect(),
+            Some(kept) => {
+                return Err(Error::Corrupt(format!(
+                    "block {} keeps {} receipts for {} frames",
+                    block.height,
+                    kept.len(),
+                    verified.len()
+                )));
+            }
+        };
+        let txs = verified
+            .into_iter()
+            .zip(receipts)
+            .map(|((frame, submission), receipt)| Tx {
+                hash: tx_hash(frame),
+                signer: submission.signer,
+                seq: submission.seq,
+                target: submission.target,
+                payload: submission.payload,
+                receipt,
             })
             .collect();
         Ok(Finalized {

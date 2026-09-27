@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use abi::{ProgramId, Refusal};
 use commonware_cryptography::Digestible as _;
-use consensus::{MarshalMailbox, Network};
+use consensus::{MarshalMailbox, Network, Receipts};
 use futures::channel::mpsc;
 use host::Applied;
 use node::Node;
@@ -56,6 +56,8 @@ pub enum Error {
     #[error(transparent)]
     Sync(#[from] statesync::Error),
     #[error(transparent)]
+    Receipts(#[from] consensus::ReceiptsError),
+    #[error(transparent)]
     Membership(#[from] consensus::MembershipError),
     #[error(transparent)]
     Http(#[from] reqwest::Error),
@@ -84,6 +86,7 @@ pub struct Daemon<E: Context> {
     pub network: Network,
     pub identity: Vec<u8>,
     pub anchors: MarshalMailbox,
+    pub receipts: Receipts<E>,
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
     subscribers: Mutex<Vec<(ProgramId, mpsc::UnboundedSender<Change>)>>,
