@@ -476,7 +476,8 @@ fn an_epoch_seats_the_members_the_boundary_block_leaves() {
         let founding = vec![member(&key(1), "v1:1")];
         let seated = vec![member(&key(1), "v1:1"), member(&key(2), "v2:1")];
 
-        node.submit(frame(&signer, 0, "valset", abi::encode(&seated)))
+        let payload = abi::encode(&(&seated, Vec::<validators::Member>::new()));
+        node.submit(frame(&signer, 0, "valset", payload))
             .await
             .unwrap()
             .unwrap();

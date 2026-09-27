@@ -1,13 +1,24 @@
 pub const KEY: &[u8] = b"members";
+pub const RESIDENTS: &[u8] = b"residents";
 
+/// A validators program: `execute` takes `(validators, residents)`, both
+/// `Vec<Member>`. `Validators` answers the validators' keys, `Members` the
+/// validators then the residents.
 #[cfg(target_arch = "wasm32")]
 mod program {
     use abi::{Env, Refusal, role::validators};
     use guest::{Execute, Program, Query, Reads};
 
-    use crate::KEY;
+    use crate::{KEY, RESIDENTS};
 
     struct Valset;
+
+    fn read(ctx: &Query, key: &[u8]) -> Result<Vec<validators::Member>, Refusal> {
+        match ctx.get(key) {
+            Some(bytes) => abi::decode(&bytes),
+            None => Ok(Vec::new()),
+        }
+    }
 
     impl Program for Valset {
         fn init(ctx: &mut Execute, _env: &Env, params: &[u8]) -> Result<(), Refusal> {
@@ -17,21 +28,24 @@ mod program {
         }
 
         fn execute(ctx: &mut Execute, _env: &Env, payload: &[u8]) -> Result<(), Refusal> {
-            let members: Vec<validators::Member> = abi::decode(payload)?;
-            ctx.set(KEY, abi::encode(&members));
+            let (validators, residents): (Vec<validators::Member>, Vec<validators::Member>) =
+                abi::decode(payload)?;
+            ctx.set(KEY, abi::encode(&validators));
+            ctx.set(RESIDENTS, abi::encode(&residents));
             Ok(())
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {
-            let members: Vec<validators::Member> = match ctx.get(KEY) {
-                Some(bytes) => abi::decode(&bytes)?,
-                None => Vec::new(),
-            };
+            let validators = read(ctx, KEY)?;
             let reply = match abi::decode(request)? {
                 validators::Query::Validators => validators::Reply::Validators(
-                    members.into_iter().map(|member| member.key).collect(),
+                    validators.into_iter().map(|member| member.key).collect(),
                 ),
-                validators::Query::Members => validators::Reply::Members(members),
+                validators::Query::Members => {
+                    let mut members = validators;
+                    members.extend(read(ctx, RESIDENTS)?);
+                    validators::Reply::Members(members)
+                }
             };
             ctx.respond(abi::encode(&reply));
             Ok(())

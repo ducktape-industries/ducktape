@@ -121,8 +121,8 @@ impl<E: Context> Daemon<E> {
         let validators = match seats.entry(epoch) {
             Entry::Occupied(seated) => seated.into_mut(),
             Entry::Vacant(vacant) => {
-                let members = self.node.lock().await.epoch_members(epoch)?;
-                vacant.insert(members.as_deref().and_then(validators_of))
+                let validators = self.node.lock().await.epoch_validators(epoch)?;
+                vacant.insert(validators.as_deref().and_then(validators_of))
             }
         };
         let validators = validators.as_ref();

@@ -29,7 +29,7 @@ const NETWORK: &[u8] = b"cluster";
 const TIME: u64 = 0;
 const BLOCK_TIME_MS: u64 = 1_000;
 
-const LABELS: [&str; 4] = ["v0", "v1", "v2", "v3"];
+const LABELS: [&str; 5] = ["v0", "v1", "v2", "v3", "v4"];
 
 type Ctx = deterministic::Context;
 type Shared = Arc<futures::lock::Mutex<Node<Ctx>>>;
@@ -232,6 +232,7 @@ impl Peer {
         )
         .await
         .unwrap();
+        let seated = node.epoch_validators(0).unwrap().unwrap();
         let node: Shared = Arc::new(futures::lock::Mutex::new(node));
         let roster = Roster::new(NETWORK.to_vec(), Some(key.clone()));
         let mesh = SimMesh::new(
@@ -275,7 +276,7 @@ impl Peer {
             &marshal,
             chain,
         );
-        let standing = membership.seat(genesis_block.tip(), members).await.unwrap();
+        let standing = membership.seat(genesis_block.tip(), &seated).await.unwrap();
         assert_eq!(standing == Standing::Validator, roster.participates(0));
         context.child("pump").spawn({
             let node = node.clone();
@@ -344,17 +345,17 @@ async fn pump(
         }
         let seating = if network.closes_an_epoch(block.height) {
             let epoch = network.epoch_after(block.height);
-            let members = node
-                .epoch_members(epoch)
+            let validators = node
+                .epoch_validators(epoch)
                 .unwrap()
                 .expect("the boundary records the epoch");
-            Some((epoch, members))
+            Some((epoch, validators))
         } else {
             None
         };
         drop(node);
-        if let Some((_, members)) = seating {
-            membership.seat(block.tip(), &members).await.unwrap();
+        if let Some((_, validators)) = seating {
+            membership.seat(block.tip(), &validators).await.unwrap();
         }
         ack.acknowledge();
         let _ = applied.unbounded_send(block.height);
@@ -532,13 +533,19 @@ fn a_validator_epochs_behind_catches_up_by_the_traffic_it_hears() {
     });
 }
 
+/// The boundary seats the four validators; the fifth key is only a member
+/// (a resident): it follows the chain but no roster seats it, so it never
+/// votes and the leader rotation never reaches it.
 #[test]
 fn an_epoch_boundary_reseats_the_validators() {
     runner().start(|context| async move {
-        let keys: Vec<_> = (1..=4).map(key).collect();
+        let keys: Vec<_> = (1..=5).map(key).collect();
         let founding: Vec<_> = keys[..3].iter().map(member).collect();
-        let seated: Vec<_> = keys.iter().map(member).collect();
+        let seated: Vec<_> = keys[..4].iter().map(member).collect();
+        let members: Vec<_> = keys.iter().map(member).collect();
+        let seats: Vec<_> = seated.iter().map(|member| member.key.clone()).collect();
         let public: Vec<_> = keys.iter().map(|k| k.public_key()).collect();
+        let resident = public[4].clone();
         let oracle = mesh(&context, &keys).await;
         let network = network(4);
         let mut peers = validators(&context, &oracle, &keys, &founding, &network).await;
@@ -548,21 +555,25 @@ fn an_epoch_boundary_reseats_the_validators() {
         peers[0]
             .submit(frame(&alice, 0, vec![set(b"epoch", b"0")]))
             .await;
+        let valset = abi::encode(&(&seated, vec![member(&keys[4])]));
         peers[0]
-            .submit(Frame::sign(&alice, NETWORK, 1, "valset", abi::encode(&seated)).encode())
+            .submit(Frame::sign(&alice, NETWORK, 1, "valset", valset).encode())
             .await;
 
         for peer in &mut peers[..3] {
             peer.reached(3).await;
         }
-        peers[3].marshal.hint(3, NonEmptyVec::new(peers[0].me()));
-        peers[3].reached(3).await;
+        let source = peers[0].me();
+        for peer in &mut peers[3..] {
+            peer.marshal.hint(3, NonEmptyVec::new(source.clone()));
+            peer.reached(3).await;
+        }
         for peer in &peers {
-            assert_eq!(
-                peer.node.lock().await.epoch_members(1).unwrap(),
-                Some(seated.clone())
-            );
-            assert!(peer.roster.participates(1));
+            let node = peer.node.lock().await;
+            assert_eq!(node.epoch_members(1).unwrap(), Some(members.clone()));
+            assert_eq!(node.epoch_validators(1).unwrap(), Some(seats.clone()));
+            assert_eq!(peer.roster.seated(1), consensus::validators_of(&seats));
+            assert_eq!(peer.roster.participates(1), peer.me() != resident);
         }
 
         let silenced = peers[2].me();

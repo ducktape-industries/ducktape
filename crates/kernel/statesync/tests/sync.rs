@@ -109,7 +109,8 @@ fn certify(
     members: &[validators::Member],
     tip: Tip,
 ) -> Certificate {
-    let validators = validators_of(members).unwrap();
+    let keys: Vec<_> = members.iter().map(|member| member.key.clone()).collect();
+    let validators = validators_of(&keys).unwrap();
     let epoch = tip.height / EPOCH_LENGTH;
     let proposal = Proposal::new(
         Round::new(Epoch::new(epoch), View::new(tip.height)),

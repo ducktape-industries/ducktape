@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use abi::role::validators::Member;
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_consensus::types::Epoch;
@@ -74,10 +73,12 @@ impl Provider for Roster {
     }
 }
 
-pub fn validators_of(members: &[Member]) -> Option<Set<PublicKey>> {
-    let keys: Vec<PublicKey> = members
+/// The seat set of an epoch from the keys its validators program answers
+/// `Validators` with; never from its `Members`, which hold residents too.
+pub fn validators_of(keys: &[Vec<u8>]) -> Option<Set<PublicKey>> {
+    let keys: Vec<PublicKey> = keys
         .iter()
-        .map(|member| PublicKey::decode(member.key.as_slice()))
+        .map(|key| PublicKey::decode(key.as_slice()))
         .collect::<Result<_, _>>()
         .ok()?;
     Set::try_from(keys).ok()
