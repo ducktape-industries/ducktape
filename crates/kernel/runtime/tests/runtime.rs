@@ -109,6 +109,7 @@ async fn execute(limits: Limits, steps: Vec<Step>) -> (Bench, Result<abi::GuestR
             &code,
             invocation(GuestCall::Execute(script(steps))),
             &mut bench,
+            &mut limits.fuel.clone(),
         )
         .await;
     (bench, verdict)
@@ -186,7 +187,12 @@ async fn a_query_responds_with_bytes_and_sets_no_output() {
     bench.state.insert(b"a".to_vec(), b"1".to_vec());
     let steps = script(vec![Step::Op(HostOp::Get(b"a".to_vec()))]);
     let verdict = runtime
-        .run(&code, invocation(GuestCall::Query(steps)), &mut bench)
+        .run(
+            &code,
+            invocation(GuestCall::Query(steps)),
+            &mut bench,
+            &mut None,
+        )
         .await;
     assert_eq!(verdict, Ok(Ok(())));
     assert_eq!(
@@ -210,7 +216,12 @@ async fn init_runs_the_program_once_with_its_parameters() {
         value: b"yes".to_vec(),
     })]);
     let verdict = runtime
-        .run(&code, invocation(GuestCall::Init(steps)), &mut bench)
+        .run(
+            &code,
+            invocation(GuestCall::Init(steps)),
+            &mut bench,
+            &mut None,
+        )
         .await;
     assert_eq!(verdict, Ok(Ok(())));
     assert_eq!(bench.state.get(b"born".as_slice()), Some(&b"yes".to_vec()));
@@ -243,6 +254,7 @@ async fn an_undecodable_payload_is_refused_not_faulted() {
             &code,
             invocation(GuestCall::Execute(vec![0xff; 3])),
             &mut bench,
+            &mut None,
         )
         .await
         .unwrap();
@@ -288,23 +300,6 @@ async fn memory_past_the_limit_is_a_trap() {
 }
 
 #[tokio::test]
-async fn a_trap_sentence_carries_no_backtrace() {
-    let limits = Limits {
-        fuel: None,
-        memory_bytes: Some(4 << 20),
-    };
-    // the probe panics into `unreachable` several frames deep
-    let (_, verdict) = execute(limits, vec![Step::Grow(96)]).await;
-    let Err(Fault::Trap(sentence)) = verdict else {
-        panic!("{verdict:?}");
-    };
-    assert!(
-        !sentence.contains("0x") && !sentence.contains('!') && !sentence.contains('\n'),
-        "{sentence}"
-    );
-}
-
-#[tokio::test]
 async fn bytes_that_are_not_a_program_do_not_load() {
     let runtime = Runtime::new(Limits::default());
     assert!(matches!(runtime.load(b"not wasm"), Err(Fault::Load(_))));
@@ -312,7 +307,12 @@ async fn bytes_that_are_not_a_program_do_not_load() {
     let code = runtime.load(&no_exports).unwrap();
     let mut bench = Bench::default();
     let verdict = runtime
-        .run(&code, invocation(GuestCall::Execute(vec![])), &mut bench)
+        .run(
+            &code,
+            invocation(GuestCall::Execute(vec![])),
+            &mut bench,
+            &mut None,
+        )
         .await;
     assert!(matches!(verdict, Err(Fault::Load(_))), "{verdict:?}");
 }

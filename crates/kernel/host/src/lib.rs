@@ -145,12 +145,6 @@ pub enum Submitted {
 }
 
 impl Submitted {
-    pub fn receipt(&self) -> &Receipt {
-        match self {
-            Submitted::Admitted(receipt) | Submitted::Refused(receipt) => receipt,
-        }
-    }
-
     pub fn into_receipt(self) -> Receipt {
         match self {
             Submitted::Admitted(receipt) | Submitted::Refused(receipt) => receipt,

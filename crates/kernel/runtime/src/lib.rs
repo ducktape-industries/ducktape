@@ -100,20 +100,10 @@ impl Runtime {
         Ok(Code { module })
     }
 
-    pub async fn run(
-        &self,
-        code: &Code,
-        invocation: Invocation,
-        host: &mut (impl Host + ?Sized),
-    ) -> Result<GuestReply, Fault> {
-        self.run_within(code, invocation, host, &mut self.limits.fuel.clone())
-            .await
-    }
-
-    /// [`Runtime::run`] on a budget: the run starts with `fuel` (`None`
+    /// Runs `invocation` on a budget: the run starts with `fuel` (`None`
     /// when the network meters none) and leaves what it did not burn there,
     /// so the runs of one frame share one budget.
-    pub async fn run_within(
+    pub async fn run(
         &self,
         code: &Code,
         invocation: Invocation,

@@ -914,13 +914,7 @@ fn messages_nest_at_most_eight_deep() {
 fn a_frame_runs_on_one_fuel_budget() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
-        let mut metered = standard();
-        // enough for a run or two of relay, not for a chain of nine
-        metered.limits = Limits {
-            fuel: Some(FRAME_FUEL),
-            memory_bytes: None,
-        };
-        let mut host = found(context, "net", dir.path(), metered).await;
+        let mut host = found(context, "net", dir.path(), metered()).await;
         let applied = host
             .apply(block(
                 1,
@@ -1970,12 +1964,10 @@ fn a_signer_submits_in_sequence_and_a_rejected_run_consumes_its_sequence() {
             .map(|submitted| matches!(submitted, Submitted::Admitted(_)))
             .collect();
         assert_eq!(admitted, [true, false, true]);
-        assert_eq!(rejected(submitted[0].receipt()).reason, "probe");
-        assert_eq!(rejected(submitted[1].receipt()).reason, reason::SEQUENCE);
-        assert!(matches!(
-            submitted[2].receipt().outcome,
-            Outcome::Applied { .. }
-        ));
+        let receipts: Vec<_> = submitted.into_iter().map(Submitted::into_receipt).collect();
+        assert_eq!(rejected(&receipts[0]).reason, "probe");
+        assert_eq!(rejected(&receipts[1]).reason, reason::SEQUENCE);
+        assert!(matches!(receipts[2].outcome, Outcome::Applied { .. }));
         assert_eq!(
             host.view(Layer::Preconfirmed).get(SIGNERS, SIGNER).unwrap(),
             Some(abi::encode(&5u64))
