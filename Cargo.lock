@@ -2045,25 +2045,6 @@ name = "ducktape-home"
 version = "0.1.0"
 
 [[package]]
-name = "ducktape-media"
-version = "0.1.0"
-dependencies = [
- "axum",
- "ducktape-rpc",
- "futures",
- "libc",
- "media-service",
- "sdk",
- "serde",
- "serde_json",
- "subtle",
- "tempfile",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "tracing",
-]
-
-[[package]]
 name = "ducktape-rpc"
 version = "0.1.0"
 dependencies = [
@@ -3249,12 +3230,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jpeg-encoder"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b454d911ac55068f53495488d8ccd0646eaa540c033a28ee15b07838afafb01f"
-
-[[package]]
 name = "js-sys"
 version = "0.3.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3454,20 +3429,6 @@ dependencies = [
  "sdk",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "media-service"
-version = "0.1.0"
-dependencies = [
- "data-plane",
- "jpeg-encoder",
- "opus-rs",
- "rand 0.8.6",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "zune-jpeg",
 ]
 
 [[package]]
@@ -3894,12 +3855,6 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
-
-[[package]]
-name = "opus-rs"
-version = "0.1.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1cc978697f3ada0ad98b323b9d85e85c6b08d478830148636c19b6d5f2ac9b85"
 
 [[package]]
 name = "p12"
@@ -7249,19 +7204,4 @@ checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
 dependencies = [
  "cc",
  "pkg-config",
-]
-
-[[package]]
-name = "zune-core"
-version = "0.4.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f423a2c17029964870cfaabb1f13dfab7d092a62a29a89264f4d36990ca414a"
-
-[[package]]
-name = "zune-jpeg"
-version = "0.4.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29ce2c8a9384ad323cf564b67da86e21d3cfdff87908bc1223ed5c99bc792713"
-dependencies = [
- "zune-core",
 ]

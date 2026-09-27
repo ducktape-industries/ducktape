@@ -15,12 +15,9 @@ interface host {
 }
 
 /// The values that cross the boundary. Every byte payload is opaque to the
-/// host: a `datagram` carries the module's own mesh frame layout (for the
-/// call guest: `media_service::voice::media` on the voice lane,
-/// `video::frame` on the video lane) and a client `frame` carries the
-/// module's own client wire (for the call guest: `call_wire` binary frames
-/// and `CallClientControl`/`CallServerControl` json text). The guest owns
-/// both framings; the host copies bytes.
+/// host: a `datagram` carries the module's own mesh frame layout and a
+/// client `frame` carries the module's own client wire. The guest owns both
+/// framings; the host copies bytes.
 interface types {
   use host.{level};
   /// A declared lane id (`LaneDecl.id` from the module's `lanes.json`).

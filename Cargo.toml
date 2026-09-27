@@ -17,10 +17,10 @@
 #                        traversal and the coordinator are their own
 #                        repository, ducktape-industries/tunnel
 #   crates/services/   — off-chain service crates: provider, sandbox, broker,
-#                        agent, airlock, media, mcp
+#                        agent, airlock, mcp
 #   crates/airlock/    — the two-party execution/auth contract
 #   crates/testing/    — dev-only shared test support (nettest)
-#   bin/               — airlock-gateway, media-service, terminal-service,
+#   bin/               — airlock-gateway, terminal-service,
 #                        duck-guest-init
 
 [workspace]
@@ -52,14 +52,12 @@ members = [
     "crates/services/agent",
     "crates/services/airlock",
     "crates/services/broker",
-    "crates/services/media",
     "crates/services/mcp",
     "crates/services/provider",
     "crates/services/sandbox",
     "crates/testing/nettest",
     "bin/node",
     "bin/airlock-gateway",
-    "bin/media-service",
     "bin/terminal-service",
     "bin/duck-guest-init",
 ]
@@ -98,10 +96,6 @@ futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 rand = "0.8"
-# Opus codec (voice) — pure Rust, no C toolchain. No FEC-decode / PLC in the
-# decoder (empty input errors), so the voice engine renders lost frames as
-# silence; see crates/services/media.
-opus-rs = "0.1"
 
 # commonware — one ecosystem, version-aligned (see auto-memory reference_qmdb_commonware).
 commonware-storage = "2026.9.0"
@@ -164,7 +158,6 @@ agent-service = { path = "crates/services/agent" }
 airlock-service = { path = "crates/services/airlock" }
 broker-host = { path = "crates/services/broker" }
 mcp-host = { path = "crates/services/mcp" }
-media-service = { path = "crates/services/media" }
 provider-host = { path = "crates/services/provider" }
 sandbox-host = { path = "crates/services/sandbox" }
 # internal — the services' module types (`sdk`, over `refusal-class`), the
@@ -232,31 +225,4 @@ opt-level = 3
 # forever" report, and it taxes every `user sign-frame` too. Same params, same
 # algorithm — this only compiles the memory-fill loop properly.
 [profile.dev.package.argon2]
-opt-level = 3
-
-# The huddle's per-frame video codecs. Every captured frame pays an MJPEG
-# decode (mozjpeg's C, whose cc build inherits this profile's OPT_LEVEL) or a
-# YUYV conversion (nokhwa-core), a JPEG encode, and every peer frame a JPEG
-# decode — 25 times a second each. Unoptimized, a VGA encode runs ~25 ms, a
-# decode ~44 ms and the channel swap ~24 ms, and the capture loop falls behind
-# the camera: the "huddle video latency" report under `make dev`.
-#
-# The pure-Rust codecs (jpeg-encoder, zune-jpeg) are GENERIC over their writer
-# and reader, so their entry points and everything inlined into them
-# instantiate in the crate that CALLS them — an override on the codec
-# packages alone left the app's O0 copy doing the work. That caller is
-# media-service (`video::codec`, non-generic entry points), optimized here so
-# the app crate stays at opt-level 0 and never touches a pixel loop; the codec
-# packages stay optimized too for the non-generic internals (IDCT, Huffman)
-# that are compiled in their own crate.
-[profile.dev.package.media-service]
-opt-level = 3
-
-[profile.dev.package.jpeg-encoder]
-opt-level = 3
-
-[profile.dev.package.zune-jpeg]
-opt-level = 3
-
-[profile.dev.package.zune-core]
 opt-level = 3

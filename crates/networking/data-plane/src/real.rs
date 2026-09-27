@@ -281,7 +281,7 @@ impl OverlaySockets {
     /// silence, and that silence is a failure mode of its own: a peer whose
     /// key the tracked set does not carry (a member the view has not caught up
     /// on, a resident dropped at a cutover) reaches our port, is discarded, and
-    /// every layer above reports health. A huddle where our frames leave and
+    /// every layer above reports health. A flow where our frames leave and
     /// theirs never arrive looks exactly like this and says nothing.
     ///
     /// Rate-limited hard: media arrives tens of times a second and an
