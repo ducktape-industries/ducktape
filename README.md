@@ -41,8 +41,7 @@ A founding file names the network, its cadence, its validators and the
 programs it starts with. Every path is relative to the file; the programs a
 network boots with (`module-registry`, `valset`, `identity`) are built in
 [modules](https://github.com/ducktape-industries/modules) (`make
-wasm-programs`, under `$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/`;
-nothing built is committed there):
+wasm-programs`, under `$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/`):
 
 ```toml
 network = "mynet"
