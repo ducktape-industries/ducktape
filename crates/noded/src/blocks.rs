@@ -63,13 +63,9 @@ impl<E: Context> Daemon<E> {
         // as `blocks`: a block above the applied tip has no receipts kept
         // yet, and `None` there would read as never kept
         let tip = self.node.lock().await.tip()?.height;
-        let Some(block) = block else {
+        let Some(block) = block.filter(|block| block.height <= tip) else {
             return Ok(None);
         };
-        let applied = block.height <= tip;
-        if !applied {
-            return Ok(None);
-        }
         Ok(Some(self.finalized(block, &mut Seats::new()).await?))
     }
 
