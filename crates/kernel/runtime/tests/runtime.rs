@@ -35,7 +35,7 @@ fn env() -> Env {
 
 #[async_trait::async_trait]
 impl Host for Bench {
-    async fn call(&mut self, op: HostOp) -> HostReply {
+    async fn call(&mut self, op: HostOp, _fuel: &mut Option<u64>) -> HostReply {
         let reply = match &op {
             HostOp::Get(key) | HostOp::CommittedGet(key) => {
                 HostReply::Value(self.state.get(key).cloned())
@@ -109,6 +109,7 @@ async fn execute(limits: Limits, steps: Vec<Step>) -> (Bench, Result<abi::GuestR
             &code,
             invocation(GuestCall::Execute(script(steps))),
             &mut bench,
+            &mut limits.fuel.clone(),
         )
         .await;
     (bench, verdict)
@@ -186,7 +187,12 @@ async fn a_query_responds_with_bytes_and_sets_no_output() {
     bench.state.insert(b"a".to_vec(), b"1".to_vec());
     let steps = script(vec![Step::Op(HostOp::Get(b"a".to_vec()))]);
     let verdict = runtime
-        .run(&code, invocation(GuestCall::Query(steps)), &mut bench)
+        .run(
+            &code,
+            invocation(GuestCall::Query(steps)),
+            &mut bench,
+            &mut None,
+        )
         .await;
     assert_eq!(verdict, Ok(Ok(())));
     assert_eq!(
@@ -210,7 +216,12 @@ async fn init_runs_the_program_once_with_its_parameters() {
         value: b"yes".to_vec(),
     })]);
     let verdict = runtime
-        .run(&code, invocation(GuestCall::Init(steps)), &mut bench)
+        .run(
+            &code,
+            invocation(GuestCall::Init(steps)),
+            &mut bench,
+            &mut None,
+        )
         .await;
     assert_eq!(verdict, Ok(Ok(())));
     assert_eq!(bench.state.get(b"born".as_slice()), Some(&b"yes".to_vec()));
@@ -243,6 +254,7 @@ async fn an_undecodable_payload_is_refused_not_faulted() {
             &code,
             invocation(GuestCall::Execute(vec![0xff; 3])),
             &mut bench,
+            &mut None,
         )
         .await
         .unwrap();
@@ -279,7 +291,10 @@ async fn memory_past_the_limit_is_a_trap() {
         memory_bytes: Some(4 << 20),
     };
     let (_, verdict) = execute(limits, vec![Step::Grow(96)]).await;
-    assert!(matches!(verdict, Err(Fault::Trap(_))), "{verdict:?}");
+    assert_eq!(
+        verdict,
+        Err(Fault::Trap("the run trapped: unreachable".into()))
+    );
     let (_, within) = execute(limits, vec![Step::Grow(16)]).await;
     assert_eq!(within, Ok(Ok(())));
 }
@@ -292,7 +307,12 @@ async fn bytes_that_are_not_a_program_do_not_load() {
     let code = runtime.load(&no_exports).unwrap();
     let mut bench = Bench::default();
     let verdict = runtime
-        .run(&code, invocation(GuestCall::Execute(vec![])), &mut bench)
+        .run(
+            &code,
+            invocation(GuestCall::Execute(vec![])),
+            &mut bench,
+            &mut None,
+        )
         .await;
     assert!(matches!(verdict, Err(Fault::Load(_))), "{verdict:?}");
 }

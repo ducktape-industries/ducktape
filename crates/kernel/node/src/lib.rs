@@ -5,11 +5,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-use abi::{BlobId, Origin, Outcome, ProgramId, Refusal, role::validators};
+use abi::{BlobId, Origin, ProgramId, Refusal, role::validators};
 use commonware_cryptography::Digestible as _;
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
-use host::{Applied, Genesis, Host, Layer, Receipt, Submission, Tip};
+use host::{Applied, Genesis, Host, Layer, Receipt, Submission, Submitted, Tip};
 use state::{Commitment, View};
 
 pub use block::{Block, Digest};
@@ -123,9 +123,7 @@ where
     }
 
     pub fn due(&self) -> Result<bool> {
-        let frames_wait = !self.pending.is_empty();
-        let deliveries_wait = self.host.deliveries_due()?;
-        Ok(frames_wait || deliveries_wait)
+        Ok(!self.pending.is_empty())
     }
 
     pub fn now(&self) -> u64 {
@@ -167,12 +165,14 @@ where
             Err(refusal) => return Ok(Err(refusal)),
         };
         let time = self.now();
-        let mut receipts = self.host.preconfirm(time, vec![submission.clone()]).await?;
-        let receipt = receipts.pop().expect("one submission yields one receipt");
-        if let Outcome::Applied { .. } = receipt.outcome {
+        let mut submitted = self.host.preconfirm(time, vec![submission.clone()]).await?;
+        let submitted = submitted.pop().expect("one submission yields one receipt");
+        // an admitted frame rides the next block even when its run was
+        // rejected: the block must consume the sequence preconfirm did
+        if let Submitted::Admitted(_) = submitted {
             self.pending.push(Pending { frame, submission });
         }
-        Ok(Ok(receipt))
+        Ok(Ok(submitted.into_receipt()))
     }
 
     pub fn build(&self, parent: Tip, time: u64) -> Block {
@@ -220,11 +220,11 @@ where
             .iter()
             .map(|pending| pending.submission.clone())
             .collect();
-        let receipts = self.host.preconfirm(time, submissions).await?;
+        let submitted = self.host.preconfirm(time, submissions).await?;
         self.pending = pending
             .into_iter()
-            .zip(receipts)
-            .filter(|(_, receipt)| matches!(receipt.outcome, Outcome::Applied { .. }))
+            .zip(submitted)
+            .filter(|(_, submitted)| matches!(submitted, Submitted::Admitted(_)))
             .map(|(pending, _)| pending)
             .collect();
         Ok(())
