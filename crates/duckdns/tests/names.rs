@@ -63,7 +63,7 @@ fn non_account_names_reject() {
     for hostname in [
         "orthory.example",
         "net.duck",
-        "docs.orthory.duck",
+        "huddle.orthory.duck",
         "orthory.duck..",
         " orthory.duck",
         "döcs.duck",

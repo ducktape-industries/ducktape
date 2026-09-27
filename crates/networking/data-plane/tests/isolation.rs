@@ -247,7 +247,7 @@ async fn overflowing_flow_drops_only_itself() {
 
 #[tokio::test(start_paused = true)]
 async fn one_sender_burst_never_evicts_another_senders_frame() {
-    // A shared camera flow: every participant sends on it, and one video
+    // A huddle's camera flow: every participant sends on it, and one video
     // frame is a burst of up to 96 fragments. Three of them landing before
     // the consumer gets a turn is 288 fragments against a 256 budget — with
     // a flow-wide bound the earliest senders' fragments are shed, their
@@ -260,7 +260,7 @@ async fn one_sender_burst_never_evicts_another_senders_frame() {
 
     let net = SimNet::new();
     let admission = Arc::new(TestAdmission::default());
-    let flow = FlowId::derive(b"video-channel:room");
+    let flow = FlowId::derive(b"video-channel:huddle");
     admission.allow(hub, VIDEO_LANE, flow);
     for sender in &senders {
         net.set_link(*sender, hub, LINK);

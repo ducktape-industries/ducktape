@@ -12,6 +12,11 @@
 //! is not 32 bytes) is a [`StepError::Trap`]: the instance's state is
 //! unknown from then on, the executor discards it and closes every session
 //! it held. It never touches the node or another plane.
+//!
+//! [`StubGuest`] is the native double of the call guest's fan-out — audio
+//! to the roster, control to the room — for the executor's tests.
+
+use std::collections::BTreeMap;
 
 pub use data_plane::{FlowId, PeerId};
 use wasmtime::component::{Component, HasSelf, Linker};
@@ -366,9 +371,364 @@ fn trap(err: impl std::fmt::Display) -> StepError {
     StepError::Trap(err.to_string())
 }
 
+// ---- the native double
+
+/// Per-sender datagram queue on the voice flow, the pre-#2216 hub's bound.
+const VOICE_FLOW_QUEUE: u32 = 128;
+
+/// The voice flow of a channel — the same derivation both sides of the
+/// mesh use, so a stub on one node talks to a guest on another.
+pub fn voice_flow(channel: &str) -> FlowId {
+    FlowId::derive(format!("voice-channel:{channel}").as_bytes())
+}
+
+struct StubSession {
+    channel: String,
+    roster: Vec<PeerId>,
+}
+
+/// The call guest's fan-out without its codecs: a client's binary frame
+/// goes to its roster on the voice lane unchanged, a voice datagram goes to
+/// every session whose roster holds the sender, a client's text frame goes
+/// to the other sessions of its channel. One flow per channel, opened by
+/// the first session and closed by the last.
+pub struct StubGuest {
+    self_peer: PeerId,
+    voice_lane: Lane,
+    sessions: BTreeMap<Session, StubSession>,
+}
+
+impl StubGuest {
+    /// Refuses a config with no lane named `voice`, as the call guest would.
+    pub fn new(config: Config) -> Result<Self, GuestError> {
+        let voice_lane = config
+            .lanes
+            .iter()
+            .find(|lane| lane.name == "voice")
+            .map(|lane| lane.id)
+            .ok_or_else(|| GuestError::Init("no lane named voice".into()))?;
+        Ok(Self {
+            self_peer: config.self_peer,
+            voice_lane,
+            sessions: BTreeMap::new(),
+        })
+    }
+
+    fn sessions_in(&self, channel: &str) -> impl Iterator<Item = (&Session, &StubSession)> {
+        self.sessions
+            .iter()
+            .filter(move |(_, session)| session.channel == channel)
+    }
+
+    fn channel_roster(&self, channel: &str) -> Vec<PeerId> {
+        let mut peers: Vec<PeerId> = self
+            .sessions_in(channel)
+            .flat_map(|(_, session)| session.roster.iter().copied())
+            .collect();
+        peers.sort();
+        peers.dedup();
+        peers
+    }
+
+    fn open(&mut self, session: Session, channel: String) -> Vec<Effect> {
+        let first_in_channel = self.sessions_in(&channel).next().is_none();
+        let open_flow = Effect::OpenFlow {
+            lane: self.voice_lane,
+            flow: voice_flow(&channel),
+            max_queued: VOICE_FLOW_QUEUE,
+        };
+        self.sessions.insert(
+            session,
+            StubSession {
+                channel,
+                roster: Vec::new(),
+            },
+        );
+        if first_in_channel {
+            vec![open_flow]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn close(&mut self, session: Session) -> Vec<Effect> {
+        let Some(closed) = self.sessions.remove(&session) else {
+            return Vec::new();
+        };
+        let last_in_channel = self.sessions_in(&closed.channel).next().is_none();
+        if last_in_channel {
+            vec![Effect::CloseFlow {
+                lane: self.voice_lane,
+                flow: voice_flow(&closed.channel),
+            }]
+        } else {
+            vec![Effect::SetRoster {
+                lane: self.voice_lane,
+                flow: voice_flow(&closed.channel),
+                peers: self.channel_roster(&closed.channel),
+            }]
+        }
+    }
+
+    fn roster(&mut self, session: Session, peers: Vec<PeerId>) -> Vec<Effect> {
+        let self_peer = self.self_peer;
+        let Some(state) = self.sessions.get_mut(&session) else {
+            return Vec::new();
+        };
+        state.roster = peers
+            .into_iter()
+            .filter(|peer| *peer != self_peer)
+            .collect();
+        let channel = state.channel.clone();
+        vec![Effect::SetRoster {
+            lane: self.voice_lane,
+            flow: voice_flow(&channel),
+            peers: self.channel_roster(&channel),
+        }]
+    }
+
+    fn client_frame(&self, session: Session, frame: Frame) -> Vec<Effect> {
+        let Some(state) = self.sessions.get(&session) else {
+            return Vec::new();
+        };
+        match frame {
+            Frame::Binary(bytes) => state
+                .roster
+                .iter()
+                .map(|peer| Effect::LaneSend {
+                    lane: self.voice_lane,
+                    peer: *peer,
+                    bytes: bytes.clone(),
+                })
+                .collect(),
+            Frame::Text(text) => self
+                .sessions_in(&state.channel)
+                .filter(|(other, _)| **other != session)
+                .map(|(other, _)| Effect::ClientSend {
+                    session: *other,
+                    frame: Frame::Text(text.clone()),
+                })
+                .collect(),
+        }
+    }
+
+    fn datagram(&self, lane: Lane, peer: PeerId, bytes: Vec<u8>) -> Vec<Effect> {
+        let on_voice_lane = lane == self.voice_lane;
+        if !on_voice_lane {
+            return Vec::new();
+        }
+        self.sessions
+            .iter()
+            .filter(|(_, session)| session.roster.contains(&peer))
+            .map(|(session, _)| Effect::ClientSend {
+                session: *session,
+                frame: Frame::Binary(bytes.clone()),
+            })
+            .collect()
+    }
+}
+
+impl LaneMachine for StubGuest {
+    fn step(&mut self, event: Event, _now_ms: u64) -> Result<Vec<Effect>, StepError> {
+        Ok(match event {
+            Event::Tick => Vec::new(),
+            Event::Datagram { lane, peer, bytes } => self.datagram(lane, peer, bytes),
+            Event::ClientFrame { session, frame } => self.client_frame(session, frame),
+            Event::Roster { session, peers } => self.roster(session, peers),
+            Event::SessionOpened { session, channel } => self.open(session, channel),
+            Event::SessionClosed { session } => self.close(session),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peer(octet: u8) -> PeerId {
+        PeerId([octet; 32])
+    }
+
+    fn stub() -> StubGuest {
+        StubGuest::new(Config {
+            self_peer: peer(1),
+            lanes: vec![LaneBinding {
+                name: "voice".into(),
+                id: 2,
+            }],
+        })
+        .unwrap()
+    }
+
+    fn step(stub: &mut StubGuest, event: Event) -> Vec<Effect> {
+        stub.step(event, 0).unwrap()
+    }
+
+    #[test]
+    fn a_config_without_a_voice_lane_is_refused() {
+        let err = StubGuest::new(Config {
+            self_peer: peer(1),
+            lanes: Vec::new(),
+        })
+        .err()
+        .unwrap();
+        assert!(matches!(err, GuestError::Init(_)), "{err}");
+    }
+
+    #[test]
+    fn audio_goes_to_the_roster_minus_self_and_back_to_who_holds_the_sender() {
+        let mut stub = stub();
+        let opened = step(
+            &mut stub,
+            Event::SessionOpened {
+                session: 7,
+                channel: "room".into(),
+            },
+        );
+        assert_eq!(
+            opened,
+            vec![Effect::OpenFlow {
+                lane: 2,
+                flow: voice_flow("room"),
+                max_queued: VOICE_FLOW_QUEUE
+            }]
+        );
+        let admitted = step(
+            &mut stub,
+            Event::Roster {
+                session: 7,
+                peers: vec![peer(1), peer(2), peer(3)],
+            },
+        );
+        assert_eq!(
+            admitted,
+            vec![Effect::SetRoster {
+                lane: 2,
+                flow: voice_flow("room"),
+                peers: vec![peer(2), peer(3)]
+            }]
+        );
+
+        let up = step(
+            &mut stub,
+            Event::ClientFrame {
+                session: 7,
+                frame: Frame::Binary(vec![1, 9]),
+            },
+        );
+        assert_eq!(
+            up,
+            vec![
+                Effect::LaneSend {
+                    lane: 2,
+                    peer: peer(2),
+                    bytes: vec![1, 9]
+                },
+                Effect::LaneSend {
+                    lane: 2,
+                    peer: peer(3),
+                    bytes: vec![1, 9]
+                },
+            ]
+        );
+
+        let down = step(
+            &mut stub,
+            Event::Datagram {
+                lane: 2,
+                peer: peer(3),
+                bytes: vec![1, 8],
+            },
+        );
+        assert_eq!(
+            down,
+            vec![Effect::ClientSend {
+                session: 7,
+                frame: Frame::Binary(vec![1, 8])
+            }]
+        );
+        let stranger = step(
+            &mut stub,
+            Event::Datagram {
+                lane: 2,
+                peer: peer(9),
+                bytes: vec![1, 8],
+            },
+        );
+        assert!(
+            stranger.is_empty(),
+            "a peer outside every roster is dropped"
+        );
+        let other_lane = step(
+            &mut stub,
+            Event::Datagram {
+                lane: 3,
+                peer: peer(3),
+                bytes: vec![1, 8],
+            },
+        );
+        assert!(other_lane.is_empty(), "only the voice lane is echoed");
+    }
+
+    #[test]
+    fn control_fans_out_to_the_channel_and_one_flow_serves_every_session() {
+        let mut stub = stub();
+        step(
+            &mut stub,
+            Event::SessionOpened {
+                session: 1,
+                channel: "room".into(),
+            },
+        );
+        let second = step(
+            &mut stub,
+            Event::SessionOpened {
+                session: 2,
+                channel: "room".into(),
+            },
+        );
+        assert!(second.is_empty(), "the flow is already open");
+        step(
+            &mut stub,
+            Event::SessionOpened {
+                session: 3,
+                channel: "other".into(),
+            },
+        );
+
+        let control = step(
+            &mut stub,
+            Event::ClientFrame {
+                session: 1,
+                frame: Frame::Text("{\"type\":\"beacon\"}".into()),
+            },
+        );
+        assert_eq!(
+            control,
+            vec![Effect::ClientSend {
+                session: 2,
+                frame: Frame::Text("{\"type\":\"beacon\"}".into())
+            }]
+        );
+
+        let first_gone = step(&mut stub, Event::SessionClosed { session: 1 });
+        assert_eq!(
+            first_gone,
+            vec![Effect::SetRoster {
+                lane: 2,
+                flow: voice_flow("room"),
+                peers: Vec::new()
+            }]
+        );
+        let last_gone = step(&mut stub, Event::SessionClosed { session: 2 });
+        assert_eq!(
+            last_gone,
+            vec![Effect::CloseFlow {
+                lane: 2,
+                flow: voice_flow("room")
+            }]
+        );
+    }
 
     #[test]
     fn an_effect_with_a_malformed_peer_is_a_trap() {

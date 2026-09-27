@@ -137,8 +137,8 @@ verb's `--help` carries the rest.
 | Programs | [`ducktape-industries/modules`](https://github.com/ducktape-industries/modules) | The contracts a program compiles against (`crates/sdk/abi`, a copy of `crates/kernel/abi` here, and `crates/sdk/guest`, the module SDK), the boot set (`crates/system/`: `module-registry`, `valset` and `identity`, whose suite founds this host over their bytes) and the app modules. The system modules beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
 | Networking | `crates/networking/` | Off-consensus byte transport for the services; the WireGuard overlay and the coordinator are `ducktape-industries/tunnel` |
-| Services | `crates/services/` | Off-chain executors: provider run loop, microVM sandbox, credential broker, airlock |
-| Binaries | `bin/` | The airlock gateway, the terminal service, the sandbox PID 1 |
+| Services | `crates/services/` | Off-chain executors: provider run loop, microVM sandbox, credential broker, airlock, media |
+| Binaries | `bin/` | The airlock gateway, the media and terminal services, the sandbox PID 1 |
 
 ## Develop
 
