@@ -72,6 +72,17 @@ impl Storage {
         Ok(self.db.write(batch)?)
     }
 
+    /// Deletes every key under `program`: a dropped program leaves no
+    /// storage for one admitted again under its id to read.
+    pub fn clear(&self, program: &str) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        for entry in self.iter(program, b"", None, false)? {
+            let (key, _) = entry?;
+            batch.delete(namespaced(program, &key));
+        }
+        Ok(self.db.write(batch)?)
+    }
+
     pub fn install(&self, height: u64, writes: &Writes) -> Result<()> {
         let mut batch = WriteBatch::new();
         stage(&mut batch, writes);
