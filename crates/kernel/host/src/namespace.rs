@@ -9,6 +9,7 @@ pub const RESERVED: [&str; 4] = [BLOBS, PROGRAMS, NETWORK, SIGNERS];
 pub const ID: &[u8] = b"id";
 pub const LIMITS: &[u8] = b"limits";
 pub const EPOCH_LENGTH: &[u8] = b"epoch_length";
+pub const MEMBER_CAP: &[u8] = b"member_cap";
 pub const TIP: &[u8] = b"tip";
 pub const ROLES: &[u8] = b"roles";
 

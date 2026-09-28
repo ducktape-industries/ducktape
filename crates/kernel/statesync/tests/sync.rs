@@ -81,6 +81,7 @@ fn genesis(members: &[validators::Member]) -> Genesis {
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
         time: TIME,
+        member_cap: 16,
     }
 }
 
@@ -268,6 +269,10 @@ fn a_joiner_adopts_the_state_at_a_finalized_tip() {
             source.host().programs().unwrap()
         );
         assert!(joined.node.host().missing_blobs().unwrap().is_empty());
+        assert_eq!(
+            joined.node.member_cap().unwrap(),
+            source.member_cap().unwrap()
+        );
         assert_eq!(
             joined
                 .node

@@ -89,6 +89,7 @@ fn genesis(programs: Vec<Founding>) -> Genesis {
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
         time: TIME,
+        member_cap: 16,
     }
 }
 
@@ -2052,5 +2053,98 @@ fn a_program_admitted_again_under_its_id_starts_empty() {
             .await
             .unwrap();
         assert!(entries.is_empty());
+    });
+}
+
+#[test]
+fn a_member_cap_outside_1_to_128_is_refused() {
+    deterministic::Runner::default().start(|context| async move {
+        for cap in [0, validators::MAX_MEMBERS + 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut founding = standard();
+            founding.member_cap = cap;
+            let refused = Host::found(
+                context.child("found"),
+                "net",
+                dir.path(),
+                block_id(0),
+                founding,
+            )
+            .await
+            .err();
+            assert!(
+                matches!(refused, Some(Error::MemberCap { cap: got }) if got == cap),
+                "cap {cap}: {refused:?}"
+            );
+            assert_eq!(
+                refused.unwrap().to_string(),
+                format!("a network's member cap is 1 to 128; this founding asks for {cap}")
+            );
+            assert!(!dir.path().join("state").exists(), "cap {cap} wrote state");
+        }
+    });
+}
+
+/// The fixture valset ignores the cap, so the kernel's backstop at epoch 0
+/// is what refuses (valset's own `init` refuses first).
+#[test]
+fn more_founding_validators_than_the_cap_is_refused() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut founding = standard();
+        founding.validators = vec![member(b"v1", "v1:1"), member(b"v2", "v2:2")];
+        founding.member_cap = 1;
+        let refused = Host::found(context, "net", dir.path(), block_id(0), founding)
+            .await
+            .err();
+        assert!(
+            matches!(&refused, Some(Error::Corrupt(why)) if why.contains("past the network's cap of 1")),
+            "{refused:?}"
+        );
+    });
+}
+
+#[test]
+fn the_cap_is_recorded_at_founding_and_read_on_open() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut founding = standard();
+        founding.member_cap = 7;
+        let host = found(context.child("found"), "net", dir.path(), founding).await;
+        assert_eq!(host.member_cap().unwrap(), 7);
+        assert_eq!(
+            host.view(Layer::Confirmed)
+                .get(NETWORK, b"member_cap")
+                .unwrap(),
+            Some(vec![7, 0, 0, 0])
+        );
+        let host = restart(context.child("restart"), dir.path(), host).await;
+        assert_eq!(host.member_cap().unwrap(), 7);
+    });
+}
+
+#[test]
+fn an_epoch_seating_more_members_than_the_cap_is_not_applied() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut founding = standard();
+        founding.member_cap = 2;
+        let mut host = found(context, "net", dir.path(), founding).await;
+        // the fixture valset ignores the cap: three members past a cap of two
+        let payload = abi::encode(&(
+            vec![member(b"v1", "v1:1"), member(b"v2", "v2:2")],
+            vec![member(b"r3", "r3:3")],
+        ));
+        host.apply(block(1, vec![submit(0, "valset", payload)]))
+            .await
+            .unwrap();
+        host.apply(block(2, Vec::new())).await.unwrap();
+        let tip = host.tip().unwrap();
+        let closing = host.apply(block(3, Vec::new())).await;
+        assert!(
+            matches!(&closing, Err(Error::Corrupt(why)) if why.contains("seats 3 members for epoch 1")),
+            "{closing:?}"
+        );
+        assert_eq!(host.tip().unwrap(), tip);
     });
 }

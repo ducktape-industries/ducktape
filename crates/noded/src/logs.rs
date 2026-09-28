@@ -14,6 +14,9 @@ const RING: usize = 4096;
 type Filter = reload::Handle<EnvFilter, Registry>;
 
 static LOGS: OnceLock<Logs> = OnceLock::new();
+/// Two nodes in one process (the daemon tests) could both find `LOGS` empty
+/// and race to set the global subscriber: installs take turns.
+static INSTALL: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
 pub struct Logs {
@@ -23,6 +26,9 @@ pub struct Logs {
 
 impl Logs {
     pub fn install(directives: &str) -> Result<Logs, String> {
+        let _turn = INSTALL
+            .lock()
+            .expect("the log install lock is never poisoned");
         if let Some(logs) = LOGS.get() {
             logs.retune(directives)?;
             return Ok(logs.clone());

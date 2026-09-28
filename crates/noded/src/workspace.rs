@@ -138,6 +138,10 @@ pub struct Founding {
     pub time: u64,
     pub epoch_length: u64,
     pub block_time_ms: u64,
+    /// How many members the network ever holds at once, 1 to 128; 16 when
+    /// the file leaves it out.
+    #[serde(default = "default_member_cap")]
+    pub member_cap: u32,
     pub roles: RoleIds,
     pub validators: Vec<Validator>,
     pub programs: Vec<Program>,
@@ -145,6 +149,10 @@ pub struct Founding {
     pub views: Vec<View>,
     #[serde(default)]
     pub limits: Metering,
+}
+
+fn default_member_cap() -> u32 {
+    16
 }
 
 /// Which founding program fills each role the kernel calls.
@@ -249,6 +257,7 @@ impl Founding {
             },
             epoch_length: self.epoch_length,
             time: self.time,
+            member_cap: self.member_cap,
         })
     }
 }
