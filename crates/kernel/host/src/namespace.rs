@@ -19,3 +19,7 @@ pub fn blob(id: &BlobId) -> Vec<u8> {
 pub fn epoch(number: u64) -> Vec<u8> {
     format!("epoch/{number}").into_bytes()
 }
+
+pub fn epoch_validators(number: u64) -> Vec<u8> {
+    format!("validators/{number}").into_bytes()
+}

@@ -452,6 +452,17 @@ where
             .transpose()
     }
 
+    /// The keys that vote and propose in `epoch`: the validators program's
+    /// `Validators` answer. [`Host::epoch_members`] is who the mesh admits,
+    /// residents included; consensus seats only these.
+    pub fn epoch_validators(&self, epoch: u64) -> Result<Option<Vec<Vec<u8>>>> {
+        self.store
+            .view(Vec::new())
+            .get(NETWORK, &namespace::epoch_validators(epoch))?
+            .map(|bytes| abi::decode(&bytes).map_err(corrupt))
+            .transpose()
+    }
+
     pub fn root(&self) -> Result<Root> {
         let roots = self.store.roots()?;
         Ok(Root(Sha256::digest(abi::encode(&roots)).into()))
@@ -558,6 +569,8 @@ where
         .await
     }
 
+    /// Records who `epoch` seats (`Validators`) and who its mesh admits
+    /// (`Members`, residents included).
     async fn record_epoch(
         &self,
         epoch: u64,
@@ -566,29 +579,56 @@ where
         overlay: &mut Overlay,
         stage: &Stage,
     ) -> Result<()> {
+        let validators::Reply::Members(members) = self
+            .ask_validators(validators::Query::Members, height, time, overlay, stage)
+            .await?
+        else {
+            return Err(Error::Corrupt(
+                "the validators program answered Members with another reply".into(),
+            ));
+        };
+        let validators::Reply::Validators(seated) = self
+            .ask_validators(validators::Query::Validators, height, time, overlay, stage)
+            .await?
+        else {
+            return Err(Error::Corrupt(
+                "the validators program answered Validators with another reply".into(),
+            ));
+        };
+        overlay.set(NETWORK, namespace::epoch(epoch), abi::encode(&members));
+        overlay.set(
+            NETWORK,
+            namespace::epoch_validators(epoch),
+            abi::encode(&seated),
+        );
+        Ok(())
+    }
+
+    async fn ask_validators(
+        &self,
+        query: validators::Query,
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+    ) -> Result<validators::Reply> {
         let reply = unit::query(
             self.world(height, time),
-            vec![&*overlay],
+            vec![overlay],
             stage,
             &[],
             Origin::System,
             self.roles.validators.clone(),
-            abi::encode(&validators::Query::Members),
+            abi::encode(&query),
             &mut self.loaded.limits().fuel,
         )
         .await?;
         let bytes = reply.map_err(|refusal| {
             Error::Corrupt(format!(
-                "the validators program refused the members query: {refusal}"
+                "the validators program refused {query:?}: {refusal}"
             ))
         })?;
-        let validators::Reply::Members(members) = abi::decode(&bytes).map_err(corrupt)? else {
-            return Err(Error::Corrupt(
-                "the validators program answered Members with another reply".into(),
-            ));
-        };
-        overlay.set(NETWORK, namespace::epoch(epoch), abi::encode(&members));
-        Ok(())
+        abi::decode(&bytes).map_err(corrupt)
     }
 
     pub async fn preconfirm(

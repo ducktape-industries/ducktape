@@ -109,7 +109,8 @@ fn certify(
     members: &[validators::Member],
     tip: Tip,
 ) -> Certificate {
-    let validators = validators_of(members).unwrap();
+    let keys: Vec<_> = members.iter().map(|member| member.key.clone()).collect();
+    let validators = validators_of(&keys).unwrap();
     let epoch = tip.height / EPOCH_LENGTH;
     let proposal = Proposal::new(
         Round::new(Epoch::new(epoch), View::new(tip.height)),
@@ -383,6 +384,71 @@ fn a_certificate_from_strangers_is_rejected() {
         .err()
         .expect("strangers cannot certify the tip");
         assert!(matches!(error, Error::Certificate { epoch: 0 }), "{error}");
+    });
+}
+
+/// Epoch 1 seats the three validators and admits three residents beside
+/// them; the tip's certificate carries the validators' quorum, which the
+/// six members would not make.
+#[test]
+fn a_tip_certificate_verifies_against_the_validators_not_the_members() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let alice = key(11);
+        let residents: Vec<_> = (21..=23).map(|seed| member(&key(seed))).collect();
+        let valset = abi::encode(&(&network.members, &residents));
+        let mut tip = network
+            .advance(vec![
+                Frame::sign(&alice, NETWORK, 0, "valset", valset).encode(),
+            ])
+            .await;
+        while tip.height < EPOCH_LENGTH {
+            tip = network.advance(Vec::new()).await;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let joined = join(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            network.exchange(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(joined.node.tip().unwrap(), tip);
+        let members = [network.members.clone(), residents].concat();
+        assert_eq!(joined.node.epoch_members(1).unwrap(), Some(members));
+    });
+}
+
+#[test]
+fn a_certificate_naming_an_unrecorded_epoch_is_rejected() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let tip = network.advance(Vec::new()).await;
+        let unrecorded = Tip {
+            height: 9 * EPOCH_LENGTH,
+            ..tip
+        };
+        let forged = certify(&network.keys, &network.members, unrecorded);
+        Arc::get_mut(&mut network.source)
+            .unwrap()
+            .certificates
+            .insert(tip.height, forged);
+
+        let dir = tempfile::tempdir().unwrap();
+        let error = join(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            network.exchange(),
+        )
+        .await
+        .err()
+        .expect("no state records epoch 9");
+        assert!(matches!(error, Error::Unrecorded { epoch: 9 }), "{error}");
     });
 }
 

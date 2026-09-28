@@ -19,17 +19,20 @@ use futures::channel::mpsc;
 use host::{Founding, Genesis, Layer, Limits, Roles};
 use node::{Block, Frame, Node, Sequenced};
 
-const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
-const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
-const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
-const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
-const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
+mod epochs;
+
+const MODULE_REGISTRY: &[u8] =
+    include_bytes!("../../../fixtures/wasm/fixture_module_registry.wasm");
+const VALSET: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_valset.wasm");
+const RELAY: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_relay.wasm");
+const IDENTITY: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_identity.wasm");
+const PROBE: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"cluster";
 const TIME: u64 = 0;
 const BLOCK_TIME_MS: u64 = 1_000;
 
-const LABELS: [&str; 4] = ["v0", "v1", "v2", "v3"];
+const LABELS: [&str; 5] = ["v0", "v1", "v2", "v3", "v4"];
 
 type Ctx = deterministic::Context;
 type Shared = Arc<futures::lock::Mutex<Node<Ctx>>>;
@@ -232,6 +235,7 @@ impl Peer {
         )
         .await
         .unwrap();
+        let seated = node.epoch_validators(0).unwrap().unwrap();
         let node: Shared = Arc::new(futures::lock::Mutex::new(node));
         let roster = Roster::new(NETWORK.to_vec(), Some(key.clone()));
         let mesh = SimMesh::new(
@@ -275,7 +279,7 @@ impl Peer {
             &marshal,
             chain,
         );
-        let standing = membership.seat(genesis_block.tip(), members).await.unwrap();
+        let standing = membership.seat(genesis_block.tip(), &seated).await.unwrap();
         assert_eq!(standing == Standing::Validator, roster.participates(0));
         context.child("pump").spawn({
             let node = node.clone();
@@ -344,17 +348,17 @@ async fn pump(
         }
         let seating = if network.closes_an_epoch(block.height) {
             let epoch = network.epoch_after(block.height);
-            let members = node
-                .epoch_members(epoch)
+            let validators = node
+                .epoch_validators(epoch)
                 .unwrap()
                 .expect("the boundary records the epoch");
-            Some((epoch, members))
+            Some((epoch, validators))
         } else {
             None
         };
         drop(node);
-        if let Some((_, members)) = seating {
-            membership.seat(block.tip(), &members).await.unwrap();
+        if let Some((_, validators)) = seating {
+            membership.seat(block.tip(), &validators).await.unwrap();
         }
         ack.acknowledge();
         let _ = applied.unbounded_send(block.height);
@@ -460,132 +464,5 @@ fn a_partitioned_validator_catches_up_when_the_link_heals() {
             peers[3].confirmed("probe", b"during").await,
             Some(b"partition".to_vec())
         );
-    });
-}
-
-#[test]
-fn a_follower_backfills_finalized_blocks_by_hint() {
-    runner().start(|context| async move {
-        let keys: Vec<_> = (1..=4).map(key).collect();
-        let members: Vec<_> = keys[..3].iter().map(member).collect();
-        let oracle = mesh(&context, &keys).await;
-        let network = network(1_000);
-        let mut peers = validators(&context, &oracle, &keys[..3], &members, &network).await;
-        let alice = key(11);
-        peers[0]
-            .submit(frame(&alice, 0, vec![set(b"seen", b"by-followers")]))
-            .await;
-        let tip = peers[0].reached(5).await;
-
-        let mut follower = Peer::spawn(
-            context.child(LABELS[3]),
-            LABELS[3],
-            &oracle,
-            keys[3].clone(),
-            &members,
-            network.clone(),
-        )
-        .await;
-        assert!(!follower.roster.participates(0));
-        follower.marshal.hint(tip, NonEmptyVec::new(peers[0].me()));
-        follower.reached(tip).await;
-        assert_eq!(follower.root_at(tip), peers[0].root_at(tip));
-        assert_eq!(
-            follower.confirmed("probe", b"seen").await,
-            Some(b"by-followers".to_vec())
-        );
-    });
-}
-
-#[test]
-fn a_validator_epochs_behind_catches_up_by_the_traffic_it_hears() {
-    runner().start(|context| async move {
-        let keys: Vec<_> = (1..=4).map(key).collect();
-        let members: Vec<_> = keys.iter().map(member).collect();
-        let oracle = mesh(&context, &keys).await;
-        let network = network(4);
-        let mut peers = validators(&context, &oracle, &keys[..3], &members, &network).await;
-        let alice = key(11);
-        peers[0]
-            .submit(frame(&alice, 0, vec![set(b"early", b"yes")]))
-            .await;
-        let ahead = peers[0].reached(11).await;
-
-        let mut late = Peer::spawn(
-            context.child(LABELS[3]),
-            LABELS[3],
-            &oracle,
-            keys[3].clone(),
-            &members,
-            network.clone(),
-        )
-        .await;
-        assert!(late.roster.participates(0));
-        let caught_up = late.reached(ahead).await;
-        assert_eq!(late.root_at(ahead), peers[0].root_at(ahead));
-        assert!(caught_up >= ahead);
-        assert_eq!(
-            late.confirmed("probe", b"early").await,
-            Some(b"yes".to_vec())
-        );
-        assert!(late.roster.participates(network.epoch_after(ahead)));
-    });
-}
-
-#[test]
-fn an_epoch_boundary_reseats_the_validators() {
-    runner().start(|context| async move {
-        let keys: Vec<_> = (1..=4).map(key).collect();
-        let founding: Vec<_> = keys[..3].iter().map(member).collect();
-        let seated: Vec<_> = keys.iter().map(member).collect();
-        let public: Vec<_> = keys.iter().map(|k| k.public_key()).collect();
-        let oracle = mesh(&context, &keys).await;
-        let network = network(4);
-        let mut peers = validators(&context, &oracle, &keys, &founding, &network).await;
-        assert!(!peers[3].roster.participates(0));
-
-        let alice = key(11);
-        peers[0]
-            .submit(frame(&alice, 0, vec![set(b"epoch", b"0")]))
-            .await;
-        peers[0]
-            .submit(Frame::sign(&alice, NETWORK, 1, "valset", abi::encode(&seated)).encode())
-            .await;
-
-        for peer in &mut peers[..3] {
-            peer.reached(3).await;
-        }
-        peers[3].marshal.hint(3, NonEmptyVec::new(peers[0].me()));
-        peers[3].reached(3).await;
-        for peer in &peers {
-            assert_eq!(
-                peer.node.lock().await.epoch_members(1).unwrap(),
-                Some(seated.clone())
-            );
-            assert!(peer.roster.participates(1));
-        }
-
-        let silenced = peers[2].me();
-        sever(&oracle, &silenced, &public).await;
-        peers[0]
-            .submit(frame(&alice, 2, vec![set(b"epoch", b"1")]))
-            .await;
-
-        let mut tips = Vec::new();
-        for peer in peers.iter_mut().filter(|peer| peer.me() != silenced) {
-            tips.push(peer.reached(9).await);
-        }
-        let common = *tips.iter().min().unwrap();
-        let root = peers[0].root_at(common);
-        for peer in peers.iter().filter(|peer| peer.me() != silenced) {
-            assert_eq!(peer.root_at(common), root);
-            assert_eq!(peer.confirmed("probe", b"epoch").await, Some(b"1".to_vec()));
-        }
-        let boundary = peers[3].marshal.certificate(3).await.unwrap();
-        let after = peers[3].marshal.certificate(4).await.unwrap();
-        let next = peers[3].marshal.certificate(8).await.unwrap();
-        assert_eq!(boundary.round().epoch().get(), 0);
-        assert_eq!(after.round().epoch().get(), 1);
-        assert_eq!(next.round().epoch().get(), 2);
     });
 }

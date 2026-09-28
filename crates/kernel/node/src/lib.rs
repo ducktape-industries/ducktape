@@ -118,6 +118,10 @@ where
         Ok(self.host.epoch_members(epoch)?)
     }
 
+    pub fn epoch_validators(&self, epoch: u64) -> Result<Option<Vec<Vec<u8>>>> {
+        Ok(self.host.epoch_validators(epoch)?)
+    }
+
     pub fn pending(&self) -> usize {
         self.pending.len()
     }

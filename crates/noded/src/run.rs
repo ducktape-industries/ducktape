@@ -4,7 +4,6 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use abi::role::validators::Member;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_cryptography::{Digestible as _, Signer as _};
 use commonware_p2p::authenticated::lookup::{Oracle, Receiver, Sender};
@@ -129,8 +128,12 @@ async fn start<E: Context>(
     let seated = recorded_epochs(&node)?;
     let tip = node.tip()?;
     let epoch = network.epoch_after(tip.height);
-    let members = seated.get(&epoch).cloned().ok_or(Error::Corrupt(format!(
-        "the state seats nobody for epoch {epoch}"
+    let validators = seated.get(&epoch).cloned().ok_or(Error::Corrupt(format!(
+        "the state records no validators for epoch {epoch}: it predates validators being \
+         recorded apart from members and must be founded again"
+    )))?;
+    let members = node.epoch_members(epoch)?.ok_or(Error::Corrupt(format!(
+        "the state records no members for epoch {epoch}"
     )))?;
 
     let (mesh, marshal_lanes, engine_channels) = Mesh::start(
@@ -143,8 +146,8 @@ async fn start<E: Context>(
     let mut oracle = mesh.oracle();
     track(&mut oracle, epoch, &members);
     let roster = Roster::new(descriptor.id(), Some(identity.clone()));
-    for (epoch, members) in &seated {
-        let validators = validators_of(members).ok_or(Error::Corrupt(format!(
+    for (epoch, validators) in &seated {
+        let validators = validators_of(validators).ok_or(Error::Corrupt(format!(
             "epoch {epoch} seats an undecodable key"
         )))?;
         roster.seat(*epoch, validators);
@@ -181,7 +184,7 @@ async fn start<E: Context>(
         &marshal,
         chain,
     );
-    let standing = membership.seat(tip, &members).await?;
+    let standing = membership.seat(tip, &validators).await?;
     tracing::info!(
         target: "ducktape::node",
         event = "node_started",
@@ -236,13 +239,15 @@ async fn start<E: Context>(
     })
 }
 
+/// Every recorded epoch's validator keys: the sets the roster verifies
+/// certificates against.
 fn recorded_epochs<E: Context>(
     node: &Node<E>,
-) -> Result<std::collections::BTreeMap<u64, Vec<Member>>> {
+) -> Result<std::collections::BTreeMap<u64, Vec<Vec<u8>>>> {
     let mut seated = std::collections::BTreeMap::new();
     let mut epoch = 0;
-    while let Some(members) = node.epoch_members(epoch)? {
-        seated.insert(epoch, members);
+    while let Some(validators) = node.epoch_validators(epoch)? {
+        seated.insert(epoch, validators);
         epoch += 1;
     }
     Ok(seated)
@@ -314,11 +319,13 @@ async fn applied<E: Context>(
         return Ok(());
     }
     let epoch = daemon.network.epoch_after(block.height);
-    let members = node.epoch_members(epoch)?.ok_or(Error::Corrupt(format!(
-        "the boundary block records no epoch {epoch}"
-    )))?;
+    let unrecorded = || Error::Corrupt(format!("the boundary block records no epoch {epoch}"));
+    let members = node.epoch_members(epoch)?.ok_or_else(unrecorded)?;
+    let validators = node.epoch_validators(epoch)?.ok_or_else(unrecorded)?;
     drop(node);
+    // The mesh admits every member, so a resident follows the chain; only
+    // the validators vote and propose.
     track(oracle, epoch, &members);
-    membership.seat(block.tip(), &members).await?;
+    membership.seat(block.tip(), &validators).await?;
     Ok(())
 }

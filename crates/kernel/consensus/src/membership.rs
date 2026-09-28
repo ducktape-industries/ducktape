@@ -1,4 +1,3 @@
-use abi::role::validators::Member;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_runtime::Handle;
@@ -17,8 +16,8 @@ use crate::{Context, Network};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("epoch {epoch} names a member key no validator scheme decodes")]
-    Members { epoch: u64 },
+    #[error("epoch {epoch} names a validator key no validator scheme decodes")]
+    Validators { epoch: u64 },
     #[error("epoch {epoch} has no floor: neither an anchor block nor a finalization names the tip")]
     Floor { epoch: u64 },
 }
@@ -70,12 +69,17 @@ where
         let (seats, seated) = mpsc::unbounded();
         let heard = heard
             .into_stream()
-            .map(|(epoch, peer)| Signal::Heard { epoch, peer });
+            .map(|(epoch, peer, certificate)| Signal::Heard {
+                epoch,
+                peer,
+                certificate,
+            });
         let signals = futures::stream::select(seated, heard);
         let catch_up = context.child("catch_up").spawn({
             let network = network.clone();
+            let roster = roster.clone();
             let marshal = marshal.mailbox().clone();
-            move |_| catchup::run(network, marshal, signals)
+            move |context| catchup::run(context, network, roster, marshal, signals)
         });
         Membership {
             context,
@@ -96,9 +100,11 @@ where
         &self.roster
     }
 
-    pub async fn seat(&mut self, tip: Tip, members: &[Member]) -> Result<Standing, Error> {
+    /// Seats the epoch after `tip` with its `validators`' keys; a node whose
+    /// key is not among them follows.
+    pub async fn seat(&mut self, tip: Tip, validators: &[Vec<u8>]) -> Result<Standing, Error> {
         let epoch = self.network.epoch_after(tip.height);
-        let validators = validators_of(members).ok_or(Error::Members { epoch })?;
+        let validators = validators_of(validators).ok_or(Error::Validators { epoch })?;
         self.roster.seat(epoch, validators);
         let standing = self.engine(epoch, tip).await?;
         let _ = self.seats.unbounded_send(Signal::Seated(epoch));

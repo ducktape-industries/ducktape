@@ -2,7 +2,9 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
+use abi::role::validators::Member;
 use abi::{HostOp, HostReply, Outcome, Scan};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
@@ -118,7 +120,7 @@ struct Live {
     thread: JoinHandle<()>,
 }
 
-fn founding(root: &Path, seats: &[&Seat]) -> PathBuf {
+fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
     std::fs::write(root.join("module_registry.wasm"), MODULE_REGISTRY).unwrap();
     std::fs::write(root.join("valset.wasm"), VALSET).unwrap();
     std::fs::write(root.join("relay.wasm"), RELAY).unwrap();
@@ -132,7 +134,7 @@ fn founding(root: &Path, seats: &[&Seat]) -> PathBuf {
     std::fs::write(root.join("params.bin"), abi::encode(&Vec::<Step>::new())).unwrap();
     let validators: String = seats.iter().map(|seat| seat.validator()).collect();
     let text = format!(
-        "network = \"{NETWORK}\"\ntime = {TIME}\nepoch_length = {EPOCH_LENGTH}\n\
+        "network = \"{NETWORK}\"\ntime = {TIME}\nepoch_length = {epoch_length}\n\
          block_time_ms = {BLOCK_TIME_MS}\n\
          [roles]\nregistry = \"module-registry\"\nvalidators = \"valset\"\nidentity = \"identity\"\n\
          {validators}\
@@ -158,6 +160,13 @@ fn frame(key: &ed25519::PrivateKey, seq: u64, steps: Vec<Step>) -> Vec<u8> {
     Frame::sign(key, NETWORK.as_bytes(), seq, "probe", abi::encode(&steps)).encode()
 }
 
+/// Polls until `client`'s node has applied `height`.
+async fn reach(client: &Client, height: u64) {
+    while client.status().await.unwrap().height < height {
+        ::tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 fn client_runtime() -> ::tokio::runtime::Runtime {
     ::tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -169,7 +178,7 @@ fn client_runtime() -> ::tokio::runtime::Runtime {
 fn a_validator_serves_its_network_over_http() {
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
-    let founding = founding(root.path(), &[&seat]);
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
     seat.init(&founding);
     let live = seat.start();
     let client = live.client.clone();
@@ -342,13 +351,137 @@ fn a_validator_serves_its_network_over_http() {
     live.thread.join().unwrap();
 }
 
+/// One validator, and a resident the valset adds whose node never runs.
+/// Only the validator is seated, so the chain finalizes on through the
+/// epoch that records the resident; seating the resident too would ask a
+/// quorum of two and stop it at that epoch's first block.
+#[test]
+fn an_offline_resident_leaves_the_chain_finalizing() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let member = |key: &ed25519::PrivateKey, address: SocketAddr| Member {
+        key: key.public_key().as_ref().to_vec(),
+        address: address.to_string(),
+    };
+    let valset = abi::encode(&(
+        vec![member(&seat.identity, seat.p2p)],
+        vec![member(&ed25519::PrivateKey::from_seed(12), free_port())],
+    ));
+
+    client_runtime().block_on(async {
+        let mut changes = client.changes("valset").await.unwrap();
+        let frame = Frame::sign(&alice, NETWORK.as_bytes(), 0, "valset", valset).encode();
+        let receipt = client.submit(frame).await.unwrap();
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
+        let recorded = changes.next().await.unwrap().unwrap().height;
+        let resident_epoch = recorded / EPOCH_LENGTH + 1;
+        let beyond = resident_epoch * EPOCH_LENGTH + 1;
+        ::tokio::time::timeout(Duration::from_secs(30), reach(&client, beyond))
+            .await
+            .expect("the chain finalizes past the first block of the resident's epoch");
+        client.admin(seat.admin(Admin::Shutdown)).await.unwrap();
+    });
+    live.thread.join().unwrap();
+}
+
+/// One validator, and a resident the valset adds that joins by state sync
+/// inside the first epoch that records it. It runs no engine, yet it follows
+/// at the tip: it applies the changes the validator makes after it starts,
+/// and comes within two blocks of the validator before the validator applies
+/// the block that closes the epoch, so no next-epoch traffic carried it.
+#[test]
+fn a_resident_follows_at_the_tip() {
+    // long enough that the resident joins, starts (seconds: a node
+    // preallocates its mailboxes) and catches up inside one epoch
+    const EPOCH: u64 = 100;
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let resident = Seat::new(root.path(), "n1");
+    let founding = founding(root.path(), &[&seat], EPOCH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let member = |seat: &Seat| Member {
+        key: seat.identity.public_key().as_ref().to_vec(),
+        address: seat.p2p.to_string(),
+    };
+    let valset = abi::encode(&(vec![member(&seat)], vec![member(&resident)]));
+    let runtime = client_runtime();
+
+    let epoch = runtime.block_on(async {
+        let mut changes = client.changes("valset").await.unwrap();
+        let frame = Frame::sign(&alice, NETWORK.as_bytes(), 0, "valset", valset).encode();
+        let receipt = client.submit(frame).await.unwrap();
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
+        let recorded = changes.next().await.unwrap().unwrap().height;
+        let epoch = recorded / EPOCH + 1;
+        ::tokio::time::timeout(Duration::from_secs(60), reach(&client, epoch * EPOCH))
+            .await
+            .expect("the chain reaches the first epoch that records the resident");
+        epoch
+    });
+    let closing = (epoch + 1) * EPOCH - 1;
+
+    resident.join(&client);
+    let follower = resident.start();
+    runtime.block_on(async {
+        let mut changes = follower.client.changes("probe").await.unwrap();
+        let follow = async {
+            let mut seq: u64 = 1;
+            loop {
+                let write = set(b"a", &seq.to_be_bytes());
+                client
+                    .submit(frame(&alice, seq, vec![write]))
+                    .await
+                    .unwrap();
+                changes.next().await.unwrap().unwrap();
+                // the resident first, so the validator's height bounds it
+                let followed = follower.client.status().await.unwrap().height;
+                let validator = client.status().await.unwrap().height;
+                assert!(
+                    validator < closing,
+                    "the resident was at {followed} once the validator applied {validator}: \
+                     block {closing} closes epoch {epoch}, so it followed only across the boundary"
+                );
+                if followed + 2 >= validator {
+                    return;
+                }
+                seq += 1;
+            }
+        };
+        ::tokio::time::timeout(Duration::from_secs(120), follow)
+            .await
+            .expect("the resident applies each change");
+        for (seat, node) in [(&seat, &live), (&resident, &follower)] {
+            node.client
+                .admin(seat.admin(Admin::Shutdown))
+                .await
+                .unwrap();
+        }
+    });
+    live.thread.join().unwrap();
+    follower.thread.join().unwrap();
+}
+
 #[test]
 fn a_late_validator_joins_by_state_sync_and_follows() {
     let root = tempfile::tempdir().unwrap();
     let seats: Vec<Seat> = (0..4)
         .map(|i| Seat::new(root.path(), &format!("n{i}")))
         .collect();
-    let founding = founding(root.path(), &seats.iter().collect::<Vec<_>>());
+    let founding = founding(root.path(), &seats.iter().collect::<Vec<_>>(), EPOCH_LENGTH);
     for seat in &seats[..3] {
         seat.init(&founding);
     }
