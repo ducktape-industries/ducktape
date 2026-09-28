@@ -66,6 +66,7 @@ fn genesis(validators: Vec<validators::Member>) -> Genesis {
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
         time: TIME,
+        member_cap: 16,
     }
 }
 

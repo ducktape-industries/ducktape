@@ -114,6 +114,10 @@ where
         Ok(self.host.epoch_length()?)
     }
 
+    pub fn member_cap(&self) -> Result<u32> {
+        Ok(self.host.member_cap()?)
+    }
+
     pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<validators::Member>>> {
         Ok(self.host.epoch_members(epoch)?)
     }

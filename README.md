@@ -48,6 +48,7 @@ network = "mynet"
 time = 1700000000000          # the genesis block's time, unix milliseconds
 epoch_length = 64             # blocks per validator epoch
 block_time_ms = 1000
+member_cap = 16               # optional, default 16: the most members (validators and residents) it ever holds, 1 to 128; fixed at founding
 
 [roles]                       # the founding program the kernel calls in each role; all three required
 registry = "module-registry"  # registers and swaps programs

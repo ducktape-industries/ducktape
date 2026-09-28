@@ -61,6 +61,12 @@ pub enum Error {
     },
     #[error("no network was founded here")]
     Unfounded,
+    #[error(
+        "a network's member cap is 1 to {max} and holds its founding validators; this founding \
+         asks for {cap} with {validators} validators",
+        max = validators::MAX_MEMBERS
+    )]
+    MemberCap { cap: u32, validators: usize },
     #[error("host state is corrupt: {0}")]
     Corrupt(String),
 }
@@ -83,6 +89,9 @@ pub struct Genesis {
     pub limits: Limits,
     pub epoch_length: u64,
     pub time: u64,
+    /// How many members the network ever holds at once: 1..=MAX_MEMBERS,
+    /// fixed here and never rewritten.
+    pub member_cap: u32,
 }
 
 pub struct Founding {
@@ -190,6 +199,12 @@ where
         block: BlockId,
         genesis: Genesis,
     ) -> Result<(Host<E>, Applied)> {
+        if !(1..=validators::MAX_MEMBERS).contains(&genesis.member_cap) {
+            return Err(Error::MemberCap {
+                cap: genesis.member_cap,
+                validators: genesis.validators.len(),
+            });
+        }
         let storage = Storage::open(&dir.join(STATE_DIR))?;
         let store = Store::open(context, name, storage, RESERVED.map(str::to_owned)).await?;
         let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
@@ -213,6 +228,11 @@ where
             NETWORK,
             namespace::EPOCH_LENGTH.to_vec(),
             abi::encode(&genesis.epoch_length),
+        );
+        overlay.set(
+            NETWORK,
+            namespace::MEMBER_CAP.to_vec(),
+            abi::encode(&genesis.member_cap),
         );
         overlay.set(
             NETWORK,
@@ -253,6 +273,7 @@ where
         });
         let params = abi::encode(&validators::Genesis {
             validators: genesis.validators,
+            member_cap: genesis.member_cap,
         });
         for entry in entries.iter_mut() {
             if entry.program == roles.validators {
@@ -444,6 +465,11 @@ where
         abi::decode(&bytes).map_err(corrupt)
     }
 
+    /// How many members the network ever holds at once, as founded.
+    pub fn member_cap(&self) -> Result<u32> {
+        member_cap_of(&self.store.view(Vec::new()))
+    }
+
     pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<validators::Member>>> {
         self.store
             .view(Vec::new())
@@ -587,6 +613,17 @@ where
                 "the validators program answered Members with another reply".into(),
             ));
         };
+        // every mesh is sized for the cap, so no node could track such an
+        // epoch: the block that closes the one before is not applied, and
+        // as that block is final the network halts there and is founded again
+        let cap = member_cap_of(&self.store.view(vec![&*overlay]))?;
+        if members.len() > cap as usize {
+            return Err(Error::Corrupt(format!(
+                "the validators program seats {} members for epoch {epoch}, past the network's \
+                 cap of {cap}",
+                members.len()
+            )));
+        }
         let validators::Reply::Validators(seated) = self
             .ask_validators(validators::Query::Validators, height, time, overlay, stage)
             .await?
@@ -1275,6 +1312,23 @@ fn limits_of(view: &View<'_>) -> Result<Limits> {
         Some(bytes) => abi::decode(&bytes).map_err(corrupt),
         None => Ok(Limits::default()),
     }
+}
+
+fn member_cap_of(view: &View<'_>) -> Result<u32> {
+    let bytes = view.get(NETWORK, namespace::MEMBER_CAP)?.ok_or_else(|| {
+        Error::Corrupt(
+            "the network records no member cap: it was founded before member caps; found it again"
+                .into(),
+        )
+    })?;
+    let cap: u32 = abi::decode(&bytes).map_err(corrupt)?;
+    if !(1..=validators::MAX_MEMBERS).contains(&cap) {
+        return Err(Error::Corrupt(format!(
+            "the network's member cap {cap} is outside 1..={}",
+            validators::MAX_MEMBERS
+        )));
+    }
+    Ok(cap)
 }
 
 fn corrupt(refusal: Refusal) -> Error {

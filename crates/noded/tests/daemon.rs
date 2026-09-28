@@ -26,6 +26,8 @@ const NETWORK: &str = "daemon";
 const TIME: u64 = 1_700_000_000;
 const EPOCH_LENGTH: u64 = 8;
 const BLOCK_TIME_MS: u64 = 250;
+/// Room for the four seats the largest test founds.
+const MEMBER_CAP: u32 = 4;
 
 fn runner(dir: &Path) -> tokio::Runner {
     tokio::Runner::new(tokio::Config::new().with_storage_directory(dir))
@@ -135,7 +137,7 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
     let validators: String = seats.iter().map(|seat| seat.validator()).collect();
     let text = format!(
         "network = \"{NETWORK}\"\ntime = {TIME}\nepoch_length = {epoch_length}\n\
-         block_time_ms = {BLOCK_TIME_MS}\n\
+         block_time_ms = {BLOCK_TIME_MS}\nmember_cap = {MEMBER_CAP}\n\
          [roles]\nregistry = \"module-registry\"\nvalidators = \"valset\"\nidentity = \"identity\"\n\
          {validators}\
          [[programs]]\nid = \"module-registry\"\ncode = \"module_registry.wasm\"\n\
@@ -499,6 +501,71 @@ fn a_resident_follows_at_the_tip() {
     });
     live.thread.join().unwrap();
     follower.thread.join().unwrap();
+}
+
+/// Three validators, and the valset drops the third. Once the chain is in
+/// the epoch that seats two, the third node is shut down: the set of three
+/// needed all three, so the two finalize on only because the shrink took
+/// effect.
+#[test]
+fn a_shrunk_set_finalizes_without_the_removed_member() {
+    let root = tempfile::tempdir().unwrap();
+    let seats: Vec<Seat> = (0..3)
+        .map(|i| Seat::new(root.path(), &format!("n{i}")))
+        .collect();
+    let founding = founding(root.path(), &seats.iter().collect::<Vec<_>>(), EPOCH_LENGTH);
+    for seat in &seats {
+        seat.init(&founding);
+    }
+    let live: Vec<Live> = seats.iter().map(Seat::start).collect();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let member = |seat: &Seat| Member {
+        key: seat.identity.public_key().as_ref().to_vec(),
+        address: seat.p2p.to_string(),
+    };
+    let valset = abi::encode(&(
+        vec![member(&seats[0]), member(&seats[1])],
+        Vec::<Member>::new(),
+    ));
+
+    client_runtime().block_on(async {
+        let client = &live[0].client;
+        let mut changes = client.changes("valset").await.unwrap();
+        let frame = Frame::sign(&alice, NETWORK.as_bytes(), 0, "valset", valset).encode();
+        let receipt = client.submit(frame).await.unwrap();
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
+        let recorded = changes.next().await.unwrap().unwrap().height;
+        let shrunk = recorded / EPOCH_LENGTH + 1;
+        ::tokio::time::timeout(
+            Duration::from_secs(30),
+            reach(client, shrunk * EPOCH_LENGTH),
+        )
+        .await
+        .expect("the chain enters the epoch that seats two");
+        live[2]
+            .client
+            .admin(seats[2].admin(Admin::Shutdown))
+            .await
+            .unwrap();
+        let beyond = (shrunk + 1) * EPOCH_LENGTH + 1;
+        for node in &live[..2] {
+            ::tokio::time::timeout(Duration::from_secs(30), reach(&node.client, beyond))
+                .await
+                .expect("the two finalize across the next boundary");
+        }
+        for (seat, node) in seats.iter().zip(&live).take(2) {
+            node.client
+                .admin(seat.admin(Admin::Shutdown))
+                .await
+                .unwrap();
+        }
+    });
+    for node in live {
+        node.thread.join().unwrap();
+    }
 }
 
 #[test]

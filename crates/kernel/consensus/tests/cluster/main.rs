@@ -104,6 +104,7 @@ fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
         limits: Limits::default(),
         epoch_length,
         time: TIME,
+        member_cap: 16,
     }
 }
 

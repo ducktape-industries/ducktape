@@ -136,12 +136,14 @@ async fn start<E: Context>(
         "the state records no members for epoch {epoch}"
     )))?;
 
+    let member_cap = node.member_cap()?;
     let (mesh, marshal_lanes, engine_channels) = Mesh::start(
         context.child("mesh"),
         identity.clone(),
         &descriptor.id(),
         listen.p2p,
         listen.reach,
+        member_cap,
     );
     let mut oracle = mesh.oracle();
     track(&mut oracle, epoch, &members);
