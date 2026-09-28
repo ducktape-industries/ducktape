@@ -5,6 +5,7 @@ use commonware_consensus::simplex::config::{Config, Floor, ForwardPolicy, SkipBu
 use commonware_consensus::simplex::elector::{Config as ElectorConfig, Elector as _, RoundRobin};
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_consensus::types::{Epoch as EpochNumber, FixedEpocher, Height, ViewDelta};
+use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_cryptography::{Sha256, sha256};
 use commonware_p2p::{Blocker, Receiver, Sender};
@@ -19,11 +20,12 @@ use crate::anchor::Anchor;
 use crate::chain::{App, Chain};
 use crate::lanes::EngineLanes;
 use crate::marshal::{Certificate, MarshalMailbox};
+use crate::votes::Votes;
 use crate::{Context, Network};
 
 const MAILBOX: NonZeroUsize = NonZeroUsize::new(1024).expect("nonzero");
 const BUFFER: NonZeroUsize = NonZeroUsize::new(1 << 20).expect("nonzero");
-const VIEW_RETENTION: u64 = 10;
+pub(crate) const VIEW_RETENTION: u64 = 10;
 const PAGE_SIZE: u16 = 1024;
 const PAGE_CACHE_PAGES: usize = 64;
 
@@ -33,6 +35,8 @@ pub(crate) struct Epoch {
     pub number: u64,
     pub scheme: Scheme,
     pub floor: EngineFloor,
+    /// The book the engine counts each finalize vote it hears into.
+    pub votes: Votes,
 }
 
 pub(crate) struct Engine {
@@ -76,6 +80,9 @@ impl Engine {
             NonZeroU16::new(PAGE_SIZE).expect("nonzero"),
             NonZeroUsize::new(PAGE_CACHE_PAGES).expect("nonzero"),
         );
+        let reporter = epoch
+            .votes
+            .recorder(marshal.clone(), epoch.scheme.participants().clone());
         let engine = commonware_consensus::simplex::Engine::new(
             context.child("simplex"),
             Config {
@@ -84,7 +91,7 @@ impl Engine {
                 blocker: lanes.blocker,
                 automaton: inline.clone(),
                 relay: inline,
-                reporter: marshal.clone(),
+                reporter,
                 strategy: Sequential,
                 partition: format!("{partition}-simplex-{}", epoch.number),
                 mailbox_size: MAILBOX,

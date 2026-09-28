@@ -205,6 +205,7 @@ async fn start<E: Context>(
         receipts,
         logs,
         shutdown,
+        votes: membership.votes().clone(),
         subscribers: Mutex::new(Vec::new()),
     });
 
@@ -308,7 +309,11 @@ async fn applied<E: Context>(
     block: &Block,
 ) -> Result<()> {
     let mut node = daemon.node.lock().await;
-    if let Sequenced::Applied(outcome) = node.apply(block).await? {
+    let sequenced = node.apply(block).await?;
+    // under the node lock, which a /v1/network read holds across the tip
+    // and the book, so no height it serves passes its tip
+    daemon.votes.applied(block.digest(), block.height);
+    if let Sequenced::Applied(outcome) = sequenced {
         daemon
             .receipts
             .keep(block.height, block.digest(), &outcome.submissions)
