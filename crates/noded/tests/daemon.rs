@@ -235,6 +235,24 @@ fn a_validator_serves_its_network_over_http() {
         assert!(status.height >= change.height);
         assert_eq!(status.root, change.root);
 
+        // the lone validator's row: its engine booked its own finalize vote
+        // for the block that wrote the change before that block could be
+        // finalized, so the book held it once the change was published,
+        // and a read takes the tip and the book under one lock
+        let network = client.network().await.unwrap();
+        assert!(network.height >= change.height);
+        let [row] = network.members.as_slice() else {
+            panic!("one member: {network:?}");
+        };
+        assert_eq!(row.key, status.identity);
+        assert!(
+            row.signed
+                .is_some_and(|signed| (change.height..=network.height).contains(&signed)),
+            "{row:?} against change {} and tip {}",
+            change.height,
+            network.height
+        );
+
         // the block that wrote it, read back from the archive
         let block = client
             .block(BlockRef::Height(change.height))
@@ -464,6 +482,14 @@ fn a_resident_follows_at_the_tip() {
         ::tokio::time::timeout(Duration::from_secs(120), follow)
             .await
             .expect("the resident applies each change");
+        // it runs no engine, so it hears no finalize vote: every member,
+        // the validator too, reads None on it
+        let network = follower.client.network().await.unwrap();
+        assert_eq!(network.members.len(), 2, "{network:?}");
+        assert!(
+            network.members.iter().all(|row| row.signed.is_none()),
+            "{network:?}"
+        );
         for (seat, node) in [(&seat, &live), (&resident, &follower)] {
             node.client
                 .admin(seat.admin(Admin::Shutdown))

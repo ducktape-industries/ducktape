@@ -8,7 +8,9 @@ use reqwest::StatusCode;
 use statesync::{Exchange, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::wire::{BlobPut, BlockRef, Blocks, Change, Finalized, Get, Query, Range, Status, route};
+use crate::wire::{
+    BlobPut, BlockRef, Blocks, Change, Finalized, Get, Network, Query, Range, Status, route,
+};
 use crate::{Error, Result};
 
 #[derive(Clone)]
@@ -31,6 +33,13 @@ impl Client {
 
     pub async fn status(&self) -> Result<Status> {
         self.fetch(route::STATUS).await
+    }
+
+    /// The current epoch's members and, for each validator, the newest
+    /// block this node applied that it heard the validator's finalize vote
+    /// for (`wire::PeerStatus`).
+    pub async fn network(&self) -> Result<Network> {
+        self.fetch(route::NETWORK).await
     }
 
     pub async fn submit(&self, frame: Vec<u8>) -> Result<Receipt> {

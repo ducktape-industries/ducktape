@@ -14,12 +14,15 @@ use futures::channel::mpsc;
 use host::Receipt;
 use statesync::Request;
 
-use crate::wire::{Admin, BlobPut, BlockRef, Blocks, Change, Finalized, Get, Query, Range, route};
+use crate::wire::{
+    Admin, BlobPut, BlockRef, Blocks, Change, Finalized, Get, Network, Query, Range, route,
+};
 use crate::{Context, Daemon};
 
 pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
     Router::new()
         .route(route::STATUS, get(status::<E>))
+        .route(route::NETWORK, get(network::<E>))
         .route(route::SUBMIT, post(submit::<E>))
         .route(route::QUERY, post(query::<E>))
         .route(route::GET, post(get_value::<E>))
@@ -68,6 +71,13 @@ fn failed<T>(error: impl ToString) -> Reply<T> {
 async fn status<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<crate::wire::Status> {
     match daemon.status().await {
         Ok(status) => Reply::Answered(status),
+        Err(error) => failed(error),
+    }
+}
+
+async fn network<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Network> {
+    match daemon.network().await {
+        Ok(network) => Reply::Answered(network),
         Err(error) => failed(error),
     }
 }

@@ -21,6 +21,7 @@ pub mod route {
     pub const LOGS: &str = "/v1/logs";
     pub const ADMIN: &str = "/v1/admin";
     pub const SYNC: &str = "/v1/sync";
+    pub const NETWORK: &str = "/v1/network";
     pub const METRICS: &str = "/metrics";
 }
 
@@ -134,4 +135,30 @@ pub struct Finalized {
     pub epoch: u64,
     pub proposer: Option<Vec<u8>>,
     pub txs: Vec<Tx>,
+}
+
+/// Every member of the current epoch as this node sees it (`/v1/network`).
+/// `height` is this node's applied tip and no row's `signed` exceeds it,
+/// so "44 behind" is `height - signed`, by this node's measure.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Network {
+    pub height: u64,
+    /// The epoch's members, validators and residents alike, in key order.
+    pub members: Vec<PeerStatus>,
+}
+
+/// One member. `signed` is the height of the newest block this node
+/// applied that the member sent a finalize vote for, as this node's
+/// consensus engine heard it. A vote that lands after its block's
+/// certificate reached quorum counts too; one for a block this node has
+/// not applied counts once it does. The vote's sender is authenticated but
+/// its signature is not checked, so a validator can misstate only its own
+/// row. `None` for a member not seated as a validator this epoch (a
+/// resident), for a validator not heard since this node started or last
+/// began validating, and for every member while this node is not itself a
+/// validator: it runs no engine, so it hears no votes.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct PeerStatus {
+    pub key: Vec<u8>,
+    pub signed: Option<u64>,
 }

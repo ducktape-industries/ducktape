@@ -2,6 +2,7 @@ mod blocks;
 mod client;
 mod logs;
 mod mesh;
+mod network;
 mod run;
 mod server;
 pub mod wire;
@@ -11,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use abi::{ProgramId, Refusal};
 use commonware_cryptography::Digestible as _;
-use consensus::{MarshalMailbox, Network, Receipts};
+use consensus::{MarshalMailbox, Network, Receipts, Votes};
 use futures::channel::mpsc;
 use host::Applied;
 use node::Node;
@@ -89,6 +90,8 @@ pub struct Daemon<E: Context> {
     pub receipts: Receipts<E>,
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
+    /// Each validator's newest finalize vote, as a height (`network.rs`).
+    votes: Votes,
     subscribers: Mutex<Vec<(ProgramId, mpsc::UnboundedSender<Change>)>>,
 }
 

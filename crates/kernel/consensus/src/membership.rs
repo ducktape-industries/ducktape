@@ -12,6 +12,7 @@ use crate::engine::{Engine, Epoch, floor};
 use crate::lanes::{EngineMux, Lanes};
 use crate::marshal::{Marshal, MarshalMailbox};
 use crate::roster::{Roster, validators_of};
+use crate::votes::Votes;
 use crate::{Context, Network};
 
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +38,7 @@ pub struct Membership<E, S: Sender, R: Receiver, B, C> {
     marshal: MarshalMailbox,
     anchor: Anchor,
     chain: C,
+    votes: Votes,
     engine: Option<Engine>,
     seats: mpsc::UnboundedSender<Signal>,
     catch_up: Handle<()>,
@@ -90,6 +92,7 @@ where
             marshal: marshal.mailbox().clone(),
             anchor: marshal.anchor().clone(),
             chain,
+            votes: Votes::default(),
             engine: None,
             seats,
             catch_up,
@@ -98,6 +101,11 @@ where
 
     pub fn roster(&self) -> &Roster {
         &self.roster
+    }
+
+    /// The finalize votes the engines this membership seats hear.
+    pub fn votes(&self) -> &Votes {
+        &self.votes
     }
 
     /// Seats the epoch after `tip` with its `validators`' keys; a node whose
@@ -114,6 +122,7 @@ where
     async fn engine(&mut self, epoch: u64, tip: Tip) -> Result<Standing, Error> {
         let Some(scheme) = self.roster.scheme(epoch) else {
             self.engine = None;
+            self.votes.clear();
             return Ok(Standing::Follower);
         };
         let floor = floor(&self.marshal, &self.anchor, &self.network, tip)
@@ -129,6 +138,7 @@ where
                 number: epoch,
                 scheme,
                 floor,
+                votes: self.votes.clone(),
             },
             lanes,
             &self.marshal,
