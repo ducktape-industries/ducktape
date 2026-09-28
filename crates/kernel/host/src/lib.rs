@@ -19,7 +19,7 @@ use commonware_runtime::Spawner;
 use commonware_storage::Context;
 use runtime::Fault;
 use sha2::{Digest as _, Sha256};
-use state::{Commitment, Overlay, Storage, Store, View, Writes, valid_program_id};
+use state::{Commitment, Overlay, Storage, Store, View, Writes, commitment_name, valid_program_id};
 
 use crate::unit::{Frame, Loaded, World, refusal_of};
 
@@ -191,7 +191,59 @@ impl<E> Host<E>
 where
     E: Context + Spawner,
 {
+    /// A refused founding leaves `dir` as it found it: it removes the state
+    /// and blobs directories it made, and with the state the commitments of
+    /// its programs. A directory that was there before is left alone.
     pub async fn found(
+        context: E,
+        name: &str,
+        dir: &Path,
+        block: BlockId,
+        genesis: Genesis,
+    ) -> Result<(Host<E>, Applied)> {
+        let state = dir.join(STATE_DIR);
+        let blobs = dir.join(BLOBS_DIR);
+        let made_state = !state.exists();
+        let made_blobs = !blobs.exists();
+        let unfound = context.child("unfound");
+        let founders = genesis
+            .programs
+            .iter()
+            .map(|founding| founding.program.clone());
+        let programs: Vec<ProgramId> = RESERVED
+            .map(str::to_owned)
+            .into_iter()
+            .chain(founders)
+            .collect();
+        // boxed: unboxed, a caller that awaits the founding deep in its own
+        // futures nests past the compiler's layout query depth
+        let founded = Box::pin(Host::found_in(context, name, dir, block, genesis)).await;
+        if founded.is_ok() {
+            return founded;
+        }
+        // the refused host is dropped, its store closed. Each removal is
+        // tried and a failed one dropped: the founding's error is what returns
+        let opened_blobs = made_blobs && blobs.exists();
+        if opened_blobs {
+            let _ = std::fs::remove_dir_all(&blobs);
+        }
+        let opened_state = made_state && state.exists();
+        if opened_state {
+            // a commitment lives in the runtime's storage, not under `dir`:
+            // each one the founding could have opened is opened to be destroyed
+            for program in &programs {
+                let context = unfound.child("program").with_attribute("program", program);
+                let opened = Commitment::open(context, &commitment_name(name, program)).await;
+                if let Ok(db) = opened.and_then(Commitment::into_db) {
+                    let _ = db.destroy().await;
+                }
+            }
+            let _ = std::fs::remove_dir_all(&state);
+        }
+        founded
+    }
+
+    async fn found_in(
         context: E,
         name: &str,
         dir: &Path,
@@ -203,20 +255,9 @@ where
                 cap: genesis.member_cap,
             });
         }
-        let storage = Storage::open(&dir.join(STATE_DIR))?;
-        let store = Store::open(context, name, storage, RESERVED.map(str::to_owned)).await?;
-        let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
-        let mut host = Host {
-            store,
-            blobs,
-            network: genesis.network.clone(),
-            roles: genesis.roles.clone(),
-            loaded: Loaded::new(genesis.limits),
-            preconfirmed: Overlay::default(),
-        };
         let mut overlay = Overlay::default();
         let mut stage = Stage::default();
-        overlay.set(NETWORK, namespace::ID.to_vec(), genesis.network);
+        overlay.set(NETWORK, namespace::ID.to_vec(), genesis.network.clone());
         overlay.set(
             NETWORK,
             namespace::LIMITS.to_vec(),
@@ -309,6 +350,18 @@ where
         // carries it
         let is_role = |entry: &registry::Entry| founding_roles.contains(&&entry.program);
         let (role_entries, rest) = entries.split_at(entries.partition_point(is_role));
+        // nothing above touches `dir`: a genesis refused there leaves no state
+        let storage = Storage::open(&dir.join(STATE_DIR))?;
+        let store = Store::open(context, name, storage, RESERVED.map(str::to_owned)).await?;
+        let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
+        let mut host = Host {
+            store,
+            blobs,
+            network: genesis.network,
+            roles: genesis.roles.clone(),
+            loaded: Loaded::new(genesis.limits),
+            preconfirmed: Overlay::default(),
+        };
         let mut receipts = Vec::new();
         for entry in role_entries {
             let receipt = host
