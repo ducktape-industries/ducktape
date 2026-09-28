@@ -1,3 +1,4 @@
+use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_runtime::Handle;
@@ -130,6 +131,7 @@ where
             .ok_or(Error::Floor { epoch })?;
         let lanes = self.lanes.register(epoch).await;
         self.engine = None;
+        self.votes.seat(scheme.participants());
         self.engine = Some(Engine::start(
             self.context.child("engine").with_attribute("epoch", epoch),
             &self.partition,

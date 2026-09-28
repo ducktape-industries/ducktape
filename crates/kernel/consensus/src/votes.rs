@@ -9,7 +9,7 @@
 //! two comes second. A vote for a block this node never applies (an
 //! orphaned notarization, a digest no block has) never counts.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use commonware_actor::Feedback;
@@ -44,6 +44,9 @@ pub struct Votes(Arc<Mutex<Book>>);
 
 #[derive(Default)]
 struct Book {
+    /// The keys of the validators this node's engine is seated with, none
+    /// while it runs no engine: the only votes the book takes.
+    seated: BTreeSet<Vec<u8>>,
     /// The blocks this node applied last, oldest first.
     applied: VecDeque<(Digest, u64)>,
     /// Voters' keys, by the round and digest they voted for, while the
@@ -62,6 +65,7 @@ impl Votes {
             applied,
             pending,
             signed,
+            ..
         } = &mut *book;
         if applied.len() == APPLIED {
             applied.pop_front();
@@ -84,10 +88,30 @@ impl Votes {
         self.book().signed.clone()
     }
 
-    /// Forgets every vote: a node that stops validating hears none, and
-    /// what it heard before would only age.
+    /// Forgets every vote and takes none until the next [`Votes::seat`]: a
+    /// node that stops validating hears none, what it heard before would
+    /// only age, and its dropped engine can still report one more.
     pub(crate) fn clear(&self) {
         *self.book() = Book::default();
+    }
+
+    /// Seats the book for an engine seated with `validators`: it takes only
+    /// their votes and forgets every other key's, so a validator seated again
+    /// after a demotion shows no height until it votes again.
+    pub(crate) fn seat(&self, validators: &Set<PublicKey>) {
+        let mut book = self.book();
+        let Book {
+            seated,
+            pending,
+            signed,
+            ..
+        } = &mut *book;
+        *seated = validators.iter().map(|key| key.as_ref().to_vec()).collect();
+        signed.retain(|key, _| seated.contains(key));
+        pending.retain(|_, voters| {
+            voters.retain(|key| seated.contains(key));
+            !voters.is_empty()
+        });
     }
 
     /// The reporter for an engine seated with `validators`: it hands every
@@ -110,10 +134,15 @@ impl Votes {
         let proposal = &finalize.proposal;
         let mut book = self.book();
         let Book {
+            seated,
             applied,
             pending,
             signed,
         } = &mut *book;
+        // a dropped engine can report once more after its seat moved on
+        if !seated.contains(&key) {
+            return;
+        }
         if let Some(&(_, height)) = applied.iter().find(|(id, _)| *id == proposal.payload) {
             raise(signed, key, height);
             return;
@@ -185,6 +214,13 @@ mod tests {
             Seated { keys, validators }
         }
 
+        /// A book seated with these validators.
+        fn votes(&self) -> Votes {
+            let votes = Votes::default();
+            votes.seat(&self.validators);
+            votes
+        }
+
         fn vote(&self, votes: &Votes, voter: usize, view: u64, id: Digest) {
             let scheme =
                 Scheme::signer(NAMESPACE, self.validators.clone(), self.keys[voter].clone())
@@ -213,7 +249,7 @@ mod tests {
     #[test]
     fn a_vote_after_its_block_is_applied_counts() {
         let seated = Seated::new();
-        let votes = Votes::default();
+        let votes = seated.votes();
         votes.applied(block(5), 5);
         // the quorum finalized block 5 and this node applied it; the
         // fourth vote arrives late and still counts
@@ -225,7 +261,7 @@ mod tests {
     #[test]
     fn a_vote_ahead_of_this_node_waits_for_its_block() {
         let seated = Seated::new();
-        let votes = Votes::default();
+        let votes = seated.votes();
         votes.applied(block(5), 5);
         seated.vote(&votes, 0, 7, block(5));
         seated.vote(&votes, 0, 8, block(6));
@@ -240,7 +276,7 @@ mod tests {
     #[test]
     fn a_vote_for_a_block_never_applied_never_counts() {
         let seated = Seated::new();
-        let votes = Votes::default();
+        let votes = seated.votes();
         seated.vote(&votes, 1, 7, block(99));
         seated.vote(&votes, 2, 6, block(3));
         for height in 1..=3 {
@@ -253,7 +289,7 @@ mod tests {
     #[test]
     fn the_waiting_votes_are_bounded_oldest_round_first() {
         let seated = Seated::new();
-        let votes = Votes::default();
+        let votes = seated.votes();
         seated.vote(&votes, 2, 3, block(1));
         for view in 100..100 + PENDING as u64 {
             seated.vote(&votes, 1, view, sha256::Digest([0xee; 32]));
@@ -271,12 +307,47 @@ mod tests {
     #[test]
     fn clearing_forgets_every_vote() {
         let seated = Seated::new();
-        let votes = Votes::default();
+        let votes = seated.votes();
         votes.applied(block(5), 5);
         seated.vote(&votes, 0, 7, block(5));
         seated.vote(&votes, 1, 8, block(6));
         votes.clear();
         votes.applied(block(6), 6);
         assert!(votes.heights().is_empty());
+    }
+
+    #[test]
+    fn a_cleared_book_takes_no_vote_until_it_is_seated_again() {
+        let seated = Seated::new();
+        let votes = seated.votes();
+        votes.applied(block(5), 5);
+        votes.clear();
+        votes.applied(block(5), 5);
+        // the dropped engine's batcher reports once more
+        seated.vote(&votes, 0, 7, block(5));
+        assert!(votes.heights().is_empty());
+        votes.seat(&seated.validators);
+        seated.vote(&votes, 0, 7, block(5));
+        assert_eq!(seated.height(&votes, 0), Some(5));
+    }
+
+    #[test]
+    fn a_validator_seated_again_starts_with_no_height() {
+        let seated = Seated::new();
+        let votes = seated.votes();
+        votes.applied(block(5), 5);
+        seated.vote(&votes, 0, 7, block(5));
+        seated.vote(&votes, 3, 7, block(5));
+        seated.vote(&votes, 3, 8, block(6));
+        // validator 3 is demoted; its old engine reports it once more
+        let three: Vec<_> = seated.validators.iter().take(3).cloned().collect();
+        votes.seat(&Set::try_from(three).unwrap());
+        seated.vote(&votes, 3, 8, block(6));
+        votes.applied(block(6), 6);
+        assert_eq!(seated.height(&votes, 0), Some(5));
+        assert_eq!(seated.height(&votes, 3), None);
+        // and seated again: nothing from its old seat survives
+        votes.seat(&seated.validators);
+        assert_eq!(seated.height(&votes, 3), None);
     }
 }
