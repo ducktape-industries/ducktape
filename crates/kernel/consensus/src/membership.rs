@@ -69,12 +69,17 @@ where
         let (seats, seated) = mpsc::unbounded();
         let heard = heard
             .into_stream()
-            .map(|(epoch, peer)| Signal::Heard { epoch, peer });
+            .map(|(epoch, peer, certificate)| Signal::Heard {
+                epoch,
+                peer,
+                certificate,
+            });
         let signals = futures::stream::select(seated, heard);
         let catch_up = context.child("catch_up").spawn({
             let network = network.clone();
+            let roster = roster.clone();
             let marshal = marshal.mailbox().clone();
-            move |_| catchup::run(network, marshal, signals)
+            move |context| catchup::run(context, network, roster, marshal, signals)
         });
         Membership {
             context,

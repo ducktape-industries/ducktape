@@ -2,7 +2,9 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
+use abi::role::validators::Member;
 use abi::{HostOp, HostReply, Outcome, Scan};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
@@ -337,6 +339,52 @@ fn a_validator_serves_its_network_over_http() {
             let again = client.block(BlockRef::Height(seen.height)).await.unwrap();
             assert_eq!(again.as_ref(), Some(seen));
         }
+        client.admin(seat.admin(Admin::Shutdown)).await.unwrap();
+    });
+    live.thread.join().unwrap();
+}
+
+/// One validator, and a resident the valset adds whose node never runs.
+/// Only the validator is seated, so the chain finalizes on through the
+/// epoch that records the resident; seating the resident too would ask a
+/// quorum of two and stop it at that epoch's first block.
+#[test]
+fn an_offline_resident_leaves_the_chain_finalizing() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat]);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let member = |key: &ed25519::PrivateKey, address: SocketAddr| Member {
+        key: key.public_key().as_ref().to_vec(),
+        address: address.to_string(),
+    };
+    let valset = abi::encode(&(
+        vec![member(&seat.identity, seat.p2p)],
+        vec![member(&ed25519::PrivateKey::from_seed(12), free_port())],
+    ));
+
+    client_runtime().block_on(async {
+        let mut changes = client.changes("valset").await.unwrap();
+        let frame = Frame::sign(&alice, NETWORK.as_bytes(), 0, "valset", valset).encode();
+        let receipt = client.submit(frame).await.unwrap();
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
+        let recorded = changes.next().await.unwrap().unwrap().height;
+        let resident_epoch = recorded / EPOCH_LENGTH + 1;
+        let beyond = resident_epoch * EPOCH_LENGTH + 1;
+        let finalizing = async {
+            while client.status().await.unwrap().height < beyond {
+                ::tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        ::tokio::time::timeout(Duration::from_secs(30), finalizing)
+            .await
+            .expect("the chain finalizes past the first block of the resident's epoch");
         client.admin(seat.admin(Admin::Shutdown)).await.unwrap();
     });
     live.thread.join().unwrap();

@@ -1202,7 +1202,7 @@ fn an_epoch_is_recorded_as_the_block_ending_the_one_before_commits() {
         let founding = vec![member(b"v1", "v1:1")];
         let validators = vec![member(b"v1", "v1:1"), member(b"v2", "v2:2")];
         let resident = member(b"r3", "r3:3");
-        let seated = [validators.clone(), vec![resident.clone()]].concat();
+        let members = [validators.clone(), vec![resident.clone()]].concat();
         let keys = vec![b"v1".to_vec(), b"v2".to_vec()];
 
         host.apply(block(1, Vec::new())).await.unwrap();
@@ -1222,7 +1222,7 @@ fn an_epoch_is_recorded_as_the_block_ending_the_one_before_commits() {
 
         host.apply(block(3, Vec::new())).await.unwrap();
         assert_eq!(host.epoch_members(0).unwrap(), Some(founding));
-        assert_eq!(host.epoch_members(1).unwrap(), Some(seated.clone()));
+        assert_eq!(host.epoch_members(1).unwrap(), Some(members.clone()));
         assert_eq!(host.epoch_validators(1).unwrap(), Some(keys.clone()));
         assert_eq!(host.epoch_members(2).unwrap(), None);
         assert_eq!(
@@ -1238,7 +1238,7 @@ fn an_epoch_is_recorded_as_the_block_ending_the_one_before_commits() {
             assert_eq!(host.epoch_members(2).unwrap(), None);
         }
         host.apply(block(7, Vec::new())).await.unwrap();
-        assert_eq!(host.epoch_members(2).unwrap(), Some(seated));
+        assert_eq!(host.epoch_members(2).unwrap(), Some(members));
         assert_eq!(host.epoch_validators(2).unwrap(), Some(keys));
     });
 }

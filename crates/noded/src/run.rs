@@ -129,7 +129,8 @@ async fn start<E: Context>(
     let tip = node.tip()?;
     let epoch = network.epoch_after(tip.height);
     let validators = seated.get(&epoch).cloned().ok_or(Error::Corrupt(format!(
-        "the state seats nobody for epoch {epoch}"
+        "the state records no validators for epoch {epoch}: it predates validators being \
+         recorded apart from members and must be founded again"
     )))?;
     let members = node.epoch_members(epoch)?.ok_or(Error::Corrupt(format!(
         "the state records no members for epoch {epoch}"

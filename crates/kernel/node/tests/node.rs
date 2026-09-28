@@ -468,29 +468,38 @@ fn a_restart_reopens_at_the_tip() {
 }
 
 #[test]
-fn an_epoch_seats_the_members_the_boundary_block_leaves() {
+fn an_epoch_seats_the_validators_the_boundary_block_leaves() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let (mut node, _) = found(context, dir.path()).await;
         let signer = key(7);
         let founding = vec![member(&key(1), "v1:1")];
-        let seated = vec![member(&key(1), "v1:1"), member(&key(2), "v2:1")];
+        let validators = vec![member(&key(1), "v1:1"), member(&key(2), "v2:1")];
+        let resident = member(&key(3), "r3:1");
+        let members = [validators.clone(), vec![resident.clone()]].concat();
+        let keys = |set: &[validators::Member]| -> Vec<Vec<u8>> {
+            set.iter().map(|member| member.key.clone()).collect()
+        };
 
-        let payload = abi::encode(&(&seated, Vec::<validators::Member>::new()));
+        let payload = abi::encode(&(&validators, vec![resident]));
         node.submit(frame(&signer, 0, "valset", payload))
             .await
             .unwrap()
             .unwrap();
         let (_, applied) = seal(&mut node).await;
         assert_eq!(applied.height, 1);
-        assert_eq!(node.epoch_members(0).unwrap(), Some(founding));
-        assert_eq!(node.epoch_members(1).unwrap(), Some(seated.clone()));
+        assert_eq!(node.epoch_members(0).unwrap(), Some(founding.clone()));
+        assert_eq!(node.epoch_validators(0).unwrap(), Some(keys(&founding)));
+        assert_eq!(node.epoch_members(1).unwrap(), Some(members.clone()));
+        assert_eq!(node.epoch_validators(1).unwrap(), Some(keys(&validators)));
         assert_eq!(node.epoch_members(2).unwrap(), None);
+        assert_eq!(node.epoch_validators(2).unwrap(), None);
 
         seal(&mut node).await;
-        assert_eq!(node.epoch_members(2).unwrap(), None);
+        assert_eq!(node.epoch_validators(2).unwrap(), None);
         seal(&mut node).await;
-        assert_eq!(node.epoch_members(2).unwrap(), Some(seated));
+        assert_eq!(node.epoch_members(2).unwrap(), Some(members));
+        assert_eq!(node.epoch_validators(2).unwrap(), Some(keys(&validators)));
     });
 }
 

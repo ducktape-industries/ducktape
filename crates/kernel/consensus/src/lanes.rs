@@ -1,8 +1,8 @@
 use commonware_p2p::utils::mux::{Builder as _, MuxHandle, Muxer, SubReceiver, SubSender};
 use commonware_p2p::{Channel, Message, Receiver, Sender};
-use commonware_runtime::{Handle, Spawner};
+use commonware_runtime::{Handle, IoBuf, Spawner};
 use commonware_utils::channel::mpsc;
-use futures::stream::{BoxStream, select_all, unfold};
+use futures::stream::{BoxStream, select, select_all, unfold};
 use futures::{Stream, StreamExt as _};
 
 const MAILBOX: usize = 1024;
@@ -50,7 +50,8 @@ impl<S: Sender, R: Receiver, B: Clone> EngineMux<S, R, B> {
                 muxers: [vote_handle, certificate_handle, resolver_handle],
             },
             heard: Heard {
-                lanes: [vote_heard, certificate_heard, resolver_heard],
+                certificate: certificate_heard,
+                others: [vote_heard, resolver_heard],
             },
         }
     }
@@ -89,12 +90,19 @@ impl<S: Sender, R: Receiver, B: Clone> Lanes<S, R, B> {
 type Unrouted<P> = mpsc::Receiver<(Channel, Message<P>)>;
 
 pub(crate) struct Heard<P> {
-    lanes: [Unrouted<P>; 3],
+    certificate: Unrouted<P>,
+    others: [Unrouted<P>; 2],
 }
 
 impl<P: Send + 'static> Heard<P> {
-    pub(crate) fn into_stream(self) -> impl Stream<Item = (u64, P)> + Send + Unpin {
-        select_all(self.lanes.map(unrouted)).map(|(epoch, (peer, _))| (epoch, peer))
+    /// Each message no engine took: its epoch, its sender, and, from the
+    /// certificate lane, its bytes.
+    pub(crate) fn into_stream(self) -> impl Stream<Item = (u64, P, Option<IoBuf>)> + Send + Unpin {
+        let certificates =
+            unrouted(self.certificate).map(|(epoch, (peer, bytes))| (epoch, peer, Some(bytes)));
+        let others =
+            select_all(self.others.map(unrouted)).map(|(epoch, (peer, _))| (epoch, peer, None));
+        select(certificates, others)
     }
 }
 
