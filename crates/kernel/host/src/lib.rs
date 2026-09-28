@@ -19,7 +19,7 @@ use commonware_runtime::Spawner;
 use commonware_storage::Context;
 use runtime::Fault;
 use sha2::{Digest as _, Sha256};
-use state::{Commitment, Overlay, Storage, Store, View, Writes, valid_program_id};
+use state::{Commitment, Overlay, Storage, Store, View, Writes, commitment_name, valid_program_id};
 
 use crate::unit::{Frame, Loaded, World, refusal_of};
 
@@ -191,7 +191,68 @@ impl<E> Host<E>
 where
     E: Context + Spawner,
 {
+    /// Founds the network `genesis` describes as the store `name` in `dir`.
+    ///
+    /// `state/` marks a founded directory. Without one the founding is
+    /// fresh and owns `name`: before anything else it destroys the
+    /// commitment of each of its programs under `name`, whether this call
+    /// made it or a failed join, a moved `state/` or an interrupted cleanup
+    /// left it, so it never builds on one. A fresh founding refused past its
+    /// open removes the `state/` it made, then those commitments; when
+    /// `state/` will not go, the commitments stay with it. A refusal removes
+    /// the `blobs/` this call made. A `state/` that was there before is left
+    /// as the refused founding leaves it.
+    ///
+    /// A cleanup error is dropped: the founding's own error is what returns,
+    /// and a commitment a failed cleanup leaves is destroyed by the next
+    /// fresh founding.
     pub async fn found(
+        context: E,
+        name: &str,
+        dir: &Path,
+        block: BlockId,
+        genesis: Genesis,
+    ) -> Result<(Host<E>, Applied)> {
+        let state = dir.join(STATE_DIR);
+        let blobs = dir.join(BLOBS_DIR);
+        let fresh = !state.exists();
+        let made_blobs = !blobs.exists();
+        let unfound = context.child("unfound");
+        let founders = genesis
+            .programs
+            .iter()
+            .map(|founding| founding.program.clone());
+        let programs: Vec<ProgramId> = RESERVED
+            .map(str::to_owned)
+            .into_iter()
+            .chain(founders)
+            .collect();
+        if fresh {
+            destroy_commitments(&unfound, name, &programs).await;
+        }
+        // boxed: unboxed, a caller that awaits the founding deep in its own
+        // futures nests past the compiler's layout query depth
+        let founded = Box::pin(Host::found_in(context, name, dir, block, genesis)).await;
+        if founded.is_ok() {
+            return founded;
+        }
+        // the refused host is dropped, its store closed
+        let opened_state = fresh && state.exists();
+        if opened_state {
+            let removed = std::fs::remove_dir_all(&state).is_ok();
+            if !removed {
+                return founded;
+            }
+            destroy_commitments(&unfound, name, &programs).await;
+        }
+        let opened_blobs = made_blobs && blobs.exists();
+        if opened_blobs {
+            let _ = std::fs::remove_dir_all(&blobs);
+        }
+        founded
+    }
+
+    async fn found_in(
         context: E,
         name: &str,
         dir: &Path,
@@ -203,20 +264,9 @@ where
                 cap: genesis.member_cap,
             });
         }
-        let storage = Storage::open(&dir.join(STATE_DIR))?;
-        let store = Store::open(context, name, storage, RESERVED.map(str::to_owned)).await?;
-        let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
-        let mut host = Host {
-            store,
-            blobs,
-            network: genesis.network.clone(),
-            roles: genesis.roles.clone(),
-            loaded: Loaded::new(genesis.limits),
-            preconfirmed: Overlay::default(),
-        };
         let mut overlay = Overlay::default();
         let mut stage = Stage::default();
-        overlay.set(NETWORK, namespace::ID.to_vec(), genesis.network);
+        overlay.set(NETWORK, namespace::ID.to_vec(), genesis.network.clone());
         overlay.set(
             NETWORK,
             namespace::LIMITS.to_vec(),
@@ -309,6 +359,18 @@ where
         // carries it
         let is_role = |entry: &registry::Entry| founding_roles.contains(&&entry.program);
         let (role_entries, rest) = entries.split_at(entries.partition_point(is_role));
+        // nothing above touches `dir`: a genesis refused there leaves no state
+        let storage = Storage::open(&dir.join(STATE_DIR))?;
+        let store = Store::open(context, name, storage, RESERVED.map(str::to_owned)).await?;
+        let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
+        let mut host = Host {
+            store,
+            blobs,
+            network: genesis.network,
+            roles: genesis.roles.clone(),
+            loaded: Loaded::new(genesis.limits),
+            preconfirmed: Overlay::default(),
+        };
         let mut receipts = Vec::new();
         for entry in role_entries {
             let receipt = host
@@ -1238,6 +1300,23 @@ fn founded(entry: &registry::Entry, receipt: Receipt) -> Result<Receipt> {
             program: entry.program.clone(),
             refusal: refusal.clone(),
         }),
+    }
+}
+
+/// Destroys the commitment of each of `programs` in the store `name`. A
+/// commitment lives in the runtime's storage, not under the node's
+/// directory, and each is opened to be destroyed: one never made opens
+/// empty and goes the same way. A failure is dropped.
+async fn destroy_commitments<E>(context: &E, name: &str, programs: &[ProgramId])
+where
+    E: Context + Spawner,
+{
+    for program in programs {
+        let context = context.child("program").with_attribute("program", program);
+        let opened = Commitment::open(context, &commitment_name(name, program)).await;
+        if let Ok(db) = opened.and_then(Commitment::into_db) {
+            let _ = db.destroy().await;
+        }
     }
 }
 

@@ -12,7 +12,7 @@ use commonware_cryptography::bls12381::primitives::group::{Private, Scalar};
 use commonware_cryptography::bls12381::primitives::ops;
 use commonware_cryptography::bls12381::primitives::variant::MinPk;
 use commonware_cryptography::{Signer as _, ed25519};
-use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+use commonware_runtime::{Runner as _, Storage as _, Supervisor as _, deterministic};
 use fixture_module_registry::Change;
 use fixture_probe::{Reply, Step};
 use fixture_relay::Script;
@@ -417,7 +417,167 @@ fn founding_refuses_an_unbound_role() {
                 panic!("a genesis with identity bound to {identity:?} was founded");
             };
             assert_eq!((role, program.as_str()), ("identity", identity));
+            assert!(!dir.path().join("state").exists(), "{name} wrote state");
+            assert!(!dir.path().join("blobs").exists(), "{name} wrote blobs");
         }
+    });
+}
+
+/// Whether the runtime's storage holds any partition of `program`'s
+/// commitment in the store `name`: the partitions its merkle journal,
+/// merkle metadata and variable op log lay out.
+async fn committed(context: &Ctx, name: &str, program: &str) -> bool {
+    let commitment = commitment_name(name, program);
+    for partition in [
+        "merkle-journal-blobs",
+        "merkle-journal-metadata",
+        "merkle-meta",
+        "log_data",
+        "log_offsets-blobs",
+        "log_offsets-metadata",
+    ] {
+        let scanned = context
+            .scan(&format!("commitment-{commitment}-{partition}"))
+            .await;
+        if scanned.is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// The bound programs, then a probe whose init refuses.
+fn refusing() -> Genesis {
+    genesis(vec![founding(
+        "probe",
+        PROBE,
+        script(vec![Step::Fail("no".into())]),
+    )])
+}
+
+/// Founds [`standard`] as `name` in `dir`, then deletes its `state/` and
+/// `blobs/`: its commitments stay in the runtime's storage holding height
+/// 0, as a failed join, a moved `state/` or an interrupted cleanup leaves
+/// them.
+async fn plant(context: &Ctx, name: &str, dir: &Path) {
+    drop(found(context.child("planted"), name, dir, standard()).await);
+    std::fs::remove_dir_all(dir.join("state")).unwrap();
+    std::fs::remove_dir_all(dir.join("blobs")).unwrap();
+    assert!(committed(context, name, "valset").await);
+}
+
+#[test]
+fn a_refused_founding_leaves_the_dir_as_it_found_it() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let refused = Host::found(
+            context.child("refused"),
+            "net",
+            dir.path(),
+            block_id(0),
+            refusing(),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(refused, Some(Error::Genesis { .. })),
+            "{refused:?}"
+        );
+        assert!(!dir.path().join("state").exists());
+        assert!(!dir.path().join("blobs").exists());
+        // valset's init ran and opened its commitment before probe's
+        // refused; the store opened the reserved ones
+        assert!(!committed(&context, "net", "valset").await);
+        assert!(!committed(&context, "net", NETWORK).await);
+
+        let host = found(context.child("corrected"), "net", dir.path(), standard()).await;
+        assert_eq!(host.height().unwrap(), 0);
+        restart(context.child("restart"), dir.path(), host).await;
+
+        // blobs that were there stay; the state the founding made goes
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("blobs")).unwrap();
+        std::fs::write(dir.path().join("blobs").join("kept"), b"kept").unwrap();
+        let refused = Host::found(
+            context.child("blobs_kept"),
+            "blobs_kept",
+            dir.path(),
+            block_id(0),
+            refusing(),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(refused, Some(Error::Genesis { .. })),
+            "{refused:?}"
+        );
+        assert!(!dir.path().join("state").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("blobs").join("kept")).unwrap(),
+            b"kept"
+        );
+
+        // a state that was there is left as the refused founding leaves it
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("state")).unwrap();
+        let refused = Host::found(
+            context.child("state_kept"),
+            "state_kept",
+            dir.path(),
+            block_id(0),
+            refusing(),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(refused, Some(Error::Genesis { .. })),
+            "{refused:?}"
+        );
+        assert!(dir.path().join("state").exists());
+        assert!(!dir.path().join("blobs").exists());
+    });
+}
+
+#[test]
+fn a_corrected_founding_over_a_refused_one_founds_the_clean_root() {
+    deterministic::Runner::default().start(|context| async move {
+        let clean = tempfile::tempdir().unwrap();
+        let clean = found(context.child("clean"), "clean", clean.path(), standard())
+            .await
+            .root()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        plant(&context, "net", dir.path()).await;
+        let refused = Host::found(
+            context.child("refused"),
+            "net",
+            dir.path(),
+            block_id(0),
+            refusing(),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(refused, Some(Error::Genesis { .. })),
+            "{refused:?}"
+        );
+        let host = found(context.child("corrected"), "net", dir.path(), standard()).await;
+        assert_eq!(host.root().unwrap(), clean);
+    });
+}
+
+#[test]
+fn a_fresh_founding_destroys_the_commitments_left_under_its_name() {
+    deterministic::Runner::default().start(|context| async move {
+        let clean = tempfile::tempdir().unwrap();
+        let clean = found(context.child("clean"), "clean", clean.path(), standard())
+            .await
+            .root()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        plant(&context, "net", dir.path()).await;
+        let host = found(context.child("over"), "net", dir.path(), standard()).await;
+        assert_eq!(host.root().unwrap(), clean);
     });
 }
 
@@ -425,17 +585,12 @@ fn founding_refuses_an_unbound_role() {
 fn founding_refuses_a_program_that_does_not_admit() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
-        let refusing = genesis(vec![founding(
-            "probe",
-            PROBE,
-            script(vec![Step::Fail("no".into())]),
-        )]);
         let Err(Error::Genesis { program, refusal }) = Host::found(
             context.child("refusing"),
             "a",
             dir.path(),
             block_id(0),
-            refusing,
+            refusing(),
         )
         .await
         else {
@@ -456,6 +611,8 @@ fn founding_refuses_a_program_that_does_not_admit() {
         };
         assert_eq!(program, "ping");
         assert_eq!(refusal.reason, reason::INVALID_INPUT);
+        assert!(!dir.path().join("state").exists());
+        assert!(!dir.path().join("blobs").exists());
 
         let dir = tempfile::tempdir().unwrap();
         let mut shadowed = genesis(vec![founding("ping", RELAY, Vec::new())]);
@@ -476,6 +633,8 @@ fn founding_refuses_a_program_that_does_not_admit() {
         };
         assert_eq!(program, "ping");
         assert_eq!(refusal.reason, reason::INVALID_INPUT);
+        assert!(!dir.path().join("state").exists());
+        assert!(!dir.path().join("blobs").exists());
 
         let dir = tempfile::tempdir().unwrap();
         let reserved = genesis(vec![founding("$ping", RELAY, Vec::new())]);
@@ -491,6 +650,8 @@ fn founding_refuses_a_program_that_does_not_admit() {
             panic!("a reserved founder was admitted");
         };
         assert_eq!(program, "$ping");
+        assert!(!dir.path().join("state").exists());
+        assert!(!dir.path().join("blobs").exists());
 
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
@@ -2101,6 +2262,8 @@ fn more_founding_validators_than_the_cap_is_refused() {
             matches!(&refused, Some(Error::Corrupt(why)) if why.contains("past the network's cap of 1")),
             "{refused:?}"
         );
+        assert!(!dir.path().join("state").exists());
+        assert!(!dir.path().join("blobs").exists());
     });
 }
 
