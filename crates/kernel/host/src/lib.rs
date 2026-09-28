@@ -62,11 +62,10 @@ pub enum Error {
     #[error("no network was founded here")]
     Unfounded,
     #[error(
-        "a network's member cap is 1 to {max} and holds its founding validators; this founding \
-         asks for {cap} with {validators} validators",
+        "a network's member cap is 1 to {max}; this founding asks for {cap}",
         max = validators::MAX_MEMBERS
     )]
-    MemberCap { cap: u32, validators: usize },
+    MemberCap { cap: u32 },
     #[error("host state is corrupt: {0}")]
     Corrupt(String),
 }
@@ -202,7 +201,6 @@ where
         if !(1..=validators::MAX_MEMBERS).contains(&genesis.member_cap) {
             return Err(Error::MemberCap {
                 cap: genesis.member_cap,
-                validators: genesis.validators.len(),
             });
         }
         let storage = Storage::open(&dir.join(STATE_DIR))?;

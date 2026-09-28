@@ -2073,8 +2073,12 @@ fn a_member_cap_outside_1_to_128_is_refused() {
             .await
             .err();
             assert!(
-                matches!(refused, Some(Error::MemberCap { cap: got, validators: 1 }) if got == cap),
+                matches!(refused, Some(Error::MemberCap { cap: got }) if got == cap),
                 "cap {cap}: {refused:?}"
+            );
+            assert_eq!(
+                refused.unwrap().to_string(),
+                format!("a network's member cap is 1 to 128; this founding asks for {cap}")
             );
             assert!(!dir.path().join("state").exists(), "cap {cap} wrote state");
         }

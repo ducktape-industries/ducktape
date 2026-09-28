@@ -419,8 +419,8 @@ fn an_offline_resident_leaves_the_chain_finalizing() {
 /// the block that closes the epoch, so no next-epoch traffic carried it.
 #[test]
 fn a_resident_follows_at_the_tip() {
-    // long enough that the resident joins, starts (seconds: a node
-    // preallocates its mailboxes) and catches up inside one epoch
+    // long enough that the resident joins, starts and catches up inside
+    // one epoch
     const EPOCH: u64 = 100;
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
