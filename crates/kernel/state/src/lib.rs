@@ -76,8 +76,8 @@ where
             storage,
             commitments: BTreeMap::new(),
         };
-        // a store with no committed height has nothing to resume: what is
-        // left under its name is a failed founding's or join's
+        // only a founding opens a store with no committed height, and
+        // nothing under its name is its own: a failed founding's or join's
         let fresh = store.storage.height()?.is_none();
         for program in programs {
             store.open_program(&program, fresh).await?;
@@ -122,13 +122,11 @@ where
         if self.commitments.contains_key(program) {
             return Ok(());
         }
-        let context = self.context(program);
         let name = commitment_name(&self.name, program);
-        let commitment = if fresh {
-            Commitment::fresh(context, &name).await?
-        } else {
-            Commitment::open(context, &name).await?
-        };
+        if fresh {
+            Commitment::destroy(self.context(program).child("fresh"), &name).await?;
+        }
+        let commitment = Commitment::open(self.context(program), &name).await?;
         self.commitments.insert(program.to_owned(), commitment);
         Ok(())
     }

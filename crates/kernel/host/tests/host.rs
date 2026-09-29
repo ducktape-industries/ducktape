@@ -467,7 +467,7 @@ async fn plant(context: &Ctx, name: &str, dir: &Path) {
 }
 
 #[test]
-fn a_refused_founding_leaves_the_dir_as_it_found_it() {
+fn a_refused_founding_removes_the_dirs_it_made() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let refused = Host::found(
@@ -542,6 +542,37 @@ fn a_refused_founding_leaves_the_dir_as_it_found_it() {
         );
         assert!(dir.path().join("state").exists());
         assert!(!dir.path().join("blobs").exists());
+    });
+}
+
+/// Opening a directory whose store records no height is refused before any
+/// commitment under the name opens: a `state/` restored from a backup finds
+/// them as it left them.
+#[test]
+fn an_unfounded_store_is_refused_before_its_commitments_open() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("founded"), "net", dir.path(), standard()).await;
+        // a block past genesis, so the last block's writes cannot rebuild
+        // the reserved commitments on their own
+        host.apply(block(1, Vec::new())).await.unwrap();
+        let root = host.root().unwrap();
+        drop(host);
+        let backup = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::rename(&state, backup.path().join("state")).unwrap();
+
+        let refused = Host::open(context.child("unfounded"), "net", dir.path())
+            .await
+            .err();
+        assert!(matches!(refused, Some(Error::Unfounded)), "{refused:?}");
+
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::rename(backup.path().join("state"), &state).unwrap();
+        let restored = Host::open(context.child("restored"), "net", dir.path())
+            .await
+            .unwrap();
+        assert_eq!(restored.root().unwrap(), root);
     });
 }
 

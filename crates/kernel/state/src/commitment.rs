@@ -99,7 +99,7 @@ pub fn config<E: Context>(context: &E, name: &str) -> Config {
 /// for its store and program. A sync cut short leaves a log that starts past
 /// 0 with no merkle over it. The next sync of the same chain resumes it, one
 /// of another chain destroys it and starts over, and `open` cannot open it:
-/// a store that owns the name opens it fresh, or destroys it, instead.
+/// a store that owns the name destroys it, then opens it empty.
 pub struct Commitment<E>
 where
     E: Context + Spawner,
@@ -120,12 +120,6 @@ where
             name: name.to_owned(),
             db: Some(db),
         })
-    }
-
-    /// Opens the commitment `name` empty, whatever was left under it.
-    pub(crate) async fn fresh(context: E, name: &str) -> Result<Commitment<E>> {
-        Self::destroy(context.child("fresh"), name).await?;
-        Self::open(context, name).await
     }
 
     /// Destroys what the commitment `name` holds, whatever it was left
@@ -162,9 +156,9 @@ where
 
     /// Syncs the commitment `name` to `target` from `source`, resuming what
     /// an earlier sync left. A journal another chain left under `name` is
-    /// reused and ends in a root mismatch, and one a crash tore does not
-    /// open: either is destroyed and the sync runs once more from nothing.
-    /// A source's failure destroys nothing, so a retry resumes.
+    /// reused and ends in a root mismatch: it is destroyed and the sync runs
+    /// once more from nothing. Any other failure destroys nothing, so a
+    /// retry resumes.
     pub async fn sync_from<S>(
         context: E,
         name: &str,
@@ -179,9 +173,7 @@ where
         let resync = context.child("resync");
         let first = sync_to(context, name, target.clone(), source.clone()).await;
         let outcome = match first {
-            Err(
-                sync::Error::Engine(EngineError::RootMismatch { .. }) | sync::Error::Database(_),
-            ) => {
+            Err(sync::Error::Engine(EngineError::RootMismatch { .. })) => {
                 Self::destroy(heal, name).await?;
                 sync_to(resync, name, target, source).await
             }

@@ -394,8 +394,14 @@ where
         Ok((host, applied))
     }
 
+    /// Opens the store `name` a founding or a join left in `dir`. A store at
+    /// no height was never founded here, and is refused before any of its
+    /// commitments opens: the commitments under `name` stay as they are.
     pub async fn open(context: E, name: &str, dir: &Path) -> Result<Host<E>> {
         let storage = Storage::open(&dir.join(STATE_DIR))?;
+        if storage.height()?.is_none() {
+            return Err(Error::Unfounded);
+        }
         let programs = programs_in(&storage)?;
         let dropped = dropped_in(&storage)?;
         let mut store = Store::open(context, name, storage, programs).await?;

@@ -85,7 +85,9 @@ impl Storage {
 
     /// Replaces everything this storage holds with `writes` at `height`: a
     /// join installs a whole state, and one a failed or cut-off join left
-    /// here, or another chain's, is no part of it.
+    /// here, or another chain's, is no part of it. The old keys are read into
+    /// the same batch, so only a retry over leftovers pays for them against
+    /// the batch's write limit.
     pub fn install(&self, height: u64, writes: &Writes) -> Result<()> {
         let mut batch = WriteBatch::new();
         for entry in self.db.iter(None, None, false)? {

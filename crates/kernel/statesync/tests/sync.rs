@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use abi::{HostOp, role::validators};
 use commonware_consensus::marshal::Start;
@@ -16,6 +17,7 @@ use consensus::{Certificate, validators_of};
 use fixture_probe::Step;
 use host::{Founding, Genesis, Layer, Limits, Roles, Tip};
 use node::{Block, Frame, Node, Sequenced};
+use state::{Storage, Store};
 use statesync::{Anchor, Anchors, Error, Exchange, Request, Response, join, serve};
 
 const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
@@ -212,6 +214,31 @@ impl Exchange for Withholding {
     }
 }
 
+/// Serves from the source and counts probe's sync requests in `asked`;
+/// past `serves` of them it refuses each, and the join ends on it.
+#[derive(Clone)]
+struct Counting {
+    source: Loopback,
+    asked: Arc<AtomicUsize>,
+    serves: usize,
+}
+
+impl Exchange for Counting {
+    type Error = Infallible;
+
+    async fn exchange(&self, request: Request) -> Result<Response, Infallible> {
+        let refused =
+            probe_sync(&request) && self.asked.fetch_add(1, Ordering::SeqCst) >= self.serves;
+        if refused {
+            return Ok(Response::Refused(abi::Refusal::new(
+                abi::reason::NOT_FOUND,
+                "no more",
+            )));
+        }
+        self.source.exchange(request).await
+    }
+}
+
 /// Every blob, which a joiner fetches once it has adopted the state.
 fn blobs(request: &Request) -> bool {
     matches!(request, Request::Blob(_))
@@ -253,12 +280,17 @@ struct Network {
 }
 
 async fn found(context: &Ctx) -> Network {
+    found_as(context, "source").await
+}
+
+/// Founds the network as the source's store `name`.
+async fn found_as(context: &Ctx, name: &'static str) -> Network {
     let keys: Vec<_> = (1..=3).map(key).collect();
     let members: Vec<_> = keys.iter().map(member).collect();
     let dir = tempfile::tempdir().unwrap();
     let (node, genesis, _) = Node::found(
-        context.child("source"),
-        "source",
+        context.child(name),
+        name,
         dir.path(),
         self::genesis(&members),
     )
@@ -302,6 +334,14 @@ impl Network {
             source: self.exchange(),
             withheld,
             refuses,
+        }
+    }
+
+    fn counting(&self, asked: &Arc<AtomicUsize>, serves: usize) -> Counting {
+        Counting {
+            source: self.exchange(),
+            asked: asked.clone(),
+            serves,
         }
     }
 
@@ -644,10 +684,9 @@ fn a_join_resyncs_what_another_chain_left_under_its_name() {
         )
         .await;
         assert!(!dir.path().join("state").exists());
-        // the next network is another chain whose source takes the same store
         drop(other);
 
-        let mut network = found(&context).await;
+        let mut network = found_as(&context, "second").await;
         let tip = network
             .advance(vec![frame(&alice, 0, vec![set(b"a", b"this")])])
             .await;
@@ -689,7 +728,7 @@ fn a_join_reads_nothing_another_chains_failed_join_adopted() {
         assert!(matches!(error, Error::Refused(_)), "{error}");
         drop(other);
 
-        let mut network = found(&context).await;
+        let mut network = found_as(&context, "second").await;
         network
             .advance(vec![frame(&alice, 0, vec![set(b"a", b"this")])])
             .await;
@@ -793,5 +832,109 @@ fn a_founding_over_a_joined_dir_is_refused() {
             })
         );
         assert!(height, "{refused}");
+    });
+}
+
+/// A join a source's refusal ended mid-sync resumes the sync when retried:
+/// it asks for less of probe than a whole sync of probe does.
+#[test]
+fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let alice = key(11);
+        // 256 keys: probe's log takes four fetches at the least
+        let frames = (0..4)
+            .map(|seq| {
+                let steps = (0..64)
+                    .map(|i| set(format!("{seq}-{i}").as_bytes(), b"1"))
+                    .collect();
+                frame(&alice, seq, steps)
+            })
+            .collect();
+        let tip = network.advance(frames).await;
+        let whole = Arc::new(AtomicUsize::new(0));
+        let elsewhere = tempfile::tempdir().unwrap();
+        join(
+            context.child("whole"),
+            "whole",
+            elsewhere.path(),
+            NETWORK.to_vec(),
+            network.counting(&whole, usize::MAX),
+        )
+        .await
+        .unwrap();
+        let whole = whole.load(Ordering::SeqCst);
+        assert!(whole >= 4, "a whole sync of probe asks {whole} times");
+
+        // the boundary, then three fetches of 64: a sync keeps its log a
+        // 64-op section at a time, sealed once the next one starts, so two
+        // whole sections are kept when the fifth request is refused
+        let dir = tempfile::tempdir().unwrap();
+        let refused = Arc::new(AtomicUsize::new(0));
+        let error = join(
+            context.child("refused"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            network.counting(&refused, 4),
+        )
+        .await
+        .err()
+        .expect("probe's fifth request is refused");
+        assert!(
+            matches!(error, Error::State(state::Error::Sync(_))),
+            "{error}"
+        );
+
+        let retried = Arc::new(AtomicUsize::new(0));
+        let joined = join(
+            context.child("retried"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            network.counting(&retried, usize::MAX),
+        )
+        .await
+        .unwrap();
+        assert_eq!(joined.node.tip().unwrap(), tip);
+        assert_eq!(joined.node.host().root().unwrap(), network.root().await);
+        let retried = retried.load(Ordering::SeqCst);
+        assert!(
+            retried < whole,
+            "the retry asked {retried} times of {whole}"
+        );
+    });
+}
+
+/// A program dropped from a store whose commitment a cut-off join left
+/// half-synced is removed: the commitment does not open, so it is destroyed
+/// by name, as `Host::open` removes each program the last block dropped.
+#[test]
+fn a_dropped_program_left_half_synced_is_removed() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        // a block past genesis puts probe's sync floor past 0
+        network
+            .advance(vec![frame(&key(11), 0, vec![set(b"a", b"1")])])
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        cut_off(
+            &context,
+            "joiner",
+            dir.path(),
+            network.withholding(probe_sync, false),
+        )
+        .await;
+
+        let state = tempfile::tempdir().unwrap();
+        let mut store = Store::open(
+            context.child("store"),
+            "joiner",
+            Storage::open(state.path()).unwrap(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        store.remove_program("probe").await.unwrap();
     });
 }
