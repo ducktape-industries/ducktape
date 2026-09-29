@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::path::Path;
 use std::sync::Arc;
 
 use abi::{HostOp, role::validators};
@@ -9,7 +10,7 @@ use commonware_consensus::simplex::types::{Finalization, Finalize, Proposal};
 use commonware_consensus::types::{Epoch, Round, View};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519, sha256};
 use commonware_parallel::Sequential;
-use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+use commonware_runtime::{Clock as _, Runner as _, Supervisor as _, deterministic};
 use commonware_utils::iter::NonEmpty;
 use consensus::{Certificate, validators_of};
 use fixture_probe::Step;
@@ -90,6 +91,10 @@ fn set(key: &[u8], value: &[u8]) -> Step {
         key: key.to_vec(),
         value: value.to_vec(),
     })
+}
+
+fn delete(key: &[u8]) -> Step {
+    Step::Op(HostOp::Delete(key.to_vec()))
 }
 
 fn frame(key: &ed25519::PrivateKey, seq: u64, steps: Vec<Step>) -> Vec<u8> {
@@ -181,6 +186,65 @@ impl Exchange for Refusing {
     }
 }
 
+/// Serves from the source, except what `withheld` picks: that it refuses
+/// when `refuses`, and otherwise never answers, as a peer gone quiet.
+#[derive(Clone)]
+struct Withholding {
+    source: Loopback,
+    withheld: fn(&Request) -> bool,
+    refuses: bool,
+}
+
+impl Exchange for Withholding {
+    type Error = Infallible;
+
+    async fn exchange(&self, request: Request) -> Result<Response, Infallible> {
+        if !(self.withheld)(&request) {
+            return self.source.exchange(request).await;
+        }
+        if !self.refuses {
+            futures::future::pending::<()>().await;
+        }
+        Ok(Response::Refused(abi::Refusal::new(
+            abi::reason::NOT_FOUND,
+            "withheld",
+        )))
+    }
+}
+
+/// Every blob, which a joiner fetches once it has adopted the state.
+fn blobs(request: &Request) -> bool {
+    matches!(request, Request::Blob(_))
+}
+
+/// `program`'s sync; the head lists the reserved programs, then identity,
+/// module-registry and ping, before probe.
+fn syncing(request: &Request, program: &str) -> bool {
+    matches!(request, Request::Sync { program: asked, .. } if asked == program)
+}
+
+fn probe_sync(request: &Request) -> bool {
+    syncing(request, "probe")
+}
+
+fn identity_sync(request: &Request) -> bool {
+    syncing(request, "identity")
+}
+
+/// Joins `name` into `dir` and cuts the join off once it waits on what
+/// `exchange` never answers, as a crash or a Ctrl-C does: nothing after the
+/// cut runs.
+async fn cut_off<X: Exchange>(context: &Ctx, name: &'static str, dir: &Path, exchange: X) {
+    let joining = join(context.child(name), name, dir, NETWORK.to_vec(), exchange);
+    let waited = context.sleep(std::time::Duration::from_secs(5));
+    futures::pin_mut!(joining, waited);
+    let cut = futures::future::select(joining, waited).await;
+    assert!(
+        matches!(cut, futures::future::Either::Right(_)),
+        "the join was cut off"
+    );
+}
+
 struct Network {
     keys: Vec<ed25519::PrivateKey>,
     members: Vec<validators::Member>,
@@ -231,6 +295,18 @@ impl Network {
 
     fn exchange(&self) -> Loopback {
         Loopback(self.source.clone())
+    }
+
+    fn withholding(&self, withheld: fn(&Request) -> bool, refuses: bool) -> Withholding {
+        Withholding {
+            source: self.exchange(),
+            withheld,
+            refuses,
+        }
+    }
+
+    async fn root(&self) -> abi::Root {
+        self.source.node.lock().await.host().root().unwrap()
     }
 }
 
@@ -472,5 +548,250 @@ fn a_refusal_ends_the_join() {
         .err()
         .expect("a refused head cannot be joined");
         assert!(matches!(error, Error::Refused(_)), "{error}");
+    });
+}
+
+/// A join cut off after it adopted the state, retried once the source
+/// deleted a key there, reads the key as the source does.
+#[test]
+fn a_retry_after_a_cut_off_join_reads_what_the_source_reads() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let alice = key(11);
+        network
+            .advance(vec![frame(&alice, 0, vec![set(b"gone", b"1")])])
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        cut_off(
+            &context,
+            "joiner",
+            dir.path(),
+            network.withholding(blobs, false),
+        )
+        .await;
+        assert!(dir.path().join("state").exists());
+
+        network
+            .advance(vec![frame(&alice, 1, vec![delete(b"gone")])])
+            .await;
+        let joined = join(
+            context.child("retried"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            network.exchange(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(joined.node.host().root().unwrap(), network.root().await);
+        let read = joined
+            .node
+            .view(Layer::Confirmed)
+            .get("probe", b"gone")
+            .unwrap();
+        assert_eq!(read, None);
+    });
+}
+
+/// A join resumes a sync it was cut off in: identity, synced before the
+/// cut, is asked for nothing more.
+#[test]
+fn a_retried_join_resumes_the_programs_it_synced() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let tip = network
+            .advance(vec![frame(&key(11), 0, vec![set(b"a", b"1")])])
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        cut_off(
+            &context,
+            "joiner",
+            dir.path(),
+            network.withholding(probe_sync, false),
+        )
+        .await;
+
+        let joined = join(
+            context.child("retried"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            network.withholding(identity_sync, true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(joined.node.tip().unwrap(), tip);
+        assert_eq!(joined.node.host().root().unwrap(), network.root().await);
+    });
+}
+
+/// A join cut off mid-sync on one chain leaves commitments that another
+/// chain's join under the same name syncs over from nothing.
+#[test]
+fn a_join_resyncs_what_another_chain_left_under_its_name() {
+    deterministic::Runner::default().start(|context| async move {
+        let alice = key(11);
+        let mut other = found(&context).await;
+        other
+            .advance(vec![frame(&alice, 0, vec![set(b"a", b"other")])])
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        cut_off(
+            &context,
+            "joiner",
+            dir.path(),
+            other.withholding(probe_sync, false),
+        )
+        .await;
+        assert!(!dir.path().join("state").exists());
+        // the next network is another chain whose source takes the same store
+        drop(other);
+
+        let mut network = found(&context).await;
+        let tip = network
+            .advance(vec![frame(&alice, 0, vec![set(b"a", b"this")])])
+            .await;
+        let joined = join(
+            context.child("joined"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            network.exchange(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(joined.node.tip().unwrap(), tip);
+        assert_eq!(joined.node.host().root().unwrap(), network.root().await);
+    });
+}
+
+/// A join that failed after it adopted one chain's state leaves none of
+/// that state to another chain's join under the same name.
+#[test]
+fn a_join_reads_nothing_another_chains_failed_join_adopted() {
+    deterministic::Runner::default().start(|context| async move {
+        let alice = key(11);
+        let mut other = found(&context).await;
+        other
+            .advance(vec![frame(&alice, 0, vec![set(b"other", b"1")])])
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let error = join(
+            context.child("other"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            other.withholding(blobs, true),
+        )
+        .await
+        .err()
+        .expect("a refused blob ends the join");
+        assert!(matches!(error, Error::Refused(_)), "{error}");
+        drop(other);
+
+        let mut network = found(&context).await;
+        network
+            .advance(vec![frame(&alice, 0, vec![set(b"a", b"this")])])
+            .await;
+        let joined = join(
+            context.child("joined"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            network.exchange(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(joined.node.host().root().unwrap(), network.root().await);
+        let read = joined
+            .node
+            .view(Layer::Confirmed)
+            .get("probe", b"other")
+            .unwrap();
+        assert_eq!(read, None);
+    });
+}
+
+/// A founding under the name of a join cut off mid-sync founds the root a
+/// founding under a clean name does, over the half-synced commitment the
+/// cut left.
+#[test]
+fn a_founding_after_a_cut_off_join_founds_the_clean_root() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        // a block past genesis puts probe's sync floor past 0
+        network
+            .advance(vec![frame(&key(11), 0, vec![set(b"a", b"1")])])
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        cut_off(
+            &context,
+            "joiner",
+            dir.path(),
+            network.withholding(probe_sync, false),
+        )
+        .await;
+
+        let clean = tempfile::tempdir().unwrap();
+        let (clean, _, _) = Node::found(
+            context.child("clean"),
+            "clean",
+            clean.path(),
+            genesis(&network.members),
+        )
+        .await
+        .unwrap();
+        let fresh = tempfile::tempdir().unwrap();
+        let (node, _, _) = Node::found(
+            context.child("founded"),
+            "joiner",
+            fresh.path(),
+            genesis(&network.members),
+        )
+        .await
+        .unwrap();
+        assert_eq!(node.host().root().unwrap(), clean.host().root().unwrap());
+    });
+}
+
+/// A founding into a directory a join adopted a state in is refused: block
+/// 0 is not that store's next.
+#[test]
+fn a_founding_over_a_joined_dir_is_refused() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        network
+            .advance(vec![frame(&key(11), 0, vec![set(b"a", b"1")])])
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        drop(
+            join(
+                context.child("joined"),
+                "joiner",
+                dir.path(),
+                NETWORK.to_vec(),
+                network.exchange(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let refused = Node::found(
+            context.child("founded"),
+            "joiner",
+            dir.path(),
+            genesis(&network.members),
+        )
+        .await
+        .err()
+        .expect("a joined store has a height");
+        let height = matches!(
+            refused,
+            node::Error::Host(host::Error::Height {
+                expected: 2,
+                got: 0
+            })
+        );
+        assert!(height, "{refused}");
     });
 }

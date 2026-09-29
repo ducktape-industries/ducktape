@@ -348,3 +348,32 @@ fn a_program_removed_after_reopen_starts_empty_when_admitted_again() {
         assert_eq!(reopened, fresh.root(APP).unwrap().unwrap());
     });
 }
+
+/// A program admitted under an id whose commitment another store under the
+/// same name left, as a failed join or another chain's does, starts empty.
+#[test]
+fn a_program_admitted_over_a_left_commitment_starts_empty() {
+    deterministic::Runner::default().start(|context| async move {
+        let left = tempfile::tempdir().unwrap();
+        let mut store = Store::open(context.child("left"), "s", storage(&left), [APP.to_owned()])
+            .await
+            .unwrap();
+        store
+            .commit(0, writes(APP, &[(b"a", Some(b"1"))]))
+            .await
+            .unwrap();
+        drop(store);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(context.child("admits"), "s", storage(&dir), [])
+            .await
+            .unwrap();
+        store.add_program(APP).await.unwrap();
+        let empty_dir = tempfile::tempdir().unwrap();
+        let mut empty = Store::open(context.child("empty"), "t", storage(&empty_dir), [])
+            .await
+            .unwrap();
+        empty.add_program(APP).await.unwrap();
+        assert_eq!(store.root(APP).unwrap(), empty.root(APP).unwrap());
+    });
+}

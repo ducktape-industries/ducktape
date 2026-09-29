@@ -486,12 +486,19 @@ fn a_refused_founding_leaves_the_dir_as_it_found_it() {
         assert!(!dir.path().join("state").exists());
         assert!(!dir.path().join("blobs").exists());
         // valset's init ran and opened its commitment before probe's
-        // refused; the store opened the reserved ones
-        assert!(!committed(&context, "net", "valset").await);
-        assert!(!committed(&context, "net", NETWORK).await);
+        // refused, and the store opened the reserved ones: they stay in the
+        // runtime's storage, and the corrected founding opens each empty
+        assert!(committed(&context, "net", "valset").await);
+        assert!(committed(&context, "net", NETWORK).await);
 
+        let clean = tempfile::tempdir().unwrap();
+        let clean = found(context.child("clean"), "clean", clean.path(), standard())
+            .await
+            .root()
+            .unwrap();
         let host = found(context.child("corrected"), "net", dir.path(), standard()).await;
         assert_eq!(host.height().unwrap(), 0);
+        assert_eq!(host.root().unwrap(), clean);
         restart(context.child("restart"), dir.path(), host).await;
 
         // blobs that were there stay; the state the founding made goes

@@ -83,8 +83,15 @@ impl Storage {
         Ok(self.db.write(batch)?)
     }
 
+    /// Replaces everything this storage holds with `writes` at `height`: a
+    /// join installs a whole state, and one a failed or cut-off join left
+    /// here, or another chain's, is no part of it.
     pub fn install(&self, height: u64, writes: &Writes) -> Result<()> {
         let mut batch = WriteBatch::new();
+        for entry in self.db.iter(None, None, false)? {
+            let (key, _) = entry?;
+            batch.delete(key);
+        }
         stage(&mut batch, writes);
         batch.put(HEIGHT, abi::encode(&height));
         batch.delete(PENDING);
