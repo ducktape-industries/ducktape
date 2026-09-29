@@ -8,6 +8,7 @@ abi = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
 borsh = { workspace = true }
 commonware-codec = { workspace = true }
+commonware-consensus = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-p2p = { workspace = true }
 commonware-runtime = { workspace = true }

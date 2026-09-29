@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
 
 use abi::{Entry, Root};
 use commonware_codec::RangeCfg;
@@ -10,6 +11,7 @@ use commonware_storage::{
     Context, journal,
     merkle::{self, Location},
     qmdb::{
+        self,
         any::{
             VariableConfig,
             unordered::{
@@ -17,7 +19,7 @@ use commonware_storage::{
                 variable::{Db as Qmdb, Operation},
             },
         },
-        sync::{self, SourceFor, Target, engine::Config as SyncConfig},
+        sync::{self, EngineError, SourceFor, Target, engine::Config as SyncConfig},
     },
     translator::TwoCap,
 };
@@ -93,6 +95,11 @@ pub fn config<E: Context>(context: &E, name: &str) -> Config {
     }
 }
 
+/// A program's authenticated state: a qmdb in the runtime's storage, named
+/// for its store and program. A sync cut short leaves a log that starts past
+/// 0 with no merkle over it. The next sync of the same chain resumes it, one
+/// of another chain destroys it and starts over, and `open` cannot open it:
+/// a store that owns the name destroys it, then opens it empty.
 pub struct Commitment<E>
 where
     E: Context + Spawner,
@@ -105,6 +112,7 @@ impl<E> Commitment<E>
 where
     E: Context + Spawner,
 {
+    /// Reopens the commitment `name` as it was left.
     pub async fn open(context: E, name: &str) -> Result<Commitment<E>> {
         let config = config(&context, name);
         let db = Db::<E>::init(context, config).await?;
@@ -114,6 +122,43 @@ where
         })
     }
 
+    /// Destroys what the commitment `name` holds, whatever it was left
+    /// holding: its op log and merkle open apart, because a log a sync left
+    /// short of its target does not replay into a database.
+    pub(crate) async fn destroy(context: E, name: &str) -> Result<()> {
+        let config = config(&context, name);
+        let log = async {
+            journal::contiguous::variable::Journal::<E, Op>::init(
+                context.child("log"),
+                config.journal_config,
+            )
+            .await?
+            .destroy()
+            .await
+        };
+        let merkle = async {
+            merkle::full::Merkle::<Family, E, Digest, Sequential>::init(
+                context.child("merkle"),
+                &qmdb::hasher::<Sha256>(),
+                config.merkle_config,
+            )
+            .await?
+            .destroy()
+            .await
+        };
+        // both are tried: a log that will not go leaves no merkle behind
+        let log = log.await;
+        let merkle = merkle.await;
+        log.map_err(qmdb::Error::<Family>::from)?;
+        merkle.map_err(qmdb::Error::<Family>::from)?;
+        Ok(())
+    }
+
+    /// Syncs the commitment `name` to `target` from `source`, resuming what
+    /// an earlier sync left. A journal another chain left under `name` is
+    /// reused and ends in a root mismatch: it is destroyed and the sync runs
+    /// once more from nothing. Any other failure destroys nothing, so a
+    /// retry resumes.
     pub async fn sync_from<S>(
         context: E,
         name: &str,
@@ -123,23 +168,18 @@ where
     where
         S: SourceFor<Db<E>>,
     {
-        let tuning = Tuning::default();
-        let db_config = config(&context, name);
-        let db = sync::sync(SyncConfig {
-            context,
-            source,
-            target,
-            max_outstanding_requests: 1,
-            fetch_batch_size: tuning.sync_fetch_batch,
-            apply_batch_size: tuning.sync_apply_batch,
-            db_config,
-            update_rx: None,
-            finish_rx: None,
-            reached_target_tx: None,
-            max_retained_roots: tuning.sync_retained_roots,
-        })
-        .await
-        .map_err(|e| Error::Sync(format!("{e:?}")))?;
+        let source = Arc::new(source);
+        let heal = context.child("heal");
+        let resync = context.child("resync");
+        let first = sync_to(context, name, target.clone(), source.clone()).await;
+        let outcome = match first {
+            Err(sync::Error::Engine(EngineError::RootMismatch { .. })) => {
+                Self::destroy(heal, name).await?;
+                sync_to(resync, name, target, source).await
+            }
+            first => first,
+        };
+        let db = outcome.map_err(|e| Error::Sync(format!("{e:?}")))?;
         Ok(Commitment {
             name: name.to_owned(),
             db: Some(db),
@@ -243,6 +283,34 @@ where
         }
         Ok(live)
     }
+}
+
+async fn sync_to<E, S>(
+    context: E,
+    name: &str,
+    target: SyncTarget,
+    source: Arc<S>,
+) -> std::result::Result<Db<E>, sync::Error<Family, S::Error, Digest>>
+where
+    E: Context + Spawner,
+    S: SourceFor<Db<E>>,
+{
+    let tuning = Tuning::default();
+    let db_config = config(&context, name);
+    sync::sync(SyncConfig {
+        context,
+        source,
+        target,
+        max_outstanding_requests: 1,
+        fetch_batch_size: tuning.sync_fetch_batch,
+        apply_batch_size: tuning.sync_apply_batch,
+        db_config,
+        update_rx: None,
+        finish_rx: None,
+        reached_target_tx: None,
+        max_retained_roots: tuning.sync_retained_roots,
+    })
+    .await
 }
 
 pub fn digest(key: &[u8]) -> Digest {

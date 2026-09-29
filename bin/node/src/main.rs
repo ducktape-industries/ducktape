@@ -14,7 +14,7 @@ use noded::wire::Admin;
 use noded::{Client, Listen, Logs, Reach, Workspace};
 
 #[derive(Parser)]
-#[command(name = "ducktape", about = "a ducktape node and its client")]
+#[command(name = "ducktape", about = "a ducktape node and its client", version)]
 struct Cli {
     #[arg(
         long,
@@ -34,6 +34,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Verb {
+    #[command(about = "print the binary's version and node contract")]
+    Version,
     #[command(about = "print this workspace's node key, minting one if absent")]
     Identity,
     #[command(about = "found a network in this workspace from a founding file")]
@@ -141,6 +143,14 @@ fn main() {
 }
 
 fn execute(cli: Cli) -> Result<(), String> {
+    if let Verb::Version = cli.verb {
+        println!(
+            "ducktape {} contract {}",
+            env!("CARGO_PKG_VERSION"),
+            noded::NODE_CONTRACT
+        );
+        return Ok(());
+    }
     let workspace = match cli.workspace {
         Some(dir) => Workspace::at(dir),
         None => Workspace::at(ducktape_home::root()?),
@@ -379,7 +389,8 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             print!("{}", client.metrics().await.sentence()?);
             Ok(())
         }
-        Verb::Identity
+        Verb::Version
+        | Verb::Identity
         | Verb::Init { .. }
         | Verb::Join { .. }
         | Verb::Run { .. }

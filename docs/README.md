@@ -19,7 +19,6 @@ nothing cites is deleted, not archived.
 | --- | --- |
 | Bring the microVM sandbox up on macOS (the vz shim) | [`sandbox-macos.md`](sandbox-macos.md) |
 | Which operator scripts and harnesses live under `ops/` | [`../ops/README.md`](../ops/README.md) |
-| The coordinator's deploy artifacts (unit, env file, Dockerfile) | [`../ops/coordinator/README.md`](../ops/coordinator/README.md) |
 | Lend a credential to a sandbox through airlock, self-hosted or from an enclave | [`../crates/airlock/README.md`](../crates/airlock/README.md) |
 
 ## References code cites by path
@@ -27,7 +26,5 @@ nothing cites is deleted, not archived.
 | Question | Read | Cited by |
 | --- | --- | --- |
 | The capability spec TOML that describes an executor | [`records/specs/capability-spec.md`](records/specs/capability-spec.md) | `crates/services/provider` |
-| The WireGuard tunnel upgrade protocol: records, mesh version, handshake, overlay addressing | [`records/protocols/wireguard-tunnel-upgrade.md`](records/protocols/wireguard-tunnel-upgrade.md) | `crates/networking/wireguard` |
-| The reachability plane: control mesh beside data tunnel, the tunnel-first invite and its fronts, cold restart, rendezvous | [`records/architecture/reachability.md`](records/architecture/reachability.md) | `crates/networking/reachability` |
 
 `docs/superpowers/` is gitignored planning scratch; nothing under it ships.

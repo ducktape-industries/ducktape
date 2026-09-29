@@ -12,16 +12,16 @@
 #   crates/noded/      — the daemon library: the /v1 http+ws surface, the
 #                        lookup mesh, the workspace on disk, the client
 #   bin/node           — the `ducktape` binary: the node and its CLI
-#   crates/networking/ — the netstack: transport infra ONLY (wireguard,
-#                        nat-traversal, netstack-machine, netstack-scenarios,
-#                        netstack-wasm, lane-wasm, reachability, data-plane,
-#                        overlay-net)
+#   crates/networking/ — off-consensus byte transport for the services
+#                        (data-plane, lane-wasm); the WireGuard overlay, NAT
+#                        traversal and the coordinator are their own
+#                        repository, ducktape-industries/tunnel
 #   crates/services/   — off-chain service crates: provider, sandbox, broker,
 #                        agent, airlock, media, mcp
 #   crates/airlock/    — the two-party execution/auth contract
 #   crates/testing/    — dev-only shared test support (nettest)
-#   bin/               — coordinator (STUN rendezvous), airlock-gateway,
-#                        media-service, terminal-service, duck-guest-init
+#   bin/               — airlock-gateway, media-service, terminal-service,
+#                        duck-guest-init
 
 [workspace]
 resolver = "2"
@@ -42,15 +42,8 @@ members = [
     "crates/services/run-envelope",
     "crates/duckdns",
     "crates/noded",
-    "crates/networking/wireguard",
-    "crates/networking/nat-traversal",
-    "crates/networking/netstack-machine",
-    "crates/networking/netstack-scenarios",
-    "crates/networking/netstack-wasm",
     "crates/networking/lane-wasm",
-    "crates/networking/reachability",
     "crates/networking/data-plane",
-    "crates/networking/overlay-net",
     "crates/airlock",
     "crates/keystore",
     "crates/ducktape-home",
@@ -64,7 +57,6 @@ members = [
     "crates/services/provider",
     "crates/services/sandbox",
     "crates/testing/nettest",
-    "bin/coordinator",
     "bin/node",
     "bin/airlock-gateway",
     "bin/media-service",
@@ -85,12 +77,8 @@ clap = { version = "4.6", features = ["derive"] }
 # `/v1/logs` AND on stderr — both gated by ONE reloadable filter, see
 # crates/noded/src/logs.rs.
 tracing = "0.1"
-arrayvec = "0.7"
-crossbeam-channel = "0.5"
-lru = "0.18"
 # rlimit/mallopt syscalls: the open-file raise every binary makes at startup.
 libc = "0.2"
-smallvec = "1"
 sha2 = "0.10"
 sha3 = "0.10"
 # the wallet schemes keyscheme verifies: secp256r1 (WebAuthn) and secp256k1
@@ -127,24 +115,8 @@ commonware-p2p = "2026.9.0"
 commonware-parallel = "2026.9.0"
 commonware-utils = "2026.9.0"
 commonware-actor = "2026.9.0"
-# the userspace overlay backend (overlay-net/userspace): the BoringTun noise
-# core used sans-io (`noise::Tunn`, no device layer) — WireGuard-compatible on
-# the wire by construction.
-defguard_boringtun = "0.6.5"
-# tests only: forging a WireGuard mac1 the way boringtun's rate limiter
-# computes it (blake2s keyed by HASH(LABEL_MAC1 || responder public)). the
-# helpers are `pub(crate)` in boringtun, and this is the same blake2 build its
-# own handshake code links.
-blake2 = "0.10"
-# the userspace backend's virtual host: a TUN-less TCP/UDP stack terminating
-# at the node's overlay ULA, entirely in-process. `medium-ip` because the
-# tunnel carries raw IP (WireGuard has no link layer), `async` for the
-# waker-based socket surface.
-smoltcp = { version = "0.13", default-features = false, features = [
-    "std", "medium-ip", "proto-ipv6", "socket-udp", "socket-tcp", "async",
-] }
-# the node's own WireGuard identity is X25519 (WireGuard's curve, not the
-# ed25519 signer's); static_secrets because the key persists across boots.
+# airlock's sealed-envelope key agreement; static_secrets because the key
+# persists across boots.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
 # duckfs path normalization: NFC so visually-identical names collide instead
@@ -173,9 +145,6 @@ borsh = { version = "1", default-features = false, features = ["derive", "std"] 
 # is consensus-affecting and every validator must run the identical build;
 # changing it is a binary upgrade, never a live program swap.
 wasmtime = "=46.0.3"
-# wit-bindgen — the guest-side binding generator for the netstack machine's
-# own component port (its `guest` feature), compiled only on wasm32.
-wit-bindgen = "0.57"
 
 # internal — kernel crates (the platform). `keyscheme` is the key schemes a
 # frame's signer may use, the one verification path the node and the host
@@ -220,25 +189,12 @@ ducktape-home = { path = "crates/ducktape-home" }
 noded = { path = "crates/noded" }
 ducktape-rpc = { path = "crates/rpc-client" }
 # internal — networking crates
-wireguard = { path = "crates/networking/wireguard" }
-# default-features off at the workspace level: the `runtime` feature (sockets,
-# clocks) is opted into by the host-side consumers below; the netstack
-# machine takes the pure wire surface only, natively and on wasm32.
-nat-traversal = { path = "crates/networking/nat-traversal", default-features = false }
-netstack-machine = { path = "crates/networking/netstack-machine" }
-netstack-scenarios = { path = "crates/networking/netstack-scenarios" }
-netstack-wasm = { path = "crates/networking/netstack-wasm" }
 lane-wasm = { path = "crates/networking/lane-wasm" }
-reachability = { path = "crates/networking/reachability" }
 data-plane = { path = "crates/networking/data-plane" }
-overlay-net = { path = "crates/networking/overlay-net" }
 
-# overlay-net's wrapper context implements commonware-runtime's `Clock` and
-# rng bounds, whose supertraits live in these crates — pinned to the exact
-# versions commonware-runtime 2026.9.0 depends on (a different semver-major
-# would be a different trait). airlock pins its own rand_core 0.6 for the
-# dalek curves, which have not moved.
-governor = "0.10.2"
+# the rng bounds commonware-runtime 2026.9.0 depends on (a different
+# semver-major would be a different trait). airlock pins its own rand_core 0.6
+# for the dalek curves, which have not moved.
 rand_core = "0.10.1"
 
 # dev/test builds compile wasm guests through cranelift (the fixture programs

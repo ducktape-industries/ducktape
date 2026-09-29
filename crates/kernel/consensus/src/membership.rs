@@ -1,4 +1,4 @@
-use abi::valset::Member;
+use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_runtime::Handle;
@@ -13,12 +13,13 @@ use crate::engine::{Engine, Epoch, floor};
 use crate::lanes::{EngineMux, Lanes};
 use crate::marshal::{Marshal, MarshalMailbox};
 use crate::roster::{Roster, validators_of};
+use crate::votes::Votes;
 use crate::{Context, Network};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("epoch {epoch} names a member key no validator scheme decodes")]
-    Members { epoch: u64 },
+    #[error("epoch {epoch} names a validator key no validator scheme decodes")]
+    Validators { epoch: u64 },
     #[error("epoch {epoch} has no floor: neither an anchor block nor a finalization names the tip")]
     Floor { epoch: u64 },
 }
@@ -38,6 +39,7 @@ pub struct Membership<E, S: Sender, R: Receiver, B, C> {
     marshal: MarshalMailbox,
     anchor: Anchor,
     chain: C,
+    votes: Votes,
     engine: Option<Engine>,
     seats: mpsc::UnboundedSender<Signal>,
     catch_up: Handle<()>,
@@ -70,12 +72,17 @@ where
         let (seats, seated) = mpsc::unbounded();
         let heard = heard
             .into_stream()
-            .map(|(epoch, peer)| Signal::Heard { epoch, peer });
+            .map(|(epoch, peer, certificate)| Signal::Heard {
+                epoch,
+                peer,
+                certificate,
+            });
         let signals = futures::stream::select(seated, heard);
         let catch_up = context.child("catch_up").spawn({
             let network = network.clone();
+            let roster = roster.clone();
             let marshal = marshal.mailbox().clone();
-            move |_| catchup::run(network, marshal, signals)
+            move |context| catchup::run(context, network, roster, marshal, signals)
         });
         Membership {
             context,
@@ -86,6 +93,7 @@ where
             marshal: marshal.mailbox().clone(),
             anchor: marshal.anchor().clone(),
             chain,
+            votes: Votes::default(),
             engine: None,
             seats,
             catch_up,
@@ -96,9 +104,16 @@ where
         &self.roster
     }
 
-    pub async fn seat(&mut self, tip: Tip, members: &[Member]) -> Result<Standing, Error> {
+    /// The finalize votes the engines this membership seats hear.
+    pub fn votes(&self) -> &Votes {
+        &self.votes
+    }
+
+    /// Seats the epoch after `tip` with its `validators`' keys; a node whose
+    /// key is not among them follows.
+    pub async fn seat(&mut self, tip: Tip, validators: &[Vec<u8>]) -> Result<Standing, Error> {
         let epoch = self.network.epoch_after(tip.height);
-        let validators = validators_of(members).ok_or(Error::Members { epoch })?;
+        let validators = validators_of(validators).ok_or(Error::Validators { epoch })?;
         self.roster.seat(epoch, validators);
         let standing = self.engine(epoch, tip).await?;
         let _ = self.seats.unbounded_send(Signal::Seated(epoch));
@@ -108,6 +123,7 @@ where
     async fn engine(&mut self, epoch: u64, tip: Tip) -> Result<Standing, Error> {
         let Some(scheme) = self.roster.scheme(epoch) else {
             self.engine = None;
+            self.votes.clear();
             return Ok(Standing::Follower);
         };
         let floor = floor(&self.marshal, &self.anchor, &self.network, tip)
@@ -115,6 +131,7 @@ where
             .ok_or(Error::Floor { epoch })?;
         let lanes = self.lanes.register(epoch).await;
         self.engine = None;
+        self.votes.seat(scheme.participants());
         self.engine = Some(Engine::start(
             self.context.child("engine").with_attribute("epoch", epoch),
             &self.partition,
@@ -123,6 +140,7 @@ where
                 number: epoch,
                 scheme,
                 floor,
+                votes: self.votes.clone(),
             },
             lanes,
             &self.marshal,

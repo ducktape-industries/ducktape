@@ -1,6 +1,10 @@
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
+
+use abi::Refusal;
 
 use commonware_broadcast::buffered;
+use commonware_codec::RangeCfg;
 use commonware_consensus::marshal::Config;
 use commonware_consensus::marshal::core::{Actor, Mailbox};
 use commonware_consensus::marshal::resolver::p2p as backfill;
@@ -14,8 +18,9 @@ use commonware_p2p::{Blocker, Provider, Receiver, Sender};
 use commonware_parallel::Sequential;
 use commonware_runtime::Handle;
 use commonware_runtime::buffer::paged::CacheRef;
-use commonware_storage::archive::immutable;
+use commonware_storage::archive::{self, Archive as _, Identifier, immutable};
 use commonware_utils::vec::NonEmptyVec;
+use host::Receipt;
 use node::{Block, Digest};
 
 use crate::anchor::Anchor;
@@ -71,7 +76,7 @@ impl Marshal {
         anchor: Anchor,
         transport: Transport<S, R, P, B>,
         chain: C,
-    ) -> Marshal
+    ) -> (Marshal, Receipts<E>)
     where
         E: Context,
         C: Chain,
@@ -102,6 +107,16 @@ impl Marshal {
         )
         .await
         .expect("the block archive opens");
+        let receipts = immutable::Archive::init(
+            context.child("receipts"),
+            archive_config(
+                &format!("{partition}-receipts"),
+                page_cache.clone(),
+                (RangeCfg::from(..), ()),
+            ),
+        )
+        .await
+        .expect("the receipt archive opens");
 
         let (broadcast_engine, buffer) = buffered::Engine::new(
             context.child("broadcast"),
@@ -157,12 +172,14 @@ impl Marshal {
         )
         .await;
         let actor = actor.start(App::<E, C>::new(chain, cadence), buffer, resolver);
-        Marshal {
+        let marshal = Marshal {
             mailbox,
             anchor,
             actor,
             broadcast,
-        }
+        };
+        let receipts = Receipts(Arc::new(futures::lock::Mutex::new(Some(receipts))));
+        (marshal, receipts)
     }
 
     pub fn mailbox(&self) -> &MarshalMailbox {
@@ -187,6 +204,60 @@ impl Marshal {
 
     pub fn hint(&self, height: u64, peers: NonEmptyVec<PublicKey>) {
         self.mailbox.hint_finalized(Height::new(height), peers);
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReceiptsError {
+    #[error(transparent)]
+    Archive(#[from] archive::Error),
+    #[error("a kept receipt does not decode: {}", .0.sentence)]
+    Decode(Refusal),
+    #[error("the receipt archive failed a write and is closed")]
+    Closed,
+}
+
+type ReceiptArchive<E> = immutable::Archive<E, Digest, Vec<u8>>;
+
+/// Each finalized block's receipts, one per frame the host ran, in a third
+/// archive beside the block's own: keyed by the block's height and digest,
+/// and kept exactly as long as the block is. They are node-local data the
+/// block's run derived, never part of the block or its digest, so a node
+/// that never ran a block (one below a state-sync anchor) keeps none.
+pub struct Receipts<E: Context>(Arc<futures::lock::Mutex<Option<ReceiptArchive<E>>>>);
+
+impl<E: Context> Clone for Receipts<E> {
+    fn clone(&self) -> Self {
+        Receipts(self.0.clone())
+    }
+}
+
+impl<E: Context> Receipts<E> {
+    /// Keeps a block's receipts, durably. A block kept once keeps its first
+    /// receipts: the archive ignores a second put at a height.
+    pub async fn keep(
+        &self,
+        height: u64,
+        id: Digest,
+        receipts: &[Receipt],
+    ) -> Result<(), ReceiptsError> {
+        let mut slot = self.0.lock().await;
+        // a failed write consumes the archive: later reads answer Closed
+        let archive = slot.take().ok_or(ReceiptsError::Closed)?;
+        let archive = archive.put_sync(height, id, abi::encode(&receipts)).await?;
+        *slot = Some(archive);
+        Ok(())
+    }
+
+    /// The receipts kept for the finalized block at `height`.
+    pub async fn get(&self, height: u64) -> Result<Option<Vec<Receipt>>, ReceiptsError> {
+        let slot = self.0.lock().await;
+        let archive = slot.as_ref().ok_or(ReceiptsError::Closed)?;
+        let Some(bytes) = archive.get(Identifier::Index(height)).await? else {
+            return Ok(None);
+        };
+        let receipts = abi::decode(&bytes).map_err(ReceiptsError::Decode)?;
+        Ok(Some(receipts))
     }
 }
 

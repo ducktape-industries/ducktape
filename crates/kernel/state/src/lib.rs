@@ -76,8 +76,11 @@ where
             storage,
             commitments: BTreeMap::new(),
         };
+        // only a founding opens a store with no committed height, and
+        // nothing under its name is its own: a failed founding's or join's
+        let fresh = store.storage.height()?.is_none();
         for program in programs {
-            store.add_program(&program).await?;
+            store.open_program(&program, fresh).await?;
         }
         store.reconcile().await?;
         Ok(store)
@@ -109,17 +112,46 @@ where
         })
     }
 
+    /// Adds an admitted program's commitment, empty: what another chain, a
+    /// failed join or a dropped program left under its id is none of its.
     pub async fn add_program(&mut self, program: &str) -> Result<()> {
+        self.open_program(program, true).await
+    }
+
+    async fn open_program(&mut self, program: &str, fresh: bool) -> Result<()> {
         if self.commitments.contains_key(program) {
             return Ok(());
         }
-        let context = self
-            .context
-            .child("program")
-            .with_attribute("program", program);
-        let commitment = Commitment::open(context, &commitment_name(&self.name, program)).await?;
+        let name = commitment_name(&self.name, program);
+        if fresh {
+            Commitment::destroy(self.context(program).child("fresh"), &name).await?;
+        }
+        let commitment = Commitment::open(self.context(program), &name).await?;
         self.commitments.insert(program.to_owned(), commitment);
         Ok(())
+    }
+
+    /// Removes a program's commitment and destroys what it holds on disk,
+    /// its storage keys with it: a program that no longer runs carries no
+    /// root, and one admitted again under the same id starts empty. A
+    /// commitment this store did not open is destroyed by name: a node that
+    /// died between a block's commit and this call left it there.
+    pub async fn remove_program(&mut self, program: &str) -> Result<()> {
+        self.storage.clear(program)?;
+        match self.commitments.remove(program) {
+            Some(commitment) => commitment.into_db()?.destroy().await?,
+            None => {
+                Commitment::destroy(self.context(program), &commitment_name(&self.name, program))
+                    .await?
+            }
+        }
+        Ok(())
+    }
+
+    fn context(&self, program: &str) -> E {
+        self.context
+            .child("program")
+            .with_attribute("program", program)
     }
 
     async fn reconcile(&mut self) -> Result<()> {

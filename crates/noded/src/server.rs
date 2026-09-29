@@ -14,12 +14,15 @@ use futures::channel::mpsc;
 use host::Receipt;
 use statesync::Request;
 
-use crate::wire::{Admin, BlobPut, Change, Get, Query, Range, route};
+use crate::wire::{
+    Admin, BlobPut, BlockRef, Blocks, Change, Finalized, Get, Network, Query, Range, route,
+};
 use crate::{Context, Daemon};
 
 pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
     Router::new()
         .route(route::STATUS, get(status::<E>))
+        .route(route::NETWORK, get(network::<E>))
         .route(route::SUBMIT, post(submit::<E>))
         .route(route::QUERY, post(query::<E>))
         .route(route::GET, post(get_value::<E>))
@@ -32,6 +35,8 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
             &format!("{}/{{program}}", route::CHANGES),
             get(changes::<E>),
         )
+        .route(route::BLOCKS, post(blocks::<E>))
+        .route(route::BLOCK, post(block::<E>))
         .route(route::LOGS, get(logs::<E>))
         .route(route::ADMIN, post(admin::<E>))
         .route(route::SYNC, post(sync::<E>))
@@ -66,6 +71,13 @@ fn failed<T>(error: impl ToString) -> Reply<T> {
 async fn status<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<crate::wire::Status> {
     match daemon.status().await {
         Ok(status) => Reply::Answered(status),
+        Err(error) => failed(error),
+    }
+}
+
+async fn network<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Network> {
+    match daemon.network().await {
+        Ok(network) => Reply::Answered(network),
         Err(error) => failed(error),
     }
 }
@@ -200,6 +212,34 @@ async fn stream(mut socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Chan
         if sent.is_err() {
             return;
         }
+    }
+}
+
+async fn blocks<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    body: Bytes,
+) -> Reply<Vec<Finalized>> {
+    let page: Blocks = match abi::decode(&body) {
+        Ok(page) => page,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    match daemon.blocks(page).await {
+        Ok(blocks) => Reply::Answered(blocks),
+        Err(error) => failed(error),
+    }
+}
+
+async fn block<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    body: Bytes,
+) -> Reply<Option<Finalized>> {
+    let by: BlockRef = match abi::decode(&body) {
+        Ok(by) => by,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    match daemon.block(by).await {
+        Ok(block) => Reply::Answered(block),
+        Err(error) => failed(error),
     }
 }
 

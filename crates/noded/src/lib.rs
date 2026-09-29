@@ -1,6 +1,8 @@
+mod blocks;
 mod client;
 mod logs;
 mod mesh;
+mod network;
 mod run;
 mod server;
 pub mod wire;
@@ -9,12 +11,14 @@ mod workspace;
 use std::sync::{Arc, Mutex};
 
 use abi::{ProgramId, Refusal};
-use consensus::{MarshalMailbox, Network};
+use commonware_cryptography::Digestible as _;
+use consensus::{MarshalMailbox, Network, Receipts, Votes};
 use futures::channel::mpsc;
 use host::Applied;
 use node::Node;
 use tokio::sync::watch;
 
+pub use blocks::tx_hash;
 pub use client::Client;
 pub use logs::Logs;
 pub use mesh::{Mesh, Reach};
@@ -53,6 +57,8 @@ pub enum Error {
     #[error(transparent)]
     Sync(#[from] statesync::Error),
     #[error(transparent)]
+    Receipts(#[from] consensus::ReceiptsError),
+    #[error(transparent)]
     Membership(#[from] consensus::MembershipError),
     #[error(transparent)]
     Http(#[from] reqwest::Error),
@@ -81,8 +87,11 @@ pub struct Daemon<E: Context> {
     pub network: Network,
     pub identity: Vec<u8>,
     pub anchors: MarshalMailbox,
+    pub receipts: Receipts<E>,
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
+    /// Each validator's newest finalize vote, as a height (`network.rs`).
+    votes: Votes,
     subscribers: Mutex<Vec<(ProgramId, mpsc::UnboundedSender<Change>)>>,
 }
 
@@ -101,6 +110,7 @@ impl<E: Context> Daemon<E> {
             epoch: self.network.epoch_after(tip.height),
             identity: self.identity.clone(),
             contract: NODE_CONTRACT,
+            genesis: self.descriptor.genesis_block().digest().0,
         })
     }
 

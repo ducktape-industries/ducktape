@@ -11,7 +11,7 @@ cannot read the credential out of it.
 - **`airlock`** (this crate) — the pure attestation + sealing + session-key
   handshake core (`attest`, `seal`, `handshake`, `token`, `wire`, `aead`), plus
   the async client (`client::Gateway`) behind the `client` feature. Off-consensus;
-  uses RustCrypto primitives directly like `reachability`.
+  uses RustCrypto primitives directly.
 - **`airlock-service`** (`crates/services/airlock`) — the LENDER half without a
   TEE: the disk-backed credential store a node co-hosts (`user cred add` writes
   it) plus the gateway router that serves it. Run as

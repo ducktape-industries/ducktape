@@ -1,17 +1,18 @@
 use std::path::Path;
 
-use abi::{HostOp, HostReply, Message, Outcome, reason, valset};
+use abi::{HostOp, HostReply, Message, Outcome, reason, role::validators};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_probe::{Reply, Step};
-use host::{Founding, Genesis, Layer, Limits, SIGNERS, Tip};
+use host::{Founding, Genesis, Layer, Limits, Roles, SIGNERS, Tip};
 use keyscheme::KeyScheme;
 use node::{Block, Body, Error, Frame, NAMESPACE, Node, Sequenced};
 
 const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
+const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"net";
@@ -25,8 +26,8 @@ fn key(seed: u64) -> ed25519::PrivateKey {
     ed25519::PrivateKey::from_seed(seed)
 }
 
-fn member(key: &ed25519::PrivateKey, address: &str) -> valset::Member {
-    valset::Member {
+fn member(key: &ed25519::PrivateKey, address: &str) -> validators::Member {
+    validators::Member {
         key: key.public_key().as_ref().to_vec(),
         address: address.to_owned(),
     }
@@ -40,20 +41,32 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
     }
 }
 
-fn genesis(validators: Vec<valset::Member>) -> Genesis {
+fn genesis(validators: Vec<validators::Member>) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        module_registry: MODULE_REGISTRY.to_vec(),
-        valset: VALSET.to_vec(),
+        roles: Roles {
+            registry: "module-registry".into(),
+            validators: "valset".into(),
+            identity: "identity".into(),
+        },
         validators,
         programs: vec![
+            founding("module-registry", MODULE_REGISTRY, Vec::new()),
+            founding("valset", VALSET, Vec::new()),
+            founding(
+                "identity",
+                IDENTITY,
+                abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
+            ),
             founding("ping", RELAY, Vec::new()),
             founding("pong", RELAY, Vec::new()),
             founding("probe", PROBE, abi::encode(&Vec::<Step>::new())),
         ],
+        views: Vec::new(),
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
         time: TIME,
+        member_cap: 16,
     }
 }
 
@@ -79,12 +92,13 @@ fn frame(key: &ed25519::PrivateKey, seq: u64, target: &str, payload: Vec<u8>) ->
     Frame::sign(key, NETWORK, seq, target, payload).encode()
 }
 
+/// A relay payload that has `target` note `payload` in the frame.
 fn message(target: &str, payload: &[u8], reply: bool) -> Vec<u8> {
-    abi::encode(&Message {
+    abi::encode(&fixture_relay::Script::Send(vec![Message {
         target: target.to_owned(),
-        payload: payload.to_vec(),
+        payload: abi::encode(&fixture_relay::Script::Note(payload.to_vec())),
         reply,
-    })
+    }]))
 }
 
 async fn seal(node: &mut TestNode) -> (Block, host::Applied) {
@@ -234,6 +248,43 @@ fn a_block_without_the_pending_frame_keeps_it_pending_and_preconfirmed() {
 }
 
 #[test]
+fn a_rejected_frame_rides_the_block_and_its_bytes_never_run_again() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut node, _) = found(context, dir.path()).await;
+        let signer = key(7);
+        let signer_key = signer.public_key().as_ref().to_vec();
+        let failing = frame(&signer, 0, "probe", script(vec![Step::Fail("no".into())]));
+
+        let receipt = node.submit(failing.clone()).await.unwrap().unwrap();
+        assert_eq!(rejected(&receipt), "probe");
+        assert_eq!(node.pending(), 1);
+        assert_eq!(
+            node.view(Layer::Preconfirmed)
+                .get(SIGNERS, &signer_key)
+                .unwrap(),
+            Some(abi::encode(&1u64))
+        );
+        let resubmitted = node.submit(failing.clone()).await.unwrap().unwrap();
+        assert_eq!(rejected(&resubmitted), reason::SEQUENCE);
+        assert_eq!(node.pending(), 1);
+
+        let (block, applied) = seal(&mut node).await;
+        assert_eq!(block.frames, vec![failing.clone()]);
+        assert_eq!(rejected(&applied.submissions[0]), "probe");
+        assert_eq!(
+            node.view(Layer::Confirmed)
+                .get(SIGNERS, &signer_key)
+                .unwrap(),
+            Some(abi::encode(&1u64))
+        );
+        let resubmitted = node.submit(failing).await.unwrap().unwrap();
+        assert_eq!(rejected(&resubmitted), reason::SEQUENCE);
+        assert_eq!(node.pending(), 0);
+    });
+}
+
+#[test]
 fn a_block_that_spends_the_signers_sequence_elsewhere_drops_the_pending_frame() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -283,6 +334,12 @@ fn a_frame_is_refused_when_it_names_another_network_or_lies_about_its_signer() {
         let refusal = node.submit(b"junk".to_vec()).await.unwrap().unwrap_err();
         assert_eq!(refusal.reason, reason::PROTOCOL);
         assert_eq!(node.pending(), 0);
+        assert_eq!(
+            node.view(Layer::Preconfirmed)
+                .get(SIGNERS, signer.public_key().as_ref())
+                .unwrap(),
+            None
+        );
         assert!(!node.due().unwrap());
     });
 }
@@ -352,7 +409,7 @@ fn a_block_must_link_to_the_tip() {
 }
 
 #[test]
-fn due_deliveries_make_empty_blocks_due_until_the_queue_drains() {
+fn a_message_lands_in_the_block_that_carries_its_frame() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let (mut node, _) = found(context, dir.path()).await;
@@ -361,22 +418,16 @@ fn due_deliveries_make_empty_blocks_due_until_the_queue_drains() {
             .await
             .unwrap()
             .unwrap();
+        assert!(node.due().unwrap());
 
         let (_, applied) = seal(&mut node).await;
         assert_eq!(applied.height, 1);
-        assert!(applied.deliveries.is_empty());
-        assert!(node.due().unwrap());
-
-        let (block, applied) = seal(&mut node).await;
-        assert!(block.frames.is_empty());
-        assert_eq!(applied.height, 2);
-        assert_eq!(applied.deliveries.len(), 1);
-        assert_eq!(applied.deliveries[0].receipt.program, "pong");
-        assert!(node.due().unwrap());
-
-        let (_, applied) = seal(&mut node).await;
-        assert_eq!(applied.height, 3);
-        assert_eq!(applied.deliveries[0].receipt.program, "ping");
+        let ran: Vec<&str> = applied.submissions[0]
+            .nested
+            .iter()
+            .map(|receipt| receipt.program.as_str())
+            .collect();
+        assert_eq!(ran, ["pong", "ping"]);
         assert!(!node.due().unwrap());
     });
 }
@@ -418,28 +469,38 @@ fn a_restart_reopens_at_the_tip() {
 }
 
 #[test]
-fn an_epoch_seats_the_members_the_boundary_block_leaves() {
+fn an_epoch_seats_the_validators_the_boundary_block_leaves() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let (mut node, _) = found(context, dir.path()).await;
         let signer = key(7);
         let founding = vec![member(&key(1), "v1:1")];
-        let seated = vec![member(&key(1), "v1:1"), member(&key(2), "v2:1")];
+        let validators = vec![member(&key(1), "v1:1"), member(&key(2), "v2:1")];
+        let resident = member(&key(3), "r3:1");
+        let members = [validators.clone(), vec![resident.clone()]].concat();
+        let keys = |set: &[validators::Member]| -> Vec<Vec<u8>> {
+            set.iter().map(|member| member.key.clone()).collect()
+        };
 
-        node.submit(frame(&signer, 0, "valset", abi::encode(&seated)))
+        let payload = abi::encode(&(&validators, vec![resident]));
+        node.submit(frame(&signer, 0, "valset", payload))
             .await
             .unwrap()
             .unwrap();
         let (_, applied) = seal(&mut node).await;
         assert_eq!(applied.height, 1);
-        assert_eq!(node.epoch_members(0).unwrap(), Some(founding));
-        assert_eq!(node.epoch_members(1).unwrap(), Some(seated.clone()));
+        assert_eq!(node.epoch_members(0).unwrap(), Some(founding.clone()));
+        assert_eq!(node.epoch_validators(0).unwrap(), Some(keys(&founding)));
+        assert_eq!(node.epoch_members(1).unwrap(), Some(members.clone()));
+        assert_eq!(node.epoch_validators(1).unwrap(), Some(keys(&validators)));
         assert_eq!(node.epoch_members(2).unwrap(), None);
+        assert_eq!(node.epoch_validators(2).unwrap(), None);
 
         seal(&mut node).await;
-        assert_eq!(node.epoch_members(2).unwrap(), None);
+        assert_eq!(node.epoch_validators(2).unwrap(), None);
         seal(&mut node).await;
-        assert_eq!(node.epoch_members(2).unwrap(), Some(seated));
+        assert_eq!(node.epoch_members(2).unwrap(), Some(members));
+        assert_eq!(node.epoch_validators(2).unwrap(), Some(keys(&validators)));
     });
 }
 

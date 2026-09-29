@@ -8,7 +8,9 @@ use reqwest::StatusCode;
 use statesync::{Exchange, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::wire::{BlobPut, Change, Get, Query, Range, Status, route};
+use crate::wire::{
+    BlobPut, BlockRef, Blocks, Change, Finalized, Get, Network, Query, Range, Status, route,
+};
 use crate::{Error, Result};
 
 #[derive(Clone)]
@@ -31,6 +33,13 @@ impl Client {
 
     pub async fn status(&self) -> Result<Status> {
         self.fetch(route::STATUS).await
+    }
+
+    /// The current epoch's members and, for each validator, the newest
+    /// block this node applied that it heard the validator's finalize vote
+    /// for (`wire::PeerStatus`).
+    pub async fn network(&self) -> Result<Network> {
+        self.fetch(route::NETWORK).await
     }
 
     pub async fn submit(&self, frame: Vec<u8>) -> Result<Receipt> {
@@ -73,6 +82,16 @@ impl Client {
 
     pub async fn programs(&self) -> Result<BTreeMap<ProgramId, BlobId>> {
         self.fetch(route::PROGRAMS).await
+    }
+
+    /// Finalized blocks, newest first: below `before` (the tip when
+    /// `None`), at most `limit` (the node caps it).
+    pub async fn blocks(&self, before: Option<u64>, limit: u32) -> Result<Vec<Finalized>> {
+        self.post(route::BLOCKS, &Blocks { before, limit }).await
+    }
+
+    pub async fn block(&self, by: BlockRef) -> Result<Option<Finalized>> {
+        self.post(route::BLOCK, &by).await
     }
 
     pub async fn logs(&self) -> Result<Vec<String>> {

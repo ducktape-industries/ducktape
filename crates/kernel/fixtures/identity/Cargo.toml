@@ -1,5 +1,5 @@
 [package]
-name = "fixture-relay"
+name = "fixture-identity"
 version.workspace = true
 edition.workspace = true
 
@@ -8,5 +8,4 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 abi = { workspace = true }
-borsh = { workspace = true }
 guest = { workspace = true }
