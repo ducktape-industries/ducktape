@@ -639,3 +639,131 @@ fn a_late_validator_joins_by_state_sync_and_follows() {
         node.thread.join().unwrap();
     }
 }
+
+async fn landed(
+    changes: &mut (impl futures::Stream<Item = noded::Result<noded::wire::Change>> + Unpin),
+    keys: &[&[u8]],
+) -> Vec<u64> {
+    let mut heights = vec![None; keys.len()];
+    while heights.iter().any(Option::is_none) {
+        let change = changes.next().await.unwrap().unwrap();
+        for (key, _) in &change.writes {
+            if let Some(at) = keys.iter().position(|wanted| wanted == key) {
+                heights[at].get_or_insert(change.height);
+            }
+        }
+    }
+    heights.into_iter().flatten().collect()
+}
+
+#[test]
+fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
+    let root = tempfile::tempdir().unwrap();
+    let seats: Vec<Seat> = (0..3)
+        .map(|i| Seat::new(root.path(), &format!("n{i}")))
+        .collect();
+    let resident = Seat::new(root.path(), "n3");
+    let founding = founding(root.path(), &seats.iter().collect::<Vec<_>>(), EPOCH_LENGTH);
+    for seat in &seats {
+        seat.init(&founding);
+    }
+    let founders: Vec<Live> = seats.iter().map(Seat::start).collect();
+    let member = |seat: &Seat| Member {
+        key: seat.identity.public_key().as_ref().to_vec(),
+        address: seat.p2p.to_string(),
+    };
+    let valset = abi::encode(&(
+        seats.iter().map(member).collect::<Vec<_>>(),
+        vec![member(&resident)],
+    ));
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let bob = ed25519::PrivateKey::from_seed(12);
+    let runtime = client_runtime();
+
+    runtime.block_on(async {
+        let client = &founders[0].client;
+        let mut changes = client.changes("valset").await.unwrap();
+        let frame = signed(client, &alice, "valset", valset).await;
+        client.submit(frame).await.unwrap();
+        let recorded = changes.next().await.unwrap().unwrap().height;
+        let epoch = recorded / EPOCH_LENGTH + 1;
+        ::tokio::time::timeout(Duration::from_secs(30), reach(client, epoch * EPOCH_LENGTH))
+            .await
+            .expect("the chain enters the first epoch that records the resident");
+    });
+    resident.join(&founders[0].client);
+    let follower = resident.start();
+    let given = |steps: Vec<Step>| runtime.block_on(frame(&follower.client, &bob, steps));
+
+    let mut changes = runtime
+        .block_on(founders[1].client.changes("probe"))
+        .unwrap();
+    let early = given(vec![set(b"early", b"at start")]);
+    let early = runtime.block_on(follower.client.submit(early)).unwrap();
+    assert!(
+        matches!(early.outcome, Outcome::Applied { .. }),
+        "{early:?}"
+    );
+    runtime.block_on(async {
+        ::tokio::time::timeout(Duration::from_secs(60), landed(&mut changes, &[b"early"]))
+            .await
+            .expect("a frame given the instant the resident starts lands");
+    });
+
+    let failing = given(vec![Step::Fail("no".into())]);
+    let mut spent = runtime
+        .block_on(founders[1].client.changes(host::SPENT))
+        .unwrap();
+    let predicted = runtime
+        .block_on(follower.client.submit(failing.clone()))
+        .unwrap();
+    assert!(
+        matches!(predicted.outcome, Outcome::Rejected(_)),
+        "{predicted:?}"
+    );
+    let carried = host::spent(&submission(&failing));
+    runtime.block_on(async {
+        ::tokio::time::timeout(Duration::from_secs(60), landed(&mut spent, &[&carried]))
+            .await
+            .expect("a frame predicted to fail is relayed and a block carries it");
+    });
+    drop(spent);
+
+    let nearly_a_block = node::BLOCK_BYTES - (1 << 16);
+    let large: Vec<Vec<u8>> = (1..=2u8).map(|n| vec![n; nearly_a_block]).collect();
+    for (n, value) in large.iter().enumerate() {
+        let key = format!("large{n}");
+        let large = given(vec![set(key.as_bytes(), value)]);
+        runtime.block_on(follower.client.submit(large)).unwrap();
+    }
+    let [one, two] = runtime.block_on(async {
+        ::tokio::time::timeout(
+            Duration::from_secs(120),
+            landed(&mut changes, &[b"large0", b"large1"]),
+        )
+        .await
+        .expect("two nearly full frames land")
+    })[..] else {
+        panic!("both large frames land");
+    };
+    assert!(
+        one < two,
+        "two nearly full frames share no block: {one}, {two}"
+    );
+    drop(changes);
+
+    let refused = runtime.block_on(follower.client.submit(vec![0; node::BLOCK_BYTES + 1]));
+    let Err(noded::Error::Refused(refusal)) = refused else {
+        panic!("a frame no block carries is refused: {refused:?}");
+    };
+    assert_eq!(refusal.reason, abi::reason::CAPACITY);
+
+    runtime.block_on(async {
+        for (seat, node) in seats.iter().zip(&founders).chain([(&resident, &follower)]) {
+            seat.admin(&node.client, Admin::Shutdown).await;
+        }
+    });
+    for node in founders.into_iter().chain([follower]) {
+        node.thread.join().unwrap();
+    }
+}

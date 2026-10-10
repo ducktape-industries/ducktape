@@ -8,12 +8,11 @@ use commonware_p2p::{Address, AddressableManager as _, AddressableTrackedPeers};
 use commonware_runtime::{Handle, Quota};
 use commonware_utils::ordered::Map;
 use commonware_utils::{NZU32, NZUsize};
-use consensus::channel::{BACKFILL, BROADCAST, CERTIFICATE, RESOLVER, VOTE};
+use consensus::channel::{BACKFILL, BROADCAST, CERTIFICATE, RELAY, RESOLVER, VOTE};
 use consensus::{EngineChannels, MarshalLanes};
 
 use crate::Context;
 
-pub const MESSAGE_SIZE: u32 = 1 << 26;
 pub const QUOTA_PER_SECOND: u32 = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,10 +21,13 @@ pub enum Reach {
     Private,
 }
 
+pub type Lane<E> = (Sender<PublicKey, E>, Receiver<PublicKey>);
+
 pub type Started<E> = (
     Mesh<E>,
     MarshalLanes<Sender<PublicKey, E>, Receiver<PublicKey>>,
     EngineChannels<Sender<PublicKey, E>, Receiver<PublicKey>>,
+    Lane<E>,
 );
 
 pub struct Mesh<E: Context> {
@@ -54,8 +56,12 @@ impl<E: Context> Mesh<E> {
         // it can leave or join the set without a restart, so the +1 is kept.
         let peers = NZUsize!(member_cap as usize + 1);
         let mut config = match reach {
-            Reach::Public => Config::recommended(identity, namespace, listen, peers, MESSAGE_SIZE),
-            Reach::Private => Config::local(identity, namespace, listen, peers, MESSAGE_SIZE),
+            Reach::Public => {
+                Config::recommended(identity, namespace, listen, peers, node::MESSAGE_BYTES)
+            }
+            Reach::Private => {
+                Config::local(identity, namespace, listen, peers, node::MESSAGE_BYTES)
+            }
         };
         // only the current epoch's set: nothing reads an older one, and the
         // previous epoch's engine is gone at the switch
@@ -71,13 +77,14 @@ impl<E: Context> Mesh<E> {
             certificate: network.register(CERTIFICATE, quota),
             resolver: network.register(RESOLVER, quota),
         };
+        let relay = network.register(RELAY, quota);
         let running = network.start();
         let mesh = Mesh {
             oracle,
             running,
             _runtime: std::marker::PhantomData,
         };
-        (mesh, marshal, engine)
+        (mesh, marshal, engine, relay)
     }
 
     pub fn oracle(&self) -> Oracle<PublicKey> {
@@ -126,7 +133,8 @@ mod tests {
                 .local_addr()
                 .unwrap();
             let identity = PrivateKey::from_seed(0);
-            let (mesh, _, _) = Mesh::start(context, identity, b"mesh", listen, Reach::Private, 3);
+            let (mesh, _, _, _) =
+                Mesh::start(context, identity, b"mesh", listen, Reach::Private, 3);
             let members: Vec<Member> = (1..=foreign)
                 .map(|seed| Member {
                     key: PrivateKey::from_seed(seed).public_key().as_ref().to_vec(),

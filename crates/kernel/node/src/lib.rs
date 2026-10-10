@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-use abi::{BlobId, Origin, ProgramId, Refusal, role::validators};
+use abi::{BlobId, Origin, ProgramId, Refusal, reason, role::validators};
 use commonware_cryptography::Digestible as _;
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
@@ -15,7 +15,7 @@ use state::{Commitment, View};
 
 use crate::pool::Pool;
 
-pub use block::{Block, Digest};
+pub use block::{BLOCK_BYTES, Block, Digest, MESSAGE_BYTES};
 pub use frame::{Body, Frame, NAMESPACE, verify};
 
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +32,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Sequenced {
     Applied(Applied),
     Replayed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Client,
+    Peer,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,7 +188,18 @@ where
             .await?)
     }
 
-    pub async fn submit(&mut self, frame: Vec<u8>) -> Result<std::result::Result<Taken, Refusal>> {
+    pub async fn submit(
+        &mut self,
+        frame: Vec<u8>,
+        source: Source,
+    ) -> Result<std::result::Result<Taken, Refusal>> {
+        if !Block::carries(&frame) {
+            let sentence = format!(
+                "the frame is {} bytes and a block carries at most {BLOCK_BYTES}",
+                frame.len()
+            );
+            return Ok(Err(Refusal::new(reason::CAPACITY, sentence)));
+        }
         let submission = match frame::verify(&frame, &self.network) {
             Ok(submission) => submission,
             Err(refusal) => return Ok(Err(refusal)),
@@ -196,7 +213,12 @@ where
         let time = self.now();
         let mut predicted = self.host.preconfirm(time, vec![submission.clone()]).await?;
         let prediction = predicted.pop().expect("one submission yields one receipt");
-        self.pool.admit(frame, submission, prediction.clone());
+        let offered = match source {
+            Source::Client => Some(self.host.tip()?.height),
+            Source::Peer => None,
+        };
+        self.pool
+            .admit(frame, submission, prediction.clone(), offered);
         Ok(Ok(Taken::New(prediction)))
     }
 
@@ -215,8 +237,18 @@ where
                 let recent = held.submission.anchor.anchors(height);
                 recent && !carried.contains(&held.id)
             })
-            .map(|held| held.frame.clone());
-        Ok(Block::next(parent, time, frames.collect()))
+            .map(|held| &held.frame);
+        Ok(Block::packed(parent, time, frames))
+    }
+
+    pub fn reoffer(&mut self) -> Result<Vec<Vec<u8>>> {
+        let height = self.host.tip()?.height;
+        Ok(self.pool.reoffer(height))
+    }
+
+    pub fn reoffer_all(&mut self) -> Result<Vec<Vec<u8>>> {
+        let height = self.host.tip()?.height;
+        Ok(self.pool.reoffer_all(height))
     }
 
     pub async fn apply(&mut self, block: &Block) -> Result<Sequenced> {

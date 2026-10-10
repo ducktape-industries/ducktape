@@ -130,12 +130,17 @@ anchor, and is valid only while that block is one of the last 256: the CLI
 anchors to the tip `status` reports. A block runs a frame at most once. A node
 takes every frame that is signed for its network, names a recent block and no
 block has carried yet, and holds it in its mempool until a block carries it or
-its anchor ages out. The receipt
-`submit` prints is the node's prediction from its preconfirmed layer, not a
-verdict: a frame predicted to fail still waits for a block, and the block
-decides. `ducktape logs`, `ducktape log-filter`, `ducktape metrics` and
-`ducktape shutdown` operate the node; the mutating ones are signed with the
-node's own identity key. Each verb's `--help` carries the rest.
+its anchor ages out. Any member's node takes a frame: it hands each frame a
+client gives it to the epoch's validators over the mesh at once, and again
+whenever a few blocks pass without the frame landing, so a frame submitted to
+a member without a vote lands like one submitted to a validator. A block holds
+at most 16 MiB of frames (`node::BLOCK_BYTES`); a frame no block can carry is
+refused. The receipt `submit` prints is the node's prediction from its
+preconfirmed layer, not a verdict: a frame predicted to fail is still relayed
+and waits for a block, and the block decides. `ducktape logs`,
+`ducktape log-filter`, `ducktape metrics` and `ducktape shutdown` operate the
+node; the mutating ones are signed with the node's own identity key. Each
+verb's `--help` carries the rest.
 
 ## How it is built
 
