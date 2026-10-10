@@ -11,8 +11,8 @@ use commonware_utils::Acknowledgement as _;
 use commonware_utils::acknowledgement::Exact;
 use commonware_utils::{NZU32, NZUsize};
 use consensus::{
-    Anchor, Cadence, Chain, EngineMux, Marshal, Membership, Network, Roster, SimMesh, Transport,
-    Votes,
+    Ancestry, Anchor, Cadence, Chain, EngineMux, Marshal, Membership, Network, Roster, SimMesh,
+    Transport, Votes,
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -36,7 +36,12 @@ fn link(latency: Duration) -> Link {
 struct Empty(mpsc::UnboundedSender<(Arc<Block>, Exact)>);
 
 impl Chain for Empty {
-    async fn propose(&mut self, parent: Arc<Block>, time: u64) -> Option<Block> {
+    async fn propose(
+        &mut self,
+        parent: Arc<Block>,
+        _: impl Ancestry<Block>,
+        time: u64,
+    ) -> Option<Block> {
         Some(Block::next(parent.tip(), time, Vec::new()))
     }
 

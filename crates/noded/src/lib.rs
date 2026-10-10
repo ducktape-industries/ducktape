@@ -18,7 +18,6 @@ use host::Applied;
 use node::Node;
 use tokio::sync::watch;
 
-pub use blocks::tx_hash;
 pub use client::Client;
 pub use logs::Logs;
 pub use mesh::{Mesh, Reach};

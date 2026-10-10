@@ -11,12 +11,13 @@ use commonware_utils::acknowledgement::Exact;
 use commonware_utils::vec::NonEmptyVec;
 use commonware_utils::{NZU32, NZUsize};
 use consensus::{
-    Anchor, Chain, EngineMux, Marshal, Membership, Network, Roster, SimMesh, Standing, Transport,
+    Ancestry, Anchor, Chain, EngineMux, Marshal, Membership, Network, Roster, SimMesh, Standing,
+    Transport,
 };
 use fixture_probe::Step;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use host::{Founding, Genesis, Layer, Limits, Roles};
+use host::{Founding, Genesis, Layer, Limits, Roles, Tip};
 use node::{Block, Frame, Node, Sequenced};
 
 mod epochs;
@@ -37,6 +38,7 @@ const LABELS: [&str; 5] = ["v0", "v1", "v2", "v3", "v4"];
 type Ctx = deterministic::Context;
 type Shared = Arc<futures::lock::Mutex<Node<Ctx>>>;
 type Roots = Arc<Mutex<BTreeMap<u64, Root>>>;
+type Carried = Arc<Mutex<BTreeMap<u64, Vec<Vec<u8>>>>>;
 type Delivery = (Arc<Block>, Exact);
 type Seating = Membership<
     Ctx,
@@ -115,8 +117,12 @@ fn set(key: &[u8], value: &[u8]) -> Step {
     })
 }
 
-fn frame(key: &ed25519::PrivateKey, seq: u64, steps: Vec<Step>) -> Vec<u8> {
-    Frame::sign(key, NETWORK, seq, "probe", abi::encode(&steps)).encode()
+fn origin() -> Tip {
+    Block::genesis(NETWORK, TIME).tip()
+}
+
+fn frame(key: &ed25519::PrivateKey, steps: Vec<Step>) -> Vec<u8> {
+    Frame::sign(key, NETWORK, origin(), None, "probe", abi::encode(&steps)).encode()
 }
 
 fn link() -> Link {
@@ -128,6 +134,14 @@ fn link() -> Link {
 }
 
 async fn mesh(context: &Ctx, keys: &[ed25519::PrivateKey]) -> Oracle<ed25519::PublicKey, Ctx> {
+    mesh_over(context, keys, link()).await
+}
+
+async fn mesh_over(
+    context: &Ctx,
+    keys: &[ed25519::PrivateKey],
+    link: Link,
+) -> Oracle<ed25519::PublicKey, Ctx> {
     let peers: Vec<ed25519::PublicKey> = keys.iter().map(|k| k.public_key()).collect();
     let (network, oracle) = simulated::Network::new_with_peers(
         context.child("network"),
@@ -144,7 +158,10 @@ async fn mesh(context: &Ctx, keys: &[ed25519::PrivateKey]) -> Oracle<ed25519::Pu
     for a in &peers {
         for b in &peers {
             if a != b {
-                oracle.add_link(a.clone(), b.clone(), link()).await.unwrap();
+                oracle
+                    .add_link(a.clone(), b.clone(), link.clone())
+                    .await
+                    .unwrap();
             }
         }
     }
@@ -198,9 +215,17 @@ struct Participant {
 }
 
 impl Chain for Participant {
-    async fn propose(&mut self, parent: Arc<Block>, time: u64) -> Option<Block> {
+    async fn propose(
+        &mut self,
+        parent: Arc<Block>,
+        ancestors: impl Ancestry<Block>,
+        time: u64,
+    ) -> Option<Block> {
+        let applied = self.node.lock().await.tip().unwrap().height;
+        let unapplied = consensus::unapplied(parent.clone(), ancestors, applied).await;
         let node = self.node.lock().await;
-        Some(node.build(parent.tip(), time))
+        let block = node.build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time);
+        Some(block.unwrap())
     }
 
     fn deliver(&mut self, block: Arc<Block>, ack: Exact) {
@@ -215,6 +240,7 @@ struct Peer {
     marshal: Marshal,
     heights: mpsc::UnboundedReceiver<u64>,
     roots: Roots,
+    carried: Carried,
     _dir: tempfile::TempDir,
 }
 
@@ -247,6 +273,7 @@ impl Peer {
         let (inbox, deliveries) = mpsc::unbounded();
         let (applied, heights) = mpsc::unbounded();
         let roots: Roots = Arc::default();
+        let carried: Carried = Arc::default();
         let chain = Participant {
             node: node.clone(),
             inbox,
@@ -285,8 +312,13 @@ impl Peer {
         context.child("pump").spawn({
             let node = node.clone();
             let roots = roots.clone();
+            let carried = carried.clone();
             let network = network.clone();
-            move |_| pump(node, membership, deliveries, applied, roots, network)
+            move |_| {
+                pump(
+                    node, membership, deliveries, applied, roots, carried, network,
+                )
+            }
         });
         Peer {
             key,
@@ -295,6 +327,7 @@ impl Peer {
             marshal,
             heights,
             roots,
+            carried,
             _dir: dir,
         }
     }
@@ -316,8 +349,19 @@ impl Peer {
         self.roots.lock().unwrap()[&height]
     }
 
+    fn carried(&self) -> Vec<Vec<u8>> {
+        self.carried
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
     async fn submit(&self, frame: Vec<u8>) {
-        let receipt = self.node.lock().await.submit(frame).await.unwrap().unwrap();
+        let taken = self.node.lock().await.submit(frame).await.unwrap().unwrap();
+        let receipt = taken.receipt();
         assert!(
             matches!(receipt.outcome, abi::Outcome::Applied { .. }),
             "{receipt:?}"
@@ -340,12 +384,17 @@ async fn pump(
     mut deliveries: mpsc::UnboundedReceiver<Delivery>,
     applied: mpsc::UnboundedSender<u64>,
     roots: Roots,
+    carried: Carried,
     network: Network,
 ) {
     while let Some((block, ack)) = deliveries.next().await {
         let mut node = node.lock().await;
         if let Sequenced::Applied(outcome) = node.apply(&block).await.unwrap() {
             roots.lock().unwrap().insert(block.height, outcome.root);
+            carried
+                .lock()
+                .unwrap()
+                .insert(block.height, block.frames.clone());
         }
         let seating = if network.closes_an_epoch(block.height) {
             let epoch = network.epoch_after(block.height);
@@ -409,13 +458,9 @@ fn three_validators_agree_on_a_chain_of_frames() {
 
         let alice = key(11);
         let bob = key(12);
-        peers[0]
-            .submit(frame(&alice, 0, vec![set(b"a", b"1")]))
-            .await;
-        peers[0]
-            .submit(frame(&alice, 1, vec![set(b"b", b"2")]))
-            .await;
-        peers[1].submit(frame(&bob, 0, vec![set(b"c", b"3")])).await;
+        peers[0].submit(frame(&alice, vec![set(b"a", b"1")])).await;
+        peers[0].submit(frame(&alice, vec![set(b"b", b"2")])).await;
+        peers[1].submit(frame(&bob, vec![set(b"c", b"3")])).await;
 
         let mut tips = Vec::new();
         for peer in &mut peers {
@@ -437,6 +482,49 @@ fn three_validators_agree_on_a_chain_of_frames() {
 }
 
 #[test]
+fn a_frame_every_validator_holds_lands_once_when_leaders_build_ahead_of_finality() {
+    runner().start(|context| async move {
+        let keys: Vec<_> = (1..=3).map(key).collect();
+        let members: Vec<_> = keys.iter().map(member).collect();
+        let slow = Link {
+            latency: Duration::from_millis(BLOCK_TIME_MS * 7 / 10),
+            jitter: Duration::from_millis(1),
+            success_rate: commonware_utils::probability!(1.0),
+        };
+        let oracle = mesh_over(&context, &keys, slow).await;
+        let network = network(1_000);
+        let mut peers = validators(&context, &oracle, &keys, &members, &network).await;
+
+        let alice = key(11);
+        let frames: Vec<Vec<u8>> = (0..4u8)
+            .map(|n| frame(&alice, vec![set(&[n], b"held by all")]))
+            .collect();
+        for frame in &frames {
+            for peer in &peers {
+                peer.submit(frame.clone()).await;
+            }
+        }
+
+        for peer in &mut peers {
+            peer.reached(6).await;
+        }
+        for peer in &peers {
+            let carried: Vec<Option<usize>> = peer
+                .carried()
+                .iter()
+                .map(|carried| frames.iter().position(|frame| frame == carried))
+                .collect();
+            assert_eq!(
+                carried,
+                [0, 1, 2, 3].map(Some),
+                "each frame rides one block"
+            );
+            assert_eq!(peer.node.lock().await.pending(), 0);
+        }
+    });
+}
+
+#[test]
 fn a_partitioned_validator_catches_up_when_the_link_heals() {
     runner().start(|context| async move {
         let keys: Vec<_> = (1..=4).map(key).collect();
@@ -453,7 +541,7 @@ fn a_partitioned_validator_catches_up_when_the_link_heals() {
         sever(&oracle, &isolated, &public).await;
         let alice = key(11);
         peers[0]
-            .submit(frame(&alice, 0, vec![set(b"during", b"partition")]))
+            .submit(frame(&alice, vec![set(b"during", b"partition")]))
             .await;
         let ahead = peers[0].reached(12).await;
         heal(&oracle, &isolated, &public).await;

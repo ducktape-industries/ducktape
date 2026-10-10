@@ -1,8 +1,8 @@
 use abi::{BlobId, ProgramId, Root, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
-use host::{Layer, Receipt};
+use host::{Layer, Receipt, Tip};
 
-pub const NODE_CONTRACT: u32 = 1;
+pub const NODE_CONTRACT: u32 = 2;
 pub const ADMIN: &str = "$admin";
 
 pub mod route {
@@ -40,6 +40,15 @@ pub struct Status {
     /// The digest of this network's genesis block: what a client salts the
     /// network's name with to name the chain (`<network>#<salt>`).
     pub genesis: [u8; 32],
+}
+
+impl Status {
+    pub fn anchor(&self) -> Tip {
+        Tip {
+            height: self.height,
+            id: self.tip,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -101,10 +110,8 @@ pub enum BlockRef {
     Id([u8; 32]),
 }
 
-/// One frame a block carries, decoded. `hash` is sha256 over the frame's
-/// exact bytes as the block carries them (signature included), so the same
-/// signed frame has one hash wherever it is seen. A frame that does not
-/// verify was not applied and is left out.
+/// One frame a block carries, decoded. A frame that does not verify was not
+/// applied and is left out.
 ///
 /// `receipt` is the frame's run as this node recorded it when it applied
 /// the block: applied or rejected with its refusal, the events, the nested
@@ -115,7 +122,7 @@ pub enum BlockRef {
 pub struct Tx {
     pub hash: [u8; 32],
     pub signer: Vec<u8>,
-    pub seq: u64,
+    pub anchor: Tip,
     pub target: String,
     pub payload: Vec<u8>,
     pub receipt: Option<Receipt>,

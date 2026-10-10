@@ -10,7 +10,7 @@ fn a_follower_backfills_finalized_blocks_by_hint() {
         let mut peers = validators(&context, &oracle, &keys[..3], &members, &network).await;
         let alice = key(11);
         peers[0]
-            .submit(frame(&alice, 0, vec![set(b"seen", b"by-followers")]))
+            .submit(frame(&alice, vec![set(b"seen", b"by-followers")]))
             .await;
         let tip = peers[0].reached(5).await;
 
@@ -44,7 +44,7 @@ fn a_validator_epochs_behind_catches_up_by_the_traffic_it_hears() {
         let mut peers = validators(&context, &oracle, &keys[..3], &members, &network).await;
         let alice = key(11);
         peers[0]
-            .submit(frame(&alice, 0, vec![set(b"early", b"yes")]))
+            .submit(frame(&alice, vec![set(b"early", b"yes")]))
             .await;
         let ahead = peers[0].reached(11).await;
 
@@ -102,11 +102,11 @@ fn an_epoch_boundary_reseats_the_validators() {
 
         let alice = key(11);
         peers[0]
-            .submit(frame(&alice, 0, vec![set(b"epoch", b"0")]))
+            .submit(frame(&alice, vec![set(b"epoch", b"0")]))
             .await;
         let valset = abi::encode(&(&seated, vec![member(&keys[4])]));
         peers[0]
-            .submit(Frame::sign(&alice, NETWORK, 1, "valset", valset).encode())
+            .submit(Frame::sign(&alice, NETWORK, origin(), None, "valset", valset).encode())
             .await;
 
         let (founders, followers) = peers.split_at_mut(3);
@@ -127,7 +127,7 @@ fn an_epoch_boundary_reseats_the_validators() {
         let silenced = peers[2].me();
         sever(&oracle, &silenced, &public).await;
         peers[0]
-            .submit(frame(&alice, 2, vec![set(b"epoch", b"1")]))
+            .submit(frame(&alice, vec![set(b"epoch", b"1")]))
             .await;
         let (voters, residents) = peers.split_at_mut(4);
         follows_at_the_tip(&mut residents[0], &voters[0], 5, &network).await;

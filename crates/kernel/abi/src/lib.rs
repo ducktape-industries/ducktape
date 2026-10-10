@@ -139,8 +139,8 @@ pub mod reason {
     pub const TRAP: &str = "trap";
     /// the host: bytes that do not decode, or an op the call's kind refuses.
     pub const PROTOCOL: &str = "protocol";
-    /// the host: the frame's sequence is not the signer's next.
-    pub const SEQUENCE: &str = "sequence";
+    pub const ANCHOR: &str = "anchor";
+    pub const DUPLICATE: &str = "duplicate";
     /// naming a thing that exists (id, key, path, account, sibling program).
     pub const NOT_FOUND: &str = "not_found";
     /// creating under a different id, or treating the create as done.
