@@ -35,9 +35,10 @@ This puts the `ducktape` binary in `~/.cargo/bin`. `make install` also
 delegates the desktop installation to the pinned
 [ducktape-app](https://github.com/ducktape-industries/ducktape-app) checkout.
 
-Each commit on `main` also has a built `ducktape` for Linux on x86_64: the
-prerelease `bin-<commit>` carries `ducktape-x86_64-unknown-linux-gnu.tar.gz`
-(`.github/workflows/release.yml`).
+Each commit on `main` also has a built `ducktape` for Linux on x86_64 and
+macOS on arm64: the prerelease `bin-<commit>` carries
+`ducktape-x86_64-unknown-linux-gnu.tar.gz` and
+`ducktape-aarch64-apple-darwin.tar.gz` (`.github/workflows/release.yml`).
 
 ## Found a network
 
