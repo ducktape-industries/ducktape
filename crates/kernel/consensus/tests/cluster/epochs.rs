@@ -104,10 +104,12 @@ fn an_epoch_boundary_reseats_the_validators() {
         peers[0]
             .submit(frame(&alice, vec![set(b"epoch", b"0")]))
             .await;
-        let valset = abi::encode(&(&seated, vec![member(&keys[4])]));
-        peers[0]
-            .submit(Frame::sign(&alice, NETWORK, origin(), None, "valset", valset).encode())
-            .await;
+        let promote = validators::Op::Vote(validators::Motion::Promote {
+            key: member(&keys[3]).key,
+        });
+        for frame in [enroll(&keys[3]), enroll(&keys[4]), valset(&alice, &promote)] {
+            peers[0].submit(frame).await;
+        }
 
         let (founders, followers) = peers.split_at_mut(3);
         for follower in followers {

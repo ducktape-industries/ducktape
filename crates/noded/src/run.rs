@@ -4,7 +4,9 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use commonware_cryptography::ed25519::PublicKey;
+use abi::Outcome;
+use abi::role::validators::{Grant, INVITE_NAMESPACE, Invite, Op};
+use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_cryptography::{Digestible as _, Signer as _};
 use commonware_p2p::authenticated::lookup::{Oracle, Receiver, Sender};
 use commonware_runtime::Handle;
@@ -16,7 +18,7 @@ use consensus::{
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use node::{Block, Node, Sequenced};
+use node::{Block, Frame, Node, Sequenced};
 use tokio::sync::watch;
 
 use crate::mesh::{Mesh, Reach, track};
@@ -64,8 +66,19 @@ pub fn join<'a, E: Context>(
     context: E,
     workspace: &'a Workspace,
     source: Client,
+    address: SocketAddr,
+    invite: Option<Invite>,
 ) -> Boxed<'a, Result<()>> {
-    Box::pin(adopt(context, workspace, source))
+    Box::pin(adopt(context, workspace, source, address, invite))
+}
+
+pub fn invite(identity: &PrivateKey, grant: Grant) -> Invite {
+    let signature = identity.sign(INVITE_NAMESPACE, &grant.preimage());
+    Invite {
+        issuer: identity.public_key().as_ref().to_vec(),
+        grant,
+        signature: signature.as_ref().to_vec(),
+    }
 }
 
 pub fn run<'a, E: Context>(
@@ -93,14 +106,38 @@ async fn found<E: Context>(mut context: E, workspace: &Workspace, founding: &Pat
     workspace.write_anchor(&Anchor::Genesis(block))
 }
 
-async fn adopt<E: Context>(mut context: E, workspace: &Workspace, source: Client) -> Result<()> {
+async fn adopt<E: Context>(
+    mut context: E,
+    workspace: &Workspace,
+    source: Client,
+    address: SocketAddr,
+    invite: Option<Invite>,
+) -> Result<()> {
     let status = source.status().await?;
+    let identity = workspace.identity_or_create(&mut context)?;
+    let salt = rand_core::Rng::next_u64(&mut context);
+    let enroll = Op::Enroll {
+        address: address.to_string(),
+        invite,
+    };
+    let frame = Frame::sign(
+        &identity,
+        status.network.as_bytes(),
+        status.anchor(),
+        Some(salt),
+        &status.roles.validators,
+        abi::encode(&enroll),
+    );
+    let (_, receipt) = source.land(&frame).await?;
+    if let Outcome::Rejected(refusal) = receipt.outcome {
+        return Err(Error::Refused(refusal));
+    }
+    seated(&source, identity.public_key().as_ref()).await?;
     let descriptor = Descriptor {
         network: status.network,
         time: status.time,
         block_time_ms: status.block_time_ms,
     };
-    workspace.identity_or_create(&mut context)?;
     let joined = statesync::join(
         context.child("join"),
         &descriptor.network,
@@ -111,6 +148,18 @@ async fn adopt<E: Context>(mut context: E, workspace: &Workspace, source: Client
     .await?;
     workspace.write_descriptor(&descriptor)?;
     workspace.write_anchor(&joined.anchor)
+}
+
+async fn seated(source: &Client, key: &[u8]) -> Result<()> {
+    let mut blocks = source.changes(host::RECENT).await?;
+    loop {
+        let network = source.network().await?;
+        let member = network.members.iter().any(|row| row.key == key);
+        if member {
+            return Ok(());
+        }
+        blocks.next().await.ok_or(Error::Closed)??;
+    }
 }
 
 async fn start<E: Context>(

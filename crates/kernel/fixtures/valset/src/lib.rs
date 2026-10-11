@@ -1,51 +1,126 @@
+// A validators program for the kernel's tests: it speaks the role's ops with no rules. Anyone
+// enrolls as a resident, and any one vote enacts a promotion, a demotion or a removal at once.
+
 pub const VALIDATORS: &[u8] = b"validators";
 pub const RESIDENTS: &[u8] = b"residents";
 
-/// A validators program: `execute` takes `(validators, residents)`, both
-/// `Vec<Member>`. `Validators` answers the validators' keys, `Members` the
-/// validators then the residents.
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::{Env, Refusal, role::validators};
+    use abi::role::validators::{Genesis, Member, Motion, Op, Query as Ask, Reply, Voted};
+    use abi::{Env, Origin, Refusal, reason};
     use guest::{Execute, Program, Query, Reads};
 
     use crate::{RESIDENTS, VALIDATORS};
 
     struct Valset;
 
-    fn read(ctx: &Query, key: &[u8]) -> Result<Vec<validators::Member>, Refusal> {
-        match ctx.get(key) {
-            Some(bytes) => abi::decode(&bytes),
-            None => Ok(Vec::new()),
+    struct Roster {
+        validators: Vec<Member>,
+        residents: Vec<Member>,
+    }
+
+    impl Roster {
+        fn read(ctx: &impl Reads) -> Result<Roster, Refusal> {
+            let list = |key| match ctx.get(key) {
+                Some(bytes) => abi::decode(&bytes),
+                None => Ok(Vec::new()),
+            };
+            Ok(Roster {
+                validators: list(VALIDATORS)?,
+                residents: list(RESIDENTS)?,
+            })
         }
+
+        fn write(&self, ctx: &mut Execute) {
+            ctx.set(VALIDATORS, abi::encode(&self.validators));
+            ctx.set(RESIDENTS, abi::encode(&self.residents));
+        }
+
+        fn take(&mut self, key: &[u8]) -> Option<Member> {
+            let held = |list: &mut Vec<Member>| {
+                let at = list.iter().position(|member| member.key == key)?;
+                Some(list.remove(at))
+            };
+            held(&mut self.validators).or_else(|| held(&mut self.residents))
+        }
+
+        fn enroll(&mut self, key: Vec<u8>, address: String) {
+            let moved = self
+                .validators
+                .iter_mut()
+                .chain(self.residents.iter_mut())
+                .find(|member| member.key == key);
+            match moved {
+                Some(member) => member.address = address,
+                None => self.residents.push(Member { key, address }),
+            }
+        }
+
+        fn enact(&mut self, motion: Motion) -> Result<(), Refusal> {
+            match motion {
+                Motion::Promote { key } => {
+                    let member = self.take(&key).ok_or_else(not_a_member)?;
+                    self.validators.push(member);
+                }
+                Motion::Demote { key } => {
+                    let member = self.take(&key).ok_or_else(not_a_member)?;
+                    self.residents.push(member);
+                }
+                Motion::Remove { key } => {
+                    self.take(&key).ok_or_else(not_a_member)?;
+                }
+                Motion::Door { .. } | Motion::Registry { .. } => {
+                    return Err(Refusal::new(
+                        reason::UNSUPPORTED,
+                        "the fixture valset has no door and no registry",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn not_a_member() -> Refusal {
+        Refusal::new(reason::NOT_FOUND, "the key is not a member")
     }
 
     impl Program for Valset {
         fn init(ctx: &mut Execute, _env: &Env, params: &[u8]) -> Result<(), Refusal> {
-            let genesis: validators::Genesis = abi::decode(params)?;
+            let genesis: Genesis = abi::decode(params)?;
             ctx.set(VALIDATORS, abi::encode(&genesis.validators));
             Ok(())
         }
 
-        fn execute(ctx: &mut Execute, _env: &Env, payload: &[u8]) -> Result<(), Refusal> {
-            let (validators, residents): (Vec<validators::Member>, Vec<validators::Member>) =
-                abi::decode(payload)?;
-            ctx.set(VALIDATORS, abi::encode(&validators));
-            ctx.set(RESIDENTS, abi::encode(&residents));
+        fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal> {
+            let Origin::External(signer) = &env.origin else {
+                return Err(Refusal::new(reason::UNAUTHORIZED, "a key signs every op"));
+            };
+            let mut roster = Roster::read(ctx)?;
+            match abi::decode(payload)? {
+                Op::Enroll { address, .. } => roster.enroll(signer.clone(), address),
+                Op::Leave => {
+                    roster.take(signer).ok_or_else(not_a_member)?;
+                }
+                Op::Vote(motion) => {
+                    roster.enact(motion)?;
+                    ctx.output(abi::encode(&Voted::Enacted));
+                }
+            }
+            roster.write(ctx);
             Ok(())
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {
-            let validators = read(ctx, VALIDATORS)?;
+            let roster = Roster::read(ctx)?;
             let reply = match abi::decode(request)? {
-                validators::Query::Validators => validators::Reply::Validators(
-                    validators.into_iter().map(|member| member.key).collect(),
+                Ask::Validators => Reply::Validators(
+                    roster
+                        .validators
+                        .into_iter()
+                        .map(|member| member.key)
+                        .collect(),
                 ),
-                validators::Query::Members => {
-                    let mut members = validators;
-                    members.extend(read(ctx, RESIDENTS)?);
-                    validators::Reply::Members(members)
-                }
+                Ask::Members => Reply::Members([roster.validators, roster.residents].concat()),
             };
             ctx.respond(abi::encode(&reply));
             Ok(())

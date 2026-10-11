@@ -528,14 +528,24 @@ fn a_certificate_from_strangers_is_rejected() {
 fn a_tip_certificate_verifies_against_the_validators_not_the_members() {
     deterministic::Runner::default().start(|context| async move {
         let mut network = found(&context).await;
-        let alice = key(11);
         let residents: Vec<_> = (21..=23).map(|seed| member(&key(seed))).collect();
-        let valset = abi::encode(&(&network.members, &residents));
-        let mut tip = network
-            .advance(vec![
-                Frame::sign(&alice, NETWORK, origin(), None, "valset", valset).encode(),
-            ])
-            .await;
+        let enrolls = (21..=23).map(|seed| {
+            let resident = key(seed);
+            let enroll = validators::Op::Enroll {
+                address: member(&resident).address,
+                invite: None,
+            };
+            Frame::sign(
+                &resident,
+                NETWORK,
+                origin(),
+                None,
+                "valset",
+                abi::encode(&enroll),
+            )
+            .encode()
+        });
+        let mut tip = network.advance(enrolls.collect()).await;
         while tip.height < EPOCH_LENGTH {
             tip = network.advance(Vec::new()).await;
         }

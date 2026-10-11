@@ -2,7 +2,7 @@ use abi::{BlobId, ProgramId, Root, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
 use host::{Layer, Receipt, Tip};
 
-pub const NODE_CONTRACT: u32 = 2;
+pub const NODE_CONTRACT: u32 = 3;
 pub const ADMIN: &str = "$admin";
 
 pub mod route {
@@ -40,6 +40,7 @@ pub struct Status {
     /// The digest of this network's genesis block: what a client salts the
     /// network's name with to name the chain (`<network>#<salt>`).
     pub genesis: [u8; 32],
+    pub roles: abi::Roles,
 }
 
 impl Status {
