@@ -5,6 +5,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use host::{Receipt, Submission, SubmissionId};
 
+const FIRST_WAIT: u64 = 4;
+const LONGEST_WAIT: u64 = 64;
+
 #[derive(Clone, Debug)]
 pub struct Held {
     pub id: SubmissionId,
@@ -12,6 +15,20 @@ pub struct Held {
     pub submission: Submission,
     pub prediction: Receipt,
     arrival: u64,
+    offer: Option<Offer>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Offer {
+    at: u64,
+    sends: u32,
+}
+
+impl Offer {
+    fn waited_out(&self, height: u64) -> bool {
+        let wait = (FIRST_WAIT << self.sends.saturating_sub(1).min(4)).min(LONGEST_WAIT);
+        height.saturating_sub(self.at) >= wait
+    }
 }
 
 #[derive(Debug, Default)]
@@ -34,7 +51,13 @@ impl Pool {
         self.held.get(id)
     }
 
-    pub fn admit(&mut self, frame: Vec<u8>, submission: Submission, prediction: Receipt) {
+    pub fn admit(
+        &mut self,
+        frame: Vec<u8>,
+        submission: Submission,
+        prediction: Receipt,
+        offered: Option<u64>,
+    ) {
         let id = submission.id();
         if self.held.contains_key(&id) {
             return;
@@ -48,6 +71,7 @@ impl Pool {
             submission,
             prediction,
             arrival,
+            offer: offered.map(|at| Offer { at, sends: 1 }),
         };
         self.held.insert(id, held);
     }
@@ -72,6 +96,30 @@ impl Pool {
         for id in gone {
             self.remove(&id);
         }
+    }
+
+    pub fn reoffer(&mut self, height: u64) -> Vec<Vec<u8>> {
+        self.offer_where(height, |offer| offer.waited_out(height))
+    }
+
+    pub fn reoffer_all(&mut self, height: u64) -> Vec<Vec<u8>> {
+        self.offer_where(height, |_| true)
+    }
+
+    fn offer_where(&mut self, height: u64, due: impl Fn(&Offer) -> bool) -> Vec<Vec<u8>> {
+        let mut offered = Vec::new();
+        for id in self.arrived.values() {
+            let held = self.held.get_mut(id).expect("every arrival is held");
+            let Some(offer) = held.offer.filter(&due) else {
+                continue;
+            };
+            held.offer = Some(Offer {
+                at: height,
+                sends: offer.sends + 1,
+            });
+            offered.push(held.frame.clone());
+        }
+        offered
     }
 
     fn remove(&mut self, id: &SubmissionId) {

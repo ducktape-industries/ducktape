@@ -20,6 +20,7 @@ use node::{Block, Node, Sequenced};
 use tokio::sync::watch;
 
 use crate::mesh::{Mesh, Reach, track};
+use crate::relay::{self, Relay};
 use crate::workspace::{Descriptor, Founding, Workspace};
 use crate::{Client, Context, Daemon, Error, Logs, Result, Shared};
 
@@ -41,7 +42,7 @@ pub struct Running<E: Context> {
     pub daemon: Arc<Daemon<E>>,
     _marshal: Marshal,
     _mesh: Mesh<E>,
-    _tasks: [Handle<()>; 2],
+    _tasks: [Handle<()>; 3],
 }
 
 impl<E: Context> Running<E> {
@@ -136,9 +137,12 @@ async fn start<E: Context>(
     let members = node.epoch_members(epoch)?.ok_or(Error::Corrupt(format!(
         "the state records no members for epoch {epoch}"
     )))?;
+    let voters = validators_of(&validators).ok_or(Error::Corrupt(format!(
+        "epoch {epoch} seats an undecodable key"
+    )))?;
 
     let member_cap = node.member_cap()?;
-    let (mesh, marshal_lanes, engine_channels) = Mesh::start(
+    let (mesh, marshal_lanes, engine_channels, (relay_sender, relay_receiver)) = Mesh::start(
         context.child("mesh"),
         identity.clone(),
         &descriptor.id(),
@@ -209,12 +213,17 @@ async fn start<E: Context>(
         logs,
         shutdown,
         votes: membership.votes().clone(),
+        relay: Relay::new(identity.public_key(), relay_sender, voters.as_ref()),
         subscribers: Mutex::new(Vec::new()),
     });
 
     let pump = context.child("pump").spawn({
         let daemon = daemon.clone();
         move |_| pump(daemon, membership, oracle, deliveries)
+    });
+    let relayed = context.child("relay").spawn({
+        let daemon = daemon.clone();
+        move |_| relay::serve(daemon, relay_receiver)
     });
     let listener = tokio::net::TcpListener::bind(listen.http).await?;
     let http = listener.local_addr()?;
@@ -239,7 +248,7 @@ async fn start<E: Context>(
         daemon,
         _marshal: marshal,
         _mesh: mesh,
-        _tasks: [pump, server],
+        _tasks: [pump, server, relayed],
     })
 }
 
@@ -355,16 +364,29 @@ async fn applied<E: Context>(
         daemon.publish(&outcome);
     }
     if !daemon.network.closes_an_epoch(block.height) {
+        let due = node.reoffer()?;
+        drop(node);
+        daemon.relay.send(due.iter().map(Vec::as_slice));
         return Ok(());
     }
     let epoch = daemon.network.epoch_after(block.height);
     let unrecorded = || Error::Corrupt(format!("the boundary block records no epoch {epoch}"));
     let members = node.epoch_members(epoch)?.ok_or_else(unrecorded)?;
     let validators = node.epoch_validators(epoch)?.ok_or_else(unrecorded)?;
+    let seated = validators_of(&validators).ok_or(Error::Corrupt(format!(
+        "epoch {epoch} seats an undecodable key"
+    )))?;
+    let reseated = daemon.relay.seat(seated.as_ref());
+    let due = if reseated {
+        node.reoffer_all()?
+    } else {
+        node.reoffer()?
+    };
     drop(node);
     // The mesh admits every member, so a resident follows the chain; only
     // the validators vote and propose.
     track(oracle, epoch, &members);
+    daemon.relay.send(due.iter().map(Vec::as_slice));
     membership.seat(block.tip(), &validators).await?;
     Ok(())
 }

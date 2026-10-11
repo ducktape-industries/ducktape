@@ -318,7 +318,11 @@ impl Network {
     async fn advance(&mut self, frames: Vec<Vec<u8>>) -> Tip {
         let mut node = self.source.node.lock().await;
         for frame in frames {
-            let taken = node.submit(frame).await.unwrap().unwrap();
+            let taken = node
+                .submit(frame, node::Source::Client)
+                .await
+                .unwrap()
+                .unwrap();
             assert!(matches!(
                 taken.receipt().outcome,
                 abi::Outcome::Applied { .. }
@@ -438,7 +442,7 @@ fn a_joined_node_applies_the_next_block_like_the_source() {
 
         let mut source = network.source.node.lock().await;
         source
-            .submit(frame(&alice, vec![set(b"c", b"3")]))
+            .submit(frame(&alice, vec![set(b"c", b"3")]), node::Source::Client)
             .await
             .unwrap()
             .unwrap();

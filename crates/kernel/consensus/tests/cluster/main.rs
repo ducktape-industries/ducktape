@@ -18,7 +18,7 @@ use fixture_probe::Step;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::{Founding, Genesis, Layer, Limits, Roles, Tip};
-use node::{Block, Frame, Node, Sequenced};
+use node::{Block, Frame, Node, Sequenced, Source};
 
 mod epochs;
 
@@ -360,7 +360,14 @@ impl Peer {
     }
 
     async fn submit(&self, frame: Vec<u8>) {
-        let taken = self.node.lock().await.submit(frame).await.unwrap().unwrap();
+        let taken = self
+            .node
+            .lock()
+            .await
+            .submit(frame, Source::Client)
+            .await
+            .unwrap()
+            .unwrap();
         let receipt = taken.receipt();
         assert!(
             matches!(receipt.outcome, abi::Outcome::Applied { .. }),

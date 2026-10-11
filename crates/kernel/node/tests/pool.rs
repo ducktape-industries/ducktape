@@ -27,7 +27,7 @@ fn applied() -> Receipt {
 fn admit(pool: &mut Pool, signer: &[u8], anchor: u64, payload: &[u8]) -> Submission {
     let submission = submission(signer, anchor, payload);
     let frame = [signer, payload].concat();
-    pool.admit(frame, submission.clone(), applied());
+    pool.admit(frame, submission.clone(), applied(), None);
     submission
 }
 
@@ -49,7 +49,7 @@ fn the_order_is_arrival() {
 fn one_body_is_held_once_whatever_bytes_carry_it() {
     let mut pool = Pool::default();
     let first = admit(&mut pool, b"alice", 0, b"a0");
-    pool.admit(b"another proof".to_vec(), first.clone(), applied());
+    pool.admit(b"another proof".to_vec(), first.clone(), applied(), None);
 
     assert_eq!(pool.len(), 1);
     assert_eq!(pool.get(&first.id()).unwrap().frame, b"alicea0".to_vec());
@@ -71,4 +71,36 @@ fn settling_drops_what_a_block_carried_and_every_frame_whose_anchor_aged_out() {
 
     pool.settle(&[], ANCHOR_WINDOW + 2);
     assert!(pool.is_empty());
+}
+
+#[test]
+fn an_offered_frame_comes_due_after_a_wait_that_doubles_up_to_64_blocks() {
+    let mut pool = Pool::default();
+    let offered = submission(b"alice", 0, b"a0");
+    pool.admit(b"a0".to_vec(), offered, applied(), Some(0));
+    admit(&mut pool, b"bob", 0, b"b0");
+
+    let due: Vec<u64> = (1..=200)
+        .filter(|&height| {
+            let sent = pool.reoffer(height);
+            assert!(sent.iter().all(|frame| frame == b"a0"));
+            !sent.is_empty()
+        })
+        .collect();
+    assert_eq!(due, vec![4, 12, 28, 60, 124, 188]);
+    assert_eq!(pool.reoffer_all(200), vec![b"a0".to_vec()]);
+}
+
+#[test]
+fn a_frame_whose_anchor_aged_out_is_offered_no_more() {
+    let mut pool = Pool::default();
+    pool.admit(
+        b"a0".to_vec(),
+        submission(b"alice", 0, b"a0"),
+        applied(),
+        Some(0),
+    );
+
+    pool.settle(&[], ANCHOR_WINDOW + 1);
+    assert!(pool.reoffer_all(ANCHOR_WINDOW + 1).is_empty());
 }

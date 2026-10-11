@@ -7,7 +7,7 @@ use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_probe::{Reply, Step};
 use host::{ANCHOR_WINDOW, Founding, Genesis, Layer, Limits, Roles, Tip};
 use keyscheme::KeyScheme;
-use node::{Block, Body, Error, Frame, NAMESPACE, Node, Sequenced, Taken};
+use node::{BLOCK_BYTES, Block, Body, Error, Frame, NAMESPACE, Node, Sequenced, Source, Taken};
 
 const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
@@ -166,7 +166,10 @@ fn a_frame_is_preconfirmed_built_and_applied_once() {
         let signer = key(7);
 
         let receipt = new(node
-            .submit(frame(&signer, "probe", script(vec![set(b"k", b"v")])))
+            .submit(
+                frame(&signer, "probe", script(vec![set(b"k", b"v")])),
+                Source::Client,
+            )
             .await
             .unwrap()
             .unwrap());
@@ -188,10 +191,13 @@ fn a_frame_is_preconfirmed_built_and_applied_once() {
         );
 
         let again = held(
-            node.submit(frame(&signer, "probe", script(vec![set(b"k", b"v")])))
-                .await
-                .unwrap()
-                .unwrap(),
+            node.submit(
+                frame(&signer, "probe", script(vec![set(b"k", b"v")])),
+                Source::Client,
+            )
+            .await
+            .unwrap()
+            .unwrap(),
         );
         assert_eq!(again, receipt);
         assert_eq!(node.pending(), 1);
@@ -212,7 +218,10 @@ fn a_frame_is_preconfirmed_built_and_applied_once() {
             Some(b"v".to_vec())
         );
         let refusal = node
-            .submit(frame(&signer, "probe", script(vec![set(b"k", b"v")])))
+            .submit(
+                frame(&signer, "probe", script(vec![set(b"k", b"v")])),
+                Source::Client,
+            )
             .await
             .unwrap()
             .unwrap_err();
@@ -237,10 +246,13 @@ fn a_block_without_the_pending_frame_keeps_it_pending_and_preconfirmed() {
         let dir = tempfile::tempdir().unwrap();
         let (mut node, _) = found(context, dir.path()).await;
         let signer = key(7);
-        node.submit(frame(&signer, "probe", script(vec![set(b"k", b"v")])))
-            .await
-            .unwrap()
-            .unwrap();
+        node.submit(
+            frame(&signer, "probe", script(vec![set(b"k", b"v")])),
+            Source::Client,
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         let tip = node.tip().unwrap();
         let empty = Block::next(tip, TIME + 1, Vec::new());
@@ -278,17 +290,30 @@ fn a_rejected_frame_rides_the_block_and_never_runs_again() {
         let signer = key(7);
         let failing = frame(&signer, "probe", script(vec![Step::Fail("no".into())]));
 
-        let receipt = new(node.submit(failing.clone()).await.unwrap().unwrap());
+        let receipt = new(node
+            .submit(failing.clone(), Source::Client)
+            .await
+            .unwrap()
+            .unwrap());
         assert_eq!(rejected(&receipt), "probe");
         assert_eq!(node.pending(), 1);
-        let resubmitted = held(node.submit(failing.clone()).await.unwrap().unwrap());
+        let resubmitted = held(
+            node.submit(failing.clone(), Source::Client)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
         assert_eq!(resubmitted, receipt);
         assert_eq!(node.pending(), 1);
 
         let (block, applied) = seal(&mut node).await;
         assert_eq!(block.frames, vec![failing.clone()]);
         assert_eq!(rejected(&applied.submissions[0]), "probe");
-        let refusal = node.submit(failing).await.unwrap().unwrap_err();
+        let refusal = node
+            .submit(failing, Source::Client)
+            .await
+            .unwrap()
+            .unwrap_err();
         assert_eq!(refusal.reason, reason::DUPLICATE);
         assert_eq!(node.pending(), 0);
     });
@@ -305,13 +330,21 @@ fn a_leader_leaves_out_what_the_blocks_it_has_not_applied_already_carry() {
         let bob_first = frame(&bob, "probe", script(vec![set(b"b", b"1")]));
         let alice_second = frame(&alice, "probe", script(vec![set(b"a", b"2")]));
         for frame in [&alice_first, &bob_first] {
-            new(node.submit(frame.clone()).await.unwrap().unwrap());
+            new(node
+                .submit(frame.clone(), Source::Client)
+                .await
+                .unwrap()
+                .unwrap());
         }
 
         let tip = node.tip().unwrap();
         let parent = node.build(tip, std::iter::empty(), TIME + 1).unwrap();
         assert_eq!(parent.frames, vec![alice_first.clone(), bob_first.clone()]);
-        new(node.submit(alice_second.clone()).await.unwrap().unwrap());
+        new(node
+            .submit(alice_second.clone(), Source::Client)
+            .await
+            .unwrap()
+            .unwrap());
 
         let child = node.build(parent.tip(), [&parent], TIME + 2).unwrap();
         assert_eq!(child.frames, vec![alice_second.clone()]);
@@ -345,6 +378,43 @@ fn a_leader_leaves_out_what_the_blocks_it_has_not_applied_already_carry() {
 }
 
 #[test]
+fn a_frame_a_client_gave_is_offered_again_until_it_lands_and_a_relayed_one_never_is() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut node, _) = found(context, dir.path()).await;
+        let given = frame(&key(7), "probe", script(vec![set(b"a", b"1")]));
+        let relayed = frame(&key(8), "probe", script(vec![set(b"b", b"1")]));
+        new(node
+            .submit(given.clone(), Source::Client)
+            .await
+            .unwrap()
+            .unwrap());
+        new(node
+            .submit(relayed.clone(), Source::Peer)
+            .await
+            .unwrap()
+            .unwrap());
+
+        let mut offered = Vec::new();
+        for _ in 0..12 {
+            let tip = node.tip().unwrap();
+            let empty = Block::next(tip, TIME + tip.height + 1, Vec::new());
+            node.apply(&empty).await.unwrap();
+            for frame in node.reoffer().unwrap() {
+                offered.push((empty.height, frame));
+            }
+        }
+        assert_eq!(offered, vec![(4, given.clone()), (12, given.clone())]);
+        assert_eq!(node.reoffer_all().unwrap(), vec![given]);
+
+        let (block, _) = seal(&mut node).await;
+        assert_eq!(block.frames.len(), 2);
+        assert_eq!(node.pending(), 0);
+        assert!(node.reoffer_all().unwrap().is_empty());
+    });
+}
+
+#[test]
 fn a_second_proof_of_one_body_is_the_same_frame() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -371,9 +441,18 @@ fn a_second_proof_of_one_body_is_the_same_frame() {
         let (one, two) = (proven("one.test"), proven("two.test"));
         assert_ne!(one, two);
 
-        let receipt = new(node.submit(one.clone()).await.unwrap().unwrap());
+        let receipt = new(node
+            .submit(one.clone(), Source::Client)
+            .await
+            .unwrap()
+            .unwrap());
         assert_eq!(
-            held(node.submit(two.clone()).await.unwrap().unwrap()),
+            held(
+                node.submit(two.clone(), Source::Client)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            ),
             receipt
         );
         assert_eq!(node.pending(), 1);
@@ -389,7 +468,7 @@ fn a_second_proof_of_one_body_is_the_same_frame() {
         assert_eq!(rejected(&applied.submissions[1]), reason::DUPLICATE);
         assert_eq!(node.pending(), 0);
         assert!(!node.due().unwrap());
-        let refusal = node.submit(one).await.unwrap().unwrap_err();
+        let refusal = node.submit(one, Source::Client).await.unwrap().unwrap_err();
         assert_eq!(refusal.reason, reason::DUPLICATE);
     });
 }
@@ -405,7 +484,11 @@ fn a_salt_makes_a_repeated_body_another_frame() {
             Frame::sign(&signer, NETWORK, origin(), salt, "probe", payload).encode()
         };
         for salt in [None, Some(1), Some(2)] {
-            new(node.submit(salted(salt)).await.unwrap().unwrap());
+            new(node
+                .submit(salted(salt), Source::Client)
+                .await
+                .unwrap()
+                .unwrap());
         }
         assert_eq!(node.pending(), 3);
 
@@ -438,11 +521,19 @@ fn a_node_refuses_a_frame_whose_anchor_is_not_a_recent_block() {
             ..origin()
         };
         for anchor in [ahead, forged] {
-            let refusal = node.submit(anchored(anchor)).await.unwrap().unwrap_err();
+            let refusal = node
+                .submit(anchored(anchor), Source::Client)
+                .await
+                .unwrap()
+                .unwrap_err();
             assert_eq!(refusal.reason, reason::ANCHOR);
         }
         assert_eq!(node.pending(), 0);
-        new(node.submit(anchored(origin())).await.unwrap().unwrap());
+        new(node
+            .submit(anchored(origin()), Source::Client)
+            .await
+            .unwrap()
+            .unwrap());
     });
 }
 
@@ -453,7 +544,11 @@ fn a_held_frame_leaves_the_pool_when_its_anchor_ages_out() {
         let (mut node, _) = found(context, dir.path()).await;
         let signer = key(7);
         let aging = frame(&signer, "probe", script(vec![set(b"k", b"v")]));
-        new(node.submit(aging.clone()).await.unwrap().unwrap());
+        new(node
+            .submit(aging.clone(), Source::Client)
+            .await
+            .unwrap()
+            .unwrap());
 
         for height in 1..ANCHOR_WINDOW {
             let empty = Block::next(node.tip().unwrap(), TIME + height, Vec::new());
@@ -474,13 +569,17 @@ fn a_held_frame_leaves_the_pool_when_its_anchor_ages_out() {
         node.apply(&empty).await.unwrap();
         assert_eq!(node.pending(), 0);
         assert!(!node.due().unwrap());
-        let refusal = node.submit(aging).await.unwrap().unwrap_err();
+        let refusal = node
+            .submit(aging, Source::Client)
+            .await
+            .unwrap()
+            .unwrap_err();
         assert_eq!(refusal.reason, reason::ANCHOR);
     });
 }
 
 #[test]
-fn a_frame_is_refused_when_it_names_another_network_or_lies_about_its_signer() {
+fn a_frame_is_refused_when_it_names_another_network_lies_about_its_signer_or_outgrows_a_block() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let (mut node, _) = found(context, dir.path()).await;
@@ -495,7 +594,11 @@ fn a_frame_is_refused_when_it_names_another_network_or_lies_about_its_signer() {
             script(Vec::new()),
         )
         .encode();
-        let refusal = node.submit(foreign).await.unwrap().unwrap_err();
+        let refusal = node
+            .submit(foreign, Source::Client)
+            .await
+            .unwrap()
+            .unwrap_err();
         assert_eq!(refusal.reason, reason::INVALID_INPUT);
 
         let mut forged = Frame::sign(
@@ -507,11 +610,27 @@ fn a_frame_is_refused_when_it_names_another_network_or_lies_about_its_signer() {
             script(Vec::new()),
         );
         forged.body.target = "ping".into();
-        let refusal = node.submit(forged.encode()).await.unwrap().unwrap_err();
+        let refusal = node
+            .submit(forged.encode(), Source::Client)
+            .await
+            .unwrap()
+            .unwrap_err();
         assert_eq!(refusal.reason, reason::INVALID_INPUT);
 
-        let refusal = node.submit(b"junk".to_vec()).await.unwrap().unwrap_err();
+        let refusal = node
+            .submit(b"junk".to_vec(), Source::Client)
+            .await
+            .unwrap()
+            .unwrap_err();
         assert_eq!(refusal.reason, reason::PROTOCOL);
+
+        let uncarried = vec![0; BLOCK_BYTES + 1];
+        let refusal = node
+            .submit(uncarried, Source::Client)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refusal.reason, reason::CAPACITY);
         assert_eq!(node.pending(), 0);
         assert!(!node.due().unwrap());
     });
@@ -587,10 +706,13 @@ fn a_message_lands_in_the_block_that_carries_its_frame() {
         let dir = tempfile::tempdir().unwrap();
         let (mut node, _) = found(context, dir.path()).await;
         let signer = key(7);
-        node.submit(frame(&signer, "ping", message("pong", b"hello", true)))
-            .await
-            .unwrap()
-            .unwrap();
+        node.submit(
+            frame(&signer, "ping", message("pong", b"hello", true)),
+            Source::Client,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(node.due().unwrap());
 
         let (_, applied) = seal(&mut node).await;
@@ -611,15 +733,21 @@ fn a_restart_reopens_at_the_tip() {
         let dir = tempfile::tempdir().unwrap();
         let signer = key(7);
         let (mut node, _) = found(context.child("first"), dir.path()).await;
-        node.submit(frame(&signer, "probe", script(vec![set(b"a", b"1")])))
-            .await
-            .unwrap()
-            .unwrap();
+        node.submit(
+            frame(&signer, "probe", script(vec![set(b"a", b"1")])),
+            Source::Client,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         seal(&mut node).await;
-        node.submit(frame(&signer, "probe", script(vec![set(b"b", b"2")])))
-            .await
-            .unwrap()
-            .unwrap();
+        node.submit(
+            frame(&signer, "probe", script(vec![set(b"b", b"2")])),
+            Source::Client,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let (second, _) = seal(&mut node).await;
         drop(node);
 
@@ -656,7 +784,7 @@ fn an_epoch_seats_the_validators_the_boundary_block_leaves() {
         };
 
         let payload = abi::encode(&(&validators, vec![resident]));
-        node.submit(frame(&signer, "valset", payload))
+        node.submit(frame(&signer, "valset", payload), Source::Client)
             .await
             .unwrap()
             .unwrap();

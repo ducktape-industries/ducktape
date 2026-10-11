@@ -7,6 +7,10 @@ use host::Tip;
 
 pub type Digest = sha256::Digest;
 
+pub const BLOCK_BYTES: usize = 16 << 20;
+const ENVELOPE_BYTES: usize = 1 << 17;
+pub const MESSAGE_BYTES: u32 = (BLOCK_BYTES + ENVELOPE_BYTES) as u32;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Block {
     pub height: u64,
@@ -32,6 +36,39 @@ impl Block {
             time,
             frames,
         }
+    }
+
+    pub fn packed<'a>(
+        parent: Tip,
+        time: u64,
+        frames: impl IntoIterator<Item = &'a Vec<u8>>,
+    ) -> Block {
+        let mut block = Block::next(parent, time, Vec::new());
+        let mut size = block.encode_size();
+        for frame in frames {
+            let count = block.frames.len();
+            let counted = (count + 1).encode_size() - count.encode_size();
+            let grown = size + counted + frame.encode_size();
+            if grown > BLOCK_BYTES {
+                break;
+            }
+            size = grown;
+            block.frames.push(frame.clone());
+        }
+        block
+    }
+
+    pub fn carries(frame: &[u8]) -> bool {
+        let Ok(length) = u32::try_from(frame.len()) else {
+            return false;
+        };
+        let widest = Tip {
+            height: u64::MAX - 1,
+            id: [0; 32],
+        };
+        let empty = Block::next(widest, u64::MAX, Vec::new()).encode_size();
+        let counted = 1usize.encode_size() - 0usize.encode_size();
+        empty + counted + UInt(length).encode_size() + frame.len() <= BLOCK_BYTES
     }
 
     pub fn tip(&self) -> Tip {

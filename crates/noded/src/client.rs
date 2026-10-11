@@ -7,6 +7,7 @@ use host::{Layer, Receipt};
 use reqwest::StatusCode;
 use statesync::{Exchange, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::wire::{
     BlobPut, BlockRef, Blocks, Change, Finalized, Get, Network, Query, Range, Status, route,
@@ -116,7 +117,13 @@ impl Client {
             self.base.replacen("http", "ws", 1),
             route::CHANGES
         );
-        let (socket, _) = tokio_tungstenite::connect_async(url).await?;
+        let unbounded = WebSocketConfig {
+            max_message_size: None,
+            max_frame_size: None,
+            ..WebSocketConfig::default()
+        };
+        let (socket, _) =
+            tokio_tungstenite::connect_async_with_config(url, Some(unbounded), false).await?;
         Ok(socket.filter_map(|message| {
             let change = match message {
                 Ok(Message::Binary(bytes)) => Some(abi::decode(&bytes).map_err(Error::Decode)),

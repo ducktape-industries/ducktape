@@ -4,7 +4,7 @@ use abi::{BlobId, Origin, ProgramId, Refusal, reason};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -12,6 +12,7 @@ use borsh::BorshSerialize;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::Receipt;
+use node::{Source, Taken};
 use statesync::Request;
 
 use crate::wire::{
@@ -41,6 +42,7 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::ADMIN, post(admin::<E>))
         .route(route::SYNC, post(sync::<E>))
         .route(route::METRICS, get(metrics::<E>))
+        .layer(DefaultBodyLimit::disable())
         .with_state(daemon)
 }
 
@@ -84,8 +86,13 @@ async fn network<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Netw
 
 async fn submit<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) -> Reply<Receipt> {
     let mut node = daemon.node.lock().await;
-    match node.submit(body.to_vec()).await {
-        Ok(Ok(taken)) => Reply::Answered(taken.into_receipt()),
+    match node.submit(body.to_vec(), Source::Client).await {
+        Ok(Ok(Taken::New(receipt))) => {
+            drop(node);
+            daemon.relay.send([body.as_ref()]);
+            Reply::Answered(receipt)
+        }
+        Ok(Ok(Taken::Held(receipt))) => Reply::Answered(receipt),
         Ok(Err(refusal)) => Reply::Refused(refusal),
         Err(error) => failed(error),
     }
