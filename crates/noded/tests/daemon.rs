@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use abi::role::validators::Member;
+use abi::role::validators::{Motion, Op};
 use abi::{HostOp, HostReply, Outcome, Scan, reason};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
@@ -76,10 +76,14 @@ impl Seat {
 
     fn join(&self, source: &Client) {
         runner(&self.workspace.runtime_dir()).start(|context| async move {
-            noded::join(context, &self.workspace, source.clone())
+            noded::join(context, &self.workspace, source.clone(), self.p2p, None)
                 .await
                 .unwrap();
         });
+    }
+
+    fn key(&self) -> Vec<u8> {
+        self.identity.public_key().as_ref().to_vec()
     }
 
     fn start(&self) -> Live {
@@ -178,6 +182,24 @@ async fn frame(client: &Client, key: &ed25519::PrivateKey, steps: Vec<Step>) -> 
     signed(client, key, "probe", abi::encode(&steps)).await
 }
 
+async fn membership(client: &Client, key: &ed25519::PrivateKey, op: Op) -> u64 {
+    let anchor = client.status().await.unwrap().anchor();
+    let frame = Frame::sign(
+        key,
+        NETWORK.as_bytes(),
+        anchor,
+        None,
+        "valset",
+        abi::encode(&op),
+    );
+    let (height, receipt) = client.land(&frame).await.unwrap();
+    assert!(
+        matches!(receipt.outcome, Outcome::Applied { .. }),
+        "{receipt:?}"
+    );
+    height
+}
+
 fn submission(frame: &[u8]) -> Submission {
     Frame::decode(frame).unwrap().body.submission()
 }
@@ -219,6 +241,23 @@ fn a_validator_serves_its_network_over_http() {
             status.genesis,
             node::Block::genesis(NETWORK.as_bytes(), TIME).digest().0,
             "the genesis digest a client salts the network name with"
+        );
+        assert_eq!(status.roles.validators, "valset");
+
+        let landing = frame(&client, &alice, vec![Step::Fail("landed".into())]).await;
+        let (height, receipt) = client
+            .land(&Frame::decode(&landing).unwrap())
+            .await
+            .unwrap();
+        let carried = client
+            .block(BlockRef::Height(height))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(carried.txs[0].hash, submission(&landing).id());
+        assert!(
+            matches!(&receipt.outcome, Outcome::Rejected(refusal) if refusal.sentence == "landed"),
+            "{receipt:?}"
         );
 
         let mut changes = client.changes("probe").await.unwrap();
@@ -404,25 +443,14 @@ fn an_offline_resident_leaves_the_chain_finalizing() {
     seat.init(&founding);
     let live = seat.start();
     let client = live.client.clone();
-    let alice = ed25519::PrivateKey::from_seed(11);
-    let member = |key: &ed25519::PrivateKey, address: SocketAddr| Member {
-        key: key.public_key().as_ref().to_vec(),
-        address: address.to_string(),
+    let offline = ed25519::PrivateKey::from_seed(12);
+    let enroll = Op::Enroll {
+        address: free_port().to_string(),
+        invite: None,
     };
-    let valset = abi::encode(&(
-        vec![member(&seat.identity, seat.p2p)],
-        vec![member(&ed25519::PrivateKey::from_seed(12), free_port())],
-    ));
 
     client_runtime().block_on(async {
-        let mut changes = client.changes("valset").await.unwrap();
-        let frame = signed(&client, &alice, "valset", valset).await;
-        let receipt = client.submit(frame).await.unwrap();
-        assert!(
-            matches!(receipt.outcome, Outcome::Applied { .. }),
-            "{receipt:?}"
-        );
-        let recorded = changes.next().await.unwrap().unwrap().height;
+        let recorded = membership(&client, &offline, enroll).await;
         let resident_epoch = recorded / EPOCH_LENGTH + 1;
         let beyond = resident_epoch * EPOCH_LENGTH + 1;
         ::tokio::time::timeout(Duration::from_secs(30), reach(&client, beyond))
@@ -433,11 +461,12 @@ fn an_offline_resident_leaves_the_chain_finalizing() {
     live.thread.join().unwrap();
 }
 
-/// One validator, and a resident the valset adds that joins by state sync
-/// inside the first epoch that records it. It runs no engine, yet it follows
-/// at the tip: it applies the changes the validator makes after it starts,
-/// and comes within two blocks of the validator before the validator applies
-/// the block that closes the epoch, so no next-epoch traffic carried it.
+/// One validator, and a stranger that joins: it enrolls, waits for the epoch
+/// that seats it as a resident, and state-syncs inside it. It runs no
+/// engine, yet it follows at the tip: it applies the changes the validator
+/// makes after it starts, and comes within two blocks of the validator before
+/// the validator applies the block that closes the epoch, so no next-epoch
+/// traffic carried it.
 #[test]
 fn a_resident_follows_at_the_tip() {
     // long enough that the resident joins, starts and catches up inside
@@ -451,31 +480,11 @@ fn a_resident_follows_at_the_tip() {
     let live = seat.start();
     let client = live.client.clone();
     let alice = ed25519::PrivateKey::from_seed(11);
-    let member = |seat: &Seat| Member {
-        key: seat.identity.public_key().as_ref().to_vec(),
-        address: seat.p2p.to_string(),
-    };
-    let valset = abi::encode(&(vec![member(&seat)], vec![member(&resident)]));
     let runtime = client_runtime();
 
-    let epoch = runtime.block_on(async {
-        let mut changes = client.changes("valset").await.unwrap();
-        let frame = signed(&client, &alice, "valset", valset).await;
-        let receipt = client.submit(frame).await.unwrap();
-        assert!(
-            matches!(receipt.outcome, Outcome::Applied { .. }),
-            "{receipt:?}"
-        );
-        let recorded = changes.next().await.unwrap().unwrap().height;
-        let epoch = recorded / EPOCH + 1;
-        ::tokio::time::timeout(Duration::from_secs(60), reach(&client, epoch * EPOCH))
-            .await
-            .expect("the chain reaches the first epoch that records the resident");
-        epoch
-    });
-    let closing = (epoch + 1) * EPOCH - 1;
-
     resident.join(&client);
+    let epoch = runtime.block_on(client.status()).unwrap().epoch;
+    let closing = (epoch + 1) * EPOCH - 1;
     let follower = resident.start();
     runtime.block_on(async {
         let mut changes = follower.client.changes("probe").await.unwrap();
@@ -536,26 +545,13 @@ fn a_shrunk_set_finalizes_without_the_removed_member() {
         seat.init(&founding);
     }
     let live: Vec<Live> = seats.iter().map(Seat::start).collect();
-    let alice = ed25519::PrivateKey::from_seed(11);
-    let member = |seat: &Seat| Member {
-        key: seat.identity.public_key().as_ref().to_vec(),
-        address: seat.p2p.to_string(),
-    };
-    let valset = abi::encode(&(
-        vec![member(&seats[0]), member(&seats[1])],
-        Vec::<Member>::new(),
-    ));
+    let remove = Op::Vote(Motion::Remove {
+        key: seats[2].key(),
+    });
 
     client_runtime().block_on(async {
         let client = &live[0].client;
-        let mut changes = client.changes("valset").await.unwrap();
-        let frame = signed(client, &alice, "valset", valset).await;
-        let receipt = client.submit(frame).await.unwrap();
-        assert!(
-            matches!(receipt.outcome, Outcome::Applied { .. }),
-            "{receipt:?}"
-        );
-        let recorded = changes.next().await.unwrap().unwrap().height;
+        let recorded = membership(client, &seats[0].identity, remove).await;
         let shrunk = recorded / EPOCH_LENGTH + 1;
         ::tokio::time::timeout(
             Duration::from_secs(30),
@@ -668,29 +664,9 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
         seat.init(&founding);
     }
     let founders: Vec<Live> = seats.iter().map(Seat::start).collect();
-    let member = |seat: &Seat| Member {
-        key: seat.identity.public_key().as_ref().to_vec(),
-        address: seat.p2p.to_string(),
-    };
-    let valset = abi::encode(&(
-        seats.iter().map(member).collect::<Vec<_>>(),
-        vec![member(&resident)],
-    ));
-    let alice = ed25519::PrivateKey::from_seed(11);
     let bob = ed25519::PrivateKey::from_seed(12);
     let runtime = client_runtime();
 
-    runtime.block_on(async {
-        let client = &founders[0].client;
-        let mut changes = client.changes("valset").await.unwrap();
-        let frame = signed(client, &alice, "valset", valset).await;
-        client.submit(frame).await.unwrap();
-        let recorded = changes.next().await.unwrap().unwrap().height;
-        let epoch = recorded / EPOCH_LENGTH + 1;
-        ::tokio::time::timeout(Duration::from_secs(30), reach(client, epoch * EPOCH_LENGTH))
-            .await
-            .expect("the chain enters the first epoch that records the resident");
-    });
     resident.join(&founders[0].client);
     let follower = resident.start();
     let given = |steps: Vec<Step>| runtime.block_on(frame(&follower.client, &bob, steps));
