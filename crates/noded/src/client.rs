@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
-use abi::{BlobId, Entry, ProgramId, Refusal, Scan};
+use abi::{BlobId, Entry, ProgramId, Refusal, Scan, reason};
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::{Stream, StreamExt as _};
-use host::{Layer, Receipt};
+use host::{ANCHOR_WINDOW, Layer, RECENT, Receipt, SubmissionId};
+use node::Frame;
 use reqwest::StatusCode;
 use statesync::{Exchange, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
@@ -45,6 +46,36 @@ impl Client {
 
     pub async fn submit(&self, frame: Vec<u8>) -> Result<Receipt> {
         self.post_raw(route::SUBMIT, frame).await
+    }
+
+    pub async fn land(&self, frame: &Frame) -> Result<(u64, Receipt)> {
+        let submission = frame.body.submission();
+        let id = submission.id();
+        let last = submission.anchor.height + ANCHOR_WINDOW;
+        let mut blocks = self.changes(RECENT).await?;
+        self.submit(frame.encode()).await?;
+        while let Some(change) = blocks.next().await {
+            let height = change?.height;
+            if let Some(receipt) = self.carried(height, &id).await? {
+                return Ok((height, receipt));
+            }
+            let aged_out = height >= last;
+            if aged_out {
+                return Err(Error::Refused(Refusal::new(
+                    reason::ANCHOR,
+                    "no block carried the frame before its anchor aged out",
+                )));
+            }
+        }
+        Err(Error::Closed)
+    }
+
+    async fn carried(&self, height: u64, id: &SubmissionId) -> Result<Option<Receipt>> {
+        let Some(block) = self.block(BlockRef::Height(height)).await? else {
+            return Ok(None);
+        };
+        let tx = block.txs.into_iter().find(|tx| &tx.hash == id);
+        Ok(tx.and_then(|tx| tx.receipt))
     }
 
     pub async fn query(&self, layer: Layer, frame: Vec<u8>) -> Result<Vec<u8>> {

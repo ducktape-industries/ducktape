@@ -52,7 +52,7 @@ member_cap = 16               # optional, default 16: the most members (validato
 
 [roles]                       # the founding program the kernel calls in each role; all three required
 registry = "module-registry"  # registers and swaps programs
-validators = "valset"         # seats each epoch's validators
+validators = "valset"         # seats each epoch's validators; runs membership and the validators' votes
 identity = "identity"         # resolves a key or a program to its account
 
 [[validators]]
@@ -98,13 +98,27 @@ ducktape init genesis.toml                          # found the network in $DUCK
 ducktape run --listen 0.0.0.0:9000 --http 127.0.0.1:8844
 ```
 
-A validator named in the file joins by adopting the network's state from any
-running node, then runs like a founder:
+Any node joins through a running one. `join` signs an enrollment with the
+node's key and sends it to the program in the validators role. Once the
+epoch that seats the node begins, `join` adopts the network's state, and the
+node runs like a founder. A stranger joins as a resident: it follows the
+chain and never votes or proposes. A validator named in the file joins the
+same way and keeps its seat.
 
 ```sh
-ducktape join http://203.0.113.7:8844
+ducktape join http://203.0.113.7:8844 --address 203.0.113.9:9000 --invite <hex>
 ducktape run --listen 0.0.0.0:9000
 ```
+
+Membership changes only by the validators' vote. The door starts closed, so
+a stranger needs an invite a validator signed: `ducktape invite` prints one,
+good for one enrollment for 72 hours (`--hours`). Validators vote with
+`ducktape vote promote|demote|remove <key>`, `ducktape vote open|close` (the
+door), and `ducktape vote registry <op>`, which sends the registry a
+program change once it passes; the registry takes a change from nothing
+else. A motion passes when more than two thirds of the current validators
+vote for it. `ducktape leave` takes the node out; the last validator cannot
+leave. Each prints the block that carried it.
 
 The workspace (`--workspace`, default `$DUCKTAPE_HOME` else `~/.ducktape`)
 holds `identity.key`, the network descriptor, the anchor the node started
@@ -113,7 +127,7 @@ from, the address its HTTP surface bound and the runtime's storage.
 ## Use a network
 
 ```sh
-ducktape status                         # height, tip, root, epoch, identity
+ducktape status                         # height, tip, root, epoch, identity, role bindings
 ducktape wallet new alice               # a user key; DUCKTAPE_PASSWORD or a prompt
 ducktape submit ping request.bin        # sign a frame with the active wallet, print its preconfirmed receipt
 ducktape get ping 6b6579                # a key in hex, from the preconfirmed layer

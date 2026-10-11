@@ -66,6 +66,18 @@ fn member(key: &ed25519::PrivateKey) -> validators::Member {
     }
 }
 
+fn valset(key: &ed25519::PrivateKey, op: &validators::Op) -> Vec<u8> {
+    Frame::sign(key, NETWORK, origin(), None, "valset", abi::encode(op)).encode()
+}
+
+fn enroll(key: &ed25519::PrivateKey) -> Vec<u8> {
+    let enroll = validators::Op::Enroll {
+        address: member(key).address,
+        invite: None,
+    };
+    valset(key, &enroll)
+}
+
 fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),

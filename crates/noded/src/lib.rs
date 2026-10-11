@@ -22,7 +22,7 @@ use tokio::sync::watch;
 pub use client::Client;
 pub use logs::Logs;
 pub use mesh::{Mesh, Reach};
-pub use run::{Listen, Running, init, join, run};
+pub use run::{Listen, Running, init, invite, join, run};
 pub use wire::{NODE_CONTRACT, Status};
 pub use workspace::{Descriptor, Founding, Workspace};
 
@@ -70,6 +70,8 @@ pub enum Error {
     Refused(Refusal),
     #[error("the node failed ({status}): {sentence}")]
     Failed { status: u16, sentence: String },
+    #[error("the node closed its change stream")]
+    Closed,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for Error {
@@ -112,6 +114,7 @@ impl<E: Context> Daemon<E> {
             identity: self.identity.clone(),
             contract: NODE_CONTRACT,
             genesis: self.descriptor.genesis_block().digest().0,
+            roles: node.host().roles().clone(),
         })
     }
 

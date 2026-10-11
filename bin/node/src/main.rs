@@ -2,6 +2,7 @@ use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use abi::role::validators::{Grant, Invite, Motion, Op, Voted};
 use abi::{BlobId, HashKind, Outcome, Scan};
 use clap::{Parser, Subcommand};
 use commonware_cryptography::{Signer as _, ed25519};
@@ -40,8 +41,17 @@ enum Verb {
     Identity,
     #[command(about = "found a network in this workspace from a founding file")]
     Init { founding: PathBuf },
-    #[command(about = "join a network by syncing its state from a running node")]
-    Join { source: String },
+    #[command(about = "enroll this node in a network, then sync its state from a running node")]
+    Join {
+        source: String,
+        #[arg(long, help = "the address peers dial this node at")]
+        address: SocketAddr,
+        #[arg(
+            long,
+            help = "a validator's invite, in hex; none when the door is open"
+        )]
+        invite: Option<String>,
+    },
     #[command(about = "run the node")]
     Run {
         #[arg(long, help = "the address peers dial")]
@@ -102,6 +112,15 @@ enum Verb {
     Shutdown,
     #[command(about = "print the node's metrics")]
     Metrics,
+    #[command(about = "print an invite this node signs: one stranger enrolls with it, once")]
+    Invite {
+        #[arg(long, default_value_t = 72)]
+        hours: u64,
+    },
+    #[command(subcommand, about = "vote, as a validator, on a motion")]
+    Vote(VoteVerb),
+    #[command(about = "take this node out of the network's members")]
+    Leave,
     #[command(subcommand, about = "the user keys that sign frames")]
     Wallet(WalletVerb),
 }
@@ -120,6 +139,24 @@ enum BlobVerb {
     },
     #[command(about = "list the blob ids the state names and the node lacks")]
     Missing,
+}
+
+#[derive(Subcommand)]
+enum VoteVerb {
+    #[command(about = "seat a resident as a validator")]
+    Promote { key: String },
+    #[command(about = "unseat a validator; it stays a resident")]
+    Demote { key: String },
+    #[command(about = "take a member out of the network")]
+    Remove { key: String },
+    #[command(about = "let anyone enroll without an invite")]
+    Open,
+    #[command(about = "make enrolling take an invite")]
+    Close,
+    #[command(
+        about = "send the registry an op, a file or stdin: schedule or cancel a program change"
+    )]
+    Registry { op: Option<PathBuf> },
 }
 
 #[derive(Subcommand)]
@@ -166,11 +203,18 @@ fn execute(cli: Cli) -> Result<(), String> {
         Verb::Init { founding } => node_runtime(&workspace).start(|context| async move {
             noded::init(context, &workspace, &founding).await.sentence()
         }),
-        Verb::Join { source } => node_runtime(&workspace).start(|context| async move {
-            noded::join(context, &workspace, Client::new(source))
-                .await
-                .sentence()
-        }),
+        Verb::Join {
+            source,
+            address,
+            invite,
+        } => {
+            let invite = invite.map(|hex| decode_invite(&hex)).transpose()?;
+            node_runtime(&workspace).start(|context| async move {
+                noded::join(context, &workspace, Client::new(source), address, invite)
+                    .await
+                    .sentence()
+            })
+        }
         Verb::Run {
             listen,
             http,
@@ -240,6 +284,10 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             );
             println!("identity  {}", hex::encode(&status.identity));
             println!("contract  {}", status.contract);
+            println!(
+                "roles     registry {}, validators {}, identity {}",
+                status.roles.registry, status.roles.validators, status.roles.identity
+            );
             Ok(())
         }
         Verb::Submit { program, payload } => {
@@ -387,6 +435,36 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             print!("{}", client.metrics().await.sentence()?);
             Ok(())
         }
+        Verb::Invite { hours } => {
+            let status = client.status().await.sentence()?;
+            let identity = workspace.identity().sentence()?;
+            let grant = Grant {
+                network: status.network.into_bytes(),
+                nonce: nonce(),
+                expires: now_ms()? + hours * 3_600_000,
+            };
+            println!(
+                "{}",
+                hex::encode(abi::encode(&noded::invite(&identity, grant)))
+            );
+            Ok(())
+        }
+        Verb::Vote(verb) => {
+            let motion = motion(verb)?;
+            let (height, output) = membership(workspace, client, Op::Vote(motion)).await?;
+            match abi::decode(&output).map_err(|refusal| refusal.sentence)? {
+                Voted::Counted { votes, needed } => {
+                    println!("counted {votes} of {needed} at block {height}")
+                }
+                Voted::Enacted => println!("enacted at block {height}"),
+            }
+            Ok(())
+        }
+        Verb::Leave => {
+            let (height, _) = membership(workspace, client, Op::Leave).await?;
+            println!("left at block {height}");
+            Ok(())
+        }
         Verb::Version
         | Verb::Identity
         | Verb::Init { .. }
@@ -394,6 +472,61 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         | Verb::Run { .. }
         | Verb::Wallet(_) => unreachable!("handled before the client is built"),
     }
+}
+
+async fn membership(
+    workspace: &Workspace,
+    client: &Client,
+    op: Op,
+) -> Result<(u64, Vec<u8>), String> {
+    let status = client.status().await.sentence()?;
+    let identity = workspace.identity().sentence()?;
+    let frame = Frame::sign(
+        &identity,
+        status.network.as_bytes(),
+        status.anchor(),
+        Some(salt()),
+        &status.roles.validators,
+        abi::encode(&op),
+    );
+    let (height, receipt) = client.land(&frame).await.sentence()?;
+    match receipt.outcome {
+        Outcome::Applied { output } => Ok((height, output)),
+        Outcome::Rejected(refusal) => Err(format!(
+            "refused at block {height}: {}: {}",
+            refusal.reason, refusal.sentence
+        )),
+    }
+}
+
+fn motion(verb: VoteVerb) -> Result<Motion, String> {
+    let key = |hex: String| hex::decode(hex).sentence();
+    Ok(match verb {
+        VoteVerb::Promote { key: member } => Motion::Promote { key: key(member)? },
+        VoteVerb::Demote { key: member } => Motion::Demote { key: key(member)? },
+        VoteVerb::Remove { key: member } => Motion::Remove { key: key(member)? },
+        VoteVerb::Open => Motion::Door { open: true },
+        VoteVerb::Close => Motion::Door { open: false },
+        VoteVerb::Registry { op } => Motion::Registry { op: bytes(op)? },
+    })
+}
+
+fn decode_invite(text: &str) -> Result<Invite, String> {
+    let bytes = hex::decode(text).sentence()?;
+    abi::decode(&bytes).map_err(|refusal| refusal.sentence)
+}
+
+fn nonce() -> [u8; 16] {
+    let mut nonce = [0; 16];
+    rand_core::Rng::fill_bytes(&mut rand_core::UnwrapErr(rand::rngs::SysRng), &mut nonce);
+    nonce
+}
+
+fn now_ms() -> Result<u64, String> {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .sentence()?;
+    Ok(since.as_millis() as u64)
 }
 
 fn salt() -> u64 {

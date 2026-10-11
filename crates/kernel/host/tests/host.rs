@@ -148,6 +148,22 @@ fn submit(target: &str, payload: Vec<u8>) -> Submission {
     }
 }
 
+fn enroll(key: &[u8], address: &str) -> Submission {
+    let enroll = validators::Op::Enroll {
+        address: address.to_owned(),
+        invite: None,
+    };
+    Submission {
+        signer: key.to_vec(),
+        ..submit("valset", abi::encode(&enroll))
+    }
+}
+
+fn promote(key: &[u8]) -> Submission {
+    let motion = validators::Motion::Promote { key: key.to_vec() };
+    submit("valset", abi::encode(&validators::Op::Vote(motion)))
+}
+
 fn anchor(height: u64) -> Tip {
     Tip {
         height,
@@ -1406,18 +1422,23 @@ fn an_epoch_is_recorded_as_the_block_ending_the_one_before_commits() {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
         let founding = vec![member(b"v1", "v1:1")];
-        let validators = vec![member(b"v1", "v1:1"), member(b"v2", "v2:2")];
-        let resident = member(b"r3", "r3:3");
-        let members = [validators.clone(), vec![resident.clone()]].concat();
+        let members = vec![
+            member(b"v1", "v1:1"),
+            member(b"v2", "v2:2"),
+            member(b"r3", "r3:3"),
+        ];
         let keys = vec![b"v1".to_vec(), b"v2".to_vec()];
 
         host.apply(block(1, Vec::new())).await.unwrap();
-        let payload = abi::encode(&(validators, vec![resident]));
-        let applied = host
-            .apply(block(2, vec![submit("valset", payload)]))
-            .await
-            .unwrap();
-        assert_eq!(applied.submissions[0].outcome, ok(b""));
+        let seating = vec![enroll(b"v2", "v2:2"), enroll(b"r3", "r3:3"), promote(b"v2")];
+        let applied = host.apply(block(2, seating)).await.unwrap();
+        let outcomes: Vec<Outcome> = applied
+            .submissions
+            .into_iter()
+            .map(|receipt| receipt.outcome)
+            .collect();
+        let enacted = ok(&abi::encode(&validators::Voted::Enacted));
+        assert_eq!(outcomes, vec![ok(b""), ok(b""), enacted]);
         assert_eq!(host.epoch_members(0).unwrap(), Some(founding.clone()));
         assert_eq!(
             host.epoch_validators(0).unwrap(),
@@ -2397,14 +2418,8 @@ fn an_epoch_seating_more_members_than_the_cap_is_not_applied() {
         let mut founding = standard();
         founding.member_cap = 2;
         let mut host = found(context, "net", dir.path(), founding).await;
-        // the fixture valset ignores the cap: three members past a cap of two
-        let payload = abi::encode(&(
-            vec![member(b"v1", "v1:1"), member(b"v2", "v2:2")],
-            vec![member(b"r3", "r3:3")],
-        ));
-        host.apply(block(1, vec![submit("valset", payload)]))
-            .await
-            .unwrap();
+        let past_the_cap = vec![enroll(b"v2", "v2:2"), enroll(b"r3", "r3:3"), promote(b"v2")];
+        host.apply(block(1, past_the_cap)).await.unwrap();
         host.apply(block(2, Vec::new())).await.unwrap();
         let tip = host.tip().unwrap();
         let closing = host.apply(block(3, Vec::new())).await;

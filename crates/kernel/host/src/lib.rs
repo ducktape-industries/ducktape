@@ -532,6 +532,10 @@ where
             .transpose()
     }
 
+    pub fn roles(&self) -> &Roles {
+        &self.roles
+    }
+
     pub fn root(&self) -> Result<Root> {
         let roots = self.store.roots()?;
         Ok(Root(Sha256::digest(abi::encode(&roots)).into()))

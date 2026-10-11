@@ -777,17 +777,29 @@ fn an_epoch_seats_the_validators_the_boundary_block_leaves() {
         let signer = key(7);
         let founding = vec![member(&key(1), "v1:1")];
         let validators = vec![member(&key(1), "v1:1"), member(&key(2), "v2:1")];
-        let resident = member(&key(3), "r3:1");
-        let members = [validators.clone(), vec![resident.clone()]].concat();
+        let members = [validators.clone(), vec![member(&key(3), "r3:1")]].concat();
         let keys = |set: &[validators::Member]| -> Vec<Vec<u8>> {
             set.iter().map(|member| member.key.clone()).collect()
         };
 
-        let payload = abi::encode(&(&validators, vec![resident]));
-        node.submit(frame(&signer, "valset", payload), Source::Client)
-            .await
-            .unwrap()
-            .unwrap();
+        let enroll = |key: &ed25519::PrivateKey, address: &str| {
+            let enroll = validators::Op::Enroll {
+                address: address.to_owned(),
+                invite: None,
+            };
+            frame(key, "valset", abi::encode(&enroll))
+        };
+        let promote = validators::Op::Vote(validators::Motion::Promote {
+            key: key(2).public_key().as_ref().to_vec(),
+        });
+        let seating = [
+            enroll(&key(2), "v2:1"),
+            enroll(&key(3), "r3:1"),
+            frame(&signer, "valset", abi::encode(&promote)),
+        ];
+        for frame in seating {
+            new(node.submit(frame, Source::Client).await.unwrap().unwrap());
+        }
         let (_, applied) = seal(&mut node).await;
         assert_eq!(applied.height, 1);
         assert_eq!(node.epoch_members(0).unwrap(), Some(founding.clone()));
