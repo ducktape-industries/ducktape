@@ -48,7 +48,7 @@ struct Seat {
     p2p: SocketAddr,
     http: SocketAddr,
     tls: SocketAddr,
-    address: String,
+    address: Option<String>,
 }
 
 impl Seat {
@@ -65,16 +65,16 @@ impl Seat {
             p2p,
             http: free_port(),
             tls: free_port(),
-            address: format!("tcp://localhost:{}", p2p.port()),
+            address: Some(format!("tcp://localhost:{}", p2p.port())),
         }
     }
 
     fn validator(&self) -> String {
-        format!(
-            "[[validators]]\nkey = \"{}\"\naddress = \"{}\"\n",
-            hex::encode(self.identity.public_key().as_ref()),
-            self.address
-        )
+        let key = hex::encode(self.identity.public_key().as_ref());
+        let Some(address) = &self.address else {
+            return format!("[[validators]]\nkey = \"{key}\"\n");
+        };
+        format!("[[validators]]\nkey = \"{key}\"\naddress = \"{address}\"\n")
     }
 
     fn init(&self, founding: &Path) {
@@ -87,7 +87,10 @@ impl Seat {
 
     fn join(&self, source: &Client) {
         runner(&self.workspace.runtime_dir()).start(|context| async move {
-            let address: Endpoint = self.address.parse().unwrap();
+            let address = self
+                .address
+                .as_deref()
+                .map(|text| text.parse::<Endpoint>().unwrap());
             noded::join(context, &self.workspace, source.clone(), address, None)
                 .await
                 .unwrap();
@@ -457,7 +460,7 @@ fn an_offline_resident_leaves_the_chain_finalizing() {
     let client = live.client.clone();
     let offline = ed25519::PrivateKey::from_seed(12);
     let enroll = Op::Enroll {
-        address: unheard(),
+        address: Some(unheard()),
         invite: None,
     };
 
@@ -486,7 +489,8 @@ fn a_resident_follows_at_the_tip() {
     const EPOCH: u64 = 100;
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
-    let resident = Seat::new(root.path(), "n1");
+    let mut resident = Seat::new(root.path(), "n1");
+    resident.address = None;
     let founding = founding(root.path(), &[&seat], EPOCH);
     seat.init(&founding);
     let live = seat.start();
@@ -786,9 +790,9 @@ fn terminate_tls(runtime: &::tokio::runtime::Runtime, listen: SocketAddr, to: So
     });
 }
 
-/// Two validators, and only `dialed` can be dialed: `dialer`'s address names
-/// a port nothing listens on. A set of two finalizes only with both votes,
-/// so a block proves `dialer` reached `dialed` at `dialed.address`.
+/// Two validators, and only `dialed` can be dialed: `dialer` has no address.
+/// A set of two finalizes only with both votes, so a block proves `dialer`
+/// reached `dialed` at `dialed.address`.
 fn reached(runtime: &::tokio::runtime::Runtime, root: &Path, dialer: Seat, dialed: Seat) {
     let founding = founding(root, &[&dialer, &dialed], EPOCH_LENGTH);
     dialer.init(&founding);
@@ -821,8 +825,8 @@ fn dialed_at(address: impl FnOnce(&Seat) -> String) {
     let root = tempfile::tempdir().unwrap();
     let mut dialer = Seat::new(root.path(), "n0");
     let mut dialed = Seat::new(root.path(), "n1");
-    dialer.address = unheard();
-    dialed.address = address(&dialed);
+    dialer.address = None;
+    dialed.address = Some(address(&dialed));
     reached(&client_runtime(), root.path(), dialer, dialed);
 }
 
@@ -849,7 +853,7 @@ fn a_validator_is_dialed_over_wss_through_a_tls_terminator() {
     let mut dialed = Seat::new(root.path(), "n1");
     let terminator = free_port();
     terminate_tls(&runtime, terminator, dialed.http);
-    dialer.address = unheard();
-    dialed.address = format!("wss://localhost:{}", terminator.port());
+    dialer.address = None;
+    dialed.address = Some(format!("wss://localhost:{}", terminator.port()));
     reached(&runtime, root.path(), dialer, dialed);
 }

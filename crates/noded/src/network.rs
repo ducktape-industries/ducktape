@@ -61,7 +61,7 @@ mod tests {
     fn member(key: u8) -> Member {
         Member {
             key: vec![key],
-            address: String::new(),
+            address: None,
         }
     }
 

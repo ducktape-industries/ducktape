@@ -29,7 +29,7 @@ fn key(seed: u64) -> ed25519::PrivateKey {
 fn member(key: &ed25519::PrivateKey, address: &str) -> validators::Member {
     validators::Member {
         key: key.public_key().as_ref().to_vec(),
-        address: address.to_owned(),
+        address: Some(address.to_owned()),
     }
 }
 
@@ -784,7 +784,7 @@ fn an_epoch_seats_the_validators_the_boundary_block_leaves() {
 
         let enroll = |key: &ed25519::PrivateKey, address: &str| {
             let enroll = validators::Op::Enroll {
-                address: address.to_owned(),
+                address: Some(address.to_owned()),
                 invite: None,
             };
             frame(key, "valset", abi::encode(&enroll))

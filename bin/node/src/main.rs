@@ -47,9 +47,10 @@ enum Verb {
         #[arg(
             long,
             help = "where peers dial this node: tcp://host:port, tls://host:port, \
-                    ws://host[:port] or wss://host[:port]"
+                    ws://host[:port] or wss://host[:port]; without it the node dials \
+                    the others and is never dialed"
         )]
-        address: Endpoint,
+        address: Option<Endpoint>,
         #[arg(
             long,
             help = "a validator's invite, in hex; none when the door is open"
