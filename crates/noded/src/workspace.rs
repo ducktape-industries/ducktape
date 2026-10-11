@@ -173,7 +173,7 @@ pub struct Metering {
 #[derive(Debug, Deserialize)]
 pub struct Validator {
     pub key: String,
-    pub address: String,
+    pub address: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,10 +211,15 @@ impl Founding {
             .validators
             .iter()
             .map(|validator| {
-                let address: Endpoint = validator.address.parse().map_err(Error::Address)?;
+                let address = validator
+                    .address
+                    .as_deref()
+                    .map(str::parse::<Endpoint>)
+                    .transpose()
+                    .map_err(Error::Address)?;
                 Ok(Member {
                     key: hex::decode(&validator.key)?,
-                    address: address.to_string(),
+                    address: address.as_ref().map(Endpoint::to_string),
                 })
             })
             .collect::<Result<Vec<_>>>()?;

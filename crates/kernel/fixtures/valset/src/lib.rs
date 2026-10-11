@@ -44,7 +44,7 @@ mod program {
             held(&mut self.validators).or_else(|| held(&mut self.residents))
         }
 
-        fn enroll(&mut self, key: Vec<u8>, address: String) {
+        fn enroll(&mut self, key: Vec<u8>, address: Option<String>) {
             let moved = self
                 .validators
                 .iter_mut()

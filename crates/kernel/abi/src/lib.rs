@@ -408,7 +408,7 @@ pub mod role {
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub struct Member {
             pub key: Vec<u8>,
-            pub address: String,
+            pub address: Option<String>,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -436,7 +436,7 @@ pub mod role {
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Op {
             Enroll {
-                address: String,
+                address: Option<String>,
                 invite: Option<Invite>,
             },
             Leave,

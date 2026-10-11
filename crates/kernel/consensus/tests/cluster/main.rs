@@ -62,7 +62,7 @@ fn key(seed: u64) -> ed25519::PrivateKey {
 fn member(key: &ed25519::PrivateKey) -> validators::Member {
     validators::Member {
         key: key.public_key().as_ref().to_vec(),
-        address: format!("{}:1", key.public_key()),
+        address: Some(format!("{}:1", key.public_key())),
     }
 }
 

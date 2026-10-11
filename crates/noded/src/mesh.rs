@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use abi::role::validators::Member;
 use commonware_codec::DecodeExt as _;
@@ -18,6 +18,7 @@ use crate::transport::{self, Bridges};
 use crate::{Context, Result};
 
 pub const QUOTA_PER_SECOND: u32 = 1024;
+const UNDIALED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
 pub type Lane<E> = (Sender<PublicKey, E>, Receiver<PublicKey>);
 
@@ -101,28 +102,37 @@ pub struct Tracker {
 impl Tracker {
     pub fn track(&mut self, epoch: u64, members: &[Member]) {
         let mut kept = HashSet::new();
-        let peers: Vec<(PublicKey, Address)> = members
-            .iter()
-            .filter_map(|member| self.peer(epoch, member, &mut kept))
-            .collect();
+        let mut dialed = Vec::new();
+        let mut accepted = Vec::new();
+        for member in members {
+            let Ok(key) = PublicKey::decode(member.key.as_slice()) else {
+                continue;
+            };
+            match self.dialed_at(epoch, &key, member, &mut kept) {
+                Some(address) => dialed.push((key, address)),
+                None => accepted.push((key, Address::Symmetric(UNDIALED))),
+            }
+        }
         self.bridges.keep(&kept);
-        let _ = self.oracle.track(
-            epoch,
-            AddressableTrackedPeers::from(Map::from_iter_dedup(peers)),
+        let peers = AddressableTrackedPeers::new(
+            Map::from_iter_dedup(dialed),
+            Map::from_iter_dedup(accepted),
         );
+        let _ = self.oracle.track(epoch, peers);
     }
 
-    fn peer(
+    fn dialed_at(
         &mut self,
         epoch: u64,
+        key: &PublicKey,
         member: &Member,
         kept: &mut HashSet<Endpoint>,
-    ) -> Option<(PublicKey, Address)> {
-        let key = PublicKey::decode(member.key.as_slice()).ok()?;
-        if key == self.me {
-            return Some((key, Address::Symmetric(self.listen)));
+    ) -> Option<Address> {
+        if *key == self.me {
+            return Some(Address::Symmetric(self.listen));
         }
-        let endpoint = match member.address.parse::<Endpoint>() {
+        let address = member.address.as_deref()?;
+        let endpoint = match address.parse::<Endpoint>() {
             Ok(endpoint) => endpoint,
             Err(error) => {
                 tracing::warn!(
@@ -130,7 +140,7 @@ impl Tracker {
                     epoch,
                     reason = "member_address_unparsable",
                     %error,
-                    "a member of the epoch cannot be dialed"
+                    "a member of the epoch is not dialed; it is accepted when it dials"
                 );
                 return None;
             }
@@ -144,13 +154,13 @@ impl Tracker {
                     reason = "bridge_unbound",
                     %endpoint,
                     %error,
-                    "a member of the epoch cannot be dialed"
+                    "a member of the epoch is not dialed; it is accepted when it dials"
                 );
                 return None;
             }
         };
         kept.insert(endpoint);
-        Some((key, Address::Symmetric(local)))
+        Some(Address::Symmetric(local))
     }
 }
 
@@ -174,7 +184,7 @@ mod tests {
             let members: Vec<Member> = (1..=foreign)
                 .map(|seed| Member {
                     key: PrivateKey::from_seed(seed).public_key().as_ref().to_vec(),
-                    address: format!("tcp://localhost:{}", 9_000 + seed),
+                    address: Some(format!("tcp://localhost:{}", 9_000 + seed)),
                 })
                 .collect();
             tracker.track(0, &members);

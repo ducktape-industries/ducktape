@@ -225,6 +225,9 @@ opt-level = 3
 [profile.dev.package.wasmparser]
 opt-level = 3
 
+[profile.dev.package.sha2]
+opt-level = 3
+
 # The sign-in unlock, and every signed write after it, runs one argon2id pass
 # over a 64 MiB buffer (`crates/keystore/src/userkey.rs` DEFAULT_M_KIB) — the KDF is
 # SUPPOSED to be expensive, but only at its release speed. Unoptimized it is
