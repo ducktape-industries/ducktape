@@ -12,7 +12,7 @@ use futures::StreamExt as _;
 use host::Layer;
 use node::Frame;
 use noded::wire::Admin;
-use noded::{Client, Listen, Logs, Reach, Workspace};
+use noded::{Client, Endpoint, Listen, Logs, Workspace};
 
 #[derive(Parser)]
 #[command(name = "ducktape", about = "a ducktape node and its client", version)]
@@ -44,8 +44,12 @@ enum Verb {
     #[command(about = "enroll this node in a network, then sync its state from a running node")]
     Join {
         source: String,
-        #[arg(long, help = "the address peers dial this node at")]
-        address: SocketAddr,
+        #[arg(
+            long,
+            help = "where peers dial this node: tcp://host:port, tls://host:port, \
+                    ws://host[:port] or wss://host[:port]"
+        )]
+        address: Endpoint,
         #[arg(
             long,
             help = "a validator's invite, in hex; none when the door is open"
@@ -54,12 +58,16 @@ enum Verb {
     },
     #[command(about = "run the node")]
     Run {
-        #[arg(long, help = "the address peers dial")]
+        #[arg(long, help = "the socket peers reach over tcp")]
         listen: SocketAddr,
-        #[arg(long, default_value = "127.0.0.1:0")]
+        #[arg(
+            long,
+            default_value = "127.0.0.1:0",
+            help = "the socket the HTTP API and ws/wss peers reach"
+        )]
         http: SocketAddr,
-        #[arg(long, help = "peers on private addresses are dialed")]
-        private: bool,
+        #[arg(long, help = "the socket peers reach over tls")]
+        tls: Option<SocketAddr>,
         #[arg(long, default_value = "info")]
         log: String,
     },
@@ -218,19 +226,14 @@ fn execute(cli: Cli) -> Result<(), String> {
         Verb::Run {
             listen,
             http,
-            private,
+            tls,
             log,
         } => node_runtime(&workspace).start(|context| async move {
             let logs = Logs::install(&log)?;
-            let reach = if private {
-                Reach::Private
-            } else {
-                Reach::Public
-            };
             let listen = Listen {
                 p2p: listen,
                 http,
-                reach,
+                tls,
             };
             let running = noded::run(context, &workspace, logs, listen)
                 .await
