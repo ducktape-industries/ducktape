@@ -790,9 +790,6 @@ fn terminate_tls(runtime: &::tokio::runtime::Runtime, listen: SocketAddr, to: So
     });
 }
 
-/// Two validators, and only `dialed` can be dialed: `dialer` has no address.
-/// A set of two finalizes only with both votes, so a block proves `dialer`
-/// reached `dialed` at `dialed.address`.
 fn reached(runtime: &::tokio::runtime::Runtime, root: &Path, dialer: Seat, dialed: Seat) {
     let founding = founding(root, &[&dialer, &dialed], EPOCH_LENGTH);
     dialer.init(&founding);
