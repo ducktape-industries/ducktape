@@ -41,7 +41,7 @@ type Ctx = deterministic::Context;
 fn member(key: &[u8], address: &str) -> validators::Member {
     validators::Member {
         key: key.to_vec(),
-        address: address.to_owned(),
+        address: Some(address.to_owned()),
     }
 }
 
@@ -150,7 +150,7 @@ fn submit(target: &str, payload: Vec<u8>) -> Submission {
 
 fn enroll(key: &[u8], address: &str) -> Submission {
     let enroll = validators::Op::Enroll {
-        address: address.to_owned(),
+        address: Some(address.to_owned()),
         invite: None,
     };
     Submission {

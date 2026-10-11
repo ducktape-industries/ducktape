@@ -63,7 +63,7 @@ identity = "identity"         # resolves a key or a program to its account
 
 [[validators]]
 key = "…"                     # hex ed25519 public key: `ducktape identity`
-address = "tcp://a.example.org:9000"  # where peers dial it; see Reach a node
+address = "tcp://a.example.org:9000"  # optional: where peers dial it; see Reach a node
 
 [[programs]]
 id = "module-registry"        # one entry per program; the registry's and validators' params are the kernel's
@@ -114,7 +114,7 @@ chain and never votes or proposes. A validator named in the file joins the
 same way and keeps its seat.
 
 ```sh
-ducktape join https://a.example.org --address wss://b.example.org --invite <hex>
+ducktape join https://a.example.org --invite <hex>
 ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844
 ```
 
@@ -136,7 +136,11 @@ from, the address its HTTP surface bound and the runtime's storage.
 
 A node's address names a transport and a host, and the host may be a name.
 Peers check who they reached by the node's key, never by its IP, so the
-connection may pass through a tunnel or a proxy.
+connection may pass through a tunnel or a proxy. A connection carries
+traffic both ways, so a node need not be reachable: one that joins or is
+founded without an address dials the others and is never dialed. Two such
+nodes never connect to each other, so the validators of a larger network
+need addresses.
 
 - `tcp://host:port`: the `--listen` socket.
 - `tls://host:port`: the `--tls` socket. The node presents a certificate it

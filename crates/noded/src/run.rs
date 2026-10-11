@@ -68,7 +68,7 @@ pub fn join<'a, E: Context>(
     context: E,
     workspace: &'a Workspace,
     source: Client,
-    address: Endpoint,
+    address: Option<Endpoint>,
     invite: Option<Invite>,
 ) -> Boxed<'a, Result<()>> {
     Box::pin(adopt(context, workspace, source, address, invite))
@@ -112,14 +112,14 @@ async fn adopt<E: Context>(
     mut context: E,
     workspace: &Workspace,
     source: Client,
-    address: Endpoint,
+    address: Option<Endpoint>,
     invite: Option<Invite>,
 ) -> Result<()> {
     let status = source.status().await?;
     let identity = workspace.identity_or_create(&mut context)?;
     let salt = rand_core::Rng::next_u64(&mut context);
     let enroll = Op::Enroll {
-        address: address.to_string(),
+        address: address.as_ref().map(Endpoint::to_string),
         invite,
     };
     let frame = Frame::sign(
