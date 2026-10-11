@@ -1,0 +1,38 @@
+# Each time `main` moves, the self-hosted runner fabrics-1 builds the ducktape binary
+# and publishes it on the prerelease bin-<commit>, beside any other platform's build.
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: ${{ github.workspace }}/../target
+
+jobs:
+  linux:
+    runs-on: [self-hosted, fabrics-1]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --locked --release -p node-bin
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: bin-${{ github.sha }}
+          ASSET: ducktape-x86_64-unknown-linux-gnu.tar.gz
+        run: |
+          tar czf "$ASSET" -C "$CARGO_TARGET_DIR/release" ducktape
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
+            --prerelease --latest=false --target "$GITHUB_SHA" --title "$TAG" \
+            --notes "The ducktape node and CLI built at $GITHUB_SHA."
+          gh release upload "$TAG" "$ASSET" --clobber
