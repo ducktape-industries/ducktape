@@ -4,20 +4,21 @@ use std::sync::Arc;
 
 use abi::{
     Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
-    HostReply, ItemRef, Message, Origin, Outcome, Refusal, Scan, Scheme, module_registry, reason,
-    valset,
+    HostReply, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, Scheme, reason,
+    role::{identity, registry, validators},
 };
 use commonware_codec::Encode as _;
 use commonware_cryptography::bls12381::primitives::group::{Private, Scalar};
 use commonware_cryptography::bls12381::primitives::ops;
 use commonware_cryptography::bls12381::primitives::variant::MinPk;
 use commonware_cryptography::{Signer as _, ed25519};
-use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+use commonware_runtime::{Runner as _, Storage as _, Supervisor as _, deterministic};
 use fixture_module_registry::Change;
 use fixture_probe::{Reply, Step};
+use fixture_relay::Script;
 use host::{
-    BLOBS, Block, BlockId, Delivered, Error, Founding, Genesis, Host, Layer, Limits, NETWORK,
-    QUEUE, Receipt, SIGNERS, Submission, Tip,
+    ANCHOR_WINDOW, BLOBS, Block, BlockId, Error, Founding, FoundingView, Genesis, Host, Layer,
+    Limits, NETWORK, RECENT, Receipt, Roles, SPENT, Submission, Tip,
 };
 use keyscheme::testkit;
 use sha2::Digest as _;
@@ -26,16 +27,19 @@ use state::{Commitment, SyncTarget, commitment_name};
 const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
+const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const SIGNER: &[u8] = b"signer";
+/// Fuel that runs one relay handler and a message of it, not a chain of eight.
+const FRAME_FUEL: u64 = 100_000;
 const EPOCH_LENGTH: u64 = 4;
 const TIME: u64 = 1_700_000_000;
 
 type Ctx = deterministic::Context;
 
-fn member(key: &[u8], address: &str) -> valset::Member {
-    valset::Member {
+fn member(key: &[u8], address: &str) -> validators::Member {
+    validators::Member {
         key: key.to_vec(),
         address: address.to_owned(),
     }
@@ -49,16 +53,43 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
     }
 }
 
+/// The account [`SIGNER`] holds.
+const ACCOUNT: u64 = 1;
+
+fn roles() -> Roles {
+    Roles {
+        registry: "module-registry".into(),
+        validators: "valset".into(),
+        identity: "identity".into(),
+    }
+}
+
+/// The account identity gives `ping`, the fourth founding program
+/// ([`standard`]): programs are numbered from `MODULES_FROM` in order.
+const PING: u64 = fixture_identity::MODULES_FROM + 3;
+
+/// The registry, the validators and identity (where [`SIGNER`] holds
+/// [`ACCOUNT`]), then `programs`.
 fn genesis(programs: Vec<Founding>) -> Genesis {
+    let bound = vec![
+        founding("module-registry", MODULE_REGISTRY, Vec::new()),
+        founding("valset", VALSET, Vec::new()),
+        founding(
+            "identity",
+            IDENTITY,
+            abi::encode(&vec![(SIGNER.to_vec(), ACCOUNT)]),
+        ),
+    ];
     Genesis {
         network: b"net".to_vec(),
-        module_registry: MODULE_REGISTRY.to_vec(),
-        valset: VALSET.to_vec(),
+        roles: roles(),
         validators: vec![member(b"v1", "v1:1")],
-        programs,
+        programs: bound.into_iter().chain(programs).collect(),
+        views: Vec::new(),
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
         time: TIME,
+        member_cap: 16,
     }
 }
 
@@ -75,6 +106,17 @@ async fn found(context: Ctx, name: &str, dir: &Path, genesis: Genesis) -> Host<C
         .await
         .unwrap()
         .0
+}
+
+/// Restarts `host` over its directory and asserts the restarted node's root
+/// is the running node's: a commitment the running node still holds that a
+/// reopened one would not open is a root the two disagree on.
+async fn restart(context: Ctx, dir: &Path, host: Host<Ctx>) -> Host<Ctx> {
+    let root = host.root().unwrap();
+    drop(host);
+    let reopened = Host::open(context, "net", dir).await.unwrap();
+    assert_eq!(reopened.root().unwrap(), root);
+    reopened
 }
 
 fn script(steps: Vec<Step>) -> Vec<u8> {
@@ -96,12 +138,27 @@ fn get(key: &[u8]) -> Step {
     op(HostOp::Get(key.to_vec()))
 }
 
-fn submit(seq: u64, target: &str, payload: Vec<u8>) -> Submission {
+fn submit(target: &str, payload: Vec<u8>) -> Submission {
     Submission {
         signer: SIGNER.to_vec(),
-        seq,
+        anchor: anchor(0),
+        salt: None,
         target: target.to_owned(),
         payload,
+    }
+}
+
+fn anchor(height: u64) -> Tip {
+    Tip {
+        height,
+        id: block_id(height),
+    }
+}
+
+fn anchored(height: u64, submission: Submission) -> Submission {
+    Submission {
+        anchor: anchor(height),
+        ..submission
     }
 }
 
@@ -120,12 +177,44 @@ fn block(height: u64, submissions: Vec<Submission>) -> Block {
     }
 }
 
-fn message(target: &str, payload: &[u8], reply: bool) -> Vec<u8> {
-    abi::encode(&Message {
+/// A relay message: `target` runs `script` in the frame, replying or not.
+fn message(target: &str, script: Script, reply: bool) -> Message {
+    Message {
         target: target.to_owned(),
-        payload: payload.to_vec(),
+        payload: abi::encode(&script),
         reply,
-    })
+    }
+}
+
+/// A relay payload that emits `messages`.
+fn send(messages: Vec<Message>) -> Vec<u8> {
+    abi::encode(&Script::Send(messages))
+}
+
+fn note(bytes: &[u8]) -> Script {
+    Script::Note(bytes.to_vec())
+}
+
+fn fail(loud: bool) -> Script {
+    Script::Fail {
+        sentence: "asked to fail".into(),
+        loud,
+    }
+}
+
+/// The refusal a relay's `fail` is.
+fn refused() -> Refusal {
+    Refusal::new(reason::INVALID_INPUT, "asked to fail")
+}
+
+/// `receipt` with `nested` runs.
+fn nested(mut receipt: Receipt, nested: Vec<Receipt>) -> Receipt {
+    receipt.nested = nested;
+    receipt
+}
+
+fn stored(host: &Host<Ctx>, program: &str, key: &[u8]) -> Option<Vec<u8>> {
+    host.view(Layer::Confirmed).get(program, key).unwrap()
 }
 
 fn item(source: &str, item: u64) -> ItemRef {
@@ -157,6 +246,26 @@ fn answers(bytes: &[u8]) -> Vec<Reply> {
     abi::decode(bytes).unwrap()
 }
 
+/// The account identity says `program` runs as.
+async fn account_of(host: &Host<Ctx>, program: &str) -> Option<u64> {
+    let asked = identity::Query::OfModule(program.into());
+    let reply = host
+        .query(
+            Layer::Confirmed,
+            TIME,
+            Origin::System,
+            "identity",
+            abi::encode(&asked),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    match abi::decode(&reply).unwrap() {
+        identity::Reply::Account(account) => account,
+        other => panic!("{other:?}"),
+    }
+}
+
 async fn ask(host: &Host<Ctx>, layer: Layer, program: &str, steps: Vec<Step>) -> Vec<Reply> {
     let answer = host
         .query(
@@ -177,6 +286,7 @@ fn receipt(program: &str, outcome: Outcome, events: Vec<&[u8]>) -> Receipt {
         program: program.to_owned(),
         outcome,
         events: events.into_iter().map(<[u8]>::to_vec).collect(),
+        nested: Vec::new(),
     }
 }
 
@@ -187,7 +297,7 @@ fn ok(output: &[u8]) -> Outcome {
 }
 
 fn change(program: &str, code: BlobId, params: Vec<u8>) -> Vec<u8> {
-    abi::encode(&Change::Set(module_registry::Entry {
+    abi::encode(&Change::Set(registry::Entry {
         program: program.to_owned(),
         code,
         params,
@@ -198,12 +308,18 @@ fn change(program: &str, code: BlobId, params: Vec<u8>) -> Vec<u8> {
 fn founding_admits_every_program_and_the_host_reopens() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
+        let mut founded = standard();
+        // a view has no program behind it: it is listed, never admitted
+        founded.views.push(FoundingView {
+            name: "explorer".into(),
+            view: b"view".to_vec(),
+        });
         let (host, applied) = Host::found(
             context.child("found"),
             "net",
             dir.path(),
             block_id(0),
-            standard(),
+            founded,
         )
         .await
         .unwrap();
@@ -213,11 +329,25 @@ fn founding_admits_every_program_and_the_host_reopens() {
             .iter()
             .map(|r| r.program.as_str())
             .collect();
-        assert_eq!(
-            admitted,
-            ["module-registry", "valset", "ping", "pong", "probe"]
-        );
-        assert!(applied.deliveries.is_empty());
+        let founded = [
+            "module-registry",
+            "valset",
+            "identity",
+            "ping",
+            "pong",
+            "probe",
+        ];
+        // the roles' admissions and accounts, then each other program's
+        // account before its admission
+        assert_eq!(admitted[..3], founded[..3]);
+        assert_eq!(admitted[3..6], ["identity"; 3]);
+        for (pair, program) in admitted[6..].chunks(2).zip(&founded[3..]) {
+            assert_eq!(pair, ["identity", *program]);
+        }
+        for (at, program) in founded.into_iter().enumerate() {
+            let number = fixture_identity::MODULES_FROM + at as u64;
+            assert_eq!(account_of(&host, program).await, Some(number));
+        }
         for receipt in &applied.admissions {
             assert!(
                 matches!(receipt.outcome, Outcome::Applied { .. }),
@@ -226,7 +356,17 @@ fn founding_admits_every_program_and_the_host_reopens() {
         }
         let programs = host.programs().unwrap();
         let ids: Vec<&str> = programs.keys().map(String::as_str).collect();
-        assert_eq!(ids, ["module-registry", "ping", "pong", "probe", "valset"]);
+        assert_eq!(
+            ids,
+            [
+                "identity",
+                "module-registry",
+                "ping",
+                "pong",
+                "probe",
+                "valset"
+            ]
+        );
         assert_eq!(programs["ping"], programs["pong"]);
         assert_ne!(programs["ping"], programs["probe"]);
         assert_eq!(
@@ -271,6 +411,8 @@ fn founding_admits_every_program_and_the_host_reopens() {
                 time: TIME,
                 me: "probe".into(),
                 origin: Origin::External(SIGNER.to_vec()),
+                sender: None,
+                roles: roles(),
                 cause: Cause::Direct,
             })]
         );
@@ -278,20 +420,230 @@ fn founding_admits_every_program_and_the_host_reopens() {
 }
 
 #[test]
+fn founding_refuses_an_unbound_role() {
+    deterministic::Runner::default().start(|context| async move {
+        for (name, identity) in [("empty", ""), ("unfounded", "nobody")] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut unbound = standard();
+            unbound.roles.identity = identity.into();
+            let Err(Error::Unbound { role, program }) =
+                Host::found(context.child(name), name, dir.path(), block_id(0), unbound).await
+            else {
+                panic!("a genesis with identity bound to {identity:?} was founded");
+            };
+            assert_eq!((role, program.as_str()), ("identity", identity));
+            assert!(!dir.path().join("state").exists(), "{name} wrote state");
+            assert!(!dir.path().join("blobs").exists(), "{name} wrote blobs");
+        }
+    });
+}
+
+/// Whether the runtime's storage holds any partition of `program`'s
+/// commitment in the store `name`: the partitions its merkle journal,
+/// merkle metadata and variable op log lay out.
+async fn committed(context: &Ctx, name: &str, program: &str) -> bool {
+    let commitment = commitment_name(name, program);
+    for partition in [
+        "merkle-journal-blobs",
+        "merkle-journal-metadata",
+        "merkle-meta",
+        "log_data",
+        "log_offsets-blobs",
+        "log_offsets-metadata",
+    ] {
+        let scanned = context
+            .scan(&format!("commitment-{commitment}-{partition}"))
+            .await;
+        if scanned.is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// The bound programs, then a probe whose init refuses.
+fn refusing() -> Genesis {
+    genesis(vec![founding(
+        "probe",
+        PROBE,
+        script(vec![Step::Fail("no".into())]),
+    )])
+}
+
+/// Founds [`standard`] as `name` in `dir`, then deletes its `state/` and
+/// `blobs/`: its commitments stay in the runtime's storage holding height
+/// 0, as a failed join, a moved `state/` or an interrupted cleanup leaves
+/// them.
+async fn plant(context: &Ctx, name: &str, dir: &Path) {
+    drop(found(context.child("planted"), name, dir, standard()).await);
+    std::fs::remove_dir_all(dir.join("state")).unwrap();
+    std::fs::remove_dir_all(dir.join("blobs")).unwrap();
+    assert!(committed(context, name, "valset").await);
+}
+
+#[test]
+fn a_refused_founding_removes_the_dirs_it_made() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let refused = Host::found(
+            context.child("refused"),
+            "net",
+            dir.path(),
+            block_id(0),
+            refusing(),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(refused, Some(Error::Genesis { .. })),
+            "{refused:?}"
+        );
+        assert!(!dir.path().join("state").exists());
+        assert!(!dir.path().join("blobs").exists());
+        // valset's init ran and opened its commitment before probe's
+        // refused, and the store opened the reserved ones: they stay in the
+        // runtime's storage, and the corrected founding opens each empty
+        assert!(committed(&context, "net", "valset").await);
+        assert!(committed(&context, "net", NETWORK).await);
+
+        let clean = tempfile::tempdir().unwrap();
+        let clean = found(context.child("clean"), "clean", clean.path(), standard())
+            .await
+            .root()
+            .unwrap();
+        let host = found(context.child("corrected"), "net", dir.path(), standard()).await;
+        assert_eq!(host.height().unwrap(), 0);
+        assert_eq!(host.root().unwrap(), clean);
+        restart(context.child("restart"), dir.path(), host).await;
+
+        // blobs that were there stay; the state the founding made goes
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("blobs")).unwrap();
+        std::fs::write(dir.path().join("blobs").join("kept"), b"kept").unwrap();
+        let refused = Host::found(
+            context.child("blobs_kept"),
+            "blobs_kept",
+            dir.path(),
+            block_id(0),
+            refusing(),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(refused, Some(Error::Genesis { .. })),
+            "{refused:?}"
+        );
+        assert!(!dir.path().join("state").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("blobs").join("kept")).unwrap(),
+            b"kept"
+        );
+
+        // a state that was there is left as the refused founding leaves it
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("state")).unwrap();
+        let refused = Host::found(
+            context.child("state_kept"),
+            "state_kept",
+            dir.path(),
+            block_id(0),
+            refusing(),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(refused, Some(Error::Genesis { .. })),
+            "{refused:?}"
+        );
+        assert!(dir.path().join("state").exists());
+        assert!(!dir.path().join("blobs").exists());
+    });
+}
+
+/// Opening a directory whose store records no height is refused before any
+/// commitment under the name opens: a `state/` restored from a backup finds
+/// them as it left them.
+#[test]
+fn an_unfounded_store_is_refused_before_its_commitments_open() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("founded"), "net", dir.path(), standard()).await;
+        // a block past genesis, so the last block's writes cannot rebuild
+        // the reserved commitments on their own
+        host.apply(block(1, Vec::new())).await.unwrap();
+        let root = host.root().unwrap();
+        drop(host);
+        let backup = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::rename(&state, backup.path().join("state")).unwrap();
+
+        let refused = Host::open(context.child("unfounded"), "net", dir.path())
+            .await
+            .err();
+        assert!(matches!(refused, Some(Error::Unfounded)), "{refused:?}");
+
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::rename(backup.path().join("state"), &state).unwrap();
+        let restored = Host::open(context.child("restored"), "net", dir.path())
+            .await
+            .unwrap();
+        assert_eq!(restored.root().unwrap(), root);
+    });
+}
+
+#[test]
+fn a_corrected_founding_over_a_refused_one_founds_the_clean_root() {
+    deterministic::Runner::default().start(|context| async move {
+        let clean = tempfile::tempdir().unwrap();
+        let clean = found(context.child("clean"), "clean", clean.path(), standard())
+            .await
+            .root()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        plant(&context, "net", dir.path()).await;
+        let refused = Host::found(
+            context.child("refused"),
+            "net",
+            dir.path(),
+            block_id(0),
+            refusing(),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(refused, Some(Error::Genesis { .. })),
+            "{refused:?}"
+        );
+        let host = found(context.child("corrected"), "net", dir.path(), standard()).await;
+        assert_eq!(host.root().unwrap(), clean);
+    });
+}
+
+#[test]
+fn a_fresh_founding_destroys_the_commitments_left_under_its_name() {
+    deterministic::Runner::default().start(|context| async move {
+        let clean = tempfile::tempdir().unwrap();
+        let clean = found(context.child("clean"), "clean", clean.path(), standard())
+            .await
+            .root()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        plant(&context, "net", dir.path()).await;
+        let host = found(context.child("over"), "net", dir.path(), standard()).await;
+        assert_eq!(host.root().unwrap(), clean);
+    });
+}
+
+#[test]
 fn founding_refuses_a_program_that_does_not_admit() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
-        let refusing = genesis(vec![founding(
-            "probe",
-            PROBE,
-            script(vec![Step::Fail("no".into())]),
-        )]);
         let Err(Error::Genesis { program, refusal }) = Host::found(
             context.child("refusing"),
             "a",
             dir.path(),
             block_id(0),
-            refusing,
+            refusing(),
         )
         .await
         else {
@@ -312,6 +664,30 @@ fn founding_refuses_a_program_that_does_not_admit() {
         };
         assert_eq!(program, "ping");
         assert_eq!(refusal.reason, reason::INVALID_INPUT);
+        assert!(!dir.path().join("state").exists());
+        assert!(!dir.path().join("blobs").exists());
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut shadowed = genesis(vec![founding("ping", RELAY, Vec::new())]);
+        shadowed.views.push(FoundingView {
+            name: "ping".into(),
+            view: b"view".to_vec(),
+        });
+        let Err(Error::Genesis { program, refusal }) = Host::found(
+            context.child("shadowed"),
+            "b2",
+            dir.path(),
+            block_id(0),
+            shadowed,
+        )
+        .await
+        else {
+            panic!("a view took a program's name");
+        };
+        assert_eq!(program, "ping");
+        assert_eq!(refusal.reason, reason::INVALID_INPUT);
+        assert!(!dir.path().join("state").exists());
+        assert!(!dir.path().join("blobs").exists());
 
         let dir = tempfile::tempdir().unwrap();
         let reserved = genesis(vec![founding("$ping", RELAY, Vec::new())]);
@@ -327,6 +703,8 @@ fn founding_refuses_a_program_that_does_not_admit() {
             panic!("a reserved founder was admitted");
         };
         assert_eq!(program, "$ping");
+        assert!(!dir.path().join("state").exists());
+        assert!(!dir.path().join("blobs").exists());
 
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
@@ -361,7 +739,7 @@ fn blocks_apply_in_sequence_only() {
 }
 
 #[test]
-fn a_call_is_delivered_next_block_and_completes_the_block_after() {
+fn a_message_runs_in_the_frame_that_emits_it_and_replies_there() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
@@ -370,123 +748,180 @@ fn a_call_is_delivered_next_block_and_completes_the_block_after() {
         let applied = host
             .apply(block(
                 1,
-                vec![submit(0, "ping", message("pong", b"hello", true))],
+                vec![submit(
+                    "ping",
+                    send(vec![message("pong", note(b"hello"), true)]),
+                )],
             ))
             .await
             .unwrap();
         assert_eq!(
             applied.submissions,
-            vec![receipt("ping", ok(&abi::encode(&first)), vec![])]
+            vec![nested(
+                receipt("ping", ok(&abi::encode(&vec![first.clone()])), vec![]),
+                vec![
+                    receipt("pong", ok(b"olleh"), vec![b"hello"]),
+                    receipt("ping", ok(b""), vec![]),
+                ]
+            )]
         );
-        assert!(applied.deliveries.is_empty());
         assert_eq!(
-            host.view(Layer::Confirmed)
-                .get("ping", &fixture_relay::sent(&first))
-                .unwrap(),
+            stored(&host, "ping", &fixture_relay::sent(&first)),
+            Some(abi::encode(&note(b"hello")))
+        );
+        assert_eq!(
+            stored(&host, "pong", &fixture_relay::got(&first)),
             Some(b"hello".to_vec())
         );
-
-        let applied = host.apply(block(2, Vec::new())).await.unwrap();
         assert_eq!(
-            applied.deliveries,
-            vec![Delivered {
-                item: 0,
-                receipt: receipt("pong", ok(b"olleh"), vec![b"hello"]),
-            }]
-        );
-        assert_eq!(
-            host.view(Layer::Confirmed)
-                .get("pong", &fixture_relay::got(&first))
-                .unwrap(),
-            Some(b"hello".to_vec())
-        );
-
-        let applied = host.apply(block(3, Vec::new())).await.unwrap();
-        assert_eq!(
-            applied.deliveries,
-            vec![Delivered {
-                item: 1,
-                receipt: receipt("ping", ok(b""), vec![]),
-            }]
-        );
-        assert_eq!(
-            host.view(Layer::Confirmed)
-                .get("ping", &fixture_relay::done(&first))
-                .unwrap(),
+            stored(&host, "ping", &fixture_relay::done(&first)),
             Some(abi::encode(&ok(b"olleh")))
         );
 
-        let applied = host.apply(block(4, Vec::new())).await.unwrap();
-        assert!(applied.deliveries.is_empty());
-        assert!(
-            host.view(Layer::Confirmed)
-                .scan(QUEUE, &Scan::prefix(b"i/"))
-                .unwrap()
-                .is_empty()
-        );
-
+        // without a reply wanted, the target's run is all that nests
+        let again = item("ping", 0);
         let applied = host
             .apply(block(
-                5,
-                vec![submit(1, "ping", message("pong", b"again", false))],
+                2,
+                vec![submit(
+                    "ping",
+                    send(vec![message("pong", note(b"again"), false)]),
+                )],
             ))
             .await
             .unwrap();
         assert_eq!(
-            output(&applied.submissions[0]),
-            abi::encode(&item("ping", 2))
+            applied.submissions,
+            vec![nested(
+                receipt("ping", ok(&abi::encode(&vec![again.clone()])), vec![]),
+                vec![receipt("pong", ok(b"niaga"), vec![b"again"])]
+            )]
         );
-        let applied = host.apply(block(6, Vec::new())).await.unwrap();
-        assert_eq!(
-            applied.deliveries,
-            vec![Delivered {
-                item: 2,
-                receipt: receipt("pong", ok(b"niaga"), vec![b"again"]),
-            }]
-        );
-        let applied = host.apply(block(7, Vec::new())).await.unwrap();
-        assert!(applied.deliveries.is_empty());
     });
 }
 
 #[test]
-fn a_delivery_sees_who_emitted_it() {
+fn messages_run_in_emit_order_depth_first() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        // ping: [pong: [ping: a], pong: b]
+        let inner = Script::Send(vec![message("ping", note(b"a"), false)]);
+        let applied = host
+            .apply(block(
+                1,
+                vec![submit(
+                    "ping",
+                    send(vec![
+                        message("pong", inner, false),
+                        message("pong", note(b"b"), false),
+                    ]),
+                )],
+            ))
+            .await
+            .unwrap();
+        let items = |items: &[ItemRef]| ok(&abi::encode(&items.to_vec()));
+        assert_eq!(
+            applied.submissions,
+            vec![nested(
+                receipt("ping", items(&[item("ping", 0), item("ping", 1)]), vec![]),
+                vec![
+                    nested(
+                        receipt("pong", items(&[item("pong", 2)]), vec![]),
+                        vec![receipt("ping", ok(b"a"), vec![b"a"])]
+                    ),
+                    receipt("pong", ok(b"b"), vec![b"b"]),
+                ]
+            )]
+        );
+    });
+}
+
+#[test]
+fn a_message_sees_who_emitted_it() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
         let probe_script = script(vec![Step::Env]);
-        host.apply(block(
-            1,
-            vec![submit(0, "ping", message("probe", &probe_script, true))],
-        ))
-        .await
-        .unwrap();
-        let applied = host.apply(block(2, Vec::new())).await.unwrap();
+        let applied = host
+            .apply(block(
+                1,
+                vec![submit(
+                    "ping",
+                    send(vec![Message {
+                        target: "probe".into(),
+                        payload: probe_script,
+                        reply: true,
+                    }]),
+                )],
+            ))
+            .await
+            .unwrap();
         let env = Env {
             network: b"net".to_vec(),
-            height: 2,
-            time: TIME + 2,
+            height: 1,
+            time: TIME + 1,
             me: "probe".into(),
             origin: Origin::Program("ping".into()),
-            cause: Cause::Delivery(item("ping", 0)),
+            // ping's own account, which identity gave it at genesis
+            sender: Some(Principal::Account(PING)),
+            roles: roles(),
+            cause: Cause::Message(item("ping", 0)),
         };
+        let [probed, replied] = applied.submissions[0].nested.as_slice() else {
+            panic!("{:?}", applied.submissions[0].nested);
+        };
+        assert_eq!(replies(probed), vec![Reply::Env(env.clone())]);
+        assert_eq!(replied, &receipt("ping", ok(b""), vec![]));
         assert_eq!(
-            replies(&applied.deliveries[0].receipt),
-            vec![Reply::Env(env.clone())]
-        );
-        let applied = host.apply(block(3, Vec::new())).await.unwrap();
-        assert_eq!(applied.deliveries[0].receipt.program, "ping");
-        assert_eq!(
-            host.view(Layer::Confirmed)
-                .get("ping", &fixture_relay::done(&item("ping", 0)))
-                .unwrap(),
+            stored(&host, "ping", &fixture_relay::done(&item("ping", 0))),
             Some(abi::encode(&ok(&abi::encode(&vec![Reply::Env(env)]))))
         );
     });
 }
 
 #[test]
-fn a_refused_or_unroutable_delivery_completes_with_its_refusal() {
+fn a_message_emitted_from_init_carries_the_program_account() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut founding_file = standard();
+        let emit = op(HostOp::Emit(Message {
+            target: "probe".into(),
+            payload: script(vec![Step::Env]),
+            reply: false,
+        }));
+        founding_file
+            .programs
+            .push(founding("emitter", PROBE, script(vec![emit])));
+        let (host, applied) = Host::found(context, "net", dir.path(), block_id(0), founding_file)
+            .await
+            .unwrap();
+        let account = account_of(&host, "emitter").await.unwrap();
+        let init = applied
+            .admissions
+            .iter()
+            .find(|receipt| receipt.program == "emitter" && !receipt.nested.is_empty())
+            .unwrap();
+        let [probed] = init.nested.as_slice() else {
+            panic!("{:?}", init.nested);
+        };
+        let env = Env {
+            network: b"net".to_vec(),
+            height: 0,
+            time: TIME,
+            me: "probe".into(),
+            origin: Origin::Program("emitter".into()),
+            // registered before its init ran
+            sender: Some(Principal::Account(account)),
+            roles: roles(),
+            cause: Cause::Message(item("emitter", 0)),
+        };
+        assert_eq!(replies(probed), vec![Reply::Env(env)]);
+    });
+}
+
+#[test]
+fn a_rejected_message_without_a_reply_undoes_the_frame() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
@@ -494,59 +929,353 @@ fn a_refused_or_unroutable_delivery_completes_with_its_refusal() {
             .apply(block(
                 1,
                 vec![
-                    submit(0, "ping", message("pong", fixture_relay::FAIL, true)),
-                    submit(1, "ping", message("nobody", b"x", true)),
-                    submit(2, "nobody", b"x".to_vec()),
+                    submit(
+                        "ping",
+                        send(vec![
+                            message("pong", note(b"first"), false),
+                            message("pong", fail(false), false),
+                            message("pong", note(b"never"), false),
+                        ]),
+                    ),
+                    submit("ping", send(vec![message("nobody", note(b"x"), false)])),
                 ],
             ))
             .await
             .unwrap();
         assert_eq!(
-            rejected(&applied.submissions[2]),
-            &Refusal::new(reason::UNKNOWN_PROGRAM, "nobody")
-        );
-
-        let applied = host.apply(block(2, Vec::new())).await.unwrap();
-        let refused = Refusal::new(reason::INVALID_INPUT, "asked to fail");
-        assert_eq!(
-            applied.deliveries,
+            applied.submissions,
             vec![
-                Delivered {
-                    item: 0,
-                    receipt: receipt("pong", Outcome::Rejected(refused.clone()), vec![]),
-                },
-                Delivered {
-                    item: 1,
-                    receipt: receipt(
+                nested(
+                    receipt("ping", Outcome::Rejected(refused()), vec![]),
+                    vec![
+                        receipt("pong", ok(b"tsrif"), vec![b"first"]),
+                        receipt("pong", Outcome::Rejected(refused()), vec![]),
+                    ]
+                ),
+                nested(
+                    receipt(
+                        "ping",
+                        Outcome::Rejected(Refusal::new(reason::UNKNOWN_PROGRAM, "nobody")),
+                        vec![]
+                    ),
+                    vec![receipt(
                         "nobody",
                         Outcome::Rejected(Refusal::new(reason::UNKNOWN_PROGRAM, "nobody")),
-                        vec![],
-                    ),
-                },
+                        vec![]
+                    )]
+                ),
+            ]
+        );
+        // the sender's and the applied target's writes are undone with it
+        assert_eq!(
+            stored(&host, "ping", &fixture_relay::sent(&item("ping", 0))),
+            None
+        );
+        assert_eq!(
+            stored(&host, "pong", &fixture_relay::got(&item("ping", 0))),
+            None
+        );
+        assert_eq!(
+            stored(&host, "pong", &fixture_relay::got(&item("ping", 2))),
+            None
+        );
+    });
+}
+
+#[test]
+fn a_rejected_reply_undoes_the_target_and_the_sender_absorbs_or_propagates() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        // pong writes, then fails without a reply: its frame is undone and
+        // ping, which wanted the reply, absorbs the rejection and goes on
+        let pong = Script::Send(vec![
+            message("ping", note(b"inner"), false),
+            message("ping", fail(false), false),
+        ]);
+        let applied = host
+            .apply(block(
+                1,
+                vec![submit(
+                    "ping",
+                    send(vec![
+                        message("pong", pong, true),
+                        message("pong", note(b"after"), false),
+                    ]),
+                )],
+            ))
+            .await
+            .unwrap();
+        let receipt_ = &applied.submissions[0];
+        assert_eq!(
+            receipt_.outcome,
+            ok(&abi::encode(&vec![item("ping", 0), item("ping", 1)]))
+        );
+        let programs: Vec<(&str, bool)> = receipt_
+            .nested
+            .iter()
+            .map(|r| {
+                (
+                    r.program.as_str(),
+                    matches!(r.outcome, Outcome::Applied { .. }),
+                )
+            })
+            .collect();
+        assert_eq!(programs, [("pong", false), ("ping", true), ("pong", true)]);
+        assert_eq!(receipt_.nested[0].outcome, Outcome::Rejected(refused()));
+        assert_eq!(
+            stored(&host, "pong", &fixture_relay::sent(&item("pong", 2))),
+            None
+        );
+        assert_eq!(
+            stored(&host, "ping", &fixture_relay::got(&item("pong", 2))),
+            None
+        );
+        assert_eq!(
+            stored(&host, "ping", &fixture_relay::done(&item("ping", 0))),
+            Some(abi::encode(&Outcome::Rejected(refused())))
+        );
+        assert_eq!(
+            stored(&host, "pong", &fixture_relay::got(&item("ping", 1))),
+            Some(b"after".to_vec())
+        );
+
+        // a reply run that refuses fails the whole frame
+        let applied = host
+            .apply(block(
+                2,
+                vec![submit(
+                    "ping",
+                    send(vec![
+                        message("pong", note(b"before"), false),
+                        message("pong", fail(true), true),
+                    ]),
+                )],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            applied.submissions,
+            vec![nested(
+                receipt("ping", Outcome::Rejected(refused()), vec![]),
+                vec![
+                    receipt("pong", ok(b"erofeb"), vec![b"before"]),
+                    receipt("pong", Outcome::Rejected(refused()), vec![]),
+                    receipt("ping", Outcome::Rejected(refused()), vec![]),
+                ]
+            )]
+        );
+        assert_eq!(
+            stored(&host, "pong", &fixture_relay::got(&item("ping", 0))),
+            None
+        );
+        assert_eq!(
+            stored(&host, "ping", &fixture_relay::done(&item("ping", 1))),
+            None
+        );
+    });
+}
+
+/// A chain of `depth` messages, ping to pong and back, ending in a note.
+fn chain(depth: u32) -> Script {
+    if depth == 0 {
+        return note(b"end");
+    }
+    let target = if depth.is_multiple_of(2) {
+        "ping"
+    } else {
+        "pong"
+    };
+    Script::Send(vec![message(target, chain(depth - 1), false)])
+}
+
+#[test]
+fn messages_nest_at_most_eight_deep() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let applied = host
+            .apply(block(
+                1,
+                vec![
+                    submit("ping", abi::encode(&chain(8))),
+                    submit("ping", abi::encode(&chain(9))),
+                ],
+            ))
+            .await
+            .unwrap();
+        let mut deepest = &applied.submissions[0];
+        let mut depth = 0;
+        while let Some(inner) = deepest.nested.first() {
+            deepest = inner;
+            depth += 1;
+        }
+        assert_eq!(depth, 8);
+        assert_eq!(deepest, &receipt("pong", ok(b"dne"), vec![b"end"]));
+        let refusal = rejected(&applied.submissions[1]);
+        assert_eq!(refusal.reason, reason::CAPACITY);
+        assert_eq!(refusal.sentence, "messages nest deeper than 8");
+    });
+}
+
+#[test]
+fn a_frame_runs_on_one_fuel_budget() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), metered()).await;
+        let applied = host
+            .apply(block(
+                1,
+                vec![
+                    submit("ping", abi::encode(&chain(1))),
+                    submit("ping", abi::encode(&chain(8))),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            matches!(applied.submissions[0].outcome, Outcome::Applied { .. }),
+            "{:?}",
+            applied.submissions[0]
+        );
+        assert_eq!(rejected(&applied.submissions[1]).reason, reason::TRAP);
+    });
+}
+
+/// A probe script that asks `probe`'s own query to spin, `times` times.
+fn spin_queries(times: usize) -> Vec<Step> {
+    let spin = || HostOp::Query {
+        program: "probe".into(),
+        request: script(vec![Step::Spin]),
+    };
+    (0..times).map(|_| op(spin())).collect()
+}
+
+/// The refusal of a run whose frame spent its fuel.
+fn spent() -> Refusal {
+    Refusal::new(reason::TRAP, runtime::OUT_OF_FUEL)
+}
+
+fn metered() -> Genesis {
+    let mut metered = standard();
+    metered.limits = Limits {
+        fuel: Some(FRAME_FUEL),
+        memory_bytes: None,
+    };
+    metered
+}
+
+#[test]
+fn a_query_inside_a_frame_runs_on_the_frame_budget() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), metered()).await;
+        // each spin would burn a whole budget of its own: the first spends
+        // the frame's, and the handler traps on what is left, nothing
+        let applied = host
+            .apply(block(1, vec![submit("probe", script(spin_queries(3)))]))
+            .await
+            .unwrap();
+        assert_eq!(rejected(&applied.submissions[0]), &spent());
+        // a query from outside any frame still runs on its own budget
+        let asked = ask(&host, Layer::Confirmed, "probe", vec![Step::Env]).await;
+        assert_eq!(asked.len(), 1);
+    });
+}
+
+#[test]
+fn a_spent_frame_starts_no_further_run() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), metered()).await;
+        let spend = Message {
+            target: "probe".into(),
+            payload: script(spin_queries(1)),
+            reply: true,
+        };
+        let payload = send(vec![spend, message("pong", note(b"late"), false)]);
+        let applied = host
+            .apply(block(1, vec![submit("ping", payload)]))
+            .await
+            .unwrap();
+        let frame = &applied.submissions[0];
+        assert_eq!(rejected(frame), &spent());
+        // the probe spends the frame; the reply it wanted, and pong after
+        // it, never start
+        assert_eq!(
+            frame.nested,
+            vec![
+                rejected_receipt("probe", spent()),
+                rejected_receipt("ping", spent()),
             ]
         );
         assert_eq!(
-            host.view(Layer::Confirmed)
-                .get("pong", &fixture_relay::got(&item("ping", 0)))
-                .unwrap(),
+            stored(&host, "pong", &fixture_relay::got(&item("ping", 1))),
             None
         );
+    });
+}
 
-        let applied = host.apply(block(3, Vec::new())).await.unwrap();
-        assert_eq!(applied.deliveries.len(), 2);
-        let view = host.view(Layer::Confirmed);
+fn rejected_receipt(program: &str, refusal: Refusal) -> Receipt {
+    receipt(program, Outcome::Rejected(refusal), Vec::new())
+}
+
+#[test]
+fn a_submission_acts_as_the_account_its_signer_holds() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("net"), "net", dir.path(), standard()).await;
+        let stranger = |target: &str, payload| Submission {
+            signer: b"stranger".to_vec(),
+            ..submit(target, payload)
+        };
+        let sender = |receipt: &Receipt| match replies(receipt).as_slice() {
+            [.., Reply::Env(env)] => env.sender.clone(),
+            other => panic!("{other:?}"),
+        };
+        let env = || script(vec![Step::Env]);
+        let env_again = || script(vec![get(b"again"), Step::Env]);
+        let applied = host
+            .apply(block(
+                1,
+                vec![
+                    submit("probe", env()),
+                    // a key that holds no account runs, as no one
+                    stranger("probe", env()),
+                    // identity seats it; the next frame in the block sees it
+                    stranger("identity", abi::encode(&(b"stranger".to_vec(), 2u64))),
+                    stranger("probe", env_again()),
+                ],
+            ))
+            .await
+            .unwrap();
+        let senders: Vec<_> = [0, 1, 3].map(|at| sender(&applied.submissions[at])).into();
         assert_eq!(
-            view.get("ping", &fixture_relay::done(&item("ping", 0)))
-                .unwrap(),
-            Some(abi::encode(&Outcome::Rejected(refused)))
+            senders,
+            [
+                Some(Principal::Account(ACCOUNT)),
+                None,
+                Some(Principal::Account(2))
+            ]
         );
-        assert_eq!(
-            view.get("ping", &fixture_relay::done(&item("ping", 1)))
-                .unwrap(),
-            Some(abi::encode(&Outcome::Rejected(Refusal::new(
-                reason::UNKNOWN_PROGRAM,
-                "nobody"
-            ))))
+
+        // an identity that does not give programs their accounts founds
+        // nothing
+        let dir = tempfile::tempdir().unwrap();
+        let mut broken = standard();
+        broken.programs[2].code = PROBE.to_vec();
+        let founded = Host::found(
+            context.child("broken"),
+            "broken",
+            dir.path(),
+            block_id(0),
+            broken,
+        )
+        .await;
+        assert!(
+            matches!(founded, Err(Error::Genesis { .. })),
+            "{:?}",
+            founded.err()
         );
     });
 }
@@ -569,7 +1298,6 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
             .apply(block(
                 1,
                 vec![submit(
-                    0,
                     "probe",
                     script(vec![set(b"k", b"v"), put(), Step::Fail("nope".into())]),
                 )],
@@ -581,7 +1309,7 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
             &Refusal::new("probe", "nope")
         );
         let touched: Vec<&str> = applied.writes.programs.keys().map(String::as_str).collect();
-        assert_eq!(touched, [NETWORK]);
+        assert_eq!(touched, [RECENT, SPENT]);
         assert_eq!(
             host.view(Layer::Confirmed).get("probe", b"k").unwrap(),
             None
@@ -591,7 +1319,7 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
         let applied = host
             .apply(block(
                 2,
-                vec![submit(0, "probe", script(vec![set(b"k", b"v"), put()]))],
+                vec![submit("probe", script(vec![set(b"k", b"v"), put()]))],
             ))
             .await
             .unwrap();
@@ -649,7 +1377,6 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
                 3,
                 vec![
                     submit(
-                        1,
                         "probe",
                         script(vec![op(HostOp::BlobPut {
                             hash: HashKind::Sha1,
@@ -657,7 +1384,7 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
                             body: b"x".to_vec(),
                         })]),
                     ),
-                    submit(2, "probe", script(vec![op(HostOp::BlobStat(staged))])),
+                    submit("probe", script(vec![op(HostOp::BlobStat(staged))])),
                 ],
             ))
             .await
@@ -679,20 +1406,30 @@ fn an_epoch_is_recorded_as_the_block_ending_the_one_before_commits() {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
         let founding = vec![member(b"v1", "v1:1")];
-        let seated = vec![member(b"v1", "v1:1"), member(b"v2", "v2:2")];
+        let validators = vec![member(b"v1", "v1:1"), member(b"v2", "v2:2")];
+        let resident = member(b"r3", "r3:3");
+        let members = [validators.clone(), vec![resident.clone()]].concat();
+        let keys = vec![b"v1".to_vec(), b"v2".to_vec()];
 
         host.apply(block(1, Vec::new())).await.unwrap();
+        let payload = abi::encode(&(validators, vec![resident]));
         let applied = host
-            .apply(block(2, vec![submit(0, "valset", abi::encode(&seated))]))
+            .apply(block(2, vec![submit("valset", payload)]))
             .await
             .unwrap();
         assert_eq!(applied.submissions[0].outcome, ok(b""));
         assert_eq!(host.epoch_members(0).unwrap(), Some(founding.clone()));
+        assert_eq!(
+            host.epoch_validators(0).unwrap(),
+            Some(vec![b"v1".to_vec()])
+        );
         assert_eq!(host.epoch_members(1).unwrap(), None);
+        assert_eq!(host.epoch_validators(1).unwrap(), None);
 
         host.apply(block(3, Vec::new())).await.unwrap();
         assert_eq!(host.epoch_members(0).unwrap(), Some(founding));
-        assert_eq!(host.epoch_members(1).unwrap(), Some(seated.clone()));
+        assert_eq!(host.epoch_members(1).unwrap(), Some(members.clone()));
+        assert_eq!(host.epoch_validators(1).unwrap(), Some(keys.clone()));
         assert_eq!(host.epoch_members(2).unwrap(), None);
         assert_eq!(
             host.tip().unwrap(),
@@ -707,7 +1444,8 @@ fn an_epoch_is_recorded_as_the_block_ending_the_one_before_commits() {
             assert_eq!(host.epoch_members(2).unwrap(), None);
         }
         host.apply(block(7, Vec::new())).await.unwrap();
-        assert_eq!(host.epoch_members(2).unwrap(), Some(seated));
+        assert_eq!(host.epoch_members(2).unwrap(), Some(members));
+        assert_eq!(host.epoch_validators(2).unwrap(), Some(keys));
     });
 }
 
@@ -715,40 +1453,46 @@ fn an_epoch_is_recorded_as_the_block_ending_the_one_before_commits() {
 fn the_roster_admits_swaps_and_drops_programs() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
-        let mut host = found(context, "net", dir.path(), standard()).await;
+        let mut host = found(context.child("found"), "net", dir.path(), standard()).await;
         let programs = host.programs().unwrap();
         let relay = programs["ping"];
         let probe = programs["probe"];
 
         host.apply(block(
             1,
-            vec![submit(
-                0,
-                "module-registry",
-                change("echo", relay, Vec::new()),
-            )],
+            vec![submit("module-registry", change("echo", relay, Vec::new()))],
         ))
         .await
         .unwrap();
         let applied = host.apply(block(2, Vec::new())).await.unwrap();
-        assert_eq!(applied.admissions, vec![receipt("echo", ok(b""), vec![])]);
+        assert_eq!(
+            applied.admissions,
+            vec![
+                receipt("identity", ok(b""), vec![]),
+                receipt("echo", ok(b""), vec![]),
+            ]
+        );
+        let seventh = fixture_identity::MODULES_FROM + 6;
+        assert_eq!(account_of(&host, "echo").await, Some(seventh));
         assert_eq!(host.programs().unwrap()["echo"], relay);
         let applied = host
             .apply(block(
                 3,
-                vec![submit(1, "echo", message("ping", b"hi", false))],
+                vec![submit(
+                    "echo",
+                    send(vec![message("ping", note(b"hi"), false)]),
+                )],
             ))
             .await
             .unwrap();
         assert_eq!(
             output(&applied.submissions[0]),
-            abi::encode(&item("echo", 0))
+            abi::encode(&vec![item("echo", 0)])
         );
 
         host.apply(block(
             4,
             vec![submit(
-                2,
                 "module-registry",
                 change("echo", probe, script(Vec::new())),
             )],
@@ -767,6 +1511,8 @@ fn the_roster_admits_swaps_and_drops_programs() {
                 time: TIME,
                 me: "echo".into(),
                 origin: Origin::External(SIGNER.to_vec()),
+                sender: None,
+                roles: roles(),
                 cause: Cause::Direct,
             })]
         );
@@ -774,7 +1520,6 @@ fn the_roster_admits_swaps_and_drops_programs() {
         host.apply(block(
             6,
             vec![submit(
-                3,
                 "module-registry",
                 abi::encode(&Change::Remove("echo".into())),
             )],
@@ -784,8 +1529,10 @@ fn the_roster_admits_swaps_and_drops_programs() {
         let applied = host.apply(block(7, Vec::new())).await.unwrap();
         assert!(applied.admissions.is_empty());
         assert!(!host.programs().unwrap().contains_key("echo"));
+        assert!(host.store().commitment("echo").is_none());
+        let mut host = restart(context.child("restart"), dir.path(), host).await;
         let applied = host
-            .apply(block(8, vec![submit(4, "echo", script(Vec::new()))]))
+            .apply(block(8, vec![submit("echo", script(Vec::new()))]))
             .await
             .unwrap();
         assert_eq!(
@@ -803,13 +1550,11 @@ fn the_roster_admits_swaps_and_drops_programs() {
             9,
             vec![
                 submit(
-                    4,
                     "module-registry",
                     change("ghost", BlobId::Sha256([9; 32]), Vec::new()),
                 ),
-                submit(5, "module-registry", change("$evil", relay, Vec::new())),
+                submit("module-registry", change("$evil", relay, Vec::new())),
                 submit(
-                    6,
                     "module-registry",
                     change("bad", probe, script(vec![Step::Fail("no".into())])),
                 ),
@@ -818,19 +1563,99 @@ fn the_roster_admits_swaps_and_drops_programs() {
         .await
         .unwrap();
         let applied = host.apply(block(10, Vec::new())).await.unwrap();
+        // bad's account is given, then undone with its refused init
         assert_eq!(
             applied.admissions,
-            vec![receipt(
-                "bad",
-                Outcome::Rejected(Refusal::new("probe", "no")),
-                vec![]
-            )]
+            vec![
+                receipt("identity", ok(b""), vec![]),
+                receipt(
+                    "bad",
+                    Outcome::Rejected(Refusal::new("probe", "no")),
+                    vec![]
+                ),
+            ]
         );
+        assert_eq!(account_of(&host, "bad").await, None);
         let programs = host.programs().unwrap();
         let ids: Vec<&str> = programs.keys().map(String::as_str).collect();
-        assert_eq!(ids, ["module-registry", "ping", "pong", "probe", "valset"]);
+        assert_eq!(
+            ids,
+            [
+                "identity",
+                "module-registry",
+                "ping",
+                "pong",
+                "probe",
+                "valset"
+            ]
+        );
+        // retried: registered and refused again
         let applied = host.apply(block(11, Vec::new())).await.unwrap();
-        assert_eq!(applied.admissions.len(), 1);
+        assert_eq!(applied.admissions.len(), 2);
+    });
+}
+
+/// A later install whose account identity refuses does not run: its init
+/// never runs, the receipt says so, and the next height admits it once
+/// identity gives it its account.
+#[test]
+fn a_program_identity_gives_no_account_is_not_admitted() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("found"), "net", dir.path(), standard()).await;
+        let relay = host.programs().unwrap()["ping"];
+        let closed =
+            |number: u64| submit("identity", abi::encode(&(b"#closed/late".to_vec(), number)));
+        host.apply(block(
+            1,
+            vec![
+                closed(1),
+                submit("module-registry", change("late", relay, Vec::new())),
+            ],
+        ))
+        .await
+        .unwrap();
+        for height in [2, 3] {
+            let applied = host.apply(block(height, Vec::new())).await.unwrap();
+            assert_eq!(
+                applied.admissions,
+                vec![receipt(
+                    "identity",
+                    Outcome::Rejected(Refusal::new("closed", "late")),
+                    vec![]
+                )]
+            );
+            assert!(!host.programs().unwrap().contains_key("late"));
+            assert!(host.store().commitment("late").is_none());
+            assert_eq!(account_of(&host, "late").await, None);
+        }
+        let mut host = restart(context.child("restart"), dir.path(), host).await;
+        let applied = host
+            .apply(block(
+                4,
+                vec![submit(
+                    "late",
+                    send(vec![message("ping", note(b"hi"), false)]),
+                )],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected(&applied.submissions[0]).reason,
+            reason::UNKNOWN_PROGRAM
+        );
+
+        host.apply(block(5, vec![closed(0)])).await.unwrap();
+        let applied = host.apply(block(6, Vec::new())).await.unwrap();
+        assert_eq!(
+            applied.admissions,
+            vec![
+                receipt("identity", ok(b""), vec![]),
+                receipt("late", ok(b""), vec![]),
+            ]
+        );
+        assert_eq!(host.programs().unwrap()["late"], relay);
+        assert!(account_of(&host, "late").await.is_some());
     });
 }
 
@@ -841,7 +1666,7 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
         let mut host = found(context, "net", dir.path(), standard()).await;
         host.apply(block(
             1,
-            vec![submit(0, "probe", script(vec![set(b"a", b"1")]))],
+            vec![submit("probe", script(vec![set(b"a", b"1")]))],
         ))
         .await
         .unwrap();
@@ -849,7 +1674,6 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
             .preconfirm(
                 TIME,
                 vec![submit(
-                    1,
                     "probe",
                     script(vec![set(b"a", b"2"), set(b"b", b"3")]),
                 )],
@@ -891,6 +1715,8 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
                     time: TIME,
                     me: "probe".into(),
                     origin: Origin::External(SIGNER.to_vec()),
+                    sender: None,
+                    roles: roles(),
                     cause: Cause::Direct,
                 }),
             ]
@@ -911,6 +1737,8 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
                     time: TIME,
                     me: "probe".into(),
                     origin: Origin::External(SIGNER.to_vec()),
+                    sender: None,
+                    roles: roles(),
                     cause: Cause::Direct,
                 }),
             ]
@@ -949,7 +1777,7 @@ fn sibling_queries_route_by_id_and_a_cycle_is_refused() {
         let mut host = found(context, "net", dir.path(), twins).await;
         host.apply(block(
             1,
-            vec![submit(0, "probe", script(vec![set(b"k", b"v")]))],
+            vec![submit("probe", script(vec![set(b"k", b"v")]))],
         ))
         .await
         .unwrap();
@@ -982,6 +1810,8 @@ fn sibling_queries_route_by_id_and_a_cycle_is_refused() {
                         time: TIME,
                         me: "probe".into(),
                         origin: Origin::Program("twin".into()),
+                        sender: None,
+                        roles: roles(),
                         cause: Cause::Direct,
                     }),
                 ])))),
@@ -998,7 +1828,6 @@ fn sibling_queries_route_by_id_and_a_cycle_is_refused() {
             .apply(block(
                 2,
                 vec![submit(
-                    1,
                     "probe",
                     script(vec![
                         set(b"k2", b"v2"),
@@ -1130,9 +1959,9 @@ fn fuel_is_a_network_parameter() {
             .apply(block(
                 1,
                 vec![
-                    submit(0, "probe", script(vec![Step::Env])),
-                    submit(1, "probe", script(vec![Step::Spin])),
-                    submit(1, "probe", script(vec![Step::Grow(2048)])),
+                    submit("probe", script(vec![Step::Env])),
+                    submit("probe", script(vec![Step::Spin])),
+                    submit("probe", script(vec![Step::Grow(2048)])),
                 ],
             ))
             .await
@@ -1158,7 +1987,6 @@ fn a_joiner_adopts_synced_commitments_and_installs_the_blobs_it_lacks() {
             .apply(block(
                 1,
                 vec![submit(
-                    0,
                     "probe",
                     script(vec![
                         set(b"k", b"v"),
@@ -1184,7 +2012,7 @@ fn a_joiner_adopts_synced_commitments_and_installs_the_blobs_it_lacks() {
             let id: BlobId = abi::decode(&entry.key).unwrap();
             framed.insert(id, upstream.blob(&id).unwrap().unwrap());
         }
-        assert_eq!(framed.len(), 5);
+        assert_eq!(framed.len(), 6);
         let targets: BTreeMap<String, SyncTarget> = upstream
             .store()
             .programs()
@@ -1260,7 +2088,6 @@ fn a_joiner_adopts_synced_commitments_and_installs_the_blobs_it_lacks() {
             .apply(block(
                 2,
                 vec![submit(
-                    1,
                     "probe",
                     script(vec![get(b"k"), op(HostOp::BlobStat(page))]),
                 )],
@@ -1281,57 +2108,310 @@ fn a_joiner_adopts_synced_commitments_and_installs_the_blobs_it_lacks() {
 }
 
 #[test]
-fn a_signer_submits_in_sequence_and_a_refusal_keeps_the_sequence() {
+fn a_block_runs_a_frame_once_and_a_rejected_run_spends_it() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
+        let first = || submit("probe", script(vec![set(b"k", b"first")]));
+        let fails = || submit("probe", script(vec![Step::Fail("no".into())]));
         let applied = host
             .apply(block(
                 1,
                 vec![
-                    submit(1, "probe", script(vec![set(b"k", b"early")])),
-                    submit(0, "probe", script(vec![set(b"k", b"first")])),
-                    submit(0, "probe", script(vec![set(b"k", b"replay")])),
-                    submit(1, "probe", script(vec![Step::Fail("no".into())])),
-                    submit(1, "probe", script(vec![set(b"k", b"second")])),
+                    first(),
+                    first(),
+                    fails(),
+                    fails(),
+                    submit("probe", script(vec![set(b"k", b"second")])),
                 ],
             ))
             .await
             .unwrap();
-        assert_eq!(rejected(&applied.submissions[0]).reason, reason::SEQUENCE);
         assert_eq!(
-            replies(&applied.submissions[1]),
+            replies(&applied.submissions[0]),
             vec![Reply::Host(HostReply::Done)]
         );
-        assert_eq!(rejected(&applied.submissions[2]).reason, reason::SEQUENCE);
-        assert_eq!(rejected(&applied.submissions[3]).reason, "probe");
+        assert_eq!(rejected(&applied.submissions[1]).reason, reason::DUPLICATE);
+        assert_eq!(rejected(&applied.submissions[2]).reason, "probe");
+        assert_eq!(rejected(&applied.submissions[3]).reason, reason::DUPLICATE);
         assert_eq!(
             replies(&applied.submissions[4]),
             vec![Reply::Host(HostReply::Done)]
         );
-        let view = host.view(Layer::Confirmed);
-        assert_eq!(view.get("probe", b"k").unwrap(), Some(b"second".to_vec()));
-        assert_eq!(view.get(SIGNERS, SIGNER).unwrap(), Some(abi::encode(&2u64)));
+        assert_eq!(stored(&host, "probe", b"k"), Some(b"second".to_vec()));
 
+        let applied = host
+            .apply(block(
+                2,
+                vec![
+                    first(),
+                    anchored(1, first()),
+                    Submission {
+                        salt: Some(1),
+                        ..first()
+                    },
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected(&applied.submissions[0]).reason, reason::DUPLICATE);
+        assert_eq!(
+            replies(&applied.submissions[1]),
+            vec![Reply::Host(HostReply::Done)]
+        );
+        assert_eq!(
+            replies(&applied.submissions[2]),
+            vec![Reply::Host(HostReply::Done)]
+        );
+        assert_eq!(stored(&host, "probe", b"k"), Some(b"first".to_vec()));
+        assert_eq!(
+            host.fresh(&first()).unwrap().unwrap_err().reason,
+            reason::DUPLICATE
+        );
+
+        let fresh = || anchored(2, fails());
         let receipts = host
             .preconfirm(
                 TIME,
                 vec![
-                    submit(2, "probe", script(Vec::new())),
-                    submit(2, "probe", script(Vec::new())),
+                    fresh(),
+                    fresh(),
+                    anchored(2, submit("probe", script(Vec::new()))),
                 ],
             )
             .await
             .unwrap();
-        assert!(matches!(receipts[0].outcome, Outcome::Applied { .. }));
-        assert_eq!(rejected(&receipts[1]).reason, reason::SEQUENCE);
+        assert_eq!(rejected(&receipts[0]).reason, "probe");
+        assert_eq!(rejected(&receipts[1]).reason, reason::DUPLICATE);
+        assert!(matches!(receipts[2].outcome, Outcome::Applied { .. }));
+        assert_eq!(host.fresh(&fresh()).unwrap(), Ok(()));
+    });
+}
+
+#[test]
+fn a_frame_runs_only_while_its_anchor_is_one_of_the_recent_blocks() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let write = |key: &[u8]| submit("probe", script(vec![set(key, b"v")]));
+        let forged = Submission {
+            anchor: Tip {
+                height: 0,
+                id: block_id(9),
+            },
+            ..write(b"forged")
+        };
+        let applied = host
+            .apply(block(
+                1,
+                vec![anchored(1, write(b"ahead")), forged, write(b"last")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected(&applied.submissions[0]).reason, reason::ANCHOR);
+        assert_eq!(rejected(&applied.submissions[1]).reason, reason::ANCHOR);
         assert_eq!(
-            host.view(Layer::Preconfirmed).get(SIGNERS, SIGNER).unwrap(),
-            Some(abi::encode(&3u64))
+            replies(&applied.submissions[2]),
+            vec![Reply::Host(HostReply::Done)]
+        );
+
+        for height in 2..ANCHOR_WINDOW {
+            host.apply(block(height, Vec::new())).await.unwrap();
+        }
+        assert_eq!(
+            host.fresh(&write(b"last")).unwrap().unwrap_err().reason,
+            reason::DUPLICATE
+        );
+        let applied = host
+            .apply(block(ANCHOR_WINDOW, vec![write(b"oldest")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            replies(&applied.submissions[0]),
+            vec![Reply::Host(HostReply::Done)]
+        );
+        let view = host.view(Layer::Confirmed);
+        assert_eq!(view.get(RECENT, &0u64.to_be_bytes()).unwrap(), None);
+        assert_eq!(
+            view.scan(SPENT, &Scan::prefix(0u64.to_be_bytes())).unwrap(),
+            Vec::new()
         );
         assert_eq!(
-            host.view(Layer::Confirmed).get(SIGNERS, SIGNER).unwrap(),
-            Some(abi::encode(&2u64))
+            view.scan(RECENT, &Scan::prefix(b"")).unwrap().len() as u64,
+            ANCHOR_WINDOW
         );
+
+        let applied = host
+            .apply(block(
+                ANCHOR_WINDOW + 1,
+                vec![write(b"late"), anchored(1, write(b"late"))],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected(&applied.submissions[0]).reason, reason::ANCHOR);
+        assert_eq!(
+            replies(&applied.submissions[1]),
+            vec![Reply::Host(HostReply::Done)]
+        );
+        assert_eq!(stored(&host, "probe", b"late"), Some(b"v".to_vec()));
+        assert_eq!(stored(&host, "probe", b"ahead"), None);
+        assert_eq!(stored(&host, "probe", b"forged"), None);
+    });
+}
+
+/// A dropped program's keys leave storage with its commitment: admitted
+/// again under the same id it reads nothing, as a node that synced the
+/// empty commitment would.
+#[test]
+fn a_program_admitted_again_under_its_id_starts_empty() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("found"), "net", dir.path(), standard()).await;
+        let probe = host.programs().unwrap()["probe"];
+        let set = op(HostOp::Set {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        });
+        host.apply(block(
+            1,
+            vec![submit(
+                "module-registry",
+                change("echo", probe, script(vec![set])),
+            )],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(2, Vec::new())).await.unwrap();
+        assert_eq!(
+            host.view(Layer::Confirmed).get("echo", b"k").unwrap(),
+            Some(b"v".to_vec())
+        );
+        host.apply(block(
+            3,
+            vec![submit(
+                "module-registry",
+                abi::encode(&Change::Remove("echo".into())),
+            )],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(4, Vec::new())).await.unwrap();
+        assert!(host.store().commitment("echo").is_none());
+        assert_eq!(host.view(Layer::Confirmed).get("echo", b"k").unwrap(), None);
+        let mut host = restart(context.child("restart"), dir.path(), host).await;
+        host.apply(block(
+            5,
+            vec![submit(
+                "module-registry",
+                change("echo", probe, script(Vec::new())),
+            )],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(6, Vec::new())).await.unwrap();
+        assert_eq!(host.view(Layer::Confirmed).get("echo", b"k").unwrap(), None);
+        let entries = host
+            .store()
+            .commitment("echo")
+            .unwrap()
+            .entries()
+            .await
+            .unwrap();
+        assert!(entries.is_empty());
+    });
+}
+
+#[test]
+fn a_member_cap_outside_1_to_128_is_refused() {
+    deterministic::Runner::default().start(|context| async move {
+        for cap in [0, validators::MAX_MEMBERS + 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut founding = standard();
+            founding.member_cap = cap;
+            let refused = Host::found(
+                context.child("found"),
+                "net",
+                dir.path(),
+                block_id(0),
+                founding,
+            )
+            .await
+            .err();
+            assert!(
+                matches!(refused, Some(Error::MemberCap { cap: got }) if got == cap),
+                "cap {cap}: {refused:?}"
+            );
+            assert_eq!(
+                refused.unwrap().to_string(),
+                format!("a network's member cap is 1 to 128; this founding asks for {cap}")
+            );
+            assert!(!dir.path().join("state").exists(), "cap {cap} wrote state");
+        }
+    });
+}
+
+/// The fixture valset ignores the cap, so the kernel's backstop at epoch 0
+/// is what refuses (valset's own `init` refuses first).
+#[test]
+fn more_founding_validators_than_the_cap_is_refused() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut founding = standard();
+        founding.validators = vec![member(b"v1", "v1:1"), member(b"v2", "v2:2")];
+        founding.member_cap = 1;
+        let refused = Host::found(context, "net", dir.path(), block_id(0), founding)
+            .await
+            .err();
+        assert!(
+            matches!(&refused, Some(Error::Corrupt(why)) if why.contains("past the network's cap of 1")),
+            "{refused:?}"
+        );
+        assert!(!dir.path().join("state").exists());
+        assert!(!dir.path().join("blobs").exists());
+    });
+}
+
+#[test]
+fn the_cap_is_recorded_at_founding_and_read_on_open() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut founding = standard();
+        founding.member_cap = 7;
+        let host = found(context.child("found"), "net", dir.path(), founding).await;
+        assert_eq!(host.member_cap().unwrap(), 7);
+        assert_eq!(
+            host.view(Layer::Confirmed)
+                .get(NETWORK, b"member_cap")
+                .unwrap(),
+            Some(vec![7, 0, 0, 0])
+        );
+        let host = restart(context.child("restart"), dir.path(), host).await;
+        assert_eq!(host.member_cap().unwrap(), 7);
+    });
+}
+
+#[test]
+fn an_epoch_seating_more_members_than_the_cap_is_not_applied() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut founding = standard();
+        founding.member_cap = 2;
+        let mut host = found(context, "net", dir.path(), founding).await;
+        // the fixture valset ignores the cap: three members past a cap of two
+        let payload = abi::encode(&(
+            vec![member(b"v1", "v1:1"), member(b"v2", "v2:2")],
+            vec![member(b"r3", "r3:3")],
+        ));
+        host.apply(block(1, vec![submit("valset", payload)]))
+            .await
+            .unwrap();
+        host.apply(block(2, Vec::new())).await.unwrap();
+        let tip = host.tip().unwrap();
+        let closing = host.apply(block(3, Vec::new())).await;
+        assert!(
+            matches!(&closing, Err(Error::Corrupt(why)) if why.contains("seats 3 members for epoch 1")),
+            "{closing:?}"
+        );
+        assert_eq!(host.tip().unwrap(), tip);
     });
 }

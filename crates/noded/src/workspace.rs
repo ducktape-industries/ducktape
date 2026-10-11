@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use abi::valset::Member;
+use abi::role::validators::Member;
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use consensus::{Anchor, Cadence};
-use host::{Founding as FoundingProgram, Genesis, Limits};
+use host::{Founding as FoundingProgram, FoundingView, Genesis, Limits, Roles};
 use node::Block;
 use rand_core::CryptoRng;
 use serde::Deserialize;
@@ -138,13 +138,29 @@ pub struct Founding {
     pub time: u64,
     pub epoch_length: u64,
     pub block_time_ms: u64,
-    #[serde(rename = "module-registry")]
-    pub module_registry: PathBuf,
-    pub valset: PathBuf,
+    /// How many members the network ever holds at once, 1 to 128; 16 when
+    /// the file leaves it out.
+    #[serde(default = "default_member_cap")]
+    pub member_cap: u32,
+    pub roles: RoleIds,
     pub validators: Vec<Validator>,
     pub programs: Vec<Program>,
     #[serde(default)]
+    pub views: Vec<View>,
+    #[serde(default)]
     pub limits: Metering,
+}
+
+fn default_member_cap() -> u32 {
+    16
+}
+
+/// Which founding program fills each role the kernel calls.
+#[derive(Debug, Deserialize)]
+pub struct RoleIds {
+    pub registry: String,
+    pub validators: String,
+    pub identity: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -164,6 +180,13 @@ pub struct Program {
     pub id: String,
     pub code: PathBuf,
     pub params: Option<PathBuf>,
+}
+
+/// A view with no program behind it, listed by the registry under `name`.
+#[derive(Debug, Deserialize)]
+pub struct View {
+    pub name: String,
+    pub code: PathBuf,
 }
 
 impl Founding {
@@ -208,18 +231,33 @@ impl Founding {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let views = self
+            .views
+            .iter()
+            .map(|view| {
+                Ok(FoundingView {
+                    name: view.name.clone(),
+                    view: std::fs::read(base.join(&view.code))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Genesis {
             network: self.network.as_bytes().to_vec(),
-            module_registry: std::fs::read(base.join(&self.module_registry))?,
-            valset: std::fs::read(base.join(&self.valset))?,
+            roles: Roles {
+                registry: self.roles.registry.clone(),
+                validators: self.roles.validators.clone(),
+                identity: self.roles.identity.clone(),
+            },
             validators,
             programs,
+            views,
             limits: Limits {
                 fuel: self.limits.fuel,
                 memory_bytes: self.limits.memory_bytes,
             },
             epoch_length: self.epoch_length,
             time: self.time,
+            member_cap: self.member_cap,
         })
     }
 }

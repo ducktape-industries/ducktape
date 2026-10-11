@@ -1,6 +1,18 @@
-use abi::ItemRef;
+use abi::{ItemRef, Message};
+use borsh::{BorshDeserialize, BorshSerialize};
 
-pub const FAIL: &[u8] = b"fail";
+/// What relay does with a payload, sent to it directly or as a message.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Script {
+    /// Keeps the bytes under [`got`], events them and outputs them reversed.
+    Note(Vec<u8>),
+    /// Emits each message (its payload a `Script`), keeps each under
+    /// [`sent`] and outputs their items.
+    Send(Vec<Message>),
+    /// Refuses. A sender that wanted a reply keeps the outcome under
+    /// [`done`], and refuses the reply too when the failure was `loud`.
+    Fail { sentence: String, loud: bool },
+}
 
 pub fn sent(item: &ItemRef) -> Vec<u8> {
     key("sent", item)
@@ -22,21 +34,27 @@ fn key(kind: &str, item: &ItemRef) -> Vec<u8> {
 
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::{Cause, Env, ItemRef, Message, Refusal, reason};
+    use abi::{Cause, Env, ItemRef, Outcome, Refusal, reason};
     use guest::{Execute, Program, Query, Reads};
 
-    use crate::{FAIL, done, got, sent};
+    use crate::{Script, done, got, sent};
 
     struct Relay;
 
     impl Program for Relay {
         fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal> {
             match &env.cause {
-                Cause::Direct => send(ctx, payload),
-                Cause::Delivery(item) => receive(ctx, item, payload),
+                Cause::Direct => run(ctx, None, payload),
+                Cause::Message(item) => run(ctx, Some(item), payload),
                 Cause::Completion { item, outcome } => {
                     ctx.set(done(item), abi::encode(outcome));
-                    Ok(())
+                    let asked: Option<Script> =
+                        ctx.get(sent(item)).and_then(|b| abi::decode(&b).ok());
+                    let loud = matches!(asked, Some(Script::Fail { loud: true, .. }));
+                    match outcome {
+                        Outcome::Rejected(refusal) if loud => Err(refusal.clone()),
+                        _ => Ok(()),
+                    }
                 }
             }
         }
@@ -47,26 +65,29 @@ mod program {
         }
     }
 
-    fn send(ctx: &mut Execute, payload: &[u8]) -> Result<(), Refusal> {
-        let message: Message = abi::decode(payload)?;
-        let body = message.payload.clone();
-        let item = match message.reply {
-            true => ctx.call(message.target, message.payload),
-            false => ctx.emit(message.target, message.payload),
-        };
-        ctx.set(sent(&item), body);
-        ctx.output(abi::encode(&item));
-        Ok(())
-    }
-
-    fn receive(ctx: &mut Execute, item: &ItemRef, payload: &[u8]) -> Result<(), Refusal> {
-        let asked_to_fail = payload == FAIL;
-        if asked_to_fail {
-            return Err(Refusal::new(reason::INVALID_INPUT, "asked to fail"));
+    fn run(ctx: &mut Execute, item: Option<&ItemRef>, payload: &[u8]) -> Result<(), Refusal> {
+        match abi::decode(payload)? {
+            Script::Note(bytes) => {
+                if let Some(item) = item {
+                    ctx.set(got(item), bytes.clone());
+                }
+                ctx.event(bytes.clone());
+                ctx.output(bytes.iter().rev().copied().collect::<Vec<u8>>());
+            }
+            Script::Send(messages) => {
+                let mut items = Vec::new();
+                for message in messages {
+                    let body = message.payload.clone();
+                    let item = ctx.emit(message.target, message.payload, message.reply);
+                    ctx.set(sent(&item), body);
+                    items.push(item);
+                }
+                ctx.output(abi::encode(&items));
+            }
+            Script::Fail { sentence, .. } => {
+                return Err(Refusal::new(reason::INVALID_INPUT, sentence));
+            }
         }
-        ctx.set(got(item), payload.to_vec());
-        ctx.event(payload.to_vec());
-        ctx.output(payload.iter().rev().copied().collect::<Vec<u8>>());
         Ok(())
     }
 

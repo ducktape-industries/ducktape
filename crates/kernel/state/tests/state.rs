@@ -310,3 +310,70 @@ fn a_joiner_rebuilds_storage_from_a_synced_commitment() {
         );
     });
 }
+
+/// A node that died after a block's writes landed and before the dropped
+/// program's commitment was destroyed still holds it on disk: the reopened
+/// store removes it, and an admission under the same id starts empty.
+#[test]
+fn a_program_removed_after_reopen_starts_empty_when_admitted_again() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(context.child("a"), "s", storage(&dir), [APP.to_owned()])
+            .await
+            .unwrap();
+        store
+            .commit(0, writes(APP, &[(b"a", Some(b"1"))]))
+            .await
+            .unwrap();
+        let old = store.root(APP).unwrap().unwrap();
+        drop(store);
+        // reopened without APP, as a host whose roster dropped it would
+        let mut store = Store::open(context.child("b"), "s", storage(&dir), [])
+            .await
+            .unwrap();
+        store.remove_program(APP).await.unwrap();
+        assert_eq!(store.view(vec![]).get(APP, b"a").unwrap(), None);
+        store.add_program(APP).await.unwrap();
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh = Store::open(
+            context.child("c"),
+            "s",
+            storage(&fresh_dir),
+            [APP.to_owned()],
+        )
+        .await
+        .unwrap();
+        let reopened = store.root(APP).unwrap().unwrap();
+        assert_ne!(reopened, old);
+        assert_eq!(reopened, fresh.root(APP).unwrap().unwrap());
+    });
+}
+
+/// A program admitted under an id whose commitment another store under the
+/// same name left, as a failed join or another chain's does, starts empty.
+#[test]
+fn a_program_admitted_over_a_left_commitment_starts_empty() {
+    deterministic::Runner::default().start(|context| async move {
+        let left = tempfile::tempdir().unwrap();
+        let mut store = Store::open(context.child("left"), "s", storage(&left), [APP.to_owned()])
+            .await
+            .unwrap();
+        store
+            .commit(0, writes(APP, &[(b"a", Some(b"1"))]))
+            .await
+            .unwrap();
+        drop(store);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(context.child("admits"), "s", storage(&dir), [])
+            .await
+            .unwrap();
+        store.add_program(APP).await.unwrap();
+        let empty_dir = tempfile::tempdir().unwrap();
+        let mut empty = Store::open(context.child("empty"), "t", storage(&empty_dir), [])
+            .await
+            .unwrap();
+        empty.add_program(APP).await.unwrap();
+        assert_eq!(store.root(APP).unwrap(), empty.root(APP).unwrap());
+    });
+}

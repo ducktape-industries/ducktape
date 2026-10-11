@@ -265,23 +265,10 @@ mod context {
             }
         }
 
+        /// Has `target` run `payload` in this frame once this handler
+        /// returns; with `reply`, its outcome comes back as a
+        /// `Cause::Completion`.
         pub fn emit(
-            &mut self,
-            target: impl Into<ProgramId>,
-            payload: impl Into<Vec<u8>>,
-        ) -> ItemRef {
-            self.send(target, payload, false)
-        }
-
-        pub fn call(
-            &mut self,
-            target: impl Into<ProgramId>,
-            payload: impl Into<Vec<u8>>,
-        ) -> ItemRef {
-            self.send(target, payload, true)
-        }
-
-        fn send(
             &mut self,
             target: impl Into<ProgramId>,
             payload: impl Into<Vec<u8>>,

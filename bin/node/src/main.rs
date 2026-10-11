@@ -8,13 +8,13 @@ use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::Runner as _;
 use commonware_runtime::tokio::{Config, Runner};
 use futures::StreamExt as _;
-use host::{Layer, SIGNERS};
+use host::Layer;
 use node::Frame;
 use noded::wire::Admin;
 use noded::{Client, Listen, Logs, Reach, Workspace};
 
 #[derive(Parser)]
-#[command(name = "ducktape", about = "a ducktape node and its client")]
+#[command(name = "ducktape", about = "a ducktape node and its client", version)]
 struct Cli {
     #[arg(
         long,
@@ -34,6 +34,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Verb {
+    #[command(about = "print the binary's version and node contract")]
+    Version,
     #[command(about = "print this workspace's node key, minting one if absent")]
     Identity,
     #[command(about = "found a network in this workspace from a founding file")]
@@ -141,6 +143,14 @@ fn main() {
 }
 
 fn execute(cli: Cli) -> Result<(), String> {
+    if let Verb::Version = cli.verb {
+        println!(
+            "ducktape {} contract {}",
+            env!("CARGO_PKG_VERSION"),
+            noded::NODE_CONTRACT
+        );
+        return Ok(());
+    }
     let workspace = match cli.workspace {
         Some(dir) => Workspace::at(dir),
         None => Workspace::at(ducktape_home::root()?),
@@ -235,27 +245,24 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         Verb::Submit { program, payload } => {
             let status = client.status().await.sentence()?;
             let key = signer(workspace)?;
-            let signer = key.public_key().as_ref().to_vec();
-            let seq = client
-                .get(Layer::Preconfirmed, SIGNERS, &signer)
-                .await
-                .sentence()?
-                .map(|bytes| abi::decode::<u64>(&bytes))
-                .transpose()
-                .map_err(|refusal| refusal.sentence)?
-                .unwrap_or(0);
             let frame = Frame::sign(
                 &key,
                 status.network.as_bytes(),
-                seq,
+                status.anchor(),
+                Some(salt()),
                 &program,
                 bytes(payload)?,
             );
             let receipt = client.submit(frame.encode()).await.sentence()?;
             match receipt.outcome {
-                Outcome::Applied { output } => println!("applied {}", hex::encode(output)),
+                Outcome::Applied { output } => {
+                    println!("preconfirmed applied {}", hex::encode(output))
+                }
                 Outcome::Rejected(refusal) => {
-                    println!("rejected {}: {}", refusal.reason, refusal.sentence)
+                    println!(
+                        "preconfirmed rejected {}: {}",
+                        refusal.reason, refusal.sentence
+                    )
                 }
             }
             for event in receipt.events {
@@ -273,7 +280,8 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             let frame = Frame::sign(
                 &key,
                 status.network.as_bytes(),
-                0,
+                status.anchor(),
+                None,
                 &program,
                 bytes(request)?,
             );
@@ -379,12 +387,17 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             print!("{}", client.metrics().await.sentence()?);
             Ok(())
         }
-        Verb::Identity
+        Verb::Version
+        | Verb::Identity
         | Verb::Init { .. }
         | Verb::Join { .. }
         | Verb::Run { .. }
         | Verb::Wallet(_) => unreachable!("handled before the client is built"),
     }
+}
+
+fn salt() -> u64 {
+    rand_core::Rng::next_u64(&mut rand_core::UnwrapErr(rand::rngs::SysRng))
 }
 
 async fn admin(workspace: &Workspace, client: &Client, verb: Admin) -> Result<Vec<u8>, String> {
@@ -393,7 +406,8 @@ async fn admin(workspace: &Workspace, client: &Client, verb: Admin) -> Result<Ve
     Ok(Frame::sign(
         &identity,
         status.network.as_bytes(),
-        0,
+        status.anchor(),
+        None,
         noded::wire::ADMIN,
         abi::encode(&verb),
     )

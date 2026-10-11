@@ -1,7 +1,7 @@
 use abi::{Refusal, reason};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_cryptography::{Signer as _, ed25519};
-use host::Submission;
+use host::{Submission, Tip};
 use keyscheme::KeyScheme;
 
 pub const NAMESPACE: &[u8] = b"ducktape:frame";
@@ -11,7 +11,8 @@ pub struct Body {
     pub scheme: KeyScheme,
     pub signer: Vec<u8>,
     pub network: Vec<u8>,
-    pub seq: u64,
+    pub anchor: Tip,
+    pub salt: Option<u64>,
     pub target: String,
     pub payload: Vec<u8>,
 }
@@ -26,13 +27,24 @@ impl Body {
     pub fn preimage(&self) -> Vec<u8> {
         abi::encode(self)
     }
+
+    pub fn submission(&self) -> Submission {
+        Submission {
+            signer: self.signer.clone(),
+            anchor: self.anchor,
+            salt: self.salt,
+            target: self.target.clone(),
+            payload: self.payload.clone(),
+        }
+    }
 }
 
 impl Frame {
     pub fn sign(
         key: &ed25519::PrivateKey,
         network: &[u8],
-        seq: u64,
+        anchor: Tip,
+        salt: Option<u64>,
         target: &str,
         payload: Vec<u8>,
     ) -> Frame {
@@ -40,7 +52,8 @@ impl Frame {
             scheme: KeyScheme::Ed25519,
             signer: key.public_key().as_ref().to_vec(),
             network: network.to_vec(),
-            seq,
+            anchor,
+            salt,
             target: target.to_owned(),
             payload,
         };
@@ -76,12 +89,7 @@ impl Frame {
                 "the proof does not bind the frame to its signer",
             ));
         }
-        Ok(Submission {
-            signer: self.body.signer.clone(),
-            seq: self.body.seq,
-            target: self.body.target.clone(),
-            payload: self.body.payload.clone(),
-        })
+        Ok(self.body.submission())
     }
 }
 

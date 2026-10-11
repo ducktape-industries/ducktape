@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use abi::{
     BlobId, Cause, Env, GuestCall, HostOp, HostReply, Invocation, ItemRef, Message, Origin,
-    Outcome, ProgramId, Refusal, reason,
+    Outcome, ProgramId, Refusal, Roles, reason,
 };
 use blobs::{Blobs, Layered, Stage};
 use commonware_runtime::Spawner;
@@ -10,7 +10,7 @@ use commonware_storage::Context;
 use runtime::{Code, Fault, Limits, Runtime};
 use state::{Overlay, Storage, Store, View};
 
-use crate::{Error, Receipt, Result, crypto, namespace, queue};
+use crate::{Error, Receipt, Result, crypto, namespace};
 
 pub struct Loaded {
     runtime: Runtime,
@@ -136,6 +136,7 @@ where
     pub blobs: &'a Blobs,
     pub loaded: &'a Loaded,
     pub network: &'a [u8],
+    pub roles: &'a Roles,
     pub height: u64,
     pub time: u64,
 }
@@ -212,7 +213,8 @@ where
         read(&layered)?.map(Some).ok_or(Error::BlobUnavailable(*id))
     }
 
-    async fn serve(&self, op: HostOp) -> Result<HostReply> {
+    /// Serves a read. A query it makes runs on `fuel`, the caller's.
+    async fn serve(&self, op: HostOp, fuel: &mut Option<u64>) -> Result<HostReply> {
         let me = self.env.me.as_str();
         let reply = match op {
             HostOp::Get(key) => HostReply::Value(self.view().get(me, &key)?),
@@ -236,6 +238,7 @@ where
                     Origin::Program(self.env.me.clone()),
                     program,
                     request,
+                    fuel,
                 )
                 .await?,
             ),
@@ -272,7 +275,7 @@ impl<E> runtime::Host for Query<'_, E>
 where
     E: Context + Spawner,
 {
-    async fn call(&mut self, op: HostOp) -> HostReply {
+    async fn call(&mut self, op: HostOp, fuel: &mut Option<u64>) -> HostReply {
         let result = match op {
             HostOp::Respond(bytes) => {
                 self.response.extend(bytes);
@@ -286,7 +289,7 @@ where
                     env: &self.env,
                     stack: &self.stack,
                 };
-                reader.serve(other).await
+                reader.serve(other, fuel).await
             }
         };
         match result {
@@ -299,6 +302,10 @@ where
     }
 }
 
+/// Runs `program`'s query on `fuel`, leaving what it did not burn: a query
+/// made inside a frame runs on the frame's budget, one made from outside on
+/// a budget of its own.
+#[allow(clippy::too_many_arguments)]
 pub async fn query<'a, E>(
     world: World<'a, E>,
     layers: Vec<&'a Overlay>,
@@ -307,6 +314,7 @@ pub async fn query<'a, E>(
     origin: Origin,
     program: ProgramId,
     request: Vec<u8>,
+    fuel: &mut Option<u64>,
 ) -> Result<std::result::Result<Vec<u8>, Refusal>>
 where
     E: Context + Spawner,
@@ -327,6 +335,9 @@ where
         time: world.time,
         me: program.clone(),
         origin,
+        // a query acts as no one: it reads, and its origin says who asks
+        sender: None,
+        roles: world.roles.clone(),
         cause: Cause::Direct,
     };
     let mut stack = stack.to_vec();
@@ -347,7 +358,7 @@ where
     let verdict = world
         .loaded
         .runtime()
-        .run(module, invocation, &mut unit)
+        .run(module, invocation, &mut unit, fuel)
         .await;
     if let Some(fault) = unit.fault {
         return Err(fault);
@@ -359,6 +370,19 @@ where
     })
 }
 
+/// What the frame is charged for each message a run emits, on top of the
+/// run it causes: the kernel's own work of dispatching it, which a message
+/// refused before any run (an unknown target, too deep) costs too.
+const EMIT_FUEL: u64 = 1_000;
+
+/// What one submission's runs share: the fuel left of the network's limit,
+/// and the number the next emitted message takes, so every item of the
+/// frame is distinct whichever run emitted it.
+pub struct Frame {
+    pub fuel: Option<u64>,
+    pub next_item: u64,
+}
+
 struct Execute<'a, E>
 where
     E: Context + Spawner,
@@ -367,7 +391,9 @@ where
     env: Env,
     overlay: &'a mut Overlay,
     stage: &'a mut Stage,
+    frame: &'a mut Frame,
     events: Vec<Vec<u8>>,
+    emitted: Vec<(ItemRef, Message)>,
     output: Vec<u8>,
     fault: Option<Error>,
 }
@@ -387,14 +413,15 @@ where
         }
     }
 
-    fn emit(&mut self, message: Message) -> Result<HostReply> {
-        let source = self.env.me.clone();
-        let item = queue::Item::Message {
-            source: source.clone(),
-            message,
+    /// Keeps the message for the frame to run once this handler returns.
+    fn emit(&mut self, message: Message) -> HostReply {
+        let item = ItemRef {
+            source: self.env.me.clone(),
+            item: self.frame.next_item,
         };
-        let seq = queue::push(self.world.store.storage(), self.overlay, item)?;
-        Ok(HostReply::Item(ItemRef { source, item: seq }))
+        self.frame.next_item += 1;
+        self.emitted.push((item.clone(), message));
+        HostReply::Item(item)
     }
 }
 
@@ -403,7 +430,7 @@ impl<E> runtime::Host for Execute<'_, E>
 where
     E: Context + Spawner,
 {
-    async fn call(&mut self, op: HostOp) -> HostReply {
+    async fn call(&mut self, op: HostOp, fuel: &mut Option<u64>) -> HostReply {
         let me = self.env.me.clone();
         let result = match op {
             HostOp::Set { key, value } => {
@@ -415,7 +442,10 @@ where
                 Ok(HostReply::Done)
             }
             HostOp::BlobPut { hash, kind, body } => Ok(self.put(hash, &kind, &body)),
-            HostOp::Emit(message) => self.emit(message),
+            HostOp::Emit(message) => {
+                *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
+                Ok(self.emit(message))
+            }
             HostOp::Event(bytes) => {
                 self.events.push(bytes);
                 Ok(HostReply::Done)
@@ -436,7 +466,7 @@ where
                     env: &self.env,
                     stack: &[],
                 };
-                reader.serve(other).await
+                reader.serve(other, fuel).await
             }
         };
         match result {
@@ -449,41 +479,44 @@ where
     }
 }
 
+/// One run of `program`: its receipt, and what it emitted (nothing when it
+/// was rejected: its writes are undone here too).
 pub async fn execute<E>(
     world: World<'_, E>,
     overlay: &mut Overlay,
     stage: &mut Stage,
+    frame: &mut Frame,
     program: &str,
     invocation: Invocation,
-) -> Result<Receipt>
+) -> Result<(Receipt, Vec<(ItemRef, Message)>)>
 where
     E: Context + Spawner,
 {
     let Some(module) = world.loaded.module(program) else {
-        return Ok(Receipt {
-            program: program.to_owned(),
-            outcome: Outcome::Rejected(unknown(program)),
-            events: Vec::new(),
-        });
+        return Ok((crate::rejected(program, unknown(program)), Vec::new()));
     };
     let checkpoint = overlay.checkpoint();
-    let (verdict, events, output, fault) = {
+    let mut fuel = frame.fuel;
+    let (verdict, events, emitted, output, fault) = {
         let mut unit = Execute {
             world,
             env: invocation.env.clone(),
             overlay: &mut *overlay,
             stage: &mut *stage,
+            frame: &mut *frame,
             events: Vec::new(),
+            emitted: Vec::new(),
             output: Vec::new(),
             fault: None,
         };
         let verdict = world
             .loaded
             .runtime()
-            .run(module, invocation, &mut unit)
+            .run(module, invocation, &mut unit, &mut fuel)
             .await;
-        (verdict, unit.events, unit.output, unit.fault)
+        (verdict, unit.events, unit.emitted, unit.output, unit.fault)
     };
+    frame.fuel = fuel;
     if let Some(fault) = fault {
         return Err(fault);
     }
@@ -492,18 +525,28 @@ where
         Ok(Err(refusal)) => Outcome::Rejected(refusal),
         Err(fault) => Outcome::Rejected(refusal_of(fault)),
     };
-    if let Outcome::Rejected(_) = &outcome {
-        overlay.restore(checkpoint);
-        discard_unrostered(world.store.storage(), overlay, stage)?;
-    }
-    Ok(Receipt {
+    let emitted = match &outcome {
+        Outcome::Applied { .. } => emitted,
+        Outcome::Rejected(_) => {
+            overlay.restore(checkpoint);
+            discard_unrostered(world.store.storage(), overlay, stage)?;
+            Vec::new()
+        }
+    };
+    let receipt = Receipt {
         program: program.to_owned(),
         outcome,
         events,
-    })
+        nested: Vec::new(),
+    };
+    Ok((receipt, emitted))
 }
 
-fn discard_unrostered(storage: &Storage, overlay: &Overlay, stage: &mut Stage) -> Result<()> {
+pub(crate) fn discard_unrostered(
+    storage: &Storage,
+    overlay: &Overlay,
+    stage: &mut Stage,
+) -> Result<()> {
     let view = View::new(storage, vec![overlay]);
     let mut kept = Vec::new();
     for id in stage.ids() {

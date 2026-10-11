@@ -22,9 +22,27 @@ pub trait Chain: Clone + Send + Sync + 'static {
     fn propose(
         &mut self,
         parent: Arc<Block>,
+        ancestors: impl Ancestry<Block>,
         time: u64,
     ) -> impl Future<Output = Option<Block>> + Send;
     fn deliver(&mut self, block: Arc<Block>, ack: Exact);
+}
+
+pub async fn unapplied(
+    parent: Arc<Block>,
+    mut ancestors: impl Ancestry<Block>,
+    applied: u64,
+) -> Vec<Arc<Block>> {
+    let mut unapplied = Vec::new();
+    let mut block = parent;
+    while block.height > applied {
+        unapplied.push(block);
+        let Some(older) = ancestors.next().await else {
+            break;
+        };
+        block = older;
+    }
+    unapplied
 }
 
 pub struct App<E, C> {
@@ -84,7 +102,7 @@ where
             context.sleep(Duration::from_millis(wait)).await;
         }
         let time = now(&context);
-        self.chain.propose(parent, time).await
+        self.chain.propose(parent, ancestry, time).await
     }
 
     async fn verify(&mut self, _: (E, Self::Context), _: impl Ancestry<Block>) -> bool {

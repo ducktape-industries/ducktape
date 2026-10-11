@@ -39,24 +39,36 @@ delegates the desktop installation to the pinned
 
 A founding file names the network, its cadence, its validators and the
 programs it starts with. Every path is relative to the file; the programs a
-network boots with (`module-registry`, `valset`, `identity`) are built and
-committed in [modules](https://github.com/ducktape-industries/modules) under
-`crates/modules/system/wasm/`:
+network boots with (`module-registry`, `valset`, `identity`) are built in
+[modules](https://github.com/ducktape-industries/modules) (`make
+wasm-programs`, under `$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/`):
 
 ```toml
 network = "mynet"
 time = 1700000000000          # the genesis block's time, unix milliseconds
 epoch_length = 64             # blocks per validator epoch
 block_time_ms = 1000
-module-registry = "module_registry.wasm"   # the program that registers and swaps programs
-valset = "valset.wasm"                     # the program that seats each epoch's validators
+member_cap = 16               # optional, default 16: the most members (validators and residents) it ever holds, 1 to 128; fixed at founding
+
+[roles]                       # the founding program the kernel calls in each role; all three required
+registry = "module-registry"  # registers and swaps programs
+validators = "valset"         # seats each epoch's validators
+identity = "identity"         # resolves a key or a program to its account
 
 [[validators]]
 key = "…"                     # hex ed25519 public key: `ducktape identity`
 address = "203.0.113.7:9000"  # where peers dial it
 
 [[programs]]
-id = "identity"               # one entry per system program, `id` = its contract's PROGRAM
+id = "module-registry"        # one entry per program; the registry's and validators' params are the kernel's
+code = "module_registry.wasm"
+
+[[programs]]
+id = "valset"
+code = "valset.wasm"
+
+[[programs]]
+id = "identity"
 code = "identity.wasm"
 
 [[programs]]
@@ -68,6 +80,17 @@ params = "ping.params"        # optional: the bytes the program's init receives
 fuel = 1000000000
 memory_bytes = 268435456
 ```
+
+The kernel calls programs by role, never by id. Founding refuses a role bound
+to a program the file does not list, and every frame's env carries the
+bindings (`Env.roles`). As the kernel admits a program, at founding or later
+off the registry, it gives the program an account: the identity role's
+`RegisterModule`, executed with the `System` origin. Once per frame the host
+asks the identity role who the frame acts as, `Account(key)` for a signed
+frame and `OfModule(program)` for a message or a reply, and passes the answer
+as `Env.sender`; a refusal rejects the frame, and a key that holds no account
+runs as no one (`None`). The interfaces are `abi::role::{registry,
+validators, identity}`; modules' `docs/roles.md` walks through them.
 
 ```sh
 ducktape identity                                   # mint this workspace's node key
@@ -92,7 +115,7 @@ from, the address its HTTP surface bound and the runtime's storage.
 ```sh
 ducktape status                         # height, tip, root, epoch, identity
 ducktape wallet new alice               # a user key; DUCKTAPE_PASSWORD or a prompt
-ducktape submit ping request.bin        # sign a frame with the active wallet, print the receipt
+ducktape submit ping request.bin        # sign a frame with the active wallet, print its preconfirmed receipt
 ducktape get ping 6b6579                # a key in hex, from the preconfirmed layer
 ducktape get ping 6b6579 --confirmed    # the committed layer
 ducktape scan ping --lo 6b               # a key range
@@ -102,7 +125,19 @@ ducktape programs                       # every program and its code blob
 ducktape blob get sha256:…              # a blob's framed bytes
 ```
 
-Reads are open; writes are signed frames. `ducktape logs`,
+Reads are open; writes are signed frames. Each frame names a recent block, its
+anchor, and is valid only while that block is one of the last 256: the CLI
+anchors to the tip `status` reports. A block runs a frame at most once. A node
+takes every frame that is signed for its network, names a recent block and no
+block has carried yet, and holds it in its mempool until a block carries it or
+its anchor ages out. Any member's node takes a frame: it hands each frame a
+client gives it to the epoch's validators over the mesh at once, and again
+whenever a few blocks pass without the frame landing, so a frame submitted to
+a member without a vote lands like one submitted to a validator. A block holds
+at most 16 MiB of frames (`node::BLOCK_BYTES`); a frame no block can carry is
+refused. The receipt `submit` prints is the node's prediction from its
+preconfirmed layer, not a verdict: a frame predicted to fail is still relayed
+and waits for a block, and the block decides. `ducktape logs`,
 `ducktape log-filter`, `ducktape metrics` and `ducktape shutdown` operate the
 node; the mutating ones are signed with the node's own identity key. Each
 verb's `--help` carries the rest.
@@ -111,12 +146,12 @@ verb's `--help` carries the rest.
 
 | Layer | Where | What |
 | --- | --- | --- |
-| Kernel | `crates/kernel/` | `abi` (the bytes ABI), `guest` (what a program compiles against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `blobs` (one content-addressed store), `host` (the sandbox: submit, query, deliver), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
-| Programs | [`ducktape-industries/modules`](https://github.com/ducktape-industries/modules) | The contracts a program compiles against (`crates/sdk/abi`, `crates/sdk/guest`: copies of `crates/kernel/abi` and `crates/kernel/guest` here), the boot set (`crates/modules`: the `modules` contracts crate, the `module-registry`, `valset` and `identity` programs under `system/`, their committed bytes under `system/wasm/`, and the suite that drives them on this host) and the app modules. The eight system modules beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
+| Kernel | `crates/kernel/` | `abi` (the bytes ABI), `guest` (what a program compiles against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `blobs` (one content-addressed store), `host` (the sandbox: submit, query, and the messages a frame emits, run in that frame), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
+| Programs | [`ducktape-industries/modules`](https://github.com/ducktape-industries/modules) | The contracts a program compiles against (`crates/sdk/abi`, a copy of `crates/kernel/abi` here, and `crates/sdk/guest`, the module SDK), the boot set (`crates/system/`: `module-registry`, `valset` and `identity`, whose suite founds this host over their bytes) and the app modules. The system modules beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
-| Networking | `crates/networking/` | WireGuard mesh, NAT traversal, reachability, overlay data plane |
+| Networking | `crates/networking/` | Off-consensus byte transport for the services; the WireGuard overlay and the coordinator are `ducktape-industries/tunnel` |
 | Services | `crates/services/` | Off-chain executors: provider run loop, microVM sandbox, credential broker, airlock, media |
-| Binaries | `bin/` | The coordinator, the airlock gateway, the media and terminal services, the sandbox PID 1 |
+| Binaries | `bin/` | The airlock gateway, the media and terminal services, the sandbox PID 1 |
 
 ## Develop
 

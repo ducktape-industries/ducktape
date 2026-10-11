@@ -13,8 +13,6 @@ node_modules
 # Brainstorm specs and implementation plans are per-PR working files, never a
 # record: they stay local and die with their worktree.
 docs/superpowers/
-ops/wg-smoke/*.log
-ops/wg-smoke/node*/
 
 # superpowers SDD scratch
 .superpowers/

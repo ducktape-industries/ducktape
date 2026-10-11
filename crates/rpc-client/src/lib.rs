@@ -36,6 +36,7 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(7_500);
 pub struct Error {
     reason: String,
     message: String,
+    status: Option<u16>,
 }
 
 impl Error {
@@ -46,6 +47,7 @@ impl Error {
         Self {
             reason: "rpc_client".into(),
             message: message.into(),
+            status: None,
         }
     }
 
@@ -54,7 +56,13 @@ impl Error {
         Self {
             reason: reason.into(),
             message: message.into(),
+            status: None,
         }
+    }
+
+    fn with_status(mut self, status: StatusCode) -> Self {
+        self.status = Some(status.as_u16());
+        self
     }
 
     /// What kind of failure this is — the token a caller branches on.
@@ -66,6 +74,13 @@ impl Error {
     /// verbatim: nothing here paraphrases it and nothing wraps it.
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// The HTTP status of the non-2xx response this error came from, if one
+    /// was seen. `None` for a failure that never got a status back (transport,
+    /// decode, stream). Branch on this, never on a status number in `message`.
+    pub fn status(&self) -> Option<u16> {
+        self.status
     }
 }
 
@@ -101,7 +116,7 @@ struct NodeRefusal {
 /// rather than writing a second parser, so both lanes split the envelope the
 /// same way and no consumer downstream has to.
 pub fn refusal(status: StatusCode, body: &[u8]) -> Error {
-    match serde_json::from_slice::<NodeRefusal>(body) {
+    let error = match serde_json::from_slice::<NodeRefusal>(body) {
         Ok(node) => Error::refused(
             node.reason.unwrap_or_else(|| "refused".into()),
             bounded_detail(&node.error),
@@ -115,7 +130,8 @@ pub fn refusal(status: StatusCode, body: &[u8]) -> Error {
                 bounded_detail(&String::from_utf8_lossy(body))
             ),
         ),
-    }
+    };
+    error.with_status(status)
 }
 
 /// Result returned by the RPC client.
@@ -846,7 +862,7 @@ impl Client {
             .map_err(|error| Error::new(format!("RPC blob get failed: {error}")))?;
         let status = response.status();
         if !status.is_success() {
-            return Err(Error::new(format!("RPC blob get returned {status}")));
+            return Err(Error::new(format!("RPC blob get returned {status}")).with_status(status));
         }
         read_bounded(response, limit).await
     }
@@ -1226,7 +1242,8 @@ async fn response_error(response: Response) -> Error {
         Ok(bytes) => refusal(status, &bytes),
         // the body itself could not be read: that is this client's failure, not
         // a refusal anyone authored.
-        Err(error) => Error::new(format!("a rejection ({status}) could not be read: {error}")),
+        Err(error) => Error::new(format!("a rejection ({status}) could not be read: {error}"))
+            .with_status(status),
     }
 }
 
@@ -1605,6 +1622,21 @@ mod tests {
         // caller that only prints one cannot accidentally branch on prose.
         assert_eq!(refused.to_string(), "forge: non-fast-forward");
         assert_eq!(unresolved.to_string(), "transaction submission failed");
+    }
+
+    /// THE STATUS IS A FIELD, NOT A PREFIX. A non-2xx carries its status
+    /// whether the body is the node's envelope or a proxy's page, and a
+    /// client-side failure carries none — so no caller sniffs `message`.
+    #[test]
+    fn a_refusal_carries_its_http_status() {
+        let node = refusal(
+            StatusCode::CONFLICT,
+            br#"{"error":"taken","reason":"taken"}"#,
+        );
+        assert_eq!((node.reason(), node.status()), ("taken", Some(409)));
+        let proxy = refusal(StatusCode::NOT_FOUND, b"<html>not found</html>");
+        assert_eq!((proxy.reason(), proxy.status()), ("http_error", Some(404)));
+        assert_eq!(Error::new("RPC stream closed").status(), None);
     }
 
     #[tokio::test(start_paused = true)]

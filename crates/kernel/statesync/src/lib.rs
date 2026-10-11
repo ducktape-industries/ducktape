@@ -46,6 +46,8 @@ pub enum Error {
         "the tip's certificate does not verify against the validators seated for epoch {epoch}"
     )]
     Certificate { epoch: u64 },
+    #[error("the tip's certificate names epoch {epoch} and the state records no validators for it")]
+    Unrecorded { epoch: u64 },
     #[error("the state names blob {0:?} and the peer does not serve it")]
     Blob(BlobId),
 }
@@ -128,8 +130,10 @@ fn verified<E: Context>(
     certificate: &Certificate,
 ) -> Result<()> {
     let epoch = certificate.round().epoch().get();
-    let members = node.epoch_members(epoch)?.unwrap_or_default();
-    let validators = validators_of(&members).ok_or(Error::Certificate { epoch })?;
+    let seated = node
+        .epoch_validators(epoch)?
+        .ok_or(Error::Unrecorded { epoch })?;
+    let validators = validators_of(&seated).ok_or(Error::Certificate { epoch })?;
     let scheme = Scheme::verifier(network, validators);
     let verifies = certificate.verify(context, &scheme, &Sequential);
     if !verifies {
