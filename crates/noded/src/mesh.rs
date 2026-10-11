@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use abi::role::validators::Member;
 use commonware_codec::DecodeExt as _;
+use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_p2p::authenticated::lookup::{Config, Network, Oracle, Receiver, Sender};
 use commonware_p2p::{Address, AddressableManager as _, AddressableTrackedPeers};
@@ -11,20 +13,17 @@ use commonware_utils::{NZU32, NZUsize};
 use consensus::channel::{BACKFILL, BROADCAST, CERTIFICATE, RELAY, RESOLVER, VOTE};
 use consensus::{EngineChannels, MarshalLanes};
 
-use crate::Context;
+use crate::endpoint::Endpoint;
+use crate::transport::{self, Bridges};
+use crate::{Context, Result};
 
 pub const QUOTA_PER_SECOND: u32 = 1024;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reach {
-    Public,
-    Private,
-}
 
 pub type Lane<E> = (Sender<PublicKey, E>, Receiver<PublicKey>);
 
 pub type Started<E> = (
     Mesh<E>,
+    Tracker,
     MarshalLanes<Sender<PublicKey, E>, Receiver<PublicKey>>,
     EngineChannels<Sender<PublicKey, E>, Receiver<PublicKey>>,
     Lane<E>,
@@ -48,21 +47,15 @@ impl<E: Context> Mesh<E> {
         identity: PrivateKey,
         namespace: &[u8],
         listen: SocketAddr,
-        reach: Reach,
         member_cap: u32,
-    ) -> Started<E> {
+    ) -> Result<Started<E>> {
         // An epoch seats at most `member_cap` members; this node takes one more
         // place whenever it is not among them (commonware `peer_set_limit`), and
         // it can leave or join the set without a restart, so the +1 is kept.
         let peers = NZUsize!(member_cap as usize + 1);
-        let mut config = match reach {
-            Reach::Public => {
-                Config::recommended(identity, namespace, listen, peers, node::MESSAGE_BYTES)
-            }
-            Reach::Private => {
-                Config::local(identity, namespace, listen, peers, node::MESSAGE_BYTES)
-            }
-        };
+        let me = identity.public_key();
+        let mut config = Config::local(identity, namespace, listen, peers, node::MESSAGE_BYTES);
+        config.bypass_ip_check = true;
         // only the current epoch's set: nothing reads an older one, and the
         // previous epoch's engine is gone at the switch
         config.tracked_peer_sets = NZUsize!(1);
@@ -79,12 +72,18 @@ impl<E: Context> Mesh<E> {
         };
         let relay = network.register(RELAY, quota);
         let running = network.start();
+        let tracker = Tracker {
+            oracle: oracle.clone(),
+            me,
+            listen: transport::loopback(listen),
+            bridges: Bridges::new(transport::dialer()?),
+        };
         let mesh = Mesh {
             oracle,
             running,
             _runtime: std::marker::PhantomData,
         };
-        (mesh, marshal, engine, relay)
+        Ok((mesh, tracker, marshal, engine, relay))
     }
 
     pub fn oracle(&self) -> Oracle<PublicKey> {
@@ -92,34 +91,71 @@ impl<E: Context> Mesh<E> {
     }
 }
 
-pub fn track(oracle: &mut Oracle<PublicKey>, epoch: u64, members: &[Member]) {
-    let peers: Vec<(PublicKey, Address)> = members
-        .iter()
-        .filter_map(|member| {
-            let key = PublicKey::decode(member.key.as_slice()).ok()?;
-            let address: SocketAddr = member.address.parse().ok()?;
-            Some((key, Address::Symmetric(address)))
-        })
-        .collect();
-    let unreachable = members.len() - peers.len();
-    if unreachable > 0 {
-        tracing::warn!(
-            target: "ducktape::mesh",
+pub struct Tracker {
+    oracle: Oracle<PublicKey>,
+    me: PublicKey,
+    listen: SocketAddr,
+    bridges: Bridges,
+}
+
+impl Tracker {
+    pub fn track(&mut self, epoch: u64, members: &[Member]) {
+        let mut kept = HashSet::new();
+        let peers: Vec<(PublicKey, Address)> = members
+            .iter()
+            .filter_map(|member| self.peer(epoch, member, &mut kept))
+            .collect();
+        self.bridges.keep(&kept);
+        let _ = self.oracle.track(
             epoch,
-            unreachable,
-            reason = "member_address_unparsable",
-            "some members of the epoch cannot be dialed"
+            AddressableTrackedPeers::from(Map::from_iter_dedup(peers)),
         );
     }
-    let _ = oracle.track(
-        epoch,
-        AddressableTrackedPeers::from(Map::from_iter_dedup(peers)),
-    );
+
+    fn peer(
+        &mut self,
+        epoch: u64,
+        member: &Member,
+        kept: &mut HashSet<Endpoint>,
+    ) -> Option<(PublicKey, Address)> {
+        let key = PublicKey::decode(member.key.as_slice()).ok()?;
+        if key == self.me {
+            return Some((key, Address::Symmetric(self.listen)));
+        }
+        let endpoint = match member.address.parse::<Endpoint>() {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                tracing::warn!(
+                    target: "ducktape::mesh",
+                    epoch,
+                    reason = "member_address_unparsable",
+                    %error,
+                    "a member of the epoch cannot be dialed"
+                );
+                return None;
+            }
+        };
+        let local = match self.bridges.local(&endpoint) {
+            Ok(local) => local,
+            Err(error) => {
+                tracing::warn!(
+                    target: "ducktape::mesh",
+                    epoch,
+                    reason = "bridge_unbound",
+                    %endpoint,
+                    %error,
+                    "a member of the epoch cannot be dialed"
+                );
+                return None;
+            }
+        };
+        kept.insert(endpoint);
+        Some((key, Address::Symmetric(local)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use commonware_cryptography::Signer as _;
     use commonware_runtime::{Runner as _, tokio};
 
     use super::*;
@@ -133,15 +169,15 @@ mod tests {
                 .local_addr()
                 .unwrap();
             let identity = PrivateKey::from_seed(0);
-            let (mesh, _, _, _) =
-                Mesh::start(context, identity, b"mesh", listen, Reach::Private, 3);
+            let (_mesh, mut tracker, _, _, _) =
+                Mesh::start(context, identity, b"mesh", listen, 3).unwrap();
             let members: Vec<Member> = (1..=foreign)
                 .map(|seed| Member {
                     key: PrivateKey::from_seed(seed).public_key().as_ref().to_vec(),
-                    address: format!("127.0.0.1:{}", 9_000 + seed),
+                    address: format!("tcp://localhost:{}", 9_000 + seed),
                 })
                 .collect();
-            track(&mut mesh.oracle(), 0, &members);
+            tracker.track(0, &members);
         });
     }
 

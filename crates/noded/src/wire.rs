@@ -22,6 +22,7 @@ pub mod route {
     pub const ADMIN: &str = "/v1/admin";
     pub const SYNC: &str = "/v1/sync";
     pub const NETWORK: &str = "/v1/network";
+    pub const P2P: &str = "/v1/p2p";
     pub const METRICS: &str = "/metrics";
 }
 
