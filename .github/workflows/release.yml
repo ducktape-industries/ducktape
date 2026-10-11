@@ -1,5 +1,6 @@
-# Each time `main` moves, the self-hosted runner fabrics-1 builds the ducktape binary
-# and publishes it on the prerelease bin-<commit>, beside any other platform's build.
+# Each time `main` moves, the self-hosted runners fabrics-1 (Linux x86_64) and
+# mac-byeongsu (macOS arm64) build the ducktape binary and publish it on the
+# prerelease bin-<commit>, one archive per platform.
 name: release
 
 on:
@@ -19,8 +20,16 @@ env:
   CARGO_TARGET_DIR: ${{ github.workspace }}/../target
 
 jobs:
-  linux:
-    runs-on: [self-hosted, fabrics-1]
+  bin:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: fabrics-1
+            triple: x86_64-unknown-linux-gnu
+          - runner: mac-byeongsu
+            triple: aarch64-apple-darwin
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -29,10 +38,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: bin-${{ github.sha }}
-          ASSET: ducktape-x86_64-unknown-linux-gnu.tar.gz
+          ASSET: ducktape-${{ matrix.triple }}.tar.gz
+          COPYFILE_DISABLE: 1 # keeps macOS tar from adding ._ducktape
         run: |
           tar czf "$ASSET" -C "$CARGO_TARGET_DIR/release" ducktape
+          # Both runners may try to create the release; the loser finds it made.
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
             --prerelease --latest=false --target "$GITHUB_SHA" --title "$TAG" \
-            --notes "The ducktape node and CLI built at $GITHUB_SHA."
+            --notes "The ducktape node and CLI built at $GITHUB_SHA." \
+            || gh release view "$TAG" >/dev/null
           gh release upload "$TAG" "$ASSET" --clobber
