@@ -7,7 +7,7 @@ use std::collections::btree_map::Entry;
 
 use commonware_consensus::types::Height;
 use commonware_cryptography::ed25519::PublicKey;
-use commonware_cryptography::{Digestible as _, Hasher as _, Sha256, sha256};
+use commonware_cryptography::{Digestible as _, sha256};
 use commonware_utils::ordered::Set;
 use consensus::validators_of;
 use node::Block;
@@ -76,7 +76,7 @@ impl<E: Context> Daemon<E> {
         let verified: Vec<_> = block
             .frames
             .iter()
-            .filter_map(|frame| Some((frame, node::verify(frame, &network).ok()?)))
+            .filter_map(|frame| node::verify(frame, &network).ok())
             .collect();
         let receipts = match self.receipts.get(block.height).await? {
             None => vec![None; verified.len()],
@@ -93,10 +93,10 @@ impl<E: Context> Daemon<E> {
         let txs = verified
             .into_iter()
             .zip(receipts)
-            .map(|((frame, submission), receipt)| Tx {
-                hash: tx_hash(frame),
+            .map(|(submission, receipt)| Tx {
+                hash: submission.id(),
                 signer: submission.signer,
-                seq: submission.seq,
+                anchor: submission.anchor,
                 target: submission.target,
                 payload: submission.payload,
                 receipt,
@@ -130,9 +130,4 @@ impl<E: Context> Daemon<E> {
             .and_then(|validators| consensus::proposer(&certificate, validators))
             .map(|key| key.as_ref().to_vec()))
     }
-}
-
-/// A transaction's hash: sha256 over the exact frame bytes a block carries.
-pub fn tx_hash(frame: &[u8]) -> [u8; 32] {
-    Sha256::hash(&[frame]).0
 }

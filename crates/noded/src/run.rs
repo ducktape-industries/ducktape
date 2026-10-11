@@ -11,7 +11,8 @@ use commonware_runtime::Handle;
 use commonware_utils::Acknowledgement as _;
 use commonware_utils::acknowledgement::Exact;
 use consensus::{
-    Anchor, Chain, EngineMux, Marshal, Membership, Network, Roster, Transport, validators_of,
+    Ancestry, Anchor, Chain, EngineMux, Marshal, Membership, Network, Roster, Transport,
+    validators_of,
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -270,10 +271,41 @@ impl<E: Context> Clone for Participant<E> {
     }
 }
 
-impl<E: Context> Chain for Participant<E> {
-    async fn propose(&mut self, parent: Arc<Block>, time: u64) -> Option<Block> {
+impl<E: Context> Participant<E> {
+    async fn build(
+        &self,
+        parent: Arc<Block>,
+        ancestors: impl Ancestry<Block>,
+        time: u64,
+    ) -> node::Result<Block> {
+        let applied = self.node.lock().await.tip()?.height;
+        let unapplied = consensus::unapplied(parent.clone(), ancestors, applied).await;
         let node = self.node.lock().await;
-        Some(node.build(parent.tip(), time))
+        node.build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time)
+    }
+}
+
+impl<E: Context> Chain for Participant<E> {
+    async fn propose(
+        &mut self,
+        parent: Arc<Block>,
+        ancestors: impl Ancestry<Block>,
+        time: u64,
+    ) -> Option<Block> {
+        let height = parent.height + 1;
+        match self.build(parent, ancestors, time).await {
+            Ok(block) => Some(block),
+            Err(error) => {
+                tracing::error!(
+                    target: "ducktape::node",
+                    event = "build_failed",
+                    height,
+                    %error,
+                    "the node cannot build a block"
+                );
+                None
+            }
+        }
     }
 
     fn deliver(&mut self, block: Arc<Block>, ack: Exact) {

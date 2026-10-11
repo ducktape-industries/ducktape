@@ -99,13 +99,19 @@ fn delete(key: &[u8]) -> Step {
     Step::Op(HostOp::Delete(key.to_vec()))
 }
 
-fn frame(key: &ed25519::PrivateKey, seq: u64, steps: Vec<Step>) -> Vec<u8> {
-    Frame::sign(key, NETWORK, seq, "probe", abi::encode(&steps)).encode()
+fn origin() -> Tip {
+    Block::genesis(NETWORK, TIME).tip()
+}
+
+fn frame(key: &ed25519::PrivateKey, steps: Vec<Step>) -> Vec<u8> {
+    Frame::sign(key, NETWORK, origin(), None, "probe", abi::encode(&steps)).encode()
 }
 
 async fn seal(node: &mut Node<Ctx>) -> Block {
     let tip = node.tip().unwrap();
-    let block = node.build(tip, TIME + tip.height + 1);
+    let block = node
+        .build(tip, std::iter::empty(), TIME + tip.height + 1)
+        .unwrap();
     let Sequenced::Applied(_) = node.apply(&block).await.unwrap() else {
         panic!("block {} was already applied", block.height);
     };
@@ -312,8 +318,11 @@ impl Network {
     async fn advance(&mut self, frames: Vec<Vec<u8>>) -> Tip {
         let mut node = self.source.node.lock().await;
         for frame in frames {
-            let receipt = node.submit(frame).await.unwrap().unwrap();
-            assert!(matches!(receipt.outcome, abi::Outcome::Applied { .. }));
+            let taken = node.submit(frame).await.unwrap().unwrap();
+            assert!(matches!(
+                taken.receipt().outcome,
+                abi::Outcome::Applied { .. }
+            ));
         }
         let tip = seal(&mut node).await.tip();
         drop(node);
@@ -356,10 +365,10 @@ fn a_joiner_adopts_the_state_at_a_finalized_tip() {
         let mut network = found(&context).await;
         let alice = key(11);
         network
-            .advance(vec![frame(&alice, 0, vec![set(b"a", b"1")])])
+            .advance(vec![frame(&alice, vec![set(b"a", b"1")])])
             .await;
         let tip = network
-            .advance(vec![frame(&alice, 1, vec![set(b"b", b"2")])])
+            .advance(vec![frame(&alice, vec![set(b"b", b"2")])])
             .await;
         assert_eq!(tip.height, 2);
 
@@ -414,7 +423,7 @@ fn a_joined_node_applies_the_next_block_like_the_source() {
         let mut network = found(&context).await;
         let alice = key(11);
         network
-            .advance(vec![frame(&alice, 0, vec![set(b"a", b"1")])])
+            .advance(vec![frame(&alice, vec![set(b"a", b"1")])])
             .await;
         let dir = tempfile::tempdir().unwrap();
         let mut joined = join(
@@ -429,7 +438,7 @@ fn a_joined_node_applies_the_next_block_like_the_source() {
 
         let mut source = network.source.node.lock().await;
         source
-            .submit(frame(&alice, 1, vec![set(b"c", b"3")]))
+            .submit(frame(&alice, vec![set(b"c", b"3")]))
             .await
             .unwrap()
             .unwrap();
@@ -520,7 +529,7 @@ fn a_tip_certificate_verifies_against_the_validators_not_the_members() {
         let valset = abi::encode(&(&network.members, &residents));
         let mut tip = network
             .advance(vec![
-                Frame::sign(&alice, NETWORK, 0, "valset", valset).encode(),
+                Frame::sign(&alice, NETWORK, origin(), None, "valset", valset).encode(),
             ])
             .await;
         while tip.height < EPOCH_LENGTH {
@@ -599,7 +608,7 @@ fn a_retry_after_a_cut_off_join_reads_what_the_source_reads() {
         let mut network = found(&context).await;
         let alice = key(11);
         network
-            .advance(vec![frame(&alice, 0, vec![set(b"gone", b"1")])])
+            .advance(vec![frame(&alice, vec![set(b"gone", b"1")])])
             .await;
         let dir = tempfile::tempdir().unwrap();
         cut_off(
@@ -612,7 +621,7 @@ fn a_retry_after_a_cut_off_join_reads_what_the_source_reads() {
         assert!(dir.path().join("state").exists());
 
         network
-            .advance(vec![frame(&alice, 1, vec![delete(b"gone")])])
+            .advance(vec![frame(&alice, vec![delete(b"gone")])])
             .await;
         let joined = join(
             context.child("retried"),
@@ -640,7 +649,7 @@ fn a_retried_join_resumes_the_programs_it_synced() {
     deterministic::Runner::default().start(|context| async move {
         let mut network = found(&context).await;
         let tip = network
-            .advance(vec![frame(&key(11), 0, vec![set(b"a", b"1")])])
+            .advance(vec![frame(&key(11), vec![set(b"a", b"1")])])
             .await;
         let dir = tempfile::tempdir().unwrap();
         cut_off(
@@ -673,7 +682,7 @@ fn a_join_resyncs_what_another_chain_left_under_its_name() {
         let alice = key(11);
         let mut other = found(&context).await;
         other
-            .advance(vec![frame(&alice, 0, vec![set(b"a", b"other")])])
+            .advance(vec![frame(&alice, vec![set(b"a", b"other")])])
             .await;
         let dir = tempfile::tempdir().unwrap();
         cut_off(
@@ -688,7 +697,7 @@ fn a_join_resyncs_what_another_chain_left_under_its_name() {
 
         let mut network = found_as(&context, "second").await;
         let tip = network
-            .advance(vec![frame(&alice, 0, vec![set(b"a", b"this")])])
+            .advance(vec![frame(&alice, vec![set(b"a", b"this")])])
             .await;
         let joined = join(
             context.child("joined"),
@@ -712,7 +721,7 @@ fn a_join_reads_nothing_another_chains_failed_join_adopted() {
         let alice = key(11);
         let mut other = found(&context).await;
         other
-            .advance(vec![frame(&alice, 0, vec![set(b"other", b"1")])])
+            .advance(vec![frame(&alice, vec![set(b"other", b"1")])])
             .await;
         let dir = tempfile::tempdir().unwrap();
         let error = join(
@@ -730,7 +739,7 @@ fn a_join_reads_nothing_another_chains_failed_join_adopted() {
 
         let mut network = found_as(&context, "second").await;
         network
-            .advance(vec![frame(&alice, 0, vec![set(b"a", b"this")])])
+            .advance(vec![frame(&alice, vec![set(b"a", b"this")])])
             .await;
         let joined = join(
             context.child("joined"),
@@ -760,7 +769,7 @@ fn a_founding_after_a_cut_off_join_founds_the_clean_root() {
         let mut network = found(&context).await;
         // a block past genesis puts probe's sync floor past 0
         network
-            .advance(vec![frame(&key(11), 0, vec![set(b"a", b"1")])])
+            .advance(vec![frame(&key(11), vec![set(b"a", b"1")])])
             .await;
         let dir = tempfile::tempdir().unwrap();
         cut_off(
@@ -800,7 +809,7 @@ fn a_founding_over_a_joined_dir_is_refused() {
     deterministic::Runner::default().start(|context| async move {
         let mut network = found(&context).await;
         network
-            .advance(vec![frame(&key(11), 0, vec![set(b"a", b"1")])])
+            .advance(vec![frame(&key(11), vec![set(b"a", b"1")])])
             .await;
         let dir = tempfile::tempdir().unwrap();
         drop(
@@ -844,11 +853,11 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
         let alice = key(11);
         // 256 keys: probe's log takes four fetches at the least
         let frames = (0..4)
-            .map(|seq| {
+            .map(|n| {
                 let steps = (0..64)
-                    .map(|i| set(format!("{seq}-{i}").as_bytes(), b"1"))
+                    .map(|i| set(format!("{n}-{i}").as_bytes(), b"1"))
                     .collect();
-                frame(&alice, seq, steps)
+                frame(&alice, steps)
             })
             .collect();
         let tip = network.advance(frames).await;
@@ -915,7 +924,7 @@ fn a_dropped_program_left_half_synced_is_removed() {
         let mut network = found(&context).await;
         // a block past genesis puts probe's sync floor past 0
         network
-            .advance(vec![frame(&key(11), 0, vec![set(b"a", b"1")])])
+            .advance(vec![frame(&key(11), vec![set(b"a", b"1")])])
             .await;
         let dir = tempfile::tempdir().unwrap();
         cut_off(

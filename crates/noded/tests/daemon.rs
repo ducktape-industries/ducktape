@@ -5,12 +5,12 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use abi::role::validators::Member;
-use abi::{HostOp, HostReply, Outcome, Scan};
+use abi::{HostOp, HostReply, Outcome, Scan, reason};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
 use fixture_probe::{Reply, Step};
 use futures::StreamExt as _;
-use host::Layer;
+use host::{Layer, Submission, Tip};
 use node::Frame;
 use noded::wire::{Admin, BlockRef};
 use noded::{Client, Listen, Logs, Reach, Workspace};
@@ -105,15 +105,21 @@ impl Seat {
         }
     }
 
-    fn admin(&self, verb: Admin) -> Vec<u8> {
+    fn admin_frame(&self, anchor: Tip, verb: Admin) -> Vec<u8> {
         Frame::sign(
             &self.identity,
             NETWORK.as_bytes(),
-            0,
+            anchor,
+            None,
             noded::wire::ADMIN,
             abi::encode(&verb),
         )
         .encode()
+    }
+
+    async fn admin(&self, client: &Client, verb: Admin) {
+        let anchor = client.status().await.unwrap().anchor();
+        client.admin(self.admin_frame(anchor, verb)).await.unwrap();
     }
 }
 
@@ -158,8 +164,22 @@ fn set(key: &[u8], value: &[u8]) -> Step {
     })
 }
 
-fn frame(key: &ed25519::PrivateKey, seq: u64, steps: Vec<Step>) -> Vec<u8> {
-    Frame::sign(key, NETWORK.as_bytes(), seq, "probe", abi::encode(&steps)).encode()
+async fn signed(
+    client: &Client,
+    key: &ed25519::PrivateKey,
+    target: &str,
+    payload: Vec<u8>,
+) -> Vec<u8> {
+    let anchor = client.status().await.unwrap().anchor();
+    Frame::sign(key, NETWORK.as_bytes(), anchor, None, target, payload).encode()
+}
+
+async fn frame(client: &Client, key: &ed25519::PrivateKey, steps: Vec<Step>) -> Vec<u8> {
+    signed(client, key, "probe", abi::encode(&steps)).await
+}
+
+fn submission(frame: &[u8]) -> Submission {
+    Frame::decode(frame).unwrap().body.submission()
 }
 
 /// Polls until `client`'s node has applied `height`.
@@ -202,14 +222,12 @@ fn a_validator_serves_its_network_over_http() {
         );
 
         let mut changes = client.changes("probe").await.unwrap();
-        // admitted but rejected: it consumes seq 0 and rides a block at or
-        // before the one that writes
-        let failed = frame(&alice, 0, vec![Step::Fail("no".into())]);
+        let failed = frame(&client, &alice, vec![Step::Fail("no".into())]).await;
         let rejected = client.submit(failed.clone()).await.unwrap();
         let Outcome::Rejected(refusal) = &rejected.outcome else {
             panic!("the failing run is rejected: {rejected:?}");
         };
-        let submitted = frame(&alice, 1, vec![set(b"a", b"1")]);
+        let submitted = frame(&client, &alice, vec![set(b"a", b"1")]).await;
         let receipt = client.submit(submitted.clone()).await.unwrap();
         assert!(
             matches!(receipt.outcome, Outcome::Applied { .. }),
@@ -267,12 +285,13 @@ fn a_validator_serves_its_network_over_http() {
             .txs
             .last()
             .expect("the writing frame is the block's last");
-        assert_eq!(tx.hash, noded::tx_hash(&submitted));
+        assert_eq!(tx.hash, submission(&submitted).id());
         assert_eq!(tx.signer, alice.public_key().as_ref().to_vec());
-        assert_eq!((tx.seq, tx.target.as_str()), (1, "probe"));
+        assert_eq!(tx.anchor, submission(&submitted).anchor);
+        assert_eq!(tx.target, "probe");
         assert_eq!(tx.payload, abi::encode(&vec![set(b"a", b"1")]));
         assert_eq!(tx.receipt.as_ref(), Some(&receipt), "the kept receipt");
-        let fails = |tx: &&noded::wire::Tx| tx.hash == noded::tx_hash(&failed);
+        let fails = |tx: &&noded::wire::Tx| tx.hash == submission(&failed).id();
         let holding = client.blocks(Some(block.height + 1), 3).await.unwrap();
         let (holder, rejected_tx) = holding
             .iter()
@@ -315,14 +334,7 @@ fn a_validator_serves_its_network_over_http() {
         assert_eq!(below[0].id, block.parent);
         assert!(client.blocks(Some(0), 5).await.unwrap().is_empty());
 
-        let query = Frame::sign(
-            &alice,
-            NETWORK.as_bytes(),
-            0,
-            "probe",
-            abi::encode(&vec![Step::Op(HostOp::Get(b"a".to_vec()))]),
-        )
-        .encode();
+        let query = frame(&client, &alice, vec![Step::Op(HostOp::Get(b"a".to_vec()))]).await;
         let answer = client.query(Layer::Confirmed, query).await.unwrap();
         assert_eq!(
             answer,
@@ -344,14 +356,23 @@ fn a_validator_serves_its_network_over_http() {
         );
         assert!(client.metrics().await.unwrap().contains("tasks_spawned"));
 
-        let forged = frame(&alice, 0, Vec::new());
+        let forged = frame(&client, &alice, Vec::new()).await;
         let refused = client.admin(forged).await.unwrap_err();
         assert!(matches!(refused, noded::Error::Refused(_)), "{refused}");
-        client
-            .admin(seat.admin(Admin::LogFilter("debug".into())))
+        let unknown = Tip {
+            height: 0,
+            id: [7; 32],
+        };
+        let stale = client
+            .admin(seat.admin_frame(unknown, Admin::Shutdown))
             .await
-            .unwrap();
-        client.admin(seat.admin(Admin::Shutdown)).await.unwrap();
+            .unwrap_err();
+        let noded::Error::Refused(refusal) = stale else {
+            panic!("an admin verb anchored to no recent block is refused: {stale}");
+        };
+        assert_eq!(refusal.reason, reason::ANCHOR);
+        seat.admin(&client, Admin::LogFilter("debug".into())).await;
+        seat.admin(&client, Admin::Shutdown).await;
         (block, holder.clone())
     });
     live.thread.join().unwrap();
@@ -366,7 +387,7 @@ fn a_validator_serves_its_network_over_http() {
             let again = client.block(BlockRef::Height(seen.height)).await.unwrap();
             assert_eq!(again.as_ref(), Some(seen));
         }
-        client.admin(seat.admin(Admin::Shutdown)).await.unwrap();
+        seat.admin(&client, Admin::Shutdown).await;
     });
     live.thread.join().unwrap();
 }
@@ -395,7 +416,7 @@ fn an_offline_resident_leaves_the_chain_finalizing() {
 
     client_runtime().block_on(async {
         let mut changes = client.changes("valset").await.unwrap();
-        let frame = Frame::sign(&alice, NETWORK.as_bytes(), 0, "valset", valset).encode();
+        let frame = signed(&client, &alice, "valset", valset).await;
         let receipt = client.submit(frame).await.unwrap();
         assert!(
             matches!(receipt.outcome, Outcome::Applied { .. }),
@@ -407,7 +428,7 @@ fn an_offline_resident_leaves_the_chain_finalizing() {
         ::tokio::time::timeout(Duration::from_secs(30), reach(&client, beyond))
             .await
             .expect("the chain finalizes past the first block of the resident's epoch");
-        client.admin(seat.admin(Admin::Shutdown)).await.unwrap();
+        seat.admin(&client, Admin::Shutdown).await;
     });
     live.thread.join().unwrap();
 }
@@ -439,7 +460,7 @@ fn a_resident_follows_at_the_tip() {
 
     let epoch = runtime.block_on(async {
         let mut changes = client.changes("valset").await.unwrap();
-        let frame = Frame::sign(&alice, NETWORK.as_bytes(), 0, "valset", valset).encode();
+        let frame = signed(&client, &alice, "valset", valset).await;
         let receipt = client.submit(frame).await.unwrap();
         assert!(
             matches!(receipt.outcome, Outcome::Applied { .. }),
@@ -459,11 +480,11 @@ fn a_resident_follows_at_the_tip() {
     runtime.block_on(async {
         let mut changes = follower.client.changes("probe").await.unwrap();
         let follow = async {
-            let mut seq: u64 = 1;
+            let mut round: u64 = 1;
             loop {
-                let write = set(b"a", &seq.to_be_bytes());
+                let write = set(b"a", &round.to_be_bytes());
                 client
-                    .submit(frame(&alice, seq, vec![write]))
+                    .submit(frame(&client, &alice, vec![write]).await)
                     .await
                     .unwrap();
                 changes.next().await.unwrap().unwrap();
@@ -478,7 +499,7 @@ fn a_resident_follows_at_the_tip() {
                 if followed + 2 >= validator {
                     return;
                 }
-                seq += 1;
+                round += 1;
             }
         };
         ::tokio::time::timeout(Duration::from_secs(120), follow)
@@ -493,10 +514,7 @@ fn a_resident_follows_at_the_tip() {
             "{network:?}"
         );
         for (seat, node) in [(&seat, &live), (&resident, &follower)] {
-            node.client
-                .admin(seat.admin(Admin::Shutdown))
-                .await
-                .unwrap();
+            seat.admin(&node.client, Admin::Shutdown).await;
         }
     });
     live.thread.join().unwrap();
@@ -531,7 +549,7 @@ fn a_shrunk_set_finalizes_without_the_removed_member() {
     client_runtime().block_on(async {
         let client = &live[0].client;
         let mut changes = client.changes("valset").await.unwrap();
-        let frame = Frame::sign(&alice, NETWORK.as_bytes(), 0, "valset", valset).encode();
+        let frame = signed(client, &alice, "valset", valset).await;
         let receipt = client.submit(frame).await.unwrap();
         assert!(
             matches!(receipt.outcome, Outcome::Applied { .. }),
@@ -545,11 +563,7 @@ fn a_shrunk_set_finalizes_without_the_removed_member() {
         )
         .await
         .expect("the chain enters the epoch that seats two");
-        live[2]
-            .client
-            .admin(seats[2].admin(Admin::Shutdown))
-            .await
-            .unwrap();
+        seats[2].admin(&live[2].client, Admin::Shutdown).await;
         let beyond = (shrunk + 1) * EPOCH_LENGTH + 1;
         for node in &live[..2] {
             ::tokio::time::timeout(Duration::from_secs(30), reach(&node.client, beyond))
@@ -557,10 +571,7 @@ fn a_shrunk_set_finalizes_without_the_removed_member() {
                 .expect("the two finalize across the next boundary");
         }
         for (seat, node) in seats.iter().zip(&live).take(2) {
-            node.client
-                .admin(seat.admin(Admin::Shutdown))
-                .await
-                .unwrap();
+            seat.admin(&node.client, Admin::Shutdown).await;
         }
     });
     for node in live {
@@ -586,7 +597,7 @@ fn a_late_validator_joins_by_state_sync_and_follows() {
         let mut changes = live[0].client.changes("probe").await.unwrap();
         live[0]
             .client
-            .submit(frame(&alice, 0, vec![set(b"a", b"1")]))
+            .submit(frame(&live[0].client, &alice, vec![set(b"a", b"1")]).await)
             .await
             .unwrap();
         changes.next().await.unwrap().unwrap()
@@ -609,7 +620,7 @@ fn a_late_validator_joins_by_state_sync_and_follows() {
         let mut changes = joined.client.changes("probe").await.unwrap();
         live[1]
             .client
-            .submit(frame(&alice, 1, vec![set(b"b", b"2")]))
+            .submit(frame(&live[1].client, &alice, vec![set(b"b", b"2")]).await)
             .await
             .unwrap();
         changes.next().await.unwrap().unwrap()
@@ -621,10 +632,7 @@ fn a_late_validator_joins_by_state_sync_and_follows() {
             .iter()
             .zip(live.iter().chain(std::iter::once(&joined)))
         {
-            node.client
-                .admin(seat.admin(Admin::Shutdown))
-                .await
-                .unwrap();
+            seat.admin(&node.client, Admin::Shutdown).await;
         }
     });
     for node in live.into_iter().chain(std::iter::once(joined)) {

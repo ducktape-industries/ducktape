@@ -254,7 +254,7 @@ where
         let page = Tuning::default().sync_apply_batch;
         let mut names: HashMap<Digest, Vec<u8>> = HashMap::new();
         let mut live = BTreeMap::new();
-        let mut at = bounds.start;
+        let mut at = db.sync_boundary();
         while at < bounds.end {
             let (_, ops) = db.proof(at, page).await?;
             if ops.is_empty() {

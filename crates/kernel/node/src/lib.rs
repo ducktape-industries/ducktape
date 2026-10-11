@@ -1,7 +1,8 @@
 mod block;
 mod frame;
+pub mod pool;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -9,8 +10,10 @@ use abi::{BlobId, Origin, ProgramId, Refusal, role::validators};
 use commonware_cryptography::Digestible as _;
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
-use host::{Applied, Genesis, Host, Layer, Receipt, Submission, Submitted, Tip};
+use host::{Applied, Genesis, Host, Layer, Receipt, Submission, SubmissionId, Tip};
 use state::{Commitment, View};
+
+use crate::pool::Pool;
 
 pub use block::{Block, Digest};
 pub use frame::{Body, Frame, NAMESPACE, verify};
@@ -31,17 +34,32 @@ pub enum Sequenced {
     Replayed,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Taken {
+    New(Receipt),
+    Held(Receipt),
+}
+
+impl Taken {
+    pub fn receipt(&self) -> &Receipt {
+        match self {
+            Taken::New(receipt) | Taken::Held(receipt) => receipt,
+        }
+    }
+
+    pub fn into_receipt(self) -> Receipt {
+        match self {
+            Taken::New(receipt) | Taken::Held(receipt) => receipt,
+        }
+    }
+}
+
 pub struct Synced<E>
 where
     E: Context + Spawner,
 {
     pub height: u64,
     pub commitments: BTreeMap<ProgramId, Commitment<E>>,
-}
-
-struct Pending {
-    frame: Vec<u8>,
-    submission: Submission,
 }
 
 pub struct Node<E>
@@ -51,7 +69,7 @@ where
     context: E,
     host: Host<E>,
     network: Vec<u8>,
-    pending: Vec<Pending>,
+    pool: Pool,
 }
 
 impl<E> Node<E>
@@ -94,7 +112,7 @@ where
             context,
             host,
             network,
-            pending: Vec::new(),
+            pool: Pool::default(),
         }
     }
 
@@ -127,11 +145,11 @@ where
     }
 
     pub fn pending(&self) -> usize {
-        self.pending.len()
+        self.pool.len()
     }
 
     pub fn due(&self) -> Result<bool> {
-        Ok(!self.pending.is_empty())
+        Ok(!self.pool.is_empty())
     }
 
     pub fn now(&self) -> u64 {
@@ -164,28 +182,41 @@ where
             .await?)
     }
 
-    pub async fn submit(
-        &mut self,
-        frame: Vec<u8>,
-    ) -> Result<std::result::Result<Receipt, Refusal>> {
+    pub async fn submit(&mut self, frame: Vec<u8>) -> Result<std::result::Result<Taken, Refusal>> {
         let submission = match frame::verify(&frame, &self.network) {
             Ok(submission) => submission,
             Err(refusal) => return Ok(Err(refusal)),
         };
-        let time = self.now();
-        let mut submitted = self.host.preconfirm(time, vec![submission.clone()]).await?;
-        let submitted = submitted.pop().expect("one submission yields one receipt");
-        // an admitted frame rides the next block even when its run was
-        // rejected: the block must consume the sequence preconfirm did
-        if let Submitted::Admitted(_) = submitted {
-            self.pending.push(Pending { frame, submission });
+        if let Some(held) = self.pool.get(&submission.id()) {
+            return Ok(Ok(Taken::Held(held.prediction.clone())));
         }
-        Ok(Ok(submitted.into_receipt()))
+        if let Err(refusal) = self.host.fresh(&submission)? {
+            return Ok(Err(refusal));
+        }
+        let time = self.now();
+        let mut predicted = self.host.preconfirm(time, vec![submission.clone()]).await?;
+        let prediction = predicted.pop().expect("one submission yields one receipt");
+        self.pool.admit(frame, submission, prediction.clone());
+        Ok(Ok(Taken::New(prediction)))
     }
 
-    pub fn build(&self, parent: Tip, time: u64) -> Block {
-        let frames = self.pending.iter().map(|pending| pending.frame.clone());
-        Block::next(parent, time, frames.collect())
+    pub fn build<'a>(
+        &self,
+        parent: Tip,
+        unapplied: impl IntoIterator<Item = &'a Block>,
+        time: u64,
+    ) -> Result<Block> {
+        let height = parent.height + 1;
+        let carried = self.carried_above_the_tip(unapplied)?;
+        let frames = self
+            .pool
+            .order()
+            .filter(|held| {
+                let recent = held.submission.anchor.anchors(height);
+                recent && !carried.contains(&held.id)
+            })
+            .map(|held| held.frame.clone());
+        Ok(Block::next(parent, time, frames.collect()))
     }
 
     pub async fn apply(&mut self, block: &Block) -> Result<Sequenced> {
@@ -201,11 +232,12 @@ where
                 tip: tip.height,
             });
         }
-        let submissions = block
+        let submissions: Vec<Submission> = block
             .frames
             .iter()
             .filter_map(|frame| frame::verify(frame, &self.network).ok())
             .collect();
+        let carried: Vec<SubmissionId> = submissions.iter().map(Submission::id).collect();
         let applied = self
             .host
             .apply(host::Block {
@@ -215,26 +247,36 @@ where
                 submissions,
             })
             .await?;
-        self.pending
-            .retain(|pending| !block.frames.contains(&pending.frame));
+        self.pool.settle(&carried, block.height + 1);
         self.replay().await?;
         Ok(Sequenced::Applied(applied))
     }
 
+    fn carried_above_the_tip<'a>(
+        &self,
+        unapplied: impl IntoIterator<Item = &'a Block>,
+    ) -> Result<HashSet<SubmissionId>> {
+        let tip = self.host.tip()?;
+        let above = unapplied
+            .into_iter()
+            .filter(|block| block.height > tip.height);
+        let carried = above
+            .flat_map(|block| &block.frames)
+            .filter_map(|frame| Some(Frame::decode(frame).ok()?.body.submission().id()));
+        Ok(carried.collect())
+    }
+
     async fn replay(&mut self) -> Result<()> {
         let time = self.now();
-        let pending = std::mem::take(&mut self.pending);
-        let submissions = pending
-            .iter()
-            .map(|pending| pending.submission.clone())
-            .collect();
-        let submitted = self.host.preconfirm(time, submissions).await?;
-        self.pending = pending
-            .into_iter()
-            .zip(submitted)
-            .filter(|(_, submitted)| matches!(submitted, Submitted::Admitted(_)))
-            .map(|(pending, _)| pending)
-            .collect();
+        let (ids, submissions): (Vec<SubmissionId>, Vec<Submission>) = self
+            .pool
+            .order()
+            .map(|held| (held.id, held.submission.clone()))
+            .unzip();
+        let predicted = self.host.preconfirm(time, submissions).await?;
+        for (id, receipt) in ids.iter().zip(predicted) {
+            self.pool.predict(id, receipt);
+        }
         Ok(())
     }
 }

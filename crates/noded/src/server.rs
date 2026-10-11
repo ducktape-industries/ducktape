@@ -85,7 +85,7 @@ async fn network<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Netw
 async fn submit<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) -> Reply<Receipt> {
     let mut node = daemon.node.lock().await;
     match node.submit(body.to_vec()).await {
-        Ok(Ok(receipt)) => Reply::Answered(receipt),
+        Ok(Ok(taken)) => Reply::Answered(taken.into_receipt()),
         Ok(Err(refusal)) => Reply::Refused(refusal),
         Err(error) => failed(error),
     }
@@ -259,6 +259,13 @@ async fn admin<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) ->
             reason::INVALID_INPUT,
             "an admin verb is signed by the node's own key",
         ));
+    }
+    let fresh = match daemon.node.lock().await.host().fresh(&submission) {
+        Ok(fresh) => fresh,
+        Err(error) => return failed(error),
+    };
+    if let Err(refusal) = fresh {
+        return Reply::Refused(refusal);
     }
     let verb: Admin = match abi::decode(&submission.payload) {
         Ok(verb) => verb,

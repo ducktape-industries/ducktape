@@ -115,7 +115,7 @@ from, the address its HTTP surface bound and the runtime's storage.
 ```sh
 ducktape status                         # height, tip, root, epoch, identity
 ducktape wallet new alice               # a user key; DUCKTAPE_PASSWORD or a prompt
-ducktape submit ping request.bin        # sign a frame with the active wallet, print the receipt
+ducktape submit ping request.bin        # sign a frame with the active wallet, print its preconfirmed receipt
 ducktape get ping 6b6579                # a key in hex, from the preconfirmed layer
 ducktape get ping 6b6579 --confirmed    # the committed layer
 ducktape scan ping --lo 6b               # a key range
@@ -125,10 +125,17 @@ ducktape programs                       # every program and its code blob
 ducktape blob get sha256:…              # a blob's framed bytes
 ```
 
-Reads are open; writes are signed frames. `ducktape logs`,
-`ducktape log-filter`, `ducktape metrics` and `ducktape shutdown` operate the
-node; the mutating ones are signed with the node's own identity key. Each
-verb's `--help` carries the rest.
+Reads are open; writes are signed frames. Each frame names a recent block, its
+anchor, and is valid only while that block is one of the last 256: the CLI
+anchors to the tip `status` reports. A block runs a frame at most once. A node
+takes every frame that is signed for its network, names a recent block and no
+block has carried yet, and holds it in its mempool until a block carries it or
+its anchor ages out. The receipt
+`submit` prints is the node's prediction from its preconfirmed layer, not a
+verdict: a frame predicted to fail still waits for a block, and the block
+decides. `ducktape logs`, `ducktape log-filter`, `ducktape metrics` and
+`ducktape shutdown` operate the node; the mutating ones are signed with the
+node's own identity key. Each verb's `--help` carries the rest.
 
 ## How it is built
 

@@ -23,7 +23,7 @@ use state::{Commitment, Overlay, Storage, Store, View, Writes, valid_program_id}
 
 use crate::unit::{Frame, Loaded, World, refusal_of};
 
-pub use namespace::{BLOBS, NETWORK, PROGRAMS, RESERVED, SIGNERS};
+pub use namespace::{BLOBS, NETWORK, PROGRAMS, RECENT, RESERVED, SPENT, spent};
 pub use runtime::Limits;
 
 const STATE_DIR: &str = "state";
@@ -32,6 +32,7 @@ const CODE_KIND: &str = "program";
 /// How deep messages nest in one frame: a submission runs at depth 0 and
 /// each message, or reply, one deeper than the run that emitted it.
 pub const MAX_DEPTH: u32 = 8;
+pub const ANCHOR_WINDOW: u64 = 256;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -73,6 +74,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub type BlockId = [u8; 32];
+pub type SubmissionId = [u8; 32];
 
 pub struct Genesis {
     pub network: Vec<u8>,
@@ -111,24 +113,35 @@ pub struct Block {
     pub submissions: Vec<Submission>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Tip {
     pub height: u64,
     pub id: BlockId,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl Tip {
+    pub fn anchors(&self, height: u64) -> bool {
+        self.height < height && height - self.height <= ANCHOR_WINDOW
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Submission {
     pub signer: Vec<u8>,
-    pub seq: u64,
+    pub anchor: Tip,
+    pub salt: Option<u64>,
     pub target: ProgramId,
     pub payload: Vec<u8>,
 }
 
+impl Submission {
+    pub fn id(&self) -> SubmissionId {
+        Sha256::digest(abi::encode(self)).into()
+    }
+}
+
 /// One frame's run. A rejected receipt's run wrote nothing: the outcome
 /// is the refusal of the run itself or, propagated, of a run nested in it.
-/// Only its admission, the signer's consumed sequence, stands
-/// (`Submitted::Admitted`).
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Receipt {
     pub program: ProgramId,
@@ -139,25 +152,6 @@ pub struct Receipt {
     /// A nested receipt's `Applied` and events stand only when every
     /// receipt above it was applied too: an ancestor's rejection undid it.
     pub nested: Vec<Receipt>,
-}
-
-/// A signed frame's fate. `Admitted` passed the checks before its run (in
-/// sequence, and an account the identity role gives its key) and consumed
-/// the signer's sequence, whether its run applied or was rejected: the
-/// same signed bytes never run twice. `Refused` failed one of those checks
-/// and consumed nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Submitted {
-    Admitted(Receipt),
-    Refused(Receipt),
-}
-
-impl Submitted {
-    pub fn into_receipt(self) -> Receipt {
-        match self {
-            Submitted::Admitted(receipt) | Submitted::Refused(receipt) => receipt,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -499,7 +493,7 @@ where
         let bytes = self
             .store
             .view(Vec::new())
-            .get(NETWORK, namespace::TIP)?
+            .get(RECENT, &namespace::height(height))?
             .ok_or_else(|| Error::Corrupt("the network records no tip".into()))?;
         let id = abi::decode(&bytes).map_err(corrupt)?;
         Ok(Tip { height, id })
@@ -545,6 +539,14 @@ where
 
     pub fn view(&self, layer: Layer) -> View<'_> {
         self.store.view(self.layers(layer))
+    }
+
+    pub fn fresh(&self, submission: &Submission) -> Result<std::result::Result<(), Refusal>> {
+        fresh(
+            &self.view(Layer::Confirmed),
+            submission,
+            self.next_height()?,
+        )
     }
 
     fn layers(&self, layer: Layer) -> Vec<&Overlay> {
@@ -721,20 +723,20 @@ where
         &mut self,
         time: u64,
         submissions: Vec<Submission>,
-    ) -> Result<Vec<Submitted>> {
+    ) -> Result<Vec<Receipt>> {
         self.ready()?;
         let height = self.next_height()?;
         let mut overlay = std::mem::take(&mut self.preconfirmed);
         let mut stage = Stage::default();
-        let mut submitted = Vec::new();
+        let mut receipts = Vec::new();
         for submission in submissions {
-            submitted.push(
+            receipts.push(
                 self.submit(submission, height, time, &mut overlay, &mut stage)
                     .await?,
             );
         }
         self.preconfirmed = overlay;
-        Ok(submitted)
+        Ok(receipts)
     }
 
     pub async fn apply(&mut self, block: Block) -> Result<Applied> {
@@ -754,7 +756,7 @@ where
             .await?;
         let mut submissions = Vec::new();
         for submission in block.submissions {
-            let submitted = self
+            let receipt = self
                 .submit(
                     submission,
                     block.height,
@@ -763,7 +765,7 @@ where
                     &mut stage,
                 )
                 .await?;
-            submissions.push(submitted.into_receipt());
+            submissions.push(receipt);
         }
         let epoch_length = self.epoch_length()?;
         let ends_an_epoch = (block.height + 1).is_multiple_of(epoch_length);
@@ -792,21 +794,12 @@ where
         time: u64,
         overlay: &mut Overlay,
         stage: &mut Stage,
-    ) -> Result<Submitted> {
-        let expected = next_sequence(&self.store.view(vec![&*overlay]), &submission.signer)?;
-        let in_sequence = submission.seq == expected;
-        if !in_sequence {
-            return Ok(Submitted::Refused(rejected(
-                &submission.target,
-                Refusal::new(
-                    reason::SEQUENCE,
-                    format!(
-                        "sequence {} is not the signer's next, {expected}",
-                        submission.seq
-                    ),
-                ),
-            )));
+    ) -> Result<Receipt> {
+        let view = self.store.view(vec![&*overlay]);
+        if let Err(refusal) = fresh(&view, &submission, height)? {
+            return Ok(rejected(&submission.target, refusal));
         }
+        overlay.set(SPENT, namespace::spent(&submission), Vec::new());
         let asked = identity::Query::Account(submission.signer.clone());
         let fuel = &mut self.loaded.limits().fuel;
         let account = match self
@@ -814,17 +807,8 @@ where
             .await?
         {
             Ok(account) => account,
-            Err(refusal) => {
-                return Ok(Submitted::Refused(rejected(&submission.target, refusal)));
-            }
+            Err(refusal) => return Ok(rejected(&submission.target, refusal)),
         };
-        // admitted: the sequence is consumed outside the run's checkpoint,
-        // so a rejected run cannot hand the same signed bytes a second run
-        overlay.set(
-            SIGNERS,
-            submission.signer.clone(),
-            abi::encode(&(submission.seq + 1)),
-        );
         let checkpoint = overlay.checkpoint();
         let env = Env {
             network: self.network.clone(),
@@ -850,7 +834,7 @@ where
         if let Outcome::Rejected(_) = receipt.outcome {
             overlay.restore(checkpoint);
         }
-        Ok(Submitted::Admitted(receipt))
+        Ok(receipt)
     }
 
     /// The account the identity role says `program` runs as, for a frame
@@ -1254,7 +1238,10 @@ where
         admissions: Vec<Receipt>,
         submissions: Vec<Receipt>,
     ) -> Result<Applied> {
-        overlay.set(NETWORK, namespace::TIP.to_vec(), abi::encode(&tip.id));
+        overlay.set(RECENT, namespace::height(tip.height), abi::encode(&tip.id));
+        if let Some(expired) = tip.height.checked_sub(ANCHOR_WINDOW) {
+            self.forget(expired, &mut overlay)?;
+        }
         let writes = overlay.into_writes();
         self.blobs.promote(stage)?;
         self.store.commit(tip.height, writes.clone()).await?;
@@ -1278,6 +1265,19 @@ where
             writes,
             root: self.root()?,
         })
+    }
+
+    fn forget(&self, height: u64, overlay: &mut Overlay) -> Result<()> {
+        let key = namespace::height(height);
+        let spent = self
+            .store
+            .view(vec![&*overlay])
+            .scan(SPENT, &Scan::prefix(&key))?;
+        for entry in spent {
+            overlay.delete(SPENT, entry.key);
+        }
+        overlay.delete(RECENT, key);
+        Ok(())
     }
 }
 
@@ -1349,11 +1349,30 @@ fn program_id(key: Vec<u8>) -> Result<ProgramId> {
     String::from_utf8(key).map_err(|_| Error::Corrupt("a program key is not a string".into()))
 }
 
-fn next_sequence(view: &View<'_>, signer: &[u8]) -> Result<u64> {
-    match view.get(SIGNERS, signer)? {
-        Some(bytes) => abi::decode(&bytes).map_err(corrupt),
-        None => Ok(0),
+fn fresh(
+    view: &View<'_>,
+    submission: &Submission,
+    height: u64,
+) -> Result<std::result::Result<(), Refusal>> {
+    let anchor = submission.anchor;
+    let recorded = view.get(RECENT, &namespace::height(anchor.height))?;
+    let names_a_recent_block = anchor.anchors(height) && recorded == Some(abi::encode(&anchor.id));
+    if !names_a_recent_block {
+        return Ok(Err(Refusal::new(
+            reason::ANCHOR,
+            format!(
+                "the frame's anchor is not one of the {ANCHOR_WINDOW} blocks before block {height}"
+            ),
+        )));
     }
+    let carried = view.get(SPENT, &namespace::spent(submission))?.is_some();
+    if carried {
+        return Ok(Err(Refusal::new(
+            reason::DUPLICATE,
+            "a block already carried this frame",
+        )));
+    }
+    Ok(Ok(()))
 }
 
 fn limits_of(view: &View<'_>) -> Result<Limits> {
