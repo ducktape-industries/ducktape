@@ -35,6 +35,10 @@ This puts the `ducktape` binary in `~/.cargo/bin`. `make install` also
 delegates the desktop installation to the pinned
 [ducktape-app](https://github.com/ducktape-industries/ducktape-app) checkout.
 
+Each commit on `main` also has a built `ducktape` for Linux on x86_64: the
+prerelease `bin-<commit>` carries `ducktape-x86_64-unknown-linux-gnu.tar.gz`
+(`.github/workflows/release.yml`).
+
 ## Found a network
 
 A founding file names the network, its cadence, its validators and the
