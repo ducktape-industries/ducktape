@@ -1,11 +1,13 @@
 mod blocks;
 mod client;
+mod endpoint;
 mod logs;
 mod mesh;
 mod network;
 mod relay;
 mod run;
 mod server;
+mod transport;
 pub mod wire;
 mod workspace;
 
@@ -20,8 +22,9 @@ use node::Node;
 use tokio::sync::watch;
 
 pub use client::Client;
+pub use endpoint::{Endpoint, Scheme};
 pub use logs::Logs;
-pub use mesh::{Mesh, Reach};
+pub use mesh::Mesh;
 pub use run::{Listen, Running, init, invite, join, run};
 pub use wire::{NODE_CONTRACT, Status};
 pub use workspace::{Descriptor, Founding, Workspace};
@@ -48,6 +51,10 @@ pub enum Error {
     Founding(#[from] toml::de::Error),
     #[error("not hex: {0}")]
     Hex(#[from] hex::FromHexError),
+    #[error("{0}")]
+    Address(String),
+    #[error("tls: {0}")]
+    Tls(String),
     #[error("the workspace is corrupt: {0}")]
     Corrupt(String),
     #[error(transparent)]
@@ -93,6 +100,7 @@ pub struct Daemon<E: Context> {
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
     pub relay: relay::Relay<E>,
+    mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).
     votes: Votes,
     subscribers: Mutex<Vec<(ProgramId, mpsc::UnboundedSender<Change>)>>,

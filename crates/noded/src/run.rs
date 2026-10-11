@@ -21,8 +21,10 @@ use futures::channel::mpsc;
 use node::{Block, Frame, Node, Sequenced};
 use tokio::sync::watch;
 
-use crate::mesh::{Mesh, Reach, track};
+use crate::endpoint::Endpoint;
+use crate::mesh::{Mesh, Tracker};
 use crate::relay::{self, Relay};
+use crate::transport;
 use crate::workspace::{Descriptor, Founding, Workspace};
 use crate::{Client, Context, Daemon, Error, Logs, Result, Shared};
 
@@ -35,7 +37,7 @@ type Seating<E> =
 pub struct Listen {
     pub p2p: SocketAddr,
     pub http: SocketAddr,
-    pub reach: Reach,
+    pub tls: Option<SocketAddr>,
 }
 
 pub struct Running<E: Context> {
@@ -44,7 +46,7 @@ pub struct Running<E: Context> {
     pub daemon: Arc<Daemon<E>>,
     _marshal: Marshal,
     _mesh: Mesh<E>,
-    _tasks: [Handle<()>; 3],
+    _tasks: Vec<Handle<()>>,
 }
 
 impl<E: Context> Running<E> {
@@ -66,7 +68,7 @@ pub fn join<'a, E: Context>(
     context: E,
     workspace: &'a Workspace,
     source: Client,
-    address: SocketAddr,
+    address: Endpoint,
     invite: Option<Invite>,
 ) -> Boxed<'a, Result<()>> {
     Box::pin(adopt(context, workspace, source, address, invite))
@@ -110,7 +112,7 @@ async fn adopt<E: Context>(
     mut context: E,
     workspace: &Workspace,
     source: Client,
-    address: SocketAddr,
+    address: Endpoint,
     invite: Option<Invite>,
 ) -> Result<()> {
     let status = source.status().await?;
@@ -191,16 +193,15 @@ async fn start<E: Context>(
     )))?;
 
     let member_cap = node.member_cap()?;
-    let (mesh, marshal_lanes, engine_channels, (relay_sender, relay_receiver)) = Mesh::start(
-        context.child("mesh"),
-        identity.clone(),
-        &descriptor.id(),
-        listen.p2p,
-        listen.reach,
-        member_cap,
-    );
-    let mut oracle = mesh.oracle();
-    track(&mut oracle, epoch, &members);
+    let (mesh, mut tracker, marshal_lanes, engine_channels, (relay_sender, relay_receiver)) =
+        Mesh::start(
+            context.child("mesh"),
+            identity.clone(),
+            &descriptor.id(),
+            listen.p2p,
+            member_cap,
+        )?;
+    tracker.track(epoch, &members);
     let roster = Roster::new(descriptor.id(), Some(identity.clone()));
     for (epoch, validators) in &seated {
         let validators = validators_of(validators).ok_or(Error::Corrupt(format!(
@@ -263,12 +264,13 @@ async fn start<E: Context>(
         shutdown,
         votes: membership.votes().clone(),
         relay: Relay::new(identity.public_key(), relay_sender, voters.as_ref()),
+        mesh: transport::loopback(listen.p2p),
         subscribers: Mutex::new(Vec::new()),
     });
 
     let pump = context.child("pump").spawn({
         let daemon = daemon.clone();
-        move |_| pump(daemon, membership, oracle, deliveries)
+        move |_| pump(daemon, membership, tracker, deliveries)
     });
     let relayed = context.child("relay").spawn({
         let daemon = daemon.clone();
@@ -276,6 +278,13 @@ async fn start<E: Context>(
     });
     let listener = tokio::net::TcpListener::bind(listen.http).await?;
     let http = listener.local_addr()?;
+    let tls = match listen.tls {
+        Some(socket) => Some((
+            tokio::net::TcpListener::bind(socket).await?,
+            transport::acceptor()?,
+        )),
+        None => None,
+    };
     let server = context.child("http").spawn({
         let router = crate::server::router(daemon.clone());
         let mut down = daemon.shutdown.subscribe();
@@ -290,6 +299,15 @@ async fn start<E: Context>(
             }
         }
     });
+    let mut tasks = vec![pump, server, relayed];
+    if let Some((listener, acceptor)) = tls {
+        let mesh = transport::loopback(listen.p2p);
+        tasks.push(
+            context
+                .child("tls")
+                .spawn(move |_| transport::inbound_tls(listener, acceptor, mesh)),
+        );
+    }
     workspace.write_http(http)?;
     Ok(Running {
         http,
@@ -297,7 +315,7 @@ async fn start<E: Context>(
         daemon,
         _marshal: marshal,
         _mesh: mesh,
-        _tasks: [pump, server, relayed],
+        _tasks: tasks,
     })
 }
 
@@ -374,11 +392,11 @@ impl<E: Context> Chain for Participant<E> {
 async fn pump<E: Context>(
     daemon: Arc<Daemon<E>>,
     mut membership: Seating<E>,
-    mut oracle: Oracle<PublicKey>,
+    mut tracker: Tracker,
     mut deliveries: mpsc::UnboundedReceiver<Delivery>,
 ) {
     while let Some((block, ack)) = deliveries.next().await {
-        let outcome = applied(&daemon, &mut membership, &mut oracle, &block).await;
+        let outcome = applied(&daemon, &mut membership, &mut tracker, &block).await;
         if let Err(error) = outcome {
             tracing::error!(
                 target: "ducktape::node",
@@ -397,7 +415,7 @@ async fn pump<E: Context>(
 async fn applied<E: Context>(
     daemon: &Daemon<E>,
     membership: &mut Seating<E>,
-    oracle: &mut Oracle<PublicKey>,
+    tracker: &mut Tracker,
     block: &Block,
 ) -> Result<()> {
     let mut node = daemon.node.lock().await;
@@ -434,7 +452,7 @@ async fn applied<E: Context>(
     drop(node);
     // The mesh admits every member, so a resident follows the chain; only
     // the validators vote and propose.
-    track(oracle, epoch, &members);
+    tracker.track(epoch, &members);
     daemon.relay.send(due.iter().map(Vec::as_slice));
     membership.seat(block.tip(), &validators).await?;
     Ok(())

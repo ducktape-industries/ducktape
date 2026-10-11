@@ -11,6 +11,7 @@ use node::Block;
 use rand_core::CryptoRng;
 use serde::Deserialize;
 
+use crate::endpoint::Endpoint;
 use crate::{Error, Result};
 
 const IDENTITY: &str = "identity.key";
@@ -210,9 +211,10 @@ impl Founding {
             .validators
             .iter()
             .map(|validator| {
+                let address: Endpoint = validator.address.parse().map_err(Error::Address)?;
                 Ok(Member {
                     key: hex::decode(&validator.key)?,
-                    address: validator.address.clone(),
+                    address: address.to_string(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;

@@ -57,7 +57,7 @@ identity = "identity"         # resolves a key or a program to its account
 
 [[validators]]
 key = "…"                     # hex ed25519 public key: `ducktape identity`
-address = "203.0.113.7:9000"  # where peers dial it
+address = "tcp://a.example.org:9000"  # where peers dial it; see Reach a node
 
 [[programs]]
 id = "module-registry"        # one entry per program; the registry's and validators' params are the kernel's
@@ -106,8 +106,8 @@ chain and never votes or proposes. A validator named in the file joins the
 same way and keeps its seat.
 
 ```sh
-ducktape join http://203.0.113.7:8844 --address 203.0.113.9:9000 --invite <hex>
-ducktape run --listen 0.0.0.0:9000
+ducktape join https://a.example.org --address wss://b.example.org --invite <hex>
+ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844
 ```
 
 Membership changes only by the validators' vote. The door starts closed, so
@@ -123,6 +123,25 @@ leave. Each prints the block that carried it.
 The workspace (`--workspace`, default `$DUCKTAPE_HOME` else `~/.ducktape`)
 holds `identity.key`, the network descriptor, the anchor the node started
 from, the address its HTTP surface bound and the runtime's storage.
+
+## Reach a node
+
+A node's address names a transport and a host, and the host may be a name.
+Peers check who they reached by the node's key, never by its IP, so the
+connection may pass through a tunnel or a proxy.
+
+- `tcp://host:port`: the `--listen` socket.
+- `tls://host:port`: the `--tls` socket. The node presents a certificate it
+  makes at start. Peers check the node's key, not the certificate, so a TLS
+  proxy in front of the `--listen` socket serves as well.
+- `wss://host[:port]` or `ws://host[:port]`: a WebSocket on the `--http`
+  socket, at `/v1/p2p`. A node behind an HTTPS tunnel (Cloudflare Tunnel,
+  ngrok) or reverse proxy is reached at `wss://` the tunnel's name; it
+  opens no port of its own.
+
+```sh
+ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844   # the tunnel serves https://b.example.org from 127.0.0.1:8844
+```
 
 ## Use a network
 
