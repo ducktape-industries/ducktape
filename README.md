@@ -42,10 +42,12 @@ prerelease `bin-<commit>` carries `ducktape-x86_64-unknown-linux-gnu.tar.gz`
 ## Found a network
 
 A founding file names the network, its cadence, its validators and the
-programs it starts with. Every path is relative to the file; the programs a
-network boots with (`module-registry`, `valset`, `identity`) are built in
-[modules](https://github.com/ducktape-industries/modules) (`make
-wasm-programs`, under `$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/`):
+programs it starts with. Every path is relative to the file.
+[modules](https://github.com/ducktape-industries/modules) publishes a
+founding for each commit on its `main`: the release `wasm-<commit>` carries
+`founding.tar.gz`, which holds every program it builds, packed with its
+view, and a `founding.toml` with only its network, time, key and address
+left to fill. The fields:
 
 ```toml
 network = "mynet"
@@ -97,9 +99,11 @@ runs as no one (`None`). The interfaces are `abi::role::{registry,
 validators, identity}`; modules' `docs/roles.md` walks through them.
 
 ```sh
+curl -fsSL https://github.com/ducktape-industries/modules/releases/download/wasm-<commit>/founding.tar.gz | tar xz
 ducktape identity                                   # mint this workspace's node key
-ducktape init genesis.toml                          # found the network in $DUCKTAPE_HOME
-ducktape run --listen 0.0.0.0:9000 --http 127.0.0.1:8844
+$EDITOR founding/founding.toml                      # network, time (`date +%s000`), that key, this node's address
+ducktape init founding/founding.toml                # found the network in $DUCKTAPE_HOME
+ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844
 ```
 
 Any node joins through a running one. `join` signs an enrollment with the
