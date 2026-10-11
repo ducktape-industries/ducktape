@@ -6,10 +6,10 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_p2p::authenticated::lookup::{Config, Network, Oracle, Receiver, Sender};
-use commonware_p2p::{Address, AddressableManager as _, AddressableTrackedPeers};
+use commonware_p2p::{Address, AddressableManager as _, AddressableTrackedPeers, Ingress};
 use commonware_runtime::{Handle, Quota};
 use commonware_utils::ordered::Map;
-use commonware_utils::{NZU32, NZUsize};
+use commonware_utils::{NZU32, NZUsize, hostname};
 use consensus::channel::{BACKFILL, BROADCAST, CERTIFICATE, RELAY, RESOLVER, VOTE};
 use consensus::{EngineChannels, MarshalLanes};
 
@@ -18,7 +18,6 @@ use crate::transport::{self, Bridges};
 use crate::{Context, Result};
 
 pub const QUOTA_PER_SECOND: u32 = 1024;
-const UNDIALED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
 pub type Lane<E> = (Sender<PublicKey, E>, Receiver<PublicKey>);
 
@@ -57,6 +56,7 @@ impl<E: Context> Mesh<E> {
         let me = identity.public_key();
         let mut config = Config::local(identity, namespace, listen, peers, node::MESSAGE_BYTES);
         config.bypass_ip_check = true;
+        config.allow_dns = false;
         // only the current epoch's set: nothing reads an older one, and the
         // previous epoch's engine is gone at the switch
         config.tracked_peer_sets = NZUsize!(1);
@@ -92,6 +92,16 @@ impl<E: Context> Mesh<E> {
     }
 }
 
+fn undialed() -> Address {
+    Address::Asymmetric {
+        ingress: Ingress::Dns {
+            host: hostname!("undialed"),
+            port: 0,
+        },
+        egress: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+    }
+}
+
 pub struct Tracker {
     oracle: Oracle<PublicKey>,
     me: PublicKey,
@@ -102,23 +112,21 @@ pub struct Tracker {
 impl Tracker {
     pub fn track(&mut self, epoch: u64, members: &[Member]) {
         let mut kept = HashSet::new();
-        let mut dialed = Vec::new();
-        let mut accepted = Vec::new();
-        for member in members {
-            let Ok(key) = PublicKey::decode(member.key.as_slice()) else {
-                continue;
-            };
-            match self.dialed_at(epoch, &key, member, &mut kept) {
-                Some(address) => dialed.push((key, address)),
-                None => accepted.push((key, Address::Symmetric(UNDIALED))),
-            }
-        }
+        let peers: Vec<(PublicKey, Address)> = members
+            .iter()
+            .filter_map(|member| {
+                let key = PublicKey::decode(member.key.as_slice()).ok()?;
+                let address = self
+                    .dialed_at(epoch, &key, member, &mut kept)
+                    .unwrap_or_else(undialed);
+                Some((key, address))
+            })
+            .collect();
         self.bridges.keep(&kept);
-        let peers = AddressableTrackedPeers::new(
-            Map::from_iter_dedup(dialed),
-            Map::from_iter_dedup(accepted),
+        let _ = self.oracle.track(
+            epoch,
+            AddressableTrackedPeers::from(Map::from_iter_dedup(peers)),
         );
-        let _ = self.oracle.track(epoch, peers);
     }
 
     fn dialed_at(
@@ -166,6 +174,7 @@ impl Tracker {
 
 #[cfg(test)]
 mod tests {
+    use commonware_p2p::Provider as _;
     use commonware_runtime::{Runner as _, tokio};
 
     use super::*;
@@ -200,5 +209,27 @@ mod tests {
     #[should_panic(expected = "peer set too large: 5 > 4")]
     fn a_set_past_the_cap_panics() {
         track_foreign(4);
+    }
+
+    #[test]
+    fn a_member_without_an_address_is_a_primary_peer() {
+        tokio::Runner::default().start(|context| async move {
+            let listen = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            let (mesh, mut tracker, _, _, _) =
+                Mesh::start(context, PrivateKey::from_seed(0), b"mesh", listen, 3).unwrap();
+            let undialed = PrivateKey::from_seed(1).public_key();
+            tracker.track(
+                0,
+                &[Member {
+                    key: undialed.as_ref().to_vec(),
+                    address: None,
+                }],
+            );
+            let tracked = mesh.oracle().peer_set(0).await.unwrap();
+            assert!(tracked.primary.position(&undialed).is_some(), "{tracked:?}");
+        });
     }
 }
