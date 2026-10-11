@@ -44,3 +44,31 @@ fn a_change_past_the_websocket_defaults_reaches_the_client() {
     });
     assert_eq!(received, one_change());
 }
+
+#[test]
+fn an_https_node_streams_its_changes_over_wss() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let error = runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { drop(listener.accept().await) });
+        let client = Client::new(format!("https://{address}"));
+        match client.changes("x").await {
+            Ok(_) => panic!("a port that hangs up opened a stream"),
+            Err(error) => error,
+        }
+    });
+    let tls_missing = matches!(
+        &error,
+        noded::Error::Ws(error) if matches!(
+            **error,
+            tokio_tungstenite::tungstenite::Error::Url(
+                tokio_tungstenite::tungstenite::error::UrlError::TlsFeatureNotEnabled
+            )
+        )
+    );
+    assert!(!tls_missing, "{error}");
+}
