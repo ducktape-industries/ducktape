@@ -96,6 +96,7 @@ thiserror = "2"
 async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 rand = "0.8"
 # Opus codec (voice) — pure Rust, no C toolchain. No FEC-decode / PLC in the

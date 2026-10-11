@@ -25,7 +25,7 @@ state = { workspace = true }
 statesync = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { workspace = true }
 toml = "0.8"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
