@@ -1,0 +1,24 @@
+# A pod holding the network's home and nothing running, to found the network into it.
+# Applied by ops/k8s/deploy --found, which substitutes NETWORK and IMAGE.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: found
+  namespace: NETWORK
+spec:
+  hostUsers: false
+  restartPolicy: Never
+  containers:
+    - name: found
+      image: IMAGE
+      command: [sleep, infinity]
+      volumeMounts:
+        - {name: home, mountPath: /data}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: {drop: [ALL]}
+        seccompProfile: {type: RuntimeDefault}
+  volumes:
+    - name: home
+      persistentVolumeClaim:
+        claimName: home

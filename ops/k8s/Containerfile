@@ -1,0 +1,11 @@
+# The node image: a released Linux ducktape on Debian, home at /data.
+# Built by ops/k8s/deploy from a staged context holding the release binary.
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 1000 --user-group --no-create-home --home-dir /data ducktape
+COPY ducktape /usr/local/bin/ducktape
+ENV DUCKTAPE_HOME=/data NO_COLOR=1
+USER 1000:1000
+ENTRYPOINT ["ducktape"]
+CMD ["run", "--listen", "127.0.0.1:9000", "--http", "127.0.0.1:8844"]
