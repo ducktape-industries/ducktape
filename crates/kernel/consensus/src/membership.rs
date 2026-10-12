@@ -3,6 +3,7 @@ use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_runtime::Handle;
+use commonware_utils::ordered::Set;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::Tip;
@@ -23,6 +24,8 @@ pub enum Error {
     Validators { epoch: u64 },
     #[error("epoch {epoch} has no floor: neither an anchor block nor a finalization names the tip")]
     Floor { epoch: u64 },
+    #[error("epoch {epoch} follows an epoch the roster never seated")]
+    Previous { epoch: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +125,7 @@ where
             self.votes.clear();
             return Ok(Standing::Follower);
         };
+        let previous = self.previous(epoch)?;
         let floor = floor(&self.marshal, &self.anchor, &self.network, tip)
             .await
             .ok_or(Error::Floor { epoch })?;
@@ -135,6 +139,7 @@ where
             Epoch {
                 number: epoch,
                 scheme,
+                previous,
                 floor,
                 votes: self.votes.clone(),
             },
@@ -143,6 +148,17 @@ where
             self.chain.clone(),
         ));
         Ok(standing)
+    }
+
+    fn previous(&self, epoch: u64) -> Result<Option<Set<PublicKey>>, Error> {
+        let Some(before) = epoch.checked_sub(1) else {
+            return Ok(None);
+        };
+        let previous = self
+            .roster
+            .seated(before)
+            .ok_or(Error::Previous { epoch })?;
+        Ok(Some(previous))
     }
 
     fn seat_in(&self, epoch: u64) -> Option<(Scheme, Standing)> {
