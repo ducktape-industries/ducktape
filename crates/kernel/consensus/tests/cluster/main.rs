@@ -53,7 +53,11 @@ type Seating = Membership<
 fn network(epoch_length: u64) -> Network {
     Network {
         epoch_length,
-        cadence: consensus::Cadence::from_millis(BLOCK_TIME_MS),
+        cadence: consensus::Cadence::new(
+            Duration::from_millis(BLOCK_TIME_MS),
+            consensus::Timeouts::default(),
+        )
+        .unwrap(),
     }
 }
 

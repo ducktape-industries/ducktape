@@ -161,6 +161,11 @@ impl Seat {
         let thread = std::thread::spawn(move || {
             runner(&workspace.runtime_dir()).start(|context| async move {
                 let logs = Logs::install("info").unwrap();
+                let cadence = workspace
+                    .descriptor()
+                    .unwrap()
+                    .cadence(consensus::Timeouts::default())
+                    .unwrap();
                 let running = noded::run(
                     context,
                     &workspace,
@@ -168,6 +173,7 @@ impl Seat {
                     listen,
                     HaloConfig::default(),
                     load,
+                    cadence,
                 )
                 .await
                 .unwrap();

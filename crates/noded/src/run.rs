@@ -18,7 +18,7 @@ use commonware_runtime::Handle;
 use commonware_utils::Acknowledgement as _;
 use commonware_utils::acknowledgement::Exact;
 use consensus::{
-    Ancestry, Anchor, Chain, EngineMux, Marshal, Membership, Network, Roster, Transport,
+    Ancestry, Anchor, Cadence, Chain, EngineMux, Marshal, Membership, Network, Roster, Transport,
     validators_of,
 };
 use futures::StreamExt as _;
@@ -162,8 +162,9 @@ pub fn run<'a, E: Context>(
     listen: Listen,
     halo: HaloConfig,
     load: LoadConfig,
+    cadence: Cadence,
 ) -> Boxed<'a, Result<Running<E>>> {
-    Box::pin(start(context, workspace, logs, listen, halo, load))
+    Box::pin(start(context, workspace, logs, listen, halo, load, cadence))
 }
 
 async fn found<E: Context>(
@@ -257,6 +258,7 @@ async fn start<E: Context>(
     listen: Listen,
     halo: HaloConfig,
     load: LoadConfig,
+    cadence: Cadence,
 ) -> Result<Running<E>> {
     let descriptor = workspace.descriptor()?;
     let identity = workspace.identity()?;
@@ -266,7 +268,7 @@ async fn start<E: Context>(
     let node = Node::open(context.child("node"), &descriptor.network, workspace.dir()).await?;
     let network = Network {
         epoch_length: node.epoch_length()?,
-        cadence: descriptor.cadence(),
+        cadence,
     };
     let seated = recorded_epochs(&node)?;
     let tip = node.tip()?;
@@ -310,6 +312,7 @@ async fn start<E: Context>(
             &descriptor.id(),
             listen.p2p,
             member_cap,
+            cadence,
         )?;
     tracker.track(epoch, &members);
     let roster = Roster::new(descriptor.id(), Some(identity.clone()));
@@ -358,6 +361,12 @@ async fn start<E: Context>(
         network = descriptor.network,
         epoch,
         ?standing,
+        block_time_ms = cadence.block_time_ms(),
+        leader_timeout_ms = cadence.leader_timeout().as_millis() as u64,
+        certification_timeout_ms = cadence.certification_timeout().as_millis() as u64,
+        timeout_retry_ms = cadence.timeout_retry().as_millis() as u64,
+        link_timeout_ms = crate::mesh::link_timeout(cadence).as_millis() as u64,
+        ping_frequency_ms = crate::mesh::ping_frequency(cadence).as_millis() as u64,
         "the node is up"
     );
 
