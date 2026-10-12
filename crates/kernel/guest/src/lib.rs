@@ -86,6 +86,9 @@ mod context {
         }
         fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal>;
         fn query(ctx: &mut Query, env: &Env, request: &[u8]) -> Result<(), Refusal>;
+        fn hook(_ctx: &mut Execute, _env: &Env, _record: abi::hook::Record) -> Result<(), Refusal> {
+            Err(Refusal::new(reason::UNSUPPORTED, "this program is no hook"))
+        }
     }
 
     pub fn dispatch<P: Program>(invocation: Invocation) -> GuestReply {
@@ -94,7 +97,19 @@ mod context {
             GuestCall::Init(params) => P::init(&mut Execute(()), &env, &params),
             GuestCall::Execute(payload) => P::execute(&mut Execute(()), &env, &payload),
             GuestCall::Query(request) => P::query(&mut Query(()), &env, &request),
+            GuestCall::Hook(record) => hook::<P>(&env, record),
         }
+    }
+
+    fn hook<P: Program>(env: &Env, record: abi::hook::Record) -> GuestReply {
+        let from_the_kernel = env.origin == Origin::System;
+        if !from_the_kernel {
+            return Err(Refusal::new(
+                reason::UNAUTHORIZED,
+                "only the kernel calls a hook",
+            ));
+        }
+        P::hook(&mut Execute(()), env, record)
     }
 
     pub trait Reads {

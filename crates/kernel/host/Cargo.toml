@@ -17,6 +17,7 @@ runtime = { workspace = true }
 sha2 = { workspace = true }
 state = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 fixture-identity = { path = "../fixtures/identity" }

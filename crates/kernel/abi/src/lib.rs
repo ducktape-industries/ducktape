@@ -354,6 +354,21 @@ pub enum GuestCall {
     Init(Vec<u8>),
     Execute(Vec<u8>),
     Query(Vec<u8>),
+    Hook(hook::Record),
+}
+
+pub mod hook {
+    use crate::{BorshDeserialize, BorshSerialize, ProgramId, role::identity::AccountNumber};
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Record {
+        pub height: u64,
+        pub position: u32,
+        pub signer: Vec<u8>,
+        pub account: Option<AccountNumber>,
+        pub target: ProgramId,
+        pub applied: bool,
+    }
 }
 
 pub type GuestReply = Result<(), Refusal>;
@@ -382,19 +397,26 @@ pub mod role {
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
         pub enum Query {
-            At(u64),
+            At(u64) = 0,
+            Hooks(u64) = 5,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
         pub enum Reply {
-            Programs(Vec<Entry>),
+            Programs(Vec<Entry>) = 0,
+            Hooks(Vec<ProgramId>) = 5,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub struct Genesis {
             pub programs: Vec<Entry>,
             pub views: Vec<View>,
+            pub hooks: Vec<ProgramId>,
         }
     }
 
@@ -605,6 +627,26 @@ mod tests {
     }
 
     #[test]
+    fn the_registry_role_keeps_at_on_tag_zero_and_asks_hooks_on_tag_five() {
+        use role::registry::{Query, Reply};
+        let at = Query::At(7);
+        let hooks = Query::Hooks(7);
+        assert_eq!(encode(&at), [&[0u8][..], &7u64.to_le_bytes()].concat());
+        assert_eq!(encode(&hooks), [&[5u8][..], &7u64.to_le_bytes()].concat());
+        assert_eq!(decode::<Query>(&encode(&hooks)).unwrap(), hooks);
+        let listed = Reply::Hooks(vec!["activity".into()]);
+        assert_eq!(encode(&listed)[0], 5);
+        assert_eq!(decode::<Reply>(&encode(&listed)).unwrap(), listed);
+        assert_eq!(encode(&Reply::Programs(Vec::new())), [0u8, 0, 0, 0, 0]);
+        assert_eq!(
+            decode::<Query>(&[1, 0, 0, 0, 0, 0, 0, 0, 0])
+                .unwrap_err()
+                .reason,
+            reason::PROTOCOL
+        );
+    }
+
+    #[test]
     fn every_envelope_round_trips() {
         let env = Env {
             network: b"n".to_vec(),
@@ -633,7 +675,14 @@ mod tests {
         let reply = HostReply::Query(Err(Refusal::new("r", "s")));
         let invocation = Invocation {
             env: env.clone(),
-            call: GuestCall::Execute(vec![3]),
+            call: GuestCall::Hook(hook::Record {
+                height: 7,
+                position: 2,
+                signer: vec![1],
+                account: Some(4),
+                target: "chat".into(),
+                applied: false,
+            }),
         };
         let guest_reply: GuestReply = Ok(());
         assert_eq!(decode::<Env>(&encode(&env)).unwrap(), env);

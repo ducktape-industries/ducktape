@@ -115,6 +115,7 @@ fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
             },
         ],
         views: Vec::new(),
+        hooks: Vec::new(),
         limits: Limits::default(),
         epoch_length,
         time: TIME,

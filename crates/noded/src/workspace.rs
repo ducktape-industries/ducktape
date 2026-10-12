@@ -149,6 +149,8 @@ pub struct Founding {
     #[serde(default)]
     pub views: Vec<View>,
     #[serde(default)]
+    pub hooks: Vec<String>,
+    #[serde(default)]
     pub limits: Metering,
 }
 
@@ -258,6 +260,7 @@ impl Founding {
             validators,
             programs,
             views,
+            hooks: self.hooks.clone(),
             limits: Limits {
                 fuel: self.limits.fuel,
                 memory_bytes: self.limits.memory_bytes,
@@ -266,5 +269,31 @@ impl Founding {
             time: self.time,
             member_cap: self.member_cap,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Founding;
+
+    fn genesis_of(text: &str) -> host::Genesis {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("code.wasm"), b"code").unwrap();
+        let founding: Founding = toml::from_str(text).unwrap();
+        founding.genesis(dir.path()).unwrap()
+    }
+
+    const FILE: &str = "network = \"n\"\ntime = 0\nepoch_length = 4\nblock_time_ms = 1000\n\
+         HOOKS\
+         [roles]\nregistry = \"r\"\nvalidators = \"v\"\nidentity = \"i\"\n\
+         [[validators]]\nkey = \"00\"\n\
+         [[programs]]\nid = \"activity\"\ncode = \"code.wasm\"\n";
+
+    #[test]
+    fn the_founding_file_names_its_hooks_or_none() {
+        let hooked = genesis_of(&FILE.replace("HOOKS", "hooks = [\"activity\"]\n"));
+        assert_eq!(hooked.hooks, ["activity"]);
+        let plain = genesis_of(&FILE.replace("HOOKS", ""));
+        assert!(plain.hooks.is_empty());
     }
 }
