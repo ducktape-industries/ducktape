@@ -56,6 +56,7 @@ time = 1700000000000          # the genesis block's time, unix milliseconds
 epoch_length = 64             # blocks per validator epoch
 block_time_ms = 1000
 member_cap = 16               # optional, default 16: the most members (validators and residents) it ever holds, 1 to 128; fixed at founding
+hooks = ["activity"]          # optional: founding programs the kernel tells of every frame; the registry holds the list from here on
 
 [roles]                       # the founding program the kernel calls in each role; all three required
 registry = "module-registry"  # registers and swaps programs
@@ -98,6 +99,17 @@ frame and `OfModule(program)` for a message or a reply, and passes the answer
 as `Env.sender`; a refusal rejects the frame, and a key that holds no account
 runs as no one (`None`). The interfaces are `abi::role::{registry,
 validators, identity}`; modules' `docs/roles.md` walks through them.
+
+A hook is a program the kernel tells of every frame a block carries, after
+the frame has run: at each block it asks the registry `Hooks(height)` and,
+after each frame, calls every hook it named with `GuestCall::Hook` and an
+`abi::hook::Record` (the height, the frame's position in the block, its
+signer, the account it acted as, its target and whether it applied), from
+the `System` origin on a fixed budget of `HOOK_FUEL`. A hook never changes
+the frame: one that refuses, traps, spends its fuel or sends a message has
+its own writes undone, and the block goes on. The founding file's `hooks`
+seeds the registry's list; a running network hooks or unhooks a program
+through the registry like any other change.
 
 ```sh
 curl -fsSL https://github.com/ducktape-industries/modules/releases/download/wasm-<commit>/founding.tar.gz | tar xz

@@ -63,6 +63,7 @@ fn genesis(validators: Vec<validators::Member>) -> Genesis {
             founding("probe", PROBE, abi::encode(&Vec::<Step>::new())),
         ],
         views: Vec::new(),
+        hooks: Vec::new(),
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
         time: TIME,

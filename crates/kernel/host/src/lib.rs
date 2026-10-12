@@ -10,7 +10,7 @@ use std::path::Path;
 pub use abi::Roles;
 use abi::{
     BlobId, Cause, Env, GuestCall, HashKind, Invocation, Origin, Outcome, Principal, ProgramId,
-    Refusal, Root, Scan, reason,
+    Refusal, Root, Scan, hook, reason,
     role::{identity, registry, validators},
 };
 use blobs::{Blobs, Layered, Stage};
@@ -33,6 +33,8 @@ const CODE_KIND: &str = "program";
 /// each message, or reply, one deeper than the run that emitted it.
 pub const MAX_DEPTH: u32 = 8;
 pub const ANCHOR_WINDOW: u64 = 256;
+pub const HOOK_FUEL: u64 = 2_000_000;
+const HOOK_LOG_EVERY: u64 = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -60,6 +62,8 @@ pub enum Error {
         role: &'static str,
         program: ProgramId,
     },
+    #[error("genesis hooks {0:?}, which is not a founding program")]
+    Unhooked(ProgramId),
     #[error("no network was founded here")]
     Unfounded,
     #[error(
@@ -87,6 +91,7 @@ pub struct Genesis {
     /// Views with no program behind them: each blob is stored and listed by
     /// the registry under its name; nothing is admitted.
     pub views: Vec<FoundingView>,
+    pub hooks: Vec<ProgramId>,
     pub limits: Limits,
     pub epoch_length: u64,
     pub time: u64,
@@ -179,6 +184,34 @@ where
     roles: Roles,
     loaded: Loaded,
     preconfirmed: Overlay,
+    hook_streaks: BTreeMap<ProgramId, u64>,
+}
+
+enum Submitted {
+    Stale(Receipt),
+    Carried {
+        receipt: Receipt,
+        account: Option<identity::AccountNumber>,
+    },
+}
+
+impl Submitted {
+    fn receipt(self) -> Receipt {
+        match self {
+            Submitted::Stale(receipt) | Submitted::Carried { receipt, .. } => receipt,
+        }
+    }
+}
+
+struct Hooks {
+    programs: Vec<ProgramId>,
+    tallies: BTreeMap<ProgramId, HookTally>,
+}
+
+#[derive(Default)]
+struct HookTally {
+    refused: u64,
+    reason: Option<String>,
 }
 
 impl<E> Host<E>
@@ -280,6 +313,12 @@ where
                 });
             }
         }
+        for hook in &genesis.hooks {
+            let founded = entries.iter().any(|entry| entry.program == *hook);
+            if !founded {
+                return Err(Error::Unhooked(hook.clone()));
+            }
+        }
         // the registry, the validators, then identity are admitted before
         // the rest
         let founding_roles = [&roles.registry, &roles.validators, &roles.identity];
@@ -323,6 +362,7 @@ where
         entries[0].params = abi::encode(&registry::Genesis {
             programs: entries.clone(),
             views,
+            hooks: genesis.hooks,
         });
         // the roles init before identity can give an account; every other
         // program has its account before its init runs, so what it emits
@@ -347,6 +387,7 @@ where
             roles: genesis.roles.clone(),
             loaded: Loaded::new(genesis.limits),
             preconfirmed: Overlay::default(),
+            hook_streaks: BTreeMap::new(),
         };
         let mut receipts = Vec::new();
         for entry in role_entries {
@@ -444,6 +485,7 @@ where
             roles,
             loaded: Loaded::new(limits),
             preconfirmed: Overlay::default(),
+            hook_streaks: BTreeMap::new(),
         };
         host.sync_code()?;
         Ok(host)
@@ -734,10 +776,10 @@ where
         let mut stage = Stage::default();
         let mut receipts = Vec::new();
         for submission in submissions {
-            receipts.push(
-                self.submit(submission, height, time, &mut overlay, &mut stage)
-                    .await?,
-            );
+            let submitted = self
+                .submit(submission, height, time, &mut overlay, &mut stage)
+                .await?;
+            receipts.push(submitted.receipt());
         }
         self.preconfirmed = overlay;
         Ok(receipts)
@@ -758,9 +800,14 @@ where
         let admissions = self
             .refresh_programs(block.height, block.time, &mut overlay, &mut stage)
             .await?;
+        let mut hooks = self
+            .hooks(block.height, block.time, &overlay, &stage)
+            .await?;
         let mut submissions = Vec::new();
-        for submission in block.submissions {
-            let receipt = self
+        for (position, submission) in block.submissions.into_iter().enumerate() {
+            let signer = submission.signer.clone();
+            let target = submission.target.clone();
+            let submitted = self
                 .submit(
                     submission,
                     block.height,
@@ -769,8 +816,25 @@ where
                     &mut stage,
                 )
                 .await?;
+            let receipt = match submitted {
+                Submitted::Stale(receipt) => receipt,
+                Submitted::Carried { receipt, account } => {
+                    let record = hook::Record {
+                        height: block.height,
+                        position: position as u32,
+                        signer,
+                        account,
+                        target,
+                        applied: matches!(receipt.outcome, Outcome::Applied { .. }),
+                    };
+                    self.tell(&mut hooks, &record, block.time, &mut overlay, &mut stage)
+                        .await?;
+                    receipt
+                }
+            };
             submissions.push(receipt);
         }
+        self.log_hooks(block.height, hooks);
         let epoch_length = self.epoch_length()?;
         let ends_an_epoch = (block.height + 1).is_multiple_of(epoch_length);
         if ends_an_epoch {
@@ -798,10 +862,10 @@ where
         time: u64,
         overlay: &mut Overlay,
         stage: &mut Stage,
-    ) -> Result<Receipt> {
+    ) -> Result<Submitted> {
         let view = self.store.view(vec![&*overlay]);
         if let Err(refusal) = fresh(&view, &submission, height)? {
-            return Ok(rejected(&submission.target, refusal));
+            return Ok(Submitted::Stale(rejected(&submission.target, refusal)));
         }
         overlay.set(SPENT, namespace::spent(&submission), Vec::new());
         let asked = identity::Query::Account(submission.signer.clone());
@@ -811,7 +875,12 @@ where
             .await?
         {
             Ok(account) => account,
-            Err(refusal) => return Ok(rejected(&submission.target, refusal)),
+            Err(refusal) => {
+                return Ok(Submitted::Carried {
+                    receipt: rejected(&submission.target, refusal),
+                    account: None,
+                });
+            }
         };
         let checkpoint = overlay.checkpoint();
         let env = Env {
@@ -838,7 +907,148 @@ where
         if let Outcome::Rejected(_) = receipt.outcome {
             overlay.restore(checkpoint);
         }
-        Ok(receipt)
+        Ok(Submitted::Carried { receipt, account })
+    }
+
+    async fn hooks(
+        &self,
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+    ) -> Result<Hooks> {
+        let none = || Hooks {
+            programs: Vec::new(),
+            tallies: BTreeMap::new(),
+        };
+        let reply = unit::query(
+            self.world(height, time),
+            vec![overlay],
+            stage,
+            &[],
+            Origin::System,
+            self.roles.registry.clone(),
+            abi::encode(&registry::Query::Hooks(height)),
+            &mut self.loaded.limits().fuel,
+        )
+        .await?;
+        let Ok(bytes) = reply else {
+            return Ok(none());
+        };
+        let Ok(registry::Reply::Hooks(listed)) = abi::decode::<registry::Reply>(&bytes) else {
+            return Ok(none());
+        };
+        let mut hooks = none();
+        for hook in listed {
+            let runs = self.loaded.module(&hook).is_some();
+            let first = !hooks.programs.contains(&hook);
+            if runs && first {
+                hooks.programs.push(hook);
+            }
+        }
+        Ok(hooks)
+    }
+
+    async fn tell(
+        &self,
+        hooks: &mut Hooks,
+        record: &hook::Record,
+        time: u64,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+    ) -> Result<()> {
+        for program in &hooks.programs {
+            let refused = self
+                .call_hook(program, record, time, overlay, stage)
+                .await?;
+            let tally = hooks.tallies.entry(program.clone()).or_default();
+            let Some(refusal) = refused else {
+                continue;
+            };
+            tracing::debug!(
+                target: "ducktape::hook",
+                event = "hook_refused",
+                hook = %program,
+                height = record.height,
+                position = record.position,
+                reason = %refusal.reason,
+            );
+            tally.refused += 1;
+            tally.reason.get_or_insert(refusal.reason);
+        }
+        Ok(())
+    }
+
+    async fn call_hook(
+        &self,
+        program: &str,
+        record: &hook::Record,
+        time: u64,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+    ) -> Result<Option<Refusal>> {
+        let checkpoint = overlay.checkpoint();
+        let env = Env {
+            network: self.network.clone(),
+            height: record.height,
+            time,
+            me: program.to_owned(),
+            origin: Origin::System,
+            sender: Some(Principal::System),
+            roles: self.roles.clone(),
+            cause: Cause::Direct,
+        };
+        let mut frame = Frame {
+            fuel: self.loaded.limits().fuel.map(|_| HOOK_FUEL),
+            next_item: 0,
+        };
+        let invocation = Invocation {
+            env,
+            call: GuestCall::Hook(record.clone()),
+        };
+        let (receipt, emitted) = unit::execute(
+            self.world(record.height, time),
+            overlay,
+            stage,
+            &mut frame,
+            program,
+            invocation,
+        )
+        .await?;
+        let sent_messages = !emitted.is_empty();
+        let refusal = match (receipt.outcome, sent_messages) {
+            (Outcome::Rejected(refusal), _) => refusal,
+            (Outcome::Applied { .. }, false) => return Ok(None),
+            (Outcome::Applied { .. }, true) => {
+                overlay.restore(checkpoint);
+                unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+                Refusal::new(reason::UNSUPPORTED, "a hook sends no messages")
+            }
+        };
+        Ok(Some(refusal))
+    }
+
+    fn log_hooks(&mut self, height: u64, hooks: Hooks) {
+        for (program, tally) in hooks.tallies {
+            let Some(reason) = tally.reason else {
+                self.hook_streaks.remove(&program);
+                continue;
+            };
+            let blocks = self.hook_streaks.entry(program.clone()).or_default();
+            *blocks += 1;
+            let due = *blocks == 1 || blocks.is_multiple_of(HOOK_LOG_EVERY);
+            if due {
+                tracing::warn!(
+                    target: "ducktape::hook",
+                    event = "hook_refused",
+                    hook = %program,
+                    height,
+                    frames = tally.refused,
+                    blocks = *blocks,
+                    reason = %reason,
+                );
+            }
+        }
     }
 
     /// The account the identity role says `program` runs as, for a frame

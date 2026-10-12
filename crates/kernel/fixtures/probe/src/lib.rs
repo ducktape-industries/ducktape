@@ -16,12 +16,23 @@ pub enum Reply {
     Env(Env),
 }
 
+pub const HOOK: &[u8] = b"#hook";
+
+pub fn seen(height: u64, position: u32) -> Vec<u8> {
+    [
+        b"#seen/".as_slice(),
+        &height.to_be_bytes(),
+        &position.to_be_bytes(),
+    ]
+    .concat()
+}
+
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::{Env, Refusal};
+    use abi::{Env, Refusal, hook};
     use guest::{Execute, Program, Query, Reads};
 
-    use crate::{Reply, Step};
+    use crate::{HOOK, Reply, Step, seen};
 
     struct Probe;
 
@@ -39,6 +50,14 @@ mod program {
         fn query(ctx: &mut Query, env: &Env, request: &[u8]) -> Result<(), Refusal> {
             let replies = run(ctx, env, request)?;
             ctx.respond(abi::encode(&replies));
+            Ok(())
+        }
+
+        fn hook(ctx: &mut Execute, env: &Env, record: hook::Record) -> Result<(), Refusal> {
+            if let Some(script) = ctx.get(HOOK) {
+                run(ctx, env, &script)?;
+            }
+            ctx.set(seen(record.height, record.position), abi::encode(&record));
             Ok(())
         }
     }

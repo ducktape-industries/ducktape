@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use abi::{
     Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
-    HostReply, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, Scheme, reason,
+    HostReply, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, Scheme, hook, reason,
     role::{identity, registry, validators},
 };
 use commonware_codec::Encode as _;
@@ -86,6 +86,7 @@ fn genesis(programs: Vec<Founding>) -> Genesis {
         validators: vec![member(b"v1", "v1:1")],
         programs: bound.into_iter().chain(programs).collect(),
         views: Vec::new(),
+        hooks: Vec::new(),
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
         time: TIME,
@@ -2428,5 +2429,220 @@ fn an_epoch_seating_more_members_than_the_cap_is_not_applied() {
             "{closing:?}"
         );
         assert_eq!(host.tip().unwrap(), tip);
+    });
+}
+
+fn hooked(genesis: Genesis, hooks: &[&str]) -> Genesis {
+    Genesis {
+        hooks: hooks.iter().map(|hook| (*hook).to_owned()).collect(),
+        ..genesis
+    }
+}
+
+fn hook_runs(genesis: Genesis, steps: Vec<Step>) -> Genesis {
+    let mut genesis = genesis;
+    let probe = genesis
+        .programs
+        .iter_mut()
+        .find(|founding| founding.program == "probe")
+        .expect("the probe is founded");
+    probe.params = script(vec![set(fixture_probe::HOOK, &script(steps))]);
+    genesis
+}
+
+fn told(host: &Host<Ctx>, height: u64, position: u32) -> Option<hook::Record> {
+    stored(host, "probe", &fixture_probe::seen(height, position))
+        .map(|bytes| abi::decode(&bytes).unwrap())
+}
+
+fn hook_change(change: Change) -> Submission {
+    submit("module-registry", abi::encode(&change))
+}
+
+fn told_of(target: &str, signer: &[u8], account: Option<u64>, applied: bool) -> hook::Record {
+    hook::Record {
+        height: 1,
+        position: 0,
+        signer: signer.to_vec(),
+        account,
+        target: target.to_owned(),
+        applied,
+    }
+}
+
+#[test]
+fn a_hook_is_told_of_every_carried_frame_after_it_runs_and_changes_none() {
+    deterministic::Runner::default().start(|context| async move {
+        let frames = || {
+            let first = submit("ping", abi::encode(&note(b"one")));
+            vec![
+                first.clone(),
+                submit("ping", abi::encode(&fail(false))),
+                first,
+                Submission {
+                    signer: b"nobody".to_vec(),
+                    ..submit("ping", abi::encode(&note(b"two")))
+                },
+            ]
+        };
+        let plain_dir = tempfile::tempdir().unwrap();
+        let mut plain = found(
+            context.child("plain"),
+            "plain",
+            plain_dir.path(),
+            standard(),
+        )
+        .await;
+        let unhooked = plain.apply(block(1, frames())).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(
+            context.child("hooked"),
+            "net",
+            dir.path(),
+            hooked(standard(), &["probe"]),
+        )
+        .await;
+        host.preconfirm(TIME, frames()).await.unwrap();
+        let preconfirmed = host
+            .view(Layer::Preconfirmed)
+            .get("probe", &fixture_probe::seen(1, 0))
+            .unwrap();
+        assert_eq!(preconfirmed, None, "a preconfirmed frame is told nothing");
+        let applied = host.apply(block(1, frames())).await.unwrap();
+        assert_eq!(applied.submissions, unhooked.submissions);
+        assert_eq!(
+            stored(&host, "ping", b"got/ping/0"),
+            stored(&plain, "ping", b"got/ping/0")
+        );
+        assert_eq!(
+            told(&host, 1, 0),
+            Some(told_of("ping", SIGNER, Some(ACCOUNT), true))
+        );
+        assert_eq!(
+            told(&host, 1, 1),
+            Some(hook::Record {
+                position: 1,
+                ..told_of("ping", SIGNER, Some(ACCOUNT), false)
+            })
+        );
+        assert_eq!(told(&host, 1, 2), None, "a frame carried already");
+        assert_eq!(
+            told(&host, 1, 3),
+            Some(hook::Record {
+                position: 3,
+                ..told_of("ping", b"nobody", None, true)
+            })
+        );
+        let host = restart(context.child("restart"), dir.path(), host).await;
+        assert!(told(&host, 1, 0).is_some());
+    });
+}
+
+#[test]
+fn a_hook_that_fails_keeps_none_of_its_writes_and_the_block_goes_on() {
+    let emit = HostOp::Emit(Message {
+        target: "pong".into(),
+        payload: abi::encode(&note(b"from a hook")),
+        reply: false,
+    });
+    let runs: [(Vec<Step>, Option<&[u8]>); 4] = [
+        (vec![set(b"k", b"v")], Some(b"v")),
+        (vec![set(b"k", b"v"), Step::Fail("no".into())], None),
+        (vec![set(b"k", b"v"), Step::Spin], None),
+        (vec![set(b"k", b"v"), op(emit)], None),
+    ];
+    for (steps, kept) in runs {
+        deterministic::Runner::default().start(|context| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let genesis = hook_runs(hooked(metered(), &["probe"]), steps);
+            let mut host = found(context, "net", dir.path(), genesis).await;
+            let applied = host
+                .apply(block(
+                    1,
+                    vec![
+                        submit("ping", abi::encode(&note(b"one"))),
+                        submit("ping", abi::encode(&note(b"two"))),
+                    ],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(output(&applied.submissions[0]), b"eno");
+            assert_eq!(output(&applied.submissions[1]), b"owt");
+            assert_eq!(stored(&host, "probe", b"k").as_deref(), kept);
+            assert_eq!(told(&host, 1, 1).is_some(), kept.is_some());
+            assert_eq!(
+                stored(&host, "pong", &fixture_relay::got(&item("probe", 0))),
+                None
+            );
+        });
+    }
+}
+
+#[test]
+fn the_registry_hooks_and_unhooks_a_program_from_the_next_block() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let ping = |bytes: &[u8]| submit("ping", abi::encode(&note(bytes)));
+        host.apply(block(
+            1,
+            vec![
+                hook_change(Change::Hook("probe".into())),
+                hook_change(Change::Hook("ghost".into())),
+                ping(b"one"),
+            ],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            told(&host, 1, 2),
+            None,
+            "hooks are asked before a block's frames"
+        );
+        host.apply(block(2, vec![ping(b"two")])).await.unwrap();
+        assert_eq!(
+            told(&host, 2, 0).map(|record| (record.height, record.position)),
+            Some((2, 0))
+        );
+        host.apply(block(3, vec![hook_change(Change::Unhook("probe".into()))]))
+            .await
+            .unwrap();
+        host.apply(block(4, vec![ping(b"four")])).await.unwrap();
+        assert_eq!(told(&host, 4, 0), None);
+    });
+}
+
+#[test]
+fn the_kernel_hooks_only_what_the_registry_answers() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut silent = hooked(standard(), &["probe"]);
+        silent.programs[0].code = RELAY.to_vec();
+        let mut host = found(context, "net", dir.path(), silent).await;
+        host.apply(block(1, vec![submit("ping", abi::encode(&note(b"one")))]))
+            .await
+            .unwrap();
+        assert_eq!(told(&host, 1, 0), None);
+    });
+}
+
+#[test]
+fn founding_refuses_a_hook_it_does_not_found() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let refused = Host::found(
+            context,
+            "net",
+            dir.path(),
+            block_id(0),
+            hooked(standard(), &["ghost"]),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(&refused, Some(Error::Unhooked(program)) if program == "ghost"),
+            "{refused:?}"
+        );
     });
 }
