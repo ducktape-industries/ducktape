@@ -9,8 +9,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use borsh::BorshSerialize;
-use futures::StreamExt as _;
 use futures::channel::mpsc;
+use futures::{SinkExt as _, StreamExt as _};
 use host::Receipt;
 use node::{Source, Taken};
 use statesync::Request;
@@ -212,13 +212,33 @@ async fn changes<E: Context>(
     upgrade.on_upgrade(move |socket| stream(socket, subscription))
 }
 
-async fn stream(mut socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Change>) {
-    while let Some(change) = changes.next().await {
-        let sent = socket
-            .send(Message::Binary(abi::encode(&change).into()))
-            .await;
-        if sent.is_err() {
-            return;
+enum Next {
+    Change(Change),
+    Frame,
+    Ended,
+}
+
+async fn stream(socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Change>) {
+    let (mut client, mut frames) = socket.split();
+    loop {
+        let next = tokio::select! {
+            change = changes.next() => change.map_or(Next::Ended, Next::Change),
+            frame = frames.next() => match frame {
+                Some(Ok(_)) => Next::Frame,
+                Some(Err(_)) | None => Next::Ended,
+            },
+        };
+        match next {
+            Next::Change(change) => {
+                let sent = client
+                    .send(Message::Binary(abi::encode(&change).into()))
+                    .await;
+                if sent.is_err() {
+                    return;
+                }
+            }
+            Next::Frame => {}
+            Next::Ended => return,
         }
     }
 }

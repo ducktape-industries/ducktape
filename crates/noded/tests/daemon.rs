@@ -9,7 +9,7 @@ use abi::{HostOp, HostReply, Outcome, Scan, reason};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
 use fixture_probe::{Reply, Step};
-use futures::StreamExt as _;
+use futures::{SinkExt as _, StreamExt as _};
 use host::{Layer, Submission, Tip};
 use node::Frame;
 use noded::wire::{Admin, BlockRef};
@@ -441,6 +441,34 @@ fn a_validator_serves_its_network_over_http() {
             let again = client.block(BlockRef::Height(seen.height)).await.unwrap();
             assert_eq!(again.as_ref(), Some(seen));
         }
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn a_changes_subscriber_that_closes_is_answered() {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+
+    client_runtime().block_on(async {
+        let url = format!("ws://{}{}/probe", seat.http, noded::wire::route::CHANGES);
+        let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        socket.send(Message::Close(None)).await.unwrap();
+        let mut answered = Vec::new();
+        while let Some(frame) = socket.next().await {
+            answered.push(frame.unwrap());
+        }
+        assert!(
+            matches!(answered.as_slice(), [Message::Close(_)]),
+            "{answered:?}"
+        );
         seat.admin(&client, Admin::Shutdown).await;
     });
     live.thread.join().unwrap();
