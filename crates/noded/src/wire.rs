@@ -187,9 +187,7 @@ pub struct Network {
 /// not applied counts once it does. The vote's sender is authenticated but
 /// its signature is not checked, so a validator can misstate only its own
 /// row. `None` for a member not seated as a validator this epoch (a
-/// resident), for a validator not heard since this node started or last
-/// began validating, and for every member while this node is not itself a
-/// validator: it runs no engine, so it hears no votes.
+/// resident), and for a validator not heard since this node started.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct PeerStatus {
     pub key: Vec<u8>,
