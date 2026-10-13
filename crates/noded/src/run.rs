@@ -22,6 +22,7 @@ use node::{Block, Frame, Node, Sequenced};
 use tokio::sync::watch;
 
 use crate::endpoint::Endpoint;
+use crate::fetch::{self, Fetch};
 use crate::mesh::{Mesh, Tracker};
 use crate::relay::{self, Relay};
 use crate::transport;
@@ -212,8 +213,10 @@ async fn start<E: Context>(
 
     let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
     let (inbox, deliveries) = mpsc::unbounded();
+    let fetch: Arc<dyn Fetch> = Arc::new(fetch::Nowhere);
     let chain = Participant {
         node: node.clone(),
+        fetch: fetch.clone(),
         inbox,
     };
     let (marshal, summaries) = Marshal::start(
@@ -264,6 +267,7 @@ async fn start<E: Context>(
         shutdown,
         votes: membership.votes().clone(),
         relay: Relay::new(identity.public_key(), relay_sender, voters.as_ref()),
+        fetch,
         mesh: transport::loopback(listen.p2p),
         subscribers: Mutex::new(Vec::new()),
         recent: Mutex::default(),
@@ -343,6 +347,7 @@ fn recorded_epochs<E: Context>(
 
 pub struct Participant<E: Context> {
     node: Shared<E>,
+    fetch: Arc<dyn Fetch>,
     inbox: mpsc::UnboundedSender<Delivery>,
 }
 
@@ -350,6 +355,7 @@ impl<E: Context> Clone for Participant<E> {
     fn clone(&self) -> Self {
         Participant {
             node: self.node.clone(),
+            fetch: self.fetch.clone(),
             inbox: self.inbox.clone(),
         }
     }
@@ -392,6 +398,21 @@ impl<E: Context> Chain for Participant<E> {
         }
     }
 
+    async fn verify(&mut self, leader: PublicKey, block: Arc<Block>) -> bool {
+        let held = fetch::hold_block(&self.node, &*self.fetch, &block, Some(leader)).await;
+        let Err(error) = held else {
+            return true;
+        };
+        tracing::error!(
+            target: "ducktape::node",
+            event = "verify_failed",
+            height = block.height,
+            %error,
+            "the node cannot hold what a proposed block attaches and abstains"
+        );
+        futures::future::pending().await
+    }
+
     fn deliver(&mut self, block: Arc<Block>, ack: Exact) {
         let _ = self.inbox.unbounded_send((block, ack));
     }
@@ -420,14 +441,38 @@ async fn pump<E: Context>(
     }
 }
 
+async fn apply_holding<'a, E: Context>(
+    daemon: &'a Daemon<E>,
+    block: &Block,
+) -> Result<(futures::lock::MutexGuard<'a, Node<E>>, Sequenced)> {
+    loop {
+        let mut node = daemon.node.lock().await;
+        match node.apply(block).await {
+            Err(node::Error::Host(host::Error::BlobUnavailable(id))) => {
+                drop(node);
+                tracing::warn!(
+                    target: "ducktape::node",
+                    event = "blob_unavailable",
+                    height = block.height,
+                    ?id,
+                    reason = "blob_missing",
+                    "the block reads a blob this node lacks; the node fetches it and applies again"
+                );
+                fetch::repair(&daemon.node, &*daemon.fetch, id).await?;
+            }
+            sequenced => return Ok((node, sequenced?)),
+        }
+    }
+}
+
 async fn applied<E: Context>(
     daemon: &Daemon<E>,
     membership: &mut Seating<E>,
     tracker: &mut Tracker,
     block: &Block,
 ) -> Result<()> {
-    let mut node = daemon.node.lock().await;
-    let sequenced = node.apply(block).await?;
+    fetch::hold_block(&daemon.node, &*daemon.fetch, block, None).await?;
+    let (mut node, sequenced) = apply_holding(daemon, block).await?;
     // under the node lock, which a /v1/network read holds across the tip
     // and the book, so no height it serves passes its tip
     daemon.votes.applied(block.digest(), block.height);

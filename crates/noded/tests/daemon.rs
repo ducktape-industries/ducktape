@@ -5,11 +5,12 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use abi::role::validators::{Motion, Op};
-use abi::{HostOp, HostReply, Outcome, Scan, reason};
+use abi::{Blob, BlobId, HashKind, HostOp, HostReply, Outcome, Scan, reason};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
 use fixture_probe::{Reply, Step};
 use futures::{SinkExt as _, StreamExt as _};
+use host::attach::{ATTACH, Attached, Attachment};
 use host::{Layer, Submission, Tip};
 use node::Frame;
 use noded::wire::{Admin, BlockRef, PREVIEW_BYTES, TxAsk, TxRef};
@@ -213,6 +214,25 @@ async fn membership(client: &Client, key: &ed25519::PrivateKey, op: Op) -> u64 {
         "{receipt:?}"
     );
     height
+}
+
+async fn page_reader(
+    client: &Client,
+    key: &ed25519::PrivateKey,
+    body: &[u8],
+) -> (BlobId, Vec<u8>, Vec<u8>) {
+    let framed = blobs::frame("page", body).unwrap();
+    let id = blobs::id_of(HashKind::Sha256, &framed);
+    let attached = Attached {
+        target: "probe".into(),
+        payload: abi::encode(&vec![Step::Op(HostOp::BlobGet(id))]),
+        blobs: vec![Attachment {
+            id,
+            len: framed.len() as u64,
+        }],
+    };
+    let frame = signed(client, key, ATTACH, abi::encode(&attached)).await;
+    (id, framed, frame)
 }
 
 fn submission(frame: &[u8]) -> Submission {
@@ -539,6 +559,44 @@ fn a_validator_serves_its_network_over_http() {
             .unwrap()
             .unwrap();
         assert_eq!(opened.tx.payload, Some(large_payload));
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn a_validator_runs_a_frame_once_it_holds_the_blob_the_frame_attaches() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+
+    client_runtime().block_on(async {
+        let (id, framed, attaching) = page_reader(&client, &alice, b"body").await;
+
+        let unheld = client.submit(attaching.clone()).await.unwrap_err();
+        let noded::Error::Refused(refusal) = unheld else {
+            panic!("a frame whose attachment is not held is refused: {unheld}");
+        };
+        assert_eq!(refusal.reason, reason::NOT_FOUND);
+
+        client.put_blob(id, framed).await.unwrap();
+        let (_, receipt) = client
+            .land(&Frame::decode(&attaching).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(receipt.program, "probe");
+        let Outcome::Applied { output } = &receipt.outcome else {
+            panic!("the attaching frame runs: {receipt:?}");
+        };
+        let read = Reply::Host(HostReply::Blob(Some(Blob {
+            kind: "page".into(),
+            body: b"body".to_vec(),
+        })));
+        assert_eq!(abi::decode::<Vec<Reply>>(output).unwrap(), vec![read]);
         seat.admin(&client, Admin::Shutdown).await;
     });
     live.thread.join().unwrap();
@@ -907,6 +965,22 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
             .expect("a frame given the instant the resident starts lands");
     });
 
+    let (id, framed, unfetchable) = runtime.block_on(page_reader(
+        &follower.client,
+        &bob,
+        b"only the resident holds this",
+    ));
+    runtime
+        .block_on(follower.client.put_blob(id, framed))
+        .unwrap();
+    let pooled = runtime
+        .block_on(follower.client.submit(unfetchable))
+        .unwrap();
+    assert!(
+        matches!(pooled.outcome, Outcome::Applied { .. }),
+        "{pooled:?}"
+    );
+
     let failing = given(vec![Step::Fail("no".into())]);
     let mut spent = runtime
         .block_on(founders[1].client.changes(host::SPENT))
@@ -922,7 +996,9 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
     runtime.block_on(async {
         ::tokio::time::timeout(Duration::from_secs(60), landed(&mut spent, &[&carried]))
             .await
-            .expect("a frame predicted to fail is relayed and a block carries it");
+            .expect(
+                "a frame predicted to fail is relayed past one whose attachment no validator can fetch, and a block carries it",
+            );
     });
     drop(spent);
 

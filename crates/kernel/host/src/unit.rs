@@ -10,6 +10,7 @@ use commonware_storage::Context;
 use runtime::{Code, Fault, Limits, Runtime};
 use state::{Overlay, Storage, Store, View};
 
+use crate::attach::Attachment;
 use crate::{Error, Receipt, Result, crypto, namespace};
 
 pub struct Loaded {
@@ -137,6 +138,7 @@ where
     pub loaded: &'a Loaded,
     pub network: &'a [u8],
     pub roles: &'a Roles,
+    pub attached: &'a [Attachment],
     pub height: u64,
     pub time: u64,
 }
@@ -203,7 +205,13 @@ where
             .view()
             .get(namespace::BLOBS, &namespace::blob(id))?
             .is_some();
-        if !rostered {
+        let attached = self
+            .world
+            .attached
+            .iter()
+            .any(|attachment| attachment.id == *id);
+        let readable = rostered || attached;
+        if !readable {
             return Ok(None);
         }
         let layered = Layered {
@@ -375,12 +383,10 @@ where
 /// refused before any run (an unknown target, too deep) costs too.
 const EMIT_FUEL: u64 = 1_000;
 
-/// What one submission's runs share: the fuel left of the network's limit,
-/// and the number the next emitted message takes, so every item of the
-/// frame is distinct whichever run emitted it.
 pub struct Frame {
     pub fuel: Option<u64>,
     pub next_item: u64,
+    pub attached: Vec<Attachment>,
 }
 
 struct Execute<'a, E>
@@ -460,7 +466,10 @@ where
             ))),
             other => {
                 let reader = Reader {
-                    world: self.world,
+                    world: World {
+                        attached: &self.frame.attached,
+                        ..self.world
+                    },
                     layers: vec![&*self.overlay],
                     stage: &*self.stage,
                     env: &self.env,

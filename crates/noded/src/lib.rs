@@ -1,6 +1,7 @@
 mod blocks;
 mod client;
 mod endpoint;
+mod fetch;
 mod logs;
 mod mesh;
 mod network;
@@ -100,6 +101,7 @@ pub struct Daemon<E: Context> {
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
     pub relay: relay::Relay<E>,
+    pub fetch: Arc<dyn fetch::Fetch>,
     mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).
     votes: Votes,

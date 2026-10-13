@@ -18,6 +18,7 @@ state = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+blobs = { workspace = true }
 commonware-utils = { workspace = true }
 fixture-module-registry = { path = "../fixtures/module-registry" }
 fixture-probe = { path = "../fixtures/probe" }

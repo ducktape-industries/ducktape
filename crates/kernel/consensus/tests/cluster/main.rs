@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use abi::{HostOp, Root, role::validators};
+use abi::{HashKind, HostOp, Root, role::validators};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_p2p::simulated::{self, Link, Oracle};
 use commonware_runtime::{Quota, Runner as _, Spawner as _, Supervisor as _, deterministic};
@@ -16,7 +16,8 @@ use consensus::{
 };
 use fixture_probe::Step;
 use futures::StreamExt as _;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
+use host::attach::{ATTACH, Attached, Attachment};
 use host::{Founding, Genesis, Layer, Limits, Roles, Tip};
 use node::{Block, Frame, Node, Sequenced, Source};
 
@@ -138,6 +139,88 @@ fn frame(key: &ed25519::PrivateKey, steps: Vec<Step>) -> Vec<u8> {
     Frame::sign(key, NETWORK, origin(), None, "probe", abi::encode(&steps)).encode()
 }
 
+fn page(body: &[u8]) -> (Attachment, Vec<u8>) {
+    let framed = blobs::frame("page", body).unwrap();
+    let id = blobs::id_of(HashKind::Sha256, &framed);
+    let attachment = Attachment {
+        id,
+        len: framed.len() as u64,
+    };
+    (attachment, framed)
+}
+
+fn attaching(key: &ed25519::PrivateKey, steps: Vec<Step>, blobs: Vec<Attachment>) -> Vec<u8> {
+    let attached = Attached {
+        target: "probe".into(),
+        payload: abi::encode(&steps),
+        blobs,
+    };
+    Frame::sign(key, NETWORK, origin(), None, ATTACH, abi::encode(&attached)).encode()
+}
+
+#[derive(Default)]
+struct Pond {
+    nodes: Vec<Shared>,
+    waiting: Vec<oneshot::Sender<()>>,
+}
+
+#[derive(Clone, Default)]
+struct Swarm(Arc<Mutex<Pond>>);
+
+impl Swarm {
+    fn join(&self, node: Shared) {
+        self.0.lock().unwrap().nodes.push(node);
+    }
+
+    fn installed(&self) {
+        for waiting in self.0.lock().unwrap().waiting.drain(..) {
+            let _ = waiting.send(());
+        }
+    }
+
+    fn next_install(&self) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.0.lock().unwrap().waiting.push(tx);
+        rx
+    }
+
+    async fn hold(&self, me: &Shared, block: &Block) {
+        loop {
+            let installed = self.next_install();
+            let needs = me.lock().await.needs(block).unwrap();
+            if needs.is_empty() {
+                return;
+            }
+            let fetched = self.fetch(me, &needs).await;
+            if !fetched {
+                let _ = installed.await;
+            }
+        }
+    }
+
+    async fn fetch(&self, me: &Shared, needs: &[Attachment]) -> bool {
+        let nodes = self.0.lock().unwrap().nodes.clone();
+        let mut fetched_all = true;
+        for attachment in needs {
+            let mut found = None;
+            for node in nodes.iter().filter(|node| !Arc::ptr_eq(node, me)) {
+                let held = node.lock().await.held_blob(&attachment.id).unwrap();
+                if let Some(framed) = held.filter(|framed| framed.len() as u64 == attachment.len) {
+                    found = Some(framed);
+                    break;
+                }
+            }
+            let Some(framed) = found else {
+                fetched_all = false;
+                continue;
+            };
+            me.lock().await.install(attachment.id, &framed).unwrap();
+            self.installed();
+        }
+        fetched_all
+    }
+}
+
 fn link() -> Link {
     Link {
         latency: Duration::from_millis(10),
@@ -224,6 +307,7 @@ async fn heal(
 #[derive(Clone)]
 struct Participant {
     node: Shared,
+    swarm: Swarm,
     inbox: mpsc::UnboundedSender<Delivery>,
 }
 
@@ -241,6 +325,11 @@ impl Chain for Participant {
         Some(block.unwrap())
     }
 
+    async fn verify(&mut self, _: ed25519::PublicKey, block: Arc<Block>) -> bool {
+        self.swarm.hold(&self.node, &block).await;
+        true
+    }
+
     fn deliver(&mut self, block: Arc<Block>, ack: Exact) {
         let _ = self.inbox.unbounded_send((block, ack));
     }
@@ -249,6 +338,7 @@ impl Chain for Participant {
 struct Peer {
     key: ed25519::PrivateKey,
     node: Shared,
+    swarm: Swarm,
     roster: Roster,
     marshal: Marshal,
     heights: mpsc::UnboundedReceiver<u64>,
@@ -265,6 +355,7 @@ impl Peer {
         key: ed25519::PrivateKey,
         members: &[validators::Member],
         network: Network,
+        swarm: &Swarm,
     ) -> Peer {
         let dir = tempfile::tempdir().unwrap();
         let (node, genesis_block, _) = Node::found(
@@ -277,6 +368,7 @@ impl Peer {
         .unwrap();
         let seated = node.epoch_validators(0).unwrap().unwrap();
         let node: Shared = Arc::new(futures::lock::Mutex::new(node));
+        swarm.join(node.clone());
         let roster = Roster::new(NETWORK.to_vec(), Some(key.clone()));
         let mesh = SimMesh::new(
             oracle.clone(),
@@ -289,6 +381,7 @@ impl Peer {
         let carried: Carried = Arc::default();
         let chain = Participant {
             node: node.clone(),
+            swarm: swarm.clone(),
             inbox,
         };
         let (marshal, _receipts) = Marshal::start(
@@ -324,18 +417,20 @@ impl Peer {
         assert_eq!(standing == Standing::Validator, roster.participates(0));
         context.child("pump").spawn({
             let node = node.clone();
+            let swarm = swarm.clone();
             let roots = roots.clone();
             let carried = carried.clone();
             let network = network.clone();
             move |_| {
                 pump(
-                    node, membership, deliveries, applied, roots, carried, network,
+                    node, swarm, membership, deliveries, applied, roots, carried, network,
                 )
             }
         });
         Peer {
             key,
             node,
+            swarm: swarm.clone(),
             roster,
             marshal,
             heights,
@@ -398,8 +493,10 @@ impl Peer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pump(
     node: Shared,
+    swarm: Swarm,
     mut membership: Seating,
     mut deliveries: mpsc::UnboundedReceiver<Delivery>,
     applied: mpsc::UnboundedSender<u64>,
@@ -408,6 +505,7 @@ async fn pump(
     network: Network,
 ) {
     while let Some((block, ack)) = deliveries.next().await {
+        swarm.hold(&node, &block).await;
         let mut node = node.lock().await;
         if let Sequenced::Applied {
             applied: outcome, ..
@@ -453,6 +551,7 @@ async fn validators(
     members: &[validators::Member],
     network: &Network,
 ) -> Vec<Peer> {
+    let swarm = Swarm::default();
     let mut peers = Vec::new();
     for (i, key) in keys.iter().enumerate() {
         peers.push(
@@ -463,6 +562,7 @@ async fn validators(
                 key.clone(),
                 members,
                 network.clone(),
+                &swarm,
             )
             .await,
         );
@@ -576,5 +676,61 @@ fn a_partitioned_validator_catches_up_when_the_link_heals() {
             peers[3].confirmed("probe", b"during").await,
             Some(b"partition".to_vec())
         );
+    });
+}
+
+#[test]
+fn a_block_finalizes_only_once_the_validators_can_hold_what_it_attaches() {
+    runner().start(|context| async move {
+        let keys: Vec<_> = (1..=4).map(key).collect();
+        let members: Vec<_> = keys.iter().map(member).collect();
+        let oracle = mesh(&context, &keys).await;
+        let network = network(1_000);
+        let mut peers = validators(&context, &oracle, &keys, &members, &network).await;
+        let (attachment, framed) = page(b"body");
+        let alice = key(11);
+        let attached = attaching(&alice, vec![set(b"k", b"v")], vec![attachment]);
+        peers[0]
+            .node
+            .lock()
+            .await
+            .install(attachment.id, &framed)
+            .unwrap();
+        peers[0].submit(attached.clone()).await;
+        blobs::Blobs::open(&peers[0]._dir.path().join("blobs"))
+            .unwrap()
+            .remove(&attachment.id)
+            .unwrap();
+
+        for peer in &mut peers {
+            peer.reached(8).await;
+        }
+        for peer in &peers {
+            assert!(!peer.carried().contains(&attached), "nobody holds it");
+        }
+
+        peers[0]
+            .node
+            .lock()
+            .await
+            .install(attachment.id, &framed)
+            .unwrap();
+        peers[0].swarm.installed();
+        let landed = loop {
+            let height = peers[0].heights.next().await.expect("the pump lives");
+            if peers[0].carried().contains(&attached) {
+                break height;
+            }
+        };
+        let root = peers[0].root_at(landed);
+        for peer in &mut peers[1..] {
+            peer.reached(landed).await;
+        }
+        for peer in &peers {
+            assert_eq!(peer.root_at(landed), root);
+            assert_eq!(peer.confirmed("probe", b"k").await, Some(b"v".to_vec()));
+            let held = peer.node.lock().await.held_blob(&attachment.id).unwrap();
+            assert_eq!(held, Some(framed.clone()));
+        }
     });
 }
