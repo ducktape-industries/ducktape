@@ -97,6 +97,7 @@ impl Stage {
     }
 }
 
+#[derive(Clone)]
 pub struct Blobs {
     dir: PathBuf,
 }
@@ -185,6 +186,14 @@ impl Blobs {
 
     pub fn stat(&self, id: &BlobId) -> Result<Option<BlobHeader>> {
         Ok(self.open_framed(id)?.map(|(_, header, _)| header))
+    }
+
+    pub fn file(&self, id: &BlobId) -> Result<Option<fs::File>> {
+        match fs::File::open(self.path(id)) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn size(&self, id: &BlobId) -> Result<Option<u64>> {

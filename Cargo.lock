@@ -2203,6 +2203,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "halo"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "blobs",
+ "borsh",
+ "bytes",
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-runtime",
+ "commonware-stream",
+ "futures",
+ "halo",
+ "quinn",
+ "rand_core 0.10.1",
+ "rcgen",
+ "rustls",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "url",
+ "x509-parser",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -9,6 +9,9 @@
 #                        engines, catch-up), statesync (a joiner adopts a
 #                        network's state); fixtures/ is its own workspace of
 #                        wasm32 test programs
+#   crates/networking/ — halo: the network between members, off consensus
+#                        (QUIC and tcp/tls/ws/wss links, the egress pacer and
+#                        its classes, the blob lane)
 #   crates/noded/      — the daemon library: the /v1 http+ws surface, the
 #                        lookup mesh, the workspace on disk, the client
 #   bin/node           — the `ducktape` binary: the node and its CLI
@@ -26,6 +29,7 @@ members = [
     "crates/kernel/consensus",
     "crates/kernel/statesync",
     "crates/kernel/keyscheme",
+    "crates/networking/halo",
     "crates/noded",
     "crates/keystore",
     "crates/ducktape-home",
@@ -70,12 +74,15 @@ commonware-codec = "2026.9.0"
 # pinned here so every commonware crate stays on the one version.
 commonware-consensus = "2026.9.0"
 commonware-p2p = "2026.9.0"
+commonware-stream = "2026.9.0"
 commonware-parallel = "2026.9.0"
 commonware-utils = "2026.9.0"
 commonware-actor = "2026.9.0"
 base64 = "0.22"
 # tests only: isolated on-disk module data dirs.
 tempfile = "3"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+x509-parser = "0.18"
 # user-key v1 at-rest custody (crates/keystore/src/userkey.rs only): BIP39
 # wordlist + entropy checksum (the PBKDF2 `to_seed` path is deliberately
 # unused — see the identity-onboarding design doc's custody model),
@@ -118,6 +125,7 @@ keystore = { path = "crates/keystore" }
 ducktape-home = { path = "crates/ducktape-home" }
 # the daemon library the `ducktape` binary runs.
 noded = { path = "crates/noded" }
+halo = { path = "crates/networking/halo" }
 
 # the rng bounds commonware-runtime 2026.9.0 depends on (a different
 # semver-major would be a different trait).
