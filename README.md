@@ -193,6 +193,8 @@ ducktape changes ping                   # follow a program's confirmed writes
 ducktape query ping request.bin         # a signed read-only call
 ducktape programs                       # every program and its code blob
 ducktape blob get sha256:…              # a blob's framed bytes
+ducktape blob put code.wasm --kind program  # put a blob on the node, print its id
+ducktape submit module-registry publish.bin --attach code.wasm --kind program
 ```
 
 Reads are open; writes are signed frames. Each frame names a recent block, its
@@ -205,7 +207,21 @@ client gives it to the epoch's validators over the mesh at once, and again
 whenever a few blocks pass without the frame landing, so a frame submitted to
 a member without a vote lands like one submitted to a validator. A block holds
 at most 16 MiB of frames (`node::BLOCK_BYTES`); a frame no block can carry is
-refused. The receipt `submit` prints is the node's prediction from its
+refused.
+
+A frame attaches a blob instead of carrying its bytes, so a block stays
+small however large the blob. `submit --attach FILE` puts the file on the
+node as a blob of `--kind` (`blob` unless set) and sends the frame inside
+the `$attach` envelope, which names each blob by id and length
+(`host::attach`). A validator fetches each attached blob from the members
+over halo before it votes for the block. The program reads an attached blob
+only during that frame, and keeps it by putting it again. A frame attaches
+at most 64 blobs and a block at most 64 MiB of them. The registry's
+`Publish` takes new program code this way: `blob put` prints the code's id
+for the payload to name, and the registry refuses code its frame does not
+attach.
+
+The receipt `submit` prints is the node's prediction from its
 preconfirmed layer, not a verdict: a frame predicted to fail is still relayed
 and waits for a block, and the block decides. `ducktape logs`,
 `ducktape log-filter`, `ducktape metrics` and `ducktape shutdown` operate the
