@@ -113,7 +113,7 @@ async fn seal(node: &mut Node<Ctx>) -> Block {
     let block = node
         .build(tip, std::iter::empty(), TIME + tip.height + 1)
         .unwrap();
-    let Sequenced::Applied(_) = node.apply(&block).await.unwrap() else {
+    let Sequenced::Applied { .. } = node.apply(&block).await.unwrap() else {
         panic!("block {} was already applied", block.height);
     };
     block
@@ -448,7 +448,7 @@ fn a_joined_node_applies_the_next_block_like_the_source() {
             .unwrap()
             .unwrap();
         let block = seal(&mut source).await;
-        let Sequenced::Applied(applied) = joined.node.apply(&block).await.unwrap() else {
+        let Sequenced::Applied { applied, .. } = joined.node.apply(&block).await.unwrap() else {
             panic!("the joiner had not seen block {}", block.height);
         };
         assert_eq!(applied.root, source.host().root().unwrap());

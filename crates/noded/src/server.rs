@@ -1,50 +1,138 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use abi::{BlobId, Origin, ProgramId, Refusal, reason};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use borsh::BorshSerialize;
 use futures::channel::mpsc;
 use futures::{SinkExt as _, StreamExt as _};
 use host::Receipt;
-use node::{Source, Taken};
-use statesync::Request;
+use http_body_util::{BodyExt as _, LengthLimitError, Limited};
+use node::{BLOCK_BYTES, Source, Taken};
+use statesync::Request as SyncRequest;
+use tokio::sync::Semaphore;
 
 use crate::wire::{
-    Admin, BlobPut, BlockRef, Blocks, Change, Finalized, Get, Network, Query, Range, route,
+    Admin, BlobPut, BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range,
+    TxAsk, route,
 };
 use crate::{Context, Daemon};
 
+const READS_IN_FLIGHT: usize = 64;
+const READ_DEADLINE: Duration = Duration::from_secs(30);
+const QUERY_DEADLINE: Duration = Duration::from_secs(300);
+const UPLOADS_IN_FLIGHT: usize = 8;
+const UPLOAD_DEADLINE: Duration = Duration::from_secs(300);
+
+const SUBMIT_BYTES: usize = BLOCK_BYTES;
+const BLOB_PUT_BYTES: usize = 2 * BLOCK_BYTES;
+const QUERY_BYTES: usize = 4 << 20;
+const ASK_BYTES: usize = 1 << 20;
+
 pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
-    Router::new()
+    let read_permits = Arc::new(Semaphore::new(READS_IN_FLIGHT));
+    let reads = Router::new()
         .route(route::STATUS, get(status::<E>))
         .route(route::NETWORK, get(network::<E>))
-        .route(route::SUBMIT, post(submit::<E>))
-        .route(route::QUERY, post(query::<E>))
         .route(route::GET, post(get_value::<E>))
         .route(route::SCAN, post(scan::<E>))
         .route(route::BLOB_GET, post(blob_get::<E>))
-        .route(route::BLOB_PUT, post(blob_put::<E>))
         .route(route::BLOB_MISSING, get(blob_missing::<E>))
         .route(route::PROGRAMS, get(programs::<E>))
-        .route(
-            &format!("{}/{{program}}", route::CHANGES),
-            get(changes::<E>),
-        )
         .route(route::BLOCKS, post(blocks::<E>))
         .route(route::BLOCK, post(block::<E>))
+        .route(route::TX, post(tx::<E>))
         .route(route::LOGS, get(logs::<E>))
         .route(route::ADMIN, post(admin::<E>))
         .route(route::SYNC, post(sync::<E>))
         .route(route::METRICS, get(metrics::<E>))
-        .route(route::P2P, get(p2p::<E>))
-        .layer(DefaultBodyLimit::disable())
+        .layer(middleware::from_fn_with_state(
+            Lane::new(read_permits.clone(), READ_DEADLINE),
+            bounded,
+        ));
+    let queries =
+        Router::new()
+            .route(route::QUERY, post(query::<E>))
+            .layer(middleware::from_fn_with_state(
+                Lane::new(read_permits, QUERY_DEADLINE),
+                bounded,
+            ));
+    let uploads = Router::new()
+        .route(route::SUBMIT, post(submit::<E>))
+        .route(route::BLOB_PUT, post(blob_put::<E>))
+        .layer(middleware::from_fn_with_state(
+            Lane::new(Arc::new(Semaphore::new(UPLOADS_IN_FLIGHT)), UPLOAD_DEADLINE),
+            bounded,
+        ));
+    let streams = Router::new()
+        .route(
+            &format!("{}/{{program}}", route::CHANGES),
+            get(changes::<E>),
+        )
+        .route(route::P2P, get(p2p::<E>));
+    reads
+        .merge(queries)
+        .merge(uploads)
+        .merge(streams)
         .with_state(daemon)
+}
+
+#[derive(Clone)]
+struct Lane {
+    permits: Arc<Semaphore>,
+    deadline: Duration,
+}
+
+impl Lane {
+    fn new(permits: Arc<Semaphore>, deadline: Duration) -> Lane {
+        Lane { permits, deadline }
+    }
+}
+
+async fn bounded(State(lane): State<Lane>, request: Request, next: middleware::Next) -> Response {
+    let deadline = tokio::time::Instant::now() + lane.deadline;
+    let seconds = lane.deadline.as_secs();
+    let permit = tokio::time::timeout_at(deadline, lane.permits.acquire_owned()).await;
+    let Ok(Ok(_permit)) = permit else {
+        let sentence =
+            format!("the node is busy and did not start this request within {seconds} s");
+        return (StatusCode::SERVICE_UNAVAILABLE, sentence).into_response();
+    };
+    match tokio::time::timeout_at(deadline, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => {
+            let sentence = format!("the node did not answer within {seconds} s");
+            (StatusCode::SERVICE_UNAVAILABLE, sentence).into_response()
+        }
+    }
+}
+
+struct Capped<const MAX: usize>(Bytes);
+
+impl<S: Send + Sync, const MAX: usize> FromRequest<S> for Capped<MAX> {
+    type Rejection = Reply<()>;
+
+    async fn from_request(request: Request, _: &S) -> Result<Self, Reply<()>> {
+        let read = Limited::new(request.into_body(), MAX).collect().await;
+        match read {
+            Ok(body) => Ok(Capped(body.to_bytes())),
+            Err(error) if error.is::<LengthLimitError>() => Err(Reply::Refused(Refusal::new(
+                reason::CAPACITY,
+                format!("the request is over the {MAX} bytes this route reads"),
+            ))),
+            Err(error) => Err(Reply::Refused(Refusal::new(
+                reason::INVALID_INPUT,
+                format!("the request body did not arrive whole: {error}"),
+            ))),
+        }
+    }
 }
 
 pub enum Reply<T> {
@@ -85,7 +173,10 @@ async fn network<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Netw
     }
 }
 
-async fn submit<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) -> Reply<Receipt> {
+async fn submit<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    Capped(body): Capped<SUBMIT_BYTES>,
+) -> Reply<Receipt> {
     let mut node = daemon.node.lock().await;
     match node.submit(body.to_vec(), Source::Client).await {
         Ok(Ok(Taken::New(receipt))) => {
@@ -99,7 +190,10 @@ async fn submit<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) -
     }
 }
 
-async fn query<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) -> Reply<Vec<u8>> {
+async fn query<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    Capped(body): Capped<QUERY_BYTES>,
+) -> Reply<Vec<u8>> {
     let query: Query = match abi::decode(&body) {
         Ok(query) => query,
         Err(refusal) => return Reply::Refused(refusal),
@@ -126,7 +220,7 @@ async fn query<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) ->
 
 async fn get_value<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    body: Bytes,
+    Capped(body): Capped<ASK_BYTES>,
 ) -> Reply<Option<Vec<u8>>> {
     let get: Get = match abi::decode(&body) {
         Ok(get) => get,
@@ -141,7 +235,7 @@ async fn get_value<E: Context>(
 
 async fn scan<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    body: Bytes,
+    Capped(body): Capped<ASK_BYTES>,
 ) -> Reply<Vec<abi::Entry>> {
     let range: Range = match abi::decode(&body) {
         Ok(range) => range,
@@ -156,7 +250,7 @@ async fn scan<E: Context>(
 
 async fn blob_get<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    body: Bytes,
+    Capped(body): Capped<ASK_BYTES>,
 ) -> Reply<Option<Vec<u8>>> {
     let id: BlobId = match abi::decode(&body) {
         Ok(id) => id,
@@ -170,7 +264,10 @@ async fn blob_get<E: Context>(
     }
 }
 
-async fn blob_put<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) -> Reply<()> {
+async fn blob_put<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    Capped(body): Capped<BLOB_PUT_BYTES>,
+) -> Reply<()> {
     let put: BlobPut = match abi::decode(&body) {
         Ok(put) => put,
         Err(refusal) => return Reply::Refused(refusal),
@@ -245,21 +342,21 @@ async fn stream(socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Change>)
 
 async fn blocks<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    body: Bytes,
-) -> Reply<Vec<Finalized>> {
+    Capped(body): Capped<ASK_BYTES>,
+) -> Reply<Page> {
     let page: Blocks = match abi::decode(&body) {
         Ok(page) => page,
         Err(refusal) => return Reply::Refused(refusal),
     };
     match daemon.blocks(page).await {
-        Ok(blocks) => Reply::Answered(blocks),
+        Ok(page) => Reply::Answered(page),
         Err(error) => failed(error),
     }
 }
 
 async fn block<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    body: Bytes,
+    Capped(body): Capped<ASK_BYTES>,
 ) -> Reply<Option<Finalized>> {
     let by: BlockRef = match abi::decode(&body) {
         Ok(by) => by,
@@ -271,11 +368,28 @@ async fn block<E: Context>(
     }
 }
 
+async fn tx<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    Capped(body): Capped<ASK_BYTES>,
+) -> Reply<Option<Located>> {
+    let ask: TxAsk = match abi::decode(&body) {
+        Ok(ask) => ask,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    match daemon.tx(ask).await {
+        Ok(tx) => Reply::Answered(tx),
+        Err(error) => failed(error),
+    }
+}
+
 async fn logs<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Vec<String>> {
     Reply::Answered(daemon.logs.lines())
 }
 
-async fn admin<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) -> Reply<()> {
+async fn admin<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    Capped(body): Capped<ASK_BYTES>,
+) -> Reply<()> {
     let submission = match node::verify(&body, &daemon.descriptor.id()) {
         Ok(submission) => submission,
         Err(refusal) => return Reply::Refused(refusal),
@@ -313,9 +427,9 @@ async fn admin<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) ->
 
 async fn sync<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    body: Bytes,
+    Capped(body): Capped<ASK_BYTES>,
 ) -> Reply<statesync::Response> {
-    let request: Request = match abi::decode(&body) {
+    let request: SyncRequest = match abi::decode(&body) {
         Ok(request) => request,
         Err(refusal) => return Reply::Refused(refusal),
     };
@@ -333,4 +447,66 @@ async fn p2p<E: Context>(
 ) -> Response {
     let mesh = daemon.mesh;
     upgrade.on_upgrade(move |socket| crate::transport::inbound_websocket(socket, mesh))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+
+    use super::*;
+
+    const CAP: usize = 16;
+
+    async fn read(bytes: usize) -> Result<Capped<CAP>, Reply<()>> {
+        let request = Request::new(Body::from(vec![0; bytes]));
+        Capped::<CAP>::from_request(request, &()).await
+    }
+
+    #[tokio::test]
+    async fn a_body_within_its_cap_is_read_whole() {
+        let Ok(Capped(body)) = read(CAP).await else {
+            panic!("a body at the cap is read");
+        };
+        assert_eq!(body.len(), CAP);
+    }
+
+    #[tokio::test]
+    async fn a_body_over_its_cap_is_refused_for_capacity() {
+        let Err(Reply::Refused(refusal)) = read(CAP + 1).await else {
+            panic!("a body over the cap is refused");
+        };
+        assert_eq!(refusal.reason, reason::CAPACITY);
+    }
+
+    async fn served(lane: Lane) -> String {
+        let router = Router::new()
+            .route("/held", get(std::future::pending::<()>))
+            .layer(middleware::from_fn_with_state(lane, bounded));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        format!("http://{address}/held")
+    }
+
+    async fn status(url: &str) -> (u16, String) {
+        let response = reqwest::get(url).await.unwrap();
+        let status = response.status().as_u16();
+        (status, response.text().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_permit_by_its_deadline_is_answered_unavailable() {
+        let lane = Lane::new(Arc::new(Semaphore::new(0)), Duration::from_millis(1));
+        let (status, sentence) = status(&served(lane).await).await;
+        assert_eq!(status, 503);
+        assert!(sentence.contains("busy"), "{sentence}");
+    }
+
+    #[tokio::test]
+    async fn a_request_unanswered_by_its_deadline_is_answered_unavailable() {
+        let lane = Lane::new(Arc::new(Semaphore::new(1)), Duration::from_millis(1));
+        let (status, sentence) = status(&served(lane).await).await;
+        assert_eq!(status, 503);
+        assert!(sentence.contains("did not answer"), "{sentence}");
+    }
 }

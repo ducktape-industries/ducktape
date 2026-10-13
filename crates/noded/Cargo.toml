@@ -16,6 +16,7 @@ commonware-utils = { workspace = true }
 consensus = { workspace = true }
 futures = { workspace = true }
 hex = "0.4"
+http-body-util = "0.1"
 host = { workspace = true }
 node = { workspace = true }
 rand_core = { workspace = true }

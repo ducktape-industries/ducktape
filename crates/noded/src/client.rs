@@ -11,7 +11,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::wire::{
-    BlobPut, BlockRef, Blocks, Change, Finalized, Get, Network, Query, Range, Status, route,
+    BlobPut, BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range,
+    Status, TxAsk, route,
 };
 use crate::{Error, Result};
 
@@ -116,14 +117,16 @@ impl Client {
         self.fetch(route::PROGRAMS).await
     }
 
-    /// Finalized blocks, newest first: below `before` (the tip when
-    /// `None`), at most `limit` (the node caps it).
-    pub async fn blocks(&self, before: Option<u64>, limit: u32) -> Result<Vec<Finalized>> {
+    pub async fn blocks(&self, before: Option<u64>, limit: u32) -> Result<Page> {
         self.post(route::BLOCKS, &Blocks { before, limit }).await
     }
 
     pub async fn block(&self, by: BlockRef) -> Result<Option<Finalized>> {
         self.post(route::BLOCK, &by).await
+    }
+
+    pub async fn tx(&self, ask: TxAsk) -> Result<Option<Located>> {
+        self.post(route::TX, &ask).await
     }
 
     pub async fn logs(&self) -> Result<Vec<String>> {

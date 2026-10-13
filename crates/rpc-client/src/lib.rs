@@ -691,28 +691,6 @@ impl Client {
         Ok((decode_json(response).await?, folded))
     }
 
-    /// Read the recent block rows (`GET /v1/blocks`), oldest-first — the
-    /// explorer surface. Rows are the node's own JSON projection, and they are
-    /// NOT all op-carrying: a node following from a checkpoint records its
-    /// ascension boundary as a row with an empty `hash` and no `ops`. Filter
-    /// for what you present (the app's `explorer_window` does).
-    pub async fn blocks(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
-        let mut url = self.url("v1/blocks")?;
-        url.set_query(Some(&format!("limit={limit}")));
-        let response = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| Error::new(format!("RPC blocks failed: {error}")))?;
-        #[derive(Deserialize)]
-        struct Blocks {
-            blocks: Vec<serde_json::Value>,
-        }
-        let reply: Blocks = decode_json(response).await?;
-        Ok(reply.blocks)
-    }
-
     /// Land raw bytes in the node-local BLOB store (`POST /v1/files/blob`) —
     /// the op-receipt lane forge fetches `PushRefs`/`MergePr` packfiles from by
     /// digest. A distinct plane from module-owned Files chunk staging:
