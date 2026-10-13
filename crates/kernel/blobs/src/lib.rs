@@ -187,6 +187,14 @@ impl Blobs {
         Ok(self.open_framed(id)?.map(|(_, header, _)| header))
     }
 
+    pub fn size(&self, id: &BlobId) -> Result<Option<u64>> {
+        match fs::metadata(self.path(id)) {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn read(&self, id: &BlobId, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
         let Some((mut file, header, body_start)) = self.open_framed(id)? else {
             return Ok(None);

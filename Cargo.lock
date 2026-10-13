@@ -1060,6 +1060,7 @@ name = "consensus"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "blobs",
  "borsh",
  "commonware-actor",
  "commonware-broadcast",
@@ -2837,6 +2838,7 @@ name = "node"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "blobs",
  "borsh",
  "bytes",
  "commonware-codec",

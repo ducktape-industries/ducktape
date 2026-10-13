@@ -45,6 +45,10 @@ impl Chain for Empty {
         Some(Block::next(parent.tip(), time, Vec::new()))
     }
 
+    async fn verify(&mut self, _: ed25519::PublicKey, _: Arc<Block>) -> bool {
+        true
+    }
+
     fn deliver(&mut self, block: Arc<Block>, ack: Exact) {
         let _ = self.0.unbounded_send((block, ack));
     }

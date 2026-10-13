@@ -16,6 +16,7 @@ use commonware_runtime::{Runner as _, Storage as _, Supervisor as _, determinist
 use fixture_module_registry::Change;
 use fixture_probe::{Reply, Step};
 use fixture_relay::Script;
+use host::attach::{ATTACH, ATTACHMENT_BYTES, Attached, Attachment, FRAME_ATTACHMENTS};
 use host::{
     ANCHOR_WINDOW, BLOBS, Block, BlockId, Error, Founding, FoundingView, Genesis, Host, Layer,
     Limits, NETWORK, RECENT, Receipt, Roles, SPENT, Submission, Tip,
@@ -2700,6 +2701,222 @@ fn founding_refuses_a_hook_it_does_not_found() {
         assert!(
             matches!(&refused, Some(Error::Unhooked(program)) if program == "ghost"),
             "{refused:?}"
+        );
+    });
+}
+
+fn page(body: &[u8]) -> (Attachment, Vec<u8>) {
+    let framed = blobs::frame("page", body).unwrap();
+    let id = blobs::id_of(HashKind::Sha256, &framed);
+    let attachment = Attachment {
+        id,
+        len: framed.len() as u64,
+    };
+    (attachment, framed)
+}
+
+fn attaching(target: &str, steps: Vec<Step>, blobs: Vec<Attachment>) -> Submission {
+    let attached = Attached {
+        target: target.to_owned(),
+        payload: script(steps),
+        blobs,
+    };
+    submit(ATTACH, abi::encode(&attached))
+}
+
+fn blob_get(id: BlobId) -> Step {
+    op(HostOp::BlobGet(id))
+}
+
+fn page_blob(body: &[u8]) -> Reply {
+    Reply::Host(HostReply::Blob(Some(Blob {
+        kind: "page".into(),
+        body: body.to_vec(),
+    })))
+}
+
+#[test]
+fn an_attached_blob_is_read_only_by_the_frame_that_attaches_it() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let genesis = hooked(standard(), &["probe"]);
+        let mut host = found(context, "net", dir.path(), genesis).await;
+        let (attachment, framed) = page(b"body");
+        host.install(attachment.id, &framed).unwrap();
+
+        let applied = host
+            .apply(block(
+                1,
+                vec![
+                    attaching("probe", vec![blob_get(attachment.id)], vec![attachment]),
+                    submit("probe", script(vec![blob_get(attachment.id)])),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(applied.submissions[0].program, "probe");
+        assert_eq!(replies(&applied.submissions[0]), vec![page_blob(b"body")]);
+        assert_eq!(
+            replies(&applied.submissions[1]),
+            vec![Reply::Host(HostReply::Blob(None))]
+        );
+        assert_eq!(told(&host, 1, 0).unwrap().target, "probe");
+        assert_eq!(host.blob(&attachment.id).unwrap(), None);
+        let asked = ask(
+            &host,
+            Layer::Confirmed,
+            "probe",
+            vec![blob_get(attachment.id)],
+        )
+        .await;
+        assert_eq!(asked, vec![Reply::Host(HostReply::Blob(None))]);
+    });
+}
+
+#[test]
+fn a_frame_that_puts_its_attachment_keeps_it_on_chain() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let (attachment, framed) = page(b"body");
+        host.install(attachment.id, &framed).unwrap();
+        let keep = op(HostOp::BlobPut {
+            hash: HashKind::Sha256,
+            kind: "page".into(),
+            body: b"body".to_vec(),
+        });
+
+        let applied = host
+            .apply(block(
+                1,
+                vec![attaching(
+                    "probe",
+                    vec![blob_get(attachment.id), keep],
+                    vec![attachment],
+                )],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            replies(&applied.submissions[0]),
+            vec![
+                page_blob(b"body"),
+                Reply::Host(HostReply::BlobId(attachment.id))
+            ]
+        );
+        assert_eq!(host.blob(&attachment.id).unwrap(), Some(framed));
+        let asked = ask(
+            &host,
+            Layer::Confirmed,
+            "probe",
+            vec![blob_get(attachment.id)],
+        )
+        .await;
+        assert_eq!(asked, vec![page_blob(b"body")]);
+    });
+}
+
+#[test]
+fn a_block_whose_attachment_is_absent_stops_and_applies_whole_once_it_arrives() {
+    deterministic::Runner::default().start(|context| async move {
+        let (attachment, framed) = page(b"body");
+        let keep = || {
+            op(HostOp::BlobPut {
+                hash: HashKind::Sha256,
+                kind: "page".into(),
+                body: b"body".to_vec(),
+            })
+        };
+        let first = || {
+            block(
+                1,
+                vec![
+                    submit("probe", script(vec![set(b"before", b"1")])),
+                    attaching("probe", vec![set(b"k", b"v"), keep()], vec![attachment]),
+                ],
+            )
+        };
+
+        let held_dir = tempfile::tempdir().unwrap();
+        let mut held = found(context.child("held"), "net", held_dir.path(), standard()).await;
+        held.install(attachment.id, &framed).unwrap();
+        held.apply(first()).await.unwrap();
+
+        let late_dir = tempfile::tempdir().unwrap();
+        let mut late = found(context.child("late"), "net", late_dir.path(), standard()).await;
+        let stopped = late.apply(first()).await.err();
+        assert!(
+            matches!(stopped, Some(Error::BlobUnavailable(id)) if id == attachment.id),
+            "{stopped:?}"
+        );
+        assert_eq!(late.height().unwrap(), 0);
+        late.install(attachment.id, &framed).unwrap();
+        late.apply(first()).await.unwrap();
+
+        assert_eq!(late.root().unwrap(), held.root().unwrap());
+        assert_eq!(stored(&late, "probe", b"k"), Some(b"v".to_vec()));
+        assert_eq!(late.blob(&attachment.id).unwrap(), Some(framed));
+    });
+}
+
+#[test]
+fn an_attaching_frame_is_refused_when_it_breaks_the_envelope_or_its_caps() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let (small, framed) = page(b"body");
+        host.install(small.id, &framed).unwrap();
+        let (absent, _) = page(b"absent");
+        let many: Vec<Attachment> = (0..=FRAME_ATTACHMENTS)
+            .map(|n| page(&n.to_be_bytes()).0)
+            .collect();
+        let named_big = Attachment {
+            len: 60 << 20,
+            ..small
+        };
+        let over_the_rest = Attachment {
+            len: 10 << 20,
+            ..absent
+        };
+        let frames = vec![
+            submit(ATTACH, b"not an envelope".to_vec()),
+            attaching("$admin", Vec::new(), Vec::new()),
+            attaching("probe", Vec::new(), vec![small, small]),
+            attaching("probe", Vec::new(), many),
+            attaching(
+                "probe",
+                Vec::new(),
+                vec![Attachment {
+                    len: ATTACHMENT_BYTES + 1,
+                    ..absent
+                }],
+            ),
+            attaching("probe", Vec::new(), vec![named_big]),
+            attaching("probe", Vec::new(), vec![over_the_rest]),
+        ];
+        assert_eq!(
+            host::attach::carried(&frames),
+            vec![named_big],
+            "the block's budget takes the frames in order"
+        );
+
+        let applied = host.apply(block(1, frames)).await.unwrap();
+        let reasons: Vec<(&str, &str)> = applied
+            .submissions
+            .iter()
+            .map(|receipt| (receipt.program.as_str(), rejected(receipt).reason.as_str()))
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                (ATTACH, reason::PROTOCOL),
+                (ATTACH, reason::INVALID_INPUT),
+                (ATTACH, reason::INVALID_INPUT),
+                (ATTACH, reason::CAPACITY),
+                (ATTACH, reason::CAPACITY),
+                ("probe", reason::INVALID_INPUT),
+                (ATTACH, reason::CAPACITY),
+            ]
         );
     });
 }

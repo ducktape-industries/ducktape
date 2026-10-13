@@ -1,3 +1,4 @@
+pub mod attach;
 mod crypto;
 mod namespace;
 mod unit;
@@ -21,6 +22,7 @@ use runtime::Fault;
 use sha2::{Digest as _, Sha256};
 use state::{Commitment, Overlay, Storage, Store, View, Writes, valid_program_id};
 
+use crate::attach::{Attachment, Budget};
 use crate::unit::{Frame, Loaded, World, refusal_of};
 
 pub use namespace::{BLOBS, NETWORK, PROGRAMS, RECENT, RESERVED, SPENT, spent};
@@ -193,14 +195,31 @@ enum Submitted {
         receipt: Receipt,
         account: Option<identity::AccountNumber>,
     },
+    Unheld {
+        target: ProgramId,
+        id: BlobId,
+    },
 }
 
 impl Submitted {
-    fn receipt(self) -> Receipt {
+    fn prediction(self) -> Receipt {
         match self {
             Submitted::Stale(receipt) | Submitted::Carried { receipt, .. } => receipt,
+            Submitted::Unheld { target, id } => rejected(
+                &target,
+                Refusal::new(
+                    reason::NOT_FOUND,
+                    format!("attachment {id:?} is not held here"),
+                ),
+            ),
         }
     }
+}
+
+enum Holding {
+    Held,
+    Absent(BlobId),
+    Misnamed(Refusal),
 }
 
 struct Hooks {
@@ -661,9 +680,38 @@ where
             loaded: &self.loaded,
             network: &self.network,
             roles: &self.roles,
+            attached: &[],
             height,
             time,
         }
+    }
+
+    pub fn held_blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
+        Ok(self.blobs.framed(id)?)
+    }
+
+    pub fn holds(&self, attachment: &Attachment) -> Result<bool> {
+        let size = self.blobs.size(&attachment.id)?;
+        Ok(size == Some(attachment.len))
+    }
+
+    fn holding(&self, attached: &[Attachment]) -> Result<Holding> {
+        for attachment in attached {
+            let Some(size) = self.blobs.size(&attachment.id)? else {
+                return Ok(Holding::Absent(attachment.id));
+            };
+            let as_named = size == attachment.len;
+            if !as_named {
+                return Ok(Holding::Misnamed(Refusal::new(
+                    reason::INVALID_INPUT,
+                    format!(
+                        "attachment {:?} is {size} bytes, and the frame names {}",
+                        attachment.id, attachment.len
+                    ),
+                )));
+            }
+        }
+        Ok(Holding::Held)
     }
 
     pub async fn query(
@@ -774,12 +822,20 @@ where
         let height = self.next_height()?;
         let mut overlay = std::mem::take(&mut self.preconfirmed);
         let mut stage = Stage::default();
+        let mut budget = Budget::default();
         let mut receipts = Vec::new();
         for submission in submissions {
             let submitted = self
-                .submit(submission, height, time, &mut overlay, &mut stage)
+                .submit(
+                    submission,
+                    height,
+                    time,
+                    &mut budget,
+                    &mut overlay,
+                    &mut stage,
+                )
                 .await?;
-            receipts.push(submitted.receipt());
+            receipts.push(submitted.prediction());
         }
         self.preconfirmed = overlay;
         Ok(receipts)
@@ -803,28 +859,30 @@ where
         let mut hooks = self
             .hooks(block.height, block.time, &overlay, &stage)
             .await?;
+        let mut budget = Budget::default();
         let mut submissions = Vec::new();
         for (position, submission) in block.submissions.into_iter().enumerate() {
             let signer = submission.signer.clone();
-            let target = submission.target.clone();
             let submitted = self
                 .submit(
                     submission,
                     block.height,
                     block.time,
+                    &mut budget,
                     &mut overlay,
                     &mut stage,
                 )
                 .await?;
             let receipt = match submitted {
                 Submitted::Stale(receipt) => receipt,
+                Submitted::Unheld { id, .. } => return Err(Error::BlobUnavailable(id)),
                 Submitted::Carried { receipt, account } => {
                     let record = hook::Record {
                         height: block.height,
                         position: position as u32,
                         signer,
                         account,
-                        target,
+                        target: receipt.program.clone(),
                         applied: matches!(receipt.outcome, Outcome::Applied { .. }),
                     };
                     self.tell(&mut hooks, &record, block.time, &mut overlay, &mut stage)
@@ -860,9 +918,12 @@ where
         submission: Submission,
         height: u64,
         time: u64,
+        budget: &mut Budget,
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Submitted> {
+        let envelope = attach::attached(&submission)
+            .map(|envelope| envelope.and_then(|attached| budget.take(attached)));
         let view = self.store.view(vec![&*overlay]);
         if let Err(refusal) = fresh(&view, &submission, height)? {
             return Ok(Submitted::Stale(rejected(&submission.target, refusal)));
@@ -882,12 +943,32 @@ where
                 });
             }
         };
+        let (target, payload, attached) = match envelope {
+            None => (submission.target, submission.payload, Vec::new()),
+            Some(Ok(attached)) => (attached.target, attached.payload, attached.blobs),
+            Some(Err(refusal)) => {
+                return Ok(Submitted::Carried {
+                    receipt: rejected(&submission.target, refusal),
+                    account,
+                });
+            }
+        };
+        match self.holding(&attached)? {
+            Holding::Held => {}
+            Holding::Absent(id) => return Ok(Submitted::Unheld { target, id }),
+            Holding::Misnamed(refusal) => {
+                return Ok(Submitted::Carried {
+                    receipt: rejected(&target, refusal),
+                    account,
+                });
+            }
+        }
         let checkpoint = overlay.checkpoint();
         let env = Env {
             network: self.network.clone(),
             height,
             time,
-            me: submission.target.clone(),
+            me: target.clone(),
             origin: Origin::External(submission.signer),
             // a key that holds no account still runs (identity's own
             // create is such a frame); it acts as no one
@@ -897,9 +978,10 @@ where
         };
         let receipt = self
             .run(
-                &submission.target,
-                GuestCall::Execute(submission.payload),
+                &target,
+                GuestCall::Execute(payload),
                 env,
+                attached,
                 overlay,
                 stage,
             )
@@ -1001,6 +1083,7 @@ where
         let mut frame = Frame {
             fuel: self.loaded.limits().fuel.map(|_| HOOK_FUEL),
             next_item: 0,
+            attached: Vec::new(),
         };
         let invocation = Invocation {
             env,
@@ -1142,12 +1225,14 @@ where
         program: &str,
         call: GuestCall,
         env: Env,
+        attached: Vec<Attachment>,
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Receipt> {
         let mut frame = Frame {
             fuel: self.loaded.limits().fuel,
             next_item: 0,
+            attached,
         };
         self.run_frame(program, call, env, overlay, stage, &mut frame, 0)
             .await
@@ -1388,6 +1473,7 @@ where
                 &entry.program,
                 GuestCall::Init(entry.params.clone()),
                 env,
+                Vec::new(),
                 overlay,
                 stage,
             )
@@ -1433,6 +1519,7 @@ where
             &self.roles.identity,
             GuestCall::Execute(abi::encode(&op)),
             env,
+            Vec::new(),
             overlay,
             stage,
         )

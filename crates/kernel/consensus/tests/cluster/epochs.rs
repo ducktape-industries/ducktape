@@ -21,6 +21,7 @@ fn a_follower_backfills_finalized_blocks_by_hint() {
             keys[3].clone(),
             &members,
             network.clone(),
+            &peers[0].swarm,
         )
         .await;
         assert!(!follower.roster.participates(0));
@@ -55,6 +56,7 @@ fn a_validator_epochs_behind_catches_up_by_the_traffic_it_hears() {
             keys[3].clone(),
             &members,
             network.clone(),
+            &peers[0].swarm,
         )
         .await;
         assert!(late.roster.participates(0));
