@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
@@ -20,7 +21,6 @@ use commonware_runtime::Handle;
 use commonware_runtime::buffer::paged::CacheRef;
 use commonware_storage::archive::{self, Archive as _, Identifier, immutable};
 use commonware_utils::vec::NonEmptyVec;
-use host::Receipt;
 use node::{Block, Digest};
 
 use crate::anchor::Anchor;
@@ -76,7 +76,7 @@ impl Marshal {
         anchor: Anchor,
         transport: Transport<S, R, P, B>,
         chain: C,
-    ) -> (Marshal, Receipts<E>)
+    ) -> (Marshal, Summaries<E>)
     where
         E: Context,
         C: Chain,
@@ -107,16 +107,28 @@ impl Marshal {
         )
         .await
         .expect("the block archive opens");
-        let receipts = immutable::Archive::init(
-            context.child("receipts"),
-            archive_config(
-                &format!("{partition}-receipts"),
-                page_cache.clone(),
-                (RangeCfg::from(..), ()),
-            ),
-        )
-        .await
-        .expect("the receipt archive opens");
+        let summaries = Kept {
+            blocks: immutable::Archive::init(
+                context.child("summaries"),
+                archive_config(
+                    &format!("{partition}-summaries"),
+                    page_cache.clone(),
+                    (RangeCfg::from(..), ()),
+                ),
+            )
+            .await
+            .expect("the summary archive opens"),
+            txs: immutable::Archive::init(
+                context.child("txs"),
+                archive_config(
+                    &format!("{partition}-txs"),
+                    page_cache.clone(),
+                    (RangeCfg::from(..), ()),
+                ),
+            )
+            .await
+            .expect("the transaction index opens"),
+        };
 
         let (broadcast_engine, buffer) = buffered::Engine::new(
             context.child("broadcast"),
@@ -178,8 +190,8 @@ impl Marshal {
             actor,
             broadcast,
         };
-        let receipts = Receipts(Arc::new(futures::lock::Mutex::new(Some(receipts))));
-        (marshal, receipts)
+        let summaries = Summaries(Arc::new(futures::lock::Mutex::new(Some(summaries))));
+        (marshal, summaries)
     }
 
     pub fn mailbox(&self) -> &MarshalMailbox {
@@ -208,56 +220,104 @@ impl Marshal {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ReceiptsError {
+pub enum SummariesError {
     #[error(transparent)]
     Archive(#[from] archive::Error),
-    #[error("a kept receipt does not decode: {}", .0.sentence)]
+    #[error("a kept transaction place does not decode: {}", .0.sentence)]
     Decode(Refusal),
-    #[error("the receipt archive failed a write and is closed")]
+    #[error("the summary archive failed a write and is closed")]
     Closed,
 }
 
-type ReceiptArchive<E> = immutable::Archive<E, Digest, Vec<u8>>;
+type SummaryArchive<E> = immutable::Archive<E, Digest, Vec<u8>>;
 
-/// Each finalized block's receipts, one per frame the host ran, in a third
-/// archive beside the block's own: keyed by the block's height and digest,
-/// and kept exactly as long as the block is. They are node-local data the
-/// block's run derived, never part of the block or its digest, so a node
-/// that never ran a block (one below a state-sync anchor) keeps none.
-pub struct Receipts<E: Context>(Arc<futures::lock::Mutex<Option<ReceiptArchive<E>>>>);
+struct Kept<E: Context> {
+    blocks: SummaryArchive<E>,
+    txs: SummaryArchive<E>,
+}
 
-impl<E: Context> Clone for Receipts<E> {
+pub struct Summaries<E: Context>(Arc<futures::lock::Mutex<Option<Kept<E>>>>);
+
+impl<E: Context> Clone for Summaries<E> {
     fn clone(&self) -> Self {
-        Receipts(self.0.clone())
+        Summaries(self.0.clone())
     }
 }
 
-impl<E: Context> Receipts<E> {
-    /// Keeps a block's receipts, durably. A block kept once keeps its first
-    /// receipts: the archive ignores a second put at a height.
+impl<E: Context> Summaries<E> {
     pub async fn keep(
         &self,
         height: u64,
         id: Digest,
-        receipts: &[Receipt],
-    ) -> Result<(), ReceiptsError> {
+        summary: Vec<u8>,
+        txs: &[[u8; 32]],
+    ) -> Result<(), SummariesError> {
         let mut slot = self.0.lock().await;
-        // a failed write consumes the archive: later reads answer Closed
-        let archive = slot.take().ok_or(ReceiptsError::Closed)?;
-        let archive = archive.put_sync(height, id, abi::encode(&receipts)).await?;
-        *slot = Some(archive);
+        let Kept {
+            blocks,
+            txs: mut places,
+        } = slot.take().ok_or(SummariesError::Closed)?;
+        let first = places.last_index().map_or(0, |last| last + 1);
+        let mut next = first;
+        let mut seen = HashSet::new();
+        for (position, hash) in txs.iter().enumerate() {
+            let key = Digest::from(*hash);
+            let landed_before = !seen.insert(*hash) || places.has(Identifier::Key(&key)).await?;
+            if landed_before {
+                continue;
+            }
+            places = places
+                .put(next, key, abi::encode(&(height, position as u32)))
+                .await?;
+            next += 1;
+        }
+        let placed_any = next > first;
+        let places = if placed_any {
+            places.sync().await?
+        } else {
+            places
+        };
+        let blocks = blocks.put_sync(height, id, summary).await?;
+        *slot = Some(Kept {
+            blocks,
+            txs: places,
+        });
         Ok(())
     }
 
-    /// The receipts kept for the finalized block at `height`.
-    pub async fn get(&self, height: u64) -> Result<Option<Vec<Receipt>>, ReceiptsError> {
+    pub async fn get(&self, height: u64) -> Result<Option<Vec<u8>>, SummariesError> {
         let slot = self.0.lock().await;
-        let archive = slot.as_ref().ok_or(ReceiptsError::Closed)?;
-        let Some(bytes) = archive.get(Identifier::Index(height)).await? else {
+        let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
+        Ok(kept.blocks.get(Identifier::Index(height)).await?)
+    }
+
+    pub async fn get_by_id(&self, id: Digest) -> Result<Option<Vec<u8>>, SummariesError> {
+        let slot = self.0.lock().await;
+        let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
+        Ok(kept.blocks.get(Identifier::Key(&id)).await?)
+    }
+
+    pub async fn has(&self, height: u64) -> Result<bool, SummariesError> {
+        let slot = self.0.lock().await;
+        let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
+        Ok(kept.blocks.has(Identifier::Index(height)).await?)
+    }
+
+    pub async fn place(&self, tx: [u8; 32]) -> Result<Option<(u64, u32)>, SummariesError> {
+        let slot = self.0.lock().await;
+        let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
+        let Some(bytes) = kept.txs.get(Identifier::Key(&Digest::from(tx))).await? else {
             return Ok(None);
         };
-        let receipts = abi::decode(&bytes).map_err(ReceiptsError::Decode)?;
-        Ok(Some(receipts))
+        abi::decode(&bytes)
+            .map(Some)
+            .map_err(SummariesError::Decode)
+    }
+
+    pub async fn span(&self) -> Result<Option<(u64, u64)>, SummariesError> {
+        let slot = self.0.lock().await;
+        let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
+        Ok(kept.blocks.first_index().zip(kept.blocks.last_index()))
     }
 }
 

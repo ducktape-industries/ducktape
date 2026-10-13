@@ -216,7 +216,7 @@ async fn start<E: Context>(
         node: node.clone(),
         inbox,
     };
-    let (marshal, receipts) = Marshal::start(
+    let (marshal, summaries) = Marshal::start(
         context.child("marshal"),
         &descriptor.network,
         &network,
@@ -259,14 +259,22 @@ async fn start<E: Context>(
         network,
         identity: identity.public_key().as_ref().to_vec(),
         anchors: marshal.mailbox().clone(),
-        receipts,
+        summaries,
         logs,
         shutdown,
         votes: membership.votes().clone(),
         relay: Relay::new(identity.public_key(), relay_sender, voters.as_ref()),
         mesh: transport::loopback(listen.p2p),
         subscribers: Mutex::new(Vec::new()),
+        recent: Mutex::default(),
     });
+    let founding = tip.height == 0;
+    if let Anchor::Genesis(genesis) = marshal.anchor()
+        && founding
+    {
+        let node = daemon.node.lock().await;
+        daemon.record_unrecorded(&node, genesis).await?;
+    }
 
     let pump = context.child("pump").spawn({
         let daemon = daemon.clone();
@@ -423,12 +431,17 @@ async fn applied<E: Context>(
     // under the node lock, which a /v1/network read holds across the tip
     // and the book, so no height it serves passes its tip
     daemon.votes.applied(block.digest(), block.height);
-    if let Sequenced::Applied(outcome) = sequenced {
-        daemon
-            .receipts
-            .keep(block.height, block.digest(), &outcome.submissions)
-            .await?;
-        daemon.publish(&outcome);
+    match sequenced {
+        Sequenced::Applied {
+            mut applied,
+            carried,
+        } => {
+            let ran = crate::blocks::ran(block, &carried)?;
+            let receipts = std::mem::take(&mut applied.submissions);
+            daemon.record(&node, block, ran, Some(receipts)).await?;
+            daemon.publish(&applied);
+        }
+        Sequenced::Replayed => daemon.record_unrecorded(&node, block).await?,
     }
     if !daemon.network.closes_an_epoch(block.height) {
         let due = node.reoffer()?;

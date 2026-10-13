@@ -12,7 +12,7 @@ use fixture_probe::{Reply, Step};
 use futures::{SinkExt as _, StreamExt as _};
 use host::{Layer, Submission, Tip};
 use node::Frame;
-use noded::wire::{Admin, BlockRef};
+use noded::wire::{Admin, BlockRef, PREVIEW_BYTES, TxAsk, TxRef};
 use noded::{Client, Endpoint, Listen, Logs, Workspace};
 
 const MODULE_REGISTRY: &[u8] =
@@ -343,11 +343,90 @@ fn a_validator_serves_its_network_over_http() {
         assert_eq!(tx.signer, alice.public_key().as_ref().to_vec());
         assert_eq!(tx.anchor, submission(&submitted).anchor);
         assert_eq!(tx.target, "probe");
-        assert_eq!(tx.payload, abi::encode(&vec![set(b"a", b"1")]));
+        let payload = abi::encode(&vec![set(b"a", b"1")]);
+        assert_eq!(tx.size as usize, payload.len());
+        assert_eq!(
+            tx.payload.as_ref(),
+            Some(&payload),
+            "a short payload rides along"
+        );
         assert_eq!(tx.receipt.as_ref(), Some(&receipt), "the kept receipt");
+        let position = (block.txs.len() - 1) as u32;
+        let at = TxRef::At {
+            height: block.height,
+            position,
+        };
+        let located = client
+            .tx(TxAsk {
+                tx: at,
+                most: u32::MAX,
+            })
+            .await
+            .unwrap()
+            .expect("the transaction by its place");
+        assert_eq!(
+            (located.height, located.position, located.time),
+            (block.height, position, block.time)
+        );
+        assert_eq!(&located.tx, tx);
+        let by_hash = client
+            .tx(TxAsk {
+                tx: TxRef::Hash(tx.hash),
+                most: 0,
+            })
+            .await
+            .unwrap()
+            .expect("the transaction by its hash");
+        assert_eq!((by_hash.height, by_hash.position), (block.height, position));
+        assert_eq!(by_hash.tx.payload, None, "over the asked cap");
+        let past = TxRef::At {
+            height: block.height,
+            position: position + 1,
+        };
+        let none = client.tx(TxAsk { tx: past, most: 0 }).await.unwrap();
+        assert_eq!(none, None);
+
+        let large = vec![set(b"large", &[7; 2 * PREVIEW_BYTES as usize])];
+        let large = frame(&client, &alice, large).await;
+        let (landed, _) = client.land(&Frame::decode(&large).unwrap()).await.unwrap();
+        let carrier = client
+            .block(BlockRef::Height(landed))
+            .await
+            .unwrap()
+            .unwrap();
+        let large_id = submission(&large).id();
+        let position = carrier
+            .txs
+            .iter()
+            .position(|tx| tx.hash == large_id)
+            .expect("the block carries the large frame") as u32;
+        let listed = &carrier.txs[position as usize];
+        let large_payload = submission(&large).payload;
+        assert_eq!(listed.size as usize, large_payload.len());
+        assert_eq!(listed.payload, None, "a block read carries no long payload");
+        let opened = client
+            .tx(TxAsk {
+                tx: TxRef::At {
+                    height: landed,
+                    position,
+                },
+                most: u32::MAX,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.tx.payload, Some(large_payload.clone()));
+        assert_eq!(opened.tx.receipt, listed.receipt);
+
         let fails = |tx: &&noded::wire::Tx| tx.hash == submission(&failed).id();
         let holding = client.blocks(Some(block.height + 1), 3).await.unwrap();
+        assert_eq!(
+            holding.listed_from,
+            Some(0),
+            "a founding node lists from genesis"
+        );
         let (holder, rejected_tx) = holding
+            .blocks
             .iter()
             .find_map(|seen| Some((seen, seen.txs.iter().find(fails)?)))
             .expect("the rejected frame rides a block");
@@ -375,7 +454,7 @@ fn a_validator_serves_its_network_over_http() {
         let by_id = client.block(BlockRef::Id(block.id)).await.unwrap();
         assert_eq!(by_id.as_ref(), Some(&block));
         assert_eq!(client.block(BlockRef::Id([7; 32])).await.unwrap(), None);
-        let newest = client.blocks(None, 1_000).await.unwrap();
+        let newest = client.blocks(None, 1_000).await.unwrap().blocks;
         assert!(newest.len() as u32 <= noded::wire::MAX_BLOCKS);
         assert!(
             newest
@@ -383,10 +462,16 @@ fn a_validator_serves_its_network_over_http() {
                 .all(|pair| pair[1].height + 1 == pair[0].height && pair[1].id == pair[0].parent)
         );
         assert!(newest.iter().any(|seen| seen == &block));
-        let below = client.blocks(Some(block.height), 2).await.unwrap();
+        let below = client.blocks(Some(block.height), 2).await.unwrap().blocks;
         assert_eq!(below[0].height, block.height - 1);
         assert_eq!(below[0].id, block.parent);
-        assert!(client.blocks(Some(0), 5).await.unwrap().is_empty());
+        assert!(client.blocks(Some(0), 5).await.unwrap().blocks.is_empty());
+        let genesis = client.blocks(Some(1), 5).await.unwrap().blocks;
+        assert_eq!(genesis.len(), 1);
+        assert_eq!(
+            genesis[0].id,
+            node::Block::genesis(NETWORK.as_bytes(), TIME).digest().0
+        );
 
         let query = frame(&client, &alice, vec![Step::Op(HostOp::Get(b"a".to_vec()))]).await;
         let answer = client.query(Layer::Confirmed, query).await.unwrap();
@@ -427,13 +512,13 @@ fn a_validator_serves_its_network_over_http() {
         assert_eq!(refusal.reason, reason::ANCHOR);
         seat.admin(&client, Admin::LogFilter("debug".into())).await;
         seat.admin(&client, Admin::Shutdown).await;
-        (block, holder.clone())
+        (block, holder.clone(), (landed, position, large_payload))
     });
     live.thread.join().unwrap();
 
     // reopened, the node answers the same receipts out of its archive: the
     // host is past these blocks and runs neither again
-    let (block, holder) = kept;
+    let (block, holder, (landed, position, large_payload)) = kept;
     let live = seat.start();
     let client = live.client.clone();
     client_runtime().block_on(async {
@@ -441,6 +526,98 @@ fn a_validator_serves_its_network_over_http() {
             let again = client.block(BlockRef::Height(seen.height)).await.unwrap();
             assert_eq!(again.as_ref(), Some(seen));
         }
+        let at = TxRef::At {
+            height: landed,
+            position,
+        };
+        let opened = client
+            .tx(TxAsk {
+                tx: at,
+                most: u32::MAX,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.tx.payload, Some(large_payload));
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn a_node_reads_a_transaction_of_a_block_it_lists_no_summary_for() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+
+    let large = client_runtime().block_on(async {
+        let steps = vec![set(b"large", &[7; 2 * PREVIEW_BYTES as usize])];
+        let large = frame(&client, &alice, steps).await;
+        let (landed, _) = client.land(&Frame::decode(&large).unwrap()).await.unwrap();
+        let block = client
+            .block(BlockRef::Height(landed))
+            .await
+            .unwrap()
+            .unwrap();
+        let id = submission(&large).id();
+        let position = block.txs.iter().position(|tx| tx.hash == id).unwrap() as u32;
+        let mut blocks = client.changes(host::RECENT).await.unwrap();
+        while blocks.next().await.unwrap().unwrap().height < landed + 4 {}
+        seat.admin(&client, Admin::Shutdown).await;
+        (landed, position, submission(&large))
+    });
+    live.thread.join().unwrap();
+
+    let (landed, position, large) = large;
+    for entry in std::fs::read_dir(seat.workspace.runtime_dir()).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let summarized = name.contains("-summaries-") || name.contains("-txs-");
+        if summarized {
+            std::fs::remove_dir_all(&path).unwrap();
+        }
+    }
+
+    let live = seat.start();
+    let client = live.client.clone();
+    client_runtime().block_on(async {
+        let mut blocks = client.changes(host::RECENT).await.unwrap();
+        blocks.next().await.unwrap().unwrap();
+        let page = client.blocks(None, 10).await.unwrap();
+        let listed_from = page.listed_from.expect("the blocks applied since");
+        assert!(listed_from > landed, "{listed_from} lists {landed}");
+        assert!(page.blocks.iter().all(|block| block.height >= listed_from));
+        let below = client.blocks(Some(listed_from), 10).await.unwrap();
+        assert!(below.blocks.is_empty());
+        assert_eq!(below.listed_from, Some(listed_from));
+        assert_eq!(client.block(BlockRef::Height(landed)).await.unwrap(), None);
+
+        let at = TxRef::At {
+            height: landed,
+            position,
+        };
+        let read = client
+            .tx(TxAsk {
+                tx: at,
+                most: u32::MAX,
+            })
+            .await
+            .unwrap()
+            .expect("read out of the block archive");
+        assert_eq!((read.height, read.position), (landed, position));
+        assert_eq!(read.tx.hash, large.id());
+        assert_eq!(read.tx.size as usize, large.payload.len());
+        assert_eq!(read.tx.payload.as_ref(), Some(&large.payload));
+        assert_eq!(read.tx.receipt, None, "no run recorded");
+        let by_hash = TxAsk {
+            tx: TxRef::Hash(large.id()),
+            most: 0,
+        };
+        assert_eq!(client.tx(by_hash).await.unwrap(), None);
         seat.admin(&client, Admin::Shutdown).await;
     });
     live.thread.join().unwrap();

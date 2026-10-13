@@ -409,7 +409,10 @@ async fn pump(
 ) {
     while let Some((block, ack)) = deliveries.next().await {
         let mut node = node.lock().await;
-        if let Sequenced::Applied(outcome) = node.apply(&block).await.unwrap() {
+        if let Sequenced::Applied {
+            applied: outcome, ..
+        } = node.apply(&block).await.unwrap()
+        {
             roots.lock().unwrap().insert(block.height, outcome.root);
             carried
                 .lock()

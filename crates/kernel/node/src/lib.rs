@@ -30,8 +30,28 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub enum Sequenced {
-    Applied(Applied),
+    Applied {
+        applied: Applied,
+        carried: Vec<Carried>,
+    },
     Replayed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Carried {
+    pub frame: u32,
+    pub id: SubmissionId,
+}
+
+pub fn carried<'a>(
+    block: &'a Block,
+    network: &'a [u8],
+) -> impl Iterator<Item = (u32, Submission)> + 'a {
+    block
+        .frames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| Some((index as u32, frame::verify(frame, network).ok()?)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,12 +284,12 @@ where
                 tip: tip.height,
             });
         }
-        let submissions: Vec<Submission> = block
-            .frames
-            .iter()
-            .filter_map(|frame| frame::verify(frame, &self.network).ok())
-            .collect();
-        let carried: Vec<SubmissionId> = submissions.iter().map(Submission::id).collect();
+        let (carried, submissions): (Vec<Carried>, Vec<Submission>) = carried(block, &self.network)
+            .map(|(frame, submission)| {
+                let id = submission.id();
+                (Carried { frame, id }, submission)
+            })
+            .unzip();
         let applied = self
             .host
             .apply(host::Block {
@@ -279,9 +299,10 @@ where
                 submissions,
             })
             .await?;
-        self.pool.settle(&carried, block.height + 1);
+        let ids: Vec<SubmissionId> = carried.iter().map(|carried| carried.id).collect();
+        self.pool.settle(&ids, block.height + 1);
         self.replay().await?;
-        Ok(Sequenced::Applied(applied))
+        Ok(Sequenced::Applied { applied, carried })
     }
 
     fn carried_above_the_tip<'a>(

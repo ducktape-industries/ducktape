@@ -111,7 +111,7 @@ async fn seal(node: &mut TestNode) -> (Block, host::Applied) {
     let block = node
         .build(tip, std::iter::empty(), TIME + tip.height + 1)
         .unwrap();
-    let Sequenced::Applied(applied) = node.apply(&block).await.unwrap() else {
+    let Sequenced::Applied { applied, .. } = node.apply(&block).await.unwrap() else {
         panic!("block {} was already applied", block.height);
     };
     (block, applied)
@@ -259,7 +259,7 @@ fn a_block_without_the_pending_frame_keeps_it_pending_and_preconfirmed() {
         let empty = Block::next(tip, TIME + 1, Vec::new());
         assert!(matches!(
             node.apply(&empty).await.unwrap(),
-            Sequenced::Applied(_)
+            Sequenced::Applied { .. }
         ));
         assert_eq!(node.pending(), 1);
         assert!(node.due().unwrap());
@@ -355,7 +355,7 @@ fn a_leader_leaves_out_what_the_blocks_it_has_not_applied_already_carry() {
         assert_eq!(again.frames, vec![alice_first, bob_first, alice_second]);
 
         for block in [&parent, &child] {
-            let Sequenced::Applied(applied) = node.apply(block).await.unwrap() else {
+            let Sequenced::Applied { applied, .. } = node.apply(block).await.unwrap() else {
                 panic!("block {} was already applied", block.height);
             };
             assert!(
@@ -459,7 +459,7 @@ fn a_second_proof_of_one_body_is_the_same_frame() {
         assert_eq!(node.pending(), 1);
 
         let block = Block::next(node.tip().unwrap(), TIME + 1, vec![two, one.clone()]);
-        let Sequenced::Applied(applied) = node.apply(&block).await.unwrap() else {
+        let Sequenced::Applied { applied, .. } = node.apply(&block).await.unwrap() else {
             panic!("the block was already applied");
         };
         assert!(matches!(
@@ -652,7 +652,7 @@ fn a_block_applies_only_the_frames_that_verify() {
             vec![forged.encode(), b"junk".to_vec(), good],
         );
 
-        let Sequenced::Applied(applied) = node.apply(&block).await.unwrap() else {
+        let Sequenced::Applied { applied, .. } = node.apply(&block).await.unwrap() else {
             panic!("the block was already applied");
         };
         assert_eq!(applied.submissions.len(), 1);

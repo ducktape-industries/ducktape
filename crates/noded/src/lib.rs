@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use abi::{ProgramId, Refusal};
 use commonware_cryptography::Digestible as _;
-use consensus::{MarshalMailbox, Network, Receipts, Votes};
+use consensus::{MarshalMailbox, Network, Summaries, Votes};
 use futures::channel::mpsc;
 use host::Applied;
 use node::Node;
@@ -64,7 +64,7 @@ pub enum Error {
     #[error(transparent)]
     Sync(#[from] statesync::Error),
     #[error(transparent)]
-    Receipts(#[from] consensus::ReceiptsError),
+    Summaries(#[from] consensus::SummariesError),
     #[error(transparent)]
     Membership(#[from] consensus::MembershipError),
     #[error(transparent)]
@@ -96,7 +96,7 @@ pub struct Daemon<E: Context> {
     pub network: Network,
     pub identity: Vec<u8>,
     pub anchors: MarshalMailbox,
-    pub receipts: Receipts<E>,
+    pub summaries: Summaries<E>,
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
     pub relay: relay::Relay<E>,
@@ -104,6 +104,7 @@ pub struct Daemon<E: Context> {
     /// Each validator's newest finalize vote, as a height (`network.rs`).
     votes: Votes,
     subscribers: Mutex<Vec<(ProgramId, mpsc::UnboundedSender<Change>)>>,
+    recent: Mutex<blocks::Recent>,
 }
 
 impl<E: Context> Daemon<E> {
