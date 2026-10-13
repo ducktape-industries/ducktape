@@ -200,6 +200,7 @@ fn message(target: &str, script: Script, reply: bool) -> Message {
         target: target.to_owned(),
         payload: abi::encode(&script),
         reply,
+        acting: None,
     }
 }
 
@@ -869,6 +870,7 @@ fn a_message_sees_who_emitted_it() {
                         target: "probe".into(),
                         payload: probe_script,
                         reply: true,
+                        acting: None,
                     }]),
                 )],
             ))
@@ -898,6 +900,58 @@ fn a_message_sees_who_emitted_it() {
 }
 
 #[test]
+fn a_message_acts_as_an_account_only_when_identity_says_its_program_runs_it() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        const AGENT: u64 = 77;
+        let mut genesis = standard();
+        let held = vec![(SIGNER.to_vec(), ACCOUNT), (b"#runs/ping".to_vec(), AGENT)];
+        genesis.programs[2].params = abi::encode(&held);
+        let mut host = found(context, "net", dir.path(), genesis).await;
+        let as_agent = |account| Message {
+            target: "probe".into(),
+            payload: script(vec![Step::Env]),
+            reply: true,
+            acting: Some(account),
+        };
+        let applied = host
+            .apply(block(
+                1,
+                vec![
+                    submit("ping", send(vec![as_agent(AGENT)])),
+                    submit("ping", send(vec![as_agent(AGENT + 1)])),
+                ],
+            ))
+            .await
+            .unwrap();
+        let env = Env {
+            network: b"net".to_vec(),
+            height: 1,
+            time: TIME + 1,
+            me: "probe".into(),
+            origin: Origin::Program("ping".into()),
+            sender: Some(Principal::Account(AGENT)),
+            roles: roles(),
+            cause: Cause::Message(item("ping", 0)),
+        };
+        let [probed, replied] = applied.submissions[0].nested.as_slice() else {
+            panic!("{:?}", applied.submissions[0].nested);
+        };
+        assert_eq!(replies(probed), vec![Reply::Env(env)]);
+        assert_eq!(replied, &receipt("ping", ok(b""), vec![]));
+        let not_run = Refusal::new(reason::UNAUTHORIZED, "ping");
+        let [refused, absorbed] = applied.submissions[1].nested.as_slice() else {
+            panic!("{:?}", applied.submissions[1].nested);
+        };
+        assert_eq!(
+            refused,
+            &receipt("probe", Outcome::Rejected(not_run), vec![])
+        );
+        assert_eq!(absorbed, &receipt("ping", ok(b""), vec![]));
+    });
+}
+
+#[test]
 fn a_message_emitted_from_init_carries_the_program_account() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -906,6 +960,7 @@ fn a_message_emitted_from_init_carries_the_program_account() {
             target: "probe".into(),
             payload: script(vec![Step::Env]),
             reply: false,
+            acting: None,
         }));
         founding_file
             .programs
@@ -1209,6 +1264,7 @@ fn a_spent_frame_starts_no_further_run() {
             target: "probe".into(),
             payload: script(spin_queries(1)),
             reply: true,
+            acting: None,
         };
         let payload = send(vec![spend, message("pong", note(b"late"), false)]);
         let applied = host
@@ -2545,6 +2601,7 @@ fn a_hook_that_fails_keeps_none_of_its_writes_and_the_block_goes_on() {
         target: "pong".into(),
         payload: abi::encode(&note(b"from a hook")),
         reply: false,
+        acting: None,
     });
     let runs: [(Vec<Step>, Option<&[u8]>); 4] = [
         (vec![set(b"k", b"v")], Some(b"v")),

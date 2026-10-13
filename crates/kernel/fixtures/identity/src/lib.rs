@@ -2,7 +2,8 @@
 //! with the keys each account holds (`Vec<(key, account)>`), and a signed
 //! execute adds one more holding. The system's `RegisterModule` gives a
 //! program the next account from [`MODULES_FROM`], refused while the key
-//! `#closed/<module>` holds a nonzero number. It keeps no profiles.
+//! `#closed/<module>` holds a nonzero number. A program runs the account the key
+//! `#runs/<program>` holds. It keeps no profiles.
 
 /// The first account number a program is given.
 pub const MODULES_FROM: u64 = 1000;
@@ -53,6 +54,14 @@ mod program {
             let key = match abi::decode(request)? {
                 identity::Query::Account(key) => key,
                 identity::Query::OfModule(module) => module_key(&module),
+                identity::Query::Runs { program, account } => {
+                    let runs: Option<u64> = ctx.record([b"#runs/", program.as_bytes()].concat())?;
+                    if runs != Some(account) {
+                        return Err(Refusal::new(reason::UNAUTHORIZED, program));
+                    }
+                    ctx.respond(abi::encode(&identity::Reply::Account(Some(account))));
+                    return Ok(());
+                }
                 identity::Query::Profile(_) | identity::Query::Profiles { .. } => {
                     return Err(Refusal::new(
                         reason::UNSUPPORTED,

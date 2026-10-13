@@ -103,6 +103,7 @@ fn message(target: &str, payload: &[u8], reply: bool) -> Vec<u8> {
         target: target.to_owned(),
         payload: abi::encode(&fixture_relay::Script::Note(payload.to_vec())),
         reply,
+        acting: None,
     }]))
 }
 

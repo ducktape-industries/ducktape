@@ -78,7 +78,7 @@ mod program {
                 let mut items = Vec::new();
                 for message in messages {
                     let body = message.payload.clone();
-                    let item = ctx.emit(message.target, message.payload, message.reply);
+                    let item = ctx.send(message);
                     ctx.set(sent(&item), body);
                     items.push(item);
                 }
