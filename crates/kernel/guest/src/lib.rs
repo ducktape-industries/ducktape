@@ -289,11 +289,31 @@ mod context {
             payload: impl Into<Vec<u8>>,
             reply: bool,
         ) -> ItemRef {
-            match host(&HostOp::Emit(Message {
+            self.send(Message {
                 target: target.into(),
                 payload: payload.into(),
                 reply,
-            })) {
+                acting: None,
+            })
+        }
+
+        pub fn emit_as(
+            &mut self,
+            account: abi::role::identity::AccountNumber,
+            target: impl Into<ProgramId>,
+            payload: impl Into<Vec<u8>>,
+            reply: bool,
+        ) -> ItemRef {
+            self.send(Message {
+                target: target.into(),
+                payload: payload.into(),
+                reply,
+                acting: Some(account),
+            })
+        }
+
+        pub fn send(&mut self, message: Message) -> ItemRef {
+            match host(&HostOp::Emit(message)) {
                 HostReply::Item(item) => item,
                 other => protocol("item", other),
             }

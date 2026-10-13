@@ -143,6 +143,7 @@ async fn every_host_op_crosses_the_boundary_and_back() {
             target: "oracle".into(),
             payload: vec![9],
             reply: true,
+            acting: None,
         })),
         Step::Op(HostOp::Event(b"happened".to_vec())),
         Step::Op(HostOp::Crypto(CryptoOp::Sha256(b"abc".to_vec()))),

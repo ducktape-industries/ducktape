@@ -1069,6 +1069,33 @@ where
         Ok(account.map(|account| account.map(Principal::Account)))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn run_by(
+        &self,
+        program: &str,
+        account: identity::AccountNumber,
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+        frame: &mut Frame,
+    ) -> Result<std::result::Result<Option<Principal>, Refusal>> {
+        let asked = identity::Query::Runs {
+            program: program.to_owned(),
+            account,
+        };
+        let answered = self
+            .account(asked, height, time, overlay, stage, &mut frame.fuel)
+            .await?;
+        Ok(answered.and_then(|answer| match answer {
+            Some(number) if number == account => Ok(Some(Principal::Account(account))),
+            _ => Err(Refusal::new(
+                reason::UNAUTHORIZED,
+                format!("{program} does not run account {account}"),
+            )),
+        }))
+    }
+
     /// The account the identity role says a frame acts as: the one a key
     /// holds (`Account`), or a program's own (`OfModule`). The role's
     /// refusal, or a reply that is not its interface's, rejects the frame.
@@ -1164,13 +1191,21 @@ where
         )
         .await?;
         // the emitter's account, asked once for all its messages
-        let emitter = if emitted.is_empty() {
-            Ok(None)
-        } else {
+        let as_itself = emitted.iter().any(|(_, message)| message.acting.is_none());
+        let emitter = if as_itself {
             self.account_of(program, height, time, overlay, stage, frame)
                 .await?
+        } else {
+            Ok(None)
         };
         for (item, message) in emitted {
+            let sender = match message.acting {
+                None => emitter.clone(),
+                Some(account) => {
+                    self.run_by(program, account, height, time, overlay, stage, frame)
+                        .await?
+                }
+            };
             let env = |me: &str, origin: &str, sender, cause| Env {
                 network: self.network.clone(),
                 height,
@@ -1181,7 +1216,7 @@ where
                 roles: self.roles.clone(),
                 cause,
             };
-            let ran = match emitter.clone() {
+            let ran = match sender {
                 Err(refusal) => rejected(&message.target, refusal),
                 Ok(sender) => {
                     let env = env(

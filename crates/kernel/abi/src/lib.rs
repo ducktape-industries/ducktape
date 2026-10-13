@@ -205,6 +205,7 @@ pub struct Message {
     pub target: ProgramId,
     pub payload: Vec<u8>,
     pub reply: bool,
+    pub acting: Option<role::identity::AccountNumber>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -503,9 +504,6 @@ pub mod role {
 
     /// Who holds a key or runs as a program (the account a frame acts as),
     /// and how each account reads to the programs and views that name it.
-    /// The kernel writes `RegisterModule` and asks `Account` and `OfModule`
-    /// alone; `Profile` and `Profiles` are for the modules and views that
-    /// name accounts.
     pub mod identity {
         use crate::{BorshDeserialize, BorshSerialize, ProgramId};
 
@@ -523,6 +521,7 @@ pub mod role {
                 manager: AccountNumber,
                 category: Category,
                 standing: Standing,
+                runner: Option<ProgramId>,
             },
             Module(ProgramId),
         }
@@ -577,6 +576,10 @@ pub mod role {
             Profiles {
                 after: Option<AccountNumber>,
                 limit: u32,
+            },
+            Runs {
+                program: ProgramId,
+                account: AccountNumber,
             },
         }
 
