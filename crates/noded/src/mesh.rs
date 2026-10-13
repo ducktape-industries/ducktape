@@ -13,9 +13,10 @@ use commonware_utils::{NZU32, NZUsize, hostname};
 use consensus::channel::{BACKFILL, BROADCAST, CERTIFICATE, RELAY, RESOLVER, VOTE};
 use consensus::{EngineChannels, MarshalLanes};
 
-use crate::endpoint::Endpoint;
-use crate::transport::{self, Bridges};
-use crate::{Context, Result};
+use halo::Endpoint;
+
+use crate::transport::Bridges;
+use crate::{Context, Error, Result};
 
 pub const QUOTA_PER_SECOND: u32 = 1024;
 
@@ -76,8 +77,10 @@ impl<E: Context> Mesh<E> {
         let tracker = Tracker {
             oracle: oracle.clone(),
             me,
-            listen: transport::loopback(listen),
-            bridges: Bridges::new(transport::dialer()?),
+            listen,
+            bridges: Bridges::new(
+                halo::dial::dialer().map_err(|error| Error::Tls(error.to_string()))?,
+            ),
         };
         let mesh = Mesh {
             oracle,

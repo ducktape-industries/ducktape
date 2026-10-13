@@ -168,6 +168,14 @@ need addresses.
   ngrok) or reverse proxy is reached at `wss://` the tunnel's name; it
   opens no port of its own.
 
+Halo, the network members fetch the blobs a frame attaches over, reaches a
+member at the same address. At a `tcp://` or `tls://` address it tries QUIC on
+UDP at that port first, so a node that also opens the port to UDP is served
+over QUIC; where UDP does not answer within two seconds it connects to the
+same socket instead. At a `ws://` or `wss://` address it opens a WebSocket at
+`/v1/halo`. `--halo-egress` caps the bytes per second a node sends over halo,
+8 MiB/s unless set.
+
 ```sh
 ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844   # the tunnel serves https://b.example.org from 127.0.0.1:8844
 ```
@@ -210,6 +218,7 @@ verb's `--help` carries the rest.
 | --- | --- | --- |
 | Kernel | `crates/kernel/` | `abi` (the bytes ABI), `guest` (what a program compiles against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `blobs` (one content-addressed store), `host` (the sandbox: submit, query, and the messages a frame emits, run in that frame), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
 | Programs | [`ducktape-industries/modules`](https://github.com/ducktape-industries/modules) | The contracts a program compiles against (`crates/sdk/abi`, a copy of `crates/kernel/abi` here, and `crates/sdk/guest`, the module SDK), the boot set (`crates/system/`: `module-registry`, `valset` and `identity`, whose suite founds this host over their bytes) and the app modules. The system modules beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
+| Network | `crates/networking/halo/` | `halo`, the network between members off consensus: QUIC on UDP at a member's tcp or tls port, a tcp, tls, ws or wss stream path where UDP does not answer, admission of current members by node key, lanes, the egress pacer and its priority classes, and the blob lane a node fetches attached blobs over |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
 
 ## Develop

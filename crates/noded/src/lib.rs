@@ -1,6 +1,5 @@
 mod blocks;
 mod client;
-mod endpoint;
 mod fetch;
 mod logs;
 mod mesh;
@@ -23,10 +22,10 @@ use node::Node;
 use tokio::sync::watch;
 
 pub use client::Client;
-pub use endpoint::{Endpoint, Scheme};
+pub use halo::{Endpoint, Scheme};
 pub use logs::Logs;
 pub use mesh::Mesh;
-pub use run::{Listen, Running, init, invite, join, run};
+pub use run::{HaloConfig, Listen, Running, init, invite, join, run};
 pub use wire::{NODE_CONTRACT, Status};
 pub use workspace::{Descriptor, Founding, Workspace};
 
@@ -101,7 +100,7 @@ pub struct Daemon<E: Context> {
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
     pub relay: relay::Relay<E>,
-    pub fetch: Arc<dyn fetch::Fetch>,
+    pub halo: Arc<halo::Halo<E>>,
     mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).
     votes: Votes,

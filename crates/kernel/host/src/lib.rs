@@ -658,6 +658,10 @@ where
         self.sync_code()
     }
 
+    pub fn blobs(&self) -> &Blobs {
+        &self.blobs
+    }
+
     pub fn blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
         let rostered = self
             .store
