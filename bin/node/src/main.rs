@@ -10,6 +10,7 @@ use commonware_runtime::Runner as _;
 use commonware_runtime::tokio::{Config, Runner};
 use futures::StreamExt as _;
 use host::Layer;
+use host::attach::{ATTACH, Attached, Attachment};
 use node::Frame;
 use noded::wire::Admin;
 use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Workspace};
@@ -92,6 +93,13 @@ enum Verb {
     Submit {
         program: String,
         payload: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "a file to put on the node as a blob and attach to the frame; repeatable"
+        )]
+        attach: Vec<PathBuf>,
+        #[arg(long, default_value = "blob", help = "the kind of every attached blob")]
+        kind: String,
     },
     #[command(about = "query a program; the request is a file or stdin, the answer is stdout")]
     Query {
@@ -312,16 +320,23 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             );
             Ok(())
         }
-        Verb::Submit { program, payload } => {
+        Verb::Submit {
+            program,
+            payload,
+            attach,
+            kind,
+        } => {
             let status = client.status().await.sentence()?;
             let key = signer(workspace)?;
+            let (target, payload) =
+                attaching(client, program, bytes(payload)?, &attach, &kind).await?;
             let frame = Frame::sign(
                 &key,
                 status.network.as_bytes(),
                 status.anchor(),
                 Some(salt()),
-                &program,
-                bytes(payload)?,
+                &target,
+                payload,
             );
             let receipt = client.submit(frame.encode()).await.sentence()?;
             match receipt.outcome {
@@ -494,6 +509,34 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         | Verb::Run { .. }
         | Verb::Wallet(_) => unreachable!("handled before the client is built"),
     }
+}
+
+async fn attaching(
+    client: &Client,
+    program: String,
+    payload: Vec<u8>,
+    files: &[PathBuf],
+    kind: &str,
+) -> Result<(String, Vec<u8>), String> {
+    if files.is_empty() {
+        return Ok((program, payload));
+    }
+    let mut attachments = Vec::with_capacity(files.len());
+    for file in files {
+        let body = std::fs::read(file).sentence()?;
+        let framed = blobs::frame(kind, &body).map_err(|refusal| refusal.sentence)?;
+        let id = blobs::id_of(HashKind::Sha256, &framed);
+        let len = framed.len() as u64;
+        client.put_blob(id, framed).await.sentence()?;
+        println!("attached {}", blob_text(&id));
+        attachments.push(Attachment { id, len });
+    }
+    let attached = Attached {
+        target: program,
+        payload,
+        blobs: attachments,
+    };
+    Ok((ATTACH.to_owned(), abi::encode(&attached)))
 }
 
 async fn membership(
