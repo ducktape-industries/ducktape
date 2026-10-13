@@ -34,15 +34,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
-        run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
       # ubuntu-latest ships rustup; the checkout's rust-toolchain.toml pins
       # the exact channel + targets, so this just makes rustup install it.
       - run: rustup show
-      # airlock's signing-route tests sign a fixture bundle with the pinned
-      # `rcodesign` the enclave image carries (ops/airlock-gateway/); the
-      # test refuses to skip without it.
-      - run: ops/airlock-gateway/install-rcodesign.sh --prefix "$HOME/.local" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: cargo test --locked --workspace --lib --no-fail-fast
       - run: cargo clippy --locked --workspace --tests --no-deps -- -D warnings

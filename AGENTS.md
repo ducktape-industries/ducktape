@@ -6,9 +6,8 @@
 
 `docs/README.md` is the one index: one line per document, grouped by the
 question it answers. Load the document that answers the question, never the
-tree. It covers the operator runbook (`docs/sandbox-macos.md`), the references
-code cites by path (`docs/records/`) and the per-area READMEs (`ops/`,
-`crates/airlock/`).
+tree. It covers the repository README, this file and the per-area README
+under `ops/`.
 
 ## No Legacy, No Compat (until a live network exists)
 
@@ -65,10 +64,9 @@ code cites by path (`docs/records/`) and the per-area READMEs (`ops/`,
   local working files: the directory is gitignored and nothing under it ships
   in a PR. When the PR merges the plan is done and the file is garbage, like
   its worktree.
-- `docs/` holds only what an operator executes (`sandbox-macos.md`) and the
-  few records code cites by path (`records/`); `docs/README.md` is the index
-  and every document is one hop from it. A record nothing cites is deleted,
-  not archived.
+- `docs/` holds only what an operator executes and the few records code
+  cites by path; `docs/README.md` is the index and every document is one hop
+  from it. A record nothing cites is deleted, not archived.
 
 ## Branching and Delivery
 
