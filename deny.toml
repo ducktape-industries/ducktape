@@ -17,19 +17,6 @@
 yanked = "deny"
 
 ignore = [
-  # ── reachable in a node, no fix upstream ────────────────────────────────
-  { id = "RUSTSEC-2025-0055", reason = "tracing-subscriber 0.2 ANSI-escape log poisoning. Pulled by ark-relations 0.5, which requires ^0.2, under commonware's arkworks stack — unreachable from here (nothing in ducktape installs an arkworks subscriber). Cleared when commonware's arkworks deps move to tracing-subscriber 0.3." },
-  { id = "RUSTSEC-2026-0008", reason = "git2 0.19 unsoundness (Buf deref); fixed in 0.20.4. forge and the app pin 0.19 and the bump is semver-major — a dependency upgrade with its own review, not a lock change." },
-  { id = "RUSTSEC-2026-0183", reason = "git2 0.19 unsoundness (Remote::list); fixed in 0.21. Same bump as RUSTSEC-2026-0008." },
-  { id = "RUSTSEC-2026-0184", reason = "git2 0.19 unsoundness (BlameHunk Signature); fixed in 0.21. Same bump as RUSTSEC-2026-0008." },
-
   # ── unmaintained crates nothing here depends on directly ────────────────
-  # Each arrives under a third-party tree (iced's renderer/highlighter, or
-  # commonware's arkworks stack). None has a safe upgrade; each is cleared by
-  # its own parent moving off it, which is why the parent is named.
-  { id = "RUSTSEC-2024-0320", reason = "yaml-rust unmaintained, under syntect ← two-face ← iced_highlighter. Cleared when iced's highlighter moves to yaml-rust2." },
-  { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, under the arkworks field crates ← commonware-cryptography. Cleared when arkworks drops paste." },
-  { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained, under syntect ← two-face ← iced_highlighter. Cleared when syntect moves to bincode 2." },
-  { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained, under fontdb/cosmic-text ← iced's text stack. Cleared when cosmic-text moves off it." },
-  { id = "RUSTSEC-2026-0206", reason = "rustybuzz unmaintained, under usvg/resvg ← iced_tiny_skia and the app's own svg rendering. Cleared when resvg moves off it." },
+  { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, under commonware-codec. Cleared when commonware-codec drops paste." },
 ]
