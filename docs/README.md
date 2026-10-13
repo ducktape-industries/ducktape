@@ -17,14 +17,6 @@ nothing cites is deleted, not archived.
 
 | Question | Read |
 | --- | --- |
-| Bring the microVM sandbox up on macOS (the vz shim) | [`sandbox-macos.md`](sandbox-macos.md) |
 | Which operator scripts and harnesses live under `ops/` | [`../ops/README.md`](../ops/README.md) |
-| Lend a credential to a sandbox through airlock, self-hosted or from an enclave | [`../crates/airlock/README.md`](../crates/airlock/README.md) |
-
-## References code cites by path
-
-| Question | Read | Cited by |
-| --- | --- | --- |
-| The capability spec TOML that describes an executor | [`records/specs/capability-spec.md`](records/specs/capability-spec.md) | `crates/services/provider` |
 
 `docs/superpowers/` is gitignored planning scratch; nothing under it ships.
