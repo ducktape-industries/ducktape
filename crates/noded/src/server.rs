@@ -76,7 +76,8 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
             &format!("{}/{{program}}", route::CHANGES),
             get(changes::<E>),
         )
-        .route(route::P2P, get(p2p::<E>));
+        .route(route::P2P, get(p2p::<E>))
+        .route(halo::ROUTE, get(halo_socket::<E>));
     reads
         .merge(queries)
         .merge(uploads)
@@ -447,6 +448,14 @@ async fn p2p<E: Context>(
 ) -> Response {
     let mesh = daemon.mesh;
     upgrade.on_upgrade(move |socket| crate::transport::inbound_websocket(socket, mesh))
+}
+
+async fn halo_socket<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let halo = daemon.halo.clone();
+    upgrade.on_upgrade(move |socket| crate::transport::inbound_halo(socket, halo))
 }
 
 #[cfg(test)]

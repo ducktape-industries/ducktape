@@ -14,7 +14,7 @@ use host::attach::{ATTACH, Attached, Attachment};
 use host::{Layer, Submission, Tip};
 use node::Frame;
 use noded::wire::{Admin, BlockRef, PREVIEW_BYTES, TxAsk, TxRef};
-use noded::{Client, Endpoint, Listen, Logs, Workspace};
+use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Workspace};
 
 const MODULE_REGISTRY: &[u8] =
     include_bytes!("../../kernel/fixtures/wasm/fixture_module_registry.wasm");
@@ -113,7 +113,12 @@ impl Seat {
         let thread = std::thread::spawn(move || {
             runner(&workspace.runtime_dir()).start(|context| async move {
                 let logs = Logs::install("info").unwrap();
-                let running = noded::run(context, &workspace, logs, listen).await.unwrap();
+                let halo = HaloConfig {
+                    egress_bytes_per_sec: 8 << 20,
+                };
+                let running = noded::run(context, &workspace, logs, listen, halo)
+                    .await
+                    .unwrap();
                 ready.send(running.http).unwrap();
                 running.stopped().await;
             });
@@ -1071,7 +1076,50 @@ fn terminate_tls(runtime: &::tokio::runtime::Runtime, listen: SocketAddr, to: So
     });
 }
 
-fn reached(runtime: &::tokio::runtime::Runtime, root: &Path, dialer: Seat, dialed: Seat) {
+fn halo_streams(metrics: &str, path: &str) -> u64 {
+    let name = format!("halo_streams_over_{path}_total");
+    metrics
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter(|line| {
+            let metric = line.split_whitespace().next().unwrap_or_default();
+            metric.ends_with(&name)
+        })
+        .filter_map(|line| line.split_whitespace().last()?.parse::<u64>().ok())
+        .sum()
+}
+
+async fn fetched_over(holder: &Client, fetcher: &Client, path: &str, other: &str) {
+    let alice = ed25519::PrivateKey::from_seed(12);
+    let (id, framed, attaching) = page_reader(holder, &alice, b"carried over halo").await;
+    holder.put_blob(id, framed).await.unwrap();
+    let (_, receipt) = ::tokio::time::timeout(
+        Duration::from_secs(60),
+        holder.land(&Frame::decode(&attaching).unwrap()),
+    )
+    .await
+    .expect("the frame lands once the other validator fetched what it attaches")
+    .unwrap();
+    let Outcome::Applied { output } = &receipt.outcome else {
+        panic!("the attaching frame runs: {receipt:?}");
+    };
+    let read = Reply::Host(HostReply::Blob(Some(Blob {
+        kind: "page".into(),
+        body: b"carried over halo".to_vec(),
+    })));
+    assert_eq!(abi::decode::<Vec<Reply>>(output).unwrap(), vec![read]);
+    let metrics = fetcher.metrics().await.unwrap();
+    assert!(halo_streams(&metrics, path) > 0, "{metrics}");
+    assert_eq!(halo_streams(&metrics, other), 0, "{metrics}");
+}
+
+fn reached(
+    runtime: &::tokio::runtime::Runtime,
+    root: &Path,
+    dialer: Seat,
+    dialed: Seat,
+    (path, other): (&str, &str),
+) {
     let founding = founding(root, &[&dialer, &dialed], EPOCH_LENGTH);
     dialer.init(&founding);
     dialed.init(&founding);
@@ -1090,6 +1138,7 @@ fn reached(runtime: &::tokio::runtime::Runtime, root: &Path, dialer: Seat, diale
             .unwrap()
             .unwrap();
         assert_eq!(change.writes, vec![(b"a".to_vec(), Some(b"1".to_vec()))]);
+        fetched_over(&live[1].client, client, path, other).await;
         for (seat, node) in [(&dialer, &live[0]), (&dialed, &live[1])] {
             seat.admin(&node.client, Admin::Shutdown).await;
         }
@@ -1099,28 +1148,51 @@ fn reached(runtime: &::tokio::runtime::Runtime, root: &Path, dialer: Seat, diale
     }
 }
 
-fn dialed_at(address: impl FnOnce(&Seat) -> String) {
+const OVER_QUIC: (&str, &str) = ("quic", "tcp");
+const OVER_TCP: (&str, &str) = ("tcp", "quic");
+
+fn dialed_at(address: impl FnOnce(&Seat) -> String, halo: (&str, &str)) {
     let root = tempfile::tempdir().unwrap();
     let mut dialer = Seat::new(root.path(), "n0");
     let mut dialed = Seat::new(root.path(), "n1");
     dialer.address = None;
     dialed.address = Some(address(&dialed));
-    reached(&client_runtime(), root.path(), dialer, dialed);
+    reached(&client_runtime(), root.path(), dialer, dialed, halo);
 }
 
 #[test]
 fn a_validator_is_dialed_over_tcp_at_its_name() {
-    dialed_at(|seat| format!("tcp://localhost:{}", seat.p2p.port()));
+    dialed_at(
+        |seat| format!("tcp://localhost:{}", seat.p2p.port()),
+        OVER_QUIC,
+    );
 }
 
 #[test]
 fn a_validator_is_dialed_over_tls() {
-    dialed_at(|seat| format!("tls://localhost:{}", seat.tls.port()));
+    dialed_at(
+        |seat| format!("tls://localhost:{}", seat.tls.port()),
+        OVER_QUIC,
+    );
 }
 
 #[test]
 fn a_validator_is_dialed_over_a_websocket_on_its_http_port() {
-    dialed_at(|seat| format!("ws://localhost:{}", seat.http.port()));
+    dialed_at(
+        |seat| format!("ws://localhost:{}", seat.http.port()),
+        OVER_TCP,
+    );
+}
+
+#[test]
+fn a_validator_whose_udp_stays_silent_is_fetched_from_over_tcp() {
+    let root = tempfile::tempdir().unwrap();
+    let mut dialer = Seat::new(root.path(), "n0");
+    let mut dialed = Seat::new(root.path(), "n1");
+    let _silent = std::net::UdpSocket::bind(dialed.p2p).unwrap();
+    dialer.address = None;
+    dialed.address = Some(format!("tcp://localhost:{}", dialed.p2p.port()));
+    reached(&client_runtime(), root.path(), dialer, dialed, OVER_TCP);
 }
 
 #[test]
@@ -1133,5 +1205,5 @@ fn a_validator_is_dialed_over_wss_through_a_tls_terminator() {
     terminate_tls(&runtime, terminator, dialed.http);
     dialer.address = None;
     dialed.address = Some(format!("wss://localhost:{}", terminator.port()));
-    reached(&runtime, root.path(), dialer, dialed);
+    reached(&runtime, root.path(), dialer, dialed, OVER_TCP);
 }

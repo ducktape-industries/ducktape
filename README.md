@@ -168,6 +168,14 @@ need addresses.
   ngrok) or reverse proxy is reached at `wss://` the tunnel's name; it
   opens no port of its own.
 
+Halo, the network members fetch the blobs a frame attaches over, reaches a
+member at the same address. At a `tcp://` or `tls://` address it tries QUIC on
+UDP at that port first, so a node that also opens the port to UDP is served
+over QUIC; where UDP does not answer within two seconds it connects to the
+same socket instead. At a `ws://` or `wss://` address it opens a WebSocket at
+`/v1/halo`. `--halo-egress` caps the bytes per second a node sends over halo,
+8 MiB/s unless set.
+
 ```sh
 ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844   # the tunnel serves https://b.example.org from 127.0.0.1:8844
 ```

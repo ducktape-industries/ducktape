@@ -2928,6 +2928,7 @@ dependencies = [
  "fixture-relay",
  "fixture-valset",
  "futures",
+ "halo",
  "hex",
  "host",
  "http-body-util",
@@ -2947,7 +2948,6 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
- "url",
 ]
 
 [[package]]

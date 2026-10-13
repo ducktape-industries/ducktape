@@ -119,7 +119,7 @@ fn prefetch<E: Context>(
     let daemon = daemon.clone();
     let prefetching = prefetching.clone();
     daemon.context.child("prefetch").spawn(move |_| async move {
-        let held = fetch::hold(&daemon.node, &*daemon.fetch, needs, Some(peer.clone())).await;
+        let held = fetch::hold(&daemon.node, &*daemon.halo, needs, Some(peer.clone())).await;
         prefetching.fetch_sub(1, Ordering::AcqRel);
         match held {
             Ok(()) => take(&daemon, &peer, frame).await,

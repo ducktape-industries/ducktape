@@ -12,7 +12,9 @@ use futures::StreamExt as _;
 use host::Layer;
 use node::Frame;
 use noded::wire::Admin;
-use noded::{Client, Endpoint, Listen, Logs, Workspace};
+use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Workspace};
+
+const HALO_EGRESS: u64 = 8 << 20;
 
 #[derive(Parser)]
 #[command(name = "ducktape", about = "a ducktape node and its client", version)]
@@ -59,7 +61,10 @@ enum Verb {
     },
     #[command(about = "run the node")]
     Run {
-        #[arg(long, help = "the socket peers reach over tcp")]
+        #[arg(
+            long,
+            help = "the socket peers reach over tcp, and over QUIC on UDP at the same port"
+        )]
         listen: SocketAddr,
         #[arg(
             long,
@@ -67,8 +72,17 @@ enum Verb {
             help = "the socket the HTTP API and ws/wss peers reach"
         )]
         http: SocketAddr,
-        #[arg(long, help = "the socket peers reach over tls")]
+        #[arg(
+            long,
+            help = "the socket peers reach over tls, and over QUIC on UDP at the same port"
+        )]
         tls: Option<SocketAddr>,
+        #[arg(
+            long,
+            default_value_t = HALO_EGRESS,
+            help = "the bytes per second this node sends to other members over halo"
+        )]
+        halo_egress: u64,
         #[arg(long, default_value = "info")]
         log: String,
     },
@@ -228,6 +242,7 @@ fn execute(cli: Cli) -> Result<(), String> {
             listen,
             http,
             tls,
+            halo_egress,
             log,
         } => node_runtime(&workspace).start(|context| async move {
             let logs = Logs::install(&log)?;
@@ -236,7 +251,10 @@ fn execute(cli: Cli) -> Result<(), String> {
                 http,
                 tls,
             };
-            let running = noded::run(context, &workspace, logs, listen)
+            let halo = HaloConfig {
+                egress_bytes_per_sec: halo_egress,
+            };
+            let running = noded::run(context, &workspace, logs, listen, halo)
                 .await
                 .sentence()?;
             println!("http {}", running.http);

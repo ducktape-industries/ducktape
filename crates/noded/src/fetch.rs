@@ -1,31 +1,21 @@
-// How a node comes to hold the bytes a block or a relayed frame needs: it asks the network through a
-// `Fetch` and installs what comes back. Used by run's pump and verify and by the relay.
+// How a node comes to hold the bytes a block or a relayed frame needs: it asks halo through a
+// `Fetch` and installs what comes back. Used by run's pump and verify and by the relay; run
+// seats halo with each epoch's members.
 
 use std::future::Future;
 use std::pin::Pin;
 
 use abi::BlobId;
+use abi::role::validators::Member;
+use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
+use halo::{Class, Halo, Seat, Want};
 use host::attach::Attachment;
 use node::Block;
 
 use crate::{Context, Result, Shared};
 
 pub type Fetched<'a> = Pin<Box<dyn Future<Output = Vec<u8>> + Send + 'a>>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Class {
-    Critical,
-    Member,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Want {
-    pub id: BlobId,
-    pub len: Option<u64>,
-    pub class: Class,
-    pub from: Option<PublicKey>,
-}
 
 pub trait Fetch: Send + Sync + 'static {
     fn fetch(&self, want: Want) -> Fetched<'_>;
@@ -79,18 +69,24 @@ pub async fn repair<E: Context>(node: &Shared<E>, fetch: &dyn Fetch, id: BlobId)
     Ok(())
 }
 
-pub struct Nowhere;
-
-impl Fetch for Nowhere {
+impl<E: Context> Fetch for Halo<E> {
     fn fetch(&self, want: Want) -> Fetched<'_> {
-        tracing::warn!(
-            target: "ducktape::fetch",
-            event = "fetch_unserved",
-            id = ?want.id,
-            class = ?want.class,
-            reason = "no_halo",
-            "this node has no network to fetch blobs over; it waits"
-        );
-        Box::pin(futures::future::pending())
+        Box::pin(Halo::fetch(self, want))
     }
+}
+
+pub fn seats(members: &[Member], validators: &[Vec<u8>]) -> Vec<Seat> {
+    members
+        .iter()
+        .filter_map(|member| {
+            let key = PublicKey::decode(member.key.as_slice()).ok()?;
+            let endpoint = member.address.as_deref().and_then(|text| text.parse().ok());
+            let validator = validators.contains(&member.key);
+            Some(Seat {
+                key,
+                endpoint,
+                validator,
+            })
+        })
+        .collect()
 }

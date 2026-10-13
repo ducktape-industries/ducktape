@@ -6,12 +6,12 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use consensus::{Anchor, Cadence};
+use halo::Endpoint;
 use host::{Founding as FoundingProgram, FoundingView, Genesis, Limits, Roles};
 use node::Block;
 use rand_core::CryptoRng;
 use serde::Deserialize;
 
-use crate::endpoint::Endpoint;
 use crate::{Error, Result};
 
 const IDENTITY: &str = "identity.key";

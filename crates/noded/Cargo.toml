@@ -15,12 +15,12 @@ commonware-runtime = { workspace = true }
 commonware-utils = { workspace = true }
 consensus = { workspace = true }
 futures = { workspace = true }
+halo = { workspace = true }
 hex = "0.4"
 http-body-util = "0.1"
 host = { workspace = true }
 node = { workspace = true }
 rand_core = { workspace = true }
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 reqwest = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { workspace = true }
@@ -33,7 +33,6 @@ tokio-tungstenite = { workspace = true }
 toml = "0.8"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-url = "2"
 
 [dev-dependencies]
 blobs = { workspace = true }
@@ -41,5 +40,6 @@ fixture-module-registry = { path = "../kernel/fixtures/module-registry" }
 fixture-probe = { path = "../kernel/fixtures/probe" }
 fixture-relay = { path = "../kernel/fixtures/relay" }
 fixture-valset = { path = "../kernel/fixtures/valset" }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
