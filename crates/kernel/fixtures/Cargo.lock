@@ -115,6 +115,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fixture-awaits"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "program",
+]
+
+[[package]]
 name = "fixture-blobs"
 version = "0.1.0"
 dependencies = [
@@ -124,19 +132,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "fixture-feed"
-version = "0.1.0"
-dependencies = [
- "abi",
- "borsh",
- "program",
-]
-
-[[package]]
 name = "fixture-identity"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "program",
+]
+
+[[package]]
+name = "fixture-oracle"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
  "program",
 ]
 

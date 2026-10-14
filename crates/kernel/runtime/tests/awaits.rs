@@ -1,5 +1,5 @@
-//! A program that awaits: each run that cannot finish parks as an image of its memory, and a
-//! fresh runtime resumes that image with a ticket's answer until the program finishes.
+//! A program that awaits: a run that cannot finish parks, resumes on its live instance or, frozen
+//! to an image of its changed pages, on a fresh runtime, until the program finishes.
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -7,8 +7,8 @@ use abi::{
     Cause, Env, HostOp, HostReply, Invocation, Origin, Principal, ProgramCall, Refusal, Roles,
     reason,
 };
-use fixture_awaiter::{Finished, Plan};
-use runtime::{Fault, Host, Image, Limits, PAGE_BYTES, Ran, Runtime};
+use fixture_awaiter::{ANSWERS, Finished, Plan};
+use runtime::{Fault, Host, Limits, PAGE_BYTES, Ran, Runtime, Suspended};
 
 const AWAITER: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaiter.wasm");
 const LIMITS: Limits = Limits {
@@ -18,7 +18,7 @@ const LIMITS: Limits = Limits {
 
 #[derive(Default)]
 struct Bench {
-    tickets: BTreeMap<u64, (String, Vec<u8>)>,
+    tickets: BTreeMap<u64, Vec<u8>>,
     state: BTreeMap<Vec<u8>, Vec<u8>>,
     output: Option<Vec<u8>>,
 }
@@ -27,9 +27,9 @@ struct Bench {
 impl Host for Bench {
     async fn call(&mut self, op: HostOp, _fuel: &mut Option<u64>) -> HostReply {
         match op {
-            HostOp::Await { target, payload } => {
+            HostOp::Await { payload, .. } => {
                 let ticket = self.tickets.len() as u64 + 1;
-                self.tickets.insert(ticket, (target, payload));
+                self.tickets.insert(ticket, payload);
                 HostReply::Ticket(ticket)
             }
             HostOp::Set { key, value } => {
@@ -62,6 +62,7 @@ fn at(height: u64, call: ProgramCall) -> Invocation {
                 validators: "validators".into(),
                 identity: "identity".into(),
                 blobs: "blobs".into(),
+                awaits: "awaits".into(),
             },
             cause: Cause::Direct,
         },
@@ -70,7 +71,14 @@ fn at(height: u64, call: ProgramCall) -> Invocation {
 }
 
 fn plan(kept: u32, together: bool) -> ProgramCall {
-    ProgramCall::Execute(abi::encode(&Plan { kept, together }))
+    let plan = Plan {
+        target: "oracle".into(),
+        asks: vec![b"first".to_vec(), b"second".to_vec()],
+        together,
+        kept,
+        fail: false,
+    };
+    ProgramCall::Execute(abi::encode(&plan))
 }
 
 fn answer(ticket: u64, answer: &[u8]) -> ProgramCall {
@@ -80,14 +88,19 @@ fn answer(ticket: u64, answer: &[u8]) -> ProgramCall {
     }
 }
 
-fn asked(what: &[u8]) -> (String, Vec<u8>) {
-    ("oracle".into(), what.to_vec())
+fn parked(ran: Ran) -> Suspended {
+    match ran {
+        Ran::Parked(suspended) => suspended,
+        Ran::Done(reply) => panic!("the program finished ({reply:?}) where it should park"),
+    }
 }
 
-fn parked(ran: Ran) -> Image {
+fn done(ran: Ran) {
     match ran {
-        Ran::Parked(image) => image,
-        Ran::Done(reply) => panic!("the program finished ({reply:?}) where it should park"),
+        Ran::Done(reply) => assert_eq!(reply, Ok(())),
+        Ran::Parked(suspended) => {
+            panic!("the program parked ({suspended:?}) where it should finish")
+        }
     }
 }
 
@@ -95,62 +108,53 @@ fn finished(bench: &Bench) -> Finished {
     abi::decode(bench.output.as_deref().expect("a finished program outputs")).unwrap()
 }
 
-async fn fresh() -> (Runtime, runtime::Code) {
+fn fresh() -> (Runtime, runtime::Code) {
     let runtime = Runtime::new(LIMITS);
     let code = runtime.load(AWAITER).unwrap();
     (runtime, code)
 }
 
 #[tokio::test]
-async fn a_frame_parks_at_each_await_and_a_fresh_runtime_resumes_it() {
+async fn a_frozen_frame_resumes_on_a_fresh_runtime_at_each_await() {
     let mut bench = Bench::default();
-    let (runtime, code) = fresh().await;
-    let started = runtime
-        .start(
-            &code,
-            at(12, plan(1000, false)),
-            &mut bench,
-            &mut LIMITS.fuel.clone(),
-        )
-        .await
-        .unwrap();
-    let first = parked(started);
-    assert_eq!(bench.tickets, BTreeMap::from([(1, asked(b"first"))]));
+    let (runtime, code) = fresh();
+    let fuel = &mut LIMITS.fuel.clone();
+    let first = parked(
+        runtime
+            .start(&code, at(12, plan(1000, false)), &mut bench, fuel)
+            .await
+            .unwrap(),
+    );
+    let image = runtime.freeze(&first).await.unwrap();
+    assert_eq!(bench.tickets, BTreeMap::from([(1, b"first".to_vec())]));
     assert!(bench.state.is_empty());
 
-    let (runtime, code) = fresh().await;
-    let resumed = runtime
-        .resume(
-            &code,
-            &first,
-            at(13, answer(1, b"A")),
-            &mut bench,
-            &mut LIMITS.fuel.clone(),
-        )
-        .await
-        .unwrap();
-    let second = parked(resumed);
-    assert_eq!(bench.state.get(b"first".as_slice()), Some(&b"A".to_vec()));
-    assert_eq!(bench.tickets.get(&2), Some(&asked(b"second")));
+    let (runtime, code) = fresh();
+    let thawed = runtime.thaw(&code, &image, fuel).await.unwrap();
+    let second = parked(
+        runtime
+            .resume(thawed, at(13, answer(1, b"A")), &mut bench, fuel)
+            .await
+            .unwrap(),
+    );
+    let kept: Vec<Result<Vec<u8>, Refusal>> = vec![Ok(b"A".to_vec())];
+    assert_eq!(bench.state.get(ANSWERS), Some(&abi::encode(&kept)));
+    assert_eq!(bench.tickets.get(&2), Some(&b"second".to_vec()));
 
-    let (runtime, code) = fresh().await;
-    let done = runtime
-        .resume(
-            &code,
-            &second,
-            at(14, answer(2, b"B")),
-            &mut bench,
-            &mut LIMITS.fuel.clone(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(done, Ran::Done(Ok(())));
+    let image = runtime.freeze(&second).await.unwrap();
+    let (runtime, code) = fresh();
+    let thawed = runtime.thaw(&code, &image, fuel).await.unwrap();
+    done(
+        runtime
+            .resume(thawed, at(14, answer(2, b"B")), &mut bench, fuel)
+            .await
+            .unwrap(),
+    );
     let sum = (0..1000u32).fold(0u8, |sum, i| sum.wrapping_add(i as u8));
     assert_eq!(
         finished(&bench),
         Finished {
-            first: b"A".to_vec(),
-            second: b"B".to_vec(),
+            answers: vec![Ok(b"A".to_vec()), Ok(b"B".to_vec())],
             height: 14,
             kept: 1000,
             sum,
@@ -159,9 +163,38 @@ async fn a_frame_parks_at_each_await_and_a_fresh_runtime_resumes_it() {
 }
 
 #[tokio::test]
+async fn a_live_frame_resumes_without_an_image() {
+    let mut bench = Bench::default();
+    let (runtime, code) = fresh();
+    let fuel = &mut LIMITS.fuel.clone();
+    let first = parked(
+        runtime
+            .start(&code, at(1, plan(0, false)), &mut bench, fuel)
+            .await
+            .unwrap(),
+    );
+    let second = parked(
+        runtime
+            .resume(first, at(1, answer(1, b"A")), &mut bench, fuel)
+            .await
+            .unwrap(),
+    );
+    done(
+        runtime
+            .resume(second, at(1, answer(2, b"B")), &mut bench, fuel)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        finished(&bench).answers,
+        vec![Ok(b"A".to_vec()), Ok(b"B".to_vec())]
+    );
+}
+
+#[tokio::test]
 async fn two_awaits_together_park_once_and_finish_in_either_order() {
     let mut bench = Bench::default();
-    let (runtime, code) = fresh().await;
+    let (runtime, code) = fresh();
     let fuel = &mut LIMITS.fuel.clone();
     let both = parked(
         runtime
@@ -172,26 +205,26 @@ async fn two_awaits_together_park_once_and_finish_in_either_order() {
     assert_eq!(bench.tickets.len(), 2);
     let one = parked(
         runtime
-            .resume(&code, &both, at(2, answer(2, b"second")), &mut bench, fuel)
+            .resume(both, at(2, answer(2, b"second")), &mut bench, fuel)
             .await
             .unwrap(),
     );
-    let done = runtime
-        .resume(&code, &one, at(3, answer(1, b"first")), &mut bench, fuel)
-        .await
-        .unwrap();
-    assert_eq!(done, Ran::Done(Ok(())));
-    let finished = finished(&bench);
+    done(
+        runtime
+            .resume(one, at(3, answer(1, b"first")), &mut bench, fuel)
+            .await
+            .unwrap(),
+    );
     assert_eq!(
-        (finished.first, finished.second),
-        (b"first".to_vec(), b"second".to_vec())
+        finished(&bench).answers,
+        vec![Ok(b"first".to_vec()), Ok(b"second".to_vec())]
     );
 }
 
 #[tokio::test]
 async fn a_run_that_may_not_park_faults_when_its_program_parks() {
     let mut bench = Bench::default();
-    let (runtime, code) = fresh().await;
+    let (runtime, code) = fresh();
     let ran = runtime
         .run(
             &code,
@@ -203,36 +236,10 @@ async fn a_run_that_may_not_park_faults_when_its_program_parks() {
     assert!(matches!(ran, Err(Fault::Protocol(_))), "{ran:?}");
 }
 
-fn pages(image: &Image) -> impl Iterator<Item = &[u8]> {
-    image.memory.chunks(PAGE_BYTES)
-}
-
-fn changed(image: &Image, initial: &Image, chunk: usize) -> usize {
-    let blank = vec![0u8; chunk];
-    image
-        .memory
-        .chunks(chunk)
-        .zip(
-            initial
-                .memory
-                .chunks(chunk)
-                .chain(std::iter::repeat(blank.as_slice())),
-        )
-        .filter(|(now, before)| now != before)
-        .count()
-        * chunk
-}
-
 #[tokio::test]
 #[ignore = "a measurement: run with --ignored --nocapture"]
 async fn measure_what_a_parked_frame_costs() {
-    let (runtime, code) = fresh().await;
-    let initial = runtime.initial(&code).await.unwrap();
-    println!(
-        "initial memory: {} pages, {} bytes",
-        initial.memory.len() / PAGE_BYTES,
-        initial.memory.len()
-    );
+    let (runtime, code) = fresh();
     for kept in [0u32, 64 << 10, 1 << 20, 8 << 20] {
         let mut bench = Bench::default();
         let fuel = &mut LIMITS.fuel.clone();
@@ -243,30 +250,25 @@ async fn measure_what_a_parked_frame_costs() {
                 .await
                 .unwrap(),
         );
+        let image = runtime.freeze(&first).await.unwrap();
         let parked_in = started.elapsed();
-        let spent_start = LIMITS.fuel.unwrap() - fuel.unwrap();
         let fuel = &mut LIMITS.fuel.clone();
         let resumed_at = Instant::now();
+        let thawed = runtime.thaw(&code, &image, fuel).await.unwrap();
         let second = parked(
             runtime
-                .resume(&code, &first, at(2, answer(1, b"A")), &mut bench, fuel)
+                .resume(thawed, at(2, answer(1, b"A")), &mut bench, fuel)
                 .await
                 .unwrap(),
         );
         let resumed_in = resumed_at.elapsed();
         let spent_resume = LIMITS.fuel.unwrap() - fuel.unwrap();
-        let nonzero = pages(&second)
-            .filter(|page| page.iter().any(|byte| *byte != 0))
-            .count();
+        let image = runtime.freeze(&second).await.unwrap();
         println!(
-            "kept {kept:>8} B: image {:>4} pages ({:>9} B), {:>3} nonzero; changed from the initial image: {:>8} B in 64 KiB pages, {:>8} B in 4 KiB chunks; start {:>8.2?} ({spent_start} fuel), resume {:>8.2?} ({spent_resume} fuel)",
-            second.memory.len() / PAGE_BYTES,
-            second.memory.len(),
-            nonzero,
-            changed(&second, &initial, PAGE_BYTES),
-            changed(&second, &initial, 4 << 10),
-            parked_in,
-            resumed_in,
+            "kept {kept:>8} B: memory {:>9} B, image {:>5} pages of {PAGE_BYTES} B ({:>9} B); park {parked_in:>8.2?}, resume {resumed_in:>8.2?} ({spent_resume} fuel)",
+            image.length,
+            image.pages.len(),
+            image.kept_bytes(),
         );
     }
 }

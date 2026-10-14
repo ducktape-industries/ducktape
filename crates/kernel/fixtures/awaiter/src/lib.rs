@@ -1,17 +1,22 @@
-//! A program whose execute awaits the host: it asks twice, one after the other or together,
-//! writes each answer, and outputs both with the height it finished at and the heap it kept.
+//! A program whose execute awaits: it calls `target` with each ask, one after another or all
+//! together, keeps each answer, and outputs them with the height it finished at and the heap it kept.
+use abi::role::awaits::Answer;
 use borsh::{BorshDeserialize, BorshSerialize};
+
+pub const ANSWERS: &[u8] = b"answers";
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Plan {
-    pub kept: u32,
+    pub target: String,
+    pub asks: Vec<Vec<u8>>,
     pub together: bool,
+    pub kept: u32,
+    pub fail: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Finished {
-    pub first: Vec<u8>,
-    pub second: Vec<u8>,
+    pub answers: Vec<Answer>,
     pub height: u64,
     pub kept: u32,
     pub sum: u8,
@@ -23,67 +28,75 @@ mod program {
     use core::pin::Pin;
     use core::task::Poll;
 
-    use abi::{Env, ProgramReply, Refusal, reason};
-    use program::awaiting::{Answer, AwaitingProgram, Call, call_raw, ctx, env};
+    use abi::role::awaits::Answer;
+    use abi::{ProgramReply, Refusal, reason};
+    use program::awaiting::{AwaitingProgram, Call, Ctx};
 
-    use crate::{Finished, Plan};
+    use crate::{ANSWERS, Finished, Plan};
 
     struct Awaiter;
 
-    fn ask(what: &[u8]) -> Call {
-        call_raw("oracle", what.to_vec())
-    }
-
-    async fn together(mut a: Call, mut b: Call) -> (Answer, Answer) {
-        let mut first = None;
-        let mut second = None;
+    async fn together(calls: Vec<Call>) -> Vec<Answer> {
+        let mut calls: Vec<(Call, Option<Answer>)> =
+            calls.into_iter().map(|call| (call, None)).collect();
         poll_fn(|context| {
-            if first.is_none()
-                && let Poll::Ready(answer) = Pin::new(&mut a).poll(context)
-            {
-                first = Some(answer);
+            for (call, answer) in calls.iter_mut() {
+                if answer.is_none()
+                    && let Poll::Ready(ready) = Pin::new(call).poll(context)
+                {
+                    *answer = Some(ready);
+                }
             }
-            if second.is_none()
-                && let Poll::Ready(answer) = Pin::new(&mut b).poll(context)
-            {
-                second = Some(answer);
-            }
-            match (first.is_some(), second.is_some()) {
-                (true, true) => Poll::Ready(()),
-                _ => Poll::Pending,
+            let all = calls.iter().all(|(_, answer)| answer.is_some());
+            match all {
+                true => Poll::Ready(()),
+                false => Poll::Pending,
             }
         })
         .await;
-        (first.unwrap(), second.unwrap())
+        calls.into_iter().filter_map(|(_, answer)| answer).collect()
+    }
+
+    async fn run(mut ctx: Ctx, plan: Plan) -> ProgramReply {
+        let kept: Vec<u8> = (0..plan.kept).map(|i| i as u8).collect();
+        let answers = match plan.together {
+            true => {
+                let calls = plan
+                    .asks
+                    .into_iter()
+                    .map(|ask| ctx.call_raw(plan.target.clone(), ask))
+                    .collect();
+                together(calls).await
+            }
+            false => {
+                let mut answers = Vec::new();
+                for ask in plan.asks {
+                    let answer = ctx.call_raw(plan.target.clone(), ask).await;
+                    answers.push(answer);
+                    ctx.put(ANSWERS, &answers);
+                }
+                answers
+            }
+        };
+        ctx.put(ANSWERS, &answers);
+        if plan.fail {
+            return Err(Refusal::new(reason::INVALID_INPUT, "asked to fail"));
+        }
+        let finished = Finished {
+            answers,
+            height: ctx.env().height,
+            kept: kept.len() as u32,
+            sum: kept.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+        };
+        ctx.output(abi::encode(&finished));
+        Ok(())
     }
 
     impl AwaitingProgram for Awaiter {
-        async fn execute(_env: Env, payload: Vec<u8>) -> ProgramReply {
+        async fn execute(ctx: Ctx, payload: Vec<u8>) -> ProgramReply {
             let plan: Plan = abi::decode(&payload)
                 .map_err(|fault| Refusal::new(reason::INVALID_INPUT, fault.sentence))?;
-            let kept: Vec<u8> = (0..plan.kept).map(|i| i as u8).collect();
-            let (first, second) = match plan.together {
-                true => {
-                    let (first, second) = together(ask(b"first"), ask(b"second")).await;
-                    (first?, second?)
-                }
-                false => {
-                    let first = ask(b"first").await?;
-                    ctx().set(b"first".to_vec(), first.clone());
-                    let second = ask(b"second").await?;
-                    (first, second)
-                }
-            };
-            ctx().set(b"second".to_vec(), second.clone());
-            let finished = Finished {
-                first,
-                second,
-                height: env().height,
-                kept: kept.len() as u32,
-                sum: kept.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
-            };
-            ctx().output(abi::encode(&finished));
-            Ok(())
+            run(ctx, plan).await
         }
     }
 

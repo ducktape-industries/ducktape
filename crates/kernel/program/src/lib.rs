@@ -266,6 +266,12 @@ mod context {
         }
     }
 
+    impl Query {
+        pub(crate) fn new() -> Query {
+            Query(())
+        }
+    }
+
     impl Reads for Execute {
         fn host(&self, op: &HostOp) -> HostReply {
             host(op)
@@ -362,6 +368,41 @@ mod context {
                 HostReply::Done => {}
                 other => protocol("done", other),
             }
+        }
+
+        pub fn defer(&mut self) -> Result<abi::role::awaits::Ticket, Refusal> {
+            match host(&HostOp::Defer) {
+                HostReply::Ticket(ticket) => Ok(ticket),
+                HostReply::Refused(refusal) => Err(refusal),
+                other => protocol("ticket", other),
+            }
+        }
+
+        pub fn resume(
+            &mut self,
+            frame: abi::role::awaits::FrameId,
+            ticket: abi::role::awaits::Ticket,
+            answer: abi::role::awaits::Answer,
+        ) -> Result<(), Refusal> {
+            match host(&HostOp::Resume {
+                frame,
+                ticket,
+                answer,
+            }) {
+                HostReply::Done => Ok(()),
+                HostReply::Refused(refusal) => Err(refusal),
+                other => protocol("done", other),
+            }
+        }
+
+        pub fn resolve(
+            &mut self,
+            env: &Env,
+            ticket: abi::role::awaits::Ticket,
+            answer: abi::role::awaits::Answer,
+        ) {
+            let op = abi::role::awaits::Op::Resolve { ticket, answer };
+            self.emit(env.roles.awaits.clone(), abi::encode(&op), false);
         }
     }
 

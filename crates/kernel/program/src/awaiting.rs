@@ -1,14 +1,16 @@
-//! Programs whose `execute` is a Rust future: a `call` to another program parks the frame until
-//! the host resumes it with that program's answer, in a later run on a restored image of memory.
+//! Programs whose `execute` is a Rust future: a `call` to another program parks the run until
+//! that program's answer resumes it, in a later run on a restored image of this memory.
 use core::future::Future;
+use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use crate::context::{Execute, host};
+use abi::role::awaits::{Answer, Ticket};
 use borsh::{BorshDeserialize, BorshSerialize};
 
+use crate::context::{Execute, Query, host};
 use crate::{
     Env, HostOp, HostReply, Invocation, ProgramCall, ProgramId, ProgramReply, Refusal, reason,
 };
@@ -19,49 +21,71 @@ unsafe extern "C" {
 }
 
 pub trait AwaitingProgram: 'static {
-    fn execute(env: Env, payload: Vec<u8>) -> impl Future<Output = ProgramReply> + 'static;
+    fn execute(ctx: Ctx, payload: Vec<u8>) -> impl Future<Output = ProgramReply> + 'static;
+
+    fn query(_ctx: &mut Query, _env: &Env, _request: &[u8]) -> ProgramReply {
+        Err(Refusal::new(
+            reason::UNSUPPORTED,
+            "this program answers no query",
+        ))
+    }
 }
 
 type Root = Pin<Box<dyn Future<Output = ProgramReply>>>;
 
-pub type Answer = Result<Vec<u8>, Refusal>;
-
 thread_local! {
     static ROOT: RefCell<Option<Root>> = const { RefCell::new(None) };
-    static ANSWERS: RefCell<BTreeMap<u64, Answer>> = const { RefCell::new(BTreeMap::new()) };
+    static ANSWERS: RefCell<BTreeMap<Ticket, Answer>> = const { RefCell::new(BTreeMap::new()) };
     static ENV: RefCell<Option<Env>> = const { RefCell::new(None) };
 }
 
-pub fn env() -> Env {
-    ENV.with(|env| env.borrow().clone())
-        .expect("every run sets the env before it polls")
+pub struct Ctx {
+    execute: Execute,
 }
 
-pub fn ctx() -> Execute {
-    Execute::new()
-}
+impl Deref for Ctx {
+    type Target = Execute;
 
-pub fn call_raw(target: impl Into<ProgramId>, payload: Vec<u8>) -> Call {
-    Call::Unsent {
-        target: target.into(),
-        payload,
+    fn deref(&self) -> &Execute {
+        &self.execute
     }
 }
 
-pub async fn call<O: BorshSerialize, R: BorshDeserialize>(
-    target: impl Into<ProgramId>,
-    op: &O,
-) -> Result<R, Refusal> {
-    let answer = call_raw(target, abi::encode(op)).await?;
-    abi::decode(&answer).map_err(|fault| Refusal::new(reason::PROTOCOL, fault.sentence))
+impl DerefMut for Ctx {
+    fn deref_mut(&mut self) -> &mut Execute {
+        &mut self.execute
+    }
+}
+
+impl Ctx {
+    pub fn env(&self) -> Env {
+        ENV.with(|env| env.borrow().clone())
+            .expect("every run sets its env before it polls")
+    }
+
+    pub fn call_raw(&self, target: impl Into<ProgramId>, payload: Vec<u8>) -> Call {
+        Call::Unsent {
+            target: target.into(),
+            payload,
+        }
+    }
+
+    pub async fn call<O: BorshSerialize, R: BorshDeserialize>(
+        &self,
+        target: impl Into<ProgramId>,
+        op: &O,
+    ) -> Result<R, Refusal> {
+        let answer = self.call_raw(target, abi::encode(op)).await?;
+        abi::decode(&answer).map_err(|fault| Refusal::new(reason::PROTOCOL, fault.sentence))
+    }
 }
 
 pub enum Call {
     Unsent { target: ProgramId, payload: Vec<u8> },
-    Waiting(u64),
+    Waiting(Ticket),
 }
 
-fn issue(target: ProgramId, payload: Vec<u8>) -> Result<u64, Refusal> {
+fn issue(target: ProgramId, payload: Vec<u8>) -> Result<Ticket, Refusal> {
     match host(&HostOp::Await { target, payload }) {
         HostReply::Ticket(ticket) => Ok(ticket),
         HostReply::Refused(refusal) => Err(refusal),
@@ -110,7 +134,12 @@ fn run<P: AwaitingProgram>(invocation: Invocation) -> ProgramReply {
     let Invocation { env, call } = invocation;
     ENV.with(|current| *current.borrow_mut() = Some(env.clone()));
     match call {
-        ProgramCall::Execute(payload) => poll(Box::pin(P::execute(env, payload))),
+        ProgramCall::Execute(payload) => {
+            let ctx = Ctx {
+                execute: Execute::new(),
+            };
+            poll(Box::pin(P::execute(ctx, payload)))
+        }
         ProgramCall::Resume { ticket, answer } => {
             ANSWERS.with(|answers| answers.borrow_mut().insert(ticket, answer));
             let Some(root) = ROOT.with(|parked| parked.borrow_mut().take()) else {
@@ -118,10 +147,11 @@ fn run<P: AwaitingProgram>(invocation: Invocation) -> ProgramReply {
             };
             poll(root)
         }
+        ProgramCall::Query(request) => P::query(&mut Query::new(), &env, &request),
         ProgramCall::Init(_) => Ok(()),
-        ProgramCall::Query(_) | ProgramCall::Hook(_) => Err(Refusal::new(
+        ProgramCall::Hook(_) => Err(Refusal::new(
             reason::UNSUPPORTED,
-            "an awaiting program only executes",
+            "an awaiting program is no hook",
         )),
     }
 }

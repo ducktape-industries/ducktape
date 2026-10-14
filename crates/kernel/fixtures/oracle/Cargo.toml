@@ -1,5 +1,5 @@
 [package]
-name = "fixture-feed"
+name = "fixture-oracle"
 version.workspace = true
 edition.workspace = true
 
