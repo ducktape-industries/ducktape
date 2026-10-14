@@ -462,3 +462,49 @@ fn throughput_over_tcp() {
 fn throughput_over_ws() {
     throughput(Listens::Ws);
 }
+
+async fn dialed_without_a_certificate(to: &Node, alpn: &[u8]) -> quinn::Connection {
+    let at = to.halo.udp()[0];
+    let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let client = halo::quic::pinned_client(&to.key, alpn).unwrap();
+    endpoint
+        .connect_with(client, at, halo::quic::NAME)
+        .unwrap()
+        .await
+        .unwrap()
+}
+
+#[test]
+fn a_client_without_a_certificate_reaches_the_relay_on_the_live_alpn() {
+    runtime::Runner::default().start(|context| async move {
+        let node = node(context.child("node"), 1, Listens::Udp, 1 << 30).await;
+        let dialed = dialed_without_a_certificate(&node, live_wire::ALPN).await;
+        let accepted = node.halo.clients().lock().await.recv().await.unwrap();
+        assert!(
+            accepted.peer_identity().is_none(),
+            "a client presents no certificate"
+        );
+        assert_eq!(
+            halo::quic::alpn_of(&accepted).as_deref(),
+            Some(live_wire::ALPN)
+        );
+        let (mut send, _) = dialed.open_bi().await.unwrap();
+        send.write_all(b"hi").await.unwrap();
+        let (_, mut recv) = accepted.accept_bi().await.unwrap();
+        let mut hi = [0u8; 2];
+        recv.read_exact(&mut hi).await.unwrap();
+        assert_eq!(&hi, b"hi");
+    });
+}
+
+#[test]
+fn a_client_without_a_certificate_is_closed_on_the_halo_alpn() {
+    runtime::Runner::default().start(|context| async move {
+        let node = node(context.child("node"), 1, Listens::Udp, 1 << 30).await;
+        let dialed = dialed_without_a_certificate(&node, halo::quic::ALPN).await;
+        let quinn::ConnectionError::ApplicationClosed(closed) = dialed.closed().await else {
+            panic!("halo closes a member connection that carries no node key");
+        };
+        assert_eq!(closed.reason.as_ref(), b"no node key");
+    });
+}

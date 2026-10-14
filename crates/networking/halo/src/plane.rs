@@ -85,6 +85,12 @@ impl<T: Transport> Plane<T> {
         Plane { shared, tasks }
     }
 
+    /// The egress bucket every stream of this plane writes through; a stream that is not the
+    /// plane's (a client's) is paced with it too, so one budget covers the node's egress.
+    pub fn pacer(&self) -> &Pacer {
+        &self.shared.pacer
+    }
+
     pub fn streams(&self, lane: Lane, backlog: usize) -> Result<Streams<T>, Taken> {
         let mut lanes = self
             .shared

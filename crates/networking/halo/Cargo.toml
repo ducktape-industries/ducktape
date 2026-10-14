@@ -16,6 +16,7 @@ commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-stream = { workspace = true }
 futures = { workspace = true }
+live-wire = { workspace = true }
 quinn = { workspace = true }
 rand_core = { workspace = true }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
