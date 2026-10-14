@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use abi::role::awaits::{Answer, FrameId, Ticket};
+use abi::role::identity::AccountNumber;
 use abi::{
     BlobId, Cause, Env, HostOp, HostReply, Invocation, ItemRef, Message, Origin, Outcome,
     ProgramCall, ProgramId, Refusal, Roles, reason,
@@ -434,6 +435,7 @@ pub struct Called {
     pub ticket: Ticket,
     pub target: ProgramId,
     pub payload: Vec<u8>,
+    pub acting: Option<AccountNumber>,
 }
 
 pub struct Resumed {
@@ -492,12 +494,18 @@ where
         HostReply::Item(item)
     }
 
-    fn call(&mut self, target: ProgramId, payload: Vec<u8>) -> Result<HostReply> {
+    fn call(
+        &mut self,
+        target: ProgramId,
+        payload: Vec<u8>,
+        acting: Option<AccountNumber>,
+    ) -> Result<HostReply> {
         let ticket = parked::take_ticket(self.world.store.storage(), self.overlay)?;
         self.effects.calls.push(Called {
             ticket,
             target,
             payload,
+            acting,
         });
         Ok(HostReply::Ticket(ticket))
     }
@@ -564,9 +572,13 @@ where
                 *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
                 Ok(self.emit(message))
             }
-            HostOp::Await { target, payload } => {
+            HostOp::Await {
+                target,
+                payload,
+                acting,
+            } => {
                 *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
-                self.call(target, payload)
+                self.call(target, payload, acting)
             }
             HostOp::Defer => Ok(self.defer()),
             HostOp::Resume {

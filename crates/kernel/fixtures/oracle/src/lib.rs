@@ -1,11 +1,12 @@
-//! A program others call: it answers a call at once, refuses it, or defers it and answers in a
-//! later submission that resolves the ticket through the awaits role.
+//! A program others call: it answers a call at once or with who called it, refuses it, or defers
+//! it and answers in a later submission that resolves the ticket through the awaits role.
 use abi::role::awaits::{Answer, Ticket};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Ask {
     Now(Vec<u8>),
+    Sender,
     Later,
     Refuse(String),
 }
@@ -28,10 +29,14 @@ mod program {
 
     struct Oracle;
 
-    fn called(ctx: &mut Execute, ticket: u64, payload: &[u8]) -> Result<(), Refusal> {
+    fn called(ctx: &mut Execute, env: &Env, ticket: u64, payload: &[u8]) -> Result<(), Refusal> {
         match abi::decode(payload)? {
             Ask::Now(bytes) => {
                 ctx.output(bytes);
+                Ok(())
+            }
+            Ask::Sender => {
+                ctx.output(abi::encode(&env.sender));
                 Ok(())
             }
             Ask::Later => {
@@ -60,7 +65,7 @@ mod program {
     impl Program for Oracle {
         fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal> {
             match env.cause {
-                Cause::Call { ticket } => called(ctx, ticket, payload),
+                Cause::Call { ticket } => called(ctx, env, ticket, payload),
                 _ => submitted(ctx, env, payload),
             }
         }

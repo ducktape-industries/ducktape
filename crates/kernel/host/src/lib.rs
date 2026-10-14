@@ -85,6 +85,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub type BlockId = [u8; 32];
 pub type SubmissionId = [u8; 32];
 
+type Sender = std::result::Result<Option<Principal>, Refusal>;
+
 pub struct Genesis {
     pub network: Vec<u8>,
     pub roles: Roles,
@@ -1097,12 +1099,53 @@ where
         overlay: &Overlay,
         stage: &Stage,
         frame: &mut Frame,
-    ) -> Result<std::result::Result<Option<Principal>, Refusal>> {
+    ) -> Result<Sender> {
         let asked = identity::Query::OfProgram(program.to_owned());
         let account = self
             .account(asked, height, time, overlay, stage, &mut frame.fuel)
             .await?;
         Ok(account.map(|account| account.map(Principal::Account)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn own_sender(
+        &self,
+        program: &str,
+        asked: bool,
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+        frame: &mut Frame,
+    ) -> Result<Sender> {
+        match asked {
+            true => {
+                self.account_of(program, height, time, overlay, stage, frame)
+                    .await
+            }
+            false => Ok(Ok(None)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn sender(
+        &self,
+        program: &str,
+        acting: Option<identity::AccountNumber>,
+        own: &Sender,
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+        frame: &mut Frame,
+    ) -> Result<Sender> {
+        match acting {
+            None => Ok(own.clone()),
+            Some(account) => {
+                self.run_by(program, account, height, time, overlay, stage, frame)
+                    .await
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1115,7 +1158,7 @@ where
         overlay: &Overlay,
         stage: &Stage,
         frame: &mut Frame,
-    ) -> Result<std::result::Result<Option<Principal>, Refusal>> {
+    ) -> Result<Sender> {
         let asked = identity::Query::Runs {
             program: program.to_owned(),
             account,
@@ -1329,20 +1372,22 @@ where
         let (height, time) = (env.height, env.time);
         // the emitter's account, asked once for all its messages
         let as_itself = emitted.iter().any(|(_, message)| message.acting.is_none());
-        let emitter = if as_itself {
-            self.account_of(program, height, time, overlay, stage, frame)
-                .await?
-        } else {
-            Ok(None)
-        };
+        let emitter = self
+            .own_sender(program, as_itself, height, time, overlay, stage, frame)
+            .await?;
         for (item, message) in emitted {
-            let sender = match message.acting {
-                None => emitter.clone(),
-                Some(account) => {
-                    self.run_by(program, account, height, time, overlay, stage, frame)
-                        .await?
-                }
-            };
+            let sender = self
+                .sender(
+                    program,
+                    message.acting,
+                    &emitter,
+                    height,
+                    time,
+                    overlay,
+                    stage,
+                    frame,
+                )
+                .await?;
             let ran = match sender {
                 Err(refusal) => Run::finished(rejected(&message.target, refusal)),
                 Ok(sender) => {

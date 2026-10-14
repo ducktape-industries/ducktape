@@ -73,6 +73,7 @@ fn at(height: u64, call: ProgramCall) -> Invocation {
 fn plan(kept: u32, together: bool) -> ProgramCall {
     let plan = Plan {
         target: "oracle".into(),
+        acting: None,
         asks: vec![b"first".to_vec(), b"second".to_vec()],
         together,
         kept,
