@@ -47,8 +47,8 @@ programs it starts with. Every path is relative to the file.
 [programs](https://github.com/ducktape-industries/programs) publishes a
 founding for each commit on its `main`: the release `wasm-<commit>` carries
 `founding.tar.gz`, which holds every program it builds, packed with its
-view, and a `founding.toml` with only its network, time, key and address
-left to fill. The fields:
+view, and a `founding.toml` with only its network, time, key, address and
+halo address left to fill. The fields:
 
 ```toml
 network = "mynet"
@@ -58,14 +58,16 @@ block_time_ms = 1000
 member_cap = 16               # optional, default 16: the most members (validators and residents) it ever holds, 1 to 128; fixed at founding
 hooks = ["activity"]          # optional: founding programs the kernel tells of every frame; the programs role holds the list from here on
 
-[roles]                       # the founding program the kernel calls in each role; all three required
+[roles]                       # the founding program the kernel calls in each role; all four required
 programs = "programs"         # registers and swaps programs
 validators = "valset"         # seats each epoch's validators; runs membership and the validators' votes
 identity = "identity"         # resolves a key or a program to its account
+blobs = "blobs"               # records each bundle of blobs put and which validators hold it
 
 [[validators]]
 key = "…"                     # hex ed25519 public key: `ducktape identity`
 address = "tcp://a.example.org:9000"  # optional: where peers dial it; see Reach a node
+halo = "a.example.org:9100"   # host:port where members reach it over halo; `init --halo` fills this node's
 
 [[programs]]
 id = "programs"               # one entry per program; the programs and validators roles' params are the kernel's
@@ -119,8 +121,8 @@ through the programs role like any other change.
 curl -fsSL https://github.com/ducktape-industries/programs/releases/download/wasm-<commit>/founding.tar.gz | tar xz
 ducktape identity                                   # mint this workspace's node key
 $EDITOR founding/founding.toml                      # network, time (`date +%s000`), that key, this node's address
-ducktape init founding/founding.toml                # found the network in $DUCKTAPE_HOME
-ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844
+ducktape init founding/founding.toml --halo a.example.org:9100   # found the network in $DUCKTAPE_HOME
+ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100
 ```
 
 Any node joins through a running one. `join` signs an enrollment with the
@@ -131,8 +133,8 @@ chain and never votes or proposes. A validator named in the file joins the
 same way and keeps its seat.
 
 ```sh
-ducktape join https://a.example.org --invite <hex>
-ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844
+ducktape join https://a.example.org --halo b.example.org:9100 --invite <hex>
+ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100
 ```
 
 Membership changes only by the validators' vote. The door starts closed, so
@@ -168,16 +170,19 @@ need addresses.
   ngrok) or reverse proxy is reached at `wss://` the tunnel's name; it
   opens no port of its own.
 
-Halo, the network members fetch the blobs a frame attaches over, reaches a
-member at the same address. At a `tcp://` or `tls://` address it tries QUIC on
-UDP at that port first, so a node that also opens the port to UDP is served
-over QUIC; where UDP does not answer within two seconds it connects to the
-same socket instead. At a `ws://` or `wss://` address it opens a WebSocket at
-`/v1/halo`. `--halo-egress` caps the bytes per second a node sends over halo,
-8 MiB/s unless set.
+Halo is the network members move blobs over. It runs QUIC on UDP, apart
+from the mesh. Every member registers a halo address, `host:port`, that the
+other members dial: a founder in the founding file or with `init --halo`, a
+joiner with `join --halo`, and any member changes its own with
+`ducktape halo <host:port>`. A registered address with an unspecified or
+loopback host (`0.0.0.0`, `::`, `127.0.0.1`, `localhost`) is refused. `run
+--halo` names the UDP socket the node binds, where `0.0.0.0:<port>` is
+right. A connection carries streams both ways, so a member whose halo
+address takes no inbound UDP still takes part by dialing out. `--halo-egress` caps the bytes per second a node sends over halo;
+without it the node sends as fast as the path allows.
 
 ```sh
-ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844   # the tunnel serves https://b.example.org from 127.0.0.1:8844
+ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100   # the tunnel serves https://b.example.org from 127.0.0.1:8844
 ```
 
 ## Use a network
@@ -193,8 +198,7 @@ ducktape changes ping                   # follow a program's confirmed writes
 ducktape query ping request.bin         # a signed read-only call
 ducktape programs                       # every program and its code blob
 ducktape blob get sha256:…              # a blob's framed bytes
-ducktape blob put code.wasm --kind program  # put a blob on the node, print its id
-ducktape submit programs publish.bin --attach code.wasm --kind program
+ducktape blob put code.wasm --kind program --wait  # put a bundle, print its ids, wait until it is held
 ```
 
 Reads are open; writes are signed frames. Each frame names a recent block, its
@@ -209,17 +213,23 @@ a member without a vote lands like one submitted to a validator. A block holds
 at most 16 MiB of frames (`node::BLOCK_BYTES`); a frame no block can carry is
 refused.
 
-A frame attaches a blob instead of carrying its bytes, so a block stays
-small however large the blob. `submit --attach FILE` puts the file on the
-node as a blob of `--kind` (`blob` unless set) and sends the frame inside
-the `$attach` envelope, which names each blob by id and length
-(`host::attach`). A validator fetches each attached blob from the members
-over halo before it votes for the block. The program reads an attached blob
-only during that frame, and keeps it by putting it again. A frame attaches
-at most 64 blobs and a block at most 64 MiB of them. The programs role's
-`Publish` takes new program code this way: `blob put` prints the code's id
-for the payload to name, and the programs role refuses code its frame does not
-attach.
+Large bytes travel as blobs, never in a frame. `ducktape blob put FILE…
+--kind K` frames each file as a blob of kind `K` and uploads the files to the
+node together with a `Put` frame, signed by the active wallet key's account,
+that names each blob by id, length and kind. The node keeps the bytes only
+when the frame is a valid put naming exactly those blobs, then submits it.
+The program in the blobs role records the put as a numbered bundle. Every
+member gathers every bundle over halo, asking the member that relayed the
+put first, then the validators, then the residents. A validator that holds
+every blob of a bundle, each checked against its id and declared kind, signs
+a receipt with its node key. Once two thirds of the current validators have
+receipted a bundle, the blobs program marks it held, and stops listing who
+receipted. `--wait` follows the blobs program's confirmed writes until then.
+Consensus never waits on a blob: a program reads a blob that a program put
+or a held bundle names (`ctx.blob_get`), and a node that lacks one when a
+block reads it fetches it over halo before it applies the block. New program
+code is a bundle of kind `program`: the programs role schedules only code the
+blobs program reports held.
 
 The receipt `submit` prints is the node's prediction from its
 preconfirmed layer, not a verdict: a frame predicted to fail is still relayed
@@ -232,9 +242,10 @@ verb's `--help` carries the rest.
 
 | Layer | Where | What |
 | --- | --- | --- |
-| Kernel | `crates/kernel/` | `abi` (the bytes ABI), `program` (the small program SDK the fixtures compile against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `blobs` (one content-addressed store), `host` (the sandbox: submit, query, and the messages a frame emits, run in that frame), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
-| Programs | [`ducktape-industries/programs`](https://github.com/ducktape-industries/programs) | The contracts a program compiles against (`crates/sdk/abi`, a copy of `crates/kernel/abi` here, and `crates/sdk/program`, the full program SDK), the boot set (`crates/system/`: `programs`, `valset` and `identity`, whose suite founds this host over their bytes) and the app programs. The system programs beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
-| Network | `crates/networking/halo/` | `halo`, the network between members off consensus: QUIC on UDP at a member's tcp or tls port, a tcp, tls, ws or wss stream path where UDP does not answer, admission of current members by node key, lanes, the egress pacer and its priority classes, and the blob lane a node fetches attached blobs over |
+| Kernel | `crates/kernel/` | `abi` (the bytes ABI), `program` (the small program SDK the fixtures compile against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `host` (the sandbox: submit, query, and the messages a frame emits, run in that frame), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
+| Programs | [`ducktape-industries/programs`](https://github.com/ducktape-industries/programs) | The contracts a program compiles against (`crates/sdk/abi`, a copy of `crates/kernel/abi` here, and `crates/sdk/program`, the full program SDK), the boot set (`crates/system/`: `programs`, `valset`, `identity` and `blobs`, whose suite founds this host over their bytes) and the app programs. The system programs beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
+| Blobs | `crates/blob/` | `blob`: the framing a blob's id hashes and the blobs program's contract (wasm32, no features); the content-addressed store (feature `store`); and the service a node gathers, serves and receipts blobs with over halo (feature `node`) |
+| Network | `crates/networking/halo/` | `halo`, the network between members off consensus: QUIC on UDP at each member's registered halo address, admission of current members by node key, lanes, the egress pacer and its priority classes |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
 
 ## Develop
