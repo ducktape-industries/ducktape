@@ -1,6 +1,7 @@
 mod blocks;
 mod client;
 mod fetch;
+pub mod live;
 mod logs;
 mod mesh;
 mod network;
@@ -103,6 +104,7 @@ pub struct Daemon<E: Context> {
     pub shutdown: watch::Sender<bool>,
     pub relay: relay::Relay<E>,
     pub halo: Arc<halo::Halo<E>>,
+    pub live: Arc<live::Relay<E>>,
     mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).
     votes: Votes,
@@ -140,6 +142,7 @@ impl<E: Context> Daemon<E> {
     }
 
     pub fn publish(&self, applied: &Applied) {
+        self.live.invalidate(&applied.writes);
         let mut subscribers = self
             .subscribers
             .lock()

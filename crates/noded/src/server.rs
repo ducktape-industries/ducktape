@@ -56,6 +56,7 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::ADMIN, post(admin::<E>))
         .route(route::SYNC, post(sync::<E>))
         .route(route::METRICS, get(metrics::<E>))
+        .route(live_wire::PORT_ROUTE, get(live_port::<E>))
         .layer(middleware::from_fn_with_state(
             Lane::new(read_permits, READ_DEADLINE),
             bounded,
@@ -73,7 +74,8 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
             get(changes::<E>),
         )
         .route(route::P2P, get(p2p::<E>))
-        .route(halo::ROUTE, get(halo_socket::<E>));
+        .route(halo::ROUTE, get(halo_socket::<E>))
+        .route(live_wire::ROUTE, get(live_socket::<E>));
     reads.merge(uploads).merge(streams).with_state(daemon)
 }
 
@@ -539,6 +541,19 @@ async fn halo_socket<E: Context>(
 ) -> Response {
     let halo = daemon.halo.clone();
     upgrade.on_upgrade(move |socket| crate::transport::inbound_halo(socket, halo))
+}
+
+/// The UDP port a client dials for live tracks, `None` when halo bound none.
+async fn live_port<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Option<u16>> {
+    Reply::Answered(daemon.halo.udp().first().map(|at| at.port()))
+}
+
+async fn live_socket<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let live = daemon.live.clone();
+    crate::live::ws_upgrade(upgrade).on_upgrade(move |socket| live.serve_ws(socket))
 }
 
 #[cfg(test)]
