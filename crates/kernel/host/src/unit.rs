@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use abi::{
-    BlobId, Cause, Env, GuestCall, HostOp, HostReply, Invocation, ItemRef, Message, Origin,
+    BlobId, Cause, Env, ProgramCall, HostOp, HostReply, Invocation, ItemRef, Message, Origin,
     Outcome, ProgramId, Refusal, Roles, reason,
 };
 use blobs::{Blobs, Layered, Stage};
@@ -352,7 +352,7 @@ where
     stack.push(program);
     let invocation = Invocation {
         env: env.clone(),
-        call: GuestCall::Query(request),
+        call: ProgramCall::Query(request),
     };
     let mut unit = Query {
         world,

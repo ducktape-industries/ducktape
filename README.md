@@ -6,7 +6,7 @@ with a wallet key submits a signed frame; consensus orders it; every node
 applies it and commits one root. Two nodes that agree on that root agree on
 everything.
 
-Every program is a wasm guest the host runs against its own key space.
+Every program is wasm the host runs against its own key space.
 Programs speak one bytes ABI ([`crates/kernel/abi`](crates/kernel/abi)): a
 call is bytes in, a reply is bytes out, and reads, writes, blobs and messages
 to other programs go through host ops. A program ships as a file the founding
@@ -44,7 +44,7 @@ macOS on arm64: the prerelease `bin-<commit>` carries
 
 A founding file names the network, its cadence, its validators and the
 programs it starts with. Every path is relative to the file.
-[modules](https://github.com/ducktape-industries/modules) publishes a
+[programs](https://github.com/ducktape-industries/programs) publishes a
 founding for each commit on its `main`: the release `wasm-<commit>` carries
 `founding.tar.gz`, which holds every program it builds, packed with its
 view, and a `founding.toml` with only its network, time, key and address
@@ -56,10 +56,10 @@ time = 1700000000000          # the genesis block's time, unix milliseconds
 epoch_length = 64             # blocks per validator epoch
 block_time_ms = 1000
 member_cap = 16               # optional, default 16: the most members (validators and residents) it ever holds, 1 to 128; fixed at founding
-hooks = ["activity"]          # optional: founding programs the kernel tells of every frame; the registry holds the list from here on
+hooks = ["activity"]          # optional: founding programs the kernel tells of every frame; the programs role holds the list from here on
 
 [roles]                       # the founding program the kernel calls in each role; all three required
-registry = "module-registry"  # registers and swaps programs
+programs = "programs"         # registers and swaps programs
 validators = "valset"         # seats each epoch's validators; runs membership and the validators' votes
 identity = "identity"         # resolves a key or a program to its account
 
@@ -68,8 +68,8 @@ key = "…"                     # hex ed25519 public key: `ducktape identity`
 address = "tcp://a.example.org:9000"  # optional: where peers dial it; see Reach a node
 
 [[programs]]
-id = "module-registry"        # one entry per program; the registry's and validators' params are the kernel's
-code = "module_registry.wasm"
+id = "programs"               # one entry per program; the programs and validators roles' params are the kernel's
+code = "programs.wasm"
 
 [[programs]]
 id = "valset"
@@ -92,31 +92,31 @@ memory_bytes = 268435456
 The kernel calls programs by role, never by id. Founding refuses a role bound
 to a program the file does not list, and every frame's env carries the
 bindings (`Env.roles`). As the kernel admits a program, at founding or later
-off the registry, it gives the program an account: the identity role's
-`RegisterModule`, executed with the `System` origin. Once per frame the host
+off the programs role, it gives the program an account: the identity role's
+`RegisterProgram`, executed with the `System` origin. Once per frame the host
 asks the identity role who the frame acts as, `Account(key)` for a signed
-frame and `OfModule(program)` for a message or a reply, and passes the answer
+frame and `OfProgram(program)` for a message or a reply, and passes the answer
 as `Env.sender`; a refusal rejects the frame, and a key that holds no account
 runs as no one (`None`). A program may send a message as another account
-(`Message.acting`, the guest's `emit_as`): the host asks the identity role
+(`Message.acting`, the program SDK's `emit_as`): the host asks the identity role
 `Runs { program, account }` and runs the message as that account only when
 the role answers with it, so an agent account its manager hands to a program
-acts through that program with no key held anywhere. The interfaces are `abi::role::{registry,
-validators, identity}`; modules' `docs/roles.md` walks through them.
+acts through that program with no key held anywhere. The interfaces are `abi::role::{programs,
+validators, identity}`; the programs repository's `docs/roles.md` walks through them.
 
 A hook is a program the kernel tells of every frame a block carries, after
-the frame has run: at each block it asks the registry `Hooks(height)` and,
-after each frame, calls every hook it named with `GuestCall::Hook` and an
+the frame has run: at each block it asks the programs role `Hooks(height)` and,
+after each frame, calls every hook it named with `ProgramCall::Hook` and an
 `abi::hook::Record` (the height, the frame's position in the block, its
 signer, the account it acted as, its target and whether it applied), from
 the `System` origin on a fixed budget of `HOOK_FUEL`. A hook never changes
 the frame: one that refuses, traps, spends its fuel or sends a message has
 its own writes undone, and the block goes on. The founding file's `hooks`
-seeds the registry's list; a running network hooks or unhooks a program
-through the registry like any other change.
+seeds the programs role's list; a running network hooks or unhooks a program
+through the programs role like any other change.
 
 ```sh
-curl -fsSL https://github.com/ducktape-industries/modules/releases/download/wasm-<commit>/founding.tar.gz | tar xz
+curl -fsSL https://github.com/ducktape-industries/programs/releases/download/wasm-<commit>/founding.tar.gz | tar xz
 ducktape identity                                   # mint this workspace's node key
 $EDITOR founding/founding.toml                      # network, time (`date +%s000`), that key, this node's address
 ducktape init founding/founding.toml                # found the network in $DUCKTAPE_HOME
@@ -139,8 +139,8 @@ Membership changes only by the validators' vote. The door starts closed, so
 a stranger needs an invite a validator signed: `ducktape invite` prints one,
 good for one enrollment for 72 hours (`--hours`). Validators vote with
 `ducktape vote promote|demote|remove <key>`, `ducktape vote open|close` (the
-door), and `ducktape vote registry <op>`, which sends the registry a
-program change once it passes; the registry takes a change from nothing
+door), and `ducktape vote programs <op>`, which sends the programs role a
+program change once it passes; the programs role takes a change from nothing
 else. A motion passes when more than two thirds of the current validators
 vote for it. `ducktape leave` takes the node out; the last validator cannot
 leave. Each prints the block that carried it.
@@ -194,7 +194,7 @@ ducktape query ping request.bin         # a signed read-only call
 ducktape programs                       # every program and its code blob
 ducktape blob get sha256:…              # a blob's framed bytes
 ducktape blob put code.wasm --kind program  # put a blob on the node, print its id
-ducktape submit module-registry publish.bin --attach code.wasm --kind program
+ducktape submit programs publish.bin --attach code.wasm --kind program
 ```
 
 Reads are open; writes are signed frames. Each frame names a recent block, its
@@ -216,9 +216,9 @@ the `$attach` envelope, which names each blob by id and length
 (`host::attach`). A validator fetches each attached blob from the members
 over halo before it votes for the block. The program reads an attached blob
 only during that frame, and keeps it by putting it again. A frame attaches
-at most 64 blobs and a block at most 64 MiB of them. The registry's
+at most 64 blobs and a block at most 64 MiB of them. The programs role's
 `Publish` takes new program code this way: `blob put` prints the code's id
-for the payload to name, and the registry refuses code its frame does not
+for the payload to name, and the programs role refuses code its frame does not
 attach.
 
 The receipt `submit` prints is the node's prediction from its
@@ -232,8 +232,8 @@ verb's `--help` carries the rest.
 
 | Layer | Where | What |
 | --- | --- | --- |
-| Kernel | `crates/kernel/` | `abi` (the bytes ABI), `guest` (what a program compiles against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `blobs` (one content-addressed store), `host` (the sandbox: submit, query, and the messages a frame emits, run in that frame), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
-| Programs | [`ducktape-industries/modules`](https://github.com/ducktape-industries/modules) | The contracts a program compiles against (`crates/sdk/abi`, a copy of `crates/kernel/abi` here, and `crates/sdk/guest`, the module SDK), the boot set (`crates/system/`: `module-registry`, `valset` and `identity`, whose suite founds this host over their bytes) and the app modules. The system modules beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
+| Kernel | `crates/kernel/` | `abi` (the bytes ABI), `program` (the small program SDK the fixtures compile against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `blobs` (one content-addressed store), `host` (the sandbox: submit, query, and the messages a frame emits, run in that frame), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
+| Programs | [`ducktape-industries/programs`](https://github.com/ducktape-industries/programs) | The contracts a program compiles against (`crates/sdk/abi`, a copy of `crates/kernel/abi` here, and `crates/sdk/program`, the full program SDK), the boot set (`crates/system/`: `programs`, `valset` and `identity`, whose suite founds this host over their bytes) and the app programs. The system programs beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
 | Network | `crates/networking/halo/` | `halo`, the network between members off consensus: QUIC on UDP at a member's tcp or tls port, a tcp, tls, ws or wss stream path where UDP does not answer, admission of current members by node key, lanes, the egress pacer and its priority classes, and the blob lane a node fetches attached blobs over |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
 

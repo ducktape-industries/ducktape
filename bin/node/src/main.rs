@@ -185,9 +185,9 @@ enum VoteVerb {
     #[command(about = "make enrolling take an invite")]
     Close,
     #[command(
-        about = "send the registry an op, a file or stdin: schedule or cancel a program change"
+        about = "send the programs role an op, a file or stdin: schedule or cancel a program change"
     )]
-    Registry { op: Option<PathBuf> },
+    Programs { op: Option<PathBuf> },
 }
 
 #[derive(Subcommand)]
@@ -315,8 +315,8 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             println!("identity  {}", hex::encode(&status.identity));
             println!("contract  {}", status.contract);
             println!(
-                "roles     registry {}, validators {}, identity {}",
-                status.roles.registry, status.roles.validators, status.roles.identity
+                "roles     programs {}, validators {}, identity {}",
+                status.roles.programs, status.roles.validators, status.roles.identity
             );
             Ok(())
         }
@@ -572,7 +572,7 @@ fn motion(verb: VoteVerb) -> Result<Motion, String> {
         VoteVerb::Remove { key: member } => Motion::Remove { key: key(member)? },
         VoteVerb::Open => Motion::Door { open: true },
         VoteVerb::Close => Motion::Door { open: false },
-        VoteVerb::Registry { op } => Motion::Registry { op: bytes(op)? },
+        VoteVerb::Programs { op } => Motion::Programs { op: bytes(op)? },
     })
 }
 

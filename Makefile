@@ -112,7 +112,7 @@ audit:
 clean:
 	$(CARGO) clean
 
-## rebuild the kernel fixture programs (wasm32 guests the runtime and host
+## rebuild the kernel fixture programs (wasm32 programs the runtime and host
 ## tests load) and refresh their committed bytes.
 kernel-fixtures:
 	$(CARGO) build --manifest-path crates/kernel/fixtures/Cargo.toml \

@@ -1073,8 +1073,8 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "consensus",
- "fixture-module-registry",
  "fixture-probe",
+ "fixture-programs",
  "fixture-relay",
  "fixture-valset",
  "futures",
@@ -1880,16 +1880,7 @@ name = "fixture-identity"
 version = "0.1.0"
 dependencies = [
  "abi",
- "guest",
-]
-
-[[package]]
-name = "fixture-module-registry"
-version = "0.1.0"
-dependencies = [
- "abi",
- "borsh",
- "guest",
+ "program",
 ]
 
 [[package]]
@@ -1898,7 +1889,16 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "borsh",
- "guest",
+ "program",
+]
+
+[[package]]
+name = "fixture-programs"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "program",
 ]
 
 [[package]]
@@ -1907,7 +1907,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "borsh",
- "guest",
+ "program",
 ]
 
 [[package]]
@@ -1915,7 +1915,7 @@ name = "fixture-valset"
 version = "0.1.0"
 dependencies = [
  "abi",
- "guest",
+ "program",
 ]
 
 [[package]]
@@ -2184,14 +2184,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "guest"
-version = "0.1.0"
-dependencies = [
- "abi",
- "borsh",
-]
-
-[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2316,8 +2308,8 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "fixture-identity",
- "fixture-module-registry",
  "fixture-probe",
+ "fixture-programs",
  "fixture-relay",
  "fixture-valset",
  "keyscheme",
@@ -2875,8 +2867,8 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
- "fixture-module-registry",
  "fixture-probe",
+ "fixture-programs",
  "fixture-relay",
  "fixture-valset",
  "host",
@@ -2923,8 +2915,8 @@ dependencies = [
  "commonware-runtime",
  "commonware-utils",
  "consensus",
- "fixture-module-registry",
  "fixture-probe",
+ "fixture-programs",
  "fixture-relay",
  "fixture-valset",
  "futures",
@@ -3509,6 +3501,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "program"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
 ]
 
 [[package]]
@@ -4448,8 +4448,8 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "consensus",
- "fixture-module-registry",
  "fixture-probe",
+ "fixture-programs",
  "fixture-relay",
  "fixture-valset",
  "futures",

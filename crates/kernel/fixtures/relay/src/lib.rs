@@ -35,7 +35,7 @@ fn key(kind: &str, item: &ItemRef) -> Vec<u8> {
 #[cfg(target_arch = "wasm32")]
 mod program {
     use abi::{Cause, Env, ItemRef, Outcome, Refusal, reason};
-    use guest::{Execute, Program, Query, Reads};
+    use program::{Execute, Program, Query, Reads};
 
     use crate::{Script, done, got, sent};
 
@@ -91,5 +91,5 @@ mod program {
         Ok(())
     }
 
-    guest::program!(Relay);
+    program::program!(Relay);
 }

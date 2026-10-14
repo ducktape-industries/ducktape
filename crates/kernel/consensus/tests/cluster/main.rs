@@ -23,8 +23,8 @@ use node::{Block, Frame, Node, Sequenced, Source};
 
 mod epochs;
 
-const MODULE_REGISTRY: &[u8] =
-    include_bytes!("../../../fixtures/wasm/fixture_module_registry.wasm");
+const PROGRAMS: &[u8] =
+    include_bytes!("../../../fixtures/wasm/fixture_programs.wasm");
 const VALSET: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_identity.wasm");
@@ -83,15 +83,15 @@ fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
         roles: Roles {
-            registry: "module-registry".into(),
+            programs: "programs".into(),
             validators: "valset".into(),
             identity: "identity".into(),
         },
         validators: members.to_vec(),
         programs: vec![
             Founding {
-                program: "module-registry".into(),
-                code: MODULE_REGISTRY.to_vec(),
+                program: "programs".into(),
+                code: PROGRAMS.to_vec(),
                 params: Vec::new(),
             },
             Founding {

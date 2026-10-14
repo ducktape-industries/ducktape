@@ -5,7 +5,7 @@ use std::sync::Arc;
 use abi::{
     Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
     HostReply, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, Scheme, hook, reason,
-    role::{identity, registry, validators},
+    role::{identity, programs, validators},
 };
 use commonware_codec::Encode as _;
 use commonware_cryptography::bls12381::primitives::group::{Private, Scalar};
@@ -13,7 +13,7 @@ use commonware_cryptography::bls12381::primitives::ops;
 use commonware_cryptography::bls12381::primitives::variant::MinPk;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Storage as _, Supervisor as _, deterministic};
-use fixture_module_registry::Change;
+use fixture_programs::Change;
 use fixture_probe::{Reply, Step};
 use fixture_relay::Script;
 use host::attach::{ATTACH, ATTACHMENT_BYTES, Attached, Attachment, FRAME_ATTACHMENTS};
@@ -25,7 +25,7 @@ use keyscheme::testkit;
 use sha2::Digest as _;
 use state::{Commitment, SyncTarget, commitment_name};
 
-const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
+const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
@@ -59,21 +59,21 @@ const ACCOUNT: u64 = 1;
 
 fn roles() -> Roles {
     Roles {
-        registry: "module-registry".into(),
+        programs: "programs".into(),
         validators: "valset".into(),
         identity: "identity".into(),
     }
 }
 
 /// The account identity gives `ping`, the fourth founding program
-/// ([`standard`]): programs are numbered from `MODULES_FROM` in order.
-const PING: u64 = fixture_identity::MODULES_FROM + 3;
+/// ([`standard`]): programs are numbered from `PROGRAMS_FROM` in order.
+const PING: u64 = fixture_identity::PROGRAMS_FROM + 3;
 
-/// The registry, the validators and identity (where [`SIGNER`] holds
+/// The programs role, the validators and identity (where [`SIGNER`] holds
 /// [`ACCOUNT`]), then `programs`.
 fn genesis(programs: Vec<Founding>) -> Genesis {
     let bound = vec![
-        founding("module-registry", MODULE_REGISTRY, Vec::new()),
+        founding("programs", PROGRAMS, Vec::new()),
         founding("valset", VALSET, Vec::new()),
         founding(
             "identity",
@@ -267,7 +267,7 @@ fn answers(bytes: &[u8]) -> Vec<Reply> {
 
 /// The account identity says `program` runs as.
 async fn account_of(host: &Host<Ctx>, program: &str) -> Option<u64> {
-    let asked = identity::Query::OfModule(program.into());
+    let asked = identity::Query::OfProgram(program.into());
     let reply = host
         .query(
             Layer::Confirmed,
@@ -316,7 +316,7 @@ fn ok(output: &[u8]) -> Outcome {
 }
 
 fn change(program: &str, code: BlobId, params: Vec<u8>) -> Vec<u8> {
-    abi::encode(&Change::Set(registry::Entry {
+    abi::encode(&Change::Set(programs::Entry {
         program: program.to_owned(),
         code,
         params,
@@ -349,7 +349,7 @@ fn founding_admits_every_program_and_the_host_reopens() {
             .map(|r| r.program.as_str())
             .collect();
         let founded = [
-            "module-registry",
+            "programs",
             "valset",
             "identity",
             "ping",
@@ -364,7 +364,7 @@ fn founding_admits_every_program_and_the_host_reopens() {
             assert_eq!(pair, ["identity", *program]);
         }
         for (at, program) in founded.into_iter().enumerate() {
-            let number = fixture_identity::MODULES_FROM + at as u64;
+            let number = fixture_identity::PROGRAMS_FROM + at as u64;
             assert_eq!(account_of(&host, program).await, Some(number));
         }
         for receipt in &applied.admissions {
@@ -379,10 +379,10 @@ fn founding_admits_every_program_and_the_host_reopens() {
             ids,
             [
                 "identity",
-                "module-registry",
                 "ping",
                 "pong",
                 "probe",
+                "programs",
                 "valset"
             ]
         );
@@ -1539,7 +1539,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
 
         host.apply(block(
             1,
-            vec![submit("module-registry", change("echo", relay, Vec::new()))],
+            vec![submit("programs", change("echo", relay, Vec::new()))],
         ))
         .await
         .unwrap();
@@ -1551,7 +1551,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
                 receipt("echo", ok(b""), vec![]),
             ]
         );
-        let seventh = fixture_identity::MODULES_FROM + 6;
+        let seventh = fixture_identity::PROGRAMS_FROM + 6;
         assert_eq!(account_of(&host, "echo").await, Some(seventh));
         assert_eq!(host.programs().unwrap()["echo"], relay);
         let applied = host
@@ -1572,7 +1572,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
         host.apply(block(
             4,
             vec![submit(
-                "module-registry",
+                "programs",
                 change("echo", probe, script(Vec::new())),
             )],
         ))
@@ -1599,7 +1599,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
         host.apply(block(
             6,
             vec![submit(
-                "module-registry",
+                "programs",
                 abi::encode(&Change::Remove("echo".into())),
             )],
         ))
@@ -1629,12 +1629,12 @@ fn the_roster_admits_swaps_and_drops_programs() {
             9,
             vec![
                 submit(
-                    "module-registry",
+                    "programs",
                     change("ghost", BlobId::Sha256([9; 32]), Vec::new()),
                 ),
-                submit("module-registry", change("$evil", relay, Vec::new())),
+                submit("programs", change("$evil", relay, Vec::new())),
                 submit(
-                    "module-registry",
+                    "programs",
                     change("bad", probe, script(vec![Step::Fail("no".into())])),
                 ),
             ],
@@ -1661,10 +1661,10 @@ fn the_roster_admits_swaps_and_drops_programs() {
             ids,
             [
                 "identity",
-                "module-registry",
                 "ping",
                 "pong",
                 "probe",
+                "programs",
                 "valset"
             ]
         );
@@ -1689,7 +1689,7 @@ fn a_program_identity_gives_no_account_is_not_admitted() {
             1,
             vec![
                 closed(1),
-                submit("module-registry", change("late", relay, Vec::new())),
+                submit("programs", change("late", relay, Vec::new())),
             ],
         ))
         .await
@@ -2019,7 +2019,7 @@ fn fuel_is_a_network_parameter() {
         else {
             panic!("founding ran a program on ten fuel");
         };
-        assert_eq!(program, "module-registry");
+        assert_eq!(program, "programs");
         assert_eq!(refusal.reason, reason::TRAP);
 
         let dir = tempfile::tempdir().unwrap();
@@ -2354,7 +2354,7 @@ fn a_program_admitted_again_under_its_id_starts_empty() {
         host.apply(block(
             1,
             vec![submit(
-                "module-registry",
+                "programs",
                 change("echo", probe, script(vec![set])),
             )],
         ))
@@ -2368,7 +2368,7 @@ fn a_program_admitted_again_under_its_id_starts_empty() {
         host.apply(block(
             3,
             vec![submit(
-                "module-registry",
+                "programs",
                 abi::encode(&Change::Remove("echo".into())),
             )],
         ))
@@ -2381,7 +2381,7 @@ fn a_program_admitted_again_under_its_id_starts_empty() {
         host.apply(block(
             5,
             vec![submit(
-                "module-registry",
+                "programs",
                 change("echo", probe, script(Vec::new())),
             )],
         ))
@@ -2513,7 +2513,7 @@ fn told(host: &Host<Ctx>, height: u64, position: u32) -> Option<hook::Record> {
 }
 
 fn hook_change(change: Change) -> Submission {
-    submit("module-registry", abi::encode(&change))
+    submit("programs", abi::encode(&change))
 }
 
 fn told_of(target: &str, signer: &[u8], account: Option<u64>, applied: bool) -> hook::Record {
@@ -2638,7 +2638,7 @@ fn a_hook_that_fails_keeps_none_of_its_writes_and_the_block_goes_on() {
 }
 
 #[test]
-fn the_registry_hooks_and_unhooks_a_program_from_the_next_block() {
+fn the_programs_role_hooks_and_unhooks_a_program_from_the_next_block() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
@@ -2672,7 +2672,7 @@ fn the_registry_hooks_and_unhooks_a_program_from_the_next_block() {
 }
 
 #[test]
-fn the_kernel_hooks_only_what_the_registry_answers() {
+fn the_kernel_hooks_only_what_the_programs_role_answers() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut silent = hooked(standard(), &["probe"]);

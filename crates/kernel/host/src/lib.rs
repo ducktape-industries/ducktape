@@ -10,9 +10,9 @@ use std::path::Path;
 /// that leaves a role empty, or names a program it does not found, is refused.
 pub use abi::Roles;
 use abi::{
-    BlobId, Cause, Env, GuestCall, HashKind, Invocation, Origin, Outcome, Principal, ProgramId,
+    BlobId, Cause, Env, ProgramCall, HashKind, Invocation, Origin, Outcome, Principal, ProgramId,
     Refusal, Root, Scan, hook, reason,
-    role::{identity, registry, validators},
+    role::{identity, programs, validators},
 };
 use blobs::{Blobs, Layered, Stage};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -87,11 +87,11 @@ pub struct Genesis {
     pub roles: Roles,
     /// The validators program's founding params: the kernel writes them.
     pub validators: Vec<validators::Member>,
-    /// The registry's founding params are the kernel's too: every founding
+    /// The programs role's founding params are the kernel's too: every founding
     /// program and view.
     pub programs: Vec<Founding>,
     /// Views with no program behind them: each blob is stored and listed by
-    /// the registry under its name; nothing is admitted.
+    /// the programs role under its name; nothing is admitted.
     pub views: Vec<FoundingView>,
     pub hooks: Vec<ProgramId>,
     pub limits: Limits,
@@ -309,10 +309,10 @@ where
             namespace::ROLES.to_vec(),
             abi::encode(&genesis.roles),
         );
-        let mut entries: Vec<registry::Entry> = genesis
+        let mut entries: Vec<programs::Entry> = genesis
             .programs
             .into_iter()
-            .map(|founding| registry::Entry {
+            .map(|founding| programs::Entry {
                 program: founding.program,
                 code: put_code(&mut overlay, &mut stage, &founding.code),
                 params: founding.params,
@@ -320,7 +320,7 @@ where
             .collect();
         let roles = &genesis.roles;
         for (role, program) in [
-            ("registry", &roles.registry),
+            ("programs", &roles.programs),
             ("validators", &roles.validators),
             ("identity", &roles.identity),
         ] {
@@ -338,9 +338,9 @@ where
                 return Err(Error::Unhooked(hook.clone()));
             }
         }
-        // the registry, the validators, then identity are admitted before
+        // the programs role, the validators, then identity are admitted before
         // the rest
-        let founding_roles = [&roles.registry, &roles.validators, &roles.identity];
+        let founding_roles = [&roles.programs, &roles.validators, &roles.identity];
         entries.sort_by_key(|entry| {
             founding_roles
                 .iter()
@@ -356,10 +356,10 @@ where
                 entry.params = params.clone();
             }
         }
-        let views: Vec<registry::View> = genesis
+        let views: Vec<programs::View> = genesis
             .views
             .into_iter()
-            .map(|founding| registry::View {
+            .map(|founding| programs::View {
                 name: founding.name,
                 view: put_code(&mut overlay, &mut stage, &founding.view),
             })
@@ -378,7 +378,7 @@ where
                 });
             }
         }
-        entries[0].params = abi::encode(&registry::Genesis {
+        entries[0].params = abi::encode(&programs::Genesis {
             programs: entries.clone(),
             views,
             hooks: genesis.hooks,
@@ -386,7 +386,7 @@ where
         // the roles init before identity can give an account; every other
         // program has its account before its init runs, so what it emits
         // carries it
-        let is_role = |entry: &registry::Entry| founding_roles.contains(&&entry.program);
+        let is_role = |entry: &programs::Entry| founding_roles.contains(&&entry.program);
         let (role_entries, rest) = entries.split_at(entries.partition_point(is_role));
         // nothing above touches `dir`: a genesis refused there leaves no state
         let storage = Storage::open(&dir.join(STATE_DIR))?;
@@ -986,7 +986,7 @@ where
         let receipt = self
             .run(
                 &target,
-                GuestCall::Execute(payload),
+                ProgramCall::Execute(payload),
                 env,
                 attached,
                 overlay,
@@ -1016,15 +1016,15 @@ where
             stage,
             &[],
             Origin::System,
-            self.roles.registry.clone(),
-            abi::encode(&registry::Query::Hooks(height)),
+            self.roles.programs.clone(),
+            abi::encode(&programs::Query::Hooks(height)),
             &mut self.loaded.limits().fuel,
         )
         .await?;
         let Ok(bytes) = reply else {
             return Ok(none());
         };
-        let Ok(registry::Reply::Hooks(listed)) = abi::decode::<registry::Reply>(&bytes) else {
+        let Ok(programs::Reply::Hooks(listed)) = abi::decode::<programs::Reply>(&bytes) else {
             return Ok(none());
         };
         let mut hooks = none();
@@ -1094,7 +1094,7 @@ where
         };
         let invocation = Invocation {
             env,
-            call: GuestCall::Hook(record.clone()),
+            call: ProgramCall::Hook(record.clone()),
         };
         let (receipt, emitted) = unit::execute(
             self.world(record.height, time),
@@ -1152,7 +1152,7 @@ where
         stage: &Stage,
         frame: &mut Frame,
     ) -> Result<std::result::Result<Option<Principal>, Refusal>> {
-        let asked = identity::Query::OfModule(program.to_owned());
+        let asked = identity::Query::OfProgram(program.to_owned());
         let account = self
             .account(asked, height, time, overlay, stage, &mut frame.fuel)
             .await?;
@@ -1187,7 +1187,7 @@ where
     }
 
     /// The account the identity role says a frame acts as: the one a key
-    /// holds (`Account`), or a program's own (`OfModule`). The role's
+    /// holds (`Account`), or a program's own (`OfProgram`). The role's
     /// refusal, or a reply that is not its interface's, rejects the frame.
     async fn account(
         &self,
@@ -1230,7 +1230,7 @@ where
     async fn run(
         &self,
         program: &str,
-        call: GuestCall,
+        call: ProgramCall,
         env: Env,
         attached: Vec<Attachment>,
         overlay: &mut Overlay,
@@ -1255,7 +1255,7 @@ where
     async fn run_frame(
         &self,
         program: &str,
-        call: GuestCall,
+        call: ProgramCall,
         env: Env,
         overlay: &mut Overlay,
         stage: &mut Stage,
@@ -1317,7 +1317,7 @@ where
                         sender,
                         Cause::Message(item.clone()),
                     );
-                    let call = GuestCall::Execute(message.payload);
+                    let call = ProgramCall::Execute(message.payload);
                     Box::pin(self.run_frame(
                         &message.target,
                         call,
@@ -1346,7 +1346,7 @@ where
                         Ok(sender) => {
                             let cause = Cause::Completion { item, outcome };
                             let env = env(program, by, sender, cause);
-                            let call = GuestCall::Execute(Vec::new());
+                            let call = ProgramCall::Execute(Vec::new());
                             Box::pin(self.run_frame(
                                 program,
                                 call,
@@ -1388,15 +1388,15 @@ where
             &*stage,
             &[],
             Origin::System,
-            self.roles.registry.clone(),
-            abi::encode(&registry::Query::At(height)),
+            self.roles.programs.clone(),
+            abi::encode(&programs::Query::At(height)),
             &mut self.loaded.limits().fuel,
         )
         .await?;
         let Ok(bytes) = reply else {
             return Ok(Vec::new());
         };
-        let Ok(registry::Reply::Programs(entries)) = abi::decode::<registry::Reply>(&bytes) else {
+        let Ok(programs::Reply::Programs(entries)) = abi::decode::<programs::Reply>(&bytes) else {
             return Ok(Vec::new());
         };
         let running = programs_of(&View::new(self.store.storage(), vec![&*overlay]))?;
@@ -1454,7 +1454,7 @@ where
 
     async fn admit(
         &mut self,
-        entry: &registry::Entry,
+        entry: &programs::Entry,
         height: u64,
         time: u64,
         overlay: &mut Overlay,
@@ -1478,7 +1478,7 @@ where
         let receipt = self
             .run(
                 &entry.program,
-                GuestCall::Init(entry.params.clone()),
+                ProgramCall::Init(entry.params.clone()),
                 env,
                 Vec::new(),
                 overlay,
@@ -1500,7 +1500,7 @@ where
     }
 
     /// Gives an admitted program its account: the identity role's
-    /// `RegisterModule`, run as the system. A refusal is the receipt's.
+    /// `RegisterProgram`, run as the system. A refusal is the receipt's.
     async fn register(
         &self,
         program: &str,
@@ -1519,12 +1519,12 @@ where
             roles: self.roles.clone(),
             cause: Cause::Direct,
         };
-        let op = identity::Op::RegisterModule {
-            module: program.to_owned(),
+        let op = identity::Op::RegisterProgram {
+            program: program.to_owned(),
         };
         self.run(
             &self.roles.identity,
-            GuestCall::Execute(abi::encode(&op)),
+            ProgramCall::Execute(abi::encode(&op)),
             env,
             Vec::new(),
             overlay,
@@ -1535,7 +1535,7 @@ where
 
     fn swap(
         &mut self,
-        entry: &registry::Entry,
+        entry: &programs::Entry,
         overlay: &mut Overlay,
         stage: &Stage,
     ) -> Result<Receipt> {
@@ -1559,7 +1559,7 @@ where
 
     fn load(
         &self,
-        entry: &registry::Entry,
+        entry: &programs::Entry,
         stage: &Stage,
     ) -> Result<std::result::Result<runtime::Code, Refusal>> {
         let layered = Layered {
@@ -1625,7 +1625,7 @@ where
 }
 
 /// A founding run's receipt, or the refusal that stops the founding.
-fn founded(entry: &registry::Entry, receipt: Receipt) -> Result<Receipt> {
+fn founded(entry: &programs::Entry, receipt: Receipt) -> Result<Receipt> {
     match &receipt.outcome {
         Outcome::Applied { .. } => Ok(receipt),
         Outcome::Rejected(refusal) => Err(Error::Genesis {

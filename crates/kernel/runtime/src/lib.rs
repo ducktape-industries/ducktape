@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use abi::{GuestReply, HostOp, HostReply, Invocation};
+use abi::{ProgramReply, HostOp, HostReply, Invocation};
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::future::{Either, select};
 use tokio::sync::{mpsc, oneshot};
@@ -109,7 +109,7 @@ impl Runtime {
         invocation: Invocation,
         host: &mut (impl Host + ?Sized),
         fuel: &mut Option<u64>,
-    ) -> Result<GuestReply, Fault> {
+    ) -> Result<ProgramReply, Fault> {
         if *fuel == Some(0) {
             return Err(Fault::Trap(OUT_OF_FUEL.into()));
         }
@@ -131,13 +131,13 @@ impl Runtime {
             store.set_fuel(fuel).map_err(load)?;
         }
         let verdict = {
-            let mut guest = Box::pin(drive(&self.engine, &mut store, &code.module, invocation));
+            let mut program = Box::pin(drive(&self.engine, &mut store, &code.module, invocation));
             loop {
                 let request = Box::pin(inbox.recv());
-                match select(guest, request).await {
+                match select(program, request).await {
                     Either::Left((verdict, _)) => break verdict,
                     Either::Right((Some((op, mut left, reply_to)), resumed)) => {
-                        guest = resumed;
+                        program = resumed;
                         let reply = host.call(op, &mut left).await;
                         let _ = reply_to.send((reply, left));
                     }
@@ -159,7 +159,7 @@ async fn drive(
     store: &mut Store<Data>,
     module: &Module,
     invocation: Invocation,
-) -> Result<GuestReply, Fault> {
+) -> Result<ProgramReply, Fault> {
     let mut linker = Linker::new(engine);
     linker
         .func_wrap_async("ducktape", "host_call", host_call)
@@ -192,7 +192,7 @@ async fn drive(
         .map_err(trap)?;
     let reply = read(&memory, &*store, (packed >> 32) as u32, packed as u32)
         .map_err(|e| Fault::Protocol(format!("reply out of memory: {e}")))?;
-    abi::decode::<GuestReply>(&reply).map_err(|r| Fault::Protocol(r.sentence))
+    abi::decode::<ProgramReply>(&reply).map_err(|r| Fault::Protocol(r.sentence))
 }
 
 fn load(error: wasmtime::Error) -> Fault {

@@ -8,5 +8,5 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 abi = { workspace = true }
-guest = { workspace = true }
+program = { workspace = true }
 borsh = { workspace = true }

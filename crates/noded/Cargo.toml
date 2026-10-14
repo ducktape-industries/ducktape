@@ -36,7 +36,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-fixture-module-registry = { path = "../kernel/fixtures/module-registry" }
+fixture-programs = { path = "../kernel/fixtures/programs" }
 fixture-probe = { path = "../kernel/fixtures/probe" }
 fixture-relay = { path = "../kernel/fixtures/relay" }
 fixture-valset = { path = "../kernel/fixtures/valset" }

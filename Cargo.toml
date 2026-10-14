@@ -1,6 +1,6 @@
 # ducktape — a BFT-replicated sandbox for wasm programs. layout:
 #   crates/kernel/     — the platform: abi (the bytes ABI programs and hosts
-#                        share), guest (what a program compiles against),
+#                        share), program (what a program compiles against),
 #                        runtime (the wasmtime embedding), state (the
 #                        authenticated store and its commitments), blobs (one
 #                        content-addressed store), host (the sandbox: submit,
@@ -20,7 +20,7 @@
 resolver = "2"
 members = [
     "crates/kernel/abi",
-    "crates/kernel/guest",
+    "crates/kernel/program",
     "crates/kernel/runtime",
     "crates/kernel/state",
     "crates/kernel/blobs",
@@ -79,7 +79,7 @@ commonware-parallel = "2026.9.0"
 commonware-utils = "2026.9.0"
 commonware-actor = "2026.9.0"
 base64 = "0.22"
-# tests only: isolated on-disk module data dirs.
+# tests only: isolated on-disk data dirs.
 tempfile = "3"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 x509-parser = "0.18"
@@ -110,7 +110,7 @@ wasmtime = "=46.0.3"
 # share.
 keyscheme = { path = "crates/kernel/keyscheme" }
 abi = { path = "crates/kernel/abi" }
-guest = { path = "crates/kernel/guest" }
+program = { path = "crates/kernel/program" }
 runtime = { path = "crates/kernel/runtime" }
 state = { path = "crates/kernel/state" }
 blobs = { path = "crates/kernel/blobs" }
@@ -131,7 +131,7 @@ halo = { path = "crates/networking/halo" }
 # semver-major would be a different trait).
 rand_core = "0.10.1"
 
-# dev/test builds compile wasm guests through cranelift (the fixture programs
+# dev/test builds compile wasm programs through cranelift (the fixture programs
 # in the kernel tests). unoptimized
 # cranelift is 10-30x slower — enough that a fleet of e2e daemons booting
 # concurrently blows readiness deadlines — so the code generator itself is
