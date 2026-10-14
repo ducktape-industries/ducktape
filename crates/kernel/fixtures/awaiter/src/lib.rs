@@ -1,6 +1,8 @@
-//! A program whose execute awaits: it calls `target` with each ask, one after another or all
-//! together, keeps each answer, and outputs them with the height it finished at and the heap it kept.
+//! A program whose execute awaits: it calls `target` with each ask, as itself or as an account it
+//! runs, one after another or all together, keeps each answer, and outputs them with the height it
+//! finished at and the heap it kept.
 use abi::role::awaits::Answer;
+use abi::role::identity::AccountNumber;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 pub const ANSWERS: &[u8] = b"answers";
@@ -8,6 +10,7 @@ pub const ANSWERS: &[u8] = b"answers";
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Plan {
     pub target: String,
+    pub acting: Option<AccountNumber>,
     pub asks: Vec<Vec<u8>>,
     pub together: bool,
     pub kept: u32,
@@ -36,6 +39,14 @@ mod program {
 
     struct Awaiter;
 
+    fn ask(ctx: &Ctx, plan: &Plan, payload: Vec<u8>) -> Call {
+        let target = plan.target.clone();
+        match plan.acting {
+            Some(account) => ctx.call_raw_as(account, target, payload),
+            None => ctx.call_raw(target, payload),
+        }
+    }
+
     async fn together(calls: Vec<Call>) -> Vec<Answer> {
         let mut calls: Vec<(Call, Option<Answer>)> =
             calls.into_iter().map(|call| (call, None)).collect();
@@ -63,15 +74,15 @@ mod program {
             true => {
                 let calls = plan
                     .asks
-                    .into_iter()
-                    .map(|ask| ctx.call_raw(plan.target.clone(), ask))
+                    .iter()
+                    .map(|payload| ask(&ctx, &plan, payload.clone()))
                     .collect();
                 together(calls).await
             }
             false => {
                 let mut answers = Vec::new();
-                for ask in plan.asks {
-                    let answer = ctx.call_raw(plan.target.clone(), ask).await;
+                for payload in plan.asks.clone() {
+                    let answer = ask(&ctx, &plan, payload).await;
                     answers.push(answer);
                     ctx.put(ANSWERS, &answers);
                 }

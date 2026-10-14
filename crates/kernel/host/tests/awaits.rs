@@ -6,15 +6,15 @@ use std::sync::Arc;
 
 use abi::role::awaits::{self, Answer, Ticket, TicketRow};
 use abi::role::{programs, validators};
-use abi::{BlobId, ItemRef, Message, Origin, Outcome, Refusal, Scan, reason};
+use abi::{BlobId, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, reason};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_awaiter::{ANSWERS, Finished, Plan};
 use fixture_oracle::{Ask, Op, owed_key};
 use fixture_programs::Change;
 use fixture_relay::Script;
 use host::{
-    Applied, BLOBS, Block, BlockId, Founding, Genesis, Host, Layer, Limits, PARKED, Receipt,
-    Roles, Submission, Tip,
+    Applied, BLOBS, Block, BlockId, Founding, Genesis, Host, Layer, Limits, PARKED, Receipt, Roles,
+    Submission, Tip,
 };
 use state::{Commitment, SyncTarget, commitment_name};
 
@@ -28,6 +28,7 @@ const ORACLE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_oracle.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 
 const SIGNER: &[u8] = b"signer";
+const AGENT: u64 = 77;
 const TIME: u64 = 1_700_000_000;
 
 type Ctx = deterministic::Context;
@@ -61,7 +62,10 @@ fn genesis() -> Genesis {
             founding(
                 "identity",
                 IDENTITY,
-                abi::encode(&vec![(SIGNER.to_vec(), 1u64)]),
+                abi::encode(&vec![
+                    (SIGNER.to_vec(), 1u64),
+                    (b"#runs/awaiter".to_vec(), AGENT),
+                ]),
             ),
             founding("blobs", BLOBS_PROGRAM, Vec::new()),
             founding("awaits", AWAITS, Vec::new()),
@@ -123,6 +127,7 @@ async fn apply(host: &mut Host<Ctx>, height: u64, submissions: Vec<Submission>) 
 fn plan(target: &str, asks: Vec<Vec<u8>>, together: bool, fail: bool) -> Vec<u8> {
     abi::encode(&Plan {
         target: target.into(),
+        acting: None,
         asks,
         together,
         kept: 0,
@@ -224,6 +229,44 @@ fn a_call_answered_at_once_resumes_the_frame_in_the_same_submission() {
         assert_eq!(finished.height, 1);
         assert_eq!(frames(&host), 0);
         assert!(find(&applied.submissions[0], "awaits").is_empty());
+    });
+}
+
+#[test]
+fn a_call_acts_as_an_account_only_when_identity_says_its_program_runs_it() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("found"), dir.path()).await;
+        let asking = |acting| {
+            let plan = Plan {
+                target: "oracle".into(),
+                acting,
+                asks: vec![abi::encode(&Ask::Sender)],
+                together: false,
+                kept: 0,
+                fail: false,
+            };
+            submit("awaiter", abi::encode(&plan))
+        };
+        let submissions = vec![asking(None), asking(Some(AGENT)), asking(Some(AGENT + 1))];
+        let applied = apply(&mut host, 1, submissions).await;
+        let answered = |index: usize| finished_in(&applied.submissions[index], "awaiter").answers;
+        let [Ok(itself)]: [Answer; 1] = answered(0).try_into().unwrap() else {
+            panic!("the call as itself is answered");
+        };
+        let itself: Option<Principal> = abi::decode(&itself).unwrap();
+        assert!(
+            matches!(itself, Some(Principal::Account(number)) if number != AGENT),
+            "{itself:?}"
+        );
+        assert_eq!(
+            answered(1),
+            vec![Ok(abi::encode(&Some(Principal::Account(AGENT))))]
+        );
+        assert_eq!(
+            answered(2),
+            vec![Err(Refusal::new(reason::UNAUTHORIZED, "awaiter"))]
+        );
     });
 }
 

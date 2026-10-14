@@ -187,16 +187,25 @@ where
         if calls.is_empty() {
             return Ok(());
         }
+        let as_itself = calls.iter().any(|call| call.acting.is_none());
         let caller = self
-            .account_of(program, env.height, env.time, overlay, stage, frame)
+            .own_sender(
+                program, as_itself, env.height, env.time, overlay, stage, frame,
+            )
             .await?;
         for Called {
             ticket,
             target,
             payload,
+            acting,
         } in calls
         {
-            let ran = match caller.clone() {
+            let sender = self
+                .sender(
+                    program, acting, &caller, env.height, env.time, overlay, stage, frame,
+                )
+                .await?;
+            let ran = match sender {
                 Err(refusal) => Run::finished(rejected(&target, refusal)),
                 Ok(sender) => {
                     let cause = Cause::Call { ticket };

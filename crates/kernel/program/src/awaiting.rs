@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use abi::role::awaits::{Answer, Ticket};
+use abi::role::identity::AccountNumber;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::context::{Execute, Query, host};
@@ -67,6 +68,20 @@ impl Ctx {
         Call::Unsent {
             target: target.into(),
             payload,
+            acting: None,
+        }
+    }
+
+    pub fn call_raw_as(
+        &self,
+        account: AccountNumber,
+        target: impl Into<ProgramId>,
+        payload: Vec<u8>,
+    ) -> Call {
+        Call::Unsent {
+            target: target.into(),
+            payload,
+            acting: Some(account),
         }
     }
 
@@ -81,12 +96,24 @@ impl Ctx {
 }
 
 pub enum Call {
-    Unsent { target: ProgramId, payload: Vec<u8> },
+    Unsent {
+        target: ProgramId,
+        payload: Vec<u8>,
+        acting: Option<AccountNumber>,
+    },
     Waiting(Ticket),
 }
 
-fn issue(target: ProgramId, payload: Vec<u8>) -> Result<Ticket, Refusal> {
-    match host(&HostOp::Await { target, payload }) {
+fn issue(
+    target: ProgramId,
+    payload: Vec<u8>,
+    acting: Option<AccountNumber>,
+) -> Result<Ticket, Refusal> {
+    match host(&HostOp::Await {
+        target,
+        payload,
+        acting,
+    }) {
         HostReply::Ticket(ticket) => Ok(ticket),
         HostReply::Refused(refusal) => Err(refusal),
         other => panic!("host answered {other:?} where a ticket was expected"),
@@ -100,8 +127,12 @@ impl Future for Call {
         let this = self.get_mut();
         let ticket = match this {
             Call::Waiting(ticket) => *ticket,
-            Call::Unsent { target, payload } => {
-                let issued = issue(core::mem::take(target), core::mem::take(payload));
+            Call::Unsent {
+                target,
+                payload,
+                acting,
+            } => {
+                let issued = issue(core::mem::take(target), core::mem::take(payload), *acting);
                 match issued {
                     Ok(ticket) => {
                         *this = Call::Waiting(ticket);

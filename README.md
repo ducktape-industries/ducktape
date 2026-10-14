@@ -117,8 +117,10 @@ validators, identity, awaits}`; the programs repository's `docs/roles.md` walks 
 
 A program can wait for another program's answer. Its `execute` is an async
 Rust function (the program SDK's `awaiting_program!`), and each
-`ctx.call(target, op).await` takes a ticket from the host. When the run ends
-still waiting, the host runs each called program with `Cause::Call { ticket }`.
+`ctx.call(target, op).await` takes a ticket from the host. A call may act as
+an account the program runs, as a message may (`call_raw_as`), and the host
+asks the identity role `Runs` the same way. When the run ends still waiting,
+the host runs each called program with `Cause::Call { ticket }`.
 A called program that answers in that run, with its output or its refusal,
 resumes the waiting program in the same submission. One that cannot answer
 yet calls `defer` and keeps the ticket. The host then stores the waiting
