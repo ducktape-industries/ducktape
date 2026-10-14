@@ -98,6 +98,7 @@ pub struct Change {
 pub const MAX_BLOCKS: u32 = 100;
 
 pub const PAGE_BYTES: usize = 4 << 20;
+pub const QUERY_BYTES: usize = 4 << 20;
 
 pub const PREVIEW_BYTES: u32 = 4 << 10;
 
