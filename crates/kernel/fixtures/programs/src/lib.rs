@@ -1,9 +1,9 @@
-use abi::{ProgramId, role::registry};
+use abi::{ProgramId, role::programs};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 #[derive(BorshSerialize, BorshDeserialize)]
 pub enum Change {
-    Set(registry::Entry),
+    Set(programs::Entry),
     Remove(ProgramId),
     Hook(ProgramId),
     Unhook(ProgramId),
@@ -19,16 +19,16 @@ pub fn hook_key(program: &str) -> Vec<u8> {
 
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::{Env, Refusal, Scan, role::registry};
-    use guest::{Execute, Program, Query, Reads};
+    use abi::{Env, Refusal, Scan, role::programs};
+    use program::{Execute, Program, Query, Reads};
 
     use crate::{Change, hook_key, key};
 
-    struct Modules;
+    struct Programs;
 
-    impl Program for Modules {
+    impl Program for Programs {
         fn init(ctx: &mut Execute, _env: &Env, params: &[u8]) -> Result<(), Refusal> {
-            let genesis: registry::Genesis = abi::decode(params)?;
+            let genesis: programs::Genesis = abi::decode(params)?;
             for entry in genesis.programs {
                 ctx.set(key(&entry.program), abi::encode(&entry));
             }
@@ -50,13 +50,13 @@ mod program {
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {
             let reply = match abi::decode(request)? {
-                registry::Query::At(_) => registry::Reply::Programs(
+                programs::Query::At(_) => programs::Reply::Programs(
                     ctx.scan(Scan::prefix(b"p/"))
                         .into_iter()
                         .map(|entry| abi::decode(&entry.value))
-                        .collect::<Result<Vec<registry::Entry>, Refusal>>()?,
+                        .collect::<Result<Vec<programs::Entry>, Refusal>>()?,
                 ),
-                registry::Query::Hooks(_) => registry::Reply::Hooks(
+                programs::Query::Hooks(_) => programs::Reply::Hooks(
                     ctx.scan(Scan::prefix(b"h/"))
                         .into_iter()
                         .map(|entry| String::from_utf8_lossy(&entry.key[2..]).into_owned())
@@ -68,5 +68,5 @@ mod program {
         }
     }
 
-    guest::program!(Modules);
+    program::program!(Programs);
 }

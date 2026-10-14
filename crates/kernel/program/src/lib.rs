@@ -1,8 +1,8 @@
 pub use abi;
 pub use abi::{
-    Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, GuestCall, GuestReply,
-    HashKind, HostOp, HostReply, Invocation, ItemRef, Message, Origin, Outcome, ProgramId, Refusal,
-    Root, Scan, Scheme, reason,
+    Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
+    HostReply, Invocation, ItemRef, Message, Origin, Outcome, ProgramCall, ProgramId, ProgramReply,
+    Refusal, Root, Scan, Scheme, reason,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -91,17 +91,17 @@ mod context {
         }
     }
 
-    pub fn dispatch<P: Program>(invocation: Invocation) -> GuestReply {
+    pub fn dispatch<P: Program>(invocation: Invocation) -> ProgramReply {
         let Invocation { env, call } = invocation;
         match call {
-            GuestCall::Init(params) => P::init(&mut Execute(()), &env, &params),
-            GuestCall::Execute(payload) => P::execute(&mut Execute(()), &env, &payload),
-            GuestCall::Query(request) => P::query(&mut Query(()), &env, &request),
-            GuestCall::Hook(record) => hook::<P>(&env, record),
+            ProgramCall::Init(params) => P::init(&mut Execute(()), &env, &params),
+            ProgramCall::Execute(payload) => P::execute(&mut Execute(()), &env, &payload),
+            ProgramCall::Query(request) => P::query(&mut Query(()), &env, &request),
+            ProgramCall::Hook(record) => hook::<P>(&env, record),
         }
     }
 
-    fn hook<P: Program>(env: &Env, record: abi::hook::Record) -> GuestReply {
+    fn hook<P: Program>(env: &Env, record: abi::hook::Record) -> ProgramReply {
         let from_the_kernel = env.origin == Origin::System;
         if !from_the_kernel {
             return Err(Refusal::new(

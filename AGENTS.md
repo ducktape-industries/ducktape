@@ -37,7 +37,7 @@ under `ops/`.
   and swaps independently of the binary that runs it: `ducktape init` reads
   every program the founding file names into the genesis block, a joiner
   receives the bytes as blobs over state sync, and a network swaps a program
-  at a block through the program bound to the registry role. Bytes compiled
+  at a block through the program bound to the programs role. Bytes compiled
   into a binary are a second copy of a program that only a rebuild can change, and a rebuild
   changing what a node founds or joins with is a silent network change.
 - Tests may `include_bytes!` a committed fixture
@@ -114,15 +114,18 @@ under `ops/`.
   the PR merges. Then `git grep` your symbol on `origin/dev`: a sibling's
   merge commit can revert it.
 - **A fixture's bytes move with everything it compiles in.** The kernel
-  suites run committed guests (`crates/kernel/fixtures/wasm/fixture_*.wasm`)
+  suites run committed programs (`crates/kernel/fixtures/wasm/fixture_*.wasm`)
   built out of `crates/kernel/fixtures/`. A change to a fixture crate, to the
-  `guest` crate they compile against, or to any shape a guest decodes (`abi`)
-  ships the rebuilt artifacts in the SAME PR: `make kernel-fixtures`, then
-  commit what changed. Even a deletion moves bytes: panic paths carry line
-  numbers. The programs a network founds with live in
-  `ducktape-industries/modules`, whose `crates/sdk/{abi,guest}` are copies of
-  `crates/kernel/{abi,guest}` here: a change to either crate is carried there
-  in the same change.
+  `program` crate they compile against, or to any shape a program decodes
+  (`abi`) ships the rebuilt artifacts in the SAME PR: `make kernel-fixtures`,
+  then commit what changed. Even a deletion moves bytes: panic paths carry
+  line numbers. The programs a network founds with live in
+  `ducktape-industries/programs`. Its `crates/sdk/abi` is a copy of
+  `crates/kernel/abi` here: a change to either copy is carried to the other
+  in the same change. `crates/kernel/program` here is the small program SDK
+  the kernel fixtures build against; that repository's `crates/sdk/program`
+  is the full SDK its programs build against. They are two crates, not
+  copies.
 - **Hold only what is really uncertain.** A PR stays open only when the
   author can name the risk in one sentence. "Waiting for CI", "waiting for
   review", or "someone else should look" are not risks.

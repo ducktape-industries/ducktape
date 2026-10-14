@@ -16,8 +16,7 @@ use node::Frame;
 use noded::wire::{Admin, BlockRef, PREVIEW_BYTES, QUERY_BYTES, TxAsk, TxRef};
 use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Workspace};
 
-const MODULE_REGISTRY: &[u8] =
-    include_bytes!("../../kernel/fixtures/wasm/fixture_module_registry.wasm");
+const PROGRAMS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_programs.wasm");
 const VALSET: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_identity.wasm");
@@ -154,7 +153,7 @@ struct Live {
 }
 
 fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
-    std::fs::write(root.join("module_registry.wasm"), MODULE_REGISTRY).unwrap();
+    std::fs::write(root.join("programs.wasm"), PROGRAMS).unwrap();
     std::fs::write(root.join("valset.wasm"), VALSET).unwrap();
     std::fs::write(root.join("relay.wasm"), RELAY).unwrap();
     std::fs::write(root.join("probe.wasm"), PROBE).unwrap();
@@ -169,9 +168,9 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
     let text = format!(
         "network = \"{NETWORK}\"\ntime = {TIME}\nepoch_length = {epoch_length}\n\
          block_time_ms = {BLOCK_TIME_MS}\nmember_cap = {MEMBER_CAP}\n\
-         [roles]\nregistry = \"module-registry\"\nvalidators = \"valset\"\nidentity = \"identity\"\n\
+         [roles]\nprograms = \"programs\"\nvalidators = \"valset\"\nidentity = \"identity\"\n\
          {validators}\
-         [[programs]]\nid = \"module-registry\"\ncode = \"module_registry.wasm\"\n\
+         [[programs]]\nid = \"programs\"\ncode = \"programs.wasm\"\n\
          [[programs]]\nid = \"valset\"\ncode = \"valset.wasm\"\n\
          [[programs]]\nid = \"identity\"\ncode = \"identity.wasm\"\nparams = \"holders.bin\"\n\
          [[programs]]\nid = \"ping\"\ncode = \"relay.wasm\"\n\

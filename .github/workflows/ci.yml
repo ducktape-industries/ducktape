@@ -7,7 +7,7 @@
 # runs every crate's unit tests.
 #
 # Everything heavier — the daemon suites over real sockets, the consensus
-# simulation, the host against its guests — is `nightly.yml`.
+# simulation, the host against its programs — is `nightly.yml`.
 name: ci
 
 on:

@@ -10,7 +10,7 @@ use host::{ANCHOR_WINDOW, Founding, Genesis, Layer, Limits, Roles, Tip};
 use keyscheme::KeyScheme;
 use node::{BLOCK_BYTES, Block, Body, Error, Frame, NAMESPACE, Node, Sequenced, Source, Taken};
 
-const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
+const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
@@ -46,13 +46,13 @@ fn genesis(validators: Vec<validators::Member>) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
         roles: Roles {
-            registry: "module-registry".into(),
+            programs: "programs".into(),
             validators: "valset".into(),
             identity: "identity".into(),
         },
         validators,
         programs: vec![
-            founding("module-registry", MODULE_REGISTRY, Vec::new()),
+            founding("programs", PROGRAMS, Vec::new()),
             founding("valset", VALSET, Vec::new()),
             founding(
                 "identity",

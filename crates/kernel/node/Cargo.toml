@@ -20,7 +20,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 blobs = { workspace = true }
 commonware-utils = { workspace = true }
-fixture-module-registry = { path = "../fixtures/module-registry" }
+fixture-programs = { path = "../fixtures/programs" }
 fixture-probe = { path = "../fixtures/probe" }
 fixture-relay = { path = "../fixtures/relay" }
 fixture-valset = { path = "../fixtures/valset" }

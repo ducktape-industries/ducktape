@@ -8,7 +8,7 @@ pub const RESIDENTS: &[u8] = b"residents";
 mod program {
     use abi::role::validators::{Genesis, Member, Motion, Op, Query as Ask, Reply, Voted};
     use abi::{Env, Origin, Refusal, reason};
-    use guest::{Execute, Program, Query, Reads};
+    use program::{Execute, Program, Query, Reads};
 
     use crate::{RESIDENTS, VALIDATORS};
 
@@ -69,10 +69,10 @@ mod program {
                 Motion::Remove { key } => {
                     self.take(&key).ok_or_else(not_a_member)?;
                 }
-                Motion::Door { .. } | Motion::Registry { .. } => {
+                Motion::Door { .. } | Motion::Programs { .. } => {
                     return Err(Refusal::new(
                         reason::UNSUPPORTED,
-                        "the fixture valset has no door and no registry",
+                        "the fixture valset has no door and no programs motion",
                     ));
                 }
             }
@@ -127,5 +127,5 @@ mod program {
         }
     }
 
-    guest::program!(Valset);
+    program::program!(Valset);
 }

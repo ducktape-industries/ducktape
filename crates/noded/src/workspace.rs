@@ -161,7 +161,7 @@ fn default_member_cap() -> u32 {
 /// Which founding program fills each role the kernel calls.
 #[derive(Debug, Deserialize)]
 pub struct RoleIds {
-    pub registry: String,
+    pub programs: String,
     pub validators: String,
     pub identity: String,
 }
@@ -185,7 +185,7 @@ pub struct Program {
     pub params: Option<PathBuf>,
 }
 
-/// A view with no program behind it, listed by the registry under `name`.
+/// A view with no program behind it, listed by the programs role under `name`.
 #[derive(Debug, Deserialize)]
 pub struct View {
     pub name: String,
@@ -253,7 +253,7 @@ impl Founding {
         Ok(Genesis {
             network: self.network.as_bytes().to_vec(),
             roles: Roles {
-                registry: self.roles.registry.clone(),
+                programs: self.roles.programs.clone(),
                 validators: self.roles.validators.clone(),
                 identity: self.roles.identity.clone(),
             },
@@ -285,7 +285,7 @@ mod tests {
 
     const FILE: &str = "network = \"n\"\ntime = 0\nepoch_length = 4\nblock_time_ms = 1000\n\
          HOOKS\
-         [roles]\nregistry = \"r\"\nvalidators = \"v\"\nidentity = \"i\"\n\
+         [roles]\nprograms = \"r\"\nvalidators = \"v\"\nidentity = \"i\"\n\
          [[validators]]\nkey = \"00\"\n\
          [[programs]]\nid = \"activity\"\ncode = \"code.wasm\"\n";
 
