@@ -23,6 +23,7 @@ use node::{Block, Frame, Node, Sequenced};
 use tokio::sync::watch;
 
 use crate::fetch;
+use crate::live;
 use crate::mesh::{Mesh, Tracker};
 use crate::relay::{self, Relay};
 use crate::transport;
@@ -290,6 +291,21 @@ async fn start<E: Context>(
     );
 
     let (shutdown, _) = watch::channel(false);
+    let live = live::Relay::start(
+        context.child("live"),
+        live::Network {
+            id: live::Network::chain_id(
+                &descriptor.network,
+                &descriptor.genesis_block().digest().0,
+            ),
+            genesis: descriptor.genesis_block().digest().0,
+            identity: node.lock().await.host().roles().identity.clone(),
+        },
+        Arc::new(node.clone()),
+        halo.clone(),
+        identity.public_key(),
+        shutdown.subscribe(),
+    );
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
         node,
@@ -303,6 +319,7 @@ async fn start<E: Context>(
         votes: membership.votes().clone(),
         relay: Relay::new(identity.public_key(), relay_sender, voters.as_ref()),
         halo: halo.clone(),
+        live,
         mesh: internal,
         subscribers: Mutex::new(Vec::new()),
         recent: Mutex::default(),

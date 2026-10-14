@@ -45,6 +45,11 @@ impl Client {
         self.fetch(route::NETWORK).await
     }
 
+    /// The UDP port the node's relay takes live tracks at, `None` when it bound none.
+    pub async fn live_port(&self) -> Result<Option<u16>> {
+        self.fetch(live_wire::PORT_ROUTE).await
+    }
+
     pub async fn submit(&self, frame: Vec<u8>) -> Result<Receipt> {
         self.post_raw(route::SUBMIT, frame).await
     }

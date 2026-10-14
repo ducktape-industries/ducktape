@@ -176,6 +176,13 @@ same socket instead. At a `ws://` or `wss://` address it opens a WebSocket at
 `/v1/halo`. `--halo-egress` caps the bytes per second a node sends over halo,
 8 MiB/s unless set.
 
+The same UDP socket takes desktop clients for live tracks: the relay in every
+node (`crates/noded/src/live/`) lets a client publish and subscribe to tracks
+of a room off consensus, over QUIC on the ALPN `ducktape-live` or the
+WebSocket `/v1/live`, in what the room's program granted its account under
+the `live` table; nodes carry a track between their clients over halo's lane
+7. `GET /v1/live/port` names the UDP port.
+
 ```sh
 ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844   # the tunnel serves https://b.example.org from 127.0.0.1:8844
 ```

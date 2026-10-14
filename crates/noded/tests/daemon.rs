@@ -278,6 +278,11 @@ fn a_validator_serves_its_network_over_http() {
         );
         assert_eq!(status.contract, noded::NODE_CONTRACT);
         assert_eq!(
+            client.live_port().await.unwrap(),
+            Some(seat.p2p.port()),
+            "live tracks are dialed at the p2p port's udp"
+        );
+        assert_eq!(
             status.genesis,
             node::Block::genesis(NETWORK.as_bytes(), TIME).digest().0,
             "the genesis digest a client salts the network name with"
