@@ -44,7 +44,7 @@ mod program {
     impl Program for Relay {
         fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal> {
             match &env.cause {
-                Cause::Direct => run(ctx, None, payload),
+                Cause::Direct | Cause::Call { .. } => run(ctx, None, payload),
                 Cause::Message(item) => run(ctx, Some(item), payload),
                 Cause::Completion { item, outcome } => {
                     ctx.set(done(item), abi::encode(outcome));

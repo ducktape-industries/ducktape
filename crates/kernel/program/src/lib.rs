@@ -8,6 +8,9 @@ pub use abi::{
 #[cfg(target_arch = "wasm32")]
 pub use context::{Execute, Program, Query, Reads, dispatch};
 
+#[cfg(target_arch = "wasm32")]
+pub mod awaiting;
+
 #[macro_export]
 macro_rules! program {
     ($program:ty) => {
@@ -22,6 +25,24 @@ macro_rules! program {
         pub extern "C" fn call(ptr: u32, len: u32) -> u64 {
             $crate::exports::call::<$program>(ptr, len)
         }
+    };
+}
+
+#[macro_export]
+macro_rules! awaiting_program {
+    ($program:ty) => {
+        #[cfg(target_arch = "wasm32")]
+        const _: () = {
+            #[unsafe(no_mangle)]
+            pub extern "C" fn alloc(len: u32) -> u32 {
+                $crate::exports::alloc(len)
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn call(ptr: u32, len: u32) -> u64 {
+                $crate::awaiting::entry::<$program>(ptr, len)
+            }
+        };
     };
 }
 
@@ -45,7 +66,7 @@ pub mod exports {
         leak(abi::encode(&reply))
     }
 
-    fn leak(bytes: Vec<u8>) -> u64 {
+    pub(crate) fn leak(bytes: Vec<u8>) -> u64 {
         let len = bytes.len() as u64;
         let ptr = bytes.as_ptr() as u64;
         core::mem::forget(bytes);
@@ -65,7 +86,7 @@ mod context {
         fn host_take(ptr: u32);
     }
 
-    fn host(op: &HostOp) -> HostReply {
+    pub(crate) fn host(op: &HostOp) -> HostReply {
         let request = abi::encode(op);
         let len = unsafe { host_call(request.as_ptr() as u32, request.len() as u32) };
         let mut reply = vec![0u8; len as usize];
@@ -98,6 +119,10 @@ mod context {
             ProgramCall::Execute(payload) => P::execute(&mut Execute(()), &env, &payload),
             ProgramCall::Query(request) => P::query(&mut Query(()), &env, &request),
             ProgramCall::Hook(record) => hook::<P>(&env, record),
+            ProgramCall::Resume { .. } => Err(Refusal::new(
+                reason::UNSUPPORTED,
+                "this program awaits nothing",
+            )),
         }
     }
 
@@ -235,6 +260,18 @@ mod context {
 
     pub struct Execute(());
 
+    impl Execute {
+        pub(crate) fn new() -> Execute {
+            Execute(())
+        }
+    }
+
+    impl Query {
+        pub(crate) fn new() -> Query {
+            Query(())
+        }
+    }
+
     impl Reads for Execute {
         fn host(&self, op: &HostOp) -> HostReply {
             host(op)
@@ -331,6 +368,41 @@ mod context {
                 HostReply::Done => {}
                 other => protocol("done", other),
             }
+        }
+
+        pub fn defer(&mut self) -> Result<abi::role::awaits::Ticket, Refusal> {
+            match host(&HostOp::Defer) {
+                HostReply::Ticket(ticket) => Ok(ticket),
+                HostReply::Refused(refusal) => Err(refusal),
+                other => protocol("ticket", other),
+            }
+        }
+
+        pub fn resume(
+            &mut self,
+            frame: abi::role::awaits::FrameId,
+            ticket: abi::role::awaits::Ticket,
+            answer: abi::role::awaits::Answer,
+        ) -> Result<(), Refusal> {
+            match host(&HostOp::Resume {
+                frame,
+                ticket,
+                answer,
+            }) {
+                HostReply::Done => Ok(()),
+                HostReply::Refused(refusal) => Err(refusal),
+                other => protocol("done", other),
+            }
+        }
+
+        pub fn resolve(
+            &mut self,
+            env: &Env,
+            ticket: abi::role::awaits::Ticket,
+            answer: abi::role::awaits::Answer,
+        ) {
+            let op = abi::role::awaits::Op::Resolve { ticket, answer };
+            self.emit(env.roles.awaits.clone(), abi::encode(&op), false);
         }
     }
 

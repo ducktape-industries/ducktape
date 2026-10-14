@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use abi::role::awaits::{Answer, FrameId, Ticket};
 use abi::{
     BlobId, Cause, Env, HostOp, HostReply, Invocation, ItemRef, Message, Origin, Outcome,
     ProgramCall, ProgramId, Refusal, Roles, reason,
@@ -7,10 +8,10 @@ use abi::{
 use blob::{Blobs, Layered, Stage};
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
-use runtime::{Code, Fault, Limits, Runtime};
+use runtime::{Code, Fault, Limits, Ran, Runtime, Suspended};
 use state::{Overlay, Storage, Store, View};
 
-use crate::{Error, Receipt, Result, crypto, namespace};
+use crate::{Error, Receipt, Result, crypto, namespace, parked};
 
 pub struct Loaded {
     runtime: Runtime,
@@ -43,6 +44,10 @@ impl Loaded {
             Slot::Running { module, .. } => Some(module),
             Slot::Awaiting { .. } => None,
         }
+    }
+
+    pub fn code(&self, program: &str) -> Option<BlobId> {
+        self.running(program).copied()
     }
 
     fn running(&self, program: &str) -> Option<&BlobId> {
@@ -157,7 +162,7 @@ pub fn refusal_of(fault: Fault) -> Refusal {
     }
 }
 
-fn unknown(program: &str) -> Refusal {
+pub(crate) fn unknown(program: &str) -> Refusal {
     Refusal::new(reason::UNKNOWN_PROGRAM, program)
 }
 
@@ -254,6 +259,9 @@ where
                 .await?,
             ),
             HostOp::Crypto(op) => crypto::serve(op),
+            HostOp::Await { .. } | HostOp::Defer | HostOp::Resume { .. } => {
+                HostReply::Refused(Refusal::new(reason::UNSUPPORTED, "a query does not await"))
+            }
             HostOp::Set { .. }
             | HostOp::Delete(_)
             | HostOp::BlobPut { .. }
@@ -418,7 +426,29 @@ const EMIT_FUEL: u64 = 1_000;
 
 pub struct Frame {
     pub fuel: Option<u64>,
+    pub first_item: u64,
     pub next_item: u64,
+}
+
+pub struct Called {
+    pub ticket: Ticket,
+    pub target: ProgramId,
+    pub payload: Vec<u8>,
+}
+
+pub struct Resumed {
+    pub frame: FrameId,
+    pub ticket: Ticket,
+    pub answer: Answer,
+}
+
+#[derive(Default)]
+pub struct Effects {
+    pub emitted: Vec<(ItemRef, Message)>,
+    pub calls: Vec<Called>,
+    pub resumes: Vec<Resumed>,
+    pub deferred: bool,
+    pub parked: Option<Suspended>,
 }
 
 struct Execute<'a, E>
@@ -431,7 +461,7 @@ where
     stage: &'a mut Stage,
     frame: &'a mut Frame,
     events: Vec<Vec<u8>>,
-    emitted: Vec<(ItemRef, Message)>,
+    effects: Effects,
     output: Vec<u8>,
     fault: Option<Error>,
 }
@@ -458,8 +488,58 @@ where
             item: self.frame.next_item,
         };
         self.frame.next_item += 1;
-        self.emitted.push((item.clone(), message));
+        self.effects.emitted.push((item.clone(), message));
         HostReply::Item(item)
+    }
+
+    fn call(&mut self, target: ProgramId, payload: Vec<u8>) -> Result<HostReply> {
+        let ticket = parked::take_ticket(self.world.store.storage(), self.overlay)?;
+        self.effects.calls.push(Called {
+            ticket,
+            target,
+            payload,
+        });
+        Ok(HostReply::Ticket(ticket))
+    }
+
+    fn defer(&mut self) -> HostReply {
+        let Cause::Call { ticket } = self.env.cause else {
+            return HostReply::Refused(Refusal::new(
+                reason::WRONG_STATE,
+                "this run answers no call",
+            ));
+        };
+        self.effects.deferred = true;
+        HostReply::Ticket(ticket)
+    }
+
+    fn resume(&mut self, frame: FrameId, ticket: Ticket, answer: Answer) -> Result<HostReply> {
+        let from_the_role = self.env.me == self.world.roles.awaits;
+        if !from_the_role {
+            return Ok(HostReply::Refused(Refusal::new(
+                reason::UNAUTHORIZED,
+                "only the awaits role resumes a frame",
+            )));
+        }
+        let view = View::new(self.world.store.storage(), vec![&*self.overlay]);
+        let parked = parked::record(&view, frame)?.is_some();
+        let resuming = self
+            .effects
+            .resumes
+            .iter()
+            .any(|resumed| resumed.frame == frame);
+        if !parked || resuming {
+            return Ok(HostReply::Refused(Refusal::new(
+                reason::NOT_FOUND,
+                format!("frame {frame} is not parked"),
+            )));
+        }
+        self.effects.resumes.push(Resumed {
+            frame,
+            ticket,
+            answer,
+        });
+        Ok(HostReply::Done)
     }
 }
 
@@ -484,6 +564,16 @@ where
                 *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
                 Ok(self.emit(message))
             }
+            HostOp::Await { target, payload } => {
+                *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
+                self.call(target, payload)
+            }
+            HostOp::Defer => Ok(self.defer()),
+            HostOp::Resume {
+                frame,
+                ticket,
+                answer,
+            } => self.resume(frame, ticket, answer),
             HostOp::Event(bytes) => {
                 self.events.push(bytes);
                 Ok(HostReply::Done)
@@ -517,25 +607,31 @@ where
     }
 }
 
-/// One run of `program`: its receipt, and what it emitted (nothing when it
-/// was rejected: its writes are undone here too).
 pub async fn execute<E>(
     world: World<'_, E>,
     overlay: &mut Overlay,
     stage: &mut Stage,
     frame: &mut Frame,
     program: &str,
+    suspended: Option<Suspended>,
     invocation: Invocation,
-) -> Result<(Receipt, Vec<(ItemRef, Message)>)>
+) -> Result<(Receipt, Effects)>
 where
     E: Context + Spawner,
 {
     let Some(module) = world.loaded.module(program) else {
-        return Ok((crate::rejected(program, unknown(program)), Vec::new()));
+        return Ok((
+            crate::rejected(program, unknown(program)),
+            Effects::default(),
+        ));
     };
     let checkpoint = overlay.checkpoint();
     let mut fuel = frame.fuel;
-    let (verdict, events, emitted, output, fault) = {
+    let may_park = matches!(
+        invocation.call,
+        ProgramCall::Execute(_) | ProgramCall::Resume { .. }
+    );
+    let (verdict, events, mut effects, output, fault) = {
         let mut unit = Execute {
             world,
             env: invocation.env.clone(),
@@ -543,32 +639,48 @@ where
             stage: &mut *stage,
             frame: &mut *frame,
             events: Vec::new(),
-            emitted: Vec::new(),
+            effects: Effects::default(),
             output: Vec::new(),
             fault: None,
         };
-        let verdict = world
-            .loaded
-            .runtime()
-            .run(module, invocation, &mut unit, &mut fuel)
-            .await;
-        (verdict, unit.events, unit.emitted, unit.output, unit.fault)
+        let runtime = world.loaded.runtime();
+        let verdict = match (suspended, may_park) {
+            (Some(suspended), _) => {
+                runtime
+                    .resume(suspended, invocation, &mut unit, &mut fuel)
+                    .await
+            }
+            (None, true) => {
+                runtime
+                    .start(module, invocation, &mut unit, &mut fuel)
+                    .await
+            }
+            (None, false) => runtime
+                .run(module, invocation, &mut unit, &mut fuel)
+                .await
+                .map(Ran::Done),
+        };
+        (verdict, unit.events, unit.effects, unit.output, unit.fault)
     };
     frame.fuel = fuel;
     if let Some(fault) = fault {
         return Err(fault);
     }
     let outcome = match verdict {
-        Ok(Ok(())) => Outcome::Applied { output },
-        Ok(Err(refusal)) => Outcome::Rejected(refusal),
+        Ok(Ran::Done(Ok(()))) => Outcome::Applied { output },
+        Ok(Ran::Done(Err(refusal))) => Outcome::Rejected(refusal),
+        Ok(Ran::Parked(suspended)) => {
+            effects.parked = Some(suspended);
+            Outcome::Applied { output }
+        }
         Err(fault) => Outcome::Rejected(refusal_of(fault)),
     };
-    let emitted = match &outcome {
-        Outcome::Applied { .. } => emitted,
+    let effects = match &outcome {
+        Outcome::Applied { .. } => effects,
         Outcome::Rejected(_) => {
             overlay.restore(checkpoint);
             discard_unrostered(world.store.storage(), overlay, stage)?;
-            Vec::new()
+            Effects::default()
         }
     };
     let receipt = Receipt {
@@ -577,7 +689,7 @@ where
         events,
         nested: Vec::new(),
     };
-    Ok((receipt, emitted))
+    Ok((receipt, effects))
 }
 
 pub(crate) fn discard_unrostered(

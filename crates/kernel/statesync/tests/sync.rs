@@ -25,6 +25,7 @@ const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
 const BLOBS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
+const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"sync";
@@ -54,6 +55,7 @@ fn genesis(members: &[validators::Member]) -> Genesis {
             validators: "valset".into(),
             identity: "identity".into(),
             blobs: "blobs".into(),
+            awaits: "awaits".into(),
         },
         validators: members.to_vec(),
         programs: vec![
@@ -86,6 +88,11 @@ fn genesis(members: &[validators::Member]) -> Genesis {
                 program: "probe".into(),
                 code: PROBE.to_vec(),
                 params: abi::encode(&Vec::<Step>::new()),
+            },
+            Founding {
+                program: "awaits".into(),
+                code: AWAITS.to_vec(),
+                params: Vec::new(),
             },
         ],
         views: Vec::new(),

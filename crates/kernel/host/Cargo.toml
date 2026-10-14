@@ -20,7 +20,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+fixture-awaiter = { path = "../fixtures/awaiter" }
 fixture-identity = { path = "../fixtures/identity" }
+fixture-oracle = { path = "../fixtures/oracle" }
 fixture-programs = { path = "../fixtures/programs" }
 fixture-probe = { path = "../fixtures/probe" }
 fixture-relay = { path = "../fixtures/relay" }

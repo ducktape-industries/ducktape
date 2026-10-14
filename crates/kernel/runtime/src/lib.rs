@@ -1,9 +1,12 @@
+mod image;
+
 use std::future::Future;
+use std::sync::Arc;
 
 use abi::{HostOp, HostReply, Invocation, ProgramReply};
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::future::{Either, select};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OnceCell, mpsc, oneshot};
 use wasmtime::{
     Caller, Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
     WasmBacktraceDetails,
@@ -46,9 +49,32 @@ pub trait Host {
     async fn call(&mut self, op: HostOp, fuel: &mut Option<u64>) -> HostReply;
 }
 
+pub use image::{Image, PAGE_BYTES, Page};
+
 #[derive(Clone)]
 pub struct Code {
     module: Module,
+    fresh: Arc<OnceCell<Vec<u8>>>,
+}
+
+pub enum Ran {
+    Done(ProgramReply),
+    Parked(Suspended),
+}
+
+pub struct Suspended {
+    code: Code,
+    store: Store<Data>,
+    inbox: mpsc::UnboundedReceiver<Request>,
+    instance: wasmtime::Instance,
+    memory: Memory,
+}
+
+impl core::fmt::Debug for Suspended {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let bytes = self.memory.data_size(&self.store);
+        write!(f, "Suspended({bytes} bytes)")
+    }
 }
 
 pub struct Runtime {
@@ -66,6 +92,7 @@ struct Data {
     requests: mpsc::UnboundedSender<Request>,
     pending: Vec<u8>,
     limiter: StoreLimits,
+    parked: bool,
 }
 
 impl Runtime {
@@ -97,7 +124,10 @@ impl Runtime {
 
     pub fn load(&self, bytes: &[u8]) -> Result<Code, Fault> {
         let module = Module::new(&self.engine, bytes).map_err(load)?;
-        Ok(Code { module })
+        Ok(Code {
+            module,
+            fresh: Arc::new(OnceCell::new()),
+        })
     }
 
     /// Runs `invocation` on a budget: the run starts with `fuel` (`None`
@@ -110,10 +140,77 @@ impl Runtime {
         host: &mut (impl Host + ?Sized),
         fuel: &mut Option<u64>,
     ) -> Result<ProgramReply, Fault> {
+        match self.start(code, invocation, host, fuel).await? {
+            Ran::Done(reply) => Ok(reply),
+            Ran::Parked(_) => Err(Fault::Protocol(
+                "the program parked in a run that must finish".into(),
+            )),
+        }
+    }
+
+    pub async fn start(
+        &self,
+        code: &Code,
+        invocation: Invocation,
+        host: &mut (impl Host + ?Sized),
+        fuel: &mut Option<u64>,
+    ) -> Result<Ran, Fault> {
+        let suspended = self.instantiate(code, fuel).await?;
+        self.resume(suspended, invocation, host, fuel).await
+    }
+
+    pub async fn resume(
+        &self,
+        mut suspended: Suspended,
+        invocation: Invocation,
+        host: &mut (impl Host + ?Sized),
+        fuel: &mut Option<u64>,
+    ) -> Result<Ran, Fault> {
+        let reply = drive(&mut suspended, invocation, host, fuel).await?;
+        let parked = suspended.store.data().parked;
+        match (parked, reply) {
+            (false, reply) => Ok(Ran::Done(reply)),
+            (true, Ok(())) => Ok(Ran::Parked(suspended)),
+            (true, Err(refusal)) => Err(Fault::Protocol(format!(
+                "the program parked and refused: {}",
+                refusal.sentence
+            ))),
+        }
+    }
+
+    pub async fn freeze(&self, suspended: &Suspended) -> Result<Image, Fault> {
+        let fresh = self.fresh(&suspended.code).await?;
+        Ok(Image::of(fresh, suspended.memory.data(&suspended.store)))
+    }
+
+    pub async fn thaw(
+        &self,
+        code: &Code,
+        image: &Image,
+        fuel: &mut Option<u64>,
+    ) -> Result<Suspended, Fault> {
+        let memory = image.onto(self.fresh(code).await?);
+        let mut suspended = self.instantiate(code, fuel).await?;
+        restore(&mut suspended.store, suspended.memory, &memory)?;
+        Ok(suspended)
+    }
+
+    async fn fresh<'c>(&self, code: &'c Code) -> Result<&'c [u8], Fault> {
+        let fresh = code
+            .fresh
+            .get_or_try_init(|| async {
+                let suspended = self.instantiate(code, &mut None).await?;
+                Ok(suspended.memory.data(&suspended.store).to_vec())
+            })
+            .await?;
+        Ok(fresh)
+    }
+
+    async fn instantiate(&self, code: &Code, fuel: &mut Option<u64>) -> Result<Suspended, Fault> {
         if *fuel == Some(0) {
             return Err(Fault::Trap(OUT_OF_FUEL.into()));
         }
-        let (requests, mut inbox) = mpsc::unbounded_channel();
+        let (requests, inbox) = mpsc::unbounded_channel();
         let mut builder = StoreLimitsBuilder::new();
         if let Some(bytes) = self.limits.memory_bytes {
             builder = builder.memory_size(bytes as usize);
@@ -124,54 +221,97 @@ impl Runtime {
                 requests,
                 pending: Vec::new(),
                 limiter: builder.build(),
+                parked: false,
             },
         );
         store.limiter(|data| &mut data.limiter);
         if let Some(fuel) = *fuel {
             store.set_fuel(fuel).map_err(load)?;
         }
-        let verdict = {
-            let mut program = Box::pin(drive(&self.engine, &mut store, &code.module, invocation));
-            loop {
-                let request = Box::pin(inbox.recv());
-                match select(program, request).await {
-                    Either::Left((verdict, _)) => break verdict,
-                    Either::Right((Some((op, mut left, reply_to)), resumed)) => {
-                        program = resumed;
-                        let reply = host.call(op, &mut left).await;
-                        let _ = reply_to.send((reply, left));
-                    }
-                    Either::Right((None, _)) => {
-                        unreachable!("the store holds the request sender for the whole run")
-                    }
-                }
-            }
-        };
+        let instance = linker(&self.engine)?
+            .instantiate_async(&mut store, &code.module)
+            .await
+            .map_err(load);
         if fuel.is_some() {
             *fuel = Some(store.get_fuel().map_err(load)?);
         }
-        verdict
+        let instance = instance?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| Fault::Load("program exports no memory".into()))?;
+        Ok(Suspended {
+            code: code.clone(),
+            store,
+            inbox,
+            instance,
+            memory,
+        })
     }
 }
 
 async fn drive(
-    engine: &Engine,
-    store: &mut Store<Data>,
-    module: &Module,
+    suspended: &mut Suspended,
     invocation: Invocation,
+    host: &mut (impl Host + ?Sized),
+    fuel: &mut Option<u64>,
 ) -> Result<ProgramReply, Fault> {
+    if *fuel == Some(0) {
+        return Err(Fault::Trap(OUT_OF_FUEL.into()));
+    }
+    if let Some(fuel) = *fuel {
+        suspended.store.set_fuel(fuel).map_err(load)?;
+    }
+    suspended.store.data_mut().parked = false;
+    let Suspended {
+        store,
+        inbox,
+        instance,
+        memory,
+        ..
+    } = suspended;
+    let verdict = {
+        let mut program = Box::pin(call(store, *instance, *memory, invocation));
+        loop {
+            let request = Box::pin(inbox.recv());
+            match select(program, request).await {
+                Either::Left((verdict, _)) => break verdict,
+                Either::Right((Some((op, mut left, reply_to)), resumed)) => {
+                    program = resumed;
+                    let reply = host.call(op, &mut left).await;
+                    let _ = reply_to.send((reply, left));
+                }
+                Either::Right((None, _)) => {
+                    unreachable!("the store holds the request sender for the whole run")
+                }
+            }
+        }
+    };
+    if fuel.is_some() {
+        *fuel = Some(store.get_fuel().map_err(load)?);
+    }
+    verdict
+}
+
+fn linker(engine: &Engine) -> Result<Linker<Data>, Fault> {
     let mut linker = Linker::new(engine);
     linker
         .func_wrap_async("ducktape", "host_call", host_call)
         .and_then(|linker| linker.func_wrap("ducktape", "host_take", host_take))
+        .and_then(|linker| linker.func_wrap("ducktape", "host_park", host_park))
         .map_err(load)?;
-    let instance = linker
-        .instantiate_async(&mut *store, module)
-        .await
-        .map_err(load)?;
-    let memory = instance
-        .get_memory(&mut *store, "memory")
-        .ok_or_else(|| Fault::Load("program exports no memory".into()))?;
+    Ok(linker)
+}
+
+fn host_park(mut caller: Caller<'_, Data>) {
+    caller.data_mut().parked = true;
+}
+
+async fn call(
+    store: &mut Store<Data>,
+    instance: wasmtime::Instance,
+    memory: Memory,
+    invocation: Invocation,
+) -> Result<ProgramReply, Fault> {
     let alloc = instance
         .get_typed_func::<u32, u32>(&mut *store, "alloc")
         .map_err(load)?;
@@ -193,6 +333,19 @@ async fn drive(
     let reply = read(&memory, &*store, (packed >> 32) as u32, packed as u32)
         .map_err(|e| Fault::Protocol(format!("reply out of memory: {e}")))?;
     abi::decode::<ProgramReply>(&reply).map_err(|r| Fault::Protocol(r.sentence))
+}
+
+const WASM_PAGE_BYTES: usize = 64 << 10;
+
+fn restore(store: &mut Store<Data>, memory: Memory, restored: &[u8]) -> Result<(), Fault> {
+    let pages = restored.len().div_ceil(WASM_PAGE_BYTES) as u64;
+    let have = memory.size(&*store);
+    if pages > have {
+        memory.grow(&mut *store, pages - have).map_err(load)?;
+    }
+    memory
+        .write(&mut *store, 0, restored)
+        .map_err(|e| Fault::Protocol(format!("the image does not fit its memory: {e}")))
 }
 
 fn load(error: wasmtime::Error) -> Fault {

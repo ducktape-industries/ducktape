@@ -31,6 +31,7 @@ const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
 const BLOBS_PROGRAM: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
+const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
 
 const SIGNER: &[u8] = b"signer";
 /// Fuel that runs one relay handler and a message of it, not a chain of eight.
@@ -65,6 +66,7 @@ fn roles() -> Roles {
         validators: "valset".into(),
         identity: "identity".into(),
         blobs: "blobs".into(),
+        awaits: "awaits".into(),
     }
 }
 
@@ -87,7 +89,11 @@ fn genesis(programs: Vec<Founding>) -> Genesis {
         network: b"net".to_vec(),
         roles: roles(),
         validators: vec![member(b"v1", "v1:1")],
-        programs: bound.into_iter().chain(programs).collect(),
+        programs: bound
+            .into_iter()
+            .chain(programs)
+            .chain([founding("awaits", AWAITS, Vec::new())])
+            .collect(),
         views: Vec::new(),
         hooks: Vec::new(),
         limits: Limits::default(),
@@ -376,7 +382,7 @@ fn founding_admits_every_program_and_the_host_reopens() {
         assert_eq!(
             ids,
             [
-                "blobs", "identity", "ping", "pong", "probe", "programs", "valset"
+                "awaits", "blobs", "identity", "ping", "pong", "probe", "programs", "valset"
             ]
         );
         assert_eq!(programs["ping"], programs["pong"]);
@@ -791,7 +797,7 @@ fn a_message_runs_in_the_frame_that_emits_it_and_replies_there() {
         );
 
         // without a reply wanted, the target's run is all that nests
-        let again = item("ping", 0);
+        let again = item("ping", 1);
         let applied = host
             .apply(block(
                 2,
@@ -1622,8 +1628,8 @@ fn the_roster_admits_swaps_and_drops_programs() {
                 receipt("echo", ok(b""), vec![]),
             ]
         );
-        let eighth = fixture_identity::PROGRAMS_FROM + 7;
-        assert_eq!(account_of(&host, "echo").await, Some(eighth));
+        let ninth = fixture_identity::PROGRAMS_FROM + 8;
+        assert_eq!(account_of(&host, "echo").await, Some(ninth));
         assert_eq!(host.programs().unwrap()["echo"], relay);
         let applied = host
             .apply(block(
@@ -1731,7 +1737,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
         assert_eq!(
             ids,
             [
-                "blobs", "identity", "ping", "pong", "probe", "programs", "valset"
+                "awaits", "blobs", "identity", "ping", "pong", "probe", "programs", "valset"
             ]
         );
         // retried: registered and refused again
@@ -2157,7 +2163,7 @@ fn a_joiner_adopts_synced_commitments_and_installs_the_blobs_it_lacks() {
             let id: BlobId = abi::decode(&entry.key).unwrap();
             framed.insert(id, upstream.blob(&id, TIME).await.unwrap().unwrap());
         }
-        assert_eq!(framed.len(), 7);
+        assert_eq!(framed.len(), 8);
         let targets: BTreeMap<String, SyncTarget> = upstream
             .store()
             .programs()

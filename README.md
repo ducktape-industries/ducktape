@@ -58,11 +58,12 @@ block_time_ms = 1000
 member_cap = 16               # optional, default 16: the most members (validators and residents) it ever holds, 1 to 128; fixed at founding
 hooks = ["activity"]          # optional: founding programs the kernel tells of every frame; the programs role holds the list from here on
 
-[roles]                       # the founding program the kernel calls in each role; all four required
+[roles]                       # the founding program the kernel calls in each role; all five required
 programs = "programs"         # registers and swaps programs
 validators = "valset"         # seats each epoch's validators; runs membership and the validators' votes
 identity = "identity"         # resolves a key or a program to its account
 blobs = "blobs"               # records each bundle of blobs put and which validators hold it
+awaits = "awaits"             # keeps the tickets of frames that await a call, and hands each its answer
 
 [[validators]]
 key = "…"                     # hex ed25519 public key: `ducktape identity`
@@ -80,6 +81,14 @@ code = "valset.wasm"
 [[programs]]
 id = "identity"
 code = "identity.wasm"
+
+[[programs]]
+id = "blobs"
+code = "blobs.wasm"
+
+[[programs]]
+id = "awaits"
+code = "awaits.wasm"
 
 [[programs]]
 id = "ping"
@@ -104,7 +113,29 @@ runs as no one (`None`). A program may send a message as another account
 `Runs { program, account }` and runs the message as that account only when
 the role answers with it, so an agent account its manager hands to a program
 acts through that program with no key held anywhere. The interfaces are `abi::role::{programs,
-validators, identity}`; the programs repository's `docs/roles.md` walks through them.
+validators, identity, awaits}`; the programs repository's `docs/roles.md` walks through them.
+
+A program can wait for another program's answer. Its `execute` is an async
+Rust function (the program SDK's `awaiting_program!`), and each
+`ctx.call(target, op).await` takes a ticket from the host. When the run ends
+still waiting, the host runs each called program with `Cause::Call { ticket }`.
+A called program that answers in that run, with its output or its refusal,
+resumes the waiting program in the same submission. One that cannot answer
+yet calls `defer` and keeps the ticket. The host then stores the waiting
+program's memory in `$parked`, only the 4 KiB pages that differ from a fresh
+instance, and tells the awaits role which tickets the frame waits on. Later
+the called program sends `resolve`, a message to the awaits role. That role
+checks that the sender is the program the ticket called, and the host
+restores the memory and resumes the program inside the resolver's
+submission, on the resolver's fuel. A ticket nobody answers expires after
+`EXPIRY_BLOCKS`: anyone may then send the awaits role `Expire`, and the
+program resumes with a refusal. A frame that finishes answers whoever waited
+on it: the emitter of a message that wanted a reply gets its `Completion`
+then, and a waiting caller gets its answer. When the programs role gives a
+program new code, the host ends every frame that program had parked and
+answers each waiter with a refusal. Each run between two waits is its own
+transaction, so a refusal undoes only the run it ends. Storing a frame and
+restoring it each cost `PAGE_FUEL` per stored page.
 
 A hook is a program the kernel tells of every frame a block carries, after
 the frame has run: at each block it asks the programs role `Hooks(height)` and,
@@ -243,7 +274,7 @@ verb's `--help` carries the rest.
 | Layer | Where | What |
 | --- | --- | --- |
 | Kernel | `crates/kernel/` | `abi` (the bytes ABI), `program` (the small program SDK the fixtures compile against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `host` (the sandbox: submit, query, and the messages a frame emits, run in that frame), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
-| Programs | [`ducktape-industries/programs`](https://github.com/ducktape-industries/programs) | The contracts a program compiles against (`crates/sdk/abi`, a copy of `crates/kernel/abi` here, and `crates/sdk/program`, the full program SDK), the boot set (`crates/system/`: `programs`, `valset`, `identity` and `blobs`, whose suite founds this host over their bytes) and the app programs. The system programs beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
+| Programs | [`ducktape-industries/programs`](https://github.com/ducktape-industries/programs) | The contracts a program compiles against (`crates/sdk/abi`, a copy of `crates/kernel/abi` here, and `crates/sdk/program`, the full program SDK), the boot set (`crates/system/`: `programs`, `valset`, `identity`, `blobs` and `awaits`, whose suite founds this host over their bytes) and the app programs. The system programs beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
 | Blobs | `crates/blob/` | `blob`: the framing a blob's id hashes and the blobs program's contract (wasm32, no features); the content-addressed store (feature `store`); and the service a node gathers, serves and receipts blobs with over halo (feature `node`) |
 | Network | `crates/networking/halo/` | `halo`, the network between members off consensus: QUIC on UDP at each member's registered halo address, admission of current members by node key, lanes, the egress pacer and its priority classes |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
