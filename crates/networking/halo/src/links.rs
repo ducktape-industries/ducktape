@@ -294,6 +294,7 @@ impl Links {
         let Ok(Some(connection)) = dialed else {
             return Err(Error::Unreachable(to.clone()));
         };
+        tracing::debug!(target: "ducktape::halo", peer = %to, at = %halo, "halo dialed a member at its halo address");
         self.carry(to, connection, Side::Dialed);
         peer.live().ok_or_else(|| Error::Unreachable(to.clone()))
     }
@@ -331,7 +332,7 @@ impl Links {
         let attempts = redial.failures;
         let worth_a_line = attempts == 1 || attempts.is_multiple_of(10);
         if worth_a_line {
-            tracing::debug!(target: "ducktape::halo", peer = %key, attempts, reason = "undialed", "halo did not reach a member at its halo address; it dials again");
+            tracing::debug!(target: "ducktape::halo", peer = %key, at = %halo, attempts, reason = "undialed", "halo did not reach a member at its halo address; it dials again");
         }
         Some(pause)
     }
