@@ -1,6 +1,6 @@
-// How a node comes to hold the bytes a block or a relayed frame needs: it asks halo through a
-// `Fetch` and installs what comes back. Used by run's pump and verify and by the relay; run
-// seats halo with each epoch's members.
+// How a node comes to hold the bytes a block, a relayed frame or a blob read needs: it asks halo
+// through a `Fetch` and installs what comes back. Used by run's pump and verify, by the relay
+// and by the server's blob reads; run seats halo with each epoch's members.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -56,12 +56,17 @@ pub async fn hold<E: Context>(
     Ok(())
 }
 
-pub async fn repair<E: Context>(node: &Shared<E>, fetch: &dyn Fetch, id: BlobId) -> Result<()> {
+pub async fn repair<E: Context>(
+    node: &Shared<E>,
+    fetch: &dyn Fetch,
+    id: BlobId,
+    class: Class,
+) -> Result<()> {
     let framed = fetch
         .fetch(Want {
             id,
             len: None,
-            class: Class::Member,
+            class,
             from: None,
         })
         .await;

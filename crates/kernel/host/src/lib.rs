@@ -662,13 +662,16 @@ where
         &self.blobs
     }
 
-    pub fn blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
-        let rostered = self
+    pub fn rostered(&self, id: &BlobId) -> Result<bool> {
+        let entry = self
             .store
             .view(Vec::new())
-            .get(BLOBS, &namespace::blob(id))?
-            .is_some();
-        if !rostered {
+            .get(BLOBS, &namespace::blob(id))?;
+        Ok(entry.is_some())
+    }
+
+    pub fn blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
+        if !self.rostered(id)? {
             return Ok(None);
         }
         self.blobs

@@ -490,7 +490,7 @@ async fn apply_holding<'a, E: Context>(
                     reason = "blob_missing",
                     "the block reads a blob this node lacks; the node fetches it and applies again"
                 );
-                fetch::repair(&daemon.node, &*daemon.halo, id).await?;
+                fetch::repair(&daemon.node, &*daemon.halo, id, halo::Class::Member).await?;
             }
             sequenced => return Ok((node, sequenced?)),
         }

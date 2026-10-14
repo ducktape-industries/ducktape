@@ -10,20 +10,23 @@ use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use blobs::Blobs;
 use borsh::BorshSerialize;
 use futures::channel::mpsc;
 use futures::{SinkExt as _, StreamExt as _};
-use host::Receipt;
+use halo::Class;
+use host::attach::ATTACHMENT_BYTES;
+use host::{Host, Receipt};
 use http_body_util::{BodyExt as _, LengthLimitError, Limited};
 use node::{BLOCK_BYTES, Source, Taken};
 use statesync::Request as SyncRequest;
 use tokio::sync::Semaphore;
 
 use crate::wire::{
-    Admin, BlobPut, BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range,
-    TxAsk, route,
+    Admin, BlobPut, BlockRef, Blocks, Change, Finalized, Get, Located, Network, PAGE_BYTES, Page,
+    Query, Range, TxAsk, route,
 };
-use crate::{Context, Daemon};
+use crate::{Context, Daemon, Error, fetch};
 
 const READS_IN_FLIGHT: usize = 64;
 const READ_DEADLINE: Duration = Duration::from_secs(30);
@@ -32,7 +35,7 @@ const UPLOADS_IN_FLIGHT: usize = 8;
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(300);
 
 const SUBMIT_BYTES: usize = BLOCK_BYTES;
-const BLOB_PUT_BYTES: usize = 2 * BLOCK_BYTES;
+const BLOB_PUT_BYTES: usize = ATTACHMENT_BYTES as usize + (1 << 10);
 const QUERY_BYTES: usize = 4 << 20;
 const ASK_BYTES: usize = 1 << 20;
 
@@ -45,6 +48,7 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::SCAN, post(scan::<E>))
         .route(route::BLOB_GET, post(blob_get::<E>))
         .route(route::BLOB_MISSING, get(blob_missing::<E>))
+        .route(route::BLOBS, post(blobs::<E>))
         .route(route::PROGRAMS, get(programs::<E>))
         .route(route::BLOCKS, post(blocks::<E>))
         .route(route::BLOCK, post(block::<E>))
@@ -257,12 +261,94 @@ async fn blob_get<E: Context>(
         Ok(id) => id,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let node = daemon.node.lock().await;
-    match node.host().blob(&id) {
-        Ok(framed) => Reply::Answered(framed),
-        Err(host::Error::BlobUnavailable(_)) => Reply::Answered(None),
+    match served(&daemon, &[id]).await {
+        Ok(page) => Reply::Answered(page.into_iter().next().flatten()),
         Err(error) => failed(error),
     }
+}
+
+async fn blobs<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    Capped(body): Capped<ASK_BYTES>,
+) -> Reply<Vec<Option<Vec<u8>>>> {
+    let ids: Vec<BlobId> = match abi::decode(&body) {
+        Ok(ids) => ids,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    match served(&daemon, &ids).await {
+        Ok(page) => Reply::Answered(page),
+        Err(error) => failed(error),
+    }
+}
+
+enum Answer {
+    Unrostered,
+    Held,
+    Missing,
+}
+
+async fn served<E: Context>(
+    daemon: &Daemon<E>,
+    ids: &[BlobId],
+) -> crate::Result<Vec<Option<Vec<u8>>>> {
+    let (answers, store) = {
+        let node = daemon.node.lock().await;
+        (answers(node.host(), ids)?, node.host().blobs().clone())
+    };
+    let mut page = Vec::with_capacity(answers.len());
+    for (id, answer) in ids.iter().zip(answers) {
+        let framed = match answer {
+            Answer::Unrostered => None,
+            Answer::Held => Some(held(&store, id)?),
+            Answer::Missing => Some(fetched(daemon, &store, id).await?),
+        };
+        page.push(framed);
+    }
+    Ok(page)
+}
+
+async fn fetched<E: Context>(
+    daemon: &Daemon<E>,
+    store: &Blobs,
+    id: &BlobId,
+) -> crate::Result<Vec<u8>> {
+    fetch::repair(&daemon.node, &*daemon.halo, *id, Class::Client).await?;
+    held(store, id)
+}
+
+fn held(store: &Blobs, id: &BlobId) -> crate::Result<Vec<u8>> {
+    let Some(framed) = store.framed(id)? else {
+        return Err(Error::Corrupt(format!(
+            "rostered blob {id:?} left the blob store"
+        )));
+    };
+    Ok(framed)
+}
+
+fn answers<E: Context>(host: &Host<E>, ids: &[BlobId]) -> crate::Result<Vec<Answer>> {
+    let mut answers = Vec::new();
+    let mut bytes = 0;
+    for id in ids {
+        if !host.rostered(id)? {
+            answers.push(Answer::Unrostered);
+            continue;
+        }
+        let Some(size) = host.blobs().size(id)? else {
+            let first = answers.is_empty();
+            if first {
+                answers.push(Answer::Missing);
+            }
+            break;
+        };
+        let carries_one = bytes > 0;
+        let past_page = bytes + size > PAGE_BYTES as u64;
+        if carries_one && past_page {
+            break;
+        }
+        bytes += size;
+        answers.push(Answer::Held);
+    }
+    Ok(answers)
 }
 
 async fn blob_put<E: Context>(

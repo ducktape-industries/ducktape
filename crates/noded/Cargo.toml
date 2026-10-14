@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 abi = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
+blobs = { workspace = true }
 borsh = { workspace = true }
 commonware-codec = { workspace = true }
 commonware-consensus = { workspace = true }
@@ -35,7 +36,6 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-blobs = { workspace = true }
 fixture-module-registry = { path = "../kernel/fixtures/module-registry" }
 fixture-probe = { path = "../kernel/fixtures/probe" }
 fixture-relay = { path = "../kernel/fixtures/relay" }

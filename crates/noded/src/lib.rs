@@ -62,6 +62,8 @@ pub enum Error {
     #[error(transparent)]
     Host(#[from] host::Error),
     #[error(transparent)]
+    Blobs(#[from] blobs::Error),
+    #[error(transparent)]
     Sync(#[from] statesync::Error),
     #[error(transparent)]
     Summaries(#[from] consensus::SummariesError),
