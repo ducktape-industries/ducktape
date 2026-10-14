@@ -6,12 +6,12 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use consensus::{Anchor, Cadence};
-use halo::Endpoint;
 use host::{Founding as FoundingProgram, FoundingView, Genesis, Limits, Roles};
 use node::Block;
 use rand_core::CryptoRng;
 use serde::Deserialize;
 
+use crate::endpoint::Endpoint;
 use crate::{Error, Result};
 
 const IDENTITY: &str = "identity.key";
@@ -164,6 +164,7 @@ pub struct RoleIds {
     pub programs: String,
     pub validators: String,
     pub identity: String,
+    pub blobs: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -176,6 +177,7 @@ pub struct Metering {
 pub struct Validator {
     pub key: String,
     pub address: Option<String>,
+    pub halo: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +202,23 @@ impl Founding {
         Ok((founding, base))
     }
 
+    pub fn seat_halo(&mut self, key: &[u8], halo: &str) -> Result<()> {
+        let halo = halo_address(halo)?;
+        for validator in &mut self.validators {
+            let mine = hex::decode(&validator.key).is_ok_and(|named| named == key);
+            if !mine {
+                continue;
+            }
+            let named = validator.halo.get_or_insert_with(|| halo.clone());
+            if *named != halo {
+                return Err(Error::Address(format!(
+                    "the founding file seats this node at halo {named}, not {halo}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn descriptor(&self) -> Descriptor {
         Descriptor {
             network: self.network.clone(),
@@ -219,9 +238,16 @@ impl Founding {
                     .map(str::parse::<Endpoint>)
                     .transpose()
                     .map_err(Error::Address)?;
+                let Some(halo) = &validator.halo else {
+                    return Err(Error::Address(format!(
+                        "validator {} names no halo address",
+                        validator.key
+                    )));
+                };
                 Ok(Member {
                     key: hex::decode(&validator.key)?,
                     address: address.as_ref().map(Endpoint::to_string),
+                    halo: halo_address(halo)?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -256,6 +282,7 @@ impl Founding {
                 programs: self.roles.programs.clone(),
                 validators: self.roles.validators.clone(),
                 identity: self.roles.identity.clone(),
+                blobs: self.roles.blobs.clone(),
             },
             validators,
             programs,
@@ -272,9 +299,15 @@ impl Founding {
     }
 }
 
+pub fn halo_address(text: &str) -> Result<String> {
+    abi::role::validators::registered_halo(text).map_err(Error::Refused)?;
+    Ok(text.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Founding;
+    use super::{Founding, halo_address};
+    use crate::Error;
 
     fn genesis_of(text: &str) -> host::Genesis {
         let dir = tempfile::tempdir().unwrap();
@@ -283,10 +316,22 @@ mod tests {
         founding.genesis(dir.path()).unwrap()
     }
 
+    fn refused_for_its_halo(outcome: crate::Result<impl std::fmt::Debug>) {
+        let Err(Error::Refused(refusal)) = outcome else {
+            panic!("not refused: {outcome:?}");
+        };
+        assert_eq!(refusal.reason, abi::reason::INVALID_INPUT);
+        assert!(
+            refusal.sentence.starts_with("halo: "),
+            "{}",
+            refusal.sentence
+        );
+    }
+
     const FILE: &str = "network = \"n\"\ntime = 0\nepoch_length = 4\nblock_time_ms = 1000\n\
          HOOKS\
-         [roles]\nprograms = \"r\"\nvalidators = \"v\"\nidentity = \"i\"\n\
-         [[validators]]\nkey = \"00\"\n\
+         [roles]\nprograms = \"r\"\nvalidators = \"v\"\nidentity = \"i\"\nblobs = \"b\"\n\
+         [[validators]]\nkey = \"00\"\nhalo = \"n0.example.org:1\"\n\
          [[programs]]\nid = \"activity\"\ncode = \"code.wasm\"\n";
 
     #[test]
@@ -295,5 +340,35 @@ mod tests {
         assert_eq!(hooked.hooks, ["activity"]);
         let plain = genesis_of(&FILE.replace("HOOKS", ""));
         assert!(plain.hooks.is_empty());
+    }
+
+    #[test]
+    fn a_library_caller_registers_only_a_halo_address_other_members_dial() {
+        assert_eq!(
+            halo_address("n0.example.org:9100").unwrap(),
+            "n0.example.org:9100"
+        );
+        for unregistrable in [
+            "127.0.0.1:9100",
+            "0.0.0.0:9100",
+            "[::1]:9100",
+            "localhost:9100",
+        ] {
+            refused_for_its_halo(halo_address(unregistrable));
+            let dir = tempfile::tempdir().unwrap();
+            let file = FILE
+                .replace("HOOKS", "")
+                .replace("n0.example.org:1", unregistrable);
+            let founding: Founding = toml::from_str(&file).unwrap();
+            refused_for_its_halo(
+                founding
+                    .genesis(dir.path())
+                    .map(|genesis| genesis.validators),
+            );
+            let mut unseated: Founding =
+                toml::from_str(&file.replace(&format!("halo = \"{unregistrable}\"\n"), ""))
+                    .unwrap();
+            refused_for_its_halo(unseated.seat_halo(&[0], unregistrable));
+        }
     }
 }

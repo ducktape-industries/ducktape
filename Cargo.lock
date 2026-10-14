@@ -388,14 +388,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "blobs"
+name = "blob"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "blob",
+ "borsh",
+ "commonware-cryptography",
+ "commonware-runtime",
+ "futures",
+ "halo",
  "sha1",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1060,7 +1068,6 @@ name = "consensus"
 version = "0.1.0"
 dependencies = [
  "abi",
- "blobs",
  "borsh",
  "commonware-actor",
  "commonware-broadcast",
@@ -2198,27 +2205,18 @@ dependencies = [
 name = "halo"
 version = "0.1.0"
 dependencies = [
- "abi",
- "blobs",
- "borsh",
  "bytes",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
- "commonware-stream",
  "futures",
  "halo",
  "quinn",
- "rand_core 0.10.1",
  "rcgen",
  "rustls",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-rustls",
- "tokio-tungstenite 0.24.0",
  "tracing",
- "url",
  "x509-parser",
 ]
 
@@ -2301,7 +2299,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "async-trait",
- "blobs",
+ "blob",
  "borsh",
  "commonware-codec",
  "commonware-cryptography",
@@ -2858,7 +2856,6 @@ name = "node"
 version = "0.1.0"
 dependencies = [
  "abi",
- "blobs",
  "borsh",
  "bytes",
  "commonware-codec",
@@ -2883,7 +2880,7 @@ name = "node-bin"
 version = "0.1.0"
 dependencies = [
  "abi",
- "blobs",
+ "blob",
  "clap",
  "commonware-cryptography",
  "commonware-runtime",
@@ -2906,8 +2903,9 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "axum",
- "blobs",
+ "blob",
  "borsh",
+ "bytes",
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
@@ -2937,9 +2935,11 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.24.0",
+ "tokio-util",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

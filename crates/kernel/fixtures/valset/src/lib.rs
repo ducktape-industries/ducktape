@@ -44,16 +44,21 @@ mod program {
             held(&mut self.validators).or_else(|| held(&mut self.residents))
         }
 
-        fn enroll(&mut self, key: Vec<u8>, address: Option<String>) {
-            let moved = self
-                .validators
+        fn enroll(&mut self, key: Vec<u8>, address: Option<String>, halo: String) {
+            match self.member(&key) {
+                Some(member) => {
+                    member.address = address;
+                    member.halo = halo;
+                }
+                None => self.residents.push(Member { key, address, halo }),
+            }
+        }
+
+        fn member(&mut self, key: &[u8]) -> Option<&mut Member> {
+            self.validators
                 .iter_mut()
                 .chain(self.residents.iter_mut())
-                .find(|member| member.key == key);
-            match moved {
-                Some(member) => member.address = address,
-                None => self.residents.push(Member { key, address }),
-            }
+                .find(|member| member.key == key)
         }
 
         fn enact(&mut self, motion: Motion) -> Result<(), Refusal> {
@@ -97,7 +102,19 @@ mod program {
             };
             let mut roster = Roster::read(ctx)?;
             match abi::decode(payload)? {
-                Op::Enroll { address, .. } => roster.enroll(signer.clone(), address),
+                Op::Enroll { address, halo, .. } => {
+                    if halo.is_empty() {
+                        return Err(Refusal::new(
+                            reason::INVALID_INPUT,
+                            "a member names its halo",
+                        ));
+                    }
+                    roster.enroll(signer.clone(), address, halo)
+                }
+                Op::SetHalo { halo } => {
+                    let member = roster.member(signer).ok_or_else(not_a_member)?;
+                    member.halo = halo;
+                }
                 Op::Leave => {
                     roster.take(signer).ok_or_else(not_a_member)?;
                 }

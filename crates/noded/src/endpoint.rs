@@ -1,6 +1,5 @@
 //! A member's address on the chain: the transport the other nodes reach it
-//! over and the name they reach it at. The consensus mesh, halo and noded's
-//! `init`/`join` parse it.
+//! over and the name they reach it at. The mesh and `init`/`join` parse it.
 
 use std::fmt;
 use std::str::FromStr;

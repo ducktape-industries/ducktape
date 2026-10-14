@@ -2,16 +2,17 @@
 #   crates/kernel/     — the platform: abi (the bytes ABI programs and hosts
 #                        share), program (what a program compiles against),
 #                        runtime (the wasmtime embedding), state (the
-#                        authenticated store and its commitments), blobs (one
-#                        content-addressed store), host (the sandbox: submit,
+#                        authenticated store and its commitments), host (the sandbox: submit,
 #                        query, deliver), node (frames, blocks, the mempool),
 #                        consensus (simplex BFT over marshal, per-epoch
 #                        engines, catch-up), statesync (a joiner adopts a
 #                        network's state); fixtures/ is its own workspace of
 #                        wasm32 test programs
+#   crates/blob/       — blobs: the content-addressed store, the blobs program's
+#                        contract, and (feature `node`) how a node gathers,
+#                        serves and receipts them over halo
 #   crates/networking/ — halo: the network between members, off consensus
-#                        (QUIC and tcp/tls/ws/wss links, the egress pacer and
-#                        its classes, the blob lane)
+#                        (QUIC links, the egress pacer and its classes)
 #   crates/noded/      — the daemon library: the /v1 http+ws surface, the
 #                        lookup mesh, the workspace on disk, the client
 #   bin/node           — the `ducktape` binary: the node and its CLI
@@ -23,12 +24,12 @@ members = [
     "crates/kernel/program",
     "crates/kernel/runtime",
     "crates/kernel/state",
-    "crates/kernel/blobs",
     "crates/kernel/host",
     "crates/kernel/node",
     "crates/kernel/consensus",
     "crates/kernel/statesync",
     "crates/kernel/keyscheme",
+    "crates/blob",
     "crates/networking/halo",
     "crates/noded",
     "crates/keystore",
@@ -113,7 +114,6 @@ abi = { path = "crates/kernel/abi" }
 program = { path = "crates/kernel/program" }
 runtime = { path = "crates/kernel/runtime" }
 state = { path = "crates/kernel/state" }
-blobs = { path = "crates/kernel/blobs" }
 host = { path = "crates/kernel/host" }
 node = { path = "crates/kernel/node" }
 consensus = { path = "crates/kernel/consensus" }
@@ -126,6 +126,7 @@ ducktape-home = { path = "crates/ducktape-home" }
 # the daemon library the `ducktape` binary runs.
 noded = { path = "crates/noded" }
 halo = { path = "crates/networking/halo" }
+blob = { path = "crates/blob", default-features = false }
 
 # the rng bounds commonware-runtime 2026.9.0 depends on (a different
 # semver-major would be a different trait).

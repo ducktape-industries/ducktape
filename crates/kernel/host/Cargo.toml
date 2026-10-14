@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 abi = { workspace = true }
 async-trait = { workspace = true }
-blobs = { workspace = true }
+blob = { workspace = true, features = ["store"] }
 borsh = { workspace = true }
 commonware-codec = { workspace = true }
 commonware-cryptography = { workspace = true }

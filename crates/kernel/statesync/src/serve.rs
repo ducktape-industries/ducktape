@@ -35,7 +35,7 @@ pub async fn serve<E: Context, A: Anchors>(
     match request {
         Request::Head => head(node, anchors).await,
         Request::Sync { program, request } => sync(node, &program, &request).await,
-        Request::Blob(id) => blob(node, &id),
+        Request::Blob(id) => blob(node, &id).await,
     }
 }
 
@@ -87,8 +87,8 @@ async fn sync<E: Context>(node: &Node<E>, program: &str, request: &[u8]) -> Resp
     }
 }
 
-fn blob<E: Context>(node: &Node<E>, id: &BlobId) -> Response {
-    match node.host().blob(id) {
+async fn blob<E: Context>(node: &Node<E>, id: &BlobId) -> Response {
+    match node.host().blob(id, node.now()).await {
         Ok(framed) => Response::Blob(framed),
         Err(error) => refused(reason::NOT_FOUND, error),
     }

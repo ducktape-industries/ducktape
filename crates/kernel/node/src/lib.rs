@@ -10,7 +10,6 @@ use abi::{BlobId, Origin, ProgramId, Refusal, reason, role::validators};
 use commonware_cryptography::Digestible as _;
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
-use host::attach::{Attachment, BLOCK_ATTACHMENT_BYTES};
 use host::{Applied, Genesis, Host, Layer, Receipt, Submission, SubmissionId, Tip};
 use state::{Commitment, View};
 
@@ -192,10 +191,6 @@ where
         self.host.view(layer)
     }
 
-    pub fn held_blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
-        Ok(self.host.held_blob(id)?)
-    }
-
     pub fn install(&mut self, id: BlobId, framed: &[u8]) -> Result<()> {
         Ok(self.host.install(id, framed)?)
     }
@@ -235,20 +230,6 @@ where
         if let Err(refusal) = self.host.fresh(&submission)? {
             return Ok(Err(refusal));
         }
-        let attached = match host::attach::attached(&submission) {
-            None => 0,
-            Some(Err(refusal)) => return Ok(Err(refusal)),
-            Some(Ok(attached)) => {
-                if let Some(missing) = self.unheld(&attached.blobs)?.first() {
-                    let sentence = format!(
-                        "attachment {:?} of {} bytes is not held here",
-                        missing.id, missing.len
-                    );
-                    return Ok(Err(Refusal::new(reason::NOT_FOUND, sentence)));
-                }
-                attached.bytes()
-            }
-        };
         let time = self.now();
         let mut predicted = self.host.preconfirm(time, vec![submission.clone()]).await?;
         let prediction = predicted.pop().expect("one submission yields one receipt");
@@ -257,7 +238,7 @@ where
             Source::Peer => None,
         };
         self.pool
-            .admit(frame, submission, prediction.clone(), attached, offered);
+            .admit(frame, submission, prediction.clone(), offered);
         Ok(Ok(Taken::New(prediction)))
     }
 
@@ -269,7 +250,6 @@ where
     ) -> Result<Block> {
         let height = parent.height + 1;
         let carried = self.carried_above_the_tip(unapplied)?;
-        let mut attached = 0u64;
         let frames = self
             .pool
             .order()
@@ -277,45 +257,8 @@ where
                 let recent = held.submission.anchor.anchors(height);
                 recent && !carried.contains(&held.id)
             })
-            .filter(|held| {
-                let with = attached.saturating_add(held.attached);
-                let fits = with <= BLOCK_ATTACHMENT_BYTES;
-                if fits {
-                    attached = with;
-                }
-                fits
-            })
             .map(|held| &held.frame);
         Ok(Block::packed(parent, time, frames))
-    }
-
-    pub fn needs(&self, block: &Block) -> Result<Vec<Attachment>> {
-        let submissions: Vec<Submission> = block
-            .frames
-            .iter()
-            .filter_map(|frame| frame::verify(frame, &self.network).ok())
-            .collect();
-        self.unheld(&host::attach::carried(&submissions))
-    }
-
-    pub fn needs_frame(&self, frame: &[u8]) -> Result<Vec<Attachment>> {
-        let Ok(submission) = frame::verify(frame, &self.network) else {
-            return Ok(Vec::new());
-        };
-        let Some(Ok(attached)) = host::attach::attached(&submission) else {
-            return Ok(Vec::new());
-        };
-        self.unheld(&attached.blobs)
-    }
-
-    fn unheld(&self, attachments: &[Attachment]) -> Result<Vec<Attachment>> {
-        let mut unheld = Vec::new();
-        for attachment in attachments {
-            if !self.host.holds(attachment)? {
-                unheld.push(*attachment);
-            }
-        }
-        Ok(unheld)
     }
 
     pub fn reoffer(&mut self) -> Result<Vec<Vec<u8>>> {

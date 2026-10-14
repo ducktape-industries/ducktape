@@ -6,8 +6,9 @@ version.workspace = true
 [dependencies]
 abi = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
-blobs = { workspace = true }
+blob = { workspace = true, features = ["node"] }
 borsh = { workspace = true }
+bytes = "1"
 commonware-codec = { workspace = true }
 commonware-consensus = { workspace = true }
 commonware-cryptography = { workspace = true }
@@ -22,24 +23,26 @@ http-body-util = "0.1"
 host = { workspace = true }
 node = { workspace = true }
 rand_core = { workspace = true }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 reqwest = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { workspace = true }
 state = { workspace = true }
 statesync = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util"] }
+tokio = { workspace = true, features = ["fs", "net", "io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
 toml = "0.8"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
 
 [dev-dependencies]
 fixture-programs = { path = "../kernel/fixtures/programs" }
 fixture-probe = { path = "../kernel/fixtures/probe" }
 fixture-relay = { path = "../kernel/fixtures/relay" }
 fixture-valset = { path = "../kernel/fixtures/valset" }
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }

@@ -21,7 +21,7 @@ async fn fetch_beside_bulk(bulk: Class, bulk_bytes: u64, fetch: Class) -> Durati
     let members = Arc::new(Members::default());
     members.seat([server.clone(), client.clone()].map(|key| Seat {
         key,
-        endpoint: None,
+        halo: "localhost:1".into(),
         validator: true,
     }));
     let net = SimNet::new();

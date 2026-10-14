@@ -62,6 +62,7 @@ mod tests {
         Member {
             key: vec![key],
             address: None,
+            halo: "localhost:1".into(),
         }
     }
 

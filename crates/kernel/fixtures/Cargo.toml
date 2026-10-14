@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["probe", "programs", "valset", "relay", "identity"]
+members = ["probe", "programs", "valset", "relay", "identity", "blobs"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,6 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 abi = { path = "../abi" }
 program = { path = "../program" }
+blob = { path = "../../blob" }
 borsh = { version = "1", default-features = false, features = ["derive", "std"] }
 
 [profile.release]
