@@ -11,7 +11,8 @@
 #                        wasm32 test programs
 #   crates/networking/ — halo: the network between members, off consensus
 #                        (QUIC and tcp/tls/ws/wss links, the egress pacer and
-#                        its classes, the blob lane)
+#                        its classes, the blob lane); live-wire: the types a
+#                        client and a node speak live tracks in
 #   crates/noded/      — the daemon library: the /v1 http+ws surface, the
 #                        lookup mesh, the workspace on disk, the client
 #   bin/node           — the `ducktape` binary: the node and its CLI
@@ -30,6 +31,7 @@ members = [
     "crates/kernel/statesync",
     "crates/kernel/keyscheme",
     "crates/networking/halo",
+    "crates/networking/live-wire",
     "crates/noded",
     "crates/keystore",
     "crates/ducktape-home",
@@ -126,6 +128,9 @@ ducktape-home = { path = "crates/ducktape-home" }
 # the daemon library the `ducktape` binary runs.
 noded = { path = "crates/noded" }
 halo = { path = "crates/networking/halo" }
+# the live wire: what a client and a node say over QUIC or a websocket to
+# publish and subscribe to tracks; a client links this and nothing of the node.
+live-wire = { path = "crates/networking/live-wire" }
 
 # the rng bounds commonware-runtime 2026.9.0 depends on (a different
 # semver-major would be a different trait).
