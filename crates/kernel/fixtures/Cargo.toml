@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["probe", "programs", "valset", "relay", "identity", "blobs"]
+members = ["awaiter", "probe", "programs", "valset", "relay", "identity", "blobs"]
 
 [workspace.package]
 version = "0.1.0"

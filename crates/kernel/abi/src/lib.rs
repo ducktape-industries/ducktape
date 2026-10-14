@@ -328,6 +328,7 @@ pub enum HostOp {
     Output(Vec<u8>),
     Respond(Vec<u8>),
     Crypto(CryptoOp),
+    Await(Vec<u8>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -343,6 +344,7 @@ pub enum HostReply {
     Query(Result<Vec<u8>, Refusal>),
     Crypto(CryptoReply),
     Refused(Refusal),
+    Ticket(u64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -357,6 +359,7 @@ pub enum ProgramCall {
     Execute(Vec<u8>),
     Query(Vec<u8>),
     Hook(hook::Record),
+    Resume { ticket: u64, answer: Vec<u8> },
 }
 
 pub mod hook {

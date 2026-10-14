@@ -1883,6 +1883,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
+name = "fixture-awaiter"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "program",
+]
+
+[[package]]
 name = "fixture-identity"
 version = "0.1.0"
 dependencies = [
@@ -4011,6 +4020,7 @@ dependencies = [
  "abi",
  "async-trait",
  "borsh",
+ "fixture-awaiter",
  "fixture-probe",
  "futures",
  "sha2 0.10.9",

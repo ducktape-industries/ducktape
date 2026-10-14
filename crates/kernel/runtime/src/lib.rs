@@ -51,6 +51,19 @@ pub struct Code {
     module: Module,
 }
 
+pub const PAGE_BYTES: usize = 64 << 10;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Image {
+    pub memory: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ran {
+    Done(ProgramReply),
+    Parked(Image),
+}
+
 pub struct Runtime {
     engine: Engine,
     limits: Limits,
@@ -66,6 +79,7 @@ struct Data {
     requests: mpsc::UnboundedSender<Request>,
     pending: Vec<u8>,
     limiter: StoreLimits,
+    parked: bool,
 }
 
 impl Runtime {
@@ -110,6 +124,66 @@ impl Runtime {
         host: &mut (impl Host + ?Sized),
         fuel: &mut Option<u64>,
     ) -> Result<ProgramReply, Fault> {
+        match self.run_on(code, None, invocation, host, fuel).await? {
+            Ran::Done(reply) => Ok(reply),
+            Ran::Parked(_) => Err(Fault::Protocol(
+                "the program parked where nothing resumes it".into(),
+            )),
+        }
+    }
+
+    pub async fn start(
+        &self,
+        code: &Code,
+        invocation: Invocation,
+        host: &mut (impl Host + ?Sized),
+        fuel: &mut Option<u64>,
+    ) -> Result<Ran, Fault> {
+        self.run_on(code, None, invocation, host, fuel).await
+    }
+
+    pub async fn resume(
+        &self,
+        code: &Code,
+        image: &Image,
+        invocation: Invocation,
+        host: &mut (impl Host + ?Sized),
+        fuel: &mut Option<u64>,
+    ) -> Result<Ran, Fault> {
+        self.run_on(code, Some(image), invocation, host, fuel).await
+    }
+
+    pub async fn initial(&self, code: &Code) -> Result<Image, Fault> {
+        let (requests, _inbox) = mpsc::unbounded_channel();
+        let mut store = Store::new(
+            &self.engine,
+            Data {
+                requests,
+                pending: Vec::new(),
+                limiter: StoreLimitsBuilder::new().build(),
+                parked: false,
+            },
+        );
+        let instance = linker(&self.engine)?
+            .instantiate_async(&mut store, &code.module)
+            .await
+            .map_err(load)?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| Fault::Load("program exports no memory".into()))?;
+        Ok(Image {
+            memory: memory.data(&store).to_vec(),
+        })
+    }
+
+    async fn run_on(
+        &self,
+        code: &Code,
+        image: Option<&Image>,
+        invocation: Invocation,
+        host: &mut (impl Host + ?Sized),
+        fuel: &mut Option<u64>,
+    ) -> Result<Ran, Fault> {
         if *fuel == Some(0) {
             return Err(Fault::Trap(OUT_OF_FUEL.into()));
         }
@@ -124,6 +198,7 @@ impl Runtime {
                 requests,
                 pending: Vec::new(),
                 limiter: builder.build(),
+                parked: false,
             },
         );
         store.limiter(|data| &mut data.limiter);
@@ -131,7 +206,13 @@ impl Runtime {
             store.set_fuel(fuel).map_err(load)?;
         }
         let verdict = {
-            let mut program = Box::pin(drive(&self.engine, &mut store, &code.module, invocation));
+            let mut program = Box::pin(drive(
+                &self.engine,
+                &mut store,
+                &code.module,
+                image,
+                invocation,
+            ));
             loop {
                 let request = Box::pin(inbox.recv());
                 match select(program, request).await {
@@ -150,28 +231,52 @@ impl Runtime {
         if fuel.is_some() {
             *fuel = Some(store.get_fuel().map_err(load)?);
         }
-        verdict
+        let (reply, memory) = verdict?;
+        let parked = store.data().parked;
+        match (parked, reply) {
+            (false, reply) => Ok(Ran::Done(reply)),
+            (true, Ok(())) => Ok(Ran::Parked(Image {
+                memory: memory.data(&store).to_vec(),
+            })),
+            (true, Err(refusal)) => Err(Fault::Protocol(format!(
+                "the program parked and refused: {}",
+                refusal.sentence
+            ))),
+        }
     }
+}
+
+fn linker(engine: &Engine) -> Result<Linker<Data>, Fault> {
+    let mut linker = Linker::new(engine);
+    linker
+        .func_wrap_async("ducktape", "host_call", host_call)
+        .and_then(|linker| linker.func_wrap("ducktape", "host_take", host_take))
+        .and_then(|linker| linker.func_wrap("ducktape", "host_park", host_park))
+        .map_err(load)?;
+    Ok(linker)
+}
+
+fn host_park(mut caller: Caller<'_, Data>) {
+    caller.data_mut().parked = true;
 }
 
 async fn drive(
     engine: &Engine,
     store: &mut Store<Data>,
     module: &Module,
+    image: Option<&Image>,
     invocation: Invocation,
-) -> Result<ProgramReply, Fault> {
-    let mut linker = Linker::new(engine);
-    linker
-        .func_wrap_async("ducktape", "host_call", host_call)
-        .and_then(|linker| linker.func_wrap("ducktape", "host_take", host_take))
-        .map_err(load)?;
-    let instance = linker
+) -> Result<(ProgramReply, Memory), Fault> {
+    let instance = linker(engine)?
         .instantiate_async(&mut *store, module)
         .await
         .map_err(load)?;
     let memory = instance
         .get_memory(&mut *store, "memory")
         .ok_or_else(|| Fault::Load("program exports no memory".into()))?;
+    if let Some(image) = image {
+        restore(store, memory, image)?;
+    }
     let alloc = instance
         .get_typed_func::<u32, u32>(&mut *store, "alloc")
         .map_err(load)?;
@@ -192,7 +297,19 @@ async fn drive(
         .map_err(trap)?;
     let reply = read(&memory, &*store, (packed >> 32) as u32, packed as u32)
         .map_err(|e| Fault::Protocol(format!("reply out of memory: {e}")))?;
-    abi::decode::<ProgramReply>(&reply).map_err(|r| Fault::Protocol(r.sentence))
+    let reply = abi::decode::<ProgramReply>(&reply).map_err(|r| Fault::Protocol(r.sentence))?;
+    Ok((reply, memory))
+}
+
+fn restore(store: &mut Store<Data>, memory: Memory, image: &Image) -> Result<(), Fault> {
+    let pages = image.memory.len().div_ceil(PAGE_BYTES) as u64;
+    let have = memory.size(&*store);
+    if pages > have {
+        memory.grow(&mut *store, pages - have).map_err(load)?;
+    }
+    memory
+        .write(&mut *store, 0, &image.memory)
+        .map_err(|e| Fault::Protocol(format!("the image does not fit its memory: {e}")))
 }
 
 fn load(error: wasmtime::Error) -> Fault {
