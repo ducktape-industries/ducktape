@@ -6,7 +6,7 @@ use std::sync::RwLock;
 
 use commonware_cryptography::ed25519::PublicKey;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seat {
     pub key: PublicKey,
     pub halo: String,
@@ -19,15 +19,23 @@ pub struct Members {
 }
 
 impl Members {
-    pub fn seat(&self, seats: impl IntoIterator<Item = Seat>) {
-        let seated = seats
+    pub fn seat(&self, seats: impl IntoIterator<Item = Seat>) -> Vec<PublicKey> {
+        let seated: HashMap<PublicKey, Seat> = seats
             .into_iter()
             .map(|seat| (seat.key.clone(), seat))
             .collect();
-        *self
+        let mut held = self
             .seats
             .write()
-            .expect("the seats lock is never poisoned") = seated;
+            .expect("the seats lock is never poisoned");
+        let removed = held.keys().filter(|key| !seated.contains_key(*key));
+        let moved = seated
+            .iter()
+            .filter(|(key, seat)| held.get(*key) != Some(*seat))
+            .map(|(key, _)| key);
+        let changed = removed.chain(moved).cloned().collect();
+        *held = seated;
+        changed
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<PublicKey, Seat>> {
@@ -89,6 +97,32 @@ mod tests {
             halo: format!("localhost:{seed}"),
             validator,
         }
+    }
+
+    #[test]
+    fn a_reseat_names_the_members_it_adds_removes_or_moves() {
+        let members = Members::default();
+        let mut first = members.seat([seat(0, true), seat(1, true), seat(2, false)]);
+        first.sort();
+        let mut all = vec![key(0), key(1), key(2)];
+        all.sort();
+        assert_eq!(first, all);
+        let moved = Seat {
+            halo: "elsewhere.example.org:9".into(),
+            ..seat(1, true)
+        };
+        let mut changed = members.seat([seat(0, true), moved, seat(2, true), seat(3, false)]);
+        changed.sort();
+        let mut expected = vec![key(1), key(2), key(3)];
+        expected.sort();
+        assert_eq!(changed, expected);
+        assert_eq!(
+            members.halo(&key(1)).as_deref(),
+            Some("elsewhere.example.org:9")
+        );
+        let removed = members.seat([seat(0, true)]);
+        assert_eq!(removed.len(), 3);
+        assert!(members.seat([seat(0, true)]).is_empty());
     }
 
     #[test]

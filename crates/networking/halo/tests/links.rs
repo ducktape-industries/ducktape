@@ -1,6 +1,6 @@
 // halo between nodes on loopback over QUIC: a stream each way on one connection, a member
-// no one can reach taking part by dialing out, the class an asker is served at, and the
-// pacer's classes on a real link.
+// no one can reach taking part by dialing out and reached over the connection it dials when
+// seated, the class an asker is served at, and the pacer's classes on a real link.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -131,6 +131,25 @@ fn a_member_no_one_can_reach_takes_part_by_dialing_out() {
         assert_eq!(there, b"out");
         let (_, back) = echoed(&open, &hidden.key, Class::Member, b"back").await;
         assert_eq!(back, b"back");
+    });
+}
+
+#[test]
+fn a_member_no_one_can_reach_is_reached_over_the_connections_it_dials_when_seated() {
+    runtime::Runner::default().start(|context| async move {
+        let first = node(&context.child("first"), 1, None);
+        let second = node(&context.child("second"), 2, None);
+        let mut hidden = node(&context.child("hidden"), 3, None);
+        hidden.seat.halo = unheard();
+        seat_all(&[&first, &second, &hidden], &[]);
+        serve_echo(&hidden);
+        first.halo.linked(&hidden.key).await;
+        second.halo.linked(&hidden.key).await;
+        let (_, from_second) = echoed(&second, &hidden.key, Class::Member, b"second").await;
+        assert_eq!(from_second, b"second");
+        let (_, from_first) = echoed(&first, &hidden.key, Class::Member, b"first").await;
+        assert_eq!(from_first, b"first");
+        assert_eq!(opened(&context, "hidden"), 0);
     });
 }
 

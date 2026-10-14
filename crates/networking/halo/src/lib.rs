@@ -63,7 +63,12 @@ impl Halo {
     }
 
     pub fn seat(&self, seats: impl IntoIterator<Item = Seat>) {
-        self.members.seat(seats);
+        let changed = self.members.seat(seats);
+        self.links.seated(changed);
+    }
+
+    pub async fn linked(&self, member: &PublicKey) {
+        self.links.linked(member).await;
     }
 
     pub fn members(&self) -> &Arc<Members> {

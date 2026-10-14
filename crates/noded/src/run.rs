@@ -6,8 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use abi::Outcome;
 use abi::Scan;
-use abi::role::validators::Member;
-use abi::role::validators::{Grant, INVITE_NAMESPACE, Invite, Op};
+use abi::role::validators::{self, Grant, INVITE_NAMESPACE, Invite, Member, Op};
 use blob::contract::{BUNDLES, Bundle, bundle_of};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
@@ -228,7 +227,7 @@ async fn start<E: Context>(
         )
         .map_err(|error| Error::Tls(error.to_string()))?,
     );
-    halo.seat(seats(&members, &validators));
+    halo.seat(halo_seats(&node, &network).await?);
     let blobs =
         blob::service::Service::start(halo.clone(), node.host().blobs().clone(), bundles(&node)?)?;
 
@@ -387,6 +386,47 @@ fn bundles<E: Context>(node: &Node<E>) -> Result<Vec<(u64, Bundle)>> {
         bundles.push((n, bundle));
     }
     Ok(bundles)
+}
+
+async fn halo_seats<E: Context>(node: &Node<E>, network: &Network) -> Result<Vec<Seat>> {
+    let epoch = network.epoch_after(node.tip()?.height);
+    let validators = node.epoch_validators(epoch)?.ok_or(Error::Corrupt(format!(
+        "the state records no validators for epoch {epoch}"
+    )))?;
+    let role = node.host().roles().validators.clone();
+    let asked = abi::encode(&validators::Query::Members);
+    let answer = node
+        .query(Layer::Confirmed, abi::Origin::System, &role, asked)
+        .await?
+        .map_err(|refusal| {
+            Error::Corrupt(format!("the validators program refused Members: {refusal}"))
+        })?;
+    let validators::Reply::Members(members) = abi::decode(&answer).map_err(|refusal| {
+        Error::Corrupt(format!(
+            "the Members answer does not decode: {}",
+            refusal.sentence
+        ))
+    })?
+    else {
+        return Err(Error::Corrupt(
+            "the validators program answered Members with another reply".into(),
+        ));
+    };
+    Ok(seats(&members, &validators))
+}
+
+async fn reseat_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64) {
+    match halo_seats(node, &daemon.network).await {
+        Ok(seats) => daemon.halo.seat(seats),
+        Err(error) => tracing::warn!(
+            target: "ducktape::halo",
+            event = "halo_unseated",
+            height,
+            %error,
+            reason = "members_unread",
+            "halo keeps its seating: the node could not read the validators program's members"
+        ),
+    }
 }
 
 pub fn seats(members: &[Member], validators: &[Vec<u8>]) -> Vec<Seat> {
@@ -563,8 +603,7 @@ async fn applied<E: Context>(
     // under the node lock, which a /v1/network read holds across the tip
     // and the book, so no height it serves passes its tip
     daemon.votes.applied(block.digest(), block.height);
-    let mut receipted = Vec::new();
-    match sequenced {
+    let (receipted, members_written) = match sequenced {
         Sequenced::Applied {
             mut applied,
             carried,
@@ -573,16 +612,30 @@ async fn applied<E: Context>(
             let receipts = std::mem::take(&mut applied.submissions);
             daemon.record(&node, block, ran, Some(receipts)).await?;
             daemon.publish(&applied);
-            let role = &node.host().roles().blobs;
-            let writes = applied.writes.programs.get(role).cloned();
+            let roles = node.host().roles();
+            let members_written = applied
+                .writes
+                .programs
+                .get(&roles.validators)
+                .is_some_and(|writes| !writes.is_empty());
+            let writes = applied.writes.programs.get(&roles.blobs).cloned();
             let bundles = daemon
                 .blobs
                 .applied(block.height, &writes.unwrap_or_default());
-            receipted = receipts_for(daemon, &mut node, block.height, bundles).await?;
+            let receipted = receipts_for(daemon, &mut node, block.height, bundles).await?;
+            (receipted, members_written)
         }
-        Sequenced::Replayed => daemon.record_unrecorded(&node, block).await?,
+        Sequenced::Replayed => {
+            daemon.record_unrecorded(&node, block).await?;
+            (Vec::new(), false)
+        }
+    };
+    let closes = daemon.network.closes_an_epoch(block.height);
+    let reseats = members_written || closes;
+    if reseats {
+        reseat_halo(daemon, &node, block.height).await;
     }
-    if !daemon.network.closes_an_epoch(block.height) {
+    if !closes {
         let due = node.reoffer()?;
         drop(node);
         daemon
@@ -607,7 +660,6 @@ async fn applied<E: Context>(
     // The mesh admits every member, so a resident follows the chain; only
     // the validators vote and propose.
     tracker.track(epoch, &members);
-    daemon.halo.seat(seats(&members, &validators));
     daemon
         .relay
         .send(due.iter().chain(&receipted).map(Vec::as_slice));

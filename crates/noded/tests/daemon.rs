@@ -67,6 +67,7 @@ struct Seat {
     http: SocketAddr,
     tls: SocketAddr,
     halo: SocketAddr,
+    registered: String,
     address: Option<String>,
 }
 
@@ -78,19 +79,28 @@ impl Seat {
             |mut context| async move { workspace.identity_or_create(&mut context).unwrap() }
         });
         let p2p = free_port();
+        let halo = free_udp_port();
         Seat {
             workspace,
             identity,
             p2p,
             http: free_port(),
             tls: free_port(),
-            halo: free_udp_port(),
+            halo,
+            registered: halo.to_string(),
             address: Some(format!("tcp://localhost:{}", p2p.port())),
         }
     }
 
+    fn unreachable(root: &Path, name: &str) -> Seat {
+        Seat {
+            registered: free_udp_port().to_string(),
+            ..Seat::new(root, name)
+        }
+    }
+
     fn halo_address(&self) -> String {
-        self.halo.to_string()
+        self.registered.clone()
     }
 
     fn validator(&self) -> String {
@@ -1141,6 +1151,123 @@ fn a_bundle_put_on_one_validator_is_gathered_over_quic_held_by_a_quorum_and_read
     for node in live {
         node.thread.join().unwrap();
     }
+}
+
+fn put_frame(status: &noded::wire::Status, blobs: Vec<Entry>, salt: u64) -> Frame {
+    Frame::sign(
+        &ed25519::PrivateKey::from_seed(PUTTER_SEED),
+        NETWORK.as_bytes(),
+        status.anchor(),
+        Some(salt),
+        &status.roles.blobs,
+        abi::encode(&blob::contract::Op::Put { blobs }),
+    )
+}
+
+async fn put_page(client: &Client, path: &Path, salt: u64) -> (BlobId, u64) {
+    let status = client.status().await.unwrap();
+    let entry = blob::file_entry("page", path).unwrap();
+    let upload = Upload {
+        kind: "page".into(),
+        path: path.to_path_buf(),
+    };
+    let (_, receipt) = ::tokio::time::timeout(
+        Duration::from_secs(60),
+        client.land_blobs(&put_frame(&status, vec![entry.clone()], salt), vec![upload]),
+    )
+    .await
+    .expect("the put lands")
+    .unwrap();
+    let Outcome::Applied { output } = receipt.outcome else {
+        panic!("the put applies: {receipt:?}");
+    };
+    (entry.id, abi::decode(&output).unwrap())
+}
+
+fn shut_down(runtime: &::tokio::runtime::Runtime, seats: &[&Seat], live: Vec<Live>) {
+    runtime.block_on(async {
+        for (seat, node) in seats.iter().zip(&live) {
+            seat.admin(&node.client, Admin::Shutdown).await;
+        }
+    });
+    for node in live {
+        node.thread.join().unwrap();
+    }
+}
+
+#[test]
+fn a_put_through_a_member_no_one_can_dial_is_gathered_over_the_connections_it_dials_and_held() {
+    let root = tempfile::tempdir().unwrap();
+    let first = Seat::new(root.path(), "n0");
+    let second = Seat::new(root.path(), "n1");
+    let hidden = Seat::unreachable(root.path(), "n2");
+    let founding = founding(root.path(), &[&first, &second, &hidden], EPOCH_LENGTH);
+    for seat in [&first, &second, &hidden] {
+        seat.init(&founding);
+    }
+    let live = vec![first.start(), second.start(), hidden.start()];
+    let page = root.path().join("page");
+    std::fs::write(&page, b"held through a hidden member").unwrap();
+    let runtime = client_runtime();
+    runtime.block_on(async {
+        let (id, bundle) = put_page(&live[2].client, &page, 1).await;
+        let role = live[2].client.status().await.unwrap().roles.blobs;
+        ::tokio::time::timeout(Duration::from_secs(120), live[2].client.held(&role, bundle))
+            .await
+            .expect("both members that can be dialed gather the bundle from the one that cannot")
+            .unwrap();
+        let framed = blob::frame("page", b"held through a hidden member").unwrap();
+        for gathered in &live[..2] {
+            assert_eq!(
+                gathered.client.blobs(&[id]).await.unwrap(),
+                vec![Some(framed.clone())]
+            );
+        }
+    });
+    shut_down(&runtime, &[&first, &second, &hidden], live);
+}
+
+#[test]
+fn a_member_that_moves_its_halo_address_is_dialed_there_within_the_epoch() {
+    const EPOCH: u64 = 400;
+    let root = tempfile::tempdir().unwrap();
+    let moving = Seat::unreachable(root.path(), "n0");
+    let hidden = Seat::unreachable(root.path(), "n1");
+    let founding = founding(root.path(), &[&moving, &hidden], EPOCH);
+    moving.init(&founding);
+    hidden.init(&founding);
+    let live = vec![moving.start(), hidden.start()];
+    let page = root.path().join("page");
+    std::fs::write(&page, b"gathered at the new address").unwrap();
+    let runtime = client_runtime();
+    runtime.block_on(async {
+        let client = &live[0].client;
+        let (id, bundle) = put_page(client, &page, 1).await;
+        let moved = membership(
+            client,
+            &moving.identity,
+            Op::SetHalo {
+                halo: moving.halo.to_string(),
+            },
+        )
+        .await;
+        let role = client.status().await.unwrap().roles.blobs;
+        let since = ::tokio::time::timeout(Duration::from_secs(300), client.held(&role, bundle))
+            .await
+            .expect("the hidden member gathers the bundle once it dials the moved address")
+            .unwrap();
+        assert_eq!(
+            since / EPOCH,
+            moved / EPOCH,
+            "the move landed at {moved} and the bundle was held at {since}, past the epoch's end"
+        );
+        let framed = blob::frame("page", b"gathered at the new address").unwrap();
+        assert_eq!(
+            live[1].client.blobs(&[id]).await.unwrap(),
+            vec![Some(framed)]
+        );
+    });
+    shut_down(&runtime, &[&moving, &hidden], live);
 }
 
 fn reached(runtime: &::tokio::runtime::Runtime, root: &Path, dialer: Seat, dialed: Seat) {
