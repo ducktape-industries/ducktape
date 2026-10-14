@@ -5,17 +5,11 @@ pub enum Class {
     Critical,
     Member,
     Client,
-    Anonymous,
 }
 
 impl Class {
-    pub const COUNT: usize = 4;
-    pub const ALL: [Class; Class::COUNT] = [
-        Class::Critical,
-        Class::Member,
-        Class::Client,
-        Class::Anonymous,
-    ];
+    pub const COUNT: usize = 3;
+    pub const ALL: [Class; Class::COUNT] = [Class::Critical, Class::Member, Class::Client];
 
     pub fn rank(self) -> usize {
         self as usize
@@ -52,7 +46,7 @@ mod tests {
     fn only_a_validator_is_served_at_critical() {
         assert_eq!(Class::Critical.capped(true), Class::Critical);
         assert_eq!(Class::Critical.capped(false), Class::Member);
-        for class in [Class::Member, Class::Client, Class::Anonymous] {
+        for class in [Class::Member, Class::Client] {
             assert_eq!(class.capped(false), class);
             assert_eq!(class.capped(true), class);
         }
@@ -63,6 +57,6 @@ mod tests {
         for class in Class::ALL {
             assert_eq!(Class::try_from(u8::from(class)), Ok(class));
         }
-        assert_eq!(Class::try_from(4), Err(4));
+        assert_eq!(Class::try_from(3), Err(3));
     }
 }

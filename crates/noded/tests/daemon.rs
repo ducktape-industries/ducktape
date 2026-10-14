@@ -13,7 +13,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use host::attach::{ATTACH, Attached, Attachment};
 use host::{Layer, Submission, Tip};
 use node::Frame;
-use noded::wire::{Admin, BlockRef, PREVIEW_BYTES, TxAsk, TxRef};
+use noded::wire::{Admin, BlockRef, PREVIEW_BYTES, QUERY_BYTES, TxAsk, TxRef};
 use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Workspace};
 
 const MODULE_REGISTRY: &[u8] =
@@ -504,6 +504,22 @@ fn a_validator_serves_its_network_over_http() {
             answer,
             abi::encode(&vec![Reply::Host(HostReply::Value(Some(b"1".to_vec())))])
         );
+
+        let envs = |count: usize| (0..count).map(|_| Step::Env).collect::<Vec<_>>();
+        let one = frame(&client, &alice, envs(1)).await;
+        let env_bytes = client.query(Layer::Confirmed, one).await.unwrap().len() - 4;
+        let fits = (QUERY_BYTES - 4) / env_bytes;
+        let at_the_cap = frame(&client, &alice, envs(fits)).await;
+        let answer = client.query(Layer::Confirmed, at_the_cap).await.unwrap();
+        assert_eq!(answer.len(), 4 + fits * env_bytes);
+        let past_the_cap = frame(&client, &alice, envs(fits + 1)).await;
+        let Err(noded::Error::Refused(refusal)) =
+            client.query(Layer::Confirmed, past_the_cap).await
+        else {
+            panic!("an answer past the cap is refused");
+        };
+        assert_eq!(refusal.reason, reason::CAPACITY);
+        assert!(refusal.sentence.contains("smaller page"), "{refusal:?}");
 
         let programs = client.programs().await.unwrap();
         let code = programs["probe"];

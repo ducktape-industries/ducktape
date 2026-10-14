@@ -24,19 +24,17 @@ use tokio::sync::Semaphore;
 
 use crate::wire::{
     Admin, BlobPut, BlockRef, Blocks, Change, Finalized, Get, Located, Network, PAGE_BYTES, Page,
-    Query, Range, TxAsk, route,
+    QUERY_BYTES, Query, Range, TxAsk, route,
 };
 use crate::{Context, Daemon, Error, fetch};
 
 const READS_IN_FLIGHT: usize = 64;
 const READ_DEADLINE: Duration = Duration::from_secs(30);
-const QUERY_DEADLINE: Duration = Duration::from_secs(300);
 const UPLOADS_IN_FLIGHT: usize = 8;
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(300);
 
 const SUBMIT_BYTES: usize = BLOCK_BYTES;
 const BLOB_PUT_BYTES: usize = ATTACHMENT_BYTES as usize + (1 << 10);
-const QUERY_BYTES: usize = 4 << 20;
 const ASK_BYTES: usize = 1 << 20;
 
 pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
@@ -46,6 +44,7 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::NETWORK, get(network::<E>))
         .route(route::GET, post(get_value::<E>))
         .route(route::SCAN, post(scan::<E>))
+        .route(route::QUERY, post(query::<E>))
         .route(route::BLOB_GET, post(blob_get::<E>))
         .route(route::BLOB_MISSING, get(blob_missing::<E>))
         .route(route::BLOBS, post(blobs::<E>))
@@ -58,16 +57,9 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::SYNC, post(sync::<E>))
         .route(route::METRICS, get(metrics::<E>))
         .layer(middleware::from_fn_with_state(
-            Lane::new(read_permits.clone(), READ_DEADLINE),
+            Lane::new(read_permits, READ_DEADLINE),
             bounded,
         ));
-    let queries =
-        Router::new()
-            .route(route::QUERY, post(query::<E>))
-            .layer(middleware::from_fn_with_state(
-                Lane::new(read_permits, QUERY_DEADLINE),
-                bounded,
-            ));
     let uploads = Router::new()
         .route(route::SUBMIT, post(submit::<E>))
         .route(route::BLOB_PUT, post(blob_put::<E>))
@@ -82,11 +74,7 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         )
         .route(route::P2P, get(p2p::<E>))
         .route(halo::ROUTE, get(halo_socket::<E>));
-    reads
-        .merge(queries)
-        .merge(uploads)
-        .merge(streams)
-        .with_state(daemon)
+    reads.merge(uploads).merge(streams).with_state(daemon)
 }
 
 #[derive(Clone)]
@@ -216,11 +204,20 @@ async fn query<E: Context>(
             submission.payload,
         )
         .await;
-    match answer {
-        Ok(Ok(bytes)) => Reply::Answered(bytes),
-        Ok(Err(refusal)) => Reply::Refused(refusal),
-        Err(error) => failed(error),
+    let bytes = match answer {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(refusal)) => return Reply::Refused(refusal),
+        Err(error) => return failed(error),
+    };
+    let over_the_cap = bytes.len() > QUERY_BYTES;
+    if over_the_cap {
+        let sentence = format!(
+            "the answer is {} bytes and a query answers at most {QUERY_BYTES}: ask for a smaller page",
+            bytes.len()
+        );
+        return Reply::Refused(Refusal::new(reason::CAPACITY, sentence));
     }
+    Reply::Answered(bytes)
 }
 
 async fn get_value<E: Context>(
