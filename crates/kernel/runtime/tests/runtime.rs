@@ -28,6 +28,7 @@ fn env() -> Env {
             programs: "programs".into(),
             validators: "validators".into(),
             identity: "identity".into(),
+            blobs: "blobs".into(),
         },
         cause: Cause::Direct,
     }

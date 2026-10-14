@@ -3,8 +3,10 @@ use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use abi::{Blob, BlobHeader, BlobId, HashKind, Refusal, hex, reason};
-use sha1::Digest as _;
+use abi::{Blob, BlobHeader, BlobId, HashKind, Refusal, reason};
+
+use crate::contract::Entry;
+use crate::{Hasher, frame, header, id_of, is_kind, name_of, parse, parse_header};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -15,52 +17,6 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-pub fn frame(kind: &str, body: &[u8]) -> std::result::Result<Vec<u8>, Refusal> {
-    let kind_is_a_word = !kind.is_empty() && !kind.contains([' ', '\0']);
-    if !kind_is_a_word {
-        return Err(Refusal::new(
-            reason::INVALID_INPUT,
-            "a blob kind is one non-empty word without spaces or NUL",
-        ));
-    }
-    let header = format!("{kind} {}\0", body.len());
-    let mut framed = Vec::with_capacity(header.len() + body.len());
-    framed.extend_from_slice(header.as_bytes());
-    framed.extend_from_slice(body);
-    Ok(framed)
-}
-
-pub fn parse(framed: &[u8]) -> Option<(BlobHeader, &[u8])> {
-    let nul = framed.iter().position(|&b| b == 0)?;
-    let header = parse_header(&framed[..nul])?;
-    let body = &framed[nul + 1..];
-    let len_matches = body.len() as u64 == header.len;
-    if !len_matches {
-        return None;
-    }
-    Some((header, body))
-}
-
-fn parse_header(head: &[u8]) -> Option<BlobHeader> {
-    let head = std::str::from_utf8(head).ok()?;
-    let (kind, len) = head.split_once(' ')?;
-    Some(BlobHeader {
-        kind: kind.to_owned(),
-        len: len.parse().ok()?,
-    })
-}
-
-pub fn id_of(hash: HashKind, framed: &[u8]) -> BlobId {
-    match hash {
-        HashKind::Sha256 => BlobId::Sha256(sha2::Sha256::digest(framed).into()),
-        HashKind::Sha1 => BlobId::Sha1(sha1::Sha1::digest(framed).into()),
-    }
-}
-
-pub fn name_of(id: &BlobId) -> String {
-    hex(&abi::encode(id))
-}
 
 #[derive(Default)]
 pub struct Stage {
@@ -196,14 +152,6 @@ impl Blobs {
         }
     }
 
-    pub fn size(&self, id: &BlobId) -> Result<Option<u64>> {
-        match fs::metadata(self.path(id)) {
-            Ok(metadata) => Ok(Some(metadata.len())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
     pub fn read(&self, id: &BlobId, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
         let Some((mut file, header, body_start)) = self.open_framed(id)? else {
             return Ok(None);
@@ -215,13 +163,112 @@ impl Blobs {
         Ok(Some(bytes))
     }
 
-    pub fn remove(&self, id: &BlobId) -> Result<()> {
-        match fs::remove_file(self.path(id)) {
+    pub fn size(&self, id: &BlobId) -> Result<Option<u64>> {
+        size_of(&self.path(id))
+    }
+
+    pub fn staged(&self, id: &BlobId) -> PathBuf {
+        self.dir.join(STAGING).join(name_of(id))
+    }
+
+    pub fn staging(&self, id: &BlobId, upload: u64) -> Result<PathBuf> {
+        let dir = self.dir.join(STAGING);
+        fs::create_dir_all(&dir)?;
+        Ok(dir.join(format!("{}.{upload}", name_of(id))))
+    }
+
+    pub fn clear_staging(&self) -> Result<()> {
+        match fs::remove_dir_all(self.dir.join(STAGING)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
     }
+
+    pub fn partial(&self, id: &BlobId) -> Result<PathBuf> {
+        let dir = self.dir.join(PARTIAL);
+        fs::create_dir_all(&dir)?;
+        Ok(dir.join(name_of(id)))
+    }
+
+    pub fn adopt(&self, id: &BlobId, from: &Path) -> Result<()> {
+        let target = self.path(id);
+        if target.is_file() {
+            fs::remove_file(from)?;
+            return Ok(());
+        }
+        fs::rename(from, target)?;
+        Ok(())
+    }
+}
+
+const STAGING: &str = ".staging";
+const PARTIAL: &str = ".partial";
+const HEADER_BYTES: u64 = 4 << 10;
+
+pub fn size_of(path: &Path) -> Result<Option<u64>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.len())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn file_entry(kind: &str, path: &Path) -> std::result::Result<Entry, Refusal> {
+    if !is_kind(kind) {
+        return Err(Refusal::new(
+            reason::INVALID_INPUT,
+            "a blob kind is one non-empty word without spaces or NUL",
+        ));
+    }
+    let unread = |error: std::io::Error| {
+        Refusal::new(
+            reason::NOT_FOUND,
+            format!("{} does not read: {error}", path.display()),
+        )
+    };
+    let mut file = fs::File::open(path).map_err(unread)?;
+    let len = file.metadata().map_err(unread)?.len();
+    let header = header(kind, len);
+    let mut hasher = Hasher::new(HashKind::Sha256);
+    hasher.update(&header);
+    let mut chunk = vec![0u8; 64 << 10];
+    loop {
+        let read = file.read(&mut chunk).map_err(unread)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
+    Ok(Entry {
+        id: hasher.finish(),
+        len: header.len() as u64 + len,
+        kind: kind.to_owned(),
+    })
+}
+
+pub fn names(path: &Path, id: &BlobId) -> Result<Option<BlobHeader>> {
+    let mut file = BufReader::new(fs::File::open(path)?);
+    let mut head = Vec::new();
+    (&mut file).take(HEADER_BYTES).read_until(0, &mut head)?;
+    let Some(header) = head.strip_suffix(&[0]).and_then(parse_header) else {
+        return Ok(None);
+    };
+    let mut hasher = Hasher::new(id.kind());
+    hasher.update(&head);
+    let mut body = 0u64;
+    let mut chunk = vec![0u8; 64 << 10];
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+        body += read as u64;
+    }
+    let sized = body == header.len;
+    let hashed = hasher.finish() == *id;
+    Ok((sized && hashed).then_some(header))
 }
 
 pub fn window(len: u64, offset: u64, want: u64) -> (u64, u64) {
@@ -277,30 +324,9 @@ fn staged<'a>(id: &BlobId, framed: &'a [u8]) -> Result<(BlobHeader, &'a [u8])> {
 
 #[cfg(test)]
 mod tests {
+    use abi::BlobHeader;
+
     use super::*;
-
-    #[test]
-    fn a_git_blob_gets_its_git_oid() {
-        let framed = frame("blob", b"hello\n").unwrap();
-        assert_eq!(framed, b"blob 6\0hello\n");
-        let id = id_of(HashKind::Sha1, &framed);
-        assert_eq!(hex(id.digest()), "ce013625030ba8dba906f756967f9e9ca394464a");
-        let (header, body) = parse(&framed).unwrap();
-        assert_eq!(header.kind, "blob");
-        assert_eq!(header.len, 6);
-        assert_eq!(body, b"hello\n");
-    }
-
-    #[test]
-    fn a_kind_is_one_word() {
-        assert_eq!(frame("", b"").unwrap_err().reason, reason::INVALID_INPUT);
-        assert_eq!(
-            frame("two words", b"").unwrap_err().reason,
-            reason::INVALID_INPUT
-        );
-        assert!(parse(b"blob 3\0hi").is_none());
-        assert!(parse(b"blob\0hi").is_none());
-    }
 
     #[test]
     fn a_staged_blob_is_promoted_and_read_back_whole_or_by_range() {
@@ -342,9 +368,6 @@ mod tests {
         assert_eq!(blobs.read(&id, 100, 1).unwrap().unwrap(), b"");
         assert_eq!(blobs.get(&BlobId::Sha1([0; 20])).unwrap(), None);
         assert_eq!(blobs.stat(&BlobId::Sha1([0; 20])).unwrap(), None);
-        blobs.remove(&id).unwrap();
-        assert!(!blobs.has(&id));
-        blobs.remove(&id).unwrap();
     }
 
     #[test]

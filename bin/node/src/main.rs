@@ -10,12 +10,9 @@ use commonware_runtime::Runner as _;
 use commonware_runtime::tokio::{Config, Runner};
 use futures::StreamExt as _;
 use host::Layer;
-use host::attach::{ATTACH, Attached, Attachment};
 use node::Frame;
 use noded::wire::Admin;
-use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Workspace};
-
-const HALO_EGRESS: u64 = 8 << 20;
+use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Upload, Workspace};
 
 #[derive(Parser)]
 #[command(name = "ducktape", about = "a ducktape node and its client", version)]
@@ -43,7 +40,16 @@ enum Verb {
     #[command(about = "print this workspace's node key, minting one if absent")]
     Identity,
     #[command(about = "found a network in this workspace from a founding file")]
-    Init { founding: PathBuf },
+    Init {
+        founding: PathBuf,
+        #[arg(
+            long,
+            value_parser = registered_halo,
+            help = "host:port where members reach this node over halo (QUIC on UDP); it seats \
+                    this node's validator entry in the founding file, or must match it"
+        )]
+        halo: String,
+    },
     #[command(about = "enroll this node in a network, then sync its state from a running node")]
     Join {
         source: String,
@@ -56,16 +62,19 @@ enum Verb {
         address: Option<Endpoint>,
         #[arg(
             long,
+            value_parser = registered_halo,
+            help = "host:port where members reach this node over halo (QUIC on UDP)"
+        )]
+        halo: String,
+        #[arg(
+            long,
             help = "a validator's invite, in hex; none when the door is open"
         )]
         invite: Option<String>,
     },
     #[command(about = "run the node")]
     Run {
-        #[arg(
-            long,
-            help = "the socket peers reach over tcp, and over QUIC on UDP at the same port"
-        )]
+        #[arg(long, help = "the socket peers reach over tcp")]
         listen: SocketAddr,
         #[arg(
             long,
@@ -73,17 +82,20 @@ enum Verb {
             help = "the socket the HTTP API and ws/wss peers reach"
         )]
         http: SocketAddr,
-        #[arg(
-            long,
-            help = "the socket peers reach over tls, and over QUIC on UDP at the same port"
-        )]
+        #[arg(long, help = "the socket peers reach over tls")]
         tls: Option<SocketAddr>,
         #[arg(
             long,
-            default_value_t = HALO_EGRESS,
-            help = "the bytes per second this node sends to other members over halo"
+            help = "the UDP socket halo binds; members reach it at the halo address this node \
+                    registered"
         )]
-        halo_egress: u64,
+        halo: SocketAddr,
+        #[arg(
+            long,
+            help = "the bytes per second this node sends to other members over halo; unlimited \
+                    when absent"
+        )]
+        halo_egress: Option<u64>,
         #[arg(long, default_value = "info")]
         log: String,
     },
@@ -93,13 +105,6 @@ enum Verb {
     Submit {
         program: String,
         payload: Option<PathBuf>,
-        #[arg(
-            long,
-            help = "a file to put on the node as a blob and attach to the frame; repeatable"
-        )]
-        attach: Vec<PathBuf>,
-        #[arg(long, default_value = "blob", help = "the kind of every attached blob")]
-        kind: String,
     },
     #[command(about = "query a program; the request is a file or stdin, the answer is stdout")]
     Query {
@@ -152,6 +157,11 @@ enum Verb {
     Vote(VoteVerb),
     #[command(about = "take this node out of the network's members")]
     Leave,
+    #[command(about = "register the host:port where members reach this node over halo")]
+    Halo {
+        #[arg(value_parser = registered_halo)]
+        halo: String,
+    },
     #[command(subcommand, about = "the user keys that sign frames")]
     Wallet(WalletVerb),
 }
@@ -160,13 +170,17 @@ enum Verb {
 enum BlobVerb {
     #[command(about = "fetch a blob's framed bytes to stdout")]
     Get { id: String },
-    #[command(about = "frame a file and install it on the node")]
+    #[command(
+        about = "put files on the network as one bundle of blobs, signed by the active wallet \
+                 key's account; prints each blob's id"
+    )]
     Put {
-        file: PathBuf,
-        #[arg(long, default_value = "blob")]
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        #[arg(long, help = "the kind of every blob in the bundle")]
         kind: String,
-        #[arg(long)]
-        sha1: bool,
+        #[arg(long, help = "wait until a quorum of validators hold the bundle")]
+        wait: bool,
     },
     #[command(about = "list the blob ids the state names and the node lacks")]
     Missing,
@@ -231,25 +245,36 @@ fn execute(cli: Cli) -> Result<(), String> {
             println!("{}", hex::encode(key.public_key().as_ref()));
             Ok(())
         }
-        Verb::Init { founding } => node_runtime(&workspace).start(|context| async move {
-            noded::init(context, &workspace, &founding).await.sentence()
+        Verb::Init { founding, halo } => node_runtime(&workspace).start(|context| async move {
+            noded::init(context, &workspace, &founding, &halo)
+                .await
+                .sentence()
         }),
         Verb::Join {
             source,
             address,
+            halo,
             invite,
         } => {
             let invite = invite.map(|hex| decode_invite(&hex)).transpose()?;
             node_runtime(&workspace).start(|context| async move {
-                noded::join(context, &workspace, Client::new(source), address, invite)
-                    .await
-                    .sentence()
+                noded::join(
+                    context,
+                    &workspace,
+                    Client::new(source),
+                    address,
+                    halo,
+                    invite,
+                )
+                .await
+                .sentence()
             })
         }
         Verb::Run {
             listen,
             http,
             tls,
+            halo,
             halo_egress,
             log,
         } => node_runtime(&workspace).start(|context| async move {
@@ -258,6 +283,7 @@ fn execute(cli: Cli) -> Result<(), String> {
                 p2p: listen,
                 http,
                 tls,
+                halo,
             };
             let halo = HaloConfig {
                 egress_bytes_per_sec: halo_egress,
@@ -315,28 +341,24 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             println!("identity  {}", hex::encode(&status.identity));
             println!("contract  {}", status.contract);
             println!(
-                "roles     programs {}, validators {}, identity {}",
-                status.roles.programs, status.roles.validators, status.roles.identity
+                "roles     programs {}, validators {}, identity {}, blobs {}",
+                status.roles.programs,
+                status.roles.validators,
+                status.roles.identity,
+                status.roles.blobs
             );
             Ok(())
         }
-        Verb::Submit {
-            program,
-            payload,
-            attach,
-            kind,
-        } => {
+        Verb::Submit { program, payload } => {
             let status = client.status().await.sentence()?;
             let key = signer(workspace)?;
-            let (target, payload) =
-                attaching(client, program, bytes(payload)?, &attach, &kind).await?;
             let frame = Frame::sign(
                 &key,
                 status.network.as_bytes(),
                 status.anchor(),
                 Some(salt()),
-                &target,
-                payload,
+                &program,
+                bytes(payload)?,
             );
             let receipt = client.submit(frame.encode()).await.sentence()?;
             match receipt.outcome {
@@ -418,18 +440,8 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             Some(framed) => emit(&framed),
             None => Err("absent".into()),
         },
-        Verb::Blob(BlobVerb::Put { file, kind, sha1 }) => {
-            let body = std::fs::read(file).sentence()?;
-            let framed = blobs::frame(&kind, &body).map_err(|refusal| refusal.sentence)?;
-            let hash = if sha1 {
-                HashKind::Sha1
-            } else {
-                HashKind::Sha256
-            };
-            let id = blobs::id_of(hash, &framed);
-            client.put_blob(id, framed).await.sentence()?;
-            println!("{}", blob_text(&id));
-            Ok(())
+        Verb::Blob(BlobVerb::Put { files, kind, wait }) => {
+            put_blobs(workspace, client, files, &kind, wait).await
         }
         Verb::Blob(BlobVerb::Missing) => {
             for id in client.missing_blobs().await.sentence()? {
@@ -502,6 +514,11 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             println!("left at block {height}");
             Ok(())
         }
+        Verb::Halo { halo } => {
+            let (height, _) = membership(workspace, client, Op::SetHalo { halo }).await?;
+            println!("halo address registered at block {height}");
+            Ok(())
+        }
         Verb::Version
         | Verb::Identity
         | Verb::Init { .. }
@@ -511,32 +528,63 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
     }
 }
 
-async fn attaching(
+async fn put_blobs(
+    workspace: &Workspace,
     client: &Client,
-    program: String,
-    payload: Vec<u8>,
-    files: &[PathBuf],
+    files: Vec<PathBuf>,
     kind: &str,
-) -> Result<(String, Vec<u8>), String> {
-    if files.is_empty() {
-        return Ok((program, payload));
+    wait: bool,
+) -> Result<(), String> {
+    let mut entries = Vec::with_capacity(files.len());
+    for file in &files {
+        entries.push(blob::file_entry(kind, file).map_err(|refusal| refusal.sentence)?);
     }
-    let mut attachments = Vec::with_capacity(files.len());
-    for file in files {
-        let body = std::fs::read(file).sentence()?;
-        let framed = blobs::frame(kind, &body).map_err(|refusal| refusal.sentence)?;
-        let id = blobs::id_of(HashKind::Sha256, &framed);
-        let len = framed.len() as u64;
-        client.put_blob(id, framed).await.sentence()?;
-        println!("attached {}", blob_text(&id));
-        attachments.push(Attachment { id, len });
-    }
-    let attached = Attached {
-        target: program,
-        payload,
-        blobs: attachments,
+    let status = client.status().await.sentence()?;
+    let key = signer(workspace)?;
+    let put = blob::contract::Op::Put {
+        blobs: entries.clone(),
     };
-    Ok((ATTACH.to_owned(), abi::encode(&attached)))
+    let frame = Frame::sign(
+        &key,
+        status.network.as_bytes(),
+        status.anchor(),
+        Some(salt()),
+        &status.roles.blobs,
+        abi::encode(&put),
+    );
+    let uploads = files
+        .into_iter()
+        .map(|path| Upload {
+            kind: kind.to_owned(),
+            path,
+        })
+        .collect();
+    let ids = || {
+        for entry in &entries {
+            println!("{}", blob_text(&entry.id));
+        }
+    };
+    if !wait {
+        let receipt = client.put_blobs(&frame, uploads).await.sentence()?;
+        if let Outcome::Rejected(refusal) = receipt.outcome {
+            return Err(format!("{}: {}", refusal.reason, refusal.sentence));
+        }
+        ids();
+        return Ok(());
+    }
+    let (height, receipt) = client.land_blobs(&frame, uploads).await.sentence()?;
+    ids();
+    let output = match receipt.outcome {
+        Outcome::Applied { output } => output,
+        Outcome::Rejected(refusal) => {
+            return Err(format!("{}: {}", refusal.reason, refusal.sentence));
+        }
+    };
+    let bundle: u64 = abi::decode(&output).map_err(|refusal| refusal.sentence)?;
+    println!("bundle {bundle} put at block {height}");
+    let since = client.held(&status.roles.blobs, bundle).await.sentence()?;
+    println!("bundle {bundle} held since block {since}");
+    Ok(())
 }
 
 async fn membership(
@@ -574,6 +622,11 @@ fn motion(verb: VoteVerb) -> Result<Motion, String> {
         VoteVerb::Close => Motion::Door { open: false },
         VoteVerb::Programs { op } => Motion::Programs { op: bytes(op)? },
     })
+}
+
+fn registered_halo(text: &str) -> Result<String, String> {
+    abi::role::validators::registered_halo(text).map_err(|refusal| refusal.sentence)?;
+    Ok(text.to_owned())
 }
 
 fn decode_invite(text: &str) -> Result<Invite, String> {
@@ -713,5 +766,57 @@ trait Sentence<T> {
 impl<T, E: std::fmt::Display> Sentence<T> for Result<T, E> {
     fn sentence(self) -> Result<T, String> {
         self.map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::{Cli, Verb};
+
+    #[test]
+    fn a_registered_halo_address_refuses_a_bind_only_host_and_run_binds_one() {
+        let verbs: [&[&str]; 3] = [
+            &["init", "founding.toml", "--halo"],
+            &["join", "https://a.example.org", "--halo"],
+            &["halo"],
+        ];
+        let parsed = |verb: &[&str], halo: &str| {
+            let args: Vec<&str> = ["ducktape"]
+                .into_iter()
+                .chain(verb.iter().copied())
+                .chain([halo])
+                .collect();
+            Cli::try_parse_from(args)
+        };
+        for verb in verbs {
+            for bind_only in [
+                "0.0.0.0:9100",
+                "[::]:9100",
+                "127.0.0.1:9100",
+                "localhost:9100",
+            ] {
+                let refused = parsed(verb, bind_only).err().unwrap().to_string();
+                assert!(
+                    refused.contains("halo: "),
+                    "{verb:?} {bind_only}: {refused}"
+                );
+            }
+            assert!(parsed(verb, "a.example.org:9100").is_ok(), "{verb:?}");
+        }
+        let run = Cli::try_parse_from([
+            "ducktape",
+            "run",
+            "--listen",
+            "127.0.0.1:9000",
+            "--halo",
+            "0.0.0.0:9100",
+        ])
+        .unwrap();
+        let Verb::Run { halo, .. } = run.verb else {
+            panic!("run parses");
+        };
+        assert_eq!(halo, "0.0.0.0:9100".parse().unwrap());
     }
 }

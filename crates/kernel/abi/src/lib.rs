@@ -98,6 +98,7 @@ pub struct Roles {
     pub validators: ProgramId,
     /// Asked, once per frame, which account the frame acts as.
     pub identity: ProgramId,
+    pub blobs: ProgramId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
@@ -374,9 +375,6 @@ pub mod hook {
 
 pub type ProgramReply = Result<(), Refusal>;
 
-/// The kernel calls programs by role, never by id: genesis binds each role
-/// (programs, validators, identity) to a founding program. Each module here is
-/// the interface the kernel speaks to the program in that role.
 pub mod role {
     /// Which code runs at a height.
     pub mod programs {
@@ -432,6 +430,7 @@ pub mod role {
         pub struct Member {
             pub key: Vec<u8>,
             pub address: Option<String>,
+            pub halo: String,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -460,10 +459,14 @@ pub mod role {
         pub enum Op {
             Enroll {
                 address: Option<String>,
+                halo: String,
                 invite: Option<Invite>,
             },
             Leave,
             Vote(Motion),
+            SetHalo {
+                halo: String,
+            },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -499,6 +502,38 @@ pub mod role {
             pub issuer: Vec<u8>,
             pub grant: Grant,
             pub signature: Vec<u8>,
+        }
+
+        pub fn registered_halo(halo: &str) -> Result<(), crate::Refusal> {
+            let refused = |why: &str| {
+                crate::Refusal::new(
+                    crate::reason::INVALID_INPUT,
+                    format!("halo: `{halo}` {why}"),
+                )
+            };
+            let Some((host, port)) = halo.rsplit_once(':') else {
+                return Err(refused("is not host:port"));
+            };
+            let ported = port.parse::<u16>().is_ok_and(|port| port != 0);
+            if host.is_empty() || !ported {
+                return Err(refused("is not host:port"));
+            }
+            let bare = host
+                .strip_prefix('[')
+                .and_then(|inner| inner.strip_suffix(']'))
+                .unwrap_or(host);
+            let name = bare.trim_end_matches('.').to_ascii_lowercase();
+            let named_localhost = name == "localhost" || name.ends_with(".localhost");
+            let bind_only = bare
+                .parse::<core::net::IpAddr>()
+                .map(|ip| ip.to_canonical())
+                .is_ok_and(|ip| ip.is_unspecified() || ip.is_loopback());
+            if named_localhost || bind_only {
+                return Err(refused(
+                    "is an unspecified or loopback host: register the host:port other members dial",
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -609,6 +644,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_registered_halo_address_names_a_host_other_members_dial() {
+        use role::validators::registered_halo;
+        for dialed in [
+            "a.example.org:9100",
+            "203.0.113.7:9100",
+            "[2001:db8::1]:9100",
+            "localhost-like.example:1",
+        ] {
+            assert_eq!(registered_halo(dialed), Ok(()), "{dialed}");
+        }
+        for unregistrable in [
+            "0.0.0.0:9100",
+            "[::]:9100",
+            ":::9100",
+            "127.0.0.1:9100",
+            "127.1.2.3:9100",
+            "[::1]:9100",
+            "[::ffff:127.0.0.1]:9100",
+            "localhost:9100",
+            "LOCALHOST.:9100",
+            "node.localhost:9100",
+            "a.example.org",
+            "a.example.org:0",
+            ":9100",
+        ] {
+            let refusal = registered_halo(unregistrable).unwrap_err();
+            assert_eq!(refusal.reason, reason::INVALID_INPUT, "{unregistrable}");
+            assert!(refusal.sentence.starts_with("halo: "), "{refusal:?}");
+        }
+    }
+
+    #[test]
     fn prefix_end_is_the_first_key_past_every_extension() {
         assert_eq!(prefix_end(b"ab"), Some(b"ac".to_vec()));
         assert_eq!(prefix_end(&[0x61, 0xff]), Some(vec![0x62]));
@@ -662,6 +729,7 @@ mod tests {
                 programs: "r".into(),
                 validators: "v".into(),
                 identity: "i".into(),
+                blobs: "b".into(),
             },
             cause: Cause::Completion {
                 item: ItemRef {

@@ -4,13 +4,12 @@ use abi::{
     BlobId, Cause, Env, HostOp, HostReply, Invocation, ItemRef, Message, Origin, Outcome,
     ProgramCall, ProgramId, Refusal, Roles, reason,
 };
-use blobs::{Blobs, Layered, Stage};
+use blob::{Blobs, Layered, Stage};
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
 use runtime::{Code, Fault, Limits, Runtime};
 use state::{Overlay, Storage, Store, View};
 
-use crate::attach::Attachment;
 use crate::{Error, Receipt, Result, crypto, namespace};
 
 pub struct Loaded {
@@ -78,11 +77,8 @@ impl Loaded {
         let Some(framed) = blobs.framed(id)? else {
             return Ok(None);
         };
-        let (_, body) = blobs::parse(&framed).ok_or_else(|| {
-            Error::Blobs(blobs::Error::Corrupt(
-                *id,
-                "the frame does not parse".into(),
-            ))
+        let (_, body) = blob::parse(&framed).ok_or_else(|| {
+            Error::Blobs(blob::Error::Corrupt(*id, "the frame does not parse".into()))
         })?;
         Ok(Some(self.runtime.load(body)))
     }
@@ -138,7 +134,6 @@ where
     pub loaded: &'a Loaded,
     pub network: &'a [u8],
     pub roles: &'a Roles,
-    pub attached: &'a [Attachment],
     pub height: u64,
     pub time: u64,
 }
@@ -196,21 +191,26 @@ where
         self.world.store.view(Vec::new())
     }
 
-    fn blob<T>(
+    async fn blob<T>(
         &self,
         id: &BlobId,
-        read: impl FnOnce(&Layered<'r>) -> blobs::Result<Option<T>>,
+        fuel: &mut Option<u64>,
+        read: impl FnOnce(&Layered<'r>) -> blob::Result<Option<T>>,
     ) -> Result<Option<T>> {
         let rostered = self
             .view()
             .get(namespace::BLOBS, &namespace::blob(id))?
             .is_some();
-        let attached = self
-            .world
-            .attached
-            .iter()
-            .any(|attachment| attachment.id == *id);
-        let readable = rostered || attached;
+        let readable = rostered
+            || held(
+                self.world,
+                self.layers.clone(),
+                self.stage,
+                self.stack,
+                id,
+                fuel,
+            )
+            .await?;
         if !readable {
             return Ok(None);
         }
@@ -229,13 +229,16 @@ where
             HostOp::Scan(scan) => HostReply::Entries(self.view().scan(me, &scan)?),
             HostOp::CommittedGet(key) => HostReply::Value(self.confirmed().get(me, &key)?),
             HostOp::CommittedScan(scan) => HostReply::Entries(self.confirmed().scan(me, &scan)?),
-            HostOp::BlobGet(id) => HostReply::Blob(self.blob(&id, |layered| layered.get(&id))?),
+            HostOp::BlobGet(id) => {
+                HostReply::Blob(self.blob(&id, fuel, |layered| layered.get(&id)).await?)
+            }
             HostOp::BlobStat(id) => {
-                HostReply::BlobHeader(self.blob(&id, |layered| layered.stat(&id))?)
+                HostReply::BlobHeader(self.blob(&id, fuel, |layered| layered.stat(&id)).await?)
             }
-            HostOp::BlobRead { id, offset, len } => {
-                HostReply::Value(self.blob(&id, |layered| layered.read(&id, offset, len))?)
-            }
+            HostOp::BlobRead { id, offset, len } => HostReply::Value(
+                self.blob(&id, fuel, |layered| layered.read(&id, offset, len))
+                    .await?,
+            ),
             HostOp::Root(program) => HostReply::Root(self.world.store.root(&program)?),
             HostOp::Query { program, request } => HostReply::Query(
                 query(
@@ -378,6 +381,36 @@ where
     })
 }
 
+pub async fn held<'a, E>(
+    world: World<'a, E>,
+    layers: Vec<&'a Overlay>,
+    stage: &'a Stage,
+    stack: &[ProgramId],
+    id: &BlobId,
+    fuel: &mut Option<u64>,
+) -> Result<bool>
+where
+    E: Context + Spawner,
+{
+    let asked = blob::contract::Query::Held { blob: *id };
+    let answer = query(
+        world,
+        layers,
+        stage,
+        stack,
+        Origin::System,
+        world.roles.blobs.clone(),
+        abi::encode(&asked),
+        fuel,
+    )
+    .await?;
+    let Ok(bytes) = answer else {
+        return Ok(false);
+    };
+    let reply = abi::decode::<blob::contract::Reply>(&bytes);
+    Ok(matches!(reply, Ok(blob::contract::Reply::Held(Some(_)))))
+}
+
 /// What the frame is charged for each message a run emits, on top of the
 /// run it causes: the kernel's own work of dispatching it, which a message
 /// refused before any run (an unknown target, too deep) costs too.
@@ -386,7 +419,6 @@ const EMIT_FUEL: u64 = 1_000;
 pub struct Frame {
     pub fuel: Option<u64>,
     pub next_item: u64,
-    pub attached: Vec<Attachment>,
 }
 
 struct Execute<'a, E>
@@ -466,10 +498,7 @@ where
             ))),
             other => {
                 let reader = Reader {
-                    world: World {
-                        attached: &self.frame.attached,
-                        ..self.world
-                    },
+                    world: self.world,
                     layers: vec![&*self.overlay],
                     stage: &*self.stage,
                     env: &self.env,

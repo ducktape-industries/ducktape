@@ -1,4 +1,3 @@
-pub mod attach;
 mod crypto;
 mod namespace;
 mod unit;
@@ -14,7 +13,7 @@ use abi::{
     Refusal, Root, Scan, hook, reason,
     role::{identity, programs, validators},
 };
-use blobs::{Blobs, Layered, Stage};
+use blob::{Blobs, Layered, Stage};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
@@ -22,7 +21,6 @@ use runtime::Fault;
 use sha2::{Digest as _, Sha256};
 use state::{Commitment, Overlay, Storage, Store, View, Writes, valid_program_id};
 
-use crate::attach::{Attachment, Budget};
 use crate::unit::{Frame, Loaded, World, refusal_of};
 
 pub use namespace::{BLOBS, NETWORK, PROGRAMS, RECENT, RESERVED, SPENT, spent};
@@ -43,7 +41,7 @@ pub enum Error {
     #[error(transparent)]
     State(#[from] state::Error),
     #[error(transparent)]
-    Blobs(#[from] blobs::Error),
+    Blobs(#[from] blob::Error),
     #[error("blob {0:?} is recorded on chain but not on this node")]
     BlobUnavailable(BlobId),
     #[error("{program} runs {code:?}, which this node cannot load: {fault}")]
@@ -195,31 +193,14 @@ enum Submitted {
         receipt: Receipt,
         account: Option<identity::AccountNumber>,
     },
-    Unheld {
-        target: ProgramId,
-        id: BlobId,
-    },
 }
 
 impl Submitted {
-    fn prediction(self) -> Receipt {
+    fn receipt(self) -> Receipt {
         match self {
             Submitted::Stale(receipt) | Submitted::Carried { receipt, .. } => receipt,
-            Submitted::Unheld { target, id } => rejected(
-                &target,
-                Refusal::new(
-                    reason::NOT_FOUND,
-                    format!("attachment {id:?} is not held here"),
-                ),
-            ),
         }
     }
-}
-
-enum Holding {
-    Held,
-    Absent(BlobId),
-    Misnamed(Refusal),
 }
 
 struct Hooks {
@@ -323,6 +304,7 @@ where
             ("programs", &roles.programs),
             ("validators", &roles.validators),
             ("identity", &roles.identity),
+            ("blobs", &roles.blobs),
         ] {
             let founded = entries.iter().any(|entry| entry.program == *program);
             if !founded {
@@ -338,9 +320,12 @@ where
                 return Err(Error::Unhooked(hook.clone()));
             }
         }
-        // the programs role, the validators, then identity are admitted before
-        // the rest
-        let founding_roles = [&roles.programs, &roles.validators, &roles.identity];
+        let founding_roles = [
+            &roles.programs,
+            &roles.validators,
+            &roles.identity,
+            &roles.blobs,
+        ];
         entries.sort_by_key(|entry| {
             founding_roles
                 .iter()
@@ -633,22 +618,17 @@ where
     }
 
     pub fn missing_blobs(&self) -> Result<Vec<BlobId>> {
-        let rostered = self
-            .store
-            .view(Vec::new())
-            .scan(BLOBS, &Scan::prefix(b""))?;
-        let mut missing = Vec::new();
-        for entry in rostered {
-            let id: BlobId = abi::decode(&entry.key).map_err(corrupt)?;
-            if !self.blobs.has(&id) {
-                missing.push(id);
-            }
+        let view = self.store.view(Vec::new());
+        let mut named = BTreeSet::new();
+        for entry in view.scan(BLOBS, &Scan::prefix(b""))? {
+            named.insert(abi::decode::<BlobId>(&entry.key).map_err(corrupt)?);
         }
-        Ok(missing)
+        named.extend(programs_of(&view)?.into_values());
+        Ok(named.into_iter().filter(|id| !self.blobs.has(id)).collect())
     }
 
     pub fn install(&mut self, id: BlobId, framed: &[u8]) -> Result<()> {
-        let hashes_to_id = blobs::id_of(id.kind(), framed) == id;
+        let hashes_to_id = blob::id_of(id.kind(), framed) == id;
         if !hashes_to_id {
             return Err(Error::Corrupt(format!(
                 "the bytes offered for {id:?} do not hash to it"
@@ -662,16 +642,39 @@ where
         &self.blobs
     }
 
-    pub fn rostered(&self, id: &BlobId) -> Result<bool> {
-        let entry = self
-            .store
-            .view(Vec::new())
-            .get(BLOBS, &namespace::blob(id))?;
-        Ok(entry.is_some())
+    pub async fn readable(&self, id: &BlobId, time: u64) -> Result<bool> {
+        let height = self.height()?;
+        self.readable_in(id, height, time, &Overlay::default(), &Stage::default())
+            .await
     }
 
-    pub fn blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
-        if !self.rostered(id)? {
+    async fn readable_in(
+        &self,
+        id: &BlobId,
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+    ) -> Result<bool> {
+        let rostered = View::new(self.store.storage(), vec![overlay])
+            .get(BLOBS, &namespace::blob(id))?
+            .is_some();
+        if rostered {
+            return Ok(true);
+        }
+        unit::held(
+            self.world(height, time),
+            vec![overlay],
+            stage,
+            &[],
+            id,
+            &mut self.loaded.limits().fuel,
+        )
+        .await
+    }
+
+    pub async fn blob(&self, id: &BlobId, time: u64) -> Result<Option<Vec<u8>>> {
+        if !self.readable(id, time).await? {
             return Ok(None);
         }
         self.blobs
@@ -687,38 +690,9 @@ where
             loaded: &self.loaded,
             network: &self.network,
             roles: &self.roles,
-            attached: &[],
             height,
             time,
         }
-    }
-
-    pub fn held_blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
-        Ok(self.blobs.framed(id)?)
-    }
-
-    pub fn holds(&self, attachment: &Attachment) -> Result<bool> {
-        let size = self.blobs.size(&attachment.id)?;
-        Ok(size == Some(attachment.len))
-    }
-
-    fn holding(&self, attached: &[Attachment]) -> Result<Holding> {
-        for attachment in attached {
-            let Some(size) = self.blobs.size(&attachment.id)? else {
-                return Ok(Holding::Absent(attachment.id));
-            };
-            let as_named = size == attachment.len;
-            if !as_named {
-                return Ok(Holding::Misnamed(Refusal::new(
-                    reason::INVALID_INPUT,
-                    format!(
-                        "attachment {:?} is {size} bytes, and the frame names {}",
-                        attachment.id, attachment.len
-                    ),
-                )));
-            }
-        }
-        Ok(Holding::Held)
     }
 
     pub async fn query(
@@ -829,20 +803,12 @@ where
         let height = self.next_height()?;
         let mut overlay = std::mem::take(&mut self.preconfirmed);
         let mut stage = Stage::default();
-        let mut budget = Budget::default();
         let mut receipts = Vec::new();
         for submission in submissions {
             let submitted = self
-                .submit(
-                    submission,
-                    height,
-                    time,
-                    &mut budget,
-                    &mut overlay,
-                    &mut stage,
-                )
+                .submit(submission, height, time, &mut overlay, &mut stage)
                 .await?;
-            receipts.push(submitted.prediction());
+            receipts.push(submitted.receipt());
         }
         self.preconfirmed = overlay;
         Ok(receipts)
@@ -866,30 +832,28 @@ where
         let mut hooks = self
             .hooks(block.height, block.time, &overlay, &stage)
             .await?;
-        let mut budget = Budget::default();
         let mut submissions = Vec::new();
         for (position, submission) in block.submissions.into_iter().enumerate() {
             let signer = submission.signer.clone();
+            let target = submission.target.clone();
             let submitted = self
                 .submit(
                     submission,
                     block.height,
                     block.time,
-                    &mut budget,
                     &mut overlay,
                     &mut stage,
                 )
                 .await?;
             let receipt = match submitted {
                 Submitted::Stale(receipt) => receipt,
-                Submitted::Unheld { id, .. } => return Err(Error::BlobUnavailable(id)),
                 Submitted::Carried { receipt, account } => {
                     let record = hook::Record {
                         height: block.height,
                         position: position as u32,
                         signer,
                         account,
-                        target: receipt.program.clone(),
+                        target,
                         applied: matches!(receipt.outcome, Outcome::Applied { .. }),
                     };
                     self.tell(&mut hooks, &record, block.time, &mut overlay, &mut stage)
@@ -925,12 +889,9 @@ where
         submission: Submission,
         height: u64,
         time: u64,
-        budget: &mut Budget,
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Submitted> {
-        let envelope = attach::attached(&submission)
-            .map(|envelope| envelope.and_then(|attached| budget.take(attached)));
         let view = self.store.view(vec![&*overlay]);
         if let Err(refusal) = fresh(&view, &submission, height)? {
             return Ok(Submitted::Stale(rejected(&submission.target, refusal)));
@@ -950,32 +911,12 @@ where
                 });
             }
         };
-        let (target, payload, attached) = match envelope {
-            None => (submission.target, submission.payload, Vec::new()),
-            Some(Ok(attached)) => (attached.target, attached.payload, attached.blobs),
-            Some(Err(refusal)) => {
-                return Ok(Submitted::Carried {
-                    receipt: rejected(&submission.target, refusal),
-                    account,
-                });
-            }
-        };
-        match self.holding(&attached)? {
-            Holding::Held => {}
-            Holding::Absent(id) => return Ok(Submitted::Unheld { target, id }),
-            Holding::Misnamed(refusal) => {
-                return Ok(Submitted::Carried {
-                    receipt: rejected(&target, refusal),
-                    account,
-                });
-            }
-        }
         let checkpoint = overlay.checkpoint();
         let env = Env {
             network: self.network.clone(),
             height,
             time,
-            me: target.clone(),
+            me: submission.target.clone(),
             origin: Origin::External(submission.signer),
             // a key that holds no account still runs (identity's own
             // create is such a frame); it acts as no one
@@ -985,10 +926,9 @@ where
         };
         let receipt = self
             .run(
-                &target,
-                ProgramCall::Execute(payload),
+                &submission.target,
+                ProgramCall::Execute(submission.payload),
                 env,
-                attached,
                 overlay,
                 stage,
             )
@@ -1090,7 +1030,6 @@ where
         let mut frame = Frame {
             fuel: self.loaded.limits().fuel.map(|_| HOOK_FUEL),
             next_item: 0,
-            attached: Vec::new(),
         };
         let invocation = Invocation {
             env,
@@ -1232,14 +1171,12 @@ where
         program: &str,
         call: ProgramCall,
         env: Env,
-        attached: Vec<Attachment>,
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Receipt> {
         let mut frame = Frame {
             fuel: self.loaded.limits().fuel,
             next_item: 0,
-            attached,
         };
         self.run_frame(program, call, env, overlay, stage, &mut frame, 0)
             .await
@@ -1407,10 +1344,10 @@ where
             if !admissible {
                 continue;
             }
-            let rostered = View::new(self.store.storage(), vec![&*overlay])
-                .get(BLOBS, &namespace::blob(&entry.code))?
-                .is_some();
-            if !rostered {
+            let readable = self
+                .readable_in(&entry.code, height, time, overlay, stage)
+                .await?;
+            if !readable {
                 continue;
             }
             wanted.insert(entry.program.clone());
@@ -1480,7 +1417,6 @@ where
                 &entry.program,
                 ProgramCall::Init(entry.params.clone()),
                 env,
-                Vec::new(),
                 overlay,
                 stage,
             )
@@ -1526,7 +1462,6 @@ where
             &self.roles.identity,
             ProgramCall::Execute(abi::encode(&op)),
             env,
-            Vec::new(),
             overlay,
             stage,
         )

@@ -6,12 +6,12 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use consensus::{Anchor, Cadence};
-use halo::Endpoint;
 use host::{Founding as FoundingProgram, FoundingView, Genesis, Limits, Roles};
 use node::Block;
 use rand_core::CryptoRng;
 use serde::Deserialize;
 
+use crate::endpoint::Endpoint;
 use crate::{Error, Result};
 
 const IDENTITY: &str = "identity.key";
@@ -164,6 +164,7 @@ pub struct RoleIds {
     pub programs: String,
     pub validators: String,
     pub identity: String,
+    pub blobs: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -176,6 +177,7 @@ pub struct Metering {
 pub struct Validator {
     pub key: String,
     pub address: Option<String>,
+    pub halo: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +202,23 @@ impl Founding {
         Ok((founding, base))
     }
 
+    pub fn seat_halo(&mut self, key: &[u8], halo: &str) -> Result<()> {
+        let halo = halo_address(halo)?;
+        for validator in &mut self.validators {
+            let mine = hex::decode(&validator.key).is_ok_and(|named| named == key);
+            if !mine {
+                continue;
+            }
+            let named = validator.halo.get_or_insert_with(|| halo.clone());
+            if *named != halo {
+                return Err(Error::Address(format!(
+                    "the founding file seats this node at halo {named}, not {halo}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn descriptor(&self) -> Descriptor {
         Descriptor {
             network: self.network.clone(),
@@ -219,9 +238,16 @@ impl Founding {
                     .map(str::parse::<Endpoint>)
                     .transpose()
                     .map_err(Error::Address)?;
+                let Some(halo) = &validator.halo else {
+                    return Err(Error::Address(format!(
+                        "validator {} names no halo address",
+                        validator.key
+                    )));
+                };
                 Ok(Member {
                     key: hex::decode(&validator.key)?,
                     address: address.as_ref().map(Endpoint::to_string),
+                    halo: halo_address(halo)?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -256,6 +282,7 @@ impl Founding {
                 programs: self.roles.programs.clone(),
                 validators: self.roles.validators.clone(),
                 identity: self.roles.identity.clone(),
+                blobs: self.roles.blobs.clone(),
             },
             validators,
             programs,
@@ -272,6 +299,19 @@ impl Founding {
     }
 }
 
+pub fn halo_address(text: &str) -> Result<String> {
+    let parsed = text
+        .rsplit_once(':')
+        .filter(|(host, _)| !host.is_empty())
+        .and_then(|(_, port)| port.parse::<u16>().ok());
+    let Some(_) = parsed else {
+        return Err(Error::Address(format!(
+            "`{text}` is not a halo address: it is host:port"
+        )));
+    };
+    Ok(text.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::Founding;
@@ -285,8 +325,8 @@ mod tests {
 
     const FILE: &str = "network = \"n\"\ntime = 0\nepoch_length = 4\nblock_time_ms = 1000\n\
          HOOKS\
-         [roles]\nprograms = \"r\"\nvalidators = \"v\"\nidentity = \"i\"\n\
-         [[validators]]\nkey = \"00\"\n\
+         [roles]\nprograms = \"r\"\nvalidators = \"v\"\nidentity = \"i\"\nblobs = \"b\"\n\
+         [[validators]]\nkey = \"00\"\nhalo = \"localhost:1\"\n\
          [[programs]]\nid = \"activity\"\ncode = \"code.wasm\"\n";
 
     #[test]

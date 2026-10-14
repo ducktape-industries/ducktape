@@ -13,10 +13,9 @@ use commonware_utils::{NZU32, NZUsize, hostname};
 use consensus::channel::{BACKFILL, BROADCAST, CERTIFICATE, RELAY, RESOLVER, VOTE};
 use consensus::{EngineChannels, MarshalLanes};
 
-use halo::Endpoint;
-
-use crate::transport::Bridges;
-use crate::{Context, Error, Result};
+use crate::endpoint::Endpoint;
+use crate::transport::{self, Bridges};
+use crate::{Context, Result};
 
 pub const QUOTA_PER_SECOND: u32 = 1024;
 
@@ -77,10 +76,8 @@ impl<E: Context> Mesh<E> {
         let tracker = Tracker {
             oracle: oracle.clone(),
             me,
-            listen,
-            bridges: Bridges::new(
-                halo::dial::dialer().map_err(|error| Error::Tls(error.to_string()))?,
-            ),
+            listen: transport::loopback(listen),
+            bridges: Bridges::new(transport::dialer()?),
         };
         let mesh = Mesh {
             oracle,
@@ -197,6 +194,7 @@ mod tests {
                 .map(|seed| Member {
                     key: PrivateKey::from_seed(seed).public_key().as_ref().to_vec(),
                     address: Some(format!("tcp://localhost:{}", 9_000 + seed)),
+                    halo: format!("localhost:{}", 9_000 + seed),
                 })
                 .collect();
             tracker.track(0, &members);
@@ -229,6 +227,7 @@ mod tests {
                 &[Member {
                     key: undialed.as_ref().to_vec(),
                     address: None,
+                    halo: "localhost:1".into(),
                 }],
             );
             let tracked = mesh.oracle().peer_set(0).await.unwrap();

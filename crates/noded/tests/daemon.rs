@@ -5,22 +5,23 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use abi::role::validators::{Motion, Op};
-use abi::{Blob, BlobId, HashKind, HostOp, HostReply, Outcome, Scan, reason};
+use abi::{BlobId, HashKind, HostOp, HostReply, Outcome, Scan, reason};
+use blob::contract::Entry;
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
 use fixture_probe::{Reply, Step};
 use futures::{SinkExt as _, StreamExt as _};
-use host::attach::{ATTACH, Attached, Attachment};
 use host::{Layer, Submission, Tip};
 use node::Frame;
-use noded::wire::{Admin, BlockRef, PREVIEW_BYTES, QUERY_BYTES, TxAsk, TxRef};
-use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Workspace};
+use noded::wire::{Admin, BlockRef, PREVIEW_BYTES, TxAsk, TxRef};
+use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Upload, Workspace};
 
 const PROGRAMS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_programs.wasm");
 const VALSET: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_identity.wasm");
 const PROBE: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_probe.wasm");
+const BLOBS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_blobs.wasm");
 
 const NETWORK: &str = "daemon";
 const TIME: u64 = 1_700_000_000;
@@ -38,9 +39,17 @@ fn free_port() -> SocketAddr {
     listener.local_addr().unwrap()
 }
 
+fn free_udp_port() -> SocketAddr {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.local_addr().unwrap()
+}
+
 fn unheard() -> String {
     format!("tcp://localhost:{}", free_port().port())
 }
+
+const PUTTER_SEED: u64 = 21;
+const PUTTER_ACCOUNT: u64 = 1;
 
 struct Seat {
     workspace: Workspace,
@@ -48,6 +57,7 @@ struct Seat {
     p2p: SocketAddr,
     http: SocketAddr,
     tls: SocketAddr,
+    halo: SocketAddr,
     address: Option<String>,
 }
 
@@ -65,21 +75,27 @@ impl Seat {
             p2p,
             http: free_port(),
             tls: free_port(),
+            halo: free_udp_port(),
             address: Some(format!("tcp://localhost:{}", p2p.port())),
         }
     }
 
+    fn halo_address(&self) -> String {
+        self.halo.to_string()
+    }
+
     fn validator(&self) -> String {
         let key = hex::encode(self.identity.public_key().as_ref());
+        let halo = self.halo_address();
         let Some(address) = &self.address else {
-            return format!("[[validators]]\nkey = \"{key}\"\n");
+            return format!("[[validators]]\nkey = \"{key}\"\nhalo = \"{halo}\"\n");
         };
-        format!("[[validators]]\nkey = \"{key}\"\naddress = \"{address}\"\n")
+        format!("[[validators]]\nkey = \"{key}\"\naddress = \"{address}\"\nhalo = \"{halo}\"\n")
     }
 
     fn init(&self, founding: &Path) {
         runner(&self.workspace.runtime_dir()).start(|context| async move {
-            noded::init(context, &self.workspace, founding)
+            noded::init(context, &self.workspace, founding, &self.halo_address())
                 .await
                 .unwrap();
         });
@@ -91,9 +107,16 @@ impl Seat {
                 .address
                 .as_deref()
                 .map(|text| text.parse::<Endpoint>().unwrap());
-            noded::join(context, &self.workspace, source.clone(), address, None)
-                .await
-                .unwrap();
+            noded::join(
+                context,
+                &self.workspace,
+                source.clone(),
+                address,
+                self.halo_address(),
+                None,
+            )
+            .await
+            .unwrap();
         });
     }
 
@@ -108,14 +131,12 @@ impl Seat {
             p2p: self.p2p,
             http: self.http,
             tls: Some(self.tls),
+            halo: self.halo,
         };
         let thread = std::thread::spawn(move || {
             runner(&workspace.runtime_dir()).start(|context| async move {
                 let logs = Logs::install("info").unwrap();
-                let halo = HaloConfig {
-                    egress_bytes_per_sec: 8 << 20,
-                };
-                let running = noded::run(context, &workspace, logs, listen, halo)
+                let running = noded::run(context, &workspace, logs, listen, HaloConfig::default())
                     .await
                     .unwrap();
                 ready.send(running.http).unwrap();
@@ -158,21 +179,22 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
     std::fs::write(root.join("relay.wasm"), RELAY).unwrap();
     std::fs::write(root.join("probe.wasm"), PROBE).unwrap();
     std::fs::write(root.join("identity.wasm"), IDENTITY).unwrap();
-    std::fs::write(
-        root.join("holders.bin"),
-        abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
-    )
-    .unwrap();
+    std::fs::write(root.join("blobs.wasm"), BLOBS).unwrap();
+    let putter = ed25519::PrivateKey::from_seed(PUTTER_SEED);
+    let holders = vec![(putter.public_key().as_ref().to_vec(), PUTTER_ACCOUNT)];
+    std::fs::write(root.join("holders.bin"), abi::encode(&holders)).unwrap();
     std::fs::write(root.join("params.bin"), abi::encode(&Vec::<Step>::new())).unwrap();
     let validators: String = seats.iter().map(|seat| seat.validator()).collect();
     let text = format!(
         "network = \"{NETWORK}\"\ntime = {TIME}\nepoch_length = {epoch_length}\n\
          block_time_ms = {BLOCK_TIME_MS}\nmember_cap = {MEMBER_CAP}\n\
          [roles]\nprograms = \"programs\"\nvalidators = \"valset\"\nidentity = \"identity\"\n\
+         blobs = \"blobs\"\n\
          {validators}\
          [[programs]]\nid = \"programs\"\ncode = \"programs.wasm\"\n\
          [[programs]]\nid = \"valset\"\ncode = \"valset.wasm\"\n\
          [[programs]]\nid = \"identity\"\ncode = \"identity.wasm\"\nparams = \"holders.bin\"\n\
+         [[programs]]\nid = \"blobs\"\ncode = \"blobs.wasm\"\n\
          [[programs]]\nid = \"ping\"\ncode = \"relay.wasm\"\n\
          [[programs]]\nid = \"probe\"\ncode = \"probe.wasm\"\nparams = \"params.bin\"\n"
     );
@@ -218,25 +240,6 @@ async fn membership(client: &Client, key: &ed25519::PrivateKey, op: Op) -> u64 {
         "{receipt:?}"
     );
     height
-}
-
-async fn page_reader(
-    client: &Client,
-    key: &ed25519::PrivateKey,
-    body: &[u8],
-) -> (BlobId, Vec<u8>, Vec<u8>) {
-    let framed = blobs::frame("page", body).unwrap();
-    let id = blobs::id_of(HashKind::Sha256, &framed);
-    let attached = Attached {
-        target: "probe".into(),
-        payload: abi::encode(&vec![Step::Op(HostOp::BlobGet(id))]),
-        blobs: vec![Attachment {
-            id,
-            len: framed.len() as u64,
-        }],
-    };
-    let frame = signed(client, key, ATTACH, abi::encode(&attached)).await;
-    (id, framed, frame)
 }
 
 fn submission(frame: &[u8]) -> Submission {
@@ -504,26 +507,10 @@ fn a_validator_serves_its_network_over_http() {
             abi::encode(&vec![Reply::Host(HostReply::Value(Some(b"1".to_vec())))])
         );
 
-        let envs = |count: usize| (0..count).map(|_| Step::Env).collect::<Vec<_>>();
-        let one = frame(&client, &alice, envs(1)).await;
-        let env_bytes = client.query(Layer::Confirmed, one).await.unwrap().len() - 4;
-        let fits = (QUERY_BYTES - 4) / env_bytes;
-        let at_the_cap = frame(&client, &alice, envs(fits)).await;
-        let answer = client.query(Layer::Confirmed, at_the_cap).await.unwrap();
-        assert_eq!(answer.len(), 4 + fits * env_bytes);
-        let past_the_cap = frame(&client, &alice, envs(fits + 1)).await;
-        let Err(noded::Error::Refused(refusal)) =
-            client.query(Layer::Confirmed, past_the_cap).await
-        else {
-            panic!("an answer past the cap is refused");
-        };
-        assert_eq!(refusal.reason, reason::CAPACITY);
-        assert!(refusal.sentence.contains("smaller page"), "{refusal:?}");
-
         let programs = client.programs().await.unwrap();
         let code = programs["probe"];
         let framed = client.blob(code).await.unwrap().unwrap();
-        assert_eq!(blobs::id_of(code.kind(), &framed), code);
+        assert_eq!(blob::id_of(code.kind(), &framed), code);
         assert!(client.missing_blobs().await.unwrap().is_empty());
         assert!(
             client
@@ -582,145 +569,6 @@ fn a_validator_serves_its_network_over_http() {
         seat.admin(&client, Admin::Shutdown).await;
     });
     live.thread.join().unwrap();
-}
-
-#[test]
-fn a_validator_runs_a_frame_once_it_holds_the_blob_the_frame_attaches() {
-    let root = tempfile::tempdir().unwrap();
-    let seat = Seat::new(root.path(), "n0");
-    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
-    seat.init(&founding);
-    let live = seat.start();
-    let client = live.client.clone();
-    let alice = ed25519::PrivateKey::from_seed(11);
-
-    client_runtime().block_on(async {
-        let (id, framed, attaching) = page_reader(&client, &alice, b"body").await;
-
-        let unheld = client.submit(attaching.clone()).await.unwrap_err();
-        let noded::Error::Refused(refusal) = unheld else {
-            panic!("a frame whose attachment is not held is refused: {unheld}");
-        };
-        assert_eq!(refusal.reason, reason::NOT_FOUND);
-
-        client.put_blob(id, framed).await.unwrap();
-        let (_, receipt) = client
-            .land(&Frame::decode(&attaching).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(receipt.program, "probe");
-        let Outcome::Applied { output } = &receipt.outcome else {
-            panic!("the attaching frame runs: {receipt:?}");
-        };
-        let read = Reply::Host(HostReply::Blob(Some(Blob {
-            kind: "page".into(),
-            body: b"body".to_vec(),
-        })));
-        assert_eq!(abi::decode::<Vec<Reply>>(output).unwrap(), vec![read]);
-        seat.admin(&client, Admin::Shutdown).await;
-    });
-    live.thread.join().unwrap();
-}
-
-fn page_put(body: &[u8]) -> (Step, BlobId, Vec<u8>) {
-    let put = Step::Op(HostOp::BlobPut {
-        hash: HashKind::Sha256,
-        kind: "page".into(),
-        body: body.to_vec(),
-    });
-    let framed = blobs::frame("page", body).unwrap();
-    (put, blobs::id_of(HashKind::Sha256, &framed), framed)
-}
-
-#[test]
-fn a_node_serves_the_blobs_it_rosters_a_page_at_a_time() {
-    let root = tempfile::tempdir().unwrap();
-    let seat = Seat::new(root.path(), "n0");
-    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
-    seat.init(&founding);
-    let live = seat.start();
-    let client = live.client.clone();
-    let alice = ed25519::PrivateKey::from_seed(11);
-
-    client_runtime().block_on(async {
-        let (put_only, put_framed) = {
-            let framed = blobs::frame("page", b"put, never rostered").unwrap();
-            (blobs::id_of(HashKind::Sha256, &framed), framed)
-        };
-        client.put_blob(put_only, put_framed).await.unwrap();
-        assert_eq!(client.blobs(&[put_only]).await.unwrap(), vec![None]);
-        assert_eq!(client.blob(put_only).await.unwrap(), None);
-
-        let (first, first_id, first_framed) = page_put(&vec![1; 5 << 19]);
-        let (second, second_id, second_framed) = page_put(&vec![2; 5 << 19]);
-        let (small, small_id, small_framed) = page_put(b"small");
-        let steps = vec![first, second, small];
-        let (_, receipt) = client
-            .land(&Frame::decode(&frame(&client, &alice, steps).await).unwrap())
-            .await
-            .unwrap();
-        assert!(
-            matches!(receipt.outcome, Outcome::Applied { .. }),
-            "{receipt:?}"
-        );
-
-        let asked = [put_only, first_id, small_id, second_id];
-        let page = client.blobs(&asked).await.unwrap();
-        assert_eq!(page, vec![None, Some(first_framed), Some(small_framed)]);
-        let rest = client.blobs(&asked[page.len()..]).await.unwrap();
-        assert_eq!(rest, vec![Some(second_framed.clone())]);
-        assert_eq!(client.blob(second_id).await.unwrap(), Some(second_framed));
-        assert!(client.blobs(&[]).await.unwrap().is_empty());
-        seat.admin(&client, Admin::Shutdown).await;
-    });
-    live.thread.join().unwrap();
-}
-
-#[test]
-fn a_reader_brings_a_node_a_rostered_blob_it_lacks_and_never_an_unrostered_one() {
-    let root = tempfile::tempdir().unwrap();
-    let holder = Seat::new(root.path(), "n0");
-    let lacker = Seat::new(root.path(), "n1");
-    let founding = founding(root.path(), &[&holder, &lacker], EPOCH_LENGTH);
-    holder.init(&founding);
-    lacker.init(&founding);
-    let live = [holder.start(), lacker.start()];
-    let alice = ed25519::PrivateKey::from_seed(11);
-    client_runtime().block_on(async {
-        let (holding, lacking) = (&live[0].client, &live[1].client);
-        let opened = |metrics: &str| halo_streams(metrics, "quic") + halo_streams(metrics, "tcp");
-
-        let framed = blobs::frame("page", b"held by one node, rostered by none").unwrap();
-        let unrostered = blobs::id_of(HashKind::Sha256, &framed);
-        holding.put_blob(unrostered, framed).await.unwrap();
-        assert_eq!(lacking.blobs(&[unrostered]).await.unwrap(), vec![None]);
-        assert_eq!(lacking.blob(unrostered).await.unwrap(), None);
-        assert_eq!(opened(&lacking.metrics().await.unwrap()), 0);
-
-        let (put, id, framed) = page_put(b"rostered, then lost by one node");
-        let landing = frame(lacking, &alice, vec![put]).await;
-        lacking
-            .land(&Frame::decode(&landing).unwrap())
-            .await
-            .unwrap();
-        let file = lacker
-            .workspace
-            .dir()
-            .join("blobs")
-            .join(blobs::name_of(&id));
-        std::fs::remove_file(file).unwrap();
-        assert_eq!(lacking.missing_blobs().await.unwrap(), vec![id]);
-
-        assert_eq!(lacking.blobs(&[id]).await.unwrap(), vec![Some(framed)]);
-        assert!(lacking.missing_blobs().await.unwrap().is_empty());
-        assert!(opened(&lacking.metrics().await.unwrap()) > 0);
-        for (seat, node) in [(&holder, &live[0]), (&lacker, &live[1])] {
-            seat.admin(&node.client, Admin::Shutdown).await;
-        }
-    });
-    for node in live {
-        node.thread.join().unwrap();
-    }
 }
 
 #[test]
@@ -845,6 +693,7 @@ fn an_offline_resident_leaves_the_chain_finalizing() {
     let offline = ed25519::PrivateKey::from_seed(12);
     let enroll = Op::Enroll {
         address: Some(unheard()),
+        halo: free_udp_port().to_string(),
         invite: None,
     };
 
@@ -1086,22 +935,6 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
             .expect("a frame given the instant the resident starts lands");
     });
 
-    let (id, framed, unfetchable) = runtime.block_on(page_reader(
-        &follower.client,
-        &bob,
-        b"only the resident holds this",
-    ));
-    runtime
-        .block_on(follower.client.put_blob(id, framed))
-        .unwrap();
-    let pooled = runtime
-        .block_on(follower.client.submit(unfetchable))
-        .unwrap();
-    assert!(
-        matches!(pooled.outcome, Outcome::Applied { .. }),
-        "{pooled:?}"
-    );
-
     let failing = given(vec![Step::Fail("no".into())]);
     let mut spent = runtime
         .block_on(founders[1].client.changes(host::SPENT))
@@ -1117,9 +950,7 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
     runtime.block_on(async {
         ::tokio::time::timeout(Duration::from_secs(60), landed(&mut spent, &[&carried]))
             .await
-            .expect(
-                "a frame predicted to fail is relayed past one whose attachment no validator can fetch, and a block carries it",
-            );
+            .expect("a frame predicted to fail is relayed and a block carries it");
     });
     drop(spent);
 
@@ -1192,50 +1023,116 @@ fn terminate_tls(runtime: &::tokio::runtime::Runtime, listen: SocketAddr, to: So
     });
 }
 
-fn halo_streams(metrics: &str, path: &str) -> u64 {
-    let name = format!("halo_streams_over_{path}_total");
-    metrics
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-        .filter(|line| {
-            let metric = line.split_whitespace().next().unwrap_or_default();
-            metric.ends_with(&name)
-        })
-        .filter_map(|line| line.split_whitespace().last()?.parse::<u64>().ok())
-        .sum()
-}
-
-async fn fetched_over(holder: &Client, fetcher: &Client, path: &str, other: &str) {
-    let alice = ed25519::PrivateKey::from_seed(12);
-    let (id, framed, attaching) = page_reader(holder, &alice, b"carried over halo").await;
-    holder.put_blob(id, framed).await.unwrap();
-    let (_, receipt) = ::tokio::time::timeout(
-        Duration::from_secs(60),
-        holder.land(&Frame::decode(&attaching).unwrap()),
-    )
-    .await
-    .expect("the frame lands once the other validator fetched what it attaches")
-    .unwrap();
-    let Outcome::Applied { output } = &receipt.outcome else {
-        panic!("the attaching frame runs: {receipt:?}");
+#[test]
+fn a_bundle_put_on_one_validator_is_gathered_over_quic_held_by_a_quorum_and_read_by_a_program() {
+    let root = tempfile::tempdir().unwrap();
+    let taker = Seat::new(root.path(), "n0");
+    let gatherer = Seat::new(root.path(), "n1");
+    let founding = founding(root.path(), &[&taker, &gatherer], EPOCH_LENGTH);
+    taker.init(&founding);
+    gatherer.init(&founding);
+    let live = [taker.start(), gatherer.start()];
+    let putter = ed25519::PrivateKey::from_seed(PUTTER_SEED);
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let files = tempfile::tempdir().unwrap();
+    let small = files.path().join("small");
+    let big = files.path().join("big");
+    std::fs::write(&small, b"a small page").unwrap();
+    std::fs::write(&big, vec![7u8; 3 << 20]).unwrap();
+    let uploads = || {
+        [&small, &big]
+            .into_iter()
+            .map(|path| Upload {
+                kind: "page".into(),
+                path: path.clone(),
+            })
+            .collect::<Vec<_>>()
     };
-    let read = Reply::Host(HostReply::Blob(Some(Blob {
-        kind: "page".into(),
-        body: b"carried over halo".to_vec(),
-    })));
-    assert_eq!(abi::decode::<Vec<Reply>>(output).unwrap(), vec![read]);
-    let metrics = fetcher.metrics().await.unwrap();
-    assert!(halo_streams(&metrics, path) > 0, "{metrics}");
-    assert_eq!(halo_streams(&metrics, other), 0, "{metrics}");
+    client_runtime().block_on(async {
+        let client = &live[0].client;
+        let status = client.status().await.unwrap();
+        let role = status.roles.blobs.clone();
+        let entries = vec![
+            blob::file_entry("page", &small).unwrap(),
+            blob::file_entry("page", &big).unwrap(),
+        ];
+        let put = |blobs: Vec<Entry>, salt: u64| {
+            Frame::sign(
+                &putter,
+                NETWORK.as_bytes(),
+                status.anchor(),
+                Some(salt),
+                &role,
+                abi::encode(&blob::contract::Op::Put { blobs }),
+            )
+        };
+
+        let mut mislabelled = entries.clone();
+        mislabelled[1].kind = "pack".into();
+        let refused = client
+            .put_blobs(&put(mislabelled, 1), uploads())
+            .await
+            .unwrap_err();
+        let noded::Error::Refused(refusal) = refused else {
+            panic!("an upload whose bytes are not the blobs its put names is refused: {refused}");
+        };
+        assert_eq!(refusal.reason, reason::INVALID_INPUT);
+
+        let (_, receipt) = ::tokio::time::timeout(
+            Duration::from_secs(60),
+            client.land_blobs(&put(entries.clone(), 2), uploads()),
+        )
+        .await
+        .expect("the put lands")
+        .unwrap();
+        let Outcome::Applied { output } = receipt.outcome else {
+            panic!("the put applies: {receipt:?}");
+        };
+        let bundle: u64 = abi::decode(&output).unwrap();
+        ::tokio::time::timeout(Duration::from_secs(60), client.held(&role, bundle))
+            .await
+            .expect("both validators receipt the bundle once each holds it")
+            .unwrap();
+
+        let ids: Vec<BlobId> = entries.iter().map(|entry| entry.id).collect();
+        let framed = [
+            blob::frame("page", b"a small page").unwrap(),
+            blob::frame("page", &vec![7u8; 3 << 20]).unwrap(),
+        ];
+        let gathered = &live[1].client;
+        assert_eq!(
+            gathered.blobs(&ids).await.unwrap(),
+            framed.clone().map(Some).to_vec()
+        );
+        let named_by_none = blob::id_of(HashKind::Sha256, b"page 1\0x");
+        assert_eq!(gathered.blobs(&[named_by_none]).await.unwrap(), vec![None]);
+
+        let reading = frame(gathered, &alice, vec![Step::Op(HostOp::BlobGet(ids[0]))]).await;
+        let (_, read) = gathered
+            .land(&Frame::decode(&reading).unwrap())
+            .await
+            .unwrap();
+        let Outcome::Applied { output } = read.outcome else {
+            panic!("the probe reads the held blob: {read:?}");
+        };
+        let replies: Vec<Reply> = abi::decode(&output).unwrap();
+        assert_eq!(
+            replies,
+            vec![Reply::Host(HostReply::Blob(Some(abi::Blob {
+                kind: "page".into(),
+                body: b"a small page".to_vec(),
+            })))]
+        );
+        for (seat, node) in [(&taker, &live[0]), (&gatherer, &live[1])] {
+            seat.admin(&node.client, Admin::Shutdown).await;
+        }
+    });
+    for node in live {
+        node.thread.join().unwrap();
+    }
 }
 
-fn reached(
-    runtime: &::tokio::runtime::Runtime,
-    root: &Path,
-    dialer: Seat,
-    dialed: Seat,
-    (path, other): (&str, &str),
-) {
+fn reached(runtime: &::tokio::runtime::Runtime, root: &Path, dialer: Seat, dialed: Seat) {
     let founding = founding(root, &[&dialer, &dialed], EPOCH_LENGTH);
     dialer.init(&founding);
     dialed.init(&founding);
@@ -1254,7 +1151,6 @@ fn reached(
             .unwrap()
             .unwrap();
         assert_eq!(change.writes, vec![(b"a".to_vec(), Some(b"1".to_vec()))]);
-        fetched_over(&live[1].client, client, path, other).await;
         for (seat, node) in [(&dialer, &live[0]), (&dialed, &live[1])] {
             seat.admin(&node.client, Admin::Shutdown).await;
         }
@@ -1264,51 +1160,28 @@ fn reached(
     }
 }
 
-const OVER_QUIC: (&str, &str) = ("quic", "tcp");
-const OVER_TCP: (&str, &str) = ("tcp", "quic");
-
-fn dialed_at(address: impl FnOnce(&Seat) -> String, halo: (&str, &str)) {
+fn dialed_at(address: impl FnOnce(&Seat) -> String) {
     let root = tempfile::tempdir().unwrap();
     let mut dialer = Seat::new(root.path(), "n0");
     let mut dialed = Seat::new(root.path(), "n1");
     dialer.address = None;
     dialed.address = Some(address(&dialed));
-    reached(&client_runtime(), root.path(), dialer, dialed, halo);
+    reached(&client_runtime(), root.path(), dialer, dialed);
 }
 
 #[test]
 fn a_validator_is_dialed_over_tcp_at_its_name() {
-    dialed_at(
-        |seat| format!("tcp://localhost:{}", seat.p2p.port()),
-        OVER_QUIC,
-    );
+    dialed_at(|seat| format!("tcp://localhost:{}", seat.p2p.port()));
 }
 
 #[test]
 fn a_validator_is_dialed_over_tls() {
-    dialed_at(
-        |seat| format!("tls://localhost:{}", seat.tls.port()),
-        OVER_QUIC,
-    );
+    dialed_at(|seat| format!("tls://localhost:{}", seat.tls.port()));
 }
 
 #[test]
 fn a_validator_is_dialed_over_a_websocket_on_its_http_port() {
-    dialed_at(
-        |seat| format!("ws://localhost:{}", seat.http.port()),
-        OVER_TCP,
-    );
-}
-
-#[test]
-fn a_validator_whose_udp_stays_silent_is_fetched_from_over_tcp() {
-    let root = tempfile::tempdir().unwrap();
-    let mut dialer = Seat::new(root.path(), "n0");
-    let mut dialed = Seat::new(root.path(), "n1");
-    let _silent = std::net::UdpSocket::bind(dialed.p2p).unwrap();
-    dialer.address = None;
-    dialed.address = Some(format!("tcp://localhost:{}", dialed.p2p.port()));
-    reached(&client_runtime(), root.path(), dialer, dialed, OVER_TCP);
+    dialed_at(|seat| format!("ws://localhost:{}", seat.http.port()));
 }
 
 #[test]
@@ -1321,5 +1194,5 @@ fn a_validator_is_dialed_over_wss_through_a_tls_terminator() {
     terminate_tls(&runtime, terminator, dialed.http);
     dialer.address = None;
     dialed.address = Some(format!("wss://localhost:{}", terminator.port()));
-    reached(&runtime, root.path(), dialer, dialed, OVER_TCP);
+    reached(&runtime, root.path(), dialer, dialed);
 }

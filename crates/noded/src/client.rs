@@ -11,8 +11,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::wire::{
-    BlobPut, BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range,
-    Status, TxAsk, route,
+    BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range, Status, TxAsk,
+    route,
 };
 use crate::{Error, Result};
 
@@ -50,11 +50,25 @@ impl Client {
     }
 
     pub async fn land(&self, frame: &Frame) -> Result<(u64, Receipt)> {
+        let blocks = self.changes(RECENT).await?;
+        self.submit(frame.encode()).await?;
+        self.landed(frame, blocks).await
+    }
+
+    pub async fn land_blobs(&self, frame: &Frame, uploads: Vec<Upload>) -> Result<(u64, Receipt)> {
+        let blocks = self.changes(RECENT).await?;
+        self.put_blobs(frame, uploads).await?;
+        self.landed(frame, blocks).await
+    }
+
+    async fn landed(
+        &self,
+        frame: &Frame,
+        mut blocks: impl Stream<Item = Result<Change>> + Unpin,
+    ) -> Result<(u64, Receipt)> {
         let submission = frame.body.submission();
         let id = submission.id();
         let last = submission.anchor.height + ANCHOR_WINDOW;
-        let mut blocks = self.changes(RECENT).await?;
-        self.submit(frame.encode()).await?;
         while let Some(change) = blocks.next().await {
             let height = change?.height;
             if let Some(receipt) = self.carried(height, &id).await? {
@@ -105,8 +119,44 @@ impl Client {
         self.post(route::BLOB_GET, &id).await
     }
 
-    pub async fn put_blob(&self, id: BlobId, framed: Vec<u8>) -> Result<()> {
-        self.post(route::BLOB_PUT, &BlobPut { id, framed }).await
+    pub async fn put_blobs(&self, frame: &Frame, uploads: Vec<Upload>) -> Result<Receipt> {
+        let encoded = frame.encode();
+        let mut opening = (encoded.len() as u32).to_le_bytes().to_vec();
+        opening.extend_from_slice(&encoded);
+        let mut parts: Vec<Part> = vec![once(opening)];
+        for upload in uploads {
+            let file = tokio::fs::File::open(&upload.path).await?;
+            let len = file.metadata().await?.len();
+            parts.push(once(blob::header(&upload.kind, len)));
+            parts.push(Box::pin(tokio_util::io::ReaderStream::new(file)));
+        }
+        let body = reqwest::Body::wrap_stream(futures::stream::iter(parts).flatten());
+        let response = self
+            .http
+            .post(self.url(route::BLOB_PUT))
+            .body(body)
+            .send()
+            .await?;
+        answered(response).await
+    }
+
+    pub async fn held(&self, role: &str, bundle: u64) -> Result<u64> {
+        let key = blob::contract::bundle_key(bundle);
+        let mut changes = self.changes(role).await?;
+        let recorded = self.get(Layer::Confirmed, role, &key).await?;
+        if let Some(since) = held_since(recorded.as_deref()) {
+            return Ok(since);
+        }
+        while let Some(change) = changes.next().await {
+            let written = change?
+                .writes
+                .into_iter()
+                .find_map(|(written, value)| (written == key).then_some(value));
+            if let Some(since) = held_since(written.flatten().as_deref()) {
+                return Ok(since);
+            }
+        }
+        Err(Error::Closed)
     }
 
     pub async fn blobs(&self, ids: &[BlobId]) -> Result<Vec<Option<Vec<u8>>>> {
@@ -192,6 +242,27 @@ impl Client {
     async fn post_raw<T: BorshDeserialize>(&self, route: &str, body: Vec<u8>) -> Result<T> {
         let response = self.http.post(self.url(route)).body(body).send().await?;
         answered(response).await
+    }
+}
+
+pub struct Upload {
+    pub kind: String,
+    pub path: std::path::PathBuf,
+}
+
+type Part = std::pin::Pin<Box<dyn Stream<Item = std::io::Result<bytes::Bytes>> + Send>>;
+
+fn once(bytes: Vec<u8>) -> Part {
+    Box::pin(futures::stream::once(futures::future::ready(Ok(
+        bytes::Bytes::from(bytes),
+    ))))
+}
+
+fn held_since(bundle: Option<&[u8]>) -> Option<u64> {
+    let bundle: blob::contract::Bundle = abi::decode(bundle?).ok()?;
+    match bundle.custody {
+        blob::contract::Custody::Held { since } => Some(since),
+        blob::contract::Custody::Receipted(_) => None,
     }
 }
 

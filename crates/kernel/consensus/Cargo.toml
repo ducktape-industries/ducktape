@@ -26,7 +26,6 @@ thiserror = { workspace = true }
 sim = []
 
 [dev-dependencies]
-blobs = { workspace = true }
 consensus = { path = ".", features = ["sim"] }
 fixture-programs = { path = "../fixtures/programs" }
 fixture-probe = { path = "../fixtures/probe" }

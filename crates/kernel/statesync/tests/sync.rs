@@ -24,6 +24,7 @@ const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.was
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
+const BLOBS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"sync";
@@ -41,6 +42,7 @@ fn member(key: &ed25519::PrivateKey) -> validators::Member {
     validators::Member {
         key: key.public_key().as_ref().to_vec(),
         address: Some(format!("{}:1", key.public_key())),
+        halo: format!("{}:2", key.public_key()),
     }
 }
 
@@ -51,6 +53,7 @@ fn genesis(members: &[validators::Member]) -> Genesis {
             programs: "programs".into(),
             validators: "valset".into(),
             identity: "identity".into(),
+            blobs: "blobs".into(),
         },
         validators: members.to_vec(),
         programs: vec![
@@ -68,6 +71,11 @@ fn genesis(members: &[validators::Member]) -> Genesis {
                 program: "identity".into(),
                 code: IDENTITY.to_vec(),
                 params: abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
+            },
+            Founding {
+                program: "blobs".into(),
+                code: BLOBS.to_vec(),
+                params: Vec::new(),
             },
             Founding {
                 program: "ping".into(),
@@ -534,6 +542,7 @@ fn a_tip_certificate_verifies_against_the_validators_not_the_members() {
             let resident = key(seed);
             let enroll = validators::Op::Enroll {
                 address: member(&resident).address,
+                halo: member(&resident).halo,
                 invite: None,
             };
             Frame::sign(

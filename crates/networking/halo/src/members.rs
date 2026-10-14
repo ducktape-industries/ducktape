@@ -1,17 +1,15 @@
-//! The current member set halo admits and dials: each member's key, the endpoint the chain
-//! records for it, and whether it votes.
+//! The current member set halo admits and dials: each member's key, the halo address it
+//! registered on the chain, and whether it votes.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
 
 use commonware_cryptography::ed25519::PublicKey;
 
-use crate::endpoint::Endpoint;
-
 #[derive(Clone, Debug)]
 pub struct Seat {
     pub key: PublicKey,
-    pub endpoint: Option<Endpoint>,
+    pub halo: String,
     pub validator: bool,
 }
 
@@ -44,8 +42,8 @@ impl Members {
         self.read().get(key).is_some_and(|seat| seat.validator)
     }
 
-    pub fn endpoint(&self, key: &PublicKey) -> Option<Endpoint> {
-        self.read().get(key)?.endpoint.clone()
+    pub fn halo(&self, key: &PublicKey) -> Option<String> {
+        Some(self.read().get(key)?.halo.clone())
     }
 
     pub fn candidates(&self, me: &PublicKey, first: Option<&PublicKey>) -> Vec<PublicKey> {
@@ -88,7 +86,7 @@ mod tests {
     fn seat(seed: u64, validator: bool) -> Seat {
         Seat {
             key: key(seed),
-            endpoint: None,
+            halo: format!("localhost:{seed}"),
             validator,
         }
     }
