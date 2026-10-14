@@ -24,15 +24,17 @@ mod program {
     use core::task::Poll;
 
     use abi::{Env, ProgramReply, Refusal, reason};
-    use program::awaiting::{Ask, AwaitingProgram, ask, ctx, env};
+    use program::awaiting::{Answer, AwaitingProgram, Call, call_raw, ctx, env};
 
     use crate::{Finished, Plan};
 
     struct Awaiter;
 
-    type Answer = Result<Vec<u8>, Refusal>;
+    fn ask(what: &[u8]) -> Call {
+        call_raw("oracle", what.to_vec())
+    }
 
-    async fn together(mut a: Ask, mut b: Ask) -> (Answer, Answer) {
+    async fn together(mut a: Call, mut b: Call) -> (Answer, Answer) {
         let mut first = None;
         let mut second = None;
         poll_fn(|context| {
@@ -62,14 +64,13 @@ mod program {
             let kept: Vec<u8> = (0..plan.kept).map(|i| i as u8).collect();
             let (first, second) = match plan.together {
                 true => {
-                    let (first, second) =
-                        together(ask(b"first".to_vec()), ask(b"second".to_vec())).await;
+                    let (first, second) = together(ask(b"first"), ask(b"second")).await;
                     (first?, second?)
                 }
                 false => {
-                    let first = ask(b"first".to_vec()).await?;
+                    let first = ask(b"first").await?;
                     ctx().set(b"first".to_vec(), first.clone());
-                    let second = ask(b"second".to_vec()).await?;
+                    let second = ask(b"second").await?;
                     (first, second)
                 }
             };

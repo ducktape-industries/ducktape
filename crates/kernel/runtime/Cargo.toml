@@ -15,5 +15,6 @@ wasmtime = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 fixture-probe = { path = "../fixtures/probe" }
 fixture-awaiter = { path = "../fixtures/awaiter" }
+fixture-feed = { path = "../fixtures/feed" }
 sha2 = { workspace = true }
 wat = "1"

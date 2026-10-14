@@ -254,7 +254,7 @@ where
                 .await?,
             ),
             HostOp::Crypto(op) => crypto::serve(op),
-            HostOp::Await(_) => HostReply::Refused(Refusal::new(
+            HostOp::Await { .. } => HostReply::Refused(Refusal::new(
                 reason::UNSUPPORTED,
                 "no program awaits on this host yet",
             )),

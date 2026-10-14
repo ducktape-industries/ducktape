@@ -18,7 +18,7 @@ const LIMITS: Limits = Limits {
 
 #[derive(Default)]
 struct Bench {
-    tickets: BTreeMap<u64, Vec<u8>>,
+    tickets: BTreeMap<u64, (String, Vec<u8>)>,
     state: BTreeMap<Vec<u8>, Vec<u8>>,
     output: Option<Vec<u8>>,
 }
@@ -27,9 +27,9 @@ struct Bench {
 impl Host for Bench {
     async fn call(&mut self, op: HostOp, _fuel: &mut Option<u64>) -> HostReply {
         match op {
-            HostOp::Await(request) => {
+            HostOp::Await { target, payload } => {
                 let ticket = self.tickets.len() as u64 + 1;
-                self.tickets.insert(ticket, request);
+                self.tickets.insert(ticket, (target, payload));
                 HostReply::Ticket(ticket)
             }
             HostOp::Set { key, value } => {
@@ -76,8 +76,12 @@ fn plan(kept: u32, together: bool) -> ProgramCall {
 fn answer(ticket: u64, answer: &[u8]) -> ProgramCall {
     ProgramCall::Resume {
         ticket,
-        answer: answer.to_vec(),
+        answer: Ok(answer.to_vec()),
     }
+}
+
+fn asked(what: &[u8]) -> (String, Vec<u8>) {
+    ("oracle".into(), what.to_vec())
 }
 
 fn parked(ran: Ran) -> Image {
@@ -111,7 +115,7 @@ async fn a_frame_parks_at_each_await_and_a_fresh_runtime_resumes_it() {
         .await
         .unwrap();
     let first = parked(started);
-    assert_eq!(bench.tickets, BTreeMap::from([(1, b"first".to_vec())]));
+    assert_eq!(bench.tickets, BTreeMap::from([(1, asked(b"first"))]));
     assert!(bench.state.is_empty());
 
     let (runtime, code) = fresh().await;
@@ -127,7 +131,7 @@ async fn a_frame_parks_at_each_await_and_a_fresh_runtime_resumes_it() {
         .unwrap();
     let second = parked(resumed);
     assert_eq!(bench.state.get(b"first".as_slice()), Some(&b"A".to_vec()));
-    assert_eq!(bench.tickets.get(&2), Some(&b"second".to_vec()));
+    assert_eq!(bench.tickets.get(&2), Some(&asked(b"second")));
 
     let (runtime, code) = fresh().await;
     let done = runtime

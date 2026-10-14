@@ -32,16 +32,17 @@ macro_rules! program {
 macro_rules! awaiting_program {
     ($program:ty) => {
         #[cfg(target_arch = "wasm32")]
-        #[unsafe(no_mangle)]
-        pub extern "C" fn alloc(len: u32) -> u32 {
-            $crate::exports::alloc(len)
-        }
+        const _: () = {
+            #[unsafe(no_mangle)]
+            pub extern "C" fn alloc(len: u32) -> u32 {
+                $crate::exports::alloc(len)
+            }
 
-        #[cfg(target_arch = "wasm32")]
-        #[unsafe(no_mangle)]
-        pub extern "C" fn call(ptr: u32, len: u32) -> u64 {
-            $crate::awaiting::call::<$program>(ptr, len)
-        }
+            #[unsafe(no_mangle)]
+            pub extern "C" fn call(ptr: u32, len: u32) -> u64 {
+                $crate::awaiting::entry::<$program>(ptr, len)
+            }
+        };
     };
 }
 

@@ -1892,6 +1892,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fixture-feed"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "program",
+]
+
+[[package]]
 name = "fixture-identity"
 version = "0.1.0"
 dependencies = [
@@ -4021,6 +4030,7 @@ dependencies = [
  "async-trait",
  "borsh",
  "fixture-awaiter",
+ "fixture-feed",
  "fixture-probe",
  "futures",
  "sha2 0.10.9",
