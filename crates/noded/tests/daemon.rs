@@ -16,8 +16,7 @@ use node::Frame;
 use noded::wire::{Admin, BlockRef, PREVIEW_BYTES, QUERY_BYTES, TxAsk, TxRef};
 use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Workspace};
 
-const PROGRAMS: &[u8] =
-    include_bytes!("../../kernel/fixtures/wasm/fixture_programs.wasm");
+const PROGRAMS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_programs.wasm");
 const VALSET: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_identity.wasm");

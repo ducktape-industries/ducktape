@@ -13,8 +13,8 @@ use commonware_cryptography::bls12381::primitives::ops;
 use commonware_cryptography::bls12381::primitives::variant::MinPk;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Storage as _, Supervisor as _, deterministic};
-use fixture_programs::Change;
 use fixture_probe::{Reply, Step};
+use fixture_programs::Change;
 use fixture_relay::Script;
 use host::attach::{ATTACH, ATTACHMENT_BYTES, Attached, Attachment, FRAME_ATTACHMENTS};
 use host::{
@@ -348,14 +348,7 @@ fn founding_admits_every_program_and_the_host_reopens() {
             .iter()
             .map(|r| r.program.as_str())
             .collect();
-        let founded = [
-            "programs",
-            "valset",
-            "identity",
-            "ping",
-            "pong",
-            "probe",
-        ];
+        let founded = ["programs", "valset", "identity", "ping", "pong", "probe"];
         // the roles' admissions and accounts, then each other program's
         // account before its admission
         assert_eq!(admitted[..3], founded[..3]);
@@ -377,14 +370,7 @@ fn founding_admits_every_program_and_the_host_reopens() {
         let ids: Vec<&str> = programs.keys().map(String::as_str).collect();
         assert_eq!(
             ids,
-            [
-                "identity",
-                "ping",
-                "pong",
-                "probe",
-                "programs",
-                "valset"
-            ]
+            ["identity", "ping", "pong", "probe", "programs", "valset"]
         );
         assert_eq!(programs["ping"], programs["pong"]);
         assert_ne!(programs["ping"], programs["probe"]);
@@ -1659,14 +1645,7 @@ fn the_roster_admits_swaps_and_drops_programs() {
         let ids: Vec<&str> = programs.keys().map(String::as_str).collect();
         assert_eq!(
             ids,
-            [
-                "identity",
-                "ping",
-                "pong",
-                "probe",
-                "programs",
-                "valset"
-            ]
+            ["identity", "ping", "pong", "probe", "programs", "valset"]
         );
         // retried: registered and refused again
         let applied = host.apply(block(11, Vec::new())).await.unwrap();
@@ -2353,10 +2332,7 @@ fn a_program_admitted_again_under_its_id_starts_empty() {
         });
         host.apply(block(
             1,
-            vec![submit(
-                "programs",
-                change("echo", probe, script(vec![set])),
-            )],
+            vec![submit("programs", change("echo", probe, script(vec![set])))],
         ))
         .await
         .unwrap();

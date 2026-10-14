@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use abi::{
-    Cause, CryptoOp, CryptoReply, Entry, Env, ProgramCall, HostOp, HostReply, Invocation, ItemRef,
-    Message, Origin, Principal, Refusal, Roles, Scan, reason,
+    Cause, CryptoOp, CryptoReply, Entry, Env, HostOp, HostReply, Invocation, ItemRef, Message,
+    Origin, Principal, ProgramCall, Refusal, Roles, Scan, reason,
 };
 use fixture_probe::{Reply, Step};
 use runtime::{Fault, Host, Limits, Runtime};

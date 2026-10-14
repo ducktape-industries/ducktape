@@ -23,8 +23,7 @@ use node::{Block, Frame, Node, Sequenced, Source};
 
 mod epochs;
 
-const PROGRAMS: &[u8] =
-    include_bytes!("../../../fixtures/wasm/fixture_programs.wasm");
+const PROGRAMS: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_programs.wasm");
 const VALSET: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_identity.wasm");

@@ -10,7 +10,7 @@ use std::path::Path;
 /// that leaves a role empty, or names a program it does not found, is refused.
 pub use abi::Roles;
 use abi::{
-    BlobId, Cause, Env, ProgramCall, HashKind, Invocation, Origin, Outcome, Principal, ProgramId,
+    BlobId, Cause, Env, HashKind, Invocation, Origin, Outcome, Principal, ProgramCall, ProgramId,
     Refusal, Root, Scan, hook, reason,
     role::{identity, programs, validators},
 };

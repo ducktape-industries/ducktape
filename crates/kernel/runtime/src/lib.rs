@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use abi::{ProgramReply, HostOp, HostReply, Invocation};
+use abi::{HostOp, HostReply, Invocation, ProgramReply};
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::future::{Either, select};
 use tokio::sync::{mpsc, oneshot};
