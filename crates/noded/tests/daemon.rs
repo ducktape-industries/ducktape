@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, TcpListener};
+use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -39,8 +39,16 @@ fn free_port() -> SocketAddr {
     listener.local_addr().unwrap()
 }
 
+fn outbound_ip() -> IpAddr {
+    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+    socket.connect("192.0.2.1:9").expect(
+        "a seat registers its halo at this host's outbound address, so the host needs a route",
+    );
+    socket.local_addr().unwrap().ip()
+}
+
 fn free_udp_port() -> SocketAddr {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let socket = UdpSocket::bind((outbound_ip(), 0)).unwrap();
     socket.local_addr().unwrap()
 }
 
