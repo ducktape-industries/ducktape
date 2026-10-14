@@ -607,6 +607,107 @@ fn a_validator_runs_a_frame_once_it_holds_the_blob_the_frame_attaches() {
     live.thread.join().unwrap();
 }
 
+fn page_put(body: &[u8]) -> (Step, BlobId, Vec<u8>) {
+    let put = Step::Op(HostOp::BlobPut {
+        hash: HashKind::Sha256,
+        kind: "page".into(),
+        body: body.to_vec(),
+    });
+    let framed = blobs::frame("page", body).unwrap();
+    (put, blobs::id_of(HashKind::Sha256, &framed), framed)
+}
+
+#[test]
+fn a_node_serves_the_blobs_it_rosters_a_page_at_a_time() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+
+    client_runtime().block_on(async {
+        let (put_only, put_framed) = {
+            let framed = blobs::frame("page", b"put, never rostered").unwrap();
+            (blobs::id_of(HashKind::Sha256, &framed), framed)
+        };
+        client.put_blob(put_only, put_framed).await.unwrap();
+        assert_eq!(client.blobs(&[put_only]).await.unwrap(), vec![None]);
+        assert_eq!(client.blob(put_only).await.unwrap(), None);
+
+        let (first, first_id, first_framed) = page_put(&vec![1; 5 << 19]);
+        let (second, second_id, second_framed) = page_put(&vec![2; 5 << 19]);
+        let (small, small_id, small_framed) = page_put(b"small");
+        let steps = vec![first, second, small];
+        let (_, receipt) = client
+            .land(&Frame::decode(&frame(&client, &alice, steps).await).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
+
+        let asked = [put_only, first_id, small_id, second_id];
+        let page = client.blobs(&asked).await.unwrap();
+        assert_eq!(page, vec![None, Some(first_framed), Some(small_framed)]);
+        let rest = client.blobs(&asked[page.len()..]).await.unwrap();
+        assert_eq!(rest, vec![Some(second_framed.clone())]);
+        assert_eq!(client.blob(second_id).await.unwrap(), Some(second_framed));
+        assert!(client.blobs(&[]).await.unwrap().is_empty());
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn a_reader_brings_a_node_a_rostered_blob_it_lacks_and_never_an_unrostered_one() {
+    let root = tempfile::tempdir().unwrap();
+    let holder = Seat::new(root.path(), "n0");
+    let lacker = Seat::new(root.path(), "n1");
+    let founding = founding(root.path(), &[&holder, &lacker], EPOCH_LENGTH);
+    holder.init(&founding);
+    lacker.init(&founding);
+    let live = [holder.start(), lacker.start()];
+    let alice = ed25519::PrivateKey::from_seed(11);
+    client_runtime().block_on(async {
+        let (holding, lacking) = (&live[0].client, &live[1].client);
+        let opened = |metrics: &str| halo_streams(metrics, "quic") + halo_streams(metrics, "tcp");
+
+        let framed = blobs::frame("page", b"held by one node, rostered by none").unwrap();
+        let unrostered = blobs::id_of(HashKind::Sha256, &framed);
+        holding.put_blob(unrostered, framed).await.unwrap();
+        assert_eq!(lacking.blobs(&[unrostered]).await.unwrap(), vec![None]);
+        assert_eq!(lacking.blob(unrostered).await.unwrap(), None);
+        assert_eq!(opened(&lacking.metrics().await.unwrap()), 0);
+
+        let (put, id, framed) = page_put(b"rostered, then lost by one node");
+        let landing = frame(lacking, &alice, vec![put]).await;
+        lacking
+            .land(&Frame::decode(&landing).unwrap())
+            .await
+            .unwrap();
+        let file = lacker
+            .workspace
+            .dir()
+            .join("blobs")
+            .join(blobs::name_of(&id));
+        std::fs::remove_file(file).unwrap();
+        assert_eq!(lacking.missing_blobs().await.unwrap(), vec![id]);
+
+        assert_eq!(lacking.blobs(&[id]).await.unwrap(), vec![Some(framed)]);
+        assert!(lacking.missing_blobs().await.unwrap().is_empty());
+        assert!(opened(&lacking.metrics().await.unwrap()) > 0);
+        for (seat, node) in [(&holder, &live[0]), (&lacker, &live[1])] {
+            seat.admin(&node.client, Admin::Shutdown).await;
+        }
+    });
+    for node in live {
+        node.thread.join().unwrap();
+    }
+}
+
 #[test]
 fn a_node_reads_a_transaction_of_a_block_it_lists_no_summary_for() {
     let root = tempfile::tempdir().unwrap();

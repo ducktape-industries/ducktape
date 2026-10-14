@@ -14,6 +14,7 @@ pub mod route {
     pub const BLOB_GET: &str = "/v1/blob/get";
     pub const BLOB_PUT: &str = "/v1/blob/put";
     pub const BLOB_MISSING: &str = "/v1/blob/missing";
+    pub const BLOBS: &str = "/v1/blobs";
     pub const PROGRAMS: &str = "/v1/programs";
     pub const CHANGES: &str = "/v1/changes";
     pub const BLOCKS: &str = "/v1/blocks";
