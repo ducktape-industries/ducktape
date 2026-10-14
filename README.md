@@ -210,8 +210,10 @@ joiner with `join --halo`, and any member changes its own with
 `ducktape halo <host:port>`. A registered address with an unspecified or
 loopback host (`0.0.0.0`, `::`, `127.0.0.1`, `localhost`) is refused. `run
 --halo` names the UDP socket the node binds, where `0.0.0.0:<port>` is
-right. A connection carries streams both ways, so a member whose halo
-address takes no inbound UDP still takes part by dialing out. `--halo-egress` caps the bytes per second a node sends over halo;
+right. Each node dials every member once it is seated and keeps that
+connection open, and a connection carries streams both ways, so a member
+whose halo address takes no inbound UDP still takes part by dialing out. A
+changed address is dialed from the next block on. `--halo-egress` caps the bytes per second a node sends over halo;
 without it the node sends as fast as the path allows.
 
 ```sh
