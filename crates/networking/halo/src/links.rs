@@ -2,6 +2,7 @@
 //! at the same host and port, one connection per peer with a stream per open; where UDP does
 //! not answer in time, or the endpoint is ws:// or wss://, it opens a tcp path per stream. A
 //! silent UDP path is remembered per peer and tried again later. Only QUIC carries datagrams.
+//! A connection on the live ALPN is a desktop client's, not a member's: it is handed on whole.
 
 use std::collections::HashMap;
 use std::io;
@@ -32,6 +33,8 @@ const QUIC_RETRY: Duration = Duration::from_secs(60);
 const INBOUND: usize = 256;
 const DATAGRAMS: usize = 1024;
 const HANDSHAKES: usize = 64;
+/// Client connections accepted and not yet taken by the relay; past it a client is told busy.
+const CLIENTS: usize = 256;
 
 pub enum Carried {
     Quic(quinn::SendStream, quinn::RecvStream),
@@ -220,6 +223,8 @@ pub struct Links<E: Context> {
     accepted: tokio::sync::Mutex<mpsc::Receiver<(PublicKey, Carried)>>,
     received: mpsc::Sender<(PublicKey, Bytes)>,
     datagrams: tokio::sync::Mutex<mpsc::Receiver<(PublicKey, Bytes)>>,
+    clients: mpsc::Sender<quinn::Connection>,
+    accepted_clients: tokio::sync::Mutex<mpsc::Receiver<quinn::Connection>>,
     opened: Opened,
     handshakes: Arc<tokio::sync::Semaphore>,
 }
@@ -241,6 +246,7 @@ impl<E: Context + Metrics> Links<E> {
         };
         let (inbound, accepted) = mpsc::channel(INBOUND);
         let (received, datagrams) = mpsc::channel(DATAGRAMS);
+        let (clients, accepted_clients) = mpsc::channel(CLIENTS);
         let opened = Opened {
             quic: context.register(
                 "halo_streams_over_quic",
@@ -264,6 +270,8 @@ impl<E: Context + Metrics> Links<E> {
             accepted: tokio::sync::Mutex::new(accepted),
             received,
             datagrams: tokio::sync::Mutex::new(datagrams),
+            clients,
+            accepted_clients: tokio::sync::Mutex::new(accepted_clients),
             handshakes: Arc::new(tokio::sync::Semaphore::new(HANDSHAKES)),
             opened,
         });
@@ -280,6 +288,11 @@ impl<E: Context + Metrics> Links<E> {
 
     pub fn udp(&self) -> Vec<SocketAddr> {
         self.quic.as_ref().map(Quic::local).unwrap_or_default()
+    }
+
+    /// Connections desktop clients opened on the live ALPN, for the relay that serves them.
+    pub fn clients(&self) -> &tokio::sync::Mutex<mpsc::Receiver<quinn::Connection>> {
+        &self.accepted_clients
     }
 
     pub fn inbound(self: &Arc<Self>, conn: impl Conn) {
@@ -384,16 +397,46 @@ async fn accepting<E: Context + Metrics>(
             let Some(links) = links.upgrade() else {
                 return;
             };
-            let Some(peer) = quic::peer_of(&connection) else {
-                connection.close(0u32.into(), b"no node key");
-                return;
-            };
-            let adopted = links.peer(&peer).adopt(&connection);
-            if let Some(before) = adopted {
-                noted(&peer, &before, &Path::Quic(connection.clone()));
+            match arrival(&connection) {
+                Arrival::Member => member_arrived(links, connection).await,
+                Arrival::Client => client_arrived(&links, connection),
+                Arrival::Unknown => connection.close(0u32.into(), b"unknown protocol"),
             }
-            carrying(Arc::downgrade(&links), peer, connection).await;
         });
+    }
+}
+
+enum Arrival {
+    Member,
+    Client,
+    Unknown,
+}
+
+fn arrival(connection: &quinn::Connection) -> Arrival {
+    match quic::alpn_of(connection).as_deref() {
+        Some(quic::ALPN) => Arrival::Member,
+        Some(live_wire::ALPN) => Arrival::Client,
+        Some(_) | None => Arrival::Unknown,
+    }
+}
+
+async fn member_arrived<E: Context + Metrics>(links: Arc<Links<E>>, connection: quinn::Connection) {
+    let Some(peer) = quic::peer_of(&connection) else {
+        connection.close(0u32.into(), b"no node key");
+        return;
+    };
+    let adopted = links.peer(&peer).adopt(&connection);
+    if let Some(before) = adopted {
+        noted(&peer, &before, &Path::Quic(connection.clone()));
+    }
+    carrying(Arc::downgrade(&links), peer, connection).await;
+}
+
+fn client_arrived<E: Context + Metrics>(links: &Links<E>, connection: quinn::Connection) {
+    let queued = links.clients.try_send(connection);
+    if let Err(full) = queued {
+        full.into_inner().close(0u32.into(), b"busy");
+        tracing::debug!(target: "ducktape::halo", reason = "clients_full", "halo refused a client connection the relay had no room for");
     }
 }
 

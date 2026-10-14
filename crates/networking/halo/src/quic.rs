@@ -1,6 +1,8 @@
 //! halo over QUIC. Each node presents a self-signed certificate made from its ed25519 node
 //! key, and both ends admit the other only if that key is a current member; the dialer also
-//! requires the key it meant to reach.
+//! requires the key it meant to reach. The same socket takes a desktop client on the live
+//! ALPN: it presents no certificate, so a member's certificate is asked for, never required,
+//! and a connection without one is told apart by its ALPN.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -20,7 +22,8 @@ use crate::dial::provider;
 use crate::members::Members;
 
 pub const ALPN: &[u8] = b"ducktape-halo";
-const NAME: &str = "ducktape-halo";
+/// The server name every node's certificate carries and every dialer asks for.
+pub const NAME: &str = "ducktape-halo";
 const IDLE: Duration = Duration::from_secs(30);
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
 const ED25519_PKCS8: [u8; 16] = [
@@ -70,6 +73,82 @@ pub fn peer_of(connection: &quinn::Connection) -> Option<PublicKey> {
     let identity = connection.peer_identity()?;
     let certs = identity.downcast::<Vec<CertificateDer<'static>>>().ok()?;
     key_of(certs.first()?)
+}
+
+/// The ALPN a connection was accepted with; `None` only for a handshake that named none.
+pub fn alpn_of(connection: &quinn::Connection) -> Option<Vec<u8>> {
+    let data = connection.handshake_data()?;
+    let data = data
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .ok()?;
+    data.protocol
+}
+
+/// A client that is no member: it presents no certificate and admits the one node key it
+/// means to reach. The shape a desktop client dials a node's live port with.
+pub fn pinned_client(peer: &PublicKey, alpn: &[u8]) -> Result<quinn::ClientConfig, Error> {
+    let pinned = Pinned {
+        peer: peer.clone(),
+        algorithms: provider().signature_verification_algorithms,
+    };
+    let mut crypto = rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(pinned))
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![alpn.to_vec()];
+    let crypto =
+        QuicClientConfig::try_from(crypto).map_err(|error| Error::Quic(error.to_string()))?;
+    let mut client = quinn::ClientConfig::new(Arc::new(crypto));
+    client.transport_config(transport());
+    Ok(client)
+}
+
+#[derive(Debug)]
+struct Pinned {
+    peer: PublicKey,
+    algorithms: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        cert: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let meant = key_of(cert).is_some_and(|key| key == self.peer);
+        if !meant {
+            return Err(rustls::Error::General(
+                "the node key is not the one dialed".into(),
+            ));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("halo speaks only tls 1.3".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signed: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, signed, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::ED25519]
+    }
 }
 
 struct Admit {
@@ -157,6 +236,12 @@ impl ClientCertVerifier for Admit {
         &[]
     }
 
+    // A desktop client on the live ALPN presents no certificate; a member that presents one
+    // is still checked by `verify_client_cert`.
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
     fn verify_client_cert(
         &self,
         cert: &CertificateDer<'_>,
@@ -190,7 +275,9 @@ impl ClientCertVerifier for Admit {
     }
 }
 
-fn transport() -> Arc<quinn::TransportConfig> {
+/// The transport both ends run: a connection dies after 30 s without a packet, so a dead peer
+/// is forgotten within a block or two, and a keep-alive every 10 s holds an idle one open.
+pub fn transport() -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
     let idle = quinn::IdleTimeout::try_from(IDLE).expect("thirty seconds is a valid idle timeout");
     transport.max_idle_timeout(Some(idle));
@@ -223,7 +310,7 @@ impl Quic {
                 vec![certified.cert.clone()],
                 PrivateKeyDer::Pkcs8(certified.key.clone_key()),
             )?;
-        crypto.alpn_protocols = vec![ALPN.to_vec()];
+        crypto.alpn_protocols = vec![ALPN.to_vec(), live_wire::ALPN.to_vec()];
         let crypto =
             QuicServerConfig::try_from(crypto).map_err(|error| Error::Quic(error.to_string()))?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));

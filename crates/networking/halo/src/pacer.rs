@@ -118,6 +118,10 @@ impl<S> Paced<S> {
     pub fn class(&self) -> Class {
         self.class
     }
+
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Paced<S> {
