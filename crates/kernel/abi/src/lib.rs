@@ -596,6 +596,50 @@ pub mod role {
     }
 }
 
+/// Who may publish and subscribe to a room's live tracks through a node:
+/// the program that owns the room decides in its own code and writes the
+/// decision as state under this table; the node reads it and enforces it.
+/// No row for an account and no `*` row means the account may do nothing in
+/// the room.
+pub mod live {
+    use crate::{BorshDeserialize, BorshSerialize, role::identity::AccountNumber};
+
+    /// The reserved table a program writes live grants in: key
+    /// `live/<room>/<who>`, `who` the account number in decimal or `*` for
+    /// every account that acts on this chain; value a borsh [`Grant`].
+    pub const TABLE: &str = "live";
+
+    /// `live/<room>/<who>`: the key of one grant row.
+    pub fn key(room: &str, who: Option<AccountNumber>) -> Vec<u8> {
+        let who = match who {
+            Some(account) => account.to_string(),
+            None => "*".to_owned(),
+        };
+        format!("{TABLE}/{room}/{who}").into_bytes()
+    }
+
+    /// What one account, or every account, may do in one room. A pattern is
+    /// a track name exactly, a prefix ending in `/*` (`presence/*`), or `*`.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Grant {
+        /// Track names this account may publish; empty = may not publish.
+        pub publish: Vec<String>,
+        /// Track names this account may subscribe to and watch; empty = may
+        /// not subscribe.
+        pub subscribe: Vec<String>,
+    }
+
+    impl Grant {
+        /// Publish and subscribe to every track of the room.
+        pub fn all() -> Grant {
+            Grant {
+                publish: vec!["*".into()],
+                subscribe: vec!["*".into()],
+            }
+        }
+    }
+}
+
 pub fn encode<T: BorshSerialize>(value: &T) -> Vec<u8> {
     borsh::to_vec(value).expect("borsh serialization of an in-memory value cannot fail")
 }
@@ -646,6 +690,21 @@ mod tests {
                 .unwrap_err()
                 .reason,
             reason::PROTOCOL
+        );
+    }
+
+    #[test]
+    fn a_grant_row_is_keyed_by_room_and_account_or_star() {
+        assert_eq!(live::key("lobby", Some(42)), b"live/lobby/42".to_vec());
+        assert_eq!(live::key("lobby", None), b"live/lobby/*".to_vec());
+        let all = live::Grant::all();
+        assert_eq!(decode::<live::Grant>(&encode(&all)).unwrap(), all);
+        assert_eq!(
+            live::Grant::default(),
+            live::Grant {
+                publish: vec![],
+                subscribe: vec![]
+            }
         );
     }
 
