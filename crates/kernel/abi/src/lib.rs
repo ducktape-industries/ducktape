@@ -927,6 +927,23 @@ pub mod live {
         pub fn subscribes(&self, name: &str, account: AccountNumber) -> bool {
             covers(&self.subscribe, name, account)
         }
+
+        /// Whether the holder may watch the room: any subscribe pattern is enough, so a watch
+        /// turns on no track name and no account.
+        pub fn watches(&self) -> bool {
+            !self.subscribe.is_empty()
+        }
+
+        /// The subscribe patterns `account` hears the room's announces through, as they read
+        /// for it; `None` when it may not watch.
+        pub fn watch_patterns(&self, account: AccountNumber) -> Option<Vec<String>> {
+            self.watches().then(|| {
+                self.subscribe
+                    .iter()
+                    .map(|pattern| for_account(pattern, account))
+                    .collect()
+            })
+        }
     }
 
     /// What a grant pattern says for the account that asks: [`ACCOUNT`] in it is the account's
