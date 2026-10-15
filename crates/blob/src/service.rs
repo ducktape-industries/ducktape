@@ -202,16 +202,6 @@ fn unstored(error: impl std::fmt::Display) -> Refusal {
     )
 }
 
-/// The reason a round that gave nothing names: this node's own lane table when every ask failed
-/// on it, else the members.
-fn missed(reasons: &[&'static str]) -> &'static str {
-    let unlaned = !reasons.is_empty() && reasons.iter().all(|reason| *reason == NO_LANE);
-    if unlaned {
-        return NO_LANE;
-    }
-    NO_MEMBER_GAVE_IT
-}
-
 fn pause(rounds: u32) -> Duration {
     PAUSE.saturating_mul(rounds).min(PAUSE_MOST)
 }
@@ -370,20 +360,23 @@ impl Inner {
         declared: Option<&Entry>,
         class: Class,
     ) -> Result<(), &'static str> {
+        // The lane is this node's own table: unserved, no member is asked and the round names
+        // the table, not the members.
+        if !self.lane.served() {
+            return Err(NO_LANE);
+        }
         let me = self.halo.me();
         let sender = self.sender(id);
-        let mut reasons = Vec::new();
         for peer in self.halo.members().candidates(me, sender.as_ref()) {
             let pulled = self.pull(&peer, id, declared, class).await;
             match pulled {
                 Ok(()) => return Ok(()),
                 Err(reason) => {
                     tracing::debug!(target: "ducktape::blob", ?id, %peer, reason, "a member did not give a blob");
-                    reasons.push(reason);
                 }
             }
         }
-        Err(missed(&reasons))
+        Err(NO_MEMBER_GAVE_IT)
     }
 
     async fn fetch(&self, id: BlobId, class: Class) {
@@ -417,10 +410,8 @@ impl Inner {
         class: Class,
         ask: &Ask,
     ) -> Result<(Answer, Paced<halo::Carried>), &'static str> {
-        let mut stream = match self.lane.open(peer, class, &abi::encode(ask)).await {
-            Ok(stream) => stream,
-            Err(halo::Error::NoLane(_)) => return Err(NO_LANE),
-            Err(_) => return Err("unopened"),
+        let Ok(mut stream) = self.lane.open(peer, class, &abi::encode(ask)).await else {
+            return Err("unopened");
         };
         let answer = within(read_answer(&mut stream)).await?;
         Ok((answer, stream))
@@ -634,17 +625,4 @@ async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
         .await
         .map_err(|_| "broken")?;
     stream.shutdown().await.map_err(|_| "broken")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{NO_LANE, NO_MEMBER_GAVE_IT, missed};
-
-    #[test]
-    fn a_round_names_the_lane_only_when_every_ask_failed_on_it() {
-        assert_eq!(missed(&[NO_LANE, NO_LANE]), NO_LANE);
-        assert_eq!(missed(&[NO_LANE, "lacks"]), NO_MEMBER_GAVE_IT);
-        assert_eq!(missed(&["unopened"]), NO_MEMBER_GAVE_IT);
-        assert_eq!(missed(&[]), NO_MEMBER_GAVE_IT);
-    }
 }
