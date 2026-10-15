@@ -55,6 +55,7 @@ fn genesis(validators: Vec<validators::Member>) -> Genesis {
             identity: "identity".into(),
             blobs: "blobs".into(),
             awaits: "awaits".into(),
+            egress: None,
         },
         validators,
         programs: vec![

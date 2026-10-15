@@ -67,6 +67,7 @@ fn roles() -> Roles {
         identity: "identity".into(),
         blobs: "blobs".into(),
         awaits: "awaits".into(),
+        egress: None,
     }
 }
 
@@ -453,6 +454,21 @@ fn founding_refuses_an_unbound_role() {
             assert!(!dir.path().join("state").exists(), "{name} wrote state");
             assert!(!dir.path().join("blobs").exists(), "{name} wrote blobs");
         }
+        let dir = tempfile::tempdir().unwrap();
+        let mut unfounded = standard();
+        unfounded.roles.egress = Some("nobody".into());
+        let Err(Error::Unbound { role, program }) = Host::found(
+            context.child("egress"),
+            "egress",
+            dir.path(),
+            block_id(0),
+            unfounded,
+        )
+        .await
+        else {
+            panic!("a genesis with egress bound to an unfounded program was founded");
+        };
+        assert_eq!((role, program.as_str()), ("egress", "nobody"));
     });
 }
 

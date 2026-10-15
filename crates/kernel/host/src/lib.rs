@@ -305,13 +305,18 @@ where
             })
             .collect();
         let roles = &genesis.roles;
-        for (role, program) in [
-            ("programs", &roles.programs),
-            ("validators", &roles.validators),
-            ("identity", &roles.identity),
-            ("blobs", &roles.blobs),
-            ("awaits", &roles.awaits),
-        ] {
+        let bound = [
+            ("programs", Some(&roles.programs)),
+            ("validators", Some(&roles.validators)),
+            ("identity", Some(&roles.identity)),
+            ("blobs", Some(&roles.blobs)),
+            ("awaits", Some(&roles.awaits)),
+            ("egress", roles.egress.as_ref()),
+        ];
+        for (role, program) in bound
+            .into_iter()
+            .filter_map(|(role, program)| Some((role, program?)))
+        {
             let founded = entries.iter().any(|entry| entry.program == *program);
             if !founded {
                 return Err(Error::Unbound {

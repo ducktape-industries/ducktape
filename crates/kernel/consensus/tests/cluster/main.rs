@@ -91,6 +91,7 @@ fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
             identity: "identity".into(),
             blobs: "blobs".into(),
             awaits: "awaits".into(),
+            egress: None,
         },
         validators: members.to_vec(),
         programs: vec![

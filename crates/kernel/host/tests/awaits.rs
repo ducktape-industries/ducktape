@@ -50,6 +50,7 @@ fn genesis() -> Genesis {
             identity: "identity".into(),
             blobs: "blobs".into(),
             awaits: "awaits".into(),
+            egress: None,
         },
         validators: vec![validators::Member {
             key: b"v1".to_vec(),
