@@ -13,31 +13,33 @@ pub const ALPN: &[u8] = b"ducktape-live";
 /// The websocket route a client falls back to on the node's http port.
 pub const ROUTE: &str = "/v1/live";
 /// GET: borsh `Option<u16>`, the UDP port a client dials for live tracks at the host of its
-/// `/v1` url, `None` when the node opened no QUIC door (the websocket alone); a node with no
-/// relay answers 404.
+/// `/v1` url, `None` when the node opened no QUIC door (the websocket alone).
 pub const PORT_ROUTE: &str = "/v1/live/port";
 /// The signing domain of a session's proof.
 pub const NAMESPACE: &[u8] = b"ducktape:live";
 
 /// One object on a group stream.
 pub const MAX_STREAM_OBJECT: usize = 64 << 10;
-/// One group, the sum of its objects; also what the cache keeps per track.
+/// The most a group may be, the sum of its objects. Two classes under one bound today: as the
+/// group a publisher encodes and every node must refuse alike, it is a wire invariant; as what
+/// the cache keeps per track, it is node memory. If the cache budget ever moves, it takes its
+/// own symbol and this wire bound stays.
 pub const MAX_GROUP_BYTES: usize = 4 << 20;
 /// A datagram's payload: with its header it fits the path's datagram size (~1200 bytes).
 pub const MAX_DATAGRAM_OBJECT: usize = 1100;
 /// A track name, in bytes: UTF-8, `/`-separated segments, none empty.
 pub const MAX_TRACK_NAME: usize = 128;
-/// A namespace, in bytes: `<chain>/<module>/<room>` as the host stamps it.
+/// A namespace, in bytes: `<chain>/<program>/<room>` as the host stamps it.
 pub const MAX_NAMESPACE: usize = 192;
-/// A session with no track and no subscription this long is closed by the node.
+/// A session with no track, subscription, watch or waiting ask this long is closed by the node.
 pub const IDLE_SESSION: Duration = Duration::from_secs(60);
 
 /// The default priority of a track, MoQ's: 0 is the highest.
 pub const DEFAULT_PRIORITY: Priority = 128;
 
-/// A full track name. `namespace` is stamped by the host, never by the view: `<chain>/<module>/
-/// <room>` where `<chain>` is the session's chain id (`<network>#<salt>`), `<module>` the view's
-/// module from its manifest and `<room>` the string the view gave. `name` is the view's.
+/// A full track name. `namespace` is stamped by the host, never by the view: `<chain>/<program>/
+/// <room>` where `<chain>` is the session's chain id (`<network>#<salt>`), `<program>` the view's
+/// program from its manifest and `<room>` the string the view gave. `name` is the view's.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
 pub struct Track {
     pub namespace: String,
@@ -55,8 +57,9 @@ pub enum Mode {
     Datagram,
 }
 
-/// A publisher's priority for a track, 0 the highest. The node serves one client's pending
-/// egress by priority, then by group: ascending in stream mode, newest first in datagram mode.
+/// A publisher's priority for a track, 0 the highest. The node sets each of a client's group
+/// streams to the track's priority, so the transport serves a higher-priority track's groups
+/// first.
 pub type Priority = u8;
 
 /// A client-chosen id for a request that lives: a subscription, a published track, a watch.

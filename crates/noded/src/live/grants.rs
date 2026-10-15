@@ -18,8 +18,8 @@ use live_wire::{Account, for_account, pattern_covers};
 
 use crate::Shared;
 
-/// Chain reads in flight at once over every session, the permit `/v1/get` reads under too: a
-/// session's control messages queue here rather than at the node lock.
+/// Chain reads in flight at once over every session: a session's control messages queue here
+/// rather than at the node lock.
 const READS_IN_FLIGHT: usize = 64;
 
 pub type Answered<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

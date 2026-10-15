@@ -703,7 +703,7 @@ impl State {
         self.metrics.tracks.set(self.tracks.len() as i64);
         self.tell(id, Control::Published { request, alias }, &mut effects);
         let held = self.tracks.get(&track).expect("inserted above");
-        self.announce(&track, held, true, true, &mut effects);
+        self.announce(&track, held, true, &mut effects);
         effects
     }
 
@@ -735,6 +735,12 @@ impl State {
         up: bool,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
+        // A peer's announce is held to the same bound a client's track is: on this chain, within
+        // the name and namespace caps. The invariant "every held track is admissible" holds for
+        // remote tracks too, not local ones alone (C3-3).
+        if !self.admissible(&track) {
+            return effects;
+        }
         if !up {
             let remote_here = self
                 .tracks
@@ -781,7 +787,7 @@ impl State {
         self.aliases.insert(alias, track.clone());
         self.metrics.tracks.set(self.tracks.len() as i64);
         let held = self.tracks.get(&track).expect("inserted above");
-        self.announce(&track, held, true, false, &mut effects);
+        self.announce(&track, held, true, &mut effects);
         effects
     }
 
@@ -857,8 +863,7 @@ impl State {
             }
         }
         self.metrics.subscriptions.set(self.subscriptions() as i64);
-        let local = matches!(held.origin, Origin::Local(_));
-        self.announce(track, &held, false, local, effects);
+        self.announce(track, &held, false, effects);
     }
 
     /// Every group in flight ends short for a subscriber that leaves it, so no stream of its
@@ -911,14 +916,7 @@ impl State {
 
     /// Watchers of the namespace hear the track came or went; for a local track the members
     /// hear it too, with the priority its groups are served at.
-    fn announce(
-        &self,
-        track: &Track,
-        held: &Published,
-        up: bool,
-        local: bool,
-        effects: &mut Vec<Effect>,
-    ) {
+    fn announce(&self, track: &Track, held: &Published, up: bool, effects: &mut Vec<Effect>) {
         let (by, mode, priority) = (held.by, held.mode, held.priority);
         if let Some(watchers) = self.watches.get(&track.namespace) {
             for watcher in watchers.iter().filter(|watcher| watcher.hears(&track.name)) {
@@ -935,14 +933,16 @@ impl State {
                 );
             }
         }
-        if local {
-            effects.push(Effect::Lane(Relayed::Announce {
+        // A local track is gossiped to the members; a remote one we only re-announce locally.
+        match held.origin {
+            Origin::Local(_) => effects.push(Effect::Lane(Relayed::Announce {
                 track: track.clone(),
                 by,
                 mode,
                 priority,
                 up,
-            }));
+            })),
+            Origin::Remote(_) => {}
         }
     }
 

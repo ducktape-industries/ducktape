@@ -566,7 +566,7 @@ async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
     // Now the session is registered, a block that moved the identity table while it proved is
     // re-checked: the re-check reads its account again and closes it if the key moved.
     strong.settled_identity(generation);
-    tracing::info!(target: "ducktape::live", event = "live_session", account, path = link.path, "a live session opened");
+    tracing::info!(target: "ducktape::live", event = "live_session_opened", account, path = link.path, "a live session opened");
     drop(strong);
     let mut idle_since: Option<Instant> = None;
     let reason = loop {
@@ -631,7 +631,7 @@ async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
     if let Some(relay) = relay.upgrade() {
         relay.step(|state| state.closed(id));
     }
-    tracing::info!(target: "ducktape::live", event = "live_session", account, path = link.path, reason, "a live session closed");
+    tracing::info!(target: "ducktape::live", event = "live_session_closed", account, path = link.path, reason, "a live session closed");
 }
 
 /// A block moved grants or identities: every request the change could cover is re-read, and
