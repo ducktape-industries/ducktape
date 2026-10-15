@@ -2441,6 +2441,89 @@ mod tests {
     }
 
     #[test]
+    fn a_publishers_revoked_grant_ends_it_and_tells_publisher_and_subscriber_apart() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let mut state = state(&context);
+            let publisher = state
+                .opened(42, vec![1], super::super::session::unconnected())
+                .expect("the node is not going away");
+            let doc = Track {
+                namespace: "net#00000000/chat/room".into(),
+                name: "doc".into(),
+            };
+            state.publish(publisher, 1, doc.clone(), Mode::Stream, 128, true);
+            let bob = state
+                .opened(43, vec![2], super::super::session::unconnected())
+                .expect("the node is not going away");
+            state.subscribe(bob, 1, doc.clone(), Start::Latest, true);
+
+            let controls = told(state.revoke(publisher, 1, &Held::Published(doc.clone())));
+            assert!(
+                controls.iter().any(|control| matches!(
+                    control,
+                    Control::Ended { reason: End::GrantRevoked, .. }
+                )),
+                "the publisher hears its grant was revoked"
+            );
+            assert!(
+                controls.iter().any(|control| matches!(
+                    control,
+                    Control::Ended { reason: End::PublisherGone, .. }
+                )),
+                "the subscriber, whose own grant is intact, hears only that the publisher is gone"
+            );
+            assert!(state.track(&doc).is_none(), "the track ends");
+        });
+    }
+
+    #[test]
+    fn a_rewatch_announces_the_tracks_the_new_patterns_add_and_remove() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let mut state = state(&context);
+            let namespace = "net#00000000/chat/room".to_string();
+            let publisher = state
+                .opened(42, vec![1], super::super::session::unconnected())
+                .expect("the node is not going away");
+            let presence = Track {
+                namespace: namespace.clone(),
+                name: "presence/42".into(),
+            };
+            let doc = Track {
+                namespace: namespace.clone(),
+                name: "doc".into(),
+            };
+            state.publish(publisher, 1, presence, Mode::Stream, 128, true);
+            state.publish(publisher, 2, doc.clone(), Mode::Stream, 128, true);
+            let watcher = state
+                .opened(43, vec![2], super::super::session::unconnected())
+                .expect("the node is not going away");
+            // Watching only `presence/*`: `doc` is up but unheard.
+            state.watch(watcher, 1, namespace.clone(), Some(vec!["presence/*".into()]));
+            let held = Held::Watching(namespace);
+
+            // Widened to everything: `doc` is now heard, up.
+            let widened = told(state.rewatch(watcher, 1, &held, vec!["*".into()]));
+            assert!(
+                widened.iter().any(|control| matches!(
+                    control,
+                    Control::Announce { track, up: true, .. } if track == &doc
+                )),
+                "a widened watcher hears a track its new patterns add: {widened:?}"
+            );
+
+            // Narrowed back: `doc` leaves the watcher's view.
+            let narrowed = told(state.rewatch(watcher, 1, &held, vec!["presence/*".into()]));
+            assert!(
+                narrowed.iter().any(|control| matches!(
+                    control,
+                    Control::Announce { track, up: false, .. } if track == &doc
+                )),
+                "a narrowed watcher hears a track its new patterns drop go down: {narrowed:?}"
+            );
+        });
+    }
+
+    #[test]
     fn a_relay_ended_subscription_wakes_its_session_to_re_arm_idle() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let mut state = state(&context);
