@@ -1,11 +1,12 @@
 use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use abi::role::validators::{Grant, Invite, Motion, Op, Voted};
 use abi::{BlobId, HashKind, Outcome, Scan};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::Runner as _;
 use commonware_runtime::tokio::{Config, Runner};
@@ -32,6 +33,144 @@ struct Cli {
     node: Option<String>,
     #[command(subcommand)]
     verb: Verb,
+}
+
+/// `run`'s flags: each an operator setting of the node.
+#[derive(Args)]
+struct RunArgs {
+    #[arg(long, help = "the socket peers reach over tcp")]
+    listen: SocketAddr,
+    #[arg(
+        long,
+        default_value = "127.0.0.1:0",
+        help = "the socket the HTTP API and ws/wss peers reach"
+    )]
+    http: SocketAddr,
+    #[arg(long, help = "the socket peers reach over tls")]
+    tls: Option<SocketAddr>,
+    #[arg(
+        long,
+        help = "the UDP socket halo binds; members reach it at the halo address this node \
+                registered"
+    )]
+    halo: SocketAddr,
+    #[arg(
+        long,
+        help = "the bytes per second this node sends to other members over halo; unlimited \
+                when absent"
+    )]
+    halo_egress: Option<u64>,
+    #[arg(
+        long,
+        help = "the UDP socket desktop clients reach live tracks on over QUIC; without it \
+                they take the websocket on the http port"
+    )]
+    live: Option<SocketAddr>,
+    #[arg(
+        long,
+        value_parser = permits,
+        default_value_t = HaloConfig::default().inbound_streams,
+        help = "the streams members open to this node that wait for it to take them; past it \
+                the node takes no more until one is taken"
+    )]
+    halo_inbound_streams: NonZeroUsize,
+    #[arg(
+        long,
+        value_parser = permits,
+        default_value_t = HaloConfig::default().datagrams,
+        help = "the datagrams from members that wait for this node to read them; past it a \
+                datagram is dropped"
+    )]
+    halo_datagrams: NonZeroUsize,
+    #[arg(
+        long,
+        value_parser = permits,
+        default_value_t = LoadConfig::default().reads_in_flight,
+        help = "the HTTP reads this node serves at once; the rest wait their turn"
+    )]
+    reads_in_flight: NonZeroUsize,
+    #[arg(
+        long,
+        value_parser = permits,
+        default_value_t = LoadConfig::default().uploads_in_flight,
+        help = "the uploads (submit, blob put) this node takes at once; the rest wait their turn"
+    )]
+    uploads_in_flight: NonZeroUsize,
+    #[arg(
+        long,
+        value_parser = permits,
+        default_value_t = LoadConfig::default().blob_serves_in_flight,
+        help = "the blobs this node sends to members at once"
+    )]
+    blob_serves_in_flight: NonZeroUsize,
+    #[arg(
+        long,
+        value_parser = permits,
+        default_value_t = LoadConfig::default().blob_backlog,
+        help = "the members' blob requests that wait for a send; past it a request is refused"
+    )]
+    blob_backlog: NonZeroUsize,
+    #[arg(
+        long,
+        default_value_t = LoadConfig::default().blob_gatherers,
+        help = "the blobs this node gathers from members at once"
+    )]
+    blob_gatherers: NonZeroUsize,
+    #[arg(
+        long,
+        value_parser = permits,
+        default_value_t = LoadConfig::default().live_session_inbound,
+        help = "the live messages waiting for one session's loop; a full queue holds the \
+                publisher back through the transport"
+    )]
+    live_session_inbound: NonZeroUsize,
+    #[arg(
+        long,
+        value_parser = permits,
+        default_value_t = LoadConfig::default().live_session_outbound,
+        help = "the live messages and objects waiting for one session's connection; a \
+                session this far behind is closed"
+    )]
+    live_session_outbound: NonZeroUsize,
+    #[arg(
+        long,
+        value_parser = permits,
+        default_value_t = LoadConfig::default().live_group_queue,
+        help = "the objects waiting for one live group stream's writer, to a client or a \
+                peer; past it the group is dropped short"
+    )]
+    live_group_queue: NonZeroUsize,
+    #[arg(
+        long,
+        value_parser = permits,
+        default_value_t = LoadConfig::default().live_peer_queue,
+        help = "the live lane items waiting for one peer's writer; past it the writer is \
+                dropped and the peer resynced"
+    )]
+    live_peer_queue: NonZeroUsize,
+    #[arg(
+        long,
+        value_parser = permits,
+        default_value_t = LoadConfig::default().live_lane_backlog,
+        help = "the live lane streams peers opened that wait for this node to take them"
+    )]
+    live_lane_backlog: NonZeroUsize,
+    #[arg(
+        long,
+        value_parser = permits,
+        default_value_t = LoadConfig::default().live_lane_per_sender,
+        help = "the live lane datagrams waiting per peer; past it the oldest is dropped"
+    )]
+    live_lane_per_sender: NonZeroUsize,
+    #[arg(
+        long,
+        default_value_t = millis(LoadConfig::default().live_linger),
+        help = "how long a closed live session's last message gets to reach the client, in \
+                milliseconds"
+    )]
+    live_linger_ms: NonZeroU64,
+    #[arg(long, default_value = "info")]
+    log: String,
 }
 
 #[derive(Subcommand)]
@@ -74,88 +213,7 @@ enum Verb {
         invite: Option<String>,
     },
     #[command(about = "run the node")]
-    Run {
-        #[arg(long, help = "the socket peers reach over tcp")]
-        listen: SocketAddr,
-        #[arg(
-            long,
-            default_value = "127.0.0.1:0",
-            help = "the socket the HTTP API and ws/wss peers reach"
-        )]
-        http: SocketAddr,
-        #[arg(long, help = "the socket peers reach over tls")]
-        tls: Option<SocketAddr>,
-        #[arg(
-            long,
-            help = "the UDP socket halo binds; members reach it at the halo address this node \
-                    registered"
-        )]
-        halo: SocketAddr,
-        #[arg(
-            long,
-            help = "the bytes per second this node sends to other members over halo; unlimited \
-                    when absent"
-        )]
-        halo_egress: Option<u64>,
-        #[arg(
-            long,
-            help = "the UDP socket desktop clients reach live tracks on over QUIC; without it \
-                    they take the websocket on the http port"
-        )]
-        live: Option<SocketAddr>,
-        #[arg(
-            long,
-            value_parser = permits,
-            default_value_t = HaloConfig::default().inbound_streams,
-            help = "the streams members open to this node that wait for it to take them; past it \
-                    the node takes no more until one is taken"
-        )]
-        halo_inbound_streams: NonZeroUsize,
-        #[arg(
-            long,
-            value_parser = permits,
-            default_value_t = HaloConfig::default().datagrams,
-            help = "the datagrams from members that wait for this node to read them; past it a \
-                    datagram is dropped"
-        )]
-        halo_datagrams: NonZeroUsize,
-        #[arg(
-            long,
-            value_parser = permits,
-            default_value_t = LoadConfig::default().reads_in_flight,
-            help = "the HTTP reads this node serves at once; the rest wait their turn"
-        )]
-        reads_in_flight: NonZeroUsize,
-        #[arg(
-            long,
-            value_parser = permits,
-            default_value_t = LoadConfig::default().uploads_in_flight,
-            help = "the uploads (submit, blob put) this node takes at once; the rest wait their turn"
-        )]
-        uploads_in_flight: NonZeroUsize,
-        #[arg(
-            long,
-            value_parser = permits,
-            default_value_t = LoadConfig::default().blob_serves_in_flight,
-            help = "the blobs this node sends to members at once"
-        )]
-        blob_serves_in_flight: NonZeroUsize,
-        #[arg(
-            long,
-            value_parser = permits,
-            default_value_t = LoadConfig::default().blob_backlog,
-            help = "the members' blob requests that wait for a send; past it a request is refused"
-        )]
-        blob_backlog: NonZeroUsize,
-        #[arg(
-            long,
-            default_value_t = LoadConfig::default().blob_gatherers,
-            help = "the blobs this node gathers from members at once"
-        )]
-        blob_gatherers: NonZeroUsize,
-        #[arg(long, default_value = "info")]
-        log: String,
-    },
+    Run(Box<RunArgs>),
     #[command(about = "print the node's height, tip, root, epoch and identity")]
     Status,
     #[command(
@@ -334,22 +392,30 @@ fn execute(cli: Cli) -> Result<(), String> {
                 .sentence()
             })
         }
-        Verb::Run {
-            listen,
-            http,
-            tls,
-            halo,
-            halo_egress,
-            live,
-            halo_inbound_streams,
-            halo_datagrams,
-            reads_in_flight,
-            uploads_in_flight,
-            blob_serves_in_flight,
-            blob_backlog,
-            blob_gatherers,
-            log,
-        } => node_runtime(&workspace).start(|context| async move {
+        Verb::Run(args) => node_runtime(&workspace).start(|context| async move {
+            let RunArgs {
+                listen,
+                http,
+                tls,
+                halo,
+                halo_egress,
+                live,
+                halo_inbound_streams,
+                halo_datagrams,
+                reads_in_flight,
+                uploads_in_flight,
+                blob_serves_in_flight,
+                blob_backlog,
+                blob_gatherers,
+                live_session_inbound,
+                live_session_outbound,
+                live_group_queue,
+                live_peer_queue,
+                live_lane_backlog,
+                live_lane_per_sender,
+                live_linger_ms,
+                log,
+            } = *args;
             let logs = Logs::install(&log)?;
             let listen = Listen {
                 p2p: listen,
@@ -369,6 +435,13 @@ fn execute(cli: Cli) -> Result<(), String> {
                 blob_backlog,
                 blob_serves_in_flight,
                 blob_gatherers,
+                live_session_inbound,
+                live_session_outbound,
+                live_group_queue,
+                live_peer_queue,
+                live_lane_backlog,
+                live_lane_per_sender,
+                live_linger: Duration::from_millis(live_linger_ms.get()),
             };
             let running = noded::run(context, &workspace, logs, listen, halo, load)
                 .await
@@ -615,7 +688,7 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         | Verb::Identity
         | Verb::Init { .. }
         | Verb::Join { .. }
-        | Verb::Run { .. }
+        | Verb::Run(_)
         | Verb::Wallet(_) => unreachable!("handled before the client is built"),
     }
 }
@@ -717,6 +790,11 @@ fn motion(verb: VoteVerb) -> Result<Motion, String> {
 fn registered_halo(text: &str) -> Result<String, String> {
     abi::role::validators::registered_halo(text).map_err(|refusal| refusal.sentence)?;
     Ok(text.to_owned())
+}
+
+/// A duration's flag value: whole milliseconds, never zero.
+fn millis(duration: Duration) -> NonZeroU64 {
+    NonZeroU64::new(duration.as_millis() as u64).expect("a relay clock is never zero")
 }
 
 fn permits(text: &str) -> Result<NonZeroUsize, String> {
@@ -883,11 +961,13 @@ fn roles(roles: &abi::Roles) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use clap::Parser as _;
 
     use noded::{HaloConfig, LoadConfig};
 
-    use super::{Cli, Verb, roles};
+    use super::{Cli, RunArgs, Verb, roles};
 
     #[test]
     fn status_prints_every_role() {
@@ -954,10 +1034,10 @@ mod tests {
             "0.0.0.0:9100",
         ])
         .unwrap();
-        let Verb::Run { halo, .. } = run.verb else {
+        let Verb::Run(args) = run.verb else {
             panic!("run parses");
         };
-        assert_eq!(halo, "0.0.0.0:9100".parse().unwrap());
+        assert_eq!(args.halo, "0.0.0.0:9100".parse().unwrap());
     }
 
     fn run(load: &[&str]) -> Result<Cli, clap::Error> {
@@ -974,32 +1054,51 @@ mod tests {
 
     #[test]
     fn run_takes_the_default_load_unless_the_operator_names_one_and_refuses_zero() {
-        let Verb::Run {
+        let Verb::Run(args) = run(&[]).unwrap().verb else {
+            panic!("run parses");
+        };
+        let RunArgs {
             reads_in_flight,
             uploads_in_flight,
             blob_serves_in_flight,
             blob_backlog,
             blob_gatherers,
+            live_session_inbound,
+            live_session_outbound,
+            live_group_queue,
+            live_peer_queue,
+            live_lane_backlog,
+            live_lane_per_sender,
+            live_linger_ms,
             ..
-        } = run(&[]).unwrap().verb
-        else {
-            panic!("run parses");
-        };
+        } = *args;
         let named = LoadConfig {
             reads_in_flight,
             uploads_in_flight,
             blob_backlog,
             blob_serves_in_flight,
             blob_gatherers,
+            live_session_inbound,
+            live_session_outbound,
+            live_group_queue,
+            live_peer_queue,
+            live_lane_backlog,
+            live_lane_per_sender,
+            live_linger: Duration::from_millis(live_linger_ms.get()),
         };
         assert_eq!(named, LoadConfig::default());
-        let Verb::Run {
-            uploads_in_flight, ..
-        } = run(&["--uploads-in-flight", "1"]).unwrap().verb
-        else {
+        assert!(
+            run(&["--live-group-queue", "0"]).is_err(),
+            "a live queue holds something"
+        );
+        assert!(
+            run(&["--live-linger-ms", "0"]).is_err(),
+            "a live clock runs"
+        );
+        let Verb::Run(args) = run(&["--uploads-in-flight", "1"]).unwrap().verb else {
             panic!("run parses");
         };
-        assert_eq!(uploads_in_flight.get(), 1);
+        assert_eq!(args.uploads_in_flight.get(), 1);
         for flag in [
             "--reads-in-flight",
             "--uploads-in-flight",
@@ -1014,15 +1113,15 @@ mod tests {
     #[test]
     fn run_takes_the_default_halo_queues_unless_named_and_refuses_zero_or_past_tokio() {
         let halo = |flags: &[&str]| {
-            let Verb::Run {
+            let Verb::Run(args) = run(flags).unwrap().verb else {
+                panic!("run parses");
+            };
+            let RunArgs {
                 halo_egress,
                 halo_inbound_streams,
                 halo_datagrams,
                 ..
-            } = run(flags).unwrap().verb
-            else {
-                panic!("run parses");
-            };
+            } = *args;
             HaloConfig {
                 egress_bytes_per_sec: halo_egress,
                 inbound_streams: halo_inbound_streams,

@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::{SinkExt as _, StreamExt as _};
 use halo::{Class, Pacer};
 use live_wire::{
-    Alias, CONTROL_BYTES, Control, DatagramHeader, Ending, GroupHeader, MAX_STREAM_OBJECT,
+    Alias, CONTROL_BYTES, Control, DatagramHeader, Ending, GroupHeader, IDLE, MAX_STREAM_OBJECT,
     Priority, WS_MESSAGE, WsFrame,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -19,19 +19,11 @@ use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
+use super::Config;
 use super::groups::{self, GroupOut, Groups};
 
-/// Inbound events waiting for the session's loop; a reader waits when it is full, so the
-/// transport's flow control holds the publisher back.
-const INBOUND: usize = 1024;
-/// Control messages and stream objects waiting for the connection; a session this far behind
-/// is closed rather than fed from a growing queue.
-const OUTBOUND: usize = 4096;
 /// The control stream outranks every group stream of the connection.
 const CONTROL_PRIORITY: i32 = 256;
-/// A last message (a refusal, a GoAway) gets this long to reach a client that stopped reading;
-/// then the connection is closed under it.
-const LINGER: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum Inbound {
@@ -250,11 +242,11 @@ impl Egress {
 /// An outlet no connection drains, for a step that is tested without one.
 #[cfg(test)]
 pub fn unconnected() -> Outlet {
-    outlet().0
+    outlet(&Config::default()).0
 }
 
-fn outlet() -> (Outlet, Egress) {
-    let (ordered, receiving) = mpsc::channel(OUTBOUND);
+fn outlet(config: &Config) -> (Outlet, Egress) {
+    let (ordered, receiving) = mpsc::channel(config.session_outbound.get());
     let latest = Arc::new(Latest::default());
     let (closing, closed) = watch::channel(None);
     let outlet = Outlet {
@@ -272,7 +264,7 @@ fn outlet() -> (Outlet, Egress) {
 }
 
 /// A connection as the session loop reads and writes it, whatever carries it. Dropping it
-/// closes the connection: the writer gets `LINGER` to put out the last message, then the
+/// closes the connection: the writer gets `linger` to put out the last message, then the
 /// connection is closed under it.
 pub struct Link {
     pub inbound: mpsc::Receiver<Inbound>,
@@ -280,6 +272,7 @@ pub struct Link {
     pub datagrams: bool,
     pub path: &'static str,
     pub closing: watch::Receiver<Option<&'static str>>,
+    linger: Duration,
     readers: Vec<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
     connection: Option<quinn::Connection>,
@@ -303,21 +296,28 @@ impl Drop for Link {
         }
         let reason = self.outlet.closed().unwrap_or("session_ended");
         if let Some(writer) = self.writer.take() {
-            tokio::spawn(lingering(writer, self.connection.take(), reason));
+            tokio::spawn(lingering(
+                writer,
+                self.connection.take(),
+                reason,
+                self.linger,
+            ));
         }
     }
 }
 
-/// The writer ends on its own once it put out what was queued before the close; one blocked by
-/// a client that stopped reading is cut off at `LINGER`, and the connection with it.
+/// The writer ends on its own once it put out what was queued before the close and the client
+/// took it; one held up by a client that stopped reading is cut off at `linger`, and the
+/// connection with it.
 async fn lingering(
     mut writer: JoinHandle<()>,
     connection: Option<quinn::Connection>,
     reason: &'static str,
+    linger: Duration,
 ) {
     tokio::select! {
         _ = &mut writer => {}
-        () = tokio::time::sleep(LINGER) => writer.abort(),
+        () = tokio::time::sleep(linger) => writer.abort(),
     }
     if let Some(connection) = connection {
         connection.close(0u32.into(), reason.as_bytes());
@@ -346,10 +346,11 @@ impl Link {
         connection: quinn::Connection,
         control: (quinn::SendStream, quinn::RecvStream),
         pacer: Pacer,
+        config: &Config,
     ) -> Link {
         let (control_send, control_recv) = control;
-        let (inbound, receiving) = mpsc::channel(INBOUND);
-        let (outlet, egress) = outlet();
+        let (inbound, receiving) = mpsc::channel(config.session_inbound.get());
+        let (outlet, egress) = outlet(config);
         let closing = egress.closing.clone();
         let readers = vec![
             tokio::spawn(quic_control_reading(control_recv, inbound.clone())),
@@ -361,6 +362,7 @@ impl Link {
             control_send,
             egress,
             pacer,
+            config.group_queue.get(),
         ));
         Link {
             inbound: receiving,
@@ -368,6 +370,7 @@ impl Link {
             outlet,
             path: "quic",
             closing,
+            linger: config.linger,
             readers,
             writer: Some(writer),
             connection: Some(connection),
@@ -525,9 +528,10 @@ async fn quic_writing(
     mut control: quinn::SendStream,
     mut egress: Egress,
     pacer: Pacer,
+    group_queue: usize,
 ) {
     let _ = control.set_priority(CONTROL_PRIORITY);
-    let mut groups = Groups::default();
+    let mut groups = Groups::new(group_queue);
     // One group writer per group stream, at the track's priority.
     let spawn = |priority: Priority| {
         let (connection, pacer) = (connection.clone(), pacer.clone());
@@ -574,10 +578,11 @@ async fn quic_writing(
                 }
             }
             Drained::Close => {
-                // The last control message reaches a reading client before the link that owns
-                // the connection closes it; one that stopped reading is cut off at LINGER.
+                // The last control message reaches the client before the link that owns the
+                // connection closes it: the stream is finished and its acknowledgement awaited.
+                // The link's `linger` cuts a writer off whose client never acknowledges.
                 let _ = control.finish();
-                let _ = tokio::time::timeout(LINGER, control.stopped()).await;
+                let _ = control.stopped().await;
                 return;
             }
         }
@@ -615,10 +620,10 @@ pub fn ws_upgrade(upgrade: WebSocketUpgrade) -> WebSocketUpgrade {
 }
 
 impl Link {
-    pub fn ws(socket: WebSocket) -> Link {
+    pub fn ws(socket: WebSocket, config: &Config) -> Link {
         let (sink, stream) = socket.split();
-        let (inbound, receiving) = mpsc::channel(INBOUND);
-        let (outlet, egress) = outlet();
+        let (inbound, receiving) = mpsc::channel(config.session_inbound.get());
+        let (outlet, egress) = outlet(config);
         let closing = egress.closing.clone();
         let readers = vec![tokio::spawn(ws_reading(stream, inbound))];
         let writer = tokio::spawn(ws_writing(sink, egress));
@@ -628,6 +633,7 @@ impl Link {
             datagrams: false,
             path: "ws",
             closing,
+            linger: config.linger,
             readers,
             writer: Some(writer),
             connection: None,
@@ -638,9 +644,11 @@ impl Link {
 type WsStream = futures::stream::SplitStream<WebSocket>;
 type WsSink = futures::stream::SplitSink<WebSocket, Message>;
 
+/// Reads the socket until it closes, fails, or is silent for `IDLE`: the websocket's idle limit
+/// is the QUIC transport's, and a client pings within it (the pong is the socket's own).
 async fn ws_reading(mut stream: WsStream, inbound: mpsc::Sender<Inbound>) {
     let mut counting: HashMap<(Alias, u64), u32> = HashMap::new();
-    while let Some(message) = stream.next().await {
+    while let Ok(Some(message)) = tokio::time::timeout(IDLE, stream.next()).await {
         let events = match message {
             Ok(Message::Binary(bytes)) => ws_arrived(bytes, &mut counting),
             Ok(Message::Ping(_) | Message::Pong(_)) => continue,
@@ -823,7 +831,7 @@ mod tests {
 
     #[test]
     fn a_datagram_slot_keeps_the_newest_per_track() {
-        let (outlet, egress) = outlet();
+        let (outlet, egress) = outlet(&Config::default());
         let header = |object| DatagramHeader {
             alias: 1,
             group: 0,
@@ -851,9 +859,10 @@ mod tests {
 
     #[test]
     fn an_ordered_queue_that_overflows_closes_the_connection_as_behind() {
-        let (outlet, _egress) = outlet();
+        let config = Config::default();
+        let (outlet, _egress) = outlet(&config);
         let message = Out::Control(Control::GoAway { in_ms: 1 });
-        for _ in 0..OUTBOUND {
+        for _ in 0..config.session_outbound.get() {
             assert_eq!(outlet.send(message.clone()), Sent::Queued);
         }
         assert_eq!(outlet.send(message), Sent::Behind);
@@ -1036,7 +1045,7 @@ mod tests {
     #[test]
     fn every_control_told_wakes_the_session_loop_and_an_object_does_not() {
         use futures::FutureExt as _;
-        let (outlet, _egress) = outlet();
+        let (outlet, _egress) = outlet(&Config::default());
         assert!(outlet.told().now_or_never().is_none(), "nothing told yet");
         // A refusal on the admit path is a control message like any other: it wakes the loop,
         // which re-reads the session's requests and re-arms its idle timer from them.

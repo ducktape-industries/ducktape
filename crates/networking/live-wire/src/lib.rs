@@ -37,6 +37,14 @@ pub const MAX_TRACK_NAME: usize = 128;
 pub const MAX_NAMESPACE: usize = 192;
 /// A session with no track, subscription, watch or waiting ask this long is closed by the node.
 pub const IDLE_SESSION: Duration = Duration::from_secs(60);
+/// The handshake's deadline, each step of it: a connection's control stream, its hello and its
+/// proof arrive within it, or the node closes the connection.
+pub const HANDSHAKE_WAIT: Duration = Duration::from_secs(5);
+/// A connection's keep-alive and idle limit, QUIC transport and websocket alike: a client that
+/// is silent for `IDLE` is closed, so it pings every `KEEP_ALIVE`, and reads the node the same
+/// way.
+pub const KEEP_ALIVE: Duration = Duration::from_secs(10);
+pub const IDLE: Duration = Duration::from_secs(30);
 
 /// The default priority of a track, MoQ's: 0 is the highest.
 pub const DEFAULT_PRIORITY: Priority = 128;
@@ -163,6 +171,11 @@ pub enum Control {
     Subscribers {
         request: RequestId,
         count: u32,
+    },
+    /// The watch is on: said once, before the `Announce` of every track up now, so a watch of a
+    /// namespace with nothing up is answered too.
+    Watching {
+        request: RequestId,
     },
     /// A track appeared or went away in a watched namespace.
     Announce {

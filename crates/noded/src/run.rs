@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use abi::Outcome;
 use abi::Scan;
@@ -88,17 +89,32 @@ pub struct LoadConfig {
     pub blob_backlog: NonZeroUsize,
     pub blob_serves_in_flight: NonZeroUsize,
     pub blob_gatherers: NonZeroUsize,
+    pub live_session_inbound: NonZeroUsize,
+    pub live_session_outbound: NonZeroUsize,
+    pub live_group_queue: NonZeroUsize,
+    pub live_peer_queue: NonZeroUsize,
+    pub live_lane_backlog: NonZeroUsize,
+    pub live_lane_per_sender: NonZeroUsize,
+    pub live_linger: Duration,
 }
 
 impl Default for LoadConfig {
     fn default() -> LoadConfig {
         let blobs = blob::service::Config::default();
+        let live = live::Config::default();
         LoadConfig {
             reads_in_flight: READS_IN_FLIGHT,
             uploads_in_flight: UPLOADS_IN_FLIGHT,
             blob_backlog: blobs.backlog,
             blob_serves_in_flight: blobs.serving,
             blob_gatherers: blobs.gatherers,
+            live_session_inbound: live.session_inbound,
+            live_session_outbound: live.session_outbound,
+            live_group_queue: live.group_queue,
+            live_peer_queue: live.peer_queue,
+            live_lane_backlog: live.lane_backlog,
+            live_lane_per_sender: live.lane_per_sender,
+            live_linger: live.linger,
         }
     }
 }
@@ -109,6 +125,20 @@ impl LoadConfig {
             backlog: self.blob_backlog,
             serving: self.blob_serves_in_flight,
             gatherers: self.blob_gatherers,
+        }
+    }
+
+    /// The relay's share; its chain reads run under the node's `reads_in_flight`.
+    fn live(&self) -> live::Config {
+        live::Config {
+            session_inbound: self.live_session_inbound,
+            session_outbound: self.live_session_outbound,
+            group_queue: self.live_group_queue,
+            peer_queue: self.live_peer_queue,
+            lane_backlog: self.live_lane_backlog,
+            lane_per_sender: self.live_lane_per_sender,
+            reads_in_flight: self.reads_in_flight,
+            linger: self.live_linger,
         }
     }
 }
@@ -310,7 +340,13 @@ async fn start<E: Context>(
     // the live door binds its socket here, beside halo's, so a socket in use fails the start
     // before consensus does any work
     let (shutdown, _) = watch::channel(false);
-    let door = listen.live.map(|at| at.to_string()).unwrap_or_default();
+    let door = listen
+        .live
+        .map(|at| {
+            live::door(&identity, at)
+                .map_err(|error| Error::Address(format!("--live {at}: {error}")))
+        })
+        .transpose()?;
     let live = live::Relay::start(
         context.child("live"),
         live::Network {
@@ -323,11 +359,10 @@ async fn start<E: Context>(
         },
         Arc::new(node.clone()),
         halo.clone(),
-        &identity,
-        listen.live,
+        door,
+        load.live(),
         shutdown.subscribe(),
-    )
-    .map_err(|error| Error::Address(format!("--live {door}: {error}")))?;
+    );
 
     let (mesh, mut tracker, marshal_lanes, engine_channels, (relay_sender, relay_receiver)) =
         Mesh::start(

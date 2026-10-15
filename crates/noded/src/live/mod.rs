@@ -14,18 +14,18 @@ mod tracks;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use abi::ProgramId;
 use abi::live::Grant;
-use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_runtime::telemetry::metrics::raw::{Counter, Gauge};
 use halo::Halo;
 use live_wire::{
-    ALPN, Account, Challenge, Code, Control, Hello, IDLE_SESSION, NAMESPACE, Proof, RequestId,
-    proof_preimage,
+    ALPN, Account, Challenge, Code, Control, HANDSHAKE_WAIT, Hello, IDLE, IDLE_SESSION, KEEP_ALIVE,
+    NAMESPACE, Proof, RequestId, proof_preimage,
 };
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
@@ -37,8 +37,52 @@ pub use session::ws_upgrade;
 use session::{Inbound, Link, Out, Outlet, Sent};
 use tracks::{Ask, Effect, GoingAway, SessionId, State};
 
-/// The control stream and the proof must arrive this soon after the connection.
-const HANDSHAKE_WAIT: Duration = Duration::from_secs(5);
+/// The relay's share of the node's load settings (`LoadConfig`, each a `run` flag): how much
+/// waits where before a client or a peer is held back, and the one clock no event ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Config {
+    /// Inbound events waiting for one session's loop; a reader waits when it is full, so the
+    /// transport's flow control holds the publisher back.
+    pub session_inbound: NonZeroUsize,
+    /// Control messages and stream objects waiting for one session's connection; a session this
+    /// far behind is closed rather than fed from a growing queue.
+    pub session_outbound: NonZeroUsize,
+    /// Objects queued per group stream before its writer, to a client or to a peer; past it the
+    /// group is dropped short.
+    pub group_queue: NonZeroUsize,
+    /// Control items waiting for one peer's lane writer; past it the writer is dropped and the
+    /// peer resynced, and the other peers are none the slower.
+    pub peer_queue: NonZeroUsize,
+    /// Lane streams peers opened and this node has not taken yet, over every peer.
+    pub lane_backlog: NonZeroUsize,
+    /// Lane datagrams waiting per peer; past it the oldest is dropped.
+    pub lane_per_sender: NonZeroUsize,
+    /// The node's `reads_in_flight`: chain reads the relay runs at once over every session; a
+    /// session's control messages queue here rather than at the node lock.
+    pub reads_in_flight: NonZeroUsize,
+    /// How long a closed session's last message (a refusal, a GoAway) gets to reach the client
+    /// before the connection is closed under it. A clock, not an event: the writer waits for
+    /// the client's acknowledgement, which a client whose receive window is full never sends,
+    /// while keep-alive holds its connection open.
+    pub linger: Duration,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        let permits = |count| NonZeroUsize::new(count).expect("nonzero");
+        Config {
+            session_inbound: permits(1024),
+            session_outbound: permits(4096),
+            group_queue: permits(256),
+            peer_queue: permits(1024),
+            lane_backlog: permits(64),
+            lane_per_sender: permits(256),
+            reads_in_flight: permits(64),
+            linger: Duration::from_secs(5),
+        }
+    }
+}
+
 /// What a client is told to wait before re-opening when the node goes away.
 const GOAWAY_MS: u32 = 1000;
 
@@ -69,6 +113,7 @@ struct Dirty {
 pub struct Relay<E: crate::Context> {
     context: E,
     network: Network,
+    config: Config,
     grants: Grants,
     halo: Arc<Halo>,
     /// The QUIC door, on its own UDP socket; `None` without `run --live`, and then clients take
@@ -90,18 +135,17 @@ pub struct Relay<E: crate::Context> {
 }
 
 impl<E: crate::Context> Relay<E> {
-    /// The relay, with its QUIC door bound at `live` when one is given.
+    /// The relay, serving `door` when one was opened (`door()`), and the websocket either way.
     pub fn start(
         context: E,
         network: Network,
         chain: Arc<dyn Chain>,
         halo: Arc<Halo>,
-        identity: &PrivateKey,
-        live: Option<SocketAddr>,
+        door: Option<quinn::Endpoint>,
+        config: Config,
         shutdown: watch::Receiver<bool>,
-    ) -> Result<Arc<Relay<E>>, halo::quic::Error> {
-        let door = live.map(|at| door(identity, at)).transpose()?;
-        let me = identity.public_key();
+    ) -> Arc<Relay<E>> {
+        let me = halo.me().clone();
         let metrics = metrics(&context);
         let rechecks = Arc::new(Notify::new());
         // The tasks and the lanes hold the relay weakly: it drops with its last owner, and
@@ -110,7 +154,8 @@ impl<E: crate::Context> Relay<E> {
             state: Mutex::new(State::new(network.id.clone(), metrics.clone())),
             context,
             network,
-            grants: Grants::new(chain),
+            config,
+            grants: Grants::new(chain, config.reads_in_flight),
             halo: halo.clone(),
             door: door.clone(),
             me: me.clone(),
@@ -121,6 +166,7 @@ impl<E: crate::Context> Relay<E> {
                 halo,
                 me,
                 metrics.dropped_behind.clone(),
+                config,
             )),
             metrics,
             tasks: Mutex::default(),
@@ -132,7 +178,7 @@ impl<E: crate::Context> Relay<E> {
         if let Some(door) = door {
             relay.spawn(accepting(weak, door));
         }
-        Ok(relay)
+        relay
     }
 
     /// A task aborted with the relay; the handle aborts it sooner. The tasks already over are
@@ -152,8 +198,9 @@ impl<E: crate::Context> Relay<E> {
     /// A websocket on `/v1/live`: the same session over the http port.
     pub async fn serve_ws(self: Arc<Self>, socket: axum::extract::ws::WebSocket) {
         let relay = Arc::downgrade(&self);
+        let config = self.config;
         drop(self);
-        serve(relay, Link::ws(socket)).await;
+        serve(relay, Link::ws(socket, &config)).await;
     }
 
     /// A block was applied: grants of a program whose `live/` table it wrote, and every
@@ -320,6 +367,7 @@ impl<E: crate::Context> Relay<E> {
             | Control::Published { .. }
             | Control::Subscribed { .. }
             | Control::Subscribers { .. }
+            | Control::Watching { .. }
             | Control::Announce { .. }
             | Control::Ended { .. }
             | Control::Refused { .. }
@@ -402,10 +450,16 @@ struct Decided {
 
 /// The QUIC door: the node key's certificate, which a client pins from `/v1/status`, on the live
 /// ALPN, asking no client for a certificate; a client proves its key in the session instead.
-fn door(identity: &PrivateKey, at: SocketAddr) -> Result<quinn::Endpoint, halo::quic::Error> {
-    // `open_server` already applies halo's idle timeout and keep-alive, so a live client that
-    // holds tracks stays open through a NAT on the same terms as a lane between members.
-    let server = halo::quic::open_server(identity, ALPN)?;
+/// The QUIC door at `at`, with the node key's certificate; the relay serves it.
+pub fn door(identity: &PrivateKey, at: SocketAddr) -> Result<quinn::Endpoint, halo::quic::Error> {
+    let mut server = halo::quic::open_server(identity, ALPN)?;
+    // The live wire's keep-alive and idle limit, the ones a client links, so a client that
+    // holds tracks stays open through a NAT and a dead one is closed when the wire says.
+    let mut transport = quinn::TransportConfig::default();
+    let idle = quinn::IdleTimeout::try_from(IDLE).expect("the live idle limit fits quinn's");
+    transport.max_idle_timeout(Some(idle));
+    transport.keep_alive_interval(Some(KEEP_ALIVE));
+    server.transport_config(Arc::new(transport));
     Ok(quinn::Endpoint::server(server, at)?)
 }
 
@@ -418,6 +472,7 @@ async fn accepting<E: crate::Context>(relay: Weak<Relay<E>>, door: quinn::Endpoi
             relay.clone(),
             incoming,
             strong.halo.plane().pacer().clone(),
+            strong.config,
         ));
     }
 }
@@ -426,6 +481,7 @@ async fn serve_quic<E: crate::Context>(
     relay: Weak<Relay<E>>,
     incoming: quinn::Incoming,
     pacer: halo::Pacer,
+    config: Config,
 ) {
     let connected = tokio::time::timeout(HANDSHAKE_WAIT, incoming).await;
     let Ok(Ok(connection)) = connected else {
@@ -436,7 +492,7 @@ async fn serve_quic<E: crate::Context>(
         connection.close(0u32.into(), b"no control stream");
         return;
     };
-    let link = Link::quic(connection, control, pacer);
+    let link = Link::quic(connection, control, pacer, &config);
     serve(relay, link).await;
 }
 

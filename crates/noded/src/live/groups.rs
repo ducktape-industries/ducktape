@@ -14,9 +14,6 @@ use tokio::sync::mpsc;
 
 use super::session::framed;
 
-/// Objects queued per group stream before its writer; past it the group is dropped short.
-const GROUP_QUEUE: usize = 256;
-
 /// What a group writer takes from its queue next.
 pub enum GroupOut {
     Object(Bytes),
@@ -76,14 +73,23 @@ struct Open {
     next: u32,
 }
 
-#[derive(Default)]
 pub struct Groups {
+    /// Objects queued per group stream before its writer; past it the group is dropped short.
+    queue: usize,
     open: HashMap<(Alias, u64), Open>,
     /// Groups dropped short: the rest of their objects are dropped quiet, until they end.
     abandoned: HashSet<(Alias, u64)>,
 }
 
 impl Groups {
+    pub fn new(queue: usize) -> Groups {
+        Groups {
+            queue,
+            open: HashMap::new(),
+            abandoned: HashSet::new(),
+        }
+    }
+
     /// One object on its group's stream, opening a writer for a new group through `spawn`. The
     /// receiver numbers a stream's objects from 0 in the order read, so a stream is opened only
     /// at a group's object 0: a group first seen past it (this egress is new, the one that
@@ -172,7 +178,7 @@ impl Groups {
             return Handed::Abandoned;
         }
         let open = self.open.entry(key).or_insert_with(|| {
-            let (sending, queue) = mpsc::channel(GROUP_QUEUE);
+            let (sending, queue) = mpsc::channel(self.queue);
             spawn(header, queue);
             Open { sending, next: 0 }
         });
@@ -198,6 +204,8 @@ impl Groups {
 mod tests {
     use super::*;
 
+    const QUEUE: usize = 4;
+
     /// The queues a counting writer spawn was handed, kept open as a writer would keep them.
     type Spawned = std::rc::Rc<std::cell::RefCell<Vec<mpsc::Receiver<GroupOut>>>>;
 
@@ -209,7 +217,7 @@ mod tests {
 
     #[test]
     fn a_group_first_seen_past_its_object_0_is_dropped_until_it_ends() {
-        let mut groups = Groups::default();
+        let mut groups = Groups::new(QUEUE);
         let header = GroupHeader { alias: 1, group: 5 };
         let (spawned, spawn) = counting();
         let body = Bytes::from_static(b"x");
@@ -254,11 +262,11 @@ mod tests {
 
     #[test]
     fn a_groups_queue_that_overflows_drops_that_group_short_and_its_end_is_quiet() {
-        let mut groups = Groups::default();
+        let mut groups = Groups::new(QUEUE);
         let (spawned, spawn) = counting();
         let body = Bytes::from_static(b"x");
         let g5 = GroupHeader { alias: 1, group: 5 };
-        for object in 0..GROUP_QUEUE as u32 {
+        for object in 0..QUEUE as u32 {
             assert!(matches!(
                 groups.object(g5, object, body.clone(), &spawn),
                 Handed::Queued
@@ -266,14 +274,14 @@ mod tests {
         }
         assert!(
             matches!(
-                groups.object(g5, GROUP_QUEUE as u32, body.clone(), &spawn),
+                groups.object(g5, QUEUE as u32, body.clone(), &spawn),
                 Handed::Dropped
             ),
             "the object past the queue drops the group, which is reset"
         );
         assert!(matches!(
             read(&mut spawned.borrow_mut()[0]),
-            (GROUP_QUEUE, Err(mpsc::error::TryRecvError::Disconnected))
+            (QUEUE, Err(mpsc::error::TryRecvError::Disconnected))
         ));
         groups.end(1, 5, true);
         assert!(
@@ -309,7 +317,7 @@ mod tests {
 
     #[test]
     fn a_track_forgotten_leaves_nothing_of_its_groups() {
-        let mut groups = Groups::default();
+        let mut groups = Groups::new(QUEUE);
         let (spawned, spawn) = counting();
         let body = Bytes::from_static(b"x");
         assert!(matches!(
@@ -331,7 +339,7 @@ mod tests {
 
     #[test]
     fn an_object_out_of_order_cuts_its_group_short() {
-        let mut groups = Groups::default();
+        let mut groups = Groups::new(QUEUE);
         let header = GroupHeader { alias: 1, group: 5 };
         let (_, spawn) = counting();
         let body = Bytes::from_static(b"x");

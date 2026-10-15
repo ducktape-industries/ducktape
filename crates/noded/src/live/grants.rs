@@ -5,6 +5,7 @@
 //! message is never stale.
 
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,10 +18,6 @@ use host::Layer;
 use live_wire::Account;
 
 use crate::Shared;
-
-/// Chain reads in flight at once over every session: a session's control messages queue here
-/// rather than at the node lock.
-const READS_IN_FLIGHT: usize = 64;
 
 pub type Answered<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -132,13 +129,15 @@ pub struct Grants {
 }
 
 impl Grants {
-    pub fn new(chain: Arc<dyn Chain>) -> Grants {
+    /// `reads_in_flight` chain reads run at once over every session; the rest queue here rather
+    /// than at the node lock.
+    pub fn new(chain: Arc<dyn Chain>, reads_in_flight: NonZeroUsize) -> Grants {
         Grants {
             chain,
             generation: AtomicU64::new(0),
             identity: AtomicU64::new(0),
             held: Arc::new(Notify::new()),
-            reads: Semaphore::new(READS_IN_FLIGHT),
+            reads: Semaphore::new(reads_in_flight.get()),
         }
     }
 

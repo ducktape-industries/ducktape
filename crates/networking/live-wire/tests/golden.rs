@@ -109,6 +109,7 @@ fn controls() -> Vec<Control> {
             request: 1,
             count: 3,
         },
+        Control::Watching { request: 4 },
         Control::Announce {
             request: 4,
             track: track.clone(),
@@ -244,7 +245,7 @@ fn every_wire_variant_has_a_golden_sample() {
     // Each variant has a number, and the matches are exhaustive (no `_`): a new `Control` or
     // `Forward` variant fails to compile here until it is numbered, and the count fails until
     // its number is seen among the samples, so no variant goes without a golden sample.
-    const CONTROLS: usize = 18;
+    const CONTROLS: usize = 19;
     const FORWARDS: usize = 8;
     let control_index = |control: &Control| -> usize {
         match control {
@@ -261,11 +262,12 @@ fn every_wire_variant_has_a_golden_sample() {
             Control::Published { .. } => 10,
             Control::Subscribed { .. } => 11,
             Control::Subscribers { .. } => 12,
-            Control::Announce { .. } => 13,
-            Control::Ended { .. } => 14,
-            Control::Refused { .. } => 15,
-            Control::Waiting { .. } => 16,
-            Control::GoAway { .. } => 17,
+            Control::Watching { .. } => 13,
+            Control::Announce { .. } => 14,
+            Control::Ended { .. } => 15,
+            Control::Refused { .. } => 16,
+            Control::Waiting { .. } => 17,
+            Control::GoAway { .. } => 18,
         }
     };
     let forward_index = |forward: &Forward| -> usize {

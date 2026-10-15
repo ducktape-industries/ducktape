@@ -19,17 +19,10 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinSet};
 
-use super::Relay;
 use super::groups::{self, GroupOut, Groups, Handed};
 use super::session::{Latest, framed};
+use super::{Config, Relay};
 
-/// Streams peers opened and this node has not taken yet, over every peer.
-const BACKLOG: usize = 64;
-/// Datagrams waiting per peer; past it the oldest is dropped.
-const PER_SENDER: usize = 256;
-/// Control items waiting for one peer's writer; past it the writer is dropped and the peer
-/// resynced, and the other peers are none the slower.
-const PEER_QUEUE: usize = 1024;
 /// A retried thing logs its first attempt, then every tenth.
 const ATTEMPTS_PER_LINE: u32 = 10;
 
@@ -138,6 +131,7 @@ pub struct Lanes<E: crate::Context> {
     streams: Arc<Streams>,
     datagrams: Arc<Datagrams>,
     dropped: Counter,
+    config: Config,
     peers: HashMap<PublicKey, Writer>,
     /// How often each peer's writer was dropped for a full control queue in the episode that
     /// is on (it ends when the peer's queue next takes an item beyond the reset's own resync),
@@ -146,16 +140,22 @@ pub struct Lanes<E: crate::Context> {
 }
 
 impl<E: crate::Context> Lanes<E> {
-    pub fn new(relay: Weak<Relay<E>>, halo: Arc<Halo>, me: PublicKey, dropped: Counter) -> Self {
+    pub fn new(
+        relay: Weak<Relay<E>>,
+        halo: Arc<Halo>,
+        me: PublicKey,
+        dropped: Counter,
+        config: Config,
+    ) -> Self {
         let plane = halo.plane();
         let streams = Arc::new(
             plane
-                .streams(LANE, BACKLOG)
+                .streams(LANE, config.lane_backlog.get())
                 .expect("the live lane is the relay's alone"),
         );
         let datagrams = Arc::new(
             plane
-                .datagrams(LANE, PER_SENDER)
+                .datagrams(LANE, config.lane_per_sender.get())
                 .expect("the live lane is the relay's alone"),
         );
         Lanes {
@@ -165,6 +165,7 @@ impl<E: crate::Context> Lanes<E> {
             streams,
             datagrams,
             dropped,
+            config,
             peers: HashMap::new(),
             resets: HashMap::new(),
         }
@@ -241,7 +242,7 @@ impl<E: crate::Context> Lanes<E> {
     fn writer(&mut self, to: PublicKey) -> Option<&mut Writer> {
         if !self.peers.contains_key(&to) {
             let relay = self.relay.upgrade()?;
-            let (control, queued) = mpsc::channel(PEER_QUEUE);
+            let (control, queued) = mpsc::channel(self.config.peer_queue.get());
             let latest = Arc::new(Latest::default());
             let link = PeerLink {
                 relay: self.relay.clone(),
@@ -257,7 +258,7 @@ impl<E: crate::Context> Lanes<E> {
                 to.clone(),
                 Writer {
                     control,
-                    groups: Groups::default(),
+                    groups: Groups::new(self.config.group_queue.get()),
                     latest,
                     writing: JoinSet::new(),
                     aborting,

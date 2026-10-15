@@ -285,7 +285,16 @@ uploads (submit, blob put) it serves together; the rest wait their turn.
 `--blob-serves-in-flight` and `--blob-gatherers` are the blobs it sends to
 members and gathers from members together. `--blob-backlog` is how many
 members' blob requests wait for a send; past it a request is refused.
-`ducktape run --help` shows each default.
+The live relay's queues are `run` flags too: `--live-session-inbound` and
+`--live-session-outbound` are the messages waiting for one client session's
+loop and for its connection (a session that far behind is closed),
+`--live-group-queue` the objects waiting for one group stream's writer (past
+it the group is dropped short), `--live-peer-queue`, `--live-lane-backlog` and
+`--live-lane-per-sender` the lane items waiting for one peer's writer, the
+peers' streams waiting to be taken and the datagrams waiting per peer; its
+chain reads run under `--reads-in-flight`. `--live-linger-ms` is how long a closed session's last message gets to reach
+the client before the connection is closed under it. `ducktape run --help`
+shows each default.
 
 Halo carries lanes, each a named kind of traffic (blobs ride `ducktape/blobs`). The halo
 role's program holds the lane table: each lane's name, the id its streams and datagrams carry
@@ -305,7 +314,10 @@ room's program granted its account under the `live` table, over QUIC on a UDP
 socket of its own (`run --live 0.0.0.0:9200`, ALPN `ducktape-live`, the node
 key's certificate) or the WebSocket `/v1/live`; nodes carry a track between
 their clients over halo's lane `ducktape/live`. `GET /v1/live/port` names the QUIC port, or
-none without `--live`, and then clients take the WebSocket.
+none without `--live`, and then clients take the WebSocket. The clocks a client must honour
+are `live-wire`'s: `HANDSHAKE_WAIT` for each step of the handshake, `KEEP_ALIVE` and `IDLE`
+(a connection silent that long is closed, on either path), and `IDLE_SESSION` for a session
+holding nothing.
 
 ```sh
 ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100   # the tunnel serves https://b.example.org from 127.0.0.1:8844

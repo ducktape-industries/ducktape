@@ -27,7 +27,7 @@ use tokio::sync::{oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::grants::{Answered, Chain};
-use super::{GOAWAY_MS, Network, Relay, ws_upgrade};
+use super::{Config, GOAWAY_MS, Network, Relay, ws_upgrade};
 
 type Context = runtime::Context;
 
@@ -198,11 +198,10 @@ fn node(context: Context, seed: u64, ledger: Arc<Ledger>) -> Node {
         },
         ledger,
         halo.clone(),
-        &identity,
-        Some("127.0.0.1:0".parse().unwrap()),
+        Some(super::door(&identity, "127.0.0.1:0".parse().unwrap()).unwrap()),
+        Config::default(),
         down,
-    )
-    .unwrap();
+    );
     Node {
         key,
         halo,
@@ -393,6 +392,11 @@ impl Client {
             } if answered == request => alias,
             other => panic!("published: {other:?}"),
         }
+    }
+
+    async fn watch(&mut self, request: u64, namespace: String) {
+        self.send(Control::Watch { request, namespace }).await;
+        assert_eq!(self.recv().await, Control::Watching { request });
     }
 
     async fn subscribe(
@@ -1095,6 +1099,7 @@ fn an_ask_a_room_does_not_grant_yet_waits_and_the_block_that_grants_it_answers_i
         else {
             panic!("bob's waiting subscription finds alice's track up");
         };
+        assert_eq!(carol.recv().await, Control::Watching { request: 1 });
         assert_eq!(
             carol.recv().await,
             Control::Announce {
@@ -1279,11 +1284,7 @@ fn a_track_published_on_one_node_reaches_a_subscriber_on_another_over_halo() {
         let doc = track("room", "doc");
 
         let (mut bob, _) = Client::open(&second, &bob).await;
-        bob.send(Control::Watch {
-            request: 1,
-            namespace: namespace("room"),
-        })
-        .await;
+        bob.watch(1, namespace("room")).await;
 
         let (mut alice, _) = Client::open(&first, &alice).await;
         let alias = alice.publish_at(1, doc.clone(), Mode::Stream, 3).await;
@@ -1687,6 +1688,7 @@ fn a_second_subscribe_or_watch_of_the_same_thing_by_one_session_is_a_duplicate()
             })
             .await;
         }
+        assert_eq!(bob.recv().await, Control::Watching { request: 3 });
         assert_eq!(
             bob.recv().await,
             Control::Announce {
@@ -1745,11 +1747,7 @@ fn a_group_the_publisher_resets_crosses_the_lane_as_cut_short() {
         let doc = track("room", "doc");
 
         let (mut bob, _) = Client::open(&second, &bob).await;
-        bob.send(Control::Watch {
-            request: 1,
-            namespace: namespace("room"),
-        })
-        .await;
+        bob.watch(1, namespace("room")).await;
         let (mut alice, _) = Client::open(&first, &alice).await;
         let alias = alice.publish(1, doc.clone(), Mode::Stream).await;
         bob.recv().await;
@@ -1797,11 +1795,7 @@ fn a_member_seated_after_a_track_was_published_hears_it_when_the_lane_opens() {
             node.halo.seat([first.seat(), second.seat()]);
         }
         let (mut bob, _) = Client::open(&second, &bob).await;
-        bob.send(Control::Watch {
-            request: 1,
-            namespace: namespace("room"),
-        })
-        .await;
+        bob.watch(1, namespace("room")).await;
 
         // Seating opens the lane between the nodes, and its resync carries the track published
         // before anyone was seated: no second publish and no reconnect make it cross.
@@ -1830,11 +1824,7 @@ fn a_member_unseated_takes_its_tracks_down_for_the_watchers_of_the_others() {
         }
         let doc = track("room", "doc");
         let (mut bob, _) = Client::open(&second, &bob).await;
-        bob.send(Control::Watch {
-            request: 1,
-            namespace: namespace("room"),
-        })
-        .await;
+        bob.watch(1, namespace("room")).await;
         let (mut alice, _) = Client::open(&first, &alice).await;
         alice.publish(1, doc.clone(), Mode::Stream).await;
         match bob.recv().await {
@@ -1882,11 +1872,7 @@ fn a_member_that_cannot_be_reached_slows_no_other() {
         let doc = track("room", "doc");
 
         let (mut bob, _) = Client::open(&second, &bob).await;
-        bob.send(Control::Watch {
-            request: 1,
-            namespace: namespace("room"),
-        })
-        .await;
+        bob.watch(1, namespace("room")).await;
         // A hundred announces in a room bob does not watch queue for the dead member, each a
         // dial it waits out, and as many for the second node, ahead of the doc's group.
         let (mut alice, _) = Client::open(&first, &alice).await;
@@ -1940,11 +1926,7 @@ fn a_watcher_hears_the_announces_its_subscribe_patterns_cover() {
         alice
             .publish(2, track("room", "presence/1"), Mode::Datagram)
             .await;
-        bob.send(Control::Watch {
-            request: 1,
-            namespace: namespace("room"),
-        })
-        .await;
+        bob.watch(1, namespace("room")).await;
         assert_eq!(
             bob.recv().await,
             Control::Announce {
@@ -2030,11 +2012,7 @@ fn a_node_asks_for_a_track_once_and_the_cache_crosses_to_it_but_not_to_a_next_su
         let doc = track("room", "doc");
 
         let (mut bob, _) = Client::open(&second, &bob).await;
-        bob.send(Control::Watch {
-            request: 1,
-            namespace: namespace("room"),
-        })
-        .await;
+        bob.watch(1, namespace("room")).await;
         let (mut alice, _) = Client::open(&first, &alice).await;
         let alias = alice.publish(1, doc.clone(), Mode::Stream).await;
         bob.recv().await;

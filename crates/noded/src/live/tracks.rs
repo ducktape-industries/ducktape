@@ -1558,6 +1558,7 @@ impl State {
             .map(|(track, held)| (track.clone(), held.by, held.mode))
             .collect();
         self.watches.entry(namespace).or_default().push(watcher);
+        self.tell(id, Control::Watching { request }, &mut effects);
         up.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
         for (track, by, mode) in up {
             self.tell(
@@ -2620,6 +2621,46 @@ mod tests {
 
     fn group_ends_sent(effects: &[Effect]) -> usize {
         sent(effects, |out| matches!(out, Out::GroupEnd { .. }))
+    }
+
+    #[test]
+    fn a_watch_granted_on_an_empty_namespace_is_answered_once_and_a_waiting_one_is_not() {
+        let mut state = state();
+        let bob = open(&mut state, 43, 2);
+        let namespace = "net#00000000/chat/room".to_string();
+        let granted = told(state.watch(bob, 1, namespace.clone(), Some(vec!["*".into()])));
+        assert_eq!(
+            granted,
+            vec![Control::Watching { request: 1 }],
+            "a watch of a namespace with nothing up is answered, with nothing to announce"
+        );
+        let alice = open(&mut state, 42, 1);
+        let doc = Track {
+            namespace: namespace.clone(),
+            name: "doc".into(),
+        };
+        let announced = told(state.publish(alice, 1, doc.clone(), Mode::Stream, 128, true));
+        assert!(
+            announced.iter().any(|control| matches!(
+                control,
+                Control::Announce {
+                    request: 1,
+                    up: true,
+                    ..
+                }
+            )),
+            "the watch is on: a track up later is announced under it: {announced:?}"
+        );
+        // Not granted: the watch waits, and the answer waits with it.
+        let carol = open(&mut state, 44, 3);
+        let waiting = told(state.watch(carol, 1, namespace, None));
+        assert_eq!(
+            waiting,
+            vec![Control::Waiting {
+                request: 1,
+                code: Code::NotGranted
+            }]
+        );
     }
 
     #[test]
