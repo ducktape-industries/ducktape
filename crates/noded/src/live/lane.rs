@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinSet};
 
 use super::Relay;
-use super::groups::{GroupOut, Groups, Handed};
+use super::groups::{self, GroupOut, Groups, Handed};
 use super::session::{Latest, framed};
 
 /// Streams peers opened and this node has not taken yet, over every peer.
@@ -602,32 +602,11 @@ async fn group_writing(
     else {
         return;
     };
-    if stream.write_all(&abi::encode(&header)).await.is_err() {
-        return;
-    }
-    loop {
-        match queue.recv().await {
-            Some(GroupOut::Object(body)) => {
-                if framed(&mut stream, &body).await.is_err() {
-                    return cut_short(stream);
-                }
-            }
-            Some(GroupOut::Batch(objects)) => {
-                for body in objects.iter() {
-                    if framed(&mut stream, body).await.is_err() {
-                        return cut_short(stream);
-                    }
-                }
-            }
-            Some(GroupOut::End { complete: true }) => {
-                let _ = stream.write_u32_le(GROUP_COMPLETE).await;
-                let _ = stream.shutdown().await;
-                return;
-            }
-            Some(GroupOut::End { complete: false }) | None => {
-                return cut_short(stream);
-            }
-        }
+    if groups::written(&mut stream, &header, &mut queue).await {
+        let _ = stream.write_u32_le(GROUP_COMPLETE).await;
+        let _ = stream.shutdown().await;
+    } else {
+        cut_short(stream);
     }
 }
 

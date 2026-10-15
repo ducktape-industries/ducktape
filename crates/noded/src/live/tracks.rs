@@ -112,6 +112,32 @@ pub struct Published {
 }
 
 impl Published {
+    fn new(
+        by: Account,
+        mode: Mode,
+        priority: Priority,
+        origin: Origin,
+        request: RequestId,
+        alias: Alias,
+    ) -> Published {
+        Published {
+            by,
+            mode,
+            priority,
+            origin,
+            request,
+            alias,
+            latest: None,
+            subscribers: Vec::new(),
+            skip: HashMap::new(),
+            pending: Vec::new(),
+            node_counts: HashMap::new(),
+            told: 0,
+            incoming: BTreeMap::new(),
+            asked: None,
+        }
+    }
+
     /// The cached group a late joiner gets: one complete, or one still being written, which
     /// goes on live. One abandoned has a hole in it and is no one's to replay.
     fn replayable(&self) -> Option<&Cached> {
@@ -145,10 +171,12 @@ pub struct Watcher {
 
 impl Watcher {
     fn hears(&self, name: &str) -> bool {
-        self.patterns
-            .iter()
-            .any(|pattern| pattern_covers(pattern, name))
+        covered(&self.patterns, name)
     }
+}
+
+fn covered(patterns: &[String], name: &str) -> bool {
+    patterns.iter().any(|pattern| pattern_covers(pattern, name))
 }
 
 /// What one of a session's requests holds: a published track, a subscription, or a watched
@@ -710,22 +738,7 @@ impl State {
         let alias = self.alias();
         self.tracks.insert(
             track.clone(),
-            Published {
-                by: account,
-                mode,
-                priority,
-                origin: Origin::Local(id),
-                request,
-                alias,
-                latest: None,
-                subscribers: Vec::new(),
-                skip: HashMap::new(),
-                pending: Vec::new(),
-                node_counts: HashMap::new(),
-                told: 0,
-                incoming: BTreeMap::new(),
-                asked: None,
-            },
+            Published::new(account, mode, priority, Origin::Local(id), request, alias),
         );
         self.aliases.insert(alias, track.clone());
         if let Some(session) = self.sessions.get_mut(&id) {
@@ -858,22 +871,7 @@ impl State {
         let alias = self.alias();
         self.tracks.insert(
             track.clone(),
-            Published {
-                by,
-                mode,
-                priority,
-                origin: Origin::Remote(peer),
-                request: 0,
-                alias,
-                latest: None,
-                subscribers: Vec::new(),
-                skip: HashMap::new(),
-                pending: Vec::new(),
-                node_counts: HashMap::new(),
-                told: 0,
-                incoming: BTreeMap::new(),
-                asked: None,
-            },
+            Published::new(by, mode, priority, Origin::Remote(peer), 0, alias),
         );
         self.aliases.insert(alias, track.clone());
         let held = self.tracks.get(&track).expect("inserted above");
@@ -893,12 +891,12 @@ impl State {
 
     /// The live lane's forwarding request of a remote track, if one was answered.
     pub fn remote_request(&self, peer: &PublicKey, request: RequestId) -> Option<Track> {
-        self.tracks
-            .iter()
-            .find(|(_, held)| {
-                held.origin == Origin::Remote(peer.clone()) && held.request == request
-            })
-            .map(|(track, _)| track.clone())
+        // The forwarding request is our alias of the track, and aliases start at 1: an alias
+        // the request does not name was never asked.
+        let alias = self.remote_alias(peer, Alias::try_from(request).ok()?)?;
+        let track = self.aliases.get(&alias)?;
+        let asked = self.tracks.get(track)?.request == request;
+        asked.then(|| track.clone())
     }
 
     fn end_track(&mut self, track: &Track, reason: End, effects: &mut Vec<Effect>) {
@@ -1603,9 +1601,6 @@ impl State {
         else {
             return Vec::new();
         };
-        let hears = |patterns: &[String], name: &str| {
-            patterns.iter().any(|pattern| pattern_covers(pattern, name))
-        };
         let was = watcher.patterns.clone();
         let mut effects = Vec::new();
         let mut moved: Vec<(Track, Account, Mode, bool)> = self
@@ -1613,8 +1608,8 @@ impl State {
             .iter()
             .filter(|(track, _)| track.namespace == *namespace)
             .filter_map(|(track, held)| {
-                let before = hears(&was, &track.name);
-                let now = hears(&patterns, &track.name);
+                let before = covered(&was, &track.name);
+                let now = covered(&patterns, &track.name);
                 (before != now).then(|| (track.clone(), held.by, held.mode, now))
             })
             .collect();
@@ -2611,12 +2606,20 @@ mod tests {
         }
     }
 
-    /// How many of a step's effects send an object to a session.
-    fn objects_sent(effects: &[Effect]) -> usize {
+    /// How many of a step's effects send a session what `sent` names.
+    fn sent(effects: &[Effect], sent: impl Fn(&Out) -> bool) -> usize {
         effects
             .iter()
-            .filter(|effect| matches!(effect, Effect::Send(_, Out::Object { .. })))
+            .filter(|effect| matches!(effect, Effect::Send(_, out) if sent(out)))
             .count()
+    }
+
+    fn objects_sent(effects: &[Effect]) -> usize {
+        sent(effects, |out| matches!(out, Out::Object { .. }))
+    }
+
+    fn group_ends_sent(effects: &[Effect]) -> usize {
+        sent(effects, |out| matches!(out, Out::GroupEnd { .. }))
     }
 
     #[test]
@@ -2842,13 +2845,6 @@ mod tests {
             )
             .0
             .expect("the node is not going away")
-    }
-
-    fn group_ends_sent(effects: &[Effect]) -> usize {
-        effects
-            .iter()
-            .filter(|effect| matches!(effect, Effect::Send(_, Out::GroupEnd { .. })))
-            .count()
     }
 
     #[test]

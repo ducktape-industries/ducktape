@@ -19,7 +19,7 @@ use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
-use super::groups::{GroupOut, Groups};
+use super::groups::{self, GroupOut, Groups};
 
 /// Inbound events waiting for the session's loop; a reader waits when it is full, so the
 /// transport's flow control holds the publisher back.
@@ -598,32 +598,10 @@ async fn quic_group_writing(
     };
     let _ = stream.set_priority(stream_priority(priority));
     let mut paced = pacer.pace(stream, Class::Client);
-    if paced.write_all(&abi::encode(&header)).await.is_err() {
-        return;
-    }
-    loop {
-        match queue.recv().await {
-            Some(GroupOut::Object(body)) => {
-                if framed(&mut paced, &body).await.is_err() {
-                    return;
-                }
-            }
-            Some(GroupOut::Batch(objects)) => {
-                for body in objects.iter() {
-                    if framed(&mut paced, body).await.is_err() {
-                        return;
-                    }
-                }
-            }
-            Some(GroupOut::End { complete: true }) => {
-                let _ = paced.shutdown().await;
-                return;
-            }
-            Some(GroupOut::End { complete: false }) | None => {
-                let _ = paced.into_inner().reset(0u32.into());
-                return;
-            }
-        }
+    if groups::written(&mut paced, &header, &mut queue).await {
+        let _ = paced.shutdown().await;
+    } else {
+        let _ = paced.into_inner().reset(0u32.into());
     }
 }
 
@@ -997,7 +975,25 @@ mod tests {
             ends(&ws_group_frames(header, &objects, Some(false))),
             vec![Ending::More, Ending::Cut]
         );
-        for frame in &frames {
+        // Many small objects slice the same way: every frame fits and every object crosses once.
+        let small = vec![Bytes::from_static(b"x"); 70_000];
+        let sliced = ws_group_frames(header, &small, Some(true));
+        assert!(sliced.len() > 1);
+        let carried: usize = sliced
+            .iter()
+            .map(|frame| match frame {
+                WsFrame::Group { objects, .. } => objects.len(),
+                WsFrame::Control(_) | WsFrame::Datagram { .. } => unreachable!(),
+            })
+            .sum();
+        assert_eq!(carried, 70_000, "every object crosses once");
+        let empties = vec![Bytes::new(); 20_000];
+        for frame in
+            frames
+                .iter()
+                .chain(&sliced)
+                .chain(&ws_group_frames(header, &empties, Some(true)))
+        {
             assert!(
                 abi::encode(frame).len() <= WS_MESSAGE,
                 "each frame fits the socket"
@@ -1035,29 +1031,6 @@ mod tests {
             ]
         ));
         assert!(counting.is_empty(), "the group is over: its count is gone");
-    }
-
-    #[test]
-    fn a_replayed_group_of_many_small_objects_is_sliced_to_the_message_cap() {
-        let header = GroupHeader { alias: 1, group: 2 };
-        let objects = vec![Bytes::from_static(b"x"); 70_000];
-        let frames = ws_group_frames(header, &objects, Some(true));
-        assert!(frames.len() > 1);
-        let mut carried = 0;
-        for frame in &frames {
-            assert!(
-                abi::encode(frame).len() <= WS_MESSAGE,
-                "each frame fits the socket"
-            );
-            if let WsFrame::Group { objects, .. } = frame {
-                carried += objects.len();
-            }
-        }
-        assert_eq!(carried, 70_000, "every object crosses once");
-        let empties = vec![Bytes::new(); 20_000];
-        for frame in ws_group_frames(header, &empties, Some(true)) {
-            assert!(abi::encode(&frame).len() <= WS_MESSAGE);
-        }
     }
 
     #[test]

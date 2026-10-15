@@ -1,14 +1,18 @@
 //! The open group streams of one egress, to a client or to a peer: which groups have a writer,
 //! which were dropped short, and the one queue item each object, batch or end is to a writer.
-//! The writer tasks differ (a client's is paced and prioritised, a peer's writes the lane's
-//! end word), so each egress spawns its own; the queueing is this one place.
+//! The writer tasks differ in how their stream opens and ends (a client's is paced and
+//! prioritised, a peer's writes the lane's end word), so each egress spawns its own around the
+//! one writing loop here; the queueing is this one place too.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use live_wire::{Alias, GroupHeader};
+use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::mpsc;
+
+use super::session::framed;
 
 /// Objects queued per group stream before its writer; past it the group is dropped short.
 const GROUP_QUEUE: usize = 256;
@@ -22,6 +26,38 @@ pub enum GroupOut {
     End {
         complete: bool,
     },
+}
+
+/// One group written onto its open stream: the header, then each object as it is queued, as
+/// length-framed bytes. `true` when the group completed and the stream is the caller's to
+/// finish; `false` when it is to reset: the group was cut short, its queue closed, or a write
+/// failed.
+pub async fn written(
+    stream: &mut (impl AsyncWrite + Unpin),
+    header: &GroupHeader,
+    queue: &mut mpsc::Receiver<GroupOut>,
+) -> bool {
+    if stream.write_all(&abi::encode(header)).await.is_err() {
+        return false;
+    }
+    loop {
+        match queue.recv().await {
+            Some(GroupOut::Object(body)) => {
+                if framed(stream, &body).await.is_err() {
+                    return false;
+                }
+            }
+            Some(GroupOut::Batch(objects)) => {
+                for body in objects.iter() {
+                    if framed(stream, body).await.is_err() {
+                        return false;
+                    }
+                }
+            }
+            Some(GroupOut::End { complete }) => return complete,
+            None => return false,
+        }
+    }
 }
 
 /// How a group's objects reach a writer: queued; dropped now, for a queue that overflowed or a
