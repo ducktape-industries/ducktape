@@ -3,7 +3,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use host::{Layer, Receipt, Tip};
 use node::Preconfirm;
 
-pub const NODE_CONTRACT: u32 = 6;
+pub const NODE_CONTRACT: u32 = 7;
 pub const ADMIN: &str = "$admin";
 
 pub mod route {

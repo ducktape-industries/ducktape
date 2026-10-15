@@ -197,6 +197,8 @@ async fn start<E: Context>(
     let descriptor = workspace.descriptor()?;
     let identity = workspace.identity()?;
     let anchor = workspace.anchor()?;
+    let egress = workspace.egress()?;
+    let clients = crate::egress::Clients::new(egress.reach).map_err(Error::Egress)?;
     let node = Node::open(context.child("node"), &descriptor.network, workspace.dir()).await?;
     let network = Network {
         epoch_length: node.epoch_length()?,
@@ -291,6 +293,7 @@ async fn start<E: Context>(
     );
 
     let (shutdown, _) = watch::channel(false);
+    let (tips, _) = watch::channel(tip.height);
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
         node,
@@ -301,6 +304,7 @@ async fn start<E: Context>(
         summaries,
         logs,
         shutdown,
+        tips,
         votes: membership.votes().clone(),
         relay: Relay::new(identity.public_key(), relay_sender, voters.as_ref()),
         blobs,
@@ -349,7 +353,8 @@ async fn start<E: Context>(
             }
         }
     });
-    let mut tasks = vec![pump, server, relayed];
+    let egressing = crate::egress::spawn(daemon.clone(), egress, clients);
+    let mut tasks = vec![pump, server, relayed, egressing];
     if let Some((listener, acceptor)) = tls {
         let mesh = transport::loopback(listen.p2p);
         tasks.push(
@@ -571,6 +576,7 @@ async fn applied<E: Context>(
     // under the node lock, which a /v1/network read holds across the tip
     // and the book, so no height it serves passes its tip
     daemon.votes.applied(block.digest(), block.height);
+    daemon.tips.send_replace(block.height);
     let (receipted, members_written) = match sequenced {
         Sequenced::Applied {
             mut applied,

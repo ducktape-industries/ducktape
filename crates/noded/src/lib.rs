@@ -1,5 +1,6 @@
 mod blocks;
 mod client;
+mod egress;
 mod endpoint;
 mod logs;
 mod mesh;
@@ -81,6 +82,8 @@ pub enum Error {
     Failed { status: u16, sentence: String },
     #[error("the node closed its change stream")]
     Closed,
+    #[error("egress: {0}")]
+    Egress(String),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for Error {
@@ -101,6 +104,7 @@ pub struct Daemon<E: Context> {
     pub summaries: Summaries<E>,
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
+    pub tips: watch::Sender<u64>,
     pub relay: relay::Relay<E>,
     pub blobs: blob::service::Service,
     halo: Arc<halo::Halo>,

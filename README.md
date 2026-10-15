@@ -58,12 +58,13 @@ block_time_ms = 1000
 member_cap = 16               # optional, default 16: the most members (validators and residents) it ever holds, 1 to 128; fixed at founding
 hooks = ["activity"]          # optional: founding programs the kernel tells of every frame; the programs role holds the list from here on
 
-[roles]                       # the founding program the kernel calls in each role; all five required
+[roles]                       # the founding program the kernel calls in each role; egress optional, the rest required
 programs = "programs"         # registers and swaps programs
 validators = "valset"         # seats each epoch's validators; runs membership and the validators' votes
 identity = "identity"         # resolves a key or a program to its account
 blobs = "blobs"               # records each bundle of blobs put and which validators hold it
 awaits = "awaits"             # keeps the tickets of frames that await a call, and hands each its answer
+egress = "egress"             # optional: answers programs' calls outside the chain; nodes read it, the kernel never calls it
 
 [[validators]]
 key = "…"                     # hex ed25519 public key: `ducktape identity`
@@ -113,7 +114,7 @@ runs as no one (`None`). A program may send a message as another account
 `Runs { program, account }` and runs the message as that account only when
 the role answers with it, so an agent account its manager hands to a program
 acts through that program with no key held anywhere. The interfaces are `abi::role::{programs,
-validators, identity, awaits}`; the programs repository's `docs/roles.md` walks through them.
+validators, identity, awaits, egress}`; the programs repository's `docs/roles.md` walks through them.
 
 A program can wait for another program's answer. Its `execute` is an async
 Rust function (the program SDK's `awaiting_program!`), and each
@@ -182,7 +183,52 @@ leave. Each prints the block that carried it.
 
 The workspace (`--workspace`, default `$DUCKTAPE_HOME` else `~/.ducktape`)
 holds `identity.key`, the network descriptor, the anchor the node started
-from, the address its HTTP surface bound and the runtime's storage.
+from, the address its HTTP surface bound, the runtime's storage and, when the
+operator writes one, `egress.toml`.
+
+## Answer calls outside the chain
+
+A program reaches something outside the chain through the program bound to the
+egress role (`abi::role::egress`): it calls that program with a `Request`, the
+chain elects a member node serving the request's service, and that node answers
+in a later block. A `Request::Http` names a service and an `http::Head`: for the
+reserved `http` service the target is a full URL on the public internet, for any
+other service a path under the base the node's operator gives it. `relay` is the
+other reserved service: it is answered with nothing, a later block's call back.
+Any other service is registered on chain by an account, which then assigns the
+node keys that may serve it; the chain elects among the assigned members that
+serve it.
+
+The node does this itself. After each block it applies, it asks the egress
+program which open requests the chain elected it for and which are past their
+deadline. It calls each new one and signs the answer with its own key, and it
+sends `Expire` for each overdue one. It also sends `Serve` while the chain's
+record of the services it serves differs from its `egress.toml`. It submits each
+of these frames again every block until a block carries it, and signs one again
+when its anchor grows old. An answer larger than a block carries goes out as a
+failure. On a network that binds no egress role the node does none of this.
+
+```toml
+# $DUCKTAPE_HOME/egress.toml: read when the node starts; absent means it serves nothing
+relay = true                  # answer `relay` requests
+http = true                   # answer `http` requests, to the public internet
+private = false               # optional: let `http` reach loopback, private and link-local addresses
+
+[services.ccs]                # a registered service this node fronts
+base = "http://127.0.0.1:4141"
+secrets = { x-api-key = "CCS_KEY" }   # header = the environment variable holding its value
+```
+
+A service request goes to `base` joined with its path; a path that would leave
+`base` fails. The node adds the service's secrets, and it adds
+`ducktape-chain`, `ducktape-program` (the program that asked) and
+`ducktape-request` (the request id) so a proxy in front of the service can decide
+what each program may do. A request may set none of those headers itself, nor
+`host`, `content-length`, `transfer-encoding` or `connection`. An `http` request
+gets no secrets and no `ducktape-*` headers, and reaches only public addresses,
+checked for an address in the URL and after the DNS lookup, unless `private =
+true`. No redirect is followed and no proxy is used: the whole response,
+redirects included, is the answer, and every node can read it.
 
 ## Reach a node
 
