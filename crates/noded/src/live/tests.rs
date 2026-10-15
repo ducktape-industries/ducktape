@@ -1552,6 +1552,7 @@ fn a_node_asks_for_a_track_once_and_the_cache_crosses_once_as_asked() {
         let alice = seated(&ledger, 11, 42);
         let bob = seated(&ledger, 12, 43);
         let carol = seated(&ledger, 13, 44);
+        let dave = seated(&ledger, 14, 45);
         ledger.grant("room", None, Grant::all());
         let first = node(context.child("first"), 1, ledger.clone());
         let second = node(context.child("second"), 2, ledger);
@@ -1569,8 +1570,14 @@ fn a_node_asks_for_a_track_once_and_the_cache_crosses_once_as_asked() {
         let (mut alice, _) = Client::open(&first, &alice).await;
         let alias = alice.publish(1, doc.clone(), Mode::Stream).await;
         bob.recv().await;
-        // Cached on the first node before anyone on the second asks.
+        let (mut dave, _) = Client::open(&first, &dave).await;
+        dave.subscribe(1, doc.clone(), Start::Next).await;
+        alice.recv().await;
+        // dave hears group 1 whole, so the first node has cached it before anyone on the
+        // second asks.
         alice.group(alias, 1, &[b"cached"]).await;
+        let (header, _, complete) = dave.received_group().await;
+        assert_eq!((header.group, complete), (1, true));
 
         // bob asks for what comes next: the first lane message opens the stream, and the
         // cached group does not cross.
