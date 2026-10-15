@@ -22,7 +22,7 @@ use live_wire::{
     proof_preimage,
 };
 use tokio::io::AsyncReadExt as _;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::grants::{Answered, Chain};
@@ -42,6 +42,14 @@ type Row = (String, String, Option<Account>);
 struct Ledger {
     accounts: Mutex<HashMap<Vec<u8>, Account>>,
     grants: Mutex<HashMap<Row, Grant>>,
+    parked: Mutex<Option<Parked>>,
+}
+
+/// A grant read the test holds once its row is read: it says so, then waits for the word to
+/// answer.
+struct Parked {
+    read: oneshot::Sender<()>,
+    answer: oneshot::Receiver<()>,
 }
 
 impl Ledger {
@@ -66,6 +74,15 @@ impl Ledger {
             .remove(&(PROGRAM.to_owned(), room.to_owned(), who));
     }
 
+    /// The next grant read parks with what it read: the first half hears it was read, the
+    /// second lets it answer.
+    fn park(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (read, was_read) = oneshot::channel();
+        let (answers, answer) = oneshot::channel();
+        *self.parked.lock().unwrap() = Some(Parked { read, answer });
+        (was_read, answers)
+    }
+
     fn unseat(&self, key: &PrivateKey) {
         self.accounts
             .lock()
@@ -86,7 +103,14 @@ impl Chain for Ledger {
         let grant = own
             .or_else(|| grants.get(&(program.to_owned(), room.to_owned(), None)))
             .cloned();
-        Box::pin(async move { grant })
+        let parked = self.parked.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(parked) = parked {
+                let _ = parked.read.send(());
+                let _ = parked.answer.await;
+            }
+            grant
+        })
     }
 }
 
@@ -854,6 +878,57 @@ fn a_grant_a_block_removes_ends_the_request_and_a_room_without_one_refuses() {
     });
 }
 
+#[test]
+fn a_grant_a_block_moves_while_a_request_reads_it_is_read_again() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let bob = seated(&ledger, 12, 43);
+        let carol = seated(&ledger, 13, 44);
+        ledger.grant("room", Some(42), Grant::all());
+        ledger.grant("room", None, Grant::all());
+        let node = node(context, 1, ledger.clone());
+        let doc = track("room", "doc");
+
+        let (mut alice, _) = Client::open(&node, &alice).await;
+        let (mut bob, _) = Client::open(&node, &bob).await;
+        let (mut carol, _) = Client::open(&node, &carol).await;
+        alice.publish(1, doc.clone(), Mode::Stream).await;
+        carol.subscribe(1, doc.clone(), Start::Next).await;
+
+        // bob's grant is read, as granted, and his request waits to be registered while a
+        // block takes the room's `*` row away.
+        let (read, answer) = ledger.park();
+        bob.send(Control::Subscribe {
+            request: 1,
+            track: doc.clone(),
+            from: Start::Next,
+        })
+        .await;
+        read.await.unwrap();
+        ledger.revoke("room", None);
+        node.relay.invalidate(&wrote_grants());
+        // The re-check ran past bob's request, which was not there yet: carol's ends.
+        assert_eq!(
+            carol.recv().await,
+            Control::Ended {
+                request: 1,
+                reason: End::GrantRevoked
+            }
+        );
+        answer.send(()).unwrap();
+        assert!(matches!(bob.recv().await, Control::Subscribed { .. }));
+        assert_eq!(
+            bob.recv().await,
+            Control::Ended {
+                request: 1,
+                reason: End::GrantRevoked
+            },
+            "a request decided across the block is read again"
+        );
+    });
+}
+
 // ---- (f) two nodes over lane 7 ----
 
 #[test]
@@ -1002,9 +1077,13 @@ fn a_session_closed_by_a_recheck_leaves_the_table_without_the_client_saying_anyt
                 reason: End::PublisherGone
             }
         );
-        assert!(
-            alice_session.recv.read_u32_le().await.is_err(),
-            "alice's connection is closed under her"
+        assert_eq!(
+            alice_session.connection.closed().await,
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: 0u32.into(),
+                reason: "no_account".into(),
+            }),
+            "alice's connection is closed under her, saying why"
         );
     });
 }
@@ -1257,6 +1336,63 @@ fn a_member_seated_after_a_track_was_published_hears_it_when_the_lane_opens() {
         }
         heard.sort();
         assert_eq!(heard, vec![early, late]);
+        first.shutdown.send_replace(true);
+        second.shutdown.send_replace(true);
+    });
+}
+
+#[test]
+fn a_member_that_cannot_be_reached_slows_no_other() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let bob = seated(&ledger, 12, 43);
+        ledger.grant("room", None, Grant::all());
+        ledger.grant("busy", None, Grant::all());
+        let first = node(context.child("first"), 1, ledger.clone());
+        let second = node(context.child("second"), 2, ledger);
+        // A member whose halo address takes datagrams and answers none: every stream to it
+        // waits out a dial.
+        let hole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead = Seat {
+            key: PrivateKey::from_seed(3).public_key(),
+            halo: format!("localhost:{}", hole.local_addr().unwrap().port()),
+            validator: true,
+        };
+        for node in [&first, &second] {
+            node.halo.seat([first.seat(), second.seat(), dead.clone()]);
+        }
+        let doc = track("room", "doc");
+
+        let (mut bob, _) = Client::open(&second, &bob).await;
+        bob.send(Control::Watch {
+            request: 1,
+            namespace: namespace("room"),
+        })
+        .await;
+        // A hundred announces in a room bob does not watch queue for the dead member, each a
+        // dial it waits out, and as many for the second node, ahead of the doc's group.
+        let (mut alice, _) = Client::open(&first, &alice).await;
+        for n in 0..50 {
+            let request = n + 2;
+            alice
+                .publish(request, track("busy", &format!("t/{n}")), Mode::Stream)
+                .await;
+            alice.send(Control::Unpublish { request }).await;
+        }
+        let alias = alice.publish(1, doc.clone(), Mode::Stream).await;
+        assert!(matches!(
+            bob.recv().await,
+            Control::Announce { up: true, .. }
+        ));
+        bob.subscribe(2, doc.clone(), Start::Next).await;
+        alice.recv().await;
+        alice.group(alias, 1, &[b"on time"]).await;
+        let (header, objects, complete) = bob.received_group().await;
+        assert_eq!(
+            (header.group, objects, complete),
+            (1, vec![b"on time".to_vec()], true)
+        );
         first.shutdown.send_replace(true);
         second.shutdown.send_replace(true);
     });

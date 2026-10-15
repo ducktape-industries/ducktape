@@ -170,7 +170,7 @@ impl Outlet {
 enum Drained {
     Out(Out),
     Datagrams(Vec<(DatagramHeader, Bytes)>),
-    Close(&'static str),
+    Close,
 }
 
 struct Egress {
@@ -195,16 +195,15 @@ impl Egress {
                 out = self.ordered.recv() => {
                     return match out {
                         Some(out) => Drained::Out(out),
-                        None => Drained::Close("relay_gone"),
+                        None => Drained::Close,
                     };
                 }
-                closed = self.closing.wait_for(|closing| closing.is_some()) => {
+                _ = self.closing.wait_for(|closing| closing.is_some()) => {
                     // A close follows what was sent before it; that goes out first.
                     if let Ok(out) = self.ordered.try_recv() {
                         return Drained::Out(out);
                     }
-                    let reason = closed.ok().and_then(|closing| *closing).unwrap_or("relay_gone");
-                    return Drained::Close(reason);
+                    return Drained::Close;
                 }
                 () = ready => {}
             }
@@ -525,12 +524,11 @@ async fn quic_writing(
                     let _ = connection.send_datagram(frame.into());
                 }
             }
-            Drained::Close(reason) => {
-                // The last control message reaches a reading client before the close; one that
-                // stopped reading is cut off at LINGER by the link that owns the connection.
+            Drained::Close => {
+                // The last control message reaches a reading client before the link that owns
+                // the connection closes it; one that stopped reading is cut off at LINGER.
                 let _ = control.finish();
                 let _ = tokio::time::timeout(LINGER, control.stopped()).await;
-                connection.close(0u32.into(), reason.as_bytes());
                 return;
             }
         }
@@ -747,7 +745,7 @@ async fn ws_writing(mut sink: WsSink, mut egress: Egress) {
                     payload: payload.to_vec(),
                 })
                 .collect(),
-            Drained::Close(_) => {
+            Drained::Close => {
                 let _ = sink.close().await;
                 return;
             }
