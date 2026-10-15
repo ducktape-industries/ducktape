@@ -394,12 +394,20 @@ async fn quic_group_reading(mut stream: quinn::RecvStream, inbound: mpsc::Sender
         };
         let fits = len <= MAX_STREAM_OBJECT;
         if !fits {
-            // The stream is stopped at the object that does not fit; the publisher hears why.
+            // The stream is stopped at the object that does not fit; the publisher hears why,
+            // and the group ends short so no entry for it is left behind (C1-11).
             let _ = stream.stop(0u32.into());
             let _ = inbound
                 .send(Inbound::Oversize {
                     alias: header.alias,
                     group: header.group,
+                })
+                .await;
+            let _ = inbound
+                .send(Inbound::GroupEnd {
+                    alias: header.alias,
+                    group: header.group,
+                    complete: false,
                 })
                 .await;
             return;
@@ -683,6 +691,12 @@ fn ws_arrived(bytes: Bytes, counting: &mut HashMap<(Alias, u64), u32>) -> Vec<In
                         alias: header.alias,
                         group: header.group,
                     });
+                    // The group ends short, so no entry for it is left behind (C1-11).
+                    events.push(Inbound::GroupEnd {
+                        alias: header.alias,
+                        group: header.group,
+                        complete: false,
+                    });
                     return events;
                 }
                 let object = *next;
@@ -867,7 +881,14 @@ mod tests {
         };
         assert!(matches!(
             ws_arrived(abi::encode(&group).into(), &mut counting).as_slice(),
-            [Inbound::Oversize { alias: 3, group: 7 }]
+            [
+                Inbound::Oversize { alias: 3, group: 7 },
+                Inbound::GroupEnd {
+                    alias: 3,
+                    group: 7,
+                    complete: false,
+                },
+            ]
         ));
     }
 }

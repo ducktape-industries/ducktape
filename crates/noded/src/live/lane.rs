@@ -397,10 +397,15 @@ async fn accepting<E: crate::Context>(relay: Weak<Relay<E>>, streams: Arc<Stream
         let Ok(meta) = abi::decode::<LaneMeta>(&inbound.meta) else {
             continue;
         };
-        match meta {
-            LaneMeta::Control => tokio::spawn(control_reading(relay.clone(), inbound)),
-            LaneMeta::Group => tokio::spawn(group_reading(relay.clone(), inbound)),
+        let Some(strong) = relay.upgrade() else {
+            return;
         };
+        // Through the relay's `JoinSet`, so a per-stream reader is aborted with the relay and
+        // does not keep a halo stream past it.
+        match meta {
+            LaneMeta::Control => strong.spawn(control_reading(relay.clone(), inbound)),
+            LaneMeta::Group => strong.spawn(group_reading(relay.clone(), inbound)),
+        }
     }
 }
 

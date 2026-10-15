@@ -1424,6 +1424,14 @@ fn an_object_over_its_cap_is_refused_too_large_and_the_session_goes_on() {
             (header.group, objects, complete),
             (2, vec![b"fits".to_vec()], true)
         );
+        // The oversized group's entry was ended short, not left behind (C1-11): both groups'
+        // entries are gone once group 2 completed, which the ordered session loop reached after
+        // the oversized group's own short end.
+        assert_eq!(
+            node.relay.state().open_groups(&doc),
+            0,
+            "the oversized group left no open-group entry"
+        );
     });
 }
 

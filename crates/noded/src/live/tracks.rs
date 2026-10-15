@@ -343,6 +343,12 @@ impl State {
         self.tracks.get(track)
     }
 
+    /// The groups a track is still writing, for a test that a short-ended group leaves none.
+    #[cfg(test)]
+    pub fn open_groups(&self, track: &Track) -> usize {
+        self.tracks.get(track).map_or(0, |held| held.incoming.len())
+    }
+
     fn outlet(&self, session: SessionId) -> Option<Outlet> {
         self.sessions
             .get(&session)

@@ -407,7 +407,8 @@ async fn accepting<E: crate::Context>(relay: Weak<Relay<E>>, door: quinn::Endpoi
         let Some(strong) = relay.upgrade() else {
             return;
         };
-        tokio::spawn(serve_quic(
+        // Through the relay's `JoinSet`, so a handshake in flight is aborted with the relay.
+        strong.spawn(serve_quic(
             relay.clone(),
             incoming,
             strong.halo.plane().pacer().clone(),
