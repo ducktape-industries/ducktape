@@ -470,7 +470,11 @@ impl<E: crate::Context> PeerLink<E> {
                 self.attempts = 0;
             }
             Err(error) => {
-                self.unlinked = matches!(error, halo::Error::Unreachable(_));
+                // Unreachable names a member halo has no connection to, or a key that is no
+                // member: only the member is waited for, so a stale item for an unseated peer
+                // does not wake on a link that resolves at once.
+                self.unlinked = matches!(error, halo::Error::Unreachable(_))
+                    && self.halo.members().admits(&self.to);
                 self.attempts += 1;
                 let worth_a_line =
                     self.attempts == 1 || self.attempts.is_multiple_of(ATTEMPTS_PER_LINE);

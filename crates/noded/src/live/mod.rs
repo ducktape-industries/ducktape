@@ -132,12 +132,12 @@ impl<E: crate::Context> Relay<E> {
     }
 
     /// A task that lives no longer than the relay.
-    /// A task aborted with the relay; the handle aborts it sooner.
+    /// A task aborted with the relay; the handle aborts it sooner. The tasks already over are
+    /// let go first, so the set holds only what runs.
     fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) -> tokio::task::AbortHandle {
-        self.tasks
-            .lock()
-            .expect("the tasks lock is never poisoned")
-            .spawn(task)
+        let mut tasks = self.tasks.lock().expect("the tasks lock is never poisoned");
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(task)
     }
 
     /// The UDP port of the QUIC door, `None` when the node opened none.

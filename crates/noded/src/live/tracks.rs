@@ -393,7 +393,9 @@ impl State {
     }
 
     /// The gauges, from the table's sizes, once per step: nothing in a decide fn sets one, so
-    /// none can drift from what the table holds.
+    /// none can drift from what the table holds. `subscriptions` walks the sessions each step.
+    // ponytail: O(sessions) per step; keep a count in add/drop_subscriber if sessions grow
+    // past what a step can walk.
     pub fn gauges(&self) {
         self.metrics.sessions.set(self.sessions.len() as i64);
         self.metrics.tracks.set(self.tracks.len() as i64);
@@ -2187,8 +2189,16 @@ impl State {
     }
 
     /// What a peer whose control stream just opened must hear to be in step: every local track
-    /// up, and our asks for its tracks that local subscribers wait on.
-    pub fn resync(&self, peer: &PublicKey) -> Vec<Forward> {
+    /// up, and our asks for its tracks that local subscribers wait on. The resync carries one
+    /// ask per track, so the asks in flight to this peer fold into that one and its one answer
+    /// is the one the waiting subscribers hear.
+    pub fn resync(&mut self, peer: &PublicKey) -> Vec<Forward> {
+        for held in self.tracks.values_mut() {
+            let theirs = held.origin == Origin::Remote(peer.clone());
+            if theirs && held.unanswered > 1 {
+                held.unanswered = 1;
+            }
+        }
         let mut tracks: Vec<(&Track, &Published)> = self.tracks.iter().collect();
         tracks.sort_by(|a, b| a.0.cmp(b.0));
         let mut forwards = Vec::new();
@@ -2916,7 +2926,14 @@ mod tests {
         state.node_subscribed(gone.clone(), 7, &ours, Start::Latest);
         state.node_subscribed(kept.clone(), 8, &ours, Start::Latest);
 
-        let swept = told(state.peers_gone(|peer| *peer == kept));
+        let swept = state.peers_gone(|peer| *peer == kept);
+        assert!(
+            !lane(swept).iter().any(|relayed| matches!(
+                relayed,
+                Relayed::Ended { to, .. } | Relayed::Resync { to } if *to == gone
+            )),
+            "nothing is sent to a member that is gone: its writer is dropped, not re-made"
+        );
         assert!(
             state.track(&theirs).is_none(),
             "the gone member's track ends"
@@ -2934,7 +2951,6 @@ mod tests {
                 .any(|s| matches!(s, Subscriber::Node { peer, .. } if *peer == kept)),
             "a member still seated keeps its subscription"
         );
-        let _ = swept;
     }
 
     #[test]
@@ -3007,6 +3023,36 @@ mod tests {
         assert_eq!(
             subscribed, 2,
             "both hear the publisher's cache: {answered:?}"
+        );
+    }
+
+    #[test]
+    fn a_resync_folds_the_asks_in_flight_into_its_one_ask() {
+        let mut state = state();
+        let peer = PrivateKey::from_seed(9).public_key();
+        let doc = room("doc");
+        state.remote_announced(peer.clone(), doc.clone(), 42, Mode::Stream, 128, true);
+        let bob = open(&mut state, 43, 1);
+        let carol = open(&mut state, 44, 2);
+        state.subscribe(bob, 1, doc.clone(), Start::Next, true);
+        state.subscribe(carol, 1, doc.clone(), Start::Latest, true);
+        // Two asks are out when the stream to the peer dies; the resync asks once, and the one
+        // answer to it is the one both waiting subscribers hear.
+        let asks = state
+            .resync(&peer)
+            .into_iter()
+            .filter(|forward| matches!(forward, Forward::Subscribe { .. }))
+            .count();
+        assert_eq!(asks, 1);
+        let request = state.track(&doc).unwrap().request;
+        let answered = told(state.node_forwarded(&peer, request, Some(7)));
+        assert_eq!(
+            answered
+                .iter()
+                .filter(|control| matches!(control, Control::Subscribed { .. }))
+                .count(),
+            2,
+            "{answered:?}"
         );
     }
 
