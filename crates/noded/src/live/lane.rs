@@ -62,6 +62,11 @@ enum ToPeer {
         header: GroupHeader,
         body: Bytes,
     },
+    Group {
+        header: GroupHeader,
+        objects: Arc<Vec<Bytes>>,
+        end: Option<bool>,
+    },
     GroupEnd {
         alias: Alias,
         group: u64,
@@ -75,6 +80,7 @@ enum ToPeer {
 
 enum GroupOut {
     Object(Bytes),
+    Batch(Arc<Vec<Bytes>>),
     End { complete: bool },
 }
 
@@ -179,6 +185,20 @@ impl<E: crate::Context> Lanes<E> {
                 object: _,
                 body,
             } => self.hand(to, ToPeer::Object { header, body }),
+            Relayed::Group {
+                to,
+                alias,
+                group,
+                objects,
+                end,
+            } => self.hand(
+                to,
+                ToPeer::Group {
+                    header: GroupHeader { alias, group },
+                    objects,
+                    end,
+                },
+            ),
             Relayed::GroupEnd {
                 to,
                 alias,
@@ -255,6 +275,11 @@ impl<E: crate::Context> PeerLink<E> {
         match item {
             ToPeer::Control(forward) => self.control(&forward).await,
             ToPeer::Object { header, body } => self.group_object(header, body),
+            ToPeer::Group {
+                header,
+                objects,
+                end,
+            } => self.group_batch(header, objects, end),
             ToPeer::GroupEnd {
                 alias,
                 group,
@@ -350,6 +375,37 @@ impl<E: crate::Context> PeerLink<E> {
             self.dropped.inc();
         }
     }
+
+    /// A whole cached group to a peer, as one queue item on its group stream; a still-open group
+    /// keeps its stream for the live objects that follow.
+    fn group_batch(&mut self, header: GroupHeader, objects: Arc<Vec<Bytes>>, end: Option<bool>) {
+        let key = (header.alias, header.group);
+        if self.abandoned.contains(&key) {
+            return;
+        }
+        while self.writing.try_join_next().is_some() {}
+        let sending = self.groups.entry(key).or_insert_with(|| {
+            let (sending, queue) = mpsc::channel(GROUP_QUEUE);
+            self.writing.spawn(group_writing(
+                self.streams.clone(),
+                self.to.clone(),
+                header,
+                queue,
+            ));
+            sending
+        });
+        if sending.try_send(GroupOut::Batch(objects)).is_err() {
+            self.groups.remove(&key);
+            self.abandoned.insert(key);
+            self.dropped.inc();
+            return;
+        }
+        if let Some(complete) = end {
+            if let Some(sending) = self.groups.remove(&key) {
+                let _ = sending.try_send(GroupOut::End { complete });
+            }
+        }
+    }
 }
 
 /// One group to a peer, as one lane stream: the header, the objects, then `GROUP_COMPLETE` and
@@ -374,6 +430,13 @@ async fn group_writing(
             Some(GroupOut::Object(body)) => {
                 if framed(&mut stream, &body).await.is_err() {
                     return cut_short(stream);
+                }
+            }
+            Some(GroupOut::Batch(objects)) => {
+                for body in objects.iter() {
+                    if framed(&mut stream, body).await.is_err() {
+                        return cut_short(stream);
+                    }
                 }
             }
             Some(GroupOut::End { complete: true }) => {

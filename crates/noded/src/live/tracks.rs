@@ -4,6 +4,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -78,6 +79,15 @@ pub enum Relayed {
         header: GroupHeader,
         object: u32,
         body: Bytes,
+    },
+    /// A whole cached group forwarded to a node that asked `Latest`, as one unit, so a large
+    /// replay across the lane is not N bounded sends that drop the group short.
+    Group {
+        to: PublicKey,
+        alias: Alias,
+        group: u64,
+        objects: Arc<Vec<Bytes>>,
+        end: Option<bool>,
     },
     GroupEnd {
         to: PublicKey,
@@ -2133,27 +2143,15 @@ fn replayed(held: &Published, cached: &Cached) -> Vec<Out> {
                 alias: held.alias,
                 group: cached.group,
             };
-            let mut out: Vec<Out> = cached
-                .objects
-                .iter()
-                .enumerate()
-                .map(|(object, body)| Out::Object {
-                    header,
-                    object: object as u32,
-                    body: body.clone(),
-                    priority: held.priority,
-                })
-                .collect();
-            // A group still being written ends for the late joiner when it ends for everyone.
+            // A group still being written ends for the late joiner when it ends for everyone;
+            // a closed one ends here. One unit, whatever the group's size.
             let closed = !held.incoming.contains_key(&cached.group);
-            if closed {
-                out.push(Out::GroupEnd {
-                    alias: held.alias,
-                    group: cached.group,
-                    complete: cached.complete,
-                });
-            }
-            out
+            vec![Out::Group {
+                header,
+                priority: held.priority,
+                objects: Arc::new(cached.objects.clone()),
+                end: closed.then_some(cached.complete),
+            }]
         }
         Mode::Datagram => cached
             .objects
@@ -2183,6 +2181,18 @@ fn relayed(to: PublicKey, alias: Alias, out: Out) -> Option<Relayed> {
             header: GroupHeader { alias, ..header },
             object,
             body,
+        }),
+        Out::Group {
+            header,
+            objects,
+            end,
+            ..
+        } => Some(Relayed::Group {
+            to,
+            alias,
+            group: header.group,
+            objects,
+            end,
         }),
         Out::GroupEnd {
             group, complete, ..
@@ -2377,6 +2387,60 @@ mod tests {
     }
 
     #[test]
+    fn a_large_cached_group_replays_as_one_unit_not_one_send_per_object() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let mut state = state(&context);
+            let publisher = state
+                .opened(42, vec![1], super::super::session::unconnected())
+                .expect("the node is not going away");
+            let doc = Track {
+                namespace: "net#00000000/chat/room".into(),
+                name: "doc".into(),
+            };
+            state.publish(publisher, 1, doc.clone(), Mode::Stream, 128, true);
+            let alias = state.track(&doc).expect("published").alias;
+            let now = Instant::now();
+            // A group far larger than any egress queue is cached complete.
+            let count = 300u32;
+            for object in 0..count {
+                state.object(
+                    Some(publisher),
+                    GroupHeader { alias, group: 1 },
+                    object,
+                    Bytes::from(vec![0u8; 8]),
+                    now,
+                );
+            }
+            state.group_end(Some(publisher), alias, 1, true);
+
+            let bob = state
+                .opened(43, vec![2], super::super::session::unconnected())
+                .expect("the node is not going away");
+            let effects = state.subscribe(bob, 1, doc, Start::Latest, true);
+            let objects: usize = effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    Effect::Send(_, Out::Object { .. }) => Some(1),
+                    _ => None,
+                })
+                .sum();
+            let group: Vec<usize> = effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    Effect::Send(_, Out::Group { objects, .. }) => Some(objects.len()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(objects, 0, "no per-object send for a replay");
+            assert_eq!(
+                group,
+                vec![count as usize],
+                "the whole cached group replays as one unit"
+            );
+        });
+    }
+
+    #[test]
     fn a_node_that_asks_again_hears_the_answer_and_no_second_replay() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let mut state = state(&context);
@@ -2409,15 +2473,14 @@ mod tests {
                 matches!(
                     replayed.as_slice(),
                     [
-                        Relayed::Object { .. },
-                        Relayed::GroupEnd { complete: true, .. },
+                        Relayed::Group { end: Some(true), .. },
                         Relayed::Answer {
                             forward: Forward::Forwarded { latest: Some(1), .. },
                             ..
                         }
                     ]
                 ),
-                "the cached group crosses once, then the answer: {replayed:?}"
+                "the cached group crosses once as one unit, then the answer: {replayed:?}"
             );
             let again = lane(state.node_subscribed(peer, 8, &doc, Start::Latest));
             assert!(

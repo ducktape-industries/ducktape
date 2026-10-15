@@ -73,6 +73,16 @@ pub enum Out {
         /// a track's priority, no longer a per-group header field).
         priority: Priority,
     },
+    /// A whole cached group replayed to a late joiner, as one unit: the writer writes every
+    /// object on one group stream, so a large replay is not N bounded sends that overflow and
+    /// reset the group or close the session. `end` is `Some(complete)` when the cached group is
+    /// closed; `None` when it is still being written and live objects follow on the same stream.
+    Group {
+        header: GroupHeader,
+        priority: Priority,
+        objects: Arc<Vec<Bytes>>,
+        end: Option<bool>,
+    },
     GroupEnd {
         alias: Alias,
         group: u64,
@@ -488,6 +498,9 @@ fn datagram_arrived(mut bytes: Bytes) -> Option<Inbound> {
 
 enum GroupOut {
     Object(Bytes),
+    /// A whole cached group's objects, written in one go: a replay is one queue item, not one
+    /// per object.
+    Batch(Arc<Vec<Bytes>>),
     End { complete: bool },
 }
 
@@ -522,6 +535,14 @@ async fn quic_writing(
                 ..
             }) => {
                 quic_group_object(&connection, &pacer, &mut groups, header, priority, body);
+            }
+            Drained::Out(Out::Group {
+                header,
+                priority,
+                objects,
+                end,
+            }) => {
+                quic_group_batch(&connection, &pacer, &mut groups, header, priority, objects, end);
             }
             Drained::Out(Out::GroupEnd {
                 alias,
@@ -583,6 +604,45 @@ fn quic_group_object(
     }
 }
 
+/// A whole cached group to a late joiner, as one queue item: the group's stream is opened and
+/// the batch handed to it; a still-open group's stream stays for live objects to follow.
+fn quic_group_batch(
+    connection: &quinn::Connection,
+    pacer: &Pacer,
+    groups: &mut Groups,
+    header: GroupHeader,
+    priority: Priority,
+    objects: Arc<Vec<Bytes>>,
+    end: Option<bool>,
+) {
+    let key = (header.alias, header.group);
+    if groups.abandoned.contains(&key) {
+        return;
+    }
+    let sending = groups.open.entry(key).or_insert_with(|| {
+        let (sending, queue) = mpsc::channel(GROUP_QUEUE);
+        tokio::spawn(quic_group_writing(
+            connection.clone(),
+            pacer.clone(),
+            header,
+            priority,
+            queue,
+        ));
+        sending
+    });
+    if sending.try_send(GroupOut::Batch(objects)).is_err() {
+        groups.open.remove(&key);
+        groups.abandoned.insert(key);
+        return;
+    }
+    // A closed group ends here; an open one keeps its stream for the live objects that follow.
+    if let Some(complete) = end {
+        if let Some(sending) = groups.open.remove(&key) {
+            let _ = sending.try_send(GroupOut::End { complete });
+        }
+    }
+}
+
 /// One egress group stream: opened at the track's priority, paced at the client class, finished
 /// when the group completes and reset when it is abandoned or its queue overflows.
 async fn quic_group_writing(
@@ -605,6 +665,13 @@ async fn quic_group_writing(
             Some(GroupOut::Object(body)) => {
                 if framed(&mut paced, &body).await.is_err() {
                     return;
+                }
+            }
+            Some(GroupOut::Batch(objects)) => {
+                for body in objects.iter() {
+                    if framed(&mut paced, body).await.is_err() {
+                        return;
+                    }
                 }
             }
             Some(GroupOut::End { complete: true }) => {
@@ -743,6 +810,18 @@ async fn ws_writing(mut sink: WsSink, mut egress: Egress) {
                 header,
                 objects: vec![body.to_vec()],
                 end: false,
+            }],
+            // A replayed group is one frame: all its objects, ending it when the cache holds it
+            // closed and complete; a still-open group's live objects follow in later frames.
+            Drained::Out(Out::Group {
+                header,
+                objects,
+                end,
+                ..
+            }) => vec![WsFrame::Group {
+                header,
+                objects: objects.iter().map(|body| body.to_vec()).collect(),
+                end: end == Some(true),
             }],
             // The frame has no word for an abandoned group: a subscriber sees the next group
             // start instead.
